@@ -37,6 +37,8 @@ import {
   type GateResult,
 } from './lib.ts'
 import { loadConfig, type RoutingConfig } from './config.ts'
+import { connectWaggle, disconnectWaggle, getWaggleClient } from './waggle.ts'
+import { SpawnManager, type QueuedMessage } from './spawn-manager.ts'
 import {
   registerSession,
   unregisterSession,
@@ -296,6 +298,11 @@ function createNewSession(
     `[slack] New session created: route="${routeName}" channel=${channelId}`,
   )
 
+  // Notify SpawnManager that a session connected (flushes any queued messages)
+  if (spawnManager) {
+    spawnManager.notifyConnected(routeName, entry)
+  }
+
   return { transport }
 }
 
@@ -371,8 +378,50 @@ async function handleMessage(event: unknown): Promise<void> {
         }
 
         if (!targetSession || !targetSession.connected) {
-          // No live session for this channel — drop silently
-          // (waggle spawn is a later Epic)
+          // No live session for this channel
+          if (spawnManager && routingConfig) {
+            // Find the route name for this channel
+            const routeForChannel = routingConfig.routes[channelId]?.name
+              ?? routingConfig.default_route
+
+            if (routeForChannel) {
+              // Build the queued message now (we need userName and meta)
+              const userName = await resolveUserName(ev['user'] as string)
+              const meta: Record<string, string> = {
+                chat_id: channelId,
+                message_id: ev['ts'] as string,
+                user: userName,
+                ts: ev['ts'] as string,
+              }
+              if (ev['thread_ts']) meta.thread_ts = ev['thread_ts'] as string
+
+              const evFilesEarly = ev['files'] as any[] | undefined
+              if (evFilesEarly?.length) {
+                const { sanitizeFilename } = await import('./lib.ts')
+                const fileDescs = evFilesEarly.map((f: any) => {
+                  const name = sanitizeFilename(f.name || 'unnamed')
+                  return `${name} (${f.mimetype || 'unknown'}, ${f.size || '?'} bytes)`
+                })
+                meta.attachment_count = String(evFilesEarly.length)
+                meta.attachments = fileDescs.join('; ')
+              }
+
+              let text = (ev['text'] as string | undefined) || ''
+              if (botUserId) {
+                text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
+              }
+
+              const queuedMsg: QueuedMessage = {
+                channelId,
+                method: 'notifications/claude/channel',
+                params: { content: text, meta },
+              }
+
+              await spawnManager.ensureSession(routeForChannel, channelId, queuedMsg)
+              return
+            }
+          }
+
           console.error(
             `[slack] No live session for channel ${channelId} — dropping message`,
           )
@@ -468,6 +517,12 @@ socket.on('app_mention', async ({ event, ack }) => {
 let routingConfig: RoutingConfig | null = null
 
 // ---------------------------------------------------------------------------
+// Waggle spawn manager (initialized after waggle connects)
+// ---------------------------------------------------------------------------
+
+let spawnManager: SpawnManager | null = null
+
+// ---------------------------------------------------------------------------
 // Graceful shutdown
 // ---------------------------------------------------------------------------
 
@@ -499,6 +554,14 @@ async function shutdown(signal: string): Promise<void> {
     }
   }
 
+  // Disconnect waggle if it was connected
+  if (routingConfig?.use_waggle) {
+    process.stderr.write('[slack] Disconnecting from waggle\n')
+    try {
+      await disconnectWaggle()
+    } catch { /* ignore */ }
+  }
+
   process.stderr.write('[slack] Disconnecting Socket Mode\n')
   try {
     await socket.disconnect()
@@ -510,6 +573,31 @@ async function shutdown(signal: string): Promise<void> {
 
 process.on('SIGTERM', () => { shutdown('SIGTERM').catch(() => process.exit(1)) })
 process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
+
+// ---------------------------------------------------------------------------
+// Spawn error reporting — Task t2.c1r.k7.w1
+//
+// Posts an error message to the Slack channel when spawn fails or times out.
+// This is the onError callback passed to SpawnManager.
+// ---------------------------------------------------------------------------
+
+/**
+ * Post a spawn error message to the given Slack channel.
+ * The message string is already formatted by SpawnManager.
+ * Wraps the post in try/catch — if the post itself fails, logs to stderr.
+ */
+function postSpawnError(channelId: string, message: string): void {
+  web.chat.postMessage({
+    channel: channelId,
+    text: message,
+    unfurl_links: false,
+    unfurl_media: false,
+  }).catch((err) => {
+    process.stderr.write(
+      `[slack] Failed to post spawn error to channel ${channelId}: ${err instanceof Error ? err.message : String(err)}\n`,
+    )
+  })
+}
 
 // ---------------------------------------------------------------------------
 // Main
@@ -549,6 +637,25 @@ async function main(): Promise<void> {
       mcpPort = Number(process.env['MCP_PORT'] ?? 3100)
     } else {
       console.error(`[slack] Fatal: routing config error — ${msg}`)
+      process.exit(1)
+    }
+  }
+
+  // Connect to waggle if enabled
+  if (routingConfig?.use_waggle) {
+    try {
+      await connectWaggle()
+      console.error('[slack] Waggle MCP client connected')
+
+      // Initialize SpawnManager with injected dependencies
+      spawnManager = new SpawnManager({
+        waggle: getWaggleClient(),
+        registry: { getSessionByRoute },
+        config: routingConfig,
+        onError: postSpawnError,
+      })
+    } catch (err) {
+      console.error('[slack] Fatal: failed to connect to waggle:', err)
       process.exit(1)
     }
   }

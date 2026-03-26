@@ -99,8 +99,8 @@ Create `~/.claude/channels/slack/routing.json` (see [Routing Configuration](#rou
 | `default_dm_session` | string | — | Route name that handles direct messages. Must match an existing route name. |
 | `bind` | string | `"127.0.0.1"` | Interface the HTTP server binds to. Use `"0.0.0.0"` to expose on all interfaces. |
 | `port` | number | `3100` | Port the HTTP server listens on. |
-| `use_waggle` | boolean | `false` | Reserved for future auto-spawn support. |
-| `spawn_timeout` | number | `60` | Seconds to wait when spawning a session (reserved). |
+| `use_waggle` | boolean | `false` | Enable auto-spawn of Claude Code sessions via waggle when a message arrives for a disconnected route. Requires waggle to be installed and in PATH. |
+| `spawn_timeout` | number | `60` | Seconds to wait for a spawned session to connect before giving up and reporting an error to the originating channel. |
 
 ---
 
@@ -140,6 +140,60 @@ claude mcp add --transport http slack-project-b http://127.0.0.1:3100/mcp/projec
 ```
 
 The URL pattern is `http://<host>:<port>/mcp/<routeName>` where `routeName` matches the `name` field in the routing config. The server rejects connections for unknown route names.
+
+---
+
+## Waggle auto-spawn
+
+The router can automatically start a Claude Code session when a Slack message arrives for a route that has no connected session. This is done via [waggle](https://github.com/anthropics/waggle), an MCP server that manages tmux sessions.
+
+### What waggle does
+
+When `use_waggle` is `true` and a message arrives for a disconnected route, the router:
+
+1. Checks whether a tmux session named after the route already exists (via waggle's `list_agents` tool).
+2. If none exists, calls waggle's `spawn_agent` tool to create a new tmux session running Claude Code in the route's `cwd`.
+3. Queues the incoming message while waiting for the session to connect to its MCP endpoint.
+4. Flushes the queue once the session connects. If the session does not connect within `spawn_timeout` seconds, the queued messages are discarded and an error is posted to the originating Slack channel.
+
+### Prerequisites
+
+waggle must be installed and available in `PATH` before starting the router:
+
+```sh
+which waggle   # should print a path
+```
+
+### Configuration
+
+Add `use_waggle: true` to your `routing.json`. The route `name` field is used as the tmux session name, so it must be a valid tmux identifier:
+
+```json
+{
+  "routes": {
+    "C0123456789": { "name": "project-a", "cwd": "~/projects/alpha" },
+    "C9876543210": { "name": "project-b", "cwd": "~/projects/beta" }
+  },
+  "default_dm_session": "project-a",
+  "use_waggle": true,
+  "spawn_timeout": 60
+}
+```
+
+### Error messages
+
+If spawning fails or times out, the router posts a message to the originating channel:
+
+| Situation | Message posted to Slack |
+|---|---|
+| Spawn timed out | `[Router] Session spawn for route \`<name>\` timed out after <N>s` |
+| Spawn error (e.g. waggle not found) | `[Router] Failed to spawn session for route \`<name>\`: <reason>` |
+
+To fix a timeout, check that the Claude Code session in the tmux window connected to the correct MCP endpoint (`claude mcp add …`) and that nothing is blocking the connection. Increase `spawn_timeout` if startup is slow on your machine.
+
+### Disabling auto-spawn
+
+Set `use_waggle: false` (the default) to run without auto-spawn. Messages that arrive for a disconnected route are silently dropped.
 
 ---
 
