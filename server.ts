@@ -41,11 +41,13 @@ import {
   registerSession,
   unregisterSession,
   getSessionByChannel,
+  getSessionByRoute,
   resolveTransportForRequest,
   registerMcpSessionId,
   createSessionServer,
   getAllSessions,
   type SessionToolDeps,
+  type SessionEntry,
 } from './registry.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
@@ -327,35 +329,61 @@ async function handleMessage(event: unknown): Promise<void> {
 
     case 'deliver': {
       const channelId = ev['channel'] as string
+      const isDm = ev['channel_type'] === 'im'
 
-      // -----------------------------------------------------------------------
-      // Task t2.c1r.zk.3d — Find the session for this channel
-      // -----------------------------------------------------------------------
-      let targetSession = routingConfig
-        ? getSessionByChannel(channelId, routingConfig)
-        : undefined
+      let targetSession: SessionEntry | undefined
 
-      // If no direct match, check default_route
-      if (!targetSession && routingConfig?.default_route) {
-        const defaultEntry = import('./registry.ts').then((m) =>
-          m.getSessionByRoute(routingConfig!.default_route!),
-        )
-        targetSession = await defaultEntry
+      if (isDm) {
+        // -----------------------------------------------------------------------
+        // Task t2.c1r.3i.gp — DM deliver: route to default_dm_session
+        // Task t2.c1r.3i.bo — Add DM channel to that session's deliveredChannels
+        // -----------------------------------------------------------------------
+        if (!routingConfig?.default_dm_session) {
+          // No DM session configured — drop silently
+          console.error(
+            `[slack] DM from channel ${channelId} but no default_dm_session configured — dropping`,
+          )
+          return
+        }
+
+        targetSession = getSessionByRoute(routingConfig.default_dm_session)
+
+        if (!targetSession || !targetSession.connected) {
+          console.error(
+            `[slack] DM session "${routingConfig.default_dm_session}" not live — dropping message`,
+          )
+          return
+        }
+
+        // Task t2.c1r.3i.bo — add DM channel ID to that session's deliveredChannels
+        targetSession.deliveredChannels.add(channelId)
+      } else {
+        // -----------------------------------------------------------------------
+        // Task t2.c1r.zk.3d — Find the session for this channel
+        // -----------------------------------------------------------------------
+        targetSession = routingConfig
+          ? getSessionByChannel(channelId, routingConfig)
+          : undefined
+
+        // If no direct match, check default_route
+        if (!targetSession && routingConfig?.default_route) {
+          targetSession = getSessionByRoute(routingConfig.default_route)
+        }
+
+        if (!targetSession || !targetSession.connected) {
+          // No live session for this channel — drop silently
+          // (waggle spawn is a later Epic)
+          console.error(
+            `[slack] No live session for channel ${channelId} — dropping message`,
+          )
+          return
+        }
+
+        // -----------------------------------------------------------------------
+        // Task t2.c1r.zk.qm — Add channel to session's deliveredChannels
+        // -----------------------------------------------------------------------
+        targetSession.deliveredChannels.add(channelId)
       }
-
-      if (!targetSession || !targetSession.connected) {
-        // No live session for this channel — drop silently
-        // (waggle spawn is a later Epic)
-        console.error(
-          `[slack] No live session for channel ${channelId} — dropping message`,
-        )
-        return
-      }
-
-      // -----------------------------------------------------------------------
-      // Task t2.c1r.zk.qm — Add channel to session's deliveredChannels
-      // -----------------------------------------------------------------------
-      targetSession.deliveredChannels.add(channelId)
 
       const access = result.access!
       const userName = await resolveUserName(ev['user'] as string)
