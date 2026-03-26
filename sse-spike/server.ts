@@ -88,7 +88,7 @@ function fireNotification(source: string): void {
 // ---------------------------------------------------------------------------
 
 const transport = new WebStandardStreamableHTTPServerTransport({
-  sessionIdGenerator: undefined, // stateless — no session management
+  sessionIdGenerator: () => crypto.randomUUID(), // stateful — required for persistent SSE notification delivery
 })
 
 await mcp.connect(transport)
