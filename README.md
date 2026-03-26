@@ -12,12 +12,12 @@ Slack (Socket Mode)
         ▼
   server.ts (Bun HTTP + SocketModeClient)
         │
-        ├── /mcp/project-a  ──►  Claude Code session A  (cwd: ~/projects/alpha)
-        ├── /mcp/project-b  ──►  Claude Code session B  (cwd: ~/projects/beta)
-        └── /mcp/project-c  ──►  Claude Code session C  (cwd: ~/projects/gamma)
+        └── /mcp  ──►  Claude Code session A  (cwd: ~/projects/alpha, channel: #project-a)
+                  ──►  Claude Code session B  (cwd: ~/projects/beta,  channel: #project-b)
+                  ──►  Claude Code session C  (cwd: ~/projects/gamma, channel: #project-c)
 ```
 
-Each Claude Code session connects to its own MCP endpoint. Channel `#project-a` sends messages only to session A, channel `#project-b` only to session B, and so on.
+All Claude Code sessions connect to the same `/mcp` endpoint. After the MCP handshake, the server calls `roots/list` on the client and matches the reported CWD against `routing.json` to assign a route. Channel `#project-a` sends messages only to session A, channel `#project-b` only to session B, and so on.
 
 ---
 
@@ -101,7 +101,7 @@ Create `~/.claude/channels/slack/routing.json` (see [Routing Configuration](#rou
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `routes` | object | required | Map of Slack channel ID → route entry. Each entry has `name` (the route identifier used in the URL) and `cwd` (the working directory for that session). `~` is expanded. |
+| `routes` | object | required | Map of Slack channel ID → route entry. Each entry has `name` (a human-readable label) and `cwd` (the working directory for that session — used to identify sessions via `roots/list`). `~` is expanded. |
 | `default_route` | string | — | Route name to use when a message arrives on a channel with no explicit entry in `routes`. Must match an existing route name. |
 | `default_dm_session` | string | — | Route name that handles direct messages. Must match an existing route name. |
 | `bind` | string | `"127.0.0.1"` | Interface the HTTP server binds to. Use `"0.0.0.0"` to expose on all interfaces. |
@@ -115,17 +115,16 @@ Create `~/.claude/channels/slack/routing.json` (see [Routing Configuration](#rou
 bun run server.ts
 ```
 
-On startup the server prints the MCP endpoint URLs and example `mcpServers` config for each configured route:
+On startup the server prints the single MCP endpoint URL and example `mcpServers` config:
 
 ```
 [slack] Loaded routing config: 2 route(s): project-a, project-b
 [slack] Socket Mode connected
-[slack] MCP server listening on http://127.0.0.1:3100/mcp/<routeName>
+[slack] MCP server listening on http://127.0.0.1:3100/mcp
 
 {
   "mcpServers": {
-    "slack-project-a": { "type": "http", "url": "http://127.0.0.1:3100/mcp/project-a" },
-    "slack-project-b": { "type": "http", "url": "http://127.0.0.1:3100/mcp/project-b" }
+    "slack": { "type": "http", "url": "http://127.0.0.1:3100/mcp" }
   }
 }
 ```
@@ -134,27 +133,31 @@ On startup the server prints the MCP endpoint URLs and example `mcpServers` conf
 
 ## Connecting Claude Code sessions
 
-Each Claude Code session must be started in the `cwd` directory listed for its route in `routing.json`. Use `claude mcp add` in that directory to register the MCP endpoint, then launch Claude with the dev-channels flag:
+Each Claude Code session must be started in the `cwd` directory listed for its route in `routing.json`. All sessions connect to the same `/mcp` URL — the server identifies each session by calling `roots/list` after the MCP handshake and matching the reported CWD against the routing config.
+
+Use `claude mcp add` in each project directory to register the MCP endpoint, then launch Claude with the dev-channels flag:
 
 ```sh
-# In ~/projects/alpha — register the MCP server
-claude mcp add --transport http slack http://127.0.0.1:3100/mcp/project-a
+# In ~/projects/alpha — register the MCP server (same URL for all sessions)
+claude mcp add --transport http slack http://127.0.0.1:3100/mcp
 
 # Then launch Claude to receive messages from the server
 claude --dangerously-load-development-channels server:slack
 ```
 
 ```sh
-# In ~/projects/beta
-claude mcp add --transport http slack http://127.0.0.1:3100/mcp/project-b
+# In ~/projects/beta — same URL, different cwd
+claude mcp add --transport http slack http://127.0.0.1:3100/mcp
 claude --dangerously-load-development-channels server:slack
 ```
 
-The URL pattern is `http://<host>:<port>/mcp/<routeName>` where `routeName` matches the `name` field in the routing config. The server rejects connections for unknown route names.
+The server matches each connecting session's CWD (from `roots/list`) to the `cwd` field in `routing.json`. Sessions with an unrecognized CWD are disconnected.
 
 ---
 
 ## How it works
+
+**Session identification:** When a Claude Code session connects to `/mcp`, the server calls `roots/list` after the MCP handshake and matches the reported CWD against the `cwd` fields in `routing.json`. On a match, the session is registered for that route. Sessions with an unrecognized CWD are disconnected.
 
 **Inbound routing:** Slack messages arrive over a single Socket Mode connection. The server looks up the message's channel ID in `routing.json`, finds the matching session entry in the registry, and dispatches the message as an MCP notification to that session's server instance. If no session is connected for the channel, the message is dropped.
 
