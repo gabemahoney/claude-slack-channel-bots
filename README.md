@@ -133,25 +133,33 @@ On startup the server prints the single MCP endpoint URL and example `mcpServers
 
 ## Connecting Claude Code sessions
 
-Each Claude Code session must be started in the `cwd` directory listed for its route in `routing.json`. All sessions connect to the same `/mcp` URL — the server identifies each session by calling `roots/list` after the MCP handshake and matching the reported CWD against the routing config.
+All sessions connect to the same `/mcp` URL. The server identifies each session by calling `roots/list` after the MCP handshake and matching the reported CWD against `routing.json`.
 
-Use `claude mcp add` in each project directory to register the MCP endpoint, then launch Claude with the dev-channels flag:
+### 1. Add the MCP server to `~/.claude.json`
 
-```sh
-# In ~/projects/alpha — register the MCP server (same URL for all sessions)
-claude mcp add --transport http slack http://127.0.0.1:3100/mcp
+Add the following entry once (globally or per-project):
 
-# Then launch Claude to receive messages from the server
-claude --dangerously-load-development-channels server:slack
+```json
+{
+  "mcpServers": {
+    "slack": {
+      "type": "http",
+      "url": "http://127.0.0.1:3100/mcp"
+    }
+  }
+}
 ```
 
+The server prints this snippet on startup as a reminder.
+
+### 2. Launch Claude from the project directory
+
 ```sh
-# In ~/projects/beta — same URL, different cwd
-claude mcp add --transport http slack http://127.0.0.1:3100/mcp
-claude --dangerously-load-development-channels server:slack
+cd ~/projects/alpha
+claude
 ```
 
-The server matches each connecting session's CWD (from `roots/list`) to the `cwd` field in `routing.json`. Sessions with an unrecognized CWD are disconnected.
+The server matches the session's CWD (from `roots/list`) to the `cwd` field in `routing.json`. Sessions with an unrecognized CWD are disconnected.
 
 ---
 
