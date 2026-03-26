@@ -9,7 +9,7 @@ import type { RouteEntry, RoutingConfig } from './config.ts'
 import {
   registerSession,
   unregisterSession,
-  getSessionByRoute,
+  getSessionByCwd,
   getSessionByChannel,
   registerMcpSessionId,
   resolveTransportForRequest,
@@ -27,27 +27,27 @@ import {
 // ---------------------------------------------------------------------------
 
 /** Creates a minimal RouteEntry fixture. */
-function makeRoute(name: string, cwd = '/tmp'): RouteEntry {
-  return { name, cwd }
+function makeRoute(cwd = '/tmp'): RouteEntry {
+  return { cwd }
 }
 
 /** Creates a RoutingConfig with two test routes. */
 function makeRoutingConfig(opts: {
   channelA?: string
-  routeA?: string
+  cwdA?: string
   channelB?: string
-  routeB?: string
+  cwdB?: string
   default_route?: string
 } = {}): RoutingConfig {
   const channelA = opts.channelA ?? 'C_ALPHA'
-  const routeA   = opts.routeA   ?? 'route-alpha'
+  const cwdA     = opts.cwdA     ?? '/tmp/alpha'
   const channelB = opts.channelB ?? 'C_BETA'
-  const routeB   = opts.routeB   ?? 'route-beta'
+  const cwdB     = opts.cwdB     ?? '/tmp/beta'
 
   const config: RoutingConfig = {
     routes: {
-      [channelA]: makeRoute(routeA),
-      [channelB]: makeRoute(routeB),
+      [channelA]: makeRoute(cwdA),
+      [channelB]: makeRoute(cwdB),
     },
     bind: '127.0.0.1',
     port: 3100,
@@ -87,44 +87,44 @@ beforeEach(() => {
 
 describe('registerSession', () => {
   test('registers a session successfully', () => {
-    const entry = registerSession('route-a', 'C_A', makeTransport(), makeServer())
+    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
 
-    expect(entry.routeName).toBe('route-a')
+    expect(entry.cwd).toBe('/tmp/a')
     expect(entry.channelId).toBe('C_A')
     expect(entry.connected).toBe(true)
   })
 
   test('seeds deliveredChannels with the assigned channelId', () => {
-    const entry = registerSession('route-a', 'C_A', makeTransport(), makeServer())
+    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
 
     expect(entry.deliveredChannels.has('C_A')).toBe(true)
     expect(entry.deliveredChannels.size).toBe(1)
   })
 
   test('replaces an existing session when re-registering for the same route', () => {
-    const first = registerSession('route-a', 'C_A', makeTransport(), makeServer())
-    const second = registerSession('route-a', 'C_A', makeTransport(), makeServer())
+    const first = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
+    const second = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
 
     expect(second).not.toBe(first)
-    expect(getSessionByRoute('route-a')).toBe(second)
+    expect(getSessionByCwd('/tmp/a')).toBe(second)
   })
 
   test('allows re-registration after the previous session was unregistered', () => {
-    registerSession('route-a', 'C_A', makeTransport(), makeServer())
-    unregisterSession('route-a')
+    registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
+    unregisterSession('/tmp/a')
 
     // Should not throw
-    const entry2 = registerSession('route-a', 'C_A', makeTransport(), makeServer())
+    const entry2 = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
     expect(entry2.connected).toBe(true)
   })
 })
 
 describe('unregisterSession', () => {
   test('removes a registered session', () => {
-    registerSession('route-a', 'C_A', makeTransport(), makeServer())
-    unregisterSession('route-a')
+    registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
+    unregisterSession('/tmp/a')
 
-    expect(getSessionByRoute('route-a')).toBeUndefined()
+    expect(getSessionByCwd('/tmp/a')).toBeUndefined()
   })
 
   test('is a no-op for unknown route names', () => {
@@ -133,29 +133,29 @@ describe('unregisterSession', () => {
   })
 })
 
-describe('getSessionByRoute', () => {
+describe('getSessionByCwd', () => {
   test('returns the registered entry for a known route', () => {
-    registerSession('route-a', 'C_A', makeTransport(), makeServer())
+    registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
 
-    const found = getSessionByRoute('route-a')
+    const found = getSessionByCwd('/tmp/a')
     expect(found).toBeDefined()
-    expect(found!.routeName).toBe('route-a')
+    expect(found!.cwd).toBe('/tmp/a')
   })
 
   test('returns undefined for a nonexistent route', () => {
-    expect(getSessionByRoute('no-such-route')).toBeUndefined()
+    expect(getSessionByCwd('no-such-route')).toBeUndefined()
   })
 })
 
 describe('getSessionByChannel', () => {
   test('returns entry for a channel that has a configured route', () => {
-    const config = makeRoutingConfig({ channelA: 'C_ALPHA', routeA: 'route-alpha' })
-    registerSession('route-alpha', 'C_ALPHA', makeTransport(), makeServer())
+    const config = makeRoutingConfig({ channelA: 'C_ALPHA', cwdA: '/tmp/alpha' })
+    registerSession('/tmp/alpha', 'C_ALPHA', makeTransport(), makeServer())
 
     const found = getSessionByChannel('C_ALPHA', config)
     expect(found).toBeDefined()
     expect(found!.channelId).toBe('C_ALPHA')
-    expect(found!.routeName).toBe('route-alpha')
+    expect(found!.cwd).toBe('/tmp/alpha')
   })
 
   test('returns undefined for a channel not in the routing config', () => {
@@ -166,7 +166,7 @@ describe('getSessionByChannel', () => {
   })
 
   test('returns undefined when route is configured but session is not registered', () => {
-    const config = makeRoutingConfig({ channelA: 'C_ALPHA', routeA: 'route-alpha' })
+    const config = makeRoutingConfig({ channelA: 'C_ALPHA', cwdA: '/tmp/alpha' })
     // Do NOT register a session for route-alpha
 
     const found = getSessionByChannel('C_ALPHA', config)
@@ -197,8 +197,8 @@ describe('resolveTransportForRequest', () => {
 
   test('returns SessionEntry for a known Mcp-Session-Id', () => {
     const transport = makeTransport()
-    const entry = registerSession('route-a', 'C_A', transport, makeServer())
-    registerMcpSessionId('test-uuid-123', 'route-a')
+    const entry = registerSession('/tmp/a', 'C_A', transport, makeServer())
+    registerMcpSessionId('test-uuid-123', '/tmp/a')
 
     const result = resolveTransportForRequest(
       makeRequest({ 'mcp-session-id': 'test-uuid-123' }),
@@ -207,11 +207,11 @@ describe('resolveTransportForRequest', () => {
   })
 
   test('returns undefined when session is registered but not connected', () => {
-    registerSession('route-a', 'C_A', makeTransport(), makeServer())
-    registerMcpSessionId('test-uuid-123', 'route-a')
+    registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
+    registerMcpSessionId('test-uuid-123', '/tmp/a')
 
     // Mark the session as disconnected
-    const entry = getSessionByRoute('route-a')!
+    const entry = getSessionByCwd('/tmp/a')!
     entry.connected = false
 
     const result = resolveTransportForRequest(
@@ -228,11 +228,11 @@ describe('resolveTransportForRequest', () => {
 describe('inbound routing — getSessionByChannel', () => {
   test('message to channel A routes to session A', () => {
     const config = makeRoutingConfig({
-      channelA: 'C_ALPHA', routeA: 'route-alpha',
-      channelB: 'C_BETA',  routeB: 'route-beta',
+      channelA: 'C_ALPHA', cwdA: '/tmp/alpha',
+      channelB: 'C_BETA',  cwdB: '/tmp/beta',
     })
-    const entryA = registerSession('route-alpha', 'C_ALPHA', makeTransport(), makeServer())
-    registerSession('route-beta', 'C_BETA', makeTransport(), makeServer())
+    const entryA = registerSession('/tmp/alpha', 'C_ALPHA', makeTransport(), makeServer())
+    registerSession('/tmp/beta', 'C_BETA', makeTransport(), makeServer())
 
     const found = getSessionByChannel('C_ALPHA', config)
     expect(found).toBe(entryA)
@@ -240,11 +240,11 @@ describe('inbound routing — getSessionByChannel', () => {
 
   test('message to channel B routes to session B', () => {
     const config = makeRoutingConfig({
-      channelA: 'C_ALPHA', routeA: 'route-alpha',
-      channelB: 'C_BETA',  routeB: 'route-beta',
+      channelA: 'C_ALPHA', cwdA: '/tmp/alpha',
+      channelB: 'C_BETA',  cwdB: '/tmp/beta',
     })
-    registerSession('route-alpha', 'C_ALPHA', makeTransport(), makeServer())
-    const entryB = registerSession('route-beta', 'C_BETA', makeTransport(), makeServer())
+    registerSession('/tmp/alpha', 'C_ALPHA', makeTransport(), makeServer())
+    const entryB = registerSession('/tmp/beta', 'C_BETA', makeTransport(), makeServer())
 
     const found = getSessionByChannel('C_BETA', config)
     expect(found).toBe(entryB)
@@ -258,9 +258,9 @@ describe('inbound routing — getSessionByChannel', () => {
   })
 
   test('channel with no connected session returns undefined', () => {
-    const config = makeRoutingConfig({ channelA: 'C_ALPHA', routeA: 'route-alpha' })
+    const config = makeRoutingConfig({ channelA: 'C_ALPHA', cwdA: '/tmp/alpha' })
     // Session registered but disconnected
-    const entry = registerSession('route-alpha', 'C_ALPHA', makeTransport(), makeServer())
+    const entry = registerSession('/tmp/alpha', 'C_ALPHA', makeTransport(), makeServer())
     entry.connected = false
 
     // getSessionByChannel returns the entry regardless of connected state;
@@ -274,20 +274,20 @@ describe('inbound routing — getSessionByChannel', () => {
 
   test('unrouted channel can fall back to default_route session when looked up by route name', () => {
     // Simulate the default_route fallback pattern used in server.ts handleMessage:
-    // if getSessionByChannel returns undefined, try getSessionByRoute(config.default_route)
+    // if getSessionByChannel returns undefined, try getSessionByCwd(config.default_route)
     const config = makeRoutingConfig({
-      channelA: 'C_DEFAULT', routeA: 'default-session',
-      channelB: 'C_OTHER',   routeB: 'other-session',
-      default_route: 'default-session',
+      channelA: 'C_DEFAULT', cwdA: '/tmp/default',
+      channelB: 'C_OTHER',   cwdB: '/tmp/other',
+      default_route: '/tmp/default',
     })
-    const defaultEntry = registerSession('default-session', 'C_DEFAULT', makeTransport(), makeServer())
+    const defaultEntry = registerSession('/tmp/default', 'C_DEFAULT', makeTransport(), makeServer())
 
     // C_UNROUTED is not in routes, so getSessionByChannel returns undefined
     const direct = getSessionByChannel('C_UNROUTED', config)
     expect(direct).toBeUndefined()
 
     // Fallback: look up via default_route
-    const fallback = getSessionByRoute(config.default_route!)
+    const fallback = getSessionByCwd(config.default_route!)
     expect(fallback).toBe(defaultEntry)
   })
 
@@ -308,27 +308,27 @@ describe('inbound routing — getSessionByChannel', () => {
 
 describe('outbound scoping — deliveredChannels', () => {
   test('deliveredChannels is seeded with the session channelId at registration', () => {
-    const entry = registerSession('route-a', 'C_A', makeTransport(), makeServer())
+    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
 
     expect(entry.deliveredChannels.has('C_A')).toBe(true)
   })
 
   test('session can reply to its assigned channel (in deliveredChannels)', () => {
-    const entry = registerSession('route-a', 'C_A', makeTransport(), makeServer())
+    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
 
     // C_A was seeded into deliveredChannels on registration
     expect(entry.deliveredChannels.has('C_A')).toBe(true)
   })
 
   test("session cannot reply to another session's channel (not in deliveredChannels)", () => {
-    const entryA = registerSession('route-a', 'C_A', makeTransport(), makeServer())
+    const entryA = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
 
     // C_B belongs to another session; it should not be in entryA's deliveredChannels
     expect(entryA.deliveredChannels.has('C_B')).toBe(false)
   })
 
   test('deliveredChannels grows as new messages arrive from additional channels', () => {
-    const entry = registerSession('route-a', 'C_A', makeTransport(), makeServer())
+    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
     expect(entry.deliveredChannels.size).toBe(1)
 
     // Simulate inbound message dispatch adding a new channel (as server.ts does)
@@ -339,8 +339,8 @@ describe('outbound scoping — deliveredChannels', () => {
   })
 
   test('two sessions have independent deliveredChannels sets', () => {
-    const entryA = registerSession('route-a', 'C_A', makeTransport(), makeServer())
-    const entryB = registerSession('route-b', 'C_B', makeTransport(), makeServer())
+    const entryA = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
+    const entryB = registerSession('/tmp/b', 'C_B', makeTransport(), makeServer())
 
     entryA.deliveredChannels.add('C_EXTRA')
 
@@ -356,7 +356,7 @@ describe('assertOutboundAllowed — per-session state', () => {
     const { assertOutboundAllowed } = await import('./lib.ts')
     const { defaultAccess } = await import('./lib.ts')
 
-    const entry = registerSession('route-a', 'C_A', makeTransport(), makeServer())
+    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
     const access = defaultAccess()
 
     // C_A is in deliveredChannels (seeded at registration)
@@ -367,7 +367,7 @@ describe('assertOutboundAllowed — per-session state', () => {
     const { assertOutboundAllowed } = await import('./lib.ts')
     const { defaultAccess } = await import('./lib.ts')
 
-    const entry = registerSession('route-a', 'C_A', makeTransport(), makeServer())
+    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
     const access = defaultAccess()
 
     expect(() =>
@@ -379,8 +379,8 @@ describe('assertOutboundAllowed — per-session state', () => {
     const { assertOutboundAllowed } = await import('./lib.ts')
     const { defaultAccess } = await import('./lib.ts')
 
-    const entryA = registerSession('route-a', 'C_A', makeTransport(), makeServer())
-    registerSession('route-b', 'C_B', makeTransport(), makeServer())
+    const entryA = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
+    registerSession('/tmp/b', 'C_B', makeTransport(), makeServer())
     const access = defaultAccess()
 
     // entryA's deliveredChannels only contains C_A, not C_B
@@ -393,7 +393,7 @@ describe('assertOutboundAllowed — per-session state', () => {
     const { assertOutboundAllowed } = await import('./lib.ts')
     const { defaultAccess } = await import('./lib.ts')
 
-    const entry = registerSession('route-a', 'C_A', makeTransport(), makeServer())
+    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
     const access = defaultAccess()
 
     // Simulate inbound message delivery adding C_NEW to this session's set
@@ -477,9 +477,9 @@ describe('registerSession — promotion path (pending → registered)', () => {
 
     createPendingSession('prom-id-1', transport, server, delivered)
 
-    const entry = registerSession('route-x', 'C_X', 'prom-id-1')
+    const entry = registerSession('/tmp/x', 'C_X', 'prom-id-1')
 
-    expect(entry.routeName).toBe('route-x')
+    expect(entry.cwd).toBe('/tmp/x')
     expect(entry.channelId).toBe('C_X')
     expect(entry.transport).toBe(transport)
     expect(entry.connected).toBe(true)
@@ -489,7 +489,7 @@ describe('registerSession — promotion path (pending → registered)', () => {
     const delivered = new Set<string>()
     createPendingSession('prom-id-2', makeTransport(), makeServer(), delivered)
 
-    const entry = registerSession('route-y', 'C_Y', 'prom-id-2')
+    const entry = registerSession('/tmp/y', 'C_Y', 'prom-id-2')
 
     expect(entry.deliveredChannels.has('C_Y')).toBe(true)
   })
@@ -498,7 +498,7 @@ describe('registerSession — promotion path (pending → registered)', () => {
     const delivered = new Set<string>()
     createPendingSession('prom-id-3', makeTransport(), makeServer(), delivered)
 
-    const entry = registerSession('route-z', 'C_Z', 'prom-id-3')
+    const entry = registerSession('/tmp/z', 'C_Z', 'prom-id-3')
 
     // Both references should be the same Set object
     expect(entry.deliveredChannels).toBe(delivered)
@@ -506,13 +506,13 @@ describe('registerSession — promotion path (pending → registered)', () => {
 
   test('promotion removes the pending entry', () => {
     createPendingSession('prom-id-4', makeTransport(), makeServer(), new Set())
-    registerSession('route-w', 'C_W', 'prom-id-4')
+    registerSession('/tmp/w', 'C_W', 'prom-id-4')
 
     expect(getPendingSession('prom-id-4')).toBeUndefined()
   })
 
   test('promotion throws if pendingId not found', () => {
-    expect(() => registerSession('route-bad', 'C_BAD', 'nonexistent-pending-id')).toThrow()
+    expect(() => registerSession('/tmp/bad', 'C_BAD', 'nonexistent-pending-id')).toThrow()
   })
 })
 
@@ -539,8 +539,8 @@ describe('resolveTransportForRequest — pending session path', () => {
     createPendingSession('pend-uuid-2', transport, makeServer(), new Set())
 
     // Promote to registered and map the MCP session ID
-    const entry = registerSession('route-promoted', 'C_P', 'pend-uuid-2')
-    registerMcpSessionId('pend-uuid-2', 'route-promoted')
+    const entry = registerSession('/tmp/promoted', 'C_P', 'pend-uuid-2')
+    registerMcpSessionId('pend-uuid-2', '/tmp/promoted')
 
     // Should now resolve to the SessionEntry, not the PendingSessionEntry
     const result = resolveTransportForRequest(makeRequest({ 'mcp-session-id': 'pend-uuid-2' }))

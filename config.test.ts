@@ -21,7 +21,6 @@ import {
 function makeRoute(overrides: Partial<RouteEntry> = {}): RouteEntry {
   return {
     cwd: '/tmp/project',
-    name: 'my-bot',
     ...overrides,
   }
 }
@@ -29,7 +28,7 @@ function makeRoute(overrides: Partial<RouteEntry> = {}): RouteEntry {
 function makeRoutingConfig(overrides: Partial<RoutingConfigInput> = {}): RoutingConfigInput {
   return {
     routes: {
-      C_GENERAL: makeRoute({ name: 'general-bot', cwd: '/tmp/general' }),
+      C_GENERAL: makeRoute({ cwd: '/tmp/general' }),
     },
     ...overrides,
   }
@@ -67,13 +66,13 @@ describe('applyDefaults', () => {
   })
 
   test('passes through default_route when provided', () => {
-    const result = applyDefaults(makeRoutingConfig({ default_route: 'general-bot' }))
-    expect(result.default_route).toBe('general-bot')
+    const result = applyDefaults(makeRoutingConfig({ default_route: '/tmp/general' }))
+    expect(result.default_route).toBe('/tmp/general')
   })
 
   test('passes through default_dm_session when provided', () => {
-    const result = applyDefaults(makeRoutingConfig({ default_dm_session: 'general-bot' }))
-    expect(result.default_dm_session).toBe('general-bot')
+    const result = applyDefaults(makeRoutingConfig({ default_dm_session: '/tmp/general' }))
+    expect(result.default_dm_session).toBe('/tmp/general')
   })
 
   test('does not mutate the input object', () => {
@@ -91,7 +90,7 @@ describe('applyDefaults', () => {
 function makeValidConfig(overrides: Partial<RoutingConfig> = {}): RoutingConfig {
   return {
     routes: {
-      C_GENERAL: makeRoute({ name: 'general-bot', cwd: '/tmp/general' }),
+      C_GENERAL: makeRoute({ cwd: '/tmp/general' }),
     },
     bind: '127.0.0.1',
     port: 3100,
@@ -107,8 +106,8 @@ describe('validateConfig', () => {
   test('valid config with multiple routes passes without throwing', () => {
     const config = makeValidConfig({
       routes: {
-        C_GENERAL: makeRoute({ name: 'general-bot', cwd: '/tmp/general' }),
-        C_DEV: makeRoute({ name: 'dev-bot', cwd: '/tmp/dev' }),
+        C_GENERAL: makeRoute({ cwd: '/tmp/general' }),
+        C_DEV: makeRoute({ cwd: '/tmp/dev' }),
       },
     })
     expect(() => validateConfig(config)).not.toThrow()
@@ -121,39 +120,39 @@ describe('validateConfig', () => {
     )
   })
 
-  test('throws on duplicate route names across different channels', () => {
+  test('throws on duplicate CWDs across different channels', () => {
     const config = makeValidConfig({
       routes: {
-        C_GENERAL: makeRoute({ name: 'duplicate-name', cwd: '/tmp/a' }),
-        C_DEV: makeRoute({ name: 'duplicate-name', cwd: '/tmp/b' }),
+        C_GENERAL: makeRoute({ cwd: '/tmp/same' }),
+        C_DEV: makeRoute({ cwd: '/tmp/same' }),
       },
     })
     expect(() => validateConfig(config)).toThrow(
-      'duplicate route name "duplicate-name"',
+      'duplicate CWD "/tmp/same"',
     )
   })
 
-  test('throws when default_route references a nonexistent name', () => {
-    const config = makeValidConfig({ default_route: 'nonexistent' })
+  test('throws when default_route references a nonexistent CWD', () => {
+    const config = makeValidConfig({ default_route: '/tmp/nonexistent' })
     expect(() => validateConfig(config)).toThrow(
-      'default_route "nonexistent" does not match any defined route name',
+      'default_route "/tmp/nonexistent" does not match any defined route CWD',
     )
   })
 
-  test('passes when default_route references a valid route name', () => {
-    const config = makeValidConfig({ default_route: 'general-bot' })
+  test('passes when default_route references a valid route CWD', () => {
+    const config = makeValidConfig({ default_route: '/tmp/general' })
     expect(() => validateConfig(config)).not.toThrow()
   })
 
-  test('throws when default_dm_session references a nonexistent name', () => {
-    const config = makeValidConfig({ default_dm_session: 'ghost-session' })
+  test('throws when default_dm_session references a nonexistent CWD', () => {
+    const config = makeValidConfig({ default_dm_session: '/tmp/ghost' })
     expect(() => validateConfig(config)).toThrow(
-      'default_dm_session "ghost-session" does not match any defined route name',
+      'default_dm_session "/tmp/ghost" does not match any defined route CWD',
     )
   })
 
-  test('passes when default_dm_session references a valid route name', () => {
-    const config = makeValidConfig({ default_dm_session: 'general-bot' })
+  test('passes when default_dm_session references a valid route CWD', () => {
+    const config = makeValidConfig({ default_dm_session: '/tmp/general' })
     expect(() => validateConfig(config)).not.toThrow()
   })
 
@@ -210,7 +209,7 @@ describe('resolveConfig', () => {
   test('expands tilde in route cwd paths', () => {
     const input = makeRoutingConfig({
       routes: {
-        C_GENERAL: makeRoute({ name: 'tilde-bot', cwd: '~/my-project' }),
+        C_GENERAL: makeRoute({ cwd: '~/my-project' }),
       },
     })
     const result = resolveConfig(input)
@@ -221,31 +220,51 @@ describe('resolveConfig', () => {
   test('resolves absolute cwd paths (path.resolve)', () => {
     const input = makeRoutingConfig({
       routes: {
-        C_GENERAL: makeRoute({ name: 'abs-bot', cwd: '/tmp/project' }),
+        C_GENERAL: makeRoute({ cwd: '/tmp/project' }),
       },
     })
     const result = resolveConfig(input)
     expect(result.routes['C_GENERAL'].cwd).toBe('/tmp/project')
   })
 
+  test('expands tilde in default_route CWD', () => {
+    const input = makeRoutingConfig({
+      routes: { C_A: { cwd: '~/my-project' } },
+      default_route: '~/my-project',
+    })
+    const result = resolveConfig(input)
+    expect(result.default_route).toStartWith(homedir())
+    expect(result.default_route).not.toContain('~')
+  })
+
+  test('expands tilde in default_dm_session CWD', () => {
+    const input = makeRoutingConfig({
+      routes: { C_A: { cwd: '~/my-project' } },
+      default_dm_session: '~/my-project',
+    })
+    const result = resolveConfig(input)
+    expect(result.default_dm_session).toStartWith(homedir())
+    expect(result.default_dm_session).not.toContain('~')
+  })
+
   test('throws on invalid config (empty routes)', () => {
     expect(() => resolveConfig({ routes: {} })).toThrow()
   })
 
-  test('throws on duplicate route names', () => {
+  test('throws on duplicate CWDs', () => {
     const input: RoutingConfigInput = {
       routes: {
-        C_A: makeRoute({ name: 'same-name', cwd: '/tmp/a' }),
-        C_B: makeRoute({ name: 'same-name', cwd: '/tmp/b' }),
+        C_A: { cwd: '/tmp/same' },
+        C_B: { cwd: '/tmp/same' },
       },
     }
-    expect(() => resolveConfig(input)).toThrow('duplicate route name')
+    expect(() => resolveConfig(input)).toThrow('duplicate CWD')
   })
 
   test('does not mutate the input', () => {
     const input = makeRoutingConfig({
       routes: {
-        C_TILDE: makeRoute({ name: 'tilde-bot', cwd: '~/stuff' }),
+        C_TILDE: makeRoute({ cwd: '~/stuff' }),
       },
     })
     const originalCwd = input.routes['C_TILDE'].cwd
@@ -308,14 +327,14 @@ describe('loadConfig', () => {
     const configPath = join(dir, 'routing.json')
     const validConfig: RoutingConfigInput = {
       routes: {
-        C_TEST: { name: 'test-bot', cwd: '/tmp' },
+        C_TEST: { cwd: '/tmp' },
       },
       port: 4242,
     }
     writeFileSync(configPath, JSON.stringify(validConfig), 'utf-8')
     const result = loadConfig(configPath)
     expect(result.port).toBe(4242)
-    expect(result.routes['C_TEST'].name).toBe('test-bot')
+    expect(result.routes['C_TEST'].cwd).toBe('/tmp')
   })
 
   test('applies defaults when loading a minimal valid config', () => {
@@ -323,7 +342,7 @@ describe('loadConfig', () => {
     const configPath = join(dir, 'routing.json')
     const minimalConfig: RoutingConfigInput = {
       routes: {
-        C_MIN: { name: 'minimal-bot', cwd: '/tmp' },
+        C_MIN: { cwd: '/tmp' },
       },
     }
     writeFileSync(configPath, JSON.stringify(minimalConfig), 'utf-8')

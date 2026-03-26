@@ -8,7 +8,7 @@
  * The handleMessage function composes:
  *   1. gate()         — access-control decision (deliver / drop / pair)
  *   2. isDm check     — ev.channel_type === 'im'
- *   3. getSessionByRoute(routingConfig.default_dm_session)
+ *   3. getSessionByCwd(routingConfig.default_dm_session)
  *   4. targetSession.deliveredChannels.add(channelId)  — on delivery
  *   5. targetSession.server.notification(...)           — dispatch to session
  *
@@ -32,7 +32,7 @@ import {
 } from './lib.ts'
 import {
   registerSession,
-  getSessionByRoute,
+  getSessionByCwd,
   _resetRegistry,
 } from './registry.ts'
 import type { RoutingConfig } from './config.ts'
@@ -76,15 +76,15 @@ function makeServer(): { server: any; notifications: any[] } {
  */
 function makeRoutingConfig(opts: {
   channelId?: string
-  routeName?: string
+  cwd?: string
   default_dm_session?: string
 } = {}): RoutingConfig {
   const channelId = opts.channelId ?? 'C_BOT_CHANNEL'
-  const routeName = opts.routeName ?? 'dm-session'
+  const cwd = opts.cwd ?? '/tmp/dm-session'
 
   const config: RoutingConfig = {
     routes: {
-      [channelId]: { name: routeName, cwd: '/tmp' },
+      [channelId]: { cwd },
     },
     bind: '127.0.0.1',
     port: 3100,
@@ -105,7 +105,7 @@ function makeRoutingConfig(opts: {
  * Logic mirrors server.ts lines 334–359:
  *   if (isDm) {
  *     if (!routingConfig?.default_dm_session) return (drop)
- *     targetSession = getSessionByRoute(routingConfig.default_dm_session)
+ *     targetSession = getSessionByCwd(routingConfig.default_dm_session)
  *     if (!targetSession || !targetSession.connected) return (drop)
  *     targetSession.deliveredChannels.add(channelId)
  *     targetSession.server.notification(...)
@@ -114,12 +114,12 @@ function makeRoutingConfig(opts: {
 function simulateDmDeliver(
   channelId: string,
   routingConfig: RoutingConfig | null,
-): { delivered: boolean; targetSession: ReturnType<typeof getSessionByRoute> } {
+): { delivered: boolean; targetSession: ReturnType<typeof getSessionByCwd> } {
   if (!routingConfig?.default_dm_session) {
     return { delivered: false, targetSession: undefined }
   }
 
-  const targetSession = getSessionByRoute(routingConfig.default_dm_session)
+  const targetSession = getSessionByCwd(routingConfig.default_dm_session)
 
   if (!targetSession || !targetSession.connected) {
     return { delivered: false, targetSession }
@@ -171,10 +171,10 @@ describe('DM routing — forwarded to default_dm_session', () => {
 
     // Set up registry with a connected dm-session
     const { server, notifications } = makeServer()
-    const entry = registerSession('dm-session', 'C_BOT', makeTransport(), server as any)
+    const entry = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), server as any)
     entry.server = server
 
-    const routingConfig = makeRoutingConfig({ default_dm_session: 'dm-session' })
+    const routingConfig = makeRoutingConfig({ default_dm_session: '/tmp/dm-session' })
 
     const { delivered } = simulateDmDeliver('D_DM1', routingConfig)
 
@@ -202,11 +202,11 @@ describe('DM routing — dropped when no default_dm_session configured', () => {
 
     // Register a session (should not be reached)
     const { server, notifications } = makeServer()
-    const entry = registerSession('some-session', 'C_BOT', makeTransport(), server as any)
+    const entry = registerSession('/tmp/some-session', 'C_BOT', makeTransport(), server as any)
     entry.server = server
 
     // RoutingConfig WITHOUT default_dm_session
-    const routingConfig = makeRoutingConfig({ routeName: 'some-session' }) // no default_dm_session
+    const routingConfig = makeRoutingConfig({ cwd: '/tmp/some-session' }) // no default_dm_session
 
     const { delivered } = simulateDmDeliver('D_DM1', routingConfig)
 
@@ -227,12 +227,12 @@ describe('DM routing — dropped when no default_dm_session configured', () => {
 describe('DM routing — dropped when default_dm_session session not connected', () => {
   test('DM is dropped when the target session exists but is not connected', async () => {
     const { server, notifications } = makeServer()
-    const entry = registerSession('dm-session', 'C_BOT', makeTransport(), server as any)
+    const entry = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), server as any)
     entry.server = server
     // Mark the session as disconnected
     entry.connected = false
 
-    const routingConfig = makeRoutingConfig({ default_dm_session: 'dm-session' })
+    const routingConfig = makeRoutingConfig({ default_dm_session: '/tmp/dm-session' })
 
     const { delivered } = simulateDmDeliver('D_DM1', routingConfig)
 
@@ -242,7 +242,7 @@ describe('DM routing — dropped when default_dm_session session not connected',
 
   test('DM is dropped when no session is registered for the default_dm_session route', async () => {
     // No session registered — registry is empty
-    const routingConfig = makeRoutingConfig({ default_dm_session: 'dm-session' })
+    const routingConfig = makeRoutingConfig({ default_dm_session: '/tmp/dm-session' })
 
     const { delivered } = simulateDmDeliver('D_DM1', routingConfig)
 
@@ -257,13 +257,13 @@ describe('DM routing — dropped when default_dm_session session not connected',
 describe('DM routing — DM channel added to deliveredChannels', () => {
   test('DM channel ID is added to the session deliveredChannels after delivery', async () => {
     const { server } = makeServer()
-    const entry = registerSession('dm-session', 'C_BOT', makeTransport(), server as any)
+    const entry = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), server as any)
     entry.server = server
 
     // Before delivery, DM channel is NOT in deliveredChannels
     expect(entry.deliveredChannels.has('D_DM1')).toBe(false)
 
-    const routingConfig = makeRoutingConfig({ default_dm_session: 'dm-session' })
+    const routingConfig = makeRoutingConfig({ default_dm_session: '/tmp/dm-session' })
 
     const { delivered } = simulateDmDeliver('D_DM1', routingConfig)
 
@@ -274,10 +274,10 @@ describe('DM routing — DM channel added to deliveredChannels', () => {
 
   test('multiple DM channels from different users are all tracked', async () => {
     const { server } = makeServer()
-    const entry = registerSession('dm-session', 'C_BOT', makeTransport(), server as any)
+    const entry = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), server as any)
     entry.server = server
 
-    const routingConfig = makeRoutingConfig({ default_dm_session: 'dm-session' })
+    const routingConfig = makeRoutingConfig({ default_dm_session: '/tmp/dm-session' })
 
     simulateDmDeliver('D_USER1', routingConfig)
     simulateDmDeliver('D_USER2', routingConfig)
@@ -290,10 +290,10 @@ describe('DM routing — DM channel added to deliveredChannels', () => {
 
   test('adding the same DM channel twice is idempotent', async () => {
     const { server } = makeServer()
-    const entry = registerSession('dm-session', 'C_BOT', makeTransport(), server as any)
+    const entry = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), server as any)
     entry.server = server
 
-    const routingConfig = makeRoutingConfig({ default_dm_session: 'dm-session' })
+    const routingConfig = makeRoutingConfig({ default_dm_session: '/tmp/dm-session' })
 
     simulateDmDeliver('D_DM1', routingConfig)
     simulateDmDeliver('D_DM1', routingConfig)
@@ -312,10 +312,10 @@ describe('DM routing — DM channel added to deliveredChannels', () => {
 describe('DM routing — outbound scoping after DM delivery', () => {
   test('session can reply to DM channel after it has been added to deliveredChannels', () => {
     const { server } = makeServer()
-    const entry = registerSession('dm-session', 'C_BOT', makeTransport(), server as any)
+    const entry = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), server as any)
     entry.server = server
 
-    const routingConfig = makeRoutingConfig({ default_dm_session: 'dm-session' })
+    const routingConfig = makeRoutingConfig({ default_dm_session: '/tmp/dm-session' })
     simulateDmDeliver('D_DM1', routingConfig)
 
     const access = makeAccess()
@@ -328,7 +328,7 @@ describe('DM routing — outbound scoping after DM delivery', () => {
 
   test('session cannot reply to a DM channel it has not received a message from', () => {
     const { server } = makeServer()
-    const entry = registerSession('dm-session', 'C_BOT', makeTransport(), server as any)
+    const entry = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), server as any)
     entry.server = server
 
     const access = makeAccess()
@@ -341,10 +341,10 @@ describe('DM routing — outbound scoping after DM delivery', () => {
 
   test('delivering to one DM channel does not unlock another DM channel', () => {
     const { server } = makeServer()
-    const entry = registerSession('dm-session', 'C_BOT', makeTransport(), server as any)
+    const entry = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), server as any)
     entry.server = server
 
-    const routingConfig = makeRoutingConfig({ default_dm_session: 'dm-session' })
+    const routingConfig = makeRoutingConfig({ default_dm_session: '/tmp/dm-session' })
     simulateDmDeliver('D_DM1', routingConfig)
 
     const access = makeAccess()
@@ -357,14 +357,14 @@ describe('DM routing — outbound scoping after DM delivery', () => {
 
   test('channel session cannot reply to DM channels that belong to another session', () => {
     const { server: serverA } = makeServer()
-    const entryA = registerSession('channel-session', 'C_CHANNEL', makeTransport(), serverA as any)
+    const entryA = registerSession('/tmp/channel-session', 'C_CHANNEL', makeTransport(), serverA as any)
     entryA.server = serverA
 
     const { server: serverB } = makeServer()
-    const entryB = registerSession('dm-session', 'C_BOT', makeTransport(), serverB as any)
+    const entryB = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), serverB as any)
     entryB.server = serverB
 
-    const routingConfig = makeRoutingConfig({ default_dm_session: 'dm-session' })
+    const routingConfig = makeRoutingConfig({ default_dm_session: '/tmp/dm-session' })
     simulateDmDeliver('D_DM1', routingConfig)
 
     const access = makeAccess()
@@ -479,7 +479,7 @@ describe('DM routing — pairing flow runs server-side', () => {
     const access = makeAccess({ dmPolicy: 'pairing' })
 
     const { server, notifications } = makeServer()
-    const entry = registerSession('dm-session', 'C_BOT', makeTransport(), server as any)
+    const entry = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), server as any)
     entry.server = server
 
     const result = await gate(

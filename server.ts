@@ -42,7 +42,7 @@ import {
   registerSession,
   unregisterByMcpSessionId,
   getSessionByChannel,
-  getSessionByRoute,
+  getSessionByCwd,
   resolveTransportForRequest,
   registerMcpSessionId,
   createSessionServer,
@@ -279,9 +279,9 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
         console.error(`[slack] Session disconnected: pending (not yet routed)`)
         return
       }
-      const routeName = unregisterByMcpSessionId(mcpSessionId)
-      if (routeName) {
-        console.error(`[slack] Session disconnected: route="${routeName}"`)
+      const cwd = unregisterByMcpSessionId(mcpSessionId)
+      if (cwd) {
+        console.error(`[slack] Session disconnected: cwd="${cwd}"`)
       }
     },
   })
@@ -379,19 +379,18 @@ async function handleInitialized(
     return
   }
 
-  const matchedRoute = routingConfig.routes[matchedChannelId]
-  const existingSession = getSessionByRoute(matchedRoute.name)
+  const existingSession = getSessionByCwd(normalizedCwd)
 
   // Promote pending → registered (removes from pendingSessionMap internally)
-  registerSession(matchedRoute.name, matchedChannelId, pendingId)
+  registerSession(normalizedCwd, matchedChannelId, pendingId)
 
   // Register MCP session ID for future HTTP request routing
-  registerMcpSessionId(pendingId, matchedRoute.name)
+  registerMcpSessionId(pendingId, normalizedCwd)
 
   if (existingSession) {
-    console.error(`[slack] Session replaced existing connection on route "${matchedRoute.name}"`)
+    console.error(`[slack] Session replaced existing connection for CWD "${normalizedCwd}"`)
   }
-  console.error(`[slack] Session connected and matched route "${matchedRoute.name}" at CWD "${normalizedCwd}"`)
+  console.error(`[slack] Session connected: channel=${matchedChannelId} cwd="${normalizedCwd}"`)
 }
 
 // ---------------------------------------------------------------------------
@@ -441,11 +440,11 @@ async function handleMessage(event: unknown): Promise<void> {
           return
         }
 
-        targetSession = getSessionByRoute(routingConfig.default_dm_session)
+        targetSession = getSessionByCwd(routingConfig.default_dm_session)
 
         if (!targetSession || !targetSession.connected) {
           console.error(
-            `[slack] DM session "${routingConfig.default_dm_session}" not live — dropping message`,
+            `[slack] DM session for CWD "${routingConfig.default_dm_session}" not live — dropping message`,
           )
           return
         }
@@ -462,7 +461,7 @@ async function handleMessage(event: unknown): Promise<void> {
 
         // If no direct match, check default_route
         if (!targetSession && routingConfig?.default_route) {
-          targetSession = getSessionByRoute(routingConfig.default_route)
+          targetSession = getSessionByCwd(routingConfig.default_route)
         }
 
         if (!targetSession || !targetSession.connected) {
@@ -595,7 +594,7 @@ async function shutdown(signal: string): Promise<void> {
   for (const entry of getAllSessions()) {
     if (entry.connected) {
       process.stderr.write(
-        `[slack] Closing MCP transport for route "${entry.routeName}"\n`,
+        `[slack] Closing MCP transport for CWD "${entry.cwd}"\n`,
       )
       try {
         await entry.transport.close()

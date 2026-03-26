@@ -18,13 +18,14 @@ import { resolve } from 'path'
 
 export interface RouteEntry {
   cwd: string
-  name: string
 }
 
 /** Raw shape of routing.json as parsed from disk. All optional fields may be absent. */
 export interface RoutingConfigInput {
   routes: Record<string, RouteEntry>
+  /** CWD path to use when a message arrives on a channel with no explicit entry in routes. */
   default_route?: string
+  /** CWD path of the session that handles direct messages. */
   default_dm_session?: string
   bind?: string
   port?: number
@@ -74,43 +75,43 @@ export function expandTilde(path: string): string {
  */
 export function validateConfig(config: RoutingConfig): void {
   // At least one route must be defined
-  const routeNames = Object.values(config.routes).map((r) => r.name)
-  if (routeNames.length === 0) {
+  const cwds = Object.values(config.routes).map((r) => r.cwd)
+  if (cwds.length === 0) {
     throw new Error('Routing config validation error: routes must contain at least one entry.')
   }
 
-  // Duplicate route names across different channels are not allowed
+  // Duplicate CWDs across different channels are not allowed (CWD is the session identity)
   const seen = new Set<string>()
-  for (const name of routeNames) {
-    if (seen.has(name)) {
+  for (const cwd of cwds) {
+    if (seen.has(cwd)) {
       throw new Error(
-        `Routing config validation error: duplicate route name "${name}" found across multiple channels. Each route name must be unique.`,
+        `Routing config validation error: duplicate CWD "${cwd}" found across multiple channels. Each route CWD must be unique.`,
       )
     }
-    seen.add(name)
+    seen.add(cwd)
   }
 
-  // default_route must reference an existing route name
+  // default_route must reference an existing route CWD
   if (config.default_route !== undefined) {
     if (!seen.has(config.default_route)) {
       throw new Error(
-        `Routing config validation error: default_route "${config.default_route}" does not match any defined route name.`,
+        `Routing config validation error: default_route "${config.default_route}" does not match any defined route CWD.`,
       )
     }
   }
 
-  // default_dm_session must reference an existing route name
+  // default_dm_session must reference an existing route CWD
   if (config.default_dm_session !== undefined) {
     if (!seen.has(config.default_dm_session)) {
       throw new Error(
-        `Routing config validation error: default_dm_session "${config.default_dm_session}" does not match any defined route name.`,
+        `Routing config validation error: default_dm_session "${config.default_dm_session}" does not match any defined route CWD.`,
       )
     }
   }
 }
 
 /**
- * Applies defaults, expands tildes on all cwd paths, then validates.
+ * Applies defaults, expands tildes on all CWD paths, then validates.
  * Returns a fully resolved RoutingConfig or throws on invalid input.
  */
 export function resolveConfig(input: RoutingConfigInput): RoutingConfig {
@@ -120,7 +121,6 @@ export function resolveConfig(input: RoutingConfigInput): RoutingConfig {
   const expandedRoutes: Record<string, RouteEntry> = {}
   for (const [channelId, entry] of Object.entries(withDefaults.routes)) {
     expandedRoutes[channelId] = {
-      ...entry,
       cwd: resolve(expandTilde(entry.cwd)),
     }
   }
@@ -128,6 +128,14 @@ export function resolveConfig(input: RoutingConfigInput): RoutingConfig {
   const config: RoutingConfig = {
     ...withDefaults,
     routes: expandedRoutes,
+    // Expand tildes on default_route and default_dm_session so they match
+    // the normalized route CWDs in the routes map.
+    default_route: withDefaults.default_route !== undefined
+      ? resolve(expandTilde(withDefaults.default_route))
+      : undefined,
+    default_dm_session: withDefaults.default_dm_session !== undefined
+      ? resolve(expandTilde(withDefaults.default_dm_session))
+      : undefined,
   }
 
   validateConfig(config)

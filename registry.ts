@@ -21,8 +21,8 @@ import type { RoutingConfig } from './config.ts'
 // ---------------------------------------------------------------------------
 
 export interface SessionEntry {
-  /** The human-readable route name (from routing config) */
-  routeName: string
+  /** The normalized absolute CWD of this session — the unique session identity */
+  cwd: string
   /** The Slack channel ID this session is assigned to */
   channelId: string
   /** MCP transport for this session */
@@ -61,15 +61,15 @@ export interface PendingSessionEntry {
 // ---------------------------------------------------------------------------
 
 /**
- * Maps route name → SessionEntry.
- * A separate index (mcpSessionIdToRouteName) maps the MCP-level session ID
- * (assigned by the transport after initialization) back to the route name,
+ * Maps CWD → SessionEntry.
+ * A separate index (mcpSessionIdToCwd) maps the MCP-level session ID
+ * (assigned by the transport after initialization) back to the CWD,
  * so that incoming HTTP requests can be dispatched to the right transport.
  */
 const registry = new Map<string, SessionEntry>()
 
-/** MCP session ID (UUID from transport) → route name, for HTTP routing */
-const mcpSessionIdToRouteName = new Map<string, string>()
+/** MCP session ID (UUID from transport) → CWD, for HTTP routing */
+const mcpSessionIdToCwd = new Map<string, string>()
 
 /**
  * Sessions that have connected but not yet been matched to a route.
@@ -85,17 +85,17 @@ const pendingSessionMap = new Map<string, PendingSessionEntry>()
  * Register a session in the registry.
  *
  * Two call forms:
- *   registerSession(routeName, channelId, transport, server)
+ *   registerSession(cwd, channelId, transport, server)
  *     — fresh registration (e.g. for testing)
  *
- *   registerSession(routeName, channelId, pendingId)
+ *   registerSession(cwd, channelId, pendingId)
  *     — promote a pending session to registered; looks up transport/server
  *       from pendingSessionMap and removes the pending entry.
  *
- * If a live session already exists for the route it is silently replaced.
+ * If a live session already exists for the CWD it is silently replaced.
  */
 export function registerSession(
-  routeName: string,
+  cwd: string,
   channelId: string,
   transportOrPendingId: WebStandardStreamableHTTPServerTransport | string,
   server?: Server,
@@ -123,23 +123,23 @@ export function registerSession(
     deliveredChannels = new Set([channelId])
   }
 
-  const existing = registry.get(routeName)
+  const existing = registry.get(cwd)
   if (existing && existing.connected) {
     // Replace stale/existing session
-    console.error(`[registry] Replacing stale session for route "${routeName}"`)
+    console.error(`[registry] Replacing stale session for CWD "${cwd}"`)
     existing.connected = false
-    registry.delete(routeName)
+    registry.delete(cwd)
   }
 
   const entry: SessionEntry = {
-    routeName,
+    cwd,
     channelId,
     transport,
     server: resolvedServer,
     deliveredChannels,
     connected: true,
   }
-  registry.set(routeName, entry)
+  registry.set(cwd, entry)
   return entry
 }
 
@@ -181,47 +181,47 @@ export function getAllPendingSessions(): PendingSessionEntry[] {
 /**
  * Remove a session from the registry by its MCP session ID.
  * Marks the entry as disconnected before removal.
- * Returns the route name if found, undefined otherwise.
+ * Returns the CWD if found, undefined otherwise.
  */
 export function unregisterByMcpSessionId(mcpSessionId: string): string | undefined {
-  const routeName = mcpSessionIdToRouteName.get(mcpSessionId)
-  if (!routeName) return undefined
-  const entry = registry.get(routeName)
+  const cwd = mcpSessionIdToCwd.get(mcpSessionId)
+  if (!cwd) return undefined
+  const entry = registry.get(cwd)
   if (entry) entry.connected = false
-  unregisterSession(routeName)
-  return routeName
+  unregisterSession(cwd)
+  return cwd
 }
 
 /**
  * Remove a session from the registry.
- * Also cleans up the MCP session ID → route name index.
+ * Also cleans up the MCP session ID → CWD index.
  */
-export function unregisterSession(routeName: string): void {
-  const entry = registry.get(routeName)
+export function unregisterSession(cwd: string): void {
+  const entry = registry.get(cwd)
   if (!entry) return
 
-  // Clean up the MCP session ID index for this route
-  for (const [mcpId, rn] of mcpSessionIdToRouteName) {
-    if (rn === routeName) {
-      mcpSessionIdToRouteName.delete(mcpId)
+  // Clean up the MCP session ID index for this CWD
+  for (const [mcpId, c] of mcpSessionIdToCwd) {
+    if (c === cwd) {
+      mcpSessionIdToCwd.delete(mcpId)
       break
     }
   }
 
-  registry.delete(routeName)
-  console.error(`[registry] Unregistered session for route "${routeName}"`)
+  registry.delete(cwd)
+  console.error(`[registry] Unregistered session for CWD "${cwd}"`)
 }
 
 /**
- * Look up a session by route name.
+ * Look up a session by its CWD (the unique session identity).
  */
-export function getSessionByRoute(routeName: string): SessionEntry | undefined {
-  return registry.get(routeName)
+export function getSessionByCwd(cwd: string): SessionEntry | undefined {
+  return registry.get(cwd)
 }
 
 /**
  * Look up a session by Slack channel ID.
- * Iterates routing config to find the matching route name, then looks up in registry.
+ * Finds the route entry for the channel, then looks up by CWD in the registry.
  */
 export function getSessionByChannel(
   channelId: string,
@@ -229,18 +229,17 @@ export function getSessionByChannel(
 ): SessionEntry | undefined {
   const route = routingConfig.routes[channelId]
   if (!route) return undefined
-  return registry.get(route.name)
+  return registry.get(route.cwd)
 }
 
 /**
  * Register the MCP transport session ID (UUID assigned after initialization)
  * so that subsequent HTTP requests can be routed to the correct transport.
- * Called from the transport's onsessioninitialized callback.
  */
-export function registerMcpSessionId(mcpSessionId: string, routeName: string): void {
-  mcpSessionIdToRouteName.set(mcpSessionId, routeName)
+export function registerMcpSessionId(mcpSessionId: string, cwd: string): void {
+  mcpSessionIdToCwd.set(mcpSessionId, cwd)
   console.error(
-    `[registry] Mapped MCP session ID "${mcpSessionId}" to route "${routeName}"`,
+    `[registry] Mapped MCP session ID "${mcpSessionId}" to CWD "${cwd}"`,
   )
 }
 
@@ -266,9 +265,9 @@ export function resolveTransportForRequest(
   }
 
   // Check registered sessions first
-  const routeName = mcpSessionIdToRouteName.get(mcpSessionId)
-  if (routeName) {
-    const entry = registry.get(routeName)
+  const cwd = mcpSessionIdToCwd.get(mcpSessionId)
+  if (cwd) {
+    const entry = registry.get(cwd)
     if (entry && entry.connected) return entry
     return undefined
   }
@@ -651,6 +650,6 @@ export function getAllSessions(): IterableIterator<SessionEntry> {
 /** For testing: reset all state. */
 export function _resetRegistry(): void {
   registry.clear()
-  mcpSessionIdToRouteName.clear()
+  mcpSessionIdToCwd.clear()
   pendingSessionMap.clear()
 }
