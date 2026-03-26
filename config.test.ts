@@ -50,16 +50,6 @@ describe('applyDefaults', () => {
     expect(result.port).toBe(3100)
   })
 
-  test('fills use_waggle with false when absent', () => {
-    const result = applyDefaults(makeRoutingConfig())
-    expect(result.use_waggle).toBe(false)
-  })
-
-  test('fills spawn_timeout with 60 when absent', () => {
-    const result = applyDefaults(makeRoutingConfig())
-    expect(result.spawn_timeout).toBe(60)
-  })
-
   test('preserves provided bind value', () => {
     const result = applyDefaults(makeRoutingConfig({ bind: '0.0.0.0' }))
     expect(result.bind).toBe('0.0.0.0')
@@ -68,16 +58,6 @@ describe('applyDefaults', () => {
   test('preserves provided port value', () => {
     const result = applyDefaults(makeRoutingConfig({ port: 8080 }))
     expect(result.port).toBe(8080)
-  })
-
-  test('preserves provided use_waggle true value', () => {
-    const result = applyDefaults(makeRoutingConfig({ use_waggle: true }))
-    expect(result.use_waggle).toBe(true)
-  })
-
-  test('preserves provided spawn_timeout value', () => {
-    const result = applyDefaults(makeRoutingConfig({ spawn_timeout: 120 }))
-    expect(result.spawn_timeout).toBe(120)
   })
 
   test('passes through routes unchanged', () => {
@@ -115,8 +95,6 @@ function makeValidConfig(overrides: Partial<RoutingConfig> = {}): RoutingConfig 
     },
     bind: '127.0.0.1',
     port: 3100,
-    use_waggle: false,
-    spawn_timeout: 60,
     ...overrides,
   }
 }
@@ -227,8 +205,6 @@ describe('resolveConfig', () => {
     const result = resolveConfig(input)
     expect(result.bind).toBe('127.0.0.1')
     expect(result.port).toBe(3100)
-    expect(result.use_waggle).toBe(false)
-    expect(result.spawn_timeout).toBe(60)
   })
 
   test('expands tilde in route cwd paths', () => {
@@ -278,10 +254,9 @@ describe('resolveConfig', () => {
   })
 
   test('preserves provided defaults over built-in defaults', () => {
-    const input = makeRoutingConfig({ port: 9999, use_waggle: true })
+    const input = makeRoutingConfig({ port: 9999 })
     const result = resolveConfig(input)
     expect(result.port).toBe(9999)
-    expect(result.use_waggle).toBe(true)
   })
 })
 
@@ -355,8 +330,6 @@ describe('loadConfig', () => {
     const result = loadConfig(configPath)
     expect(result.bind).toBe('127.0.0.1')
     expect(result.port).toBe(3100)
-    expect(result.use_waggle).toBe(false)
-    expect(result.spawn_timeout).toBe(60)
   })
 
   test('throws a clear error when routes field is missing', () => {

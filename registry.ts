@@ -70,9 +70,13 @@ export function registerSession(
 ): SessionEntry {
   const existing = registry.get(routeName)
   if (existing && existing.connected) {
-    throw new Error(
-      `[registry] Duplicate connection attempt for route "${routeName}": a live session already exists.`,
+    // HTTP Streamable transports have no persistent connection, so the old
+    // session may be stale (client restarted).  Replace it instead of rejecting.
+    console.error(
+      `[registry] Replacing stale session for route "${routeName}"`,
     )
+    existing.connected = false
+    registry.delete(routeName)
   }
 
   const entry: SessionEntry = {

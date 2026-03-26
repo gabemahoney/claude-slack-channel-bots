@@ -28,8 +28,6 @@ export interface RoutingConfigInput {
   default_dm_session?: string
   bind?: string
   port?: number
-  use_waggle?: boolean
-  spawn_timeout?: number
 }
 
 /** Validated, fully-resolved routing configuration with all defaults applied. */
@@ -39,8 +37,6 @@ export interface RoutingConfig {
   default_dm_session?: string
   bind: string
   port: number
-  use_waggle: boolean
-  spawn_timeout: number
 }
 
 // ---------------------------------------------------------------------------
@@ -58,8 +54,6 @@ export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
     default_dm_session: input.default_dm_session,
     bind: input.bind ?? '127.0.0.1',
     port: input.port ?? 3100,
-    use_waggle: input.use_waggle ?? false,
-    spawn_timeout: input.spawn_timeout ?? 60,
   }
 }
 

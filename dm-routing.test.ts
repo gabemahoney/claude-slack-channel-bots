@@ -88,8 +88,6 @@ function makeRoutingConfig(opts: {
     },
     bind: '127.0.0.1',
     port: 3100,
-    use_waggle: false,
-    spawn_timeout: 60,
   }
 
   if (opts.default_dm_session !== undefined) {

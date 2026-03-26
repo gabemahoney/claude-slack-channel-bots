@@ -46,8 +46,6 @@ function makeRoutingConfig(opts: {
     },
     bind: '127.0.0.1',
     port: 3100,
-    use_waggle: false,
-    spawn_timeout: 60,
   }
 
   if (opts.default_route !== undefined) {
@@ -98,12 +96,12 @@ describe('registerSession', () => {
     expect(entry.deliveredChannels.size).toBe(1)
   })
 
-  test('rejects duplicate registration for same route when live session exists', () => {
-    registerSession('route-a', 'C_A', makeTransport(), makeServer())
+  test('replaces an existing session when re-registering for the same route', () => {
+    const first = registerSession('route-a', 'C_A', makeTransport(), makeServer())
+    const second = registerSession('route-a', 'C_A', makeTransport(), makeServer())
 
-    expect(() =>
-      registerSession('route-a', 'C_A', makeTransport(), makeServer()),
-    ).toThrow(/Duplicate connection attempt for route "route-a"/)
+    expect(second).not.toBe(first)
+    expect(getSessionByRoute('route-a')).toBe(second)
   })
 
   test('allows re-registration after the previous session was unregistered', () => {
