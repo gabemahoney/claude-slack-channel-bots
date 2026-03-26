@@ -39,6 +39,23 @@ export interface SessionEntry {
   connected: boolean
 }
 
+/**
+ * A session that has connected but not yet been matched to a route.
+ * Exists between the MCP init request and roots/list resolution.
+ */
+export interface PendingSessionEntry {
+  /** The MCP session ID — also the key in pendingSessionMap */
+  pendingId: string
+  /** MCP transport for this session */
+  transport: WebStandardStreamableHTTPServerTransport
+  /** MCP Server instance — already connected to transport */
+  server: Server
+  /** Delivered channels set — shared with SessionEntry after promotion */
+  deliveredChannels: Set<string>
+  /** Unix ms timestamp of creation */
+  createdAt: number
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -54,27 +71,62 @@ const registry = new Map<string, SessionEntry>()
 /** MCP session ID (UUID from transport) → route name, for HTTP routing */
 const mcpSessionIdToRouteName = new Map<string, string>()
 
+/**
+ * Sessions that have connected but not yet been matched to a route.
+ * Keyed by the MCP session ID (pendingId).
+ */
+const pendingSessionMap = new Map<string, PendingSessionEntry>()
+
 // ---------------------------------------------------------------------------
 // Public API — registry operations
 // ---------------------------------------------------------------------------
 
 /**
- * Register a new session in the registry.
- * Throws if a live session already exists for this route.
+ * Register a session in the registry.
+ *
+ * Two call forms:
+ *   registerSession(routeName, channelId, transport, server)
+ *     — fresh registration (e.g. for testing)
+ *
+ *   registerSession(routeName, channelId, pendingId)
+ *     — promote a pending session to registered; looks up transport/server
+ *       from pendingSessionMap and removes the pending entry.
+ *
+ * If a live session already exists for the route it is silently replaced.
  */
 export function registerSession(
   routeName: string,
   channelId: string,
-  transport: WebStandardStreamableHTTPServerTransport,
-  server: Server,
+  transportOrPendingId: WebStandardStreamableHTTPServerTransport | string,
+  server?: Server,
 ): SessionEntry {
+  let transport: WebStandardStreamableHTTPServerTransport
+  let resolvedServer: Server
+  let deliveredChannels: Set<string>
+
+  if (typeof transportOrPendingId === 'string') {
+    // Promotion path: look up pending entry by ID
+    const pendingId = transportOrPendingId
+    const pending = pendingSessionMap.get(pendingId)
+    if (!pending) {
+      throw new Error(`registerSession: no pending session found for ID "${pendingId}"`)
+    }
+    transport = pending.transport
+    resolvedServer = pending.server
+    deliveredChannels = pending.deliveredChannels
+    deliveredChannels.add(channelId)  // seed with channel ID on promotion
+    removePendingSession(pendingId)
+  } else {
+    // Fresh registration path
+    transport = transportOrPendingId
+    resolvedServer = server!
+    deliveredChannels = new Set([channelId])
+  }
+
   const existing = registry.get(routeName)
   if (existing && existing.connected) {
-    // HTTP Streamable transports have no persistent connection, so the old
-    // session may be stale (client restarted).  Replace it instead of rejecting.
-    console.error(
-      `[registry] Replacing stale session for route "${routeName}"`,
-    )
+    // Replace stale/existing session
+    console.error(`[registry] Replacing stale session for route "${routeName}"`)
     existing.connected = false
     registry.delete(routeName)
   }
@@ -83,12 +135,61 @@ export function registerSession(
     routeName,
     channelId,
     transport,
-    server,
-    deliveredChannels: new Set([channelId]),
+    server: resolvedServer,
+    deliveredChannels,
     connected: true,
   }
   registry.set(routeName, entry)
   return entry
+}
+
+// ---------------------------------------------------------------------------
+// Pending session operations
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a pending session entry (session connected, route not yet known).
+ * The pendingId must equal the transport's MCP session ID so that
+ * resolveTransportForRequest can look it up by the Mcp-Session-Id header.
+ */
+export function createPendingSession(
+  pendingId: string,
+  transport: WebStandardStreamableHTTPServerTransport,
+  server: Server,
+  deliveredChannels: Set<string> = new Set(),
+): PendingSessionEntry {
+  const entry: PendingSessionEntry = { pendingId, transport, server, deliveredChannels, createdAt: Date.now() }
+  pendingSessionMap.set(pendingId, entry)
+  return entry
+}
+
+/** Look up a pending session by its ID. */
+export function getPendingSession(pendingId: string): PendingSessionEntry | undefined {
+  return pendingSessionMap.get(pendingId)
+}
+
+/** Remove a pending session. No-op if not found. */
+export function removePendingSession(pendingId: string): void {
+  pendingSessionMap.delete(pendingId)
+}
+
+/** Return all pending sessions (for graceful shutdown). */
+export function getAllPendingSessions(): PendingSessionEntry[] {
+  return Array.from(pendingSessionMap.values())
+}
+
+/**
+ * Remove a session from the registry by its MCP session ID.
+ * Marks the entry as disconnected before removal.
+ * Returns the route name if found, undefined otherwise.
+ */
+export function unregisterByMcpSessionId(mcpSessionId: string): string | undefined {
+  const routeName = mcpSessionIdToRouteName.get(mcpSessionId)
+  if (!routeName) return undefined
+  const entry = registry.get(routeName)
+  if (entry) entry.connected = false
+  unregisterSession(routeName)
+  return routeName
 }
 
 /**
@@ -147,36 +248,37 @@ export function registerMcpSessionId(mcpSessionId: string, routeName: string): v
  * Find the transport to handle an incoming HTTP request.
  *
  * Strategy:
- *   1. If the request carries an Mcp-Session-Id header, look up the transport
- *      by that session ID (normal routing for established sessions).
- *   2. If no session ID is present, this is an initialization request — return
- *      null so the caller knows to create a new transport/server pair.
- *
- * Returns the SessionEntry if found, undefined if not found (reject with 404),
- * or null to indicate "this is a new init request, create a new session".
+ *   1. If no Mcp-Session-Id header: init request — return null so the caller
+ *      creates a new pending session.
+ *   2. If session ID matches a registered session: return it.
+ *   3. If session ID matches a pending session (not yet route-matched): return it
+ *      so in-flight requests (e.g. SSE stream establishment) are served.
+ *   4. Otherwise return undefined (404).
  */
 export function resolveTransportForRequest(
   req: Request,
-): SessionEntry | null | undefined {
+): SessionEntry | PendingSessionEntry | null | undefined {
   const mcpSessionId = req.headers.get('mcp-session-id')
 
   if (!mcpSessionId) {
-    // No session ID → initialization request → caller should create a new session
+    // No session ID → initialization request
     return null
   }
 
+  // Check registered sessions first
   const routeName = mcpSessionIdToRouteName.get(mcpSessionId)
-  if (!routeName) {
-    // Session ID present but unknown → 404 territory, return undefined
+  if (routeName) {
+    const entry = registry.get(routeName)
+    if (entry && entry.connected) return entry
     return undefined
   }
 
-  const entry = registry.get(routeName)
-  if (!entry || !entry.connected) {
-    return undefined
-  }
+  // Check pending sessions
+  const pendingEntry = pendingSessionMap.get(mcpSessionId)
+  if (pendingEntry) return pendingEntry
 
-  return entry
+  // Unknown session ID
+  return undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -550,4 +652,5 @@ export function getAllSessions(): IterableIterator<SessionEntry> {
 export function _resetRegistry(): void {
   registry.clear()
   mcpSessionIdToRouteName.clear()
+  pendingSessionMap.clear()
 }

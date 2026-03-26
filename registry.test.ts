@@ -13,8 +13,13 @@ import {
   getSessionByChannel,
   registerMcpSessionId,
   resolveTransportForRequest,
+  createPendingSession,
+  getPendingSession,
+  removePendingSession,
+  getAllPendingSessions,
   _resetRegistry,
   type SessionEntry,
+  type PendingSessionEntry,
 } from './registry.ts'
 
 // ---------------------------------------------------------------------------
@@ -397,5 +402,148 @@ describe('assertOutboundAllowed — per-session state', () => {
     expect(() =>
       assertOutboundAllowed('C_NEW', access, entry.deliveredChannels),
     ).not.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Pending Session Tests (Task t3.256.pw.ro.uw)
+// ---------------------------------------------------------------------------
+
+describe('createPendingSession / getPendingSession / removePendingSession / getAllPendingSessions', () => {
+  test('createPendingSession stores and returns a PendingSessionEntry', () => {
+    const transport = makeTransport()
+    const server = makeServer()
+    const delivered = new Set<string>()
+
+    const entry = createPendingSession('pending-id-1', transport, server, delivered)
+
+    expect(entry.pendingId).toBe('pending-id-1')
+    expect(entry.transport).toBe(transport)
+    expect(entry.server).toBe(server)
+    expect(entry.deliveredChannels).toBe(delivered)
+    expect(typeof entry.createdAt).toBe('number')
+  })
+
+  test('getPendingSession returns the stored entry by ID', () => {
+    const entry = createPendingSession('pid-2', makeTransport(), makeServer(), new Set())
+
+    const found = getPendingSession('pid-2')
+    expect(found).toBe(entry)
+  })
+
+  test('getPendingSession returns undefined for unknown ID', () => {
+    expect(getPendingSession('no-such-id')).toBeUndefined()
+  })
+
+  test('removePendingSession removes the entry', () => {
+    createPendingSession('pid-3', makeTransport(), makeServer(), new Set())
+    removePendingSession('pid-3')
+
+    expect(getPendingSession('pid-3')).toBeUndefined()
+  })
+
+  test('removePendingSession is a no-op for unknown IDs', () => {
+    expect(() => removePendingSession('nonexistent')).not.toThrow()
+  })
+
+  test('getAllPendingSessions returns all pending entries', () => {
+    createPendingSession('pid-a', makeTransport(), makeServer(), new Set())
+    createPendingSession('pid-b', makeTransport(), makeServer(), new Set())
+
+    const all = getAllPendingSessions()
+    const ids = all.map((e) => e.pendingId).sort()
+    expect(ids).toEqual(['pid-a', 'pid-b'])
+  })
+
+  test('getAllPendingSessions returns empty array when no pending sessions', () => {
+    expect(getAllPendingSessions()).toEqual([])
+  })
+
+  test('_resetRegistry clears pending sessions', () => {
+    createPendingSession('pid-reset', makeTransport(), makeServer(), new Set())
+    expect(getAllPendingSessions()).toHaveLength(1)
+
+    _resetRegistry()
+
+    expect(getAllPendingSessions()).toHaveLength(0)
+  })
+})
+
+describe('registerSession — promotion path (pending → registered)', () => {
+  test('promotes a pending session to registered using pendingId', () => {
+    const transport = makeTransport()
+    const server = makeServer()
+    const delivered = new Set<string>()
+
+    createPendingSession('prom-id-1', transport, server, delivered)
+
+    const entry = registerSession('route-x', 'C_X', 'prom-id-1')
+
+    expect(entry.routeName).toBe('route-x')
+    expect(entry.channelId).toBe('C_X')
+    expect(entry.transport).toBe(transport)
+    expect(entry.connected).toBe(true)
+  })
+
+  test('promotion seeds deliveredChannels with the channelId', () => {
+    const delivered = new Set<string>()
+    createPendingSession('prom-id-2', makeTransport(), makeServer(), delivered)
+
+    const entry = registerSession('route-y', 'C_Y', 'prom-id-2')
+
+    expect(entry.deliveredChannels.has('C_Y')).toBe(true)
+  })
+
+  test('promotion shares the deliveredChannels set by reference', () => {
+    const delivered = new Set<string>()
+    createPendingSession('prom-id-3', makeTransport(), makeServer(), delivered)
+
+    const entry = registerSession('route-z', 'C_Z', 'prom-id-3')
+
+    // Both references should be the same Set object
+    expect(entry.deliveredChannels).toBe(delivered)
+  })
+
+  test('promotion removes the pending entry', () => {
+    createPendingSession('prom-id-4', makeTransport(), makeServer(), new Set())
+    registerSession('route-w', 'C_W', 'prom-id-4')
+
+    expect(getPendingSession('prom-id-4')).toBeUndefined()
+  })
+
+  test('promotion throws if pendingId not found', () => {
+    expect(() => registerSession('route-bad', 'C_BAD', 'nonexistent-pending-id')).toThrow()
+  })
+})
+
+describe('resolveTransportForRequest — pending session path', () => {
+  function makeRequest(headers: Record<string, string> = {}): Request {
+    return new Request('http://localhost/mcp', { headers })
+  }
+
+  test('returns PendingSessionEntry for a pending Mcp-Session-Id', () => {
+    const transport = makeTransport()
+    const pending = createPendingSession('pend-uuid-1', transport, makeServer(), new Set())
+
+    const result = resolveTransportForRequest(makeRequest({ 'mcp-session-id': 'pend-uuid-1' }))
+    expect(result).toBe(pending)
+  })
+
+  test('returns undefined for a Mcp-Session-Id that is neither registered nor pending', () => {
+    const result = resolveTransportForRequest(makeRequest({ 'mcp-session-id': 'totally-unknown' }))
+    expect(result).toBeUndefined()
+  })
+
+  test('returns registered SessionEntry (not pending) after promotion', () => {
+    const transport = makeTransport()
+    createPendingSession('pend-uuid-2', transport, makeServer(), new Set())
+
+    // Promote to registered and map the MCP session ID
+    const entry = registerSession('route-promoted', 'C_P', 'pend-uuid-2')
+    registerMcpSessionId('pend-uuid-2', 'route-promoted')
+
+    // Should now resolve to the SessionEntry, not the PendingSessionEntry
+    const result = resolveTransportForRequest(makeRequest({ 'mcp-session-id': 'pend-uuid-2' }))
+    expect(result).toBe(entry)
   })
 })
