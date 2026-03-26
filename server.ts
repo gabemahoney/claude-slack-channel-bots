@@ -36,16 +36,21 @@ import {
   type Access,
   type GateResult,
 } from './lib.ts'
-import { loadConfig, type RoutingConfig } from './config.ts'
+import { loadConfig, expandTilde, type RoutingConfig } from './config.ts'
 import {
   registerSession,
   unregisterSession,
+  unregisterByMcpSessionId,
   getSessionByChannel,
   getSessionByRoute,
   resolveTransportForRequest,
   registerMcpSessionId,
   createSessionServer,
   getAllSessions,
+  createPendingSession,
+  getPendingSession,
+  removePendingSession,
+  getAllPendingSessions,
   type SessionToolDeps,
   type SessionEntry,
 } from './registry.ts'
@@ -237,71 +242,158 @@ const sessionToolDeps: SessionToolDeps = {
 }
 
 // ---------------------------------------------------------------------------
-// Session factory
+// Pending session factory
 //
-// Task t2.c1r.zk.6r: creates a new Transport + Server pair for each connecting
-// Claude Code session.
-//
-// Task t2.c1r.zk.8b: Session identification.
-// The URL path carries the route name: POST /mcp/<routeName>
-// This is the simplest reliable approach — the Claude Code MCP config specifies
-// the full URL (e.g. http://127.0.0.1:3100/mcp/my-bot), binding the session
-// identity at connection time without requiring roots protocol or custom headers.
+// Creates a Transport + Server pair for an init request before the session's
+// route is known. The session is held in the pending map until roots/list
+// resolves the CWD to a route.
 // ---------------------------------------------------------------------------
 
-function createNewSession(
-  routeName: string,
-  channelId: string,
-): { transport: WebStandardStreamableHTTPServerTransport } {
-  // Guard: reject if route already has a live session
-  // (registerSession also checks, but we log early here)
+function initPendingSession(): { pendingId: string; transport: WebStandardStreamableHTTPServerTransport } {
+  const pendingId = crypto.randomUUID()
+
+  // Empty deliveredChannels set — shared by reference with SessionEntry on promotion
+  const deliveredChannels = new Set<string>()
+
+  // Stub entry for createSessionServer to close over deliveredChannels.
+  // routeName/channelId are placeholders; tools only use deliveredChannels.
+  const entryStub: SessionEntry = {
+    routeName: '',
+    channelId: '',
+    transport: null as unknown as WebStandardStreamableHTTPServerTransport,
+    server: null as unknown as import('@modelcontextprotocol/sdk/server/index.js').Server,
+    deliveredChannels,
+    connected: true,
+  }
+
   const transport = new WebStandardStreamableHTTPServerTransport({
-    sessionIdGenerator: () => crypto.randomUUID(),
-    onsessioninitialized: (mcpSessionId) => {
-      // Index the transport-level session ID so we can route follow-up HTTP requests
-      registerMcpSessionId(mcpSessionId, routeName)
-      console.error(
-        `[slack] Session initialized: route="${routeName}" channel=${channelId} mcp-session=${mcpSessionId}`,
-      )
+    sessionIdGenerator: () => pendingId,
+    onsessioninitialized: (_mcpSessionId) => {
+      // Transport-level init. Roots resolution happens via server.oninitialized.
     },
     onsessionclosed: (mcpSessionId) => {
-      console.error(
-        `[slack] MCP session closed: ${mcpSessionId} (route "${routeName}")`,
-      )
-      // Mark the registry entry as disconnected
-      const entry = getSessionByChannel(channelId, routingConfig!)
-      if (entry) {
-        entry.connected = false
+      // Session closed — clean up pending or registered state
+      const pending = getPendingSession(mcpSessionId)
+      if (pending) {
+        removePendingSession(mcpSessionId)
+        console.error(`[slack] Session disconnected: pending (not yet routed)`)
+        return
       }
-      unregisterSession(routeName)
+      const routeName = unregisterByMcpSessionId(mcpSessionId)
+      if (routeName) {
+        console.error(`[slack] Session disconnected: route="${routeName}"`)
+      }
     },
   })
 
-  // Register the session with a placeholder server first, then build the real server
-  // that closes over this entry's deliveredChannels, then patch it in.
-  // We need the entry to exist before createSessionServer so it can close over entry,
-  // but we also need the server to pass into registerSession cleanly.
-  // Solution: register with a stub, build server (it closes over entry ref), patch entry.server.
-  const stubServer = { connect: async () => {}, notification: () => {} } as any
-  const entry = registerSession(routeName, channelId, transport, stubServer)
+  entryStub.transport = transport
 
-  // Build a Server that closes over this entry's deliveredChannels
-  const server = createSessionServer(entry, sessionToolDeps)
+  // Build the MCP server (closes over entryStub.deliveredChannels)
+  const server = createSessionServer(entryStub, sessionToolDeps)
+  entryStub.server = server
 
-  // Patch the real server reference into the entry
-  entry.server = server
+  // Set roots handler — fires after MCP initialized notification
+  server.oninitialized = () => {
+    handleInitialized(pendingId, server).catch((err) => {
+      console.error(`[slack] Error in roots handler for session "${pendingId}":`, err)
+    })
+  }
+
+  // Store as pending
+  createPendingSession(pendingId, transport, server, deliveredChannels)
 
   // Wire server to transport
   server.connect(transport).catch((err) => {
-    console.error(`[slack] Error connecting MCP server for route "${routeName}":`, err)
-    unregisterSession(routeName)
+    console.error(`[slack] Error connecting MCP server for pending session "${pendingId}":`, err)
+    removePendingSession(pendingId)
   })
 
-  console.error(
-    `[slack] New session created: route="${routeName}" channel=${channelId}`,
-  )
+  return { pendingId, transport }
+}
 
-  return { transport }
+// ---------------------------------------------------------------------------
+// Roots-based session identification
+//
+// Called after the MCP initialized notification. Calls roots/list on the
+// client, normalizes the CWD, and matches against the routing config.
+// On match: promotes the pending session to registered.
+// On no match or error: disconnects the session.
+// ---------------------------------------------------------------------------
+
+async function handleInitialized(
+  pendingId: string,
+  server: import('@modelcontextprotocol/sdk/server/index.js').Server,
+): Promise<void> {
+  let roots: { uri: string }[]
+
+  try {
+    const result = await server.listRoots()
+    roots = result.roots
+  } catch (err) {
+    console.error(`[slack] roots/list failed for pending session "${pendingId}":`, err)
+    const pending = getPendingSession(pendingId)
+    if (pending) {
+      removePendingSession(pendingId)
+      try { await pending.transport.close() } catch { /* ignore */ }
+    }
+    return
+  }
+
+  if (!roots.length) {
+    console.error(`[slack] Pending session "${pendingId}" reported no roots — disconnecting`)
+    const pending = getPendingSession(pendingId)
+    if (pending) {
+      removePendingSession(pendingId)
+      try { await pending.transport.close() } catch { /* ignore */ }
+    }
+    return
+  }
+
+  // Extract filesystem path from file:// URI (use first root as CWD)
+  const rawCwd = roots[0].uri.replace(/^file:\/\//, '')
+  const normalizedCwd = resolve(expandTilde(rawCwd))
+
+  if (!routingConfig) {
+    console.error(`[slack] No routing config — disconnecting pending session "${pendingId}" (CWD: "${normalizedCwd}")`)
+    const pending = getPendingSession(pendingId)
+    if (pending) {
+      removePendingSession(pendingId)
+      try { await pending.transport.close() } catch { /* ignore */ }
+    }
+    return
+  }
+
+  // Find the route whose cwd matches (exact after normalization)
+  const matchedChannelId = Object.entries(routingConfig.routes).find(
+    ([, route]) => resolve(expandTilde(route.cwd)) === normalizedCwd,
+  )?.[0]
+
+  if (!matchedChannelId) {
+    console.error(`[slack] Session connected with CWD "${normalizedCwd}" — no matching route`)
+    const pending = getPendingSession(pendingId)
+    if (pending) {
+      removePendingSession(pendingId)
+      try { await pending.transport.close() } catch { /* ignore */ }
+    }
+    return
+  }
+
+  const matchedRoute = routingConfig.routes[matchedChannelId]
+  const existingSession = getSessionByRoute(matchedRoute.name)
+
+  // Promote pending → registered (removes from pendingSessionMap internally)
+  const entry = registerSession(matchedRoute.name, matchedChannelId, pendingId)
+
+  // Register MCP session ID for future HTTP request routing
+  registerMcpSessionId(pendingId, matchedRoute.name)
+
+  if (existingSession) {
+    console.error(`[slack] Session replaced existing connection on route "${matchedRoute.name}"`)
+  }
+  console.error(`[slack] Session connected and matched route "${matchedRoute.name}" at CWD "${normalizedCwd}"`)
+
+  // Suppress unused-var warning (entry is used via registry)
+  void entry
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +584,15 @@ async function shutdown(signal: string): Promise<void> {
     httpServer = null
   }
 
+  // Close all pending (not yet routed) MCP transports
+  for (const pending of getAllPendingSessions()) {
+    process.stderr.write('[slack] Closing pending MCP transport (not yet routed)\n')
+    removePendingSession(pending.pendingId)
+    try {
+      await pending.transport.close()
+    } catch { /* ignore */ }
+  }
+
   // Close all active MCP transports
   for (const entry of getAllSessions()) {
     if (entry.connected) {
@@ -520,17 +621,16 @@ process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
 // ---------------------------------------------------------------------------
 // Main
 //
-// HTTP routing strategy (t2.c1r.zk.6r / t2.c1r.zk.8b):
+// HTTP routing strategy (roots-based session identity):
 //
-//   POST /mcp/<routeName>   — init request (no Mcp-Session-Id) for a named route
-//   GET/POST/DELETE /mcp/<routeName>?sessionId=... — handled by transport internally
+//   POST /mcp              — init request (no Mcp-Session-Id); creates a pending
+//                            session and resolves the route via roots/list
+//   GET/POST/DELETE /mcp   — subsequent requests (Mcp-Session-Id header required)
+//   *                      — 404 for all other paths
 //
-// The route name is embedded in the URL path so that the Claude Code MCP config
-// can point to the correct endpoint:
-//   { "type": "http", "url": "http://127.0.0.1:3100/mcp/my-bot" }
-//
-// For subsequent requests the Mcp-Session-Id header is used to look up the
-// transport, falling back to a 404 if the session is unknown.
+// All Claude Code sessions point to the same URL: http://<host>:<port>/mcp
+// Route assignment happens after the MCP initialized notification when the
+// server calls roots/list and matches the CWD against routing.json.
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
@@ -572,14 +672,7 @@ async function main(): Promise<void> {
   console.error('[slack] Socket Mode connected')
 
   // -------------------------------------------------------------------------
-  // HTTP server — multi-session routing
-  //
-  // URL scheme: /mcp/<routeName>
-  //
-  // 1. Extract routeName from URL path.
-  // 2. If Mcp-Session-Id header is present: look up existing transport and forward.
-  // 3. If no session ID (init request): verify routeName matches a config route,
-  //    create a new Transport+Server pair, register it, and forward to it.
+  // HTTP server — single /mcp endpoint, roots-based session identity
   // -------------------------------------------------------------------------
 
   httpServer = Bun.serve({
@@ -589,14 +682,16 @@ async function main(): Promise<void> {
     async fetch(req: Request): Promise<Response> {
       const url = new URL(req.url)
 
-      // Extract route name from path: /mcp/<routeName>[/...]
-      const pathParts = url.pathname.replace(/^\/+/, '').split('/')
-      // Support both /mcp/<routeName> and /<routeName>
-      let routeName: string | undefined
-      if (pathParts[0] === 'mcp' && pathParts[1]) {
-        routeName = pathParts[1]
-      } else if (pathParts[0]) {
-        routeName = pathParts[0]
+      // Only /mcp is the MCP endpoint — everything else is a 404
+      if (url.pathname !== '/mcp') {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'Not found' },
+            id: null,
+          }),
+          { status: 404, headers: { 'Content-Type': 'application/json' } },
+        )
       }
 
       // --- Existing session: route by Mcp-Session-Id header ---
@@ -614,125 +709,34 @@ async function main(): Promise<void> {
             { status: 404, headers: { 'Content-Type': 'application/json' } },
           )
         }
-        // entry is guaranteed non-null here (null means init, but we have a session ID)
+        // entry is non-null here (null means init request, but we have a session ID)
         return (entry as NonNullable<typeof entry>).transport.handleRequest(req)
       }
 
-      // --- Init request: no session ID ---
-      if (!routeName) {
-        return new Response(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            error: {
-              code: -32000,
-              message:
-                'Bad Request: URL must include route name, e.g. /mcp/<routeName>',
-            },
-            id: null,
-          }),
-          { status: 400, headers: { 'Content-Type': 'application/json' } },
-        )
-      }
-
-      // Validate route name against config
-      if (routingConfig) {
-        const routeEntry = Object.values(routingConfig.routes).find(
-          (r) => r.name === routeName,
-        )
-        if (!routeEntry) {
-          return new Response(
-            JSON.stringify({
-              jsonrpc: '2.0',
-              error: {
-                code: -32000,
-                message: `Unknown route "${routeName}". Check your routing config.`,
-              },
-              id: null,
-            }),
-            { status: 404, headers: { 'Content-Type': 'application/json' } },
-          )
-        }
-
-        // Find the channel ID for this route (reverse lookup in routes map)
-        const channelId = Object.entries(routingConfig.routes).find(
-          ([, r]) => r.name === routeName,
-        )?.[0]
-
-        if (!channelId) {
-          return new Response(
-            JSON.stringify({
-              jsonrpc: '2.0',
-              error: { code: -32000, message: `No channel found for route "${routeName}"` },
-              id: null,
-            }),
-            { status: 500, headers: { 'Content-Type': 'application/json' } },
-          )
-        }
-
-        try {
-          const { transport } = createNewSession(routeName, channelId)
-          return transport.handleRequest(req)
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          console.error(`[slack] Failed to create session for route "${routeName}":`, msg)
-          return new Response(
-            JSON.stringify({
-              jsonrpc: '2.0',
-              error: { code: -32000, message: msg },
-              id: null,
-            }),
-            { status: 409, headers: { 'Content-Type': 'application/json' } },
-          )
-        }
-      }
-
-      // No routing config — legacy single-session fallback
-      // Create a session with a placeholder channel ID
-      try {
-        const fallbackChannel = 'UNKNOWN'
-        const { transport } = createNewSession(routeName, fallbackChannel)
-        return transport.handleRequest(req)
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        return new Response(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            error: { code: -32000, message: msg },
-            id: null,
-          }),
-          { status: 409, headers: { 'Content-Type': 'application/json' } },
-        )
-      }
+      // --- Init request: no Mcp-Session-Id ---
+      // Create a pending session; route resolved after roots/list in handleInitialized()
+      const { transport } = initPendingSession()
+      return transport.handleRequest(req)
     },
   })
 
-  console.error(`[slack] MCP server listening on http://${mcpHost}:${mcpPort}/mcp/<routeName>`)
+  console.error(`[slack] MCP server listening on http://${mcpHost}:${mcpPort}/mcp`)
   console.error('')
-  console.error('Add to Claude Code ~/.claude.json mcpServers (one entry per route):')
-
-  if (routingConfig) {
-    const examples: Record<string, unknown> = {}
-    for (const [, route] of Object.entries(routingConfig.routes)) {
-      examples[`slack-${route.name}`] = {
-        type: 'http',
-        url: `http://${mcpHost}:${mcpPort}/mcp/${route.name}`,
-      }
-    }
-    console.error(JSON.stringify({ mcpServers: examples }, null, 2))
-  } else {
-    console.error(
-      JSON.stringify(
-        {
+  console.error('Add to Claude Code ~/.claude.json mcpServers:')
+  console.error(
+    JSON.stringify(
+      {
+        mcpServers: {
           slack: {
             type: 'http',
-            url: `http://${mcpHost}:${mcpPort}/mcp/default`,
+            url: `http://${mcpHost}:${mcpPort}/mcp`,
           },
         },
-        null,
-        2,
-      ),
-    )
-  }
+      },
+      null,
+      2,
+    ),
+  )
   console.error('')
 }
 
