@@ -39,6 +39,7 @@ import {
   type Access,
   type GateResult,
 } from './lib.ts'
+import { loadConfig, type RoutingConfig } from './config.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -645,11 +646,10 @@ socket.on('app_mention', async ({ event, ack }) => {
 })
 
 // ---------------------------------------------------------------------------
-// Startup
+// Routing config — loaded at startup, used for bind/port and channel routing
 // ---------------------------------------------------------------------------
 
-const MCP_HOST = process.env['MCP_HOST'] ?? '127.0.0.1'
-const MCP_PORT = Number(process.env['MCP_PORT'] ?? 3100)
+let routingConfig: RoutingConfig | null = null
 
 // ---------------------------------------------------------------------------
 // Graceful shutdown
@@ -695,6 +695,30 @@ process.on('SIGTERM', () => { shutdown('SIGTERM').catch(() => process.exit(1)) }
 process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
 
 async function main(): Promise<void> {
+  // Load routing config — must happen after loadEnv() and before HTTP server creation.
+  // If the file is missing: log a warning and fall back to env vars / hardcoded defaults.
+  // If the file exists but is invalid: log the error and exit.
+  let mcpHost: string
+  let mcpPort: number
+  try {
+    routingConfig = loadConfig()
+    mcpHost = routingConfig.bind
+    mcpPort = routingConfig.port
+    const routeNames = Object.values(routingConfig.routes).map((r) => r.name)
+    console.error(`[slack] Loaded routing config: ${routeNames.length} route(s): ${routeNames.join(', ')}`)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    // Distinguish "file not found" from "file exists but is invalid"
+    if (msg.includes('cannot read routing config')) {
+      console.error(`[slack] Warning: no routing config found — falling back to env vars (MCP_HOST/MCP_PORT)`)
+      mcpHost = process.env['MCP_HOST'] ?? '127.0.0.1'
+      mcpPort = Number(process.env['MCP_PORT'] ?? 3100)
+    } else {
+      console.error(`[slack] Fatal: routing config error — ${msg}`)
+      process.exit(1)
+    }
+  }
+
   // Resolve bot's own user ID (for mention detection + self-filtering)
   try {
     const auth = await web.auth.test()
@@ -718,14 +742,14 @@ async function main(): Promise<void> {
 
   // Start Bun HTTP server — route all requests through the transport
   httpServer = Bun.serve({
-    hostname: MCP_HOST,
-    port: MCP_PORT,
+    hostname: mcpHost,
+    port: mcpPort,
     async fetch(req: Request): Promise<Response> {
       return mcpTransport!.handleRequest(req)
     },
   })
 
-  console.error(`[slack] MCP server listening on http://${MCP_HOST}:${MCP_PORT}/mcp`)
+  console.error(`[slack] MCP server listening on http://${mcpHost}:${mcpPort}/mcp`)
   console.error('')
   console.error('Add to Claude Code ~/.claude.json mcpServers:')
   console.error(
@@ -733,7 +757,7 @@ async function main(): Promise<void> {
       {
         slack: {
           type: 'http',
-          url: `http://${MCP_HOST}:${MCP_PORT}/mcp`,
+          url: `http://${mcpHost}:${mcpPort}/mcp`,
         },
       },
       null,
