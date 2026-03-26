@@ -717,21 +717,8 @@ async function main(): Promise<void> {
 
   console.error(`[slack] MCP server listening on http://${mcpHost}:${mcpPort}/mcp`)
   console.error('')
-  console.error('Add to Claude Code ~/.claude.json mcpServers:')
-  console.error(
-    JSON.stringify(
-      {
-        mcpServers: {
-          slack: {
-            type: 'http',
-            url: `http://${mcpHost}:${mcpPort}/mcp`,
-          },
-        },
-      },
-      null,
-      2,
-    ),
-  )
+  console.error('Launch Claude from a project directory with:')
+  console.error(`  claude --mcp-config '{"mcpServers":{"slack":{"type":"http","url":"http://${mcpHost}:${mcpPort}/mcp"}}}'`)
   console.error('')
 }
 

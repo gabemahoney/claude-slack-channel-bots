@@ -133,33 +133,14 @@ On startup the server prints the single MCP endpoint URL and example `mcpServers
 
 ## Connecting Claude Code sessions
 
-All sessions connect to the same `/mcp` URL. The server identifies each session by calling `roots/list` after the MCP handshake and matching the reported CWD against `routing.json`.
-
-### 1. Add the MCP server to `~/.claude.json`
-
-Add the following entry once (globally or per-project):
-
-```json
-{
-  "mcpServers": {
-    "slack": {
-      "type": "http",
-      "url": "http://127.0.0.1:3100/mcp"
-    }
-  }
-}
-```
-
-The server prints this snippet on startup as a reminder.
-
-### 2. Launch Claude from the project directory
+Launch Claude from the project directory using `--mcp-config`:
 
 ```sh
 cd ~/projects/alpha
-claude
+claude --mcp-config '{"mcpServers":{"slack":{"type":"http","url":"http://127.0.0.1:3100/mcp"}}}'
 ```
 
-The server matches the session's CWD (from `roots/list`) to the `cwd` field in `routing.json`. Sessions with an unrecognized CWD are disconnected.
+The server calls `roots/list` after the MCP handshake and matches the session's CWD against `routing.json`. Sessions with an unrecognized CWD are disconnected. Claude instances launched without `--mcp-config` are unaffected.
 
 ---
 
