@@ -638,10 +638,8 @@ async function main(): Promise<void> {
     routingConfig = loadConfig()
     mcpHost = routingConfig.bind
     mcpPort = routingConfig.port
-    const routeNames = Object.values(routingConfig.routes).map((r) => r.name)
-    console.error(
-      `[slack] Loaded routing config: ${routeNames.length} route(s): ${routeNames.join(', ')}`,
-    )
+    const routeCount = Object.keys(routingConfig.routes).length
+    console.error(`[slack] Loaded routing config: ${routeCount} route(s)`)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     if (msg.includes('cannot read routing config')) {

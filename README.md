@@ -69,10 +69,10 @@ Create `~/.claude/channels/slack/routing.json` (see [Routing Configuration](#rou
 ```json
 {
   "routes": {
-    "C0123456789": { "name": "project-a", "cwd": "~/projects/alpha" },
-    "C9876543210": { "name": "project-b", "cwd": "~/projects/beta" }
+    "C0123456789": { "cwd": "~/projects/alpha" },
+    "C9876543210": { "cwd": "~/projects/beta" }
   },
-  "default_dm_session": "project-a"
+  "default_dm_session": "~/projects/alpha"
 }
 ```
 
@@ -87,11 +87,11 @@ Create `~/.claude/channels/slack/routing.json` (see [Routing Configuration](#rou
 ```json
 {
   "routes": {
-    "C0123456789": { "name": "project-a", "cwd": "~/projects/alpha" },
-    "C9876543210": { "name": "project-b", "cwd": "~/projects/beta" }
+    "C0123456789": { "cwd": "~/projects/alpha" },
+    "C9876543210": { "cwd": "~/projects/beta" }
   },
-  "default_route": "project-a",
-  "default_dm_session": "project-a",
+  "default_route": "~/projects/alpha",
+  "default_dm_session": "~/projects/alpha",
   "bind": "127.0.0.1",
   "port": 3100
 }
@@ -101,9 +101,9 @@ Create `~/.claude/channels/slack/routing.json` (see [Routing Configuration](#rou
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `routes` | object | required | Map of Slack channel ID → route entry. Each entry has `name` (a human-readable label) and `cwd` (the working directory for that session — used to identify sessions via `roots/list`). `~` is expanded. |
-| `default_route` | string | — | Route name to use when a message arrives on a channel with no explicit entry in `routes`. Must match an existing route name. |
-| `default_dm_session` | string | — | Route name that handles direct messages. Must match an existing route name. |
+| `routes` | object | required | Map of Slack channel ID → route entry. Each entry has `cwd` (the working directory for that session — used to identify sessions via `roots/list`). `~` is expanded. |
+| `default_route` | string | — | CWD path to use when a message arrives on a channel with no explicit entry in `routes`. Must match an existing route `cwd`. |
+| `default_dm_session` | string | — | CWD path of the session that handles direct messages. Must match an existing route `cwd`. |
 | `bind` | string | `"127.0.0.1"` | Interface the HTTP server binds to. Use `"0.0.0.0"` to expose on all interfaces. |
 | `port` | number | `3100` | Port the HTTP server listens on. |
 
@@ -118,7 +118,7 @@ bun run server.ts
 On startup the server prints the single MCP endpoint URL and example `mcpServers` config:
 
 ```
-[slack] Loaded routing config: 2 route(s): project-a, project-b
+[slack] Loaded routing config: 2 route(s)
 [slack] Socket Mode connected
 [slack] MCP server listening on http://127.0.0.1:3100/mcp
 
