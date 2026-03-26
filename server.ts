@@ -279,13 +279,18 @@ function createNewSession(
     },
   })
 
-  // Register the session (creates SessionEntry with deliveredChannels seeded with channelId)
-  const entry = registerSession(routeName, channelId, transport, null as any)
+  // Register the session with a placeholder server first, then build the real server
+  // that closes over this entry's deliveredChannels, then patch it in.
+  // We need the entry to exist before createSessionServer so it can close over entry,
+  // but we also need the server to pass into registerSession cleanly.
+  // Solution: register with a stub, build server (it closes over entry ref), patch entry.server.
+  const stubServer = { connect: async () => {}, notification: () => {} } as any
+  const entry = registerSession(routeName, channelId, transport, stubServer)
 
   // Build a Server that closes over this entry's deliveredChannels
   const server = createSessionServer(entry, sessionToolDeps)
 
-  // Patch the server reference into the entry (createSessionServer returns it)
+  // Patch the real server reference into the entry
   entry.server = server
 
   // Wire server to transport

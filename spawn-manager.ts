@@ -32,6 +32,8 @@ export interface QueuedMessage {
   params: { content: string; meta: Record<string, string> }
 }
 
+const MAX_QUEUE_DEPTH = 50
+
 type SpawnState = 'idle' | 'spawning'
 
 interface RouteState {
@@ -89,7 +91,14 @@ export class SpawnManager {
     const state = this._getOrCreateState(routeName)
 
     if (state.state === 'spawning') {
-      // Already in progress — just queue the message
+      // Already in progress — just queue the message, enforcing max depth
+      if (state.queue.length >= MAX_QUEUE_DEPTH) {
+        const dropped = state.queue.shift()
+        console.error(
+          `[spawn-manager] Route "${routeName}" queue full (${MAX_QUEUE_DEPTH}) — dropped oldest message`,
+        )
+        void dropped // suppress unused-variable warning
+      }
       state.queue.push(message)
       console.error(
         `[spawn-manager] Route "${routeName}" already spawning — queued message (queue depth: ${state.queue.length})`,
@@ -99,6 +108,10 @@ export class SpawnManager {
 
     // Transition to spawning
     state.state = 'spawning'
+    // Enforce max depth even on the first message (defensive)
+    if (state.queue.length >= MAX_QUEUE_DEPTH) {
+      state.queue.shift()
+    }
     state.queue.push(message)
     console.error(`[spawn-manager] Spawning session for route "${routeName}"`)
 

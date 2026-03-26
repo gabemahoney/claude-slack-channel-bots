@@ -309,6 +309,11 @@ describe('assertSendable', () => {
   test('allows home directory files', () => {
     expect(() => assertSendable('/home/user/project/file.ts', stateDir, inboxDir)).not.toThrow()
   })
+
+  test('blocks traversal into state dir via ..', () => {
+    // Path that traverses out of inbox/ back into the protected state dir
+    expect(() => assertSendable(`${inboxDir}/../access.json`, stateDir, inboxDir)).toThrow()
+  })
 })
 
 // ---------------------------------------------------------------------------

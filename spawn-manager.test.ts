@@ -191,13 +191,11 @@ describe('SpawnManager.notifyConnected', () => {
     mgr.notifyConnected('route-alpha', session)
 
     // After notifyConnected, the route should be idle — next ensureSession should
-    // start a new spawn attempt rather than just queueing
-    // (In practice the session would now be in registry, but we test state machine only)
-    // Access internal state via the queue being empty: re-calling ensureSession would
-    // start a new spawn (not just queue). Since we can't easily test that without
-    // reading internal state, verify no error was thrown and the queue was cleared.
-    // (no assertion needed beyond confirming it doesn't throw)
-    expect(true).toBe(true)
+    // start a new spawn attempt rather than just queueing.
+    // Verify by checking that waggle.spawnAgent is called again for a second ensureSession.
+    const spawnCountAfterConnect = waggle.spawnCalls.length
+    await mgr.ensureSession('route-alpha', 'C_ALPHA', makeMessage())
+    expect(waggle.spawnCalls.length).toBe(spawnCountAfterConnect + 1)
   })
 
   test('is a no-op for unknown routes', () => {

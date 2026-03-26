@@ -1,3 +1,8 @@
+> **Historical document.** This report was written during the pre-production SSE
+> spike (Epic t1.c1r.jp). The stateless transport reuse bug described in Test 5
+> and Observation 1 has been fixed in the production server (`server.ts`), which
+> uses stateful session mode. This document is retained for reference only.
+
 # SSE Spike Test Results
 
 **Task:** t3.c1r.jp.ah.8v — Run SSE test and write results document

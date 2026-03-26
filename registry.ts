@@ -405,6 +405,7 @@ export function createSessionServer(
       // react
       // ---------------------------------------------------------------------
       case 'react': {
+        assertOutboundAllowed(args.chat_id, entry.deliveredChannels)
         await web.reactions.add({
           channel: args.chat_id,
           timestamp: args.message_id,
@@ -419,6 +420,7 @@ export function createSessionServer(
       // edit_message
       // ---------------------------------------------------------------------
       case 'edit_message': {
+        assertOutboundAllowed(args.chat_id, entry.deliveredChannels)
         await web.chat.update({
           channel: args.chat_id,
           ts: args.message_id,
@@ -433,6 +435,7 @@ export function createSessionServer(
       // fetch_messages
       // ---------------------------------------------------------------------
       case 'fetch_messages': {
+        assertOutboundAllowed(args.channel, entry.deliveredChannels)
         const channel: string = args.channel
         const limit = Math.min(args.limit || 20, 100)
         const threadTs: string | undefined = args.thread_ts
@@ -473,6 +476,7 @@ export function createSessionServer(
       // download_attachment
       // ---------------------------------------------------------------------
       case 'download_attachment': {
+        assertOutboundAllowed(args.chat_id, entry.deliveredChannels)
         const channel: string = args.chat_id
         const messageTs: string = args.message_id
 

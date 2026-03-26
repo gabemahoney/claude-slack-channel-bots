@@ -53,6 +53,15 @@ EOF
 chmod 600 ~/.claude/channels/slack/.env
 ```
 
+#### Environment variables
+
+| Variable | Description |
+|---|---|
+| `SLACK_BOT_TOKEN` | Slack bot token (`xoxb-…`). Read from `.env` file. |
+| `SLACK_APP_TOKEN` | Slack app-level token (`xapp-…`). Read from `.env` file. |
+| `SLACK_STATE_DIR` | Override the directory where `.env`, `routing.json`, and access state are stored. Defaults to `~/.claude/channels/slack`. |
+| `SLACK_ACCESS_MODE` | Set to `static` to load the access config once at startup and cache it for the lifetime of the process, rather than re-reading it on every event. Useful in high-throughput environments where disk reads are a concern. |
+
 ### 3. Configure routing
 
 Create `~/.claude/channels/slack/routing.json` (see [Routing Configuration](#routing-configuration) below):
@@ -202,3 +211,17 @@ Set `use_waggle: false` (the default) to run without auto-spawn. Messages that a
 **Inbound routing:** Slack messages arrive over a single Socket Mode connection. The server looks up the message's channel ID in `routing.json`, finds the matching session entry in the registry, and dispatches the message as an MCP notification to that session's server instance. If no session is connected for the channel, the message is dropped.
 
 **Outbound scoping:** Each session tracks the set of channels it has received messages from (`deliveredChannels`). When a session calls the `reply` tool, the server checks that the target channel is in that set (or in the access allowlist). This prevents one session from sending messages to channels it has never received from, isolating sessions from each other even though they share the same bot token.
+
+---
+
+## Tools
+
+Each MCP endpoint exposes the following tools to the connected Claude Code session:
+
+| Tool | Description |
+|---|---|
+| `reply` | Send a message to a Slack channel or DM. Auto-chunks long text. Supports file attachments. |
+| `react` | Add an emoji reaction to a Slack message. |
+| `edit_message` | Edit a previously sent message (bot's own messages only). |
+| `fetch_messages` | Fetch message history from a channel or thread. Returns oldest-first. |
+| `download_attachment` | Download attachments from a Slack message. Returns local file paths. |
