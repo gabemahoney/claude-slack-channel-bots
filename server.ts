@@ -19,6 +19,7 @@ import { SocketModeClient } from '@slack/socket-mode'
 import { WebClient } from '@slack/web-api'
 import { homedir } from 'os'
 import { join, resolve } from 'path'
+import { fileURLToPath } from 'url'
 import {
   readFileSync,
   writeFileSync,
@@ -39,7 +40,6 @@ import {
 import { loadConfig, expandTilde, type RoutingConfig } from './config.ts'
 import {
   registerSession,
-  unregisterSession,
   unregisterByMcpSessionId,
   getSessionByChannel,
   getSessionByRoute,
@@ -349,8 +349,9 @@ async function handleInitialized(
     return
   }
 
-  // Extract filesystem path from file:// URI (use first root as CWD)
-  const rawCwd = roots[0].uri.replace(/^file:\/\//, '')
+  // Extract filesystem path from file:// URI (use first root as CWD).
+  // fileURLToPath handles percent-encoded characters and the triple-slash convention.
+  const rawCwd = fileURLToPath(roots[0].uri)
   const normalizedCwd = resolve(expandTilde(rawCwd))
 
   if (!routingConfig) {
@@ -382,7 +383,7 @@ async function handleInitialized(
   const existingSession = getSessionByRoute(matchedRoute.name)
 
   // Promote pending → registered (removes from pendingSessionMap internally)
-  const entry = registerSession(matchedRoute.name, matchedChannelId, pendingId)
+  registerSession(matchedRoute.name, matchedChannelId, pendingId)
 
   // Register MCP session ID for future HTTP request routing
   registerMcpSessionId(pendingId, matchedRoute.name)
@@ -391,9 +392,6 @@ async function handleInitialized(
     console.error(`[slack] Session replaced existing connection on route "${matchedRoute.name}"`)
   }
   console.error(`[slack] Session connected and matched route "${matchedRoute.name}" at CWD "${normalizedCwd}"`)
-
-  // Suppress unused-var warning (entry is used via registry)
-  void entry
 }
 
 // ---------------------------------------------------------------------------
