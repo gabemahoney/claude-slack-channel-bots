@@ -127,6 +127,20 @@ const socket = new SocketModeClient({ appToken })
 let botUserId = ''
 
 // ---------------------------------------------------------------------------
+// Permission relay — pending request registry
+// ---------------------------------------------------------------------------
+
+interface PendingPermission {
+  requestId: string
+  channelId: string
+  messageTs: string
+  toolName: string
+  resolve: (decision: 'allow' | 'deny') => void
+}
+
+const pendingPermissions = new Map<string, PendingPermission>()
+
+// ---------------------------------------------------------------------------
 // Access control — load / save / prune
 // ---------------------------------------------------------------------------
 
@@ -531,6 +545,70 @@ async function handleMessage(event: unknown): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Block Kit builders — permission request messages
+// ---------------------------------------------------------------------------
+
+function buildPermissionBlocks(
+  toolName: string,
+  toolInput: Record<string, unknown>,
+  requestId: string,
+): any[] {
+  let summary: string
+  if (toolName === 'Bash') {
+    summary = String(toolInput['command'] ?? JSON.stringify(toolInput).slice(0, 500))
+  } else if (toolName === 'Edit' || toolName === 'Write') {
+    summary = String(toolInput['file_path'] ?? JSON.stringify(toolInput).slice(0, 500))
+  } else {
+    const raw = JSON.stringify(toolInput)
+    summary = raw.length > 500 ? raw.slice(0, 500) + '…' : raw
+  }
+
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*${toolName}*\n${summary}`,
+      },
+    },
+    {
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: 'Allow' },
+          style: 'primary',
+          action_id: `perm_allow_${requestId}`,
+        },
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: 'Deny' },
+          style: 'danger',
+          action_id: `perm_deny_${requestId}`,
+        },
+      ],
+    },
+  ]
+}
+
+function buildPermissionDecisionBlocks(
+  toolName: string,
+  decision: 'allow' | 'deny',
+  userName: string,
+): any[] {
+  const label = decision === 'allow' ? 'Allowed' : 'Denied'
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*${toolName}* — ${label} by ${userName}`,
+      },
+    },
+  ]
+}
+
+// ---------------------------------------------------------------------------
 // Socket Mode event routing
 // ---------------------------------------------------------------------------
 
@@ -554,6 +632,42 @@ socket.on('app_mention', async ({ event, ack }) => {
   } catch (err) {
     console.error('[slack] Error handling mention:', err)
   }
+})
+
+socket.on('interactive', async ({ payload, ack }) => {
+  const p = payload as Record<string, unknown>
+  const actions = (p['actions'] as Array<{ action_id: string }> | undefined) ?? []
+  for (const action of actions) {
+    const actionId = action.action_id
+    if (actionId.startsWith('perm_allow_') || actionId.startsWith('perm_deny_')) {
+      const isAllow = actionId.startsWith('perm_allow_')
+      const prefix = isAllow ? 'perm_allow_' : 'perm_deny_'
+      const requestId = actionId.slice(prefix.length)
+      const pending = pendingPermissions.get(requestId)
+      if (pending) {
+        const decision: 'allow' | 'deny' = isAllow ? 'allow' : 'deny'
+        pending.resolve(decision)
+        await ack()
+        pendingPermissions.delete(requestId)
+
+        // Update the Slack message to remove buttons and show the decision
+        const userId = ((p['user'] as Record<string, unknown> | undefined)?.['id'] as string | undefined) ?? ''
+        const userName = userId ? await resolveUserName(userId) : 'unknown'
+        try {
+          await web.chat.update({
+            channel: pending.channelId,
+            ts: pending.messageTs,
+            text: `${pending.toolName} — ${decision === 'allow' ? 'Allowed' : 'Denied'} by ${userName}`,
+            blocks: buildPermissionDecisionBlocks(pending.toolName, decision, userName),
+          })
+        } catch (err) {
+          console.error('[slack] /permission: chat.update failed:', err)
+        }
+        return
+      }
+    }
+  }
+  await ack()
 })
 
 // ---------------------------------------------------------------------------
@@ -674,8 +788,111 @@ async function main(): Promise<void> {
     hostname: mcpHost,
     port: mcpPort,
     idleTimeout: 255,
-    async fetch(req: Request): Promise<Response> {
+    async fetch(req: Request, server: { requestIP(r: Request): { address: string } | null }): Promise<Response> {
       const url = new URL(req.url)
+
+      // -----------------------------------------------------------------------
+      // /permission — permission relay endpoint
+      // -----------------------------------------------------------------------
+      if (url.pathname === '/permission') {
+        if (req.method !== 'POST') {
+          return new Response('Method Not Allowed', { status: 405 })
+        }
+
+        // Validate request from localhost
+        const remoteAddr = server.requestIP(req)
+        const remoteHost = remoteAddr?.address ?? ''
+        if (remoteHost !== '127.0.0.1' && remoteHost !== '::1' && !remoteHost.startsWith('::ffff:127.')) {
+          return new Response('Forbidden', { status: 403 })
+        }
+
+        // Parse and validate JSON body
+        let body: { tool_name?: unknown; tool_input?: unknown; cwd?: unknown }
+        try {
+          body = await req.json()
+        } catch {
+          return new Response(JSON.stringify({ error: 'Invalid JSON' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+
+        const { tool_name, tool_input, cwd } = body
+        if (
+          typeof tool_name !== 'string' ||
+          typeof tool_input !== 'object' ||
+          tool_input === null ||
+          typeof cwd !== 'string'
+        ) {
+          return new Response(
+            JSON.stringify({ error: 'Missing or invalid fields: tool_name, tool_input, cwd required' }),
+            { status: 400, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+
+        // Normalize CWD and find matching channel
+        const normalizedCwd = resolve(expandTilde(cwd))
+        const matchedChannelId = routingConfig
+          ? Object.entries(routingConfig.routes).find(
+              ([, route]) => resolve(expandTilde(route.cwd)) === normalizedCwd,
+            )?.[0]
+          : undefined
+
+        if (!matchedChannelId) {
+          return new Response(JSON.stringify({ error: 'No route found for CWD' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+
+        // Generate unique request ID
+        const requestId = crypto.randomUUID()
+
+        // Post Block Kit message to channel
+        let messageTs: string
+        try {
+          const blocks = buildPermissionBlocks(tool_name, tool_input as Record<string, unknown>, requestId)
+          const postResult = await web.chat.postMessage({
+            channel: matchedChannelId,
+            text: `Permission request: ${tool_name}`,
+            blocks,
+          })
+          messageTs = postResult.ts as string
+        } catch (err) {
+          console.error('[slack] /permission: chat.postMessage failed:', err)
+          return new Response(JSON.stringify({ error: 'Failed to post message' }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+
+        // Hold HTTP connection open until user clicks Allow/Deny
+        let decision: 'allow' | 'deny'
+        try {
+          decision = await new Promise<'allow' | 'deny'>((resolvePermission, rejectPermission) => {
+            pendingPermissions.set(requestId, {
+              requestId,
+              channelId: matchedChannelId,
+              messageTs,
+              toolName: tool_name,
+              resolve: resolvePermission,
+            })
+
+            req.signal.addEventListener('abort', () => {
+              pendingPermissions.delete(requestId)
+              rejectPermission(new Error('client disconnected'))
+            })
+          })
+        } catch {
+          // Client disconnected before a decision was made — nothing to respond to
+          return new Response('', { status: 499 })
+        }
+
+        return new Response(JSON.stringify({ decision }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
 
       // Only /mcp is the MCP endpoint — everything else is a 404
       if (url.pathname !== '/mcp') {
