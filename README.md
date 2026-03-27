@@ -137,7 +137,7 @@ Launch Claude from the project directory using `--mcp-config`:
 
 ```sh
 cd ~/projects/alpha
-claude --mcp-config '{"mcpServers":{"slack":{"type":"http","url":"http://127.0.0.1:3100/mcp"}}}' --dangerously-load-development-channels server:slack
+claude --mcp-config '{"mcpServers":{"slack":{"type":"http","url":"http://127.0.0.1:3100/mcp"}}}' --dangerously-load-development-channels
 ```
 
 The server calls `roots/list` after the MCP handshake and matches the session's CWD against `routing.json`. Sessions with an unrecognized CWD are disconnected. Claude instances launched without `--mcp-config` are unaffected.

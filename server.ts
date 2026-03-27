@@ -718,7 +718,7 @@ async function main(): Promise<void> {
   console.error(`[slack] MCP server listening on http://${mcpHost}:${mcpPort}/mcp`)
   console.error('')
   console.error('Launch Claude from a project directory with:')
-  console.error(`  claude --mcp-config '{"mcpServers":{"slack":{"type":"http","url":"http://${mcpHost}:${mcpPort}/mcp"}}}' --dangerously-load-development-channels server:slack`)
+  console.error(`  claude --mcp-config '{"mcpServers":{"slack":{"type":"http","url":"http://${mcpHost}:${mcpPort}/mcp"}}}' --dangerously-load-development-channels`)
   console.error('')
 }
 
