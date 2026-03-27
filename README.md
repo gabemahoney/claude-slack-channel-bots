@@ -165,3 +165,44 @@ Each MCP endpoint exposes the following tools to the connected Claude Code sessi
 | `edit_message` | Edit a previously sent message (bot's own messages only). |
 | `fetch_messages` | Fetch message history from a channel or thread. Returns oldest-first. |
 | `download_attachment` | Download attachments from a Slack message. Returns local file paths. |
+
+---
+
+## Permission Relay
+
+When Claude Code requires tool approval, the permission relay surfaces an interactive Slack message with **Allow** and **Deny** buttons instead of blocking the TUI. The Claude Code hook POSTs the pending request to the server, then long-polls for the user's response. Once the user clicks a button, the result is returned to Claude Code and execution continues.
+
+### Slack app prerequisites
+
+The Slack app must have **interactivity enabled** with **Socket Mode** as the delivery method. Without this, button-click payloads are never delivered and the relay will not work.
+
+To enable it: open your Slack app config → **Interactivity & Shortcuts** → toggle **Interactivity** on. No Request URL is needed — Socket Mode delivers interaction payloads over the existing socket connection.
+
+### Hook installation
+
+1. Copy the hook script to `~/.claude/hooks/permission-relay.sh`.
+2. Make it executable:
+
+   ```sh
+   chmod +x ~/.claude/hooks/permission-relay.sh
+   ```
+
+3. Ensure `curl` and `jq` are on your `PATH`.
+
+4. Add the following to your Claude Code `settings.json`:
+
+   ```jsonc
+   "PermissionRequest": [
+     {
+       "matcher": ".*",
+       "hooks": [{ "type": "command", "command": "~/.waggle/hooks/waggle_set_state.sh waiting" }]
+     },
+     {
+       "matcher": ".*",
+       "timeout": 2000000,
+       "hooks": [{ "type": "command", "command": "~/.claude/hooks/permission-relay.sh" }]
+     }
+   ]
+   ```
+
+   The first hook updates the waggle state to `waiting` so the UI reflects that approval is pending. The second hook (with a generous timeout) runs the relay script, which blocks until the user responds in Slack.
