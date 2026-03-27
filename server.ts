@@ -135,10 +135,11 @@ interface PendingPermission {
   channelId: string
   messageTs: string
   toolName: string
-  resolve: (decision: 'allow' | 'deny') => void
+  waiters: Array<(decision: 'allow' | 'deny') => void>
 }
 
 const pendingPermissions = new Map<string, PendingPermission>()
+const completedDecisions = new Map<string, 'allow' | 'deny'>()
 
 // ---------------------------------------------------------------------------
 // Access control — load / save / prune
@@ -646,7 +647,8 @@ socket.on('interactive', async ({ payload, ack }) => {
       const pending = pendingPermissions.get(requestId)
       if (pending) {
         const decision: 'allow' | 'deny' = isAllow ? 'allow' : 'deny'
-        pending.resolve(decision)
+        completedDecisions.set(requestId, decision)
+        for (const waiter of pending.waiters) waiter(decision)
         await ack()
         pendingPermissions.delete(requestId)
 
@@ -792,10 +794,11 @@ async function main(): Promise<void> {
       const url = new URL(req.url)
 
       // -----------------------------------------------------------------------
-      // /permission — permission relay endpoint
+      // /permission — permission relay endpoint (POST + GET long-poll)
       // -----------------------------------------------------------------------
-      if (url.pathname === '/permission') {
-        if (req.method !== 'POST') {
+      if (url.pathname === '/permission' || url.pathname.startsWith('/permission/')) {
+        // Reject non-GET/POST methods on /permission paths
+        if (req.method !== 'POST' && req.method !== 'GET') {
           return new Response('Method Not Allowed', { status: 405 })
         }
 
@@ -804,6 +807,79 @@ async function main(): Promise<void> {
         const remoteHost = remoteAddr?.address ?? ''
         if (remoteHost !== '127.0.0.1' && remoteHost !== '::1' && !remoteHost.startsWith('::ffff:127.')) {
           return new Response('Forbidden', { status: 403 })
+        }
+
+        // GET /permission/<requestId> — long-poll for decision
+        if (req.method === 'GET' && url.pathname.startsWith('/permission/')) {
+          const pollRequestId = url.pathname.slice('/permission/'.length)
+
+          // Already decided — return immediately
+          const existingDecision = completedDecisions.get(pollRequestId)
+          if (existingDecision !== undefined) {
+            return new Response(JSON.stringify({ status: 'decided', decision: existingDecision }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            })
+          }
+
+          const pendingEntry = pendingPermissions.get(pollRequestId)
+
+          // Unknown requestId — deny
+          if (!pendingEntry) {
+            return new Response(JSON.stringify({ status: 'decided', decision: 'deny' }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            })
+          }
+
+          // Race 60s timeout vs waiter resolving
+          const decision = await new Promise<'allow' | 'deny' | null>((promiseResolve) => {
+            let settled = false
+            let timerId: ReturnType<typeof setTimeout>
+
+            const waiter = (d: 'allow' | 'deny') => {
+              if (settled) return
+              settled = true
+              clearTimeout(timerId)
+              promiseResolve(d)
+            }
+
+            pendingEntry.waiters.push(waiter)
+
+            timerId = setTimeout(() => {
+              if (settled) return
+              settled = true
+              const idx = pendingEntry.waiters.indexOf(waiter)
+              if (idx !== -1) pendingEntry.waiters.splice(idx, 1)
+              promiseResolve(null)
+            }, 60_000)
+
+            req.signal.addEventListener('abort', () => {
+              if (settled) return
+              settled = true
+              clearTimeout(timerId)
+              const idx = pendingEntry.waiters.indexOf(waiter)
+              if (idx !== -1) pendingEntry.waiters.splice(idx, 1)
+              promiseResolve(null)
+            })
+          })
+
+          if (decision === null) {
+            return new Response(JSON.stringify({ status: 'pending' }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            })
+          }
+
+          return new Response(JSON.stringify({ status: 'decided', decision }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+
+        // POST /permission — create permission request and return requestId immediately
+        if (req.method !== 'POST') {
+          return new Response('Method Not Allowed', { status: 405 })
         }
 
         // Parse and validate JSON body
@@ -866,29 +942,16 @@ async function main(): Promise<void> {
           })
         }
 
-        // Hold HTTP connection open until user clicks Allow/Deny
-        let decision: 'allow' | 'deny'
-        try {
-          decision = await new Promise<'allow' | 'deny'>((resolvePermission, rejectPermission) => {
-            pendingPermissions.set(requestId, {
-              requestId,
-              channelId: matchedChannelId,
-              messageTs,
-              toolName: tool_name,
-              resolve: resolvePermission,
-            })
+        // Register pending entry with empty waiters array
+        pendingPermissions.set(requestId, {
+          requestId,
+          channelId: matchedChannelId,
+          messageTs,
+          toolName: tool_name,
+          waiters: [],
+        })
 
-            req.signal.addEventListener('abort', () => {
-              pendingPermissions.delete(requestId)
-              rejectPermission(new Error('client disconnected'))
-            })
-          })
-        } catch {
-          // Client disconnected before a decision was made — nothing to respond to
-          return new Response('', { status: 499 })
-        }
-
-        return new Response(JSON.stringify({ decision }), {
+        return new Response(JSON.stringify({ requestId }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         })

@@ -21,7 +21,7 @@ interface PendingPermission {
   channelId: string
   messageTs: string
   toolName: string
-  resolve: (decision: 'allow' | 'deny') => void
+  waiters: Array<(decision: 'allow' | 'deny') => void>
 }
 
 // ---------------------------------------------------------------------------
@@ -31,6 +31,7 @@ interface PendingPermission {
 // ---------------------------------------------------------------------------
 
 const pendingPermissions = new Map<string, PendingPermission>()
+const completedDecisions = new Map<string, 'allow' | 'deny'>()
 
 let routingConfig: { routes: Record<string, { cwd: string }> } | null = null
 
@@ -108,6 +109,7 @@ function buildPermissionDecisionBlocks(
 
 // ---------------------------------------------------------------------------
 // Interactive event handler — mirrors socket.on('interactive') in server.ts
+// Uses waiters array + completedDecisions map (new two-phase model)
 // ---------------------------------------------------------------------------
 
 async function handleInteractive(payload: Record<string, unknown>): Promise<void> {
@@ -121,7 +123,8 @@ async function handleInteractive(payload: Record<string, unknown>): Promise<void
       const pending = pendingPermissions.get(requestId)
       if (pending) {
         const decision: 'allow' | 'deny' = isAllow ? 'allow' : 'deny'
-        pending.resolve(decision)
+        completedDecisions.set(requestId, decision)
+        for (const waiter of pending.waiters) waiter(decision)
         pendingPermissions.delete(requestId)
         await stubChatUpdate({
           channel: pending.channelId,
@@ -137,24 +140,27 @@ async function handleInteractive(payload: Record<string, unknown>): Promise<void
 
 // ---------------------------------------------------------------------------
 // Test server — binds on port 0 (OS assigns a free port)
+// Uses a short poll timeout so the "returns pending" test completes quickly.
 // ---------------------------------------------------------------------------
+
+const POLL_TIMEOUT_MS = 200
 
 const testServer = Bun.serve({
   port: 0,
   async fetch(req: Request, server: any): Promise<Response> {
     const url = new URL(req.url)
 
-    if (url.pathname !== '/permission') {
+    if (!url.pathname.startsWith('/permission')) {
       return new Response('Not Found', { status: 404 })
     }
 
-    if (req.method !== 'POST') {
+    // Reject methods other than GET and POST
+    if (req.method !== 'POST' && req.method !== 'GET') {
       return new Response('Method Not Allowed', { status: 405 })
     }
 
     const remoteAddr = server.requestIP(req)
     const remoteHost = remoteAddr?.address ?? ''
-    // Accept loopback in both plain and IPv4-mapped-IPv6 forms
     const isLocalhost =
       remoteHost === '127.0.0.1' ||
       remoteHost === '::1' ||
@@ -162,6 +168,81 @@ const testServer = Bun.serve({
     if (!isLocalhost) {
       return new Response('Forbidden', { status: 403 })
     }
+
+    // GET /permission/<requestId> — long-poll for decision
+    if (req.method === 'GET' && url.pathname.startsWith('/permission/')) {
+      const pollRequestId = url.pathname.slice('/permission/'.length)
+
+      // Already decided — return immediately
+      const existingDecision = completedDecisions.get(pollRequestId)
+      if (existingDecision !== undefined) {
+        return new Response(JSON.stringify({ status: 'decided', decision: existingDecision }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      const pendingEntry = pendingPermissions.get(pollRequestId)
+
+      // Unknown requestId — deny immediately
+      if (!pendingEntry) {
+        return new Response(JSON.stringify({ status: 'decided', decision: 'deny' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      // Race POLL_TIMEOUT_MS vs waiter resolving vs client abort
+      const decision = await new Promise<'allow' | 'deny' | null>((promiseResolve) => {
+        let settled = false
+        let timerId: ReturnType<typeof setTimeout>
+
+        const waiter = (d: 'allow' | 'deny') => {
+          if (settled) return
+          settled = true
+          clearTimeout(timerId)
+          promiseResolve(d)
+        }
+
+        pendingEntry.waiters.push(waiter)
+
+        timerId = setTimeout(() => {
+          if (settled) return
+          settled = true
+          const idx = pendingEntry.waiters.indexOf(waiter)
+          if (idx !== -1) pendingEntry.waiters.splice(idx, 1)
+          promiseResolve(null)
+        }, POLL_TIMEOUT_MS)
+
+        req.signal.addEventListener('abort', () => {
+          if (settled) return
+          settled = true
+          clearTimeout(timerId)
+          const idx = pendingEntry.waiters.indexOf(waiter)
+          if (idx !== -1) pendingEntry.waiters.splice(idx, 1)
+          promiseResolve(null)
+        })
+      })
+
+      if (decision === null) {
+        return new Response(JSON.stringify({ status: 'pending' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      return new Response(JSON.stringify({ status: 'decided', decision }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    // GET /permission (no requestId suffix) falls through to the POST-only guard below
+    if (req.method !== 'POST') {
+      return new Response('Method Not Allowed', { status: 405 })
+    }
+
+    // POST /permission — validate, post stub message, register pending, return requestId
 
     let body: { tool_name?: unknown; tool_input?: unknown; cwd?: unknown }
     try {
@@ -218,28 +299,16 @@ const testServer = Bun.serve({
       })
     }
 
-    let decision: 'allow' | 'deny'
-    try {
-      decision = await new Promise<'allow' | 'deny'>((resolvePermission, rejectPermission) => {
-        pendingPermissions.set(requestId, {
-          requestId,
-          channelId: matchedChannelId,
-          messageTs,
-          toolName: tool_name,
-          resolve: resolvePermission,
-        })
+    // Register pending entry with empty waiters array; return requestId immediately
+    pendingPermissions.set(requestId, {
+      requestId,
+      channelId: matchedChannelId,
+      messageTs,
+      toolName: tool_name,
+      waiters: [],
+    })
 
-        req.signal.addEventListener('abort', () => {
-          pendingPermissions.delete(requestId)
-          rejectPermission(new DOMException('Request aborted', 'AbortError'))
-        })
-      })
-    } catch {
-      // Client disconnected — pending entry already cleaned up above
-      return new Response('', { status: 499 })
-    }
-
-    return new Response(JSON.stringify({ decision }), {
+    return new Response(JSON.stringify({ requestId }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     })
@@ -258,7 +327,7 @@ function makePendingPermission(overrides: Partial<PendingPermission> = {}): Pend
     channelId: 'C_TEST',
     messageTs: 'msg-ts-123',
     toolName: 'Bash',
-    resolve: () => {},
+    waiters: [],
     ...overrides,
   }
 }
@@ -269,6 +338,7 @@ function makePendingPermission(overrides: Partial<PendingPermission> = {}): Pend
 
 beforeEach(() => {
   pendingPermissions.clear()
+  completedDecisions.clear()
   postMessageCalls.length = 0
   chatUpdateCalls.length = 0
   routingConfig = null
@@ -283,11 +353,12 @@ afterAll(() => {
 // ---------------------------------------------------------------------------
 
 describe('permission relay — /permission endpoint', () => {
-  // TC-1: valid CWD → held response resolves on button click
-  test('TC-1: POST with valid CWD returns held response that resolves on button click', async () => {
+  // TC-1: POST returns requestId immediately; GET long-poll resolves after handleInteractive
+  test('TC-1: POST returns requestId immediately; GET long-poll resolves after handleInteractive', async () => {
     routingConfig = { routes: { C_TEST: { cwd: '/tmp/test-project' } } }
 
-    const permissionFetch = fetch(`${BASE_URL}/permission`, {
+    // Step 1: POST — must return requestId without blocking
+    const postRes = await fetch(`${BASE_URL}/permission`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -296,27 +367,34 @@ describe('permission relay — /permission endpoint', () => {
         cwd: '/tmp/test-project',
       }),
     })
-
-    // Wait for the server to register the pending entry
-    await Bun.sleep(50)
+    expect(postRes.status).toBe(200)
+    const { requestId } = (await postRes.json()) as { requestId: string }
+    expect(typeof requestId).toBe('string')
     expect(pendingPermissions.size).toBe(1)
 
-    const [[requestId, pending]] = [...pendingPermissions.entries()]
+    const pending = pendingPermissions.get(requestId)!
     expect(pending.toolName).toBe('Bash')
     expect(pending.channelId).toBe('C_TEST')
     expect(pending.messageTs).toBe('msg-ts-123')
 
-    // Simulate Allow button click
-    pending.resolve('allow')
-    pendingPermissions.delete(requestId)
+    // Step 2: Start GET long-poll concurrently
+    const pollPromise = fetch(`${BASE_URL}/permission/${requestId}`)
 
-    const response = await permissionFetch
-    expect(response.status).toBe(200)
-    const body = (await response.json()) as { decision: string }
+    // Step 3: Wait briefly for poll to register its waiter
+    await Bun.sleep(50)
+
+    // Step 4: Simulate Allow button click
+    await handleInteractive({ actions: [{ action_id: `perm_allow_${requestId}` }] })
+
+    // Step 5: Poll resolves with the decision
+    const pollRes = await pollPromise
+    expect(pollRes.status).toBe(200)
+    const body = (await pollRes.json()) as { status: string; decision: string }
+    expect(body.status).toBe('decided')
     expect(body.decision).toBe('allow')
   })
 
-  // TC-2: unrecognized CWD → 404
+  // TC-2: unrecognized CWD → 404 (unchanged)
   test('TC-2: POST with unrecognized CWD returns 404', async () => {
     routingConfig = { routes: { C_TEST: { cwd: '/tmp/known-project' } } }
 
@@ -335,7 +413,7 @@ describe('permission relay — /permission endpoint', () => {
     expect(body.error).toContain('No route found')
   })
 
-  // TC-3: missing required fields → 400
+  // TC-3: missing required fields → 400 (unchanged)
   test('TC-3: POST with missing fields returns 400', async () => {
     const response = await fetch(`${BASE_URL}/permission`, {
       method: 'POST',
@@ -346,9 +424,9 @@ describe('permission relay — /permission endpoint', () => {
     expect(response.status).toBe(400)
   })
 
-  // TC-4: non-POST method → 405
-  test('TC-4: Non-POST to /permission returns 405', async () => {
-    const response = await fetch(`${BASE_URL}/permission`, { method: 'GET' })
+  // TC-4: unsupported method → 405 (now tests DELETE instead of GET)
+  test('TC-4: DELETE to /permission returns 405', async () => {
+    const response = await fetch(`${BASE_URL}/permission`, { method: 'DELETE' })
     expect(response.status).toBe(405)
   })
 
@@ -360,29 +438,30 @@ describe('permission relay — /permission endpoint', () => {
       'req-tc5',
       makePendingPermission({
         requestId: 'req-tc5',
-        resolve: (d) => { resolved = d },
+        waiters: [(d) => { resolved = d }],
       }),
     )
 
     await handleInteractive({ actions: [{ action_id: 'perm_allow_req-tc5' }] })
 
-    expect(resolved).toBe('allow')
+    expect(resolved!).toBe('allow')
     expect(pendingPermissions.has('req-tc5')).toBe(false)
+    expect(completedDecisions.get('req-tc5')).toBe('allow')
   })
 
-  // TC-6: interactive event with unknown action ID is silently ignored
+  // TC-6: interactive event with unknown action ID is silently ignored (unchanged)
   test('TC-6: Interactive event with unknown action ID is silently ignored', async () => {
-    // No matching entry in map
     await handleInteractive({ actions: [{ action_id: 'perm_allow_no-such-id' }] })
 
     expect(chatUpdateCalls).toHaveLength(0)
   })
 
-  // TC-7: concurrent pending requests on same channel resolve independently
+  // TC-7: concurrent pending requests on same channel resolve independently via GET long-poll
   test('TC-7: Concurrent pending requests on the same channel resolve independently', async () => {
     routingConfig = { routes: { C_SHARED: { cwd: '/tmp/shared-project' } } }
 
-    const promise1 = fetch(`${BASE_URL}/permission`, {
+    // Create two permission requests via POST
+    const post1 = await fetch(`${BASE_URL}/permission`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -391,8 +470,7 @@ describe('permission relay — /permission endpoint', () => {
         cwd: '/tmp/shared-project',
       }),
     })
-
-    const promise2 = fetch(`${BASE_URL}/permission`, {
+    const post2 = await fetch(`${BASE_URL}/permission`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -401,72 +479,56 @@ describe('permission relay — /permission endpoint', () => {
         cwd: '/tmp/shared-project',
       }),
     })
-
-    // Wait for both requests to register
-    await Bun.sleep(50)
+    const { requestId: id1 } = (await post1.json()) as { requestId: string }
+    const { requestId: id2 } = (await post2.json()) as { requestId: string }
     expect(pendingPermissions.size).toBe(2)
 
-    const entries = [...pendingPermissions.entries()]
-    const [id1, perm1] = entries[0]
-    const [id2, perm2] = entries[1]
+    // Start GET long-polls for both
+    const poll1 = fetch(`${BASE_URL}/permission/${id1}`)
+    const poll2 = fetch(`${BASE_URL}/permission/${id2}`)
+
+    // Wait for waiters to register
+    await Bun.sleep(50)
 
     // Resolve in opposite order to confirm independence
-    perm2.resolve('deny')
-    pendingPermissions.delete(id2)
+    await handleInteractive({ actions: [{ action_id: `perm_deny_${id2}` }] })
+    await handleInteractive({ actions: [{ action_id: `perm_allow_${id1}` }] })
 
-    perm1.resolve('allow')
-    pendingPermissions.delete(id1)
+    const [res1, res2] = await Promise.all([poll1, poll2])
+    const body1 = (await res1.json()) as { status: string; decision: string }
+    const body2 = (await res2.json()) as { status: string; decision: string }
 
-    const [res1, res2] = await Promise.all([promise1, promise2])
-    const body1 = (await res1.json()) as { decision: string }
-    const body2 = (await res2.json()) as { decision: string }
-
-    // Both decisions must be present (one allow, one deny)
+    expect(body1.status).toBe('decided')
+    expect(body2.status).toBe('decided')
     const decisions = new Set([body1.decision, body2.decision])
     expect(decisions).toEqual(new Set(['allow', 'deny']))
   })
 
-  // TC-8: pending entry cleaned up on client disconnect
-  test('TC-8: Pending entry is cleaned up on client disconnect', async () => {
-    routingConfig = { routes: { C_TEST: { cwd: '/tmp/disconnect-test' } } }
-    const controller = new AbortController()
+  // TC-8: aborting GET long-poll removes waiter from pending entry
+  test('TC-8: Aborting GET long-poll removes the waiter from the pending entry', async () => {
+    pendingPermissions.set('req-tc8', makePendingPermission({ requestId: 'req-tc8' }))
 
-    const fetchPromise = fetch(`${BASE_URL}/permission`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        tool_name: 'Bash',
-        tool_input: { command: 'sleep 100' },
-        cwd: '/tmp/disconnect-test',
-      }),
+    const controller = new AbortController()
+    const pollPromise = fetch(`${BASE_URL}/permission/req-tc8`, {
       signal: controller.signal,
     })
-    // Attach a no-op catch immediately so Bun does not treat the eventual
-    // AbortError as an unhandled rejection before we check it below.
-    const settled = fetchPromise.then(() => 'resolved' as const).catch(() => 'rejected' as const)
+    const settled = pollPromise.then(() => 'resolved' as const).catch(() => 'rejected' as const)
 
-    // Wait for the pending entry to appear
+    // Wait for the waiter to be registered
     await Bun.sleep(50)
-    expect(pendingPermissions.size).toBe(1)
+    expect(pendingPermissions.get('req-tc8')!.waiters.length).toBe(1)
 
     // Abort the client request (simulates disconnect)
     controller.abort()
 
-    // Wait for the server-side abort event to fire and clean up
+    // Wait for the server-side abort handler to fire
     await Bun.sleep(50)
-    expect(pendingPermissions.size).toBe(0)
-
-    // Confirm the fetch was rejected (not resolved)
+    expect(pendingPermissions.get('req-tc8')!.waiters.length).toBe(0)
     expect(await settled).toBe('rejected')
   })
 
-  // TC-9: pending entry survives Socket Mode disconnect; resolves when interaction
-  //        arrives after reconnect
+  // TC-9: pending entry survives Socket Mode disconnect; resolves when interaction arrives
   test('TC-9: Pending entry survives Socket Mode disconnect and resolves after reconnect', async () => {
-    // In the real server, pendingPermissions lives in module scope and outlives
-    // Socket Mode reconnections.  We verify the same invariant: after a simulated
-    // "disconnect" (the Map is untouched), the entry can still be resolved by a
-    // subsequent interactive event.
     let resolved: 'allow' | 'deny' | null = null
 
     pendingPermissions.set(
@@ -474,7 +536,7 @@ describe('permission relay — /permission endpoint', () => {
       makePendingPermission({
         requestId: 'req-tc9',
         toolName: 'Edit',
-        resolve: (d) => { resolved = d },
+        waiters: [(d) => { resolved = d }],
       }),
     )
 
@@ -484,11 +546,11 @@ describe('permission relay — /permission endpoint', () => {
     // Simulate reconnect — interactive event arrives
     await handleInteractive({ actions: [{ action_id: 'perm_deny_req-tc9' }] })
 
-    expect(resolved).toBe('deny')
+    expect(resolved!).toBe('deny')
     expect(pendingPermissions.has('req-tc9')).toBe(false)
   })
 
-  // TC-10: Slack message is updated after decision
+  // TC-10: Slack message is updated after decision; completedDecisions is populated
   test('TC-10: Message is updated after decision', async () => {
     pendingPermissions.set(
       'req-tc10',
@@ -497,7 +559,6 @@ describe('permission relay — /permission endpoint', () => {
         channelId: 'C_DECISION',
         messageTs: 'ts-12345',
         toolName: 'Edit',
-        resolve: () => {},
       }),
     )
 
@@ -508,5 +569,36 @@ describe('permission relay — /permission endpoint', () => {
     expect(call.channel).toBe('C_DECISION')
     expect(call.ts).toBe('ts-12345')
     expect(call.text).toContain('Allowed')
+    expect(completedDecisions.get('req-tc10')).toBe('allow')
+  })
+
+  // New: GET returns decision immediately when already in completedDecisions
+  test('GET long-poll returns immediately when decision already in completedDecisions', async () => {
+    completedDecisions.set('req-already', 'allow')
+
+    const res = await fetch(`${BASE_URL}/permission/req-already`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { status: string; decision: string }
+    expect(body.status).toBe('decided')
+    expect(body.decision).toBe('allow')
+  })
+
+  // New: GET returns pending after poll timeout with no decision
+  test('GET long-poll returns pending after poll timeout with no decision', async () => {
+    pendingPermissions.set('req-timeout', makePendingPermission({ requestId: 'req-timeout' }))
+
+    const res = await fetch(`${BASE_URL}/permission/req-timeout`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { status: string }
+    expect(body.status).toBe('pending')
+  })
+
+  // New: GET /permission/<unknownId> returns decided deny
+  test('GET /permission/<unknownId> returns decided deny', async () => {
+    const res = await fetch(`${BASE_URL}/permission/no-such-request`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { status: string; decision: string }
+    expect(body.status).toBe('decided')
+    expect(body.decision).toBe('deny')
   })
 })
