@@ -13,7 +13,6 @@ import { homedir } from 'os'
 import { join, resolve } from 'path'
 import { existsSync, readFileSync, unlinkSync } from 'fs'
 import { spawnSync } from 'child_process'
-import { main } from './server.ts'
 import { isProcessRunning } from './pid.ts'
 
 // ---------------------------------------------------------------------------
@@ -97,7 +96,7 @@ export function createCli(deps: CliDeps): CliHandlers {
     if (!process.env['_CLI_DAEMON_CHILD']) {
       // Parent: spawn a detached background child and exit
       const { spawn } = await import('child_process')
-      const child = spawn(process.execPath, [import.meta.filename], {
+      const child = spawn(process.execPath, [import.meta.filename, 'start'], {
         detached: true,
         stdio: 'ignore',
         env: { ...process.env, _CLI_DAEMON_CHILD: '1' },
@@ -182,7 +181,7 @@ if (import.meta.main) {
     isProcessRunning,
     kill: (pid, signal) => process.kill(pid, signal as NodeJS.Signals),
     resolveStateDir: defaultStateDir,
-    startServer: main,
+    startServer: async () => { const { main } = await import('./server.ts'); return main() },
     exit: (code) => process.exit(code),
   }
 
