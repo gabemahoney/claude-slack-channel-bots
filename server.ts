@@ -38,6 +38,9 @@ import {
   type GateResult,
 } from './lib.ts'
 import { loadConfig, expandTilde, type RoutingConfig } from './config.ts'
+import { readSessions, writeSessions } from './sessions.ts'
+import { defaultTmuxClient } from './tmux.ts'
+import { startupSessionManager } from './session-manager.ts'
 import {
   registerSession,
   unregisterByMcpSessionId,
@@ -311,7 +314,15 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
       }
       const cwd = unregisterByMcpSessionId(mcpSessionId)
       if (cwd) {
-        console.error(`[slack] Session disconnected: cwd="${cwd}"`)
+        // Look up channelId by CWD — hook point for t1.uya.co (restart logic)
+        const channelId = routingConfig
+          ? Object.entries(routingConfig.routes).find(([, route]) => route.cwd === cwd)?.[0]
+          : undefined
+        if (channelId) {
+          console.error(`[slack] Session disconnected: channel=${channelId} cwd="${cwd}"`)
+        } else {
+          console.error(`[slack] Session disconnected: cwd="${cwd}"`)
+        }
       }
     },
   })
@@ -461,6 +472,9 @@ async function handleInitialized(
     console.error(`[slack] Session replaced existing connection for CWD "${normalizedCwd}"`)
   }
   console.error(`[slack] Session connected: channel=${matchedChannelId} cwd="${normalizedCwd}"`)
+
+  // Hook point for t1.uya.co — onSessionConnected(matchedChannelId)
+  // No restart logic here; the next epic wires in the restart timer.
 }
 
 // ---------------------------------------------------------------------------
@@ -1265,6 +1279,16 @@ async function main(): Promise<void> {
   console.error('Then launch Claude from a project directory with:')
   console.error('  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:slack-channel-router')
   console.error('')
+
+  // Start up managed tmux sessions for all configured routes.
+  // If tmux is unavailable or startup fails, log a warning and continue.
+  if (routingConfig) {
+    try {
+      await startupSessionManager(routingConfig, defaultTmuxClient, readSessions, writeSessions)
+    } catch (err) {
+      console.error('[slack] Warning: session startup failed — continuing without managed sessions:', err)
+    }
+  }
 }
 
 main().catch((err) => {

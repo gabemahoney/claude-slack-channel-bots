@@ -7,10 +7,13 @@ The Slack Channel Router is a two-way bridge between Slack and Claude Code sessi
 ## Module Map
 
 ```
-server.ts          Main entry point — HTTP server, Socket Mode, session lifecycle, message routing
-├── config.ts      Routing configuration — load, validate, defaults, tilde expansion
-├── registry.ts    Session registry — pending/registered sessions, MCP Server factory, transport routing
-├── lib.ts         Pure utilities — gate, access control, chunking, sanitization
+server.ts               Main entry point — HTTP server, Socket Mode, session lifecycle, message routing
+├── config.ts           Routing configuration — load, validate, defaults, tilde expansion
+├── registry.ts         Session registry — pending/registered sessions, MCP Server factory, transport routing
+├── lib.ts              Pure utilities — gate, access control, chunking, sanitization
+├── session-manager.ts  Startup orchestration — per-route state detection, reconnect/relaunch logic
+├── tmux.ts             TmuxClient interface and defaultTmuxClient — tmux shell ops, isClaudeRunning
+├── sessions.ts         sessions.json I/O — readSessions/writeSessions, SessionRecord, SessionsMap
 └── hooks/
     ├── permission-relay.sh   PermissionRequest hook — POST + long-poll for Allow/Deny
     └── ask-relay.sh          AskUserQuestion hook — POST + long-poll for option selection
@@ -57,11 +60,28 @@ Same pattern as permission relay but via `PreToolUse` hook on `AskUserQuestion`:
 3. CWD from roots is matched against `routingConfig.routes` → session promoted from pending to registered
 4. Session receives messages from its assigned Slack channel
 
+### Server-Managed Startup
+
+Called from `main()` in `server.ts` via `startupSessionManager()` after the HTTP server and Socket Mode listeners are ready.
+
+1. **tmux availability check** — `tmuxClient.checkAvailability()` runs `tmux -V`. If tmux is not installed, startup is skipped with a warning and the server continues.
+2. **Iterate routes** — for each `channelId`/`cwd` pair in `routingConfig.routes`, determine state via `tmuxClient.hasSession()` + `isClaudeRunning()`:
+   - **live** (session exists, Claude running) → send `/mcp reconnect slack-channel-router` + Enter so Claude re-registers with this server instance
+   - **zombie** (session exists, Claude dead) → `killSession()` then relaunch via `launchSession()`
+   - **missing** (no tmux session) → launch fresh via `launchSession()`
+3. **Launch flow** (`launchSession()`):
+   - `tmuxClient.newSession(name, cwd)` creates a detached session
+   - Sends `claude --mcp-config <mcp_config_path> --dangerously-load-development-channels server:slack-channel-router` + Enter
+   - Polls `capturePane()` with exponential backoff (500 ms start, 2× per step, 5 s cap, 60 s total timeout) waiting for the safety prompt text
+   - On prompt found: sends Enter to acknowledge, records `{ tmuxSession, lastLaunch }` to `sessions.json`
+   - Fallback: if the prompt is not found but `isClaudeRunning()` returns true, records success anyway (forward-compatible)
+   - Otherwise: returns failure and logs a warning
+
 ### Disconnection
 
 1. Transport closes → `onsessionclosed` fires
 2. Session removed from registry
-3. If server-managed: auto-restart timer begins (see session management)
+3. `onsessionclosed` resolves the session's CWD back to a `channelId` via `routingConfig.routes` — this exposes the channel for an auto-restart hook (t1.uya.co)
 
 ## Configuration
 
