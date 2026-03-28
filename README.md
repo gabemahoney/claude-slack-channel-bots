@@ -4,20 +4,50 @@ A single HTTP MCP server that holds one Slack Socket Mode connection and routes 
 
 ---
 
-## Architecture
+## Quick Start
 
-```
-Slack (Socket Mode)
-        │
-        ▼
-  server.ts (Bun HTTP + SocketModeClient)
-        │
-        └── /mcp  ──►  Claude Code session A  (cwd: ~/projects/alpha, channel: #project-a)
-                  ──►  Claude Code session B  (cwd: ~/projects/beta,  channel: #project-b)
-                  ──►  Claude Code session C  (cwd: ~/projects/gamma, channel: #project-c)
-```
+1. **Install globally via bun:**
 
-All Claude Code sessions connect to the same `/mcp` endpoint. After the MCP handshake, the server calls `roots/list` on the client and matches the reported CWD against `routing.json` to assign a route. Channel `#project-a` sends messages only to session A, channel `#project-b` only to session B, and so on.
+   ```sh
+   bun install -g claude-slack-channel-bots
+   ```
+
+2. **Create a Slack app from the manifest:**
+
+   In the [Slack API dashboard](https://api.slack.com/apps), choose "Create New App" → "From a manifest". Paste the contents of `slack-app-manifest.yml` from this repo. This provisions all required OAuth scopes, Socket Mode, and interactivity settings.
+
+3. **Generate an app-level token:**
+
+   In your Slack app config → **Basic Information** → **App-Level Tokens**, click "Generate Token and Scopes". Add the `connections:write` scope. Copy the resulting `xapp-…` token.
+
+4. **Set environment variables:**
+
+   ```sh
+   export SLACK_BOT_TOKEN=xoxb-your-bot-token
+   export SLACK_APP_TOKEN=xapp-your-app-token
+   ```
+
+   Add these exports to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) so they persist across sessions. See [Environment Variables](#environment-variables) for all options.
+
+5. **Populate routing.json:**
+
+   Edit `~/.claude/channels/slack/routing.json` (created by postinstall with a skeleton). Add at least one route mapping a Slack channel ID to a project directory:
+
+   ```json
+   {
+     "routes": {
+       "C0123456789": { "cwd": "~/projects/alpha" },
+       "C9876543210": { "cwd": "~/projects/beta" }
+     },
+     "default_dm_session": "~/projects/alpha"
+   }
+   ```
+
+6. **Start the server:**
+
+   ```sh
+   claude-slack-channel-bots start
+   ```
 
 ---
 
@@ -25,65 +55,44 @@ All Claude Code sessions connect to the same `/mcp` endpoint. After the MCP hand
 
 - [Bun](https://bun.sh) v1.0+
 - [tmux](https://github.com/tmux/tmux) (required for server-managed sessions)
-- A Slack app with **Socket Mode** enabled
-- A **Bot Token** (`xoxb-…`) with scopes: `chat:write`, `reactions:write`, `channels:history`, `im:history`, `files:read`
-- An **App-Level Token** (`xapp-…`) with scope: `connections:write`
+- [Claude Code](https://claude.ai/code) installed and authenticated
+- `curl` and `jq` on your `PATH` (required for the permission relay hooks)
+- Slack workspace admin access (to create and configure the Slack app)
 
 ---
 
-## Setup
+## Configuration
 
-### 1. Clone and install
+### Environment Variables
 
-```sh
-git clone <repo-url>
-cd slack-channel-bots-project/repo
-bun install
-```
-
-### 2. Configure credentials
-
-Credentials are read from `~/.claude/channels/slack/.env` (the path can be overridden with the `SLACK_STATE_DIR` environment variable):
-
-```sh
-mkdir -p ~/.claude/channels/slack
-cat > ~/.claude/channels/slack/.env <<'EOF'
-SLACK_BOT_TOKEN=xoxb-your-bot-token
-SLACK_APP_TOKEN=xapp-your-app-token
-EOF
-chmod 600 ~/.claude/channels/slack/.env
-```
-
-#### Environment variables
+Tokens and runtime options are read from environment variables. There is no `.env` file — export these in your shell profile.
 
 | Variable | Description |
 |---|---|
-| `SLACK_BOT_TOKEN` | Slack bot token (`xoxb-…`). Read from `.env` file. |
-| `SLACK_APP_TOKEN` | Slack app-level token (`xapp-…`). Read from `.env` file. |
-| `SLACK_STATE_DIR` | Override the directory where `.env`, `routing.json`, and access state are stored. Defaults to `~/.claude/channels/slack`. |
-| `SLACK_ACCESS_MODE` | Set to `static` to load the access config once at startup and cache it for the lifetime of the process, rather than re-reading it on every event. Useful in high-throughput environments where disk reads are a concern. |
+| `SLACK_BOT_TOKEN` | Slack bot token (`xoxb-…`). Required. Granted by the OAuth install flow. |
+| `SLACK_APP_TOKEN` | Slack app-level token (`xapp-…`). Required. Generated under Basic Information → App-Level Tokens with the `connections:write` scope. |
+| `SLACK_STATE_DIR` | Override the directory where `routing.json`, `access.json`, and runtime state are stored. Defaults to `~/.claude/channels/slack`. |
+| `SLACK_ACCESS_MODE` | Set to `static` to load `access.json` once at startup and cache it for the lifetime of the process rather than re-reading it on every event. Useful in high-throughput environments where disk reads are a concern. |
 
-### 3. Configure routing
+Shell profile example:
 
-Create `~/.claude/channels/slack/routing.json` (see [Routing Configuration](#routing-configuration) below):
-
-```json
-{
-  "routes": {
-    "C0123456789": { "cwd": "~/projects/alpha" },
-    "C9876543210": { "cwd": "~/projects/beta" }
-  },
-  "default_dm_session": "~/projects/alpha"
-}
+```sh
+export SLACK_BOT_TOKEN=xoxb-your-bot-token
+export SLACK_APP_TOKEN=xapp-your-app-token
+# Optional overrides:
+export SLACK_STATE_DIR=~/.config/slack-channel-bots
+export SLACK_ACCESS_MODE=static
 ```
 
 ---
 
-## Routing Configuration
+### Routing (routing.json)
 
-`routing.json` is read from `~/.claude/channels/slack/routing.json` by default.
+`routing.json` is read from `~/.claude/channels/slack/routing.json` by default. Override the directory with `SLACK_STATE_DIR`.
 
-### Full example
+A skeleton file is created by postinstall. Populate it before running `start`.
+
+#### Complete example
 
 ```json
 {
@@ -100,27 +109,128 @@ Create `~/.claude/channels/slack/routing.json` (see [Routing Configuration](#rou
 }
 ```
 
-### Field reference
+#### Field reference
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `routes` | object | required | Map of Slack channel ID → route entry. Each entry has `cwd` (the working directory for that session — used to identify sessions via `roots/list`). `~` is expanded. |
+| `routes` | object | required | Map of Slack channel ID → route entry. Each entry requires a `cwd` field: the working directory for that session. Used to identify sessions via `roots/list` after MCP handshake. `~` is expanded. Each `cwd` must be unique across all routes. |
 | `default_route` | string | — | CWD path to use when a message arrives on a channel with no explicit entry in `routes`. Must match an existing route `cwd`. |
 | `default_dm_session` | string | — | CWD path of the session that handles direct messages. Must match an existing route `cwd`. |
 | `bind` | string | `"127.0.0.1"` | Interface the HTTP server binds to. Use `"0.0.0.0"` to expose on all interfaces. |
 | `port` | number | `3100` | Port the HTTP server listens on. |
-| `session_restart_delay` | number | `60` | Seconds to wait before auto-restarting a dead session. Set to `0` to disable auto-restart. |
+| `session_restart_delay` | number | `60` | Seconds to wait before auto-restarting a dead session. Set to `0` to disable auto-restart. Must be non-negative. |
 | `mcp_config_path` | string | `~/.claude/slack-mcp.json` | Path to the MCP config file passed to Claude Code when launching managed sessions. |
 
 ---
 
-## Starting the server
+### Access Control (access.json)
 
-```sh
-bun run server.ts
+`access.json` is read from `~/.claude/channels/slack/access.json` by default (same directory as `routing.json`). A skeleton file with defaults is created by postinstall. The file is written with `0600` permissions.
+
+The `slack-channel-access` skill manages pairings, channel opt-ins, and allowlist entries at runtime.
+
+#### Complete example
+
+```json
+{
+  "dmPolicy": "pairing",
+  "allowFrom": ["U0123456789"],
+  "channels": {
+    "C0123456789": {
+      "requireMention": false,
+      "allowFrom": []
+    },
+    "C9876543210": {
+      "requireMention": true,
+      "allowFrom": ["U0123456789", "U9876543210"]
+    }
+  },
+  "pending": {},
+  "ackReaction": "eyes",
+  "textChunkLimit": 3000,
+  "chunkMode": "newline"
+}
 ```
 
-On startup the server prints the single MCP endpoint URL and example `mcpServers` config:
+#### Field reference
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `dmPolicy` | `"pairing"` \| `"allowlist"` \| `"disabled"` | `"pairing"` | Controls who can DM the bot. `pairing`: unknown users receive a one-time code and are added to `allowFrom` after verification. `allowlist`: only users in `allowFrom` are accepted. `disabled`: all DMs are dropped. |
+| `allowFrom` | string[] | `[]` | Slack user IDs allowed to DM the bot unconditionally (regardless of `dmPolicy`). |
+| `channels` | object | `{}` | Per-channel opt-in map. Channels not listed here have all messages dropped. Each entry is a `ChannelPolicy`. |
+| `channels[id].requireMention` | boolean | — | When `true`, messages in that channel are only delivered if the bot is `@mentioned`. |
+| `channels[id].allowFrom` | string[] | — | When non-empty, restricts delivery to the listed Slack user IDs for that channel. |
+| `pending` | object | `{}` | Managed by the server. Stores in-flight pairing codes indexed by code string. Do not edit manually. |
+| `ackReaction` | string | — | Emoji name (without colons) to react with when a message is received and dispatched. |
+| `textChunkLimit` | number | — | Maximum character count per Slack message when chunking long replies. Controlled by the `reply` tool. |
+| `chunkMode` | `"length"` \| `"newline"` | — | How to split overlong replies. `length`: hard split at `textChunkLimit` characters. `newline`: split at newline boundaries without exceeding `textChunkLimit`. |
+
+---
+
+### MCP Server Config (slack-mcp.json)
+
+Claude Code sessions need a config file pointing at the MCP server. A skeleton is created by postinstall at `~/.claude/slack-mcp.json`.
+
+```json
+{
+  "mcpServers": {
+    "slack-channel-router": {
+      "type": "http",
+      "url": "http://127.0.0.1:3100/mcp"
+    }
+  }
+}
+```
+
+If you changed `port` or `bind` in `routing.json`, update the `url` here to match. The server-managed session launcher uses `mcp_config_path` from `routing.json` to locate this file.
+
+---
+
+## CLI Reference
+
+The `claude-slack-channel-bots` binary exposes two subcommands.
+
+### `claude-slack-channel-bots start`
+
+Checks prerequisites, then daemonizes the server.
+
+**Prerequisite checks (in order):**
+
+1. `tmux` is on `PATH` — fails with `missing prerequisite: tmux` if not found.
+2. `SLACK_BOT_TOKEN` is set — fails with `missing prerequisite: SLACK_BOT_TOKEN environment variable` if absent.
+3. `SLACK_APP_TOKEN` is set — fails with `missing prerequisite: SLACK_APP_TOKEN environment variable` if absent.
+4. `routing.json` exists at `STATE_DIR/routing.json` — fails with the full path if not found.
+
+If all checks pass, the parent process spawns a detached child process and exits immediately, printing the child PID. The child starts the server and writes its PID to `STATE_DIR/server.pid`.
+
+```
+[slack] Server starting in background (PID 12345)
+```
+
+### `claude-slack-channel-bots stop`
+
+Reads `STATE_DIR/server.pid` and sends `SIGTERM` to the process.
+
+Behavior by case:
+
+- **PID file missing:** prints `server is not running` and exits 0.
+- **Stale PID file** (process no longer running): removes the PID file, prints `server is not running (removed stale PID file)`, exits 0.
+- **Live process:** sends `SIGTERM`, polls for exit every 100ms for up to 5 seconds. Prints `[slack] Server stopped.` on clean exit. Prints a warning if the server does not stop within 5 seconds (does not force-kill).
+
+### PID file
+
+The PID file is stored at `STATE_DIR/server.pid` (default: `~/.claude/channels/slack/server.pid`). It is written on startup and removed on clean shutdown. A conflict check at startup prevents running two servers against the same state directory.
+
+### Direct invocation for development
+
+Skip the CLI and run the server directly with Bun for development or debugging:
+
+```sh
+bun server.ts
+```
+
+On startup the server prints the MCP endpoint and example config:
 
 ```
 [slack] Loaded routing config: 2 route(s)
@@ -136,34 +246,46 @@ On startup the server prints the single MCP endpoint URL and example `mcpServers
 
 ---
 
-## Server-managed sessions
+## How It Works
 
-The server automatically launches and manages Claude Code sessions via tmux. This requires tmux to be installed.
+### Architecture
 
-On startup, the server creates a tmux session for each route and launches Claude Code in it. If a tmux session with that name already exists from a previous run, the server reconnects it instead of relaunching.
+```
+Slack (Socket Mode)
+        │
+        ▼
+  server.ts (Bun HTTP + SocketModeClient)
+        │
+        └── /mcp  ──►  Claude Code session A  (cwd: ~/projects/alpha, channel: #project-a)
+                  ──►  Claude Code session B  (cwd: ~/projects/beta,  channel: #project-b)
+                  ──►  Claude Code session C  (cwd: ~/projects/gamma, channel: #project-c)
+```
+
+All Claude Code sessions connect to the same `/mcp` endpoint. After the MCP handshake, the server calls `roots/list` on the client and matches the reported CWD against `routing.json` to assign a route.
+
+### Session identification
+
+When a Claude Code session connects to `/mcp`, the server calls `roots/list` after the MCP handshake and matches the reported CWD against the `cwd` fields in `routing.json`. On a match, the session is registered for that route. Sessions with an unrecognized CWD are disconnected.
+
+### Inbound routing
+
+Slack messages arrive over a single Socket Mode connection. The server looks up the message's channel ID in `routing.json`, finds the matching session entry in the registry, and dispatches the message as an MCP notification to that session's server instance. If no session is connected for the channel, the message is dropped.
+
+### Outbound scoping
+
+Each session tracks the set of channels it has received messages from (`deliveredChannels`). When a session calls the `reply` tool, the server checks that the target channel is in that set (or in the `access.json` allowlist). This prevents one session from sending messages to channels it has never received from, isolating sessions from each other even though they share the same bot token.
+
+### Server-managed sessions
+
+The server automatically launches and manages Claude Code sessions via tmux. On startup, the server creates a tmux session for each route and launches Claude Code in it. If a tmux session with that name already exists from a previous run, the server reconnects it instead of relaunching.
 
 If a session dies unexpectedly, the server automatically restarts it after `session_restart_delay` seconds. After 3 consecutive launch failures for a route, auto-restart stops for that route until the server is restarted. Setting `session_restart_delay` to `0` disables auto-restart entirely.
 
-Each session is launched using the `mcp_config_path` file, so that path must be set up before starting the server (see [Connecting Claude Code sessions](#connecting-claude-code-sessions) for the config format).
+Each session is launched using the `mcp_config_path` file, so that path must be set up before starting the server.
 
----
+### Connecting sessions manually
 
-## Connecting Claude Code sessions
-
-Create a config file for the Slack MCP server (e.g. `~/.claude/slack-mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "slack-channel-router": {
-      "type": "http",
-      "url": "http://127.0.0.1:3100/mcp"
-    }
-  }
-}
-```
-
-Then launch Claude from the project directory, passing the config file path:
+To connect a Claude Code session manually (for development or one-off use), launch Claude from the project directory passing the MCP config file path:
 
 ```sh
 cd ~/projects/alpha
@@ -171,18 +293,6 @@ claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-chan
 ```
 
 `--mcp-config` takes a **file path** (not inline JSON). It adds the Slack server on top of any globally configured MCP servers — Claude sessions launched without `--mcp-config` are unaffected and never connect to the Slack server.
-
-The server calls `roots/list` after the MCP handshake and matches the session's CWD against `routing.json`. Sessions with an unrecognized CWD are disconnected.
-
----
-
-## How it works
-
-**Session identification:** When a Claude Code session connects to `/mcp`, the server calls `roots/list` after the MCP handshake and matches the reported CWD against the `cwd` fields in `routing.json`. On a match, the session is registered for that route. Sessions with an unrecognized CWD are disconnected.
-
-**Inbound routing:** Slack messages arrive over a single Socket Mode connection. The server looks up the message's channel ID in `routing.json`, finds the matching session entry in the registry, and dispatches the message as an MCP notification to that session's server instance. If no session is connected for the channel, the message is dropped.
-
-**Outbound scoping:** Each session tracks the set of channels it has received messages from (`deliveredChannels`). When a session calls the `reply` tool, the server checks that the target channel is in that set (or in the access allowlist). This prevents one session from sending messages to channels it has never received from, isolating sessions from each other even though they share the same bot token.
 
 ---
 
@@ -192,11 +302,11 @@ Each MCP endpoint exposes the following tools to the connected Claude Code sessi
 
 | Tool | Description |
 |---|---|
-| `reply` | Send a message to a Slack channel or DM. Auto-chunks long text. Supports file attachments. |
+| `reply` | Send a message to a Slack channel or DM. Auto-chunks long text according to `textChunkLimit` and `chunkMode` in `access.json`. Supports file attachments. |
 | `react` | Add an emoji reaction to a Slack message. |
 | `edit_message` | Edit a previously sent message (bot's own messages only). |
 | `fetch_messages` | Fetch message history from a channel or thread. Returns oldest-first. |
-| `download_attachment` | Download attachments from a Slack message. Returns local file paths. |
+| `download_attachment` | Download attachments from a Slack message. Saves files to `STATE_DIR/inbox/`. Returns local file paths. |
 
 ---
 
@@ -204,11 +314,18 @@ Each MCP endpoint exposes the following tools to the connected Claude Code sessi
 
 When Claude Code requires tool approval, the permission relay surfaces an interactive Slack message with **Allow** and **Deny** buttons instead of blocking the TUI. The Claude Code hook POSTs the pending request to the server, then long-polls for the user's response. Once the user clicks a button, the result is returned to Claude Code and execution continues.
 
+The `ask-relay.sh` hook intercepts `AskUserQuestion` tool calls via `PreToolUse`, posts the question and its options to Slack as interactive buttons, and waits for the user's selection. The answer is returned to Claude Code via `updatedInput` without blocking the TUI.
+
+Both hooks use a **two-phase long-poll protocol**:
+
+1. **Phase 1 — Create request:** The hook POSTs to `/permission` (or `/ask`) with the tool name, input, and CWD. The server posts an interactive Slack message and returns a `requestId`.
+2. **Phase 2 — Long-poll:** The hook GETs `/permission/{requestId}` (or `/ask/{requestId}`) in a loop with a 90-second `curl` timeout. The server holds the connection for up to 60 seconds waiting for a button click, then returns `{"status":"pending"}` if no decision has arrived. The hook retries immediately. Once the user clicks, the server returns `{"status":"decided","decision":"allow"|"deny"}` and the hook exits.
+
 ### Slack app prerequisites
 
 The Slack app must have **interactivity enabled** with **Socket Mode** as the delivery method. Without this, button-click payloads are never delivered and the relay will not work.
 
-To enable it: open your Slack app config → **Interactivity & Shortcuts** → toggle **Interactivity** on. No Request URL is needed — Socket Mode delivers interaction payloads over the existing socket connection.
+To enable it: open your Slack app config → **Interactivity & Shortcuts** → toggle **Interactivity** on. No Request URL is needed — Socket Mode delivers interaction payloads over the existing socket connection. This is included automatically if you created the app from `slack-app-manifest.yml`.
 
 ### Hook installation
 
@@ -217,6 +334,13 @@ To enable it: open your Slack app config → **Interactivity & Shortcuts** → t
    ```sh
    cp hooks/permission-relay.sh hooks/ask-relay.sh ~/.claude/hooks/
    chmod +x ~/.claude/hooks/permission-relay.sh ~/.claude/hooks/ask-relay.sh
+   ```
+
+   Alternatively, symlink them so updates to the repo are reflected automatically:
+
+   ```sh
+   ln -sf /path/to/repo/hooks/permission-relay.sh ~/.claude/hooks/permission-relay.sh
+   ln -sf /path/to/repo/hooks/ask-relay.sh ~/.claude/hooks/ask-relay.sh
    ```
 
 2. Ensure `curl` and `jq` are on your `PATH`.
@@ -240,4 +364,32 @@ To enable it: open your Slack app config → **Interactivity & Shortcuts** → t
    ]
    ```
 
-   `permission-relay.sh` relays tool permission requests (Allow/Deny) to Slack via `PermissionRequest`. `ask-relay.sh` relays `AskUserQuestion` calls to Slack via `PreToolUse`, returning the user's selection without blocking the TUI. Both use a two-phase long-poll protocol with a ~23-day timeout.
+   `permission-relay.sh` relays tool permission requests (Allow/Deny) to Slack via `PermissionRequest`. `ask-relay.sh` relays `AskUserQuestion` calls to Slack via `PreToolUse`, returning the user's selection without blocking the TUI.
+
+Both hooks auto-detect the server port from `routing.json`. They read `${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/routing.json` and use the `port` field (defaulting to `3100`), so they stay in sync if you change the port in routing config.
+
+### Setup skill
+
+The `update-config` skill can automate hook installation. It copies or symlinks the hooks and writes the `settings.json` entries in one step — use it if you prefer not to configure hooks manually.
+
+---
+
+## Troubleshooting
+
+**Missing environment variables**
+`start` exits with `missing prerequisite: SLACK_BOT_TOKEN environment variable` or `SLACK_APP_TOKEN environment variable`. Export both tokens in your shell profile and open a new terminal before running `start`.
+
+**routing.json not found**
+`start` exits with `missing prerequisite: routing.json not found at <path>`. Run `bun postinstall.ts` to create a skeleton, or create the file manually. Verify `SLACK_STATE_DIR` matches the directory you populated.
+
+**routing.json CWD mismatch**
+If a Claude Code session connects but immediately disconnects, the session's actual CWD does not match any `cwd` in `routing.json`. Confirm the session's working directory matches the entry exactly (after tilde expansion). Duplicate CWDs across multiple routes are rejected at startup.
+
+**Channel not in access.json**
+Messages to channels not listed in `access.json → channels` are silently dropped. Use the `slack-channel-access` skill or edit `access.json` directly to add the channel ID with a `ChannelPolicy` entry.
+
+**Permission relay not working**
+Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify `curl` and `jq` are on your `PATH`. Confirm the hook scripts are executable (`chmod +x`). If the port was changed in `routing.json`, ensure `SLACK_STATE_DIR` is set correctly so the hooks can read the updated port.
+
+**Session not restarting after crash**
+After 3 consecutive launch failures for a route, auto-restart is suspended until the server is restarted. Restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`. To disable auto-restart entirely, set `session_restart_delay` to `0` in `routing.json`.
