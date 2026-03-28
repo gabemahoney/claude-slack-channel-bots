@@ -79,39 +79,38 @@ async function spawnClaudeProcess() {
 // ---------------------------------------------------------------------------
 
 describe('startupSessionManager', () => {
-  test('1. live session: sendKeys /mcp reconnect, no killSession or newSession', async () => {
-    const proc = await spawnClaudeProcess()
-    try {
-      const stub = makeTmuxStub({
-        hasSessionResult: true,
-        getPanePidResult: String(proc.pid),
-      })
-      const sessions = makeSessionsStubs()
-      const config = makeRoutingConfig()
-
-      const results = await startupSessionManager(config, stub, sessions.read, sessions.write)
-
-      expect(results).toHaveLength(1)
-      expect(results[0].action).toBe('reconnected')
-      expect(results[0].channelId).toBe('C_TEST1')
-      expect(results[0].sessionName).toBe(sessionName('C_TEST1'))
-
-      const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-      expect(sendKeysCalls).toHaveLength(2)
-      expect(sendKeysCalls[0].args[1]).toBe('/mcp reconnect slack-channel-router')
-      expect(sendKeysCalls[1].args[1]).toBe('Enter')
-
-      expect(stub.calls.filter(c => c.method === 'killSession')).toHaveLength(0)
-      expect(stub.calls.filter(c => c.method === 'newSession')).toHaveLength(0)
-    } finally {
-      proc.kill()
-    }
-  })
-
-  test('2. zombie session: killSession called, then newSession and sendKeys with launch command', async () => {
+  test('1. existing session: killSession called, then newSession and sendKeys with launch command', async () => {
     const stub = makeTmuxStub({
       hasSessionResult: true,
-      getPanePidResult: '99999999', // isClaudeRunning → false
+      getPanePidResult: '99999999',
+    })
+    const sessions = makeSessionsStubs()
+    const config = makeRoutingConfig()
+
+    const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0 })
+
+    expect(results).toHaveLength(1)
+    expect(results[0].channelId).toBe('C_TEST1')
+    expect(results[0].sessionName).toBe(sessionName('C_TEST1'))
+
+    const killCalls = stub.calls.filter(c => c.method === 'killSession')
+    expect(killCalls).toHaveLength(1)
+    expect(killCalls[0].args[0]).toBe(sessionName('C_TEST1'))
+
+    const newCalls = stub.calls.filter(c => c.method === 'newSession')
+    expect(newCalls).toHaveLength(1)
+    expect(newCalls[0].args[0]).toBe(sessionName('C_TEST1'))
+
+    // killSession must appear before newSession in the call log
+    const killIdx = stub.calls.findIndex(c => c.method === 'killSession')
+    const newIdx = stub.calls.findIndex(c => c.method === 'newSession')
+    expect(killIdx).toBeLessThan(newIdx)
+  })
+
+  test('2. existing session: action is relaunched when launchSession succeeds', async () => {
+    const stub = makeTmuxStub({
+      hasSessionResult: true,
+      getPanePidResult: '99999999',
     })
     const sessions = makeSessionsStubs()
     const config = makeRoutingConfig()

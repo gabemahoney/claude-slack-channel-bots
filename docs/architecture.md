@@ -11,7 +11,7 @@ server.ts               Main entry point — HTTP server, Socket Mode, session l
 ├── config.ts           Routing configuration — load, validate, defaults, tilde expansion
 ├── registry.ts         Session registry — pending/registered sessions, MCP Server factory, transport routing
 ├── lib.ts              Pure utilities — gate, access control, chunking, sanitization
-├── session-manager.ts  Startup orchestration — per-route state detection, reconnect/relaunch logic
+├── session-manager.ts  Startup orchestration — per-route state detection, kill/relaunch logic
 ├── restart.ts          Auto-restart — delayed relaunch on disconnect, failure counting, timer cancellation
 ├── tmux.ts             TmuxClient interface and defaultTmuxClient — tmux shell ops, isClaudeRunning
 ├── sessions.ts         sessions.json I/O — readSessions/writeSessions, SessionRecord, SessionsMap
@@ -66,9 +66,8 @@ Same pattern as permission relay but via `PreToolUse` hook on `AskUserQuestion`:
 Called from `main()` in `server.ts` via `startupSessionManager()` after the HTTP server and Socket Mode listeners are ready.
 
 1. **tmux availability check** — `tmuxClient.checkAvailability()` runs `tmux -V`. If tmux is not installed, startup is skipped with a warning and the server continues.
-2. **Iterate routes** — for each `channelId`/`cwd` pair in `routingConfig.routes`, determine state via `tmuxClient.hasSession()` + `isClaudeRunning()`:
-   - **live** (session exists, Claude running) → send `/mcp reconnect slack-channel-router` + Enter so Claude re-registers with this server instance
-   - **zombie** (session exists, Claude dead) → `killSession()` then relaunch via `launchSession()`
+2. **Iterate routes** — for each `channelId`/`cwd` pair in `routingConfig.routes`, determine state via `tmuxClient.hasSession()`:
+   - **exists** (session found) → `killSession()` then relaunch via `launchSession()`
    - **missing** (no tmux session) → launch fresh via `launchSession()`
 3. **Launch flow** (`launchSession()`):
    - `tmuxClient.newSession(name, cwd)` creates a detached session
