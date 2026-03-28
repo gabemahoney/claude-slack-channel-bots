@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test'
-import { mkdtempSync, copyFileSync, chmodSync, existsSync } from 'fs'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { mkdtempSync, copyFileSync, chmodSync, existsSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { type TmuxClient, sessionName } from './tmux.ts'
@@ -112,10 +112,19 @@ function makeRoutingConfig(overrides?: Partial<RoutingConfig>): RoutingConfig {
 // Helper: spawn a real process named "claude" so isClaudeRunning returns true
 // ---------------------------------------------------------------------------
 
+let spawnedTmpDir = ''
+
+afterEach(() => {
+  if (spawnedTmpDir) {
+    rmSync(spawnedTmpDir, { recursive: true, force: true })
+    spawnedTmpDir = ''
+  }
+})
+
 async function spawnClaudeProcess() {
   const sleepBin = existsSync('/usr/bin/sleep') ? '/usr/bin/sleep' : '/bin/sleep'
-  const tmpDir = mkdtempSync(join(tmpdir(), 'session-mgr-test-'))
-  const claudePath = join(tmpDir, 'claude')
+  spawnedTmpDir = mkdtempSync(join(tmpdir(), 'session-mgr-test-'))
+  const claudePath = join(spawnedTmpDir, 'claude')
   copyFileSync(sleepBin, claudePath)
   chmodSync(claudePath, 0o755)
   const proc = Bun.spawn([claudePath, '60'])

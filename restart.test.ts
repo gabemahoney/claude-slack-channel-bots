@@ -109,6 +109,16 @@ describe('scheduleRestart', () => {
     expect(deps.launchSessionCalls).toHaveLength(0)
   })
 
+  test('timer fires but isShuttingDown=true — launchSession never called', async () => {
+    const deps = makeDeps({ isShuttingDown: true })
+    initRestart(deps)
+
+    scheduleRestart('C_TEST1', '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    expect(deps.launchSessionCalls).toHaveLength(0)
+  })
+
   test('4. timer fires, session dead — killSession then launchSession called', async () => {
     const deps = makeDeps({ isSessionAliveResult: false })
     initRestart(deps)

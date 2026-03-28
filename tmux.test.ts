@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test'
-import { mkdtempSync, copyFileSync, chmodSync, existsSync } from 'fs'
+import { describe, test, expect, beforeEach, afterAll } from 'bun:test'
+import { mkdtempSync, copyFileSync, chmodSync, existsSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { sessionName, isClaudeRunning, type TmuxClient } from './tmux.ts'
@@ -89,6 +89,16 @@ let stub: ReturnType<typeof makeTmuxStub>
 
 beforeEach(() => {
   stub = makeTmuxStub()
+})
+
+// ---------------------------------------------------------------------------
+// Temp dir cleanup for isClaudeRunning test
+// ---------------------------------------------------------------------------
+
+let claudeTestTmpDir = ''
+
+afterAll(() => {
+  if (claudeTestTmpDir) rmSync(claudeTestTmpDir, { recursive: true, force: true })
 })
 
 // ---------------------------------------------------------------------------
@@ -346,8 +356,8 @@ describe('isClaudeRunning', () => {
   test('returns true when a process named "claude" is found under the pane PID', async () => {
     // Copy a known binary to a temp file named "claude" so that ps reports comm="claude"
     const sleepBin = existsSync('/usr/bin/sleep') ? '/usr/bin/sleep' : '/bin/sleep'
-    const tmpDir = mkdtempSync(join(tmpdir(), 'tmux-test-'))
-    const claudePath = join(tmpDir, 'claude')
+    claudeTestTmpDir = mkdtempSync(join(tmpdir(), 'tmux-test-'))
+    const claudePath = join(claudeTestTmpDir, 'claude')
     copyFileSync(sleepBin, claudePath)
     chmodSync(claudePath, 0o755)
 

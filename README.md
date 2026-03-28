@@ -24,6 +24,7 @@ All Claude Code sessions connect to the same `/mcp` endpoint. After the MCP hand
 ## Prerequisites
 
 - [Bun](https://bun.sh) v1.0+
+- [tmux](https://github.com/tmux/tmux) (required for server-managed sessions)
 - A Slack app with **Socket Mode** enabled
 - A **Bot Token** (`xoxb-…`) with scopes: `chat:write`, `reactions:write`, `channels:history`, `im:history`, `files:read`
 - An **App-Level Token** (`xapp-…`) with scope: `connections:write`
@@ -93,7 +94,9 @@ Create `~/.claude/channels/slack/routing.json` (see [Routing Configuration](#rou
   "default_route": "~/projects/alpha",
   "default_dm_session": "~/projects/alpha",
   "bind": "127.0.0.1",
-  "port": 3100
+  "port": 3100,
+  "session_restart_delay": 60,
+  "mcp_config_path": "~/.claude/slack-mcp.json"
 }
 ```
 
@@ -106,6 +109,8 @@ Create `~/.claude/channels/slack/routing.json` (see [Routing Configuration](#rou
 | `default_dm_session` | string | — | CWD path of the session that handles direct messages. Must match an existing route `cwd`. |
 | `bind` | string | `"127.0.0.1"` | Interface the HTTP server binds to. Use `"0.0.0.0"` to expose on all interfaces. |
 | `port` | number | `3100` | Port the HTTP server listens on. |
+| `session_restart_delay` | number | `60` | Seconds to wait before auto-restarting a dead session. Set to `0` to disable auto-restart. |
+| `mcp_config_path` | string | `~/.claude/slack-mcp.json` | Path to the MCP config file passed to Claude Code when launching managed sessions. |
 
 ---
 
@@ -128,6 +133,18 @@ On startup the server prints the single MCP endpoint URL and example `mcpServers
   }
 }
 ```
+
+---
+
+## Server-managed sessions
+
+The server automatically launches and manages Claude Code sessions via tmux. This requires tmux to be installed.
+
+On startup, the server creates a tmux session for each route and launches Claude Code in it. If a tmux session with that name already exists from a previous run, the server reconnects it instead of relaunching.
+
+If a session dies unexpectedly, the server automatically restarts it after `session_restart_delay` seconds. After 3 consecutive launch failures for a route, auto-restart stops for that route until the server is restarted. Setting `session_restart_delay` to `0` disables auto-restart entirely.
+
+Each session is launched using the `mcp_config_path` file, so that path must be set up before starting the server (see [Connecting Claude Code sessions](#connecting-claude-code-sessions) for the config format).
 
 ---
 

@@ -56,7 +56,8 @@ export async function launchSession(
   console.error(`[slack] Session created: ${name} (cwd="${cwd}")`)
 
   // Send the claude launch command, then Enter to execute it
-  const launchCmd = `claude --mcp-config ${routingConfig.mcp_config_path} --dangerously-load-development-channels server:slack-channel-router`
+  const escapedConfigPath = routingConfig.mcp_config_path.replace(/'/g, "'\\''")
+  const launchCmd = `claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:slack-channel-router`
   await tmuxClient.sendKeys(name, launchCmd)
   await tmuxClient.sendKeys(name, 'Enter')
   console.error(`[slack] Claude launch command sent to session: ${name}`)
