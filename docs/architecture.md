@@ -7,17 +7,20 @@ The Slack Channel Router is a two-way bridge between Slack and Claude Code sessi
 ## Module Map
 
 ```
-server.ts               Main entry point — HTTP server, Socket Mode, session lifecycle, message routing
-├── config.ts           Routing configuration — load, validate, defaults, tilde expansion
-├── registry.ts         Session registry — pending/registered sessions, MCP Server factory, transport routing
-├── lib.ts              Pure utilities — gate, access control, chunking, sanitization
-├── session-manager.ts  Startup orchestration — per-route state detection, kill/relaunch logic
-├── restart.ts          Auto-restart — delayed relaunch on disconnect, failure counting, timer cancellation
-├── tmux.ts             TmuxClient interface and defaultTmuxClient — tmux shell ops, isClaudeRunning
-├── sessions.ts         sessions.json I/O — readSessions/writeSessions, SessionRecord, SessionsMap
-└── hooks/
-    ├── permission-relay.sh   PermissionRequest hook — POST + long-poll for Allow/Deny
-    └── ask-relay.sh          AskUserQuestion hook — POST + long-poll for option selection
+cli.ts                  CLI entry point for the claude-slack-channel-bots command, dispatches start/stop subcommands, performs prerequisite checks, thin wrapper around server.ts main()
+└── server.ts           Main entry point — HTTP server, Socket Mode, session lifecycle, message routing
+    ├── config.ts           Routing configuration — load, validate, defaults, tilde expansion
+    ├── registry.ts         Session registry — pending/registered sessions, MCP Server factory, transport routing
+    ├── lib.ts              Pure utilities — gate, access control, chunking, sanitization
+    ├── session-manager.ts  Startup orchestration — per-route state detection, kill/relaunch logic
+    ├── restart.ts          Auto-restart — delayed relaunch on disconnect, failure counting, timer cancellation
+    ├── tmux.ts             TmuxClient interface and defaultTmuxClient — tmux shell ops, isClaudeRunning
+    ├── sessions.ts         sessions.json I/O — readSessions/writeSessions, SessionRecord, SessionsMap
+    ├── pid.ts              PID file management — write, read, conflict detection, isProcessRunning
+    ├── tokens.ts           Token loading — reads SLACK_BOT_TOKEN/SLACK_APP_TOKEN from env, validates prefixes
+    └── hooks/
+        ├── permission-relay.sh   PermissionRequest hook — POST + long-poll for Allow/Deny
+        └── ask-relay.sh          AskUserQuestion hook — POST + long-poll for option selection
 ```
 
 ## Data Flow

@@ -828,7 +828,7 @@ process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
 // server calls roots/list and matches the CWD against routing.json.
 // ---------------------------------------------------------------------------
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   checkPidConflict(PID_FILE)
 
   let mcpHost: string
@@ -1315,7 +1315,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error('[slack] Fatal:', err)
-  process.exit(1)
-})
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error('[slack] Fatal:', err)
+    process.exit(1)
+  })
+}
