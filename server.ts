@@ -556,12 +556,12 @@ function buildPermissionBlocks(
 ): any[] {
   let summary: string
   if (toolName === 'Bash') {
-    summary = String(toolInput['command'] ?? JSON.stringify(toolInput).slice(0, 500))
+    summary = '`' + String(toolInput['command'] ?? JSON.stringify(toolInput).slice(0, 500)) + '`'
   } else if (toolName === 'Edit' || toolName === 'Write') {
-    summary = String(toolInput['file_path'] ?? JSON.stringify(toolInput).slice(0, 500))
+    summary = '`' + String(toolInput['file_path'] ?? JSON.stringify(toolInput).slice(0, 500)) + '`'
   } else {
     const raw = JSON.stringify(toolInput)
-    summary = raw.length > 500 ? raw.slice(0, 500) + '…' : raw
+    summary = '`' + (raw.length > 500 ? raw.slice(0, 500) + '…' : raw) + '`'
   }
 
   return [
@@ -569,7 +569,7 @@ function buildPermissionBlocks(
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `*${toolName}*\n${summary}`,
+        text: `🤖🛠️ *${toolName}*\n${summary}`,
       },
     },
     {
@@ -635,9 +635,10 @@ socket.on('app_mention', async ({ event, ack }) => {
   }
 })
 
-socket.on('interactive', async ({ payload, ack }) => {
-  const p = payload as Record<string, unknown>
-  const actions = (p['actions'] as Array<{ action_id: string }> | undefined) ?? []
+socket.on('interactive', async (evt) => {
+  const { ack } = evt as { ack: () => Promise<void> }
+  const p = ((evt as any).body ?? (evt as any).payload ?? evt) as Record<string, unknown>
+  const actions = (Array.isArray(p['actions']) ? p['actions'] : []) as Array<{ action_id: string }>
   for (const action of actions) {
     const actionId = action.action_id
     if (actionId.startsWith('perm_allow_') || actionId.startsWith('perm_deny_')) {
