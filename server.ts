@@ -48,6 +48,7 @@ import {
   cancelAllRestartTimers,
 } from './restart.ts'
 import { loadTokens } from './tokens.ts'
+import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
 import {
   registerSession,
   unregisterByMcpSessionId,
@@ -75,6 +76,7 @@ export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
 const STATE_DIR = process.env['SLACK_STATE_DIR'] || join(homedir(), '.claude', 'channels', 'slack')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const PID_FILE = join(STATE_DIR, 'server.pid')
 
 // ---------------------------------------------------------------------------
 // Bootstrap — tokens & state directory
@@ -802,6 +804,8 @@ async function shutdown(signal: string): Promise<void> {
     await socket.disconnect()
   } catch { /* ignore */ }
 
+  removePidFile(PID_FILE)
+
   process.stderr.write('[slack] Shutdown complete\n')
   process.exit(0)
 }
@@ -825,6 +829,8 @@ process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  checkPidConflict(PID_FILE)
+
   let mcpHost: string
   let mcpPort: number
 
@@ -1265,6 +1271,8 @@ async function main(): Promise<void> {
       return transport.handleRequest(req)
     },
   })
+
+  writePidFile(PID_FILE)
 
   console.error(`[slack] MCP server listening on http://${mcpHost}:${mcpPort}/mcp`)
   console.error('')

@@ -98,7 +98,7 @@ After `scheduleRestart` is called:
 
 ### Graceful Shutdown
 
-On `SIGTERM` or `SIGINT`, the shutdown handler calls `cancelAllRestartTimers()` before tearing down Socket Mode and the HTTP server. All pending restart timers are cleared so no relaunch fires during shutdown.
+On `SIGTERM` or `SIGINT`, the shutdown handler calls `cancelAllRestartTimers()` before tearing down Socket Mode and the HTTP server. All pending restart timers are cleared so no relaunch fires during shutdown. The PID file (`STATE_DIR/server.pid`) is removed as the final step of shutdown.
 
 ## Configuration
 
@@ -118,6 +118,10 @@ Key fields:
 ### sessions.json (~/.claude/channels/slack/sessions.json)
 
 Persistent registry of server-managed tmux sessions. Maps channel IDs to tmux session names and launch timestamps. Survives server restarts.
+
+### server.pid (STATE_DIR/server.pid)
+
+Written at startup with the server's process ID. Used by the CLI `stop` command to send `SIGTERM` to a running server and by startup to detect a conflicting already-running instance. Removed on graceful shutdown.
 
 ### Environment Variables
 
