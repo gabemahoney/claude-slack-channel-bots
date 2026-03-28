@@ -1,12 +1,24 @@
 {
-  "name": "claude-channel-slack",
+  "name": "claude-slack-channel-bots",
   "version": "0.1.0",
-  "description": "Slack channel for Claude Code — two-way chat via Socket Mode",
+  "description": "Multi-session Slack-to-Claude bridge — run multiple Claude Code bots across Slack channels via Socket Mode",
   "type": "module",
-  "bin": "./server.ts",
+  "bin": {
+    "claude-slack-channel-bots": "./cli.ts"
+  },
+  "files": [
+    "*.ts",
+    "!*.test.ts",
+    "hooks/",
+    "slack-app-manifest.yml",
+    "README.md",
+    "skills/"
+  ],
+  "engines": {
+    "bun": ">=1.0.0"
+  },
   "scripts": {
     "start": "bun install --no-summary && bun server.ts",
-    "start:node": "npx tsx server.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
