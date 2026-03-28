@@ -18,6 +18,7 @@
     "bun": ">=1.0.0"
   },
   "scripts": {
+    "postinstall": "bun postinstall.ts",
     "start": "bun install --no-summary && bun server.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
