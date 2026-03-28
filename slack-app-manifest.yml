@@ -1,0 +1,51 @@
+# Slack App Manifest for Claude Slack Channel Bots
+#
+# MANUAL STEP REQUIRED after creating the app from this manifest:
+# In the Slack admin UI, go to Basic Information → App-Level Tokens and generate
+# an App-Level Token with the `connections:write` scope. This token is required
+# for Socket Mode and must be set as the SLACK_APP_TOKEN environment variable.
+
+_metadata:
+  major_version: 1
+  minor_version: 1
+
+display_information:
+  name: Claude Slack Channel Bots
+  description: >-
+    Multi-session Slack-to-Claude bridge that routes Slack channel and DM messages
+    to Claude Code sessions via Socket Mode, enabling interactive AI assistance
+    directly within Slack channels.
+  background_color: "#1a1a2e"
+
+features:
+  bot_user:
+    display_name: Claude Slack Channel Bots
+    always_online: true
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - reactions:write
+      - channels:history
+      - im:history
+      - files:read
+      - files:write
+      - users:read
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.im
+      - message.groups
+      - app_mention
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
