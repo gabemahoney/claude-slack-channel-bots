@@ -142,6 +142,21 @@ const pendingPermissions = new Map<string, PendingPermission>()
 const completedDecisions = new Map<string, 'allow' | 'deny'>()
 
 // ---------------------------------------------------------------------------
+// AskUserQuestion relay — pending question registry
+// ---------------------------------------------------------------------------
+
+interface PendingQuestion {
+  requestId: string
+  channelId: string
+  messageTs: string
+  question: string
+  waiters: Array<(answer: string) => void>
+}
+
+const pendingQuestions = new Map<string, PendingQuestion>()
+const completedAnswers = new Map<string, string>()
+
+// ---------------------------------------------------------------------------
 // Access control — load / save / prune
 // ---------------------------------------------------------------------------
 
@@ -711,6 +726,45 @@ socket.on('interactive', async (evt) => {
         return
       }
     }
+    // Handle ask_ action IDs (AskUserQuestion relay)
+    if (actionId.startsWith('ask_')) {
+      // Format: ask_<requestId>_<optionIndex>
+      const rest = actionId.slice('ask_'.length)
+      const lastUnderscore = rest.lastIndexOf('_')
+      if (lastUnderscore !== -1) {
+        const requestId = rest.slice(0, lastUnderscore)
+        const optionIndex = parseInt(rest.slice(lastUnderscore + 1), 10)
+        const pending = pendingQuestions.get(requestId)
+        if (pending) {
+          // Get the button text as the answer
+          const buttonText = (action as any).text?.text ?? `Option ${optionIndex + 1}`
+          completedAnswers.set(requestId, buttonText)
+          for (const waiter of pending.waiters) waiter(buttonText)
+          await ack()
+          pendingQuestions.delete(requestId)
+
+          const userId = ((p['user'] as Record<string, unknown> | undefined)?.['id'] as string | undefined) ?? ''
+          const userName = userId ? await resolveUserName(userId) : 'unknown'
+          try {
+            await web.chat.update({
+              channel: pending.channelId,
+              ts: pending.messageTs,
+              text: `${pending.question} — "${buttonText}" selected by ${userName}`,
+              blocks: [{
+                type: 'section',
+                text: {
+                  type: 'mrkdwn',
+                  text: `❓ *${pending.question}*\n✅ _"${buttonText}"_ — selected by ${userName}`,
+                },
+              }],
+            })
+          } catch (err) {
+            console.error('[slack] /ask: chat.update failed:', err)
+          }
+          return
+        }
+      }
+    }
   }
   await ack()
 })
@@ -993,6 +1047,169 @@ async function main(): Promise<void> {
           channelId: matchedChannelId,
           messageTs,
           toolName: tool_name,
+          waiters: [],
+        })
+
+        return new Response(JSON.stringify({ requestId }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      // -----------------------------------------------------------------------
+      // /ask — AskUserQuestion relay endpoint (POST + GET long-poll)
+      // -----------------------------------------------------------------------
+      if (url.pathname === '/ask' || url.pathname.startsWith('/ask/')) {
+        if (req.method !== 'POST' && req.method !== 'GET') {
+          return new Response('Method Not Allowed', { status: 405 })
+        }
+
+        const remoteAddr = server.requestIP(req)
+        const remoteHost = remoteAddr?.address ?? ''
+        if (remoteHost !== '127.0.0.1' && remoteHost !== '::1' && !remoteHost.startsWith('::ffff:127.')) {
+          return new Response('Forbidden', { status: 403 })
+        }
+
+        // GET /ask/<requestId> — long-poll for answer
+        if (req.method === 'GET' && url.pathname.startsWith('/ask/')) {
+          const pollRequestId = url.pathname.slice('/ask/'.length)
+
+          const existingAnswer = completedAnswers.get(pollRequestId)
+          if (existingAnswer !== undefined) {
+            return new Response(JSON.stringify({ status: 'decided', answer: existingAnswer }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            })
+          }
+
+          const pendingEntry = pendingQuestions.get(pollRequestId)
+          if (!pendingEntry) {
+            return new Response(JSON.stringify({ status: 'decided', answer: '' }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            })
+          }
+
+          const answer = await new Promise<string | null>((promiseResolve) => {
+            let settled = false
+            let timerId: ReturnType<typeof setTimeout>
+
+            const waiter = (a: string) => {
+              if (settled) return
+              settled = true
+              clearTimeout(timerId)
+              promiseResolve(a)
+            }
+
+            pendingEntry.waiters.push(waiter)
+
+            timerId = setTimeout(() => {
+              if (settled) return
+              settled = true
+              const idx = pendingEntry.waiters.indexOf(waiter)
+              if (idx !== -1) pendingEntry.waiters.splice(idx, 1)
+              promiseResolve(null)
+            }, 60_000)
+
+            req.signal.addEventListener('abort', () => {
+              if (settled) return
+              settled = true
+              clearTimeout(timerId)
+              const idx = pendingEntry.waiters.indexOf(waiter)
+              if (idx !== -1) pendingEntry.waiters.splice(idx, 1)
+              promiseResolve(null)
+            })
+          })
+
+          if (answer !== null) {
+            return new Response(JSON.stringify({ status: 'decided', answer }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            })
+          }
+          return new Response(JSON.stringify({ status: 'pending' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+
+        // POST /ask — create a new question
+        let body: { question?: unknown; options?: unknown; cwd?: unknown }
+        try {
+          body = await req.json()
+        } catch {
+          return new Response(JSON.stringify({ error: 'Invalid JSON' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+
+        const { question, options, cwd } = body
+        if (typeof question !== 'string' || !Array.isArray(options) || typeof cwd !== 'string') {
+          return new Response(
+            JSON.stringify({ error: 'Missing or invalid fields: question, options, cwd required' }),
+            { status: 400, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+
+        const normalizedCwd = resolve(expandTilde(cwd as string))
+        const matchedChannelId = routingConfig
+          ? Object.entries(routingConfig.routes).find(
+              ([, route]) => resolve(expandTilde(route.cwd)) === normalizedCwd,
+            )?.[0]
+          : undefined
+
+        if (!matchedChannelId) {
+          return new Response(JSON.stringify({ error: 'No route found for CWD' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+
+        const requestId = crypto.randomUUID()
+
+        // Build Block Kit with option buttons
+        const optionButtons = (options as string[]).map((opt: string, i: number) => ({
+          type: 'button',
+          text: { type: 'plain_text', text: opt },
+          action_id: `ask_${requestId}_${i}`,
+        }))
+
+        const blocks = [
+          {
+            type: 'section',
+            text: {
+              type: 'mrkdwn',
+              text: `❓ *${question}*`,
+            },
+          },
+          {
+            type: 'actions',
+            elements: optionButtons,
+          },
+        ]
+
+        let messageTs: string
+        try {
+          const postResult = await web.chat.postMessage({
+            channel: matchedChannelId,
+            text: `Question: ${question}`,
+            blocks,
+          })
+          messageTs = postResult.ts as string
+        } catch (err) {
+          console.error('[slack] /ask: chat.postMessage failed:', err)
+          return new Response(JSON.stringify({ error: 'Failed to post message' }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+
+        pendingQuestions.set(requestId, {
+          requestId,
+          channelId: matchedChannelId,
+          messageTs,
+          question: question as string,
           waiters: [],
         })
 
