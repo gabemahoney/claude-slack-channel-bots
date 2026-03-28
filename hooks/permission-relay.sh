@@ -19,7 +19,7 @@ TOOL_INPUT=$(echo "$INPUT" | jq -c '.tool_input // {}' 2>/dev/null) || exit 0
 CWD=$(echo "$INPUT" | jq -r '.cwd // ""' 2>/dev/null) || exit 0
 
 # Read port from routing.json, default to 3100
-ROUTING_FILE="${HOME}/.claude/channels/slack/routing.json"
+ROUTING_FILE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/routing.json"
 PORT=3100
 if [ -f "$ROUTING_FILE" ]; then
   ROUTED_PORT=$(jq -r '.port // empty' "$ROUTING_FILE" 2>/dev/null) || true
