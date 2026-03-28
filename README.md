@@ -124,7 +124,7 @@ On startup the server prints the single MCP endpoint URL and example `mcpServers
 
 {
   "mcpServers": {
-    "slack": { "type": "http", "url": "http://127.0.0.1:3100/mcp" }
+    "slack-channel-router": { "type": "http", "url": "http://127.0.0.1:3100/mcp" }
   }
 }
 ```
@@ -133,14 +133,29 @@ On startup the server prints the single MCP endpoint URL and example `mcpServers
 
 ## Connecting Claude Code sessions
 
-Launch Claude from the project directory using `--mcp-config`:
+Create a config file for the Slack MCP server (e.g. `~/.claude/slack-mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "slack-channel-router": {
+      "type": "http",
+      "url": "http://127.0.0.1:3100/mcp"
+    }
+  }
+}
+```
+
+Then launch Claude from the project directory, passing the config file path:
 
 ```sh
 cd ~/projects/alpha
-claude --mcp-config '{"mcpServers":{"slack":{"type":"http","url":"http://127.0.0.1:3100/mcp"}}}' --dangerously-load-development-channels
+claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:slack-channel-router
 ```
 
-The server calls `roots/list` after the MCP handshake and matches the session's CWD against `routing.json`. Sessions with an unrecognized CWD are disconnected. Claude instances launched without `--mcp-config` are unaffected.
+`--mcp-config` takes a **file path** (not inline JSON). It adds the Slack server on top of any globally configured MCP servers — Claude sessions launched without `--mcp-config` are unaffected and never connect to the Slack server.
+
+The server calls `roots/list` after the MCP handshake and matches the session's CWD against `routing.json`. Sessions with an unrecognized CWD are disconnected.
 
 ---
 

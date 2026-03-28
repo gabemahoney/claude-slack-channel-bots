@@ -271,9 +271,9 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
   const deliveredChannels = new Set<string>()
 
   // Stub entry for createSessionServer to close over deliveredChannels.
-  // routeName/channelId are placeholders; tools only use deliveredChannels.
+  // cwd/channelId are placeholders; tools only use deliveredChannels.
   const entryStub: SessionEntry = {
-    routeName: '',
+    cwd: '',
     channelId: '',
     transport: null as unknown as WebStandardStreamableHTTPServerTransport,
     server: null as unknown as import('@modelcontextprotocol/sdk/server/index.js').Server,
@@ -309,6 +309,11 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
 
   // Set roots handler — fires after MCP initialized notification
   server.oninitialized = () => {
+    const caps = server.getClientCapabilities()
+    const clientInfo = server.getClientVersion?.() ?? (server as any)._clientVersion
+    console.error(`[slack] Session "${pendingId}" initialized`)
+    console.error(`[slack]   Client: ${JSON.stringify(clientInfo)}`)
+    console.error(`[slack]   Capabilities: ${JSON.stringify(caps)}`)
     handleInitialized(pendingId, server).catch((err) => {
       console.error(`[slack] Error in roots handler for session "${pendingId}":`, err)
     })
@@ -335,10 +340,45 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
 // On no match or error: disconnects the session.
 // ---------------------------------------------------------------------------
 
+/**
+ * Wait for the client to open a GET SSE stream on the transport.
+ * The MCP SDK silently drops server-to-client requests when no SSE stream
+ * is available, so we must wait before calling roots/list.
+ */
+async function waitForSseStream(
+  transport: WebStandardStreamableHTTPServerTransport,
+  timeoutMs = 10_000,
+): Promise<boolean> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    // Check the transport's internal stream mapping for the standalone GET stream
+    if ((transport as any)._streamMapping?.has('_GET_stream')) return true
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  return false
+}
+
 async function handleInitialized(
   pendingId: string,
   server: import('@modelcontextprotocol/sdk/server/index.js').Server,
 ): Promise<void> {
+  // Get the pending session's transport so we can wait for SSE stream
+  const pendingEntry = getPendingSession(pendingId)
+  if (!pendingEntry) {
+    console.error(`[slack] Pending session "${pendingId}" disappeared before roots resolution`)
+    return
+  }
+
+  // Wait for the client to open the GET SSE stream before sending roots/list.
+  // Without this, the transport silently drops the request (no delivery channel).
+  const sseReady = await waitForSseStream(pendingEntry.transport)
+  if (!sseReady) {
+    console.error(`[slack] Timed out waiting for SSE stream from session "${pendingId}" — disconnecting`)
+    removePendingSession(pendingId)
+    try { await pendingEntry.transport.close() } catch { /* ignore */ }
+    return
+  }
+
   let roots: { uri: string }[]
 
   try {
@@ -420,6 +460,7 @@ async function handleMessage(event: unknown): Promise<void> {
 
   switch (result.action) {
     case 'drop':
+      console.error(`[slack] Gate dropped message from channel=${ev['channel']} user=${ev['user']}`)
       return
 
     case 'pair': {
@@ -537,6 +578,7 @@ async function handleMessage(event: unknown): Promise<void> {
       }
 
       // Dispatch to the session's Server instance
+      console.error(`[slack] Dispatching to session cwd="${targetSession.cwd}" channel=${channelId} text="${text.slice(0, 80)}"`)
       targetSession.server.notification({
         method: 'notifications/claude/channel',
         params: { content: text, meta },
@@ -793,6 +835,8 @@ async function main(): Promise<void> {
     idleTimeout: 255,
     async fetch(req: Request, server: { requestIP(r: Request): { address: string } | null }): Promise<Response> {
       const url = new URL(req.url)
+      const mcpSid = req.headers.get('mcp-session-id')
+      console.error(`[slack] HTTP ${req.method} ${url.pathname} session=${mcpSid ?? '(none)'}`)
 
       // -----------------------------------------------------------------------
       // /permission — permission relay endpoint (POST + GET long-poll)
@@ -998,8 +1042,11 @@ async function main(): Promise<void> {
 
   console.error(`[slack] MCP server listening on http://${mcpHost}:${mcpPort}/mcp`)
   console.error('')
-  console.error('Launch Claude from a project directory with:')
-  console.error(`  claude --mcp-config '{"mcpServers":{"slack":{"type":"http","url":"http://${mcpHost}:${mcpPort}/mcp"}}}' --dangerously-load-development-channels`)
+  console.error('Save this to ~/.claude/slack-mcp.json:')
+  console.error(JSON.stringify({ mcpServers: { 'slack-channel-router': { type: 'http', url: `http://${mcpHost}:${mcpPort}/mcp` } } }, null, 2))
+  console.error('')
+  console.error('Then launch Claude from a project directory with:')
+  console.error('  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:slack-channel-router')
   console.error('')
 }
 

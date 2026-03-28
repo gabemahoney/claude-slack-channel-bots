@@ -332,7 +332,7 @@ export function createSessionServer(
   const { web, assertOutboundAllowed, assertSendable, getAccess, resolveUserName, inboxDir } = deps
 
   const server = new Server(
-    { name: 'slack', version: '0.1.0' },
+    { name: 'slack-channel-router', version: '0.1.0' },
     {
       capabilities: {
         experimental: { 'claude/channel': {} },
