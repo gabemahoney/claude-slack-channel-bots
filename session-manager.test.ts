@@ -4,73 +4,15 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, test, expect, afterEach } from 'bun:test'
 import { mkdtempSync, copyFileSync, chmodSync, existsSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { type TmuxClient, sessionName } from './tmux.ts'
+import { sessionName } from './tmux.ts'
 import { type SessionsMap } from './sessions.ts'
 import { type RoutingConfig } from './config.ts'
 import { startupSessionManager, launchSession } from './session-manager.ts'
-
-// ---------------------------------------------------------------------------
-// TmuxClient stub factory
-// ---------------------------------------------------------------------------
-
-type Call = { method: string; args: unknown[] }
-
-type TmuxStubOpts = {
-  checkAvailabilityResult?: string | Error
-  hasSessionResult?: boolean | Error
-  getPanePidResult?: string | Error
-  newSessionResult?: Error
-  sendKeysResult?: Error
-  capturePaneResult?: string | Error
-  killSessionResult?: Error
-}
-
-function makeTmuxStub(opts: TmuxStubOpts = {}): TmuxClient & { calls: Call[] } {
-  const calls: Call[] = []
-  return {
-    calls,
-    async checkAvailability() {
-      calls.push({ method: 'checkAvailability', args: [] })
-      const r = opts.checkAvailabilityResult ?? 'tmux 3.3a'
-      if (r instanceof Error) throw r
-      return r
-    },
-    async hasSession(name) {
-      calls.push({ method: 'hasSession', args: [name] })
-      const r = opts.hasSessionResult ?? false
-      if (r instanceof Error) throw r
-      return r
-    },
-    async getPanePid(session) {
-      calls.push({ method: 'getPanePid', args: [session] })
-      const r = opts.getPanePidResult ?? '99999999'
-      if (r instanceof Error) throw r
-      return r
-    },
-    async newSession(name, cwd) {
-      calls.push({ method: 'newSession', args: [name, cwd] })
-      if (opts.newSessionResult instanceof Error) throw opts.newSessionResult
-    },
-    async sendKeys(session, keys) {
-      calls.push({ method: 'sendKeys', args: [session, keys] })
-      if (opts.sendKeysResult instanceof Error) throw opts.sendKeysResult
-    },
-    async capturePane(session) {
-      calls.push({ method: 'capturePane', args: [session] })
-      const r = opts.capturePaneResult ?? ''
-      if (r instanceof Error) throw r
-      return r
-    },
-    async killSession(session) {
-      calls.push({ method: 'killSession', args: [session] })
-      if (opts.killSessionResult instanceof Error) throw opts.killSessionResult
-    },
-  }
-}
+import { makeTmuxStub } from './test-helpers/tmux-stub.ts'
 
 // ---------------------------------------------------------------------------
 // In-memory sessions stubs

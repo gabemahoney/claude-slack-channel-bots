@@ -12,7 +12,8 @@
  */
 
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'fs'
-import { dirname } from 'path'
+import { dirname, join } from 'path'
+import { homedir } from 'os'
 import { expandTilde } from './config.ts'
 
 // ---------------------------------------------------------------------------
@@ -30,7 +31,10 @@ export type SessionsMap = Record<string, SessionRecord>
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_SESSIONS_PATH = '~/.claude/channels/slack/sessions.json'
+const DEFAULT_SESSIONS_PATH = join(
+  process.env['SLACK_STATE_DIR'] || join(homedir(), '.claude', 'channels', 'slack'),
+  'sessions.json'
+)
 
 // ---------------------------------------------------------------------------
 // Functions
