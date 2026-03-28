@@ -47,6 +47,7 @@ import {
   resetFailureCounter,
   cancelAllRestartTimers,
 } from './restart.ts'
+import { loadTokens } from './tokens.ts'
 import {
   registerSession,
   unregisterByMcpSessionId,
@@ -72,7 +73,6 @@ export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
 // ---------------------------------------------------------------------------
 
 const STATE_DIR = process.env['SLACK_STATE_DIR'] || join(homedir(), '.claude', 'channels', 'slack')
-const ENV_FILE = join(STATE_DIR, '.env')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 
@@ -83,48 +83,7 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 mkdirSync(STATE_DIR, { recursive: true })
 mkdirSync(INBOX_DIR, { recursive: true })
 
-function loadEnv(): { botToken: string; appToken: string } {
-  if (!existsSync(ENV_FILE)) {
-    console.error(
-      `[slack] No .env found at ${ENV_FILE}\n` +
-        'Run /slack-channel:configure <bot-token> <app-token> first.',
-    )
-    process.exit(1)
-  }
-
-  chmodSync(ENV_FILE, 0o600)
-
-  const raw = readFileSync(ENV_FILE, 'utf-8')
-  const vars: Record<string, string> = {}
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#')) continue
-    const eq = trimmed.indexOf('=')
-    if (eq < 0) continue
-    const key = trimmed.slice(0, eq).trim()
-    let val = trimmed.slice(eq + 1).trim()
-    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-      val = val.slice(1, -1)
-    }
-    vars[key] = val
-  }
-
-  const botToken = vars['SLACK_BOT_TOKEN'] || ''
-  const appToken = vars['SLACK_APP_TOKEN'] || ''
-
-  if (!botToken.startsWith('xoxb-')) {
-    console.error('[slack] SLACK_BOT_TOKEN must start with xoxb-')
-    process.exit(1)
-  }
-  if (!appToken.startsWith('xapp-')) {
-    console.error('[slack] SLACK_APP_TOKEN must start with xapp-')
-    process.exit(1)
-  }
-
-  return { botToken, appToken }
-}
-
-const { botToken, appToken } = loadEnv()
+const { botToken, appToken } = loadTokens()
 
 // ---------------------------------------------------------------------------
 // Slack clients

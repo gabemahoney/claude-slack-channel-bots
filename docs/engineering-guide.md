@@ -19,7 +19,7 @@
 
 Extract to a new module when:
 - A concern has its own types + state + functions (e.g., registry.ts owns session Maps)
-- Tests need to import the logic without triggering server-side side effects (loading .env, connecting sockets)
+- Tests need to import the logic without triggering server-side side effects (connecting sockets, starting listeners)
 - The module is independently testable
 
 Do NOT extract prematurely — a few related functions in server.ts are fine until they grow.
@@ -41,7 +41,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 ## Security
 
 - Localhost-only endpoints: check `server.requestIP(req)` for `127.0.0.1`, `::1`, and `::ffff:127.*`
-- Sensitive files (`.env`, `access.json`): `chmod 0o600`
+- Sensitive files (`access.json`): `chmod 0o600`
 - No secrets in config files that don't need them (routing.json, sessions.json)
 - Gate all inbound Slack messages through the `gate()` function before processing
 

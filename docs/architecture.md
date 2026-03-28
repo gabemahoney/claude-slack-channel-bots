@@ -119,9 +119,14 @@ Key fields:
 
 Persistent registry of server-managed tmux sessions. Maps channel IDs to tmux session names and launch timestamps. Survives server restarts.
 
-### .env (~/.claude/channels/slack/.env)
+### Environment Variables
 
-Slack credentials: `SLACK_BOT_TOKEN` (xoxb-) and `SLACK_APP_TOKEN` (xapp-). chmod 600.
+Required at startup:
+
+- `SLACK_BOT_TOKEN` — bot user OAuth token; must begin with `xoxb-`
+- `SLACK_APP_TOKEN` — app-level token for Socket Mode; must begin with `xapp-`
+
+Both values are read directly from the process environment.
 
 ### access.json (~/.claude/channels/slack/access.json)
 
