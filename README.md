@@ -195,29 +195,32 @@ To enable it: open your Slack app config → **Interactivity & Shortcuts** → t
 
 ### Hook installation
 
-1. Copy the hook script to `~/.claude/hooks/permission-relay.sh`.
-2. Make it executable:
+1. Copy the hook scripts from the repo to `~/.claude/hooks/`:
 
    ```sh
-   chmod +x ~/.claude/hooks/permission-relay.sh
+   cp hooks/permission-relay.sh hooks/ask-relay.sh ~/.claude/hooks/
+   chmod +x ~/.claude/hooks/permission-relay.sh ~/.claude/hooks/ask-relay.sh
    ```
 
-3. Ensure `curl` and `jq` are on your `PATH`.
+2. Ensure `curl` and `jq` are on your `PATH`.
 
-4. Add the following to your Claude Code `settings.json`:
+3. Add the following to your Claude Code `settings.json`:
 
    ```jsonc
    "PermissionRequest": [
      {
        "matcher": ".*",
-       "hooks": [{ "type": "command", "command": "~/.waggle/hooks/waggle_set_state.sh waiting" }]
-     },
-     {
-       "matcher": ".*",
        "timeout": 2000000,
        "hooks": [{ "type": "command", "command": "~/.claude/hooks/permission-relay.sh" }]
+     }
+   ],
+   "PreToolUse": [
+     {
+       "matcher": "AskUserQuestion",
+       "timeout": 2000000,
+       "hooks": [{ "type": "command", "command": "~/.claude/hooks/ask-relay.sh" }]
      }
    ]
    ```
 
-   The first hook updates the waggle state to `waiting` so the UI reflects that approval is pending. The second hook (with a generous timeout) runs the relay script, which blocks until the user responds in Slack.
+   `permission-relay.sh` relays tool permission requests (Allow/Deny) to Slack via `PermissionRequest`. `ask-relay.sh` relays `AskUserQuestion` calls to Slack via `PreToolUse`, returning the user's selection without blocking the TUI. Both use a two-phase long-poll protocol with a ~23-day timeout.
