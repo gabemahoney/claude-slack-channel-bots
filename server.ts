@@ -39,8 +39,14 @@ import {
 } from './lib.ts'
 import { loadConfig, expandTilde, type RoutingConfig } from './config.ts'
 import { readSessions, writeSessions } from './sessions.ts'
-import { defaultTmuxClient } from './tmux.ts'
-import { startupSessionManager } from './session-manager.ts'
+import { defaultTmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
+import { startupSessionManager, launchSession } from './session-manager.ts'
+import {
+  initRestart,
+  scheduleRestart,
+  resetFailureCounter,
+  cancelAllRestartTimers,
+} from './restart.ts'
 import {
   registerSession,
   unregisterByMcpSessionId,
@@ -320,6 +326,7 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
           : undefined
         if (channelId) {
           console.error(`[slack] Session disconnected: channel=${channelId} cwd="${cwd}"`)
+          scheduleRestart(channelId, cwd)
         } else {
           console.error(`[slack] Session disconnected: cwd="${cwd}"`)
         }
@@ -473,8 +480,8 @@ async function handleInitialized(
   }
   console.error(`[slack] Session connected: channel=${matchedChannelId} cwd="${normalizedCwd}"`)
 
-  // Hook point for t1.uya.co — onSessionConnected(matchedChannelId)
-  // No restart logic here; the next epic wires in the restart timer.
+  // Reset failure counter — session reconnected successfully
+  resetFailureCounter(matchedChannelId)
 }
 
 // ---------------------------------------------------------------------------
@@ -799,6 +806,7 @@ let httpServer: ReturnType<typeof Bun.serve> | null = null
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
+  cancelAllRestartTimers()
 
   process.stderr.write(`[slack] Received ${signal} — shutting down\n`)
 
@@ -1279,6 +1287,27 @@ async function main(): Promise<void> {
   console.error('Then launch Claude from a project directory with:')
   console.error('  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:slack-channel-router')
   console.error('')
+
+  // Initialize restart module with adapters bridging tmux + session-manager
+  initRestart({
+    isSessionAlive: async (channelId) => {
+      const name = sessionName(channelId)
+      const exists = await defaultTmuxClient.hasSession(name)
+      if (!exists) return false
+      return isClaudeRunning(name, defaultTmuxClient)
+    },
+    killSession: async (channelId) => {
+      const name = sessionName(channelId)
+      const exists = await defaultTmuxClient.hasSession(name)
+      if (exists) await defaultTmuxClient.killSession(name)
+    },
+    launchSession: (channelId, cwd) => {
+      if (!routingConfig) return Promise.resolve(false)
+      return launchSession(channelId, cwd, routingConfig, defaultTmuxClient, readSessions, writeSessions)
+    },
+    getRestartDelay: () => routingConfig?.session_restart_delay ?? 60,
+    isShuttingDown: () => shuttingDown,
+  })
 
   // Start up managed tmux sessions for all configured routes.
   // If tmux is unavailable or startup fails, log a warning and continue.

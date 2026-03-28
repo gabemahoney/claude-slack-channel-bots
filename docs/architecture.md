@@ -12,6 +12,7 @@ server.ts               Main entry point — HTTP server, Socket Mode, session l
 ├── registry.ts         Session registry — pending/registered sessions, MCP Server factory, transport routing
 ├── lib.ts              Pure utilities — gate, access control, chunking, sanitization
 ├── session-manager.ts  Startup orchestration — per-route state detection, reconnect/relaunch logic
+├── restart.ts          Auto-restart — delayed relaunch on disconnect, failure counting, timer cancellation
 ├── tmux.ts             TmuxClient interface and defaultTmuxClient — tmux shell ops, isClaudeRunning
 ├── sessions.ts         sessions.json I/O — readSessions/writeSessions, SessionRecord, SessionsMap
 └── hooks/
@@ -81,7 +82,24 @@ Called from `main()` in `server.ts` via `startupSessionManager()` after the HTTP
 
 1. Transport closes → `onsessionclosed` fires
 2. Session removed from registry
-3. `onsessionclosed` resolves the session's CWD back to a `channelId` via `routingConfig.routes` — this exposes the channel for an auto-restart hook (t1.uya.co)
+3. `onsessionclosed` resolves the session's CWD back to a `channelId` via `routingConfig.routes`
+4. If a `channelId` is found, `scheduleRestart(channelId, cwd)` is called
+
+### Auto-Restart
+
+After `scheduleRestart` is called:
+
+1. **Delay check** — if `session_restart_delay` is 0, restart is skipped immediately
+2. **Failure guard** — if the channel has reached `MAX_CONSECUTIVE_FAILURES` (3), restart is abandoned
+3. **Timer** — a `setTimeout` fires after `session_restart_delay` seconds
+4. **Liveness check** — `isSessionAlive()` checks whether Claude is already running in tmux; if alive, restart is skipped
+5. **Kill zombie** — any dead tmux session for the channel is cleaned up (errors ignored)
+6. **Relaunch** — `launchSession()` is called; on failure the per-channel failure counter increments
+7. **Success reset** — when a session successfully reconnects and registers, `resetFailureCounter()` clears the counter for that channel
+
+### Graceful Shutdown
+
+On `SIGTERM` or `SIGINT`, the shutdown handler calls `cancelAllRestartTimers()` before tearing down Socket Mode and the HTTP server. All pending restart timers are cleared so no relaunch fires during shutdown.
 
 ## Configuration
 

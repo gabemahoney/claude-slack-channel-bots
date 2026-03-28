@@ -53,6 +53,33 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 - Functions: camelCase, verb-first (e.g., `registerSession`, `buildPermissionBlocks`)
 - Section comments: `// ---` separator with descriptive header
 
+## Auto-Restart
+
+When a managed session's MCP connection closes, `onsessionclosed` calls `scheduleRestart()` in `restart.ts` to schedule a delayed relaunch.
+
+### Configuration
+
+`session_restart_delay` in `routing.json` sets the delay in seconds before attempting a relaunch. Default is 60. Set to 0 to disable auto-restart entirely — the server will log `Auto-restart disabled (delay=0)` and skip all scheduling for that disconnect.
+
+### Failure Limiting
+
+The restart module tracks consecutive relaunch failures per channel. After 3 consecutive failures (`MAX_CONSECUTIVE_FAILURES`), the module stops retrying for that channel. The counter resets to 0 when the session successfully reconnects and registers. Restarting the server process also resets all counters — the state is module-scoped and not persisted.
+
+### Log Messages
+
+All restart activity is logged to stderr with the `[slack]` prefix:
+
+| Message | Meaning |
+|---|---|
+| `[slack] Scheduling restart for channel=<id> in <N>s` | Restart timer queued |
+| `[slack] Auto-restart disabled (delay=0) — skipping restart for channel=<id>` | Restart skipped; feature disabled |
+| `[slack] Max consecutive failures (3) reached — giving up on channel=<id>` | Retry limit hit; no more attempts |
+| `[slack] Session already live — skipping restart for channel=<id>` | Liveness check passed; no action needed |
+| `[slack] Relaunching session for channel=<id> cwd="<path>"` | Relaunch attempt starting |
+| `[slack] Session relaunch failed for channel=<id> (failure N/3)` | Relaunch failed; failure counter incremented |
+| `[slack] Skipping restart — server is shutting down (channel=<id>)` | Timer fired during shutdown; abort |
+| `[slack] Cancelled restart timer for channel=<id>` | Pending timer cleared on graceful shutdown |
+
 ## Async Patterns
 
 - Use `async/await` throughout — no raw Promises except where explicitly holding connections open (permission relay long-poll)
