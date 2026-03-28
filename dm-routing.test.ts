@@ -22,6 +22,7 @@
  */
 
 import { describe, test, expect, beforeEach } from 'bun:test'
+import { homedir } from 'os'
 import {
   gate,
   assertOutboundAllowed,
@@ -88,6 +89,8 @@ function makeRoutingConfig(opts: {
     },
     bind: '127.0.0.1',
     port: 3100,
+    session_restart_delay: 60,
+    mcp_config_path: `${homedir()}/.claude/slack-mcp.json`,
   }
 
   if (opts.default_dm_session !== undefined) {

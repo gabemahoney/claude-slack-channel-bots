@@ -29,6 +29,8 @@ export interface RoutingConfigInput {
   default_dm_session?: string
   bind?: string
   port?: number
+  session_restart_delay?: number
+  mcp_config_path?: string
 }
 
 /** Validated, fully-resolved routing configuration with all defaults applied. */
@@ -38,6 +40,8 @@ export interface RoutingConfig {
   default_dm_session?: string
   bind: string
   port: number
+  session_restart_delay: number
+  mcp_config_path: string
 }
 
 // ---------------------------------------------------------------------------
@@ -55,6 +59,8 @@ export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
     default_dm_session: input.default_dm_session,
     bind: input.bind ?? '127.0.0.1',
     port: input.port ?? 3100,
+    session_restart_delay: input.session_restart_delay ?? 60,
+    mcp_config_path: input.mcp_config_path ?? '~/.claude/slack-mcp.json',
   }
 }
 
@@ -100,6 +106,13 @@ export function validateConfig(config: RoutingConfig): void {
     }
   }
 
+  // session_restart_delay must not be negative
+  if (config.session_restart_delay < 0) {
+    throw new Error(
+      'Routing config validation error: session_restart_delay must be a non-negative number.',
+    )
+  }
+
   // default_dm_session must reference an existing route CWD
   if (config.default_dm_session !== undefined) {
     if (!seen.has(config.default_dm_session)) {
@@ -136,6 +149,7 @@ export function resolveConfig(input: RoutingConfigInput): RoutingConfig {
     default_dm_session: withDefaults.default_dm_session !== undefined
       ? resolve(expandTilde(withDefaults.default_dm_session))
       : undefined,
+    mcp_config_path: resolve(expandTilde(withDefaults.mcp_config_path)),
   }
 
   validateConfig(config)

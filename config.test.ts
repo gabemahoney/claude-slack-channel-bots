@@ -30,6 +30,8 @@ function makeRoutingConfig(overrides: Partial<RoutingConfigInput> = {}): Routing
     routes: {
       C_GENERAL: makeRoute({ cwd: '/tmp/general' }),
     },
+    session_restart_delay: 60,
+    mcp_config_path: '~/.claude/slack-mcp.json',
     ...overrides,
   }
 }
@@ -81,6 +83,31 @@ describe('applyDefaults', () => {
     applyDefaults(input)
     expect(JSON.stringify(input)).toBe(inputCopy)
   })
+
+  test('fills session_restart_delay with 60 when absent', () => {
+    const result = applyDefaults(makeRoutingConfig({ session_restart_delay: undefined }))
+    expect(result.session_restart_delay).toBe(60)
+  })
+
+  test('preserves provided session_restart_delay value', () => {
+    const result = applyDefaults(makeRoutingConfig({ session_restart_delay: 120 }))
+    expect(result.session_restart_delay).toBe(120)
+  })
+
+  test('preserves session_restart_delay of 0', () => {
+    const result = applyDefaults(makeRoutingConfig({ session_restart_delay: 0 }))
+    expect(result.session_restart_delay).toBe(0)
+  })
+
+  test('fills mcp_config_path with default when absent', () => {
+    const result = applyDefaults(makeRoutingConfig({ mcp_config_path: undefined }))
+    expect(result.mcp_config_path).toBe('~/.claude/slack-mcp.json')
+  })
+
+  test('preserves provided mcp_config_path value', () => {
+    const result = applyDefaults(makeRoutingConfig({ mcp_config_path: '/custom/mcp.json' }))
+    expect(result.mcp_config_path).toBe('/custom/mcp.json')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -94,6 +121,8 @@ function makeValidConfig(overrides: Partial<RoutingConfig> = {}): RoutingConfig 
     },
     bind: '127.0.0.1',
     port: 3100,
+    session_restart_delay: 60,
+    mcp_config_path: `${homedir()}/.claude/slack-mcp.json`,
     ...overrides,
   }
 }
@@ -158,6 +187,11 @@ describe('validateConfig', () => {
 
   test('error message mentions "Routing config validation error"', () => {
     const config = makeValidConfig({ routes: {} })
+    expect(() => validateConfig(config)).toThrow('Routing config validation error')
+  })
+
+  test('throws when session_restart_delay is negative', () => {
+    const config = makeValidConfig({ session_restart_delay: -1 })
     expect(() => validateConfig(config)).toThrow('Routing config validation error')
   })
 })
@@ -276,6 +310,25 @@ describe('resolveConfig', () => {
     const input = makeRoutingConfig({ port: 9999 })
     const result = resolveConfig(input)
     expect(result.port).toBe(9999)
+  })
+
+  test('expands tilde in mcp_config_path', () => {
+    const input = makeRoutingConfig({ mcp_config_path: '~/.claude/slack-mcp.json' })
+    const result = resolveConfig(input)
+    expect(result.mcp_config_path).toStartWith(homedir())
+  })
+
+  test('resolved mcp_config_path does not contain tilde', () => {
+    const input = makeRoutingConfig({ mcp_config_path: '~/.claude/slack-mcp.json' })
+    const result = resolveConfig(input)
+    expect(result.mcp_config_path).not.toContain('~')
+  })
+
+  test('does not mutate mcp_config_path in input', () => {
+    const input = makeRoutingConfig({ mcp_config_path: '~/.claude/slack-mcp.json' })
+    const originalPath = input.mcp_config_path
+    resolveConfig(input)
+    expect(input.mcp_config_path).toBe(originalPath)
   })
 })
 
