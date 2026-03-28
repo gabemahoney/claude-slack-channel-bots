@@ -1269,6 +1269,34 @@ async function main(): Promise<void> {
           )
         }
         // entry is non-null here (null means init request, but we have a session ID)
+
+        // For GET requests (SSE streams), attach an abort listener to detect
+        // client disconnections. The MCP SDK's onsessionclosed only fires on
+        // explicit HTTP DELETE, so silent TCP/tmux kills are never detected
+        // without this. When the signal aborts, look up the session by
+        // mcpSessionId (not by entry state at attach time, since the session
+        // may still be pending when the GET arrives but registered by abort time).
+        if (req.method === 'GET') {
+          req.signal.addEventListener('abort', () => {
+            // Look up the session at abort time — it may have been registered
+            // after this GET request started (the SSE stream opens before
+            // roots/list completes). Also guards against double-fire if
+            // onsessionclosed already ran from an explicit DELETE.
+            const cwd = unregisterByMcpSessionId(mcpSessionId)
+            if (!cwd) return
+
+            const channelId = routingConfig
+              ? Object.entries(routingConfig.routes).find(([, route]) => route.cwd === cwd)?.[0]
+              : undefined
+            if (channelId) {
+              console.error(`[slack] Session disconnected (SSE abort): channel=${channelId} cwd="${cwd}"`)
+              scheduleRestart(channelId, cwd)
+            } else {
+              console.error(`[slack] Session disconnected (SSE abort): cwd="${cwd}"`)
+            }
+          })
+        }
+
         return (entry as NonNullable<typeof entry>).transport.handleRequest(req)
       }
 
