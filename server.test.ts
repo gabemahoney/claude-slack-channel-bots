@@ -276,6 +276,71 @@ describe('gate', () => {
     )
     expect(result.action).toBe('deliver')
   })
+
+  // -- routing.json auto-opt-in (bug b.iv5) --
+
+  test('delivers channel messages when channel is in routeChannels but not access.json', async () => {
+    const routeChannels = new Set(['C_ROUTED'])
+    const result = await gate(
+      { user: 'U123', channel: 'C_ROUTED', channel_type: 'channel' },
+      makeOpts({ routeChannels }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('drops channel messages when channel is neither in routeChannels nor access.json', async () => {
+    const routeChannels = new Set(['C_OTHER'])
+    const result = await gate(
+      { user: 'U123', channel: 'C_UNKNOWN', channel_type: 'channel' },
+      makeOpts({ routeChannels }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('access.json requireMention override applies to routed channel', async () => {
+    const routeChannels = new Set(['C_ROUTED'])
+    const access = makeAccess({
+      channels: { C_ROUTED: { requireMention: true, allowFrom: [] } },
+    })
+    const result = await gate(
+      { user: 'U123', channel: 'C_ROUTED', channel_type: 'channel', text: 'hello' },
+      makeOpts({ access, routeChannels }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('access.json requireMention override delivers when bot is mentioned on routed channel', async () => {
+    const routeChannels = new Set(['C_ROUTED'])
+    const access = makeAccess({
+      channels: { C_ROUTED: { requireMention: true, allowFrom: [] } },
+    })
+    const result = await gate(
+      { user: 'U123', channel: 'C_ROUTED', channel_type: 'channel', text: 'hey <@U_BOT> help' },
+      makeOpts({ access, routeChannels, botUserId: 'U_BOT' }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('access.json allowFrom override applies to routed channel', async () => {
+    const routeChannels = new Set(['C_ROUTED'])
+    const access = makeAccess({
+      channels: { C_ROUTED: { requireMention: false, allowFrom: ['U_VIP'] } },
+    })
+    const result = await gate(
+      { user: 'U_NOBODY', channel: 'C_ROUTED', channel_type: 'channel' },
+      makeOpts({ access, routeChannels }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('routed channel with no access.json entry allows any user', async () => {
+    const routeChannels = new Set(['C_ROUTED'])
+    const result = await gate(
+      { user: 'U_ANYONE', channel: 'C_ROUTED', channel_type: 'channel' },
+      makeOpts({ routeChannels }),
+    )
+    expect(result.action).toBe('deliver')
+  })
 })
 
 // ---------------------------------------------------------------------------

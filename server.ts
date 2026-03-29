@@ -200,11 +200,15 @@ function assertOutboundAllowed(chatId: string, deliveredChannels: Set<string>): 
 // ---------------------------------------------------------------------------
 
 async function gate(event: unknown): Promise<GateResult> {
+  const routeChannels = routingConfig
+    ? new Set(Object.keys(routingConfig.routes))
+    : undefined
   return libGate(event, {
     access: getAccess(),
     staticMode: STATIC_MODE,
     saveAccess,
     botUserId,
+    routeChannels,
   })
 }
 
