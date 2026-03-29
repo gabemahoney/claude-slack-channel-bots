@@ -46,7 +46,10 @@ import {
   scheduleRestart,
   resetFailureCounter,
   cancelAllRestartTimers,
+  isRestartPendingOrActive,
+  hasReachedMaxFailures,
 } from './restart.ts'
+import { initHealthCheck, startHealthCheck, stopHealthCheck } from './health-check.ts'
 import { loadTokens } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
 import {
@@ -767,6 +770,7 @@ let httpServer: ReturnType<typeof Bun.serve> | null = null
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
+  stopHealthCheck()
   cancelAllRestartTimers()
 
   process.stderr.write(`[slack] Received ${signal} — shutting down\n`)
@@ -1312,6 +1316,32 @@ export async function main(): Promise<void> {
     } catch (err) {
       console.error('[slack] Warning: session startup failed — continuing without managed sessions:', err)
     }
+  }
+
+  // Initialize and start the health-check poller.
+  const isSessionAliveAdapter = async (channelId: string): Promise<boolean> => {
+    const name = sessionName(channelId)
+    const exists = await defaultTmuxClient.hasSession(name)
+    if (!exists) return false
+    return isClaudeRunning(name, defaultTmuxClient)
+  }
+
+  initHealthCheck({
+    isSessionAlive: isSessionAliveAdapter,
+    isRestartPendingOrActive,
+    hasReachedMaxFailures,
+    scheduleRestart,
+    isShuttingDown: () => shuttingDown,
+    getRoutes: () => {
+      if (!routingConfig) return {}
+      return Object.fromEntries(
+        Object.entries(routingConfig.routes).map(([channelId, route]) => [channelId, route.cwd]),
+      )
+    },
+  })
+
+  if (routingConfig) {
+    startHealthCheck(routingConfig.health_check_interval)
   }
 }
 

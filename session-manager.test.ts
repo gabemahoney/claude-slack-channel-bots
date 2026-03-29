@@ -10,45 +10,10 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { sessionName } from './tmux.ts'
 import { type SessionsMap } from './sessions.ts'
-import { type RoutingConfig } from './config.ts'
 import { startupSessionManager, launchSession } from './session-manager.ts'
 import { makeTmuxStub } from './test-helpers/tmux-stub.ts'
-
-// ---------------------------------------------------------------------------
-// In-memory sessions stubs
-// ---------------------------------------------------------------------------
-
-function makeSessionsStubs(initial: SessionsMap = {}) {
-  let sessions: SessionsMap = { ...initial }
-  const writtenSessions: SessionsMap[] = []
-
-  return {
-    get current() { return sessions },
-    writtenSessions,
-    read: (_path?: string): SessionsMap => ({ ...sessions }),
-    write: (s: SessionsMap, _path?: string): void => {
-      writtenSessions.push({ ...s })
-      sessions = { ...s }
-    },
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Factory functions
-// ---------------------------------------------------------------------------
-
-function makeRoutingConfig(overrides?: Partial<RoutingConfig>): RoutingConfig {
-  return {
-    routes: {
-      'C_TEST1': { cwd: '/tmp/test-cwd' },
-    },
-    bind: '127.0.0.1',
-    port: 3100,
-    session_restart_delay: 60,
-    mcp_config_path: '/tmp/test-mcp.json',
-    ...overrides,
-  }
-}
+import { makeSessionsStubs } from './test-helpers/sessions-stub.ts'
+import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 
 // ---------------------------------------------------------------------------
 // Helper: spawn a real process named "claude" so isClaudeRunning returns true

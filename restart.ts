@@ -31,6 +31,7 @@ export const MAX_CONSECUTIVE_FAILURES = 3
 
 const failureCounters = new Map<string, number>()
 const pendingRestartTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const activeLaunches = new Set<string>()
 let deps: RestartDeps | null = null
 
 // ---------------------------------------------------------------------------
@@ -103,20 +104,25 @@ export function scheduleRestart(channelId: string, cwd: string): void {
     } catch { /* ignore */ }
 
     console.error(`[slack] Relaunching session for channel=${channelId} cwd="${cwd}"`)
-    let ok: boolean
+    activeLaunches.add(channelId)
     try {
-      ok = await deps.launchSession(channelId, cwd)
-    } catch (err) {
-      console.error(`[slack] restart: launchSession threw for channel=${channelId}:`, err)
-      ok = false
-    }
+      let ok: boolean
+      try {
+        ok = await deps.launchSession(channelId, cwd)
+      } catch (err) {
+        console.error(`[slack] restart: launchSession threw for channel=${channelId}:`, err)
+        ok = false
+      }
 
-    if (!ok) {
-      const count = (failureCounters.get(channelId) ?? 0) + 1
-      failureCounters.set(channelId, count)
-      console.error(
-        `[slack] Session relaunch failed for channel=${channelId} (failure ${count}/${MAX_CONSECUTIVE_FAILURES})`,
-      )
+      if (!ok) {
+        const count = (failureCounters.get(channelId) ?? 0) + 1
+        failureCounters.set(channelId, count)
+        console.error(
+          `[slack] Session relaunch failed for channel=${channelId} (failure ${count}/${MAX_CONSECUTIVE_FAILURES})`,
+        )
+      }
+    } finally {
+      activeLaunches.delete(channelId)
     }
   }, delay * 1000)
 
@@ -144,6 +150,18 @@ export function cancelAllRestartTimers(): void {
 }
 
 // ---------------------------------------------------------------------------
+// isRestartPendingOrActive / hasReachedMaxFailures — query functions
+// ---------------------------------------------------------------------------
+
+export function isRestartPendingOrActive(channelId: string): boolean {
+  return pendingRestartTimers.has(channelId) || activeLaunches.has(channelId)
+}
+
+export function hasReachedMaxFailures(channelId: string): boolean {
+  return (failureCounters.get(channelId) ?? 0) >= MAX_CONSECUTIVE_FAILURES
+}
+
+// ---------------------------------------------------------------------------
 // _resetRestartState — exported for test cleanup
 // ---------------------------------------------------------------------------
 
@@ -153,5 +171,6 @@ export function _resetRestartState(): void {
   }
   failureCounters.clear()
   pendingRestartTimers.clear()
+  activeLaunches.clear()
   deps = null
 }

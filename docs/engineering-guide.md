@@ -80,6 +80,39 @@ All restart activity is logged to stderr with the `[slack]` prefix:
 | `[slack] Skipping restart — server is shutting down (channel=<id>)` | Timer fired during shutdown; abort |
 | `[slack] Cancelled restart timer for channel=<id>` | Pending timer cleared on graceful shutdown |
 
+## Health-Check Poller
+
+`health-check.ts` runs a `setInterval` loop that checks every configured route on a fixed cadence and schedules restarts for sessions that are dead and not already being recovered.
+
+### Configuration
+
+`health_check_interval` in `routing.json` sets the polling interval in seconds. Type: `number`. Default: `120`. Set to `0` to disable the poller entirely — `startHealthCheck()` returns immediately without creating an interval.
+
+### Async Interval Pattern
+
+Each tick fires an `async` callback. The callback iterates routes sequentially (not in parallel) to avoid flooding tmux with concurrent `isClaudeRunning` calls. Errors on a single channel are caught and logged; they do not abort the rest of the iteration.
+
+```typescript
+intervalId = setInterval(async () => {
+  for (const [channelId, cwd] of Object.entries(routes)) {
+    try {
+      // check and maybe scheduleRestart
+    } catch (err) {
+      console.error(`[slack] health-check: error checking channel=${channelId}:`, err)
+    }
+  }
+}, intervalSeconds * 1000)
+```
+
+### Coordination with restart.ts
+
+Before calling `scheduleRestart`, the poller queries two guards from `restart.ts`:
+
+- `isRestartPendingOrActive(channelId)` — returns `true` if a restart timer is queued or a launch is in flight; skip to avoid double-launching
+- `hasReachedMaxFailures(channelId)` — returns `true` if the channel has hit `MAX_CONSECUTIVE_FAILURES`; skip to respect the failure limit
+
+When neither guard fires and the session is dead, the poller calls `scheduleRestart(channelId, cwd)` — the same function used by the reactive `onsessionclosed` path.
+
 ## Async Patterns
 
 - Use `async/await` throughout — no raw Promises except where explicitly holding connections open (permission relay long-poll)

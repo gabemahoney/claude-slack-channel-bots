@@ -30,6 +30,7 @@ export interface RoutingConfigInput {
   bind?: string
   port?: number
   session_restart_delay?: number
+  health_check_interval?: number
   mcp_config_path?: string
 }
 
@@ -41,6 +42,7 @@ export interface RoutingConfig {
   bind: string
   port: number
   session_restart_delay: number
+  health_check_interval: number
   mcp_config_path: string
 }
 
@@ -60,6 +62,7 @@ export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
     bind: input.bind ?? '127.0.0.1',
     port: input.port ?? 3100,
     session_restart_delay: input.session_restart_delay ?? 60,
+    health_check_interval: input.health_check_interval ?? 120,
     mcp_config_path: input.mcp_config_path ?? '~/.claude/slack-mcp.json',
   }
 }
@@ -110,6 +113,13 @@ export function validateConfig(config: RoutingConfig): void {
   if (config.session_restart_delay < 0) {
     throw new Error(
       'Routing config validation error: session_restart_delay must be a non-negative number.',
+    )
+  }
+
+  // health_check_interval must not be negative
+  if (config.health_check_interval < 0) {
+    throw new Error(
+      'Routing config validation error: health_check_interval must be a non-negative number.',
     )
   }
 

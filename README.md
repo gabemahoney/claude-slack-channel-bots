@@ -88,6 +88,7 @@ A skeleton file is created by postinstall. Populate it before running `start`.
   "bind": "127.0.0.1",
   "port": 3100,
   "session_restart_delay": 60,
+  "health_check_interval": 120,
   "mcp_config_path": "~/.claude/slack-mcp.json"
 }
 ```
@@ -102,6 +103,7 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | `bind` | string | `"127.0.0.1"` | Interface the HTTP server binds to. Use `"0.0.0.0"` to expose on all interfaces. |
 | `port` | number | `3100` | Port the HTTP server listens on. |
 | `session_restart_delay` | number | `60` | Seconds to wait before auto-restarting a dead session. Set to `0` to disable auto-restart. Must be non-negative. |
+| `health_check_interval` | number | `120` | Seconds between periodic liveness polls. Set to `0` to disable. Must be non-negative. |
 | `mcp_config_path` | string | `~/.claude/slack-mcp.json` | Path to the MCP config file passed to Claude Code when launching managed sessions. |
 
 ---

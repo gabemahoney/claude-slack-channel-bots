@@ -14,6 +14,7 @@ cli.ts                  CLI entry point for the claude-slack-channel-bots comman
     ├── lib.ts              Pure utilities — gate, access control, chunking, sanitization
     ├── session-manager.ts  Startup orchestration — per-route state detection, kill/relaunch logic
     ├── restart.ts          Auto-restart — delayed relaunch on disconnect, failure counting, timer cancellation
+    ├── health-check.ts     Periodic liveness poller — checks routes on a timer, schedules restarts for dead sessions
     ├── tmux.ts             TmuxClient interface and defaultTmuxClient — tmux shell ops, isClaudeRunning
     ├── sessions.ts         sessions.json I/O — readSessions/writeSessions, SessionRecord, SessionsMap
     ├── pid.ts              PID file management — write, read, conflict detection, isProcessRunning
@@ -99,6 +100,20 @@ After `scheduleRestart` is called:
 6. **Relaunch** — `launchSession()` is called; on failure the per-channel failure counter increments
 7. **Success reset** — when a session successfully reconnects and registers, `resetFailureCounter()` clears the counter for that channel
 
+### Health-Check Poller
+
+A periodic backstop that runs alongside the reactive disconnect path. Where `onsessionclosed` handles restarts after MCP disconnects, the health-check poller catches sessions that die without triggering a close event (e.g., a tmux session killed externally).
+
+On each tick:
+
+1. **Route iteration** — for each `channelId`/`cwd` pair in `routingConfig.routes`:
+   - **Skip if restart pending/active** — `isRestartPendingOrActive(channelId)` returns true; a relaunch is already in flight
+   - **Skip if max failures reached** — `hasReachedMaxFailures(channelId)` returns true; the channel has been abandoned
+   - **Liveness check** — `isClaudeRunning()` via `tmux.ts` checks whether Claude is alive in the session's tmux window
+2. **Dead session** — if the liveness check fails, `scheduleRestart(channelId, cwd)` is called, delegating to the same restart path used by `onsessionclosed`
+
+The interval is controlled by `health_check_interval` in `routing.json`. If the value is `0`, `startHealthCheck()` returns immediately and no interval is created. `stopHealthCheck()` clears the interval during graceful shutdown, before `cancelAllRestartTimers()` runs.
+
 ### Graceful Shutdown
 
 On `SIGTERM` or `SIGINT`, the shutdown handler calls `cancelAllRestartTimers()` before tearing down Socket Mode and the HTTP server. All pending restart timers are cleared so no relaunch fires during shutdown. The PID file (`STATE_DIR/server.pid`) is removed as the final step of shutdown.
@@ -116,6 +131,7 @@ Key fields:
 - `default_route` — CWD for channels without explicit routes
 - `default_dm_session` — CWD for handling direct messages
 - `session_restart_delay` — seconds before auto-restarting dead sessions (default: 60, 0 = disabled)
+- `health_check_interval` — seconds between health-check polls (default: 120, 0 = disabled)
 - `mcp_config_path` — path to MCP config file for Claude launch (default: ~/.claude/slack-mcp.json)
 
 ### sessions.json (~/.claude/channels/slack/sessions.json)
