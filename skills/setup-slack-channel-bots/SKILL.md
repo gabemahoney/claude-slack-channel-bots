@@ -148,6 +148,37 @@ their defaults. Prompt only if the user wants to customise:
 | `session_restart_delay` | `60` | Seconds before auto-restarting a crashed session. `0` disables auto-restart. |
 | `mcp_config_path` | `~/.claude/slack-mcp.json` | Path to the MCP config file used when launching sessions. |
 
+**Prompting for `default_route` and `default_dm_session`:**
+
+These fields must match an existing route `cwd`. When prompting the user for
+either value:
+
+1. Collect the list of `cwd` values from the `routes` object that was just
+   configured (or already present in the file).
+2. Present that list as the only valid options, numbered for easy selection.
+   Example:
+   ```
+   Available route cwds:
+     1) /home/alice/project-a
+     2) /home/alice/project-b
+   Enter the number of your choice (or leave blank to skip):
+   ```
+3. Accept either the number or the exact cwd path typed in full.
+4. Do not accept a free-form path that is not in the list.
+
+**Validation before writing:**
+
+Before writing `routing.json`, verify that any value supplied for
+`default_route` or `default_dm_session` exactly matches one of the `cwd`
+values in `routes`. If a value does not match:
+
+- Warn the user: "The value `<value>` does not match any configured route cwd."
+- Show the list of valid cwds again.
+- Re-prompt until the user enters a valid cwd or explicitly chooses to skip
+  the field (leaving it unset).
+
+Only write the field once a valid value is confirmed.
+
 Write the final `routing.json` with only the fields the user explicitly set
 (plus the required `routes`). Do not write optional fields the user left at
 their defaults unless asked.
