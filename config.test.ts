@@ -31,6 +31,7 @@ function makeRoutingConfig(overrides: Partial<RoutingConfigInput> = {}): Routing
       C_GENERAL: makeRoute({ cwd: '/tmp/general' }),
     },
     session_restart_delay: 60,
+    health_check_interval: 120,
     mcp_config_path: '~/.claude/slack-mcp.json',
     ...overrides,
   }
@@ -99,6 +100,21 @@ describe('applyDefaults', () => {
     expect(result.session_restart_delay).toBe(0)
   })
 
+  test('fills health_check_interval with 120 when absent', () => {
+    const result = applyDefaults(makeRoutingConfig({ health_check_interval: undefined }))
+    expect(result.health_check_interval).toBe(120)
+  })
+
+  test('preserves provided health_check_interval value', () => {
+    const result = applyDefaults(makeRoutingConfig({ health_check_interval: 30 }))
+    expect(result.health_check_interval).toBe(30)
+  })
+
+  test('preserves health_check_interval of 0', () => {
+    const result = applyDefaults(makeRoutingConfig({ health_check_interval: 0 }))
+    expect(result.health_check_interval).toBe(0)
+  })
+
   test('fills mcp_config_path with default when absent', () => {
     const result = applyDefaults(makeRoutingConfig({ mcp_config_path: undefined }))
     expect(result.mcp_config_path).toBe('~/.claude/slack-mcp.json')
@@ -122,6 +138,7 @@ function makeValidConfig(overrides: Partial<RoutingConfig> = {}): RoutingConfig 
     bind: '127.0.0.1',
     port: 3100,
     session_restart_delay: 60,
+    health_check_interval: 120,
     mcp_config_path: `${homedir()}/.claude/slack-mcp.json`,
     ...overrides,
   }
@@ -192,6 +209,11 @@ describe('validateConfig', () => {
 
   test('throws when session_restart_delay is negative', () => {
     const config = makeValidConfig({ session_restart_delay: -1 })
+    expect(() => validateConfig(config)).toThrow('Routing config validation error')
+  })
+
+  test('throws when health_check_interval is negative', () => {
+    const config = makeValidConfig({ health_check_interval: -1 })
     expect(() => validateConfig(config)).toThrow('Routing config validation error')
   })
 })
@@ -310,6 +332,12 @@ describe('resolveConfig', () => {
     const input = makeRoutingConfig({ port: 9999 })
     const result = resolveConfig(input)
     expect(result.port).toBe(9999)
+  })
+
+  test('passes health_check_interval through unchanged', () => {
+    const input = makeRoutingConfig({ health_check_interval: 45 })
+    const result = resolveConfig(input)
+    expect(result.health_check_interval).toBe(45)
   })
 
   test('expands tilde in mcp_config_path', () => {
