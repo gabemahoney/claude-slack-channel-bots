@@ -14,7 +14,7 @@
 
 import { describe, test, expect, beforeAll, beforeEach, afterEach } from 'bun:test'
 import { join } from 'path'
-import type { CliDeps, CliHandlers } from './cli.ts'
+import type { CliDeps, CliHandlers } from '../cli.ts'
 
 // ---------------------------------------------------------------------------
 // Env bootstrapping — must happen before cli.ts (and server.ts) are loaded
@@ -32,7 +32,7 @@ let createCli: (deps: CliDeps) => CliHandlers
 
 beforeAll(async () => {
   // Dynamic import defers module evaluation until after env vars are set above
-  const mod = await import('./cli.ts')
+  const mod = await import('../cli.ts')
   createCli = mod.createCli
 })
 

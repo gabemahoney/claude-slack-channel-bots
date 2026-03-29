@@ -12,8 +12,8 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { runPostinstall } from './postinstall.ts'
-import { defaultAccess } from './lib.ts'
+import { runPostinstall } from '../postinstall.ts'
+import { defaultAccess } from '../lib.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers

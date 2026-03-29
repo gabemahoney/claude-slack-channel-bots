@@ -9,13 +9,13 @@ _metadata:
   major_version: 1
 
 display_information:
-  name: Claude Slack Channel Bots
+  name: Claude Slack Channels Bot
   description: "Multi-session Slack-to-Claude bridge that routes messages to Claude Code sessions via Socket Mode"
   background_color: "#1a1a2e"
 
 features:
   bot_user:
-    display_name: Claude Slack Channel Bots
+    display_name: Claude Slack Channels Bot
     always_online: true
   app_home:
     home_tab_enabled: false

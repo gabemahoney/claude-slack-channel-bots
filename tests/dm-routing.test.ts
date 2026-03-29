@@ -30,13 +30,13 @@ import {
   type Access,
   type GateOptions,
   type GateResult,
-} from './lib.ts'
+} from '../lib.ts'
 import {
   registerSession,
   getSessionByCwd,
   _resetRegistry,
-} from './registry.ts'
-import type { RoutingConfig } from './config.ts'
+} from '../registry.ts'
+import type { RoutingConfig } from '../config.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
