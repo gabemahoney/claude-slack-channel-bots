@@ -171,6 +171,11 @@ ask whether to proceed anyway or provide a different path.
 
 After collecting at least one route, write the updated `routing.json`.
 
+**Important:** Remind the user to invite the bot to each channel they configured.
+In Slack, type `/invite @Claude Slack Channel Bots` in each channel (or whatever
+the bot's display name is). The bot cannot receive messages from channels it has
+not been invited to.
+
 **Optional routing fields** — after required routes are set, offer these with
 their defaults. Prompt only if the user wants to customise:
 
