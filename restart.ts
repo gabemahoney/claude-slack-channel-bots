@@ -77,35 +77,36 @@ export function scheduleRestart(channelId: string, cwd: string): void {
 
   const timer = setTimeout(async () => {
     pendingRestartTimers.delete(channelId)
-
-    if (!deps) return
-
-    if (deps.isShuttingDown()) {
-      console.error(`[slack] Skipping restart — server is shutting down (channel=${channelId})`)
-      return
-    }
-
-    let alive: boolean
-    try {
-      alive = await deps.isSessionAlive(channelId)
-    } catch (err) {
-      console.error(`[slack] restart: isSessionAlive failed for channel=${channelId}:`, err)
-      alive = false
-    }
-
-    if (alive) {
-      console.error(`[slack] Session already live — skipping restart for channel=${channelId}`)
-      return
-    }
-
-    // Kill zombie if needed (ignore errors — session may not exist)
-    try {
-      await deps.killSession(channelId)
-    } catch { /* ignore */ }
-
-    console.error(`[slack] Relaunching session for channel=${channelId} cwd="${cwd}"`)
     activeLaunches.add(channelId)
+
     try {
+      if (!deps) return
+
+      if (deps.isShuttingDown()) {
+        console.error(`[slack] Skipping restart — server is shutting down (channel=${channelId})`)
+        return
+      }
+
+      let alive: boolean
+      try {
+        alive = await deps.isSessionAlive(channelId)
+      } catch (err) {
+        console.error(`[slack] restart: isSessionAlive failed for channel=${channelId}:`, err)
+        alive = false
+      }
+
+      if (alive) {
+        console.error(`[slack] Session already live — skipping restart for channel=${channelId}`)
+        return
+      }
+
+      // Kill zombie if needed (ignore errors — session may not exist)
+      try {
+        await deps.killSession(channelId)
+      } catch { /* ignore */ }
+
+      console.error(`[slack] Relaunching session for channel=${channelId} cwd="${cwd}"`)
+
       let ok: boolean
       try {
         ok = await deps.launchSession(channelId, cwd)

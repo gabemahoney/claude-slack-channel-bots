@@ -313,6 +313,35 @@ describe('isRestartPendingOrActive', () => {
 
     expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
   })
+
+  test('regression b.2ir: returns true while isSessionAlive is pending (race window between pendingRestartTimers.delete and activeLaunches.add is closed)', async () => {
+    // Before the fix, activeLaunches.add happened after pendingRestartTimers.delete
+    // but before the first await (isSessionAlive). During that gap,
+    // isRestartPendingOrActive returned false even though a restart was in progress.
+    // The fix moves activeLaunches.add immediately after pendingRestartTimers.delete.
+    let aliveResolve!: (alive: boolean) => void
+    const alivePromise = new Promise<boolean>((res) => { aliveResolve = res })
+
+    const deps: RestartDeps = {
+      isSessionAlive: (_channelId) => alivePromise,  // never resolves until we say so
+      killSession: async () => {},
+      launchSession: async () => true,
+      getRestartDelay: () => FAST_DELAY_S,
+      isShuttingDown: () => false,
+    }
+    initRestart(deps)
+
+    scheduleRestart('C_TEST1', '/cwd/test')
+    await Bun.sleep(WAIT_MS) // timer has fired; isSessionAlive is now awaiting
+
+    // pendingRestartTimers no longer has C_TEST1 (timer removed itself),
+    // so the only thing keeping isRestartPendingOrActive true is activeLaunches.
+    // Before the fix this returned false; after the fix it must return true.
+    expect(isRestartPendingOrActive('C_TEST1')).toBe(true)
+
+    aliveResolve(false) // avoid dangling promise
+    await Bun.sleep(1)  // let finally block run
+  })
 })
 
 // ---------------------------------------------------------------------------
