@@ -1297,13 +1297,17 @@ export async function main(): Promise<void> {
   // Initialize restart module with adapters bridging tmux + session-manager
   initRestart({
     isSessionAlive: async (channelId) => {
-      const name = sessionName(channelId)
+      const cwd = routingConfig?.routes[channelId]?.cwd
+      if (!cwd) return false
+      const name = sessionName(cwd)
       const exists = await defaultTmuxClient.hasSession(name)
       if (!exists) return false
       return isClaudeRunning(name, defaultTmuxClient)
     },
     killSession: async (channelId) => {
-      const name = sessionName(channelId)
+      const cwd = routingConfig?.routes[channelId]?.cwd
+      if (!cwd) return
+      const name = sessionName(cwd)
       const exists = await defaultTmuxClient.hasSession(name)
       if (exists) await defaultTmuxClient.killSession(name)
     },
@@ -1327,7 +1331,9 @@ export async function main(): Promise<void> {
 
   // Initialize and start the health-check poller.
   const isSessionAliveAdapter = async (channelId: string): Promise<boolean> => {
-    const name = sessionName(channelId)
+    const cwd = routingConfig?.routes[channelId]?.cwd
+    if (!cwd) return false
+    const name = sessionName(cwd)
     const exists = await defaultTmuxClient.hasSession(name)
     if (!exists) return false
     return isClaudeRunning(name, defaultTmuxClient)

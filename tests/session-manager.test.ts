@@ -56,15 +56,15 @@ describe('startupSessionManager', () => {
 
     expect(results).toHaveLength(1)
     expect(results[0].channelId).toBe('C_TEST1')
-    expect(results[0].sessionName).toBe(sessionName('C_TEST1'))
+    expect(results[0].sessionName).toBe(sessionName('/tmp/test-cwd'))
 
     const killCalls = stub.calls.filter(c => c.method === 'killSession')
     expect(killCalls).toHaveLength(1)
-    expect(killCalls[0].args[0]).toBe(sessionName('C_TEST1'))
+    expect(killCalls[0].args[0]).toBe(sessionName('/tmp/test-cwd'))
 
     const newCalls = stub.calls.filter(c => c.method === 'newSession')
     expect(newCalls).toHaveLength(1)
-    expect(newCalls[0].args[0]).toBe(sessionName('C_TEST1'))
+    expect(newCalls[0].args[0]).toBe(sessionName('/tmp/test-cwd'))
 
     // killSession must appear before newSession in the call log
     const killIdx = stub.calls.findIndex(c => c.method === 'killSession')
@@ -82,7 +82,7 @@ describe('startupSessionManager', () => {
 
     await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0 })
 
-    const name = sessionName('C_TEST1')
+    const name = sessionName('/tmp/test-cwd')
 
     const killCalls = stub.calls.filter(c => c.method === 'killSession')
     expect(killCalls).toHaveLength(1)
@@ -119,7 +119,7 @@ describe('startupSessionManager', () => {
 
     const newCalls = stub.calls.filter(c => c.method === 'newSession')
     expect(newCalls).toHaveLength(1)
-    expect(newCalls[0].args[0]).toBe(sessionName('C_TEST1'))
+    expect(newCalls[0].args[0]).toBe(sessionName('/tmp/test-cwd'))
     expect(newCalls[0].args[1]).toBe('/tmp/test-cwd')
 
     const launchCmd = stub.calls.filter(c => c.method === 'sendKeys').find(
@@ -154,7 +154,7 @@ describe('startupSessionManager', () => {
 
     // newSession called for the route even though sessions.json had no entries
     expect(stub.calls.filter(c => c.method === 'newSession')).toHaveLength(1)
-    expect(stub.calls.filter(c => c.method === 'newSession')[0].args[0]).toBe(sessionName('C_TEST1'))
+    expect(stub.calls.filter(c => c.method === 'newSession')[0].args[0]).toBe(sessionName('/tmp/test-cwd'))
   })
 })
 
@@ -189,7 +189,7 @@ describe('launchSession', () => {
     expect(sessions.writtenSessions).toHaveLength(1)
     const written = sessions.writtenSessions[0]
     expect(written['C_TEST1']).toBeDefined()
-    expect(written['C_TEST1'].tmuxSession).toBe(sessionName('C_TEST1'))
+    expect(written['C_TEST1'].tmuxSession).toBe(sessionName('/tmp/test-cwd'))
   })
 
   test('5. prompt not found, Claude running: returns success, no Enter sent for prompt', async () => {
@@ -242,7 +242,7 @@ describe('launchSession', () => {
     })
     const existing: SessionsMap = {
       'C_OTHER': {
-        tmuxSession: 'slack_channel_bot_C_OTHER',
+        tmuxSession: 'slack_bot_tmp_other_cwd',
         lastLaunch: '2026-01-01T00:00:00.000Z',
       },
     }
@@ -260,9 +260,9 @@ describe('launchSession', () => {
     const written = sessions.writtenSessions[0]
     // Pre-existing entry preserved
     expect(written['C_OTHER']).toBeDefined()
-    expect(written['C_OTHER'].tmuxSession).toBe('slack_channel_bot_C_OTHER')
+    expect(written['C_OTHER'].tmuxSession).toBe('slack_bot_tmp_other_cwd')
     // New entry keyed by channelId with correct session name
     expect(written['C_TEST1']).toBeDefined()
-    expect(written['C_TEST1'].tmuxSession).toBe(sessionName('C_TEST1'))
+    expect(written['C_TEST1'].tmuxSession).toBe(sessionName('/tmp/test-cwd'))
   })
 })

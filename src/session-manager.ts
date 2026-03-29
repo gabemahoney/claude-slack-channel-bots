@@ -47,7 +47,7 @@ export async function launchSession(
   writeSessionsFn: (sessions: SessionsMap, path?: string) => void,
   options?: LaunchOptions,
 ): Promise<boolean> {
-  const name = sessionName(channelId)
+  const name = sessionName(cwd)
   const pollTimeout = options?.pollTimeout ?? 60_000
 
   // Create detached tmux session with the channel's CWD
@@ -139,7 +139,7 @@ export async function startupSessionManager(
   const results: SessionStateResult[] = []
 
   for (const [channelId, route] of Object.entries(routingConfig.routes)) {
-    const name = sessionName(channelId)
+    const name = sessionName(route.cwd)
 
     try {
       const exists = await tmuxClient.hasSession(name)

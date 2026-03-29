@@ -5,6 +5,7 @@
  */
 
 import { $ } from 'bun'
+import { homedir } from 'os'
 
 // ---------------------------------------------------------------------------
 // Interface
@@ -31,9 +32,12 @@ export interface TmuxClient {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Returns the canonical tmux session name for a given Slack channel ID. */
-export function sessionName(channelId: string): string {
-  return `slack_channel_bot_${channelId}`
+/** Returns the canonical tmux session name for a given working directory path. */
+export function sessionName(cwd: string): string {
+  const expanded = cwd.startsWith('~') ? homedir() + cwd.slice(1) : cwd
+  const normalized = expanded.replace(/[^a-zA-Z0-9_]/g, '_')
+  const stripped = normalized.replace(/^_+/, '')
+  return `slack_bot_${stripped}`
 }
 
 // ---------------------------------------------------------------------------

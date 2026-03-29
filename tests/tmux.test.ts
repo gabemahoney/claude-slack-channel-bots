@@ -6,7 +6,7 @@
 
 import { describe, test, expect, beforeEach, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, chmodSync, existsSync, rmSync } from 'fs'
-import { tmpdir } from 'os'
+import { tmpdir, homedir } from 'os'
 import { join } from 'path'
 import { sessionName, isClaudeRunning } from '../src/tmux.ts'
 import { makeTmuxStub } from './test-helpers/tmux-stub.ts'
@@ -36,25 +36,57 @@ afterAll(() => {
 // ---------------------------------------------------------------------------
 
 describe('sessionName', () => {
-  test('returns prefixed session name for a standard channel ID', () => {
-    expect(sessionName('C123ABC')).toBe('slack_channel_bot_C123ABC')
+  test('uses the slack_bot_ prefix', () => {
+    expect(sessionName('/tmp/test-cwd')).toStartWith('slack_bot_')
   })
 
-  test('uses the slack_channel_bot_ prefix', () => {
-    expect(sessionName('CTEST')).toStartWith('slack_channel_bot_')
+  test('returns correct session name for a standard absolute path', () => {
+    expect(sessionName('/tmp/test-cwd')).toBe('slack_bot_tmp_test_cwd')
   })
 
-  test('appends the channel ID verbatim', () => {
-    const channelId = 'C_GENERAL_42'
-    expect(sessionName(channelId)).toBe(`slack_channel_bot_${channelId}`)
+  test('normalizes dots in the path', () => {
+    expect(sessionName('/path/with.dots')).toBe('slack_bot_path_with_dots')
   })
 
-  test('handles short channel IDs', () => {
-    expect(sessionName('C1')).toBe('slack_channel_bot_C1')
+  test('normalizes dashes in the path', () => {
+    expect(sessionName('/path/with-dashes')).toBe('slack_bot_path_with_dashes')
+  })
+
+  test('normalizes colons in the path', () => {
+    expect(sessionName('/path:with:colons')).toBe('slack_bot_path_with_colons')
+  })
+
+  test('strips leading underscores produced by leading slash normalization', () => {
+    // /foo → _foo → strip leading _ → foo → slack_bot_foo
+    expect(sessionName('/foo')).toBe('slack_bot_foo')
+  })
+
+  test('expands ~ to home directory', () => {
+    const home = homedir()
+    // e.g. ~/projects/foo → /home/user/projects/foo → normalized
+    const expected = sessionName(home + '/projects/foo')
+    expect(sessionName('~/projects/foo')).toBe(expected)
   })
 
   test('handles empty string', () => {
-    expect(sessionName('')).toBe('slack_channel_bot_')
+    expect(sessionName('')).toBe('slack_bot_')
+  })
+
+  test('handles root path /', () => {
+    // / → _ → strip leading _ → '' → slack_bot_
+    expect(sessionName('/')).toBe('slack_bot_')
+  })
+
+  // Regression: old implementation used channelId-based naming and a different prefix.
+  // This test would FAIL with the old sessionName(channelId) → `slack_channel_bot_${channelId}`
+  // and PASSES with the new CWD-based normalization.
+  test('regression: CWD input produces slack_bot_ prefix, not slack_channel_bot_', () => {
+    const result = sessionName('/tmp/project')
+    // Old code: 'slack_channel_bot_/tmp/project'
+    // New code: 'slack_bot_tmp_project'
+    expect(result).toBe('slack_bot_tmp_project')
+    expect(result).not.toContain('slack_channel_bot_')
+    expect(result).not.toContain('/')
   })
 })
 
