@@ -11,6 +11,8 @@ import {
   resetFailureCounter,
   cancelAllRestartTimers,
   _resetRestartState,
+  isRestartPendingOrActive,
+  hasReachedMaxFailures,
   type RestartDeps,
   MAX_CONSECUTIVE_FAILURES,
 } from './restart.ts'
@@ -20,6 +22,7 @@ import {
 // ---------------------------------------------------------------------------
 
 const FAST_DELAY_S = 0.01  // 10 ms timer — fast enough for tests
+const SLOW_DELAY_S = 9999  // large enough to never fire during a test
 const WAIT_MS = 50         // wait after scheduling; long enough for FAST_DELAY_S to fire
 
 // ---------------------------------------------------------------------------
@@ -29,6 +32,7 @@ const WAIT_MS = 50         // wait after scheduling; long enough for FAST_DELAY_
 type DepsOpts = {
   isSessionAliveResult?: boolean  // default: false (session is dead)
   launchSessionResult?: boolean   // default: true (launch succeeds)
+  launchSession?: (channelId: string, cwd: string) => Promise<boolean>  // override entire launchSession
   restartDelay?: number           // default: FAST_DELAY_S
   isShuttingDown?: boolean        // default: false
 }
@@ -56,6 +60,7 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     },
     async launchSession(channelId, cwd) {
       launchSessionCalls.push({ channelId, cwd })
+      if (opts.launchSession) return opts.launchSession(channelId, cwd)
       return opts.launchSessionResult ?? true
     },
     getRestartDelay: () => opts.restartDelay ?? FAST_DELAY_S,
@@ -211,5 +216,175 @@ describe('cancelAllRestartTimers', () => {
     await Bun.sleep(WAIT_MS)
 
     expect(deps.launchSessionCalls).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// isRestartPendingOrActive
+// ---------------------------------------------------------------------------
+
+describe('isRestartPendingOrActive', () => {
+  test('returns false for channel with no timer and no active launch', () => {
+    expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
+  })
+
+  test('returns true after scheduleRestart is called (timer pending, not yet fired)', () => {
+    const deps = makeDeps({ restartDelay: SLOW_DELAY_S })
+    initRestart(deps)
+
+    scheduleRestart('C_TEST1', '/cwd/test')
+
+    expect(isRestartPendingOrActive('C_TEST1')).toBe(true)
+  })
+
+  test('returns true while launchSession is in progress', async () => {
+    let launchResolve!: (ok: boolean) => void
+    const launchPromise = new Promise<boolean>((res) => { launchResolve = res })
+
+    const deps = makeDeps({ launchSession: () => launchPromise })
+    initRestart(deps)
+
+    scheduleRestart('C_TEST1', '/cwd/test')
+    await Bun.sleep(WAIT_MS) // timer has fired; launchSession is now awaiting
+
+    expect(isRestartPendingOrActive('C_TEST1')).toBe(true)
+
+    launchResolve(true)
+    await Bun.sleep(1) // let finally block run
+  })
+
+  test('returns false after launchSession completes successfully', async () => {
+    let launchResolve!: (ok: boolean) => void
+    const launchPromise = new Promise<boolean>((res) => { launchResolve = res })
+
+    const deps = makeDeps({ launchSession: () => launchPromise })
+    initRestart(deps)
+
+    scheduleRestart('C_TEST1', '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    launchResolve(true)
+    await Bun.sleep(1)
+
+    expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
+  })
+
+  test('returns false after launchSession completes with failure', async () => {
+    let launchResolve!: (ok: boolean) => void
+    const launchPromise = new Promise<boolean>((res) => { launchResolve = res })
+
+    const deps = makeDeps({ launchSession: () => launchPromise })
+    initRestart(deps)
+
+    scheduleRestart('C_TEST1', '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    launchResolve(false)
+    await Bun.sleep(1)
+
+    expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
+  })
+
+  test('returns false for different channel while another has restart in progress', async () => {
+    let launchResolve!: (ok: boolean) => void
+    const launchPromise = new Promise<boolean>((res) => { launchResolve = res })
+
+    const deps = makeDeps({ launchSession: () => launchPromise })
+    initRestart(deps)
+
+    scheduleRestart('C_TEST1', '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    expect(isRestartPendingOrActive('C_TEST1')).toBe(true)
+    expect(isRestartPendingOrActive('C_TEST2')).toBe(false)
+
+    launchResolve(true)
+    await Bun.sleep(1)
+  })
+
+  test('returns false after cancelAllRestartTimers clears pending timer', () => {
+    const deps = makeDeps({ restartDelay: SLOW_DELAY_S })
+    initRestart(deps)
+
+    scheduleRestart('C_TEST1', '/cwd/test')
+    expect(isRestartPendingOrActive('C_TEST1')).toBe(true)
+
+    cancelAllRestartTimers()
+
+    expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// hasReachedMaxFailures
+// ---------------------------------------------------------------------------
+
+describe('hasReachedMaxFailures', () => {
+  test('returns false for channel with no recorded failures', () => {
+    expect(hasReachedMaxFailures('C_TEST1')).toBe(false)
+  })
+
+  test('returns false after fewer than MAX_CONSECUTIVE_FAILURES failures', async () => {
+    const deps = makeDeps({ launchSessionResult: false })
+    initRestart(deps)
+
+    for (let i = 0; i < MAX_CONSECUTIVE_FAILURES - 1; i++) {
+      scheduleRestart('C_TEST1', '/cwd/test')
+      await Bun.sleep(WAIT_MS)
+    }
+
+    expect(hasReachedMaxFailures('C_TEST1')).toBe(false)
+  })
+
+  test('returns true after exactly MAX_CONSECUTIVE_FAILURES failures', async () => {
+    const deps = makeDeps({ launchSessionResult: false })
+    initRestart(deps)
+
+    for (let i = 0; i < MAX_CONSECUTIVE_FAILURES; i++) {
+      scheduleRestart('C_TEST1', '/cwd/test')
+      await Bun.sleep(WAIT_MS)
+    }
+
+    expect(hasReachedMaxFailures('C_TEST1')).toBe(true)
+  })
+
+  test('returns false after resetFailureCounter is called', async () => {
+    const deps = makeDeps({ launchSessionResult: false })
+    initRestart(deps)
+
+    for (let i = 0; i < MAX_CONSECUTIVE_FAILURES; i++) {
+      scheduleRestart('C_TEST1', '/cwd/test')
+      await Bun.sleep(WAIT_MS)
+    }
+    expect(hasReachedMaxFailures('C_TEST1')).toBe(true)
+
+    resetFailureCounter('C_TEST1')
+
+    expect(hasReachedMaxFailures('C_TEST1')).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// _resetRestartState
+// ---------------------------------------------------------------------------
+
+describe('_resetRestartState', () => {
+  test('clears activeLaunches — isRestartPendingOrActive returns false after reset', async () => {
+    let launchResolve!: (ok: boolean) => void
+    const launchPromise = new Promise<boolean>((res) => { launchResolve = res })
+
+    const deps = makeDeps({ launchSession: () => launchPromise })
+    initRestart(deps)
+
+    scheduleRestart('C_TEST1', '/cwd/test')
+    await Bun.sleep(WAIT_MS) // launch is now in progress
+
+    expect(isRestartPendingOrActive('C_TEST1')).toBe(true)
+
+    _resetRestartState()
+
+    expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
+
+    launchResolve(true) // resolve to avoid dangling promise
   })
 })
