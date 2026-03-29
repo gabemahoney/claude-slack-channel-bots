@@ -40,6 +40,7 @@ cli.ts                  CLI entry point for the claude-slack-channel-bots comman
 1. Claude Code calls MCP tools (`reply`, `react`, `edit_message`, etc.)
 2. Tool handler checks `assertOutboundAllowed()` — session can only send to channels it has received messages from
 3. Tool calls the Slack Web API (`web.chat.postMessage`, `web.reactions.add`, etc.)
+4. After the first chunk posts, if `message_id` was provided and `consumeAck(channelId, messageTs)` finds a tracked entry, the ack reaction is removed via `reactions.remove`
 
 ### Permission Relay
 

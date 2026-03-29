@@ -18,10 +18,15 @@ import {
   getPendingSession,
   removePendingSession,
   getAllPendingSessions,
+  createSessionServer,
   _resetRegistry,
   type SessionEntry,
   type PendingSessionEntry,
+  type SessionToolDeps,
 } from '../src/registry.ts'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
+import { trackAck, consumeAck, _resetAckTracker } from '../src/ack-tracker.ts'
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -74,6 +79,73 @@ function makeServer(): any {
   return {
     connect: async () => {},
     notification: () => {},
+  }
+}
+
+/**
+ * WebClient stub that captures reactions.remove and chat.postMessage calls.
+ * Returns capture arrays alongside the stub so tests can assert on them.
+ */
+function makeWebClient() {
+  const postMessageCalls: any[] = []
+  const reactionsRemoveCalls: any[] = []
+
+  const web: any = {
+    chat: {
+      postMessage: async (args: any) => {
+        postMessageCalls.push(args)
+        return { ok: true, ts: '111.222' }
+      },
+      update: async () => ({ ok: true }),
+    },
+    reactions: {
+      remove: async (args: any) => {
+        reactionsRemoveCalls.push(args)
+        return { ok: true }
+      },
+      add: async () => ({ ok: true }),
+    },
+    conversations: {
+      replies: async () => ({ messages: [] }),
+      history: async () => ({ messages: [] }),
+    },
+    filesUploadV2: async () => ({ ok: true }),
+  }
+
+  return { web, postMessageCalls, reactionsRemoveCalls }
+}
+
+/** Build a SessionToolDeps fixture with sensible test defaults. */
+function makeDeps(web: any, overrides: Partial<SessionToolDeps> = {}): SessionToolDeps {
+  return {
+    assertOutboundAllowed: () => {},
+    assertSendable: () => {},
+    getAccess: () => ({
+      dmPolicy: 'pairing' as const,
+      allowFrom: [],
+      channels: {},
+      pending: {},
+      ackReaction: 'eyes',
+    }),
+    web,
+    botToken: 'xoxb-test',
+    inboxDir: '/tmp',
+    resolveUserName: async (userId: string) => userId,
+    consumeAck,
+    ...overrides,
+  }
+}
+
+/** Connect a server to an in-memory client, run fn, then close the client. */
+async function withClient(server: any, fn: (client: Client) => Promise<void>): Promise<void> {
+  const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair()
+  await server.connect(serverTransport)
+  const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} })
+  await client.connect(clientTransport)
+  try {
+    await fn(client)
+  } finally {
+    await client.close()
   }
 }
 
@@ -549,5 +621,102 @@ describe('resolveTransportForRequest — pending session path', () => {
     // Should now resolve to the SessionEntry, not the PendingSessionEntry
     const result = resolveTransportForRequest(makeRequest({ 'mcp-session-id': 'pend-uuid-2' }))
     expect(result).toBe(entry)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Ack Reaction Removal Tests (Task t3.xrm.9d.n1.3c)
+// ---------------------------------------------------------------------------
+
+describe('reply tool — ack reaction removal', () => {
+  const TEST_CHANNEL = 'C_TEST'
+  const TEST_CWD = '/tmp/test-ack'
+  const TEST_MSG_TS = '1000000.111111'
+
+  beforeEach(() => {
+    _resetAckTracker()
+  })
+
+  test('ackReaction configured + reply with message_id → reactions.remove called with correct params', async () => {
+    const entry = registerSession(TEST_CWD, TEST_CHANNEL, makeTransport(), makeServer())
+    const { web, reactionsRemoveCalls } = makeWebClient()
+    const server = createSessionServer(entry, makeDeps(web))
+
+    trackAck(TEST_CHANNEL, TEST_MSG_TS)
+
+    await withClient(server, async (client) => {
+      await client.callTool({ name: 'reply', arguments: { chat_id: TEST_CHANNEL, text: 'hi', message_id: TEST_MSG_TS } })
+    })
+
+    expect(reactionsRemoveCalls).toHaveLength(1)
+    expect(reactionsRemoveCalls[0]).toEqual({
+      channel: TEST_CHANNEL,
+      timestamp: TEST_MSG_TS,
+      name: 'eyes',
+    })
+  })
+
+  test('second reply with same message_id → no second reactions.remove call', async () => {
+    const entry = registerSession(TEST_CWD, TEST_CHANNEL, makeTransport(), makeServer())
+    const { web, reactionsRemoveCalls } = makeWebClient()
+    const server = createSessionServer(entry, makeDeps(web))
+
+    trackAck(TEST_CHANNEL, TEST_MSG_TS)
+
+    await withClient(server, async (client) => {
+      await client.callTool({ name: 'reply', arguments: { chat_id: TEST_CHANNEL, text: 'first', message_id: TEST_MSG_TS } })
+      await client.callTool({ name: 'reply', arguments: { chat_id: TEST_CHANNEL, text: 'second', message_id: TEST_MSG_TS } })
+    })
+
+    expect(reactionsRemoveCalls).toHaveLength(1)
+  })
+
+  test('reactions.remove throws → reply still succeeds', async () => {
+    const entry = registerSession(TEST_CWD, TEST_CHANNEL, makeTransport(), makeServer())
+    const { web } = makeWebClient()
+    web.reactions.remove = async () => { throw new Error('reaction_not_found') }
+    const server = createSessionServer(entry, makeDeps(web))
+
+    trackAck(TEST_CHANNEL, TEST_MSG_TS)
+
+    let result: any
+    await withClient(server, async (client) => {
+      result = await client.callTool({ name: 'reply', arguments: { chat_id: TEST_CHANNEL, text: 'hi', message_id: TEST_MSG_TS } })
+    })
+
+    expect(result.isError).toBeFalsy()
+    expect(result.content[0].text).toContain('Sent')
+  })
+
+  test('ackReaction not configured → no reactions.remove call', async () => {
+    const entry = registerSession(TEST_CWD, TEST_CHANNEL, makeTransport(), makeServer())
+    const { web, reactionsRemoveCalls } = makeWebClient()
+    // Access without ackReaction — server.ts only calls trackAck when ackReaction is set,
+    // so consumeAck will return false and reactions.remove will never be called.
+    const server = createSessionServer(entry, makeDeps(web, {
+      getAccess: () => ({ dmPolicy: 'pairing' as const, allowFrom: [], channels: {}, pending: {} }),
+    }))
+
+    // No trackAck call — simulates server.ts skipping ack tracking when no ackReaction
+
+    await withClient(server, async (client) => {
+      await client.callTool({ name: 'reply', arguments: { chat_id: TEST_CHANNEL, text: 'hi', message_id: TEST_MSG_TS } })
+    })
+
+    expect(reactionsRemoveCalls).toHaveLength(0)
+  })
+
+  test('reply without message_id → no reactions.remove call', async () => {
+    const entry = registerSession(TEST_CWD, TEST_CHANNEL, makeTransport(), makeServer())
+    const { web, reactionsRemoveCalls } = makeWebClient()
+    const server = createSessionServer(entry, makeDeps(web))
+
+    trackAck(TEST_CHANNEL, TEST_MSG_TS)
+
+    await withClient(server, async (client) => {
+      await client.callTool({ name: 'reply', arguments: { chat_id: TEST_CHANNEL, text: 'hi' } })
+    })
+
+    expect(reactionsRemoveCalls).toHaveLength(0)
   })
 })
