@@ -11,10 +11,7 @@ _metadata:
 
 display_information:
   name: Claude Slack Channel Bots
-  description: >-
-    Multi-session Slack-to-Claude bridge that routes Slack channel and DM messages
-    to Claude Code sessions via Socket Mode, enabling interactive AI assistance
-    directly within Slack channels.
+  description: "Multi-session Slack-to-Claude bridge that routes messages to Claude Code sessions via Socket Mode"
   background_color: "#1a1a2e"
 
 features:
