@@ -19,6 +19,7 @@ cli.ts                  CLI entry point for the claude-slack-channel-bots comman
     ├── sessions.ts         sessions.json I/O — readSessions/writeSessions, SessionRecord, SessionsMap
     ├── pid.ts              PID file management — write, read, conflict detection, isProcessRunning
     ├── tokens.ts           Token loading — reads SLACK_BOT_TOKEN/SLACK_APP_TOKEN from env, validates prefixes
+    ├── ack-tracker.ts      In-memory ack reaction state — Map keyed by channelId:messageTs, trackAck/consumeAck API, 30-day expiry pruning
     └── hooks/
         ├── permission-relay.sh   PermissionRequest hook — POST + long-poll for Allow/Deny
         └── ask-relay.sh          AskUserQuestion hook — POST + long-poll for option selection
@@ -30,14 +31,16 @@ cli.ts                  CLI entry point for the claude-slack-channel-bots comman
 
 1. Slack message arrives via Socket Mode (`message` or `app_mention` event)
 2. `gate()` checks access control (bot messages, subtypes, DM policy, allowlist)
-3. Message is routed to the correct session via `getSessionByChannel()` or `getSessionByCwd()`
-4. Session's MCP Server sends `notifications/claude/channel` to the Claude Code client
+3. If `ackReaction` is configured, the ack emoji is applied to the message and `trackAck(channelId, messageTs)` records the pending ack for later removal
+4. Message is routed to the correct session via `getSessionByChannel()` or `getSessionByCwd()`
+5. Session's MCP Server sends `notifications/claude/channel` to the Claude Code client
 
 ### Outbound (Claude Code → Slack)
 
 1. Claude Code calls MCP tools (`reply`, `react`, `edit_message`, etc.)
 2. Tool handler checks `assertOutboundAllowed()` — session can only send to channels it has received messages from
 3. Tool calls the Slack Web API (`web.chat.postMessage`, `web.reactions.add`, etc.)
+4. After the first chunk posts, if `message_id` was provided and `consumeAck(channelId, messageTs)` finds a tracked entry, the ack reaction is removed via `reactions.remove`
 
 ### Permission Relay
 

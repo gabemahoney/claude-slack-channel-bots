@@ -303,6 +303,8 @@ export interface SessionToolDeps {
   inboxDir: string
   /** Resolve user display name */
   resolveUserName: (userId: string) => Promise<string>
+  /** Consume a pending ack entry — returns true if it existed */
+  consumeAck: (channelId: string, messageTs: string) => boolean
 }
 
 const MCP_INSTRUCTIONS = [
@@ -311,6 +313,7 @@ const MCP_INSTRUCTIONS = [
   'Messages from Slack arrive as <channel source="slack" chat_id="C..." message_id="1234567890.123456" user="jeremy" thread_ts="..." ts="...">.',
   'If the tag has attachment_count, call download_attachment(chat_id, message_id) to fetch them.',
   'Reply with the reply tool — pass chat_id back. Use thread_ts to reply in a thread.',
+  'Pass message_id (the triggering message ts) to reply to automatically remove the ack reaction when done.',
   'reply accepts file paths (files: ["/abs/path.png"]) for attachments.',
   'Use react to add emoji reactions, edit_message to update a previously sent message.',
   'fetch_messages pulls real Slack history from conversations.history.',
@@ -329,7 +332,7 @@ export function createSessionServer(
   entry: SessionEntry,
   deps: SessionToolDeps,
 ): Server {
-  const { web, assertOutboundAllowed, assertSendable, getAccess, resolveUserName, inboxDir } = deps
+  const { web, assertOutboundAllowed, assertSendable, getAccess, resolveUserName, inboxDir, consumeAck } = deps
 
   const server = new Server(
     { name: 'slack-channel-router', version: '0.1.0' },
@@ -365,6 +368,10 @@ export function createSessionServer(
               type: 'array',
               items: { type: 'string' },
               description: 'Absolute paths of files to upload (optional)',
+            },
+            message_id: {
+              type: 'string',
+              description: 'Message timestamp (ts) of the triggering message — removes ack reaction when provided (optional)',
             },
           },
           required: ['chat_id', 'text'],
@@ -462,6 +469,7 @@ export function createSessionServer(
         const text: string = args.text
         const threadTs: string | undefined = args.thread_ts
         const files: string[] | undefined = args.files
+        const messageId: string | undefined = args.message_id
 
         // Per-session outbound gate (t2.c1r.zk.qm)
         assertOutboundAllowed(chatId, entry.deliveredChannels)
@@ -472,6 +480,7 @@ export function createSessionServer(
         const chunks = chunkText(text, limit, mode)
 
         let lastTs = ''
+        let firstChunk = true
         for (const chunk of chunks) {
           const res = await web.chat.postMessage({
             channel: chatId,
@@ -481,6 +490,19 @@ export function createSessionServer(
             unfurl_media: false,
           })
           lastTs = (res.ts as string) || lastTs
+
+          if (firstChunk) {
+            firstChunk = false
+            if (messageId && consumeAck(chatId, messageId)) {
+              try {
+                await web.reactions.remove({
+                  channel: chatId,
+                  timestamp: messageId,
+                  name: access.ackReaction!,
+                })
+              } catch { /* non-critical */ }
+            }
+          }
         }
 
         if (files && files.length > 0) {
