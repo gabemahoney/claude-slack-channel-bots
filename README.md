@@ -112,7 +112,9 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 
 `access.json` is read from `~/.claude/channels/slack/access.json` by default (same directory as `routing.json`). A skeleton file with defaults is created by postinstall. The file is written with `0600` permissions.
 
-The `slack-channel-access` skill manages pairings, channel opt-ins, and allowlist entries at runtime.
+Channels in `routing.json` are automatically allowed — you do not need to list them here. The `channels` map is only needed for per-channel overrides like requiring @mentions or restricting which users can trigger the bot.
+
+The `slack-channel-access` skill manages pairings and allowlist entries at runtime.
 
 #### Complete example
 
@@ -121,10 +123,6 @@ The `slack-channel-access` skill manages pairings, channel opt-ins, and allowlis
   "dmPolicy": "pairing",
   "allowFrom": ["U0123456789"],
   "channels": {
-    "C0123456789": {
-      "requireMention": false,
-      "allowFrom": []
-    },
     "C9876543210": {
       "requireMention": true,
       "allowFrom": ["U0123456789", "U9876543210"]
@@ -143,9 +141,9 @@ The `slack-channel-access` skill manages pairings, channel opt-ins, and allowlis
 |---|---|---|---|
 | `dmPolicy` | `"pairing"` \| `"allowlist"` \| `"disabled"` | `"pairing"` | Controls who can DM the bot. `pairing`: unknown users receive a one-time code and are added to `allowFrom` after verification. `allowlist`: only users in `allowFrom` are accepted. `disabled`: all DMs are dropped. |
 | `allowFrom` | string[] | `[]` | Slack user IDs allowed to DM the bot unconditionally (regardless of `dmPolicy`). |
-| `channels` | object | `{}` | Per-channel opt-in map. Channels not listed here have all messages dropped. Each entry is a `ChannelPolicy`. |
-| `channels[id].requireMention` | boolean | — | When `true`, messages in that channel are only delivered if the bot is `@mentioned`. |
-| `channels[id].allowFrom` | string[] | — | When non-empty, restricts delivery to the listed Slack user IDs for that channel. |
+| `channels` | object | `{}` | Optional per-channel overrides. Channels in `routing.json` are allowed automatically — only add entries here to customize behavior (e.g. require @mention or restrict users). Each entry is a `ChannelPolicy`. |
+| `channels[id].requireMention` | boolean | `false` | When `true`, messages in that channel are only delivered if the bot is `@mentioned`. |
+| `channels[id].allowFrom` | string[] | `[]` | When non-empty, restricts delivery to the listed Slack user IDs for that channel. |
 | `pending` | object | `{}` | Managed by the server. Stores in-flight pairing codes indexed by code string. Do not edit manually. |
 | `ackReaction` | string | — | Emoji name (without colons) to react with when a message is received and dispatched. |
 | `textChunkLimit` | number | — | Maximum character count per Slack message when chunking long replies. Controlled by the `reply` tool. |
