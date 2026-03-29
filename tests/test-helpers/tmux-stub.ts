@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { type TmuxClient } from '../tmux.ts'
+import { type TmuxClient } from '../../src/tmux.ts'
 
 export type Call = { method: string; args: unknown[] }
 

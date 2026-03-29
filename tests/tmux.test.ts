@@ -8,7 +8,7 @@ import { describe, test, expect, beforeEach, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, chmodSync, existsSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { sessionName, isClaudeRunning } from '../tmux.ts'
+import { sessionName, isClaudeRunning } from '../src/tmux.ts'
 import { makeTmuxStub } from './test-helpers/tmux-stub.ts'
 
 // ---------------------------------------------------------------------------

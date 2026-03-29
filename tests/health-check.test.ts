@@ -10,7 +10,7 @@ import {
   startHealthCheck,
   _resetHealthCheckState,
   type HealthCheckDeps,
-} from '../health-check.ts'
+} from '../src/health-check.ts'
 
 // ---------------------------------------------------------------------------
 // Constants

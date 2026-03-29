@@ -5,7 +5,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { loadTokens } from '../tokens.ts'
+import { loadTokens } from '../src/tokens.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers

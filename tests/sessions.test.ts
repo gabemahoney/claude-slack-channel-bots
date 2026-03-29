@@ -2,7 +2,7 @@ import { describe, test, expect, afterEach } from 'bun:test'
 import { writeFileSync, readFileSync, mkdtempSync, existsSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { readSessions, writeSessions, type SessionRecord, type SessionsMap } from '../sessions.ts'
+import { readSessions, writeSessions, type SessionRecord, type SessionsMap } from '../src/sessions.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers

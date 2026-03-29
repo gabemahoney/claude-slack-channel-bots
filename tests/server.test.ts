@@ -13,7 +13,7 @@ import {
   PAIRING_EXPIRY_MS,
   type Access,
   type GateOptions,
-} from '../lib.ts'
+} from '../src/lib.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers

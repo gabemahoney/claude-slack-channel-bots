@@ -4,11 +4,11 @@
   "description": "Multi-session Slack-to-Claude bridge — run multiple Claude Code bots across Slack channels via Socket Mode",
   "type": "module",
   "bin": {
-    "claude-slack-channel-bots": "./cli.ts"
+    "claude-slack-channel-bots": "./src/cli.ts"
   },
   "files": [
-    "*.ts",
-    "!*.test.ts",
+    "src/*.ts",
+    "!src/*.test.ts",
     "hooks/",
     "slack-app-manifest.yml",
     "README.md",
@@ -18,8 +18,8 @@
     "bun": ">=1.0.0"
   },
   "scripts": {
-    "postinstall": "bun postinstall.ts",
-    "start": "bun install --no-summary && bun server.ts",
+    "postinstall": "bun src/postinstall.ts",
+    "start": "bun install --no-summary && bun src/server.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

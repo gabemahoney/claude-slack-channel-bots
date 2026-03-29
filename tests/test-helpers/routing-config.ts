@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { type RoutingConfig } from '../config.ts'
+import { type RoutingConfig } from '../../src/config.ts'
 
 export function makeRoutingConfig(overrides?: Partial<RoutingConfig>): RoutingConfig {
   return {

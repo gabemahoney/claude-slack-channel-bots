@@ -15,7 +15,7 @@ import {
   hasReachedMaxFailures,
   type RestartDeps,
   MAX_CONSECUTIVE_FAILURES,
-} from '../restart.ts'
+} from '../src/restart.ts'
 
 // ---------------------------------------------------------------------------
 // Constants

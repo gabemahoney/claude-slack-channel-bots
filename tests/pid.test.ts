@@ -8,7 +8,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { isProcessRunning, checkPidConflict, writePidFile, removePidFile } from '../pid.ts'
+import { isProcessRunning, checkPidConflict, writePidFile, removePidFile } from '../src/pid.ts'
 
 // ---------------------------------------------------------------------------
 // Test isolation helpers

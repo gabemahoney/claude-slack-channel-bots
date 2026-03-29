@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { type SessionsMap } from '../sessions.ts'
+import { type SessionsMap } from '../../src/sessions.ts'
 
 export function makeSessionsStubs(initial: SessionsMap = {}) {
   let sessions: SessionsMap = { ...initial }

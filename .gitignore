@@ -1,4 +1,4 @@
 .idea/
 node_modules/
-._.idea
-._IDEA.md
+*.tgz
+._*

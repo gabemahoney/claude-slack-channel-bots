@@ -12,7 +12,7 @@ import {
   type RouteEntry,
   type RoutingConfigInput,
   type RoutingConfig,
-} from '../config.ts'
+} from '../src/config.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers

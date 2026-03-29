@@ -12,5 +12,5 @@
     "noEmit": true,
     "types": ["bun-types"]
   },
-  "include": ["server.ts", "lib.ts", "config.ts", "tmux.ts", "sessions.ts", "session-manager.ts", "restart.ts", "cli.ts", "tests/*.test.ts", "tests/test-helpers/*.ts"]
+  "include": ["src/**/*.ts", "tests/*.test.ts", "tests/test-helpers/*.ts"]
 }

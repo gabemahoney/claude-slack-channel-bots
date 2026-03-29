@@ -30,13 +30,13 @@ import {
   type Access,
   type GateOptions,
   type GateResult,
-} from '../lib.ts'
+} from '../src/lib.ts'
 import {
   registerSession,
   getSessionByCwd,
   _resetRegistry,
-} from '../registry.ts'
-import type { RoutingConfig } from '../config.ts'
+} from '../src/registry.ts'
+import type { RoutingConfig } from '../src/config.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -90,6 +90,7 @@ function makeRoutingConfig(opts: {
     bind: '127.0.0.1',
     port: 3100,
     session_restart_delay: 60,
+    health_check_interval: 120,
     mcp_config_path: `${homedir()}/.claude/slack-mcp.json`,
   }
 

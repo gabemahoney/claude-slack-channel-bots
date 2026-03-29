@@ -6,7 +6,7 @@
 
 import { describe, test, expect, beforeEach } from 'bun:test'
 import { homedir } from 'os'
-import type { RouteEntry, RoutingConfig } from '../config.ts'
+import type { RouteEntry, RoutingConfig } from '../src/config.ts'
 import {
   registerSession,
   unregisterSession,
@@ -21,7 +21,7 @@ import {
   _resetRegistry,
   type SessionEntry,
   type PendingSessionEntry,
-} from '../registry.ts'
+} from '../src/registry.ts'
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -53,6 +53,7 @@ function makeRoutingConfig(opts: {
     bind: '127.0.0.1',
     port: 3100,
     session_restart_delay: 60,
+    health_check_interval: 120,
     mcp_config_path: `${homedir()}/.claude/slack-mcp.json`,
   }
 
@@ -356,8 +357,8 @@ describe('assertOutboundAllowed — per-session state', () => {
   // Test the function from lib.ts using per-session deliveredChannels,
   // mirroring how server.ts wires it up.
   test('allows reply to channel in deliveredChannels', async () => {
-    const { assertOutboundAllowed } = await import('../lib.ts')
-    const { defaultAccess } = await import('../lib.ts')
+    const { assertOutboundAllowed } = await import('../src/lib.ts')
+    const { defaultAccess } = await import('../src/lib.ts')
 
     const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
     const access = defaultAccess()
@@ -367,8 +368,8 @@ describe('assertOutboundAllowed — per-session state', () => {
   })
 
   test('blocks reply to channel not in deliveredChannels or access channels', async () => {
-    const { assertOutboundAllowed } = await import('../lib.ts')
-    const { defaultAccess } = await import('../lib.ts')
+    const { assertOutboundAllowed } = await import('../src/lib.ts')
+    const { defaultAccess } = await import('../src/lib.ts')
 
     const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
     const access = defaultAccess()
@@ -379,8 +380,8 @@ describe('assertOutboundAllowed — per-session state', () => {
   })
 
   test('session A cannot reply to session B channel via per-session deliveredChannels', async () => {
-    const { assertOutboundAllowed } = await import('../lib.ts')
-    const { defaultAccess } = await import('../lib.ts')
+    const { assertOutboundAllowed } = await import('../src/lib.ts')
+    const { defaultAccess } = await import('../src/lib.ts')
 
     const entryA = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
     registerSession('/tmp/b', 'C_B', makeTransport(), makeServer())
@@ -393,8 +394,8 @@ describe('assertOutboundAllowed — per-session state', () => {
   })
 
   test('after delivering a message, session can reply to the new channel', async () => {
-    const { assertOutboundAllowed } = await import('../lib.ts')
-    const { defaultAccess } = await import('../lib.ts')
+    const { assertOutboundAllowed } = await import('../src/lib.ts')
+    const { defaultAccess } = await import('../src/lib.ts')
 
     const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
     const access = defaultAccess()
