@@ -14,25 +14,15 @@ A single HTTP MCP server that holds one Slack Socket Mode connection and routes 
 
    The postinstall script creates skeleton config files in `~/.claude/channels/slack/`.
 
-2. **Install and run the setup skill:**
+2. **Run the setup skill:**
 
-   The package includes a Claude Code skill that walks you through the entire configuration. Copy or symlink it into your skills directory:
-
-   ```sh
-   # Find where the package was installed
-   PKG_DIR=$(bun pm -g ls 2>/dev/null | grep claude-slack-channel-bots | sed 's/.*node_modules//' | xargs -I{} echo "$HOME/.bun/install/global/node_modules{}")
-
-   # Symlink the skill (updates automatically with package upgrades)
-   ln -sf "$PKG_DIR/skills/setup-slack-channel-bots" ~/.claude/skills/setup-slack-channel-bots
-   ```
-
-   Then run it:
+   The package includes a Claude Code skill at `skills/setup-slack-channel-bots/` that walks you through the entire configuration. Copy or symlink it into `~/.claude/skills/`, then run:
 
    ```sh
    claude /setup-slack-channel-bots
    ```
 
-   The skill walks you through creating a Slack app from the manifest, setting tokens, populating routing and access control, installing hooks, and validating everything. It detects what's already configured and only prompts for what's missing.
+   It handles Slack app creation, tokens, routing, access control, hooks, and validation — and skips anything already configured.
 
 3. **Start the server:**
 
