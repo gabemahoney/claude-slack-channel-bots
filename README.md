@@ -12,42 +12,23 @@ A single HTTP MCP server that holds one Slack Socket Mode connection and routes 
    bun install -g claude-slack-channel-bots
    ```
 
-2. **Create a Slack app from the manifest:**
+   The postinstall script creates skeleton config files in `~/.claude/channels/slack/`.
 
-   In the [Slack API dashboard](https://api.slack.com/apps), choose "Create New App" → "From a manifest". Paste the contents of `slack-app-manifest.yml` from this repo. This provisions all required OAuth scopes, Socket Mode, and interactivity settings.
-
-3. **Generate an app-level token:**
-
-   In your Slack app config → **Basic Information** → **App-Level Tokens**, click "Generate Token and Scopes". Add the `connections:write` scope. Copy the resulting `xapp-…` token.
-
-4. **Set environment variables:**
+2. **Run the setup skill:**
 
    ```sh
-   export SLACK_BOT_TOKEN=xoxb-your-bot-token
-   export SLACK_APP_TOKEN=xapp-your-app-token
+   claude /setup-slack-channel-bots
    ```
 
-   Add these exports to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) so they persist across sessions. See [Environment Variables](#environment-variables) for all options.
+   The skill walks you through the entire configuration: creating a Slack app from the manifest, setting tokens, populating routing and access control, installing hooks, and validating everything. It detects what's already configured and only prompts for what's missing.
 
-5. **Populate routing.json:**
-
-   Edit `~/.claude/channels/slack/routing.json` (created by postinstall with a skeleton). Add at least one route mapping a Slack channel ID to a project directory:
-
-   ```json
-   {
-     "routes": {
-       "C0123456789": { "cwd": "~/projects/alpha" },
-       "C9876543210": { "cwd": "~/projects/beta" }
-     },
-     "default_dm_session": "~/projects/alpha"
-   }
-   ```
-
-6. **Start the server:**
+3. **Start the server:**
 
    ```sh
    claude-slack-channel-bots start
    ```
+
+See the sections below for manual configuration details if you prefer not to use the skill.
 
 ---
 
