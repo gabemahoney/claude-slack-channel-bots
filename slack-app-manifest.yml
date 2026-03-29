@@ -33,6 +33,7 @@ oauth_config:
       - files:write
       - users:read
       - app_mentions:read
+      - groups:history
 
 settings:
   event_subscriptions:
