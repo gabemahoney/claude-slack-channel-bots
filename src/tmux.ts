@@ -36,8 +36,15 @@ export interface TmuxClient {
 export function sessionName(cwd: string): string {
   const expanded = cwd.startsWith('~') ? homedir() + cwd.slice(1) : cwd
   const normalized = expanded.replace(/[^a-zA-Z0-9_]/g, '_')
-  const stripped = normalized.replace(/^_+/, '')
-  return `slack_bot_${stripped}`
+  let stripped = normalized.replace(/^_+/, '')
+  const MAX_STRIPPED = 239 // 255 - len('slack_bot_') - len('_<6-char-hash>')
+  if (stripped.length > MAX_STRIPPED) {
+    stripped = stripped.slice(stripped.length - MAX_STRIPPED).replace(/^_+/, '')
+  }
+  const hasher = new Bun.CryptoHasher('md5')
+  hasher.update(expanded)
+  const hash = hasher.digest('hex').slice(0, 6)
+  return `slack_bot_${stripped}_${hash}`
 }
 
 // ---------------------------------------------------------------------------
