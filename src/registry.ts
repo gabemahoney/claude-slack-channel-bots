@@ -303,6 +303,8 @@ export interface SessionToolDeps {
   inboxDir: string
   /** Resolve user display name */
   resolveUserName: (userId: string) => Promise<string>
+  /** Consume a pending ack entry — returns true if it existed */
+  consumeAck: (channelId: string, messageTs: string) => boolean
 }
 
 const MCP_INSTRUCTIONS = [

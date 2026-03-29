@@ -52,6 +52,7 @@ import {
 import { initHealthCheck, startHealthCheck, stopHealthCheck } from './health-check.ts'
 import { loadTokens } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
+import { trackAck, consumeAck } from './ack-tracker.ts'
 import {
   registerSession,
   unregisterByMcpSessionId,
@@ -246,6 +247,7 @@ const sessionToolDeps: SessionToolDeps = {
   botToken,
   inboxDir: INBOX_DIR,
   resolveUserName,
+  consumeAck,
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +552,7 @@ async function handleMessage(event: unknown): Promise<void> {
             name: access.ackReaction,
           })
         } catch { /* non-critical */ }
+        trackAck(channelId, ev['ts'] as string)
       }
 
       // Build meta attributes for the <channel> tag
