@@ -229,56 +229,6 @@ On startup the server prints the MCP endpoint and example config:
 
 ---
 
-## How It Works
-
-### Architecture
-
-```
-Slack (Socket Mode)
-        │
-        ▼
-  server.ts (Bun HTTP + SocketModeClient)
-        │
-        └── /mcp  ──►  Claude Code session A  (cwd: ~/projects/alpha, channel: #project-a)
-                  ──►  Claude Code session B  (cwd: ~/projects/beta,  channel: #project-b)
-                  ──►  Claude Code session C  (cwd: ~/projects/gamma, channel: #project-c)
-```
-
-All Claude Code sessions connect to the same `/mcp` endpoint. After the MCP handshake, the server calls `roots/list` on the client and matches the reported CWD against `routing.json` to assign a route.
-
-### Session identification
-
-When a Claude Code session connects to `/mcp`, the server calls `roots/list` after the MCP handshake and matches the reported CWD against the `cwd` fields in `routing.json`. On a match, the session is registered for that route. Sessions with an unrecognized CWD are disconnected.
-
-### Inbound routing
-
-Slack messages arrive over a single Socket Mode connection. The server looks up the message's channel ID in `routing.json`, finds the matching session entry in the registry, and dispatches the message as an MCP notification to that session's server instance. If no session is connected for the channel, the message is dropped.
-
-### Outbound scoping
-
-Each session tracks the set of channels it has received messages from (`deliveredChannels`). When a session calls the `reply` tool, the server checks that the target channel is in that set (or in the `access.json` allowlist). This prevents one session from sending messages to channels it has never received from, isolating sessions from each other even though they share the same bot token.
-
-### Server-managed sessions
-
-The server automatically launches and manages Claude Code sessions via tmux. On startup, the server creates a tmux session for each route and launches Claude Code in it. If a tmux session with that name already exists from a previous run, the server reconnects it instead of relaunching.
-
-If a session dies unexpectedly, the server automatically restarts it after `session_restart_delay` seconds. After 3 consecutive launch failures for a route, auto-restart stops for that route until the server is restarted. Setting `session_restart_delay` to `0` disables auto-restart entirely.
-
-Each session is launched using the `mcp_config_path` file, so that path must be set up before starting the server.
-
-### Connecting sessions manually
-
-To connect a Claude Code session manually (for development or one-off use), launch Claude from the project directory passing the MCP config file path:
-
-```sh
-cd ~/projects/alpha
-claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:slack-channel-router
-```
-
-`--mcp-config` takes a **file path** (not inline JSON). It adds the Slack server on top of any globally configured MCP servers — Claude sessions launched without `--mcp-config` are unaffected and never connect to the Slack server.
-
----
-
 ## Tools
 
 Each MCP endpoint exposes the following tools to the connected Claude Code session:
