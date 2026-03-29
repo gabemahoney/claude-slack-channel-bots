@@ -49,7 +49,42 @@ file.
 
 ---
 
-### Step 2 — Check environment variables
+### Step 2 — Slack App Manifest
+
+Before checking tokens, ensure the user has a Slack app. If they don't have
+tokens yet, they need to create the app first.
+
+Inform the user where to find the Slack App Manifest:
+
+The manifest file is included in the installed package at:
+
+```
+<package-root>/slack-app-manifest.yml
+```
+
+To create the Slack app from it:
+1. Go to [https://api.slack.com/apps](https://api.slack.com/apps)
+2. Click **Create New App** → **From a manifest**
+3. Select your workspace
+4. Switch format to **YAML**
+5. Paste the contents of `slack-app-manifest.yml`
+6. Review and create
+
+This provisions all required OAuth scopes, Socket Mode, and interactivity
+settings in one step.
+
+After creation:
+1. **Install to workspace** — Go to **OAuth & Permissions** → **Install to
+   Workspace**. Copy the **Bot User OAuth Token** (`xoxb-…`).
+2. **Generate app-level token** — Go to **Basic Information** → **App-Level
+   Tokens** → **Generate Token and Scopes** → add the `connections:write`
+   scope → copy the resulting `xapp-…` token.
+
+If the user already has a Slack app and tokens, skip this step.
+
+---
+
+### Step 3 — Check environment variables
 
 Check whether `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` are set:
 
@@ -87,7 +122,7 @@ want confirmation.
 
 ---
 
-### Step 3 — Check routing.json
+### Step 4 — Check routing.json
 
 State directory defaults to `~/.claude/channels/slack/`. Respect
 `$SLACK_STATE_DIR` if set.
@@ -185,7 +220,7 @@ their defaults unless asked.
 
 ---
 
-### Step 4 — Check access.json
+### Step 5 — Check access.json
 
 ```bash
 STATE_DIR="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
@@ -224,7 +259,7 @@ Do not modify `access.json` during setup unless the user asks to.
 
 ---
 
-### Step 5 — Check hooks
+### Step 6 — Check hooks
 
 Check whether the relay hooks exist and are executable:
 
@@ -272,7 +307,7 @@ chmod +x ~/.claude/hooks/permission-relay.sh ~/.claude/hooks/ask-relay.sh
 
 ---
 
-### Step 6 — Check Claude Code settings.json for hook entries
+### Step 7 — Check Claude Code settings.json for hook entries
 
 Read `~/.claude/settings.json` and check whether the `PermissionRequest` and
 `PreToolUse` hook entries for the relay scripts are present.
@@ -319,35 +354,6 @@ user the full minimal structure to add.
 
 Offer to write the missing entries automatically to `~/.claude/settings.json`.
 If the user agrees, make the targeted edits, preserving all existing content.
-
----
-
-### Step 7 — Slack App Manifest
-
-Inform the user where to find the Slack App Manifest:
-
-The manifest file is included in the installed package at:
-
-```
-<package-root>/slack-app-manifest.yml
-```
-
-To create the Slack app from it:
-1. Go to [https://api.slack.com/apps](https://api.slack.com/apps)
-2. Click **Create New App** → **From a manifest**
-3. Select your workspace
-4. Paste the contents of `slack-app-manifest.yml`
-5. Review and create
-
-This provisions all required OAuth scopes, Socket Mode, and interactivity
-settings in one step. Interactivity must be enabled (toggle on in
-**Interactivity & Shortcuts**) for the permission relay buttons to work.
-
-After creation:
-- The **Bot User OAuth Token** (`xoxb-…`) is under **OAuth & Permissions** →
-  **Bot Token**.
-- The **App-Level Token** (`xapp-…`) is under **Basic Information** →
-  **App-Level Tokens** → generate one with the `connections:write` scope.
 
 ---
 
