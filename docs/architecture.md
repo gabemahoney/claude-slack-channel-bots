@@ -78,10 +78,12 @@ Called from `main()` in `server.ts` via `startupSessionManager()` after the HTTP
    - **missing** (no tmux session) → launch fresh via `launchSession()`
 3. **Launch flow** (`launchSession()`):
    - `tmuxClient.newSession(name, cwd)` creates a detached session
-   - Sends `claude --mcp-config <mcp_config_path> --dangerously-load-development-channels server:slack-channel-router` + Enter
+   - If a `sessionId` is present in sessions.json for this channel, appends `--resume <id>` to the CLI command; otherwise launches fresh
    - Polls `capturePane()` with exponential backoff (500 ms start, 2× per step, 5 s cap, 60 s total timeout) waiting for the safety prompt text
-   - On prompt found: sends Enter to acknowledge, records `{ tmuxSession, lastLaunch }` to `sessions.json`
+   - On prompt found: sends Enter to acknowledge
    - Fallback: if the prompt is not found but `isClaudeRunning()` returns true, records success anyway (forward-compatible)
+   - **Resume failure fallback**: if a `--resume` attempt fails (Claude not running after timeout), kills the tmux session, recreates it, and retries once with a fresh launch (no `--resume`) in the same `launchSession()` call
+   - After every successful launch: `captureSessionId()` polls `~/.claude/sessions/` for a `.json` file matching the CWD with `startedAt > launchTimestamp`; the captured ID is persisted to sessions.json (capture failure is non-fatal)
    - Otherwise: returns failure and logs a warning
 
 ### Disconnection
@@ -139,7 +141,21 @@ Key fields:
 
 ### sessions.json (~/.claude/channels/slack/sessions.json)
 
-Persistent registry of server-managed tmux sessions. Maps channel IDs to tmux session names and launch timestamps. Survives server restarts.
+Persistent registry of server-managed tmux sessions. Maps channel IDs to session records. Survives server restarts.
+
+Each record has the shape:
+
+```typescript
+{
+  tmuxSession: string   // tmux session name
+  lastLaunch:  string   // ISO-8601 timestamp of the most recent launch
+  sessionId?:  string   // Claude session UUID (optional) — captured after each successful launch
+}
+```
+
+`sessionId` is populated by `captureSessionId()` after every successful launch and used on the next launch attempt to pass `--resume <id>` to Claude Code. Capture failure is non-fatal; the field is simply omitted when capture does not succeed.
+
+**Breaking change**: files written by v0.0.3 and earlier do not contain `sessionId`. The server handles missing fields gracefully (treated as a fresh launch), but older server versions will ignore the field if present.
 
 ### server.pid (STATE_DIR/server.pid)
 
