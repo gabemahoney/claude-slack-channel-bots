@@ -29,7 +29,7 @@ export interface LaunchOptions {
 
 export interface SessionStateResult {
   channelId: string
-  action: 'relaunched' | 'launched' | 'resumed' | 'failed'
+  action: 'reconnected' | 'launched' | 'resumed' | 'failed'
   sessionName: string
 }
 
@@ -264,7 +264,7 @@ export async function startupSessionManager(
           console.error(`[slack] Session live — reconnecting MCP server "${MCP_SERVER_NAME}": channel=${channelId} session=${name}`)
           await tmuxClient.sendKeys(name, `/mcp reconnect ${MCP_SERVER_NAME}`)
           await tmuxClient.sendKeys(name, 'Enter')
-          results.push({ channelId, action: 'relaunched', sessionName: name })
+          results.push({ channelId, action: 'reconnected', sessionName: name })
           continue
         }
       }

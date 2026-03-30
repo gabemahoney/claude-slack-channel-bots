@@ -171,7 +171,7 @@ describe('startupSessionManager', () => {
       const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0 })
 
       expect(results).toHaveLength(1)
-      expect(results[0].action).toBe('relaunched')
+      expect(results[0].action).toBe('reconnected')
 
       expect(stub.calls.filter(c => c.method === 'killSession')).toHaveLength(0)
       expect(stub.calls.filter(c => c.method === 'newSession')).toHaveLength(0)
@@ -181,6 +181,32 @@ describe('startupSessionManager', () => {
         c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`/mcp reconnect ${MCP_SERVER_NAME}`),
       )
       expect(reconnectCall).toBeDefined()
+
+      // 'Enter' must be sent after the /mcp reconnect command
+      const reconnectIdx = sendKeysCalls.indexOf(reconnectCall!)
+      const enterCall = sendKeysCalls[reconnectIdx + 1]
+      expect(enterCall).toBeDefined()
+      expect(enterCall.args[1]).toBe('Enter')
+    } finally {
+      proc.kill()
+    }
+  })
+
+  test('14b. live Claude process: sendKeys failure during reconnect — action is failed', async () => {
+    const proc = await spawnClaudeProcess()
+    try {
+      const stub = makeTmuxStub({
+        hasSessionResult: true,
+        getPanePidResult: String(proc.pid),
+        sendKeysResult: new Error('sendKeys failed'),
+      })
+      const sessions = makeSessionsStubs()
+      const config = makeRoutingConfig()
+
+      const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0 })
+
+      expect(results).toHaveLength(1)
+      expect(results[0].action).toBe('failed')
     } finally {
       proc.kill()
     }
