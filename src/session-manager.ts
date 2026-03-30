@@ -1,9 +1,10 @@
 /**
  * session-manager.ts — Startup orchestration for tmux-managed Claude Code sessions.
  *
- * Handles two cases per route at server startup:
- *   exists  — tmux session found → kill and relaunch
- *   missing — no tmux session → launch fresh
+ * Handles three cases per route at server startup:
+ *   reconnect — tmux session exists AND Claude is running → send /mcp reconnect, do not relaunch
+ *   resume    — dead or missing process with stored session ID → kill stale session, relaunch with --resume
+ *   fresh     — dead or missing process without stored session ID → kill stale session, launch fresh
  *
  * SPDX-License-Identifier: MIT
  */
@@ -28,7 +29,7 @@ export interface LaunchOptions {
 
 export interface SessionStateResult {
   channelId: string
-  action: 'relaunched' | 'launched' | 'failed'
+  action: 'relaunched' | 'launched' | 'resumed' | 'failed'
   sessionName: string
 }
 
@@ -216,9 +217,11 @@ export async function launchSession(
 // ---------------------------------------------------------------------------
 
 /**
- * On server startup, inspects all configured routes and takes action:
- *   - Exists (session found): kills session and relaunches
- *   - Missing: launches fresh
+ * On server startup, inspects all configured routes and takes action using a
+ * three-branch decision tree per route:
+ *   - Reconnect: tmux session exists AND Claude is running → send /mcp reconnect, do not relaunch
+ *   - Resume: dead or missing process with stored session ID → kill stale session, relaunch with --resume
+ *   - Fresh: dead or missing process without stored session ID → kill stale session, launch fresh
  *
  * Returns early with a warning if tmux is unavailable.
  */
@@ -240,6 +243,9 @@ export async function startupSessionManager(
 
   const results: SessionStateResult[] = []
 
+  // Load stored session IDs for all channels once before the route iteration loop
+  const storedSessions = readSessionsFn()
+
   for (const [channelId, route] of Object.entries(routingConfig.routes)) {
     const name = sessionName(route.cwd)
 
@@ -247,17 +253,38 @@ export async function startupSessionManager(
       const exists = await tmuxClient.hasSession(name)
 
       if (exists) {
-        // Session exists — kill and relaunch regardless of whether Claude is running
-        console.error(`[slack] Session exists — killing and relaunching: channel=${channelId} session=${name}`)
+        const running = await isClaudeRunning(name, tmuxClient)
+
+        if (running) {
+          // Branch 1: Reconnect — session live, send /mcp reconnect
+          console.error(`[slack] Session live — reconnecting: channel=${channelId} session=${name}`)
+          await tmuxClient.sendKeys(name, '/mcp reconnect')
+          await tmuxClient.sendKeys(name, 'Enter')
+          results.push({ channelId, action: 'relaunched', sessionName: name })
+          continue
+        }
+      }
+
+      // Branch 2 or 3: Dead or missing process — check for stored session ID
+      const storedSessionId = storedSessions[channelId]?.sessionId
+
+      if (exists) {
+        // Kill stale tmux session before relaunching
+        console.error(`[slack] Stale session found — killing before relaunch: channel=${channelId} session=${name}`)
         await tmuxClient.killSession(name)
+      }
+
+      if (storedSessionId) {
+        // Branch 2: Resume — launch with stored session ID
+        console.error(`[slack] Dead/missing process with stored session ID — resuming: channel=${channelId} session=${name} sessionId=${storedSessionId}`)
         const ok = await launchSession(
           channelId, route.cwd, routingConfig, tmuxClient,
-          readSessionsFn, writeSessionsFn, options,
+          readSessionsFn, writeSessionsFn, { ...options, sessionId: storedSessionId },
         )
-        results.push({ channelId, action: ok ? 'relaunched' : 'failed', sessionName: name })
+        results.push({ channelId, action: ok ? 'resumed' : 'failed', sessionName: name })
       } else {
-        // No session — launch fresh
-        console.error(`[slack] No session found — launching: channel=${channelId} session=${name}`)
+        // Branch 3: Fresh — launch without session ID
+        console.error(`[slack] No stored session ID — launching fresh: channel=${channelId} session=${name}`)
         const ok = await launchSession(
           channelId, route.cwd, routingConfig, tmuxClient,
           readSessionsFn, writeSessionsFn, options,

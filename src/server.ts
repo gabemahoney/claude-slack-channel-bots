@@ -296,7 +296,7 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
           : undefined
         if (channelId) {
           console.error(`[slack] Session disconnected: channel=${channelId} cwd="${cwd}"`)
-          scheduleRestart(channelId, cwd)
+          scheduleRestart(channelId, cwd, readSessions()[channelId]?.sessionId)
         } else {
           console.error(`[slack] Session disconnected: cwd="${cwd}"`)
         }
@@ -1266,7 +1266,7 @@ export async function main(): Promise<void> {
               : undefined
             if (channelId) {
               console.error(`[slack] Session disconnected (SSE abort): channel=${channelId} cwd="${cwd}"`)
-              scheduleRestart(channelId, cwd)
+              scheduleRestart(channelId, cwd, readSessions()[channelId]?.sessionId)
             } else {
               console.error(`[slack] Session disconnected (SSE abort): cwd="${cwd}"`)
             }
@@ -1311,9 +1311,13 @@ export async function main(): Promise<void> {
       const exists = await defaultTmuxClient.hasSession(name)
       if (exists) await defaultTmuxClient.killSession(name)
     },
-    launchSession: (channelId, cwd) => {
+    launchSession: (channelId, cwd, sessionId) => {
       if (!routingConfig) return Promise.resolve(false)
-      return launchSession(channelId, cwd, routingConfig, defaultTmuxClient, readSessions, writeSessions)
+      const resolvedSessionId = sessionId ?? readSessions()[channelId]?.sessionId
+      return launchSession(
+        channelId, cwd, routingConfig, defaultTmuxClient, readSessions, writeSessions,
+        resolvedSessionId !== undefined ? { sessionId: resolvedSessionId } : undefined,
+      )
     },
     getRestartDelay: () => routingConfig?.session_restart_delay ?? 60,
     isShuttingDown: () => shuttingDown,
