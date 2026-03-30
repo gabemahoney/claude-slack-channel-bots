@@ -42,7 +42,7 @@ export interface SessionStateResult {
  * with a startedAt timestamp after `launchTimestamp`. Returns the sessionId
  * string if found, or undefined if capture fails or times out.
  *
- * Polls up to ~5 seconds (10 × 500ms intervals).
+ * Polls up to ~2 seconds (4 × 500ms intervals).
  */
 async function captureSessionId(cwd: string, launchTimestamp: number): Promise<string | undefined> {
   const sessionsDir = join(homedir(), '.claude', 'sessions')
@@ -121,10 +121,14 @@ export async function launchSession(
   async function attemptLaunch(
     withResumeId: string | undefined,
   ): Promise<{ ok: true; capturedId: string | undefined } | { ok: false }> {
+    const safeResumeId = withResumeId && /^[a-zA-Z0-9_-]+$/.test(withResumeId) ? withResumeId : undefined
+    if (withResumeId && !safeResumeId) {
+      console.error(`[slack] Invalid session ID format — ignoring resume for channel=${channelId}`)
+    }
     const launchTimestamp = Date.now()
-    const launchCmd = withResumeId ? `${baseCmd} --resume ${withResumeId}` : baseCmd
-    if (withResumeId) {
-      console.error(`[slack] Attempting resume launch for channel=${channelId} sessionId=${withResumeId}`)
+    const launchCmd = safeResumeId ? `${baseCmd} --resume ${safeResumeId}` : baseCmd
+    if (safeResumeId) {
+      console.error(`[slack] Attempting resume launch for channel=${channelId} sessionId=${safeResumeId}`)
     } else {
       console.error(`[slack] Attempting fresh launch for channel=${channelId}`)
     }

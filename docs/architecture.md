@@ -156,7 +156,7 @@ Each record has the shape:
 
 `sessionId` is populated by `captureSessionId()` after every successful launch and used on the next launch attempt to pass `--resume <id>` to Claude Code. Capture failure is non-fatal; the field is simply omitted when capture does not succeed.
 
-**Breaking change**: files written by v0.0.3 and earlier do not contain `sessionId`. The server handles missing fields gracefully (treated as a fresh launch), but older server versions will ignore the field if present.
+If the `sessionId` field is absent, the session is treated as having no resumable state and launches fresh.
 
 ### server.pid (STATE_DIR/server.pid)
 
