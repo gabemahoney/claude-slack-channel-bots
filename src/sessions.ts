@@ -23,6 +23,7 @@ import { expandTilde } from './config.ts'
 export interface SessionRecord {
   tmuxSession: string
   lastLaunch: string // ISO-8601, e.g. new Date().toISOString()
+  sessionId?: string // Claude session UUID, captured after launch
 }
 
 export type SessionsMap = Record<string, SessionRecord>

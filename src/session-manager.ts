@@ -8,6 +8,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { readdirSync, readFileSync } from 'fs'
+import { join } from 'path'
+import { homedir } from 'os'
 import { type TmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
 import { type SessionsMap } from './sessions.ts'
 import { type RoutingConfig } from './config.ts'
@@ -19,12 +22,61 @@ import { type RoutingConfig } from './config.ts'
 export interface LaunchOptions {
   /** Maximum time in ms to poll for the safety prompt. Default: 60000. */
   pollTimeout?: number
+  /** Claude session UUID to resume. When provided, --resume <id> is appended to the CLI command. */
+  sessionId?: string
 }
 
 export interface SessionStateResult {
   channelId: string
   action: 'relaunched' | 'launched' | 'failed'
   sessionName: string
+}
+
+// ---------------------------------------------------------------------------
+// Session ID capture helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Polls ~/.claude/sessions/ for a new session file matching the given CWD
+ * with a startedAt timestamp after `launchTimestamp`. Returns the sessionId
+ * string if found, or undefined if capture fails or times out.
+ *
+ * Polls up to ~5 seconds (10 × 500ms intervals).
+ */
+async function captureSessionId(cwd: string, launchTimestamp: number): Promise<string | undefined> {
+  const sessionsDir = join(homedir(), '.claude', 'sessions')
+  const POLL_INTERVAL_MS = 500
+  const POLL_ATTEMPTS = 4
+
+  for (let i = 0; i < POLL_ATTEMPTS; i++) {
+    await new Promise<void>((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
+    try {
+      const files = readdirSync(sessionsDir)
+      for (const file of files) {
+        if (!file.endsWith('.json')) continue
+        try {
+          const raw = readFileSync(join(sessionsDir, file), 'utf-8')
+          const entry = JSON.parse(raw)
+          if (
+            typeof entry === 'object' &&
+            entry !== null &&
+            entry.cwd === cwd &&
+            typeof entry.startedAt === 'number' &&
+            entry.startedAt > launchTimestamp &&
+            typeof entry.sessionId === 'string' &&
+            entry.sessionId.length > 0
+          ) {
+            return entry.sessionId as string
+          }
+        } catch {
+          // skip unreadable or malformed files
+        }
+      }
+    } catch {
+      // sessionsDir may not exist yet; keep polling
+    }
+  }
+  return undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -35,6 +87,10 @@ export interface SessionStateResult {
  * Creates a new tmux session for a Slack channel, launches Claude with the
  * correct MCP config, polls for the safety prompt, and records the session
  * in sessions.json on success.
+ *
+ * When options.sessionId is provided, appends --resume <id> to the CLI
+ * command. If the resume attempt fails, kills the tmux session and retries
+ * once with a fresh launch (no --resume).
  *
  * Returns true on success, false on failure.
  */
@@ -49,64 +105,110 @@ export async function launchSession(
 ): Promise<boolean> {
   const name = sessionName(cwd)
   const pollTimeout = options?.pollTimeout ?? 60_000
+  const resumeSessionId = options?.sessionId
+
+  const escapedConfigPath = routingConfig.mcp_config_path.replace(/'/g, "'\\''")
+  const baseCmd = `claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:slack-channel-router`
+
+  const POLL_START_MS = 500
+  const POLL_CAP_MS = 5_000
+  const PROMPT_TEXT = 'I am using this for local development'
+
+  // Inner helper: sends the launch command and polls for the safety prompt.
+  // Returns { ok: true, capturedId } on success (capturedId may be undefined if capture failed),
+  // or { ok: false } when Claude is not running after the poll timeout.
+  async function attemptLaunch(
+    withResumeId: string | undefined,
+  ): Promise<{ ok: true; capturedId: string | undefined } | { ok: false }> {
+    const launchTimestamp = Date.now()
+    const launchCmd = withResumeId ? `${baseCmd} --resume ${withResumeId}` : baseCmd
+    if (withResumeId) {
+      console.error(`[slack] Attempting resume launch for channel=${channelId} sessionId=${withResumeId}`)
+    } else {
+      console.error(`[slack] Attempting fresh launch for channel=${channelId}`)
+    }
+    await tmuxClient.sendKeys(name, launchCmd)
+    await tmuxClient.sendKeys(name, 'Enter')
+    console.error(`[slack] Claude launch command sent to session: ${name}`)
+
+    let delay = POLL_START_MS
+    const deadline = launchTimestamp + pollTimeout
+
+    while (Date.now() < deadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, delay))
+      delay = Math.min(delay * 2, POLL_CAP_MS)
+
+      let pane: string
+      try {
+        pane = await tmuxClient.capturePane(name)
+      } catch {
+        // capturePane failure is terminal — session may have died
+        break
+      }
+
+      if (pane.includes(PROMPT_TEXT)) {
+        await tmuxClient.sendKeys(name, 'Enter')
+        console.error(`[slack] Safety prompt acknowledged in session: ${name}`)
+        const capturedId = await captureSessionId(cwd, launchTimestamp)
+        if (capturedId) {
+          console.error(`[slack] Session ID captured for channel=${channelId}: ${capturedId}`)
+        } else {
+          console.error(`[slack] Session ID capture failed for channel=${channelId} — continuing without it`)
+        }
+        return { ok: true, capturedId }
+      }
+    }
+
+    // Prompt not found — check if Claude is running anyway (forward-compatible)
+    const running = await isClaudeRunning(name, tmuxClient)
+    if (running) {
+      console.error(`[slack] Safety prompt not found but Claude is running — accepting session: ${name}`)
+      const capturedId = await captureSessionId(cwd, launchTimestamp)
+      if (capturedId) {
+        console.error(`[slack] Session ID captured for channel=${channelId}: ${capturedId}`)
+      } else {
+        console.error(`[slack] Session ID capture failed for channel=${channelId} — continuing without it`)
+      }
+      return { ok: true, capturedId }
+    }
+
+    return { ok: false }
+  }
 
   // Create detached tmux session with the channel's CWD
   await tmuxClient.newSession(name, cwd)
   console.error(`[slack] Session created: ${name} (cwd="${cwd}")`)
 
-  // Send the claude launch command, then Enter to execute it
-  const escapedConfigPath = routingConfig.mcp_config_path.replace(/'/g, "'\\''")
-  const launchCmd = `claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:slack-channel-router`
-  await tmuxClient.sendKeys(name, launchCmd)
-  await tmuxClient.sendKeys(name, 'Enter')
-  console.error(`[slack] Claude launch command sent to session: ${name}`)
+  // Attempt launch (with --resume if sessionId provided)
+  let result = await attemptLaunch(resumeSessionId)
 
-  // Poll capturePane for the safety prompt with exponential backoff.
-  // Start at 500ms, double each iteration, cap at 5s, total limit 60s.
-  const POLL_START_MS = 500
-  const POLL_CAP_MS = 5_000
-  const PROMPT_TEXT = 'I am using this for local development'
-
-  let delay = POLL_START_MS
-  const deadline = Date.now() + pollTimeout
-
-  while (Date.now() < deadline) {
-    await new Promise<void>((resolve) => setTimeout(resolve, delay))
-    delay = Math.min(delay * 2, POLL_CAP_MS)
-
-    let pane: string
+  // resumeSessionId was provided but launch failed — fall back to a fresh launch
+  if (!result.ok && resumeSessionId !== undefined) {
+    console.error(`[slack] Resume failed for channel=${channelId} — killing session and retrying with fresh launch`)
     try {
-      pane = await tmuxClient.capturePane(name)
+      await tmuxClient.killSession(name)
     } catch {
-      // capturePane failure is terminal — session may have died
-      break
+      // ignore kill errors; proceed with fresh session creation
     }
-
-    if (pane.includes(PROMPT_TEXT)) {
-      // Safety prompt found — acknowledge it and record success
-      await tmuxClient.sendKeys(name, 'Enter')
-      console.error(`[slack] Safety prompt acknowledged in session: ${name}`)
-      const sessions = readSessionsFn()
-      sessions[channelId] = { tmuxSession: name, lastLaunch: new Date().toISOString() }
-      writeSessionsFn(sessions)
-      console.error(`[slack] Session recorded in sessions.json: channel=${channelId}`)
-      return true
-    }
+    await tmuxClient.newSession(name, cwd)
+    console.error(`[slack] Session recreated for fresh fallback: ${name} (cwd="${cwd}")`)
+    result = await attemptLaunch(undefined)
   }
 
-  // Prompt not found — check if Claude is running anyway (forward-compatible)
-  const running = await isClaudeRunning(name, tmuxClient)
-  if (running) {
-    console.error(`[slack] Safety prompt not found but Claude is running — accepting session: ${name}`)
-    const sessions = readSessionsFn()
-    sessions[channelId] = { tmuxSession: name, lastLaunch: new Date().toISOString() }
-    writeSessionsFn(sessions)
-    console.error(`[slack] Session recorded in sessions.json: channel=${channelId}`)
-    return true
+  if (!result.ok) {
+    console.error(`[slack] Session launch failed — Claude not running in session: ${name}`)
+    return false
   }
 
-  console.error(`[slack] Session launch failed — Claude not running in session: ${name}`)
-  return false
+  const sessions = readSessionsFn()
+  sessions[channelId] = {
+    tmuxSession: name,
+    lastLaunch: new Date().toISOString(),
+    ...(result.capturedId !== undefined ? { sessionId: result.capturedId } : {}),
+  }
+  writeSessionsFn(sessions)
+  console.error(`[slack] Session recorded in sessions.json: channel=${channelId}`)
+  return true
 }
 
 // ---------------------------------------------------------------------------
