@@ -331,8 +331,11 @@ Look for an entry inside `hooks.PreToolUse` with:
 { "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "~/.claude/hooks/ask-relay.sh" }] }
 ```
 
-**If either entry is missing**, show the user the exact JSON to add. This is
-the complete block for both entries:
+**If either entry is missing OR exists but is missing `"timeout": 2000000`**,
+show the user the exact JSON to add or fix. The timeout is critical — without
+it Claude Code uses a short default timeout, kills the hook before the
+long-poll completes, and falls back to TUI approval. This is the complete
+block for both entries:
 
 ```jsonc
 "PermissionRequest": [
