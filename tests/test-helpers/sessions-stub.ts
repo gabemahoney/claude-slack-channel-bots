@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { type SessionsMap } from '../../src/sessions.ts'
+import { type SessionRecord, type SessionsMap } from '../../src/sessions.ts'
 
-export function makeSessionsStubs(initial: SessionsMap = {}) {
+export function makeSessionsStubs(initial: Record<string, SessionRecord> = {}) {
   let sessions: SessionsMap = { ...initial }
   const writtenSessions: SessionsMap[] = []
 

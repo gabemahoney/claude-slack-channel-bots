@@ -265,4 +265,118 @@ describe('launchSession', () => {
     expect(written['C_TEST1']).toBeDefined()
     expect(written['C_TEST1'].tmuxSession).toBe(sessionName('/tmp/test-cwd'))
   })
+
+  // ---------------------------------------------------------------------------
+  // Resume tests
+  // ---------------------------------------------------------------------------
+
+  test('10. resume success: --resume <id> included in sendKeys command, session recorded', async () => {
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const sessions = makeSessionsStubs()
+    const config = makeRoutingConfig()
+    const resumeId = 'abc-session-123'
+
+    const ok = await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
+      { pollTimeout: 600, sessionId: resumeId },
+    )
+
+    expect(ok).toBe(true)
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const resumeCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${resumeId}`),
+    )
+    expect(resumeCmd).toBeDefined()
+
+    expect(sessions.writtenSessions).toHaveLength(1)
+    expect(sessions.writtenSessions[0]['C_TEST1']).toBeDefined()
+  })
+
+  test('11. resume fallback: resume fails then fresh command sent, kill and newSession called twice', async () => {
+    // pollTimeout: 0 → poll loop never runs, isClaudeRunning returns false → both attempts fail structurally
+    // This test verifies the fallback mechanism: kill + recreate + fresh launch command
+    const stub = makeTmuxStub({
+      getPanePidResult: '99999999', // isClaudeRunning → false
+    })
+    const sessions = makeSessionsStubs()
+    const config = makeRoutingConfig()
+    const resumeId = 'stale-session-456'
+
+    // Both attempts fail (no prompt, Claude not running), but fallback path is exercised
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
+      { pollTimeout: 0, sessionId: resumeId },
+    )
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+
+    // First attempt: command includes --resume
+    const resumeCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${resumeId}`),
+    )
+    expect(resumeCmd).toBeDefined()
+
+    // Fallback attempt: command does NOT include --resume
+    const freshCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' &&
+        (c.args[1] as string).startsWith('claude --mcp-config') &&
+        !(c.args[1] as string).includes('--resume'),
+    )
+    expect(freshCmd).toBeDefined()
+
+    // killSession called during fallback (once)
+    const killCalls = stub.calls.filter(c => c.method === 'killSession')
+    expect(killCalls).toHaveLength(1)
+
+    // newSession called twice: initial + after kill
+    const newCalls = stub.calls.filter(c => c.method === 'newSession')
+    expect(newCalls).toHaveLength(2)
+  })
+
+  test('12. fresh launch when no session ID: command does not include --resume', async () => {
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const sessions = makeSessionsStubs()
+    const config = makeRoutingConfig()
+
+    // No sessionId in options
+    const ok = await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
+      { pollTimeout: 600 },
+    )
+
+    expect(ok).toBe(true)
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).startsWith('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).includes('--resume')).toBe(false)
+  })
+
+  test('13. session ID absent in written record when capture returns undefined', async () => {
+    // captureSessionId polls ~/.claude/sessions/ which does not exist in the test environment,
+    // so capturedId is always undefined. Verify the written record omits sessionId in that case.
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const sessions = makeSessionsStubs()
+    const config = makeRoutingConfig()
+
+    const ok = await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
+      { pollTimeout: 600 },
+    )
+
+    expect(ok).toBe(true)
+    expect(sessions.writtenSessions).toHaveLength(1)
+    const written = sessions.writtenSessions[0]['C_TEST1']
+    expect(written).toBeDefined()
+    expect(written.sessionId).toBeUndefined()
+  })
 })

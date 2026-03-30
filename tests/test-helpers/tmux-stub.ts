@@ -15,6 +15,8 @@ export type TmuxStubOpts = {
   newSessionResult?: Error
   sendKeysResult?: Error
   capturePaneResult?: string | Error
+  /** Sequential capturePane responses. Each call returns the next entry; last entry repeats. */
+  capturePaneResults?: Array<string | Error>
   killSessionResult?: Error
 }
 
@@ -24,6 +26,7 @@ export type TmuxStubOpts = {
  */
 export function makeTmuxStub(opts: TmuxStubOpts = {}): TmuxClient & { calls: Call[] } {
   const calls: Call[] = []
+  let capturePaneCallCount = 0
 
   return {
     calls,
@@ -61,7 +64,14 @@ export function makeTmuxStub(opts: TmuxStubOpts = {}): TmuxClient & { calls: Cal
 
     async capturePane(session) {
       calls.push({ method: 'capturePane', args: [session] })
-      const r = opts.capturePaneResult ?? 'pane output'
+      let r: string | Error
+      if (opts.capturePaneResults && opts.capturePaneResults.length > 0) {
+        const idx = Math.min(capturePaneCallCount, opts.capturePaneResults.length - 1)
+        r = opts.capturePaneResults[idx]
+      } else {
+        r = opts.capturePaneResult ?? 'pane output'
+      }
+      capturePaneCallCount++
       if (r instanceof Error) throw r
       return r
     },
