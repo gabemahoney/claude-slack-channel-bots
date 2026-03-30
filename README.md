@@ -185,7 +185,7 @@ Checks prerequisites, then daemonizes the server.
 3. `SLACK_APP_TOKEN` is set — fails with `missing prerequisite: SLACK_APP_TOKEN environment variable` if absent.
 4. `routing.json` exists at `STATE_DIR/routing.json` — fails with the full path if not found.
 
-If all checks pass, the parent process spawns a detached child process and exits immediately, printing the child PID. The child starts the server and writes its PID to `STATE_DIR/server.pid`.
+If all checks pass, the parent process spawns a detached child process and exits immediately, printing the child PID. The child starts the server and writes its PID to `STATE_DIR/server.pid`. When a stored session ID is available in `sessions.json`, Claude is launched with `--resume`, so conversation context survives server restarts.
 
 ```
 [slack] Server starting in background (PID 12345)

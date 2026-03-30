@@ -73,10 +73,11 @@ Same pattern as permission relay but via `PreToolUse` hook on `AskUserQuestion`:
 Called from `main()` in `server.ts` via `startupSessionManager()` after the HTTP server and Socket Mode listeners are ready.
 
 1. **tmux availability check** — `tmuxClient.checkAvailability()` runs `tmux -V`. If tmux is not installed, startup is skipped with a warning and the server continues.
-2. **Iterate routes** — for each `channelId`/`cwd` pair in `routingConfig.routes`, determine state via `tmuxClient.hasSession()`:
-   - **exists** (session found) → `killSession()` then relaunch via `launchSession()`
-   - **missing** (no tmux session) → launch fresh via `launchSession()`
-3. **Launch flow** (`launchSession()`):
+2. **Iterate routes** — for each `channelId`/`cwd` pair in `routingConfig.routes`, apply a three-branch decision tree:
+   - **Reconnect** — tmux session exists AND `isClaudeRunning()` returns true → send `/mcp reconnect` to the running session; no relaunch
+   - **Resume** — dead or missing process with a stored `sessionId` in sessions.json → kill any stale tmux session, call `launchSession()` with the stored session ID (passes `--resume <id>` to Claude)
+   - **Fresh** — dead or missing process without a stored session ID → kill any stale tmux session, call `launchSession()` with no session ID
+3. **Launch flow** (`launchSession()`) — accepts an optional `sessionId`:
    - `tmuxClient.newSession(name, cwd)` creates a detached session
    - If a `sessionId` is present in sessions.json for this channel, appends `--resume <id>` to the CLI command; otherwise launches fresh
    - Polls `capturePane()` with exponential backoff (500 ms start, 2× per step, 5 s cap, 60 s total timeout) waiting for the safety prompt text
@@ -102,7 +103,7 @@ After `scheduleRestart` is called:
 3. **Timer** — a `setTimeout` fires after `session_restart_delay` seconds
 4. **Liveness check** — `isSessionAlive()` checks whether Claude is already running in tmux; if alive, restart is skipped
 5. **Kill zombie** — any dead tmux session for the channel is cleaned up (errors ignored)
-6. **Relaunch** — `launchSession()` is called; on failure the per-channel failure counter increments
+6. **Relaunch** — `launchSession()` is called with the stored `sessionId` from sessions.json if one exists; when present, Claude launches with `--resume <id>`, preserving conversation context across the restart. If no stored ID is available, behavior is unchanged (fresh launch). On failure the per-channel failure counter increments.
 7. **Success reset** — when a session successfully reconnects and registers, `resetFailureCounter()` clears the counter for that channel
 
 ### Health-Check Poller
