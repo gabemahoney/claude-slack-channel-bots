@@ -14,7 +14,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 import { type TmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
 import { type SessionsMap } from './sessions.ts'
-import { type RoutingConfig } from './config.ts'
+import { type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -109,7 +109,7 @@ export async function launchSession(
   const resumeSessionId = options?.sessionId
 
   const escapedConfigPath = routingConfig.mcp_config_path.replace(/'/g, "'\\''")
-  const baseCmd = `claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:slack-channel-router`
+  const baseCmd = `claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
 
   const POLL_START_MS = 500
   const POLL_CAP_MS = 5_000
@@ -260,9 +260,9 @@ export async function startupSessionManager(
         const running = await isClaudeRunning(name, tmuxClient)
 
         if (running) {
-          // Branch 1: Reconnect — session live, send /mcp reconnect
-          console.error(`[slack] Session live — reconnecting: channel=${channelId} session=${name}`)
-          await tmuxClient.sendKeys(name, '/mcp reconnect')
+          // Branch 1: Reconnect — session live, send /mcp reconnect <server-name>
+          console.error(`[slack] Session live — reconnecting MCP server "${MCP_SERVER_NAME}": channel=${channelId} session=${name}`)
+          await tmuxClient.sendKeys(name, `/mcp reconnect ${MCP_SERVER_NAME}`)
           await tmuxClient.sendKeys(name, 'Enter')
           results.push({ channelId, action: 'relaunched', sessionName: name })
           continue

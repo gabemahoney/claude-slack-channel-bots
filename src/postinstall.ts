@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { dirname, join } from 'path'
 import { defaultAccess } from './lib.ts'
+import { MCP_SERVER_NAME } from './config.ts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -70,7 +71,7 @@ export function runPostinstall(options: PostinstallOptions = {}): void {
   } else {
     const skeleton = {
       mcpServers: {
-        'slack-channel-router': {
+        [MCP_SERVER_NAME]: {
           type: 'http',
           url: 'http://127.0.0.1:3100/mcp',
         },

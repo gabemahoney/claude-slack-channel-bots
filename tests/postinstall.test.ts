@@ -14,6 +14,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { runPostinstall } from '../src/postinstall.ts'
 import { defaultAccess } from '../src/lib.ts'
+import { MCP_SERVER_NAME } from '../src/config.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -209,8 +210,8 @@ describe('slack-mcp.json — creation', () => {
     const content = readJson(mcpConfigPath) as Record<string, unknown>
     const servers = content['mcpServers'] as Record<string, unknown>
     expect(servers).toBeDefined()
-    expect(servers['slack-channel-router']).toBeDefined()
-    const router = servers['slack-channel-router'] as Record<string, unknown>
+    expect(servers[MCP_SERVER_NAME]).toBeDefined()
+    const router = servers[MCP_SERVER_NAME] as Record<string, unknown>
     expect(router['type']).toBe('http')
   })
 
@@ -223,7 +224,7 @@ describe('slack-mcp.json — creation', () => {
 
     const content = readJson(mcpConfigPath) as Record<string, unknown>
     const servers = content['mcpServers'] as Record<string, unknown>
-    const router = servers['slack-channel-router'] as Record<string, unknown>
+    const router = servers[MCP_SERVER_NAME] as Record<string, unknown>
     expect(router['url']).toBe('http://127.0.0.1:3100/mcp')
   })
 })

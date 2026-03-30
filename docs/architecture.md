@@ -74,7 +74,7 @@ Called from `main()` in `server.ts` via `startupSessionManager()` after the HTTP
 
 1. **tmux availability check** — `tmuxClient.checkAvailability()` runs `tmux -V`. If tmux is not installed, startup is skipped with a warning and the server continues.
 2. **Iterate routes** — for each `channelId`/`cwd` pair in `routingConfig.routes`, apply a three-branch decision tree:
-   - **Reconnect** — tmux session exists AND `isClaudeRunning()` returns true → send `/mcp reconnect` to the running session; no relaunch
+   - **Reconnect** — tmux session exists AND `isClaudeRunning()` returns true → send `/mcp reconnect <server-name>` (from shared `MCP_SERVER_NAME` constant in `config.ts`) to the running session; no relaunch
    - **Resume** — dead or missing process with a stored `sessionId` in sessions.json → kill any stale tmux session, call `launchSession()` with the stored session ID (passes `--resume <id>` to Claude)
    - **Fresh** — dead or missing process without a stored session ID → kill any stale tmux session, call `launchSession()` with no session ID
 3. **Launch flow** (`launchSession()`) — accepts an optional `sessionId`:

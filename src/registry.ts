@@ -14,7 +14,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import type { RoutingConfig } from './config.ts'
+import { MCP_SERVER_NAME, type RoutingConfig } from './config.ts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -335,7 +335,7 @@ export function createSessionServer(
   const { web, assertOutboundAllowed, assertSendable, getAccess, resolveUserName, inboxDir, consumeAck } = deps
 
   const server = new Server(
-    { name: 'slack-channel-router', version: '0.1.0' },
+    { name: MCP_SERVER_NAME, version: '0.1.0' },
     {
       capabilities: {
         experimental: { 'claude/channel': {} },

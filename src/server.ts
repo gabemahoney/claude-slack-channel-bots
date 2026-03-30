@@ -37,7 +37,7 @@ import {
   type Access,
   type GateResult,
 } from './lib.ts'
-import { loadConfig, expandTilde, type RoutingConfig } from './config.ts'
+import { loadConfig, expandTilde, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
 import { readSessions, writeSessions } from './sessions.ts'
 import { defaultTmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
 import { startupSessionManager, launchSession } from './session-manager.ts'
@@ -1288,10 +1288,10 @@ export async function main(): Promise<void> {
   console.error(`[slack] MCP server listening on http://${mcpHost}:${mcpPort}/mcp`)
   console.error('')
   console.error('Save this to ~/.claude/slack-mcp.json:')
-  console.error(JSON.stringify({ mcpServers: { 'slack-channel-router': { type: 'http', url: `http://${mcpHost}:${mcpPort}/mcp` } } }, null, 2))
+  console.error(JSON.stringify({ mcpServers: { [MCP_SERVER_NAME]: { type: 'http', url: `http://${mcpHost}:${mcpPort}/mcp` } } }, null, 2))
   console.error('')
   console.error('Then launch Claude from a project directory with:')
-  console.error('  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:slack-channel-router')
+  console.error(`  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:${MCP_SERVER_NAME}`)
   console.error('')
 
   // Initialize restart module with adapters bridging tmux + session-manager

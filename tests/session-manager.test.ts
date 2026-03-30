@@ -14,6 +14,7 @@ import { startupSessionManager, launchSession } from '../src/session-manager.ts'
 import { makeTmuxStub } from './test-helpers/tmux-stub.ts'
 import { makeSessionsStubs } from './test-helpers/sessions-stub.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
+import { MCP_SERVER_NAME } from '../src/config.ts'
 
 // ---------------------------------------------------------------------------
 // Helper: spawn a real process named "claude" so isClaudeRunning returns true
@@ -157,7 +158,7 @@ describe('startupSessionManager', () => {
     expect(stub.calls.filter(c => c.method === 'newSession')[0].args[0]).toBe(sessionName('/tmp/test-cwd'))
   })
 
-  test('14. live Claude process in tmux: reconnect path — sendKeys /mcp reconnect, no kill, no newSession', async () => {
+  test('14. live Claude process in tmux: reconnect path — sendKeys /mcp reconnect <server-name>, no kill, no newSession', async () => {
     const proc = await spawnClaudeProcess()
     try {
       const stub = makeTmuxStub({
@@ -177,7 +178,7 @@ describe('startupSessionManager', () => {
 
       const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
       const reconnectCall = sendKeysCalls.find(
-        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('/mcp reconnect'),
+        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`/mcp reconnect ${MCP_SERVER_NAME}`),
       )
       expect(reconnectCall).toBeDefined()
     } finally {
