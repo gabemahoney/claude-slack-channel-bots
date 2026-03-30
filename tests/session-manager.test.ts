@@ -156,6 +156,83 @@ describe('startupSessionManager', () => {
     expect(stub.calls.filter(c => c.method === 'newSession')).toHaveLength(1)
     expect(stub.calls.filter(c => c.method === 'newSession')[0].args[0]).toBe(sessionName('/tmp/test-cwd'))
   })
+
+  test('14. live Claude process in tmux: reconnect path — sendKeys /mcp reconnect, no kill, no newSession', async () => {
+    const proc = await spawnClaudeProcess()
+    try {
+      const stub = makeTmuxStub({
+        hasSessionResult: true,
+        getPanePidResult: String(proc.pid),
+      })
+      const sessions = makeSessionsStubs()
+      const config = makeRoutingConfig()
+
+      const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0 })
+
+      expect(results).toHaveLength(1)
+      expect(results[0].action).toBe('relaunched')
+
+      expect(stub.calls.filter(c => c.method === 'killSession')).toHaveLength(0)
+      expect(stub.calls.filter(c => c.method === 'newSession')).toHaveLength(0)
+
+      const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+      const reconnectCall = sendKeysCalls.find(
+        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('/mcp reconnect'),
+      )
+      expect(reconnectCall).toBeDefined()
+    } finally {
+      proc.kill()
+    }
+  })
+
+  test('15. dead process + stored session ID: resume path — sendKeys includes --resume, action is resumed', async () => {
+    const stub = makeTmuxStub({
+      hasSessionResult: false,
+      getPanePidResult: '99999999',
+      capturePaneResult: 'I am using this for local development',
+    })
+    const sessions = makeSessionsStubs({
+      'C_TEST1': {
+        tmuxSession: 'slack_bot_tmp_test_cwd_8497a1',
+        lastLaunch: '2026-01-01T00:00:00.000Z',
+        sessionId: 'resume-session-abc',
+      },
+    })
+    const config = makeRoutingConfig()
+
+    const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 600 })
+
+    expect(results).toHaveLength(1)
+    expect(results[0].action).toBe('resumed')
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const resumeCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume resume-session-abc'),
+    )
+    expect(resumeCmd).toBeDefined()
+  })
+
+  test('16. dead process + no stored session ID: fresh path — sendKeys does not include --resume', async () => {
+    const stub = makeTmuxStub({
+      hasSessionResult: false,
+      getPanePidResult: '99999999',
+    })
+    const sessions = makeSessionsStubs() // no stored session ID
+    const config = makeRoutingConfig()
+
+    const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0 })
+
+    expect(results).toHaveLength(1)
+    // With pollTimeout: 0 and Claude not running, the launch will fail
+    expect(results[0].action).toBe('failed')
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).startsWith('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).includes('--resume')).toBe(false)
+  })
 })
 
 // ---------------------------------------------------------------------------
