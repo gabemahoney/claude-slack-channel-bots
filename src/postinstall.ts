@@ -9,9 +9,9 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { existsSync, mkdirSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, writeFileSync, symlinkSync, readlinkSync, unlinkSync } from 'fs'
 import { homedir } from 'os'
-import { dirname, join } from 'path'
+import { dirname, join, resolve } from 'path'
 import { defaultAccess } from './lib.ts'
 import { MCP_SERVER_NAME } from './config.ts'
 
@@ -63,6 +63,36 @@ export function runPostinstall(options: PostinstallOptions = {}): void {
       { mode: 0o600 },
     )
     console.log(`created: ${accessPath}`)
+  }
+
+  // Symlink skills into ~/.claude/skills/
+  const skillsTarget = join(homedir(), '.claude', 'skills')
+  mkdirSync(skillsTarget, { recursive: true })
+
+  const skillNames = ['claude-slack-channels-config']
+  const packageSkillsDir = resolve(dirname(import.meta.filename), '..', 'skills')
+  for (const name of skillNames) {
+    const src = join(packageSkillsDir, name)
+    const dest = join(skillsTarget, name)
+    if (existsSync(src)) {
+      try {
+        // Remove stale symlink or directory if it points elsewhere
+        if (existsSync(dest)) {
+          try {
+            const current = readlinkSync(dest)
+            if (resolve(current) === resolve(src)) {
+              console.log(`skipped: ${dest} (already linked)`)
+              continue
+            }
+          } catch { /* not a symlink — remove it */ }
+          unlinkSync(dest)
+        }
+        symlinkSync(src, dest)
+        console.log(`linked: ${dest} -> ${src}`)
+      } catch (err) {
+        console.log(`warning: could not symlink ${name}: ${err}`)
+      }
+    }
   }
 
   // slack-mcp.json
