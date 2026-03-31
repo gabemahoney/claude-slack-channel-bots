@@ -139,6 +139,7 @@ Key fields:
 - `session_restart_delay` — seconds before auto-restarting dead sessions (default: 60, 0 = disabled)
 - `health_check_interval` — seconds between health-check polls (default: 120, 0 = disabled)
 - `mcp_config_path` — path to MCP config file for Claude launch (default: ~/.claude/slack-mcp.json)
+- `append_system_prompt_file` — optional path to a file appended to every managed session's system prompt via `--append-system-prompt-file`; missing file silently skipped
 
 ### sessions.json (~/.claude/channels/slack/sessions.json)
 

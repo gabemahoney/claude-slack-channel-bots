@@ -225,7 +225,49 @@ their defaults unless asked.
 
 ---
 
-### Step 5 — Check access.json
+### Step 5 — Configure custom CLAUDE.md (optional)
+
+Worker sessions launched by the server can receive a custom system-prompt
+append via `append_system_prompt_file` in `routing.json`. This is useful for
+giving all workers project-specific instructions: communication rules,
+development process, how to spawn sub-workers, and so on.
+
+An example template is included with the package. Show the operator where it
+lives:
+
+```bash
+ls "$(npm root -g)/claude-slack-channel-bots/skills/EXAMPLE_CLAUDE.md" 2>/dev/null \
+  || echo "NOT_FOUND"
+```
+
+If the file is found, print its path so the operator can inspect it as a
+starting point.
+
+Ask the operator: **"Do you want to configure a custom CLAUDE.md file for
+worker sessions?"**
+
+**If yes:**
+
+1. Prompt for the absolute path to their CLAUDE.md file.
+2. Verify the file exists:
+   ```bash
+   test -f "<provided-path>" && echo "ok" || echo "not found"
+   ```
+   Expand `~` before checking. If the file does not exist, warn the operator
+   and re-prompt until a valid path is given or they choose to skip.
+3. Read `routing.json`, add or update the top-level field:
+   ```json
+   "append_system_prompt_file": "<provided-path>"
+   ```
+   Write the updated file, preserving all other fields.
+
+**If skipped:**
+
+Do not write `append_system_prompt_file` to `routing.json`. Move on.
+
+---
+
+### Step 6 — Check access.json
 
 ```bash
 STATE_DIR="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
@@ -264,7 +306,7 @@ Do not modify `access.json` during setup unless the user asks to.
 
 ---
 
-### Step 6 — Check hooks
+### Step 7 — Check hooks
 
 Check whether the relay hooks exist and are executable:
 
@@ -312,7 +354,7 @@ chmod +x ~/.claude/hooks/permission-relay.sh ~/.claude/hooks/ask-relay.sh
 
 ---
 
-### Step 7 — Check Claude Code settings.json for hook entries
+### Step 8 — Check Claude Code settings.json for hook entries
 
 Read `~/.claude/settings.json` and check whether the `PermissionRequest` and
 `PreToolUse` hook entries for the relay scripts are present.
@@ -365,13 +407,14 @@ If the user agrees, make the targeted edits, preserving all existing content.
 
 ---
 
-### Step 8 — Summary
+### Step 9 — Summary
 
 Print a final summary of what was checked and configured:
 
 - Environment variables: set / missing
 - Token format: valid / invalid
 - routing.json: populated (N routes) / skeleton
+- append_system_prompt_file: configured / skipped
 - access.json: present / missing
 - permission-relay.sh hook: present and executable / missing
 - ask-relay.sh hook: present and executable / missing
