@@ -9,7 +9,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { readdirSync, readFileSync } from 'fs'
+import { readdirSync, readFileSync, accessSync, constants } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
 import { type TmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
@@ -109,7 +109,17 @@ export async function launchSession(
   const resumeSessionId = options?.sessionId
 
   const escapedConfigPath = routingConfig.mcp_config_path.replace(/'/g, "'\\''")
-  const baseCmd = `claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
+  let baseCmd = `claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
+
+  if (routingConfig.append_system_prompt_file !== undefined) {
+    try {
+      accessSync(routingConfig.append_system_prompt_file, constants.R_OK)
+      const escapedPromptPath = routingConfig.append_system_prompt_file.replace(/'/g, "'\\''")
+      baseCmd += ` --append-system-prompt-file '${escapedPromptPath}'`
+    } catch {
+      // file missing or unreadable — skip
+    }
+  }
 
   const POLL_START_MS = 500
   const POLL_CAP_MS = 5_000

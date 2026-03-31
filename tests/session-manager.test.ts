@@ -5,7 +5,7 @@
  */
 
 import { describe, test, expect, afterEach } from 'bun:test'
-import { mkdtempSync, copyFileSync, chmodSync, existsSync, rmSync } from 'fs'
+import { mkdtempSync, copyFileSync, chmodSync, existsSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { sessionName } from '../src/tmux.ts'
@@ -482,5 +482,166 @@ describe('launchSession', () => {
     const written = sessions.writtenSessions[0]['C_TEST1']
     expect(written).toBeDefined()
     expect(written.sessionId).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// append_system_prompt_file
+// ---------------------------------------------------------------------------
+
+describe('append_system_prompt_file', () => {
+  let tmpPromptDir = ''
+
+  afterEach(() => {
+    if (tmpPromptDir) {
+      rmSync(tmpPromptDir, { recursive: true, force: true })
+      tmpPromptDir = ''
+    }
+  })
+
+  test('17. config field set + file exists: sendKeys command includes --append-system-prompt-file with path', async () => {
+    tmpPromptDir = mkdtempSync(join(tmpdir(), 'append-prompt-test-'))
+    const promptFile = join(tmpPromptDir, 'CLAUDE.md')
+    writeFileSync(promptFile, 'You are a helpful assistant.')
+
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const sessions = makeSessionsStubs()
+    const config = makeRoutingConfig({ append_system_prompt_file: promptFile })
+
+    const ok = await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
+      { pollTimeout: 600 },
+    )
+
+    expect(ok).toBe(true)
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).startsWith('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(true)
+    expect((launchCmd!.args[1] as string).includes(promptFile)).toBe(true)
+  })
+
+  test('18. config field set + file missing: flag omitted, launch proceeds normally', async () => {
+    const missingPath = '/tmp/nonexistent-prompt-file-that-does-not-exist.md'
+
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const sessions = makeSessionsStubs()
+    const config = makeRoutingConfig({ append_system_prompt_file: missingPath })
+
+    const ok = await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
+      { pollTimeout: 600 },
+    )
+
+    expect(ok).toBe(true)
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).startsWith('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(false)
+  })
+
+  test('19. config field absent: flag omitted, launch proceeds normally', async () => {
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const sessions = makeSessionsStubs()
+    // No append_system_prompt_file in config
+    const config = makeRoutingConfig()
+
+    const ok = await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
+      { pollTimeout: 600 },
+    )
+
+    expect(ok).toBe(true)
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).startsWith('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(false)
+  })
+
+  test('20. path with single quotes: correctly shell-escaped in the command', async () => {
+    // Create a temp dir whose path contains a single quote character
+    const baseDir = mkdtempSync(join(tmpdir(), 'append-prompt-test-'))
+    tmpPromptDir = baseDir
+    // Create a subdirectory whose name contains a single quote
+    const quotedDir = join(baseDir, "it's a test")
+    // Bun.write does not mkdir; use mkdtempSync-safe approach with writeFileSync
+    const { mkdirSync } = await import('fs')
+    mkdirSync(quotedDir, { recursive: true })
+    const promptFile = join(quotedDir, 'CLAUDE.md')
+    writeFileSync(promptFile, 'Prompt content.')
+
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const sessions = makeSessionsStubs()
+    const config = makeRoutingConfig({ append_system_prompt_file: promptFile })
+
+    const ok = await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
+      { pollTimeout: 600 },
+    )
+
+    expect(ok).toBe(true)
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--append-system-prompt-file'),
+    )
+    expect(launchCmd).toBeDefined()
+
+    const cmd = launchCmd!.args[1] as string
+    // The raw single quote in the path must be shell-escaped (rendered as '\'' in single-quote context)
+    expect(cmd.includes("'\\''")).toBe(true)
+    // The path must not contain an unescaped single quote that would break the shell command
+    // Verify it does not contain a bare ' followed immediately by a non-backslash sequence
+    // (i.e., the literal path string is not directly embedded unescaped)
+    const flagIndex = cmd.indexOf('--append-system-prompt-file')
+    const afterFlag = cmd.slice(flagIndex)
+    // After shell-escaping "it's a test", it becomes 'it'\''s a test'
+    expect(afterFlag.includes("it'\\''s a test")).toBe(true)
+  })
+
+  test('21. resume launch with file present: --append-system-prompt-file appears alongside --resume', async () => {
+    tmpPromptDir = mkdtempSync(join(tmpdir(), 'append-prompt-test-'))
+    const promptFile = join(tmpPromptDir, 'CLAUDE.md')
+    writeFileSync(promptFile, 'You are a helpful assistant.')
+
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const sessions = makeSessionsStubs()
+    const config = makeRoutingConfig({ append_system_prompt_file: promptFile })
+    const resumeId = 'resume-session-xyz'
+
+    const ok = await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
+      { pollTimeout: 600, sessionId: resumeId },
+    )
+
+    expect(ok).toBe(true)
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' &&
+        (c.args[1] as string).includes(`--resume ${resumeId}`),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(true)
+    expect((launchCmd!.args[1] as string).includes(promptFile)).toBe(true)
   })
 })
