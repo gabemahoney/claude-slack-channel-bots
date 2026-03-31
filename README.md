@@ -319,8 +319,11 @@ The `update-config` skill can automate hook installation. It copies or symlinks 
 **routing.json CWD mismatch**
 If a Claude Code session connects but immediately disconnects, the session's actual CWD does not match any `cwd` in `routing.json`. Confirm the session's working directory matches the entry exactly (after tilde expansion). Duplicate CWDs across multiple routes are rejected at startup.
 
+**Bot not receiving messages in a new channel**
+After inviting the bot to a channel, Slack may not deliver messages until the bot is @mentioned for the first time. This is a Slack Socket Mode behavior — the first @mention activates event delivery for that channel. After that, all messages flow normally regardless of `requireMention` settings.
+
 **Channel not in access.json**
-Messages to channels not listed in `access.json → channels` are silently dropped. Use the `slack-channel-access` skill or edit `access.json` directly to add the channel ID with a `ChannelPolicy` entry.
+Messages to channels not listed in `access.json → channels` and not present in `routing.json → routes` are silently dropped. Use the `claude-slack-channels-config` skill or edit `access.json` directly to add the channel ID with a `ChannelPolicy` entry.
 
 **Permission relay not working**
 Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify `curl` and `jq` are on your `PATH`. Confirm the hook scripts are executable (`chmod +x`). If the port was changed in `routing.json`, ensure `SLACK_STATE_DIR` is set correctly so the hooks can read the updated port.
