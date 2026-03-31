@@ -38,6 +38,7 @@ export interface RoutingConfigInput {
   session_restart_delay?: number
   health_check_interval?: number
   mcp_config_path?: string
+  append_system_prompt_file?: string
 }
 
 /** Validated, fully-resolved routing configuration with all defaults applied. */
@@ -50,6 +51,7 @@ export interface RoutingConfig {
   session_restart_delay: number
   health_check_interval: number
   mcp_config_path: string
+  append_system_prompt_file?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +72,7 @@ export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
     session_restart_delay: input.session_restart_delay ?? 60,
     health_check_interval: input.health_check_interval ?? 120,
     mcp_config_path: input.mcp_config_path ?? '~/.claude/slack-mcp.json',
+    append_system_prompt_file: input.append_system_prompt_file,
   }
 }
 
@@ -166,6 +169,9 @@ export function resolveConfig(input: RoutingConfigInput): RoutingConfig {
       ? resolve(expandTilde(withDefaults.default_dm_session))
       : undefined,
     mcp_config_path: resolve(expandTilde(withDefaults.mcp_config_path)),
+    append_system_prompt_file: withDefaults.append_system_prompt_file !== undefined
+      ? resolve(expandTilde(withDefaults.append_system_prompt_file))
+      : undefined,
   }
 
   validateConfig(config)

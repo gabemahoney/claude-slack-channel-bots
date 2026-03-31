@@ -124,6 +124,16 @@ describe('applyDefaults', () => {
     const result = applyDefaults(makeRoutingConfig({ mcp_config_path: '/custom/mcp.json' }))
     expect(result.mcp_config_path).toBe('/custom/mcp.json')
   })
+
+  test('passes through append_system_prompt_file when present', () => {
+    const result = applyDefaults(makeRoutingConfig({ append_system_prompt_file: '~/my-prompts/extra.md' }))
+    expect(result.append_system_prompt_file).toBe('~/my-prompts/extra.md')
+  })
+
+  test('omits append_system_prompt_file when absent', () => {
+    const result = applyDefaults(makeRoutingConfig())
+    expect(result.append_system_prompt_file).toBeUndefined()
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -215,6 +225,16 @@ describe('validateConfig', () => {
   test('throws when health_check_interval is negative', () => {
     const config = makeValidConfig({ health_check_interval: -1 })
     expect(() => validateConfig(config)).toThrow('Routing config validation error')
+  })
+
+  test('passes when append_system_prompt_file is present', () => {
+    const config = makeValidConfig({ append_system_prompt_file: '/tmp/extra.md' })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('passes when append_system_prompt_file is absent', () => {
+    const config = makeValidConfig()
+    expect(() => validateConfig(config)).not.toThrow()
   })
 })
 
@@ -357,6 +377,25 @@ describe('resolveConfig', () => {
     const originalPath = input.mcp_config_path
     resolveConfig(input)
     expect(input.mcp_config_path).toBe(originalPath)
+  })
+
+  test('expands tilde in append_system_prompt_file', () => {
+    const input = makeRoutingConfig({ append_system_prompt_file: '~/my-prompts/extra.md' })
+    const result = resolveConfig(input)
+    expect(result.append_system_prompt_file).toStartWith(homedir())
+    expect(result.append_system_prompt_file).not.toContain('~')
+  })
+
+  test('resolves absolute append_system_prompt_file path unchanged', () => {
+    const input = makeRoutingConfig({ append_system_prompt_file: '/etc/prompts/extra.md' })
+    const result = resolveConfig(input)
+    expect(result.append_system_prompt_file).toBe('/etc/prompts/extra.md')
+  })
+
+  test('leaves append_system_prompt_file undefined when absent', () => {
+    const input = makeRoutingConfig()
+    const result = resolveConfig(input)
+    expect(result.append_system_prompt_file).toBeUndefined()
   })
 })
 
