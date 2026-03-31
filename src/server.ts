@@ -18,7 +18,7 @@ import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/
 import { SocketModeClient } from '@slack/socket-mode'
 import { WebClient } from '@slack/web-api'
 import { homedir } from 'os'
-import { join, resolve } from 'path'
+import { join, resolve, relative, isAbsolute } from 'path'
 import { fileURLToPath } from 'url'
 import {
   readFileSync,
@@ -72,6 +72,30 @@ import {
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Find the channel whose route CWD is the closest ancestor of (or equal to)
+ * the given absolute path. Returns undefined when no route matches.
+ */
+function findChannelByCwd(absoluteCwd: string, routes: RoutingConfig['routes']): string | undefined {
+  let bestChannel: string | undefined
+  let bestLen = -1
+  for (const [channelId, route] of Object.entries(routes)) {
+    const routeCwd = resolve(expandTilde(route.cwd))
+    const rel = relative(routeCwd, absoluteCwd)
+    if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) {
+      if (routeCwd.length > bestLen) {
+        bestLen = routeCwd.length
+        bestChannel = channelId
+      }
+    }
+  }
+  return bestChannel
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1003,12 +1027,10 @@ export async function main(): Promise<void> {
           )
         }
 
-        // Normalize CWD and find matching channel
+        // Find the most specific route whose CWD is an ancestor of (or equal to) the request CWD
         const normalizedCwd = resolve(expandTilde(cwd))
         const matchedChannelId = routingConfig
-          ? Object.entries(routingConfig.routes).find(
-              ([, route]) => resolve(expandTilde(route.cwd)) === normalizedCwd,
-            )?.[0]
+          ? findChannelByCwd(normalizedCwd, routingConfig.routes)
           : undefined
 
         if (!matchedChannelId) {
@@ -1150,11 +1172,10 @@ export async function main(): Promise<void> {
           )
         }
 
+        // Find the most specific route whose CWD is an ancestor of (or equal to) the request CWD
         const normalizedCwd = resolve(expandTilde(cwd as string))
         const matchedChannelId = routingConfig
-          ? Object.entries(routingConfig.routes).find(
-              ([, route]) => resolve(expandTilde(route.cwd)) === normalizedCwd,
-            )?.[0]
+          ? findChannelByCwd(normalizedCwd, routingConfig.routes)
           : undefined
 
         if (!matchedChannelId) {

@@ -10,7 +10,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterAll } from 'bun:test'
-import { resolve } from 'path'
+import { resolve, relative, isAbsolute } from 'path'
 
 // ---------------------------------------------------------------------------
 // Types (mirrored from server.ts)
@@ -268,11 +268,20 @@ const testServer = Bun.serve({
     }
 
     const normalizedCwd = resolve(cwd)
-    const matchedChannelId = routingConfig
-      ? Object.entries(routingConfig.routes).find(
-          ([, route]) => resolve(route.cwd) === normalizedCwd,
-        )?.[0]
-      : undefined
+    let matchedChannelId: string | undefined
+    if (routingConfig) {
+      let bestLen = -1
+      for (const [chId, route] of Object.entries(routingConfig.routes)) {
+        const routeCwd = resolve(route.cwd)
+        const rel = relative(routeCwd, normalizedCwd)
+        if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) {
+          if (routeCwd.length > bestLen) {
+            bestLen = routeCwd.length
+            matchedChannelId = chId
+          }
+        }
+      }
+    }
 
     if (!matchedChannelId) {
       return new Response(JSON.stringify({ error: 'No route found for CWD' }), {
@@ -411,6 +420,67 @@ describe('permission relay — /permission endpoint', () => {
     expect(response.status).toBe(404)
     const body = (await response.json()) as { error: string }
     expect(body.error).toContain('No route found')
+  })
+
+  test('POST with CWD that is a subdirectory of a route matches that route', async () => {
+    routingConfig = { routes: { C_TEST: { cwd: '/tmp/known-project' } } }
+
+    const response = await fetch(`${BASE_URL}/permission`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tool_name: 'Bash',
+        tool_input: { command: 'ls' },
+        cwd: '/tmp/known-project/subdir/repo',
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { requestId: string }
+    expect(body.requestId).toBeDefined()
+    expect(postMessageCalls.length).toBe(1)
+    expect(postMessageCalls[0].channel).toBe('C_TEST')
+  })
+
+  test('POST with multiple routes picks the most specific match', async () => {
+    routingConfig = {
+      routes: {
+        C_PARENT: { cwd: '/tmp/projects' },
+        C_CHILD: { cwd: '/tmp/projects/specific-project' },
+      },
+    }
+
+    const response = await fetch(`${BASE_URL}/permission`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tool_name: 'Read',
+        tool_input: { file_path: '/etc/foo' },
+        cwd: '/tmp/projects/specific-project/src',
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { requestId: string }
+    expect(body.requestId).toBeDefined()
+    expect(postMessageCalls.length).toBe(1)
+    expect(postMessageCalls[0].channel).toBe('C_CHILD')
+  })
+
+  test('POST with CWD outside all routes returns 404', async () => {
+    routingConfig = { routes: { C_TEST: { cwd: '/tmp/known-project' } } }
+
+    const response = await fetch(`${BASE_URL}/permission`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tool_name: 'Bash',
+        tool_input: { command: 'ls' },
+        cwd: '/tmp/known-project-other',
+      }),
+    })
+
+    expect(response.status).toBe(404)
   })
 
   // TC-3: missing required fields → 400 (unchanged)
