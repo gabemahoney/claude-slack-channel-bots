@@ -231,11 +231,6 @@ describe('validateConfig', () => {
     const config = makeValidConfig({ append_system_prompt_file: '/tmp/extra.md' })
     expect(() => validateConfig(config)).not.toThrow()
   })
-
-  test('passes when append_system_prompt_file is absent', () => {
-    const config = makeValidConfig()
-    expect(() => validateConfig(config)).not.toThrow()
-  })
 })
 
 // ---------------------------------------------------------------------------

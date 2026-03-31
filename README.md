@@ -105,7 +105,7 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | `session_restart_delay` | number | `60` | Seconds to wait before auto-restarting a dead session. Set to `0` to disable auto-restart. Must be non-negative. |
 | `health_check_interval` | number | `120` | Seconds between periodic liveness polls. Set to `0` to disable. Must be non-negative. |
 | `mcp_config_path` | string | `~/.claude/slack-mcp.json` | Path to the MCP config file passed to Claude Code when launching managed sessions. |
-| `append_system_prompt_file` | string | — | Path to a file whose contents are injected into every managed Claude session via `--append-system-prompt-file` at launch. Additive alongside any project `CLAUDE.md`. If the file does not exist, it is silently skipped. Omit the field to disable injection entirely. Use `skills/EXAMPLE_CLAUDE.md` as a starting template. |
+| `append_system_prompt_file` | string | — | Path to a file appended to every managed session's system prompt via `--append-system-prompt-file`. Missing file silently skipped. See `skills/EXAMPLE_CLAUDE.md` for a template. |
 
 ---
 

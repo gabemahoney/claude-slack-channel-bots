@@ -5,7 +5,7 @@
  */
 
 import { describe, test, expect, afterEach } from 'bun:test'
-import { mkdtempSync, copyFileSync, chmodSync, existsSync, rmSync, writeFileSync } from 'fs'
+import { mkdtempSync, mkdirSync, copyFileSync, chmodSync, existsSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { sessionName } from '../src/tmux.ts'
@@ -580,7 +580,6 @@ describe('append_system_prompt_file', () => {
     // Create a subdirectory whose name contains a single quote
     const quotedDir = join(baseDir, "it's a test")
     // Bun.write does not mkdir; use mkdtempSync-safe approach with writeFileSync
-    const { mkdirSync } = await import('fs')
     mkdirSync(quotedDir, { recursive: true })
     const promptFile = join(quotedDir, 'CLAUDE.md')
     writeFileSync(promptFile, 'Prompt content.')
