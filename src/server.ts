@@ -910,7 +910,7 @@ export async function main(): Promise<void> {
     hostname: mcpHost,
     port: mcpPort,
     idleTimeout: 255,
-    async fetch(req: Request, server: { requestIP(r: Request): { address: string } | null }): Promise<Response> {
+    async fetch(req: Request, server: { requestIP(r: Request): { address: string } | null; timeout(req: Request, seconds: number): void }): Promise<Response> {
       const url = new URL(req.url)
       const mcpSid = req.headers.get('mcp-session-id')
       console.error(`[slack] HTTP ${req.method} ${url.pathname} session=${mcpSid ?? '(none)'}`)
@@ -1275,6 +1275,7 @@ export async function main(): Promise<void> {
         // mcpSessionId (not by entry state at attach time, since the session
         // may still be pending when the GET arrives but registered by abort time).
         if (req.method === 'GET') {
+          server.timeout(req, 0)
           req.signal.addEventListener('abort', () => {
             // Look up the session at abort time — it may have been registered
             // after this GET request started (the SSE stream opens before
