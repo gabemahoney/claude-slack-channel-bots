@@ -15,11 +15,6 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { MCP_SERVER_NAME, type RoutingConfig } from './config.ts'
-import { appendFileSync } from 'fs'
-
-function debugLog(msg: string) {
-  try { appendFileSync('/tmp/claude-slack-debug.log', `${new Date().toISOString()} ${msg}\n`) } catch {}
-}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -165,7 +160,6 @@ export function createPendingSession(
 ): PendingSessionEntry {
   const entry: PendingSessionEntry = { pendingId, transport, server, deliveredChannels, createdAt: Date.now() }
   pendingSessionMap.set(pendingId, entry)
-  debugLog(`[debug] createPendingSession: pendingId="${pendingId}" totalPending=${pendingSessionMap.size}`)
   return entry
 }
 
@@ -234,17 +228,8 @@ export function getSessionByChannel(
   routingConfig: RoutingConfig,
 ): SessionEntry | undefined {
   const route = routingConfig.routes[channelId]
-  if (!route) {
-    debugLog(`[debug] getSessionByChannel: channelId=${channelId} — no route found`)
-    return undefined
-  }
-  const session = registry.get(route.cwd)
-  debugLog(`[debug] getSessionByChannel: channelId=${channelId} routeCwd="${route.cwd}" registryHit=${!!session}`)
-  if (!session) {
-    const keys = Array.from(registry.keys())
-    debugLog(`[debug] getSessionByChannel: route exists but no registry entry — registry keys: ${JSON.stringify(keys)}`)
-  }
-  return session
+  if (!route) return undefined
+  return registry.get(route.cwd)
 }
 
 /**

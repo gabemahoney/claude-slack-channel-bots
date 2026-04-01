@@ -102,7 +102,7 @@ After `scheduleRestart` is called:
 1. **Delay check** — if `session_restart_delay` is 0, restart is skipped immediately
 2. **Failure guard** — if the channel has reached `MAX_CONSECUTIVE_FAILURES` (3), restart is abandoned
 3. **Timer** — a `setTimeout` fires after `session_restart_delay` seconds
-4. **Liveness check** — `isSessionAlive()` checks whether Claude is already running in tmux; if alive, restart is skipped
+4. **Liveness check** — `isSessionAlive()` checks whether Claude is already running in tmux; if alive, `reconnectSession()` sends `/mcp reconnect <server-name>` to the running tmux session and returns — no relaunch needed
 5. **Kill zombie** — any dead tmux session for the channel is cleaned up (errors ignored)
 6. **Relaunch** — `launchSession()` is called with the stored `sessionId` from sessions.json if one exists; when present, Claude launches with `--resume <id>`, preserving conversation context across the restart. If no stored ID is available, behavior is unchanged (fresh launch). On failure the per-channel failure counter increments.
 7. **Success reset** — when a session successfully reconnects and registers, `resetFailureCounter()` clears the counter for that channel

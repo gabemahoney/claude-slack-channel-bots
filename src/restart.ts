@@ -13,6 +13,7 @@
 
 export interface RestartDeps {
   isSessionAlive(channelId: string): Promise<boolean>
+  reconnectSession(channelId: string): Promise<void>
   killSession(channelId: string): Promise<void>
   launchSession(channelId: string, cwd: string, sessionId?: string): Promise<boolean>
   getRestartDelay(): number
@@ -96,7 +97,12 @@ export function scheduleRestart(channelId: string, cwd: string, sessionId?: stri
       }
 
       if (alive) {
-        console.error(`[slack] Session already live — skipping restart for channel=${channelId}`)
+        console.error(`[slack] Session alive but disconnected — reconnecting MCP for channel=${channelId}`)
+        try {
+          await deps.reconnectSession(channelId)
+        } catch (err) {
+          console.error(`[slack] restart: reconnectSession failed for channel=${channelId}:`, err)
+        }
         return
       }
 

@@ -23,16 +23,12 @@ import { fileURLToPath } from 'url'
 import {
   readFileSync,
   writeFileSync,
-  appendFileSync,
   mkdirSync,
   chmodSync,
   existsSync,
   renameSync,
 } from 'fs'
 
-function debugLog(msg: string) {
-  try { appendFileSync('/tmp/claude-slack-debug.log', `${new Date().toISOString()} ${msg}\n`) } catch {}
-}
 import {
   defaultAccess,
   pruneExpired,
@@ -343,7 +339,6 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
   server.oninitialized = () => {
     const caps = server.getClientCapabilities()
     const clientInfo = server.getClientVersion?.() ?? (server as any)._clientVersion
-    debugLog(`[debug] oninitialized fired: pendingId="${pendingId}"`)
     console.error(`[slack] Session "${pendingId}" initialized`)
     console.error(`[slack]   Client: ${JSON.stringify(clientInfo)}`)
     console.error(`[slack]   Capabilities: ${JSON.stringify(caps)}`)
@@ -441,7 +436,6 @@ async function handleInitialized(
   // fileURLToPath handles percent-encoded characters and the triple-slash convention.
   const rawCwd = fileURLToPath(roots[0].uri)
   const normalizedCwd = resolve(expandTilde(rawCwd))
-  debugLog(`[debug] handleInitialized: pendingId="${pendingId}" rawUri="${roots[0].uri}" rawCwd="${rawCwd}" normalizedCwd="${normalizedCwd}"`)
 
   if (!routingConfig) {
     console.error(`[slack] No routing config — disconnecting pending session "${pendingId}" (CWD: "${normalizedCwd}")`)
@@ -454,8 +448,6 @@ async function handleInitialized(
   }
 
   // Find the route whose cwd matches (exact after normalization)
-  const routeCwds = Object.entries(routingConfig.routes).map(([ch, r]) => ({ channel: ch, cwd: r.cwd, resolved: resolve(expandTilde(r.cwd)) }))
-  debugLog(`[debug] handleInitialized: comparing normalizedCwd="${normalizedCwd}" against routes: ${JSON.stringify(routeCwds)}`)
   const matchedChannelId = Object.entries(routingConfig.routes).find(
     ([, route]) => resolve(expandTilde(route.cwd)) === normalizedCwd,
   )?.[0]
@@ -554,18 +546,9 @@ async function handleMessage(event: unknown): Promise<void> {
           ? getSessionByChannel(channelId, routingConfig)
           : undefined
 
-        debugLog(`[debug] handleMessage: channelId=${channelId} sessionFound=${!!targetSession} connected=${targetSession?.connected ?? 'N/A'}`)
-
         // If no direct match, check default_route
         if (!targetSession && routingConfig?.default_route && !routingConfig.routes[channelId]) {
-          debugLog(`[debug] handleMessage: falling through to default_route cwd="${routingConfig.default_route}"`)
           targetSession = getSessionByCwd(routingConfig.default_route)
-        }
-
-        // Log full registry state when a channel has a route but no session
-        if (!targetSession && routingConfig?.routes[channelId]) {
-          const allSessions = Array.from(getAllSessions()).map(s => ({ cwd: s.cwd, connected: s.connected }))
-          debugLog(`[debug] handleMessage: channel ${channelId} has route but no registered session — registry: ${JSON.stringify(allSessions)}`)
         }
 
         if (!targetSession || !targetSession.connected) {
@@ -1342,6 +1325,13 @@ export async function main(): Promise<void> {
       const exists = await defaultTmuxClient.hasSession(name)
       if (!exists) return false
       return isClaudeRunning(name, defaultTmuxClient)
+    },
+    reconnectSession: async (channelId) => {
+      const cwd = routingConfig?.routes[channelId]?.cwd
+      if (!cwd) return
+      const name = sessionName(cwd)
+      await defaultTmuxClient.sendKeys(name, `/mcp reconnect ${MCP_SERVER_NAME}`)
+      await defaultTmuxClient.sendKeys(name, 'Enter')
     },
     killSession: async (channelId) => {
       const cwd = routingConfig?.routes[channelId]?.cwd

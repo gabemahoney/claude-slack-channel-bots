@@ -41,19 +41,25 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
   isSessionAliveCalls: string[]
   killSessionCalls: string[]
   launchSessionCalls: Array<{ channelId: string; cwd: string; sessionId: string | undefined }>
+  reconnectSessionCalls: string[]
 } {
   const isSessionAliveCalls: string[] = []
   const killSessionCalls: string[] = []
   const launchSessionCalls: Array<{ channelId: string; cwd: string; sessionId: string | undefined }> = []
+  const reconnectSessionCalls: string[] = []
 
   return {
     isSessionAliveCalls,
     killSessionCalls,
     launchSessionCalls,
+    reconnectSessionCalls,
 
     async isSessionAlive(channelId) {
       isSessionAliveCalls.push(channelId)
       return opts.isSessionAliveResult ?? false
+    },
+    async reconnectSession(channelId) {
+      reconnectSessionCalls.push(channelId)
     },
     async killSession(channelId) {
       killSessionCalls.push(channelId)
@@ -103,7 +109,7 @@ describe('scheduleRestart', () => {
     expect(deps.launchSessionCalls).toHaveLength(0)
   })
 
-  test('3. timer fires, session already alive — launchSession NOT called', async () => {
+  test('3. timer fires, session already alive — reconnectSession called, launchSession NOT called', async () => {
     const deps = makeDeps({ isSessionAliveResult: true })
     initRestart(deps)
 
@@ -111,6 +117,24 @@ describe('scheduleRestart', () => {
     await Bun.sleep(WAIT_MS)
 
     expect(deps.isSessionAliveCalls).toHaveLength(1)
+    expect(deps.reconnectSessionCalls).toHaveLength(1)
+    expect(deps.reconnectSessionCalls[0]).toBe('C_TEST1')
+    expect(deps.launchSessionCalls).toHaveLength(0)
+  })
+
+  test('3b. session alive but reconnectSession throws — does not propagate, launchSession NOT called', async () => {
+    const deps = makeDeps({ isSessionAliveResult: true })
+    let reconnectCalled = false
+    deps.reconnectSession = async () => {
+      reconnectCalled = true
+      throw new Error('sendKeys failed')
+    }
+    initRestart(deps)
+
+    scheduleRestart('C_TEST1', '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    expect(reconnectCalled).toBe(true)
     expect(deps.launchSessionCalls).toHaveLength(0)
   })
 
@@ -360,6 +384,7 @@ describe('isRestartPendingOrActive', () => {
 
     const deps: RestartDeps = {
       isSessionAlive: (_channelId) => alivePromise,  // never resolves until we say so
+      reconnectSession: async () => {},
       killSession: async () => {},
       launchSession: async () => true,
       getRestartDelay: () => FAST_DELAY_S,
