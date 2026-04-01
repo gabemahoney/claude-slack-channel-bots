@@ -83,7 +83,8 @@ Called from `main()` in `server.ts` via `startupSessionManager()` after the HTTP
    - If a `sessionId` is present in sessions.json for this channel, appends `--resume <id>` to the CLI command; otherwise launches fresh
    - Polls `capturePane()` with exponential backoff (500 ms start, 2× per step, 5 s cap, 60 s total timeout) waiting for the safety prompt text
    - On prompt found: sends Enter to acknowledge
-   - Fallback: if the prompt is not found but `isClaudeRunning()` returns true, records success anyway (forward-compatible)
+   - Early detection: after 5 s have elapsed since launch, each poll iteration also calls `isClaudeRunning()`; if Claude is running with no prompt (e.g. `--resume` skips the safety prompt), accepts the session immediately without waiting for the full timeout
+   - Post-loop fallback: if the poll loop times out and `isClaudeRunning()` is still true, records success anyway (forward-compatible)
    - **Resume failure fallback**: if a `--resume` attempt fails (Claude not running after timeout), kills the tmux session, recreates it, and retries once with a fresh launch (no `--resume`) in the same `launchSession()` call
    - After every successful launch: `captureSessionId()` polls `~/.claude/sessions/` for a `.json` file matching the CWD with `startedAt > launchTimestamp`; the captured ID is persisted to sessions.json (capture failure is non-fatal)
    - Otherwise: returns failure and logs a warning

@@ -25,6 +25,12 @@ export interface LaunchOptions {
   pollTimeout?: number
   /** Claude session UUID to resume. When provided, --resume <id> is appended to the CLI command. */
   sessionId?: string
+  /**
+   * How many ms after launch before checking isClaudeRunning inside the poll loop.
+   * Guards against accepting a session too early before Claude has a chance to start.
+   * Default: 5000.
+   */
+  earlyDetectAfterMs?: number
 }
 
 export interface SessionStateResult {
@@ -107,6 +113,7 @@ export async function launchSession(
   const name = sessionName(cwd)
   const pollTimeout = options?.pollTimeout ?? 60_000
   const resumeSessionId = options?.sessionId
+  const earlyDetectAfterMs = options?.earlyDetectAfterMs ?? 5_000
 
   const escapedConfigPath = routingConfig.mcp_config_path.replace(/'/g, "'\\''")
   let baseCmd = `SLACK_CHANNEL_BOT_SESSION=1 claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
@@ -171,6 +178,20 @@ export async function launchSession(
           console.error(`[slack] Session ID capture failed for channel=${channelId} — continuing without it`)
         }
         return { ok: true, capturedId }
+      }
+
+      if (Date.now() - launchTimestamp > earlyDetectAfterMs) {
+        const running = await isClaudeRunning(name, tmuxClient)
+        if (running) {
+          console.error(`[slack] No safety prompt but Claude is running — accepting session early: ${name}`)
+          const capturedId = await captureSessionId(cwd, launchTimestamp)
+          if (capturedId) {
+            console.error(`[slack] Session ID captured for channel=${channelId}: ${capturedId}`)
+          } else {
+            console.error(`[slack] Session ID capture failed for channel=${channelId} — continuing without it`)
+          }
+          return { ok: true, capturedId }
+        }
       }
     }
 

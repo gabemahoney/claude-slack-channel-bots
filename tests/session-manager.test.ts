@@ -484,6 +484,38 @@ describe('launchSession', () => {
     expect(written.sessionId).toBeUndefined()
   })
 
+  test('22. no safety prompt but Claude running inside loop: early detection accepts session before full timeout', async () => {
+    const proc = await spawnClaudeProcess()
+    try {
+      const stub = makeTmuxStub({
+        getPanePidResult: String(proc.pid),
+        capturePaneResult: 'some unrelated output', // no safety prompt
+      })
+      const sessions = makeSessionsStubs()
+      const config = makeRoutingConfig()
+
+      const ok = await launchSession(
+        'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
+        { pollTimeout: 5_000, earlyDetectAfterMs: 0 },
+      )
+
+      expect(ok).toBe(true)
+
+      // Poll loop ran — capturePane was called at least once
+      expect(stub.calls.filter(c => c.method === 'capturePane').length).toBeGreaterThanOrEqual(1)
+
+      // Only two sendKeys: launch command + Enter to run it — no Enter for the safety prompt
+      const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+      expect(sendKeysCalls).toHaveLength(2)
+      expect(sendKeysCalls[1].args[1]).toBe('Enter')
+
+      expect(sessions.writtenSessions).toHaveLength(1)
+      expect(sessions.writtenSessions[0]['C_TEST1']).toBeDefined()
+    } finally {
+      proc.kill()
+    }
+  })
+
   test('launch command includes SLACK_CHANNEL_BOT_SESSION=1 env var', async () => {
     const stub = makeTmuxStub({
       capturePaneResult: 'I am using this for local development',
