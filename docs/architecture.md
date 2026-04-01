@@ -7,7 +7,7 @@ The Slack Channel Router is a two-way bridge between Slack and Claude Code sessi
 ## Module Map
 
 ```
-cli.ts                  CLI entry point for the claude-slack-channel-bots command, dispatches start/stop subcommands, performs prerequisite checks, thin wrapper around server.ts main()
+cli.ts                  CLI entry point for the claude-slack-channel-bots command, dispatches start/stop/clean_restart subcommands, performs prerequisite checks, thin wrapper around server.ts main()
 └── server.ts           Main entry point — HTTP server, Socket Mode, session lifecycle, message routing
     ├── config.ts           Routing configuration — load, validate, defaults, tilde expansion
     ├── registry.ts         Session registry — pending/registered sessions, MCP Server factory, transport routing
@@ -119,6 +119,19 @@ On each tick:
 2. **Dead session** — if the liveness check fails, `scheduleRestart(channelId, cwd)` is called, delegating to the same restart path used by `onsessionclosed`
 
 The interval is controlled by `health_check_interval` in `routing.json`. If the value is `0`, `startHealthCheck()` returns immediately and no interval is created. `stopHealthCheck()` clears the interval during graceful shutdown, before `cancelAllRestartTimers()` runs.
+
+### clean_restart
+
+`clean_restart` (CLI subcommand) gracefully exits all managed Claude Code sessions before performing a stop/start cycle. `CliDeps` is extended with injectable tmux operations (`hasSession`, `sendKeys`, `isClaudeRunning`, `killSession`) and a `readSessions` function.
+
+Algorithm:
+
+1. **Read sessions** — `readSessions()` loads `sessions.json`. If no entries exist, the shutdown phase is skipped.
+2. **Send /exit** — for each session record, checks `hasSession(tmuxSession)` and, if present, sends `/exit` + Enter via `sendKeys`. All sessions are fanned out in parallel via `Promise.all`. Per-session errors are caught and logged; they never abort the restart.
+3. **Poll for exit** — in a second parallel fan-out, polls `isClaudeRunning(tmuxSession)` with exponential backoff (500 ms start, doubles each step, 5 s cap) for up to 60 seconds per session.
+4. **Force-kill on timeout** — if a session does not exit within 60 seconds, `killSession(tmuxSession)` is called. Kill errors are caught and logged.
+5. **Stop** — shells out to `claude-slack-channel-bots stop`.
+6. **Start** — shells out to `claude-slack-channel-bots start`. A non-zero exit code from `start` is propagated and the process exits with that code.
 
 ### Graceful Shutdown
 
