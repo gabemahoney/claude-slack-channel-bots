@@ -109,7 +109,7 @@ export async function launchSession(
   const resumeSessionId = options?.sessionId
 
   const escapedConfigPath = routingConfig.mcp_config_path.replace(/'/g, "'\\''")
-  let baseCmd = `claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
+  let baseCmd = `SLACK_CHANNEL_BOT_SESSION=1 claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
 
   if (routingConfig.append_system_prompt_file !== undefined) {
     try {

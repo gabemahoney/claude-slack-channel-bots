@@ -96,7 +96,7 @@ describe('startupSessionManager', () => {
 
     const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
     const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).startsWith('claude --mcp-config'),
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
     )
     expect(launchCmd).toBeDefined()
 
@@ -124,7 +124,7 @@ describe('startupSessionManager', () => {
     expect(newCalls[0].args[1]).toBe('/tmp/test-cwd')
 
     const launchCmd = stub.calls.filter(c => c.method === 'sendKeys').find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).startsWith('claude --mcp-config'),
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
     )
     expect(launchCmd).toBeDefined()
   })
@@ -255,7 +255,7 @@ describe('startupSessionManager', () => {
 
     const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
     const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).startsWith('claude --mcp-config'),
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
     )
     expect(launchCmd).toBeDefined()
     expect((launchCmd!.args[1] as string).includes('--resume')).toBe(false)
@@ -426,7 +426,7 @@ describe('launchSession', () => {
     // Fallback attempt: command does NOT include --resume
     const freshCmd = sendKeysCalls.find(
       c => typeof c.args[1] === 'string' &&
-        (c.args[1] as string).startsWith('claude --mcp-config') &&
+        (c.args[1] as string).includes('claude --mcp-config') &&
         !(c.args[1] as string).includes('--resume'),
     )
     expect(freshCmd).toBeDefined()
@@ -457,7 +457,7 @@ describe('launchSession', () => {
 
     const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
     const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).startsWith('claude --mcp-config'),
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
     )
     expect(launchCmd).toBeDefined()
     expect((launchCmd!.args[1] as string).includes('--resume')).toBe(false)
@@ -482,6 +482,26 @@ describe('launchSession', () => {
     const written = sessions.writtenSessions[0]['C_TEST1']
     expect(written).toBeDefined()
     expect(written.sessionId).toBeUndefined()
+  })
+
+  test('launch command includes SLACK_CHANNEL_BOT_SESSION=1 env var', async () => {
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const sessions = makeSessionsStubs()
+    const config = makeRoutingConfig()
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
+      { pollTimeout: 600 },
+    )
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).includes('SLACK_CHANNEL_BOT_SESSION=1')).toBe(true)
   })
 })
 
@@ -519,7 +539,7 @@ describe('append_system_prompt_file', () => {
 
     const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
     const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).startsWith('claude --mcp-config'),
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
     )
     expect(launchCmd).toBeDefined()
     expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(true)
@@ -544,7 +564,7 @@ describe('append_system_prompt_file', () => {
 
     const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
     const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).startsWith('claude --mcp-config'),
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
     )
     expect(launchCmd).toBeDefined()
     expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(false)
@@ -567,7 +587,7 @@ describe('append_system_prompt_file', () => {
 
     const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
     const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).startsWith('claude --mcp-config'),
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
     )
     expect(launchCmd).toBeDefined()
     expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(false)

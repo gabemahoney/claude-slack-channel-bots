@@ -79,6 +79,7 @@ Called from `main()` in `server.ts` via `startupSessionManager()` after the HTTP
    - **Fresh** — dead or missing process without a stored session ID → kill any stale tmux session, call `launchSession()` with no session ID
 3. **Launch flow** (`launchSession()`) — accepts an optional `sessionId`:
    - `tmuxClient.newSession(name, cwd)` creates a detached session
+   - The `claude` CLI command is prefixed with `SLACK_CHANNEL_BOT_SESSION=1` so the permission relay hooks activate only inside bot-managed sessions
    - If a `sessionId` is present in sessions.json for this channel, appends `--resume <id>` to the CLI command; otherwise launches fresh
    - Polls `capturePane()` with exponential backoff (500 ms start, 2× per step, 5 s cap, 60 s total timeout) waiting for the safety prompt text
    - On prompt found: sends Enter to acknowledge
@@ -185,6 +186,10 @@ Required at startup:
 
 Both values are read directly from the process environment.
 
+Set by the server at session launch:
+
+- `SLACK_CHANNEL_BOT_SESSION` — set to `1` as a prefix on the tmux `claude` launch command (e.g. `SLACK_CHANNEL_BOT_SESSION=1 claude ...`). The permission relay hooks (`permission-relay.sh`, `ask-relay.sh`) exit immediately when this variable is absent, limiting their scope to bot-managed sessions only.
+
 ### access.json (~/.claude/channels/slack/access.json)
 
 Access control policy: DM policy, allowlist, channel policies, ack reaction. chmod 600.
@@ -195,3 +200,4 @@ Access control policy: DM policy, allowlist, channel policies, ack reaction. chm
 - **Outbound scoping**: Each session can only send to channels it has received messages from (per-session `deliveredChannels` Set)
 - **File exfiltration guard**: `assertSendable()` blocks uploading files from the state directory
 - **Localhost restriction**: `/permission` and `/ask` endpoints only accept requests from 127.0.0.1/::1/::ffff:127.*
+- **Session scope guard**: The permission relay hooks (`permission-relay.sh`, `ask-relay.sh`) are no-ops outside bot-managed sessions. `SLACK_CHANNEL_BOT_SESSION` is only set in tmux sessions launched by the server, so the hooks exit immediately when the variable is absent and do not interfere with Claude sessions run outside the bot.

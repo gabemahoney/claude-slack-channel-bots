@@ -2,6 +2,11 @@
 # AskUserQuestion relay — intercepts via PreToolUse, posts to Slack, returns answer
 set -euo pipefail
 
+# Guard: only relay for bot-managed sessions
+if [ -z "${SLACK_CHANNEL_BOT_SESSION:-}" ]; then
+  exit 0
+fi
+
 # Only handle AskUserQuestion
 INPUT=$(cat)
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // ""' 2>/dev/null) || exit 0
