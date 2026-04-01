@@ -59,6 +59,7 @@ async function captureSessionId(cwd: string, launchTimestamp: number): Promise<s
     await new Promise<void>((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
     try {
       const files = readdirSync(sessionsDir)
+      console.error(`[slack] captureSessionId: poll ${i + 1}/${POLL_ATTEMPTS}, scanning ${files.length} files`)
       for (const file of files) {
         if (!file.endsWith('.json')) continue
         try {
@@ -73,6 +74,7 @@ async function captureSessionId(cwd: string, launchTimestamp: number): Promise<s
             typeof entry.sessionId === 'string' &&
             entry.sessionId.length > 0
           ) {
+            console.error(`[slack] captureSessionId: found match file=${file} sessionId=${entry.sessionId}`)
             return entry.sessionId as string
           }
         } catch {
@@ -80,9 +82,10 @@ async function captureSessionId(cwd: string, launchTimestamp: number): Promise<s
         }
       }
     } catch {
-      // sessionsDir may not exist yet; keep polling
+      console.error(`[slack] captureSessionId: poll ${i + 1}/${POLL_ATTEMPTS}, sessionsDir not readable`)
     }
   }
+  console.error(`[slack] captureSessionId: all ${POLL_ATTEMPTS} attempts exhausted, no match found`)
   return undefined
 }
 
@@ -144,6 +147,7 @@ export async function launchSession(
     }
     const launchTimestamp = Date.now()
     const launchCmd = safeResumeId ? `${baseCmd} --resume ${safeResumeId}` : baseCmd
+    console.error(`[slack] launchSession: launchCmd=${launchCmd}`)
     if (safeResumeId) {
       console.error(`[slack] Attempting resume launch for channel=${channelId} sessionId=${safeResumeId}`)
     } else {
@@ -243,7 +247,7 @@ export async function launchSession(
     ...(result.capturedId !== undefined ? { sessionId: result.capturedId } : {}),
   }
   writeSessionsFn(sessions)
-  console.error(`[slack] Session recorded in sessions.json: channel=${channelId}`)
+  console.error(`[slack] Session recorded in sessions.json: channel=${channelId} capturedId=${result.capturedId ?? 'none'} saved=${JSON.stringify(sessions[channelId])}`)
   return true
 }
 
@@ -280,6 +284,7 @@ export async function startupSessionManager(
 
   // Load stored session IDs for all channels once before the route iteration loop
   const storedSessions = readSessionsFn()
+  console.error(`[slack] startupSessionManager: storedSessions=${JSON.stringify(storedSessions)}`)
 
   for (const [channelId, route] of Object.entries(routingConfig.routes)) {
     const name = sessionName(route.cwd)
@@ -292,6 +297,8 @@ export async function startupSessionManager(
 
         if (running) {
           // Branch 1: Reconnect — session live, send /mcp reconnect <server-name>
+          const reconnectSessionId = storedSessions[channelId]?.sessionId ?? 'none'
+          console.error(`[slack] startupSessionManager: branch=reconnect channel=${channelId} sessionId=${reconnectSessionId}`)
           console.error(`[slack] Session live — reconnecting MCP server "${MCP_SERVER_NAME}": channel=${channelId} session=${name}`)
           await tmuxClient.sendKeys(name, `/mcp reconnect ${MCP_SERVER_NAME}`)
           await tmuxClient.sendKeys(name, 'Enter')
@@ -311,6 +318,7 @@ export async function startupSessionManager(
 
       if (storedSessionId) {
         // Branch 2: Resume — launch with stored session ID
+        console.error(`[slack] startupSessionManager: branch=resume channel=${channelId} sessionId=${storedSessionId}`)
         console.error(`[slack] Dead/missing process with stored session ID — resuming: channel=${channelId} session=${name} sessionId=${storedSessionId}`)
         const ok = await launchSession(
           channelId, route.cwd, routingConfig, tmuxClient,
@@ -319,6 +327,7 @@ export async function startupSessionManager(
         results.push({ channelId, action: ok ? 'resumed' : 'failed', sessionName: name })
       } else {
         // Branch 3: Fresh — launch without session ID
+        console.error(`[slack] startupSessionManager: branch=fresh channel=${channelId} sessionId=none`)
         console.error(`[slack] No stored session ID — launching fresh: channel=${channelId} session=${name}`)
         const ok = await launchSession(
           channelId, route.cwd, routingConfig, tmuxClient,
