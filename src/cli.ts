@@ -14,6 +14,8 @@ import { join, resolve } from 'path'
 import { existsSync, readFileSync, unlinkSync } from 'fs'
 import { spawnSync } from 'child_process'
 import { isProcessRunning } from './pid.ts'
+import { defaultTmuxClient, isClaudeRunning as tmuxIsClaudeRunning } from './tmux.ts'
+import { readSessions, type SessionsMap } from './sessions.ts'
 
 // ---------------------------------------------------------------------------
 // Injectable dependency interface
@@ -40,6 +42,16 @@ export interface CliDeps {
   startServer: () => Promise<void>
   /** Exit the process. */
   exit: (code: number) => never
+  /** Returns true if a tmux session with the given name exists. */
+  hasSession: (name: string) => Promise<boolean>
+  /** Sends keystrokes to the given tmux session. */
+  sendKeys: (session: string, keys: string) => Promise<void>
+  /** Returns true if a 'claude' process is running in the given tmux session. */
+  isClaudeRunning: (session: string) => Promise<boolean>
+  /** Kills the named tmux session. */
+  killSession: (session: string) => Promise<void>
+  /** Read the sessions registry. */
+  readSessions: () => SessionsMap
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +70,7 @@ function defaultStateDir(): string {
 export interface CliHandlers {
   start: () => Promise<void>
   stop: () => Promise<void>
+  clean_restart: () => Promise<void>
 }
 
 /**
@@ -154,7 +167,77 @@ export function createCli(deps: CliDeps): CliHandlers {
     deps.exit(0)
   }
 
-  return { start, stop }
+  async function clean_restart(): Promise<void> {
+    const sessions = deps.readSessions()
+    const entries = Object.entries(sessions)
+
+    if (entries.length > 0) {
+      console.error(`[slack] clean_restart: sending /exit to ${entries.length} session(s)`)
+
+      // Fan out: send /exit + Enter to all sessions in parallel (best-effort)
+      await Promise.all(entries.map(async ([channelId, record]) => {
+        try {
+          const exists = await deps.hasSession(record.tmuxSession)
+          if (!exists) {
+            console.error(`[slack] clean_restart: session not found for channel=${channelId}, skipping`)
+            return
+          }
+          await deps.sendKeys(record.tmuxSession, '/exit')
+          await deps.sendKeys(record.tmuxSession, 'Enter')
+          console.error(`[slack] clean_restart: sent /exit to channel=${channelId} session=${record.tmuxSession}`)
+        } catch (err) {
+          console.error(`[slack] clean_restart: error sending /exit to channel=${channelId}:`, err)
+        }
+      }))
+
+      // Poll each session until Claude exits or 60s timeout (best-effort)
+      await Promise.all(entries.map(async ([channelId, record]) => {
+        try {
+          const exists = await deps.hasSession(record.tmuxSession)
+          if (!exists) return
+
+          const timeout = 60_000
+          const start = Date.now()
+          let delay = 500
+          const maxDelay = 5_000
+
+          while (Date.now() - start < timeout) {
+            const running = await deps.isClaudeRunning(record.tmuxSession)
+            if (!running) {
+              console.error(`[slack] clean_restart: channel=${channelId} exited cleanly`)
+              return
+            }
+            await new Promise<void>((r) => setTimeout(r, delay))
+            delay = Math.min(delay * 2, maxDelay)
+          }
+
+          // Timed out — force kill
+          console.error(`[slack] clean_restart: timeout waiting for channel=${channelId}, force-killing`)
+          try {
+            await deps.killSession(record.tmuxSession)
+          } catch (err) {
+            console.error(`[slack] clean_restart: killSession failed for channel=${channelId}:`, err)
+          }
+        } catch (err) {
+          console.error(`[slack] clean_restart: error polling channel=${channelId}:`, err)
+        }
+      }))
+    }
+
+    // Stop the server
+    console.error('[slack] clean_restart: stopping server')
+    deps.spawnSync(process.execPath, [process.argv[1], 'stop'])
+
+    // Start the server
+    console.error('[slack] clean_restart: starting server')
+    const startResult = deps.spawnSync(process.execPath, [process.argv[1], 'start'])
+    if (startResult.status !== 0) {
+      console.error(`[slack] clean_restart: start failed with exit code ${startResult.status}`)
+      deps.exit(startResult.status ?? 1)
+    }
+  }
+
+  return { start, stop, clean_restart }
 }
 
 // ---------------------------------------------------------------------------
@@ -164,11 +247,12 @@ export function createCli(deps: CliDeps): CliHandlers {
 if (import.meta.main) {
   const subcommand = process.argv[2]
 
-  if (subcommand !== 'start' && subcommand !== 'stop') {
-    console.error('Usage: cli.ts <start|stop>')
+  if (subcommand !== 'start' && subcommand !== 'stop' && subcommand !== 'clean_restart') {
+    console.error('Usage: cli.ts <start|stop|clean_restart>')
     console.error('')
-    console.error('  start  Validate prerequisites and start the server in the background')
-    console.error('  stop   Send SIGTERM to a running server')
+    console.error('  start          Validate prerequisites and start the server in the background')
+    console.error('  stop           Send SIGTERM to a running server')
+    console.error('  clean_restart  Exit all managed sessions, then stop and start the server')
     process.exit(1)
   }
 
@@ -183,6 +267,11 @@ if (import.meta.main) {
     resolveStateDir: defaultStateDir,
     startServer: async () => { const { main } = await import('./server.ts'); return main() },
     exit: (code) => process.exit(code),
+    hasSession: (name) => defaultTmuxClient.hasSession(name),
+    sendKeys: (session, keys) => defaultTmuxClient.sendKeys(session, keys),
+    isClaudeRunning: (session) => tmuxIsClaudeRunning(session, defaultTmuxClient),
+    killSession: (session) => defaultTmuxClient.killSession(session),
+    readSessions: () => readSessions(),
   }
 
   const cli = createCli(realDeps)
@@ -192,8 +281,13 @@ if (import.meta.main) {
       console.error('[slack] Fatal:', err)
       process.exit(1)
     })
-  } else {
+  } else if (subcommand === 'stop') {
     cli.stop().catch((err) => {
+      console.error('[slack] Fatal:', err)
+      process.exit(1)
+    })
+  } else {
+    cli.clean_restart().catch((err) => {
       console.error('[slack] Fatal:', err)
       process.exit(1)
     })
