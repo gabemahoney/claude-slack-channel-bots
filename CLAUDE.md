@@ -1,4 +1,4 @@
-This is the claude-slack-channel-bots repo. When working here, respond directly in the terminal — do not route communication through Slack.
+This is the claude-slack-channel-bots repo.
 
 ## Documentation Locations
 
