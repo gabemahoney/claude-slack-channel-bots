@@ -16,9 +16,6 @@ import { makeSessionsStubs } from './test-helpers/sessions-stub.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 import { MCP_SERVER_NAME } from '../src/config.ts'
 
-// Short capture params so tests don't block on captureSessionId polling
-const FAST_CAPTURE = { captureIntervalMs: 10, captureAttempts: 1 } as const
-
 // ---------------------------------------------------------------------------
 // Helper: spawn a real process named "claude" so isClaudeRunning returns true
 // ---------------------------------------------------------------------------
@@ -56,7 +53,7 @@ describe('startupSessionManager', () => {
     const sessions = makeSessionsStubs()
     const config = makeRoutingConfig()
 
-    const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0, ...FAST_CAPTURE })
+    const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0})
 
     expect(results).toHaveLength(1)
     expect(results[0].channelId).toBe('C_TEST1')
@@ -84,7 +81,7 @@ describe('startupSessionManager', () => {
     const sessions = makeSessionsStubs()
     const config = makeRoutingConfig()
 
-    await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0, ...FAST_CAPTURE })
+    await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0})
 
     const name = sessionName('/tmp/test-cwd')
 
@@ -117,7 +114,7 @@ describe('startupSessionManager', () => {
     const sessions = makeSessionsStubs()
     const config = makeRoutingConfig()
 
-    await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0, ...FAST_CAPTURE })
+    await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0})
 
     expect(stub.calls.filter(c => c.method === 'killSession')).toHaveLength(0)
 
@@ -154,7 +151,7 @@ describe('startupSessionManager', () => {
     const sessions = makeSessionsStubs() // empty — simulates missing file
     const config = makeRoutingConfig()
 
-    await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0, ...FAST_CAPTURE })
+    await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0})
 
     // newSession called for the route even though sessions.json had no entries
     expect(stub.calls.filter(c => c.method === 'newSession')).toHaveLength(1)
@@ -171,7 +168,7 @@ describe('startupSessionManager', () => {
       const sessions = makeSessionsStubs()
       const config = makeRoutingConfig()
 
-      const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0, ...FAST_CAPTURE })
+      const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0})
 
       expect(results).toHaveLength(1)
       expect(results[0].action).toBe('reconnected')
@@ -206,7 +203,7 @@ describe('startupSessionManager', () => {
       const sessions = makeSessionsStubs()
       const config = makeRoutingConfig()
 
-      const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0, ...FAST_CAPTURE })
+      const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0})
 
       expect(results).toHaveLength(1)
       expect(results[0].action).toBe('failed')
@@ -230,7 +227,7 @@ describe('startupSessionManager', () => {
     })
     const config = makeRoutingConfig()
 
-    const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 600, ...FAST_CAPTURE })
+    const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 600})
 
     expect(results).toHaveLength(1)
     expect(results[0].action).toBe('resumed')
@@ -250,7 +247,7 @@ describe('startupSessionManager', () => {
     const sessions = makeSessionsStubs() // no stored session ID
     const config = makeRoutingConfig()
 
-    const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0, ...FAST_CAPTURE })
+    const results = await startupSessionManager(config, stub, sessions.read, sessions.write, { pollTimeout: 0})
 
     expect(results).toHaveLength(1)
     // With pollTimeout: 0 and Claude not running, the launch will fail
@@ -280,7 +277,7 @@ describe('launchSession', () => {
 
     const ok = await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
-      { pollTimeout: 600, ...FAST_CAPTURE },
+      { pollTimeout: 600},
     )
 
     expect(ok).toBe(true)
@@ -311,7 +308,7 @@ describe('launchSession', () => {
 
       const ok = await launchSession(
         'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
-        { pollTimeout: 0, ...FAST_CAPTURE },
+        { pollTimeout: 0},
       )
 
       expect(ok).toBe(true)
@@ -336,7 +333,7 @@ describe('launchSession', () => {
 
     const ok = await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
-      { pollTimeout: 0, ...FAST_CAPTURE },
+      { pollTimeout: 0},
     )
 
     expect(ok).toBe(false)
@@ -358,7 +355,7 @@ describe('launchSession', () => {
 
     const ok = await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
-      { pollTimeout: 600, ...FAST_CAPTURE },
+      { pollTimeout: 600},
     )
 
     expect(ok).toBe(true)
@@ -387,7 +384,7 @@ describe('launchSession', () => {
 
     const ok = await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
-      { pollTimeout: 600, sessionId: resumeId, ...FAST_CAPTURE },
+      { pollTimeout: 600, sessionId: resumeId},
     )
 
     expect(ok).toBe(true)
@@ -415,7 +412,7 @@ describe('launchSession', () => {
     // Both attempts fail (no prompt, Claude not running), but fallback path is exercised
     await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
-      { pollTimeout: 0, sessionId: resumeId, ...FAST_CAPTURE },
+      { pollTimeout: 0, sessionId: resumeId},
     )
 
     const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
@@ -453,7 +450,7 @@ describe('launchSession', () => {
     // No sessionId in options
     const ok = await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
-      { pollTimeout: 600, ...FAST_CAPTURE },
+      { pollTimeout: 600},
     )
 
     expect(ok).toBe(true)
@@ -466,9 +463,9 @@ describe('launchSession', () => {
     expect((launchCmd!.args[1] as string).includes('--resume')).toBe(false)
   })
 
-  test('13. session ID absent in written record when capture returns undefined', async () => {
-    // captureSessionId polls ~/.claude/sessions/ which does not exist in the test environment,
-    // so capturedId is always undefined. Verify the written record omits sessionId in that case.
+  test('13. session ID absent in written record for fresh launch (no resumeSessionId)', async () => {
+    // Fresh launch (no sessionId option) — the initial sessions.json write has no sessionId.
+    // Background verification would discover it async, but in tests there's no ~/.claude/sessions/.
     const stub = makeTmuxStub({
       capturePaneResult: 'I am using this for local development',
     })
@@ -477,7 +474,7 @@ describe('launchSession', () => {
 
     const ok = await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
-      { pollTimeout: 600, ...FAST_CAPTURE },
+      { pollTimeout: 600},
     )
 
     expect(ok).toBe(true)
@@ -499,7 +496,7 @@ describe('launchSession', () => {
 
       const ok = await launchSession(
         'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
-        { pollTimeout: 5_000, earlyDetectAfterMs: 0, ...FAST_CAPTURE },
+        { pollTimeout: 5_000, earlyDetectAfterMs: 0},
       )
 
       expect(ok).toBe(true)
@@ -528,7 +525,7 @@ describe('launchSession', () => {
 
     await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
-      { pollTimeout: 600, ...FAST_CAPTURE },
+      { pollTimeout: 600},
     )
 
     const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
@@ -567,7 +564,7 @@ describe('append_system_prompt_file', () => {
 
     const ok = await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
-      { pollTimeout: 600, ...FAST_CAPTURE },
+      { pollTimeout: 600},
     )
 
     expect(ok).toBe(true)
@@ -592,7 +589,7 @@ describe('append_system_prompt_file', () => {
 
     const ok = await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
-      { pollTimeout: 600, ...FAST_CAPTURE },
+      { pollTimeout: 600},
     )
 
     expect(ok).toBe(true)
@@ -615,7 +612,7 @@ describe('append_system_prompt_file', () => {
 
     const ok = await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
-      { pollTimeout: 600, ...FAST_CAPTURE },
+      { pollTimeout: 600},
     )
 
     expect(ok).toBe(true)
@@ -647,7 +644,7 @@ describe('append_system_prompt_file', () => {
 
     const ok = await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
-      { pollTimeout: 600, ...FAST_CAPTURE },
+      { pollTimeout: 600},
     )
 
     expect(ok).toBe(true)
@@ -684,7 +681,7 @@ describe('append_system_prompt_file', () => {
 
     const ok = await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub, sessions.read, sessions.write,
-      { pollTimeout: 600, sessionId: resumeId, ...FAST_CAPTURE },
+      { pollTimeout: 600, sessionId: resumeId},
     )
 
     expect(ok).toBe(true)

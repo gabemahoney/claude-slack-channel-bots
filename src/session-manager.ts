@@ -31,72 +31,12 @@ export interface LaunchOptions {
    * Default: 5000.
    */
   earlyDetectAfterMs?: number
-  /** Interval in ms between captureSessionId poll attempts. Default: 1000. */
-  captureIntervalMs?: number
-  /** Number of captureSessionId poll attempts. Default: 8. */
-  captureAttempts?: number
 }
 
 export interface SessionStateResult {
   channelId: string
   action: 'reconnected' | 'launched' | 'resumed' | 'failed'
   sessionName: string
-}
-
-// ---------------------------------------------------------------------------
-// Session ID capture helper
-// ---------------------------------------------------------------------------
-
-/**
- * Polls ~/.claude/sessions/ for a new session file matching the given CWD
- * with a startedAt timestamp after `launchTimestamp`. Returns the sessionId
- * string if found, or undefined if capture fails or times out.
- *
- * Polls up to ~8 seconds by default (8 × 1000ms intervals).
- * Poll interval and attempt count can be overridden for testing.
- */
-async function captureSessionId(
-  cwd: string,
-  launchTimestamp: number,
-  pollIntervalMs = 1_000,
-  pollAttempts = 8,
-): Promise<string | undefined> {
-  const sessionsDir = join(homedir(), '.claude', 'sessions')
-  const POLL_INTERVAL_MS = pollIntervalMs
-  const POLL_ATTEMPTS = pollAttempts
-
-  for (let i = 0; i < POLL_ATTEMPTS; i++) {
-    await new Promise<void>((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
-    try {
-      const files = readdirSync(sessionsDir)
-      console.error(`[slack] captureSessionId: poll ${i + 1}/${POLL_ATTEMPTS}, scanning ${files.length} files`)
-      for (const file of files) {
-        if (!file.endsWith('.json')) continue
-        try {
-          const raw = readFileSync(join(sessionsDir, file), 'utf-8')
-          const entry = JSON.parse(raw)
-          if (
-            typeof entry === 'object' &&
-            entry !== null &&
-            entry.cwd === cwd &&
-            typeof entry.startedAt === 'number' &&
-            entry.startedAt > launchTimestamp &&
-            typeof entry.sessionId === 'string' &&
-            entry.sessionId.length > 0
-          ) {
-            console.error(`[slack] captureSessionId: found match file=${file} sessionId=${entry.sessionId}`)
-            return entry.sessionId as string
-          }
-        } catch {
-          // skip unreadable or malformed files
-        }
-      }
-    } catch {
-      console.error(`[slack] captureSessionId: poll ${i + 1}/${POLL_ATTEMPTS}, sessionsDir not readable`)
-    }
-  }
-  console.error(`[slack] captureSessionId: all ${POLL_ATTEMPTS} attempts exhausted, no match found`)
-  return undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -127,8 +67,6 @@ export async function launchSession(
   const pollTimeout = options?.pollTimeout ?? 60_000
   const resumeSessionId = options?.sessionId
   const earlyDetectAfterMs = options?.earlyDetectAfterMs ?? 5_000
-  const captureIntervalMs = options?.captureIntervalMs
-  const captureAttempts = options?.captureAttempts
 
   const escapedConfigPath = routingConfig.mcp_config_path.replace(/'/g, "'\\''")
   let baseCmd = `SLACK_CHANNEL_BOT_SESSION=1 claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
@@ -148,16 +86,16 @@ export async function launchSession(
   const PROMPT_TEXT = 'I am using this for local development'
 
   // Inner helper: sends the launch command and polls for the safety prompt.
-  // Returns { ok: true, capturedId } on success (capturedId may be undefined if capture failed),
-  // or { ok: false } when Claude is not running after the poll timeout.
+  // Returns { ok: true } on success, or { ok: false } when Claude is not
+  // running after the poll timeout. Session ID discovery is handled
+  // asynchronously by verifySessionIdInBackground after launch succeeds.
   async function attemptLaunch(
     withResumeId: string | undefined,
-  ): Promise<{ ok: true; capturedId: string | undefined } | { ok: false }> {
+  ): Promise<{ ok: true } | { ok: false }> {
     const safeResumeId = withResumeId && /^[a-zA-Z0-9_-]+$/.test(withResumeId) ? withResumeId : undefined
     if (withResumeId && !safeResumeId) {
       console.error(`[slack] Invalid session ID format — ignoring resume for channel=${channelId}`)
     }
-    const launchTimestamp = Date.now()
     const launchCmd = safeResumeId ? `${baseCmd} --resume ${safeResumeId}` : baseCmd
     console.error(`[slack] launchSession: launchCmd=${launchCmd}`)
     if (safeResumeId) {
@@ -169,8 +107,9 @@ export async function launchSession(
     await tmuxClient.sendKeys(name, 'Enter')
     console.error(`[slack] Claude launch command sent to session: ${name}`)
 
+    const launchStart = Date.now()
     let delay = POLL_START_MS
-    const deadline = launchTimestamp + pollTimeout
+    const deadline = launchStart + pollTimeout
 
     while (Date.now() < deadline) {
       await new Promise<void>((resolve) => setTimeout(resolve, delay))
@@ -187,26 +126,14 @@ export async function launchSession(
       if (pane.includes(PROMPT_TEXT)) {
         await tmuxClient.sendKeys(name, 'Enter')
         console.error(`[slack] Safety prompt acknowledged in session: ${name}`)
-        const capturedId = await captureSessionId(cwd, launchTimestamp, captureIntervalMs, captureAttempts)
-        if (capturedId) {
-          console.error(`[slack] Session ID captured for channel=${channelId}: ${capturedId}`)
-        } else {
-          console.error(`[slack] Session ID capture failed for channel=${channelId} — continuing without it`)
-        }
-        return { ok: true, capturedId }
+        return { ok: true }
       }
 
-      if (Date.now() - launchTimestamp > earlyDetectAfterMs) {
+      if (Date.now() - launchStart > earlyDetectAfterMs) {
         const running = await isClaudeRunning(name, tmuxClient)
         if (running) {
           console.error(`[slack] No safety prompt but Claude is running — accepting session early: ${name}`)
-          const capturedId = await captureSessionId(cwd, launchTimestamp, captureIntervalMs, captureAttempts)
-          if (capturedId) {
-            console.error(`[slack] Session ID captured for channel=${channelId}: ${capturedId}`)
-          } else {
-            console.error(`[slack] Session ID capture failed for channel=${channelId} — continuing without it`)
-          }
-          return { ok: true, capturedId }
+          return { ok: true }
         }
       }
     }
@@ -215,13 +142,7 @@ export async function launchSession(
     const running = await isClaudeRunning(name, tmuxClient)
     if (running) {
       console.error(`[slack] Safety prompt not found but Claude is running — accepting session: ${name}`)
-      const capturedId = await captureSessionId(cwd, launchTimestamp, captureIntervalMs, captureAttempts)
-      if (capturedId) {
-        console.error(`[slack] Session ID captured for channel=${channelId}: ${capturedId}`)
-      } else {
-        console.error(`[slack] Session ID capture failed for channel=${channelId} — continuing without it`)
-      }
-      return { ok: true, capturedId }
+      return { ok: true }
     }
 
     return { ok: false }
@@ -252,26 +173,25 @@ export async function launchSession(
     return false
   }
 
-  const effectiveSessionId = result.capturedId ?? resumeSessionId
+  // Record session immediately — preserve resumeSessionId if available.
+  // Background verification will discover/confirm the actual sessionId async.
   const launchTimestamp = Date.now()
   const sessions = readSessionsFn()
   sessions[channelId] = {
     tmuxSession: name,
     lastLaunch: new Date().toISOString(),
-    ...(effectiveSessionId !== undefined ? { sessionId: effectiveSessionId } : {}),
+    ...(resumeSessionId !== undefined ? { sessionId: resumeSessionId } : {}),
   }
   writeSessionsFn(sessions)
-  console.error(`[slack] Session recorded in sessions.json: channel=${channelId} capturedId=${result.capturedId ?? 'none'} effectiveSessionId=${effectiveSessionId ?? 'none'} saved=${JSON.stringify(sessions[channelId])}`)
+  console.error(`[slack] Session recorded in sessions.json: channel=${channelId} sessionId=${resumeSessionId ?? 'none'} saved=${JSON.stringify(sessions[channelId])}`)
 
-  // Fire background verification if we have a sessionId to verify
-  if (effectiveSessionId !== undefined) {
-    verifySessionIdInBackground(
-      channelId, cwd, launchTimestamp, effectiveSessionId,
-      readSessionsFn, writeSessionsFn,
-    ).catch((err) => {
-      console.error(`[slack] verifySessionIdInBackground: unexpected error for channel=${channelId}:`, err)
-    })
-  }
+  // Fire background verification to discover (fresh) or confirm/update (resume) the sessionId
+  verifySessionIdInBackground(
+    channelId, cwd, launchTimestamp, resumeSessionId,
+    readSessionsFn, writeSessionsFn,
+  ).catch((err) => {
+    console.error(`[slack] verifySessionIdInBackground: unexpected error for channel=${channelId}:`, err)
+  })
 
   return true
 }
@@ -282,12 +202,15 @@ export async function launchSession(
 
 /**
  * After a successful launch, polls ~/.claude/sessions/ for up to 2 minutes
- * (exponential backoff: 2s initial, 15s cap) to verify the stored sessionId.
+ * (exponential backoff: 2s initial, 15s cap) to discover or verify the sessionId.
  *
- * - If it finds a session file matching cwd with startedAt > launchTimestamp
- *   whose sessionId matches expectedSessionId: logs confirmation.
- * - If it finds a DIFFERENT sessionId: updates sessions.json and logs a warning.
- * - If it times out: logs that verification failed but the stored ID is preserved.
+ * This is the sole mechanism for session ID discovery/confirmation.
+ *
+ * - Fresh launch (expectedSessionId undefined): discovers the new sessionId and
+ *   saves it to sessions.json.
+ * - Resume launch (expectedSessionId provided): confirms or updates the sessionId
+ *   if a different one is found.
+ * - If it times out: logs that discovery/verification failed but any stored ID is preserved.
  *
  * This runs asynchronously and never throws (caller should add .catch() anyway).
  */
@@ -295,7 +218,7 @@ export async function verifySessionIdInBackground(
   channelId: string,
   cwd: string,
   launchTimestamp: number,
-  expectedSessionId: string,
+  expectedSessionId: string | undefined,
   readSessionsFn: (path?: string) => SessionsMap,
   writeSessionsFn: (sessions: SessionsMap, path?: string) => void,
 ): Promise<void> {
@@ -329,18 +252,31 @@ export async function verifySessionIdInBackground(
             typeof entry.sessionId === 'string' &&
             entry.sessionId.length > 0
           ) {
-            if (entry.sessionId === expectedSessionId) {
+            const foundId = entry.sessionId as string
+
+            if (expectedSessionId === undefined) {
+              // Fresh launch — discovered sessionId for the first time
+              console.error(`[slack] verifySessionIdInBackground: discovered sessionId=${foundId} for channel=${channelId} (attempt ${attempt})`)
+              const sessions = readSessionsFn()
+              const existing = sessions[channelId]
+              if (existing) {
+                existing.sessionId = foundId
+                writeSessionsFn(sessions)
+                console.error(`[slack] verifySessionIdInBackground: sessions.json updated for channel=${channelId} with sessionId=${foundId}`)
+              }
+              return
+            } else if (foundId === expectedSessionId) {
               console.error(`[slack] verifySessionIdInBackground: confirmed sessionId=${expectedSessionId} for channel=${channelId} (attempt ${attempt})`)
               return
             } else {
               // Different sessionId found — update sessions.json
-              console.error(`[slack] verifySessionIdInBackground: WARNING sessionId mismatch for channel=${channelId} — expected=${expectedSessionId} found=${entry.sessionId}, updating sessions.json`)
+              console.error(`[slack] verifySessionIdInBackground: WARNING sessionId mismatch for channel=${channelId} — expected=${expectedSessionId} found=${foundId}, updating sessions.json`)
               const sessions = readSessionsFn()
               const existing = sessions[channelId]
               if (existing) {
-                existing.sessionId = entry.sessionId as string
+                existing.sessionId = foundId
                 writeSessionsFn(sessions)
-                console.error(`[slack] verifySessionIdInBackground: sessions.json updated for channel=${channelId} with sessionId=${entry.sessionId}`)
+                console.error(`[slack] verifySessionIdInBackground: sessions.json updated for channel=${channelId} with sessionId=${foundId}`)
               }
               return
             }
@@ -354,7 +290,7 @@ export async function verifySessionIdInBackground(
     }
   }
 
-  console.error(`[slack] verifySessionIdInBackground: timed out after ${TIMEOUT_MS / 1000}s for channel=${channelId} — stored sessionId=${expectedSessionId} preserved`)
+  console.error(`[slack] verifySessionIdInBackground: timed out after ${TIMEOUT_MS / 1000}s for channel=${channelId} — stored sessionId=${expectedSessionId ?? 'none'} preserved`)
 }
 
 // ---------------------------------------------------------------------------
