@@ -11,7 +11,7 @@
 
 import { homedir } from 'os'
 import { join, resolve } from 'path'
-import { existsSync, readFileSync, unlinkSync } from 'fs'
+import { existsSync, readFileSync, unlinkSync, openSync } from 'fs'
 import { spawnSync } from 'child_process'
 import { isProcessRunning } from './pid.ts'
 import { defaultTmuxClient, isClaudeRunning as tmuxIsClaudeRunning } from './tmux.ts'
@@ -109,9 +109,11 @@ export function createCli(deps: CliDeps): CliHandlers {
     if (!process.env['_CLI_DAEMON_CHILD']) {
       // Parent: spawn a detached background child and exit
       const { spawn } = await import('child_process')
+      const logPath = join(stateDir, 'server.log')
+      const logFd = openSync(logPath, 'a')
       const child = spawn(process.execPath, [import.meta.filename, 'start'], {
         detached: true,
-        stdio: 'ignore',
+        stdio: ['ignore', logFd, logFd],
         env: { ...process.env, _CLI_DAEMON_CHILD: '1' },
       })
       child.unref()

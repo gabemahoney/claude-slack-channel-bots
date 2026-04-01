@@ -98,7 +98,7 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `routes` | object | required | Map of Slack channel ID → route entry. Each entry requires a `cwd` field: the working directory for that session. Used to identify sessions via `roots/list` after MCP handshake. `~` is expanded. Each `cwd` must be unique across all routes. |
-| `default_route` | string | — | CWD path to use when a message arrives on a channel with no explicit entry in `routes`. Must match an existing route `cwd`. |
+| `default_route` | string | — | CWD path to use when a message arrives on a channel with no explicit entry in `routes`. Must match an existing route `cwd`. Channels that are in `routes` but whose session is not yet registered have their messages dropped — they do not fall back to `default_route`. |
 | `default_dm_session` | string | — | CWD path of the session that handles direct messages. Must match an existing route `cwd`. |
 | `bind` | string | `"127.0.0.1"` | Interface the HTTP server binds to. Use `"0.0.0.0"` to expose on all interfaces. |
 | `port` | number | `3100` | Port the HTTP server listens on. |
