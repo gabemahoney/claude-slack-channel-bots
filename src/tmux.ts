@@ -21,7 +21,7 @@ export interface TmuxClient {
   /** Creates a new detached tmux session with the given name and working directory. */
   newSession(name: string, cwd: string): Promise<void>
   /** Sends keystrokes to the given session. */
-  sendKeys(session: string, keys: string): Promise<void>
+  sendKeys(session: string, ...keys: string[]): Promise<void>
   /** Returns the current text content of the session's pane. */
   capturePane(session: string): Promise<string>
   /** Kills the named tmux session. */
@@ -90,7 +90,7 @@ export const defaultTmuxClient: TmuxClient = {
     }
   },
 
-  async sendKeys(session: string, keys: string): Promise<void> {
+  async sendKeys(session: string, ...keys: string[]): Promise<void> {
     try {
       await $`tmux send-keys -t ${session} ${keys}`
     } catch (err) {
@@ -127,15 +127,27 @@ export const defaultTmuxClient: TmuxClient = {
  * rooted at the given tmux session's pane PID.
  */
 export async function isClaudeRunning(session: string, client: TmuxClient): Promise<boolean> {
+  return (await getClaudePid(session, client)) !== null
+}
+
+// ---------------------------------------------------------------------------
+// getClaudePid
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the PID of the 'claude' process found in the process tree
+ * rooted at the given tmux session's pane PID, or null if not found.
+ */
+export async function getClaudePid(session: string, client: TmuxClient): Promise<number | null> {
   let panePid: string
   try {
     panePid = await client.getPanePid(session)
   } catch {
-    return false
+    return null
   }
 
   const rootPid = parseInt(panePid, 10)
-  if (isNaN(rootPid) || rootPid <= 0) return false
+  if (isNaN(rootPid) || rootPid <= 0) return null
 
   try {
     // Build a map of pid → {ppid, comm} from the full process table.
@@ -166,14 +178,14 @@ export async function isClaudeRunning(session: string, client: TmuxClient): Prom
       }
     }
 
-    // Return true if any process in the subtree has 'claude' in its name.
+    // Return the PID of the first process in the subtree with 'claude' in its name.
     for (const pid of subtree) {
       const entry = processes.get(pid)
-      if (entry && entry.comm.toLowerCase().includes('claude')) return true
+      if (entry && entry.comm.toLowerCase().includes('claude')) return pid
     }
-    return false
+    return null
   } catch (err) {
-    console.error('[slack] isClaudeRunning: process tree check failed:', err)
-    return false
+    console.error('[slack] getClaudePid: process tree check failed:', err)
+    return null
   }
 }

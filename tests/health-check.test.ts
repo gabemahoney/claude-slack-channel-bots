@@ -171,4 +171,33 @@ describe('startHealthCheck', () => {
 
     expect(deps.isSessionAliveCalls).toHaveLength(0)
   })
+
+  // T26: Health check starts only after sessions.json is written.
+  // Architectural invariant enforced in server.ts: startHealthCheck() is called
+  // only after startupSessionManager() returns and writeSessions() completes.
+  // The unit-level guarantee is that initHealthCheck() alone does NOT start the
+  // poller — the poller only starts when startHealthCheck() is explicitly called.
+  test('T26: initHealthCheck alone does not start poller — isSessionAlive not called until startHealthCheck is invoked', async () => {
+    const deps = makeDeps({ isSessionAliveResult: false })
+    initHealthCheck(deps)
+
+    // Deliberately do NOT call startHealthCheck — simulate the window between
+    // initHealthCheck (called before startup) and startHealthCheck (called after
+    // writeSessions completes).
+    await Bun.sleep(WAIT_MS)
+
+    expect(deps.isSessionAliveCalls).toHaveLength(0)
+  })
+
+  test('T26: poller starts immediately once startHealthCheck is called after writeSessions phase', async () => {
+    const deps = makeDeps({ isSessionAliveResult: true })
+    initHealthCheck(deps)
+
+    // Simulate the writeSessions phase completing — then start health check
+    startHealthCheck(FAST_INTERVAL_S)
+    await Bun.sleep(WAIT_MS)
+
+    // Poller fired at least once after startHealthCheck was called
+    expect(deps.isSessionAliveCalls.length).toBeGreaterThan(0)
+  })
 })

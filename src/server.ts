@@ -39,7 +39,7 @@ import {
   type GateResult,
 } from './lib.ts'
 import { loadConfig, expandTilde, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
-import { readSessions, writeSessions } from './sessions.ts'
+import { readSessions, writeSessions, rotateSessions } from './sessions.ts'
 import { defaultTmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
 import { startupSessionManager, launchSession } from './session-manager.ts'
 import {
@@ -556,6 +556,15 @@ async function handleMessage(event: unknown): Promise<void> {
           console.error(
             `[slack] No live session for channel ${channelId} — dropping message`,
           )
+          // If the channel has a route but no registered session, notify the sender
+          if (routingConfig?.routes[channelId]) {
+            try {
+              await web.chat.postMessage({
+                channel: channelId,
+                text: 'Message not delivered — session starting up, please retry in a moment.',
+              })
+            } catch { /* non-critical */ }
+          }
           return
         }
 
@@ -805,17 +814,17 @@ async function shutdown(signal: string): Promise<void> {
   stopHealthCheck()
   cancelAllRestartTimers()
 
-  process.stderr.write(`[slack] Received ${signal} — shutting down\n`)
+  console.error(`[slack] Received ${signal} — shutting down`)
 
   if (httpServer) {
-    process.stderr.write('[slack] Stopping HTTP server\n')
+    console.error('[slack] Stopping HTTP server')
     httpServer.stop(true)
     httpServer = null
   }
 
   // Close all pending (not yet routed) MCP transports
   for (const pending of getAllPendingSessions()) {
-    process.stderr.write('[slack] Closing pending MCP transport (not yet routed)\n')
+    console.error('[slack] Closing pending MCP transport (not yet routed)')
     removePendingSession(pending.pendingId)
     try {
       await pending.transport.close()
@@ -825,9 +834,7 @@ async function shutdown(signal: string): Promise<void> {
   // Close all active MCP transports
   for (const entry of getAllSessions()) {
     if (entry.connected) {
-      process.stderr.write(
-        `[slack] Closing MCP transport for CWD "${entry.cwd}"\n`,
-      )
+      console.error(`[slack] Closing MCP transport for CWD "${entry.cwd}"`)
       try {
         await entry.transport.close()
       } catch { /* ignore */ }
@@ -835,14 +842,14 @@ async function shutdown(signal: string): Promise<void> {
     }
   }
 
-  process.stderr.write('[slack] Disconnecting Socket Mode\n')
+  console.error('[slack] Disconnecting Socket Mode')
   try {
     await socket.disconnect()
   } catch { /* ignore */ }
 
   removePidFile(PID_FILE)
 
-  process.stderr.write('[slack] Shutdown complete\n')
+  console.error('[slack] Shutdown complete')
   process.exit(0)
 }
 
@@ -865,6 +872,10 @@ process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
 // ---------------------------------------------------------------------------
 
 export async function main(): Promise<void> {
+  // Rotate sessions.json → sessions.json.last before any other startup work.
+  // This preserves last-known session IDs for resume logic below.
+  rotateSessions()
+
   checkPidConflict(PID_FILE)
 
   let mcpHost: string
@@ -1317,16 +1328,19 @@ export async function main(): Promise<void> {
   console.error(`  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:${MCP_SERVER_NAME}`)
   console.error('')
 
+  // Shared adapter: checks whether a tmux session for the given channel has Claude running.
+  const isSessionAliveAdapter = async (channelId: string): Promise<boolean> => {
+    const cwd = routingConfig?.routes[channelId]?.cwd
+    if (!cwd) return false
+    const name = sessionName(cwd)
+    const exists = await defaultTmuxClient.hasSession(name)
+    if (!exists) return false
+    return isClaudeRunning(name, defaultTmuxClient)
+  }
+
   // Initialize restart module with adapters bridging tmux + session-manager
   initRestart({
-    isSessionAlive: async (channelId) => {
-      const cwd = routingConfig?.routes[channelId]?.cwd
-      if (!cwd) return false
-      const name = sessionName(cwd)
-      const exists = await defaultTmuxClient.hasSession(name)
-      if (!exists) return false
-      return isClaudeRunning(name, defaultTmuxClient)
-    },
+    isSessionAlive: isSessionAliveAdapter,
     reconnectSession: async (channelId) => {
       const cwd = routingConfig?.routes[channelId]?.cwd
       if (!cwd) return
@@ -1341,13 +1355,20 @@ export async function main(): Promise<void> {
       const exists = await defaultTmuxClient.hasSession(name)
       if (exists) await defaultTmuxClient.killSession(name)
     },
-    launchSession: (channelId, cwd, sessionId) => {
-      if (!routingConfig) return Promise.resolve(false)
+    launchSession: async (channelId, cwd, sessionId) => {
+      if (!routingConfig) return false
       const resolvedSessionId = sessionId ?? readSessions()[channelId]?.sessionId
-      return launchSession(
-        channelId, cwd, routingConfig, defaultTmuxClient, readSessions, writeSessions,
+      const record = await launchSession(
+        channelId, cwd, routingConfig, defaultTmuxClient,
         resolvedSessionId !== undefined ? { sessionId: resolvedSessionId } : undefined,
       )
+      if (record) {
+        const sessions = readSessions()
+        sessions[channelId] = record
+        writeSessions(sessions)
+        console.error(`[slack] Session recorded in sessions.json: channel=${channelId} sessionId=${record.sessionId}`)
+      }
+      return record !== null
     },
     getRestartDelay: () => routingConfig?.session_restart_delay ?? 60,
     isShuttingDown: () => shuttingDown,
@@ -1357,22 +1378,17 @@ export async function main(): Promise<void> {
   // If tmux is unavailable or startup fails, log a warning and continue.
   if (routingConfig) {
     try {
-      await startupSessionManager(routingConfig, defaultTmuxClient, readSessions, writeSessions)
+      const lastPath = join(STATE_DIR, 'sessions.json.last')
+      const storedSessions = readSessions(lastPath)
+      const records = await startupSessionManager(routingConfig, defaultTmuxClient, storedSessions)
+      const sessionsMap = Object.fromEntries(records)
+      writeSessions(sessionsMap)
     } catch (err) {
       console.error('[slack] Warning: session startup failed — continuing without managed sessions:', err)
     }
   }
 
   // Initialize and start the health-check poller.
-  const isSessionAliveAdapter = async (channelId: string): Promise<boolean> => {
-    const cwd = routingConfig?.routes[channelId]?.cwd
-    if (!cwd) return false
-    const name = sessionName(cwd)
-    const exists = await defaultTmuxClient.hasSession(name)
-    if (!exists) return false
-    return isClaudeRunning(name, defaultTmuxClient)
-  }
-
   initHealthCheck({
     isSessionAlive: isSessionAliveAdapter,
     isRestartPendingOrActive,
@@ -1388,6 +1404,9 @@ export async function main(): Promise<void> {
   })
 
   if (routingConfig) {
+    // INVARIANT: Health check starts only after startupSessionManager() returns
+    // and sessions.json is written. Promise.allSettled ensures all launches have
+    // settled before this point. Do not move this call earlier in the startup sequence.
     startHealthCheck(routingConfig.health_check_interval)
   }
 }

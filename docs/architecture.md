@@ -12,6 +12,7 @@ cli.ts                  CLI entry point for the claude-slack-channel-bots comman
     ├── config.ts           Routing configuration — load, validate, defaults, tilde expansion
     ├── registry.ts         Session registry — pending/registered sessions, MCP Server factory, transport routing
     ├── lib.ts              Pure utilities — gate, access control, chunking, sanitization
+    ├── logging.ts          Log file setup — overrides console.error/console.log with timestamped writeSync to a log file
     ├── session-manager.ts  Startup orchestration — per-route state detection, kill/relaunch logic
     ├── restart.ts          Auto-restart — delayed relaunch on disconnect, failure counting, timer cancellation
     ├── health-check.ts     Periodic liveness poller — checks routes on a timer, schedules restarts for dead sessions
@@ -32,7 +33,7 @@ cli.ts                  CLI entry point for the claude-slack-channel-bots comman
 1. Slack message arrives via Socket Mode (`message` or `app_mention` event)
 2. `gate()` checks access control (bot messages, subtypes, DM policy, allowlist)
 3. If `ackReaction` is configured, the ack emoji is applied to the message and `trackAck(channelId, messageTs)` records the pending ack for later removal
-4. Message is routed to the correct session via `getSessionByChannel()` or `getSessionByCwd()`. If the channel has an entry in `routes` but its session is not yet registered (e.g. still starting up), the message is **dropped** — `default_route` does not apply. `default_route` is only consulted for channels with no entry in `routes` at all.
+4. Message is routed to the correct session via `getSessionByChannel()` or `getSessionByCwd()`. If the channel has an entry in `routes` but its session is not yet registered (e.g. still starting up), the message is not delivered to Claude — instead, the server posts `"Message not delivered — session starting up, please retry in a moment."` back to the channel. `default_route` does not apply for configured channels; it is only consulted for channels with no entry in `routes` at all.
 5. Session's MCP Server sends `notifications/claude/channel` to the Claude Code client
 
 ### Outbound (Claude Code → Slack)
@@ -70,24 +71,26 @@ Same pattern as permission relay but via `PreToolUse` hook on `AskUserQuestion`:
 
 ### Server-Managed Startup
 
-Called from `main()` in `server.ts` via `startupSessionManager()` after the HTTP server and Socket Mode listeners are ready.
+Called from `main()` in `server.ts`. `rotateSessions()` runs as the very first action, renaming `sessions.json` → `sessions.json.last` to preserve last-known session IDs before any state is overwritten.
 
-1. **tmux availability check** — `tmuxClient.checkAvailability()` runs `tmux -V`. If tmux is not installed, startup is skipped with a warning and the server continues.
-2. **Iterate routes** — for each `channelId`/`cwd` pair in `routingConfig.routes`, apply a three-branch decision tree:
-   - **Reconnect** — tmux session exists AND `isClaudeRunning()` returns true → send `/mcp reconnect <server-name>` (from shared `MCP_SERVER_NAME` constant in `config.ts`) to the running session; no relaunch
-   - **Resume** — dead or missing process with a stored `sessionId` in sessions.json → kill any stale tmux session, call `launchSession()` with the stored session ID (passes `--resume <id>` to Claude)
+1. **Rotate sessions** — `rotateSessions()` renames `sessions.json` → `sessions.json.last`. If `sessions.json` does not exist, this is a no-op.
+2. **Read stored IDs** — `sessions.json.last` is read via `readSessions(lastPath)` to obtain the previous session IDs used for `--resume` logic.
+3. **tmux availability check** — `startupSessionManager()` calls `tmuxClient.checkAvailability()` (`tmux -V`). If tmux is not installed, startup is skipped with a warning and the server continues.
+4. **Concurrent route launch** — all routes are processed concurrently via `Promise.allSettled`. Each route applies a three-branch decision tree:
+   - **Reconnect** — tmux session exists AND `isClaudeRunning()` returns true → send `/mcp reconnect <server-name>` (from `MCP_SERVER_NAME` in `config.ts`) to the running session; discover session ID via PID-based lookup; no relaunch
+   - **Resume** — dead or missing process with a stored `sessionId` in `sessions.json.last` → kill any stale tmux session, call `launchSession()` with the stored session ID (passes `--resume <id>` to Claude)
    - **Fresh** — dead or missing process without a stored session ID → kill any stale tmux session, call `launchSession()` with no session ID
-3. **Launch flow** (`launchSession()`) — accepts an optional `sessionId`:
-   - `tmuxClient.newSession(name, cwd)` creates a detached session
+5. **Atomic sessions.json write** — after all routes settle, results are collected into a `SessionsMap` and written atomically via `writeSessions()`. This is the only write to `sessions.json` during startup.
+6. **Launch flow** (`launchSession()`) — signature: `(channelId, cwd, routingConfig, tmuxClient, options?) → Promise<SessionRecord | null>`:
+   - `tmuxClient.newSession(name, cwd)` creates a detached tmux session
    - The `claude` CLI command is prefixed with `SLACK_CHANNEL_BOT_SESSION=1` so the permission relay hooks activate only inside bot-managed sessions
-   - If a `sessionId` is present in sessions.json for this channel, appends `--resume <id>` to the CLI command; otherwise launches fresh
-   - Polls `capturePane()` with exponential backoff (500 ms start, 2× per step, 5 s cap, 60 s total timeout) waiting for the safety prompt text
+   - If `options.sessionId` is provided, appends `--resume <id>` to the CLI command; otherwise launches fresh
+   - Polls `capturePane()` with exponential backoff (500 ms start, 2× per step, 5 s cap, 120 s total timeout) waiting for the safety prompt text
    - On prompt found: sends Enter to acknowledge
-   - Early detection: after 5 s have elapsed since launch, each poll iteration also calls `isClaudeRunning()`; if Claude is running with no prompt (e.g. `--resume` skips the safety prompt), accepts the session immediately without waiting for the full timeout
-   - Post-loop fallback: if the poll loop times out and `isClaudeRunning()` is still true, records success anyway (forward-compatible)
-   - **Resume failure fallback**: if a `--resume` attempt fails (Claude not running after timeout), kills the tmux session, recreates it, and retries once with a fresh launch (no `--resume`) in the same `launchSession()` call
-   - After every successful launch: `captureSessionId()` polls `~/.claude/sessions/` for a `.json` file matching the CWD with `startedAt > launchTimestamp`; the captured ID is persisted to sessions.json (capture failure is non-fatal)
-   - Otherwise: returns failure and logs a warning
+   - Early detection: after 5 s have elapsed since launch, each poll iteration also calls `isClaudeRunning()` and attempts PID-based session ID discovery; if Claude is running with no prompt (e.g. `--resume` skips the safety prompt), the session is accepted immediately
+   - **PID-based session ID discovery** — `getClaudePid(sessionName, tmuxClient)` walks the process tree from the tmux pane PID to find the `claude` process PID. Once found, `~/.claude/sessions/<pid>.json` is read and `entry.sessionId` is extracted. Polling continues until the file appears and the field is populated.
+   - **Resume failure fallback** — if `"No conversation found"` is detected in the pane, or if the `--resume` attempt times out, the tmux session is killed, recreated, and retried once with a fresh launch (no `--resume`)
+   - Returns a `SessionRecord` on success (with `sessionId` always populated), or `null` on failure
 
 ### Disconnection
 
@@ -122,18 +125,24 @@ On each tick:
 
 The interval is controlled by `health_check_interval` in `routing.json`. If the value is `0`, `startHealthCheck()` returns immediately and no interval is created. `stopHealthCheck()` clears the interval during graceful shutdown, before `cancelAllRestartTimers()` runs.
 
+**Ordering invariant**: `startHealthCheck()` is called only after `startupSessionManager()` returns and `sessions.json` has been written. `Promise.allSettled` in startup ensures all route launches have settled before the health-check poller begins. Moving `startHealthCheck()` earlier in the startup sequence would risk the poller racing with in-progress launches.
+
+### stop command
+
+`stop` (CLI subcommand) sends SIGTERM to the running server via the PID file at `STATE_DIR/server.pid`. If the process does not exit within `stop_timeout` seconds (default 30 s, configurable in `routing.json`), a SIGKILL is sent. A brief 2 s confirmation poll follows the SIGKILL. Stale PID files (process no longer running) are silently removed. A non-zero exit from this phase causes `stop` to exit 1.
+
 ### clean_restart
 
-`clean_restart` (CLI subcommand) gracefully exits all managed Claude Code sessions before performing a stop/start cycle. `CliDeps` is extended with injectable tmux operations (`hasSession`, `sendKeys`, `isClaudeRunning`, `killSession`) and a `readSessions` function.
+`clean_restart` (CLI subcommand) stops the server daemon first, then concurrently exits all managed Claude Code sessions, then starts a fresh server. The stop-first ordering prevents the health-check poller and auto-restart logic from interfering with session teardown. It logs to `STATE_DIR/clean_restart.log` via `initLogging()` (see [Logging](#logging)). `CliDeps` is extended with injectable tmux operations (`hasSession`, `sendKeys`, `isClaudeRunning`, `killSession`) and a `loadConfig` function for route and timeout discovery.
 
 Algorithm:
 
-1. **Read sessions** — `readSessions()` loads `sessions.json`. If no entries exist, the shutdown phase is skipped.
-2. **Send /exit** — for each session record, checks `hasSession(tmuxSession)` and, if present, sends `/exit` + Enter via `sendKeys`. All sessions are fanned out in parallel via `Promise.all`. Per-session errors are caught and logged; they never abort the restart.
-3. **Poll for exit** — in a second parallel fan-out, polls `isClaudeRunning(tmuxSession)` with exponential backoff (500 ms start, doubles each step, 5 s cap) for up to 60 seconds per session.
-4. **Force-kill on timeout** — if a session does not exit within 60 seconds, `killSession(tmuxSession)` is called. Kill errors are caught and logged.
-5. **Stop** — shells out to `claude-slack-channel-bots stop`.
-6. **Start** — shells out to `claude-slack-channel-bots start`. A non-zero exit code from `start` is propagated and the process exits with that code.
+1. **Init logging + load config** — `initLogging()` redirects output to `clean_restart.log`. `loadConfig()` reads `routing.json` and provides the `routes` map and `exit_timeout` value used in subsequent phases. Config load failure is fatal.
+2. **Stop server daemon** — shells out to `claude-slack-channel-bots stop`, which sends SIGTERM and escalates to SIGKILL after `stop_timeout` (see [stop command](#stop-command)).
+3. **Exit sessions** — iterates `routingConfig.routes`. For each route, `sessionName(route.cwd)` derives the tmux session name. `hasSession()` and `isClaudeRunning()` gate the attempt; if either check fails the session is skipped. All routes are fanned out in parallel via `Promise.allSettled`. Per-session errors are caught and logged; they never abort the restart.
+4. **Force-kill on timeout** — within each per-session goroutine, `/exit` + Enter is sent as a single atomic `sendKeys` call. `isClaudeRunning()` is then polled with exponential backoff (500 ms start, doubles each step, 5 s cap) for up to `exit_timeout` seconds (default 120 s). If the session does not exit within the timeout, `killSession()` is called.
+5. **Start new server daemon** — shells out to `claude-slack-channel-bots start`.
+6. **Exit** — a non-zero exit code from `start` is propagated and the process exits with that code.
 
 ### Graceful Shutdown
 
@@ -153,6 +162,8 @@ Key fields:
 - `default_dm_session` — CWD for handling direct messages
 - `session_restart_delay` — seconds before auto-restarting dead sessions (default: 60, 0 = disabled)
 - `health_check_interval` — seconds between health-check polls (default: 120, 0 = disabled)
+- `exit_timeout` — seconds `clean_restart` waits for a Claude session to exit cleanly before force-killing it (default: 120)
+- `stop_timeout` — seconds the `stop` command waits after SIGTERM before escalating to SIGKILL (default: 30)
 - `mcp_config_path` — path to MCP config file for Claude launch (default: ~/.claude/slack-mcp.json)
 - `append_system_prompt_file` — optional path to a file appended to every managed session's system prompt via `--append-system-prompt-file`; missing file silently skipped
 
@@ -166,17 +177,21 @@ Each record has the shape:
 {
   tmuxSession: string   // tmux session name
   lastLaunch:  string   // ISO-8601 timestamp of the most recent launch
-  sessionId?:  string   // Claude session UUID (optional) — captured after each successful launch
+  sessionId:   string   // Claude session UUID — discovered via PID-based file lookup after each successful launch
 }
 ```
 
-`sessionId` is populated by `captureSessionId()` after every successful launch and used on the next launch attempt to pass `--resume <id>` to Claude Code. Capture failure is non-fatal; the field is simply omitted when capture does not succeed.
+`sessionId` is discovered via `getClaudePid` → `~/.claude/sessions/<pid>.json` during every successful launch and is always present in a written record. It is used on the next startup to pass `--resume <id>` to Claude Code, preserving conversation context across restarts.
 
-If the `sessionId` field is absent, the session is treated as having no resumable state and launches fresh.
+`sessions.json` is written once atomically after all routes finish launching at startup. Individual route launches do not write to `sessions.json`.
+
+### sessions.json.last (STATE_DIR/sessions.json.last)
+
+Created by `rotateSessions()` at the start of every server startup run. Contains the `sessions.json` snapshot from the previous run, used by the startup manager to read stored session IDs for `--resume` without risking a partially-written current `sessions.json`. Overwritten on each startup. If no `sessions.json` existed when the server last started, this file is absent (treated as an empty map by `readSessions()`).
 
 ### server.pid (STATE_DIR/server.pid)
 
-Written at startup with the server's process ID. Used by the CLI `stop` command to send `SIGTERM` to a running server and by startup to detect a conflicting already-running instance. Removed on graceful shutdown.
+Written at startup with the server's process ID. Used by the CLI `stop` command to send SIGTERM (with SIGKILL escalation after `stop_timeout`) to a running server, and by startup to detect a conflicting already-running instance. Removed on graceful shutdown.
 
 ### Environment Variables
 
@@ -194,6 +209,34 @@ Set by the server at session launch:
 ### access.json (~/.claude/channels/slack/access.json)
 
 Access control policy: DM policy, allowlist, channel policies, ack reaction. chmod 600.
+
+## Logging
+
+### Why console.error/console.log are overridden directly
+
+Bun bypasses `process.stderr.write` overrides — the runtime writes directly to the file descriptor, so patching `process.stderr.write` has no effect. `src/logging.ts` works around this by replacing `console.error` and `console.log` themselves before any logging occurs.
+
+### initLogging()
+
+`initLogging(logFilePath)` in `src/logging.ts` opens the target file in append mode and replaces both `console.error` and `console.log` with wrapper functions that:
+
+1. Format all arguments to a single string (JSON-serializing objects)
+2. Prepend an ISO-8601 timestamp: `[2024-01-01T00:00:00.000Z] message`
+3. Write the line synchronously via `writeSync` to the open file descriptor
+4. Fall back to the original `console.error`/`console.log` if the write fails
+
+The originals are captured at module load time so the fallback always refers to Bun's native output.
+
+### Log file locations
+
+Both paths are rooted in `SLACK_STATE_DIR` (default: `~/.claude/channels/slack/`).
+
+| Process | Log file |
+|---------|----------|
+| Server daemon (`server.ts`) | `STATE_DIR/server.log` |
+| `clean_restart` subcommand | `STATE_DIR/clean_restart.log` |
+
+Both files are opened in append mode — multiple restarts accumulate in the same file rather than overwriting it.
 
 ## Security Model
 

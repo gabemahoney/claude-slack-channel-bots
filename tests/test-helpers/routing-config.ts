@@ -15,6 +15,8 @@ export function makeRoutingConfig(overrides?: Partial<RoutingConfig>): RoutingCo
     port: 3100,
     session_restart_delay: 60,
     health_check_interval: 120,
+    exit_timeout: 120,
+    stop_timeout: 30,
     mcp_config_path: '/tmp/test-mcp.json',
     ...overrides,
   }

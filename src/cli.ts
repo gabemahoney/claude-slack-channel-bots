@@ -11,11 +11,13 @@
 
 import { homedir } from 'os'
 import { join, resolve } from 'path'
-import { existsSync, readFileSync, unlinkSync, openSync, writeSync } from 'fs'
+import { existsSync, openSync, readFileSync, unlinkSync } from 'fs'
 import { spawnSync } from 'child_process'
 import { isProcessRunning } from './pid.ts'
-import { defaultTmuxClient, isClaudeRunning as tmuxIsClaudeRunning } from './tmux.ts'
+import { defaultTmuxClient, isClaudeRunning as tmuxIsClaudeRunning, sessionName as tmuxSessionName } from './tmux.ts'
 import { readSessions, type SessionsMap } from './sessions.ts'
+import { loadConfig as configLoadConfig, type RoutingConfig } from './config.ts'
+import { initLogging } from './logging.ts'
 
 // ---------------------------------------------------------------------------
 // Injectable dependency interface
@@ -44,8 +46,12 @@ export interface CliDeps {
   exit: (code: number) => never
   /** Returns true if a tmux session with the given name exists. */
   hasSession: (name: string) => Promise<boolean>
+  /** Load the routing configuration. */
+  loadConfig: () => RoutingConfig
+  /** Returns the canonical tmux session name for a given working directory path. */
+  sessionName: (cwd: string) => string
   /** Sends keystrokes to the given tmux session. */
-  sendKeys: (session: string, keys: string) => Promise<void>
+  sendKeys: (session: string, ...keys: string[]) => Promise<void>
   /** Returns true if a 'claude' process is running in the given tmux session. */
   isClaudeRunning: (session: string) => Promise<boolean>
   /** Kills the named tmux session. */
@@ -122,18 +128,7 @@ export function createCli(deps: CliDeps): CliHandlers {
     }
 
     // Child (daemon): redirect stderr/stdout to server.log
-    // Bun's child_process.spawn does not reliably pass numeric fds via stdio,
-    // so the daemon must open the log file itself and override process streams.
-    try {
-      const logPath = join(stateDir, 'server.log')
-      const logFd = openSync(logPath, 'a')
-      const writeToLog = (chunk: any): boolean => {
-        try { writeSync(logFd, typeof chunk === 'string' ? chunk : String(chunk)) } catch { /* ignore */ }
-        return true
-      }
-      process.stderr.write = writeToLog as typeof process.stderr.write
-      process.stdout.write = writeToLog as typeof process.stdout.write
-    } catch { /* best-effort: log redirect failure is non-fatal */ }
+    try { initLogging(join(stateDir, 'server.log')) } catch { /* best-effort: log redirect failure is non-fatal */ }
 
     // Child (daemon): start the server
     await deps.startServer()
@@ -167,91 +162,121 @@ export function createCli(deps: CliDeps): CliHandlers {
       deps.exit(0)
     }
 
-    // Live process — send SIGTERM and poll until exit or 5s timeout
+    // Load stop_timeout from config (fall back to 30s if unavailable)
+    let stopTimeoutMs = 30_000
+    try {
+      const config = deps.loadConfig()
+      if (typeof config.stop_timeout === 'number') {
+        stopTimeoutMs = config.stop_timeout * 1000
+      }
+    } catch { /* use default */ }
+
+    // Live process — send SIGTERM and poll until exit or stop_timeout
     deps.kill(pid!, 'SIGTERM')
 
-    const deadline = Date.now() + 5000
+    const deadline = Date.now() + stopTimeoutMs
     while (Date.now() < deadline) {
       await new Promise<void>((r) => setTimeout(r, 100))
       if (!deps.isProcessRunning(pid!)) {
+        try { deps.unlinkSync(pidFile) } catch { /* ignore */ }
         console.error('[slack] Server stopped.')
         deps.exit(0)
       }
     }
 
-    console.error('[slack] Warning: server did not stop within 5s after SIGTERM.')
-    deps.exit(0)
+    // SIGTERM timed out — escalate to SIGKILL
+    console.error(`[slack] Warning: server did not stop within ${stopTimeoutMs / 1000}s after SIGTERM — sending SIGKILL.`)
+    deps.kill(pid!, 'SIGKILL')
+
+    // Poll briefly (~2s) to confirm death after SIGKILL
+    const killDeadline = Date.now() + 2000
+    while (Date.now() < killDeadline) {
+      await new Promise<void>((r) => setTimeout(r, 100))
+      if (!deps.isProcessRunning(pid!)) {
+        try { deps.unlinkSync(pidFile) } catch { /* ignore */ }
+        console.error('[slack] Server killed.')
+        deps.exit(0)
+      }
+    }
+
+    console.error('[slack] Warning: server did not die after SIGKILL.')
+    deps.exit(1)
   }
 
   async function clean_restart(): Promise<void> {
-    const sessions = deps.readSessions()
-    console.error(`[slack] clean_restart: sessions.json contents: ${JSON.stringify(sessions)}`)
-    const entries = Object.entries(sessions)
+    try { initLogging(join(deps.resolveStateDir(), 'clean_restart.log')) } catch { /* best-effort */ }
 
-    if (entries.length > 0) {
-      console.error(`[slack] clean_restart: sending /exit to ${entries.length} session(s)`)
+    // Phase 1: Load config
+    let config: RoutingConfig
+    try {
+      config = deps.loadConfig()
+    } catch (err) {
+      console.error('[slack] clean_restart: failed to load config:', err)
+      deps.exit(1)
+    }
+    const { routes, exit_timeout } = config!
 
-      // Fan out: send /exit + Enter to all sessions in parallel (best-effort)
-      await Promise.all(entries.map(async ([channelId, record]) => {
-        try {
-          const exists = await deps.hasSession(record.tmuxSession)
-          if (!exists) {
-            console.error(`[slack] clean_restart: session not found for channel=${channelId}, skipping`)
-            return
-          }
-          await deps.sendKeys(record.tmuxSession, '/exit')
-          await deps.sendKeys(record.tmuxSession, 'Enter')
-          console.error(`[slack] clean_restart: sent /exit to channel=${channelId} session=${record.tmuxSession}`)
-        } catch (err) {
-          console.error(`[slack] clean_restart: error sending /exit to channel=${channelId}:`, err)
-        }
-      }))
-
-      // Poll each session until Claude exits or 60s timeout (best-effort)
-      await Promise.all(entries.map(async ([channelId, record]) => {
-        try {
-          const exists = await deps.hasSession(record.tmuxSession)
-          if (!exists) return
-
-          const timeout = 60_000
-          const start = Date.now()
-          let delay = 500
-          const maxDelay = 5_000
-
-          while (Date.now() - start < timeout) {
-            const running = await deps.isClaudeRunning(record.tmuxSession)
-            if (!running) {
-              console.error(`[slack] clean_restart: channel=${channelId} exited cleanly`)
-              return
-            }
-            await new Promise<void>((r) => setTimeout(r, delay))
-            delay = Math.min(delay * 2, maxDelay)
-          }
-
-          // Timed out — force kill
-          console.error(`[slack] clean_restart: timeout waiting for channel=${channelId}, force-killing`)
-          try {
-            await deps.killSession(record.tmuxSession)
-          } catch (err) {
-            console.error(`[slack] clean_restart: killSession failed for channel=${channelId}:`, err)
-          }
-        } catch (err) {
-          console.error(`[slack] clean_restart: error polling channel=${channelId}:`, err)
-        }
-      }))
+    // Phase 2: Stop the server daemon
+    console.error('[slack] clean_restart: stopping server')
+    const stopResult = deps.spawnSync(process.execPath, [process.argv[1], 'stop'])
+    if (stopResult.status !== 0) {
+      console.error(`[slack] clean_restart: stop returned non-zero exit code: ${stopResult.status}`)
     }
 
-    // Stop the server
-    console.error('[slack] clean_restart: stopping server')
-    deps.spawnSync(process.execPath, [process.argv[1], 'stop'])
+    // Phases 3-4: Exit Claude sessions concurrently
+    await Promise.allSettled(Object.entries(routes).map(async ([channelId, route]) => {
+      const name = deps.sessionName(route.cwd)
+      try {
+        // Phase 3: Check session exists
+        const exists = await deps.hasSession(name)
+        if (!exists) {
+          console.error(`[slack] clean_restart: session not found for channel=${channelId} session=${name}`)
+          return
+        }
 
-    // Start the server
+        const claudeRunning = await deps.isClaudeRunning(name)
+        if (!claudeRunning) {
+          console.error(`[slack] clean_restart: Claude not running for channel=${channelId} session=${name}`)
+          return
+        }
+
+        // Phase 4: Send /exit atomically
+        await deps.sendKeys(name, '/exit', 'Enter')
+
+        // Poll with exponential backoff until exit or timeout
+        const timeoutMs = exit_timeout * 1000
+        const start = Date.now()
+        let delay = 500
+        const maxDelay = 5_000
+
+        while (Date.now() - start < timeoutMs) {
+          await new Promise<void>((r) => setTimeout(r, delay))
+          delay = Math.min(delay * 2, maxDelay)
+          const running = await deps.isClaudeRunning(name)
+          if (!running) {
+            const elapsed = Date.now() - start
+            console.error(`[slack] clean_restart: channel=${channelId} session=${name} exited cleanly in ${elapsed}ms`)
+            return
+          }
+        }
+
+        // Timeout — force kill
+        const elapsed = Date.now() - start
+        await deps.killSession(name)
+        console.error(`[slack] clean_restart: channel=${channelId} session=${name} force-killed after ${elapsed}ms`)
+      } catch (err) {
+        console.error(`[slack] clean_restart: error processing channel=${channelId} session=${name}:`, err)
+      }
+    }))
+
+    // Phases 5-6: Start new server and exit
     console.error('[slack] clean_restart: starting server')
     const startResult = deps.spawnSync(process.execPath, [process.argv[1], 'start'])
     if (startResult.status !== 0) {
       console.error(`[slack] clean_restart: start failed with exit code ${startResult.status}`)
       deps.exit(startResult.status ?? 1)
     }
+    console.error('[slack] clean_restart: done')
   }
 
   return { start, stop, clean_restart }
@@ -284,8 +309,10 @@ if (import.meta.main) {
     resolveStateDir: defaultStateDir,
     startServer: async () => { const { main } = await import('./server.ts'); return main() },
     exit: (code) => process.exit(code),
+    loadConfig: () => configLoadConfig(),
+    sessionName: (cwd) => tmuxSessionName(cwd),
     hasSession: (name) => defaultTmuxClient.hasSession(name),
-    sendKeys: (session, keys) => defaultTmuxClient.sendKeys(session, keys),
+    sendKeys: (session, ...keys) => defaultTmuxClient.sendKeys(session, ...keys),
     isClaudeRunning: (session) => tmuxIsClaudeRunning(session, defaultTmuxClient),
     killSession: (session) => defaultTmuxClient.killSession(session),
     readSessions: () => readSessions(),
