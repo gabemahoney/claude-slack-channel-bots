@@ -234,40 +234,43 @@ export async function launchSession(
 // ---------------------------------------------------------------------------
 
 /**
- * On server startup, inspects all configured routes and takes action using a
- * three-branch decision tree per route:
- *   - Reconnect: tmux session exists AND Claude is running → send /mcp reconnect, do not relaunch
- *   - Resume: dead or missing process with stored session ID → kill stale session, relaunch with --resume
- *   - Fresh: dead or missing process without stored session ID → kill stale session, launch fresh
+ * On server startup, inspects all configured routes concurrently and takes
+ * action using a three-branch decision tree per route:
+ *   - Reconnect: tmux session exists AND Claude is running → send /mcp reconnect,
+ *                discover session ID via PID-based file lookup, return SessionRecord
+ *   - Resume: dead or missing process with stored session ID → kill stale session,
+ *             relaunch with --resume, return SessionRecord
+ *   - Fresh: dead or missing process without stored session ID → kill stale session,
+ *            launch fresh, return SessionRecord
  *
+ * Accepts stored sessions externally (caller is responsible for reading them).
+ * Returns a Map of channelId → SessionRecord for all successfully launched routes.
  * Returns early with a warning if tmux is unavailable.
  */
 export async function startupSessionManager(
   routingConfig: RoutingConfig,
   tmuxClient: TmuxClient,
-  readSessionsFn: (path?: string) => SessionsMap,
-  writeSessionsFn: (sessions: SessionsMap, path?: string) => void,
-  options?: LaunchOptions,
-): Promise<SessionStateResult[]> {
+  storedSessions: SessionsMap,
+  options?: { earlyDetectAfterMs?: number; pollTimeout?: number },
+): Promise<Map<string, SessionRecord>> {
   // Verify tmux is installed before proceeding
   try {
     const version = await tmuxClient.checkAvailability()
     console.error(`[slack] tmux available: ${version}`)
   } catch {
     console.error('[slack] Warning: tmux not available — skipping session startup')
-    return []
+    return new Map()
   }
 
-  const results: SessionStateResult[] = []
-
-  // Load stored session IDs for all channels once before the route iteration loop
-  const storedSessions = readSessionsFn()
   console.error(`[slack] startupSessionManager: storedSessions=${JSON.stringify(storedSessions)}`)
 
-  for (const [channelId, route] of Object.entries(routingConfig.routes)) {
-    const name = sessionName(route.cwd)
+  const routeEntries = Object.entries(routingConfig.routes)
 
-    try {
+  // Process all routes concurrently; each resolves to [channelId, SessionRecord | null]
+  const settled = await Promise.allSettled(
+    routeEntries.map(async ([channelId, route]): Promise<[string, SessionRecord | null]> => {
+      const name = sessionName(route.cwd)
+
       const exists = await tmuxClient.hasSession(name)
 
       if (exists) {
@@ -278,10 +281,36 @@ export async function startupSessionManager(
           const reconnectSessionId = storedSessions[channelId]?.sessionId ?? 'none'
           console.error(`[slack] startupSessionManager: branch=reconnect channel=${channelId} sessionId=${reconnectSessionId}`)
           console.error(`[slack] Session live — reconnecting MCP server "${MCP_SERVER_NAME}": channel=${channelId} session=${name}`)
-          await tmuxClient.sendKeys(name, `/mcp reconnect ${MCP_SERVER_NAME}`)
-          await tmuxClient.sendKeys(name, 'Enter')
-          results.push({ channelId, action: 'reconnected', sessionName: name })
-          continue
+          await tmuxClient.sendKeys(name, `/mcp reconnect ${MCP_SERVER_NAME}`, 'Enter')
+
+          // Discover session ID via PID-based file lookup
+          const pid = await getClaudePid(name, tmuxClient)
+          if (pid !== null) {
+            const sessionFilePath = `${homedir()}/.claude/sessions/${pid}.json`
+            try {
+              const raw = readFileSync(sessionFilePath, 'utf-8')
+              const entry = JSON.parse(raw)
+              if (
+                typeof entry === 'object' &&
+                entry !== null &&
+                typeof entry.sessionId === 'string' &&
+                entry.sessionId.length > 0
+              ) {
+                const foundId = entry.sessionId as string
+                console.error(`[slack] startupSessionManager: reconnect discovered sessionId=${foundId} via PID=${pid} for channel=${channelId}`)
+                return [channelId, {
+                  tmuxSession: name,
+                  lastLaunch: new Date().toISOString(),
+                  sessionId: foundId,
+                }]
+              }
+            } catch {
+              console.error(`[slack] startupSessionManager: reconnect — could not read session file for PID=${pid} channel=${channelId}`)
+            }
+          } else {
+            console.error(`[slack] startupSessionManager: reconnect — no claude PID found for channel=${channelId}`)
+          }
+          return [channelId, null]
         }
       }
 
@@ -302,13 +331,7 @@ export async function startupSessionManager(
           channelId, route.cwd, routingConfig, tmuxClient,
           { ...options, sessionId: storedSessionId },
         )
-        if (record) {
-          const sessions = readSessionsFn()
-          sessions[channelId] = record
-          writeSessionsFn(sessions)
-          console.error(`[slack] Session recorded in sessions.json: channel=${channelId} sessionId=${record.sessionId}`)
-        }
-        results.push({ channelId, action: record ? 'resumed' : 'failed', sessionName: name })
+        return [channelId, record]
       } else {
         // Branch 3: Fresh — launch without session ID
         console.error(`[slack] startupSessionManager: branch=fresh channel=${channelId} sessionId=none`)
@@ -317,23 +340,32 @@ export async function startupSessionManager(
           channelId, route.cwd, routingConfig, tmuxClient,
           options,
         )
-        if (record) {
-          const sessions = readSessionsFn()
-          sessions[channelId] = record
-          writeSessionsFn(sessions)
-          console.error(`[slack] Session recorded in sessions.json: channel=${channelId} sessionId=${record.sessionId}`)
-        }
-        results.push({ channelId, action: record ? 'launched' : 'failed', sessionName: name })
+        return [channelId, record]
       }
-    } catch (err) {
-      console.error(`[slack] Session startup error for channel=${channelId}:`, err)
-      results.push({ channelId, action: 'failed', sessionName: name })
+    }),
+  )
+
+  // Collect non-null results into Map<channelId, SessionRecord>
+  const resultMap = new Map<string, SessionRecord>()
+  let succeeded = 0
+  let failed = 0
+
+  for (const outcome of settled) {
+    if (outcome.status === 'fulfilled') {
+      const [channelId, record] = outcome.value
+      if (record !== null) {
+        resultMap.set(channelId, record)
+        succeeded++
+      } else {
+        failed++
+      }
+    } else {
+      console.error('[slack] Session startup error:', outcome.reason)
+      failed++
     }
   }
 
-  const succeeded = results.filter((r) => r.action !== 'failed').length
-  const failed = results.filter((r) => r.action === 'failed').length
   console.error(`[slack] Session startup complete: ${succeeded} ok, ${failed} failed`)
 
-  return results
+  return resultMap
 }
