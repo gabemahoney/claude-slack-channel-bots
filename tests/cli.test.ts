@@ -450,6 +450,272 @@ describe('stop — live process', () => {
 })
 
 // ---------------------------------------------------------------------------
+// stop — normal SIGTERM shutdown (process dies within timeout)
+// ---------------------------------------------------------------------------
+
+describe('stop — normal SIGTERM shutdown', () => {
+  let cli: CliHandlers
+  let killedPids: Array<{ pid: number; signal: string | number }>
+  let exitCodes: number[]
+  let unlinkedPaths: string[]
+
+  beforeEach(() => {
+    jest.useFakeTimers()
+    let callCount = 0
+    const result = makeDeps({
+      existingPaths: [PID_FILE],
+      pidFileContent: '54321\n',
+      // Alive for first check, dead on subsequent checks
+      isProcessRunning: (_pid) => {
+        callCount++
+        return callCount <= 1
+      },
+    })
+    cli = createCli(result.deps)
+    killedPids = result.killedPids
+    exitCodes = result.exitCodes
+    unlinkedPaths = result.unlinkedPaths
+  })
+
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  test('sends only SIGTERM (no SIGKILL) when process exits within timeout', async () => {
+    const p = cli.stop()
+    jest.advanceTimersByTime(200)
+    await p.catch(() => {})
+    const signals = killedPids.map((k) => k.signal)
+    expect(signals).toContain('SIGTERM')
+    expect(signals).not.toContain('SIGKILL')
+  })
+
+  test('removes PID file after clean SIGTERM shutdown', async () => {
+    const p = cli.stop()
+    jest.advanceTimersByTime(200)
+    await p.catch(() => {})
+    expect(unlinkedPaths).toContain(PID_FILE)
+  })
+
+  test('exits with code 0 after clean SIGTERM shutdown', async () => {
+    const p = cli.stop()
+    jest.advanceTimersByTime(200)
+    await runHandler(() => p)
+    expect(exitCodes).toEqual([0])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// stop — SIGKILL escalation after stop_timeout
+// ---------------------------------------------------------------------------
+
+describe('stop — SIGKILL escalation after stop_timeout', () => {
+  let cli: CliHandlers
+  let killedPids: Array<{ pid: number; signal: string | number }>
+  let exitCodes: number[]
+  let unlinkedPaths: string[]
+
+  beforeEach(() => {
+    jest.useFakeTimers()
+    // Process stays alive through SIGTERM window, dies after SIGKILL
+    let killedWithSigkill = false
+    const result = makeDeps({
+      existingPaths: [PID_FILE],
+      pidFileContent: '77777\n',
+      // Always running until SIGKILL is sent; detected via killedPids length
+      isProcessRunning: (_pid) => !killedWithSigkill,
+      loadConfig: () => makeRoutingConfig({ stop_timeout: 1 }), // 1s timeout
+    })
+    // Intercept kill to detect SIGKILL
+    const originalKill = result.deps.kill
+    result.deps.kill = (pid, signal) => {
+      originalKill(pid, signal)
+      if (signal === 'SIGKILL') killedWithSigkill = true
+    }
+    cli = createCli(result.deps)
+    killedPids = result.killedPids
+    exitCodes = result.exitCodes
+    unlinkedPaths = result.unlinkedPaths
+  })
+
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  test('sends SIGTERM first, then SIGKILL after stop_timeout', async () => {
+    const p = cli.stop()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    await p.catch(() => {})
+    const signals = killedPids.map((k) => k.signal)
+    expect(signals[0]).toBe('SIGTERM')
+    expect(signals).toContain('SIGKILL')
+  })
+
+  test('SIGKILL is sent to the correct PID', async () => {
+    const p = cli.stop()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    await p.catch(() => {})
+    const sigkillEntry = killedPids.find((k) => k.signal === 'SIGKILL')
+    expect(sigkillEntry).toBeDefined()
+    expect(sigkillEntry!.pid).toBe(77777)
+  })
+
+  test('PID file is removed after SIGKILL and confirmed death', async () => {
+    const p = cli.stop()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    await p.catch(() => {})
+    expect(unlinkedPaths).toContain(PID_FILE)
+  })
+
+  test('exits with code 0 after confirmed SIGKILL death', async () => {
+    const p = cli.stop()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    await runHandler(() => p)
+    expect(exitCodes).toEqual([0])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// stop — SIGKILL escalation but process survives (no death confirmation)
+// ---------------------------------------------------------------------------
+
+describe('stop — SIGKILL sent but process never dies', () => {
+  let cli: CliHandlers
+  let killedPids: Array<{ pid: number; signal: string | number }>
+  let exitCodes: number[]
+
+  beforeEach(() => {
+    jest.useFakeTimers()
+    const result = makeDeps({
+      existingPaths: [PID_FILE],
+      pidFileContent: '88888\n',
+      isProcessRunning: (_pid) => true, // never dies
+      loadConfig: () => makeRoutingConfig({ stop_timeout: 1 }), // 1s timeout
+    })
+    cli = createCli(result.deps)
+    killedPids = result.killedPids
+    exitCodes = result.exitCodes
+  })
+
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  test('still sends SIGKILL after stop_timeout even when process survives', async () => {
+    const p = cli.stop()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    await p.catch(() => {})
+    expect(killedPids.some((k) => k.signal === 'SIGKILL')).toBe(true)
+  })
+
+  test('exits with code 1 when process survives SIGKILL', async () => {
+    const p = cli.stop()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    await runHandler(() => p)
+    expect(exitCodes).toEqual([1])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// stop — falls back to 30s default when loadConfig throws
+// ---------------------------------------------------------------------------
+
+describe('stop — loadConfig throws, falls back to 30s default', () => {
+  let cli: CliHandlers
+  let killedPids: Array<{ pid: number; signal: string | number }>
+  let exitCodes: number[]
+  let unlinkedPaths: string[]
+
+  beforeEach(() => {
+    jest.useFakeTimers()
+    let killedWithSigkill = false
+    const result = makeDeps({
+      existingPaths: [PID_FILE],
+      pidFileContent: '66666\n',
+      isProcessRunning: (_pid) => !killedWithSigkill,
+      loadConfig: () => { throw new Error('config file not found') },
+    })
+    const originalKill = result.deps.kill
+    result.deps.kill = (pid, signal) => {
+      originalKill(pid, signal)
+      if (signal === 'SIGKILL') killedWithSigkill = true
+    }
+    cli = createCli(result.deps)
+    killedPids = result.killedPids
+    exitCodes = result.exitCodes
+    unlinkedPaths = result.unlinkedPaths
+  })
+
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  test('still sends SIGTERM initially even when loadConfig throws', async () => {
+    const p = cli.stop()
+    // Advance past 30s default timeout
+    jest.advanceTimersByTime(35_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    await p.catch(() => {})
+    expect(killedPids[0]!.signal).toBe('SIGTERM')
+  })
+
+  test('escalates to SIGKILL after the 30s default timeout', async () => {
+    const p = cli.stop()
+    // Advance only 10s — should NOT have SIGKILL yet (within 30s default window)
+    jest.advanceTimersByTime(10_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    expect(killedPids.some((k) => k.signal === 'SIGKILL')).toBe(false)
+    // Now advance past the 30s default
+    jest.advanceTimersByTime(25_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    await p.catch(() => {})
+    expect(killedPids.some((k) => k.signal === 'SIGKILL')).toBe(true)
+  })
+
+  test('removes PID file after SIGKILL death even with missing config', async () => {
+    const p = cli.stop()
+    jest.advanceTimersByTime(35_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    await p.catch(() => {})
+    expect(unlinkedPaths).toContain(PID_FILE)
+  })
+
+  test('exits with code 0 after SIGKILL death with default timeout', async () => {
+    const p = cli.stop()
+    jest.advanceTimersByTime(35_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    jest.advanceTimersByTime(5_000)
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    await runHandler(() => p)
+    expect(exitCodes).toEqual([0])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Shared session fixtures for clean_restart tests
 // ---------------------------------------------------------------------------
 

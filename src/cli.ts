@@ -162,20 +162,45 @@ export function createCli(deps: CliDeps): CliHandlers {
       deps.exit(0)
     }
 
-    // Live process — send SIGTERM and poll until exit or 5s timeout
+    // Load stop_timeout from config (fall back to 30s if unavailable)
+    let stopTimeoutMs = 30_000
+    try {
+      const config = deps.loadConfig()
+      if (typeof config.stop_timeout === 'number') {
+        stopTimeoutMs = config.stop_timeout * 1000
+      }
+    } catch { /* use default */ }
+
+    // Live process — send SIGTERM and poll until exit or stop_timeout
     deps.kill(pid!, 'SIGTERM')
 
-    const deadline = Date.now() + 5000
+    const deadline = Date.now() + stopTimeoutMs
     while (Date.now() < deadline) {
       await new Promise<void>((r) => setTimeout(r, 100))
       if (!deps.isProcessRunning(pid!)) {
+        try { deps.unlinkSync(pidFile) } catch { /* ignore */ }
         console.error('[slack] Server stopped.')
         deps.exit(0)
       }
     }
 
-    console.error('[slack] Warning: server did not stop within 5s after SIGTERM.')
-    deps.exit(0)
+    // SIGTERM timed out — escalate to SIGKILL
+    console.error(`[slack] Warning: server did not stop within ${stopTimeoutMs / 1000}s after SIGTERM — sending SIGKILL.`)
+    deps.kill(pid!, 'SIGKILL')
+
+    // Poll briefly (~2s) to confirm death after SIGKILL
+    const killDeadline = Date.now() + 2000
+    while (Date.now() < killDeadline) {
+      await new Promise<void>((r) => setTimeout(r, 100))
+      if (!deps.isProcessRunning(pid!)) {
+        try { deps.unlinkSync(pidFile) } catch { /* ignore */ }
+        console.error('[slack] Server killed.')
+        deps.exit(0)
+      }
+    }
+
+    console.error('[slack] Warning: server did not die after SIGKILL.')
+    deps.exit(1)
   }
 
   async function clean_restart(): Promise<void> {
