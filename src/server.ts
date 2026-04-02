@@ -39,7 +39,7 @@ import {
   type GateResult,
 } from './lib.ts'
 import { loadConfig, expandTilde, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
-import { readSessions, writeSessions } from './sessions.ts'
+import { readSessions, writeSessions, rotateSessions } from './sessions.ts'
 import { defaultTmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
 import { startupSessionManager, launchSession } from './session-manager.ts'
 import {
@@ -863,6 +863,10 @@ process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
 // ---------------------------------------------------------------------------
 
 export async function main(): Promise<void> {
+  // Rotate sessions.json → sessions.json.last before any other startup work.
+  // This preserves last-known session IDs for resume logic below.
+  rotateSessions()
+
   checkPidConflict(PID_FILE)
 
   let mcpHost: string
@@ -1362,7 +1366,11 @@ export async function main(): Promise<void> {
   // If tmux is unavailable or startup fails, log a warning and continue.
   if (routingConfig) {
     try {
-      await startupSessionManager(routingConfig, defaultTmuxClient, readSessions, writeSessions)
+      const lastPath = join(STATE_DIR, 'sessions.json.last')
+      const storedSessions = readSessions(lastPath)
+      const records = await startupSessionManager(routingConfig, defaultTmuxClient, storedSessions)
+      const sessionsMap = Object.fromEntries(records)
+      writeSessions(sessionsMap)
     } catch (err) {
       console.error('[slack] Warning: session startup failed — continuing without managed sessions:', err)
     }
