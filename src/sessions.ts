@@ -23,7 +23,7 @@ import { expandTilde } from './config.ts'
 export interface SessionRecord {
   tmuxSession: string
   lastLaunch: string // ISO-8601, e.g. new Date().toISOString()
-  sessionId?: string // Claude session UUID, captured after launch
+  sessionId: string // Claude session UUID; 'pending' until background verification discovers it
 }
 
 export type SessionsMap = Record<string, SessionRecord>
@@ -75,4 +75,23 @@ export function writeSessions(sessions: SessionsMap, path?: string): void {
   mkdirSync(dirname(sessionsPath), { recursive: true })
   writeFileSync(tmpPath, JSON.stringify(sessions, null, 2), 'utf-8')
   renameSync(tmpPath, sessionsPath)
+}
+
+/**
+ * Rotates the current sessions.json to sessions.json.last by renaming it.
+ * If the file does not exist (ENOENT), silently returns — any existing .last
+ * file is preserved. Re-throws any other error.
+ *
+ * @param path  Path to sessions.json. Defaults to ~/.claude/channels/slack/sessions.json.
+ */
+export function rotateSessions(path?: string): void {
+  const sessionsPath = expandTilde(path ?? DEFAULT_SESSIONS_PATH)
+  try {
+    renameSync(sessionsPath, sessionsPath + '.last')
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return
+    }
+    throw err
+  }
 }

@@ -180,7 +180,7 @@ export async function launchSession(
   sessions[channelId] = {
     tmuxSession: name,
     lastLaunch: new Date().toISOString(),
-    ...(resumeSessionId !== undefined ? { sessionId: resumeSessionId } : {}),
+    sessionId: resumeSessionId ?? 'pending',
   }
   writeSessionsFn(sessions)
   console.error(`[slack] Session recorded in sessions.json: channel=${channelId} sessionId=${resumeSessionId ?? 'none'} saved=${JSON.stringify(sessions[channelId])}`)
@@ -358,7 +358,7 @@ export async function startupSessionManager(
         await tmuxClient.killSession(name)
       }
 
-      if (storedSessionId) {
+      if (storedSessionId && storedSessionId !== 'pending') {
         // Branch 2: Resume — launch with stored session ID
         console.error(`[slack] startupSessionManager: branch=resume channel=${channelId} sessionId=${storedSessionId}`)
         console.error(`[slack] Dead/missing process with stored session ID — resuming: channel=${channelId} session=${name} sessionId=${storedSessionId}`)

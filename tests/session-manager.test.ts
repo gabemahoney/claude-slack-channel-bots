@@ -348,6 +348,7 @@ describe('launchSession', () => {
       'C_OTHER': {
         tmuxSession: 'slack_bot_tmp_other_cwd',
         lastLaunch: '2026-01-01T00:00:00.000Z',
+        sessionId: 'pending',
       },
     }
     const sessions = makeSessionsStubs(existing)
@@ -463,9 +464,10 @@ describe('launchSession', () => {
     expect((launchCmd!.args[1] as string).includes('--resume')).toBe(false)
   })
 
-  test('13. session ID absent in written record for fresh launch (no resumeSessionId)', async () => {
-    // Fresh launch (no sessionId option) — the initial sessions.json write has no sessionId.
-    // Background verification would discover it async, but in tests there's no ~/.claude/sessions/.
+  test('13. session ID is pending in written record for fresh launch (no resumeSessionId)', async () => {
+    // Fresh launch (no sessionId option) — the initial sessions.json write uses 'pending' as placeholder.
+    // Background verification would discover/update the actual sessionId async, but in tests
+    // there's no ~/.claude/sessions/.
     const stub = makeTmuxStub({
       capturePaneResult: 'I am using this for local development',
     })
@@ -481,7 +483,7 @@ describe('launchSession', () => {
     expect(sessions.writtenSessions).toHaveLength(1)
     const written = sessions.writtenSessions[0]['C_TEST1']
     expect(written).toBeDefined()
-    expect(written.sessionId).toBeUndefined()
+    expect(written.sessionId).toBe('pending')
   })
 
   test('22. no safety prompt but Claude running inside loop: early detection accepts session before full timeout', async () => {

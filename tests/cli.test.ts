@@ -446,9 +446,9 @@ describe('stop — live process', () => {
 // Shared session fixtures for clean_restart tests
 // ---------------------------------------------------------------------------
 
-const SESSION_A = { tmuxSession: 'slack_bot_a', lastLaunch: '2026-01-01T00:00:00Z' }
-const SESSION_B = { tmuxSession: 'slack_bot_b', lastLaunch: '2026-01-01T00:00:00Z' }
-const SESSION_C = { tmuxSession: 'slack_bot_c', lastLaunch: '2026-01-01T00:00:00Z' }
+const SESSION_A = { tmuxSession: 'slack_bot_a', lastLaunch: '2026-01-01T00:00:00Z', sessionId: 'pending' }
+const SESSION_B = { tmuxSession: 'slack_bot_b', lastLaunch: '2026-01-01T00:00:00Z', sessionId: 'pending' }
+const SESSION_C = { tmuxSession: 'slack_bot_c', lastLaunch: '2026-01-01T00:00:00Z', sessionId: 'pending' }
 
 // ---------------------------------------------------------------------------
 // clean_restart — all sessions exit cleanly in parallel

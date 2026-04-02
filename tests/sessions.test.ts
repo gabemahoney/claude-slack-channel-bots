@@ -2,7 +2,7 @@ import { describe, test, expect, afterEach } from 'bun:test'
 import { writeFileSync, readFileSync, mkdtempSync, existsSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { readSessions, writeSessions, type SessionRecord, type SessionsMap } from '../src/sessions.ts'
+import { readSessions, writeSessions, rotateSessions, type SessionRecord, type SessionsMap } from '../src/sessions.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -12,6 +12,7 @@ function makeSessionRecord(overrides: Partial<SessionRecord> = {}): SessionRecor
   return {
     tmuxSession: 'claude:0',
     lastLaunch: '2024-01-01T00:00:00.000Z',
+    sessionId: 'pending',
     ...overrides,
   }
 }
@@ -170,6 +171,57 @@ describe('sessionId field', () => {
     writeSessions(sessions, sessionsPath)
     const result = readSessions(sessionsPath)
     expect(result['C_GENERAL'].sessionId).toBe('round-trip-uuid-789')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// rotateSessions()
+// ---------------------------------------------------------------------------
+
+describe('rotateSessions', () => {
+  test('renames sessions.json to sessions.json.last when file exists', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'sessions-test-'))
+    const sessionsPath = join(tempDir, 'sessions.json')
+    writeFileSync(sessionsPath, JSON.stringify(makeSessionsMap()), 'utf-8')
+    rotateSessions(sessionsPath)
+    expect(existsSync(sessionsPath)).toBe(false)
+    expect(existsSync(sessionsPath + '.last')).toBe(true)
+  })
+
+  test('sessions.json.last has the original content after rotation', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'sessions-test-'))
+    const sessionsPath = join(tempDir, 'sessions.json')
+    const sessions = makeSessionsMap({ C_GENERAL: makeSessionRecord({ tmuxSession: 'rotate:0' }) })
+    writeFileSync(sessionsPath, JSON.stringify(sessions), 'utf-8')
+    rotateSessions(sessionsPath)
+    const rotated = JSON.parse(readFileSync(sessionsPath + '.last', 'utf-8'))
+    expect(rotated).toEqual(sessions)
+  })
+
+  test('is a no-op when sessions.json does not exist', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'sessions-test-'))
+    const sessionsPath = join(tempDir, 'sessions.json')
+    expect(() => rotateSessions(sessionsPath)).not.toThrow()
+  })
+
+  test('preserves existing .last file when sessions.json does not exist', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'sessions-test-'))
+    const sessionsPath = join(tempDir, 'sessions.json')
+    const lastSessions = makeSessionsMap({ C_OLD: makeSessionRecord({ tmuxSession: 'old:0' }) })
+    writeFileSync(sessionsPath + '.last', JSON.stringify(lastSessions), 'utf-8')
+    rotateSessions(sessionsPath)
+    const preserved = JSON.parse(readFileSync(sessionsPath + '.last', 'utf-8'))
+    expect(preserved).toEqual(lastSessions)
+  })
+
+  test('accepts a custom path parameter', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'sessions-test-'))
+    const customPath = join(tempDir, 'custom-sessions.json')
+    const sessions = makeSessionsMap()
+    writeFileSync(customPath, JSON.stringify(sessions), 'utf-8')
+    rotateSessions(customPath)
+    expect(existsSync(customPath)).toBe(false)
+    expect(existsSync(customPath + '.last')).toBe(true)
   })
 })
 
