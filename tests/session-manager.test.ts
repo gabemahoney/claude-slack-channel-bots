@@ -434,6 +434,56 @@ describe('startupSessionManager', () => {
     }
   })
 
+  test('T18: atomic write — startupSessionManager returns complete Map after all routes settle (no intermediate partial results)', async () => {
+    // T18: sessions.json must be written exactly once after all routes settle.
+    // startupSessionManager does NOT call writeSessions itself — it returns a
+    // complete Map after Promise.allSettled, so the caller writes exactly once.
+    // This test verifies the returned Map contains entries for all successfully
+    // launched routes and that the function does not return until all routes have
+    // settled (i.e., no race where a partial Map is returned mid-flight).
+    const proc1 = await spawnClaudeProcess()
+    const proc2 = await spawnClaudeProcess()
+    try {
+      writeClaudeSessionFile(proc1.pid!, 'session-t18-ch1')
+      writeClaudeSessionFile(proc2.pid!, 'session-t18-ch2')
+
+      let pidCallCount = 0
+      const stub = makeTmuxStub({
+        hasSessionResult: false,
+        capturePaneResult: 'I am using this for local development',
+      })
+      stub.getPanePid = async (_session: string) => {
+        pidCallCount++
+        return pidCallCount % 2 === 1 ? String(proc1.pid) : String(proc2.pid)
+      }
+
+      const config = {
+        ...makeRoutingConfig(),
+        routes: {
+          'C_T18A': { cwd: '/tmp/test-cwd-t18a' },
+          'C_T18B': { cwd: '/tmp/test-cwd-t18b' },
+        },
+      }
+
+      // The function must return a single complete Map — not a partial result.
+      const result = await startupSessionManager(config, stub, {}, {
+        pollTimeout: 3_000,
+        earlyDetectAfterMs: 0,
+      })
+
+      // Both routes must be present — write-once semantics: caller has complete data
+      expect(result).toBeInstanceOf(Map)
+      expect(result.size).toBe(2)
+      expect(result.has('C_T18A')).toBe(true)
+      expect(result.has('C_T18B')).toBe(true)
+      expect(result.get('C_T18A')!.sessionId).toBe('session-t18-ch1')
+      expect(result.get('C_T18B')!.sessionId).toBe('session-t18-ch2')
+    } finally {
+      proc1.kill()
+      proc2.kill()
+    }
+  })
+
   test('all-fail: all routes fail → returns empty Map', async () => {
     const stub = makeTmuxStub({
       hasSessionResult: false,
@@ -740,6 +790,15 @@ describe('launchSession', () => {
       proc.kill()
     }
   })
+
+  // T23: Bare bash prompt detected — NOT IMPLEMENTED in launchSession.
+  // The SRD describes detecting a bare shell prompt (e.g. "$ ") in pane output
+  // as a signal that Claude exited unexpectedly during a --resume launch, which
+  // should trigger a fresh fallback. This detection path has not been added to
+  // launchSession. If implemented, the test would: stub capturePane to return
+  // a bare "$ " prompt after a --resume attempt, then verify killSession is
+  // called and a fresh launch is retried.
+  // test.todo('T23: bare bash prompt detection triggers kill and fresh retry')
 
   test('launch command includes SLACK_CHANNEL_BOT_SESSION=1 env var', async () => {
     const stub = makeTmuxStub({

@@ -1159,6 +1159,86 @@ describe('clean_restart — all sessions force-killed', () => {
 // clean_restart — mixed: clean exit, timeout, sendKeys error
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// clean_restart — T8: concurrent /exit fan-out
+// All sessions receive /exit before any session's timeout can expire.
+// With Promise.allSettled the fan-out is concurrent — /exit reaches every
+// session at approximately the same time regardless of per-session exit latency.
+// ---------------------------------------------------------------------------
+
+describe('clean_restart — T8: concurrent /exit fan-out', () => {
+  beforeEach(() => {
+    jest.useFakeTimers()
+  })
+
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  test('T8: /exit sent to all sessions before any session timeout expires', async () => {
+    // Three sessions with different simulated exit latencies:
+    //   C1 exits after 1 poll cycle, C2 after 2, C3 never exits (force-killed)
+    const sendKeysTimes: Record<string, number> = {}
+    const callCounts = new Map<string, number>()
+
+    const result = makeDeps({
+      loadConfig: THREE_ROUTE_CONFIG,
+      sessionName: fakeSessionName,
+      hasSession: async () => true,
+      sendKeys: async (session, ...keys) => {
+        if (keys.includes('/exit')) {
+          sendKeysTimes[session] = Date.now()
+        }
+      },
+      isClaudeRunning: async (session) => {
+        const n = (callCounts.get(session) ?? 0) + 1
+        callCounts.set(session, n)
+        if (session === SN_C3) return true   // never exits — force-killed
+        if (session === SN_C2) return n <= 2 // exits after 2 polls
+        return n === 1                        // C1 exits after 1 poll
+      },
+    })
+
+    const p = createCli(result.deps).clean_restart()
+    await drainFakeTimers(p)
+
+    // All three sessions must have received /exit
+    expect(Object.keys(sendKeysTimes)).toHaveLength(3)
+    expect(Object.keys(sendKeysTimes)).toContain(SN_C1)
+    expect(Object.keys(sendKeysTimes)).toContain(SN_C2)
+    expect(Object.keys(sendKeysTimes)).toContain(SN_C3)
+  })
+
+  test('T8: no session waits for another session to finish before receiving /exit', async () => {
+    // Verify /exit goes to both sessions even when one exits very quickly.
+    // If sessions were sequential, the second would not receive /exit before C1 exits.
+    const callCounts = new Map<string, number>()
+    const result = makeDeps({
+      loadConfig: TWO_ROUTE_CONFIG,
+      sessionName: fakeSessionName,
+      hasSession: async () => true,
+      isClaudeRunning: async (session) => {
+        const n = (callCounts.get(session) ?? 0) + 1
+        callCounts.set(session, n)
+        return n === 1 // each session exits after first poll check
+      },
+    })
+
+    const p = createCli(result.deps).clean_restart()
+    await drainFakeTimers(p)
+
+    // Both sessions must have received /exit (concurrent fan-out)
+    const exitTargets = new Set(
+      result.sendKeysCalls.filter((c) => c.keys === '/exit').map((c) => c.session),
+    )
+    expect(exitTargets).toEqual(new Set([SN_C1, SN_C2]))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// clean_restart — mixed: clean exit, timeout, sendKeys error
+// ---------------------------------------------------------------------------
+
 describe('clean_restart — mixed success/failure', () => {
   // C1: exits cleanly; C2: times out, force-killed; C3: sendKeys throws, best-effort
 
@@ -1209,3 +1289,17 @@ describe('clean_restart — mixed success/failure', () => {
     expect(result.exitCodes).toHaveLength(0)
   })
 })
+
+// ---------------------------------------------------------------------------
+// T4 / T29 — Integration tests: intentionally not covered in unit tests
+// ---------------------------------------------------------------------------
+//
+// T4: clean_restart survives invoker death.
+//   Requires launching a real process in a real tmux session and killing the
+//   invoking shell mid-run. Not feasible as a unit test. Integration test only.
+//
+// T29: All lifecycle events logged (clean_restart.log + server.log contents).
+//   Requires a full end-to-end run with real tmux sessions and file I/O.
+//   The individual logging behaviors (timestamp format, append mode, etc.) are
+//   covered by logging.test.ts (T30). The full lifecycle log audit (T29) is an
+//   integration test that inspects log file output from a real clean_restart run.

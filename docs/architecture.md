@@ -33,7 +33,7 @@ cli.ts                  CLI entry point for the claude-slack-channel-bots comman
 1. Slack message arrives via Socket Mode (`message` or `app_mention` event)
 2. `gate()` checks access control (bot messages, subtypes, DM policy, allowlist)
 3. If `ackReaction` is configured, the ack emoji is applied to the message and `trackAck(channelId, messageTs)` records the pending ack for later removal
-4. Message is routed to the correct session via `getSessionByChannel()` or `getSessionByCwd()`. If the channel has an entry in `routes` but its session is not yet registered (e.g. still starting up), the message is **dropped** — `default_route` does not apply. `default_route` is only consulted for channels with no entry in `routes` at all.
+4. Message is routed to the correct session via `getSessionByChannel()` or `getSessionByCwd()`. If the channel has an entry in `routes` but its session is not yet registered (e.g. still starting up), the message is not delivered to Claude — instead, the server posts `"Message not delivered — session starting up, please retry in a moment."` back to the channel. `default_route` does not apply for configured channels; it is only consulted for channels with no entry in `routes` at all.
 5. Session's MCP Server sends `notifications/claude/channel` to the Claude Code client
 
 ### Outbound (Claude Code → Slack)
@@ -124,6 +124,8 @@ On each tick:
 2. **Dead session** — if the liveness check fails, `scheduleRestart(channelId, cwd)` is called, delegating to the same restart path used by `onsessionclosed`
 
 The interval is controlled by `health_check_interval` in `routing.json`. If the value is `0`, `startHealthCheck()` returns immediately and no interval is created. `stopHealthCheck()` clears the interval during graceful shutdown, before `cancelAllRestartTimers()` runs.
+
+**Ordering invariant**: `startHealthCheck()` is called only after `startupSessionManager()` returns and `sessions.json` has been written. `Promise.allSettled` in startup ensures all route launches have settled before the health-check poller begins. Moving `startHealthCheck()` earlier in the startup sequence would risk the poller racing with in-progress launches.
 
 ### stop command
 
