@@ -210,7 +210,9 @@ describe('"not delivered" reply — not sent when session is live', () => {
       '/tmp/not-delivered-session', 'C_CONFIGURED', makeTransport(), makeServer(),
     )
 
-    const routingConfig = makeRoutingConfig({ channelId: 'C_CONFIGURED' })
+    const routingConfig = makeRoutingConfig({
+      routes: { 'C_CONFIGURED': { cwd: '/tmp/not-delivered-session' } },
+    })
 
     const { dropped, notifiedSender } = await simulateChannelMessage(
       'C_CONFIGURED', routingConfig, postMessageCalls,

@@ -1328,16 +1328,19 @@ export async function main(): Promise<void> {
   console.error(`  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:${MCP_SERVER_NAME}`)
   console.error('')
 
+  // Shared adapter: checks whether a tmux session for the given channel has Claude running.
+  const isSessionAliveAdapter = async (channelId: string): Promise<boolean> => {
+    const cwd = routingConfig?.routes[channelId]?.cwd
+    if (!cwd) return false
+    const name = sessionName(cwd)
+    const exists = await defaultTmuxClient.hasSession(name)
+    if (!exists) return false
+    return isClaudeRunning(name, defaultTmuxClient)
+  }
+
   // Initialize restart module with adapters bridging tmux + session-manager
   initRestart({
-    isSessionAlive: async (channelId) => {
-      const cwd = routingConfig?.routes[channelId]?.cwd
-      if (!cwd) return false
-      const name = sessionName(cwd)
-      const exists = await defaultTmuxClient.hasSession(name)
-      if (!exists) return false
-      return isClaudeRunning(name, defaultTmuxClient)
-    },
+    isSessionAlive: isSessionAliveAdapter,
     reconnectSession: async (channelId) => {
       const cwd = routingConfig?.routes[channelId]?.cwd
       if (!cwd) return
@@ -1386,15 +1389,6 @@ export async function main(): Promise<void> {
   }
 
   // Initialize and start the health-check poller.
-  const isSessionAliveAdapter = async (channelId: string): Promise<boolean> => {
-    const cwd = routingConfig?.routes[channelId]?.cwd
-    if (!cwd) return false
-    const name = sessionName(cwd)
-    const exists = await defaultTmuxClient.hasSession(name)
-    if (!exists) return false
-    return isClaudeRunning(name, defaultTmuxClient)
-  }
-
   initHealthCheck({
     isSessionAlive: isSessionAliveAdapter,
     isRestartPendingOrActive,

@@ -127,55 +127,7 @@ export const defaultTmuxClient: TmuxClient = {
  * rooted at the given tmux session's pane PID.
  */
 export async function isClaudeRunning(session: string, client: TmuxClient): Promise<boolean> {
-  let panePid: string
-  try {
-    panePid = await client.getPanePid(session)
-  } catch {
-    return false
-  }
-
-  const rootPid = parseInt(panePid, 10)
-  if (isNaN(rootPid) || rootPid <= 0) return false
-
-  try {
-    // Build a map of pid → {ppid, comm} from the full process table.
-    // Skip the header line by slicing from index 1.
-    const psOut = await $`ps -eo pid,ppid,comm`.text()
-    const processes = new Map<number, { ppid: number; comm: string }>()
-    for (const line of psOut.split('\n').slice(1)) {
-      const parts = line.trim().split(/\s+/)
-      if (parts.length < 3) continue
-      const pid = parseInt(parts[0], 10)
-      const ppid = parseInt(parts[1], 10)
-      const comm = parts[2]
-      if (!isNaN(pid) && !isNaN(ppid)) {
-        processes.set(pid, { ppid, comm })
-      }
-    }
-
-    // BFS to collect all PIDs in the subtree rooted at rootPid.
-    const subtree = new Set<number>([rootPid])
-    const queue = [rootPid]
-    while (queue.length > 0) {
-      const current = queue.shift()!
-      for (const [pid, { ppid }] of processes) {
-        if (ppid === current && !subtree.has(pid)) {
-          subtree.add(pid)
-          queue.push(pid)
-        }
-      }
-    }
-
-    // Return true if any process in the subtree has 'claude' in its name.
-    for (const pid of subtree) {
-      const entry = processes.get(pid)
-      if (entry && entry.comm.toLowerCase().includes('claude')) return true
-    }
-    return false
-  } catch (err) {
-    console.error('[slack] isClaudeRunning: process tree check failed:', err)
-    return false
-  }
+  return (await getClaudePid(session, client)) !== null
 }
 
 // ---------------------------------------------------------------------------

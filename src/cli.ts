@@ -11,7 +11,7 @@
 
 import { homedir } from 'os'
 import { join, resolve } from 'path'
-import { existsSync, readFileSync, unlinkSync } from 'fs'
+import { existsSync, openSync, readFileSync, unlinkSync } from 'fs'
 import { spawnSync } from 'child_process'
 import { isProcessRunning } from './pid.ts'
 import { defaultTmuxClient, isClaudeRunning as tmuxIsClaudeRunning, sessionName as tmuxSessionName } from './tmux.ts'
@@ -218,7 +218,10 @@ export function createCli(deps: CliDeps): CliHandlers {
 
     // Phase 2: Stop the server daemon
     console.error('[slack] clean_restart: stopping server')
-    deps.spawnSync(process.execPath, [process.argv[1], 'stop'])
+    const stopResult = deps.spawnSync(process.execPath, [process.argv[1], 'stop'])
+    if (stopResult.status !== 0) {
+      console.error(`[slack] clean_restart: stop returned non-zero exit code: ${stopResult.status}`)
+    }
 
     // Phases 3-4: Exit Claude sessions concurrently
     await Promise.allSettled(Object.entries(routes).map(async ([channelId, route]) => {
