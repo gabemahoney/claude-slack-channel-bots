@@ -226,6 +226,51 @@ describe('rotateSessions', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Crash recovery
+// ---------------------------------------------------------------------------
+
+describe('rotateSessions — crash recovery (T25)', () => {
+  test('T25: server crash before rotation — sessions.json renamed to .last, original content preserved', () => {
+    // Scenario: server had a valid sessions.json from a previous cycle.
+    // When rotateSessions() runs (e.g. on next startup), sessions.json must be
+    // renamed to sessions.json.last and the original file must no longer exist.
+    tempDir = mkdtempSync(join(tmpdir(), 'sessions-test-'))
+    const sessionsPath = join(tempDir, 'sessions.json')
+    const sessions = makeSessionsMap({
+      C_GENERAL: makeSessionRecord({ tmuxSession: 'crash:0', sessionId: 'pre-crash-session-id' }),
+    })
+    writeFileSync(sessionsPath, JSON.stringify(sessions), 'utf-8')
+
+    rotateSessions(sessionsPath)
+
+    // sessions.json must no longer exist after rotation
+    expect(existsSync(sessionsPath)).toBe(false)
+
+    // sessions.json.last must exist and contain the original data
+    expect(existsSync(sessionsPath + '.last')).toBe(true)
+    const rotated = JSON.parse(readFileSync(sessionsPath + '.last', 'utf-8'))
+    expect(rotated).toEqual(sessions)
+  })
+
+  test('T25: .last content matches original sessions.json byte-for-byte (parsed)', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'sessions-test-'))
+    const sessionsPath = join(tempDir, 'sessions.json')
+    const sessions: SessionsMap = {
+      C_GENERAL: makeSessionRecord({ sessionId: 'abc-123', tmuxSession: 'main:0' }),
+      C_DEV: makeSessionRecord({ sessionId: 'def-456', tmuxSession: 'dev:1' }),
+    }
+    writeFileSync(sessionsPath, JSON.stringify(sessions), 'utf-8')
+
+    rotateSessions(sessionsPath)
+
+    const last = JSON.parse(readFileSync(sessionsPath + '.last', 'utf-8')) as SessionsMap
+    expect(last['C_GENERAL'].sessionId).toBe('abc-123')
+    expect(last['C_DEV'].sessionId).toBe('def-456')
+    expect(last['C_GENERAL'].tmuxSession).toBe('main:0')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Edge cases
 // ---------------------------------------------------------------------------
 

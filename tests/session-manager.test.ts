@@ -920,3 +920,144 @@ describe('append_system_prompt_file', () => {
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// Crash recovery
+// ---------------------------------------------------------------------------
+
+describe('crash recovery', () => {
+  // T24: Server crash before sessions.json write
+  // sessions.json does NOT exist (crashed before it was persisted).
+  // Claude process is still alive in tmux. startupSessionManager must
+  // discover session IDs via PID lookup and return complete records.
+  test('T24: crash before sessions.json write — reconnect branch discovers session via PID, returns complete record', async () => {
+    const proc = await spawnClaudeProcess()
+    try {
+      writeClaudeSessionFile(proc.pid!, 'crash-recovery-session-id')
+
+      // tmux session exists and Claude is alive — reconnect branch
+      const stub = makeTmuxStub({
+        hasSessionResult: true,
+        getPanePidResult: String(proc.pid),
+      })
+      const config = makeRoutingConfig()
+
+      // storedSessions is empty — sessions.json was never written (crashed before phase 11)
+      const result = await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
+
+      // Reconnect branch must discover the session via PID and return a full record
+      expect(result).toBeInstanceOf(Map)
+      expect(result.size).toBe(1)
+
+      const record = result.get('C_TEST1')
+      expect(record).toBeDefined()
+      expect(record!.sessionId).toBe('crash-recovery-session-id')
+      expect(record!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
+      expect(typeof record!.lastLaunch).toBe('string')
+
+      // No kill or newSession — reconnect path only sends /mcp reconnect
+      expect(stub.calls.filter(c => c.method === 'killSession')).toHaveLength(0)
+      expect(stub.calls.filter(c => c.method === 'newSession')).toHaveLength(0)
+    } finally {
+      proc.kill()
+    }
+  })
+
+  test('T24: crash before sessions.json write — reconnect sends /mcp reconnect to the live session', async () => {
+    const proc = await spawnClaudeProcess()
+    try {
+      writeClaudeSessionFile(proc.pid!, 'crash-recovery-session-id-2')
+
+      const stub = makeTmuxStub({
+        hasSessionResult: true,
+        getPanePidResult: String(proc.pid),
+      })
+      const config = makeRoutingConfig()
+
+      await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
+
+      const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+      const reconnectCall = sendKeysCalls.find(
+        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`/mcp reconnect ${MCP_SERVER_NAME}`),
+      )
+      expect(reconnectCall).toBeDefined()
+      // 'Enter' passed as variadic third arg
+      expect(reconnectCall!.args[2]).toBe('Enter')
+    } finally {
+      proc.kill()
+    }
+  })
+
+  // T9: Force-killed session — stale ID in .last
+  // storedSessions has a stale session ID that causes "No conversation found".
+  // launchSession must detect the fast-fail, kill/recreate, then launch fresh.
+  // The returned record must have a NEW session ID (not the stale one).
+  test('T9: stale session ID fast-fails, fresh fallback launches and returns new session ID', async () => {
+    const proc = await spawnClaudeProcess()
+    try {
+      const freshSessionId = 'fresh-session-after-stale'
+      writeClaudeSessionFile(proc.pid!, freshSessionId)
+
+      // capturePaneResults: first call returns "No conversation found" (fast-fail trigger),
+      // subsequent calls return the safety prompt so the fresh attempt succeeds.
+      const stub = makeTmuxStub({
+        getPanePidResult: String(proc.pid),
+        capturePaneResults: [
+          'No conversation found',
+          'I am using this for local development',
+        ],
+      })
+      const config = makeRoutingConfig()
+
+      const result = await launchSession(
+        'C_TEST1', '/tmp/test-cwd', config, stub,
+        { pollTimeout: 5_000, sessionId: 'stale-force-killed-id', earlyDetectAfterMs: 0 },
+      )
+
+      // Fresh fallback must succeed and return a record
+      expect(result).not.toBeNull()
+
+      // The returned session ID must be the newly discovered one, not the stale resume ID
+      expect(result!.sessionId).toBe(freshSessionId)
+      expect(result!.sessionId).not.toBe('stale-force-killed-id')
+
+      // Fast-fail path: kill was called at least once (to tear down the stale session)
+      const killCalls = stub.calls.filter(c => c.method === 'killSession')
+      expect(killCalls.length).toBeGreaterThanOrEqual(1)
+
+      // At least one fresh launch command (no --resume) was sent after the fast-fail
+      const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+      const freshCmd = sendKeysCalls.find(
+        c => typeof c.args[1] === 'string' &&
+          (c.args[1] as string).includes('claude --mcp-config') &&
+          !(c.args[1] as string).includes('--resume'),
+      )
+      expect(freshCmd).toBeDefined()
+    } finally {
+      proc.kill()
+    }
+  })
+
+  test('T9: stale session ID — initial launch command includes --resume with the stale ID', async () => {
+    // Verify the resume was actually attempted before the fast-fail
+    const stub = makeTmuxStub({
+      getPanePidResult: '99999999', // Claude never running — both attempts fail
+      capturePaneResults: [
+        'No conversation found',
+        'some output',
+      ],
+    })
+    const config = makeRoutingConfig()
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 600, sessionId: 'stale-force-killed-id', earlyDetectAfterMs: 0 },
+    )
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const resumeCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume stale-force-killed-id'),
+    )
+    expect(resumeCmd).toBeDefined()
+  })
+})
