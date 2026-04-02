@@ -12,6 +12,7 @@ cli.ts                  CLI entry point for the claude-slack-channel-bots comman
     ├── config.ts           Routing configuration — load, validate, defaults, tilde expansion
     ├── registry.ts         Session registry — pending/registered sessions, MCP Server factory, transport routing
     ├── lib.ts              Pure utilities — gate, access control, chunking, sanitization
+    ├── logging.ts          Log file setup — overrides console.error/console.log with timestamped writeSync to a log file
     ├── session-manager.ts  Startup orchestration — per-route state detection, kill/relaunch logic
     ├── restart.ts          Auto-restart — delayed relaunch on disconnect, failure counting, timer cancellation
     ├── health-check.ts     Periodic liveness poller — checks routes on a timer, schedules restarts for dead sessions
@@ -124,7 +125,7 @@ The interval is controlled by `health_check_interval` in `routing.json`. If the 
 
 ### clean_restart
 
-`clean_restart` (CLI subcommand) gracefully exits all managed Claude Code sessions before performing a stop/start cycle. `CliDeps` is extended with injectable tmux operations (`hasSession`, `sendKeys`, `isClaudeRunning`, `killSession`) and a `readSessions` function.
+`clean_restart` (CLI subcommand) gracefully exits all managed Claude Code sessions before performing a stop/start cycle. It logs to `STATE_DIR/clean_restart.log` via `initLogging()` (see [Logging](#logging)). `CliDeps` is extended with injectable tmux operations (`hasSession`, `sendKeys`, `isClaudeRunning`, `killSession`) and a `readSessions` function.
 
 Algorithm:
 
@@ -194,6 +195,34 @@ Set by the server at session launch:
 ### access.json (~/.claude/channels/slack/access.json)
 
 Access control policy: DM policy, allowlist, channel policies, ack reaction. chmod 600.
+
+## Logging
+
+### Why console.error/console.log are overridden directly
+
+Bun bypasses `process.stderr.write` overrides — the runtime writes directly to the file descriptor, so patching `process.stderr.write` has no effect. `src/logging.ts` works around this by replacing `console.error` and `console.log` themselves before any logging occurs.
+
+### initLogging()
+
+`initLogging(logFilePath)` in `src/logging.ts` opens the target file in append mode and replaces both `console.error` and `console.log` with wrapper functions that:
+
+1. Format all arguments to a single string (JSON-serializing objects)
+2. Prepend an ISO-8601 timestamp: `[2024-01-01T00:00:00.000Z] message`
+3. Write the line synchronously via `writeSync` to the open file descriptor
+4. Fall back to the original `console.error`/`console.log` if the write fails
+
+The originals are captured at module load time so the fallback always refers to Bun's native output.
+
+### Log file locations
+
+Both paths are rooted in `SLACK_STATE_DIR` (default: `~/.claude/channels/slack/`).
+
+| Process | Log file |
+|---------|----------|
+| Server daemon (`server.ts`) | `STATE_DIR/server.log` |
+| `clean_restart` subcommand | `STATE_DIR/clean_restart.log` |
+
+Both files are opened in append mode — multiple restarts accumulate in the same file rather than overwriting it.
 
 ## Security Model
 

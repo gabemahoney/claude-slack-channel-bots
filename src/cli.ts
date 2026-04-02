@@ -11,12 +11,13 @@
 
 import { homedir } from 'os'
 import { join, resolve } from 'path'
-import { existsSync, readFileSync, unlinkSync, openSync, writeSync } from 'fs'
+import { existsSync, readFileSync, unlinkSync } from 'fs'
 import { spawnSync } from 'child_process'
 import { isProcessRunning } from './pid.ts'
 import { defaultTmuxClient, isClaudeRunning as tmuxIsClaudeRunning, sessionName as tmuxSessionName } from './tmux.ts'
 import { readSessions, type SessionsMap } from './sessions.ts'
 import { loadConfig as configLoadConfig, type RoutingConfig } from './config.ts'
+import { initLogging } from './logging.ts'
 
 // ---------------------------------------------------------------------------
 // Injectable dependency interface
@@ -127,18 +128,7 @@ export function createCli(deps: CliDeps): CliHandlers {
     }
 
     // Child (daemon): redirect stderr/stdout to server.log
-    // Bun's child_process.spawn does not reliably pass numeric fds via stdio,
-    // so the daemon must open the log file itself and override process streams.
-    try {
-      const logPath = join(stateDir, 'server.log')
-      const logFd = openSync(logPath, 'a')
-      const writeToLog = (chunk: any): boolean => {
-        try { writeSync(logFd, typeof chunk === 'string' ? chunk : String(chunk)) } catch { /* ignore */ }
-        return true
-      }
-      process.stderr.write = writeToLog as typeof process.stderr.write
-      process.stdout.write = writeToLog as typeof process.stdout.write
-    } catch { /* best-effort: log redirect failure is non-fatal */ }
+    try { initLogging(join(stateDir, 'server.log')) } catch { /* best-effort: log redirect failure is non-fatal */ }
 
     // Child (daemon): start the server
     await deps.startServer()
@@ -189,6 +179,7 @@ export function createCli(deps: CliDeps): CliHandlers {
   }
 
   async function clean_restart(): Promise<void> {
+    try { initLogging(join(deps.resolveStateDir(), 'clean_restart.log')) } catch { /* best-effort */ }
     const sessions = deps.readSessions()
     console.error(`[slack] clean_restart: sessions.json contents: ${JSON.stringify(sessions)}`)
     const entries = Object.entries(sessions)

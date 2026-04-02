@@ -805,17 +805,17 @@ async function shutdown(signal: string): Promise<void> {
   stopHealthCheck()
   cancelAllRestartTimers()
 
-  process.stderr.write(`[slack] Received ${signal} — shutting down\n`)
+  console.error(`[slack] Received ${signal} — shutting down`)
 
   if (httpServer) {
-    process.stderr.write('[slack] Stopping HTTP server\n')
+    console.error('[slack] Stopping HTTP server')
     httpServer.stop(true)
     httpServer = null
   }
 
   // Close all pending (not yet routed) MCP transports
   for (const pending of getAllPendingSessions()) {
-    process.stderr.write('[slack] Closing pending MCP transport (not yet routed)\n')
+    console.error('[slack] Closing pending MCP transport (not yet routed)')
     removePendingSession(pending.pendingId)
     try {
       await pending.transport.close()
@@ -825,9 +825,7 @@ async function shutdown(signal: string): Promise<void> {
   // Close all active MCP transports
   for (const entry of getAllSessions()) {
     if (entry.connected) {
-      process.stderr.write(
-        `[slack] Closing MCP transport for CWD "${entry.cwd}"\n`,
-      )
+      console.error(`[slack] Closing MCP transport for CWD "${entry.cwd}"`)
       try {
         await entry.transport.close()
       } catch { /* ignore */ }
@@ -835,14 +833,14 @@ async function shutdown(signal: string): Promise<void> {
     }
   }
 
-  process.stderr.write('[slack] Disconnecting Socket Mode\n')
+  console.error('[slack] Disconnecting Socket Mode')
   try {
     await socket.disconnect()
   } catch { /* ignore */ }
 
   removePidFile(PID_FILE)
 
-  process.stderr.write('[slack] Shutdown complete\n')
+  console.error('[slack] Shutdown complete')
   process.exit(0)
 }
 
