@@ -14,8 +14,9 @@ import { join, resolve } from 'path'
 import { existsSync, readFileSync, unlinkSync, openSync, writeSync } from 'fs'
 import { spawnSync } from 'child_process'
 import { isProcessRunning } from './pid.ts'
-import { defaultTmuxClient, isClaudeRunning as tmuxIsClaudeRunning } from './tmux.ts'
+import { defaultTmuxClient, isClaudeRunning as tmuxIsClaudeRunning, sessionName as tmuxSessionName } from './tmux.ts'
 import { readSessions, type SessionsMap } from './sessions.ts'
+import { loadConfig as configLoadConfig, type RoutingConfig } from './config.ts'
 
 // ---------------------------------------------------------------------------
 // Injectable dependency interface
@@ -44,8 +45,12 @@ export interface CliDeps {
   exit: (code: number) => never
   /** Returns true if a tmux session with the given name exists. */
   hasSession: (name: string) => Promise<boolean>
+  /** Load the routing configuration. */
+  loadConfig: () => RoutingConfig
+  /** Returns the canonical tmux session name for a given working directory path. */
+  sessionName: (cwd: string) => string
   /** Sends keystrokes to the given tmux session. */
-  sendKeys: (session: string, keys: string) => Promise<void>
+  sendKeys: (session: string, ...keys: string[]) => Promise<void>
   /** Returns true if a 'claude' process is running in the given tmux session. */
   isClaudeRunning: (session: string) => Promise<boolean>
   /** Kills the named tmux session. */
@@ -284,8 +289,10 @@ if (import.meta.main) {
     resolveStateDir: defaultStateDir,
     startServer: async () => { const { main } = await import('./server.ts'); return main() },
     exit: (code) => process.exit(code),
+    loadConfig: () => configLoadConfig(),
+    sessionName: (cwd) => tmuxSessionName(cwd),
     hasSession: (name) => defaultTmuxClient.hasSession(name),
-    sendKeys: (session, keys) => defaultTmuxClient.sendKeys(session, keys),
+    sendKeys: (session, ...keys) => defaultTmuxClient.sendKeys(session, ...keys),
     isClaudeRunning: (session) => tmuxIsClaudeRunning(session, defaultTmuxClient),
     killSession: (session) => defaultTmuxClient.killSession(session),
     readSessions: () => readSessions(),

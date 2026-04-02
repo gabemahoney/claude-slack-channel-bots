@@ -16,6 +16,7 @@ import { describe, test, expect, beforeAll, beforeEach, afterEach, jest } from '
 import { join } from 'path'
 import type { CliDeps, CliHandlers } from '../src/cli.ts'
 import type { SessionsMap } from '../src/sessions.ts'
+import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 
 // ---------------------------------------------------------------------------
 // Env bootstrapping — must happen before cli.ts (and server.ts) are loaded
@@ -65,7 +66,9 @@ interface DepsOverrides {
   isProcessRunning?: (pid: number) => boolean
   sessions?: SessionsMap
   hasSession?: (name: string) => Promise<boolean>
-  sendKeys?: (session: string, keys: string) => Promise<void>
+  loadConfig?: () => ReturnType<typeof makeRoutingConfig>
+  sessionName?: (cwd: string) => string
+  sendKeys?: (session: string, ...keys: string[]) => Promise<void>
   isClaudeRunning?: (session: string) => Promise<boolean>
   killSession?: (session: string) => Promise<void>
 }
@@ -126,9 +129,13 @@ function makeDeps(overrides: DepsOverrides = {}): DepsBundle {
       throw new ExitError(code)
     },
     hasSession: overrides.hasSession ?? (async (_name) => true),
-    sendKeys: async (session, keys) => {
-      sendKeysCalls.push({ session, keys })
-      await (overrides.sendKeys ?? (() => Promise.resolve()))(session, keys)
+    loadConfig: overrides.loadConfig ?? (() => makeRoutingConfig()),
+    sessionName: overrides.sessionName ?? ((cwd) => `slack_bot_stub_${cwd}`),
+    sendKeys: async (session, ...keys) => {
+      for (const key of keys) {
+        sendKeysCalls.push({ session, keys: key })
+      }
+      await (overrides.sendKeys ?? (() => Promise.resolve()))(session, ...keys)
     },
     isClaudeRunning: overrides.isClaudeRunning ?? (async (_session) => false),
     killSession: async (session) => {
@@ -712,7 +719,7 @@ describe('clean_restart — mixed success/failure', () => {
     return makeDeps({
       sessions: { C1: SESSION_A, C2: SESSION_B, C3: SESSION_C },
       hasSession: async () => true,
-      sendKeys: async (session, _keys) => {
+      sendKeys: async (session, ..._keys) => {
         if (session === SESSION_C.tmuxSession) throw new Error('sendKeys failed')
       },
       isClaudeRunning: async (session) => session === SESSION_B.tmuxSession,
