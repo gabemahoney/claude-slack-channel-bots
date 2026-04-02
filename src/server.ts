@@ -1339,13 +1339,20 @@ export async function main(): Promise<void> {
       const exists = await defaultTmuxClient.hasSession(name)
       if (exists) await defaultTmuxClient.killSession(name)
     },
-    launchSession: (channelId, cwd, sessionId) => {
-      if (!routingConfig) return Promise.resolve(false)
+    launchSession: async (channelId, cwd, sessionId) => {
+      if (!routingConfig) return false
       const resolvedSessionId = sessionId ?? readSessions()[channelId]?.sessionId
-      return launchSession(
-        channelId, cwd, routingConfig, defaultTmuxClient, readSessions, writeSessions,
+      const record = await launchSession(
+        channelId, cwd, routingConfig, defaultTmuxClient,
         resolvedSessionId !== undefined ? { sessionId: resolvedSessionId } : undefined,
       )
+      if (record) {
+        const sessions = readSessions()
+        sessions[channelId] = record
+        writeSessions(sessions)
+        console.error(`[slack] Session recorded in sessions.json: channel=${channelId} sessionId=${record.sessionId}`)
+      }
+      return record !== null
     },
     getRestartDelay: () => routingConfig?.session_restart_delay ?? 60,
     isShuttingDown: () => shuttingDown,
