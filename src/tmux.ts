@@ -21,7 +21,7 @@ export interface TmuxClient {
   /** Creates a new detached tmux session with the given name and working directory. */
   newSession(name: string, cwd: string): Promise<void>
   /** Sends keystrokes to the given session. */
-  sendKeys(session: string, keys: string): Promise<void>
+  sendKeys(session: string, ...keys: string[]): Promise<void>
   /** Returns the current text content of the session's pane. */
   capturePane(session: string): Promise<string>
   /** Kills the named tmux session. */
@@ -90,7 +90,7 @@ export const defaultTmuxClient: TmuxClient = {
     }
   },
 
-  async sendKeys(session: string, keys: string): Promise<void> {
+  async sendKeys(session: string, ...keys: string[]): Promise<void> {
     try {
       await $`tmux send-keys -t ${session} ${keys}`
     } catch (err) {
@@ -175,5 +175,65 @@ export async function isClaudeRunning(session: string, client: TmuxClient): Prom
   } catch (err) {
     console.error('[slack] isClaudeRunning: process tree check failed:', err)
     return false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// getClaudePid
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the PID of the 'claude' process found in the process tree
+ * rooted at the given tmux session's pane PID, or null if not found.
+ */
+export async function getClaudePid(session: string, client: TmuxClient): Promise<number | null> {
+  let panePid: string
+  try {
+    panePid = await client.getPanePid(session)
+  } catch {
+    return null
+  }
+
+  const rootPid = parseInt(panePid, 10)
+  if (isNaN(rootPid) || rootPid <= 0) return null
+
+  try {
+    // Build a map of pid → {ppid, comm} from the full process table.
+    // Skip the header line by slicing from index 1.
+    const psOut = await $`ps -eo pid,ppid,comm`.text()
+    const processes = new Map<number, { ppid: number; comm: string }>()
+    for (const line of psOut.split('\n').slice(1)) {
+      const parts = line.trim().split(/\s+/)
+      if (parts.length < 3) continue
+      const pid = parseInt(parts[0], 10)
+      const ppid = parseInt(parts[1], 10)
+      const comm = parts[2]
+      if (!isNaN(pid) && !isNaN(ppid)) {
+        processes.set(pid, { ppid, comm })
+      }
+    }
+
+    // BFS to collect all PIDs in the subtree rooted at rootPid.
+    const subtree = new Set<number>([rootPid])
+    const queue = [rootPid]
+    while (queue.length > 0) {
+      const current = queue.shift()!
+      for (const [pid, { ppid }] of processes) {
+        if (ppid === current && !subtree.has(pid)) {
+          subtree.add(pid)
+          queue.push(pid)
+        }
+      }
+    }
+
+    // Return the PID of the first process in the subtree with 'claude' in its name.
+    for (const pid of subtree) {
+      const entry = processes.get(pid)
+      if (entry && entry.comm.toLowerCase().includes('claude')) return pid
+    }
+    return null
+  } catch (err) {
+    console.error('[slack] getClaudePid: process tree check failed:', err)
+    return null
   }
 }

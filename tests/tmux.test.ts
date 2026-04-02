@@ -8,7 +8,7 @@ import { describe, test, expect, beforeEach, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, chmodSync, existsSync, rmSync } from 'fs'
 import { tmpdir, homedir } from 'os'
 import { join } from 'path'
-import { sessionName, isClaudeRunning } from '../src/tmux.ts'
+import { sessionName, isClaudeRunning, getClaudePid } from '../src/tmux.ts'
 import { makeTmuxStub } from './test-helpers/tmux-stub.ts'
 
 // ---------------------------------------------------------------------------
@@ -182,5 +182,79 @@ describe('isClaudeRunning', () => {
     } finally {
       proc.kill()
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// getClaudePid()
+// ---------------------------------------------------------------------------
+
+describe('getClaudePid', () => {
+  test('returns null when getPanePid throws', async () => {
+    const s = makeTmuxStub({ getPanePidResult: new Error('tmux gone') })
+    expect(await getClaudePid('my-session', s)).toBe(null)
+  })
+
+  test('returns null when getPanePid returns a non-numeric string', async () => {
+    const s = makeTmuxStub({ getPanePidResult: 'not-a-pid' })
+    expect(await getClaudePid('my-session', s)).toBe(null)
+  })
+
+  test('returns null when no claude process exists under the pane PID', async () => {
+    // PID 99999999 is above Linux max PID and will not appear in the process table
+    const s = makeTmuxStub({ getPanePidResult: '99999999' })
+    expect(await getClaudePid('my-session', s)).toBe(null)
+  })
+
+  test('passes the session name to getPanePid', async () => {
+    // getPanePid throws so getClaudePid returns early — we just verify the call
+    const s = makeTmuxStub({ getPanePidResult: new Error('bail') })
+    await getClaudePid('target-session', s)
+    expect(s.calls[0]).toEqual({ method: 'getPanePid', args: ['target-session'] })
+  })
+
+  test('returns the PID when a process named "claude" is found under the pane PID', async () => {
+    // Copy a known binary to a temp file named "claude" so that ps reports comm="claude"
+    const sleepBin = existsSync('/usr/bin/sleep') ? '/usr/bin/sleep' : '/bin/sleep'
+    const tmpDir = mkdtempSync(join(tmpdir(), 'tmux-test-'))
+    const claudePath = join(tmpDir, 'claude')
+    copyFileSync(sleepBin, claudePath)
+    chmodSync(claudePath, 0o755)
+
+    const proc = Bun.spawn([claudePath, '60'])
+    // Brief pause for the process to appear in the OS process table
+    await Bun.sleep(100)
+
+    try {
+      const s = makeTmuxStub({ getPanePidResult: String(proc.pid) })
+      const result = await getClaudePid('test-session', s)
+      expect(result).toBe(proc.pid)
+    } finally {
+      proc.kill()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// sendKeys() — variadic signature
+// ---------------------------------------------------------------------------
+
+describe('sendKeys (variadic)', () => {
+  test('records a single key in the calls array', async () => {
+    const s = makeTmuxStub()
+    await s.sendKeys('my-session', 'Enter')
+    expect(s.calls[0]).toEqual({ method: 'sendKeys', args: ['my-session', 'Enter'] })
+  })
+
+  test('records multiple keys as separate variadic args', async () => {
+    const s = makeTmuxStub()
+    await s.sendKeys('my-session', 'hello', 'Enter')
+    expect(s.calls[0]).toEqual({ method: 'sendKeys', args: ['my-session', 'hello', 'Enter'] })
+  })
+
+  test('throws when sendKeysResult is an Error', async () => {
+    const s = makeTmuxStub({ sendKeysResult: new Error('send failed') })
+    expect(s.sendKeys('my-session', 'Enter')).rejects.toThrow('send failed')
   })
 })

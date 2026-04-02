@@ -57,8 +57,8 @@ export function makeTmuxStub(opts: TmuxStubOpts = {}): TmuxClient & { calls: Cal
       if (opts.newSessionResult instanceof Error) throw opts.newSessionResult
     },
 
-    async sendKeys(session, keys) {
-      calls.push({ method: 'sendKeys', args: [session, keys] })
+    async sendKeys(session, ...keys) {
+      calls.push({ method: 'sendKeys', args: [session, ...keys] })
       if (opts.sendKeysResult instanceof Error) throw opts.sendKeysResult
     },
 
