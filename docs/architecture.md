@@ -123,18 +123,22 @@ On each tick:
 
 The interval is controlled by `health_check_interval` in `routing.json`. If the value is `0`, `startHealthCheck()` returns immediately and no interval is created. `stopHealthCheck()` clears the interval during graceful shutdown, before `cancelAllRestartTimers()` runs.
 
+### stop command
+
+`stop` (CLI subcommand) sends SIGTERM to the running server via the PID file at `STATE_DIR/server.pid`. If the process does not exit within `stop_timeout` seconds (default 30 s, configurable in `routing.json`), a SIGKILL is sent. A brief 2 s confirmation poll follows the SIGKILL. Stale PID files (process no longer running) are silently removed. A non-zero exit from this phase causes `stop` to exit 1.
+
 ### clean_restart
 
-`clean_restart` (CLI subcommand) gracefully exits all managed Claude Code sessions before performing a stop/start cycle. It logs to `STATE_DIR/clean_restart.log` via `initLogging()` (see [Logging](#logging)). `CliDeps` is extended with injectable tmux operations (`hasSession`, `sendKeys`, `isClaudeRunning`, `killSession`) and a `readSessions` function.
+`clean_restart` (CLI subcommand) stops the server daemon first, then concurrently exits all managed Claude Code sessions, then starts a fresh server. The stop-first ordering prevents the health-check poller and auto-restart logic from interfering with session teardown. It logs to `STATE_DIR/clean_restart.log` via `initLogging()` (see [Logging](#logging)). `CliDeps` is extended with injectable tmux operations (`hasSession`, `sendKeys`, `isClaudeRunning`, `killSession`) and a `loadConfig` function for route and timeout discovery.
 
 Algorithm:
 
-1. **Read sessions** — `readSessions()` loads `sessions.json`. If no entries exist, the shutdown phase is skipped.
-2. **Send /exit** — for each session record, checks `hasSession(tmuxSession)` and, if present, sends `/exit` + Enter via `sendKeys`. All sessions are fanned out in parallel via `Promise.all`. Per-session errors are caught and logged; they never abort the restart.
-3. **Poll for exit** — in a second parallel fan-out, polls `isClaudeRunning(tmuxSession)` with exponential backoff (500 ms start, doubles each step, 5 s cap) for up to 60 seconds per session.
-4. **Force-kill on timeout** — if a session does not exit within 60 seconds, `killSession(tmuxSession)` is called. Kill errors are caught and logged.
-5. **Stop** — shells out to `claude-slack-channel-bots stop`.
-6. **Start** — shells out to `claude-slack-channel-bots start`. A non-zero exit code from `start` is propagated and the process exits with that code.
+1. **Init logging + load config** — `initLogging()` redirects output to `clean_restart.log`. `loadConfig()` reads `routing.json` and provides the `routes` map and `exit_timeout` value used in subsequent phases. Config load failure is fatal.
+2. **Stop server daemon** — shells out to `claude-slack-channel-bots stop`, which sends SIGTERM and escalates to SIGKILL after `stop_timeout` (see [stop command](#stop-command)).
+3. **Exit sessions** — iterates `routingConfig.routes`. For each route, `sessionName(route.cwd)` derives the tmux session name. `hasSession()` and `isClaudeRunning()` gate the attempt; if either check fails the session is skipped. All routes are fanned out in parallel via `Promise.allSettled`. Per-session errors are caught and logged; they never abort the restart.
+4. **Force-kill on timeout** — within each per-session goroutine, `/exit` + Enter is sent as a single atomic `sendKeys` call. `isClaudeRunning()` is then polled with exponential backoff (500 ms start, doubles each step, 5 s cap) for up to `exit_timeout` seconds (default 120 s). If the session does not exit within the timeout, `killSession()` is called.
+5. **Start new server daemon** — shells out to `claude-slack-channel-bots start`.
+6. **Exit** — a non-zero exit code from `start` is propagated and the process exits with that code.
 
 ### Graceful Shutdown
 
@@ -154,6 +158,8 @@ Key fields:
 - `default_dm_session` — CWD for handling direct messages
 - `session_restart_delay` — seconds before auto-restarting dead sessions (default: 60, 0 = disabled)
 - `health_check_interval` — seconds between health-check polls (default: 120, 0 = disabled)
+- `exit_timeout` — seconds `clean_restart` waits for a Claude session to exit cleanly before force-killing it (default: 120)
+- `stop_timeout` — seconds the `stop` command waits after SIGTERM before escalating to SIGKILL (default: 30)
 - `mcp_config_path` — path to MCP config file for Claude launch (default: ~/.claude/slack-mcp.json)
 - `append_system_prompt_file` — optional path to a file appended to every managed session's system prompt via `--append-system-prompt-file`; missing file silently skipped
 
@@ -177,7 +183,7 @@ If the `sessionId` field is absent, the session is treated as having no resumabl
 
 ### server.pid (STATE_DIR/server.pid)
 
-Written at startup with the server's process ID. Used by the CLI `stop` command to send `SIGTERM` to a running server and by startup to detect a conflicting already-running instance. Removed on graceful shutdown.
+Written at startup with the server's process ID. Used by the CLI `stop` command to send SIGTERM (with SIGKILL escalation after `stop_timeout`) to a running server, and by startup to detect a conflicting already-running instance. Removed on graceful shutdown.
 
 ### Environment Variables
 

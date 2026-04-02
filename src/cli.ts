@@ -205,74 +205,75 @@ export function createCli(deps: CliDeps): CliHandlers {
 
   async function clean_restart(): Promise<void> {
     try { initLogging(join(deps.resolveStateDir(), 'clean_restart.log')) } catch { /* best-effort */ }
-    const sessions = deps.readSessions()
-    console.error(`[slack] clean_restart: sessions.json contents: ${JSON.stringify(sessions)}`)
-    const entries = Object.entries(sessions)
 
-    if (entries.length > 0) {
-      console.error(`[slack] clean_restart: sending /exit to ${entries.length} session(s)`)
-
-      // Fan out: send /exit + Enter to all sessions in parallel (best-effort)
-      await Promise.all(entries.map(async ([channelId, record]) => {
-        try {
-          const exists = await deps.hasSession(record.tmuxSession)
-          if (!exists) {
-            console.error(`[slack] clean_restart: session not found for channel=${channelId}, skipping`)
-            return
-          }
-          await deps.sendKeys(record.tmuxSession, '/exit')
-          await deps.sendKeys(record.tmuxSession, 'Enter')
-          console.error(`[slack] clean_restart: sent /exit to channel=${channelId} session=${record.tmuxSession}`)
-        } catch (err) {
-          console.error(`[slack] clean_restart: error sending /exit to channel=${channelId}:`, err)
-        }
-      }))
-
-      // Poll each session until Claude exits or 60s timeout (best-effort)
-      await Promise.all(entries.map(async ([channelId, record]) => {
-        try {
-          const exists = await deps.hasSession(record.tmuxSession)
-          if (!exists) return
-
-          const timeout = 60_000
-          const start = Date.now()
-          let delay = 500
-          const maxDelay = 5_000
-
-          while (Date.now() - start < timeout) {
-            const running = await deps.isClaudeRunning(record.tmuxSession)
-            if (!running) {
-              console.error(`[slack] clean_restart: channel=${channelId} exited cleanly`)
-              return
-            }
-            await new Promise<void>((r) => setTimeout(r, delay))
-            delay = Math.min(delay * 2, maxDelay)
-          }
-
-          // Timed out — force kill
-          console.error(`[slack] clean_restart: timeout waiting for channel=${channelId}, force-killing`)
-          try {
-            await deps.killSession(record.tmuxSession)
-          } catch (err) {
-            console.error(`[slack] clean_restart: killSession failed for channel=${channelId}:`, err)
-          }
-        } catch (err) {
-          console.error(`[slack] clean_restart: error polling channel=${channelId}:`, err)
-        }
-      }))
+    // Phase 1: Load config
+    let config: RoutingConfig
+    try {
+      config = deps.loadConfig()
+    } catch (err) {
+      console.error('[slack] clean_restart: failed to load config:', err)
+      deps.exit(1)
     }
+    const { routes, exit_timeout } = config!
 
-    // Stop the server
+    // Phase 2: Stop the server daemon
     console.error('[slack] clean_restart: stopping server')
     deps.spawnSync(process.execPath, [process.argv[1], 'stop'])
 
-    // Start the server
+    // Phases 3-4: Exit Claude sessions concurrently
+    await Promise.allSettled(Object.entries(routes).map(async ([channelId, route]) => {
+      const name = deps.sessionName(route.cwd)
+      try {
+        // Phase 3: Check session exists
+        const exists = await deps.hasSession(name)
+        if (!exists) {
+          console.error(`[slack] clean_restart: session not found for channel=${channelId} session=${name}`)
+          return
+        }
+
+        const claudeRunning = await deps.isClaudeRunning(name)
+        if (!claudeRunning) {
+          console.error(`[slack] clean_restart: Claude not running for channel=${channelId} session=${name}`)
+          return
+        }
+
+        // Phase 4: Send /exit atomically
+        await deps.sendKeys(name, '/exit', 'Enter')
+
+        // Poll with exponential backoff until exit or timeout
+        const timeoutMs = exit_timeout * 1000
+        const start = Date.now()
+        let delay = 500
+        const maxDelay = 5_000
+
+        while (Date.now() - start < timeoutMs) {
+          await new Promise<void>((r) => setTimeout(r, delay))
+          delay = Math.min(delay * 2, maxDelay)
+          const running = await deps.isClaudeRunning(name)
+          if (!running) {
+            const elapsed = Date.now() - start
+            console.error(`[slack] clean_restart: channel=${channelId} session=${name} exited cleanly in ${elapsed}ms`)
+            return
+          }
+        }
+
+        // Timeout — force kill
+        const elapsed = Date.now() - start
+        await deps.killSession(name)
+        console.error(`[slack] clean_restart: channel=${channelId} session=${name} force-killed after ${elapsed}ms`)
+      } catch (err) {
+        console.error(`[slack] clean_restart: error processing channel=${channelId} session=${name}:`, err)
+      }
+    }))
+
+    // Phases 5-6: Start new server and exit
     console.error('[slack] clean_restart: starting server')
     const startResult = deps.spawnSync(process.execPath, [process.argv[1], 'start'])
     if (startResult.status !== 0) {
       console.error(`[slack] clean_restart: start failed with exit code ${startResult.status}`)
       deps.exit(startResult.status ?? 1)
     }
+    console.error('[slack] clean_restart: done')
   }
 
   return { start, stop, clean_restart }

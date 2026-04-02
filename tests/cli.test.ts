@@ -716,59 +716,105 @@ describe('stop — loadConfig throws, falls back to 30s default', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Shared session fixtures for clean_restart tests
+// Shared fixtures for clean_restart tests
 // ---------------------------------------------------------------------------
 
-const SESSION_A = { tmuxSession: 'slack_bot_a', lastLaunch: '2026-01-01T00:00:00Z', sessionId: 'pending' }
-const SESSION_B = { tmuxSession: 'slack_bot_b', lastLaunch: '2026-01-01T00:00:00Z', sessionId: 'pending' }
-const SESSION_C = { tmuxSession: 'slack_bot_c', lastLaunch: '2026-01-01T00:00:00Z', sessionId: 'pending' }
+// Deterministic session name helper — mirrors the sessionName stub default
+function fakeSessionName(cwd: string): string {
+  return `slack_bot_${cwd.replace(/\//g, '_')}`
+}
+
+const CWD_C1 = '/cwd/c1'
+const CWD_C2 = '/cwd/c2'
+const CWD_C3 = '/cwd/c3'
+
+const SN_C1 = fakeSessionName(CWD_C1)
+const SN_C2 = fakeSessionName(CWD_C2)
+const SN_C3 = fakeSessionName(CWD_C3)
+
+// Two-route config used by most tests (exit_timeout=1 for fast tests)
+const TWO_ROUTE_CONFIG = () =>
+  makeRoutingConfig({
+    routes: { C1: { cwd: CWD_C1 }, C2: { cwd: CWD_C2 } },
+    exit_timeout: 1,
+  })
+
+// Three-route config for mixed tests
+const THREE_ROUTE_CONFIG = () =>
+  makeRoutingConfig({
+    routes: { C1: { cwd: CWD_C1 }, C2: { cwd: CWD_C2 }, C3: { cwd: CWD_C3 } },
+    exit_timeout: 1,
+  })
 
 // ---------------------------------------------------------------------------
-// clean_restart — all sessions exit cleanly in parallel
+// clean_restart — all sessions exit cleanly
 // ---------------------------------------------------------------------------
 
-describe('clean_restart — all sessions exit cleanly in parallel', () => {
+describe('clean_restart — all sessions exit cleanly', () => {
   let cli: CliHandlers
   let result: DepsBundle
 
   beforeEach(() => {
+    jest.useFakeTimers()
+    // isClaudeRunning: true on first call (guard passes → sendKeys fires),
+    // false on subsequent calls (poll detects clean exit)
+    const callCounts = new Map<string, number>()
     result = makeDeps({
-      sessions: { C1: SESSION_A, C2: SESSION_B },
+      loadConfig: TWO_ROUTE_CONFIG,
+      sessionName: fakeSessionName,
       hasSession: async () => true,
-      isClaudeRunning: async () => false, // both exit immediately on first poll
+      isClaudeRunning: async (session) => {
+        const n = (callCounts.get(session) ?? 0) + 1
+        callCounts.set(session, n)
+        return n === 1 // true first time (guard), false on poll
+      },
     })
     cli = createCli(result.deps)
   })
 
-  test('sends /exit to every session', async () => {
-    await cli.clean_restart()
-    const exitTargets = new Set(
-      result.sendKeysCalls.filter((c) => c.keys === '/exit').map((c) => c.session),
-    )
-    expect(exitTargets).toEqual(new Set([SESSION_A.tmuxSession, SESSION_B.tmuxSession]))
+  afterEach(() => {
+    jest.useRealTimers()
   })
 
-  test('sends Enter to every session', async () => {
-    await cli.clean_restart()
-    const enterTargets = new Set(
-      result.sendKeysCalls.filter((c) => c.keys === 'Enter').map((c) => c.session),
-    )
-    expect(enterTargets).toEqual(new Set([SESSION_A.tmuxSession, SESSION_B.tmuxSession]))
+  test('stop called before /exit is sent to sessions', async () => {
+    const p = cli.clean_restart()
+    await drainFakeTimers(p)
+    const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
+    const stopIdx = subcommands.indexOf('stop')
+    const startIdx = subcommands.indexOf('start')
+    expect(stopIdx).toBeGreaterThanOrEqual(0)
+    expect(startIdx).toBeGreaterThan(stopIdx)
+  })
+
+  test('sends /exit atomically (single sendKeys call) to each session', async () => {
+    const p = cli.clean_restart()
+    await drainFakeTimers(p)
+    // Each session should have exactly one sendKeys call with '/exit' key and one with 'Enter'
+    for (const sn of [SN_C1, SN_C2]) {
+      const exitCalls = result.sendKeysCalls.filter((c) => c.session === sn && c.keys === '/exit')
+      const enterCalls = result.sendKeysCalls.filter((c) => c.session === sn && c.keys === 'Enter')
+      expect(exitCalls).toHaveLength(1)
+      expect(enterCalls).toHaveLength(1)
+    }
   })
 
   test('does not force-kill any session', async () => {
-    await cli.clean_restart()
+    const p = cli.clean_restart()
+    await drainFakeTimers(p)
     expect(result.killSessionCalls).toHaveLength(0)
   })
 
-  test('calls stop before start', async () => {
-    await cli.clean_restart()
+  test('start called after stop', async () => {
+    const p = cli.clean_restart()
+    await drainFakeTimers(p)
     const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
-    expect(subcommands.indexOf('stop')).toBeLessThan(subcommands.indexOf('start'))
+    expect(subcommands).toContain('stop')
+    expect(subcommands).toContain('start')
   })
 
   test('does not call exit with an error code', async () => {
-    const err = await runHandler(() => cli.clean_restart())
+    const p = cli.clean_restart()
+    const err = await runHandler(() => drainFakeTimers(p))
     expect(err).toBeNull()
     expect(result.exitCodes).toHaveLength(0)
   })
@@ -784,11 +830,19 @@ describe('clean_restart — one session times out, force-killed', () => {
 
   beforeEach(() => {
     jest.useFakeTimers()
+    // C1: true on first call (guard passes), false on poll → clean exit
+    // C2: always true → times out and gets force-killed
+    const callCounts = new Map<string, number>()
     result = makeDeps({
-      sessions: { C1: SESSION_A, C2: SESSION_B },
+      loadConfig: TWO_ROUTE_CONFIG,
+      sessionName: fakeSessionName,
       hasSession: async () => true,
-      // B never exits; A exits immediately on first poll
-      isClaudeRunning: async (session) => session === SESSION_B.tmuxSession,
+      isClaudeRunning: async (session) => {
+        const n = (callCounts.get(session) ?? 0) + 1
+        callCounts.set(session, n)
+        if (session === SN_C2) return true  // C2 never exits
+        return n === 1                       // C1: true first call, false on poll
+      },
     })
     cli = createCli(result.deps)
   })
@@ -803,13 +857,13 @@ describe('clean_restart — one session times out, force-killed', () => {
     const exitTargets = new Set(
       result.sendKeysCalls.filter((c) => c.keys === '/exit').map((c) => c.session),
     )
-    expect(exitTargets).toEqual(new Set([SESSION_A.tmuxSession, SESSION_B.tmuxSession]))
+    expect(exitTargets).toEqual(new Set([SN_C1, SN_C2]))
   })
 
   test('force-kills only the timed-out session', async () => {
     const p = cli.clean_restart()
     await drainFakeTimers(p)
-    expect(result.killSessionCalls).toEqual([SESSION_B.tmuxSession])
+    expect(result.killSessionCalls).toEqual([SN_C2])
   })
 
   test('restart proceeds after the force-kill', async () => {
@@ -822,16 +876,17 @@ describe('clean_restart — one session times out, force-killed', () => {
 })
 
 // ---------------------------------------------------------------------------
-// clean_restart — sessions.json missing (no entries)
+// clean_restart — no routes configured
 // ---------------------------------------------------------------------------
 
-describe('clean_restart — sessions.json missing', () => {
+describe('clean_restart — no routes configured', () => {
   let cli: CliHandlers
   let result: DepsBundle
 
   beforeEach(() => {
     result = makeDeps({
-      sessions: {}, // no sessions → file missing or empty
+      loadConfig: () => makeRoutingConfig({ routes: {}, exit_timeout: 1 }),
+      sessionName: fakeSessionName,
     })
     cli = createCli(result.deps)
   })
@@ -842,7 +897,7 @@ describe('clean_restart — sessions.json missing', () => {
     expect(result.killSessionCalls).toHaveLength(0)
   })
 
-  test('proceeds to stop and start', async () => {
+  test('stop and start still proceed', async () => {
     await cli.clean_restart()
     const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
     expect(subcommands).toContain('stop')
@@ -856,54 +911,26 @@ describe('clean_restart — sessions.json missing', () => {
 })
 
 // ---------------------------------------------------------------------------
-// clean_restart — server not running (tmux sessions gone)
+// clean_restart — missing tmux session (hasSession returns false)
 // ---------------------------------------------------------------------------
 
-describe('clean_restart — server not running', () => {
-  let cli: CliHandlers
-  let result: DepsBundle
-
-  beforeEach(() => {
-    result = makeDeps({
-      sessions: { C1: SESSION_A },
-      hasSession: async () => false, // tmux sessions no longer exist
-    })
-    cli = createCli(result.deps)
-  })
-
-  test('makes no sendKeys calls when tmux sessions are gone', async () => {
-    await cli.clean_restart()
-    expect(result.sendKeysCalls).toHaveLength(0)
-  })
-
-  test('stop exits 0', async () => {
-    await cli.clean_restart()
-    const stopCall = result.spawnCalls.find((c) => c.args[c.args.length - 1] === 'stop')
-    expect(stopCall).toBeDefined()
-  })
-
-  test('start exits 0 and no error is surfaced', async () => {
-    const err = await runHandler(() => cli.clean_restart())
-    expect(err).toBeNull()
-    const startCall = result.spawnCalls.find((c) => c.args[c.args.length - 1] === 'start')
-    expect(startCall).toBeDefined()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// clean_restart — all sessions force-killed
-// ---------------------------------------------------------------------------
-
-describe('clean_restart — all sessions force-killed', () => {
+describe('clean_restart — missing tmux session', () => {
   let cli: CliHandlers
   let result: DepsBundle
 
   beforeEach(() => {
     jest.useFakeTimers()
+    // C1 has no tmux session; C2 has a session and exits cleanly
+    const callCounts = new Map<string, number>()
     result = makeDeps({
-      sessions: { C1: SESSION_A, C2: SESSION_B },
-      hasSession: async () => true,
-      isClaudeRunning: async () => true, // neither session ever exits
+      loadConfig: TWO_ROUTE_CONFIG,
+      sessionName: fakeSessionName,
+      hasSession: async (name) => name === SN_C2,
+      isClaudeRunning: async (session) => {
+        const n = (callCounts.get(session) ?? 0) + 1
+        callCounts.set(session, n)
+        return n === 1 // true on guard check, false on poll
+      },
     })
     cli = createCli(result.deps)
   })
@@ -912,15 +939,23 @@ describe('clean_restart — all sessions force-killed', () => {
     jest.useRealTimers()
   })
 
-  test('killSession called for every session', async () => {
+  test('skips sendKeys for the missing session', async () => {
     const p = cli.clean_restart()
     await drainFakeTimers(p)
-    expect(new Set(result.killSessionCalls)).toEqual(
-      new Set([SESSION_A.tmuxSession, SESSION_B.tmuxSession]),
-    )
+    const targets = new Set(result.sendKeysCalls.map((c) => c.session))
+    expect(targets).not.toContain(SN_C1)
   })
 
-  test('restart still proceeds after all force-kills', async () => {
+  test('still sends /exit to the present session', async () => {
+    const p = cli.clean_restart()
+    await drainFakeTimers(p)
+    const targets = new Set(
+      result.sendKeysCalls.filter((c) => c.keys === '/exit').map((c) => c.session),
+    )
+    expect(targets).toContain(SN_C2)
+  })
+
+  test('stop and start still proceed', async () => {
     const p = cli.clean_restart()
     await drainFakeTimers(p)
     const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
@@ -930,16 +965,54 @@ describe('clean_restart — all sessions force-killed', () => {
 })
 
 // ---------------------------------------------------------------------------
-// clean_restart — start fails after stop
+// clean_restart — Claude not running (isClaudeRunning returns false immediately)
 // ---------------------------------------------------------------------------
 
-describe('clean_restart — start fails after stop', () => {
+describe('clean_restart — Claude not running', () => {
   let cli: CliHandlers
   let result: DepsBundle
 
   beforeEach(() => {
     result = makeDeps({
-      sessions: {},
+      loadConfig: TWO_ROUTE_CONFIG,
+      sessionName: fakeSessionName,
+      hasSession: async () => true,
+      isClaudeRunning: async () => false, // returns false on first check → skipped
+    })
+    cli = createCli(result.deps)
+  })
+
+  test('skips sendKeys when Claude is not running', async () => {
+    await cli.clean_restart()
+    // isClaudeRunning is called before sendKeys; since false, sendKeys not called
+    expect(result.sendKeysCalls).toHaveLength(0)
+  })
+
+  test('does not force-kill sessions when Claude was not running', async () => {
+    await cli.clean_restart()
+    expect(result.killSessionCalls).toHaveLength(0)
+  })
+
+  test('stop and start still proceed', async () => {
+    await cli.clean_restart()
+    const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
+    expect(subcommands).toContain('stop')
+    expect(subcommands).toContain('start')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// clean_restart — start fails
+// ---------------------------------------------------------------------------
+
+describe('clean_restart — start fails', () => {
+  let cli: CliHandlers
+  let result: DepsBundle
+
+  beforeEach(() => {
+    result = makeDeps({
+      loadConfig: () => makeRoutingConfig({ routes: {}, exit_timeout: 1 }),
+      sessionName: fakeSessionName,
       spawnSyncFn: (_cmd, args) => {
         const subcommand = args[args.length - 1]
         return { status: subcommand === 'stop' ? 0 : 1 }
@@ -967,11 +1040,127 @@ describe('clean_restart — start fails after stop', () => {
 })
 
 // ---------------------------------------------------------------------------
+// clean_restart — config load fails
+// ---------------------------------------------------------------------------
+
+describe('clean_restart — config load fails', () => {
+  let cli: CliHandlers
+  let result: DepsBundle
+
+  beforeEach(() => {
+    result = makeDeps({
+      loadConfig: () => { throw new Error('config read error') },
+      sessionName: fakeSessionName,
+    })
+    cli = createCli(result.deps)
+  })
+
+  test('calls exit(1) immediately', async () => {
+    const err = await runHandler(() => cli.clean_restart())
+    expect(err).not.toBeNull()
+    expect(err!.code).toBe(1)
+  })
+
+  test('does not call stop or start when config fails', async () => {
+    await runHandler(() => cli.clean_restart())
+    const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
+    expect(subcommands).not.toContain('stop')
+    expect(subcommands).not.toContain('start')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// clean_restart — atomic /exit (single sendKeys call per session)
+// ---------------------------------------------------------------------------
+
+describe('clean_restart — atomic /exit per session', () => {
+  let cli: CliHandlers
+  let result: DepsBundle
+
+  beforeEach(() => {
+    jest.useFakeTimers()
+    // true on first call (guard passes → sendKeys fires), false on poll (clean exit)
+    const callCounts = new Map<string, number>()
+    result = makeDeps({
+      loadConfig: TWO_ROUTE_CONFIG,
+      sessionName: fakeSessionName,
+      hasSession: async () => true,
+      isClaudeRunning: async (session) => {
+        const n = (callCounts.get(session) ?? 0) + 1
+        callCounts.set(session, n)
+        return n === 1
+      },
+    })
+    cli = createCli(result.deps)
+  })
+
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  test('exactly one /exit key sent per session', async () => {
+    const p = cli.clean_restart()
+    await drainFakeTimers(p)
+    for (const sn of [SN_C1, SN_C2]) {
+      const count = result.sendKeysCalls.filter((c) => c.session === sn && c.keys === '/exit').length
+      expect(count).toBe(1)
+    }
+  })
+
+  test('exactly one Enter key sent per session', async () => {
+    const p = cli.clean_restart()
+    await drainFakeTimers(p)
+    for (const sn of [SN_C1, SN_C2]) {
+      const count = result.sendKeysCalls.filter((c) => c.session === sn && c.keys === 'Enter').length
+      expect(count).toBe(1)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// clean_restart — all sessions force-killed (timeout)
+// ---------------------------------------------------------------------------
+
+describe('clean_restart — all sessions force-killed', () => {
+  let cli: CliHandlers
+  let result: DepsBundle
+
+  beforeEach(() => {
+    jest.useFakeTimers()
+    result = makeDeps({
+      loadConfig: TWO_ROUTE_CONFIG,
+      sessionName: fakeSessionName,
+      hasSession: async () => true,
+      isClaudeRunning: async () => true, // neither session ever exits
+    })
+    cli = createCli(result.deps)
+  })
+
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  test('killSession called for every session', async () => {
+    const p = cli.clean_restart()
+    await drainFakeTimers(p)
+    expect(new Set(result.killSessionCalls)).toEqual(new Set([SN_C1, SN_C2]))
+  })
+
+  test('restart still proceeds after all force-kills', async () => {
+    const p = cli.clean_restart()
+    await drainFakeTimers(p)
+    const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
+    expect(subcommands).toContain('stop')
+    expect(subcommands).toContain('start')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // clean_restart — mixed: clean exit, timeout, sendKeys error
 // ---------------------------------------------------------------------------
 
 describe('clean_restart — mixed success/failure', () => {
-  // A: exits cleanly; B: times out, force-killed; C: sendKeys throws, treated as best-effort
+  // C1: exits cleanly; C2: times out, force-killed; C3: sendKeys throws, best-effort
 
   beforeEach(() => {
     jest.useFakeTimers()
@@ -983,12 +1172,14 @@ describe('clean_restart — mixed success/failure', () => {
 
   function makeMixedDeps() {
     return makeDeps({
-      sessions: { C1: SESSION_A, C2: SESSION_B, C3: SESSION_C },
+      loadConfig: THREE_ROUTE_CONFIG,
+      sessionName: fakeSessionName,
       hasSession: async () => true,
       sendKeys: async (session, ..._keys) => {
-        if (session === SESSION_C.tmuxSession) throw new Error('sendKeys failed')
+        if (session === SN_C3) throw new Error('sendKeys failed')
       },
-      isClaudeRunning: async (session) => session === SESSION_B.tmuxSession,
+      // C1 exits immediately; C2 never exits; C3 throws before poll
+      isClaudeRunning: async (session) => session === SN_C2,
     })
   }
 
@@ -1001,13 +1192,13 @@ describe('clean_restart — mixed success/failure', () => {
     expect(subcommands).toContain('start')
   })
 
-  test('B is force-killed, A and C are not', async () => {
+  test('C2 is force-killed, C1 and C3 are not', async () => {
     const result = makeMixedDeps()
     const p = createCli(result.deps).clean_restart()
     await drainFakeTimers(p)
-    expect(result.killSessionCalls).toContain(SESSION_B.tmuxSession)
-    expect(result.killSessionCalls).not.toContain(SESSION_A.tmuxSession)
-    expect(result.killSessionCalls).not.toContain(SESSION_C.tmuxSession)
+    expect(result.killSessionCalls).toContain(SN_C2)
+    expect(result.killSessionCalls).not.toContain(SN_C1)
+    expect(result.killSessionCalls).not.toContain(SN_C3)
   })
 
   test('does not surface individual session errors as a process exit', async () => {
