@@ -134,6 +134,36 @@ describe('applyDefaults', () => {
     const result = applyDefaults(makeRoutingConfig())
     expect(result.append_system_prompt_file).toBeUndefined()
   })
+
+  test('fills exit_timeout with 120 when absent', () => {
+    const result = applyDefaults(makeRoutingConfig({ exit_timeout: undefined }))
+    expect(result.exit_timeout).toBe(120)
+  })
+
+  test('preserves provided exit_timeout value', () => {
+    const result = applyDefaults(makeRoutingConfig({ exit_timeout: 60 }))
+    expect(result.exit_timeout).toBe(60)
+  })
+
+  test('preserves exit_timeout of 0', () => {
+    const result = applyDefaults(makeRoutingConfig({ exit_timeout: 0 }))
+    expect(result.exit_timeout).toBe(0)
+  })
+
+  test('fills stop_timeout with 30 when absent', () => {
+    const result = applyDefaults(makeRoutingConfig({ stop_timeout: undefined }))
+    expect(result.stop_timeout).toBe(30)
+  })
+
+  test('preserves provided stop_timeout value', () => {
+    const result = applyDefaults(makeRoutingConfig({ stop_timeout: 10 }))
+    expect(result.stop_timeout).toBe(10)
+  })
+
+  test('preserves stop_timeout of 0', () => {
+    const result = applyDefaults(makeRoutingConfig({ stop_timeout: 0 }))
+    expect(result.stop_timeout).toBe(0)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -149,6 +179,8 @@ function makeValidConfig(overrides: Partial<RoutingConfig> = {}): RoutingConfig 
     port: 3100,
     session_restart_delay: 60,
     health_check_interval: 120,
+    exit_timeout: 120,
+    stop_timeout: 30,
     mcp_config_path: `${homedir()}/.claude/slack-mcp.json`,
     ...overrides,
   }
@@ -229,6 +261,26 @@ describe('validateConfig', () => {
 
   test('passes when append_system_prompt_file is present', () => {
     const config = makeValidConfig({ append_system_prompt_file: '/tmp/extra.md' })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('throws when exit_timeout is negative', () => {
+    const config = makeValidConfig({ exit_timeout: -1 })
+    expect(() => validateConfig(config)).toThrow('Routing config validation error')
+  })
+
+  test('throws when stop_timeout is negative', () => {
+    const config = makeValidConfig({ stop_timeout: -1 })
+    expect(() => validateConfig(config)).toThrow('Routing config validation error')
+  })
+
+  test('accepts zero for exit_timeout', () => {
+    const config = makeValidConfig({ exit_timeout: 0 })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('accepts zero for stop_timeout', () => {
+    const config = makeValidConfig({ stop_timeout: 0 })
     expect(() => validateConfig(config)).not.toThrow()
   })
 })
@@ -478,5 +530,51 @@ describe('loadConfig', () => {
     const badPath = join(dir, 'routing.json')
     writeFileSync(badPath, JSON.stringify([1, 2, 3]), 'utf-8')
     expect(() => loadConfig(badPath)).toThrow('must be a JSON object')
+  })
+
+  test('round-trips exit_timeout correctly', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'routing.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+      exit_timeout: 45,
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.exit_timeout).toBe(45)
+  })
+
+  test('applies default exit_timeout of 120 when absent', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'routing.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.exit_timeout).toBe(120)
+  })
+
+  test('round-trips stop_timeout correctly', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'routing.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+      stop_timeout: 5,
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.stop_timeout).toBe(5)
+  })
+
+  test('applies default stop_timeout of 30 when absent', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'routing.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.stop_timeout).toBe(30)
   })
 })

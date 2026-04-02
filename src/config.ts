@@ -37,6 +37,8 @@ export interface RoutingConfigInput {
   port?: number
   session_restart_delay?: number
   health_check_interval?: number
+  exit_timeout?: number
+  stop_timeout?: number
   mcp_config_path?: string
   append_system_prompt_file?: string
 }
@@ -50,6 +52,8 @@ export interface RoutingConfig {
   port: number
   session_restart_delay: number
   health_check_interval: number
+  exit_timeout: number
+  stop_timeout: number
   mcp_config_path: string
   append_system_prompt_file?: string
 }
@@ -71,6 +75,8 @@ export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
     port: input.port ?? 3100,
     session_restart_delay: input.session_restart_delay ?? 60,
     health_check_interval: input.health_check_interval ?? 120,
+    exit_timeout: input.exit_timeout ?? 120,
+    stop_timeout: input.stop_timeout ?? 30,
     mcp_config_path: input.mcp_config_path ?? '~/.claude/slack-mcp.json',
     append_system_prompt_file: input.append_system_prompt_file,
   }
@@ -129,6 +135,20 @@ export function validateConfig(config: RoutingConfig): void {
   if (config.health_check_interval < 0) {
     throw new Error(
       'Routing config validation error: health_check_interval must be a non-negative number.',
+    )
+  }
+
+  // exit_timeout must not be negative
+  if (config.exit_timeout < 0) {
+    throw new Error(
+      'Routing config validation error: exit_timeout must be a non-negative number.',
+    )
+  }
+
+  // stop_timeout must not be negative
+  if (config.stop_timeout < 0) {
+    throw new Error(
+      'Routing config validation error: stop_timeout must be a non-negative number.',
     )
   }
 
