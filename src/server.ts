@@ -556,6 +556,15 @@ async function handleMessage(event: unknown): Promise<void> {
           console.error(
             `[slack] No live session for channel ${channelId} — dropping message`,
           )
+          // If the channel has a route but no registered session, notify the sender
+          if (routingConfig?.routes[channelId]) {
+            try {
+              await web.chat.postMessage({
+                channel: channelId,
+                text: 'Message not delivered — session starting up, please retry in a moment.',
+              })
+            } catch { /* non-critical */ }
+          }
           return
         }
 
@@ -1401,6 +1410,9 @@ export async function main(): Promise<void> {
   })
 
   if (routingConfig) {
+    // INVARIANT: Health check starts only after startupSessionManager() returns
+    // and sessions.json is written. Promise.allSettled ensures all launches have
+    // settled before this point. Do not move this call earlier in the startup sequence.
     startHealthCheck(routingConfig.health_check_interval)
   }
 }

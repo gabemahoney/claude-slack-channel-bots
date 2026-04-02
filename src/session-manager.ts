@@ -319,6 +319,7 @@ export async function startupSessionManager(
 
       if (exists) {
         // Kill stale tmux session before relaunching
+        console.error(`[slack] Bare tmux session detected (Claude not running) — will relaunch: channel=${channelId} session=${name}`)
         console.error(`[slack] Stale session found — killing before relaunch: channel=${channelId} session=${name}`)
         await tmuxClient.killSession(name)
       }
