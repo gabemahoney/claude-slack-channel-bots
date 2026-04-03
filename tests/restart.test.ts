@@ -33,7 +33,7 @@ type DepsOpts = {
   isSessionAliveResult?: boolean  // default: false (session is dead)
   isSessionConnectedResult?: boolean  // default: false (not yet reconnected)
   launchSessionResult?: boolean   // default: true (launch succeeds)
-  launchSession?: (channelId: string, cwd: string, sessionId?: string) => Promise<boolean>  // override entire launchSession
+  launchSession?: (channelId: string, cwd: string) => Promise<boolean>  // override entire launchSession
   restartDelay?: number           // default: FAST_DELAY_S
   isShuttingDown?: boolean        // default: false
 }
@@ -41,12 +41,12 @@ type DepsOpts = {
 function makeDeps(opts: DepsOpts = {}): RestartDeps & {
   isSessionAliveCalls: string[]
   killSessionCalls: string[]
-  launchSessionCalls: Array<{ channelId: string; cwd: string; sessionId: string | undefined }>
+  launchSessionCalls: Array<{ channelId: string; cwd: string }>
   reconnectSessionCalls: string[]
 } {
   const isSessionAliveCalls: string[] = []
   const killSessionCalls: string[] = []
-  const launchSessionCalls: Array<{ channelId: string; cwd: string; sessionId: string | undefined }> = []
+  const launchSessionCalls: Array<{ channelId: string; cwd: string }> = []
   const reconnectSessionCalls: string[] = []
 
   return {
@@ -68,9 +68,9 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     async killSession(channelId) {
       killSessionCalls.push(channelId)
     },
-    async launchSession(channelId, cwd, sessionId) {
-      launchSessionCalls.push({ channelId, cwd, sessionId })
-      if (opts.launchSession) return opts.launchSession(channelId, cwd, sessionId)
+    async launchSession(channelId, cwd) {
+      launchSessionCalls.push({ channelId, cwd })
+      if (opts.launchSession) return opts.launchSession(channelId, cwd)
       return opts.launchSessionResult ?? true
     },
     getRestartDelay: () => opts.restartDelay ?? FAST_DELAY_S,
@@ -224,39 +224,16 @@ describe('scheduleRestart', () => {
     expect(deps.launchSessionCalls.length).toBe(iterations)
   })
 
-  test('8. restart with stored session ID — launchSession receives session ID argument', async () => {
-    const deps = makeDeps()
-    initRestart(deps)
-
-    scheduleRestart('C_TEST1', '/cwd/test', 'saved-session-123')
-    await Bun.sleep(WAIT_MS)
-
-    expect(deps.launchSessionCalls).toHaveLength(1)
-    expect(deps.launchSessionCalls[0].channelId).toBe('C_TEST1')
-    expect(deps.launchSessionCalls[0].cwd).toBe('/cwd/test')
-    expect(deps.launchSessionCalls[0].sessionId).toBe('saved-session-123')
-  })
-
-  test('9. restart without stored session ID — launchSession called without session ID', async () => {
-    const deps = makeDeps()
+  test('9. launchSession called with channelId and cwd — failure counter not incremented on success', async () => {
+    const deps = makeDeps({ launchSessionResult: true })
     initRestart(deps)
 
     scheduleRestart('C_TEST1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     expect(deps.launchSessionCalls).toHaveLength(1)
-    expect(deps.launchSessionCalls[0].sessionId).toBeUndefined()
-  })
-
-  test('10. launchSession succeeds with session ID — failure counter not incremented', async () => {
-    const deps = makeDeps({ launchSessionResult: true })
-    initRestart(deps)
-
-    scheduleRestart('C_TEST1', '/cwd/test', 'saved-session-123')
-    await Bun.sleep(WAIT_MS)
-
-    expect(deps.launchSessionCalls).toHaveLength(1)
-    expect(deps.launchSessionCalls[0].sessionId).toBe('saved-session-123')
+    expect(deps.launchSessionCalls[0].channelId).toBe('C_TEST1')
+    expect(deps.launchSessionCalls[0].cwd).toBe('/cwd/test')
     expect(hasReachedMaxFailures('C_TEST1')).toBe(false)
   })
 })

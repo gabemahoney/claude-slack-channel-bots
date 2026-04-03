@@ -17,7 +17,7 @@ export interface RestartDeps {
   isSessionConnected(channelId: string): boolean
   reconnectSession(channelId: string): Promise<void>
   killSession(channelId: string): Promise<void>
-  launchSession(channelId: string, cwd: string, sessionId?: string): Promise<boolean>
+  launchSession(channelId: string, cwd: string): Promise<boolean>
   getRestartDelay(): number
   isShuttingDown(): boolean
 }
@@ -49,7 +49,7 @@ export function initRestart(d: RestartDeps): void {
 // scheduleRestart
 // ---------------------------------------------------------------------------
 
-export function scheduleRestart(channelId: string, cwd: string, sessionId?: string): void {
+export function scheduleRestart(channelId: string, cwd: string): void {
   if (!deps) {
     console.error('[slack] scheduleRestart: deps not initialized — skipping')
     return
@@ -123,7 +123,7 @@ export function scheduleRestart(channelId: string, cwd: string, sessionId?: stri
 
       let ok: boolean
       try {
-        ok = await deps.launchSession(channelId, cwd, sessionId)
+        ok = await deps.launchSession(channelId, cwd)
       } catch (err) {
         console.error(`[slack] restart: launchSession threw for channel=${channelId}:`, err)
         ok = false

@@ -1,8 +1,10 @@
 # Session Resume Research Findings
 
+> **HISTORICAL DOCUMENT** — This document describes the approach researched and initially implemented for session ID capture. The PID-based session discovery method described in Section 3 was removed in **b.tom** and replaced by JSONL directory scanning (`findLatestJsonlSessionId` in `src/session-manager.ts`), implemented in **b.sy9**. Session IDs are no longer stored in `SessionRecord` or `sessions.json`. Refer to `docs/architecture.md` for the current approach.
+
 **Epic**: t1.xir.6w — Session Resume Research Spike
 **Date**: 2026-03-30
-**Status**: Complete
+**Status**: Complete (superseded by b.sy9 / b.tom)
 
 ---
 

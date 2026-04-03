@@ -321,7 +321,7 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
           : undefined
         if (channelId) {
           console.error(`[slack] Session disconnected: channel=${channelId} cwd="${cwd}"`)
-          scheduleRestart(channelId, cwd, readSessions()[channelId]?.sessionId)
+          scheduleRestart(channelId, cwd)
         } else {
           console.error(`[slack] Session disconnected: cwd="${cwd}"`)
         }
@@ -1302,7 +1302,7 @@ export async function main(): Promise<void> {
               : undefined
             if (channelId) {
               console.error(`[slack] Session disconnected (SSE abort): channel=${channelId} cwd="${cwd}"`)
-              scheduleRestart(channelId, cwd, readSessions()[channelId]?.sessionId)
+              scheduleRestart(channelId, cwd)
             } else {
               console.error(`[slack] Session disconnected (SSE abort): cwd="${cwd}"`)
             }
@@ -1363,18 +1363,16 @@ export async function main(): Promise<void> {
       const exists = await defaultTmuxClient.hasSession(name)
       if (exists) await defaultTmuxClient.killSession(name)
     },
-    launchSession: async (channelId, cwd, sessionId) => {
+    launchSession: async (channelId, cwd) => {
       if (!routingConfig) return false
-      const resolvedSessionId = sessionId ?? readSessions()[channelId]?.sessionId
       const record = await launchSession(
         channelId, cwd, routingConfig, defaultTmuxClient,
-        resolvedSessionId !== undefined ? { sessionId: resolvedSessionId } : undefined,
       )
       if (record) {
         const sessions = readSessions()
         sessions[channelId] = record
         writeSessions(sessions)
-        console.error(`[slack] Session recorded in sessions.json: channel=${channelId} sessionId=${record.sessionId}`)
+        console.error(`[slack] Session recorded in sessions.json: channel=${channelId}`)
       }
       return record !== null
     },
@@ -1388,13 +1386,13 @@ export async function main(): Promise<void> {
     try {
       const lastPath = join(STATE_DIR, 'sessions.json.last')
       const storedSessions = readSessions(lastPath)
-      const records = await startupSessionManager(routingConfig, defaultTmuxClient, storedSessions)
+      const records = await startupSessionManager(routingConfig, defaultTmuxClient)
 
       // Build sessions map: start with stored IDs for failed routes so they
       // survive to the next restart, then overwrite with successful launches.
       const sessionsMap: Record<string, import('./sessions.ts').SessionRecord> = {}
       for (const [channelId, stored] of Object.entries(storedSessions)) {
-        if (!records.has(channelId) && stored.sessionId && stored.sessionId !== 'pending') {
+        if (!records.has(channelId)) {
           sessionsMap[channelId] = stored
         }
       }

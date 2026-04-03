@@ -214,7 +214,7 @@ Gracefully exits all managed Claude Code sessions, then stops and starts the ser
 claude-slack-channel-bots clean_restart
 ```
 
-For each session in `sessions.json`, sends `/exit` to the tmux session and polls until Claude exits. All sessions are processed in parallel. If a session does not exit within `exit_timeout` seconds (default 120s), its tmux session is force-killed. Individual session errors are logged and do not abort the restart. After the server restarts, sessions are relaunched with `--resume` using the stored session IDs in `sessions.json`, preserving conversation context.
+For each session in `sessions.json`, sends `/exit` to the tmux session and polls until Claude exits. All sessions are processed in parallel. If a session does not exit within `exit_timeout` seconds (default 120s), its tmux session is force-killed. Individual session errors are logged and do not abort the restart. After the server restarts, sessions are relaunched; the server scans JSONL conversation files to discover the current session ID and passes `--resume <id>` to Claude when one is found, preserving conversation context.
 
 Behavior by case:
 

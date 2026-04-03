@@ -154,79 +154,77 @@ Files under test:
 
 ---
 
-### T9: Force-Killed Session — Stale ID in .last Handled on Next Startup
+### T9: Force-Killed Session — Stale JSONL Handled on Next Startup
 
 **Preconditions:**
-- A route's Claude session was previously force-killed, leaving a stale `sessionId` in `sessions.json.last`.
-- The `sessionId` refers to a conversation that no longer exists on disk.
+- A route's Claude session was previously force-killed.
+- JSONL files exist on disk for the route's CWD, but the conversation they reference no longer exists in Claude's state.
 
 **Actions:**
 1. Invoke `claude-slack-channel-bots start` (or `clean_restart`).
-2. Startup reads the stale `sessionId` from `sessions.json.last` and attempts `--resume`.
+2. `launchSession()` calls `findLatestJsonlSessionId()`, finds a stale JSONL file, and attempts `--resume <id>`.
 3. `"No conversation found"` is detected in the pane output.
 4. The resume attempt fails and the fallback path kicks in.
 5. A fresh launch is attempted with no `--resume` flag.
 
 **Expected Outcomes:**
 - The fresh fallback launch succeeds.
-- A valid `SessionRecord` is written to `sessions.json` with a new `sessionId`.
-- The stale ID from `.last` is not carried forward into the new `sessions.json`.
+- A valid `SessionRecord` is written to `sessions.json`.
+- The stale JSONL session ID is not carried forward into `sessions.json`.
 
 ---
 
 ## Startup Resume
 
-### T10: Successful Resume from .last
+### T10: Successful Resume via JSONL Discovery
 
 **Preconditions:**
-- `sessions.json.last` contains a valid `sessionId` for a route.
-- The Claude conversation referenced by `sessionId` exists on disk.
+- A `.jsonl` file exists in `~/.claude/projects/<slug>/` for the route's CWD.
+- The Claude conversation referenced by the JSONL filename UUID exists on disk.
 - No tmux session is currently alive for the route.
 
 **Actions:**
 1. Start the server.
-2. Startup reads the `sessionId` from `.last` and calls `launchSession()` with `--resume <id>`.
+2. `launchSession()` calls `findLatestJsonlSessionId()`, finds the UUID, and calls Claude with `--resume <id>`.
 3. The session launches and `--resume` skips the safety prompt.
-4. Early detection via `isClaudeRunning()` accepts the running session.
-5. PID-based session ID discovery reads `~/.claude/sessions/<pid>.json`.
+4. `isClaudeRunning()` detects Claude running and accepts the session.
 
 **Expected Outcomes:**
 - The session is resumed (not relaunched fresh).
-- The discovered `sessionId` from the PID file matches the one passed via `--resume`.
-- A `SessionRecord` with the correct `sessionId` is written to `sessions.json`.
+- A `SessionRecord` is written to `sessions.json` for the route.
 
 ---
 
 ### T11: Failed Resume, Successful Fresh Fallback
 
 **Preconditions:**
-- `sessions.json.last` contains a `sessionId` that refers to a non-existent conversation.
+- A JSONL file exists for the route but refers to a non-existent conversation.
 - No tmux session is alive for the route.
 
 **Actions:**
 1. Start the server.
-2. `launchSession()` is called with `--resume <id>`.
+2. `launchSession()` finds the JSONL UUID and calls Claude with `--resume <id>`.
 3. `"No conversation found"` appears in the pane.
 4. The tmux session is killed and recreated.
 5. `launchSession()` is retried with no `--resume` flag.
-6. The fresh session starts, acknowledges the safety prompt, and the session ID is discovered via PID.
+6. The fresh session starts and acknowledges the safety prompt.
 
 **Expected Outcomes:**
 - The resume failure is detected quickly (fast-fail on the error text in the pane).
 - The fresh launch succeeds.
-- The `SessionRecord` written to `sessions.json` contains the new `sessionId` from the fresh launch.
+- A `SessionRecord` is written to `sessions.json` for the route.
 
 ---
 
 ### T12: Failed Resume, Failed Fresh Fallback
 
 **Preconditions:**
-- `sessions.json.last` contains a `sessionId` that refers to a non-existent conversation.
+- A JSONL file exists for the route but refers to a non-existent conversation.
 - The Claude binary is broken or unavailable, causing the fresh fallback to also fail.
 
 **Actions:**
 1. Start the server.
-2. Resume is attempted and fails.
+2. Resume is attempted and fails (`"No conversation found"` detected).
 3. The fresh fallback is attempted and also fails (e.g., times out without a prompt).
 4. `launchSession()` returns `null`.
 
@@ -238,40 +236,39 @@ Files under test:
 
 ---
 
-### T13: Fresh Launch — No Entry in .last
+### T13: Fresh Launch — No JSONL Files
 
 **Preconditions:**
-- `sessions.json.last` does not exist, or exists but has no entry for this route.
+- No `.jsonl` files exist in `~/.claude/projects/<slug>/` for the route's CWD (first run or previously cleaned up).
 - No tmux session is alive for the route.
 
 **Actions:**
 1. Start the server.
-2. Startup detects no stored `sessionId` for the route.
+2. `launchSession()` calls `findLatestJsonlSessionId()`, which returns `null`.
 3. `launchSession()` is called with no `--resume` flag.
 4. Claude displays the safety prompt and Enter is sent.
-5. Session ID is discovered via PID.
 
 **Expected Outcomes:**
 - Claude is launched without `--resume`.
-- A new `SessionRecord` is written to `sessions.json` with a fresh `sessionId`.
+- A new `SessionRecord` is written to `sessions.json`.
 - The session registers and begins accepting messages.
 
 ---
 
-### T14: Claude Running but No Session File After Timeout
+### T14: Launch Times Out — Claude Never Starts
 
 **Preconditions:**
 - A fresh launch is attempted.
-- Claude starts and is detectable via `isClaudeRunning()`, but the PID session file (`~/.claude/sessions/<pid>.json`) never appears within the discovery polling window.
+- Claude fails to start (e.g., the binary hangs or is unavailable) — neither the safety prompt nor a running Claude process is detected.
 
 **Actions:**
 1. Start the server.
-2. `launchSession()` polls for the safety prompt and also attempts PID-based session ID discovery.
-3. The total timeout (120 s) elapses without the session file appearing.
+2. `launchSession()` polls `capturePane()` with exponential backoff.
+3. The total timeout (120 s) elapses without the safety prompt or `isClaudeRunning()` returning true.
 
 **Expected Outcomes:**
 - `launchSession()` returns `null`.
-- The failure is logged with enough detail to diagnose (e.g., "session file not found after timeout").
+- The timeout is logged.
 - No record is written to `sessions.json` for this route.
 
 ---
@@ -283,37 +280,35 @@ Files under test:
 **Preconditions:**
 - A tmux session exists for the route.
 - `isClaudeRunning()` returns true for that session.
-- `sessions.json.last` may or may not contain a `sessionId` for the route.
 
 **Actions:**
 1. Start the server.
 2. Startup detects the running Claude session (reconnect branch).
 3. `/mcp reconnect <server-name>` is sent to the tmux session.
-4. Session ID is discovered via PID-based lookup.
 
 **Expected Outcomes:**
 - Claude is not killed or relaunched.
 - The MCP reconnect command is sent to the running session.
-- The discovered `sessionId` is written to `sessions.json`.
+- A `SessionRecord` with the current timestamp is written to `sessions.json`.
 
 ---
 
-### T16: Claude Running but Session File Missing
+### T16: JSONL Directory Does Not Exist — Fresh Launch
 
 **Preconditions:**
-- A tmux session exists and `isClaudeRunning()` returns true.
-- PID-based session ID discovery fails because `~/.claude/sessions/<pid>.json` does not exist (e.g., Claude was launched without session persistence).
+- No JSONL project directory exists for the route's CWD (e.g., `~/.claude/projects/<slug>/` is absent).
+- No tmux session is alive for the route.
 
 **Actions:**
 1. Start the server.
-2. The reconnect branch is taken.
-3. `/mcp reconnect` is sent.
-4. PID discovery polling times out without finding the session file.
+2. `launchSession()` calls `findLatestJsonlSessionId()`.
+3. `readdirSync` throws (directory not found); `findLatestJsonlSessionId()` returns `null`.
+4. Claude is launched without `--resume`.
 
 **Expected Outcomes:**
-- The error is logged.
-- No record is written to `sessions.json` for this route.
-- The route is effectively offline but the server starts and handles other routes.
+- The fresh launch proceeds normally.
+- Claude is launched without `--resume`.
+- A `SessionRecord` is written to `sessions.json` once Claude is confirmed running.
 
 ---
 
@@ -394,22 +389,22 @@ Files under test:
 
 **Preconditions:**
 - Three routes are configured:
-  - Route A: has a stored `sessionId` in `.last` and no running tmux session → resume path.
-  - Route B: has a stored `sessionId` in `.last`, but the conversation no longer exists, and no running tmux session → failed resume → fresh fallback path.
+  - Route A: JSONL files exist for the CWD with a valid conversation; no running tmux session → resume path.
+  - Route B: JSONL files exist for the CWD but the conversation no longer exists; no running tmux session → failed resume → fresh fallback path.
   - Route C: has a running Claude session in tmux → reconnect path.
 
 **Actions:**
 1. Start the server.
 2. All three routes are launched concurrently.
-3. Route A resumes successfully.
+3. Route A resumes successfully via JSONL-discovered session ID.
 4. Route B's resume fails and the fallback fresh launch succeeds.
 5. Route C reconnects to the existing session.
 
 **Expected Outcomes:**
 - `sessions.json` contains correct records for all three routes.
-- Route A's record has the resumed `sessionId`.
-- Route B's record has the new `sessionId` from the fresh launch.
-- Route C's record has the `sessionId` discovered from the reconnected session.
+- Route A's record reflects the resumed session.
+- Route B's record reflects the fresh launch.
+- Route C's record reflects the reconnected session.
 
 ---
 
@@ -467,7 +462,6 @@ Files under test:
 2. Crash the server process after sessions are running but before `sessions.json` is written.
 3. Restart the server.
 4. Startup detects running Claude sessions via `isClaudeRunning()` → reconnect branch.
-5. Session IDs are discovered via PID-based lookup.
 
 **Expected Outcomes:**
 - The reconnect path recovers the sessions without relaunching them.
@@ -490,7 +484,7 @@ Files under test:
 **Expected Outcomes:**
 - `sessions.json` from the pre-crash run is still valid and readable.
 - The second startup rotates it to `sessions.json.last` normally.
-- Startup proceeds to read stored IDs from `sessions.json.last` and resume sessions.
+- Startup proceeds normally; session IDs for resume are discovered via JSONL scanning.
 
 ---
 
@@ -569,7 +563,7 @@ Files under test:
 
 **Expected Outcomes:**
 - `clean_restart.log` contains timestamped entries for: init, config load, server stop, session exit (per route), server start, and completion.
-- `server.log` contains entries for: startup rotation, route launch decisions (resume/reconnect/fresh), session ID discovery, and `sessions.json` write.
+- `server.log` contains entries for: startup rotation, route launch decisions (resume/reconnect/fresh), JSONL session ID discovery, and `sessions.json` write.
 - Both files are in append mode — existing prior entries are preserved.
 - All timestamps are valid ISO-8601 format.
 
