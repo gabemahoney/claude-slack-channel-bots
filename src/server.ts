@@ -920,7 +920,7 @@ export async function main(): Promise<void> {
   httpServer = Bun.serve({
     hostname: mcpHost,
     port: mcpPort,
-    idleTimeout: 255,
+    idleTimeout: 0, // Disabled: SSE connections are long-lived and idle between messages. Dead processes are detected by TCP socket closure (localhost) and the health check (isClaudeRunning).
     async fetch(req: Request, server: { requestIP(r: Request): { address: string } | null; timeout(req: Request, seconds: number): void }): Promise<Response> {
       const url = new URL(req.url)
       const mcpSid = req.headers.get('mcp-session-id')
