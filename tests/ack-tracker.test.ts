@@ -70,6 +70,9 @@ describe('pruning expired entries', () => {
 
     // The new entry should still be present
     expect(consumeAck('C_TEST', '1234567890.000600')).toBe(true)
+
+    // Restore system time so parallel tests aren't affected
+    jest.setSystemTime()
   })
 })
 
