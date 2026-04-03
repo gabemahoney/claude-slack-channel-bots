@@ -5,7 +5,7 @@
  */
 
 import { describe, test, expect, afterEach } from 'bun:test'
-import { mkdtempSync, mkdirSync, copyFileSync, chmodSync, existsSync, rmSync, writeFileSync } from 'fs'
+import { mkdtempSync, mkdirSync, copyFileSync, chmodSync, existsSync, rmSync, writeFileSync, unlinkSync } from 'fs'
 import { tmpdir, homedir } from 'os'
 import { join } from 'path'
 import { sessionName } from '../src/tmux.ts'
@@ -20,12 +20,17 @@ import { MCP_SERVER_NAME } from '../src/config.ts'
 // ---------------------------------------------------------------------------
 
 let spawnedTmpDir = ''
+const claudeSessionFiles: string[] = []
 
 afterEach(() => {
   if (spawnedTmpDir) {
     rmSync(spawnedTmpDir, { recursive: true, force: true })
     spawnedTmpDir = ''
   }
+  for (const f of claudeSessionFiles) {
+    try { unlinkSync(f) } catch { /* ignore */ }
+  }
+  claudeSessionFiles.length = 0
 })
 
 async function spawnClaudeProcess() {
@@ -37,6 +42,19 @@ async function spawnClaudeProcess() {
   const proc = Bun.spawn([claudePath, '60'])
   await Bun.sleep(100)
   return proc
+}
+
+/**
+ * Writes a fake ~/.claude/sessions/<pid>.json so PID-based discovery succeeds.
+ * Registers the file for cleanup in afterEach.
+ */
+function writeClaudeSessionFile(pid: number, sessionId: string): string {
+  const dir = join(homedir(), '.claude', 'sessions')
+  mkdirSync(dir, { recursive: true })
+  const filePath = join(dir, `${pid}.json`)
+  writeFileSync(filePath, JSON.stringify({ sessionId }), 'utf-8')
+  claudeSessionFiles.push(filePath)
+  return filePath
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +185,7 @@ describe('startupSessionManager', () => {
       const record = result.get('C_TEST1')
       expect(record).toBeDefined()
       expect(record!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
+      expect(record!.sessionId).toBe('reconnect-session-id')
       expect(typeof record!.lastLaunch).toBe('string')
 
       expect(stub.calls.filter(c => c.method === 'killSession')).toHaveLength(0)
@@ -185,10 +204,10 @@ describe('startupSessionManager', () => {
     }
   })
 
-  test('14b. live Claude process: reconnect succeeds even without JSONL files', async () => {
+  test('14b. live Claude process: no JSONL files after reconnect — channel not in returned Map', async () => {
     const proc = await spawnClaudeProcess()
     try {
-      // No JSONL files for this CWD — reconnect no longer requires JSONL discovery
+      // No JSONL files for this CWD — reconnect cannot discover session ID
       const stub = makeTmuxStub({
         hasSessionResult: true,
         getPanePidResult: String(proc.pid),
@@ -197,14 +216,11 @@ describe('startupSessionManager', () => {
 
       const result = await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
 
-      // Reconnect path always succeeds, no JSONL required
+      // No JSONL files → null record → not in map
       expect(result).toBeInstanceOf(Map)
-      expect(result.size).toBe(1)
-      const record = result.get('C_TEST1')
-      expect(record).toBeDefined()
-      expect(record!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
+      expect(result.size).toBe(0)
 
-      // sendKeys was called with /mcp reconnect
+      // sendKeys was still called with /mcp reconnect
       const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
       const reconnectCall = sendKeysCalls.find(
         c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`/mcp reconnect ${MCP_SERVER_NAME}`),
@@ -238,6 +254,7 @@ describe('startupSessionManager', () => {
   test('15. dead process + JSONL session ID: resume path — sendKeys includes --resume, SessionRecord in returned Map', async () => {
     const proc = await spawnClaudeProcess()
     try {
+      writeClaudeSessionFile(proc.pid!, 'resume-session-abc')
       writeJsonlFile('/tmp/test-cwd', 'resume-session-abc')
       const stub = makeTmuxStub({
         hasSessionResult: false,
@@ -255,6 +272,7 @@ describe('startupSessionManager', () => {
       expect(result.size).toBe(1)
       const record = result.get('C_TEST1')
       expect(record).toBeDefined()
+      expect(record!.sessionId).toBe('resume-session-abc')
       expect(record!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
       expect(typeof record!.lastLaunch).toBe('string')
 
@@ -294,6 +312,9 @@ describe('startupSessionManager', () => {
     const proc1 = await spawnClaudeProcess()
     const proc2 = await spawnClaudeProcess()
     try {
+      writeClaudeSessionFile(proc1.pid!, 'session-ch1')
+      writeClaudeSessionFile(proc2.pid!, 'session-ch2')
+
       // Alternate getPanePid responses: first call returns proc1.pid, second returns proc2.pid
       let pidCallCount = 0
       const stub = makeTmuxStub({
@@ -301,6 +322,7 @@ describe('startupSessionManager', () => {
         capturePaneResult: 'I am using this for local development',
       })
       // Override getPanePid to rotate through the two PIDs
+      const origGetPanePid = stub.getPanePid.bind(stub)
       stub.getPanePid = async (session: string) => {
         pidCallCount++
         return pidCallCount % 2 === 1 ? String(proc1.pid) : String(proc2.pid)
@@ -376,10 +398,10 @@ describe('startupSessionManager', () => {
 
       expect(result).toBeInstanceOf(Map)
 
-      // CH1: reconnect path — record should be present
+      // CH1: reconnect path — JSONL file found, record should be present
       const ch1 = result.get('C_CH1')
       expect(ch1).toBeDefined()
-      expect(ch1!.tmuxSession).toBe(sessionName('/tmp/cwd-ch1'))
+      expect(ch1!.sessionId).toBe('reconnect-id-ch1')
 
       // CH2: resume path — JSONL found, sendKeys called with --resume jsonl-id-ch2
       const resumeCmd = stub.calls.filter(c => c.method === 'sendKeys').find(
@@ -409,6 +431,9 @@ describe('startupSessionManager', () => {
     const proc1 = await spawnClaudeProcess()
     const proc2 = await spawnClaudeProcess()
     try {
+      writeClaudeSessionFile(proc1.pid!, 'session-t18-ch1')
+      writeClaudeSessionFile(proc2.pid!, 'session-t18-ch2')
+
       let pidCallCount = 0
       const stub = makeTmuxStub({
         hasSessionResult: false,
@@ -430,7 +455,7 @@ describe('startupSessionManager', () => {
       // The function must return a single complete Map — not a partial result.
       const result = await startupSessionManager(config, stub, {}, {
         pollTimeout: 3_000,
-
+        
       })
 
       // Both routes must be present — write-once semantics: caller has complete data
@@ -438,8 +463,8 @@ describe('startupSessionManager', () => {
       expect(result.size).toBe(2)
       expect(result.has('C_T18A')).toBe(true)
       expect(result.has('C_T18B')).toBe(true)
-      expect(result.get('C_T18A')!.tmuxSession).toBe(sessionName('/tmp/test-cwd-t18a'))
-      expect(result.get('C_T18B')!.tmuxSession).toBe(sessionName('/tmp/test-cwd-t18b'))
+      expect(result.get('C_T18A')!.sessionId).toBe('session-t18-ch1')
+      expect(result.get('C_T18B')!.sessionId).toBe('session-t18-ch2')
     } finally {
       proc1.kill()
       proc2.kill()
@@ -465,9 +490,10 @@ describe('startupSessionManager', () => {
 // ---------------------------------------------------------------------------
 
 describe('launchSession', () => {
-  test('4. prompt found + Claude running: returns SessionRecord with correct tmuxSession', async () => {
+  test('4. prompt found + PID session file present: returns SessionRecord with correct tmuxSession', async () => {
     const proc = await spawnClaudeProcess()
     try {
+      writeClaudeSessionFile(proc.pid!, 'discovered-session-id')
       const stub = makeTmuxStub({
         getPanePidResult: String(proc.pid),
         capturePaneResult: 'I am using this for local development',
@@ -481,6 +507,7 @@ describe('launchSession', () => {
 
       expect(result).not.toBeNull()
       expect(result!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
+      expect(result!.sessionId).toBe('discovered-session-id')
       expect(typeof result!.lastLaunch).toBe('string')
 
       // Enter was sent to acknowledge the safety prompt
@@ -492,9 +519,10 @@ describe('launchSession', () => {
     }
   })
 
-  test('5. prompt not found, Claude running: returns SessionRecord', async () => {
+  test('5. prompt not found, Claude running, session file present: returns SessionRecord via PID discovery', async () => {
     const proc = await spawnClaudeProcess()
     try {
+      writeClaudeSessionFile(proc.pid!, 'pid-discovered-session')
       const stub = makeTmuxStub({
         getPanePidResult: String(proc.pid),
         capturePaneResult: 'some unrelated output',
@@ -507,6 +535,7 @@ describe('launchSession', () => {
       )
 
       expect(result).not.toBeNull()
+      expect(result!.sessionId).toBe('pid-discovered-session')
       expect(result!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
     } finally {
       proc.kill()
@@ -527,11 +556,11 @@ describe('launchSession', () => {
     expect(result).toBeNull()
   })
 
-  test('10. resume success: JSONL discovery triggers --resume in sendKeys command, returns SessionRecord', async () => {
+  test('10. resume success: --resume <id> included in sendKeys command, returns SessionRecord', async () => {
     const proc = await spawnClaudeProcess()
     try {
       const resumeId = 'abc-session-123'
-      writeJsonlFile('/tmp/test-cwd', resumeId)
+      writeClaudeSessionFile(proc.pid!, resumeId)
       const stub = makeTmuxStub({
         getPanePidResult: String(proc.pid),
         capturePaneResult: 'I am using this for local development',
@@ -540,11 +569,11 @@ describe('launchSession', () => {
 
       const result = await launchSession(
         'C_TEST1', '/tmp/test-cwd', config, stub,
-        { pollTimeout: 2_000 },
+        { pollTimeout: 2_000, sessionId: resumeId },
       )
 
       expect(result).not.toBeNull()
-      expect(result!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
+      expect(result!.sessionId).toBe(resumeId)
 
       const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
       const resumeCmd = sendKeysCalls.find(
@@ -559,17 +588,16 @@ describe('launchSession', () => {
   test('11. resume fallback: resume fails then fresh command sent, kill and newSession called twice', async () => {
     // pollTimeout: 0 → poll loop never runs, isClaudeRunning returns false → both attempts fail structurally
     // This test verifies the fallback mechanism: kill + recreate + fresh launch command
-    const resumeId = 'stale-session-456'
-    writeJsonlFile('/tmp/test-cwd', resumeId)
     const stub = makeTmuxStub({
       getPanePidResult: '99999999', // isClaudeRunning → false
     })
     const config = makeRoutingConfig()
+    const resumeId = 'stale-session-456'
 
     // Both attempts fail (no prompt, Claude not running), but fallback path is exercised
     const result = await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 0 },
+      { pollTimeout: 0, sessionId: resumeId },
     )
 
     expect(result).toBeNull()
@@ -599,9 +627,10 @@ describe('launchSession', () => {
     expect(newCalls).toHaveLength(2)
   })
 
-  test('12. fresh launch when no JSONL file: command does not include --resume', async () => {
+  test('12. fresh launch when no session ID: command does not include --resume', async () => {
     const proc = await spawnClaudeProcess()
     try {
+      writeClaudeSessionFile(proc.pid!, 'fresh-launch-session')
       const stub = makeTmuxStub({
         getPanePidResult: String(proc.pid),
         capturePaneResult: 'I am using this for local development',
@@ -630,6 +659,7 @@ describe('launchSession', () => {
   test('22. no safety prompt but Claude running inside loop: early detection accepts session, returns SessionRecord', async () => {
     const proc = await spawnClaudeProcess()
     try {
+      writeClaudeSessionFile(proc.pid!, 'early-detect-session')
       const stub = makeTmuxStub({
         getPanePidResult: String(proc.pid),
         capturePaneResult: 'some unrelated output', // no safety prompt
@@ -642,7 +672,7 @@ describe('launchSession', () => {
       )
 
       expect(result).not.toBeNull()
-      expect(result!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
+      expect(result!.sessionId).toBe('early-detect-session')
 
       // Poll loop ran — capturePane was called at least once
       expect(stub.calls.filter(c => c.method === 'capturePane').length).toBeGreaterThanOrEqual(1)
@@ -661,23 +691,19 @@ describe('launchSession', () => {
     // If that fresh attempt also fails (null), the "resume timed out or failed" fallback ALSO fires
     // (because resumeSessionId is still set), causing a second kill+newSession+fresh attempt.
     // Total: initial newSession + 2 kills + 2 newSessions = 3 newSessions total.
-    // Note: fresh attempts use Error entries in capturePaneResults so they exit via the catch
-    // branch rather than relying on Date.now() comparisons (which may be frozen by other test
-    // files using jest.setSystemTime).
-    writeJsonlFile('/tmp/test-cwd', 'stale-id-xyz')
     const stub = makeTmuxStub({
       getPanePidResult: '99999999', // Claude not running — all attempts fail
       capturePaneResults: [
         'No conversation found',
-        new Error('capturePane: session terminated'),
-        new Error('capturePane: session terminated'),
+        'some output',
+        'some output',
       ],
     })
     const config = makeRoutingConfig()
 
     const result = await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 30_000 },
+      { pollTimeout: 600, sessionId: 'stale-id-xyz' },
     )
 
     // All attempts fail
@@ -730,6 +756,28 @@ describe('launchSession', () => {
     expect(newCalls).toHaveLength(1)
   })
 
+  test('timeout with Claude still running: returns null', async () => {
+    const proc = await spawnClaudeProcess()
+    try {
+      // No session file — PID discovery will always fail, causing timeout
+      const stub = makeTmuxStub({
+        getPanePidResult: String(proc.pid),
+        capturePaneResult: 'some unrelated output',
+      })
+      const config = makeRoutingConfig()
+
+      const result = await launchSession(
+        'C_TEST1', '/tmp/test-cwd', config, stub,
+        { pollTimeout: 600 },
+      )
+
+      // Timed out waiting for session file — returns null
+      expect(result).toBeNull()
+    } finally {
+      proc.kill()
+    }
+  })
+
   // T23: Bare bash prompt detected — NOT IMPLEMENTED in launchSession.
   // The SRD describes detecting a bare shell prompt (e.g. "$ ") in pane output
   // as a signal that Claude exited unexpectedly during a --resume launch, which
@@ -780,6 +828,7 @@ describe('append_system_prompt_file', () => {
 
     const proc = await spawnClaudeProcess()
     try {
+      writeClaudeSessionFile(proc.pid!, 'append-prompt-session')
       const stub = makeTmuxStub({
         getPanePidResult: String(proc.pid),
         capturePaneResult: 'I am using this for local development',
@@ -890,7 +939,7 @@ describe('append_system_prompt_file', () => {
     const proc = await spawnClaudeProcess()
     try {
       const resumeId = 'resume-session-xyz'
-      writeJsonlFile('/tmp/test-cwd', resumeId)
+      writeClaudeSessionFile(proc.pid!, resumeId)
       const stub = makeTmuxStub({
         getPanePidResult: String(proc.pid),
         capturePaneResult: 'I am using this for local development',
@@ -899,7 +948,7 @@ describe('append_system_prompt_file', () => {
 
       const result = await launchSession(
         'C_TEST1', '/tmp/test-cwd', config, stub,
-        { pollTimeout: 2_000 },
+        { pollTimeout: 2_000, sessionId: resumeId },
       )
 
       expect(result).not.toBeNull()
@@ -948,6 +997,7 @@ describe('crash recovery', () => {
 
       const record = result.get('C_TEST1')
       expect(record).toBeDefined()
+      expect(record!.sessionId).toBe('crash-recovery-session-id')
       expect(record!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
       expect(typeof record!.lastLaunch).toBe('string')
 
@@ -988,10 +1038,11 @@ describe('crash recovery', () => {
   // storedSessions has a stale session ID that causes "No conversation found".
   // launchSession must detect the fast-fail, kill/recreate, then launch fresh.
   // The returned record must have a NEW session ID (not the stale one).
-  test('T9: stale session ID fast-fails, fresh fallback launches successfully', async () => {
+  test('T9: stale session ID fast-fails, fresh fallback launches and returns new session ID', async () => {
     const proc = await spawnClaudeProcess()
     try {
-      writeJsonlFile('/tmp/test-cwd', 'stale-force-killed-id')
+      const freshSessionId = 'fresh-session-after-stale'
+      writeClaudeSessionFile(proc.pid!, freshSessionId)
 
       // capturePaneResults: first call returns "No conversation found" (fast-fail trigger),
       // subsequent calls return the safety prompt so the fresh attempt succeeds.
@@ -1006,12 +1057,15 @@ describe('crash recovery', () => {
 
       const result = await launchSession(
         'C_TEST1', '/tmp/test-cwd', config, stub,
-        { pollTimeout: 5_000 },
+        { pollTimeout: 5_000, sessionId: 'stale-force-killed-id' },
       )
 
       // Fresh fallback must succeed and return a record
       expect(result).not.toBeNull()
-      expect(result!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
+
+      // The returned session ID must be the newly discovered one, not the stale resume ID
+      expect(result!.sessionId).toBe(freshSessionId)
+      expect(result!.sessionId).not.toBe('stale-force-killed-id')
 
       // Fast-fail path: kill was called at least once (to tear down the stale session)
       const killCalls = stub.calls.filter(c => c.method === 'killSession')
@@ -1031,19 +1085,19 @@ describe('crash recovery', () => {
   })
 
   test('T9: stale session ID — initial launch command includes --resume with the stale ID', async () => {
-    // Verify the resume was actually attempted before the fast-fail.
-    // pollTimeout: 0 — the sendKeys for the launch command fires before the poll loop, so
-    // the --resume assertion holds even though the loop never runs. This avoids reliance on
-    // Date.now() comparisons that may be frozen by jest.setSystemTime in other test files.
-    writeJsonlFile('/tmp/test-cwd', 'stale-force-killed-id')
+    // Verify the resume was actually attempted before the fast-fail
     const stub = makeTmuxStub({
       getPanePidResult: '99999999', // Claude never running — both attempts fail
+      capturePaneResults: [
+        'No conversation found',
+        'some output',
+      ],
     })
     const config = makeRoutingConfig()
 
     await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 0 },
+      { pollTimeout: 600, sessionId: 'stale-force-killed-id' },
     )
 
     const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
@@ -1142,10 +1196,12 @@ describe('findLatestJsonlSessionId', () => {
 })
 
 describe('JSONL-based resume (b.sy9 fix)', () => {
-  test('reconnect branch: uses JSONL session ID — PID-based discovery is not used', async () => {
+  test('reconnect branch: uses JSONL session ID, ignores PID file', async () => {
     const proc = await spawnClaudeProcess()
     try {
-      // JSONL has the current ID (post-compaction) — this is the only source of truth
+      // PID file has a stale ID — should be ignored entirely
+      writeClaudeSessionFile(proc.pid!, 'stale-pid-session-id')
+      // JSONL has the current ID (post-compaction)
       writeJsonlFile('/tmp/test-cwd', 'current-jsonl-session-id')
 
       const stub = makeTmuxStub({
@@ -1156,21 +1212,22 @@ describe('JSONL-based resume (b.sy9 fix)', () => {
 
       const result = await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
 
-      // Reconnect succeeds — JSONL presence not required for reconnect branch itself
       expect(result).toBeInstanceOf(Map)
       expect(result.size).toBe(1)
       const record = result.get('C_TEST1')
       expect(record).toBeDefined()
-      expect(record!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
+      expect(record!.sessionId).toBe('current-jsonl-session-id')
     } finally {
       proc.kill()
     }
   })
 
-  test('reconnect branch: succeeds even without JSONL files — no PID fallback', async () => {
+  test('reconnect branch: no JSONL files → fails, does not fall back to PID', async () => {
     const proc = await spawnClaudeProcess()
     try {
-      // No JSONL files — reconnect path always succeeds, no PID file fallback
+      // PID file exists but must be ignored when no JSONL
+      writeClaudeSessionFile(proc.pid!, 'pid-session-id')
+
       const stub = makeTmuxStub({
         hasSessionResult: true,
         getPanePidResult: String(proc.pid),
@@ -1179,9 +1236,9 @@ describe('JSONL-based resume (b.sy9 fix)', () => {
 
       const result = await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
 
-      // Reconnect always succeeds — PID file is never consulted
+      // No JSONL → reconnect fails, no PID fallback
       expect(result).toBeInstanceOf(Map)
-      expect(result.size).toBe(1)
+      expect(result.size).toBe(0)
     } finally {
       proc.kill()
     }
@@ -1190,6 +1247,7 @@ describe('JSONL-based resume (b.sy9 fix)', () => {
   test('resume branch: uses JSONL session ID instead of stale stored session ID', async () => {
     const proc = await spawnClaudeProcess()
     try {
+      writeClaudeSessionFile(proc.pid!, 'discovered-after-resume')
       // JSONL has the post-compaction ID
       writeJsonlFile('/tmp/test-cwd', 'jsonl-post-compaction-id')
 
@@ -1202,6 +1260,7 @@ describe('JSONL-based resume (b.sy9 fix)', () => {
         'C_TEST1': {
           tmuxSession: sessionName('/tmp/test-cwd'),
           lastLaunch: '2026-01-01T00:00:00.000Z',
+          sessionId: 'stale-stored-session-id',
         },
       }
       const config = makeRoutingConfig()
@@ -1230,6 +1289,7 @@ describe('JSONL-based resume (b.sy9 fix)', () => {
   test('resume branch: JSONL scan enables resume even without stored sessions', async () => {
     const proc = await spawnClaudeProcess()
     try {
+      writeClaudeSessionFile(proc.pid!, 'discovered-fresh')
       // JSONL file exists — resume should be attempted even with no storedSessions entry
       writeJsonlFile('/tmp/test-cwd', 'jsonl-orphan-session-id')
 
@@ -1265,6 +1325,7 @@ describe('JSONL-based resume (b.sy9 fix)', () => {
       'C_TEST1': {
         tmuxSession: sessionName('/tmp/test-cwd'),
         lastLaunch: '2026-01-01T00:00:00.000Z',
+        sessionId: 'stored-fallback-id',
       },
     }
     const config = makeRoutingConfig()

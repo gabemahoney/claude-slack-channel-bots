@@ -12,6 +12,7 @@ function makeSessionRecord(overrides: Partial<SessionRecord> = {}): SessionRecor
   return {
     tmuxSession: 'claude:0',
     lastLaunch: '2024-01-01T00:00:00.000Z',
+    sessionId: 'pending',
     ...overrides,
   }
 }
@@ -134,6 +135,46 @@ describe('writeSessions', () => {
 })
 
 // ---------------------------------------------------------------------------
+// sessionId field
+// ---------------------------------------------------------------------------
+
+describe('sessionId field', () => {
+  test('read returns sessionId when present in file', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'sessions-test-'))
+    const sessionsPath = join(tempDir, 'sessions.json')
+    const sessions: SessionsMap = {
+      C_GENERAL: makeSessionRecord({ sessionId: 'abc-uuid-123' }),
+    }
+    writeFileSync(sessionsPath, JSON.stringify(sessions), 'utf-8')
+    const result = readSessions(sessionsPath)
+    expect(result['C_GENERAL'].sessionId).toBe('abc-uuid-123')
+  })
+
+  test('read returns undefined sessionId for legacy record without sessionId', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'sessions-test-'))
+    const sessionsPath = join(tempDir, 'sessions.json')
+    const legacyRecord = {
+      tmuxSession: 'claude:0',
+      lastLaunch: '2024-01-01T00:00:00.000Z',
+    }
+    writeFileSync(sessionsPath, JSON.stringify({ C_GENERAL: legacyRecord }), 'utf-8')
+    const result = readSessions(sessionsPath)
+    expect(result['C_GENERAL'].sessionId).toBeUndefined()
+  })
+
+  test('round-trip: sessionId written then read back intact', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'sessions-test-'))
+    const sessionsPath = join(tempDir, 'sessions.json')
+    const sessions: SessionsMap = {
+      C_GENERAL: makeSessionRecord({ sessionId: 'round-trip-uuid-789' }),
+    }
+    writeSessions(sessions, sessionsPath)
+    const result = readSessions(sessionsPath)
+    expect(result['C_GENERAL'].sessionId).toBe('round-trip-uuid-789')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // rotateSessions()
 // ---------------------------------------------------------------------------
 
@@ -196,7 +237,7 @@ describe('rotateSessions — crash recovery (T25)', () => {
     tempDir = mkdtempSync(join(tmpdir(), 'sessions-test-'))
     const sessionsPath = join(tempDir, 'sessions.json')
     const sessions = makeSessionsMap({
-      C_GENERAL: makeSessionRecord({ tmuxSession: 'crash:0' }),
+      C_GENERAL: makeSessionRecord({ tmuxSession: 'crash:0', sessionId: 'pre-crash-session-id' }),
     })
     writeFileSync(sessionsPath, JSON.stringify(sessions), 'utf-8')
 
@@ -215,16 +256,17 @@ describe('rotateSessions — crash recovery (T25)', () => {
     tempDir = mkdtempSync(join(tmpdir(), 'sessions-test-'))
     const sessionsPath = join(tempDir, 'sessions.json')
     const sessions: SessionsMap = {
-      C_GENERAL: makeSessionRecord({ tmuxSession: 'main:0' }),
-      C_DEV: makeSessionRecord({ tmuxSession: 'dev:1' }),
+      C_GENERAL: makeSessionRecord({ sessionId: 'abc-123', tmuxSession: 'main:0' }),
+      C_DEV: makeSessionRecord({ sessionId: 'def-456', tmuxSession: 'dev:1' }),
     }
     writeFileSync(sessionsPath, JSON.stringify(sessions), 'utf-8')
 
     rotateSessions(sessionsPath)
 
     const last = JSON.parse(readFileSync(sessionsPath + '.last', 'utf-8')) as SessionsMap
+    expect(last['C_GENERAL'].sessionId).toBe('abc-123')
+    expect(last['C_DEV'].sessionId).toBe('def-456')
     expect(last['C_GENERAL'].tmuxSession).toBe('main:0')
-    expect(last['C_DEV'].tmuxSession).toBe('dev:1')
   })
 })
 
