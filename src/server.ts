@@ -1343,6 +1343,12 @@ export async function main(): Promise<void> {
   // Initialize restart module with adapters bridging tmux + session-manager
   initRestart({
     isSessionAlive: isSessionAliveAdapter,
+    isSessionConnected: (channelId) => {
+      const cwd = routingConfig?.routes[channelId]?.cwd
+      if (!cwd) return false
+      const session = getSessionByCwd(cwd)
+      return session?.connected === true
+    },
     reconnectSession: async (channelId) => {
       const cwd = routingConfig?.routes[channelId]?.cwd
       if (!cwd) return
@@ -1383,7 +1389,18 @@ export async function main(): Promise<void> {
       const lastPath = join(STATE_DIR, 'sessions.json.last')
       const storedSessions = readSessions(lastPath)
       const records = await startupSessionManager(routingConfig, defaultTmuxClient, storedSessions)
-      const sessionsMap = Object.fromEntries(records)
+
+      // Build sessions map: start with stored IDs for failed routes so they
+      // survive to the next restart, then overwrite with successful launches.
+      const sessionsMap: Record<string, import('./sessions.ts').SessionRecord> = {}
+      for (const [channelId, stored] of Object.entries(storedSessions)) {
+        if (!records.has(channelId) && stored.sessionId && stored.sessionId !== 'pending') {
+          sessionsMap[channelId] = stored
+        }
+      }
+      for (const [channelId, record] of records) {
+        sessionsMap[channelId] = record
+      }
       writeSessions(sessionsMap)
     } catch (err) {
       console.error('[slack] Warning: session startup failed — continuing without managed sessions:', err)

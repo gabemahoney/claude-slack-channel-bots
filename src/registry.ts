@@ -182,12 +182,30 @@ export function getAllPendingSessions(): PendingSessionEntry[] {
  * Remove a session from the registry by its MCP session ID.
  * Marks the entry as disconnected before removal.
  * Returns the CWD if found, undefined otherwise.
+ *
+ * Guards against a race condition where a reconnect registers a new session
+ * for the same CWD before the old SSE abort fires. If the current registry
+ * entry's transport belongs to a different MCP session, the old mapping is
+ * cleaned up but the new session is left intact.
  */
 export function unregisterByMcpSessionId(mcpSessionId: string): string | undefined {
   const cwd = mcpSessionIdToCwd.get(mcpSessionId)
   if (!cwd) return undefined
+
+  // Always clean up the stale MCP ID → CWD mapping
+  mcpSessionIdToCwd.delete(mcpSessionId)
+
   const entry = registry.get(cwd)
-  if (entry) entry.connected = false
+  if (!entry) return cwd
+
+  // If a newer session has already replaced this one in the registry,
+  // don't destroy it — just clean up the old mapping and return.
+  if (entry.transport.sessionId !== mcpSessionId) {
+    console.error(`[registry] Skipping unregister for stale MCP session "${mcpSessionId}" — CWD "${cwd}" already has a newer session`)
+    return undefined
+  }
+
+  entry.connected = false
   unregisterSession(cwd)
   return cwd
 }

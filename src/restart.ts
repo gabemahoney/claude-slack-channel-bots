@@ -13,6 +13,8 @@
 
 export interface RestartDeps {
   isSessionAlive(channelId: string): Promise<boolean>
+  /** Check if the session already has a live MCP connection in the registry. */
+  isSessionConnected(channelId: string): boolean
   reconnectSession(channelId: string): Promise<void>
   killSession(channelId: string): Promise<void>
   launchSession(channelId: string, cwd: string, sessionId?: string): Promise<boolean>
@@ -97,6 +99,12 @@ export function scheduleRestart(channelId: string, cwd: string, sessionId?: stri
       }
 
       if (alive) {
+        // If the session already re-established its MCP connection (e.g. Claude
+        // Code refreshed the SSE stream on its own), skip the reconnect.
+        if (deps.isSessionConnected(channelId)) {
+          console.error(`[slack] Session already reconnected — skipping restart for channel=${channelId}`)
+          return
+        }
         console.error(`[slack] Session alive but disconnected — reconnecting MCP for channel=${channelId}`)
         try {
           await deps.reconnectSession(channelId)

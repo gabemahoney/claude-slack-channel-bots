@@ -254,8 +254,9 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
 
   if (!policy && !isRouted) return { action: 'drop' }
 
-  // Use the explicit policy if present, otherwise fall back to permissive defaults
-  const effectivePolicy = policy ?? { requireMention: false, allowFrom: [] }
+  // Use the explicit policy if present, otherwise fall back to permissive defaults.
+  // Merge with defaults so partial entries (e.g. missing allowFrom) don't crash.
+  const effectivePolicy = { requireMention: false, allowFrom: [], ...policy }
 
   if (effectivePolicy.allowFrom.length > 0 && !effectivePolicy.allowFrom.includes(ev['user'] as string)) {
     return { action: 'drop' }

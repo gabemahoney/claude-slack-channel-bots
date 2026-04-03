@@ -24,12 +24,6 @@ export interface LaunchOptions {
   pollTimeout?: number
   /** Claude session UUID to resume. When provided, --resume <id> is appended to the CLI command. */
   sessionId?: string
-  /**
-   * How many ms after launch before checking isClaudeRunning inside the poll loop.
-   * Guards against accepting a session too early before Claude has a chance to start.
-   * Default: 5000.
-   */
-  earlyDetectAfterMs?: number
 }
 
 export interface SessionStateResult {
@@ -63,8 +57,8 @@ export async function launchSession(
 ): Promise<SessionRecord | null> {
   const name = sessionName(cwd)
   const pollTimeout = options?.pollTimeout ?? 120_000
+  const launchDeadline = Date.now() + pollTimeout
   const resumeSessionId = options?.sessionId
-  const earlyDetectAfterMs = options?.earlyDetectAfterMs ?? 5_000
 
   const escapedConfigPath = routingConfig.mcp_config_path.replace(/'/g, "'\\''")
   let baseCmd = `SLACK_CHANNEL_BOT_SESSION=1 claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
@@ -106,12 +100,10 @@ export async function launchSession(
     await tmuxClient.sendKeys(sessionName_, 'Enter')
     console.error(`[slack] Claude launch command sent to session: ${sessionName_}`)
 
-    const launchStart = Date.now()
     let delay = POLL_START_MS
-    const deadline = launchStart + pollTimeout
     let promptAcknowledged = false
 
-    while (Date.now() < deadline) {
+    while (Date.now() < launchDeadline) {
       await new Promise<void>((resolve) => setTimeout(resolve, delay))
       delay = Math.min(delay * 2, POLL_CAP_MS)
 
@@ -129,62 +121,40 @@ export async function launchSession(
         promptAcknowledged = true
       }
 
-      if (Date.now() - launchStart > earlyDetectAfterMs) {
-        // Fast-fail: "No conversation found" means the resume failed
-        if (pane.includes(NO_CONVERSATION_TEXT)) {
-          console.error(`[slack] "No conversation found" detected — fast-fail resume for channel=${channelId}`)
-          return 'NO_CONVERSATION' as unknown as SessionRecord
-        }
+      // Fast-fail: "No conversation found" means the resume failed
+      if (pane.includes(NO_CONVERSATION_TEXT)) {
+        console.error(`[slack] "No conversation found" detected — fast-fail resume for channel=${channelId}`)
+        return 'NO_CONVERSATION' as unknown as SessionRecord
+      }
 
-        const running = await isClaudeRunning(sessionName_, tmuxClient)
-
-        if (!promptAcknowledged && running) {
-          console.error(`[slack] No safety prompt but Claude is running — accepted session early: ${sessionName_}`)
-          promptAcknowledged = true
-        }
-
-        if (promptAcknowledged || running) {
-          // Claude is running — try to discover session ID via PID
-          const pid = await getClaudePid(sessionName_, tmuxClient)
-          if (pid !== null) {
-            const sessionFilePath = `${homedir()}/.claude/sessions/${pid}.json`
-            try {
-              const raw = readFileSync(sessionFilePath, 'utf-8')
-              const entry = JSON.parse(raw)
-              if (
-                typeof entry === 'object' &&
-                entry !== null &&
-                typeof entry.sessionId === 'string' &&
-                entry.sessionId.length > 0
-              ) {
-                const foundId = entry.sessionId as string
-                console.error(`[slack] launchSession: discovered sessionId=${foundId} via PID=${pid} for channel=${channelId}`)
-                return {
-                  tmuxSession: sessionName_,
-                  lastLaunch: new Date().toISOString(),
-                  sessionId: foundId,
-                }
-              }
-              // Session file exists but sessionId not yet populated — keep polling
-            } catch {
-              // Session file not yet written — keep polling
+      // Try to discover session ID via PID
+      const pid = await getClaudePid(sessionName_, tmuxClient)
+      if (pid !== null) {
+        const sessionFilePath = `${homedir()}/.claude/sessions/${pid}.json`
+        try {
+          const raw = readFileSync(sessionFilePath, 'utf-8')
+          const entry = JSON.parse(raw)
+          if (
+            typeof entry === 'object' &&
+            entry !== null &&
+            typeof entry.sessionId === 'string' &&
+            entry.sessionId.length > 0
+          ) {
+            const foundId = entry.sessionId as string
+            console.error(`[slack] launchSession: discovered sessionId=${foundId} via PID=${pid} for channel=${channelId}`)
+            return {
+              tmuxSession: sessionName_,
+              lastLaunch: new Date().toISOString(),
+              sessionId: foundId,
             }
           }
-          // PID found or Claude running but no session file yet — keep polling
-        } else {
-          // Claude is not running after earlyDetectAfterMs — fail
-          return null
+        } catch {
+          // Session file not yet written — keep polling
         }
       }
     }
 
-    // Timeout — check if Claude is still running
-    const running = await isClaudeRunning(sessionName_, tmuxClient)
-    if (running) {
-      console.error(`[slack] Timed out waiting for session ID with Claude running — returning null for channel=${channelId}`)
-      return null
-    }
-
+    console.error(`[slack] Timed out waiting for session ID for channel=${channelId}`)
     return null
   }
 
@@ -251,7 +221,7 @@ export async function startupSessionManager(
   routingConfig: RoutingConfig,
   tmuxClient: TmuxClient,
   storedSessions: SessionsMap,
-  options?: { earlyDetectAfterMs?: number; pollTimeout?: number },
+  options?: { pollTimeout?: number; concurrency?: number; startupTimeout?: number },
 ): Promise<Map<string, SessionRecord>> {
   // Verify tmux is installed before proceeding
   try {
@@ -265,106 +235,135 @@ export async function startupSessionManager(
   console.error(`[slack] startupSessionManager: storedSessions=${JSON.stringify(storedSessions)}`)
 
   const routeEntries = Object.entries(routingConfig.routes)
+  const concurrency = options?.concurrency ?? 3
+  const startupTimeout = options?.startupTimeout ?? 60_000
 
-  // Process all routes concurrently; each resolves to [channelId, SessionRecord | null]
-  const settled = await Promise.allSettled(
-    routeEntries.map(async ([channelId, route]): Promise<[string, SessionRecord | null]> => {
-      const name = sessionName(route.cwd)
+  console.error(`[slack] startupSessionManager: ${routeEntries.length} route(s), concurrency=${concurrency}, per-route timeout=${startupTimeout}ms`)
 
-      const exists = await tmuxClient.hasSession(name)
-
-      if (exists) {
-        const running = await isClaudeRunning(name, tmuxClient)
-
-        if (running) {
-          // Branch 1: Reconnect — session live, send /mcp reconnect <server-name>
-          const reconnectSessionId = storedSessions[channelId]?.sessionId ?? 'none'
-          console.error(`[slack] startupSessionManager: branch=reconnect channel=${channelId} sessionId=${reconnectSessionId}`)
-          console.error(`[slack] Session live — reconnecting MCP server "${MCP_SERVER_NAME}": channel=${channelId} session=${name}`)
-          await tmuxClient.sendKeys(name, `/mcp reconnect ${MCP_SERVER_NAME}`, 'Enter')
-
-          // Discover session ID via PID-based file lookup
-          const pid = await getClaudePid(name, tmuxClient)
-          if (pid !== null) {
-            const sessionFilePath = `${homedir()}/.claude/sessions/${pid}.json`
-            try {
-              const raw = readFileSync(sessionFilePath, 'utf-8')
-              const entry = JSON.parse(raw)
-              if (
-                typeof entry === 'object' &&
-                entry !== null &&
-                typeof entry.sessionId === 'string' &&
-                entry.sessionId.length > 0
-              ) {
-                const foundId = entry.sessionId as string
-                console.error(`[slack] startupSessionManager: reconnect discovered sessionId=${foundId} via PID=${pid} for channel=${channelId}`)
-                return [channelId, {
-                  tmuxSession: name,
-                  lastLaunch: new Date().toISOString(),
-                  sessionId: foundId,
-                }]
-              }
-            } catch {
-              console.error(`[slack] startupSessionManager: reconnect — could not read session file for PID=${pid} channel=${channelId}`)
-            }
-          } else {
-            console.error(`[slack] startupSessionManager: reconnect — no claude PID found for channel=${channelId}`)
-          }
-          return [channelId, null]
-        }
-      }
-
-      // Branch 2 or 3: Dead or missing process — check for stored session ID
-      const storedSessionId = storedSessions[channelId]?.sessionId
-
-      if (exists) {
-        // Kill stale tmux session before relaunching
-        console.error(`[slack] Bare tmux session detected (Claude not running) — will relaunch: channel=${channelId} session=${name}`)
-        console.error(`[slack] Stale session found — killing before relaunch: channel=${channelId} session=${name}`)
-        await tmuxClient.killSession(name)
-      }
-
-      if (storedSessionId && storedSessionId !== 'pending') {
-        // Branch 2: Resume — launch with stored session ID
-        console.error(`[slack] startupSessionManager: branch=resume channel=${channelId} sessionId=${storedSessionId}`)
-        console.error(`[slack] Dead/missing process with stored session ID — resuming: channel=${channelId} session=${name} sessionId=${storedSessionId}`)
-        const record = await launchSession(
-          channelId, route.cwd, routingConfig, tmuxClient,
-          { ...options, sessionId: storedSessionId },
-        )
-        return [channelId, record]
-      } else {
-        // Branch 3: Fresh — launch without session ID
-        console.error(`[slack] startupSessionManager: branch=fresh channel=${channelId} sessionId=none`)
-        console.error(`[slack] No stored session ID — launching fresh: channel=${channelId} session=${name}`)
-        const record = await launchSession(
-          channelId, route.cwd, routingConfig, tmuxClient,
-          options,
-        )
-        return [channelId, record]
-      }
-    }),
-  )
-
-  // Collect non-null results into Map<channelId, SessionRecord>
   const resultMap = new Map<string, SessionRecord>()
   let succeeded = 0
   let failed = 0
+  let nextIdx = 0
 
-  for (const outcome of settled) {
-    if (outcome.status === 'fulfilled') {
-      const [channelId, record] = outcome.value
+  // Process a single route: reconnect, resume, or fresh launch
+  async function processRoute(channelId: string, route: { cwd: string }): Promise<void> {
+    const routeStart = Date.now()
+    const name = sessionName(route.cwd)
+    const exists = await tmuxClient.hasSession(name)
+
+    if (exists) {
+      const running = await isClaudeRunning(name, tmuxClient)
+
+      if (running) {
+        // Branch 1: Reconnect — session live, send /mcp reconnect <server-name>
+        const reconnectSessionId = storedSessions[channelId]?.sessionId ?? 'none'
+        console.error(`[slack] startupSessionManager: branch=reconnect channel=${channelId} sessionId=${reconnectSessionId}`)
+        console.error(`[slack] Session live — reconnecting MCP server "${MCP_SERVER_NAME}": channel=${channelId} session=${name}`)
+        await tmuxClient.sendKeys(name, `/mcp reconnect ${MCP_SERVER_NAME}`, 'Enter')
+
+        // Discover session ID via PID-based file lookup
+        const pid = await getClaudePid(name, tmuxClient)
+        if (pid !== null) {
+          const sessionFilePath = `${homedir()}/.claude/sessions/${pid}.json`
+          try {
+            const raw = readFileSync(sessionFilePath, 'utf-8')
+            const entry = JSON.parse(raw)
+            if (
+              typeof entry === 'object' &&
+              entry !== null &&
+              typeof entry.sessionId === 'string' &&
+              entry.sessionId.length > 0
+            ) {
+              const foundId = entry.sessionId as string
+              console.error(`[slack] startupSessionManager: reconnect discovered sessionId=${foundId} via PID=${pid} for channel=${channelId} (${Date.now() - routeStart}ms)`)
+              resultMap.set(channelId, {
+                tmuxSession: name,
+                lastLaunch: new Date().toISOString(),
+                sessionId: foundId,
+              })
+              succeeded++
+              return
+            }
+          } catch {
+            console.error(`[slack] startupSessionManager: reconnect — could not read session file for PID=${pid} channel=${channelId}`)
+          }
+        } else {
+          console.error(`[slack] startupSessionManager: reconnect — no claude PID found for channel=${channelId}`)
+        }
+        failed++
+        return
+      }
+    }
+
+    // Branch 2 or 3: Dead or missing process — check for stored session ID
+    const storedSessionId = storedSessions[channelId]?.sessionId
+
+    if (exists) {
+      // Kill stale tmux session before relaunching
+      console.error(`[slack] Bare tmux session detected (Claude not running) — will relaunch: channel=${channelId} session=${name}`)
+      console.error(`[slack] Stale session found — killing before relaunch: channel=${channelId} session=${name}`)
+      await tmuxClient.killSession(name)
+    }
+
+    // Each route gets the full startupTimeout as its poll window
+    const effectiveTimeout = Math.min(options?.pollTimeout ?? 120_000, startupTimeout)
+    const launchOpts = { ...options, pollTimeout: effectiveTimeout }
+
+    if (storedSessionId && storedSessionId !== 'pending') {
+      // Branch 2: Resume — launch with stored session ID
+      console.error(`[slack] startupSessionManager: branch=resume channel=${channelId} sessionId=${storedSessionId}`)
+      console.error(`[slack] Dead/missing process with stored session ID — resuming: channel=${channelId} session=${name} sessionId=${storedSessionId}`)
+      const record = await launchSession(
+        channelId, route.cwd, routingConfig, tmuxClient,
+        { ...launchOpts, sessionId: storedSessionId },
+      )
+      const elapsed = Date.now() - routeStart
       if (record !== null) {
+        console.error(`[slack] startupSessionManager: channel=${channelId} resumed in ${elapsed}ms`)
         resultMap.set(channelId, record)
         succeeded++
       } else {
+        console.error(`[slack] startupSessionManager: channel=${channelId} resume failed after ${elapsed}ms`)
         failed++
       }
     } else {
-      console.error('[slack] Session startup error:', outcome.reason)
-      failed++
+      // Branch 3: Fresh — launch without session ID
+      console.error(`[slack] startupSessionManager: branch=fresh channel=${channelId} sessionId=none`)
+      console.error(`[slack] No stored session ID — launching fresh: channel=${channelId} session=${name}`)
+      const record = await launchSession(
+        channelId, route.cwd, routingConfig, tmuxClient,
+        launchOpts,
+      )
+      const elapsed = Date.now() - routeStart
+      if (record !== null) {
+        console.error(`[slack] startupSessionManager: channel=${channelId} launched fresh in ${elapsed}ms`)
+        resultMap.set(channelId, record)
+        succeeded++
+      } else {
+        console.error(`[slack] startupSessionManager: channel=${channelId} fresh launch failed after ${elapsed}ms`)
+        failed++
+      }
     }
   }
+
+  // Worker pool — each worker grabs the next unprocessed route until done
+  async function worker(): Promise<void> {
+    while (nextIdx < routeEntries.length) {
+      const idx = nextIdx++
+      if (idx >= routeEntries.length) break
+      const [channelId, route] = routeEntries[idx]
+      try {
+        await processRoute(channelId, route)
+      } catch (err) {
+        console.error('[slack] Session startup error:', err)
+        failed++
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, routeEntries.length) }, () => worker()),
+  )
 
   console.error(`[slack] Session startup complete: ${succeeded} ok, ${failed} failed`)
 

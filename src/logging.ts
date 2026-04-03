@@ -10,6 +10,7 @@ function formatArgs(args: unknown[]): string {
   return args
     .map(arg => {
       if (typeof arg === 'string') return arg
+      if (arg instanceof Error) return `${arg.name}: ${arg.message}\n${arg.stack ?? ''}`
       if (arg !== null && typeof arg === 'object') return JSON.stringify(arg)
       return String(arg)
     })
