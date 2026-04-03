@@ -872,11 +872,13 @@ process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
 // ---------------------------------------------------------------------------
 
 export async function main(): Promise<void> {
-  // Rotate sessions.json → sessions.json.last before any other startup work.
+  // Check for existing server BEFORE rotating sessions.json.
+  // If we rotate first, a failed start (e.g., server already running) destroys sessions.json.
+  checkPidConflict(PID_FILE)
+
+  // Rotate sessions.json → sessions.json.last now that we know we're the only server.
   // This preserves last-known session IDs for resume logic below.
   rotateSessions()
-
-  checkPidConflict(PID_FILE)
 
   let mcpHost: string
   let mcpPort: number
