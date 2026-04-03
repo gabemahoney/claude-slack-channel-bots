@@ -271,7 +271,7 @@ describe('startupSessionManager', () => {
 
       const result = await startupSessionManager(config, stub, storedSessions, {
         pollTimeout: 2_000,
-        earlyDetectAfterMs: 0,
+        
       })
 
       expect(result).toBeInstanceOf(Map)
@@ -345,7 +345,7 @@ describe('startupSessionManager', () => {
       const start = Date.now()
       const result = await startupSessionManager(config, stub, {}, {
         pollTimeout: 3_000,
-        earlyDetectAfterMs: 0,
+        
       })
       const elapsed = Date.now() - start
 
@@ -405,7 +405,7 @@ describe('startupSessionManager', () => {
 
       const result = await startupSessionManager(config, stub, storedSessions, {
         pollTimeout: 0,
-        earlyDetectAfterMs: 0,
+        
       })
 
       expect(result).toBeInstanceOf(Map)
@@ -468,7 +468,7 @@ describe('startupSessionManager', () => {
       // The function must return a single complete Map — not a partial result.
       const result = await startupSessionManager(config, stub, {}, {
         pollTimeout: 3_000,
-        earlyDetectAfterMs: 0,
+        
       })
 
       // Both routes must be present — write-once semantics: caller has complete data
@@ -515,7 +515,7 @@ describe('launchSession', () => {
 
       const result = await launchSession(
         'C_TEST1', '/tmp/test-cwd', config, stub,
-        { pollTimeout: 2_000, earlyDetectAfterMs: 0 },
+        { pollTimeout: 2_000 },
       )
 
       expect(result).not.toBeNull()
@@ -544,7 +544,7 @@ describe('launchSession', () => {
 
       const result = await launchSession(
         'C_TEST1', '/tmp/test-cwd', config, stub,
-        { pollTimeout: 2_000, earlyDetectAfterMs: 0 },
+        { pollTimeout: 2_000 },
       )
 
       expect(result).not.toBeNull()
@@ -582,7 +582,7 @@ describe('launchSession', () => {
 
       const result = await launchSession(
         'C_TEST1', '/tmp/test-cwd', config, stub,
-        { pollTimeout: 2_000, earlyDetectAfterMs: 0, sessionId: resumeId },
+        { pollTimeout: 2_000, sessionId: resumeId },
       )
 
       expect(result).not.toBeNull()
@@ -653,7 +653,7 @@ describe('launchSession', () => {
       // No sessionId in options
       const result = await launchSession(
         'C_TEST1', '/tmp/test-cwd', config, stub,
-        { pollTimeout: 2_000, earlyDetectAfterMs: 0 },
+        { pollTimeout: 2_000 },
       )
 
       expect(result).not.toBeNull()
@@ -681,7 +681,7 @@ describe('launchSession', () => {
 
       const result = await launchSession(
         'C_TEST1', '/tmp/test-cwd', config, stub,
-        { pollTimeout: 5_000, earlyDetectAfterMs: 0 },
+        { pollTimeout: 5_000 },
       )
 
       expect(result).not.toBeNull()
@@ -716,7 +716,7 @@ describe('launchSession', () => {
 
     const result = await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 600, sessionId: 'stale-id-xyz', earlyDetectAfterMs: 0 },
+      { pollTimeout: 600, sessionId: 'stale-id-xyz' },
     )
 
     // All attempts fail
@@ -758,7 +758,7 @@ describe('launchSession', () => {
 
     const result = await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 600, earlyDetectAfterMs: 0 },
+      { pollTimeout: 600 },
     )
 
     // NO_CONVERSATION without resumeId is treated as null by the outer logic
@@ -781,7 +781,7 @@ describe('launchSession', () => {
 
       const result = await launchSession(
         'C_TEST1', '/tmp/test-cwd', config, stub,
-        { pollTimeout: 600, earlyDetectAfterMs: 0 },
+        { pollTimeout: 600 },
       )
 
       // Timed out waiting for session file — returns null
@@ -850,7 +850,7 @@ describe('append_system_prompt_file', () => {
 
       const result = await launchSession(
         'C_TEST1', '/tmp/test-cwd', config, stub,
-        { pollTimeout: 2_000, earlyDetectAfterMs: 0 },
+        { pollTimeout: 2_000 },
       )
 
       expect(result).not.toBeNull()
@@ -961,7 +961,7 @@ describe('append_system_prompt_file', () => {
 
       const result = await launchSession(
         'C_TEST1', '/tmp/test-cwd', config, stub,
-        { pollTimeout: 2_000, earlyDetectAfterMs: 0, sessionId: resumeId },
+        { pollTimeout: 2_000, sessionId: resumeId },
       )
 
       expect(result).not.toBeNull()
@@ -1070,7 +1070,7 @@ describe('crash recovery', () => {
 
       const result = await launchSession(
         'C_TEST1', '/tmp/test-cwd', config, stub,
-        { pollTimeout: 5_000, sessionId: 'stale-force-killed-id', earlyDetectAfterMs: 0 },
+        { pollTimeout: 5_000, sessionId: 'stale-force-killed-id' },
       )
 
       // Fresh fallback must succeed and return a record
@@ -1110,7 +1110,7 @@ describe('crash recovery', () => {
 
     await launchSession(
       'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 600, sessionId: 'stale-force-killed-id', earlyDetectAfterMs: 0 },
+      { pollTimeout: 600, sessionId: 'stale-force-killed-id' },
     )
 
     const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')

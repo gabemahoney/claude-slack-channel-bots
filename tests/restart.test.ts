@@ -31,6 +31,7 @@ const WAIT_MS = 50         // wait after scheduling; long enough for FAST_DELAY_
 
 type DepsOpts = {
   isSessionAliveResult?: boolean  // default: false (session is dead)
+  isSessionConnectedResult?: boolean  // default: false (not yet reconnected)
   launchSessionResult?: boolean   // default: true (launch succeeds)
   launchSession?: (channelId: string, cwd: string, sessionId?: string) => Promise<boolean>  // override entire launchSession
   restartDelay?: number           // default: FAST_DELAY_S
@@ -57,6 +58,9 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     async isSessionAlive(channelId) {
       isSessionAliveCalls.push(channelId)
       return opts.isSessionAliveResult ?? false
+    },
+    isSessionConnected(_channelId) {
+      return opts.isSessionConnectedResult ?? false
     },
     async reconnectSession(channelId) {
       reconnectSessionCalls.push(channelId)
@@ -384,6 +388,7 @@ describe('isRestartPendingOrActive', () => {
 
     const deps: RestartDeps = {
       isSessionAlive: (_channelId) => alivePromise,  // never resolves until we say so
+      isSessionConnected: () => false,
       reconnectSession: async () => {},
       killSession: async () => {},
       launchSession: async () => true,
