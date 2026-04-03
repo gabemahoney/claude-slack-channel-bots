@@ -9,9 +9,8 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { readFileSync, readdirSync, statSync, accessSync, constants } from 'fs'
+import { readFileSync, accessSync, constants } from 'fs'
 import { homedir } from 'node:os'
-import { join, basename } from 'node:path'
 import { type TmuxClient, sessionName, isClaudeRunning, getClaudePid } from './tmux.ts'
 import { type SessionsMap, type SessionRecord } from './sessions.ts'
 import { type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
@@ -31,54 +30,6 @@ export interface SessionStateResult {
   channelId: string
   action: 'reconnected' | 'launched' | 'resumed' | 'failed'
   sessionName: string
-}
-
-// ---------------------------------------------------------------------------
-// JSONL-based session ID discovery
-// ---------------------------------------------------------------------------
-
-/**
- * Computes the Claude project directory slug from a CWD path.
- * Claude Code stores conversation JSONL files under:
- *   ~/.claude/projects/<slug>/*.jsonl
- * where <slug> is the absolute CWD with '/' replaced by '-' and '_' replaced by '-'.
- */
-export function projectSlug(cwd: string): string {
-  const expanded = cwd.startsWith('~') ? homedir() + cwd.slice(1) : cwd
-  return expanded.replace(/\//g, '-').replace(/_/g, '-')
-}
-
-/**
- * Scans the JSONL conversation directory for the given CWD and returns the
- * session ID (UUID) from the most recently modified .jsonl file, or null
- * if no files are found or the directory does not exist.
- *
- * This is more reliable than PID-based session file lookup because Claude Code
- * creates new JSONL files with new UUIDs after context window compaction,
- * while the PID-based session file retains the original (stale) UUID.
- */
-export function findLatestJsonlSessionId(cwd: string): string | null {
-  const slug = projectSlug(cwd)
-  const dir = join(homedir(), '.claude', 'projects', slug)
-
-  try {
-    const files = readdirSync(dir).filter(f => f.endsWith('.jsonl'))
-    if (files.length === 0) return null
-
-    let latest: { name: string; mtime: number } | null = null
-    for (const file of files) {
-      const filePath = join(dir, file)
-      const stat = statSync(filePath)
-      if (latest === null || stat.mtimeMs > latest.mtime) {
-        latest = { name: file, mtime: stat.mtimeMs }
-      }
-    }
-
-    if (latest === null) return null
-    return basename(latest.name, '.jsonl')
-  } catch {
-    return null
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -310,27 +261,42 @@ export async function startupSessionManager(
         console.error(`[slack] Session live — reconnecting MCP server "${MCP_SERVER_NAME}": channel=${channelId} session=${name}`)
         await tmuxClient.sendKeys(name, `/mcp reconnect ${MCP_SERVER_NAME}`, 'Enter')
 
-        // Discover session ID via JSONL directory scan
-        const jsonlId = findLatestJsonlSessionId(route.cwd)
-        if (jsonlId) {
-          console.error(`[slack] startupSessionManager: reconnect discovered sessionId=${jsonlId} via JSONL scan for channel=${channelId} (${Date.now() - routeStart}ms)`)
-          resultMap.set(channelId, {
-            tmuxSession: name,
-            lastLaunch: new Date().toISOString(),
-            sessionId: jsonlId,
-          })
-          succeeded++
-          return
+        // Discover session ID via PID-based file lookup
+        const pid = await getClaudePid(name, tmuxClient)
+        if (pid !== null) {
+          const sessionFilePath = `${homedir()}/.claude/sessions/${pid}.json`
+          try {
+            const raw = readFileSync(sessionFilePath, 'utf-8')
+            const entry = JSON.parse(raw)
+            if (
+              typeof entry === 'object' &&
+              entry !== null &&
+              typeof entry.sessionId === 'string' &&
+              entry.sessionId.length > 0
+            ) {
+              const foundId = entry.sessionId as string
+              console.error(`[slack] startupSessionManager: reconnect discovered sessionId=${foundId} via PID=${pid} for channel=${channelId} (${Date.now() - routeStart}ms)`)
+              resultMap.set(channelId, {
+                tmuxSession: name,
+                lastLaunch: new Date().toISOString(),
+                sessionId: foundId,
+              })
+              succeeded++
+              return
+            }
+          } catch {
+            console.error(`[slack] startupSessionManager: reconnect — could not read session file for PID=${pid} channel=${channelId}`)
+          }
+        } else {
+          console.error(`[slack] startupSessionManager: reconnect — no claude PID found for channel=${channelId}`)
         }
-
-        console.error(`[slack] startupSessionManager: reconnect — no JSONL files found for channel=${channelId}`)
         failed++
         return
       }
     }
 
-    // Branch 2 or 3: Dead or missing process — JSONL scan is the only source of session IDs
-    const storedSessionId = findLatestJsonlSessionId(route.cwd)
+    // Branch 2 or 3: Dead or missing process — check for stored session ID
+    const storedSessionId = storedSessions[channelId]?.sessionId
 
     if (exists) {
       // Kill stale tmux session before relaunching
