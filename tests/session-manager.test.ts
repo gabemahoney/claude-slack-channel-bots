@@ -10,7 +10,7 @@ import { tmpdir, homedir } from 'os'
 import { join } from 'path'
 import { sessionName } from '../src/tmux.ts'
 import { type SessionsMap } from '../src/sessions.ts'
-import { startupSessionManager, launchSession } from '../src/session-manager.ts'
+import { startupSessionManager, launchSession, projectSlug, findLatestJsonlSessionId } from '../src/session-manager.ts'
 import { makeTmuxStub } from './test-helpers/tmux-stub.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 import { MCP_SERVER_NAME } from '../src/config.ts'
@@ -170,7 +170,7 @@ describe('startupSessionManager', () => {
   test('14. live Claude process in tmux: reconnect path — sendKeys /mcp reconnect <server-name> and Enter as variadic args, no kill, no newSession', async () => {
     const proc = await spawnClaudeProcess()
     try {
-      writeClaudeSessionFile(proc.pid!, 'reconnect-session-id')
+      writeJsonlFile('/tmp/test-cwd', 'reconnect-session-id')
       const stub = makeTmuxStub({
         hasSessionResult: true,
         getPanePidResult: String(proc.pid),
@@ -204,10 +204,10 @@ describe('startupSessionManager', () => {
     }
   })
 
-  test('14b. live Claude process: PID file missing after reconnect — channel not in returned Map', async () => {
+  test('14b. live Claude process: no JSONL files after reconnect — channel not in returned Map', async () => {
     const proc = await spawnClaudeProcess()
     try {
-      // No session file written — PID discovery fails, reconnect returns null
+      // No JSONL files for this CWD — reconnect cannot discover session ID
       const stub = makeTmuxStub({
         hasSessionResult: true,
         getPanePidResult: String(proc.pid),
@@ -216,7 +216,7 @@ describe('startupSessionManager', () => {
 
       const result = await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
 
-      // PID file missing → null record → not in map
+      // No JSONL files → null record → not in map
       expect(result).toBeInstanceOf(Map)
       expect(result.size).toBe(0)
 
@@ -251,27 +251,21 @@ describe('startupSessionManager', () => {
     }
   })
 
-  test('15. dead process + stored session ID: resume path — sendKeys includes --resume, SessionRecord in returned Map', async () => {
+  test('15. dead process + JSONL session ID: resume path — sendKeys includes --resume, SessionRecord in returned Map', async () => {
     const proc = await spawnClaudeProcess()
     try {
       writeClaudeSessionFile(proc.pid!, 'resume-session-abc')
+      writeJsonlFile('/tmp/test-cwd', 'resume-session-abc')
       const stub = makeTmuxStub({
         hasSessionResult: false,
         getPanePidResult: String(proc.pid),
         capturePaneResult: 'I am using this for local development',
       })
-      const storedSessions: SessionsMap = {
-        'C_TEST1': {
-          tmuxSession: 'slack_bot_tmp_test_cwd_8497a1',
-          lastLaunch: '2026-01-01T00:00:00.000Z',
-          sessionId: 'resume-session-abc',
-        },
-      }
       const config = makeRoutingConfig()
 
-      const result = await startupSessionManager(config, stub, storedSessions, {
+      const result = await startupSessionManager(config, stub, {}, {
         pollTimeout: 2_000,
-        
+
       })
 
       expect(result).toBeInstanceOf(Map)
@@ -282,7 +276,7 @@ describe('startupSessionManager', () => {
       expect(record!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
       expect(typeof record!.lastLaunch).toBe('string')
 
-      // sendKeys was called with --resume <stored-session-id>
+      // sendKeys was called with --resume <JSONL-scanned-session-id>
       const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
       const resumeCmd = sendKeysCalls.find(
         c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume resume-session-abc'),
@@ -362,12 +356,13 @@ describe('startupSessionManager', () => {
   })
 
   test('mixed: reconnect + resume + fresh — correct records in returned Map', async () => {
-    // Route CH1: session exists, Claude running → reconnect
-    // Route CH2: session missing, stored session ID → resume
-    // Route CH3: session missing, no stored session → fresh (fails with pollTimeout: 0)
+    // Route CH1: session exists, Claude running → reconnect (JSONL exists)
+    // Route CH2: session missing, JSONL exists → resume
+    // Route CH3: session missing, no JSONL → fresh (fails with pollTimeout: 0)
     const proc = await spawnClaudeProcess()
     try {
-      writeClaudeSessionFile(proc.pid!, 'reconnect-id-ch1')
+      writeJsonlFile('/tmp/cwd-ch1', 'reconnect-id-ch1')
+      writeJsonlFile('/tmp/cwd-ch2', 'jsonl-id-ch2')
 
       const sessionCalls: Record<string, number> = {}
       const stub = makeTmuxStub({
@@ -395,34 +390,26 @@ describe('startupSessionManager', () => {
           'C_CH3': { cwd: '/tmp/cwd-ch3' },
         },
       }
-      const storedSessions: SessionsMap = {
-        'C_CH2': {
-          tmuxSession: sessionName('/tmp/cwd-ch2'),
-          lastLaunch: '2026-01-01T00:00:00.000Z',
-          sessionId: 'stored-id-ch2',
-        },
-      }
 
-      const result = await startupSessionManager(config, stub, storedSessions, {
+      const result = await startupSessionManager(config, stub, {}, {
         pollTimeout: 0,
-        
+
       })
 
       expect(result).toBeInstanceOf(Map)
 
-      // CH1: reconnect path — session file was written, record should be present
+      // CH1: reconnect path — JSONL file found, record should be present
       const ch1 = result.get('C_CH1')
       expect(ch1).toBeDefined()
       expect(ch1!.sessionId).toBe('reconnect-id-ch1')
 
-      // CH2: resume path — pollTimeout:0 → fresh launch won't succeed; may not be in map
-      // Verify sendKeys was called with --resume stored-id-ch2
+      // CH2: resume path — JSONL found, sendKeys called with --resume jsonl-id-ch2
       const resumeCmd = stub.calls.filter(c => c.method === 'sendKeys').find(
-        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume stored-id-ch2'),
+        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume jsonl-id-ch2'),
       )
       expect(resumeCmd).toBeDefined()
 
-      // CH3: fresh path — sendKeys command does NOT include --resume
+      // CH3: fresh path — no JSONL, sendKeys command does NOT include --resume
       const freshCmd = stub.calls.filter(c => c.method === 'sendKeys').find(
         c => typeof c.args[1] === 'string' &&
           (c.args[1] as string).includes('claude --mcp-config') &&
@@ -988,11 +975,11 @@ describe('crash recovery', () => {
   // T24: Server crash before sessions.json write
   // sessions.json does NOT exist (crashed before it was persisted).
   // Claude process is still alive in tmux. startupSessionManager must
-  // discover session IDs via PID lookup and return complete records.
-  test('T24: crash before sessions.json write — reconnect branch discovers session via PID, returns complete record', async () => {
+  // discover session IDs via JSONL scan and return complete records.
+  test('T24: crash before sessions.json write — reconnect branch discovers session via JSONL, returns complete record', async () => {
     const proc = await spawnClaudeProcess()
     try {
-      writeClaudeSessionFile(proc.pid!, 'crash-recovery-session-id')
+      writeJsonlFile('/tmp/test-cwd', 'crash-recovery-session-id')
 
       // tmux session exists and Claude is alive — reconnect branch
       const stub = makeTmuxStub({
@@ -1004,7 +991,7 @@ describe('crash recovery', () => {
       // storedSessions is empty — sessions.json was never written (crashed before phase 11)
       const result = await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
 
-      // Reconnect branch must discover the session via PID and return a full record
+      // Reconnect branch must discover the session via JSONL and return a full record
       expect(result).toBeInstanceOf(Map)
       expect(result.size).toBe(1)
 
@@ -1025,7 +1012,7 @@ describe('crash recovery', () => {
   test('T24: crash before sessions.json write — reconnect sends /mcp reconnect to the live session', async () => {
     const proc = await spawnClaudeProcess()
     try {
-      writeClaudeSessionFile(proc.pid!, 'crash-recovery-session-id-2')
+      writeJsonlFile('/tmp/test-cwd', 'crash-recovery-session-id-2')
 
       const stub = makeTmuxStub({
         hasSessionResult: true,
@@ -1118,5 +1105,247 @@ describe('crash recovery', () => {
       c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume stale-force-killed-id'),
     )
     expect(resumeCmd).toBeDefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// JSONL-based session ID discovery
+// ---------------------------------------------------------------------------
+
+const jsonlDirsToClean: string[] = []
+
+afterEach(() => {
+  for (const dir of jsonlDirsToClean) {
+    try { rmSync(dir, { recursive: true, force: true }) } catch { /* ignore */ }
+  }
+  jsonlDirsToClean.length = 0
+})
+
+/**
+ * Creates a JSONL file in ~/.claude/projects/<slug>/ for a given CWD.
+ * Registers the directory for cleanup in afterEach.
+ * Returns the full path to the created file.
+ */
+function writeJsonlFile(cwd: string, sessionId: string): string {
+  const slug = projectSlug(cwd)
+  const dir = join(homedir(), '.claude', 'projects', slug)
+  mkdirSync(dir, { recursive: true })
+  jsonlDirsToClean.push(dir)
+  const filePath = join(dir, `${sessionId}.jsonl`)
+  writeFileSync(filePath, '{"type":"test"}\n', 'utf-8')
+  return filePath
+}
+
+describe('projectSlug', () => {
+  test('replaces / with - and _ with -', () => {
+    expect(projectSlug('/tmp/test-cwd')).toBe('-tmp-test-cwd')
+  })
+
+  test('replaces underscores with dashes', () => {
+    expect(projectSlug('/home/user/my_project')).toBe('-home-user-my-project')
+  })
+
+  test('handles paths with no special chars', () => {
+    expect(projectSlug('/abc')).toBe('-abc')
+  })
+})
+
+describe('findLatestJsonlSessionId', () => {
+  test('returns null when directory does not exist', () => {
+    expect(findLatestJsonlSessionId('/tmp/nonexistent-jsonl-test-dir-12345')).toBeNull()
+  })
+
+  test('returns null when directory exists but has no .jsonl files', () => {
+    const cwd = `/tmp/jsonl-empty-${Date.now()}`
+    const slug = projectSlug(cwd)
+    const dir = join(homedir(), '.claude', 'projects', slug)
+    mkdirSync(dir, { recursive: true })
+    jsonlDirsToClean.push(dir)
+    writeFileSync(join(dir, 'not-a-jsonl.txt'), 'hello', 'utf-8')
+
+    expect(findLatestJsonlSessionId(cwd)).toBeNull()
+  })
+
+  test('returns the session ID from the single .jsonl file', () => {
+    const cwd = `/tmp/jsonl-single-${Date.now()}`
+    writeJsonlFile(cwd, 'abc-session-123')
+
+    expect(findLatestJsonlSessionId(cwd)).toBe('abc-session-123')
+  })
+
+  test('returns the most recently modified .jsonl file when multiple exist', async () => {
+    const cwd = `/tmp/jsonl-multi-${Date.now()}`
+    const slug = projectSlug(cwd)
+    const dir = join(homedir(), '.claude', 'projects', slug)
+    mkdirSync(dir, { recursive: true })
+    jsonlDirsToClean.push(dir)
+
+    // Write an older file
+    const oldFile = join(dir, 'old-session-id.jsonl')
+    writeFileSync(oldFile, '{"type":"old"}\n', 'utf-8')
+
+    // Ensure mtime difference
+    await Bun.sleep(50)
+
+    // Write a newer file
+    const newFile = join(dir, 'new-session-id.jsonl')
+    writeFileSync(newFile, '{"type":"new"}\n', 'utf-8')
+
+    expect(findLatestJsonlSessionId(cwd)).toBe('new-session-id')
+  })
+})
+
+describe('JSONL-based resume (b.sy9 fix)', () => {
+  test('reconnect branch: uses JSONL session ID, ignores PID file', async () => {
+    const proc = await spawnClaudeProcess()
+    try {
+      // PID file has a stale ID — should be ignored entirely
+      writeClaudeSessionFile(proc.pid!, 'stale-pid-session-id')
+      // JSONL has the current ID (post-compaction)
+      writeJsonlFile('/tmp/test-cwd', 'current-jsonl-session-id')
+
+      const stub = makeTmuxStub({
+        hasSessionResult: true,
+        getPanePidResult: String(proc.pid),
+      })
+      const config = makeRoutingConfig()
+
+      const result = await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
+
+      expect(result).toBeInstanceOf(Map)
+      expect(result.size).toBe(1)
+      const record = result.get('C_TEST1')
+      expect(record).toBeDefined()
+      expect(record!.sessionId).toBe('current-jsonl-session-id')
+    } finally {
+      proc.kill()
+    }
+  })
+
+  test('reconnect branch: no JSONL files → fails, does not fall back to PID', async () => {
+    const proc = await spawnClaudeProcess()
+    try {
+      // PID file exists but must be ignored when no JSONL
+      writeClaudeSessionFile(proc.pid!, 'pid-session-id')
+
+      const stub = makeTmuxStub({
+        hasSessionResult: true,
+        getPanePidResult: String(proc.pid),
+      })
+      const config = makeRoutingConfig()
+
+      const result = await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
+
+      // No JSONL → reconnect fails, no PID fallback
+      expect(result).toBeInstanceOf(Map)
+      expect(result.size).toBe(0)
+    } finally {
+      proc.kill()
+    }
+  })
+
+  test('resume branch: uses JSONL session ID instead of stale stored session ID', async () => {
+    const proc = await spawnClaudeProcess()
+    try {
+      writeClaudeSessionFile(proc.pid!, 'discovered-after-resume')
+      // JSONL has the post-compaction ID
+      writeJsonlFile('/tmp/test-cwd', 'jsonl-post-compaction-id')
+
+      const stub = makeTmuxStub({
+        hasSessionResult: false,
+        getPanePidResult: String(proc.pid),
+        capturePaneResult: 'I am using this for local development',
+      })
+      const storedSessions: SessionsMap = {
+        'C_TEST1': {
+          tmuxSession: sessionName('/tmp/test-cwd'),
+          lastLaunch: '2026-01-01T00:00:00.000Z',
+          sessionId: 'stale-stored-session-id',
+        },
+      }
+      const config = makeRoutingConfig()
+
+      const result = await startupSessionManager(config, stub, storedSessions, {
+        pollTimeout: 2_000,
+      })
+
+      // The resume command must use the JSONL ID, not the stale stored one
+      const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+      const resumeCmd = sendKeysCalls.find(
+        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume jsonl-post-compaction-id'),
+      )
+      expect(resumeCmd).toBeDefined()
+
+      // Must NOT have used the stale stored session ID
+      const staleCmd = sendKeysCalls.find(
+        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume stale-stored-session-id'),
+      )
+      expect(staleCmd).toBeUndefined()
+    } finally {
+      proc.kill()
+    }
+  })
+
+  test('resume branch: JSONL scan enables resume even without stored sessions', async () => {
+    const proc = await spawnClaudeProcess()
+    try {
+      writeClaudeSessionFile(proc.pid!, 'discovered-fresh')
+      // JSONL file exists — resume should be attempted even with no storedSessions entry
+      writeJsonlFile('/tmp/test-cwd', 'jsonl-orphan-session-id')
+
+      const stub = makeTmuxStub({
+        hasSessionResult: false,
+        getPanePidResult: String(proc.pid),
+        capturePaneResult: 'I am using this for local development',
+      })
+      const config = makeRoutingConfig()
+
+      // Empty storedSessions — no stored ID for this channel
+      const result = await startupSessionManager(config, stub, {}, {
+        pollTimeout: 2_000,
+      })
+
+      // Should have attempted --resume with the JSONL ID
+      const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+      const resumeCmd = sendKeysCalls.find(
+        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume jsonl-orphan-session-id'),
+      )
+      expect(resumeCmd).toBeDefined()
+    } finally {
+      proc.kill()
+    }
+  })
+
+  test('resume branch: no JSONL files + stored session ID → launches fresh, not resume', async () => {
+    const stub = makeTmuxStub({
+      hasSessionResult: false,
+      getPanePidResult: '99999999',
+    })
+    const storedSessions: SessionsMap = {
+      'C_TEST1': {
+        tmuxSession: sessionName('/tmp/test-cwd'),
+        lastLaunch: '2026-01-01T00:00:00.000Z',
+        sessionId: 'stored-fallback-id',
+      },
+    }
+    const config = makeRoutingConfig()
+
+    await startupSessionManager(config, stub, storedSessions, {
+      pollTimeout: 0,
+    })
+
+    // No JSONL → no resume attempted, fresh launch instead
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const resumeCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume'),
+    )
+    expect(resumeCmd).toBeUndefined()
+
+    const freshCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' &&
+        (c.args[1] as string).includes('claude --mcp-config') &&
+        !(c.args[1] as string).includes('--resume'),
+    )
+    expect(freshCmd).toBeDefined()
   })
 })
