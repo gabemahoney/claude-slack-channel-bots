@@ -91,7 +91,10 @@ function makeRoutingConfig(opts: {
     port: 3100,
     session_restart_delay: 60,
     health_check_interval: 120,
+    exit_timeout: 120,
+    stop_timeout: 30,
     mcp_config_path: `${homedir()}/.claude/slack-mcp.json`,
+    cozempic_prescription: 'standard',
   }
 
   if (opts.default_dm_session !== undefined) {

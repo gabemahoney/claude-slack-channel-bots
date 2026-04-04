@@ -164,6 +164,21 @@ describe('applyDefaults', () => {
     const result = applyDefaults(makeRoutingConfig({ stop_timeout: 0 }))
     expect(result.stop_timeout).toBe(0)
   })
+
+  test('fills cozempic_prescription with "standard" when absent', () => {
+    const result = applyDefaults(makeRoutingConfig())
+    expect(result.cozempic_prescription).toBe('standard')
+  })
+
+  test('preserves provided cozempic_prescription value "gentle"', () => {
+    const result = applyDefaults(makeRoutingConfig({ cozempic_prescription: 'gentle' }))
+    expect(result.cozempic_prescription).toBe('gentle')
+  })
+
+  test('preserves provided cozempic_prescription value "aggressive"', () => {
+    const result = applyDefaults(makeRoutingConfig({ cozempic_prescription: 'aggressive' }))
+    expect(result.cozempic_prescription).toBe('aggressive')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -182,6 +197,7 @@ function makeValidConfig(overrides: Partial<RoutingConfig> = {}): RoutingConfig 
     exit_timeout: 120,
     stop_timeout: 30,
     mcp_config_path: `${homedir()}/.claude/slack-mcp.json`,
+    cozempic_prescription: 'standard',
     ...overrides,
   }
 }
@@ -282,6 +298,37 @@ describe('validateConfig', () => {
   test('accepts zero for stop_timeout', () => {
     const config = makeValidConfig({ stop_timeout: 0 })
     expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('passes for cozempic_prescription "gentle"', () => {
+    const config = makeValidConfig({ cozempic_prescription: 'gentle' })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('passes for cozempic_prescription "standard"', () => {
+    const config = makeValidConfig({ cozempic_prescription: 'standard' })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('passes for cozempic_prescription "aggressive"', () => {
+    const config = makeValidConfig({ cozempic_prescription: 'aggressive' })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('throws for invalid cozempic_prescription "turbo"', () => {
+    const config = makeValidConfig({ cozempic_prescription: 'turbo' })
+    expect(() => validateConfig(config)).toThrow('Routing config validation error')
+    expect(() => validateConfig(config)).toThrow('"turbo"')
+  })
+
+  test('throws for empty string cozempic_prescription', () => {
+    const config = makeValidConfig({ cozempic_prescription: '' })
+    expect(() => validateConfig(config)).toThrow('Routing config validation error')
+  })
+
+  test('throws for cozempic_prescription "STANDARD" (case-sensitive)', () => {
+    const config = makeValidConfig({ cozempic_prescription: 'STANDARD' })
+    expect(() => validateConfig(config)).toThrow('Routing config validation error')
   })
 })
 
@@ -444,6 +491,22 @@ describe('resolveConfig', () => {
     const result = resolveConfig(input)
     expect(result.append_system_prompt_file).toBeUndefined()
   })
+
+  test('defaults cozempic_prescription to "standard" when absent', () => {
+    const input = makeRoutingConfig()
+    const result = resolveConfig(input)
+    expect(result.cozempic_prescription).toBe('standard')
+  })
+
+  test('passes through valid cozempic_prescription "gentle"', () => {
+    const input = makeRoutingConfig({ cozempic_prescription: 'gentle' })
+    const result = resolveConfig(input)
+    expect(result.cozempic_prescription).toBe('gentle')
+  })
+
+  test('throws on invalid cozempic_prescription end-to-end', () => {
+    expect(() => resolveConfig({ routes: { C: { cwd: '/tmp' } }, cozempic_prescription: 'turbo' })).toThrow('"turbo"')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -576,5 +639,28 @@ describe('loadConfig', () => {
     writeFileSync(configPath, JSON.stringify(config), 'utf-8')
     const result = loadConfig(configPath)
     expect(result.stop_timeout).toBe(30)
+  })
+
+  test('round-trips cozempic_prescription "aggressive" correctly', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'routing.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+      cozempic_prescription: 'aggressive',
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.cozempic_prescription).toBe('aggressive')
+  })
+
+  test('applies default cozempic_prescription of "standard" when absent', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'routing.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.cozempic_prescription).toBe('standard')
   })
 })

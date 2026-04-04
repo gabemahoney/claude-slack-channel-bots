@@ -41,6 +41,7 @@ export interface RoutingConfigInput {
   stop_timeout?: number
   mcp_config_path?: string
   append_system_prompt_file?: string
+  cozempic_prescription?: string
 }
 
 /** Validated, fully-resolved routing configuration with all defaults applied. */
@@ -56,6 +57,7 @@ export interface RoutingConfig {
   stop_timeout: number
   mcp_config_path: string
   append_system_prompt_file?: string
+  cozempic_prescription: string
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +81,7 @@ export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
     stop_timeout: input.stop_timeout ?? 30,
     mcp_config_path: input.mcp_config_path ?? '~/.claude/slack-mcp.json',
     append_system_prompt_file: input.append_system_prompt_file,
+    cozempic_prescription: input.cozempic_prescription ?? 'standard',
   }
 }
 
@@ -149,6 +152,14 @@ export function validateConfig(config: RoutingConfig): void {
   if (config.stop_timeout < 0) {
     throw new Error(
       'Routing config validation error: stop_timeout must be a non-negative number.',
+    )
+  }
+
+  // cozempic_prescription must be one of the allowed values
+  const allowedPrescriptions = ['gentle', 'standard', 'aggressive']
+  if (!allowedPrescriptions.includes(config.cozempic_prescription)) {
+    throw new Error(
+      `Routing config validation error: cozempic_prescription "${config.cozempic_prescription}" is invalid. Allowed values are: ${allowedPrescriptions.join(', ')}.`,
     )
   }
 

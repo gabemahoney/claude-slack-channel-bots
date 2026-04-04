@@ -66,7 +66,10 @@ function makeRoutingConfig(opts: {
     port: 3100,
     session_restart_delay: 60,
     health_check_interval: 120,
+    exit_timeout: 120,
+    stop_timeout: 30,
     mcp_config_path: `${homedir()}/.claude/slack-mcp.json`,
+    cozempic_prescription: 'standard',
   }
 
   if (opts.default_route !== undefined) {
@@ -210,9 +213,7 @@ describe('"not delivered" reply — not sent when session is live', () => {
       '/tmp/not-delivered-session', 'C_CONFIGURED', makeTransport(), makeServer(),
     )
 
-    const routingConfig = makeRoutingConfig({
-      routes: { 'C_CONFIGURED': { cwd: '/tmp/not-delivered-session' } },
-    })
+    const routingConfig = makeRoutingConfig({ cwd: '/tmp/not-delivered-session' })
 
     const { dropped, notifiedSender } = await simulateChannelMessage(
       'C_CONFIGURED', routingConfig, postMessageCalls,

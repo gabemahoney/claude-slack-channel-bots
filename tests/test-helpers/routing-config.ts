@@ -18,6 +18,7 @@ export function makeRoutingConfig(overrides?: Partial<RoutingConfig>): RoutingCo
     exit_timeout: 120,
     stop_timeout: 30,
     mcp_config_path: '/tmp/test-mcp.json',
+    cozempic_prescription: 'standard',
     ...overrides,
   }
 }
