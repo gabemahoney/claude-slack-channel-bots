@@ -78,7 +78,7 @@ Called from `main()` in `server.ts`. `rotateSessions()` runs as the very first a
 3. **tmux availability check** — `startupSessionManager()` calls `tmuxClient.checkAvailability()` (`tmux -V`). If tmux is not installed, startup is skipped with a warning and the server continues.
 4. **Concurrent route launch** — all routes are processed concurrently via `Promise.allSettled`. Each route applies a three-branch decision tree:
    - **Reconnect** — tmux session exists AND `isClaudeRunning()` returns true → send `/mcp reconnect <server-name>` (from `MCP_SERVER_NAME` in `config.ts`) to the running session; discover session ID via PID-based lookup; no relaunch
-   - **Resume** — dead or missing process with a stored `sessionId` in `sessions.json.last` → kill any stale tmux session, call `launchSession()` with the stored session ID (passes `--resume <id>` to Claude)
+   - **Resume** — dead or missing process with a stored `sessionId` in `sessions.json.last` → verify `~/.claude/projects/<slug>/<sessionId>.jsonl` exists; if the file is absent, fall through to **Fresh** immediately (no tmux launch attempted); otherwise kill any stale tmux session, call `launchSession()` with the stored session ID (passes `--resume <id>` to Claude)
    - **Fresh** — dead or missing process without a stored session ID → kill any stale tmux session, call `launchSession()` with no session ID
 5. **Atomic sessions.json write** — after all routes settle, results are collected into a `SessionsMap` and written atomically via `writeSessions()`. This is the only write to `sessions.json` during startup.
 6. **Launch flow** (`launchSession()`) — signature: `(channelId, cwd, routingConfig, tmuxClient, options?) → Promise<SessionRecord | null>`:
@@ -89,7 +89,7 @@ Called from `main()` in `server.ts`. `rotateSessions()` runs as the very first a
    - On prompt found: sends Enter to acknowledge
    - Early detection: after 5 s have elapsed since launch, each poll iteration also calls `isClaudeRunning()` and attempts PID-based session ID discovery; if Claude is running with no prompt (e.g. `--resume` skips the safety prompt), the session is accepted immediately
    - **PID-based session ID discovery** — `getClaudePid(sessionName, tmuxClient)` walks the process tree from the tmux pane PID to find the `claude` process PID. Once found, `~/.claude/sessions/<pid>.json` is read and `entry.sessionId` is extracted. Polling continues until the file appears and the field is populated.
-   - **Resume failure fallback** — if `"No conversation found"` is detected in the pane, or if the `--resume` attempt times out, the tmux session is killed, recreated, and retried once with a fresh launch (no `--resume`)
+   - **Resume failure fallback** — if `"No conversation found"` is detected in the pane, or if the `--resume` attempt times out, the tmux session is killed, recreated, and retried once with a fresh launch (no `--resume`). Note: the JSONL pre-check in the startup decision tree gates this path — if the file is absent, startup falls through to Fresh before any tmux launch is attempted
    - Returns a `SessionRecord` on success (with `sessionId` always populated), or `null` on failure
 
 ### Disconnection

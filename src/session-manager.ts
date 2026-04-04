@@ -9,11 +9,27 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { readFileSync, accessSync, constants } from 'fs'
+import { readFileSync, accessSync, existsSync, constants } from 'fs'
 import { homedir } from 'node:os'
 import { type TmuxClient, sessionName, isClaudeRunning, getClaudePid } from './tmux.ts'
 import { type SessionsMap, type SessionRecord } from './sessions.ts'
 import { type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
+
+// ---------------------------------------------------------------------------
+// JSONL existence helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true if the JSONL conversation file exists for the given session.
+ * The slug is computed from the CWD by replacing all non-alphanumeric-or-hyphen
+ * characters with hyphens, matching Claude's project directory naming.
+ */
+export function jsonlExistsForSession(cwd: string, sessionId: string): boolean {
+  if (!/^[a-zA-Z0-9_-]+$/.test(sessionId)) return false
+  const slug = cwd.replace(/[^a-zA-Z0-9-]/g, '-')
+  const path = `${homedir()}/.claude/projects/${slug}/${sessionId}.jsonl`
+  return existsSync(path)
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -309,7 +325,12 @@ export async function startupSessionManager(
     const effectiveTimeout = Math.min(options?.pollTimeout ?? 120_000, startupTimeout)
     const launchOpts = { ...options, pollTimeout: effectiveTimeout }
 
-    if (storedSessionId && storedSessionId !== 'pending') {
+    const shouldResume = !!(storedSessionId && storedSessionId !== 'pending' && jsonlExistsForSession(route.cwd, storedSessionId))
+    if (!shouldResume && storedSessionId && storedSessionId !== 'pending') {
+      console.error(`[slack] startupSessionManager: no JSONL for stored session — skipping resume: channel=${channelId} sessionId=${storedSessionId}`)
+    }
+
+    if (shouldResume) {
       // Branch 2: Resume — launch with stored session ID
       console.error(`[slack] startupSessionManager: branch=resume channel=${channelId} sessionId=${storedSessionId}`)
       console.error(`[slack] Dead/missing process with stored session ID — resuming: channel=${channelId} session=${name} sessionId=${storedSessionId}`)
@@ -319,7 +340,9 @@ export async function startupSessionManager(
       )
       const elapsed = Date.now() - routeStart
       if (record !== null) {
-        console.error(`[slack] startupSessionManager: channel=${channelId} resumed in ${elapsed}ms`)
+        const actuallyResumed = record.sessionId === storedSessionId
+        const verb = actuallyResumed ? 'resumed' : 'launched fresh (resume fell back)'
+        console.error(`[slack] startupSessionManager: channel=${channelId} ${verb} in ${elapsed}ms`)
         resultMap.set(channelId, record)
         succeeded++
       } else {

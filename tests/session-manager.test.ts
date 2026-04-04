@@ -10,7 +10,7 @@ import { tmpdir, homedir } from 'os'
 import { join } from 'path'
 import { sessionName } from '../src/tmux.ts'
 import { type SessionsMap } from '../src/sessions.ts'
-import { startupSessionManager, launchSession } from '../src/session-manager.ts'
+import { startupSessionManager, launchSession, jsonlExistsForSession } from '../src/session-manager.ts'
 import { makeTmuxStub } from './test-helpers/tmux-stub.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 import { MCP_SERVER_NAME } from '../src/config.ts'
@@ -21,6 +21,7 @@ import { MCP_SERVER_NAME } from '../src/config.ts'
 
 let spawnedTmpDir = ''
 const claudeSessionFiles: string[] = []
+const jsonlCleanupFiles: string[] = []
 
 afterEach(() => {
   if (spawnedTmpDir) {
@@ -31,6 +32,10 @@ afterEach(() => {
     try { unlinkSync(f) } catch { /* ignore */ }
   }
   claudeSessionFiles.length = 0
+  for (const f of jsonlCleanupFiles) {
+    try { unlinkSync(f) } catch { /* ignore */ }
+  }
+  jsonlCleanupFiles.length = 0
 })
 
 async function spawnClaudeProcess() {
@@ -255,6 +260,12 @@ describe('startupSessionManager', () => {
     const proc = await spawnClaudeProcess()
     try {
       writeClaudeSessionFile(proc.pid!, 'resume-session-abc')
+      // JSONL must exist for resume path to be taken (Fix 1)
+      const jsonlDir = join(homedir(), '.claude', 'projects', '-tmp-test-cwd')
+      mkdirSync(jsonlDir, { recursive: true })
+      const jsonlPath = join(jsonlDir, 'resume-session-abc.jsonl')
+      writeFileSync(jsonlPath, '', 'utf-8')
+      jsonlCleanupFiles.push(jsonlPath)
       const stub = makeTmuxStub({
         hasSessionResult: false,
         getPanePidResult: String(proc.pid),
@@ -271,7 +282,7 @@ describe('startupSessionManager', () => {
 
       const result = await startupSessionManager(config, stub, storedSessions, {
         pollTimeout: 2_000,
-        
+
       })
 
       expect(result).toBeInstanceOf(Map)
@@ -293,6 +304,45 @@ describe('startupSessionManager', () => {
     }
   })
 
+  test('B. JSONL missing for stored session ID → skip to fresh path (no --resume)', async () => {
+    // Key regression test: with the JSONL pre-check fix, a stored session ID
+    // whose JSONL file does not exist must NOT attempt --resume.
+    const stub = makeTmuxStub({
+      hasSessionResult: false,
+      getPanePidResult: '99999999', // Claude never running → launch fails
+    })
+    const storedSessions: SessionsMap = {
+      'C_TEST1': {
+        tmuxSession: sessionName('/tmp/test-cwd'),
+        lastLaunch: '2026-01-01T00:00:00.000Z',
+        sessionId: 'missing-jsonl-session-id',
+      },
+    }
+    const config = makeRoutingConfig()
+
+    // Do NOT create the JSONL file — jsonlExistsForSession must return false
+    const result = await startupSessionManager(config, stub, storedSessions, {
+      pollTimeout: 0,
+    })
+
+    // Launch fails (pollTimeout:0, Claude not running), but the important thing is
+    // --resume was never sent.
+    expect(result).toBeInstanceOf(Map)
+    expect(result.size).toBe(0)
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const resumeCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume'),
+    )
+    expect(resumeCmd).toBeUndefined()
+
+    // A launch command was still sent (fresh path)
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+  })
+
   test('16. dead process + no stored session ID: fresh path — sendKeys does not include --resume, launch fails → empty Map', async () => {
     const stub = makeTmuxStub({
       hasSessionResult: false,
@@ -305,6 +355,30 @@ describe('startupSessionManager', () => {
     // pollTimeout: 0 with Claude not running → fresh launch fails → channel not in Map
     expect(result).toBeInstanceOf(Map)
     expect(result.size).toBe(0)
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).includes('--resume')).toBe(false)
+  })
+
+  test('stored session with sessionId "pending" → fresh path, no --resume', async () => {
+    const stub = makeTmuxStub({
+      hasSessionResult: false,
+      getPanePidResult: '99999999',
+    })
+    const config = makeRoutingConfig()
+    const storedSessions: SessionsMap = {
+      'C_TEST1': {
+        tmuxSession: sessionName('/tmp/test-cwd'),
+        lastLaunch: '2026-01-01T00:00:00.000Z',
+        sessionId: 'pending',
+      },
+    }
+
+    await startupSessionManager(config, stub, storedSessions, { pollTimeout: 0 })
 
     const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
     const launchCmd = sendKeysCalls.find(
@@ -363,11 +437,17 @@ describe('startupSessionManager', () => {
 
   test('mixed: reconnect + resume + fresh — correct records in returned Map', async () => {
     // Route CH1: session exists, Claude running → reconnect
-    // Route CH2: session missing, stored session ID → resume
+    // Route CH2: session missing, stored session ID → resume (JSONL must exist for Fix 1)
     // Route CH3: session missing, no stored session → fresh (fails with pollTimeout: 0)
     const proc = await spawnClaudeProcess()
     try {
       writeClaudeSessionFile(proc.pid!, 'reconnect-id-ch1')
+      // Create JSONL file for CH2 resume path
+      const ch2JsonlDir = join(homedir(), '.claude', 'projects', '-tmp-cwd-ch2')
+      mkdirSync(ch2JsonlDir, { recursive: true })
+      const ch2JsonlPath = join(ch2JsonlDir, 'stored-id-ch2.jsonl')
+      writeFileSync(ch2JsonlPath, '', 'utf-8')
+      jsonlCleanupFiles.push(ch2JsonlPath)
 
       const sessionCalls: Record<string, number> = {}
       const stub = makeTmuxStub({
@@ -1118,5 +1198,67 @@ describe('crash recovery', () => {
       c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume stale-force-killed-id'),
     )
     expect(resumeCmd).toBeDefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// jsonlExistsForSession
+// ---------------------------------------------------------------------------
+
+describe('jsonlExistsForSession', () => {
+  const jsonlUnitCleanup: string[] = []
+
+  afterEach(() => {
+    for (const f of jsonlUnitCleanup) {
+      try { unlinkSync(f) } catch { /* ignore */ }
+    }
+    jsonlUnitCleanup.length = 0
+  })
+
+  test('returns true when JSONL file exists', () => {
+    const cwd = '/tmp/test-cwd'
+    const sessionId = 'unit-test-session-exists'
+    const slug = '-tmp-test-cwd'
+    const dir = join(homedir(), '.claude', 'projects', slug)
+    mkdirSync(dir, { recursive: true })
+    const filePath = join(dir, `${sessionId}.jsonl`)
+    writeFileSync(filePath, '', 'utf-8')
+    jsonlUnitCleanup.push(filePath)
+
+    expect(jsonlExistsForSession(cwd, sessionId)).toBe(true)
+  })
+
+  test('returns false when JSONL file does not exist', () => {
+    const cwd = '/tmp/test-cwd'
+    const sessionId = 'unit-test-session-nonexistent-' + Date.now()
+
+    // Deliberately do not create the file
+    expect(jsonlExistsForSession(cwd, sessionId)).toBe(false)
+  })
+
+  test('slug computation: /tmp/test-cwd → -tmp-test-cwd', () => {
+    const sessionId = 'slug-test-session-' + Date.now()
+    const slug = '-tmp-test-cwd'
+    const dir = join(homedir(), '.claude', 'projects', slug)
+    mkdirSync(dir, { recursive: true })
+    const filePath = join(dir, `${sessionId}.jsonl`)
+    writeFileSync(filePath, '', 'utf-8')
+    jsonlUnitCleanup.push(filePath)
+
+    expect(jsonlExistsForSession('/tmp/test-cwd', sessionId)).toBe(true)
+  })
+
+  test('slug computation: /home/user/my_project → -home-user-my-project', () => {
+    const sessionId = 'slug-test-underscores-' + Date.now()
+    const slug = '-home-user-my-project'
+    const dir = join(homedir(), '.claude', 'projects', slug)
+    mkdirSync(dir, { recursive: true })
+    const filePath = join(dir, `${sessionId}.jsonl`)
+    writeFileSync(filePath, '', 'utf-8')
+    jsonlUnitCleanup.push(filePath)
+
+    expect(jsonlExistsForSession('/home/user/my_project', sessionId)).toBe(true)
+    // Verify a different slug would NOT find the file
+    expect(jsonlExistsForSession('/home/user/my_project_other', sessionId)).toBe(false)
   })
 })
