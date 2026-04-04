@@ -1109,6 +1109,17 @@ export async function main(): Promise<void> {
         // Generate unique request ID
         const requestId = crypto.randomUUID()
 
+        // Register pending entry BEFORE posting to Slack to avoid race condition:
+        // If the user clicks Allow/Deny before postMessage returns, the interactive
+        // handler needs the entry to already exist in pendingPermissions.
+        pendingPermissions.set(requestId, {
+          requestId,
+          channelId: matchedChannelId,
+          messageTs: '',
+          toolName: tool_name,
+          waiters: [],
+        })
+
         // Post Block Kit message to channel
         let messageTs: string
         try {
@@ -1120,6 +1131,7 @@ export async function main(): Promise<void> {
           })
           messageTs = postResult.ts as string
         } catch (err) {
+          pendingPermissions.delete(requestId)
           console.error('[slack] /permission: chat.postMessage failed:', err)
           return new Response(JSON.stringify({ error: 'Failed to post message' }), {
             status: 500,
@@ -1127,14 +1139,9 @@ export async function main(): Promise<void> {
           })
         }
 
-        // Register pending entry with empty waiters array
-        pendingPermissions.set(requestId, {
-          requestId,
-          channelId: matchedChannelId,
-          messageTs,
-          toolName: tool_name,
-          waiters: [],
-        })
+        // Update with the real message timestamp (needed for chat.update on decision)
+        const pending = pendingPermissions.get(requestId)
+        if (pending) pending.messageTs = messageTs
 
         return new Response(JSON.stringify({ requestId }), {
           status: 200,
@@ -1274,6 +1281,17 @@ export async function main(): Promise<void> {
           },
         ]
 
+        // Register pending entry BEFORE posting to Slack to avoid race condition:
+        // If the user clicks a button before postMessage returns, the interactive
+        // handler needs the entry to already exist in pendingQuestions.
+        pendingQuestions.set(requestId, {
+          requestId,
+          channelId: matchedChannelId,
+          messageTs: '',
+          question: question as string,
+          waiters: [],
+        })
+
         let messageTs: string
         try {
           const postResult = await web.chat.postMessage({
@@ -1283,6 +1301,7 @@ export async function main(): Promise<void> {
           })
           messageTs = postResult.ts as string
         } catch (err) {
+          pendingQuestions.delete(requestId)
           console.error('[slack] /ask: chat.postMessage failed:', err)
           return new Response(JSON.stringify({ error: 'Failed to post message' }), {
             status: 500,
@@ -1290,13 +1309,9 @@ export async function main(): Promise<void> {
           })
         }
 
-        pendingQuestions.set(requestId, {
-          requestId,
-          channelId: matchedChannelId,
-          messageTs,
-          question: question as string,
-          waiters: [],
-        })
+        // Update with the real message timestamp
+        const pendingQ = pendingQuestions.get(requestId)
+        if (pendingQ) pendingQ.messageTs = messageTs
 
         return new Response(JSON.stringify({ requestId }), {
           status: 200,
