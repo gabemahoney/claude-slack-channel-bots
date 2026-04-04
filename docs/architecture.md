@@ -20,6 +20,7 @@ cli.ts                  CLI entry point for the claude-slack-channel-bots comman
     ├── sessions.ts         sessions.json I/O — readSessions/writeSessions, SessionRecord, SessionsMap
     ├── pid.ts              PID file management — write, read, conflict detection, isProcessRunning
     ├── peer-pid.ts         Post-call session ID discovery — getPeerPidByPort (ss -tnp) + getSessionIdForPid (~/.claude/sessions/<pid>.json)
+    ├── cozempic.ts         Optional cozempic CLI integration: PATH check, JSONL path resolution, file size helpers, async session cleaner
     ├── tokens.ts           Token loading — reads SLACK_BOT_TOKEN/SLACK_APP_TOKEN from env, validates prefixes
     ├── ack-tracker.ts      In-memory ack reaction state — Map keyed by channelId:messageTs, trackAck/consumeAck API, 30-day expiry pruning
     └── hooks/
@@ -80,11 +81,12 @@ Called from `main()` in `server.ts`. `rotateSessions()` runs as the very first a
 3. **tmux availability check** — `startupSessionManager()` calls `tmuxClient.checkAvailability()` (`tmux -V`). If tmux is not installed, startup is skipped with a warning and the server continues.
 4. **Concurrent route launch** — all routes are processed concurrently via `Promise.allSettled`. Each route applies a three-branch decision tree:
    - **Reconnect** — tmux session exists AND `isClaudeRunning()` returns true → send `/mcp reconnect <server-name>` (from `MCP_SERVER_NAME` in `config.ts`) to the running session; the stored `sessionId` from `sessions.json.last` is carried forward (or `"pending"` if absent); no relaunch
-   - **Resume** — dead or missing process with a stored `sessionId` in `sessions.json.last` → verify `~/.claude/projects/<slug>/<sessionId>.jsonl` exists; if the file is absent, fall through to **Fresh** immediately (no tmux launch attempted); otherwise kill any stale tmux session, call `launchSession()` with the stored session ID (passes `--resume <id>` to Claude)
+   - **Resume** — dead or missing process with a stored `sessionId` in `sessions.json.last` → verify `~/.claude/projects/<slug>/<sessionId>.jsonl` exists; if the file is absent, fall through to **Fresh** immediately (no tmux launch attempted); otherwise kill any stale tmux session, call `cleanSession()` if cozempic is available (cleans the JSONL file before resume to reduce load times), then call `launchSession()` with the stored session ID (passes `--resume <id>` to Claude)
    - **Fresh** — dead or missing process without a stored session ID → kill any stale tmux session, call `launchSession()` with no session ID
 5. **Atomic sessions.json write** — after all routes settle, results are collected into a `SessionsMap` and written atomically via `writeSessions()`. This is the only write to `sessions.json` during startup.
 6. **Launch flow** (`launchSession()`) — signature: `(channelId, cwd, routingConfig, tmuxClient, options?) → Promise<SessionRecord | null>`:
    - `tmuxClient.newSession(name, cwd)` creates a detached tmux session
+   - If `options.cleanSession` is provided and `options.sessionId` is set, `cleanSession()` is called before the tmux launch to clean the JSONL file (cozempic integration; no-op if cozempic is not installed)
    - The `claude` CLI command is prefixed with `SLACK_CHANNEL_BOT_SESSION=1` so the permission relay hooks activate only inside bot-managed sessions
    - If `options.sessionId` is provided, appends `--resume <id>` to the CLI command; otherwise launches fresh
    - Polls `capturePane()` with exponential backoff (500 ms start, 2× per step, 5 s cap, 120 s total timeout) waiting for the safety prompt text
@@ -179,6 +181,7 @@ Key fields:
 - `stop_timeout` — seconds the `stop` command waits after SIGTERM before escalating to SIGKILL (default: 30)
 - `mcp_config_path` — path to MCP config file for Claude launch (default: ~/.claude/slack-mcp.json)
 - `append_system_prompt_file` — optional path to a file appended to every managed session's system prompt via `--append-system-prompt-file`; missing file silently skipped
+- `cozempic_prescription` — cozempic cleaning intensity used before `--resume` launches (default: `"standard"`; valid: `gentle`, `standard`, `aggressive`); has no effect if cozempic is not installed
 
 ### sessions.json (~/.claude/channels/slack/sessions.json)
 

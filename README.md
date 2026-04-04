@@ -42,6 +42,7 @@ See the sections below for manual configuration details if you prefer not to use
 - `ss` from [iproute2](https://github.com/iproute2/iproute2) on your `PATH` (required for session ID discovery; pre-installed on most Linux distributions)
 - `curl` and `jq` on your `PATH` (required for the permission relay hooks)
 - Slack workspace admin access (to create and configure the Slack app)
+- **cozempic** (optional) — Python 3.10+ and `pip install cozempic` — enables session file cleaning before `--resume` for faster load times
 
 ---
 
@@ -92,7 +93,8 @@ A skeleton file is created by postinstall. Populate it before running `start`.
   "health_check_interval": 120,
   "exit_timeout": 120,
   "stop_timeout": 30,
-  "mcp_config_path": "~/.claude/slack-mcp.json"
+  "mcp_config_path": "~/.claude/slack-mcp.json",
+  "cozempic_prescription": "standard"
 }
 ```
 
@@ -111,6 +113,7 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | `stop_timeout` | number | `30` | Seconds to wait for the server process to exit after `SIGTERM` before escalating to `SIGKILL`. |
 | `mcp_config_path` | string | `~/.claude/slack-mcp.json` | Path to the MCP config file passed to Claude Code when launching managed sessions. |
 | `append_system_prompt_file` | string | — | Path to a file appended to every managed session's system prompt via `--append-system-prompt-file`. Missing file silently skipped. See `skills/EXAMPLE_CLAUDE.md` for a template. |
+| `cozempic_prescription` | string | `"standard"` | Cozempic cleaning intensity before resume. Valid values: `gentle`, `standard`, `aggressive`. Has no effect if cozempic is not installed. |
 
 ---
 
