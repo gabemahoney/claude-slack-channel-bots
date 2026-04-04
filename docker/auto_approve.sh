@@ -32,18 +32,16 @@ while true; do
         sleep 0.2
         tmux send-keys -t "$PANE" "Enter"
         echo "[$SESSION] $(date +%H:%M:%S) APPROVED permission prompt"
-    fi
 
     # Approve edit prompts
-    if echo "$content" | grep -q "Do you want to make"; then
+    elif echo "$content" | grep -q "Do you want to make"; then
         tmux send-keys -t "$PANE" "1"
         sleep 0.2
         tmux send-keys -t "$PANE" "Enter"
         echo "[$SESSION] $(date +%H:%M:%S) APPROVED edit prompt"
-    fi
 
     # Approve create prompts
-    if echo "$content" | grep -q "Do you want to create"; then
+    elif echo "$content" | grep -q "Do you want to create"; then
         tmux send-keys -t "$PANE" "1"
         sleep 0.2
         tmux send-keys -t "$PANE" "Enter"

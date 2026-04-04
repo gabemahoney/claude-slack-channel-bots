@@ -56,6 +56,7 @@ If the build fails, report the error and stop.
 ## Step 4 — Start container
 
 ```bash
+docker rm -f cscb-ci 2>/dev/null || true
 TARBALL=<tarball-filename>
 docker run -d --name cscb-ci \
   -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}" \
