@@ -227,45 +227,67 @@ their defaults unless asked.
 
 ---
 
-### Step 5 — Configure custom CLAUDE.md (optional)
+### Step 5 — Configure custom system prompt for worker sessions
 
-Worker sessions launched by the server can receive a custom system-prompt
-append via `append_system_prompt_file` in `routing.json`. This is useful for
-giving all workers project-specific instructions: communication rules,
-development process, how to spawn sub-workers, and so on.
+Worker sessions launched by the server can receive a custom system prompt
+via `append_system_prompt_file` in `routing.json`. This controls how the
+bots behave — their role, communication style, and capabilities.
 
-An example template is included with the package. Show the operator where it
-lives:
+**This is important.** Without a system prompt, bots won't know to communicate
+via Slack and will try to use the TUI (which nobody can see).
+
+An example template is included with the package. Read it for reference:
 
 ```bash
-ls "$(npm root -g)/claude-slack-channel-bots/skills/EXAMPLE_CLAUDE.md" 2>/dev/null \
+cat "$(npm root -g)/claude-slack-channel-bots/skills/EXAMPLE_CLAUDE.md" 2>/dev/null \
   || echo "NOT_FOUND"
 ```
 
-If the file is found, print its path so the operator can inspect it as a
-starting point.
+Show the user the example content so they understand what a system prompt
+looks like.
 
-Ask the operator: **"Do you want to configure a custom CLAUDE.md file for
-worker sessions?"**
+Then ask: **"What should your bots do? Describe the role you want them to
+play, how they should communicate, and any specific behaviors."**
 
-**If yes:**
+Examples to offer if they're unsure:
+- "I want a coding assistant that responds to my messages in Slack"
+- "I want an orchestrator that manages workers and reports status"
+- "I want a simple bot that answers questions about my codebase"
 
-1. Prompt for the absolute path to their CLAUDE.md file.
-2. Verify the file exists:
-   ```bash
-   test -f "<provided-path>" && echo "ok" || echo "not found"
+**After the user describes what they want:**
+
+1. Write a system prompt file based on their description. The file MUST
+   always include these two essential sections at the top (adapt the wording
+   to match their described role):
+
+   ```markdown
+   # Communication with the User
+   The User communicates with you via Slack. Always use the
+   mcp__slack-channel-router__reply tool to send messages.
+   **Important**: Nothing you send to the TUI will be seen by the User.
    ```
-   Expand `~` before checking. If the file does not exist, warn the operator
-   and re-prompt until a valid path is given or they choose to skip.
-3. Read `routing.json`, add or update the top-level field:
+
+   Then add sections based on what the user described (role, process,
+   capabilities, tone, etc.).
+
+2. Save the file to `~/.claude/channels/slack/system-prompt.md`:
+   ```bash
+   STATE_DIR="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+   ```
+
+3. Read `routing.json`, add or update:
    ```json
-   "append_system_prompt_file": "<provided-path>"
+   "append_system_prompt_file": "~/.claude/channels/slack/system-prompt.md"
    ```
    Write the updated file, preserving all other fields.
 
-**If skipped:**
+4. Show the user what was written and ask if they want to make changes.
+   Iterate until they're happy.
 
-Do not write `append_system_prompt_file` to `routing.json`. Move on.
+**If the user explicitly skips:**
+
+Do not write `append_system_prompt_file` to `routing.json`, but warn them
+that bots won't know to communicate via Slack without a system prompt.
 
 ---
 
