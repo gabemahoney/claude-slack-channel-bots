@@ -143,7 +143,11 @@ export async function launchSession(
         return 'NO_CONVERSATION' as unknown as SessionRecord
       }
 
-      // Try to discover session ID via PID
+      // When resuming, wait for the safety prompt before reading the PID file.
+      // Claude writes a placeholder session ID on startup, then overwrites it
+      // with the resumed conversation's ID once the resume completes. Reading
+      // too early captures the placeholder.
+      if (safeResumeId && !promptAcknowledged) continue
       const pid = await getClaudePid(sessionName_, tmuxClient)
       if (pid !== null) {
         const sessionFilePath = `${homedir()}/.claude/sessions/${pid}.json`
