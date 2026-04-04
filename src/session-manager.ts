@@ -340,9 +340,7 @@ export async function startupSessionManager(
       )
       const elapsed = Date.now() - routeStart
       if (record !== null) {
-        const actuallyResumed = record.sessionId === storedSessionId
-        const verb = actuallyResumed ? 'resumed' : 'launched fresh (resume fell back)'
-        console.error(`[slack] startupSessionManager: channel=${channelId} ${verb} in ${elapsed}ms`)
+        console.error(`[slack] startupSessionManager: channel=${channelId} resumed in ${elapsed}ms (storedId=${storedSessionId} discoveredId=${record.sessionId})`)
         resultMap.set(channelId, record)
         succeeded++
       } else {
