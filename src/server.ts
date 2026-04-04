@@ -42,6 +42,7 @@ import { loadConfig, expandTilde, type RoutingConfig, MCP_SERVER_NAME } from './
 import { readSessions, writeSessions, rotateSessions } from './sessions.ts'
 import { defaultTmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
 import { startupSessionManager, launchSession } from './session-manager.ts'
+import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import {
   initRestart,
   scheduleRestart,
@@ -1423,7 +1424,9 @@ export async function main(): Promise<void> {
       const resolvedSessionId = stored !== 'pending' ? stored : undefined
       const record = await launchSession(
         channelId, cwd, routingConfig, defaultTmuxClient,
-        resolvedSessionId !== undefined ? { sessionId: resolvedSessionId } : undefined,
+        resolvedSessionId !== undefined
+          ? { sessionId: resolvedSessionId, cleanSession: getCozempicAvailable() ? cleanSession : undefined }
+          : undefined,
       )
       if (record) {
         const sessions = readSessions()

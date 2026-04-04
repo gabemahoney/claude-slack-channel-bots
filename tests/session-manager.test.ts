@@ -11,6 +11,7 @@ import { join } from 'path'
 import { sessionName } from '../src/tmux.ts'
 import { type SessionsMap } from '../src/sessions.ts'
 import { startupSessionManager, launchSession, jsonlExistsForSession } from '../src/session-manager.ts'
+import { type CleanSessionFn } from '../src/cozempic.ts'
 import { makeTmuxStub } from './test-helpers/tmux-stub.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 import { MCP_SERVER_NAME } from '../src/config.ts'
@@ -1118,5 +1119,87 @@ describe('jsonlExistsForSession', () => {
     expect(jsonlExistsForSession('/home/user/my_project', sessionId)).toBe(true)
     // Verify a different slug would NOT find the file
     expect(jsonlExistsForSession('/home/user/my_project_other', sessionId)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// launchSession — cleaning integration
+// ---------------------------------------------------------------------------
+
+describe('launchSession — cleaning integration', () => {
+  test('cleaning called before --resume when sessionId is provided', async () => {
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const config = makeRoutingConfig()
+
+    const cleanCalls: Array<[string, string, string]> = []
+    const mockClean: CleanSessionFn = async (sessionId, cwd, prescription) => {
+      cleanCalls.push([sessionId, cwd, prescription])
+    }
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 2_000, sessionId: 'abc123', cleanSession: mockClean },
+    )
+
+    expect(cleanCalls).toHaveLength(1)
+    expect(cleanCalls[0][0]).toBe('abc123')
+    expect(cleanCalls[0][1]).toBe('/tmp/test-cwd')
+    expect(cleanCalls[0][2]).toBe('standard') // default prescription from makeRoutingConfig
+  })
+
+  test('cleaning NOT called for fresh launches (no sessionId)', async () => {
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const config = makeRoutingConfig()
+
+    const cleanCalls: number[] = []
+    const mockClean: CleanSessionFn = async () => { cleanCalls.push(1) }
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 2_000, cleanSession: mockClean }, // no sessionId
+    )
+
+    expect(cleanCalls).toHaveLength(0)
+  })
+
+  test('cleaning NOT called when sessionId is "pending"', async () => {
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const config = makeRoutingConfig()
+
+    const cleanCalls: number[] = []
+    const mockClean: CleanSessionFn = async () => { cleanCalls.push(1) }
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 2_000, sessionId: 'pending', cleanSession: mockClean },
+    )
+
+    expect(cleanCalls).toHaveLength(0)
+  })
+
+  test('cleaning error does not abort resume — SessionRecord still returned', async () => {
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const config = makeRoutingConfig()
+
+    // Simulates an internal failure that still resolves (per CleanSessionFn contract)
+    const mockClean: CleanSessionFn = async () => {
+      console.error('[test] mock clean: simulated failure, resolving anyway')
+    }
+
+    const result = await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 2_000, sessionId: 'abc123', cleanSession: mockClean },
+    )
+
+    expect(result).not.toBeNull()
+    expect(result!.sessionId).toBe('abc123')
   })
 })

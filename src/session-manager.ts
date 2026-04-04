@@ -10,8 +10,8 @@
  */
 
 import { accessSync, existsSync, constants } from 'fs'
-import { homedir } from 'node:os'
 import { type TmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
+import { type CleanSessionFn, checkCozempicAvailable, getCozempicAvailable, cleanSession as defaultCleanSession, resolveJsonlPath } from './cozempic.ts'
 import { type SessionsMap, type SessionRecord } from './sessions.ts'
 import { type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
 
@@ -26,8 +26,7 @@ import { type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
  */
 export function jsonlExistsForSession(cwd: string, sessionId: string): boolean {
   if (!/^[a-zA-Z0-9_-]+$/.test(sessionId)) return false
-  const slug = cwd.replace(/[^a-zA-Z0-9-]/g, '-')
-  const path = `${homedir()}/.claude/projects/${slug}/${sessionId}.jsonl`
+  const path = resolveJsonlPath(cwd, sessionId)
   return existsSync(path)
 }
 
@@ -40,6 +39,8 @@ export interface LaunchOptions {
   pollTimeout?: number
   /** Claude session UUID to resume. When provided, --resume <id> is appended to the CLI command. */
   sessionId?: string
+  /** Optional session cleaning function to run before --resume launches. */
+  cleanSession?: CleanSessionFn
 }
 
 export interface SessionStateResult {
@@ -155,6 +156,11 @@ export async function launchSession(
   await tmuxClient.newSession(name, cwd)
   console.error(`[slack] Session created: ${name} (cwd="${cwd}")`)
 
+  // Clean JSONL before resuming (if a cleanSession fn was provided)
+  if (resumeSessionId && resumeSessionId !== 'pending' && options?.cleanSession) {
+    await options.cleanSession(resumeSessionId, cwd, routingConfig.cozempic_prescription)
+  }
+
   // Attempt launch (with --resume if sessionId provided)
   let result = await attemptLaunch(resumeSessionId, name)
 
@@ -227,6 +233,8 @@ export async function startupSessionManager(
 
   console.error(`[slack] startupSessionManager: storedSessions=${JSON.stringify(storedSessions)}`)
 
+  await checkCozempicAvailable()
+
   const routeEntries = Object.entries(routingConfig.routes)
   const concurrency = options?.concurrency ?? 3
   const startupTimeout = options?.startupTimeout ?? 60_000
@@ -294,7 +302,7 @@ export async function startupSessionManager(
       console.error(`[slack] Dead/missing process with stored session ID — resuming: channel=${channelId} session=${name} sessionId=${storedSessionId}`)
       const record = await launchSession(
         channelId, route.cwd, routingConfig, tmuxClient,
-        { ...launchOpts, sessionId: storedSessionId },
+        { ...launchOpts, sessionId: storedSessionId, cleanSession: getCozempicAvailable() ? defaultCleanSession : undefined },
       )
       const elapsed = Date.now() - routeStart
       if (record !== null) {
