@@ -106,6 +106,43 @@ const STATE_DIR = process.env['SLACK_STATE_DIR'] || join(homedir(), '.claude', '
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'server.pid')
+const KEEP_ALIVE_INTERVAL_MS = 30_000
+
+// ---------------------------------------------------------------------------
+// SSE keep-alive — prevents idle stream disconnection
+// ---------------------------------------------------------------------------
+
+const keepAliveTimers = new Map<WebStandardStreamableHTTPServerTransport, ReturnType<typeof setInterval>>()
+
+export function startSseKeepAlive(transport: WebStandardStreamableHTTPServerTransport): void {
+  const id = setInterval(() => {
+    const streamEntry = (transport as any)._streamMapping?.get('_GET_stream')
+    if (streamEntry?.controller && streamEntry?.encoder) {
+      try {
+        streamEntry.controller.enqueue(streamEntry.encoder.encode(':ping\n\n'))
+      } catch {
+        clearInterval(id)
+        keepAliveTimers.delete(transport)
+      }
+    }
+  }, KEEP_ALIVE_INTERVAL_MS)
+  keepAliveTimers.set(transport, id)
+}
+
+export function stopSseKeepAlive(transport: WebStandardStreamableHTTPServerTransport): void {
+  const id = keepAliveTimers.get(transport)
+  if (id !== undefined) {
+    clearInterval(id)
+    keepAliveTimers.delete(transport)
+  }
+}
+
+export function stopAllKeepAliveTimers(): void {
+  for (const id of keepAliveTimers.values()) {
+    clearInterval(id)
+  }
+  keepAliveTimers.clear()
+}
 
 // ---------------------------------------------------------------------------
 // Bootstrap — tokens & state directory
@@ -306,6 +343,7 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
       // Transport-level init. Roots resolution happens via server.oninitialized.
     },
     onsessionclosed: (mcpSessionId) => {
+      stopSseKeepAlive(transport)
       // Session closed — clean up pending or registered state
       const pending = getPendingSession(mcpSessionId)
       if (pending) {
@@ -330,6 +368,7 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
   })
 
   entryStub.transport = transport
+  startSseKeepAlive(transport)
 
   // Build the MCP server (closes over entryStub.deliveredChannels)
   const server = createSessionServer(entryStub, sessionToolDeps)
@@ -813,6 +852,7 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true
   stopHealthCheck()
   cancelAllRestartTimers()
+  stopAllKeepAliveTimers()
 
   console.error(`[slack] Received ${signal} — shutting down`)
 

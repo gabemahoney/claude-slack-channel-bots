@@ -68,6 +68,7 @@ Same pattern as permission relay but via `PreToolUse` hook on `AskUserQuestion`:
 2. MCP handshake completes → `server.oninitialized` fires → `handleInitialized()` calls `roots/list`
 3. CWD from roots is matched against `routingConfig.routes` → session promoted from pending to registered
 4. Session receives messages from its assigned Slack channel
+5. A keep-alive timer is started (`startSseKeepAlive`) that writes SSE comment frames (`:ping\n\n`) every ~30 s to prevent idle connection drops from proxies or load balancers
 
 ### Server-Managed Startup
 
@@ -146,7 +147,7 @@ Algorithm:
 
 ### Graceful Shutdown
 
-On `SIGTERM` or `SIGINT`, the shutdown handler calls `cancelAllRestartTimers()` before tearing down Socket Mode and the HTTP server. All pending restart timers are cleared so no relaunch fires during shutdown. The PID file (`STATE_DIR/server.pid`) is removed as the final step of shutdown.
+On `SIGTERM` or `SIGINT`, the shutdown handler calls `stopAllKeepAliveTimers()` and `cancelAllRestartTimers()` before tearing down Socket Mode and the HTTP server. All pending keep-alive and restart timers are cleared so no work fires during shutdown. The PID file (`STATE_DIR/server.pid`) is removed as the final step of shutdown.
 
 ## Configuration
 
