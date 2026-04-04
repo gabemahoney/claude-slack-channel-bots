@@ -19,6 +19,7 @@ cli.ts                  CLI entry point for the claude-slack-channel-bots comman
     ├── tmux.ts             TmuxClient interface and defaultTmuxClient — tmux shell ops, isClaudeRunning
     ├── sessions.ts         sessions.json I/O — readSessions/writeSessions, SessionRecord, SessionsMap
     ├── pid.ts              PID file management — write, read, conflict detection, isProcessRunning
+    ├── peer-pid.ts         Post-call session ID discovery — getPeerPidByPort (ss -tnp) + getSessionIdForPid (~/.claude/sessions/<pid>.json)
     ├── tokens.ts           Token loading — reads SLACK_BOT_TOKEN/SLACK_APP_TOKEN from env, validates prefixes
     ├── ack-tracker.ts      In-memory ack reaction state — Map keyed by channelId:messageTs, trackAck/consumeAck API, 30-day expiry pruning
     └── hooks/
@@ -78,7 +79,7 @@ Called from `main()` in `server.ts`. `rotateSessions()` runs as the very first a
 2. **Read stored IDs** — `sessions.json.last` is read via `readSessions(lastPath)` to obtain the previous session IDs used for `--resume` logic.
 3. **tmux availability check** — `startupSessionManager()` calls `tmuxClient.checkAvailability()` (`tmux -V`). If tmux is not installed, startup is skipped with a warning and the server continues.
 4. **Concurrent route launch** — all routes are processed concurrently via `Promise.allSettled`. Each route applies a three-branch decision tree:
-   - **Reconnect** — tmux session exists AND `isClaudeRunning()` returns true → send `/mcp reconnect <server-name>` (from `MCP_SERVER_NAME` in `config.ts`) to the running session; discover session ID via PID-based lookup; no relaunch
+   - **Reconnect** — tmux session exists AND `isClaudeRunning()` returns true → send `/mcp reconnect <server-name>` (from `MCP_SERVER_NAME` in `config.ts`) to the running session; the stored `sessionId` from `sessions.json.last` is carried forward (or `"pending"` if absent); no relaunch
    - **Resume** — dead or missing process with a stored `sessionId` in `sessions.json.last` → verify `~/.claude/projects/<slug>/<sessionId>.jsonl` exists; if the file is absent, fall through to **Fresh** immediately (no tmux launch attempted); otherwise kill any stale tmux session, call `launchSession()` with the stored session ID (passes `--resume <id>` to Claude)
    - **Fresh** — dead or missing process without a stored session ID → kill any stale tmux session, call `launchSession()` with no session ID
 5. **Atomic sessions.json write** — after all routes settle, results are collected into a `SessionsMap` and written atomically via `writeSessions()`. This is the only write to `sessions.json` during startup.
@@ -88,10 +89,21 @@ Called from `main()` in `server.ts`. `rotateSessions()` runs as the very first a
    - If `options.sessionId` is provided, appends `--resume <id>` to the CLI command; otherwise launches fresh
    - Polls `capturePane()` with exponential backoff (500 ms start, 2× per step, 5 s cap, 120 s total timeout) waiting for the safety prompt text
    - On prompt found: sends Enter to acknowledge
-   - Early detection: after 5 s have elapsed since launch, each poll iteration also calls `isClaudeRunning()` and attempts PID-based session ID discovery; if Claude is running with no prompt (e.g. `--resume` skips the safety prompt), the session is accepted immediately
-   - **PID-based session ID discovery** — `getClaudePid(sessionName, tmuxClient)` walks the process tree from the tmux pane PID to find the `claude` process PID. Once found, `~/.claude/sessions/<pid>.json` is read and `entry.sessionId` is extracted. Polling continues until the file appears and the field is populated.
+   - Early detection: after 5 s have elapsed since launch, each poll iteration also calls `isClaudeRunning()`; if Claude is running with no prompt (e.g. `--resume` skips the safety prompt), the session is accepted immediately
+   - **Session ID** — fresh launches write `sessionId: "pending"` immediately after the safety prompt ACK. The real UUID is discovered later, after the session's first MCP tool call, via the post-call discovery path in `registry.ts` (see [Session ID Discovery](#session-id-discovery)). Resume launches carry the stored UUID from `sessions.json.last` directly and `sessionId` is never `"pending"`.
    - **Resume failure fallback** — if `"No conversation found"` is detected in the pane, or if the `--resume` attempt times out, the tmux session is killed, recreated, and retried once with a fresh launch (no `--resume`). Note: the JSONL pre-check in the startup decision tree gates this path — if the file is absent, startup falls through to Fresh before any tmux launch is attempted
-   - Returns a `SessionRecord` on success (with `sessionId` always populated), or `null` on failure
+   - Returns a `SessionRecord` on success, or `null` on failure
+
+### Session ID Discovery
+
+After every MCP tool call by a registered session, `registry.ts` fires a fire-and-forget async block that discovers and persists the real Claude session UUID without blocking the tool call response:
+
+1. **Peer port** — the TCP peer port of the MCP request is recorded on `SessionEntry.peerPort` before each `handleRequest()` call (via `server.requestIP(req)` in `server.ts`).
+2. **PID lookup** — `getPeerPidByPort(peerPort, serverPort)` runs `ss -tnp` and finds the Claude process PID by matching the TCP connection's local/peer port pair on the loopback interface.
+3. **Session file read** — `getSessionIdForPid(pid)` reads `~/.claude/sessions/<pid>.json` and extracts the `sessionId` string field.
+4. **Atomic write** — if the discovered UUID differs from the stored one, `sessions.json` is updated via `writeSessions()`. On the next server startup, the UUID is available immediately for `--resume`.
+
+This path is skipped if `peerPort` is 0 (not yet set), if the `ss` command fails, or if the session file does not yet exist. For resume launches the stored UUID is already correct; for fresh launches `"pending"` is replaced with the real UUID on the first successful discovery.
 
 ### Disconnection
 
@@ -109,7 +121,7 @@ After `scheduleRestart` is called:
 3. **Timer** — a `setTimeout` fires after `session_restart_delay` seconds
 4. **Liveness check** — `isSessionAlive()` checks whether Claude is already running in tmux; if alive, `reconnectSession()` sends `/mcp reconnect <server-name>` to the running tmux session and returns — no relaunch needed
 5. **Kill zombie** — any dead tmux session for the channel is cleaned up (errors ignored)
-6. **Relaunch** — `launchSession()` is called with the stored `sessionId` from sessions.json if one exists; when present, Claude launches with `--resume <id>`, preserving conversation context across the restart. If no stored ID is available, behavior is unchanged (fresh launch). On failure the per-channel failure counter increments.
+6. **Relaunch** — `launchSession()` is called with the stored `sessionId` from sessions.json if one exists and is not `"pending"`; when a real UUID is available, Claude launches with `--resume <id>`, preserving conversation context across the restart. If the stored ID is absent or `"pending"`, a fresh launch is performed. On failure the per-channel failure counter increments.
 7. **Success reset** — when a session successfully reconnects and registers, `resetFailureCounter()` clears the counter for that channel
 
 ### Health-Check Poller
@@ -178,11 +190,11 @@ Each record has the shape:
 {
   tmuxSession: string   // tmux session name
   lastLaunch:  string   // ISO-8601 timestamp of the most recent launch
-  sessionId:   string   // Claude session UUID — discovered via PID-based file lookup after each successful launch
+  sessionId:   string   // Claude session UUID, or "pending" for fresh launches awaiting first tool call
 }
 ```
 
-`sessionId` is discovered via `getClaudePid` → `~/.claude/sessions/<pid>.json` during every successful launch and is always present in a written record. It is used on the next startup to pass `--resume <id>` to Claude Code, preserving conversation context across restarts.
+`sessionId` is `"pending"` for fresh launches immediately after startup. It transitions to a real UUID after the session's first MCP tool call, via the post-call discovery path in `registry.ts` (see [Session ID Discovery](#session-id-discovery)). For resume launches, the stored UUID from `sessions.json.last` is used immediately. The UUID is passed as `--resume <id>` on the next startup to preserve conversation context across restarts. The guards in `server.ts` treat `"pending"` as absent — no `--resume` is attempted for sessions that have not yet discovered their UUID.
 
 `sessions.json` is written once atomically after all routes finish launching at startup. Individual route launches do not write to `sessions.json`.
 

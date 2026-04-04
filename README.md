@@ -39,6 +39,7 @@ See the sections below for manual configuration details if you prefer not to use
 - [Bun](https://bun.sh) v1.0+
 - [tmux](https://github.com/tmux/tmux) (required for server-managed sessions)
 - [Claude Code](https://claude.ai/code) installed and authenticated
+- `ss` from [iproute2](https://github.com/iproute2/iproute2) on your `PATH` (required for session ID discovery; pre-installed on most Linux distributions)
 - `curl` and `jq` on your `PATH` (required for the permission relay hooks)
 - Slack workspace admin access (to create and configure the Slack app)
 
