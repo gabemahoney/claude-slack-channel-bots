@@ -30,6 +30,6 @@ chown -R testuser:testuser "${TESTUSER_HOME}/.claude" "${TESTUSER_HOME}/.claude.
 exec gosu testuser bash -c '
   /usr/local/bin/auto_approve.sh ci > /tmp/auto_approve.log 2>&1 &
   sleep 1
-  tmux new-session -d -s ci
+  tmux new-session -d -s ci /usr/local/bin/test_runner.sh
   while tmux has-session -t ci 2>/dev/null; do sleep 5; done
 '

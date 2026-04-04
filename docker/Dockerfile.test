@@ -32,6 +32,10 @@ COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY docker/auto_approve.sh /usr/local/bin/auto_approve.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/auto_approve.sh
 
+COPY .claude/skills /test-repo/.claude/skills
+COPY docker/test_runner.sh /usr/local/bin/test_runner.sh
+RUN chmod +x /usr/local/bin/test_runner.sh
+
 RUN mkdir -p /test-repo
 RUN useradd -m -s /bin/bash testuser && chown -R testuser:testuser /test-repo
 
