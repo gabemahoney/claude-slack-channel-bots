@@ -8,10 +8,23 @@
  */
 
 // ---------------------------------------------------------------------------
+// Dry-run detection
+// ---------------------------------------------------------------------------
+
+export function isDryRun(): boolean {
+  const val = (process.env['SLACK_DRY_RUN'] ?? '').toLowerCase()
+  return val === '1' || val === 'true' || val === 'yes'
+}
+
+// ---------------------------------------------------------------------------
 // Token loading
 // ---------------------------------------------------------------------------
 
 export function loadTokens(): { botToken: string; appToken: string } {
+  if (isDryRun()) {
+    return { botToken: 'xoxb-dry-run', appToken: 'xapp-dry-run' }
+  }
+
   const botToken = process.env['SLACK_BOT_TOKEN'] ?? ''
   const appToken = process.env['SLACK_APP_TOKEN'] ?? ''
 

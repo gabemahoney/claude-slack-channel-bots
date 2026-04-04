@@ -52,7 +52,7 @@ import {
   hasReachedMaxFailures,
 } from './restart.ts'
 import { initHealthCheck, startHealthCheck, stopHealthCheck } from './health-check.ts'
-import { loadTokens } from './tokens.ts'
+import { loadTokens, isDryRun } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
 import { trackAck, consumeAck } from './ack-tracker.ts'
 import {
@@ -947,17 +947,22 @@ export async function main(): Promise<void> {
     }
   }
 
-  // Resolve bot user ID
-  try {
-    const auth = await web.auth.test()
-    botUserId = (auth.user_id as string) || ''
-  } catch (err) {
-    console.error('[slack] Failed to resolve bot user ID:', err)
-  }
+  if (isDryRun()) {
+    console.error('[slack] Running in dry-run mode — Slack disabled')
+    botUserId = 'U000DRY'
+  } else {
+    // Resolve bot user ID
+    try {
+      const auth = await web.auth.test()
+      botUserId = (auth.user_id as string) || ''
+    } catch (err) {
+      console.error('[slack] Failed to resolve bot user ID:', err)
+    }
 
-  // Connect Socket Mode
-  await socket.start()
-  console.error('[slack] Socket Mode connected')
+    // Connect Socket Mode
+    await socket.start()
+    console.error('[slack] Socket Mode connected')
+  }
 
   // Propagate resolved port to tool deps for peer PID discovery
   sessionToolDeps.serverPort = mcpPort

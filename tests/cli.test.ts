@@ -289,6 +289,46 @@ describe('start — missing SLACK_APP_TOKEN', () => {
 })
 
 // ---------------------------------------------------------------------------
+// start — dry-run mode skips token prerequisite checks
+// ---------------------------------------------------------------------------
+
+describe('start — dry-run mode skips token checks', () => {
+  let cli: CliHandlers
+  let exitCodes: number[]
+  let savedDryRun: string | undefined
+
+  beforeEach(() => {
+    savedDryRun = process.env['SLACK_DRY_RUN']
+    process.env['SLACK_DRY_RUN'] = '1'
+    enterDaemonChild()
+    const result = makeDeps({
+      env: {}, // No SLACK_BOT_TOKEN or SLACK_APP_TOKEN
+      existingPaths: [], // routing.json missing → will exit(1) at routing check, not token check
+    })
+    cli = createCli(result.deps)
+    exitCodes = result.exitCodes
+  })
+
+  afterEach(() => {
+    if (savedDryRun === undefined) {
+      delete process.env['SLACK_DRY_RUN']
+    } else {
+      process.env['SLACK_DRY_RUN'] = savedDryRun
+    }
+    exitDaemonChild()
+  })
+
+  test('does not exit on missing tokens when SLACK_DRY_RUN=1 — reaches routing.json check', async () => {
+    // With no tokens and SLACK_DRY_RUN=1, the token prerequisite is skipped.
+    // The next check (routing.json) will fail since existingPaths is empty.
+    // If this exits with code 1, we know it got past the token check.
+    const err = await runHandler(() => cli.start())
+    expect(err).not.toBeNull()
+    expect(exitCodes).toEqual([1])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // start — missing routing.json
 // ---------------------------------------------------------------------------
 

@@ -216,7 +216,11 @@ Required at startup:
 - `SLACK_BOT_TOKEN` — bot user OAuth token; must begin with `xoxb-`
 - `SLACK_APP_TOKEN` — app-level token for Socket Mode; must begin with `xapp-`
 
-Both values are read directly from the process environment.
+Both values are read directly from the process environment. When `SLACK_DRY_RUN` is set (see below), `loadTokens()` returns dummy values (`xoxb-dry-run` / `xapp-dry-run`) and validation is skipped.
+
+Optional:
+
+- `SLACK_DRY_RUN` — set to `1`, `true`, or `yes` to enable dry-run mode. Bypasses token validation, skips `socket.start()` and `web.auth.test()`, and stubs all MCP tool calls (`reply`, `react`, `edit_message`, `fetch_messages`, `download_attachment`) — each returns a `[dry-run]` placeholder and logs the call to the server log. The HTTP/MCP server still starts normally so Claude Code sessions can connect and exercise tool calls without a Slack workspace.
 
 Set by the server at session launch:
 

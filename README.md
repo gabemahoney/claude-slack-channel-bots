@@ -58,6 +58,7 @@ Tokens and runtime options are read from environment variables. There is no `.en
 | `SLACK_APP_TOKEN` | Slack app-level token (`xapp-…`). Required. Generated under Basic Information → App-Level Tokens with the `connections:write` scope. |
 | `SLACK_STATE_DIR` | Override the directory where `routing.json`, `access.json`, and runtime state are stored. Defaults to `~/.claude/channels/slack`. |
 | `SLACK_ACCESS_MODE` | Set to `static` to load `access.json` once at startup and cache it for the lifetime of the process rather than re-reading it on every event. Useful in high-throughput environments where disk reads are a concern. |
+| `SLACK_DRY_RUN` | Set to `1` to start the server without Slack credentials. Token validation is skipped, Socket Mode and `web.auth.test()` are not called, and MCP tool calls (`reply`, `react`, etc.) are logged instead of sent. Useful for integration testing. |
 
 Shell profile example:
 
@@ -67,6 +68,8 @@ export SLACK_APP_TOKEN=xapp-your-app-token
 # Optional overrides:
 export SLACK_STATE_DIR=~/.config/slack-channel-bots
 export SLACK_ACCESS_MODE=static
+# Dry-run mode (no Slack credentials needed):
+export SLACK_DRY_RUN=1
 ```
 
 ---

@@ -18,6 +18,7 @@ import { defaultTmuxClient, isClaudeRunning as tmuxIsClaudeRunning, sessionName 
 import { readSessions, type SessionsMap } from './sessions.ts'
 import { loadConfig as configLoadConfig, type RoutingConfig } from './config.ts'
 import { initLogging } from './logging.ts'
+import { isDryRun } from './tokens.ts'
 
 // ---------------------------------------------------------------------------
 // Injectable dependency interface
@@ -92,14 +93,16 @@ export function createCli(deps: CliDeps): CliHandlers {
       deps.exit(1)
     }
 
-    // Check required Slack tokens
-    if (!deps.env['SLACK_BOT_TOKEN']) {
-      console.error('missing prerequisite: SLACK_BOT_TOKEN environment variable')
-      deps.exit(1)
-    }
-    if (!deps.env['SLACK_APP_TOKEN']) {
-      console.error('missing prerequisite: SLACK_APP_TOKEN environment variable')
-      deps.exit(1)
+    // Check required Slack tokens (skipped in dry-run mode)
+    if (!isDryRun()) {
+      if (!deps.env['SLACK_BOT_TOKEN']) {
+        console.error('missing prerequisite: SLACK_BOT_TOKEN environment variable')
+        deps.exit(1)
+      }
+      if (!deps.env['SLACK_APP_TOKEN']) {
+        console.error('missing prerequisite: SLACK_APP_TOKEN environment variable')
+        deps.exit(1)
+      }
     }
 
     // Check routing.json exists

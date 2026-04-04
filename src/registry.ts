@@ -15,6 +15,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { MCP_SERVER_NAME, type RoutingConfig } from './config.ts'
+import { isDryRun } from './tokens.ts'
 import { getPeerPidByPort, getSessionIdForPid } from './peer-pid.ts'
 import { readSessions, writeSessions, type SessionsMap } from './sessions.ts'
 
@@ -516,6 +517,11 @@ export function createSessionServer(
         // Per-session outbound gate (t2.c1r.zk.qm)
         assertOutboundAllowed(chatId, entry.deliveredChannels)
 
+        if (isDryRun()) {
+          console.error(`[slack] dry-run: reply to ${chatId} (${text.length} chars)`)
+          return { content: [{ type: 'text', text: `[dry-run] Would send message to ${chatId}` }] }
+        }
+
         const access = getAccess()
         const limit = access.textChunkLimit || DEFAULT_CHUNK_LIMIT
         const mode = access.chunkMode || 'newline'
@@ -575,6 +581,10 @@ export function createSessionServer(
       // ---------------------------------------------------------------------
       case 'react': {
         assertOutboundAllowed(args.chat_id, entry.deliveredChannels)
+        if (isDryRun()) {
+          console.error(`[slack] dry-run: react :${args.emoji}: on ${args.message_id}`)
+          return { content: [{ type: 'text', text: `[dry-run] Would react :${args.emoji}: to ${args.message_id}` }] }
+        }
         await web.reactions.add({
           channel: args.chat_id,
           timestamp: args.message_id,
@@ -590,6 +600,10 @@ export function createSessionServer(
       // ---------------------------------------------------------------------
       case 'edit_message': {
         assertOutboundAllowed(args.chat_id, entry.deliveredChannels)
+        if (isDryRun()) {
+          console.error(`[slack] dry-run: edit_message ${args.message_id} in ${args.chat_id}`)
+          return { content: [{ type: 'text', text: `[dry-run] Would edit message ${args.message_id}` }] }
+        }
         await web.chat.update({
           channel: args.chat_id,
           ts: args.message_id,
@@ -605,6 +619,10 @@ export function createSessionServer(
       // ---------------------------------------------------------------------
       case 'fetch_messages': {
         assertOutboundAllowed(args.channel, entry.deliveredChannels)
+        if (isDryRun()) {
+          console.error(`[slack] dry-run: fetch_messages from ${args.channel}`)
+          return { content: [{ type: 'text', text: `[dry-run] Would fetch messages from ${args.channel}` }] }
+        }
         const channel: string = args.channel
         const limit = Math.min(args.limit || 20, 100)
         const threadTs: string | undefined = args.thread_ts
@@ -646,6 +664,10 @@ export function createSessionServer(
       // ---------------------------------------------------------------------
       case 'download_attachment': {
         assertOutboundAllowed(args.chat_id, entry.deliveredChannels)
+        if (isDryRun()) {
+          console.error(`[slack] dry-run: download_attachment from ${args.chat_id} msg=${args.message_id}`)
+          return { content: [{ type: 'text', text: `[dry-run] Would download attachments from ${args.message_id}` }] }
+        }
         const channel: string = args.chat_id
         const messageTs: string = args.message_id
 

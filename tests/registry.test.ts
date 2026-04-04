@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { homedir } from 'os'
 import type { RouteEntry, RoutingConfig } from '../src/config.ts'
 import {
@@ -722,5 +722,136 @@ describe('reply tool — ack reaction removal', () => {
     })
 
     expect(reactionsRemoveCalls).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Dry-Run Mode Tests
+// ---------------------------------------------------------------------------
+
+describe('dry-run mode', () => {
+  const DRY_CWD = '/tmp/dry-run-test'
+  const DRY_CHANNEL = 'C_DRY'
+  const DRY_MSG_TS = '9999999.000001'
+
+  let savedDryRunEnv: string | undefined
+
+  beforeEach(() => {
+    savedDryRunEnv = process.env['SLACK_DRY_RUN']
+    process.env['SLACK_DRY_RUN'] = '1'
+  })
+
+  afterEach(() => {
+    if (savedDryRunEnv === undefined) {
+      delete process.env['SLACK_DRY_RUN']
+    } else {
+      process.env['SLACK_DRY_RUN'] = savedDryRunEnv
+    }
+  })
+
+  /**
+   * WebClient spy that tracks ALL method calls across every sub-namespace.
+   * If any Slack API method is called, apiCalls will be non-empty.
+   */
+  function makeSpyWebClient() {
+    const apiCalls: { method: string; args: any }[] = []
+
+    const spy = (method: string) => async (args: any) => {
+      apiCalls.push({ method, args })
+      return { ok: true, ts: '111.222', messages: [] }
+    }
+
+    const web: any = {
+      chat: {
+        postMessage: spy('chat.postMessage'),
+        update: spy('chat.update'),
+      },
+      reactions: {
+        add: spy('reactions.add'),
+        remove: spy('reactions.remove'),
+      },
+      conversations: {
+        replies: spy('conversations.replies'),
+        history: spy('conversations.history'),
+      },
+      filesUploadV2: spy('files.uploadV2'),
+    }
+
+    return { web, apiCalls }
+  }
+
+  test('reply — skips Slack API and returns dry-run response', async () => {
+    const entry = registerSession(DRY_CWD, DRY_CHANNEL, makeTransport(), makeServer())
+    const { web, apiCalls } = makeSpyWebClient()
+    const server = createSessionServer(entry, makeDeps(web))
+
+    let result: any
+    await withClient(server, async (client) => {
+      result = await client.callTool({ name: 'reply', arguments: { chat_id: DRY_CHANNEL, text: 'hello' } })
+    })
+
+    expect(apiCalls).toHaveLength(0)
+    expect(result.content[0].text).toContain('[dry-run]')
+    expect(result.isError).toBeFalsy()
+  })
+
+  test('react — skips Slack API and returns dry-run response', async () => {
+    const entry = registerSession(DRY_CWD, DRY_CHANNEL, makeTransport(), makeServer())
+    const { web, apiCalls } = makeSpyWebClient()
+    const server = createSessionServer(entry, makeDeps(web))
+
+    let result: any
+    await withClient(server, async (client) => {
+      result = await client.callTool({ name: 'react', arguments: { chat_id: DRY_CHANNEL, message_id: DRY_MSG_TS, emoji: 'thumbsup' } })
+    })
+
+    expect(apiCalls).toHaveLength(0)
+    expect(result.content[0].text).toContain('[dry-run]')
+    expect(result.isError).toBeFalsy()
+  })
+
+  test('edit_message — skips Slack API and returns dry-run response', async () => {
+    const entry = registerSession(DRY_CWD, DRY_CHANNEL, makeTransport(), makeServer())
+    const { web, apiCalls } = makeSpyWebClient()
+    const server = createSessionServer(entry, makeDeps(web))
+
+    let result: any
+    await withClient(server, async (client) => {
+      result = await client.callTool({ name: 'edit_message', arguments: { chat_id: DRY_CHANNEL, message_id: DRY_MSG_TS, text: 'edited' } })
+    })
+
+    expect(apiCalls).toHaveLength(0)
+    expect(result.content[0].text).toContain('[dry-run]')
+    expect(result.isError).toBeFalsy()
+  })
+
+  test('fetch_messages — skips Slack API and returns dry-run response', async () => {
+    const entry = registerSession(DRY_CWD, DRY_CHANNEL, makeTransport(), makeServer())
+    const { web, apiCalls } = makeSpyWebClient()
+    const server = createSessionServer(entry, makeDeps(web))
+
+    let result: any
+    await withClient(server, async (client) => {
+      result = await client.callTool({ name: 'fetch_messages', arguments: { channel: DRY_CHANNEL } })
+    })
+
+    expect(apiCalls).toHaveLength(0)
+    expect(result.content[0].text).toContain('[dry-run]')
+    expect(result.isError).toBeFalsy()
+  })
+
+  test('download_attachment — skips Slack API and returns dry-run response', async () => {
+    const entry = registerSession(DRY_CWD, DRY_CHANNEL, makeTransport(), makeServer())
+    const { web, apiCalls } = makeSpyWebClient()
+    const server = createSessionServer(entry, makeDeps(web))
+
+    let result: any
+    await withClient(server, async (client) => {
+      result = await client.callTool({ name: 'download_attachment', arguments: { chat_id: DRY_CHANNEL, message_id: DRY_MSG_TS } })
+    })
+
+    expect(apiCalls).toHaveLength(0)
+    expect(result.content[0].text).toContain('[dry-run]')
+    expect(result.isError).toBeFalsy()
   })
 })

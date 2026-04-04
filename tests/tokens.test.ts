@@ -5,7 +5,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { loadTokens } from '../src/tokens.ts'
+import { isDryRun, loadTokens } from '../src/tokens.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -25,6 +25,7 @@ beforeEach(() => {
   // Remove Slack token vars so each test starts from a clean slate
   delete process.env['SLACK_BOT_TOKEN']
   delete process.env['SLACK_APP_TOKEN']
+  delete process.env['SLACK_DRY_RUN']
 
   errorMessages = []
   exitCodes = []
@@ -234,5 +235,70 @@ describe('loadTokens — both tokens missing', () => {
 
     expect(exitError).not.toBeNull()
     expect(exitError!.code).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// isDryRun
+// ---------------------------------------------------------------------------
+
+describe('isDryRun — truthy values', () => {
+  test.each(['1', 'true', 'yes', 'TRUE', 'YES', 'True'])('returns true for SLACK_DRY_RUN=%s', (val) => {
+    process.env['SLACK_DRY_RUN'] = val
+
+    expect(isDryRun()).toBe(true)
+  })
+})
+
+describe('isDryRun — falsy values', () => {
+  test('returns false when SLACK_DRY_RUN is "0"', () => {
+    process.env['SLACK_DRY_RUN'] = '0'
+    expect(isDryRun()).toBe(false)
+  })
+
+  test('returns false when SLACK_DRY_RUN is "false"', () => {
+    process.env['SLACK_DRY_RUN'] = 'false'
+    expect(isDryRun()).toBe(false)
+  })
+
+  test('returns false when SLACK_DRY_RUN is unset', () => {
+    delete process.env['SLACK_DRY_RUN']
+    expect(isDryRun()).toBe(false)
+  })
+
+  test('returns false when SLACK_DRY_RUN is empty string', () => {
+    process.env['SLACK_DRY_RUN'] = ''
+    expect(isDryRun()).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// loadTokens — dry-run mode
+// ---------------------------------------------------------------------------
+
+describe('loadTokens — dry-run mode', () => {
+  test('returns dummy botToken when SLACK_DRY_RUN=1', () => {
+    process.env['SLACK_DRY_RUN'] = '1'
+
+    const { result } = runLoadTokens()
+
+    expect(result!.botToken).toBe('xoxb-dry-run')
+  })
+
+  test('returns dummy appToken when SLACK_DRY_RUN=1', () => {
+    process.env['SLACK_DRY_RUN'] = '1'
+
+    const { result } = runLoadTokens()
+
+    expect(result!.appToken).toBe('xapp-dry-run')
+  })
+
+  test('does not call process.exit when SLACK_DRY_RUN=1 and tokens are missing', () => {
+    process.env['SLACK_DRY_RUN'] = '1'
+    // No SLACK_BOT_TOKEN or SLACK_APP_TOKEN set
+
+    runLoadTokens()
+
+    expect(exitCodes).toHaveLength(0)
   })
 })
