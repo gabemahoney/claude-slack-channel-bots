@@ -17,6 +17,7 @@ import { resolve } from 'path'
 // ---------------------------------------------------------------------------
 
 export const MCP_SERVER_NAME = 'slack-channel-router'
+export const ALLOWED_PRESCRIPTIONS = ['gentle', 'standard', 'aggressive']
 
 // ---------------------------------------------------------------------------
 // Types
@@ -156,10 +157,9 @@ export function validateConfig(config: RoutingConfig): void {
   }
 
   // cozempic_prescription must be one of the allowed values
-  const allowedPrescriptions = ['gentle', 'standard', 'aggressive']
-  if (!allowedPrescriptions.includes(config.cozempic_prescription)) {
+  if (!ALLOWED_PRESCRIPTIONS.includes(config.cozempic_prescription)) {
     throw new Error(
-      `Routing config validation error: cozempic_prescription "${config.cozempic_prescription}" is invalid. Allowed values are: ${allowedPrescriptions.join(', ')}.`,
+      `Routing config validation error: cozempic_prescription "${config.cozempic_prescription}" is invalid. Allowed values are: ${ALLOWED_PRESCRIPTIONS.join(', ')}.`,
     )
   }
 

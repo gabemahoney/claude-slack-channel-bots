@@ -125,11 +125,11 @@ describe('cleanSession', () => {
       return makeFakeProcess(0)
     }
 
-    await expect(cleanSession(SESSION_ID, FAKE_CWD, 'default')).resolves.toBeUndefined()
+    await expect(cleanSession(SESSION_ID, FAKE_CWD, 'standard')).resolves.toBeUndefined()
 
     expect(spawnCalls).toHaveLength(1)
     expect(spawnCalls[0].cmd).toBe('cozempic')
-    expect(spawnCalls[0].args).toEqual(['treat', SESSION_ID, '-rx', 'default', '--execute'])
+    expect(spawnCalls[0].args).toEqual(['treat', SESSION_ID, '-rx', 'standard', '--execute'])
 
     // before-size log appeared
     const loggedMessages: string[] = consoleErrorSpy.mock.calls.map((c: any[]) => c[0] as string)
@@ -151,7 +151,7 @@ describe('cleanSession', () => {
     spawnFactory = (_cmd: string, _args: string[]) =>
       makeFakeProcess(1, ['something went wrong'])
 
-    await expect(cleanSession(SESSION_ID, FAKE_CWD, 'default')).resolves.toBeUndefined()
+    await expect(cleanSession(SESSION_ID, FAKE_CWD, 'standard')).resolves.toBeUndefined()
 
     const loggedMessages: string[] = consoleErrorSpy.mock.calls.map((c: any[]) => c[0] as string)
     const hasExitCodeLog = loggedMessages.some(
@@ -165,7 +165,7 @@ describe('cleanSession', () => {
 
     spawnFactory = (_cmd: string, _args: string[]) => makeErrorProcess('ENOENT')
 
-    await expect(cleanSession(SESSION_ID, FAKE_CWD, 'default')).resolves.toBeUndefined()
+    await expect(cleanSession(SESSION_ID, FAKE_CWD, 'standard')).resolves.toBeUndefined()
   })
 
   test('4. missing JSONL file — returns early without spawning', async () => {
@@ -177,7 +177,7 @@ describe('cleanSession', () => {
       return makeFakeProcess(0)
     }
 
-    await expect(cleanSession(SESSION_ID, FAKE_CWD, 'default')).resolves.toBeUndefined()
+    await expect(cleanSession(SESSION_ID, FAKE_CWD, 'standard')).resolves.toBeUndefined()
 
     expect(spawnCalls).toHaveLength(0)
   })
@@ -190,7 +190,7 @@ describe('cleanSession', () => {
       return makeFakeProcess(0)
     }
 
-    await expect(cleanSession(SESSION_ID, FAKE_CWD, 'default')).resolves.toBeUndefined()
+    await expect(cleanSession(SESSION_ID, FAKE_CWD, 'standard')).resolves.toBeUndefined()
 
     expect(spawnCalls).toHaveLength(0)
   })

@@ -9,7 +9,8 @@
 
 import { spawn } from 'child_process'
 import { statSync } from 'fs'
-import { homedir } from 'node:os'
+import { homedir } from 'os'
+import { ALLOWED_PRESCRIPTIONS } from './config.ts'
 
 // ---------------------------------------------------------------------------
 // PATH availability check
@@ -23,21 +24,24 @@ let cozempicAvailable: boolean | null = null
  */
 export async function checkCozempicAvailable(): Promise<void> {
   return new Promise<void>((resolve) => {
+    let settled = false
+    const done = (available: boolean, msg: string) => {
+      if (settled) return
+      settled = true
+      cozempicAvailable = available
+      console.error(msg)
+      resolve()
+    }
     const proc = spawn('which', ['cozempic'])
     proc.on('error', () => {
-      cozempicAvailable = false
-      console.error('[slack] Warning: cozempic not found on PATH — session cleaning disabled')
-      resolve()
+      done(false, '[slack] Warning: cozempic not found on PATH — session cleaning disabled')
     })
     proc.on('close', (code) => {
       if (code === 0) {
-        cozempicAvailable = true
-        console.error('[slack] cozempic available')
+        done(true, '[slack] cozempic available')
       } else {
-        cozempicAvailable = false
-        console.error('[slack] Warning: cozempic not found on PATH — session cleaning disabled')
+        done(false, '[slack] Warning: cozempic not found on PATH — session cleaning disabled')
       }
-      resolve()
     })
   })
 }
@@ -95,6 +99,10 @@ export type CleanSessionFn = (sessionId: string, cwd: string, prescription: stri
  * with the `[slack] cozempic:` prefix and logs before/after file sizes.
  */
 export async function cleanSession(sessionId: string, cwd: string, prescription: string): Promise<void> {
+  if (!ALLOWED_PRESCRIPTIONS.includes(prescription)) {
+    console.error(`[slack] cozempic: invalid prescription "${prescription}" — skipping clean session=${sessionId}`)
+    return
+  }
   const path = resolveJsonlPath(cwd, sessionId)
   const beforeSize = readFileSizeBytes(path)
 
