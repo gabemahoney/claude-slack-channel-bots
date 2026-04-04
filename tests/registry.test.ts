@@ -132,6 +132,7 @@ function makeDeps(web: any, overrides: Partial<SessionToolDeps> = {}): SessionTo
     inboxDir: '/tmp',
     resolveUserName: async (userId: string) => userId,
     consumeAck,
+    serverPort: 0,
     ...overrides,
   }
 }

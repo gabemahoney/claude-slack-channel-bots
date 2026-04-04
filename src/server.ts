@@ -310,6 +310,7 @@ const sessionToolDeps: SessionToolDeps = {
   inboxDir: INBOX_DIR,
   resolveUserName,
   consumeAck,
+  serverPort: 0, // updated to actual port in main() before Bun.serve
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +336,7 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
     server: null as unknown as import('@modelcontextprotocol/sdk/server/index.js').Server,
     deliveredChannels,
     connected: true,
+    peerPort: 0,
   }
 
   const transport = new WebStandardStreamableHTTPServerTransport({
@@ -955,6 +957,9 @@ export async function main(): Promise<void> {
   await socket.start()
   console.error('[slack] Socket Mode connected')
 
+  // Propagate resolved port to tool deps for peer PID discovery
+  sessionToolDeps.serverPort = mcpPort
+
   // -------------------------------------------------------------------------
   // HTTP server — single /mcp endpoint, roots-based session identity
   // -------------------------------------------------------------------------
@@ -1320,6 +1325,12 @@ export async function main(): Promise<void> {
           )
         }
         // entry is non-null here (null means init request, but we have a session ID)
+
+        // Propagate peer port to registered sessions for tool call PID discovery
+        if (entry !== null && 'channelId' in entry) {
+          const remoteAddr = server.requestIP(req) as { address: string; port: number } | null
+          if (remoteAddr?.port) (entry as SessionEntry).peerPort = remoteAddr.port
+        }
 
         // For GET requests (SSE streams), attach an abort listener to detect
         // client disconnections. The MCP SDK's onsessionclosed only fires on

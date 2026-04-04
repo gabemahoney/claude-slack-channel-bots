@@ -15,6 +15,8 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { MCP_SERVER_NAME, type RoutingConfig } from './config.ts'
+import { getPeerPidByPort, getSessionIdForPid } from './peer-pid.ts'
+import { readSessions, writeSessions, type SessionsMap } from './sessions.ts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -37,6 +39,12 @@ export interface SessionEntry {
   deliveredChannels: Set<string>
   /** Whether the session is currently connected (transport alive) */
   connected: boolean
+  /**
+   * TCP peer port of the most recent MCP request from this session.
+   * Updated per-request in server.ts before transport.handleRequest().
+   * Used by the CallToolRequestSchema handler to identify the calling process.
+   */
+  peerPort: number
 }
 
 /**
@@ -138,6 +146,7 @@ export function registerSession(
     server: resolvedServer,
     deliveredChannels,
     connected: true,
+    peerPort: 0,
   }
   registry.set(cwd, entry)
   return entry
@@ -323,6 +332,16 @@ export interface SessionToolDeps {
   resolveUserName: (userId: string) => Promise<string>
   /** Consume a pending ack entry — returns true if it existed */
   consumeAck: (channelId: string, messageTs: string) => boolean
+  /** TCP port the MCP HTTP server is listening on — used for peer PID discovery */
+  serverPort: number
+  /** Injectable for testing: replaces getPeerPidByPort in the discovery hook */
+  getPeerPidByPort?: (peerPort: number, serverPort: number) => Promise<number | null>
+  /** Injectable for testing: replaces getSessionIdForPid in the discovery hook */
+  getSessionIdForPid?: (pid: number) => Promise<string | null>
+  /** Injectable for testing: replaces readSessions in the discovery hook */
+  readSessions?: () => SessionsMap
+  /** Injectable for testing: replaces writeSessions in the discovery hook */
+  writeSessions?: (sessions: SessionsMap) => void
 }
 
 const MCP_INSTRUCTIONS = [
@@ -351,6 +370,10 @@ export function createSessionServer(
   deps: SessionToolDeps,
 ): Server {
   const { web, assertOutboundAllowed, assertSendable, getAccess, resolveUserName, inboxDir, consumeAck } = deps
+  const _getPeerPid = deps.getPeerPidByPort ?? getPeerPidByPort
+  const _getSessionId = deps.getSessionIdForPid ?? getSessionIdForPid
+  const _readSessions = deps.readSessions ?? readSessions
+  const _writeSessions = deps.writeSessions ?? writeSessions
 
   const server = new Server(
     { name: MCP_SERVER_NAME, version: '0.1.0' },
@@ -478,7 +501,8 @@ export function createSessionServer(
 
     const DEFAULT_CHUNK_LIMIT = 4000
 
-    switch (name) {
+    // Wrap switch in IIFE so we can trigger post-call discovery after the result is computed
+    const result = await (async () => { switch (name) {
       // ---------------------------------------------------------------------
       // reply
       // ---------------------------------------------------------------------
@@ -672,7 +696,36 @@ export function createSessionServer(
           content: [{ type: 'text', text: `Unknown tool: ${name}` }],
           isError: true,
         }
+    } })() // end IIFE
+
+    // -------------------------------------------------------------------------
+    // Post-call: fire-and-forget peer PID → session ID discovery (t2.nrd.so.a7)
+    // Never blocks or delays the tool call response.
+    // -------------------------------------------------------------------------
+    if (entry.peerPort > 0) {
+      const peerPort = entry.peerPort
+      const serverPort = deps.serverPort
+      const channelId = entry.channelId
+      ;(async () => {
+        try {
+          const pid = await _getPeerPid(peerPort, serverPort)
+          if (pid === null) return
+          const sessionId = await _getSessionId(pid)
+          if (!sessionId) return
+          const sessions = _readSessions()
+          const record = sessions[channelId]
+          if (!record) return
+          if (record.sessionId === sessionId) return
+          sessions[channelId] = { ...record, sessionId }
+          _writeSessions(sessions)
+          console.error(`[slack] peer-pid: updated sessionId for channel=${channelId} pid=${pid}`)
+        } catch (err) {
+          console.error('[slack] peer-pid: session discovery failed', err)
+        }
+      })()
     }
+
+    return result
   })
 
   return server
