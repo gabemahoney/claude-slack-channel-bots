@@ -189,8 +189,8 @@ export interface GateOptions {
 export async function gate(event: unknown, opts: GateOptions): Promise<GateResult> {
   const ev = event as Record<string, unknown>
 
-  // 1. Drop bot messages immediately
-  if (ev['bot_id']) return { action: 'drop' }
+  // 1. Drop our own bot messages (but allow messages from other bots)
+  if (ev['bot_id'] && ev['user'] === opts.botUserId) return { action: 'drop' }
 
   // 2. Drop non-message subtypes (message_changed, message_deleted, etc.)
   if (ev['subtype'] && ev['subtype'] !== 'file_share') return { action: 'drop' }

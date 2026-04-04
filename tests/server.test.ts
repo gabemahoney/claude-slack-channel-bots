@@ -38,12 +38,20 @@ function makeOpts(overrides: Partial<GateOptions> = {}): GateOptions {
 // ---------------------------------------------------------------------------
 
 describe('gate', () => {
-  test('drops messages with bot_id', async () => {
+  test('drops own bot messages (bot_id + matching user)', async () => {
     const result = await gate(
-      { bot_id: 'B123', user: 'U123', channel_type: 'im', channel: 'D1' },
+      { bot_id: 'B123', user: 'U_BOT', channel_type: 'im', channel: 'D1' },
       makeOpts(),
     )
     expect(result.action).toBe('drop')
+  })
+
+  test('delivers messages from other bots (bot_id + different user)', async () => {
+    const result = await gate(
+      { bot_id: 'B_OTHER', user: 'U_OTHER_BOT', channel_type: 'im', channel: 'D1', text: 'hello' },
+      makeOpts({ access: { dmPolicy: 'pairing', allowFrom: ['U_OTHER_BOT'], channels: {}, pending: {} } }),
+    )
+    expect(result.action).toBe('deliver')
   })
 
   test('drops message_changed subtype', async () => {
