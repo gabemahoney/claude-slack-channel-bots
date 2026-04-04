@@ -361,7 +361,8 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
           : undefined
         if (channelId) {
           console.error(`[slack] Session disconnected: channel=${channelId} cwd="${cwd}"`)
-          scheduleRestart(channelId, cwd, readSessions()[channelId]?.sessionId)
+          const storedId = readSessions()[channelId]?.sessionId
+          scheduleRestart(channelId, cwd, storedId !== 'pending' ? storedId : undefined)
         } else {
           console.error(`[slack] Session disconnected: cwd="${cwd}"`)
         }
@@ -1353,7 +1354,8 @@ export async function main(): Promise<void> {
               : undefined
             if (channelId) {
               console.error(`[slack] Session disconnected (SSE abort): channel=${channelId} cwd="${cwd}"`)
-              scheduleRestart(channelId, cwd, readSessions()[channelId]?.sessionId)
+              const storedId = readSessions()[channelId]?.sessionId
+              scheduleRestart(channelId, cwd, storedId !== 'pending' ? storedId : undefined)
             } else {
               console.error(`[slack] Session disconnected (SSE abort): cwd="${cwd}"`)
             }
@@ -1416,7 +1418,9 @@ export async function main(): Promise<void> {
     },
     launchSession: async (channelId, cwd, sessionId) => {
       if (!routingConfig) return false
-      const resolvedSessionId = sessionId ?? readSessions()[channelId]?.sessionId
+      const stored = sessionId ?? readSessions()[channelId]?.sessionId
+      // Treat "pending" as undefined — fall back to a fresh launch, not --resume
+      const resolvedSessionId = stored !== 'pending' ? stored : undefined
       const record = await launchSession(
         channelId, cwd, routingConfig, defaultTmuxClient,
         resolvedSessionId !== undefined ? { sessionId: resolvedSessionId } : undefined,
