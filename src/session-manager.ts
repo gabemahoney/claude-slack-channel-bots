@@ -14,6 +14,7 @@ import { type TmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
 import { type CleanSessionFn, checkCozempicAvailable, getCozempicAvailable, cleanSession as defaultCleanSession, resolveJsonlPath } from './cozempic.ts'
 import { type SessionsMap, type SessionRecord } from './sessions.ts'
 import { type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
+import { isDryRun } from './tokens.ts'
 
 // ---------------------------------------------------------------------------
 // JSONL existence helper
@@ -78,7 +79,11 @@ export async function launchSession(
   const resumeSessionId = options?.sessionId
 
   const escapedConfigPath = routingConfig.mcp_config_path.replace(/'/g, "'\\''")
-  let baseCmd = `SLACK_CHANNEL_BOT_SESSION=1 claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
+  // In dry-run mode, skip --dangerously-load-development-channels (requires OAuth which isn't
+  // available in Docker/CI). MCP still connects via --mcp-config; only channel routing is lost.
+  let baseCmd = isDryRun()
+    ? `SLACK_CHANNEL_BOT_SESSION=1 claude --mcp-config '${escapedConfigPath}'`
+    : `SLACK_CHANNEL_BOT_SESSION=1 claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
 
   if (routingConfig.append_system_prompt_file !== undefined) {
     try {
@@ -141,6 +146,18 @@ export async function launchSession(
       if (pane.includes(PROMPT_TEXT)) {
         await tmuxClient.sendKeys(sessionName_, 'Enter')
         console.error(`[slack] Safety prompt acknowledged in session: ${sessionName_}`)
+        return {
+          tmuxSession: sessionName_,
+          lastLaunch: new Date().toISOString(),
+          sessionId: safeResumeId ?? 'pending',
+        }
+      }
+
+      // If trust was pre-accepted (e.g. in Docker CI), Claude skips the safety
+      // prompt and goes straight to the ready prompt. Detect the Claude Code
+      // welcome banner which appears when Claude is fully loaded and ready.
+      if (pane.includes('Claude Code v') && pane.includes('❯')) {
+        console.error(`[slack] Claude ready (no safety prompt) in session: ${sessionName_}`)
         return {
           tmuxSession: sessionName_,
           lastLaunch: new Date().toISOString(),

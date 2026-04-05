@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     jq \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Bun
@@ -25,8 +26,8 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 # Install Claude Code globally
 RUN npm install -g @anthropic-ai/claude-code
 
-# Install cozempic
-RUN pip install cozempic
+# Install cozempic and bees
+RUN pip install cozempic bees-md[serve]
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY docker/auto_approve.sh /usr/local/bin/auto_approve.sh
@@ -35,6 +36,9 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/auto_approve.sh
 COPY .claude/skills /test-repo/.claude/skills
 COPY docker/test_runner.sh /usr/local/bin/test_runner.sh
 RUN chmod +x /usr/local/bin/test_runner.sh
+
+# Copy testplans hive into the image
+COPY testplans /test-repo/testplans
 
 RUN useradd -m -s /bin/bash testuser && chown -R testuser:testuser /test-repo
 
