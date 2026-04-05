@@ -289,6 +289,19 @@ Examples to offer if they're unsure:
 Do not write `append_system_prompt_file` to `config.json`, but warn them
 that bots won't know to communicate via Slack without a system prompt.
 
+If the project's `CLAUDE.md` already contains all the instructions the bot
+needs (including Slack communication directives), the user can opt out of a
+separate prompt file by setting `system_prompt_mode: "none"` in `config.json`:
+
+```json
+"system_prompt_mode": "none"
+```
+
+With this setting, `append_system_prompt_file` is ignored even if present, and
+only `CLAUDE.md` is used. This is the recommended approach when the bot's
+behavior is fully defined in the project's `CLAUDE.md` and a separate
+`system-prompt.md` would be redundant.
+
 ---
 
 ### Step 6 — Check access.json

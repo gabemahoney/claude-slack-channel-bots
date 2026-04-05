@@ -89,6 +89,7 @@ Called from `main()` in `server.ts`. `rotateSessions()` runs as the very first a
    - If `options.cleanSession` is provided and `options.sessionId` is set, `cleanSession()` is called before the tmux launch to clean the JSONL file (cozempic integration; no-op if cozempic is not installed)
    - The `claude` CLI command is prefixed with `SLACK_CHANNEL_BOT_SESSION=1` so the permission relay hooks activate only inside bot-managed sessions
    - If `options.sessionId` is provided, appends `--resume <id>` to the CLI command; otherwise launches fresh
+   - If `system_prompt_mode` is `"append"` and `append_system_prompt_file` is set, appends `--append-system-prompt-file <path>` to the CLI command; if `system_prompt_mode` is `"none"`, the flag is omitted and only `CLAUDE.md` is used
    - Polls `capturePane()` with exponential backoff (500 ms start, 2× per step, 5 s cap, 120 s total timeout) waiting for the safety prompt text
    - On prompt found: sends Enter to acknowledge
    - Early detection: after 5 s have elapsed since launch, each poll iteration also calls `isClaudeRunning()`; if Claude is running with no prompt (e.g. `--resume` skips the safety prompt), the session is accepted immediately
@@ -181,6 +182,7 @@ Key fields:
 - `stop_timeout` — seconds the `stop` command waits after SIGTERM before escalating to SIGKILL (default: 30)
 - `mcp_config_path` — path to MCP config file for Claude launch (default: ~/.claude/slack-mcp.json)
 - `append_system_prompt_file` — optional path to a file appended to every managed session's system prompt via `--append-system-prompt-file`; missing file silently skipped
+- `system_prompt_mode` — controls whether `append_system_prompt_file` is applied (default: `"append"`; valid: `append`, `none`). `"append"` passes `--append-system-prompt-file` to Claude when launching sessions; `"none"` skips the flag entirely so only `CLAUDE.md` is used
 - `cozempic_prescription` — cozempic cleaning intensity used before `--resume` launches (default: `"standard"`; valid: `gentle`, `standard`, `aggressive`); has no effect if cozempic is not installed
 
 ### sessions.json (~/.claude/channels/slack/sessions.json)
