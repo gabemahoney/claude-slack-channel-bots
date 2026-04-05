@@ -912,7 +912,7 @@ process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
 //
 // All Claude Code sessions point to the same URL: http://<host>:<port>/mcp
 // Route assignment happens after the MCP initialized notification when the
-// server calls roots/list and matches the CWD against routing.json.
+// server calls roots/list and matches the CWD against config.json.
 // ---------------------------------------------------------------------------
 
 export async function main(): Promise<void> {

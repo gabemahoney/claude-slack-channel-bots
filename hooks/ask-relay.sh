@@ -23,8 +23,8 @@ if [ -z "$QUESTION" ] || [ "$OPTIONS" = "[]" ] || [ -z "$CWD" ]; then
   exit 0
 fi
 
-# Read port from routing config
-PORT=$(jq -r '.port // 3100' "${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/routing.json" 2>/dev/null) || PORT=3100
+# Read port from config.json
+PORT=$(jq -r '.port // 3100' "${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/config.json" 2>/dev/null) || PORT=3100
 
 # Phase 1: POST question to server
 RESPONSE=$(curl -s -f -X POST "http://127.0.0.1:${PORT}/ask" \

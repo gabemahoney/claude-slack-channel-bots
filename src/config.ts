@@ -27,7 +27,7 @@ export interface RouteEntry {
   cwd: string
 }
 
-/** Raw shape of routing.json as parsed from disk. All optional fields may be absent. */
+/** Raw shape of config.json as parsed from disk. All optional fields may be absent. */
 export interface RoutingConfigInput {
   routes: Record<string, RouteEntry>
   /** CWD path to use when a message arrives on a channel with no explicit entry in routes. */
@@ -213,14 +213,14 @@ export function resolveConfig(input: RoutingConfigInput): RoutingConfig {
 // I/O wrapper
 // ---------------------------------------------------------------------------
 
-const DEFAULT_CONFIG_PATH = '~/.claude/channels/slack/routing.json'
+const DEFAULT_CONFIG_PATH = '~/.claude/channels/slack/config.json'
 
 /**
  * Reads routing configuration from disk, parses it, and returns a validated
  * RoutingConfig. Throws a descriptive error for missing files, malformed JSON,
  * or validation failures.
  *
- * @param path  Path to routing.json. Defaults to ~/.claude/channels/slack/routing.json.
+ * @param path  Path to config.json. Defaults to ~/.claude/channels/slack/config.json.
  */
 export function loadConfig(path?: string): RoutingConfig {
   const configPath = resolve(expandTilde(path ?? DEFAULT_CONFIG_PATH))

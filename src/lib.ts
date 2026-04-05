@@ -179,7 +179,7 @@ export interface GateOptions {
   /** Current bot user ID for mention detection */
   botUserId: string
   /**
-   * Set of channel IDs from routing.json. Any channel in this set is
+   * Set of channel IDs from config.json. Any channel in this set is
    * implicitly opted-in even if it has no entry in access.json's channels map.
    * access.json entries still take precedence for per-channel overrides.
    */
@@ -244,7 +244,7 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
   // 5. Channel handling — opt-in per channel ID
   //
   // A channel is allowed if it has an explicit entry in access.json OR if it
-  // appears in routing.json (routeChannels). Channels in routing.json are
+  // appears in config.json (routeChannels). Channels in config.json are
   // implicitly opted-in; access.json entries provide per-channel overrides
   // (requireMention, allowFrom). If neither applies, drop.
   const channel = ev['channel'] as string

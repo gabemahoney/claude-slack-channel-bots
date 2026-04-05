@@ -33,7 +33,7 @@ message handling (ack reactions, chunking).
 ```bash
 STATE_DIR="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
 # access.json lives at $STATE_DIR/access.json
-# routing.json lives at $STATE_DIR/routing.json
+# config.json lives at $STATE_DIR/config.json
 ```
 
 Always resolve the state directory using `$SLACK_STATE_DIR` with fallback to
@@ -102,12 +102,12 @@ Parse `$ARGUMENTS` and execute the matching subcommand:
 
 ### `status`
 1. Load `access.json`
-2. Load `routing.json` from the same state directory
+2. Load `config.json` from the same state directory
 3. Display:
    - DM policy
    - Allowlisted user IDs
    - Opted-in channels with their policies, showing two categories:
-     - **Implicit** — channels present in `routing.json` routes (automatically opted-in)
+     - **Implicit** — channels present in `config.json` routes (automatically opted-in)
      - **Explicit** — channels configured in `access.json` channels (with their `requireMention` and `allowFrom` settings)
    - Pending pairings (code + sender ID + expiry)
    - Ack reaction setting (or "not set")

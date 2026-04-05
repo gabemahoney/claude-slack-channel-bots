@@ -3,13 +3,14 @@
  * postinstall.ts — Scaffold skeleton config files for the Slack Channel Router.
  *
  * Creates STATE_DIR and the MCP config parent if missing, then writes
- * routing.json, access.json, and slack-mcp.json only when they do not
+ * config.json, access.json, and slack-mcp.json only when they do not
  * already exist.  Safe to re-run: existing files are never modified.
+ * Migrates routing.json → config.json if the old file is present.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { existsSync, mkdirSync, writeFileSync, symlinkSync, readlinkSync, unlinkSync } from 'fs'
+import { existsSync, mkdirSync, writeFileSync, symlinkSync, readlinkSync, unlinkSync, renameSync } from 'fs'
 import { homedir } from 'os'
 import { dirname, join, resolve } from 'path'
 import { defaultAccess } from './lib.ts'
@@ -43,13 +44,20 @@ export function runPostinstall(options: PostinstallOptions = {}): void {
   mkdirSync(stateDir, { recursive: true })
   mkdirSync(dirname(mcpConfigPath), { recursive: true })
 
-  // routing.json
-  const routingPath = join(stateDir, 'routing.json')
-  if (existsSync(routingPath)) {
-    console.log(`skipped: ${routingPath}`)
+  // config.json — migrate from routing.json if needed
+  const configPath = join(stateDir, 'config.json')
+  const legacyPath = join(stateDir, 'routing.json')
+  if (existsSync(legacyPath) && !existsSync(configPath)) {
+    renameSync(legacyPath, configPath)
+    console.log(`Migrated routing.json → config.json`)
+  }
+
+  // Create skeleton config.json if neither old nor new file exists
+  if (existsSync(configPath)) {
+    console.log(`skipped: ${configPath}`)
   } else {
-    writeFileSync(routingPath, JSON.stringify({ routes: {} }, null, 2) + '\n')
-    console.log(`created: ${routingPath}`)
+    writeFileSync(configPath, JSON.stringify({ routes: {} }, null, 2) + '\n')
+    console.log(`created: ${configPath}`)
   }
 
   // access.json (permissions 0o600)

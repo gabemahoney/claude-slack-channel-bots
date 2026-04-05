@@ -105,11 +105,11 @@ export function createCli(deps: CliDeps): CliHandlers {
       }
     }
 
-    // Check routing.json exists
+    // Check config.json exists
     const stateDir = deps.resolveStateDir()
-    const routingJson = join(stateDir, 'routing.json')
+    const routingJson = join(stateDir, 'config.json')
     if (!deps.existsSync(routingJson)) {
-      console.error(`missing prerequisite: routing.json not found at ${routingJson}`)
+      console.error(`missing prerequisite: config.json not found at ${routingJson}`)
       deps.exit(1)
     }
 

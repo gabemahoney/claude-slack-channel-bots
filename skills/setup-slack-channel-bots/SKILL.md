@@ -1,6 +1,6 @@
 ---
 name: setup-slack-channel-bots
-description: Interactive setup wizard for claude-slack-channel-bots — checks tokens, routing.json, access.json, hooks, and Claude Code settings
+description: Interactive setup wizard for claude-slack-channel-bots — checks tokens, config.json, access.json, hooks, and Claude Code settings
 version: 1.0.0
 author: Jeremy Longshore <jeremy@intentsolutions.io>
 license: MIT
@@ -122,14 +122,14 @@ want confirmation.
 
 ---
 
-### Step 4 — Check routing.json
+### Step 4 — Check config.json
 
 State directory defaults to `~/.claude/channels/slack/`. Respect
 `$SLACK_STATE_DIR` if set.
 
 ```bash
 STATE_DIR="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
-cat "$STATE_DIR/routing.json" 2>/dev/null || echo "NOT_FOUND"
+cat "$STATE_DIR/config.json" 2>/dev/null || echo "NOT_FOUND"
 ```
 
 **If the file does not exist:**
@@ -169,7 +169,7 @@ test -d "<expanded-path>" && echo "ok" || echo "not found"
 Expand `~` before checking. If the directory does not exist, warn the user and
 ask whether to proceed anyway or provide a different path.
 
-After collecting at least one route, write the updated `routing.json`.
+After collecting at least one route, write the updated `config.json`.
 
 **Important:** Remind the user to invite the bot to each channel they configured.
 In Slack, type `/invite @Claude Slack Channel Bots` in each channel (or whatever
@@ -210,7 +210,7 @@ either value:
 
 **Validation before writing:**
 
-Before writing `routing.json`, verify that any value supplied for
+Before writing `config.json`, verify that any value supplied for
 `default_route` or `default_dm_session` exactly matches one of the `cwd`
 values in `routes`. If a value does not match:
 
@@ -221,7 +221,7 @@ values in `routes`. If a value does not match:
 
 Only write the field once a valid value is confirmed.
 
-Write the final `routing.json` with only the fields the user explicitly set
+Write the final `config.json` with only the fields the user explicitly set
 (plus the required `routes`). Do not write optional fields the user left at
 their defaults unless asked.
 
@@ -230,7 +230,7 @@ their defaults unless asked.
 ### Step 5 — Configure custom system prompt for worker sessions
 
 Worker sessions launched by the server can receive a custom system prompt
-via `append_system_prompt_file` in `routing.json`. This controls how the
+via `append_system_prompt_file` in `config.json`. This controls how the
 bots behave — their role, communication style, and capabilities.
 
 **This is important.** Without a system prompt, bots won't know to communicate
@@ -275,7 +275,7 @@ Examples to offer if they're unsure:
    STATE_DIR="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
    ```
 
-3. Read `routing.json`, add or update:
+3. Read `config.json`, add or update:
    ```json
    "append_system_prompt_file": "~/.claude/channels/slack/system-prompt.md"
    ```
@@ -286,7 +286,7 @@ Examples to offer if they're unsure:
 
 **If the user explicitly skips:**
 
-Do not write `append_system_prompt_file` to `routing.json`, but warn them
+Do not write `append_system_prompt_file` to `config.json`, but warn them
 that bots won't know to communicate via Slack without a system prompt.
 
 ---
@@ -437,7 +437,7 @@ Print a final summary of what was checked and configured:
 
 - Environment variables: set / missing
 - Token format: valid / invalid
-- routing.json: populated (N routes) / skeleton
+- config.json: populated (N routes) / skeleton
 - append_system_prompt_file: configured / skipped
 - access.json: present / missing
 - permission-relay.sh hook: present and executable / missing
