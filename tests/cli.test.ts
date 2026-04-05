@@ -55,7 +55,7 @@ class ExitError extends Error {
 
 const STATE_DIR = '/fake/state'
 const PID_FILE = join(STATE_DIR, 'server.pid')
-const ROUTING_JSON = join(STATE_DIR, 'routing.json')
+const CONFIG_JSON = join(STATE_DIR, 'config.json')
 
 interface DepsOverrides {
   spawnSyncStatus?: number | null
@@ -94,7 +94,7 @@ function makeDeps(overrides: DepsOverrides = {}): DepsBundle {
   const sendKeysCalls: Array<{ session: string; keys: string }> = []
   const killSessionCalls: string[] = []
 
-  const existingPaths = new Set(overrides.existingPaths ?? [ROUTING_JSON])
+  const existingPaths = new Set(overrides.existingPaths ?? [CONFIG_JSON])
 
   const deps: CliDeps = {
     spawnSync: (cmd, args) => {
@@ -303,7 +303,7 @@ describe('start — dry-run mode skips token checks', () => {
     enterDaemonChild()
     const result = makeDeps({
       env: {}, // No SLACK_BOT_TOKEN or SLACK_APP_TOKEN
-      existingPaths: [], // routing.json missing → will exit(1) at routing check, not token check
+      existingPaths: [], // config.json missing → will exit(1) at config check, not token check
     })
     cli = createCli(result.deps)
     exitCodes = result.exitCodes
@@ -318,9 +318,9 @@ describe('start — dry-run mode skips token checks', () => {
     exitDaemonChild()
   })
 
-  test('does not exit on missing tokens when SLACK_DRY_RUN=1 — reaches routing.json check', async () => {
+  test('does not exit on missing tokens when SLACK_DRY_RUN=1 — reaches config.json check', async () => {
     // With no tokens and SLACK_DRY_RUN=1, the token prerequisite is skipped.
-    // The next check (routing.json) will fail since existingPaths is empty.
+    // The next check (config.json) will fail since existingPaths is empty.
     // If this exits with code 1, we know it got past the token check.
     const err = await runHandler(() => cli.start())
     expect(err).not.toBeNull()
@@ -329,17 +329,17 @@ describe('start — dry-run mode skips token checks', () => {
 })
 
 // ---------------------------------------------------------------------------
-// start — missing routing.json
+// start — missing config.json
 // ---------------------------------------------------------------------------
 
-describe('start — missing routing.json', () => {
+describe('start — missing config.json', () => {
   let cli: CliHandlers
   let exitCodes: number[]
 
   beforeEach(() => {
     enterDaemonChild()
     const result = makeDeps({
-      existingPaths: [], // routing.json not present
+      existingPaths: [], // config.json not present
     })
     cli = createCli(result.deps)
     exitCodes = result.exitCodes
@@ -347,7 +347,7 @@ describe('start — missing routing.json', () => {
 
   afterEach(() => exitDaemonChild())
 
-  test('calls exit(1) when routing.json does not exist', async () => {
+  test('calls exit(1) when config.json does not exist', async () => {
     const err = await runHandler(() => cli.start())
     expect(err).not.toBeNull()
     expect(err!.code).toBe(1)

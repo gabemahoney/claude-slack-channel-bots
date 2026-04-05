@@ -9,7 +9,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'fs'
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync, renameSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { runPostinstall } from '../src/postinstall.ts'
@@ -81,51 +81,106 @@ describe('directory creation', () => {
 })
 
 // ---------------------------------------------------------------------------
-// routing.json
+// config.json
 // ---------------------------------------------------------------------------
 
-describe('routing.json — creation', () => {
-  test('creates routing.json in STATE_DIR', () => {
+describe('config.json — creation', () => {
+  test('creates config.json in STATE_DIR', () => {
     const stateDir = makeTempDir()
     const mcpDir = makeTempDir()
 
     runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json') })
 
-    expect(existsSync(join(stateDir, 'routing.json'))).toBe(true)
+    expect(existsSync(join(stateDir, 'config.json'))).toBe(true)
   })
 
-  test('routing.json contains {"routes": {}}', () => {
+  test('config.json contains {"routes": {}}', () => {
     const stateDir = makeTempDir()
     const mcpDir = makeTempDir()
 
     runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json') })
 
-    const content = readJson(join(stateDir, 'routing.json'))
+    const content = readJson(join(stateDir, 'config.json'))
     expect(content).toEqual({ routes: {} })
   })
 })
 
-describe('routing.json — skip if exists', () => {
-  test('does not overwrite routing.json when it already exists', () => {
+describe('config.json — skip if exists', () => {
+  test('does not overwrite config.json when it already exists', () => {
     const stateDir = makeTempDir()
     const mcpDir = makeTempDir()
-    const routingPath = join(stateDir, 'routing.json')
+    const configPath = join(stateDir, 'config.json')
 
     // First run creates it
     runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json') })
-    const originalContent = readFileSync(routingPath, 'utf-8')
+    const originalContent = readFileSync(configPath, 'utf-8')
 
     // Manually modify the file
 
-    writeFileSync(routingPath, JSON.stringify({ routes: { C_TEST: { cwd: '/tmp' } } }, null, 2) + '\n')
-    const modifiedContent = readFileSync(routingPath, 'utf-8')
+    writeFileSync(configPath, JSON.stringify({ routes: { C_TEST: { cwd: '/tmp' } } }, null, 2) + '\n')
+    const modifiedContent = readFileSync(configPath, 'utf-8')
 
     // Second run — should not overwrite
     runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json') })
-    const afterSecondRun = readFileSync(routingPath, 'utf-8')
+    const afterSecondRun = readFileSync(configPath, 'utf-8')
 
     expect(afterSecondRun).toBe(modifiedContent)
     expect(afterSecondRun).not.toBe(originalContent)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// routing.json → config.json migration
+// ---------------------------------------------------------------------------
+
+describe('migration: routing.json → config.json', () => {
+  test('renames routing.json to config.json when routing.json exists and config.json does not', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const legacyPath = join(stateDir, 'routing.json')
+    const configPath = join(stateDir, 'config.json')
+
+    // Seed a legacy routing.json
+    const legacyContent = JSON.stringify({ routes: { C_OLD: { cwd: '/tmp/old' } } }, null, 2) + '\n'
+    writeFileSync(legacyPath, legacyContent)
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json') })
+
+    // routing.json should be gone and config.json should exist with same content
+    expect(existsSync(legacyPath)).toBe(false)
+    expect(existsSync(configPath)).toBe(true)
+    expect(readFileSync(configPath, 'utf-8')).toBe(legacyContent)
+  })
+
+  test('does not overwrite config.json when both routing.json and config.json exist', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const legacyPath = join(stateDir, 'routing.json')
+    const configPath = join(stateDir, 'config.json')
+
+    // Seed both files with distinct content
+    const legacyContent = JSON.stringify({ routes: { C_OLD: { cwd: '/tmp/old' } } }, null, 2) + '\n'
+    const existingContent = JSON.stringify({ routes: { C_NEW: { cwd: '/tmp/new' } } }, null, 2) + '\n'
+    writeFileSync(legacyPath, legacyContent)
+    writeFileSync(configPath, existingContent)
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json') })
+
+    // config.json is unchanged and routing.json is left in place
+    expect(readFileSync(configPath, 'utf-8')).toBe(existingContent)
+    expect(existsSync(legacyPath)).toBe(true)
+  })
+
+  test('fresh install (neither file exists) creates skeleton config.json', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const configPath = join(stateDir, 'config.json')
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json') })
+
+    expect(existsSync(configPath)).toBe(true)
+    const content = readJson(configPath)
+    expect(content).toEqual({ routes: {} })
   })
 })
 
@@ -264,7 +319,7 @@ describe('SLACK_STATE_DIR env override', () => {
 
     runPostinstall({ mcpConfigPath: join(mcpDir, 'slack-mcp.json') })
 
-    expect(existsSync(join(customStateDir, 'routing.json'))).toBe(true)
+    expect(existsSync(join(customStateDir, 'config.json'))).toBe(true)
   })
 
   test('stateDir option takes precedence over SLACK_STATE_DIR env var', () => {
@@ -277,11 +332,11 @@ describe('SLACK_STATE_DIR env override', () => {
     runPostinstall({ stateDir: optStateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json') })
 
     // Files should appear in optStateDir, not envStateDir
-    expect(existsSync(join(optStateDir, 'routing.json'))).toBe(true)
-    expect(existsSync(join(envStateDir, 'routing.json'))).toBe(false)
+    expect(existsSync(join(optStateDir, 'config.json'))).toBe(true)
+    expect(existsSync(join(envStateDir, 'config.json'))).toBe(false)
   })
 
-  test('creates routing.json in SLACK_STATE_DIR path', () => {
+  test('creates config.json in SLACK_STATE_DIR path', () => {
     const customStateDir = makeTempDir()
     const mcpDir = makeTempDir()
 
@@ -289,7 +344,7 @@ describe('SLACK_STATE_DIR env override', () => {
 
     runPostinstall({ mcpConfigPath: join(mcpDir, 'slack-mcp.json') })
 
-    const content = readJson(join(customStateDir, 'routing.json'))
+    const content = readJson(join(customStateDir, 'config.json'))
     expect(content).toEqual({ routes: {} })
   })
 
@@ -310,16 +365,16 @@ describe('SLACK_STATE_DIR env override', () => {
 // ---------------------------------------------------------------------------
 
 describe('no-overwrite — running twice', () => {
-  test('routing.json is unchanged after second run', () => {
+  test('config.json is unchanged after second run', () => {
     const stateDir = makeTempDir()
     const mcpDir = makeTempDir()
     const opts = { stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json') }
 
     runPostinstall(opts)
-    const afterFirst = readFileSync(join(stateDir, 'routing.json'), 'utf-8')
+    const afterFirst = readFileSync(join(stateDir, 'config.json'), 'utf-8')
 
     runPostinstall(opts)
-    const afterSecond = readFileSync(join(stateDir, 'routing.json'), 'utf-8')
+    const afterSecond = readFileSync(join(stateDir, 'config.json'), 'utf-8')
 
     expect(afterSecond).toBe(afterFirst)
   })
@@ -362,7 +417,7 @@ describe('no-overwrite — running twice', () => {
     runPostinstall(opts)
     runPostinstall(opts)
 
-    expect(existsSync(join(stateDir, 'routing.json'))).toBe(true)
+    expect(existsSync(join(stateDir, 'config.json'))).toBe(true)
     expect(existsSync(join(stateDir, 'access.json'))).toBe(true)
     expect(existsSync(mcpConfigPath)).toBe(true)
   })

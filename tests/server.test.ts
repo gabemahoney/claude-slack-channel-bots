@@ -285,7 +285,7 @@ describe('gate', () => {
     expect(result.action).toBe('deliver')
   })
 
-  // -- routing.json auto-opt-in (bug b.iv5) --
+  // -- config.json auto-opt-in (bug b.iv5) --
 
   test('delivers channel messages when channel is in routeChannels but not access.json', async () => {
     const routeChannels = new Set(['C_ROUTED'])

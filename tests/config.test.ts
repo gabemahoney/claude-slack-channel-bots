@@ -533,14 +533,14 @@ describe('loadConfig', () => {
 
   test('throws a clear error for malformed JSON', () => {
     const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
-    const badPath = join(dir, 'routing.json')
+    const badPath = join(dir, 'config.json')
     writeFileSync(badPath, '{ this is not valid json !!!', 'utf-8')
     expect(() => loadConfig(badPath)).toThrow('loadConfig: malformed JSON')
   })
 
   test('malformed JSON error includes the file path', () => {
     const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
-    const badPath = join(dir, 'routing.json')
+    const badPath = join(dir, 'config.json')
     writeFileSync(badPath, '{ bad json }', 'utf-8')
     let caught: Error | null = null
     try {
@@ -554,7 +554,7 @@ describe('loadConfig', () => {
 
   test('loads and returns a valid config from a temp file', () => {
     const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
-    const configPath = join(dir, 'routing.json')
+    const configPath = join(dir, 'config.json')
     const validConfig: RoutingConfigInput = {
       routes: {
         C_TEST: { cwd: '/tmp' },
@@ -569,7 +569,7 @@ describe('loadConfig', () => {
 
   test('applies defaults when loading a minimal valid config', () => {
     const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
-    const configPath = join(dir, 'routing.json')
+    const configPath = join(dir, 'config.json')
     const minimalConfig: RoutingConfigInput = {
       routes: {
         C_MIN: { cwd: '/tmp' },
@@ -583,21 +583,21 @@ describe('loadConfig', () => {
 
   test('throws a clear error when routes field is missing', () => {
     const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
-    const badPath = join(dir, 'routing.json')
+    const badPath = join(dir, 'config.json')
     writeFileSync(badPath, JSON.stringify({ bind: '0.0.0.0' }), 'utf-8')
     expect(() => loadConfig(badPath)).toThrow('missing a valid "routes" object')
   })
 
   test('throws when JSON is valid but not an object (array)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
-    const badPath = join(dir, 'routing.json')
+    const badPath = join(dir, 'config.json')
     writeFileSync(badPath, JSON.stringify([1, 2, 3]), 'utf-8')
     expect(() => loadConfig(badPath)).toThrow('must be a JSON object')
   })
 
   test('round-trips exit_timeout correctly', () => {
     const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
-    const configPath = join(dir, 'routing.json')
+    const configPath = join(dir, 'config.json')
     const config: RoutingConfigInput = {
       routes: { C_TEST: { cwd: '/tmp' } },
       exit_timeout: 45,
@@ -609,7 +609,7 @@ describe('loadConfig', () => {
 
   test('applies default exit_timeout of 120 when absent', () => {
     const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
-    const configPath = join(dir, 'routing.json')
+    const configPath = join(dir, 'config.json')
     const config: RoutingConfigInput = {
       routes: { C_TEST: { cwd: '/tmp' } },
     }
@@ -620,7 +620,7 @@ describe('loadConfig', () => {
 
   test('round-trips stop_timeout correctly', () => {
     const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
-    const configPath = join(dir, 'routing.json')
+    const configPath = join(dir, 'config.json')
     const config: RoutingConfigInput = {
       routes: { C_TEST: { cwd: '/tmp' } },
       stop_timeout: 5,
@@ -632,7 +632,7 @@ describe('loadConfig', () => {
 
   test('applies default stop_timeout of 30 when absent', () => {
     const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
-    const configPath = join(dir, 'routing.json')
+    const configPath = join(dir, 'config.json')
     const config: RoutingConfigInput = {
       routes: { C_TEST: { cwd: '/tmp' } },
     }
@@ -643,7 +643,7 @@ describe('loadConfig', () => {
 
   test('round-trips cozempic_prescription "aggressive" correctly', () => {
     const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
-    const configPath = join(dir, 'routing.json')
+    const configPath = join(dir, 'config.json')
     const config: RoutingConfigInput = {
       routes: { C_TEST: { cwd: '/tmp' } },
       cozempic_prescription: 'aggressive',
@@ -655,7 +655,7 @@ describe('loadConfig', () => {
 
   test('applies default cozempic_prescription of "standard" when absent', () => {
     const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
-    const configPath = join(dir, 'routing.json')
+    const configPath = join(dir, 'config.json')
     const config: RoutingConfigInput = {
       routes: { C_TEST: { cwd: '/tmp' } },
     }
