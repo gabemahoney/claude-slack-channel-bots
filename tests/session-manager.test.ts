@@ -931,6 +931,120 @@ describe('append_system_prompt_file', () => {
 })
 
 // ---------------------------------------------------------------------------
+// system_prompt_mode
+// ---------------------------------------------------------------------------
+
+describe('system_prompt_mode', () => {
+  let tmpPromptDir = ''
+
+  afterEach(() => {
+    if (tmpPromptDir) {
+      rmSync(tmpPromptDir, { recursive: true, force: true })
+      tmpPromptDir = ''
+    }
+  })
+
+  test("'append' mode (default) with prompt file present: --append-system-prompt-file included in launch command", async () => {
+    tmpPromptDir = mkdtempSync(join(tmpdir(), 'spm-test-'))
+    const promptFile = join(tmpPromptDir, 'CLAUDE.md')
+    writeFileSync(promptFile, 'You are a helpful assistant.')
+
+    const stub = makeTmuxStub({
+      getPanePidResult: '99999999',
+    })
+    // system_prompt_mode defaults to 'append' in makeRoutingConfig
+    const config = makeRoutingConfig({ append_system_prompt_file: promptFile })
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 0 },
+    )
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(true)
+    expect((launchCmd!.args[1] as string).includes(promptFile)).toBe(true)
+  })
+
+  test("'none' mode with prompt file present: --append-system-prompt-file NOT included even though file is readable", async () => {
+    tmpPromptDir = mkdtempSync(join(tmpdir(), 'spm-test-'))
+    const promptFile = join(tmpPromptDir, 'CLAUDE.md')
+    writeFileSync(promptFile, 'You are a helpful assistant.')
+
+    const stub = makeTmuxStub({
+      getPanePidResult: '99999999',
+    })
+    const config = makeRoutingConfig({
+      system_prompt_mode: 'none',
+      append_system_prompt_file: promptFile,
+    })
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 0 },
+    )
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(false)
+  })
+
+  test("'none' mode with no file configured: launch proceeds normally, no --append-system-prompt-file flag", async () => {
+    const stub = makeTmuxStub({
+      getPanePidResult: '99999999',
+    })
+    // No append_system_prompt_file; system_prompt_mode 'none'
+    const config = makeRoutingConfig({ system_prompt_mode: 'none' })
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 0 },
+    )
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(false)
+  })
+
+  test("explicit 'append' mode with file present: behaves identically to default 'append' — flag included", async () => {
+    tmpPromptDir = mkdtempSync(join(tmpdir(), 'spm-test-'))
+    const promptFile = join(tmpPromptDir, 'CLAUDE.md')
+    writeFileSync(promptFile, 'You are a helpful assistant.')
+
+    const stub = makeTmuxStub({
+      getPanePidResult: '99999999',
+    })
+    // Explicitly set system_prompt_mode to 'append' (same as default)
+    const config = makeRoutingConfig({
+      system_prompt_mode: 'append',
+      append_system_prompt_file: promptFile,
+    })
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 0 },
+    )
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(true)
+    expect((launchCmd!.args[1] as string).includes(promptFile)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Crash recovery
 // ---------------------------------------------------------------------------
 

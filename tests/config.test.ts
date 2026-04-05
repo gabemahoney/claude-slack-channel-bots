@@ -179,6 +179,21 @@ describe('applyDefaults', () => {
     const result = applyDefaults(makeRoutingConfig({ cozempic_prescription: 'aggressive' }))
     expect(result.cozempic_prescription).toBe('aggressive')
   })
+
+  test('fills system_prompt_mode with "append" when absent', () => {
+    const result = applyDefaults(makeRoutingConfig())
+    expect(result.system_prompt_mode).toBe('append')
+  })
+
+  test('preserves provided system_prompt_mode value "append"', () => {
+    const result = applyDefaults(makeRoutingConfig({ system_prompt_mode: 'append' }))
+    expect(result.system_prompt_mode).toBe('append')
+  })
+
+  test('preserves provided system_prompt_mode value "none"', () => {
+    const result = applyDefaults(makeRoutingConfig({ system_prompt_mode: 'none' }))
+    expect(result.system_prompt_mode).toBe('none')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -329,6 +344,32 @@ describe('validateConfig', () => {
 
   test('throws for cozempic_prescription "STANDARD" (case-sensitive)', () => {
     const config = makeValidConfig({ cozempic_prescription: 'STANDARD' })
+    expect(() => validateConfig(config)).toThrow('Routing config validation error')
+  })
+
+  test('passes for system_prompt_mode "append"', () => {
+    const config = makeValidConfig({ system_prompt_mode: 'append' })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('passes for system_prompt_mode "none"', () => {
+    const config = makeValidConfig({ system_prompt_mode: 'none' })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('throws for invalid system_prompt_mode "replace"', () => {
+    const config = makeValidConfig({ system_prompt_mode: 'replace' })
+    expect(() => validateConfig(config)).toThrow('Routing config validation error')
+    expect(() => validateConfig(config)).toThrow('"replace"')
+  })
+
+  test('throws for empty string system_prompt_mode', () => {
+    const config = makeValidConfig({ system_prompt_mode: '' })
+    expect(() => validateConfig(config)).toThrow('Routing config validation error')
+  })
+
+  test('throws for system_prompt_mode "APPEND" (case-sensitive)', () => {
+    const config = makeValidConfig({ system_prompt_mode: 'APPEND' })
     expect(() => validateConfig(config)).toThrow('Routing config validation error')
   })
 })
@@ -508,6 +549,22 @@ describe('resolveConfig', () => {
   test('throws on invalid cozempic_prescription end-to-end', () => {
     expect(() => resolveConfig({ routes: { C: { cwd: '/tmp' } }, cozempic_prescription: 'turbo' })).toThrow('"turbo"')
   })
+
+  test('defaults system_prompt_mode to "append" when absent', () => {
+    const input = makeRoutingConfig()
+    const result = resolveConfig(input)
+    expect(result.system_prompt_mode).toBe('append')
+  })
+
+  test('passes through valid system_prompt_mode "none"', () => {
+    const input = makeRoutingConfig({ system_prompt_mode: 'none' })
+    const result = resolveConfig(input)
+    expect(result.system_prompt_mode).toBe('none')
+  })
+
+  test('throws on invalid system_prompt_mode end-to-end', () => {
+    expect(() => resolveConfig({ routes: { C: { cwd: '/tmp' } }, system_prompt_mode: 'replace' })).toThrow('"replace"')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -663,5 +720,28 @@ describe('loadConfig', () => {
     writeFileSync(configPath, JSON.stringify(config), 'utf-8')
     const result = loadConfig(configPath)
     expect(result.cozempic_prescription).toBe('standard')
+  })
+
+  test('round-trips system_prompt_mode "none" correctly', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+      system_prompt_mode: 'none',
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.system_prompt_mode).toBe('none')
+  })
+
+  test('applies default system_prompt_mode of "append" when absent', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.system_prompt_mode).toBe('append')
   })
 })
