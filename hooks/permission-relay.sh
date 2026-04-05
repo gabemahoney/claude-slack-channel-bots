@@ -2,8 +2,8 @@
 # permission-relay.sh - Claude Code PermissionRequest hook
 # Implements two-phase long-poll to relay permission decisions via Slack channel server
 
-# Guard: only relay for bot-managed sessions
-if [ -z "${SLACK_CHANNEL_BOT_SESSION:-}" ]; then
+# Guard: only relay for bot-managed sessions (must be exactly "1", not empty)
+if [ "${SLACK_CHANNEL_BOT_SESSION:-}" != "1" ]; then
   exit 0
 fi
 

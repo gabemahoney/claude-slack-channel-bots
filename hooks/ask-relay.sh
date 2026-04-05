@@ -2,8 +2,8 @@
 # AskUserQuestion relay — intercepts via PreToolUse, posts to Slack, returns answer
 set -euo pipefail
 
-# Guard: only relay for bot-managed sessions
-if [ -z "${SLACK_CHANNEL_BOT_SESSION:-}" ]; then
+# Guard: only relay for bot-managed sessions (must be exactly "1", not empty)
+if [ "${SLACK_CHANNEL_BOT_SESSION:-}" != "1" ]; then
   exit 0
 fi
 
