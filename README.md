@@ -56,7 +56,7 @@ Tokens and runtime options are read from environment variables. There is no `.en
 |---|---|
 | `SLACK_BOT_TOKEN` | Slack bot token (`xoxb-…`). Required. Granted by the OAuth install flow. |
 | `SLACK_APP_TOKEN` | Slack app-level token (`xapp-…`). Required. Generated under Basic Information → App-Level Tokens with the `connections:write` scope. |
-| `SLACK_STATE_DIR` | Override the directory where `routing.json`, `access.json`, and runtime state are stored. Defaults to `~/.claude/channels/slack`. |
+| `SLACK_STATE_DIR` | Override the directory where `config.json`, `access.json`, and runtime state are stored. Defaults to `~/.claude/channels/slack`. |
 | `SLACK_ACCESS_MODE` | Set to `static` to load `access.json` once at startup and cache it for the lifetime of the process rather than re-reading it on every event. Useful in high-throughput environments where disk reads are a concern. |
 | `SLACK_DRY_RUN` | Set to `1` to start the server without Slack credentials. Token validation is skipped, Socket Mode and `web.auth.test()` are not called, and MCP tool calls (`reply`, `react`, etc.) are logged instead of sent. Useful for integration testing. |
 
@@ -74,9 +74,9 @@ export SLACK_DRY_RUN=1
 
 ---
 
-### Routing (routing.json)
+### Routing (config.json)
 
-`routing.json` is read from `~/.claude/channels/slack/routing.json` by default. Override the directory with `SLACK_STATE_DIR`.
+`config.json` is read from `~/.claude/channels/slack/config.json` by default. Override the directory with `SLACK_STATE_DIR`.
 
 A skeleton file is created by postinstall. Populate it before running `start`.
 
@@ -122,9 +122,9 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 
 ### Access Control (access.json)
 
-`access.json` is read from `~/.claude/channels/slack/access.json` by default (same directory as `routing.json`). A skeleton file with defaults is created by postinstall. The file is written with `0600` permissions.
+`access.json` is read from `~/.claude/channels/slack/access.json` by default (same directory as `config.json`). A skeleton file with defaults is created by postinstall. The file is written with `0600` permissions.
 
-Channels in `routing.json` are automatically allowed — you do not need to list them here. The `channels` map is only needed for per-channel overrides like requiring @mentions or restricting which users can trigger the bot.
+Channels in `config.json` are automatically allowed — you do not need to list them here. The `channels` map is only needed for per-channel overrides like requiring @mentions or restricting which users can trigger the bot.
 
 The `slack-channel-access` skill manages pairings and allowlist entries at runtime.
 
@@ -153,7 +153,7 @@ The `slack-channel-access` skill manages pairings and allowlist entries at runti
 |---|---|---|---|
 | `dmPolicy` | `"pairing"` \| `"allowlist"` \| `"disabled"` | `"pairing"` | Controls who can DM the bot. `pairing`: unknown users receive a one-time code and are added to `allowFrom` after verification. `allowlist`: only users in `allowFrom` are accepted. `disabled`: all DMs are dropped. |
 | `allowFrom` | string[] | `[]` | Slack user IDs allowed to DM the bot unconditionally (regardless of `dmPolicy`). |
-| `channels` | object | `{}` | Optional per-channel overrides. Channels in `routing.json` are allowed automatically — only add entries here to customize behavior (e.g. require @mention or restrict users). Each entry is a `ChannelPolicy`. |
+| `channels` | object | `{}` | Optional per-channel overrides. Channels in `config.json` are allowed automatically — only add entries here to customize behavior (e.g. require @mention or restrict users). Each entry is a `ChannelPolicy`. |
 | `channels[id].requireMention` | boolean | `false` | When `true`, messages in that channel are only delivered if the bot is `@mentioned`. |
 | `channels[id].allowFrom` | string[] | `[]` | When non-empty, restricts delivery to the listed Slack user IDs for that channel. |
 | `pending` | object | `{}` | Managed by the server. Stores in-flight pairing codes indexed by code string. Do not edit manually. |
@@ -178,7 +178,7 @@ Claude Code sessions need a config file pointing at the MCP server. A skeleton i
 }
 ```
 
-If you changed `port` or `bind` in `routing.json`, update the `url` here to match. The server-managed session launcher uses `mcp_config_path` from `routing.json` to locate this file.
+If you changed `port` or `bind` in `config.json`, update the `url` here to match. The server-managed session launcher uses `mcp_config_path` from `config.json` to locate this file.
 
 ---
 
@@ -195,7 +195,7 @@ Checks prerequisites, then daemonizes the server.
 1. `tmux` is on `PATH` — fails with `missing prerequisite: tmux` if not found.
 2. `SLACK_BOT_TOKEN` is set — fails with `missing prerequisite: SLACK_BOT_TOKEN environment variable` if absent.
 3. `SLACK_APP_TOKEN` is set — fails with `missing prerequisite: SLACK_APP_TOKEN environment variable` if absent.
-4. `routing.json` exists at `STATE_DIR/routing.json` — fails with the full path if not found.
+4. `config.json` exists at `STATE_DIR/config.json` — fails with the full path if not found.
 
 If all checks pass, the parent process spawns a detached child process and exits immediately, printing the child PID. The child starts the server and writes its PID to `STATE_DIR/server.pid`. Conversation context is preserved across server restarts when possible.
 
@@ -328,7 +328,7 @@ To enable it: open your Slack app config → **Interactivity & Shortcuts** → t
 
    `permission-relay.sh` relays tool permission requests (Allow/Deny) to Slack via `PermissionRequest`. `ask-relay.sh` relays `AskUserQuestion` calls to Slack via `PreToolUse`, returning the user's selection without blocking the TUI.
 
-Both hooks auto-detect the server port from `routing.json`. They read `${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/routing.json` and use the `port` field (defaulting to `3100`), so they stay in sync if you change the port in routing config.
+Both hooks auto-detect the server port from `config.json`. They read `${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/config.json` and use the `port` field (defaulting to `3100`), so they stay in sync if you change the port in routing config.
 
 ### Setup skill
 
@@ -341,23 +341,23 @@ The `update-config` skill can automate hook installation. It copies or symlinks 
 **Missing environment variables**
 `start` exits with `missing prerequisite: SLACK_BOT_TOKEN environment variable` or `SLACK_APP_TOKEN environment variable`. Export both tokens in your shell profile and open a new terminal before running `start`.
 
-**routing.json not found**
-`start` exits with `missing prerequisite: routing.json not found at <path>`. Run `bun postinstall.ts` to create a skeleton, or create the file manually. Verify `SLACK_STATE_DIR` matches the directory you populated.
+**config.json not found**
+`start` exits with `missing prerequisite: config.json not found at <path>`. Run `bun postinstall.ts` to create a skeleton, or create the file manually. Verify `SLACK_STATE_DIR` matches the directory you populated.
 
-**routing.json CWD mismatch**
-If a Claude Code session connects but immediately disconnects, the session's actual CWD does not match any `cwd` in `routing.json`. Confirm the session's working directory matches the entry exactly (after tilde expansion). Duplicate CWDs across multiple routes are rejected at startup.
+**config.json CWD mismatch**
+If a Claude Code session connects but immediately disconnects, the session's actual CWD does not match any `cwd` in `config.json`. Confirm the session's working directory matches the entry exactly (after tilde expansion). Duplicate CWDs across multiple routes are rejected at startup.
 
 **Bot not receiving messages in a new channel**
 After inviting the bot to a channel, Slack may not deliver messages until the bot is @mentioned for the first time. This is a Slack Socket Mode behavior — the first @mention activates event delivery for that channel. After that, all messages flow normally regardless of `requireMention` settings.
 
 **Channel not in access.json**
-Messages to channels not listed in `access.json → channels` and not present in `routing.json → routes` are silently dropped. Use the `claude-slack-channels-config` skill or edit `access.json` directly to add the channel ID with a `ChannelPolicy` entry.
+Messages to channels not listed in `access.json → channels` and not present in `config.json → routes` are silently dropped. Use the `claude-slack-channels-config` skill or edit `access.json` directly to add the channel ID with a `ChannelPolicy` entry.
 
 **Permission relay not working**
-Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify `curl` and `jq` are on your `PATH`. Confirm the hook scripts are executable (`chmod +x`). If the port was changed in `routing.json`, ensure `SLACK_STATE_DIR` is set correctly so the hooks can read the updated port. If the hooks are silently doing nothing, confirm the session was launched by the server — the hooks only activate when `SLACK_CHANNEL_BOT_SESSION=1` is present in the environment. Sessions launched manually will not trigger the relay.
+Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify `curl` and `jq` are on your `PATH`. Confirm the hook scripts are executable (`chmod +x`). If the port was changed in `config.json`, ensure `SLACK_STATE_DIR` is set correctly so the hooks can read the updated port. If the hooks are silently doing nothing, confirm the session was launched by the server — the hooks only activate when `SLACK_CHANNEL_BOT_SESSION=1` is present in the environment. Sessions launched manually will not trigger the relay.
 
 **Session not restarting after crash**
-After 3 consecutive launch failures for a route, auto-restart is suspended until the server is restarted. Restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`. To disable auto-restart entirely, set `session_restart_delay` to `0` in `routing.json`.
+After 3 consecutive launch failures for a route, auto-restart is suspended until the server is restarted. Restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`. To disable auto-restart entirely, set `session_restart_delay` to `0` in `config.json`.
 
 **Session stuck during clean_restart**
 If a session does not exit within `exit_timeout` seconds (default 120s), `clean_restart` force-kills its tmux session and proceeds. To manually recover, run `tmux kill-session -t <session-name>` for any remaining sessions, then `claude-slack-channel-bots stop && claude-slack-channel-bots start`.

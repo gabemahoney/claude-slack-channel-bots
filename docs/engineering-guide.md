@@ -33,7 +33,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 
 ## Configuration
 
-- Routing config lives at `~/.claude/channels/slack/routing.json`
+- Routing config lives at `~/.claude/channels/slack/config.json`
 - State directory is `~/.claude/channels/slack/` (overridable via `SLACK_STATE_DIR` env var)
 - New config fields: add to `RoutingConfigInput` (optional), `RoutingConfig` (with default), `applyDefaults()`, and `validateConfig()`
 - Atomic file writes: write to `.tmp` file, then `renameSync` to final path
@@ -42,7 +42,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 
 - Localhost-only endpoints: check `server.requestIP(req)` for `127.0.0.1`, `::1`, and `::ffff:127.*`
 - Sensitive files (`access.json`): `chmod 0o600`
-- No secrets in config files that don't need them (routing.json, sessions.json)
+- No secrets in config files that don't need them (config.json, sessions.json)
 - Gate all inbound Slack messages through the `gate()` function before processing
 
 ## Naming Conventions
@@ -59,7 +59,7 @@ When a managed session's MCP connection closes, `onsessionclosed` calls `schedul
 
 ### Configuration
 
-`session_restart_delay` in `routing.json` sets the delay in seconds before attempting a relaunch. Default is 60. Set to 0 to disable auto-restart entirely — the server will log `Auto-restart disabled (delay=0)` and skip all scheduling for that disconnect.
+`session_restart_delay` in `config.json` sets the delay in seconds before attempting a relaunch. Default is 60. Set to 0 to disable auto-restart entirely — the server will log `Auto-restart disabled (delay=0)` and skip all scheduling for that disconnect.
 
 ### Failure Limiting
 
@@ -86,7 +86,7 @@ All restart activity is logged to stderr with the `[slack]` prefix:
 
 ### Configuration
 
-`health_check_interval` in `routing.json` sets the polling interval in seconds. Type: `number`. Default: `120`. Set to `0` to disable the poller entirely — `startHealthCheck()` returns immediately without creating an interval.
+`health_check_interval` in `config.json` sets the polling interval in seconds. Type: `number`. Default: `120`. Set to `0` to disable the poller entirely — `startHealthCheck()` returns immediately without creating an interval.
 
 ### Async Interval Pattern
 

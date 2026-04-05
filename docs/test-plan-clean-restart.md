@@ -16,7 +16,7 @@ Files under test:
 ### T1: Graceful Exit — All Sessions Respond to /exit
 
 **Preconditions:**
-- Two or more routes are configured in `routing.json`.
+- Two or more routes are configured in `config.json`.
 - Each route has an active tmux session with Claude running inside it.
 - The server daemon is running.
 
@@ -56,7 +56,7 @@ Files under test:
 ### T3: Missing Tmux Session
 
 **Preconditions:**
-- A route is configured in `routing.json`.
+- A route is configured in `config.json`.
 - No tmux session exists for that route (`hasSession()` returns false).
 
 **Actions:**
