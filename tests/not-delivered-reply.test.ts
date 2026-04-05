@@ -70,6 +70,7 @@ function makeRoutingConfig(opts: {
     stop_timeout: 30,
     mcp_config_path: `${homedir()}/.claude/slack-mcp.json`,
     cozempic_prescription: 'standard',
+    system_prompt_mode: 'append',
   }
 
   if (opts.default_route !== undefined) {

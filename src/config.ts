@@ -18,6 +18,7 @@ import { resolve } from 'path'
 
 export const MCP_SERVER_NAME = 'slack-channel-router'
 export const ALLOWED_PRESCRIPTIONS = ['gentle', 'standard', 'aggressive']
+export const ALLOWED_SYSTEM_PROMPT_MODES = ['append', 'none']
 
 // ---------------------------------------------------------------------------
 // Types
@@ -43,6 +44,7 @@ export interface RoutingConfigInput {
   mcp_config_path?: string
   append_system_prompt_file?: string
   cozempic_prescription?: string
+  system_prompt_mode?: string
 }
 
 /** Validated, fully-resolved routing configuration with all defaults applied. */
@@ -59,6 +61,7 @@ export interface RoutingConfig {
   mcp_config_path: string
   append_system_prompt_file?: string
   cozempic_prescription: string
+  system_prompt_mode: string
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +86,7 @@ export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
     mcp_config_path: input.mcp_config_path ?? '~/.claude/slack-mcp.json',
     append_system_prompt_file: input.append_system_prompt_file,
     cozempic_prescription: input.cozempic_prescription ?? 'standard',
+    system_prompt_mode: input.system_prompt_mode ?? 'append',
   }
 }
 
@@ -160,6 +164,13 @@ export function validateConfig(config: RoutingConfig): void {
   if (!ALLOWED_PRESCRIPTIONS.includes(config.cozempic_prescription)) {
     throw new Error(
       `Routing config validation error: cozempic_prescription "${config.cozempic_prescription}" is invalid. Allowed values are: ${ALLOWED_PRESCRIPTIONS.join(', ')}.`,
+    )
+  }
+
+  // system_prompt_mode must be one of the allowed values
+  if (!ALLOWED_SYSTEM_PROMPT_MODES.includes(config.system_prompt_mode)) {
+    throw new Error(
+      `Routing config validation error: system_prompt_mode "${config.system_prompt_mode}" is invalid. Allowed values are: ${ALLOWED_SYSTEM_PROMPT_MODES.join(', ')}.`,
     )
   }
 

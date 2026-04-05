@@ -85,7 +85,7 @@ export async function launchSession(
     ? `SLACK_CHANNEL_BOT_SESSION=1 claude --mcp-config '${escapedConfigPath}'`
     : `SLACK_CHANNEL_BOT_SESSION=1 claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
 
-  if (routingConfig.append_system_prompt_file !== undefined) {
+  if (routingConfig.system_prompt_mode === 'append' && routingConfig.append_system_prompt_file !== undefined) {
     try {
       accessSync(routingConfig.append_system_prompt_file, constants.R_OK)
       const escapedPromptPath = routingConfig.append_system_prompt_file.replace(/'/g, "'\\''")
