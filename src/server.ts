@@ -1003,6 +1003,7 @@ export async function main(): Promise<void> {
           // Already decided — return immediately
           const existingDecision = completedDecisions.get(pollRequestId)
           if (existingDecision !== undefined) {
+            completedDecisions.delete(pollRequestId)
             return new Response(JSON.stringify({ status: 'decided', decision: existingDecision }), {
               status: 200,
               headers: { 'Content-Type': 'application/json' },
@@ -1058,6 +1059,7 @@ export async function main(): Promise<void> {
             })
           }
 
+          completedDecisions.delete(pollRequestId)
           return new Response(JSON.stringify({ status: 'decided', decision }), {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
@@ -1169,6 +1171,7 @@ export async function main(): Promise<void> {
 
           const existingAnswer = completedAnswers.get(pollRequestId)
           if (existingAnswer !== undefined) {
+            completedAnswers.delete(pollRequestId)
             return new Response(JSON.stringify({ status: 'decided', answer: existingAnswer }), {
               status: 200,
               headers: { 'Content-Type': 'application/json' },
@@ -1215,6 +1218,7 @@ export async function main(): Promise<void> {
           })
 
           if (answer !== null) {
+            completedAnswers.delete(pollRequestId)
             return new Response(JSON.stringify({ status: 'decided', answer }), {
               status: 200,
               headers: { 'Content-Type': 'application/json' },

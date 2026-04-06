@@ -25,6 +25,18 @@ interface PendingPermission {
 }
 
 // ---------------------------------------------------------------------------
+// Types (mirrored from server.ts)
+// ---------------------------------------------------------------------------
+
+interface PendingQuestion {
+  requestId: string
+  channelId: string
+  messageTs: string
+  question: string
+  waiters: Array<(answer: string) => void>
+}
+
+// ---------------------------------------------------------------------------
 // Shared mutable state — captured by closure in the test server.
 // All three consumers (test server handler, handleInteractive, tests) read the
 // same bindings, so reassigning or mutating them in beforeEach is visible everywhere.
@@ -32,6 +44,8 @@ interface PendingPermission {
 
 const pendingPermissions = new Map<string, PendingPermission>()
 const completedDecisions = new Map<string, 'allow' | 'deny'>()
+const pendingQuestions = new Map<string, PendingQuestion>()
+const completedAnswers = new Map<string, string>()
 
 let routingConfig: { routes: Record<string, { cwd: string }> } | null = null
 
@@ -150,7 +164,7 @@ const testServer = Bun.serve({
   async fetch(req: Request, server: any): Promise<Response> {
     const url = new URL(req.url)
 
-    if (!url.pathname.startsWith('/permission')) {
+    if (!url.pathname.startsWith('/permission') && !url.pathname.startsWith('/ask')) {
       return new Response('Not Found', { status: 404 })
     }
 
@@ -176,6 +190,7 @@ const testServer = Bun.serve({
       // Already decided — return immediately
       const existingDecision = completedDecisions.get(pollRequestId)
       if (existingDecision !== undefined) {
+        completedDecisions.delete(pollRequestId)
         return new Response(JSON.stringify({ status: 'decided', decision: existingDecision }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
@@ -231,7 +246,73 @@ const testServer = Bun.serve({
         })
       }
 
+      completedDecisions.delete(pollRequestId)
       return new Response(JSON.stringify({ status: 'decided', decision }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    // GET /ask/<requestId> — long-poll for answer
+    if (req.method === 'GET' && url.pathname.startsWith('/ask/')) {
+      const pollRequestId = url.pathname.slice('/ask/'.length)
+
+      const existingAnswer = completedAnswers.get(pollRequestId)
+      if (existingAnswer !== undefined) {
+        completedAnswers.delete(pollRequestId)
+        return new Response(JSON.stringify({ status: 'decided', answer: existingAnswer }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      const pendingEntry = pendingQuestions.get(pollRequestId)
+      if (!pendingEntry) {
+        return new Response(JSON.stringify({ status: 'decided', answer: '' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      const answer = await new Promise<string | null>((promiseResolve) => {
+        let settled = false
+        let timerId: ReturnType<typeof setTimeout>
+
+        const waiter = (a: string) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timerId)
+          promiseResolve(a)
+        }
+
+        pendingEntry.waiters.push(waiter)
+
+        timerId = setTimeout(() => {
+          if (settled) return
+          settled = true
+          const idx = pendingEntry.waiters.indexOf(waiter)
+          if (idx !== -1) pendingEntry.waiters.splice(idx, 1)
+          promiseResolve(null)
+        }, POLL_TIMEOUT_MS)
+
+        req.signal.addEventListener('abort', () => {
+          if (settled) return
+          settled = true
+          clearTimeout(timerId)
+          const idx = pendingEntry.waiters.indexOf(waiter)
+          if (idx !== -1) pendingEntry.waiters.splice(idx, 1)
+          promiseResolve(null)
+        })
+      })
+
+      if (answer !== null) {
+        completedAnswers.delete(pollRequestId)
+        return new Response(JSON.stringify({ status: 'decided', answer }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ status: 'pending' }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       })
@@ -341,6 +422,27 @@ function makePendingPermission(overrides: Partial<PendingPermission> = {}): Pend
   }
 }
 
+function makePendingQuestion(overrides: Partial<PendingQuestion> = {}): PendingQuestion {
+  return {
+    requestId: 'test-q-id',
+    channelId: 'C_TEST',
+    messageTs: 'msg-ts-456',
+    question: 'What should I do?',
+    waiters: [],
+    ...overrides,
+  }
+}
+
+// Simulates a user clicking an answer button — mirrors interactive handler in server.ts
+function handleInteractiveAnswer(requestId: string, answer: string): void {
+  const pending = pendingQuestions.get(requestId)
+  if (pending) {
+    completedAnswers.set(requestId, answer)
+    for (const waiter of pending.waiters) waiter(answer)
+    pendingQuestions.delete(requestId)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Reset state between tests
 // ---------------------------------------------------------------------------
@@ -348,6 +450,8 @@ function makePendingPermission(overrides: Partial<PendingPermission> = {}): Pend
 beforeEach(() => {
   pendingPermissions.clear()
   completedDecisions.clear()
+  pendingQuestions.clear()
+  completedAnswers.clear()
   postMessageCalls.length = 0
   chatUpdateCalls.length = 0
   routingConfig = null
@@ -670,5 +774,75 @@ describe('permission relay — /permission endpoint', () => {
     const body = (await res.json()) as { status: string; decision: string }
     expect(body.status).toBe('decided')
     expect(body.decision).toBe('deny')
+  })
+
+  // Regression: memory leak — completedDecisions entry must be deleted after GET consumes it (already-decided path)
+  test('GET /permission/<id> deletes completedDecisions entry when decision was already present', async () => {
+    completedDecisions.set('req-pre-decided', 'deny')
+
+    const res = await fetch(`${BASE_URL}/permission/req-pre-decided`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { status: string; decision: string }
+    expect(body.status).toBe('decided')
+    expect(body.decision).toBe('deny')
+
+    // Entry must have been deleted — a second GET must not find it
+    expect(completedDecisions.has('req-pre-decided')).toBe(false)
+  })
+
+  // Regression: memory leak — completedDecisions entry must be deleted after GET consumes it (waiter-resolved path)
+  test('GET /permission/<id> deletes completedDecisions entry after waiter resolves', async () => {
+    pendingPermissions.set('req-waiter', makePendingPermission({ requestId: 'req-waiter' }))
+
+    const pollPromise = fetch(`${BASE_URL}/permission/req-waiter`)
+
+    // Wait for the waiter to register
+    await Bun.sleep(50)
+
+    await handleInteractive({ actions: [{ action_id: 'perm_allow_req-waiter' }] })
+
+    const res = await pollPromise
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { status: string; decision: string }
+    expect(body.status).toBe('decided')
+    expect(body.decision).toBe('allow')
+
+    // Entry must have been deleted from completedDecisions after being consumed
+    expect(completedDecisions.has('req-waiter')).toBe(false)
+  })
+
+  // Regression: memory leak — completedAnswers entry must be deleted after GET /ask consumes it (already-answered path)
+  test('GET /ask/<id> deletes completedAnswers entry when answer was already present', async () => {
+    completedAnswers.set('q-pre-answered', 'Yes')
+
+    const res = await fetch(`${BASE_URL}/ask/q-pre-answered`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { status: string; answer: string }
+    expect(body.status).toBe('decided')
+    expect(body.answer).toBe('Yes')
+
+    // Entry must have been deleted — a second GET must not find it
+    expect(completedAnswers.has('q-pre-answered')).toBe(false)
+  })
+
+  // Regression: memory leak — completedAnswers entry must be deleted after GET /ask consumes it (waiter-resolved path)
+  test('GET /ask/<id> deletes completedAnswers entry after waiter resolves', async () => {
+    pendingQuestions.set('q-waiter', makePendingQuestion({ requestId: 'q-waiter' }))
+
+    const pollPromise = fetch(`${BASE_URL}/ask/q-waiter`)
+
+    // Wait for the waiter to register
+    await Bun.sleep(50)
+
+    handleInteractiveAnswer('q-waiter', 'No')
+
+    const res = await pollPromise
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { status: string; answer: string }
+    expect(body.status).toBe('decided')
+    expect(body.answer).toBe('No')
+
+    // Entry must have been deleted from completedAnswers after being consumed
+    expect(completedAnswers.has('q-waiter')).toBe(false)
   })
 })
