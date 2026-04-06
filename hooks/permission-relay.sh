@@ -2,11 +2,6 @@
 # permission-relay.sh - Claude Code PermissionRequest hook
 # Implements two-phase long-poll to relay permission decisions via Slack channel server
 
-# Guard: only relay for bot-managed sessions (must be exactly "1", not empty)
-if [ "${SLACK_CHANNEL_BOT_SESSION:-}" != "1" ]; then
-  exit 0
-fi
-
 # Check dependencies
 if ! command -v jq &>/dev/null; then
   exit 0
@@ -14,14 +9,6 @@ fi
 if ! command -v curl &>/dev/null; then
   exit 0
 fi
-
-# Read stdin
-INPUT=$(cat)
-
-# Extract fields from input
-TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // ""' 2>/dev/null) || exit 0
-TOOL_INPUT=$(echo "$INPUT" | jq -c '.tool_input // {}' 2>/dev/null) || exit 0
-CWD=$(echo "$INPUT" | jq -r '.cwd // ""' 2>/dev/null) || exit 0
 
 # Read port from config.json, default to 3100
 CONFIG_FILE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/config.json"
@@ -32,6 +19,20 @@ if [ -f "$CONFIG_FILE" ]; then
     PORT="$ROUTED_PORT"
   fi
 fi
+
+# Guard: only relay for bot-managed sessions (server PID check)
+HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/is-managed?pid=$PPID" 2>/dev/null) || HTTP_STATUS="000"
+if [ "$HTTP_STATUS" != "200" ]; then
+  exit 0
+fi
+
+# Read stdin
+INPUT=$(cat)
+
+# Extract fields from input
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // ""' 2>/dev/null) || exit 0
+TOOL_INPUT=$(echo "$INPUT" | jq -c '.tool_input // {}' 2>/dev/null) || exit 0
+CWD=$(echo "$INPUT" | jq -r '.cwd // ""' 2>/dev/null) || exit 0
 
 BASE_URL="http://127.0.0.1:${PORT}"
 

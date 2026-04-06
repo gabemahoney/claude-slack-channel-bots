@@ -40,7 +40,7 @@ import {
 } from './lib.ts'
 import { loadConfig, expandTilde, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
 import { readSessions, writeSessions, rotateSessions } from './sessions.ts'
-import { defaultTmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
+import { defaultTmuxClient, sessionName, isClaudeRunning, getClaudePid } from './tmux.ts'
 import { startupSessionManager, launchSession } from './session-manager.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import {
@@ -1319,6 +1319,44 @@ export async function main(): Promise<void> {
 
         return new Response(JSON.stringify({ requestId }), {
           status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      // /is-managed — PID-based session membership check for hook guards
+      if (url.pathname === '/is-managed') {
+        if (req.method !== 'GET') {
+          return new Response('Method Not Allowed', { status: 405 })
+        }
+        // Validate localhost
+        const remoteAddr = server.requestIP(req)
+        const remoteHost = remoteAddr?.address ?? ''
+        if (remoteHost !== '127.0.0.1' && remoteHost !== '::1' && !remoteHost.startsWith('::ffff:127.')) {
+          return new Response('Forbidden', { status: 403 })
+        }
+        const pidStr = url.searchParams.get('pid')
+        const pid = pidStr ? parseInt(pidStr, 10) : NaN
+        if (isNaN(pid) || pid <= 0) {
+          return new Response(JSON.stringify({ error: 'Missing or invalid pid parameter' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        // Check all configured routes
+        if (routingConfig) {
+          for (const [, route] of Object.entries(routingConfig.routes)) {
+            const name = sessionName(route.cwd)
+            const claudePid = await getClaudePid(name, defaultTmuxClient)
+            if (claudePid === pid) {
+              return new Response(JSON.stringify({ managed: true }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              })
+            }
+          }
+        }
+        return new Response(JSON.stringify({ managed: false }), {
+          status: 404,
           headers: { 'Content-Type': 'application/json' },
         })
       }

@@ -2,8 +2,20 @@
 # AskUserQuestion relay — intercepts via PreToolUse, posts to Slack, returns answer
 set -euo pipefail
 
-# Guard: only relay for bot-managed sessions (must be exactly "1", not empty)
-if [ "${SLACK_CHANNEL_BOT_SESSION:-}" != "1" ]; then
+# Check dependencies (must be before guard since guard needs curl+jq)
+if ! command -v jq &>/dev/null; then
+  exit 0
+fi
+if ! command -v curl &>/dev/null; then
+  exit 0
+fi
+
+# Read port from config.json
+PORT=$(jq -r '.port // 3100' "${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/config.json" 2>/dev/null) || PORT=3100
+
+# Guard: only relay for bot-managed sessions (server PID check)
+HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/is-managed?pid=$PPID" 2>/dev/null) || HTTP_STATUS="000"
+if [ "$HTTP_STATUS" != "200" ]; then
   exit 0
 fi
 
@@ -22,9 +34,6 @@ CWD=$(echo "$INPUT" | jq -r '.cwd // ""' 2>/dev/null) || exit 0
 if [ -z "$QUESTION" ] || [ "$OPTIONS" = "[]" ] || [ -z "$CWD" ]; then
   exit 0
 fi
-
-# Read port from config.json
-PORT=$(jq -r '.port // 3100' "${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/config.json" 2>/dev/null) || PORT=3100
 
 # Phase 1: POST question to server
 RESPONSE=$(curl -s -f -X POST "http://127.0.0.1:${PORT}/ask" \

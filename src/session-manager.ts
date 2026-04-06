@@ -82,8 +82,8 @@ export async function launchSession(
   // In dry-run mode, skip --dangerously-load-development-channels (requires OAuth which isn't
   // available in Docker/CI). MCP still connects via --mcp-config; only channel routing is lost.
   let baseCmd = isDryRun()
-    ? `SLACK_CHANNEL_BOT_SESSION=1 claude --mcp-config '${escapedConfigPath}'`
-    : `SLACK_CHANNEL_BOT_SESSION=1 claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
+    ? `claude --mcp-config '${escapedConfigPath}'`
+    : `claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
 
   if (routingConfig.system_prompt_mode === 'append' && routingConfig.append_system_prompt_file !== undefined) {
     try {

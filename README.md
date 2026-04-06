@@ -277,7 +277,7 @@ When Claude Code requires tool approval, the permission relay surfaces an intera
 
 The `ask-relay.sh` hook intercepts `AskUserQuestion` tool calls via `PreToolUse`, posts the question and its options to Slack as interactive buttons, and waits for the user's selection. The answer is returned to Claude Code via `updatedInput` without blocking the TUI.
 
-Both hooks are **scope-guarded**: they check for the `SLACK_CHANNEL_BOT_SESSION` environment variable and exit immediately (no-op) if it is not set. The server sets this variable on every Claude session it launches. This means installing the hooks globally in `settings.json` is safe — they will not activate for Claude sessions you run outside the bot.
+Both hooks are **scope-guarded**: on each invocation they call the server's `GET /is-managed?pid=$PPID` endpoint to verify that the calling process belongs to a server-managed Claude session. If the server is not running or does not recognize the PID, the hooks exit silently (no-op). This means installing the hooks globally in `settings.json` is safe — they will not activate for Claude sessions you run outside the bot.
 
 Both hooks use a **two-phase long-poll protocol**:
 
@@ -355,7 +355,7 @@ After inviting the bot to a channel, Slack may not deliver messages until the bo
 Messages to channels not listed in `access.json → channels` and not present in `config.json → routes` are silently dropped. Use the `claude-slack-channels-config` skill or edit `access.json` directly to add the channel ID with a `ChannelPolicy` entry.
 
 **Permission relay not working**
-Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify `curl` and `jq` are on your `PATH`. Confirm the hook scripts are executable (`chmod +x`). If the port was changed in `config.json`, ensure `SLACK_STATE_DIR` is set correctly so the hooks can read the updated port. If the hooks are silently doing nothing, confirm the session was launched by the server — the hooks only activate when `SLACK_CHANNEL_BOT_SESSION=1` is present in the environment. Sessions launched manually will not trigger the relay.
+Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify `curl` and `jq` are on your `PATH`. Confirm the hook scripts are executable (`chmod +x`). If the port was changed in `config.json`, ensure `SLACK_STATE_DIR` is set correctly so the hooks can read the updated port. If the hooks are silently doing nothing, confirm the session was launched by the server — the hooks call `GET /is-managed?pid=$PPID` and exit silently if the server is unreachable or the PID is not recognized. Sessions launched manually will not trigger the relay.
 
 **Session not restarting after crash**
 After 3 consecutive launch failures for a route, auto-restart is suspended until the server is restarted. Restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`. To disable auto-restart entirely, set `session_restart_delay` to `0` in `config.json`.

@@ -1,5 +1,5 @@
 /**
- * hook-guard.test.ts — Tests that hook scripts exit 0 early when SLACK_CHANNEL_BOT_SESSION is not set
+ * hook-guard.test.ts — Tests that hook scripts exit 0 early when the /is-managed endpoint is unreachable
  *
  * SPDX-License-Identifier: MIT
  */
@@ -23,14 +23,14 @@ async function runHook(scriptName: string, env: Record<string, string> = {}): Pr
   return { exitCode: proc.exitCode ?? -1, stdout }
 }
 
-describe('hook guards — SLACK_CHANNEL_BOT_SESSION not set', () => {
-  test('permission-relay.sh exits 0 with no stdout when SLACK_CHANNEL_BOT_SESSION is absent', async () => {
+describe('hook guards — no server running', () => {
+  test('permission-relay.sh exits 0 with no stdout when /is-managed is unreachable', async () => {
     const { exitCode, stdout } = await runHook('permission-relay.sh')
     expect(exitCode).toBe(0)
     expect(stdout).toBe('')
   })
 
-  test('ask-relay.sh exits 0 with no stdout when SLACK_CHANNEL_BOT_SESSION is absent', async () => {
+  test('ask-relay.sh exits 0 with no stdout when /is-managed is unreachable', async () => {
     const { exitCode, stdout } = await runHook('ask-relay.sh')
     expect(exitCode).toBe(0)
     expect(stdout).toBe('')

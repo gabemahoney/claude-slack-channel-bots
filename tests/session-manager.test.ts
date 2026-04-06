@@ -764,7 +764,7 @@ describe('launchSession', () => {
   // called and a fresh launch is retried.
   // test.todo('T23: bare bash prompt detection triggers kill and fresh retry')
 
-  test('launch command includes SLACK_CHANNEL_BOT_SESSION=1 env var', async () => {
+  test('launch command does not include SLACK_CHANNEL_BOT_SESSION env var', async () => {
     const stub = makeTmuxStub({
       getPanePidResult: '99999999',
     })
@@ -780,7 +780,7 @@ describe('launchSession', () => {
       c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
     )
     expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).includes('SLACK_CHANNEL_BOT_SESSION=1')).toBe(true)
+    expect((launchCmd!.args[1] as string).includes('SLACK_CHANNEL_BOT_SESSION')).toBe(false)
   })
 })
 

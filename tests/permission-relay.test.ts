@@ -46,6 +46,7 @@ const pendingPermissions = new Map<string, PendingPermission>()
 const completedDecisions = new Map<string, 'allow' | 'deny'>()
 const pendingQuestions = new Map<string, PendingQuestion>()
 const completedAnswers = new Map<string, string>()
+const managedPids = new Set<number>()
 
 let routingConfig: { routes: Record<string, { cwd: string }> } | null = null
 
@@ -163,6 +164,30 @@ const testServer = Bun.serve({
   port: 0,
   async fetch(req: Request, server: any): Promise<Response> {
     const url = new URL(req.url)
+
+    if (url.pathname === '/is-managed') {
+      if (req.method !== 'GET') {
+        return new Response('Method Not Allowed', { status: 405 })
+      }
+      const pidStr = url.searchParams.get('pid')
+      const pid = pidStr ? parseInt(pidStr, 10) : NaN
+      if (isNaN(pid) || pid <= 0) {
+        return new Response(JSON.stringify({ error: 'Missing or invalid pid parameter' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (managedPids.has(pid)) {
+        return new Response(JSON.stringify({ managed: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ managed: false }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
 
     if (!url.pathname.startsWith('/permission') && !url.pathname.startsWith('/ask')) {
       return new Response('Not Found', { status: 404 })
@@ -452,6 +477,7 @@ beforeEach(() => {
   completedDecisions.clear()
   pendingQuestions.clear()
   completedAnswers.clear()
+  managedPids.clear()
   postMessageCalls.length = 0
   chatUpdateCalls.length = 0
   routingConfig = null
@@ -844,5 +870,47 @@ describe('permission relay — /permission endpoint', () => {
 
     // Entry must have been deleted from completedAnswers after being consumed
     expect(completedAnswers.has('q-waiter')).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// /is-managed endpoint
+// ---------------------------------------------------------------------------
+
+describe('/is-managed endpoint', () => {
+  test('returns 200 for managed PID', async () => {
+    managedPids.add(12345)
+    const res = await fetch(`${BASE_URL}/is-managed?pid=12345`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { managed: boolean }
+    expect(body.managed).toBe(true)
+    managedPids.delete(12345)
+  })
+
+  test('returns 404 for unmanaged PID', async () => {
+    const res = await fetch(`${BASE_URL}/is-managed?pid=99999`)
+    expect(res.status).toBe(404)
+    const body = (await res.json()) as { managed: boolean }
+    expect(body.managed).toBe(false)
+  })
+
+  test('returns 400 for missing pid', async () => {
+    const res = await fetch(`${BASE_URL}/is-managed`)
+    expect(res.status).toBe(400)
+  })
+
+  test('returns 400 for invalid pid', async () => {
+    const res = await fetch(`${BASE_URL}/is-managed?pid=abc`)
+    expect(res.status).toBe(400)
+  })
+
+  test('returns 400 for negative pid', async () => {
+    const res = await fetch(`${BASE_URL}/is-managed?pid=-1`)
+    expect(res.status).toBe(400)
+  })
+
+  test('returns 405 for POST', async () => {
+    const res = await fetch(`${BASE_URL}/is-managed`, { method: 'POST' })
+    expect(res.status).toBe(405)
   })
 })
