@@ -45,6 +45,7 @@ export interface RoutingConfigInput {
   append_system_prompt_file?: string
   cozempic_prescription?: string
   system_prompt_mode?: string
+  channelsEnabled?: boolean
 }
 
 /** Validated, fully-resolved routing configuration with all defaults applied. */
@@ -62,6 +63,7 @@ export interface RoutingConfig {
   append_system_prompt_file?: string
   cozempic_prescription: string
   system_prompt_mode: string
+  channelsEnabled: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +89,7 @@ export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
     append_system_prompt_file: input.append_system_prompt_file,
     cozempic_prescription: input.cozempic_prescription ?? 'standard',
     system_prompt_mode: input.system_prompt_mode ?? 'append',
+    channelsEnabled: input.channelsEnabled ?? true,
   }
 }
 
@@ -171,6 +174,13 @@ export function validateConfig(config: RoutingConfig): void {
   if (!ALLOWED_SYSTEM_PROMPT_MODES.includes(config.system_prompt_mode)) {
     throw new Error(
       `Routing config validation error: system_prompt_mode "${config.system_prompt_mode}" is invalid. Allowed values are: ${ALLOWED_SYSTEM_PROMPT_MODES.join(', ')}.`,
+    )
+  }
+
+  // channelsEnabled must be a boolean
+  if (typeof config.channelsEnabled !== 'boolean') {
+    throw new Error(
+      'Routing config validation error: channelsEnabled must be a boolean.',
     )
   }
 

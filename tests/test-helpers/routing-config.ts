@@ -20,6 +20,7 @@ export function makeRoutingConfig(overrides?: Partial<RoutingConfig>): RoutingCo
     mcp_config_path: '/tmp/test-mcp.json',
     cozempic_prescription: 'standard',
     system_prompt_mode: 'append',
+    channelsEnabled: true,
     ...overrides,
   }
 }

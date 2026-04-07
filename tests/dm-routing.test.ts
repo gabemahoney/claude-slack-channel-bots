@@ -96,6 +96,7 @@ function makeRoutingConfig(opts: {
     mcp_config_path: `${homedir()}/.claude/slack-mcp.json`,
     cozempic_prescription: 'standard',
     system_prompt_mode: 'append',
+    channelsEnabled: true,
   }
 
   if (opts.default_dm_session !== undefined) {

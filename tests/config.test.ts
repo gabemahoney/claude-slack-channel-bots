@@ -194,6 +194,21 @@ describe('applyDefaults', () => {
     const result = applyDefaults(makeRoutingConfig({ system_prompt_mode: 'none' }))
     expect(result.system_prompt_mode).toBe('none')
   })
+
+  test('fills channelsEnabled with true when absent', () => {
+    const result = applyDefaults(makeRoutingConfig())
+    expect(result.channelsEnabled).toBe(true)
+  })
+
+  test('preserves provided channelsEnabled value true', () => {
+    const result = applyDefaults(makeRoutingConfig({ channelsEnabled: true }))
+    expect(result.channelsEnabled).toBe(true)
+  })
+
+  test('preserves provided channelsEnabled value false', () => {
+    const result = applyDefaults(makeRoutingConfig({ channelsEnabled: false }))
+    expect(result.channelsEnabled).toBe(false)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -214,6 +229,7 @@ function makeValidConfig(overrides: Partial<RoutingConfig> = {}): RoutingConfig 
     mcp_config_path: `${homedir()}/.claude/slack-mcp.json`,
     cozempic_prescription: 'standard',
     system_prompt_mode: 'append',
+    channelsEnabled: true,
     ...overrides,
   }
 }
@@ -371,6 +387,28 @@ describe('validateConfig', () => {
   test('throws for system_prompt_mode "APPEND" (case-sensitive)', () => {
     const config = makeValidConfig({ system_prompt_mode: 'APPEND' })
     expect(() => validateConfig(config)).toThrow('Routing config validation error')
+  })
+
+  test('passes for channelsEnabled true', () => {
+    const config = makeValidConfig({ channelsEnabled: true })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('passes for channelsEnabled false', () => {
+    const config = makeValidConfig({ channelsEnabled: false })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('throws for invalid channelsEnabled string "true"', () => {
+    const config = makeValidConfig({ channelsEnabled: 'true' as unknown as boolean })
+    expect(() => validateConfig(config)).toThrow('Routing config validation error')
+    expect(() => validateConfig(config)).toThrow('channelsEnabled must be a boolean')
+  })
+
+  test('throws for invalid channelsEnabled number', () => {
+    const config = makeValidConfig({ channelsEnabled: 1 as unknown as boolean })
+    expect(() => validateConfig(config)).toThrow('Routing config validation error')
+    expect(() => validateConfig(config)).toThrow('channelsEnabled must be a boolean')
   })
 })
 
@@ -565,6 +603,18 @@ describe('resolveConfig', () => {
   test('throws on invalid system_prompt_mode end-to-end', () => {
     expect(() => resolveConfig({ routes: { C: { cwd: '/tmp' } }, system_prompt_mode: 'replace' })).toThrow('"replace"')
   })
+
+  test('defaults channelsEnabled to true when absent', () => {
+    const input = makeRoutingConfig()
+    const result = resolveConfig(input)
+    expect(result.channelsEnabled).toBe(true)
+  })
+
+  test('passes through channelsEnabled false end-to-end', () => {
+    const input = makeRoutingConfig({ channelsEnabled: false })
+    const result = resolveConfig(input)
+    expect(result.channelsEnabled).toBe(false)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -743,5 +793,28 @@ describe('loadConfig', () => {
     writeFileSync(configPath, JSON.stringify(config), 'utf-8')
     const result = loadConfig(configPath)
     expect(result.system_prompt_mode).toBe('append')
+  })
+
+  test('applies default channelsEnabled of true when absent from JSON', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.channelsEnabled).toBe(true)
+  })
+
+  test('round-trips explicit channelsEnabled false correctly', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+      channelsEnabled: false,
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.channelsEnabled).toBe(false)
   })
 })
