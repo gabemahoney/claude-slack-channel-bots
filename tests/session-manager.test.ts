@@ -782,6 +782,44 @@ describe('launchSession', () => {
     expect(launchCmd).toBeDefined()
     expect((launchCmd!.args[1] as string).includes('SLACK_CHANNEL_BOT_SESSION')).toBe(false)
   })
+
+  test('channelsEnabled true: launch command includes --dangerously-load-development-channels', async () => {
+    const stub = makeTmuxStub({
+      getPanePidResult: '99999999',
+    })
+    const config = makeRoutingConfig({ channelsEnabled: true })
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 0 },
+    )
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string)).toContain('--dangerously-load-development-channels')
+  })
+
+  test('channelsEnabled false: launch command does NOT include --dangerously-load-development-channels', async () => {
+    const stub = makeTmuxStub({
+      getPanePidResult: '99999999',
+    })
+    const config = makeRoutingConfig({ channelsEnabled: false })
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 0 },
+    )
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string)).not.toContain('--dangerously-load-development-channels')
+  })
 })
 
 // ---------------------------------------------------------------------------

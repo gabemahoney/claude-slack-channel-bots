@@ -736,109 +736,6 @@ function buildPermissionDecisionBlocks(
 }
 
 // ---------------------------------------------------------------------------
-// Socket Mode event routing
-// ---------------------------------------------------------------------------
-
-socket.on('message', async ({ event, ack }) => {
-  console.error('[slack] RAW message event:', JSON.stringify(event)?.slice(0, 300))
-  await ack()
-  if (!event) return
-  try {
-    await handleMessage(event)
-  } catch (err) {
-    console.error('[slack] Error handling message:', err)
-  }
-})
-
-socket.on('app_mention', async ({ event, ack }) => {
-  console.error('[slack] RAW app_mention event:', JSON.stringify(event)?.slice(0, 300))
-  await ack()
-  if (!event) return
-  try {
-    await handleMessage(event)
-  } catch (err) {
-    console.error('[slack] Error handling mention:', err)
-  }
-})
-
-socket.on('interactive', async (evt) => {
-  const { ack } = evt as { ack: () => Promise<void> }
-  const p = ((evt as any).body ?? (evt as any).payload ?? evt) as Record<string, unknown>
-  const actions = (Array.isArray(p['actions']) ? p['actions'] : []) as Array<{ action_id: string }>
-  for (const action of actions) {
-    const actionId = action.action_id
-    if (actionId.startsWith('perm_allow_') || actionId.startsWith('perm_deny_')) {
-      const isAllow = actionId.startsWith('perm_allow_')
-      const prefix = isAllow ? 'perm_allow_' : 'perm_deny_'
-      const requestId = actionId.slice(prefix.length)
-      const pending = pendingPermissions.get(requestId)
-      if (pending) {
-        const decision: 'allow' | 'deny' = isAllow ? 'allow' : 'deny'
-        completedDecisions.set(requestId, decision)
-        for (const waiter of pending.waiters) waiter(decision)
-        await ack()
-        pendingPermissions.delete(requestId)
-
-        // Update the Slack message to remove buttons and show the decision
-        const userId = ((p['user'] as Record<string, unknown> | undefined)?.['id'] as string | undefined) ?? ''
-        const userName = userId ? await resolveUserName(userId) : 'unknown'
-        try {
-          await web.chat.update({
-            channel: pending.channelId,
-            ts: pending.messageTs,
-            text: `${pending.toolName} — ${decision === 'allow' ? 'Allowed' : 'Denied'} by ${userName}`,
-            blocks: buildPermissionDecisionBlocks(pending.toolName, decision, userName),
-          })
-        } catch (err) {
-          console.error('[slack] /permission: chat.update failed:', err)
-        }
-        return
-      }
-    }
-    // Handle ask_ action IDs (AskUserQuestion relay)
-    if (actionId.startsWith('ask_')) {
-      // Format: ask_<requestId>_<optionIndex>
-      const rest = actionId.slice('ask_'.length)
-      const lastUnderscore = rest.lastIndexOf('_')
-      if (lastUnderscore !== -1) {
-        const requestId = rest.slice(0, lastUnderscore)
-        const optionIndex = parseInt(rest.slice(lastUnderscore + 1), 10)
-        const pending = pendingQuestions.get(requestId)
-        if (pending) {
-          // Get the button text as the answer
-          const buttonText = (action as any).text?.text ?? `Option ${optionIndex + 1}`
-          completedAnswers.set(requestId, buttonText)
-          for (const waiter of pending.waiters) waiter(buttonText)
-          await ack()
-          pendingQuestions.delete(requestId)
-
-          const userId = ((p['user'] as Record<string, unknown> | undefined)?.['id'] as string | undefined) ?? ''
-          const userName = userId ? await resolveUserName(userId) : 'unknown'
-          try {
-            await web.chat.update({
-              channel: pending.channelId,
-              ts: pending.messageTs,
-              text: `${pending.question} — "${buttonText}" selected by ${userName}`,
-              blocks: [{
-                type: 'section',
-                text: {
-                  type: 'mrkdwn',
-                  text: `❓ *${pending.question}*\n✅ _"${buttonText}"_ — selected by ${userName}`,
-                },
-              }],
-            })
-          } catch (err) {
-            console.error('[slack] /ask: chat.update failed:', err)
-          }
-          return
-        }
-      }
-    }
-  }
-  await ack()
-})
-
-// ---------------------------------------------------------------------------
 // Routing config
 // ---------------------------------------------------------------------------
 
@@ -946,6 +843,119 @@ export async function main(): Promise<void> {
       process.exit(1)
     }
   }
+
+  if (routingConfig) {
+    if (routingConfig.channelsEnabled) {
+      console.error('[slack] Channels enabled')
+    } else {
+      console.error('[slack] Channels disabled (no-channels mode)')
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Socket Mode event routing
+  // ---------------------------------------------------------------------------
+
+  if (routingConfig?.channelsEnabled) {
+    socket.on('message', async ({ event, ack }) => {
+      console.error('[slack] RAW message event:', JSON.stringify(event)?.slice(0, 300))
+      await ack()
+      if (!event) return
+      try {
+        await handleMessage(event)
+      } catch (err) {
+        console.error('[slack] Error handling message:', err)
+      }
+    })
+
+    socket.on('app_mention', async ({ event, ack }) => {
+      console.error('[slack] RAW app_mention event:', JSON.stringify(event)?.slice(0, 300))
+      await ack()
+      if (!event) return
+      try {
+        await handleMessage(event)
+      } catch (err) {
+        console.error('[slack] Error handling mention:', err)
+      }
+    })
+  }
+
+  socket.on('interactive', async (evt) => {
+    const { ack } = evt as { ack: () => Promise<void> }
+    const p = ((evt as any).body ?? (evt as any).payload ?? evt) as Record<string, unknown>
+    const actions = (Array.isArray(p['actions']) ? p['actions'] : []) as Array<{ action_id: string }>
+    for (const action of actions) {
+      const actionId = action.action_id
+      if (actionId.startsWith('perm_allow_') || actionId.startsWith('perm_deny_')) {
+        const isAllow = actionId.startsWith('perm_allow_')
+        const prefix = isAllow ? 'perm_allow_' : 'perm_deny_'
+        const requestId = actionId.slice(prefix.length)
+        const pending = pendingPermissions.get(requestId)
+        if (pending) {
+          const decision: 'allow' | 'deny' = isAllow ? 'allow' : 'deny'
+          completedDecisions.set(requestId, decision)
+          for (const waiter of pending.waiters) waiter(decision)
+          await ack()
+          pendingPermissions.delete(requestId)
+
+          // Update the Slack message to remove buttons and show the decision
+          const userId = ((p['user'] as Record<string, unknown> | undefined)?.['id'] as string | undefined) ?? ''
+          const userName = userId ? await resolveUserName(userId) : 'unknown'
+          try {
+            await web.chat.update({
+              channel: pending.channelId,
+              ts: pending.messageTs,
+              text: `${pending.toolName} — ${decision === 'allow' ? 'Allowed' : 'Denied'} by ${userName}`,
+              blocks: buildPermissionDecisionBlocks(pending.toolName, decision, userName),
+            })
+          } catch (err) {
+            console.error('[slack] /permission: chat.update failed:', err)
+          }
+          return
+        }
+      }
+      // Handle ask_ action IDs (AskUserQuestion relay)
+      if (actionId.startsWith('ask_')) {
+        // Format: ask_<requestId>_<optionIndex>
+        const rest = actionId.slice('ask_'.length)
+        const lastUnderscore = rest.lastIndexOf('_')
+        if (lastUnderscore !== -1) {
+          const requestId = rest.slice(0, lastUnderscore)
+          const optionIndex = parseInt(rest.slice(lastUnderscore + 1), 10)
+          const pending = pendingQuestions.get(requestId)
+          if (pending) {
+            // Get the button text as the answer
+            const buttonText = (action as any).text?.text ?? `Option ${optionIndex + 1}`
+            completedAnswers.set(requestId, buttonText)
+            for (const waiter of pending.waiters) waiter(buttonText)
+            await ack()
+            pendingQuestions.delete(requestId)
+
+            const userId = ((p['user'] as Record<string, unknown> | undefined)?.['id'] as string | undefined) ?? ''
+            const userName = userId ? await resolveUserName(userId) : 'unknown'
+            try {
+              await web.chat.update({
+                channel: pending.channelId,
+                ts: pending.messageTs,
+                text: `${pending.question} — "${buttonText}" selected by ${userName}`,
+                blocks: [{
+                  type: 'section',
+                  text: {
+                    type: 'mrkdwn',
+                    text: `❓ *${pending.question}*\n✅ _"${buttonText}"_ — selected by ${userName}`,
+                  },
+                }],
+              })
+            } catch (err) {
+              console.error('[slack] /ask: chat.update failed:', err)
+            }
+            return
+          }
+        }
+      }
+    }
+    await ack()
+  })
 
   if (isDryRun()) {
     console.error('[slack] Running in dry-run mode — Slack disabled')
