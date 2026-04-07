@@ -62,6 +62,20 @@ Same pattern as permission relay but via `PreToolUse` hook on `AskUserQuestion`:
 4. User clicks option → server resolves
 5. Hook returns `allow` with `updatedInput.answers` containing the user's selection
 
+### Socket Mode Handler Registration
+
+Which Socket Mode event handlers are registered depends on the `channelsEnabled` config field:
+
+| Handler | `channelsEnabled: true` | `channelsEnabled: false` | Reason |
+|---------|------------------------|--------------------------|--------|
+| `message` | registered | not registered | Inbound channel messages |
+| `app_mention` | registered | not registered | Inbound @-mentions |
+| `interactive` | registered | registered | Always needed for permission/ask relay button clicks |
+
+The `interactive` handler is always registered regardless of mode because Allow/Deny button clicks from the permission relay and AskUserQuestion relay go through this path. Without it, hook long-polls would never resolve even when channels are disabled.
+
+Startup logs `[slack] Channels enabled` or `[slack] Channels disabled (no-channels mode)` to indicate which mode is active.
+
 ## Session Lifecycle
 
 ### Connection
@@ -184,6 +198,7 @@ Key fields:
 - `append_system_prompt_file` — optional path to a file appended to every managed session's system prompt via `--append-system-prompt-file`; missing file silently skipped
 - `system_prompt_mode` — controls whether `append_system_prompt_file` is applied (default: `"append"`; valid: `append`, `none`). `"append"` passes `--append-system-prompt-file` to Claude when launching sessions; `"none"` skips the flag entirely so only `CLAUDE.md` is used
 - `cozempic_prescription` — cozempic cleaning intensity used before `--resume` launches (default: `"standard"`; valid: `gentle`, `standard`, `aggressive`); has no effect if cozempic is not installed
+- `channelsEnabled` — when `false`, disables Socket Mode `message` and `app_mention` handlers so the server does not process channel messages (default: `true`; valid: `true`, `false`)
 
 ### sessions.json (~/.claude/channels/slack/sessions.json)
 

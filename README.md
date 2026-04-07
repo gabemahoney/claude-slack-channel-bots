@@ -118,6 +118,32 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | `append_system_prompt_file` | string | — | Path to a file appended to every managed session's system prompt via `--append-system-prompt-file`. Missing file silently skipped. See `skills/EXAMPLE_CLAUDE.md` for a template. |
 | `system_prompt_mode` | string | `"append"` | Controls how `append_system_prompt_file` is applied. `"append"`: the custom prompt file is appended on top of `CLAUDE.md` (default, current behavior). `"none"`: only `CLAUDE.md` is used; `append_system_prompt_file` is ignored even if set. Use `"none"` when the project's `CLAUDE.md` already contains everything the bot needs. |
 | `cozempic_prescription` | string | `"standard"` | Cozempic cleaning intensity before resume. Valid values: `gentle`, `standard`, `aggressive`. Has no effect if cozempic is not installed. |
+| `channelsEnabled` | boolean | `true` | When `false`, disables Slack channel message and `app_mention` handlers. The server starts without `--dangerously-load-development-channels`, no channel routes are registered, and inbound Slack messages are not dispatched. MCP tools (`reply`, `react`, etc.) and the interactive handler (permission relay, ask relay buttons) remain fully functional. See [No-Channels Mode](#no-channels-mode). |
+
+---
+
+### No-Channels Mode
+
+Set `channelsEnabled: false` in `config.json` to run the server without Slack channel message handling.
+
+**What changes:**
+
+- No `--dangerously-load-development-channels` flag is passed to managed sessions
+- `message` and `app_mention` Socket Mode event handlers are not registered
+- Channel routes in `config.json` are ignored — inbound messages are not dispatched to any session
+
+**What stays the same:**
+
+- The interactive handler is always registered. Permission relay and ask relay buttons work regardless of `channelsEnabled`.
+- All MCP tools (`reply`, `react`, `edit_message`, `fetch_messages`, `download_attachment`) are available.
+- Session management, health checks, and auto-restart are unchanged.
+- DM handling follows `dmPolicy` in `access.json` as normal.
+
+**When to use it:**
+
+- You want Slack as a notification and approval dashboard without giving Claude Code sessions access to channel message history.
+- You do not have a claude.ai Teams/Enterprise subscription and cannot use OAuth-gated channel features.
+- You are incrementally rolling out the integration — start with `channelsEnabled: false` and flip it to `true` later when you are ready for full channel routing.
 
 ---
 
