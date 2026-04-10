@@ -63,6 +63,13 @@ export interface PendingSessionEntry {
   deliveredChannels: Set<string>
   /** Unix ms timestamp of creation */
   createdAt: number
+  /**
+   * The SessionEntry stub created in initPendingSession.
+   * When present, the promotion path in registerSession mutates this object
+   * in place instead of creating a new one, so tool handler closures that
+   * captured the stub always read the latest peerPort / channelId / cwd.
+   */
+  stub?: SessionEntry
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +120,8 @@ export function registerSession(
   let resolvedServer: Server
   let deliveredChannels: Set<string>
 
+  let stub: SessionEntry | undefined
+
   if (typeof transportOrPendingId === 'string') {
     // Promotion path: look up pending entry by ID
     const pendingId = transportOrPendingId
@@ -124,6 +133,7 @@ export function registerSession(
     resolvedServer = pending.server
     deliveredChannels = pending.deliveredChannels
     deliveredChannels.add(channelId)  // seed with channel ID on promotion
+    stub = pending.stub
     removePendingSession(pendingId)
   } else {
     // Fresh registration path
@@ -140,14 +150,28 @@ export function registerSession(
     registry.delete(cwd)
   }
 
-  const entry: SessionEntry = {
-    cwd,
-    channelId,
-    transport,
-    server: resolvedServer,
-    deliveredChannels,
-    connected: true,
-    peerPort: 0,
+  let entry: SessionEntry
+  if (stub) {
+    // Mutate the existing stub in place so that any closures that captured it
+    // (e.g. tool handlers in createSessionServer) see the updated values.
+    stub.cwd = cwd
+    stub.channelId = channelId
+    stub.transport = transport
+    stub.server = resolvedServer
+    stub.deliveredChannels = deliveredChannels
+    stub.connected = true
+    // peerPort intentionally left as-is (stays 0 until first HTTP request)
+    entry = stub
+  } else {
+    entry = {
+      cwd,
+      channelId,
+      transport,
+      server: resolvedServer,
+      deliveredChannels,
+      connected: true,
+      peerPort: 0,
+    }
   }
   registry.set(cwd, entry)
   return entry
@@ -161,14 +185,19 @@ export function registerSession(
  * Create a pending session entry (session connected, route not yet known).
  * The pendingId must equal the transport's MCP session ID so that
  * resolveTransportForRequest can look it up by the Mcp-Session-Id header.
+ *
+ * Pass `stub` when the SessionEntry was already created (e.g. in initPendingSession)
+ * so that the promotion path in registerSession can mutate it in place rather than
+ * creating a new object. This keeps tool handler closures in sync with the registry.
  */
 export function createPendingSession(
   pendingId: string,
   transport: WebStandardStreamableHTTPServerTransport,
   server: Server,
   deliveredChannels: Set<string> = new Set(),
+  stub?: SessionEntry,
 ): PendingSessionEntry {
-  const entry: PendingSessionEntry = { pendingId, transport, server, deliveredChannels, createdAt: Date.now() }
+  const entry: PendingSessionEntry = { pendingId, transport, server, deliveredChannels, createdAt: Date.now(), stub }
   pendingSessionMap.set(pendingId, entry)
   return entry
 }

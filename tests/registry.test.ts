@@ -595,6 +595,32 @@ describe('registerSession — promotion path (pending → registered)', () => {
   test('promotion throws if pendingId not found', () => {
     expect(() => registerSession('/tmp/bad', 'C_BAD', 'nonexistent-pending-id')).toThrow()
   })
+
+  test('stub-less promotion: creates a fresh SessionEntry when no stub was provided', () => {
+    const transport = makeTransport()
+    const server = makeServer()
+    const delivered = new Set<string>()
+
+    // createPendingSession called WITHOUT a stub — exercises the else branch in registerSession
+    createPendingSession('stubless-id', transport, server, delivered)
+
+    const entry = registerSession('/tmp/stubless', 'C_SL', 'stubless-id')
+
+    // A new object must be returned (not undefined)
+    expect(entry).toBeDefined()
+    expect(entry.cwd).toBe('/tmp/stubless')
+    expect(entry.channelId).toBe('C_SL')
+    expect(entry.transport).toBe(transport)
+    expect(entry.server).toBe(server)
+    expect(entry.connected).toBe(true)
+    expect(entry.peerPort).toBe(0)
+
+    // deliveredChannels seeded with channelId on promotion
+    expect(entry.deliveredChannels.has('C_SL')).toBe(true)
+
+    // Pending entry must be cleaned up after promotion
+    expect(getPendingSession('stubless-id')).toBeUndefined()
+  })
 })
 
 describe('resolveTransportForRequest — pending session path', () => {

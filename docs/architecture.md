@@ -108,6 +108,8 @@ After every MCP tool call by a registered session, `registry.ts` fires a fire-an
 
 This path is skipped if `peerPort` is 0 (not yet set), if the `ss` command fails, or if the session file does not yet exist. For resume launches the stored UUID is already correct; for fresh launches `"pending"` is replaced with the real UUID on the first successful discovery.
 
+**Object identity invariant**: the `SessionEntry` stub created by `initPendingSession` in `server.ts` — the object that `createSessionServer`'s tool handlers close over — must be the same object stored in the registry after `registerSession` promotes the pending entry. `registerSession` mutates this stub in place and stores it directly, so that the `peerPort` write from the HTTP fetch handler (step 1 above) is immediately visible to the tool handler closure. If the registry and the closure held separate objects, `peerPort` would remain 0 and peer-PID discovery would never fire.
+
 ### Disconnection
 
 1. Transport closes → `onsessionclosed` fires

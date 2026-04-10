@@ -390,8 +390,9 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
     })
   }
 
-  // Store as pending
-  createPendingSession(pendingId, transport, server, deliveredChannels)
+  // Store as pending — pass entryStub so the promotion path can mutate it in
+  // place, keeping tool handler closures in sync with the registry entry.
+  createPendingSession(pendingId, transport, server, deliveredChannels, entryStub)
 
   // Wire server to transport
   server.connect(transport).catch((err) => {
