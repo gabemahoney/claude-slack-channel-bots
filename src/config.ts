@@ -221,6 +221,24 @@ export function resolveConfig(input: RoutingConfigInput): RoutingConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Route lookup
+// ---------------------------------------------------------------------------
+
+/**
+ * Find the channel whose route CWD exactly matches the given absolute path.
+ * Returns undefined when no route matches.
+ */
+export function findChannelByCwd(absoluteCwd: string, routes: RoutingConfig['routes']): string | undefined {
+  for (const [channelId, route] of Object.entries(routes)) {
+    const routeCwd = resolve(expandTilde(route.cwd))
+    if (routeCwd === absoluteCwd) {
+      return channelId
+    }
+  }
+  return undefined
+}
+
+// ---------------------------------------------------------------------------
 // I/O wrapper
 // ---------------------------------------------------------------------------
 

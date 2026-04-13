@@ -7,6 +7,7 @@ import {
   applyDefaults,
   validateConfig,
   expandTilde,
+  findChannelByCwd,
   resolveConfig,
   loadConfig,
   type RouteEntry,
@@ -743,5 +744,43 @@ describe('loadConfig', () => {
     writeFileSync(configPath, JSON.stringify(config), 'utf-8')
     const result = loadConfig(configPath)
     expect(result.system_prompt_mode).toBe('append')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// findChannelByCwd — b.qgw: exact match only, no ancestor matching
+// ---------------------------------------------------------------------------
+
+describe('findChannelByCwd', () => {
+  const routes: RoutingConfig['routes'] = {
+    C_PROJECTS: { cwd: '/home/user/projects' },
+    C_FOO: { cwd: '/home/user/projects/foo' },
+    C_BAR: { cwd: '/home/user/bar' },
+  }
+
+  test('exact match returns the channel', () => {
+    expect(findChannelByCwd('/home/user/projects', routes)).toBe('C_PROJECTS')
+    expect(findChannelByCwd('/home/user/projects/foo', routes)).toBe('C_FOO')
+    expect(findChannelByCwd('/home/user/bar', routes)).toBe('C_BAR')
+  })
+
+  test('subdirectory does NOT match parent route', () => {
+    expect(findChannelByCwd('/home/user/projects/baz', routes)).toBeUndefined()
+  })
+
+  test('subdirectory of a matched route does NOT match', () => {
+    expect(findChannelByCwd('/home/user/projects/foo/src', routes)).toBeUndefined()
+  })
+
+  test('parent directory does NOT match child route', () => {
+    expect(findChannelByCwd('/home/user', routes)).toBeUndefined()
+  })
+
+  test('unrelated path returns undefined', () => {
+    expect(findChannelByCwd('/tmp/something', routes)).toBeUndefined()
+  })
+
+  test('empty routes returns undefined', () => {
+    expect(findChannelByCwd('/home/user/projects', {})).toBeUndefined()
   })
 })

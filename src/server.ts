@@ -38,7 +38,7 @@ import {
   type Access,
   type GateResult,
 } from './lib.ts'
-import { loadConfig, expandTilde, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
+import { loadConfig, expandTilde, findChannelByCwd, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
 import { readSessions, writeSessions, rotateSessions } from './sessions.ts'
 import { defaultTmuxClient, sessionName, isClaudeRunning, getClaudePid } from './tmux.ts'
 import { startupSessionManager, launchSession } from './session-manager.ts'
@@ -79,19 +79,7 @@ export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
 // Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Find the channel whose route CWD exactly matches the given absolute path.
- * Returns undefined when no route matches.
- */
-function findChannelByCwd(absoluteCwd: string, routes: RoutingConfig['routes']): string | undefined {
-  for (const [channelId, route] of Object.entries(routes)) {
-    const routeCwd = resolve(expandTilde(route.cwd))
-    if (routeCwd === absoluteCwd) {
-      return channelId
-    }
-  }
-  return undefined
-}
+// findChannelByCwd imported from config.ts
 
 // ---------------------------------------------------------------------------
 // Constants
