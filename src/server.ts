@@ -80,23 +80,17 @@ export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
 // ---------------------------------------------------------------------------
 
 /**
- * Find the channel whose route CWD is the closest ancestor of (or equal to)
- * the given absolute path. Returns undefined when no route matches.
+ * Find the channel whose route CWD exactly matches the given absolute path.
+ * Returns undefined when no route matches.
  */
 function findChannelByCwd(absoluteCwd: string, routes: RoutingConfig['routes']): string | undefined {
-  let bestChannel: string | undefined
-  let bestLen = -1
   for (const [channelId, route] of Object.entries(routes)) {
     const routeCwd = resolve(expandTilde(route.cwd))
-    const rel = relative(routeCwd, absoluteCwd)
-    if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) {
-      if (routeCwd.length > bestLen) {
-        bestLen = routeCwd.length
-        bestChannel = channelId
-      }
+    if (routeCwd === absoluteCwd) {
+      return channelId
     }
   }
-  return bestChannel
+  return undefined
 }
 
 // ---------------------------------------------------------------------------
