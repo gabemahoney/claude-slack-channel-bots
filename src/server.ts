@@ -56,6 +56,14 @@ import { loadTokens, isDryRun } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
 import { trackAck, consumeAck } from './ack-tracker.ts'
 import {
+  openArchiveDatabase,
+  createNameResolver,
+  archiveSlackMessage,
+  type SlackMessageEvent,
+  type NameResolver,
+} from './message-archive.ts'
+import type { Database as ArchiveDatabase } from 'bun:sqlite'
+import {
   registerSession,
   unregisterByMcpSessionId,
   getSessionByChannel,
@@ -144,6 +152,26 @@ const web = new WebClient(botToken)
 const socket = new SocketModeClient({ appToken })
 
 let botUserId = ''
+
+// ---------------------------------------------------------------------------
+// Message archive — write every inbound Slack message to SQLite (feature-gated)
+// ---------------------------------------------------------------------------
+
+let archiveDb: ArchiveDatabase | undefined
+let archiveResolver: NameResolver | undefined
+
+/**
+ * Fire-and-forget archive write. Safe to call on every inbound event; a no-op
+ * when the feature is disabled. Errors are logged but never thrown so archiving
+ * can never interfere with routing/delivery.
+ */
+function archiveInboundMessage(event: unknown): void {
+  if (!archiveDb || !archiveResolver) return
+  const msg = event as SlackMessageEvent
+  archiveSlackMessage(archiveDb, msg, archiveResolver).catch((err) => {
+    console.error('[slack] message-archive write failed:', err)
+  })
+}
 
 // ---------------------------------------------------------------------------
 // Permission relay — pending request registry
@@ -726,6 +754,7 @@ socket.on('message', async ({ event, ack }) => {
   console.error('[slack] RAW message event:', JSON.stringify(event)?.slice(0, 300))
   await ack()
   if (!event) return
+  archiveInboundMessage(event)
   try {
     await handleMessage(event)
   } catch (err) {
@@ -737,6 +766,7 @@ socket.on('app_mention', async ({ event, ack }) => {
   console.error('[slack] RAW app_mention event:', JSON.stringify(event)?.slice(0, 300))
   await ack()
   if (!event) return
+  archiveInboundMessage(event)
   try {
     await handleMessage(event)
   } catch (err) {
@@ -916,6 +946,20 @@ export async function main(): Promise<void> {
     mcpPort = routingConfig.port
     const routeCount = Object.keys(routingConfig.routes).length
     console.error(`[slack] Loaded routing config: ${routeCount} route(s)`)
+
+    // Initialize message archive if configured
+    if (routingConfig.message_archive_db) {
+      try {
+        archiveDb = openArchiveDatabase(routingConfig.message_archive_db)
+        archiveResolver = createNameResolver(web)
+        console.error(`[slack] Message archive enabled: ${routingConfig.message_archive_db}`)
+      } catch (err) {
+        const cause = err instanceof Error ? err.message : String(err)
+        console.error(`[slack] Warning: failed to initialize message archive: ${cause}`)
+        archiveDb = undefined
+        archiveResolver = undefined
+      }
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     if (msg.includes('cannot read routing config')) {

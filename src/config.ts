@@ -45,6 +45,8 @@ export interface RoutingConfigInput {
   append_system_prompt_file?: string
   cozempic_prescription?: string
   system_prompt_mode?: string
+  /** Optional path to a SQLite DB where every inbound Slack message will be archived. */
+  message_archive_db?: string
 }
 
 /** Validated, fully-resolved routing configuration with all defaults applied. */
@@ -62,6 +64,8 @@ export interface RoutingConfig {
   append_system_prompt_file?: string
   cozempic_prescription: string
   system_prompt_mode: string
+  /** Absolute path to SQLite archive DB. Undefined disables the feature. */
+  message_archive_db?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +91,7 @@ export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
     append_system_prompt_file: input.append_system_prompt_file,
     cozempic_prescription: input.cozempic_prescription ?? 'standard',
     system_prompt_mode: input.system_prompt_mode ?? 'append',
+    message_archive_db: input.message_archive_db,
   }
 }
 
@@ -213,6 +218,9 @@ export function resolveConfig(input: RoutingConfigInput): RoutingConfig {
     mcp_config_path: resolve(expandTilde(withDefaults.mcp_config_path)),
     append_system_prompt_file: withDefaults.append_system_prompt_file !== undefined
       ? resolve(expandTilde(withDefaults.append_system_prompt_file))
+      : undefined,
+    message_archive_db: withDefaults.message_archive_db !== undefined
+      ? resolve(expandTilde(withDefaults.message_archive_db))
       : undefined,
   }
 

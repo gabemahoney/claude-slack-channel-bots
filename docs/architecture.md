@@ -23,6 +23,7 @@ cli.ts                  CLI entry point for the claude-slack-channel-bots comman
     ├── cozempic.ts         Optional cozempic CLI integration: PATH check, JSONL path resolution, file size helpers, async session cleaner
     ├── tokens.ts           Token loading — reads SLACK_BOT_TOKEN/SLACK_APP_TOKEN from env, validates prefixes
     ├── ack-tracker.ts      In-memory ack reaction state — Map keyed by channelId:messageTs, trackAck/consumeAck API, 30-day expiry pruning
+    ├── message-archive.ts  Optional SQLite archive of every inbound Slack message — opened when `message_archive_db` is set in config, writes fire-and-forget from socket.on('message'|'app_mention'), schema compatible with the Python nightly backfill script
     └── hooks/
         ├── permission-relay.sh   PermissionRequest hook — POST + long-poll for Allow/Deny
         └── ask-relay.sh          AskUserQuestion hook — POST + long-poll for option selection

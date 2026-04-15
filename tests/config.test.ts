@@ -136,6 +136,16 @@ describe('applyDefaults', () => {
     expect(result.append_system_prompt_file).toBeUndefined()
   })
 
+  test('passes through message_archive_db when present', () => {
+    const result = applyDefaults(makeRoutingConfig({ message_archive_db: '~/archive.db' }))
+    expect(result.message_archive_db).toBe('~/archive.db')
+  })
+
+  test('omits message_archive_db when absent', () => {
+    const result = applyDefaults(makeRoutingConfig())
+    expect(result.message_archive_db).toBeUndefined()
+  })
+
   test('fills exit_timeout with 120 when absent', () => {
     const result = applyDefaults(makeRoutingConfig({ exit_timeout: undefined }))
     expect(result.exit_timeout).toBe(120)
@@ -533,6 +543,19 @@ describe('resolveConfig', () => {
     const input = makeRoutingConfig()
     const result = resolveConfig(input)
     expect(result.append_system_prompt_file).toBeUndefined()
+  })
+
+  test('expands tilde in message_archive_db', () => {
+    const input = makeRoutingConfig({ message_archive_db: '~/archives/msg.db' })
+    const result = resolveConfig(input)
+    expect(result.message_archive_db).toStartWith(homedir())
+    expect(result.message_archive_db).not.toContain('~')
+  })
+
+  test('leaves message_archive_db undefined when absent', () => {
+    const input = makeRoutingConfig()
+    const result = resolveConfig(input)
+    expect(result.message_archive_db).toBeUndefined()
   })
 
   test('defaults cozempic_prescription to "standard" when absent', () => {
