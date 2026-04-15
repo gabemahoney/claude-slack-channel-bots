@@ -39,6 +39,7 @@ export interface SlackMessageEvent {
   thread_ts?: string
   subtype?: string
   bot_id?: string
+  username?: string
   hidden?: boolean
 }
 
@@ -64,22 +65,43 @@ export interface NameResolverWebClient {
 // Pure helpers
 // ---------------------------------------------------------------------------
 
+/** Subtype events that represent system/channel metadata, not chat content. */
+const SYSTEM_SUBTYPES = new Set([
+  'message_changed',
+  'message_deleted',
+  'channel_join',
+  'channel_leave',
+  'channel_topic',
+  'channel_purpose',
+  'channel_name',
+  'channel_archive',
+  'channel_unarchive',
+  'pinned_item',
+  'unpinned_item',
+])
+
 /**
  * Decide whether an inbound Slack message event should be archived.
- * We skip:
- *   - bot messages (bot_id present) — these are our own or other bots' posts
- *   - subtype events that aren't human chat (message_changed, message_deleted, channel_join, etc.)
- *   - events missing required fields
+ * We archive:
+ *   - Normal user messages (subtype undefined)
+ *   - Bot messages (subtype "bot_message" or bot_id set, user missing) — including
+ *     Carl, this router's own replies, and any other app in the channel, so both
+ *     sides of a conversation are captured
+ *   - File shares (human text accompanies the upload)
+ *   - Thread replies (subtype undefined, thread_ts set)
  *
- * Thread replies ARE archived (subtype is undefined, thread_ts carries linkage).
+ * We skip:
+ *   - System subtypes (edits, deletes, joins, topic changes, pins)
+ *   - Hidden events
+ *   - Events missing channel, ts, or text
+ *
+ * A message event must have EITHER user OR bot_id to identify the sender.
  */
 export function shouldArchive(event: SlackMessageEvent): boolean {
-  if (!event.channel || !event.user || !event.ts || typeof event.text !== 'string') return false
-  if (event.bot_id) return false
+  if (!event.channel || !event.ts || typeof event.text !== 'string') return false
+  if (!event.user && !event.bot_id) return false
   if (event.hidden) return false
-  // Only archive plain user messages. subtype === undefined means a normal chat message.
-  // Allow "file_share" since it carries human text too.
-  if (event.subtype && event.subtype !== 'file_share') return false
+  if (event.subtype && SYSTEM_SUBTYPES.has(event.subtype)) return false
   return true
 }
 
@@ -178,6 +200,29 @@ export function openArchiveDatabase(dbPath: string): Database {
 }
 
 /**
+ * Resolve sender identity from a Slack message event, handling both
+ * user-authored and bot-authored messages.
+ *
+ * - For user messages: sender_id = user, sender_name via resolver
+ * - For bot_message subtype (no user): sender_id = "bot:{bot_id}", sender_name = event.username or bot_id
+ * - For bot-posted messages WITH a user field (modern apps): sender_id = user, sender_name via resolver
+ */
+export async function resolveSenderIdentity(
+  event: SlackMessageEvent,
+  resolver: NameResolver,
+): Promise<{ senderId: string; senderName: string }> {
+  if (event.user) {
+    const senderName = await resolver.resolveUserName(event.user)
+    return { senderId: event.user, senderName }
+  }
+  // Bot message with no user field
+  const botId = event.bot_id ?? 'unknown'
+  const senderId = `bot:${botId}`
+  const senderName = event.username ?? botId
+  return { senderId, senderName }
+}
+
+/**
  * Insert a message into the archive. Uses INSERT OR IGNORE so concurrent
  * writes from the backfill script or edited-message races are safe.
  * Returns true if a new row was written, false if the message was already
@@ -191,13 +236,12 @@ export async function archiveSlackMessage(
   if (!shouldArchive(event)) return false
 
   const channelId = event.channel!
-  const userId = event.user!
   const ts = event.ts!
   const text = event.text!
 
-  const [channelName, senderName] = await Promise.all([
+  const [channelName, identity] = await Promise.all([
     resolver.resolveChannelName(channelId),
-    resolver.resolveUserName(userId),
+    resolveSenderIdentity(event, resolver),
   ])
 
   const id = buildMessageId(channelId, ts)
@@ -209,6 +253,15 @@ export async function archiveSlackMessage(
        (id, channel_id, channel_name, timestamp, sender_id, sender_name, message_text, thread_ts)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   )
-  const info = stmt.run(id, channelId, channelName, timestamp, userId, senderName, text, threadTs)
+  const info = stmt.run(
+    id,
+    channelId,
+    channelName,
+    timestamp,
+    identity.senderId,
+    identity.senderName,
+    text,
+    threadTs,
+  )
   return (info.changes ?? 0) > 0
 }

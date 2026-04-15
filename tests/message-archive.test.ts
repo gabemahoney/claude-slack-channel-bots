@@ -8,6 +8,7 @@ import {
   openArchiveDatabase,
   archiveSlackMessage,
   createNameResolver,
+  resolveSenderIdentity,
   type SlackMessageEvent,
   type NameResolver,
   type NameResolverWebClient,
@@ -68,8 +69,29 @@ describe('shouldArchive', () => {
     expect(shouldArchive(makeMessageEvent())).toBe(true)
   })
 
-  test('skips events from bots', () => {
-    expect(shouldArchive(makeMessageEvent({ bot_id: 'B123' }))).toBe(false)
+  test('archives bot messages with a user field (modern apps)', () => {
+    expect(shouldArchive(makeMessageEvent({ bot_id: 'B123' }))).toBe(true)
+  })
+
+  test('archives legacy bot_message subtype (no user, has bot_id)', () => {
+    const event: SlackMessageEvent = {
+      channel: 'C123',
+      ts: '1700000000.000100',
+      text: 'hello from bot',
+      subtype: 'bot_message',
+      bot_id: 'B999',
+      username: 'Carl',
+    }
+    expect(shouldArchive(event)).toBe(true)
+  })
+
+  test('rejects events with neither user nor bot_id', () => {
+    const event: SlackMessageEvent = {
+      channel: 'C1',
+      ts: '1',
+      text: 'hi',
+    }
+    expect(shouldArchive(event)).toBe(false)
   })
 
   test('skips events marked hidden', () => {
@@ -88,13 +110,19 @@ describe('shouldArchive', () => {
     expect(shouldArchive(makeMessageEvent({ subtype: 'channel_join' }))).toBe(false)
   })
 
+  test('skips channel_leave, channel_topic, pinned_item, etc.', () => {
+    for (const subtype of ['channel_leave', 'channel_topic', 'channel_purpose', 'channel_name', 'pinned_item', 'unpinned_item']) {
+      expect(shouldArchive(makeMessageEvent({ subtype }))).toBe(false)
+    }
+  })
+
   test('archives file_share subtype', () => {
     expect(shouldArchive(makeMessageEvent({ subtype: 'file_share' }))).toBe(true)
   })
 
   test('rejects events missing required fields', () => {
     expect(shouldArchive({ user: 'U1', ts: '1', text: 'hi' })).toBe(false)  // no channel
-    expect(shouldArchive({ channel: 'C1', ts: '1', text: 'hi' })).toBe(false)  // no user
+    expect(shouldArchive({ channel: 'C1', ts: '1', text: 'hi' })).toBe(false)  // no user or bot_id
     expect(shouldArchive({ channel: 'C1', user: 'U1', text: 'hi' })).toBe(false)  // no ts
     expect(shouldArchive({ channel: 'C1', user: 'U1', ts: '1' })).toBe(false)  // no text
   })
@@ -203,7 +231,7 @@ describe('archiveSlackMessage', () => {
   test('returns false and skips insert for non-archivable events', async () => {
     const result = await archiveSlackMessage(
       db,
-      makeMessageEvent({ bot_id: 'B1' }),
+      makeMessageEvent({ subtype: 'message_deleted' }),
       makeResolver(),
     )
     expect(result).toBe(false)
@@ -226,6 +254,83 @@ describe('archiveSlackMessage', () => {
     await archiveSlackMessage(db, makeMessageEvent({ ts: '2.2' }), makeResolver())
     const count = (db.query('SELECT COUNT(*) as c FROM messages').get() as any).c
     expect(count).toBe(2)
+  })
+
+  test('archives a legacy bot_message event (no user, has bot_id + username)', async () => {
+    const event: SlackMessageEvent = {
+      channel: 'C123',
+      ts: '1700000000.777000',
+      text: 'reply from Carl',
+      subtype: 'bot_message',
+      bot_id: 'B_CARL',
+      username: 'Carl',
+    }
+    const result = await archiveSlackMessage(db, event, makeResolver())
+    expect(result).toBe(true)
+
+    const row = db.query('SELECT * FROM messages').get() as any
+    expect(row.sender_id).toBe('bot:B_CARL')
+    expect(row.sender_name).toBe('Carl')
+    expect(row.message_text).toBe('reply from Carl')
+  })
+
+  test('archives a modern bot post (user set, bot_id set)', async () => {
+    const event: SlackMessageEvent = {
+      channel: 'C123',
+      user: 'U_APP',
+      ts: '1700000000.888000',
+      text: 'modern bot says hi',
+      bot_id: 'B_APP',
+    }
+    const result = await archiveSlackMessage(db, event, makeResolver())
+    expect(result).toBe(true)
+    const row = db.query('SELECT * FROM messages').get() as any
+    expect(row.sender_id).toBe('U_APP')  // prefer user when present
+  })
+})
+
+// ---------------------------------------------------------------------------
+// resolveSenderIdentity
+// ---------------------------------------------------------------------------
+
+describe('resolveSenderIdentity', () => {
+  test('uses user + resolver for user messages', async () => {
+    const identity = await resolveSenderIdentity(makeMessageEvent({ user: 'U123' }), makeResolver())
+    expect(identity.senderId).toBe('U123')
+    expect(identity.senderName).toBe('user-U123')
+  })
+
+  test('uses bot:<bot_id> + username for bot_message events', async () => {
+    const event: SlackMessageEvent = {
+      channel: 'C1',
+      ts: '1',
+      text: 'hi',
+      subtype: 'bot_message',
+      bot_id: 'B_CARL',
+      username: 'Carl',
+    }
+    const identity = await resolveSenderIdentity(event, makeResolver())
+    expect(identity.senderId).toBe('bot:B_CARL')
+    expect(identity.senderName).toBe('Carl')
+  })
+
+  test('falls back to bot_id when username missing', async () => {
+    const event: SlackMessageEvent = {
+      channel: 'C1',
+      ts: '1',
+      text: 'hi',
+      subtype: 'bot_message',
+      bot_id: 'B_X',
+    }
+    const identity = await resolveSenderIdentity(event, makeResolver())
+    expect(identity.senderId).toBe('bot:B_X')
+    expect(identity.senderName).toBe('B_X')
+  })
+
+  test('uses "unknown" placeholder when both user and bot_id missing (degenerate)', async () => {
+    const event: SlackMessageEvent = { channel: 'C1', ts: '1', text: 'hi' }
+    const identity = await resolveSenderIdentity(event, makeResolver())
+    expect(identity.senderId).toBe('bot:unknown')
   })
 })
 
