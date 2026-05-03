@@ -20,34 +20,23 @@ if [ -f "$CONFIG_FILE" ]; then
   fi
 fi
 
-# Guard: only relay for bot-managed sessions. Claude Code wraps hooks in
-# `sh -c`, so $PPID is the transient shell, not the claude process. Walk
-# up the process tree until we find the nearest ancestor whose comm is
-# "claude", then query /is-managed with that PID. Subagent chains hit a
-# subagent-claude (not in any configured route) → 404 → hook exits silently.
-CHECK_PID=$PPID
-for _ in 1 2 3 4 5 6 7 8; do
-  if [ -z "$CHECK_PID" ] || [ "$CHECK_PID" = "0" ] || [ "$CHECK_PID" = "1" ]; then
-    break
-  fi
-  COMM=$(cat /proc/$CHECK_PID/comm 2>/dev/null || true)
-  if [ "$COMM" = "claude" ]; then
-    break
-  fi
-  CHECK_PID=$(awk '/^PPid:/{print $2}' /proc/$CHECK_PID/status 2>/dev/null || echo "")
-done
-HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/is-managed?pid=$CHECK_PID" 2>/dev/null) || HTTP_STATUS="000"
-if [ "$HTTP_STATUS" != "200" ]; then
+# Guard: only relay for bot-managed sessions
+if [ -z "${CLAUDE_MANAGED_CHANNEL:-}" ]; then
   exit 0
 fi
+CHANNEL="$CLAUDE_MANAGED_CHANNEL"
+
+deny_and_exit() {
+  printf '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"%s"}}}\n' "$1"
+  exit 0
+}
 
 # Read stdin
 INPUT=$(cat)
 
 # Extract fields from input
-TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // ""' 2>/dev/null) || exit 0
-TOOL_INPUT=$(echo "$INPUT" | jq -c '.tool_input // {}' 2>/dev/null) || exit 0
-CWD=$(echo "$INPUT" | jq -r '.cwd // ""' 2>/dev/null) || exit 0
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // ""' 2>/dev/null) || deny_and_exit "Failed to parse tool_name"
+TOOL_INPUT=$(echo "$INPUT" | jq -c '.tool_input // {}' 2>/dev/null) || deny_and_exit "Failed to parse tool_input"
 
 BASE_URL="http://127.0.0.1:${PORT}"
 
@@ -55,27 +44,27 @@ BASE_URL="http://127.0.0.1:${PORT}"
 PAYLOAD=$(jq -n \
   --arg tool_name "$TOOL_NAME" \
   --argjson tool_input "$TOOL_INPUT" \
-  --arg cwd "$CWD" \
-  '{tool_name: $tool_name, tool_input: $tool_input, cwd: $cwd}' 2>/dev/null) || exit 0
+  --arg channel "$CHANNEL" \
+  '{tool_name: $tool_name, tool_input: $tool_input, channel: $channel}' 2>/dev/null) || deny_and_exit "Failed to build payload"
 
 RESPONSE=$(curl -s -f -X POST \
   -H "Content-Type: application/json" \
   -d "$PAYLOAD" \
   --max-time 10 \
-  "${BASE_URL}/permission" 2>/dev/null) || exit 0
+  "${BASE_URL}/permission" 2>/dev/null) || deny_and_exit "Server unreachable"
 
-REQUEST_ID=$(echo "$RESPONSE" | jq -r '.requestId // ""' 2>/dev/null) || exit 0
+REQUEST_ID=$(echo "$RESPONSE" | jq -r '.requestId // ""' 2>/dev/null) || deny_and_exit "Failed to parse response"
 if [ -z "$REQUEST_ID" ]; then
-  exit 0
+  deny_and_exit "No requestId in server response"
 fi
 
 # Phase 2 — Long-poll loop (curl --max-time 90: 60s server hold + 30s buffer)
 while true; do
   POLL_RESPONSE=$(curl -s -f \
     --max-time 90 \
-    "${BASE_URL}/permission/${REQUEST_ID}" 2>/dev/null) || exit 0
+    "${BASE_URL}/permission/${REQUEST_ID}" 2>/dev/null) || deny_and_exit "Server connection lost"
 
-  STATUS=$(echo "$POLL_RESPONSE" | jq -r '.status // ""' 2>/dev/null) || exit 0
+  STATUS=$(echo "$POLL_RESPONSE" | jq -r '.status // ""' 2>/dev/null) || deny_and_exit "Failed to parse response"
 
   case "$STATUS" in
     "pending")
@@ -83,7 +72,7 @@ while true; do
       continue
       ;;
     "decided")
-      BEHAVIOR=$(echo "$POLL_RESPONSE" | jq -r '.decision // ""' 2>/dev/null) || exit 0
+      BEHAVIOR=$(echo "$POLL_RESPONSE" | jq -r '.decision // ""' 2>/dev/null) || deny_and_exit "Failed to parse decision"
       if [ "$BEHAVIOR" = "allow" ]; then
         printf '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}\n'
       else
@@ -92,8 +81,8 @@ while true; do
       exit 0
       ;;
     *)
-      # Unknown status — fall through to TUI
-      exit 0
+      # Unknown status — deny to fail closed
+      deny_and_exit "Unexpected poll status: $STATUS"
       ;;
   esac
 done
