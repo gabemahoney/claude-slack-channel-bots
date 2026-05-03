@@ -1338,6 +1338,82 @@ export async function main(): Promise<void> {
       }
 
 
+      // -----------------------------------------------------------------------
+      // /interject — inject a message into an active session from localhost
+      // -----------------------------------------------------------------------
+      if (url.pathname === '/interject') {
+        if (req.method !== 'POST') {
+          return new Response('Method Not Allowed', { status: 405 })
+        }
+        const remoteAddr = server.requestIP(req)
+        const remoteHost = remoteAddr?.address ?? ''
+        if (remoteHost !== '127.0.0.1' && remoteHost !== '::1' && !remoteHost.startsWith('::ffff:127.')) {
+          return new Response('Forbidden', { status: 403 })
+        }
+
+        let body: { channel?: unknown; message?: unknown; sender?: unknown }
+        try {
+          body = await req.json()
+        } catch {
+          return new Response(JSON.stringify({ error: 'Invalid JSON' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+
+        const { channel, message, sender } = body
+        if (typeof channel !== 'string' || !channel) {
+          return new Response(
+            JSON.stringify({ error: 'Missing or invalid field: channel (string) required' }),
+            { status: 400, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        if (typeof message !== 'string' || !message) {
+          return new Response(
+            JSON.stringify({ error: 'Missing or invalid field: message (string) required' }),
+            { status: 400, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+
+        // Check if the channel exists in routing config
+        const route = routingConfig?.routes[channel]
+        if (!route) {
+          return new Response(
+            JSON.stringify({ error: 'Channel not found in routing config' }),
+            { status: 404, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+
+        // Check if a session is connected for this channel
+        const targetSession = getSessionByChannel(channel, routingConfig!)
+        if (!targetSession || !targetSession.connected) {
+          return new Response(
+            JSON.stringify({ error: 'No active session for this channel' }),
+            { status: 503, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+
+        const senderLabel = typeof sender === 'string' && sender ? sender : 'interject'
+        const ts = String(Date.now() / 1000)
+        const meta: Record<string, string> = {
+          chat_id: channel,
+          message_id: ts,
+          user: senderLabel,
+          ts,
+        }
+
+        console.error(`[slack] /interject: delivering to session cwd="${targetSession.cwd}" channel=${channel} sender="${senderLabel}" message="${message.slice(0, 80)}"`)
+        targetSession.server.notification({
+          method: 'notifications/claude/channel',
+          params: { content: message, meta },
+        })
+
+        return new Response(JSON.stringify({ ok: true, channel, cwd: targetSession.cwd }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
       // Only /mcp is the MCP endpoint — everything else is a 404
       if (url.pathname !== '/mcp') {
         return new Response(
