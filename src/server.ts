@@ -18,7 +18,7 @@ import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/
 import { SocketModeClient } from '@slack/socket-mode'
 import { WebClient } from '@slack/web-api'
 import { homedir } from 'os'
-import { join, resolve, relative, isAbsolute } from 'path'
+import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
 import {
   readFileSync,
@@ -38,9 +38,9 @@ import {
   type Access,
   type GateResult,
 } from './lib.ts'
-import { loadConfig, expandTilde, findChannelByCwd, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
+import { loadConfig, expandTilde, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
 import { readSessions, writeSessions, rotateSessions } from './sessions.ts'
-import { defaultTmuxClient, sessionName, isClaudeRunning, getClaudePid } from './tmux.ts'
+import { defaultTmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
 import { startupSessionManager, launchSession } from './session-manager.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import {
@@ -87,7 +87,6 @@ export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
 // Helpers
 // ---------------------------------------------------------------------------
 
-// findChannelByCwd imported from config.ts
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1099,7 +1098,7 @@ export async function main(): Promise<void> {
         }
 
         // Parse and validate JSON body
-        let body: { tool_name?: unknown; tool_input?: unknown; cwd?: unknown }
+        let body: { tool_name?: unknown; tool_input?: unknown; channel?: unknown }
         try {
           body = await req.json()
         } catch {
@@ -1109,29 +1108,23 @@ export async function main(): Promise<void> {
           })
         }
 
-        const { tool_name, tool_input, cwd } = body
+        const { tool_name, tool_input, channel } = body
         if (
           typeof tool_name !== 'string' ||
           typeof tool_input !== 'object' ||
           tool_input === null ||
-          typeof cwd !== 'string'
+          typeof channel !== 'string'
         ) {
           return new Response(
-            JSON.stringify({ error: 'Missing or invalid fields: tool_name, tool_input, cwd required' }),
+            JSON.stringify({ error: 'Missing or invalid fields: tool_name, tool_input, channel required' }),
             { status: 400, headers: { 'Content-Type': 'application/json' } },
           )
         }
 
-        // Find the most specific route whose CWD is an ancestor of (or equal to) the request CWD
-        const normalizedCwd = resolve(expandTilde(cwd))
-        const matchedChannelId = routingConfig
-          ? findChannelByCwd(normalizedCwd, routingConfig.routes)
-          : undefined
-
+        const matchedChannelId = routingConfig?.routes[channel] ? channel : undefined
         if (!matchedChannelId) {
-          return new Response(JSON.stringify({ error: 'No route found for CWD' }), {
-            status: 404,
-            headers: { 'Content-Type': 'application/json' },
+          return new Response(JSON.stringify({ error: 'Unknown channel' }), {
+            status: 404, headers: { 'Content-Type': 'application/json' },
           })
         }
 
@@ -1258,7 +1251,7 @@ export async function main(): Promise<void> {
         }
 
         // POST /ask — create a new question
-        let body: { question?: unknown; options?: unknown; cwd?: unknown }
+        let body: { question?: unknown; options?: unknown; channel?: unknown }
         try {
           body = await req.json()
         } catch {
@@ -1268,24 +1261,18 @@ export async function main(): Promise<void> {
           })
         }
 
-        const { question, options, cwd } = body
-        if (typeof question !== 'string' || !Array.isArray(options) || typeof cwd !== 'string') {
+        const { question, options, channel } = body
+        if (typeof question !== 'string' || !Array.isArray(options) || typeof channel !== 'string') {
           return new Response(
-            JSON.stringify({ error: 'Missing or invalid fields: question, options, cwd required' }),
+            JSON.stringify({ error: 'Missing or invalid fields: question, options, channel required' }),
             { status: 400, headers: { 'Content-Type': 'application/json' } },
           )
         }
 
-        // Find the most specific route whose CWD is an ancestor of (or equal to) the request CWD
-        const normalizedCwd = resolve(expandTilde(cwd as string))
-        const matchedChannelId = routingConfig
-          ? findChannelByCwd(normalizedCwd, routingConfig.routes)
-          : undefined
-
+        const matchedChannelId = routingConfig?.routes[channel] ? channel : undefined
         if (!matchedChannelId) {
-          return new Response(JSON.stringify({ error: 'No route found for CWD' }), {
-            status: 404,
-            headers: { 'Content-Type': 'application/json' },
+          return new Response(JSON.stringify({ error: 'Unknown channel' }), {
+            status: 404, headers: { 'Content-Type': 'application/json' },
           })
         }
 
@@ -1350,43 +1337,6 @@ export async function main(): Promise<void> {
         })
       }
 
-      // /is-managed — PID-based session membership check for hook guards
-      if (url.pathname === '/is-managed') {
-        if (req.method !== 'GET') {
-          return new Response('Method Not Allowed', { status: 405 })
-        }
-        // Validate localhost
-        const remoteAddr = server.requestIP(req)
-        const remoteHost = remoteAddr?.address ?? ''
-        if (remoteHost !== '127.0.0.1' && remoteHost !== '::1' && !remoteHost.startsWith('::ffff:127.')) {
-          return new Response('Forbidden', { status: 403 })
-        }
-        const pidStr = url.searchParams.get('pid')
-        const pid = pidStr ? parseInt(pidStr, 10) : NaN
-        if (isNaN(pid) || pid <= 0) {
-          return new Response(JSON.stringify({ error: 'Missing or invalid pid parameter' }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' },
-          })
-        }
-        // Check all configured routes
-        if (routingConfig) {
-          for (const [, route] of Object.entries(routingConfig.routes)) {
-            const name = sessionName(route.cwd)
-            const claudePid = await getClaudePid(name, defaultTmuxClient)
-            if (claudePid === pid) {
-              return new Response(JSON.stringify({ managed: true }), {
-                status: 200,
-                headers: { 'Content-Type': 'application/json' },
-              })
-            }
-          }
-        }
-        return new Response(JSON.stringify({ managed: false }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' },
-        })
-      }
 
       // Only /mcp is the MCP endpoint — everything else is a 404
       if (url.pathname !== '/mcp') {

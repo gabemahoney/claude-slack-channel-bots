@@ -10,7 +10,8 @@
  */
 
 import { describe, test, expect, beforeEach, afterAll } from 'bun:test'
-import { resolve, relative, isAbsolute } from 'path'
+
+
 
 // ---------------------------------------------------------------------------
 // Types (mirrored from server.ts)
@@ -46,8 +47,6 @@ const pendingPermissions = new Map<string, PendingPermission>()
 const completedDecisions = new Map<string, 'allow' | 'deny'>()
 const pendingQuestions = new Map<string, PendingQuestion>()
 const completedAnswers = new Map<string, string>()
-const managedPids = new Set<number>()
-
 let routingConfig: { routes: Record<string, { cwd: string }> } | null = null
 
 // Call-capture arrays — reset in beforeEach via .length = 0
@@ -164,30 +163,6 @@ const testServer = Bun.serve({
   port: 0,
   async fetch(req: Request, server: any): Promise<Response> {
     const url = new URL(req.url)
-
-    if (url.pathname === '/is-managed') {
-      if (req.method !== 'GET') {
-        return new Response('Method Not Allowed', { status: 405 })
-      }
-      const pidStr = url.searchParams.get('pid')
-      const pid = pidStr ? parseInt(pidStr, 10) : NaN
-      if (isNaN(pid) || pid <= 0) {
-        return new Response(JSON.stringify({ error: 'Missing or invalid pid parameter' }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json' },
-        })
-      }
-      if (managedPids.has(pid)) {
-        return new Response(JSON.stringify({ managed: true }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        })
-      }
-      return new Response(JSON.stringify({ managed: false }), {
-        status: 404,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    }
 
     if (!url.pathname.startsWith('/permission') && !url.pathname.startsWith('/ask')) {
       return new Response('Not Found', { status: 404 })
@@ -350,7 +325,7 @@ const testServer = Bun.serve({
 
     // POST /permission — validate, post stub message, register pending, return requestId
 
-    let body: { tool_name?: unknown; tool_input?: unknown; cwd?: unknown }
+    let body: { tool_name?: unknown; tool_input?: unknown; channel?: unknown }
     try {
       body = await req.json()
     } catch {
@@ -360,37 +335,23 @@ const testServer = Bun.serve({
       })
     }
 
-    const { tool_name, tool_input, cwd } = body
+    const { tool_name, tool_input, channel } = body
     if (
       typeof tool_name !== 'string' ||
       typeof tool_input !== 'object' ||
       tool_input === null ||
-      typeof cwd !== 'string'
+      typeof channel !== 'string'
     ) {
       return new Response(
-        JSON.stringify({ error: 'Missing or invalid fields: tool_name, tool_input, cwd required' }),
+        JSON.stringify({ error: 'Missing or invalid fields: tool_name, tool_input, channel required' }),
         { status: 400, headers: { 'Content-Type': 'application/json' } },
       )
     }
 
-    const normalizedCwd = resolve(cwd)
-    let matchedChannelId: string | undefined
-    if (routingConfig) {
-      let bestLen = -1
-      for (const [chId, route] of Object.entries(routingConfig.routes)) {
-        const routeCwd = resolve(route.cwd)
-        const rel = relative(routeCwd, normalizedCwd)
-        if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) {
-          if (routeCwd.length > bestLen) {
-            bestLen = routeCwd.length
-            matchedChannelId = chId
-          }
-        }
-      }
-    }
+    const matchedChannelId = routingConfig?.routes[channel as string] ? (channel as string) : undefined
 
     if (!matchedChannelId) {
-      return new Response(JSON.stringify({ error: 'No route found for CWD' }), {
+      return new Response(JSON.stringify({ error: 'Unknown channel' }), {
         status: 404,
         headers: { 'Content-Type': 'application/json' },
       })
@@ -477,7 +438,6 @@ beforeEach(() => {
   completedDecisions.clear()
   pendingQuestions.clear()
   completedAnswers.clear()
-  managedPids.clear()
   postMessageCalls.length = 0
   chatUpdateCalls.length = 0
   routingConfig = null
@@ -503,7 +463,7 @@ describe('permission relay — /permission endpoint', () => {
       body: JSON.stringify({
         tool_name: 'Bash',
         tool_input: { command: 'ls -la' },
-        cwd: '/tmp/test-project',
+        channel: 'C_TEST',
       }),
     })
     expect(postRes.status).toBe(200)
@@ -533,8 +493,8 @@ describe('permission relay — /permission endpoint', () => {
     expect(body.decision).toBe('allow')
   })
 
-  // TC-2: unrecognized CWD → 404 (unchanged)
-  test('TC-2: POST with unrecognized CWD returns 404', async () => {
+  // TC-2: unknown channel → 404
+  test('TC-2: POST with unknown channel returns 404', async () => {
     routingConfig = { routes: { C_TEST: { cwd: '/tmp/known-project' } } }
 
     const response = await fetch(`${BASE_URL}/permission`, {
@@ -543,82 +503,21 @@ describe('permission relay — /permission endpoint', () => {
       body: JSON.stringify({
         tool_name: 'Bash',
         tool_input: { command: 'ls' },
-        cwd: '/tmp/unknown-project',
+        channel: 'C_UNKNOWN',
       }),
     })
 
     expect(response.status).toBe(404)
     const body = (await response.json()) as { error: string }
-    expect(body.error).toContain('No route found')
+    expect(body.error).toContain('Unknown channel')
   })
 
-  test('POST with CWD that is a subdirectory of a route matches that route', async () => {
-    routingConfig = { routes: { C_TEST: { cwd: '/tmp/known-project' } } }
-
+  // TC-3: missing required fields → 400
+  test('TC-3: POST with missing fields (tool_input, channel) returns 400', async () => {
     const response = await fetch(`${BASE_URL}/permission`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        tool_name: 'Bash',
-        tool_input: { command: 'ls' },
-        cwd: '/tmp/known-project/subdir/repo',
-      }),
-    })
-
-    expect(response.status).toBe(200)
-    const body = (await response.json()) as { requestId: string }
-    expect(body.requestId).toBeDefined()
-    expect(postMessageCalls.length).toBe(1)
-    expect(postMessageCalls[0].channel).toBe('C_TEST')
-  })
-
-  test('POST with multiple routes picks the most specific match', async () => {
-    routingConfig = {
-      routes: {
-        C_PARENT: { cwd: '/tmp/projects' },
-        C_CHILD: { cwd: '/tmp/projects/specific-project' },
-      },
-    }
-
-    const response = await fetch(`${BASE_URL}/permission`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        tool_name: 'Read',
-        tool_input: { file_path: '/etc/foo' },
-        cwd: '/tmp/projects/specific-project/src',
-      }),
-    })
-
-    expect(response.status).toBe(200)
-    const body = (await response.json()) as { requestId: string }
-    expect(body.requestId).toBeDefined()
-    expect(postMessageCalls.length).toBe(1)
-    expect(postMessageCalls[0].channel).toBe('C_CHILD')
-  })
-
-  test('POST with CWD outside all routes returns 404', async () => {
-    routingConfig = { routes: { C_TEST: { cwd: '/tmp/known-project' } } }
-
-    const response = await fetch(`${BASE_URL}/permission`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        tool_name: 'Bash',
-        tool_input: { command: 'ls' },
-        cwd: '/tmp/known-project-other',
-      }),
-    })
-
-    expect(response.status).toBe(404)
-  })
-
-  // TC-3: missing required fields → 400 (unchanged)
-  test('TC-3: POST with missing fields returns 400', async () => {
-    const response = await fetch(`${BASE_URL}/permission`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tool_name: 'Bash' }), // tool_input and cwd absent
+      body: JSON.stringify({ tool_name: 'Bash' }), // tool_input and channel absent
     })
 
     expect(response.status).toBe(400)
@@ -667,7 +566,7 @@ describe('permission relay — /permission endpoint', () => {
       body: JSON.stringify({
         tool_name: 'Bash',
         tool_input: { command: 'echo 1' },
-        cwd: '/tmp/shared-project',
+        channel: 'C_SHARED',
       }),
     })
     const post2 = await fetch(`${BASE_URL}/permission`, {
@@ -676,7 +575,7 @@ describe('permission relay — /permission endpoint', () => {
       body: JSON.stringify({
         tool_name: 'Write',
         tool_input: { file_path: '/tmp/foo.txt' },
-        cwd: '/tmp/shared-project',
+        channel: 'C_SHARED',
       }),
     })
     const { requestId: id1 } = (await post1.json()) as { requestId: string }
@@ -873,44 +772,3 @@ describe('permission relay — /permission endpoint', () => {
   })
 })
 
-// ---------------------------------------------------------------------------
-// /is-managed endpoint
-// ---------------------------------------------------------------------------
-
-describe('/is-managed endpoint', () => {
-  test('returns 200 for managed PID', async () => {
-    managedPids.add(12345)
-    const res = await fetch(`${BASE_URL}/is-managed?pid=12345`)
-    expect(res.status).toBe(200)
-    const body = (await res.json()) as { managed: boolean }
-    expect(body.managed).toBe(true)
-    managedPids.delete(12345)
-  })
-
-  test('returns 404 for unmanaged PID', async () => {
-    const res = await fetch(`${BASE_URL}/is-managed?pid=99999`)
-    expect(res.status).toBe(404)
-    const body = (await res.json()) as { managed: boolean }
-    expect(body.managed).toBe(false)
-  })
-
-  test('returns 400 for missing pid', async () => {
-    const res = await fetch(`${BASE_URL}/is-managed`)
-    expect(res.status).toBe(400)
-  })
-
-  test('returns 400 for invalid pid', async () => {
-    const res = await fetch(`${BASE_URL}/is-managed?pid=abc`)
-    expect(res.status).toBe(400)
-  })
-
-  test('returns 400 for negative pid', async () => {
-    const res = await fetch(`${BASE_URL}/is-managed?pid=-1`)
-    expect(res.status).toBe(400)
-  })
-
-  test('returns 405 for POST', async () => {
-    const res = await fetch(`${BASE_URL}/is-managed`, { method: 'POST' })
-    expect(res.status).toBe(405)
-  })
-})
