@@ -278,11 +278,11 @@ When Claude Code requires tool approval, the permission relay surfaces an intera
 
 The `ask-relay.sh` hook intercepts `AskUserQuestion` tool calls via `PreToolUse`, posts the question and its options to Slack as interactive buttons, and waits for the user's selection. The answer is returned to Claude Code via `updatedInput` without blocking the TUI.
 
-Both hooks are **scope-guarded**: on each invocation they call the server's `GET /is-managed?pid=$PPID` endpoint to verify that the calling process belongs to a server-managed Claude session. If the server is not running or does not recognize the PID, the hooks exit silently (no-op). This means installing the hooks globally in `settings.json` is safe — they will not activate for Claude sessions you run outside the bot.
+Both hooks are **scope-guarded**: they check the `CLAUDE_MANAGED_CHANNEL` environment variable, which is set as an inline env var (no `export`) on the `claude` command at launch. If the variable is absent, the hooks exit silently (no-op). This means installing the hooks globally in `settings.json` is safe — they will not activate for Claude sessions you run outside the bot. If the variable is present but the server is unreachable, hooks fail closed (deny the tool call) to prevent indefinite hangs in headless sessions.
 
 Both hooks use a **two-phase long-poll protocol**:
 
-1. **Phase 1 — Create request:** The hook POSTs to `/permission` (or `/ask`) with the tool name, input, and CWD. The server posts an interactive Slack message and returns a `requestId`.
+1. **Phase 1 — Create request:** The hook POSTs to `/permission` (or `/ask`) with the tool name, input, and channel ID (from `$CLAUDE_MANAGED_CHANNEL`). The server posts an interactive Slack message and returns a `requestId`.
 2. **Phase 2 — Long-poll:** The hook GETs `/permission/{requestId}` (or `/ask/{requestId}`) in a loop with a 90-second `curl` timeout. The server holds the connection for up to 60 seconds waiting for a button click, then returns `{"status":"pending"}` if no decision has arrived. The hook retries immediately. Once the user clicks, the server returns `{"status":"decided","decision":"allow"|"deny"}` and the hook exits.
 
 ### Slack app prerequisites
@@ -356,7 +356,7 @@ After inviting the bot to a channel, Slack may not deliver messages until the bo
 Messages to channels not listed in `access.json → channels` and not present in `config.json → routes` are silently dropped. Use the `claude-slack-channels-config` skill or edit `access.json` directly to add the channel ID with a `ChannelPolicy` entry.
 
 **Permission relay not working**
-Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify `curl` and `jq` are on your `PATH`. Confirm the hook scripts are executable (`chmod +x`). If the port was changed in `config.json`, ensure `SLACK_STATE_DIR` is set correctly so the hooks can read the updated port. If the hooks are silently doing nothing, confirm the session was launched by the server — the hooks call `GET /is-managed?pid=$PPID` and exit silently if the server is unreachable or the PID is not recognized. Sessions launched manually will not trigger the relay.
+Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify `curl` and `jq` are on your `PATH`. Confirm the hook scripts are executable (`chmod +x`). If the port was changed in `config.json`, ensure `SLACK_STATE_DIR` is set correctly so the hooks can read the updated port. If the hooks are silently doing nothing, confirm the session was launched by the server — the hooks check the `CLAUDE_MANAGED_CHANNEL` env var and exit silently if it is not set. Sessions launched manually will not have this variable and will not trigger the relay.
 
 **Session not restarting after crash**
 After 3 consecutive launch failures for a route, auto-restart is suspended until the server is restarted. Restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`. To disable auto-restart entirely, set `session_restart_delay` to `0` in `config.json`.

@@ -49,19 +49,23 @@ cli.ts                  CLI entry point for the claude-slack-channel-bots comman
 ### Permission Relay
 
 1. Claude Code hits a permission prompt → `PermissionRequest` hook fires
-2. `permission-relay.sh` POSTs to `/permission` → server posts Block Kit message to Slack
-3. Hook long-polls `GET /permission/<requestId>` (60s per poll)
-4. User clicks Allow/Deny button → Socket Mode interactive event → server resolves the decision
-5. Hook returns decision to Claude Code
+2. `permission-relay.sh` checks `$CLAUDE_MANAGED_CHANNEL` — if unset, exits silently (not a managed session)
+3. Hook POSTs to `/permission` with the channel ID directly → server posts Block Kit message to Slack
+4. Hook long-polls `GET /permission/<requestId>` (60s per poll)
+5. User clicks Allow/Deny button → Socket Mode interactive event → server resolves the decision
+6. Hook returns decision to Claude Code
+7. **Fail-closed**: if the server is unreachable or returns an error, the hook emits a deny response rather than falling through to terminal (which would hang in a headless tmux session)
 
 ### AskUserQuestion Relay
 
 Same pattern as permission relay but via `PreToolUse` hook on `AskUserQuestion`:
-1. `ask-relay.sh` intercepts via PreToolUse → POSTs question + options to `/ask`
-2. Server posts Block Kit message with option buttons
-3. Hook long-polls `GET /ask/<requestId>`
-4. User clicks option → server resolves
-5. Hook returns `allow` with `updatedInput.answers` containing the user's selection
+1. `ask-relay.sh` checks `$CLAUDE_MANAGED_CHANNEL` — if unset, exits silently
+2. Hook intercepts via PreToolUse → POSTs question + options + channel ID to `/ask`
+3. Server posts Block Kit message with option buttons
+4. Hook long-polls `GET /ask/<requestId>`
+5. User clicks option → server resolves
+6. Hook returns `allow` with `updatedInput.answers` containing the user's selection
+7. **Fail-closed**: same deny-on-error behavior as the permission hook
 
 ## Session Lifecycle
 
@@ -88,7 +92,7 @@ Called from `main()` in `server.ts`. `rotateSessions()` runs as the very first a
 6. **Launch flow** (`launchSession()`) — signature: `(channelId, cwd, routingConfig, tmuxClient, options?) → Promise<SessionRecord | null>`:
    - `tmuxClient.newSession(name, cwd)` creates a detached tmux session
    - If `options.cleanSession` is provided and `options.sessionId` is set, `cleanSession()` is called before the tmux launch to clean the JSONL file (cozempic integration; no-op if cozempic is not installed)
-   - The `claude` CLI command is launched directly (no env var prefix); hook scripts identify managed sessions via the `/is-managed` endpoint instead
+   - The `claude` CLI command is launched with an inline `CLAUDE_MANAGED_CHANNEL=<channelId>` env var prefix. This propagates to child processes (including subagents) but not to tmux split-panes or separate sessions. Hook scripts check this variable to identify managed sessions and route permissions to the correct Slack channel.
    - If `options.sessionId` is provided, appends `--resume <id>` to the CLI command; otherwise launches fresh
    - If `system_prompt_mode` is `"append"` and `append_system_prompt_file` is set, appends `--append-system-prompt-file <path>` to the CLI command; if `system_prompt_mode` is `"none"`, the flag is omitted and only `CLAUDE.md` is used
    - Polls `capturePane()` with exponential backoff (500 ms start, 2× per step, 5 s cap, 120 s total timeout) waiting for the safety prompt text
@@ -227,9 +231,9 @@ Optional:
 
 - `SLACK_DRY_RUN` — set to `1`, `true`, or `yes` to enable dry-run mode. Bypasses token validation, skips `socket.start()` and `web.auth.test()`, and stubs all MCP tool calls (`reply`, `react`, `edit_message`, `fetch_messages`, `download_attachment`) — each returns a `[dry-run]` placeholder and logs the call to the server log. The HTTP/MCP server still starts normally so Claude Code sessions can connect and exercise tool calls without a Slack workspace.
 
-Checked by hook scripts at runtime:
+Set by the session manager at launch time:
 
-- `GET /is-managed?pid=<pid>` — the permission relay hooks (`permission-relay.sh`, `ask-relay.sh`) call this endpoint with `$PPID` before doing any work. The server iterates all managed routes, resolves the Claude process PID for each tmux session via `getClaudePid()`, and returns 200 if the PID matches a managed session or 404 otherwise. If the server is unreachable or returns 404, the hooks exit silently (no-op). This replaces the former `SLACK_CHANNEL_BOT_SESSION` env var guard.
+- `CLAUDE_MANAGED_CHANNEL` — inline env var (no `export`) set on the `claude` CLI command. Contains the Slack channel ID for the managed session. Inherited by child processes (including Explore/Plan subagents) but not by tmux split-panes or separate sessions. The permission and ask relay hooks check this variable to determine if they are in a managed session and which channel to route to. If unset, hooks exit silently (not a managed session). If set but the server is unreachable, hooks fail closed (deny).
 
 ### access.json (~/.claude/channels/slack/access.json)
 
@@ -269,4 +273,4 @@ Both files are opened in append mode — multiple restarts accumulate in the sam
 - **Outbound scoping**: Each session can only send to channels it has received messages from (per-session `deliveredChannels` Set)
 - **File exfiltration guard**: `assertSendable()` blocks uploading files from the state directory
 - **Localhost restriction**: `/permission` and `/ask` endpoints only accept requests from 127.0.0.1/::1/::ffff:127.*
-- **Session scope guard**: The permission relay hooks (`permission-relay.sh`, `ask-relay.sh`) are no-ops outside bot-managed sessions. On each invocation the hooks call `GET /is-managed?pid=$PPID` on the server; the server checks whether the PID belongs to a Claude process in any managed tmux session's process tree and returns 200 or 404. If the server is unreachable or returns 404, the hooks exit silently without interfering. This PID-based check is more reliable than env vars because it cannot leak through tmux's environment inheritance.
+- **Session scope guard**: The permission relay hooks (`permission-relay.sh`, `ask-relay.sh`) are no-ops outside bot-managed sessions. They check the `CLAUDE_MANAGED_CHANNEL` inline env var — set at launch without `export`, so it propagates to child processes (subagents) but not to tmux split-panes or separate sessions. If the variable is absent, hooks exit silently. If present but the server is unreachable, hooks fail closed (deny) to prevent indefinite hangs in headless sessions.
