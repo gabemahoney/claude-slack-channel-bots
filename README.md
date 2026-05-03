@@ -272,6 +272,54 @@ Each MCP endpoint exposes the following tools to the connected Claude Code sessi
 
 ---
 
+## Interject
+
+POST to `/interject` to inject a message into an active Claude session from localhost. Only requests from `127.0.0.1` or `::1` are accepted — external callers are rejected with 403.
+
+### Request
+
+```sh
+curl -X POST http://localhost:<port>/interject \
+  -H "Content-Type: application/json" \
+  -d '{"channel": "C1234567890", "message": "Hello from a script", "sender": "my-cron-job"}'
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `channel` | yes | Slack channel ID matching an entry in `config.json → routes`. |
+| `message` | yes | Text to inject into the session. |
+| `sender` | no | Label attached to the injected message. Defaults to `"interject"`. |
+
+### Response
+
+On success, returns HTTP 200:
+
+```json
+{ "ok": true, "channel": "C1234567890", "cwd": "/path/to/session" }
+```
+
+### Error conditions
+
+| Status | Meaning |
+|---|---|
+| 400 | Invalid JSON or missing required field (`channel` or `message`). |
+| 403 | Request did not originate from localhost. |
+| 404 | Channel not found in `config.json → routes`. |
+| 405 | Must use POST method. |
+| 413 | Request body exceeds 32KB. |
+| 503 | Channel is routed but no active session is connected. |
+
+### Example: crontab reminder
+
+```sh
+# crontab -e
+0 9 * * 1 curl -s -X POST http://localhost:3100/interject \
+  -H "Content-Type: application/json" \
+  -d '{"channel": "C1234567890", "message": "Weekly reminder: update the changelog before standup.", "sender": "cron"}'
+```
+
+---
+
 ## Permission Relay
 
 When Claude Code requires tool approval, the permission relay surfaces an interactive Slack message with **Allow** and **Deny** buttons instead of blocking the TUI. The Claude Code hook POSTs the pending request to the server, then long-polls for the user's response. Once the user clicks a button, the result is returned to Claude Code and execution continues.
