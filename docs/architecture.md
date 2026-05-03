@@ -267,10 +267,47 @@ Both paths are rooted in `SLACK_STATE_DIR` (default: `~/.claude/channels/slack/`
 
 Both files are opened in append mode — multiple restarts accumulate in the same file rather than overwriting it.
 
+## Endpoint Inventory
+
+### POST /interject
+
+Injects a message directly into an active Claude session without going through Slack. Localhost-only.
+
+**Request body** (JSON, max 32 KB)
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `channel` | string | yes | Slack channel ID |
+| `message` | string | yes | Message content to inject |
+| `sender` | string | no | Display name; defaults to `"interject"` |
+
+**Success response**
+
+`200 OK` — `{ ok: true, channel, cwd }`
+
+**Status codes**
+
+| Status | Condition |
+|--------|-----------|
+| 200 | Notification delivered to session |
+| 400 | Invalid JSON or missing required field (`channel`, `message`) |
+| 403 | Non-localhost origin |
+| 404 | Channel not found in `routingConfig.routes` |
+| 405 | Non-POST method |
+| 413 | Body exceeds 32 KB |
+| 503 | No active session for the channel |
+
+**Behavior**
+
+- Looks up the channel in `routingConfig.routes`; 404 if absent
+- Calls `getSessionByChannel()` to resolve the active session; 503 if none or not connected
+- Sends `notifications/claude/channel` with `content: message` and `meta: { chat_id, message_id, user, ts }` (timestamps derived from `Date.now()`)
+- Does not call `gate()`, the Slack API, or mutate `deliveredChannels`
+
 ## Security Model
 
 - **Gate layer**: All inbound messages pass through `gate()` — drops bot messages, enforces DM policy, validates allowlist
 - **Outbound scoping**: Each session can only send to channels it has received messages from (per-session `deliveredChannels` Set)
 - **File exfiltration guard**: `assertSendable()` blocks uploading files from the state directory
-- **Localhost restriction**: `/permission` and `/ask` endpoints only accept requests from 127.0.0.1/::1/::ffff:127.*
+- **Localhost restriction**: `/permission`, `/ask`, and `/interject` endpoints only accept requests from 127.0.0.1/::1/::ffff:127.*
 - **Session scope guard**: The permission relay hooks (`permission-relay.sh`, `ask-relay.sh`) are no-ops outside bot-managed sessions. They check the `CLAUDE_MANAGED_CHANNEL` inline env var — set at launch without `export`, so it propagates to child processes (subagents) but not to tmux split-panes or separate sessions. If the variable is absent, hooks exit silently. If present but the server is unreachable, hooks fail closed (deny) to prevent indefinite hangs in headless sessions.
