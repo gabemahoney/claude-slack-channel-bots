@@ -1343,17 +1343,25 @@ export async function main(): Promise<void> {
       // -----------------------------------------------------------------------
       if (url.pathname === '/interject') {
         if (req.method !== 'POST') {
-          return new Response('Method Not Allowed', { status: 405 })
+          return new Response(JSON.stringify({ error: 'Method Not Allowed' }), { status: 405, headers: { 'Content-Type': 'application/json' } })
         }
         const remoteAddr = server.requestIP(req)
         const remoteHost = remoteAddr?.address ?? ''
         if (remoteHost !== '127.0.0.1' && remoteHost !== '::1' && !remoteHost.startsWith('::ffff:127.')) {
-          return new Response('Forbidden', { status: 403 })
+          return new Response(JSON.stringify({ error: 'Forbidden' }), { status: 403, headers: { 'Content-Type': 'application/json' } })
+        }
+
+        const bodyText = await req.text()
+        if (new TextEncoder().encode(bodyText).byteLength > 32768) {
+          return new Response(JSON.stringify({ error: 'Request body too large (max 32KB)' }), {
+            status: 413,
+            headers: { 'Content-Type': 'application/json' },
+          })
         }
 
         let body: { channel?: unknown; message?: unknown; sender?: unknown }
         try {
-          body = await req.json()
+          body = JSON.parse(bodyText)
         } catch {
           return new Response(JSON.stringify({ error: 'Invalid JSON' }), {
             status: 400,
