@@ -1175,6 +1175,105 @@ describe('crash recovery', () => {
 })
 
 // ---------------------------------------------------------------------------
+// CLAUDE_MANAGED_CHANNEL env var injection
+// ---------------------------------------------------------------------------
+
+describe('CLAUDE_MANAGED_CHANNEL env var injection', () => {
+  test('fresh launch via launchSession: sendKeys command contains CLAUDE_MANAGED_CHANNEL=\'C_TEST1\' before claude', async () => {
+    const stub = makeTmuxStub({
+      getPanePidResult: '99999999',
+    })
+    const config = makeRoutingConfig()
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 0 },
+    )
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+
+    const cmd = launchCmd!.args[1] as string
+    expect(cmd.includes("CLAUDE_MANAGED_CHANNEL='C_TEST1'")).toBe(true)
+    // Env var must appear before 'claude'
+    expect(cmd.indexOf("CLAUDE_MANAGED_CHANNEL='C_TEST1'")).toBeLessThan(cmd.indexOf('claude '))
+  })
+
+  test('resume launch via launchSession: command includes env var prefix alongside --resume <id>', async () => {
+    const resumeId = 'resume-session-abc'
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const config = makeRoutingConfig()
+
+    const result = await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 2_000, sessionId: resumeId },
+    )
+
+    expect(result).not.toBeNull()
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const resumeCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${resumeId}`),
+    )
+    expect(resumeCmd).toBeDefined()
+
+    const cmd = resumeCmd!.args[1] as string
+    expect(cmd.includes("CLAUDE_MANAGED_CHANNEL='C_TEST1'")).toBe(true)
+    expect(cmd.includes(`--resume ${resumeId}`)).toBe(true)
+    // Env var still appears before 'claude'
+    expect(cmd.indexOf("CLAUDE_MANAGED_CHANNEL='C_TEST1'")).toBeLessThan(cmd.indexOf('claude '))
+  })
+
+  test('fresh launch via startupSessionManager: delegated sendKeys includes CLAUDE_MANAGED_CHANNEL for route channel ID', async () => {
+    const stub = makeTmuxStub({
+      hasSessionResult: false,
+      getPanePidResult: '99999999',
+    })
+    const config = makeRoutingConfig()
+
+    await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).includes("CLAUDE_MANAGED_CHANNEL='C_TEST1'")).toBe(true)
+  })
+
+  test('dynamic channel ID: env var value matches the route key used', async () => {
+    const stub = makeTmuxStub({
+      hasSessionResult: false,
+      getPanePidResult: '99999999',
+    })
+    const config = {
+      ...makeRoutingConfig(),
+      routes: {
+        'C_OTHERCHAN': { cwd: '/tmp/test-cwd-other' },
+      },
+    }
+
+    await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+
+    const cmd = launchCmd!.args[1] as string
+    expect(cmd.includes("CLAUDE_MANAGED_CHANNEL='C_OTHERCHAN'")).toBe(true)
+    // Must NOT contain the default channel ID
+    expect(cmd.includes("CLAUDE_MANAGED_CHANNEL='C_TEST1'")).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // jsonlExistsForSession
 // ---------------------------------------------------------------------------
 
