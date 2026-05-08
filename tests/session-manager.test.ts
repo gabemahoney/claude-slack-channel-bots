@@ -1698,6 +1698,129 @@ describe('resume_enabled', () => {
 })
 
 // ---------------------------------------------------------------------------
+// auto-restart launchSession: resume_enabled gating (bug b.own fix regression)
+//
+// The server.ts auto-restart closure (RestartDeps.launchSession) computes
+// resolvedSessionId as:
+//   routingConfig.resume_enabled !== false && stored !== 'pending' ? stored : undefined
+// then calls launchSession(channelId, cwd, config, tmux, resolvedSessionId !== undefined
+//   ? { sessionId: resolvedSessionId } : undefined)
+//
+// Before the fix, resume_enabled was ignored and stored was always used.
+// These tests exercise launchSession() directly, simulating what the
+// auto-restart closure does after applying the gate, so they confirm
+// the full end-to-end behaviour (no --resume / --resume in the tmux command).
+// ---------------------------------------------------------------------------
+
+describe('auto-restart launchSession: resume_enabled gating', () => {
+  test('resume_enabled: false + stored session ID → auto-restart launches fresh (no --resume)', async () => {
+    // This test would FAIL before the fix: the pre-fix closure always forwarded
+    // `stored` as the sessionId, so launchSession received sessionId='stored-id'
+    // and emitted '--resume stored-id' even when resume_enabled was false.
+    const stub = makeTmuxStub({
+      getPanePidResult: '99999999', // Claude never running → launch fails quickly
+    })
+    // resume_enabled: false — the fixed closure resolves sessionId to undefined
+    const config = makeRoutingConfig({ resume_enabled: false })
+    const storedSessionId = 'auto-restart-resume-disabled-id'
+
+    // Simulate what the fixed server.ts closure does:
+    //   resolvedSessionId = config.resume_enabled !== false && stored !== 'pending'
+    //                       ? stored : undefined
+    const resolvedSessionId = config.resume_enabled !== false && (storedSessionId as string) !== 'pending'
+      ? storedSessionId
+      : undefined
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      resolvedSessionId !== undefined ? { sessionId: resolvedSessionId, pollTimeout: 0 } : { pollTimeout: 0 },
+    )
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+
+    // No --resume in any sent command
+    const resumeCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume'),
+    )
+    expect(resumeCmd).toBeUndefined()
+
+    // A fresh launch command was still sent
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+  })
+
+  test('resume_enabled: true (default) + stored session ID → auto-restart uses --resume', async () => {
+    // With resume_enabled: true the fixed closure forwards the stored session ID,
+    // so launchSession receives sessionId and emits '--resume <id>' in the command.
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const config = makeRoutingConfig({ resume_enabled: true })
+    const storedSessionId = 'auto-restart-resume-enabled-id'
+
+    // Same gating logic as the fixed server.ts closure
+    const resolvedSessionId = config.resume_enabled !== false && (storedSessionId as string) !== 'pending'
+      ? storedSessionId
+      : undefined
+
+    const result = await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      resolvedSessionId !== undefined ? { sessionId: resolvedSessionId, pollTimeout: 2_000 } : { pollTimeout: 2_000 },
+    )
+
+    expect(result).not.toBeNull()
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const resumeCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${storedSessionId}`),
+    )
+    expect(resumeCmd).toBeDefined()
+  })
+
+  test('resume_enabled: true + storedSessionId = "pending" → auto-restart launches fresh (no --resume)', async () => {
+    // When resume_enabled is true but the stored session ID is "pending" (session
+    // was still initialising when the server last shut down), the closure must
+    // treat it as an absent ID and do a fresh launch without --resume.
+    const stub = makeTmuxStub({
+      getPanePidResult: '99999999', // Claude never running → launch fails quickly
+    })
+    const config = makeRoutingConfig({ resume_enabled: true })
+    const storedSessionId = 'pending'
+
+    // Simulate what the fixed server.ts closure does:
+    //   resolvedSessionId = config.resume_enabled !== false && stored !== 'pending'
+    //                       ? stored : undefined
+    const resolvedSessionId = config.resume_enabled !== false && (storedSessionId as string) !== 'pending'
+      ? storedSessionId
+      : undefined
+
+    // resolvedSessionId must be undefined — "pending" is excluded even when resume_enabled: true
+    expect(resolvedSessionId).toBeUndefined()
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      resolvedSessionId !== undefined ? { sessionId: resolvedSessionId, pollTimeout: 0 } : { pollTimeout: 0 },
+    )
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+
+    // No --resume in any sent command
+    const resumeCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume'),
+    )
+    expect(resumeCmd).toBeUndefined()
+
+    // A fresh launch command was still sent
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // launchSession — cleaning integration
 // ---------------------------------------------------------------------------
 

@@ -1546,8 +1546,12 @@ export async function main(): Promise<void> {
     launchSession: async (channelId, cwd, sessionId) => {
       if (!routingConfig) return false
       const stored = sessionId ?? readSessions()[channelId]?.sessionId
-      // Treat "pending" as undefined — fall back to a fresh launch, not --resume
-      const resolvedSessionId = stored !== 'pending' ? stored : undefined
+      // Treat "pending" as undefined — fall back to a fresh launch, not --resume.
+      // Also skip --resume when resume_enabled is explicitly false.
+      const resolvedSessionId = routingConfig.resume_enabled !== false && stored !== 'pending' ? stored : undefined
+      if (!resolvedSessionId && routingConfig.resume_enabled === false) {
+        console.error(`[slack] launchSession (restart): resume_enabled=false — launching fresh for channel=${channelId}`)
+      }
       const record = await launchSession(
         channelId, cwd, routingConfig, defaultTmuxClient,
         resolvedSessionId !== undefined

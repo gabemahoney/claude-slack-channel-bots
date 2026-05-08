@@ -120,7 +120,7 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | `cozempic_prescription` | string | `"standard"` | Cozempic cleaning intensity before resume. Valid values: `gentle`, `standard`, `aggressive`. Has no effect if cozempic is not installed. |
 | `message_archive_db` | string | — | Path to a SQLite DB where every inbound Slack message is archived in real time. Parent directories are created if missing; schema is initialized on first open. Compatible with the `archive-messages.py` backfill script — both can write concurrently. Feature is disabled when absent. |
 | `claude_config_dir` | string | — | Path to a Claude on-disk config directory. When set, managed sessions launch with `CLAUDE_CONFIG_DIR='<resolved-path>'` so the bot authenticates against a specific account. `~` is expanded and the path is resolved to absolute. Per-route `routes[id].claude_config_dir` overrides this top-level value for individual channels. When neither is set, Claude's own default applies. Must be non-empty when set. |
-| `resume_enabled` | boolean | `true` | When `false`, the session manager always performs a fresh Claude session launch on restart, even when a stored session ID exists. Disabling this skips the `--resume` flag entirely. Use this as a workaround if your Claude Code version crashes with "sandbox required but unavailable" on `--resume` (a known regression in v2.1.120). |
+| `resume_enabled` | boolean | `true` | When `false`, the session manager always performs a fresh Claude session launch instead of resuming, both on startup and on runtime auto-restart, even when a stored session ID exists. Disabling this skips the `--resume` flag entirely. Use this as a workaround if your Claude Code version crashes with "sandbox required but unavailable" on `--resume` (a known regression in v2.1.120). |
 
 #### Per-route `claude_config_dir` override
 
@@ -246,7 +246,7 @@ Gracefully exits all managed Claude Code sessions, then stops and starts the ser
 claude-slack-channel-bots clean_restart
 ```
 
-For each session in `sessions.json`, sends `/exit` to the tmux session and polls until Claude exits. All sessions are processed in parallel. If a session does not exit within `exit_timeout` seconds (default 120s), its tmux session is force-killed. Individual session errors are logged and do not abort the restart. After the server restarts, sessions are relaunched with `--resume` using the stored session IDs in `sessions.json`, preserving conversation context.
+For each session in `sessions.json`, sends `/exit` to the tmux session and polls until Claude exits. All sessions are processed in parallel. If a session does not exit within `exit_timeout` seconds (default 120s), its tmux session is force-killed. Individual session errors are logged and do not abort the restart. After the server restarts, sessions are relaunched using the stored session IDs in `sessions.json`. When `resume_enabled` is `true` (the default), sessions resume with `--resume`, preserving conversation context. When `resume_enabled` is `false`, sessions always launch fresh without `--resume`.
 
 Behavior by case:
 
@@ -436,7 +436,7 @@ After 3 consecutive launch failures for a route, auto-restart is suspended until
 If a session does not exit within `exit_timeout` seconds (default 120s), `clean_restart` force-kills its tmux session and proceeds. To manually recover, run `tmux kill-session -t <session-name>` for any remaining sessions, then `claude-slack-channel-bots stop && claude-slack-channel-bots start`.
 
 **Session crashes on resume with "sandbox required but unavailable"**
-This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json` to disable `--resume` entirely — the bot will always start a fresh Claude session on restart instead of resuming a prior conversation:
+This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json` to disable `--resume` entirely — the bot will always start a fresh Claude session instead of resuming a prior conversation, both on startup and on runtime auto-restart:
 
 ```json
 {
