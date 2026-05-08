@@ -194,4 +194,62 @@ describe('cleanSession', () => {
 
     expect(spawnCalls).toHaveLength(0)
   })
+
+  test('6. configDir override — JSONL is read from <configDir>/projects/<slug>/<id>.jsonl', async () => {
+    // Place the JSONL under a custom configDir, NOT under ${homedir()}/.claude.
+    // cleanSession must resolve the path through configDir so the size check
+    // succeeds and cozempic gets spawned. Without the configDir fix this test
+    // would skip-with-"JSONL not found" and never spawn.
+    const customConfigDir = mkdtempSync(join(tmpdir(), 'session-cleaner-cfg-'))
+    try {
+      const slug = FAKE_CWD.replace(/[^a-zA-Z0-9-]/g, '-')
+      const dir = join(customConfigDir, 'projects', slug)
+      mkdirSync(dir, { recursive: true })
+      const path = join(dir, `${SESSION_ID}.jsonl`)
+      writeFileSync(path, 'some content under custom configDir\n')
+
+      // Make sure NO file exists at the default homedir location, so a regression
+      // (ignoring configDir) would silently miss and skip the spawn.
+      removeJsonlFile()
+
+      spawnFactory = (cmd: string, args: string[]) => {
+        spawnCalls.push({ cmd, args })
+        return makeFakeProcess(0)
+      }
+
+      await expect(
+        cleanSession(SESSION_ID, FAKE_CWD, 'standard', customConfigDir),
+      ).resolves.toBeUndefined()
+
+      expect(spawnCalls).toHaveLength(1)
+      expect(spawnCalls[0].cmd).toBe('cozempic')
+      expect(spawnCalls[0].args).toEqual(['treat', SESSION_ID, '-rx', 'standard', '--execute'])
+    } finally {
+      rmSync(customConfigDir, { recursive: true, force: true })
+    }
+  })
+
+  test('7. configDir override — missing JSONL under custom dir skips spawn even if home-default exists', async () => {
+    // Regression guard: a JSONL at the default location must NOT satisfy the
+    // pre-spawn existence check when a configDir is passed. The lookup must be
+    // exclusively under the configDir.
+    const customConfigDir = mkdtempSync(join(tmpdir(), 'session-cleaner-cfg-'))
+    try {
+      // Write a JSONL at the DEFAULT location only. The configDir is empty.
+      writeJsonlFile('content at default location\n')
+
+      spawnFactory = (cmd: string, args: string[]) => {
+        spawnCalls.push({ cmd, args })
+        return makeFakeProcess(0)
+      }
+
+      await expect(
+        cleanSession(SESSION_ID, FAKE_CWD, 'standard', customConfigDir),
+      ).resolves.toBeUndefined()
+
+      expect(spawnCalls).toHaveLength(0)
+    } finally {
+      rmSync(customConfigDir, { recursive: true, force: true })
+    }
+  })
 })

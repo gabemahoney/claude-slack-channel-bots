@@ -92,7 +92,7 @@ Called from `main()` in `server.ts`. `rotateSessions()` runs as the very first a
 6. **Launch flow** (`launchSession()`) — signature: `(channelId, cwd, routingConfig, tmuxClient, options?) → Promise<SessionRecord | null>`:
    - `tmuxClient.newSession(name, cwd)` creates a detached tmux session
    - If `options.cleanSession` is provided and `options.sessionId` is set, `cleanSession()` is called before the tmux launch to clean the JSONL file (cozempic integration; no-op if cozempic is not installed)
-   - The `claude` CLI command is launched with an inline `CLAUDE_MANAGED_CHANNEL=<channelId>` env var prefix. This propagates to child processes (including subagents) but not to tmux split-panes or separate sessions. Hook scripts check this variable to identify managed sessions and route permissions to the correct Slack channel.
+   - The `claude` CLI command is launched with an inline `CLAUDE_MANAGED_CHANNEL=<channelId>` env var prefix. This propagates to child processes (including subagents) but not to tmux split-panes or separate sessions. Hook scripts check this variable to identify managed sessions and route permissions to the correct Slack channel. When a per-route `routes[id].claude_config_dir` is set (or, as a fallback, the top-level `claude_config_dir`), `CLAUDE_CONFIG_DIR='<resolved-path>'` is added to the same prefix so different routes can authenticate against different on-disk Claude accounts. The path is `~`-expanded, resolved to absolute, and single-quote-escaped before being sent to tmux.
    - If `options.sessionId` is provided, appends `--resume <id>` to the CLI command; otherwise launches fresh
    - If `system_prompt_mode` is `"append"` and `append_system_prompt_file` is set, appends `--append-system-prompt-file <path>` to the CLI command; if `system_prompt_mode` is `"none"`, the flag is omitted and only `CLAUDE.md` is used
    - Polls `capturePane()` with exponential backoff (500 ms start, 2× per step, 5 s cap, 120 s total timeout) waiting for the safety prompt text
@@ -191,6 +191,7 @@ Key fields:
 - `append_system_prompt_file` — optional path to a file appended to every managed session's system prompt via `--append-system-prompt-file`; missing file silently skipped
 - `system_prompt_mode` — controls whether `append_system_prompt_file` is applied (default: `"append"`; valid: `append`, `none`). `"append"` passes `--append-system-prompt-file` to Claude when launching sessions; `"none"` skips the flag entirely so only `CLAUDE.md` is used
 - `cozempic_prescription` — cozempic cleaning intensity used before `--resume` launches (default: `"standard"`; valid: `gentle`, `standard`, `aggressive`); has no effect if cozempic is not installed
+- `claude_config_dir` — optional path to a Claude on-disk config directory used for managed sessions; when set, launches are prefixed with `CLAUDE_CONFIG_DIR='<resolved-path>'` so the route authenticates against a specific account. `~` is expanded and the path is resolved to absolute. Per-route `routes[id].claude_config_dir` overrides this top-level value. When neither is set, Claude's own default applies.
 
 ### sessions.json (~/.claude/channels/slack/sessions.json)
 

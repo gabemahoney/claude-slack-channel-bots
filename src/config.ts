@@ -26,6 +26,15 @@ export const ALLOWED_SYSTEM_PROMPT_MODES = ['append', 'none']
 
 export interface RouteEntry {
   cwd: string
+  /**
+   * Optional path to a Claude on-disk config directory for this route.
+   * When set, sessions for this route launch with `CLAUDE_CONFIG_DIR=<path>`,
+   * letting different routes authenticate against different Claude accounts.
+   * `~` is expanded and the path is resolved to absolute. When omitted, the
+   * top-level `claude_config_dir` is used (and Claude's own default applies
+   * if neither is set).
+   */
+  claude_config_dir?: string
 }
 
 /** Raw shape of config.json as parsed from disk. All optional fields may be absent. */
@@ -47,6 +56,13 @@ export interface RoutingConfigInput {
   system_prompt_mode?: string
   /** Optional path to a SQLite DB where every inbound Slack message will be archived. */
   message_archive_db?: string
+  /**
+   * Top-level Claude on-disk config directory for routes that do not specify
+   * their own `claude_config_dir`. When set, managed sessions launch with
+   * `CLAUDE_CONFIG_DIR=<path>`. When omitted, Claude's own default applies.
+   * `~` is expanded and the path is resolved to absolute.
+   */
+  claude_config_dir?: string
 }
 
 /** Validated, fully-resolved routing configuration with all defaults applied. */
@@ -66,6 +82,7 @@ export interface RoutingConfig {
   system_prompt_mode: string
   /** Absolute path to SQLite archive DB. Undefined disables the feature. */
   message_archive_db?: string
+  claude_config_dir?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +109,7 @@ export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
     cozempic_prescription: input.cozempic_prescription ?? 'standard',
     system_prompt_mode: input.system_prompt_mode ?? 'append',
     message_archive_db: input.message_archive_db,
+    claude_config_dir: input.claude_config_dir,
   }
 }
 
@@ -187,6 +205,26 @@ export function validateConfig(config: RoutingConfig): void {
       )
     }
   }
+
+  // Top-level claude_config_dir, when set, must be a non-empty (post-trim) string
+  if (config.claude_config_dir !== undefined) {
+    if (typeof config.claude_config_dir !== 'string' || config.claude_config_dir.trim() === '') {
+      throw new Error(
+        'Routing config validation error: claude_config_dir must be a non-empty string when set.',
+      )
+    }
+  }
+
+  // Per-route claude_config_dir, when set, must also be a non-empty (post-trim) string
+  for (const [channelId, route] of Object.entries(config.routes)) {
+    if (route.claude_config_dir !== undefined) {
+      if (typeof route.claude_config_dir !== 'string' || route.claude_config_dir.trim() === '') {
+        throw new Error(
+          `Routing config validation error: routes["${channelId}"].claude_config_dir must be a non-empty string when set.`,
+        )
+      }
+    }
+  }
 }
 
 /**
@@ -196,11 +234,20 @@ export function validateConfig(config: RoutingConfig): void {
 export function resolveConfig(input: RoutingConfigInput): RoutingConfig {
   const withDefaults = applyDefaults(input)
 
-  // Expand tildes on every route's cwd
+  // Expand tildes on every route's cwd and claude_config_dir; preserve other fields verbatim.
+  // Empty/whitespace claude_config_dir is preserved unchanged so validateConfig can reject it.
   const expandedRoutes: Record<string, RouteEntry> = {}
   for (const [channelId, entry] of Object.entries(withDefaults.routes)) {
     expandedRoutes[channelId] = {
+      ...entry,
       cwd: resolve(expandTilde(entry.cwd)),
+      ...(entry.claude_config_dir !== undefined
+        ? {
+            claude_config_dir: entry.claude_config_dir.trim() === ''
+              ? entry.claude_config_dir
+              : resolve(expandTilde(entry.claude_config_dir)),
+          }
+        : {}),
     }
   }
 
@@ -221,6 +268,11 @@ export function resolveConfig(input: RoutingConfigInput): RoutingConfig {
       : undefined,
     message_archive_db: withDefaults.message_archive_db !== undefined
       ? resolve(expandTilde(withDefaults.message_archive_db))
+      : undefined,
+    claude_config_dir: withDefaults.claude_config_dir !== undefined
+      ? (withDefaults.claude_config_dir.trim() === ''
+          ? withDefaults.claude_config_dir
+          : resolve(expandTilde(withDefaults.claude_config_dir)))
       : undefined,
   }
 

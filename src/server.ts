@@ -321,6 +321,9 @@ const sessionToolDeps: SessionToolDeps = {
   resolveUserName,
   consumeAck,
   serverPort: 0, // updated to actual port in main() before Bun.serve
+  // Resolved at call time so reloads of routingConfig take effect immediately.
+  getClaudeConfigDir: (channelId) =>
+    routingConfig?.routes[channelId]?.claude_config_dir ?? routingConfig?.claude_config_dir,
 }
 
 // ---------------------------------------------------------------------------

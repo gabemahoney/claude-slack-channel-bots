@@ -328,6 +328,103 @@ describe('startupSessionManager', () => {
     expect(launchCmd).toBeDefined()
   })
 
+  test('C. resume picks up JSONL under custom claude_config_dir (top-level)', async () => {
+    // Regression test: when the route is configured with a custom CLAUDE_CONFIG_DIR,
+    // Claude writes its JSONL transcripts under <configDir>/projects/..., NOT under
+    // ${homedir()}/.claude/projects/... The pre-resume JSONL existence check must
+    // honor that, otherwise the resume is silently downgraded to a fresh launch.
+    const customConfigDir = mkdtempSync(join(tmpdir(), 'session-mgr-cfg-'))
+    try {
+      const jsonlDir = join(customConfigDir, 'projects', '-tmp-test-cwd')
+      mkdirSync(jsonlDir, { recursive: true })
+      const sessionId = 'custom-cfg-resume-id'
+      const jsonlPath = join(jsonlDir, `${sessionId}.jsonl`)
+      writeFileSync(jsonlPath, '', 'utf-8')
+      // No need to push to jsonlCleanupFiles — entire dir is rmSync'd in finally
+
+      const stub = makeTmuxStub({
+        hasSessionResult: false,
+        capturePaneResult: 'I am using this for local development',
+      })
+      const storedSessions: SessionsMap = {
+        'C_TEST1': {
+          tmuxSession: sessionName('/tmp/test-cwd'),
+          lastLaunch: '2026-01-01T00:00:00.000Z',
+          sessionId,
+        },
+      }
+      const config = makeRoutingConfig({ claude_config_dir: customConfigDir })
+
+      const result = await startupSessionManager(config, stub, storedSessions, {
+        pollTimeout: 2_000,
+      })
+
+      // Resume branch was taken: Map has the session and --resume <id> was sent
+      expect(result.size).toBe(1)
+      expect(result.get('C_TEST1')!.sessionId).toBe(sessionId)
+
+      const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+      const resumeCmd = sendKeysCalls.find(
+        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${sessionId}`),
+      )
+      expect(resumeCmd).toBeDefined()
+      // And the launch carried CLAUDE_CONFIG_DIR pointing at the custom dir
+      expect((resumeCmd!.args[1] as string).includes(`CLAUDE_CONFIG_DIR='${customConfigDir}'`)).toBe(true)
+    } finally {
+      rmSync(customConfigDir, { recursive: true, force: true })
+    }
+  })
+
+  test('D. resume picks up JSONL under per-route claude_config_dir override', async () => {
+    // Per-route claude_config_dir takes precedence over top-level. The JSONL
+    // pre-check must use the per-route value when set.
+    const topLevelDir = mkdtempSync(join(tmpdir(), 'session-mgr-cfg-top-'))
+    const perRouteDir = mkdtempSync(join(tmpdir(), 'session-mgr-cfg-route-'))
+    try {
+      // Place the JSONL ONLY under the per-route dir; top-level dir is empty.
+      const jsonlDir = join(perRouteDir, 'projects', '-tmp-test-cwd')
+      mkdirSync(jsonlDir, { recursive: true })
+      const sessionId = 'per-route-resume-id'
+      writeFileSync(join(jsonlDir, `${sessionId}.jsonl`), '', 'utf-8')
+
+      const stub = makeTmuxStub({
+        hasSessionResult: false,
+        capturePaneResult: 'I am using this for local development',
+      })
+      const storedSessions: SessionsMap = {
+        'C_TEST1': {
+          tmuxSession: sessionName('/tmp/test-cwd'),
+          lastLaunch: '2026-01-01T00:00:00.000Z',
+          sessionId,
+        },
+      }
+      const config = makeRoutingConfig({
+        claude_config_dir: topLevelDir,
+        routes: {
+          'C_TEST1': { cwd: '/tmp/test-cwd', claude_config_dir: perRouteDir },
+        },
+      })
+
+      const result = await startupSessionManager(config, stub, storedSessions, {
+        pollTimeout: 2_000,
+      })
+
+      expect(result.size).toBe(1)
+      expect(result.get('C_TEST1')!.sessionId).toBe(sessionId)
+
+      const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+      const resumeCmd = sendKeysCalls.find(
+        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${sessionId}`),
+      )
+      expect(resumeCmd).toBeDefined()
+      // Launch carried the per-route dir, not the top-level
+      expect((resumeCmd!.args[1] as string).includes(`CLAUDE_CONFIG_DIR='${perRouteDir}'`)).toBe(true)
+    } finally {
+      rmSync(topLevelDir, { recursive: true, force: true })
+      rmSync(perRouteDir, { recursive: true, force: true })
+    }
+  })
+
   test('16. dead process + no stored session ID: fresh path — sendKeys does not include --resume, launch fails → empty Map', async () => {
     const stub = makeTmuxStub({
       hasSessionResult: false,
@@ -1045,6 +1142,144 @@ describe('system_prompt_mode', () => {
 })
 
 // ---------------------------------------------------------------------------
+// claude_config_dir override
+// ---------------------------------------------------------------------------
+
+describe('claude_config_dir override', () => {
+  test('default config: no CLAUDE_CONFIG_DIR is added', async () => {
+    const stub = makeTmuxStub({ getPanePidResult: '99999999' })
+    const config = makeRoutingConfig()
+
+    await launchSession('C_TEST1', '/tmp/test-cwd', config, stub, { pollTimeout: 0 })
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    const cmd = launchCmd!.args[1] as string
+    expect(cmd.startsWith("CLAUDE_MANAGED_CHANNEL='C_TEST1' claude --mcp-config")).toBe(true)
+    expect(cmd.includes('CLAUDE_CONFIG_DIR=')).toBe(false)
+  })
+
+  test('top-level claude_config_dir: launch command is prefixed with CLAUDE_CONFIG_DIR=...', async () => {
+    const stub = makeTmuxStub({ getPanePidResult: '99999999' })
+    const config = makeRoutingConfig({
+      claude_config_dir: '/home/horde/.claude-maxauth',
+    })
+
+    await launchSession('C_TEST1', '/tmp/test-cwd', config, stub, { pollTimeout: 0 })
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    const cmd = launchCmd!.args[1] as string
+    expect(cmd.startsWith("CLAUDE_MANAGED_CHANNEL='C_TEST1' CLAUDE_CONFIG_DIR='/home/horde/.claude-maxauth' claude --mcp-config")).toBe(true)
+  })
+
+  test('per-route claude_config_dir applies only to its route', async () => {
+    const stub = makeTmuxStub({ getPanePidResult: '99999999' })
+    const config = makeRoutingConfig({
+      routes: {
+        C_TEST1: { cwd: '/tmp/test-cwd', claude_config_dir: '/p' },
+      },
+    })
+
+    await launchSession('C_TEST1', '/tmp/test-cwd', config, stub, { pollTimeout: 0 })
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).startsWith("CLAUDE_MANAGED_CHANNEL='C_TEST1' CLAUDE_CONFIG_DIR='/p' claude --mcp-config")).toBe(true)
+  })
+
+  test('per-route override takes priority over top-level claude_config_dir', async () => {
+    const stub = makeTmuxStub({ getPanePidResult: '99999999' })
+    const config = makeRoutingConfig({
+      claude_config_dir: '/global',
+      routes: {
+        C_TEST1: { cwd: '/tmp/test-cwd', claude_config_dir: '/route' },
+      },
+    })
+
+    await launchSession('C_TEST1', '/tmp/test-cwd', config, stub, { pollTimeout: 0 })
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    const cmd = launchCmd!.args[1] as string
+    expect(cmd.startsWith("CLAUDE_MANAGED_CHANNEL='C_TEST1' CLAUDE_CONFIG_DIR='/route' claude --mcp-config")).toBe(true)
+    expect(cmd.includes('/global')).toBe(false)
+  })
+
+  test('falls back to top-level claude_config_dir when route does not override', async () => {
+    const stub = makeTmuxStub({ getPanePidResult: '99999999' })
+    const config = makeRoutingConfig({
+      claude_config_dir: '/global',
+      routes: {
+        C_TEST1: { cwd: '/tmp/test-cwd' },
+      },
+    })
+
+    await launchSession('C_TEST1', '/tmp/test-cwd', config, stub, { pollTimeout: 0 })
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).startsWith("CLAUDE_MANAGED_CHANNEL='C_TEST1' CLAUDE_CONFIG_DIR='/global' claude --mcp-config")).toBe(true)
+  })
+
+  test('claude_config_dir composes correctly with --resume', async () => {
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const config = makeRoutingConfig({
+      claude_config_dir: '/maxauth',
+    })
+    const resumeId = 'session-resume-abc'
+
+    const result = await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 2_000, sessionId: resumeId },
+    )
+
+    expect(result).not.toBeNull()
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${resumeId}`),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).startsWith("CLAUDE_MANAGED_CHANNEL='C_TEST1' CLAUDE_CONFIG_DIR='/maxauth' claude --mcp-config")).toBe(true)
+  })
+
+  test('single-quote in claude_config_dir is shell-escaped safely', async () => {
+    const stub = makeTmuxStub({ getPanePidResult: '99999999' })
+    const config = makeRoutingConfig({
+      claude_config_dir: "/home/horde/it's-mine",
+    })
+
+    await launchSession('C_TEST1', '/tmp/test-cwd', config, stub, { pollTimeout: 0 })
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+    expect((launchCmd!.args[1] as string).startsWith(
+      "CLAUDE_MANAGED_CHANNEL='C_TEST1' CLAUDE_CONFIG_DIR='/home/horde/it'\\''s-mine' claude --mcp-config",
+    )).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Crash recovery
 // ---------------------------------------------------------------------------
 
@@ -1414,5 +1649,83 @@ describe('launchSession — cleaning integration', () => {
 
     expect(result).not.toBeNull()
     expect(result!.sessionId).toBe('abc123')
+  })
+
+  test('cleaning receives top-level claude_config_dir as 4th argument on resume', async () => {
+    // Regression guard for the cozempic configDir bug: when a route is launched
+    // with a custom CLAUDE_CONFIG_DIR, the cleanSession call must receive that
+    // configDir so its JSONL lookup matches where Claude actually wrote the file.
+    // Without this, the pre-resume clean silently no-ops.
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const customConfigDir = '/home/horde/.claude-maxauth'
+    const config = makeRoutingConfig({ claude_config_dir: customConfigDir })
+
+    const cleanCalls: Array<[string, string, string, string | undefined]> = []
+    const mockClean: CleanSessionFn = async (sessionId, cwd, prescription, configDir) => {
+      cleanCalls.push([sessionId, cwd, prescription, configDir])
+    }
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 2_000, sessionId: 'abc123', cleanSession: mockClean },
+    )
+
+    expect(cleanCalls).toHaveLength(1)
+    expect(cleanCalls[0][0]).toBe('abc123')
+    expect(cleanCalls[0][1]).toBe('/tmp/test-cwd')
+    expect(cleanCalls[0][2]).toBe('standard')
+    expect(cleanCalls[0][3]).toBe(customConfigDir)
+  })
+
+  test('cleaning receives per-route claude_config_dir override (priority over top-level)', async () => {
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const topLevelDir = '/home/horde/.claude-global'
+    const perRouteDir = '/home/horde/.claude-route-specific'
+    const config = makeRoutingConfig({
+      claude_config_dir: topLevelDir,
+      routes: {
+        'C_TEST1': { cwd: '/tmp/test-cwd', claude_config_dir: perRouteDir },
+      },
+    })
+
+    const cleanCalls: Array<[string, string, string, string | undefined]> = []
+    const mockClean: CleanSessionFn = async (sessionId, cwd, prescription, configDir) => {
+      cleanCalls.push([sessionId, cwd, prescription, configDir])
+    }
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 2_000, sessionId: 'abc123', cleanSession: mockClean },
+    )
+
+    expect(cleanCalls).toHaveLength(1)
+    // Per-route value wins over top-level
+    expect(cleanCalls[0][3]).toBe(perRouteDir)
+  })
+
+  test('cleaning receives undefined configDir when no claude_config_dir is configured', async () => {
+    // Sanity: routes without a custom CLAUDE_CONFIG_DIR pass undefined so that
+    // cleanSession falls back to the default ${homedir()}/.claude lookup.
+    const stub = makeTmuxStub({
+      capturePaneResult: 'I am using this for local development',
+    })
+    const config = makeRoutingConfig() // no claude_config_dir
+
+    const cleanCalls: Array<[string, string, string, string | undefined]> = []
+    const mockClean: CleanSessionFn = async (sessionId, cwd, prescription, configDir) => {
+      cleanCalls.push([sessionId, cwd, prescription, configDir])
+    }
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 2_000, sessionId: 'abc123', cleanSession: mockClean },
+    )
+
+    expect(cleanCalls).toHaveLength(1)
+    expect(cleanCalls[0][3]).toBeUndefined()
   })
 })

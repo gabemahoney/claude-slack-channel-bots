@@ -5,8 +5,8 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { writeFileSync, mkdirSync, rmSync, existsSync } from 'fs'
-import { homedir } from 'os'
+import { writeFileSync, mkdirSync, mkdtempSync, rmSync, existsSync } from 'fs'
+import { homedir, tmpdir } from 'os'
 import { join } from 'path'
 import { getPeerPidByPort, getSessionIdForPid } from '../src/peer-pid.ts'
 
@@ -49,21 +49,25 @@ function stubSpawnThrows(err: Error): void {
 // Sample ss -tnp output lines
 // ---------------------------------------------------------------------------
 
-/** Valid line with IPv4 loopback: local=127.0.0.1:8080, peer=127.0.0.1:54321, pid=12345 */
+/** Client side: local=127.0.0.1:54321 (peerPort), peer=127.0.0.1:8080 (serverPort), pid=12345 */
 const IPV4_LINE =
-  'ESTAB      0      0      127.0.0.1:8080          127.0.0.1:54321         users:(("bun",pid=12345,fd=7))'
+  'ESTAB      0      0      127.0.0.1:54321         127.0.0.1:8080          users:(("claude",pid=12345,fd=7))'
 
-/** Valid line with IPv6 loopback: local=[::1]:8080, peer=[::1]:54321, pid=67890 */
+/** Client side, IPv6: local=[::1]:54321, peer=[::1]:8080, pid=67890 */
 const IPV6_LINE =
-  'ESTAB      0      0      [::1]:8080               [::1]:54321              users:(("bun",pid=67890,fd=5))'
+  'ESTAB      0      0      [::1]:54321              [::1]:8080               users:(("claude",pid=67890,fd=5))'
 
-/** Line matching peer port but with a different server port (9090 instead of 8080). */
+/** Server side of the same connection — must NOT match (local=serverPort). */
+const SERVER_SIDE_LINE =
+  'ESTAB      0      0      127.0.0.1:8080          127.0.0.1:54321         users:(("bun",pid=99999,fd=20))'
+
+/** Line with the right peerPort in local but a different remote port (9090 instead of 8080). */
 const WRONG_SERVER_PORT_LINE =
-  'ESTAB      0      0      127.0.0.1:9090          127.0.0.1:54321         users:(("bun",pid=11111,fd=3))'
+  'ESTAB      0      0      127.0.0.1:54321         127.0.0.1:9090          users:(("bun",pid=11111,fd=3))'
 
-/** Line matching both ports but missing the pid= field in the users section. */
+/** Client-side line missing the pid= field in the users section. */
 const NO_PID_LINE =
-  'ESTAB      0      0      127.0.0.1:8080          127.0.0.1:54321         users:(("bun",fd=7))'
+  'ESTAB      0      0      127.0.0.1:54321         127.0.0.1:8080          users:(("claude",fd=7))'
 
 // ---------------------------------------------------------------------------
 // getPeerPidByPort
@@ -98,6 +102,18 @@ describe('getPeerPidByPort', () => {
     stubSpawnOutput(NO_PID_LINE + '\n')
     const pid = await getPeerPidByPort(54321, 8080)
     expect(pid).toBeNull()
+  })
+
+  test('rejects the server-side line (local=serverPort) and only matches the client side', async () => {
+    stubSpawnOutput(SERVER_SIDE_LINE + '\n')
+    const pid = await getPeerPidByPort(54321, 8080)
+    expect(pid).toBeNull()
+  })
+
+  test('returns the client-side PID when both sides of the loopback pair are present', async () => {
+    stubSpawnOutput(SERVER_SIDE_LINE + '\n' + IPV4_LINE + '\n')
+    const pid = await getPeerPidByPort(54321, 8080)
+    expect(pid).toBe(12345)
   })
 })
 
@@ -164,5 +180,36 @@ describe('getSessionIdForPid', () => {
     writeSessionFile(testPid, JSON.stringify({ sessionId: 42 }))
     const result = await getSessionIdForPid(testPid)
     expect(result).toBeNull()
+  })
+
+  test('reads from a custom claudeConfigDir when provided', async () => {
+    const customDir = mkdtempSync(join(tmpdir(), 'peer-pid-customdir-'))
+    const customSessionsDir = join(customDir, 'sessions')
+    mkdirSync(customSessionsDir, { recursive: true })
+    const customPid = TEST_PID_BASE + 50_000
+    const customFile = join(customSessionsDir, `${customPid}.json`)
+    writeFileSync(customFile, JSON.stringify({ sessionId: 'from-custom-dir' }), 'utf-8')
+
+    try {
+      // Default lookup (no override) should miss
+      const defaultResult = await getSessionIdForPid(customPid)
+      expect(defaultResult).toBeNull()
+
+      // Override should hit
+      const overrideResult = await getSessionIdForPid(customPid, customDir)
+      expect(overrideResult).toBe('from-custom-dir')
+    } finally {
+      rmSync(customDir, { recursive: true, force: true })
+    }
+  })
+
+  test('returns null when claudeConfigDir override has no matching file', async () => {
+    const customDir = mkdtempSync(join(tmpdir(), 'peer-pid-customdir-'))
+    try {
+      const result = await getSessionIdForPid(TEST_PID_BASE + 50_001, customDir)
+      expect(result).toBeNull()
+    } finally {
+      rmSync(customDir, { recursive: true, force: true })
+    }
   })
 })

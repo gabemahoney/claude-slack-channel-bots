@@ -367,11 +367,19 @@ export interface SessionToolDeps {
   /** Injectable for testing: replaces getPeerPidByPort in the discovery hook */
   getPeerPidByPort?: (peerPort: number, serverPort: number) => Promise<number | null>
   /** Injectable for testing: replaces getSessionIdForPid in the discovery hook */
-  getSessionIdForPid?: (pid: number) => Promise<string | null>
+  getSessionIdForPid?: (pid: number, claudeConfigDir?: string) => Promise<string | null>
   /** Injectable for testing: replaces readSessions in the discovery hook */
   readSessions?: () => SessionsMap
   /** Injectable for testing: replaces writeSessions in the discovery hook */
   writeSessions?: (sessions: SessionsMap) => void
+  /**
+   * Resolves the Claude on-disk config dir for a given channel, if one is
+   * configured (per-route or top-level `claude_config_dir`). Used by the
+   * post-call discovery hook so it reads `<dir>/sessions/<pid>.json` from
+   * the right directory when the managed session was launched with
+   * `CLAUDE_CONFIG_DIR=<dir>`.
+   */
+  getClaudeConfigDir?: (channelId: string) => string | undefined
 }
 
 const MCP_INSTRUCTIONS = [
@@ -757,11 +765,12 @@ export function createSessionServer(
       const peerPort = entry.peerPort
       const serverPort = deps.serverPort
       const channelId = entry.channelId
+      const claudeConfigDir = deps.getClaudeConfigDir?.(channelId)
       ;(async () => {
         try {
           const pid = await _getPeerPid(peerPort, serverPort)
           if (pid === null) return
-          const sessionId = await _getSessionId(pid)
+          const sessionId = await _getSessionId(pid, claudeConfigDir)
           if (!sessionId) return
           const sessions = _readSessions()
           const record = sessions[channelId]

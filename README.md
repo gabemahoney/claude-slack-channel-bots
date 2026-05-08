@@ -105,7 +105,7 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `routes` | object | required | Map of Slack channel ID → route entry. Each entry requires a `cwd` field: the working directory for that session. Used to identify sessions via `roots/list` after MCP handshake. `~` is expanded. Each `cwd` must be unique across all routes. |
+| `routes` | object | required | Map of Slack channel ID → route entry. Each entry requires a `cwd` field: the working directory for that session. Used to identify sessions via `roots/list` after MCP handshake. `~` is expanded. Each `cwd` must be unique across all routes. May also include an optional `claude_config_dir` string (see below). |
 | `default_route` | string | — | CWD path to use when a message arrives on a channel with no explicit entry in `routes`. Must match an existing route `cwd`. Channels that are in `routes` but whose session is not yet registered have their messages dropped — they do not fall back to `default_route`. |
 | `default_dm_session` | string | — | CWD path of the session that handles direct messages. Must match an existing route `cwd`. |
 | `bind` | string | `"127.0.0.1"` | Interface the HTTP server binds to. Use `"0.0.0.0"` to expose on all interfaces. |
@@ -119,6 +119,28 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | `system_prompt_mode` | string | `"append"` | Controls how `append_system_prompt_file` is applied. `"append"`: the custom prompt file is appended on top of `CLAUDE.md` (default, current behavior). `"none"`: only `CLAUDE.md` is used; `append_system_prompt_file` is ignored even if set. Use `"none"` when the project's `CLAUDE.md` already contains everything the bot needs. |
 | `cozempic_prescription` | string | `"standard"` | Cozempic cleaning intensity before resume. Valid values: `gentle`, `standard`, `aggressive`. Has no effect if cozempic is not installed. |
 | `message_archive_db` | string | — | Path to a SQLite DB where every inbound Slack message is archived in real time. Parent directories are created if missing; schema is initialized on first open. Compatible with the `archive-messages.py` backfill script — both can write concurrently. Feature is disabled when absent. |
+| `claude_config_dir` | string | — | Path to a Claude on-disk config directory. When set, managed sessions launch with `CLAUDE_CONFIG_DIR='<resolved-path>'` so the bot authenticates against a specific account. `~` is expanded and the path is resolved to absolute. Per-route `routes[id].claude_config_dir` overrides this top-level value for individual channels. When neither is set, Claude's own default applies. Must be non-empty when set. |
+
+#### Per-route `claude_config_dir` override
+
+When you want different bot sessions to authenticate as different Claude accounts (e.g. one channel runs as a personal Max account, another as a corporate account), set `claude_config_dir` on the individual route. Per-route values take priority over the top-level `claude_config_dir`; routes without their own override fall back to the top-level value.
+
+```json
+{
+  "routes": {
+    "C_PERSONAL": {
+      "cwd": "~/projects/alpha",
+      "claude_config_dir": "~/.claude-maxauth"
+    },
+    "C_CORPORATE": {
+      "cwd": "~/projects/beta"
+    }
+  },
+  "claude_config_dir": "~/.claude-corp"
+}
+```
+
+`C_PERSONAL` launches with the Max account; `C_CORPORATE` falls through to the top-level value and uses the corporate account. Use `claude auth login --claudeai` (or `--console`) with `CLAUDE_CONFIG_DIR` set to the same directory to populate each config dir before starting the server.
 
 ---
 

@@ -204,6 +204,30 @@ describe('applyDefaults', () => {
     const result = applyDefaults(makeRoutingConfig({ system_prompt_mode: 'none' }))
     expect(result.system_prompt_mode).toBe('none')
   })
+
+  test('leaves claude_config_dir undefined when absent', () => {
+    const result = applyDefaults(makeRoutingConfig())
+    expect(result.claude_config_dir).toBeUndefined()
+  })
+
+  test('preserves provided claude_config_dir value', () => {
+    const result = applyDefaults(makeRoutingConfig({
+      claude_config_dir: '/foo',
+    }))
+    expect(result.claude_config_dir).toBe('/foo')
+  })
+
+  test('preserves per-route claude_config_dir verbatim', () => {
+    const result = applyDefaults(makeRoutingConfig({
+      routes: {
+        C_GENERAL: makeRoute({
+          cwd: '/tmp/general',
+          claude_config_dir: '/route-dir',
+        }),
+      },
+    }))
+    expect(result.routes['C_GENERAL'].claude_config_dir).toBe('/route-dir')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -381,6 +405,53 @@ describe('validateConfig', () => {
   test('throws for system_prompt_mode "APPEND" (case-sensitive)', () => {
     const config = makeValidConfig({ system_prompt_mode: 'APPEND' })
     expect(() => validateConfig(config)).toThrow('Routing config validation error')
+  })
+
+  test('passes when claude_config_dir is omitted', () => {
+    const config = makeValidConfig()
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('passes for valid claude_config_dir', () => {
+    const config = makeValidConfig({ claude_config_dir: '/foo' })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('throws for empty claude_config_dir', () => {
+    const config = makeValidConfig({ claude_config_dir: '' })
+    expect(() => validateConfig(config)).toThrow('claude_config_dir must be a non-empty string')
+  })
+
+  test('throws for whitespace-only claude_config_dir', () => {
+    const config = makeValidConfig({ claude_config_dir: '   ' })
+    expect(() => validateConfig(config)).toThrow('claude_config_dir must be a non-empty string')
+  })
+
+  test('passes for per-route claude_config_dir override', () => {
+    const config = makeValidConfig({
+      routes: {
+        C_GENERAL: { cwd: '/tmp/general', claude_config_dir: '/x' },
+      },
+    })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('throws for empty per-route claude_config_dir', () => {
+    const config = makeValidConfig({
+      routes: {
+        C_GENERAL: { cwd: '/tmp/general', claude_config_dir: '' },
+      },
+    })
+    expect(() => validateConfig(config)).toThrow('routes["C_GENERAL"].claude_config_dir must be a non-empty string')
+  })
+
+  test('throws for whitespace-only per-route claude_config_dir', () => {
+    const config = makeValidConfig({
+      routes: {
+        C_GENERAL: { cwd: '/tmp/general', claude_config_dir: '\t  ' },
+      },
+    })
+    expect(() => validateConfig(config)).toThrow('routes["C_GENERAL"].claude_config_dir must be a non-empty string')
   })
 })
 
@@ -588,6 +659,45 @@ describe('resolveConfig', () => {
   test('throws on invalid system_prompt_mode end-to-end', () => {
     expect(() => resolveConfig({ routes: { C: { cwd: '/tmp' } }, system_prompt_mode: 'replace' })).toThrow('"replace"')
   })
+
+  test('leaves claude_config_dir undefined when absent', () => {
+    const input = makeRoutingConfig()
+    const result = resolveConfig(input)
+    expect(result.claude_config_dir).toBeUndefined()
+  })
+
+  test('expands ~ on top-level claude_config_dir and resolves to absolute', () => {
+    const input = makeRoutingConfig({ claude_config_dir: '~/.claude-maxauth' })
+    const result = resolveConfig(input)
+    expect(result.claude_config_dir).toBe(`${homedir()}/.claude-maxauth`)
+  })
+
+  test('preserves and expands per-route claude_config_dir through resolveConfig', () => {
+    const input: RoutingConfigInput = {
+      routes: {
+        C_A: { cwd: '/tmp/a', claude_config_dir: '/x' },
+        C_B: { cwd: '/tmp/b' },
+        C_C: { cwd: '/tmp/c', claude_config_dir: '~/personal' },
+      },
+    }
+    const result = resolveConfig(input)
+    expect(result.routes['C_A'].claude_config_dir).toBe('/x')
+    expect(result.routes['C_B'].claude_config_dir).toBeUndefined()
+    expect(result.routes['C_C'].claude_config_dir).toBe(`${homedir()}/personal`)
+  })
+
+  test('throws on empty top-level claude_config_dir end-to-end', () => {
+    expect(() => resolveConfig({
+      routes: { C: { cwd: '/tmp' } },
+      claude_config_dir: '',
+    })).toThrow('claude_config_dir must be a non-empty string')
+  })
+
+  test('throws on empty per-route claude_config_dir end-to-end', () => {
+    expect(() => resolveConfig({
+      routes: { C_X: { cwd: '/tmp', claude_config_dir: '' } },
+    })).toThrow('routes["C_X"].claude_config_dir must be a non-empty string')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -766,6 +876,44 @@ describe('loadConfig', () => {
     writeFileSync(configPath, JSON.stringify(config), 'utf-8')
     const result = loadConfig(configPath)
     expect(result.system_prompt_mode).toBe('append')
+  })
+
+  test('round-trips top-level claude_config_dir through loadConfig', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+      claude_config_dir: '/home/horde/.claude-maxauth',
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.claude_config_dir).toBe('/home/horde/.claude-maxauth')
+  })
+
+  test('round-trips per-route claude_config_dir through loadConfig', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const config: RoutingConfigInput = {
+      routes: {
+        C_PERSONAL: { cwd: '/tmp/personal', claude_config_dir: '/p' },
+        C_DEFAULT: { cwd: '/tmp/default' },
+      },
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.routes['C_PERSONAL'].claude_config_dir).toBe('/p')
+    expect(result.routes['C_DEFAULT'].claude_config_dir).toBeUndefined()
+  })
+
+  test('leaves claude_config_dir undefined when absent', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.claude_config_dir).toBeUndefined()
   })
 })
 

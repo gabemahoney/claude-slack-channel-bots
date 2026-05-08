@@ -63,10 +63,17 @@ export function _resetCozempicAvailable(): void {
 /**
  * Builds the absolute JSONL path for a given cwd and session ID.
  * Pure function — no I/O, no validation.
+ *
+ * When `configDir` is provided, the path is rooted at `${configDir}/projects/...`.
+ * This is used by managed bots launched with a custom `CLAUDE_CONFIG_DIR`,
+ * since Claude writes JSONL transcripts under that directory rather than
+ * `${homedir()}/.claude`. When omitted, falls back to the default
+ * `${homedir()}/.claude/projects/...` location.
  */
-export function resolveJsonlPath(cwd: string, sessionId: string): string {
+export function resolveJsonlPath(cwd: string, sessionId: string, configDir?: string): string {
   const slug = cwd.replace(/[^a-zA-Z0-9-]/g, '-')
-  return `${homedir()}/.claude/projects/${slug}/${sessionId}.jsonl`
+  const root = configDir ?? `${homedir()}/.claude`
+  return `${root}/projects/${slug}/${sessionId}.jsonl`
 }
 
 // ---------------------------------------------------------------------------
@@ -89,7 +96,7 @@ export function readFileSizeBytes(path: string): number | null {
 // Session cleaning
 // ---------------------------------------------------------------------------
 
-export type CleanSessionFn = (sessionId: string, cwd: string, prescription: string) => Promise<void>
+export type CleanSessionFn = (sessionId: string, cwd: string, prescription: string, configDir?: string) => Promise<void>
 
 /**
  * Runs `cozempic treat <sessionId> -rx <prescription> --execute` against the
@@ -97,13 +104,19 @@ export type CleanSessionFn = (sessionId: string, cwd: string, prescription: stri
  *
  * Skips if the JSONL is missing or empty. Streams cozempic output to stderr
  * with the `[slack] cozempic:` prefix and logs before/after file sizes.
+ *
+ * When `configDir` is provided, resolves the JSONL path under
+ * `${configDir}/projects/...` rather than the default `${homedir()}/.claude/...`.
+ * This is required for managed bots launched with a custom `CLAUDE_CONFIG_DIR`,
+ * since Claude writes its transcripts under that directory. Without it,
+ * cleaning before a `--resume` silently no-ops because the JSONL lookup misses.
  */
-export async function cleanSession(sessionId: string, cwd: string, prescription: string): Promise<void> {
+export async function cleanSession(sessionId: string, cwd: string, prescription: string, configDir?: string): Promise<void> {
   if (!ALLOWED_PRESCRIPTIONS.includes(prescription)) {
     console.error(`[slack] cozempic: invalid prescription "${prescription}" — skipping clean session=${sessionId}`)
     return
   }
-  const path = resolveJsonlPath(cwd, sessionId)
+  const path = resolveJsonlPath(cwd, sessionId, configDir)
   const beforeSize = readFileSizeBytes(path)
 
   if (beforeSize === null) {

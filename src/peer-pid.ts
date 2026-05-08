@@ -36,14 +36,25 @@ export async function getPeerPidByPort(
   }
 }
 
-/** Returns true if the ss output line matches the expected port pair on loopback. */
+/** Returns true if the ss output line is the peer (client) side of the loopback pair.
+ *
+ * Each loopback connection appears twice in `ss -tnp` — once owned by the
+ * server (local=serverPort, peer=peerPort) and once by the client process
+ * (local=peerPort, peer=serverPort). We want the client side so the PID is
+ * the connecting process, not our own server. Match positionally on the
+ * Local-Address and Peer-Address columns.
+ */
 function matchesPorts(line: string, peerPort: number, serverPort: number): boolean {
-  // ss -tnp columns: State Recv-Q Send-Q Local-Address:Port Peer-Address:Port ...
-  // Accept both 127.0.0.1 and ::1 loopback addresses.
+  // ss -tnp columns: State Recv-Q Send-Q Local-Address:Port Peer-Address:Port [users:(...)]
+  const tokens = line.trim().split(/\s+/)
+  if (tokens.length < 5) return false
+  const localAddr = tokens[3]
+  const peerAddr = tokens[4]
+  if (localAddr === undefined || peerAddr === undefined) return false
   const loopback = '(?:127\\.0\\.0\\.1|\\[?::1\\]?)'
-  const local = new RegExp(`${loopback}:${serverPort}(?:\\s|$)`)
-  const peer = new RegExp(`${loopback}:${peerPort}(?:\\s|$)`)
-  return local.test(line) && peer.test(line)
+  const localRe = new RegExp(`^${loopback}:${peerPort}$`)
+  const peerRe = new RegExp(`^${loopback}:${serverPort}$`)
+  return localRe.test(localAddr) && peerRe.test(peerAddr)
 }
 
 /**
@@ -63,15 +74,23 @@ function parsePid(line: string): number | null {
 // ---------------------------------------------------------------------------
 
 /**
- * Read the Claude Code session ID stored at ~/.claude/sessions/<pid>.json.
+ * Read the Claude Code session ID stored at <claudeConfigDir>/sessions/<pid>.json.
  * Returns the sessionId string, or null if the file is missing, unreadable,
  * or does not contain a valid sessionId string field.
  *
+ * `claudeConfigDir` defaults to `~/.claude` (Claude Code's default). When the
+ * managed session was launched with `CLAUDE_CONFIG_DIR=/some/path`, callers
+ * must pass that path so the lookup hits the right directory.
+ *
  * Never throws.
  */
-export async function getSessionIdForPid(pid: number): Promise<string | null> {
+export async function getSessionIdForPid(
+  pid: number,
+  claudeConfigDir?: string,
+): Promise<string | null> {
   try {
-    const filePath = join(homedir(), '.claude', 'sessions', `${pid}.json`)
+    const baseDir = claudeConfigDir ?? join(homedir(), '.claude')
+    const filePath = join(baseDir, 'sessions', `${pid}.json`)
     const raw = await readFile(filePath, 'utf-8')
     const parsed = JSON.parse(raw)
     if (parsed && typeof parsed.sessionId === 'string') return parsed.sessionId

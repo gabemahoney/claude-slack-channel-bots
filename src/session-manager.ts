@@ -24,10 +24,15 @@ import { isDryRun } from './tokens.ts'
  * Returns true if the JSONL conversation file exists for the given session.
  * The slug is computed from the CWD by replacing all non-alphanumeric-or-hyphen
  * characters with hyphens, matching Claude's project directory naming.
+ *
+ * When `configDir` is provided, looks under `${configDir}/projects/...` instead
+ * of the default `${homedir()}/.claude/projects/...`. This is required for
+ * managed bots launched with a custom `CLAUDE_CONFIG_DIR`, since Claude writes
+ * its transcripts there rather than the server's home directory.
  */
-export function jsonlExistsForSession(cwd: string, sessionId: string): boolean {
+export function jsonlExistsForSession(cwd: string, sessionId: string, configDir?: string): boolean {
   if (!/^[a-zA-Z0-9_-]+$/.test(sessionId)) return false
-  const path = resolveJsonlPath(cwd, sessionId)
+  const path = resolveJsonlPath(cwd, sessionId, configDir)
   return existsSync(path)
 }
 
@@ -80,11 +85,19 @@ export async function launchSession(
 
   const escapedConfigPath = routingConfig.mcp_config_path.replace(/'/g, "'\\''")
   const escapedChannelId = channelId.replace(/'/g, "'\\''")
+  // Per-route claude_config_dir overrides the top-level one. When set, the launch
+  // env is augmented with `CLAUDE_CONFIG_DIR='<dir>'` so the route authenticates
+  // against a specific on-disk Claude account.
+  const claudeConfigDir =
+    routingConfig.routes[channelId]?.claude_config_dir ?? routingConfig.claude_config_dir
+  const envPrefix = claudeConfigDir
+    ? `CLAUDE_MANAGED_CHANNEL='${escapedChannelId}' CLAUDE_CONFIG_DIR='${claudeConfigDir.replace(/'/g, "'\\''")}'`
+    : `CLAUDE_MANAGED_CHANNEL='${escapedChannelId}'`
   // In dry-run mode, skip --dangerously-load-development-channels (requires OAuth which isn't
   // available in Docker/CI). MCP still connects via --mcp-config; only channel routing is lost.
   let baseCmd = isDryRun()
-    ? `CLAUDE_MANAGED_CHANNEL='${escapedChannelId}' claude --mcp-config '${escapedConfigPath}'`
-    : `CLAUDE_MANAGED_CHANNEL='${escapedChannelId}' claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
+    ? `${envPrefix} claude --mcp-config '${escapedConfigPath}'`
+    : `${envPrefix} claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
 
   if (routingConfig.system_prompt_mode === 'append' && routingConfig.append_system_prompt_file !== undefined) {
     try {
@@ -174,9 +187,12 @@ export async function launchSession(
   await tmuxClient.newSession(name, cwd)
   console.error(`[slack] Session created: ${name} (cwd="${cwd}")`)
 
-  // Clean JSONL before resuming (if a cleanSession fn was provided)
+  // Clean JSONL before resuming (if a cleanSession fn was provided).
+  // Pass `claudeConfigDir` so the JSONL lookup matches where Claude actually
+  // writes its transcripts for routes that override `CLAUDE_CONFIG_DIR` —
+  // otherwise cleaning silently no-ops because the file isn't found.
   if (resumeSessionId && resumeSessionId !== 'pending' && options?.cleanSession) {
-    await options.cleanSession(resumeSessionId, cwd, routingConfig.cozempic_prescription)
+    await options.cleanSession(resumeSessionId, cwd, routingConfig.cozempic_prescription, claudeConfigDir)
   }
 
   // Attempt launch (with --resume if sessionId provided)
@@ -309,7 +325,14 @@ export async function startupSessionManager(
     const effectiveTimeout = Math.min(options?.pollTimeout ?? 120_000, startupTimeout)
     const launchOpts = { ...options, pollTimeout: effectiveTimeout }
 
-    const shouldResume = !!(storedSessionId && storedSessionId !== 'pending' && jsonlExistsForSession(route.cwd, storedSessionId))
+    // Resolve effective claude_config_dir using the same precedence as the launcher:
+    // per-route override → top-level → undefined (Claude's default ~/.claude).
+    // This must match launchSession so the JSONL pre-check looks in the same place
+    // Claude actually writes its transcripts.
+    const effectiveConfigDir =
+      routingConfig.routes[channelId]?.claude_config_dir ?? routingConfig.claude_config_dir
+
+    const shouldResume = !!(storedSessionId && storedSessionId !== 'pending' && jsonlExistsForSession(route.cwd, storedSessionId, effectiveConfigDir))
     if (!shouldResume && storedSessionId && storedSessionId !== 'pending') {
       console.error(`[slack] startupSessionManager: no JSONL for stored session — skipping resume: channel=${channelId} sessionId=${storedSessionId}`)
     }
