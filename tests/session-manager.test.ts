@@ -1571,6 +1571,133 @@ describe('jsonlExistsForSession', () => {
 })
 
 // ---------------------------------------------------------------------------
+// resume_enabled flag
+// ---------------------------------------------------------------------------
+
+describe('resume_enabled', () => {
+  test('resume_enabled: false — does fresh launch even when stored session ID and JSONL both exist', async () => {
+    // This test would FAIL before the fix: without the resume_enabled gate,
+    // a stored sessionId + existing JSONL would always take the resume branch.
+    const jsonlDir = join(homedir(), '.claude', 'projects', '-tmp-test-cwd')
+    mkdirSync(jsonlDir, { recursive: true })
+    const sessionId = 'stored-resume-disabled-id'
+    const jsonlPath = join(jsonlDir, `${sessionId}.jsonl`)
+    writeFileSync(jsonlPath, '', 'utf-8')
+    jsonlCleanupFiles.push(jsonlPath)
+
+    const stub = makeTmuxStub({
+      hasSessionResult: false,
+      getPanePidResult: '99999999', // Claude never running → fresh launch fails
+    })
+    const storedSessions: SessionsMap = {
+      'C_TEST1': {
+        tmuxSession: sessionName('/tmp/test-cwd'),
+        lastLaunch: '2026-01-01T00:00:00.000Z',
+        sessionId,
+      },
+    }
+    // resume_enabled: false — bots must always launch fresh
+    const config = makeRoutingConfig({ resume_enabled: false })
+
+    await startupSessionManager(config, stub, storedSessions, { pollTimeout: 0 })
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+
+    // --resume must NOT appear anywhere in the sent commands
+    const resumeCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume'),
+    )
+    expect(resumeCmd).toBeUndefined()
+
+    // A fresh launch command (containing 'claude --mcp-config') must have been sent
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
+    )
+    expect(launchCmd).toBeDefined()
+  })
+
+  test('resume_enabled: false has NO effect on reconnect path — live Claude process still gets /mcp reconnect', async () => {
+    // Reconnect fires when the tmux session is alive and Claude is running.
+    // resume_enabled controls whether --resume is used when Claude is dead and a
+    // stored session ID exists. It must not block the reconnect path at all.
+    const proc = await spawnClaudeProcess()
+    try {
+      const stub = makeTmuxStub({
+        hasSessionResult: true,
+        getPanePidResult: String(proc.pid),
+      })
+      const storedSessions: SessionsMap = {
+        'C_TEST1': {
+          tmuxSession: sessionName('/tmp/test-cwd'),
+          lastLaunch: '2026-01-01T00:00:00.000Z',
+          sessionId: 'live-session-id',
+        },
+      }
+      const config = makeRoutingConfig({ resume_enabled: false })
+
+      const result = await startupSessionManager(config, stub, storedSessions, { pollTimeout: 0 })
+
+      // Reconnect path succeeds regardless of resume_enabled
+      expect(result).toBeInstanceOf(Map)
+      expect(result.size).toBe(1)
+      const record = result.get('C_TEST1')
+      expect(record).toBeDefined()
+      expect(record!.sessionId).toBe('live-session-id')
+
+      // No kill or newSession — reconnect path only
+      expect(stub.calls.filter(c => c.method === 'killSession')).toHaveLength(0)
+      expect(stub.calls.filter(c => c.method === 'newSession')).toHaveLength(0)
+
+      // /mcp reconnect was sent as usual
+      const reconnectCall = stub.calls.filter(c => c.method === 'sendKeys').find(
+        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`/mcp reconnect ${MCP_SERVER_NAME}`),
+      )
+      expect(reconnectCall).toBeDefined()
+    } finally {
+      proc.kill()
+    }
+  })
+
+  test('resume_enabled: true (explicit) — resumes when stored session ID and JSONL both exist', async () => {
+    const jsonlDir = join(homedir(), '.claude', 'projects', '-tmp-test-cwd')
+    mkdirSync(jsonlDir, { recursive: true })
+    const sessionId = 'stored-resume-enabled-id'
+    const jsonlPath = join(jsonlDir, `${sessionId}.jsonl`)
+    writeFileSync(jsonlPath, '', 'utf-8')
+    jsonlCleanupFiles.push(jsonlPath)
+
+    const stub = makeTmuxStub({
+      hasSessionResult: false,
+      capturePaneResult: 'I am using this for local development',
+    })
+    const storedSessions: SessionsMap = {
+      'C_TEST1': {
+        tmuxSession: sessionName('/tmp/test-cwd'),
+        lastLaunch: '2026-01-01T00:00:00.000Z',
+        sessionId,
+      },
+    }
+    // resume_enabled: true (explicit) — normal resume path
+    const config = makeRoutingConfig({ resume_enabled: true })
+
+    const result = await startupSessionManager(config, stub, storedSessions, {
+      pollTimeout: 2_000,
+    })
+
+    expect(result).toBeInstanceOf(Map)
+    expect(result.size).toBe(1)
+    expect(result.get('C_TEST1')!.sessionId).toBe(sessionId)
+
+    // --resume <sessionId> must appear in the sent commands
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    const resumeCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${sessionId}`),
+    )
+    expect(resumeCmd).toBeDefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // launchSession — cleaning integration
 // ---------------------------------------------------------------------------
 

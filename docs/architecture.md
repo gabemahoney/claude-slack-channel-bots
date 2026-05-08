@@ -86,8 +86,8 @@ Called from `main()` in `server.ts`. `rotateSessions()` runs as the very first a
 3. **tmux availability check** — `startupSessionManager()` calls `tmuxClient.checkAvailability()` (`tmux -V`). If tmux is not installed, startup is skipped with a warning and the server continues.
 4. **Concurrent route launch** — all routes are processed concurrently via `Promise.allSettled`. Each route applies a three-branch decision tree:
    - **Reconnect** — tmux session exists AND `isClaudeRunning()` returns true → send `/mcp reconnect <server-name>` (from `MCP_SERVER_NAME` in `config.ts`) to the running session; the stored `sessionId` from `sessions.json.last` is carried forward (or `"pending"` if absent); no relaunch
-   - **Resume** — dead or missing process with a stored `sessionId` in `sessions.json.last` → verify `~/.claude/projects/<slug>/<sessionId>.jsonl` exists; if the file is absent, fall through to **Fresh** immediately (no tmux launch attempted); otherwise kill any stale tmux session, call `cleanSession()` if cozempic is available (cleans the JSONL file before resume to reduce load times), then call `launchSession()` with the stored session ID (passes `--resume <id>` to Claude)
-   - **Fresh** — dead or missing process without a stored session ID → kill any stale tmux session, call `launchSession()` with no session ID
+   - **Resume** — dead or missing process with a stored `sessionId` in `sessions.json.last` AND `resume_enabled` is `true` (default) → verify `~/.claude/projects/<slug>/<sessionId>.jsonl` exists; if the file is absent, fall through to **Fresh** immediately (no tmux launch attempted); otherwise kill any stale tmux session, call `cleanSession()` if cozempic is available (cleans the JSONL file before resume to reduce load times), then call `launchSession()` with the stored session ID (passes `--resume <id>` to Claude). If `resume_enabled` is `false`, this branch is bypassed entirely and the route falls through to **Fresh** regardless of the stored session ID.
+   - **Fresh** — dead or missing process without a stored session ID, or `resume_enabled` is `false` → kill any stale tmux session, call `launchSession()` with no session ID
 5. **Atomic sessions.json write** — after all routes settle, results are collected into a `SessionsMap` and written atomically via `writeSessions()`. This is the only write to `sessions.json` during startup.
 6. **Launch flow** (`launchSession()`) — signature: `(channelId, cwd, routingConfig, tmuxClient, options?) → Promise<SessionRecord | null>`:
    - `tmuxClient.newSession(name, cwd)` creates a detached tmux session
@@ -131,7 +131,7 @@ After `scheduleRestart` is called:
 3. **Timer** — a `setTimeout` fires after `session_restart_delay` seconds
 4. **Liveness check** — `isSessionAlive()` checks whether Claude is already running in tmux; if alive, `reconnectSession()` sends `/mcp reconnect <server-name>` to the running tmux session and returns — no relaunch needed
 5. **Kill zombie** — any dead tmux session for the channel is cleaned up (errors ignored)
-6. **Relaunch** — `launchSession()` is called with the stored `sessionId` from sessions.json if one exists and is not `"pending"`; when a real UUID is available, Claude launches with `--resume <id>`, preserving conversation context across the restart. If the stored ID is absent or `"pending"`, a fresh launch is performed. On failure the per-channel failure counter increments.
+6. **Relaunch** — `launchSession()` is called with the stored `sessionId` from sessions.json if one exists, is not `"pending"`, and `resume_enabled` is `true` (default); when a real UUID is available and resume is enabled, Claude launches with `--resume <id>`, preserving conversation context across the restart. If the stored ID is absent, `"pending"`, or `resume_enabled` is `false`, a fresh launch is performed. On failure the per-channel failure counter increments.
 7. **Success reset** — when a session successfully reconnects and registers, `resetFailureCounter()` clears the counter for that channel
 
 ### Health-Check Poller
@@ -192,6 +192,7 @@ Key fields:
 - `system_prompt_mode` — controls whether `append_system_prompt_file` is applied (default: `"append"`; valid: `append`, `none`). `"append"` passes `--append-system-prompt-file` to Claude when launching sessions; `"none"` skips the flag entirely so only `CLAUDE.md` is used
 - `cozempic_prescription` — cozempic cleaning intensity used before `--resume` launches (default: `"standard"`; valid: `gentle`, `standard`, `aggressive`); has no effect if cozempic is not installed
 - `claude_config_dir` — optional path to a Claude on-disk config directory used for managed sessions; when set, launches are prefixed with `CLAUDE_CONFIG_DIR='<resolved-path>'` so the route authenticates against a specific account. `~` is expanded and the path is resolved to absolute. Per-route `routes[id].claude_config_dir` overrides this top-level value. When neither is set, Claude's own default applies.
+- `resume_enabled` — boolean (default: `true`). When `false`, the session manager skips `--resume` entirely and always performs a fresh launch, even when a stored session ID exists. Use this to work around versions of Claude Code that crash on `--resume` (e.g. the v2.1.120 "sandbox required but unavailable" regression). Affects both startup (step 4, **Resume** branch) and auto-restart (step 6).
 
 ### sessions.json (~/.claude/channels/slack/sessions.json)
 

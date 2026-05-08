@@ -228,6 +228,21 @@ describe('applyDefaults', () => {
     }))
     expect(result.routes['C_GENERAL'].claude_config_dir).toBe('/route-dir')
   })
+
+  test('fills resume_enabled with true when absent', () => {
+    const result = applyDefaults(makeRoutingConfig())
+    expect(result.resume_enabled).toBe(true)
+  })
+
+  test('preserves resume_enabled: false when explicitly set', () => {
+    const result = applyDefaults(makeRoutingConfig({ resume_enabled: false }))
+    expect(result.resume_enabled).toBe(false)
+  })
+
+  test('preserves resume_enabled: true when explicitly set', () => {
+    const result = applyDefaults(makeRoutingConfig({ resume_enabled: true }))
+    expect(result.resume_enabled).toBe(true)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -248,6 +263,7 @@ function makeValidConfig(overrides: Partial<RoutingConfig> = {}): RoutingConfig 
     mcp_config_path: `${homedir()}/.claude/slack-mcp.json`,
     cozempic_prescription: 'standard',
     system_prompt_mode: 'append',
+    resume_enabled: true,
     ...overrides,
   }
 }
@@ -698,6 +714,12 @@ describe('resolveConfig', () => {
       routes: { C_X: { cwd: '/tmp', claude_config_dir: '' } },
     })).toThrow('routes["C_X"].claude_config_dir must be a non-empty string')
   })
+
+  test('preserves resume_enabled: false through resolveConfig', () => {
+    const input = makeRoutingConfig({ resume_enabled: false })
+    const result = resolveConfig(input)
+    expect(result.resume_enabled).toBe(false)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -914,6 +936,18 @@ describe('loadConfig', () => {
     writeFileSync(configPath, JSON.stringify(config), 'utf-8')
     const result = loadConfig(configPath)
     expect(result.claude_config_dir).toBeUndefined()
+  })
+
+  test('resume_enabled: false survives JSON parse + resolve pipeline', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+      resume_enabled: false,
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.resume_enabled).toBe(false)
   })
 })
 

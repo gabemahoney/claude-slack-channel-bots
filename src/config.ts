@@ -63,6 +63,12 @@ export interface RoutingConfigInput {
    * `~` is expanded and the path is resolved to absolute.
    */
   claude_config_dir?: string
+  /**
+   * When false, disables --resume on startup so bots always launch fresh.
+   * Defaults to true. Set to false to work around `--resume` regressions
+   * (e.g. Claude Code v2.1.120 "sandbox required but unavailable").
+   */
+  resume_enabled?: boolean
 }
 
 /** Validated, fully-resolved routing configuration with all defaults applied. */
@@ -83,6 +89,8 @@ export interface RoutingConfig {
   /** Absolute path to SQLite archive DB. Undefined disables the feature. */
   message_archive_db?: string
   claude_config_dir?: string
+  /** When false, --resume is skipped on startup and bots always launch fresh. Defaults to true. */
+  resume_enabled: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +118,7 @@ export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
     system_prompt_mode: input.system_prompt_mode ?? 'append',
     message_archive_db: input.message_archive_db,
     claude_config_dir: input.claude_config_dir,
+    resume_enabled: input.resume_enabled ?? true,
   }
 }
 

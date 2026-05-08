@@ -332,8 +332,11 @@ export async function startupSessionManager(
     const effectiveConfigDir =
       routingConfig.routes[channelId]?.claude_config_dir ?? routingConfig.claude_config_dir
 
-    const shouldResume = !!(storedSessionId && storedSessionId !== 'pending' && jsonlExistsForSession(route.cwd, storedSessionId, effectiveConfigDir))
-    if (!shouldResume && storedSessionId && storedSessionId !== 'pending') {
+    const shouldResume = routingConfig.resume_enabled !== false && !!(storedSessionId && storedSessionId !== 'pending' && jsonlExistsForSession(route.cwd, storedSessionId, effectiveConfigDir))
+    if (!routingConfig.resume_enabled) {
+      console.error(`[slack] startupSessionManager: resume_enabled=false — skipping resume for channel=${channelId}`)
+    }
+    if (routingConfig.resume_enabled !== false && !shouldResume && storedSessionId && storedSessionId !== 'pending') {
       console.error(`[slack] startupSessionManager: no JSONL for stored session — skipping resume: channel=${channelId} sessionId=${storedSessionId}`)
     }
 
