@@ -28,10 +28,14 @@ async function runHook(
 }
 
 describe('hook guards — no env var', () => {
-  test('permission-relay.sh exits 0 with empty stdout when CLAUDE_MANAGED_CHANNEL is unset', async () => {
+  test('permission-relay.sh emits deny JSON when CLAUDE_MANAGED_CHANNEL is unset', async () => {
     const { exitCode, stdout } = await runHook('permission-relay.sh')
     expect(exitCode).toBe(0)
-    expect(stdout.trim()).toBe('')
+    const parsed = JSON.parse(stdout.trim())
+    expect(parsed.hookSpecificOutput.hookEventName).toBe('PermissionRequest')
+    expect(parsed.hookSpecificOutput.decision.behavior).toBe('deny')
+    expect(typeof parsed.hookSpecificOutput.decision.message).toBe('string')
+    expect(parsed.hookSpecificOutput.decision.message.length).toBeGreaterThan(0)
   })
 
   test('ask-relay.sh exits 0 with empty stdout when CLAUDE_MANAGED_CHANNEL is unset', async () => {

@@ -22,6 +22,7 @@ fi
 
 # Guard: only relay for bot-managed sessions
 if [ -z "${CLAUDE_MANAGED_CHANNEL:-}" ]; then
+  printf '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Not a managed Slack session"}}}\n'
   exit 0
 fi
 CHANNEL="$CLAUDE_MANAGED_CHANNEL"
