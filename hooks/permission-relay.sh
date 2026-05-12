@@ -51,7 +51,7 @@ PAYLOAD=$(jq -n \
 RESPONSE=$(curl -s -f -X POST \
   -H "Content-Type: application/json" \
   -d "$PAYLOAD" \
-  --max-time 10 \
+  --max-time 900 \
   "${BASE_URL}/permission" 2>/dev/null) || deny_and_exit "Server unreachable"
 
 REQUEST_ID=$(echo "$RESPONSE" | jq -r '.requestId // ""' 2>/dev/null) || deny_and_exit "Failed to parse response"
