@@ -10,7 +10,7 @@ The Slack Channel Router is a two-way bridge between Slack and Claude Code sessi
 cli.ts                  CLI entry point for the claude-slack-channel-bots command, dispatches start/stop/clean_restart subcommands, performs prerequisite checks, thin wrapper around server.ts main()
 └── server.ts           Main entry point — HTTP server, Socket Mode, session lifecycle, message routing
     ├── config.ts           Routing configuration — load, validate, defaults, tilde expansion
-    ├── registry.ts         Session registry — pending/registered sessions, MCP Server factory, transport routing
+    ├── registry.ts         Session registry — keyed by channelId; pending/registered sessions, MCP Server factory, transport routing
     ├── lib.ts              Pure utilities — gate, access control, chunking, sanitization
     ├── logging.ts          Log file setup — overrides console.error/console.log with timestamped writeSync to a log file
     ├── session-manager.ts  Startup orchestration — per-route state detection, kill/relaunch logic
@@ -36,7 +36,7 @@ cli.ts                  CLI entry point for the claude-slack-channel-bots comman
 1. Slack message arrives via Socket Mode (`message` or `app_mention` event)
 2. `gate()` checks access control (bot messages, subtypes, DM policy, allowlist)
 3. If `ackReaction` is configured, the ack emoji is applied to the message and `trackAck(channelId, messageTs)` records the pending ack for later removal
-4. Message is routed to the correct session via `getSessionByChannel()` or `getSessionByCwd()`. If the channel has an entry in `routes` but its session is not yet registered (e.g. still starting up), the message is not delivered to Claude — instead, the server posts `"Message not delivered — session starting up, please retry in a moment."` back to the channel. `default_route` does not apply for configured channels; it is only consulted for channels with no entry in `routes` at all.
+4. Message is routed to the correct session via `getSessionByChannel()` (O(1) direct `registry.get(channelId)` lookup) or `getSessionByCwd()` (O(n) linear scan, used only for `default_route` and `default_dm_session` lookups). If the channel has an entry in `routes` but its session is not yet registered (e.g. still starting up), the message is not delivered to Claude — instead, the server posts `"Message not delivered — session starting up, please retry in a moment."` back to the channel. `default_route` does not apply for configured channels; it is only consulted for channels with no entry in `routes` at all.
 5. Session's MCP Server sends `notifications/claude/channel` to the Claude Code client
 
 ### Outbound (Claude Code → Slack)
@@ -73,7 +73,7 @@ Same pattern as permission relay but via `PreToolUse` hook on `AskUserQuestion`:
 
 1. Claude Code sends POST to `/mcp` (no session ID) → `initPendingSession()` creates a pending session
 2. MCP handshake completes → `server.oninitialized` fires → `handleInitialized()` calls `roots/list`
-3. CWD from roots is matched against `routingConfig.routes` → session promoted from pending to registered
+3. CWD from roots is matched against `routingConfig.routes` to resolve the `channelId` → session promoted from pending to registered, keyed by `channelId` in the registry
 4. Session receives messages from its assigned Slack channel
 5. A keep-alive timer is started (`startSseKeepAlive`) that writes SSE comment frames (`:ping\n\n`) every ~30 s to prevent idle connection drops from proxies or load balancers
 
@@ -118,8 +118,8 @@ This path is skipped if `peerPort` is 0 (not yet set), if the `ss` command fails
 ### Disconnection
 
 1. Transport closes → `onsessionclosed` fires
-2. Session removed from registry
-3. `onsessionclosed` resolves the session's CWD back to a `channelId` via `routingConfig.routes`
+2. `unregisterByMcpSessionId()` removes the session from the registry and returns its `channelId` directly (O(1) lookup via `mcpSessionIdToChannelId` index, then `registry.delete(channelId)`)
+3. The CWD is resolved from `routingConfig.routes[channelId]` for the restart call
 4. If a `channelId` is found, `scheduleRestart(channelId, cwd)` is called
 
 ### Auto-Restart
@@ -175,7 +175,7 @@ On `SIGTERM` or `SIGINT`, the shutdown handler calls `stopAllKeepAliveTimers()` 
 
 ### config.json (~/.claude/channels/slack/config.json)
 
-Maps Slack channels to project directories. The server uses CWD matching to route sessions.
+Maps Slack channels to project directories. The session registry is keyed by `channelId`; CWD matching is used only at connection time to identify which route a new session belongs to.
 
 Key fields:
 - `routes` — `Record<channelId, { cwd: string }>` — the channel-to-directory mapping
