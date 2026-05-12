@@ -96,7 +96,7 @@ function simulateChannelRoute(
   routingConfig: RoutingConfig | null,
 ): { targetSession: ReturnType<typeof getSessionByCwd>; usedDefaultRoute: boolean } {
   const targetByChannel = routingConfig
-    ? getSessionByChannel(channelId, routingConfig)
+    ? getSessionByChannel(channelId)
     : undefined
 
   let targetSession = targetByChannel
