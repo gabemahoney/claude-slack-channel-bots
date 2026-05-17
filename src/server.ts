@@ -53,6 +53,7 @@ import {
 } from './restart.ts'
 import { initHealthCheck, startHealthCheck, stopHealthCheck } from './health-check.ts'
 import { loadTokens, isDryRun } from './tokens.ts'
+import { bootstrapTrust } from './trust-bootstrap.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
 import { trackAck, consumeAck } from './ack-tracker.ts'
 import {
@@ -1566,6 +1567,11 @@ export async function main(): Promise<void> {
   // Start up managed tmux sessions for all configured routes.
   // If tmux is unavailable or startup fails, log a warning and continue.
   if (routingConfig) {
+    try {
+      bootstrapTrust(routingConfig)
+    } catch (err) {
+      console.error('[slack] Warning: trust bootstrap failed — continuing without trust pre-acceptance:', err)
+    }
     try {
       const lastPath = join(STATE_DIR, 'sessions.json.last')
       const storedSessions = readSessions(lastPath)

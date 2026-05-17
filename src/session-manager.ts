@@ -138,6 +138,7 @@ export async function launchSession(
     console.error(`[slack] Claude launch command sent to session: ${sessionName_}`)
 
     let delay = POLL_START_MS
+    let trustDialogHandled = false
 
     while (Date.now() < launchDeadline) {
       await new Promise<void>((resolve) => setTimeout(resolve, delay))
@@ -155,6 +156,20 @@ export async function launchSession(
       if (pane.includes(NO_CONVERSATION_TEXT)) {
         console.error(`[slack] "No conversation found" detected — fast-fail resume for channel=${channelId}`)
         return 'NO_CONVERSATION' as unknown as SessionRecord
+      }
+
+      // Trust dialog: "Do you trust the files in this folder?" — default is "No, exit".
+      // Must select "Yes, proceed" with Down then Enter before continuing.
+      if (
+        !trustDialogHandled &&
+        pane.includes('Do you trust the files in this folder') &&
+        pane.includes('Yes, proceed')
+      ) {
+        console.error(`[slack] Trust dialog detected — selecting "Yes, proceed" in session: ${sessionName_}`)
+        await tmuxClient.sendKeys(sessionName_, 'Down')
+        await tmuxClient.sendKeys(sessionName_, 'Enter')
+        trustDialogHandled = true
+        continue
       }
 
       if (pane.includes(PROMPT_TEXT)) {

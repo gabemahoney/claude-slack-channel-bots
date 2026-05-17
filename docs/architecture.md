@@ -102,6 +102,18 @@ Called from `main()` in `server.ts`. `rotateSessions()` runs as the very first a
    - **Resume failure fallback** — if `"No conversation found"` is detected in the pane, or if the `--resume` attempt times out, the tmux session is killed, recreated, and retried once with a fresh launch (no `--resume`). Note: the JSONL pre-check in the startup decision tree gates this path — if the file is absent, startup falls through to Fresh before any tmux launch is attempted
    - Returns a `SessionRecord` on success, or `null` on failure
 
+### Trust Bootstrap
+
+Before `startupSessionManager` is called, `main()` in `src/server.ts` calls `bootstrapTrust(routingConfig)` (from `src/trust-bootstrap.ts`) inside the same `if (routingConfig) { ... }` block. Any exception is caught and logged; failure is non-fatal and startup continues.
+
+**Why it exists.** Claude Code shows a "Do you trust the files in this folder?" interactive dialog the first time it opens a project directory. This dialog appears before the safety prompt, so the `attemptLaunch` poll loop in `session-manager.ts` would never see the safety prompt text — the session would time out. `bootstrapTrust` pre-accepts trust at server startup so the dialog never appears for managed sessions.
+
+**What it touches.** For each route, it resolves the effective `claude_config_dir` using the same precedence as the launcher: per-route `routes[id].claude_config_dir` → top-level `claude_config_dir` → `~/.claude`. It then patches `<claude_config_dir>/.claude.json` so that `projects[<absolute-cwd>].hasTrustDialogAccepted` and `projects[<absolute-cwd>].hasCompletedProjectOnboarding` are both `true`. Routes that share a `claude_config_dir` are grouped so each `(configDir, cwd)` pair is processed once; the `.claude.json` is read (and atomically rewritten, if a change is needed) once per CWD in that dir. The write is atomic (write to `.claude.json.tmp`, then rename).
+
+**Idempotency and missing files.** If both flags are already `true`, the file is not rewritten. If `.claude.json` is missing, unreadable, or malformed JSON, the route is silently skipped with a log line — the file is never auto-created. A missing file typically means the Claude account for that config dir has not been set up; the operator must run `claude auth login` with `CLAUDE_CONFIG_DIR` set to that path to populate it.
+
+**Defense-in-depth.** Even with trust pre-accepted, the `attemptLaunch` poll loop in `session-manager.ts` also handles the dialog if it appears at launch time (e.g. a route whose CWD was never provisioned, or trust state clobbered on disk). When the pane contains both `'Do you trust the files in this folder'` and `'Yes, proceed'`, the launcher sends `Down` then `Enter` — not Enter alone, which would select the default "No, exit" and terminate the session. A one-shot flag (`trustDialogHandled`) prevents re-sending while the pane redraws. The poll loop then continues waiting for the safety prompt or ready banner.
+
 ### Session ID Discovery
 
 After every MCP tool call by a registered session, `registry.ts` fires a fire-and-forget async block that discovers and persists the real Claude session UUID without blocking the tool call response:

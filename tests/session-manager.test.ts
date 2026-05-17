@@ -1979,3 +1979,120 @@ describe('launchSession — cleaning integration', () => {
     expect(cleanCalls[0][3]).toBeUndefined()
   })
 })
+
+// ---------------------------------------------------------------------------
+// Trust dialog handling in launchSession / attemptLaunch
+// ---------------------------------------------------------------------------
+
+describe('launchSession trust dialog handling', () => {
+  const TRUST_PANE = 'Do you trust the files in this folder?\n  Yes, proceed\n  No, exit'
+  const SAFETY_PANE = 'I am using this for local development'
+  const READY_PANE = 'Claude Code v2.0.0\n❯'
+
+  test('A. trust dialog before safety prompt: Down+Enter sent, then Enter for safety prompt, returns pending record', async () => {
+    // This is the regression-guard test: before the fix, the launcher had no
+    // trust-dialog handler and would loop forever waiting for PROMPT_TEXT that
+    // never arrived (the dialog stayed on screen). With the fix it dismisses
+    // the dialog and proceeds to the safety prompt.
+    const stub = makeTmuxStub({
+      capturePaneResults: [
+        TRUST_PANE,    // first poll → trust dialog
+        SAFETY_PANE,   // second poll → safety prompt
+      ],
+    })
+    const config = makeRoutingConfig()
+
+    const result = await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 5_000 },
+    )
+
+    expect(result).not.toBeNull()
+    expect(result!.sessionId).toBe('pending')
+
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+
+    // Launch command was sent first
+    const launchCmd = sendKeysCalls.find(
+      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude'),
+    )
+    expect(launchCmd).toBeDefined()
+    const launchIdx = stub.calls.indexOf(launchCmd!)
+
+    // Down then Enter for trust dialog
+    const downCalls = sendKeysCalls.filter(c => c.args[1] === 'Down')
+    expect(downCalls).toHaveLength(1)
+    const enterCalls = sendKeysCalls.filter(c => c.args[1] === 'Enter')
+    // At least: Enter for launch + Enter for trust dialog + Enter for safety prompt = 3
+    expect(enterCalls.length).toBe(3)
+
+    const downIdx = stub.calls.indexOf(downCalls[0])
+    expect(downIdx).toBeGreaterThan(launchIdx)
+
+    // Down must come before the final safety-prompt Enter
+    const lastEnterIdx = stub.calls.lastIndexOf(enterCalls[enterCalls.length - 1])
+    expect(downIdx).toBeLessThan(lastEnterIdx)
+  })
+
+  test('B. trust dialog still showing on second poll → Down+Enter sent exactly once', async () => {
+    const stub = makeTmuxStub({
+      capturePaneResults: [
+        TRUST_PANE,    // first poll → trust dialog
+        TRUST_PANE,    // second poll → still trust dialog (still rendering)
+        SAFETY_PANE,   // third poll → safety prompt
+      ],
+    })
+    const config = makeRoutingConfig()
+
+    await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 5_000 },
+    )
+
+    const downCalls = stub.calls.filter(c => c.method === 'sendKeys' && c.args[1] === 'Down')
+    expect(downCalls).toHaveLength(1)
+  })
+
+  test('C. trust dialog then ready banner (no safety prompt) → non-null record, Down+Enter sent once', async () => {
+    const stub = makeTmuxStub({
+      capturePaneResults: [
+        TRUST_PANE,  // first poll → trust dialog
+        READY_PANE,  // second poll → ready banner
+      ],
+    })
+    const config = makeRoutingConfig()
+
+    const result = await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 5_000 },
+    )
+
+    expect(result).not.toBeNull()
+    expect(result!.sessionId).toBe('pending')
+
+    const downCalls = stub.calls.filter(c => c.method === 'sendKeys' && c.args[1] === 'Down')
+    expect(downCalls).toHaveLength(1)
+  })
+
+  test('D. trust marker text alone (no "Yes, proceed") does NOT trigger handler', async () => {
+    // Pane has the trust question but not the menu option — handler must NOT fire
+    const PARTIAL_TRUST_PANE = 'Do you trust the files in this folder'
+    const stub = makeTmuxStub({
+      capturePaneResults: [
+        PARTIAL_TRUST_PANE,  // first poll → only question text, no menu
+        SAFETY_PANE,         // second poll → safety prompt
+      ],
+    })
+    const config = makeRoutingConfig()
+
+    const result = await launchSession(
+      'C_TEST1', '/tmp/test-cwd', config, stub,
+      { pollTimeout: 5_000 },
+    )
+
+    expect(result).not.toBeNull()
+
+    const downCalls = stub.calls.filter(c => c.method === 'sendKeys' && c.args[1] === 'Down')
+    expect(downCalls).toHaveLength(0)
+  })
+})
