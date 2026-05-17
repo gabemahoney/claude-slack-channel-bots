@@ -1985,15 +1985,14 @@ describe('launchSession — cleaning integration', () => {
 // ---------------------------------------------------------------------------
 
 describe('launchSession trust dialog handling', () => {
-  const TRUST_PANE = 'Do you trust the files in this folder?\n  Yes, proceed\n  No, exit'
+  const TRUST_PANE = 'Do you trust the files in this folder?\n❯ 1. Yes, I trust this folder\n  2. No, exit'
   const SAFETY_PANE = 'I am using this for local development'
   const READY_PANE = 'Claude Code v2.0.0\n❯'
 
-  test('A. trust dialog before safety prompt: Down+Enter sent, then Enter for safety prompt, returns pending record', async () => {
-    // This is the regression-guard test: before the fix, the launcher had no
-    // trust-dialog handler and would loop forever waiting for PROMPT_TEXT that
-    // never arrived (the dialog stayed on screen). With the fix it dismisses
-    // the dialog and proceeds to the safety prompt.
+  test('A. trust dialog before safety prompt: Enter sent (no Down), then Enter for safety prompt, returns pending record', async () => {
+    // Regression-guard: default focus on the trust dialog is "Yes, I trust this
+    // folder", so plain Enter accepts. Sending Down would move focus to
+    // "No, exit" and kill Claude — assert no Down keys are sent.
     const stub = makeTmuxStub({
       capturePaneResults: [
         TRUST_PANE,    // first poll → trust dialog
@@ -2017,24 +2016,17 @@ describe('launchSession trust dialog handling', () => {
       c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude'),
     )
     expect(launchCmd).toBeDefined()
-    const launchIdx = stub.calls.indexOf(launchCmd!)
 
-    // Down then Enter for trust dialog
+    // No Down keys must be sent — Down would select "No, exit"
     const downCalls = sendKeysCalls.filter(c => c.args[1] === 'Down')
-    expect(downCalls).toHaveLength(1)
+    expect(downCalls).toHaveLength(0)
+
+    // Enters: launch + trust accept + safety prompt = 3
     const enterCalls = sendKeysCalls.filter(c => c.args[1] === 'Enter')
-    // At least: Enter for launch + Enter for trust dialog + Enter for safety prompt = 3
     expect(enterCalls.length).toBe(3)
-
-    const downIdx = stub.calls.indexOf(downCalls[0])
-    expect(downIdx).toBeGreaterThan(launchIdx)
-
-    // Down must come before the final safety-prompt Enter
-    const lastEnterIdx = stub.calls.lastIndexOf(enterCalls[enterCalls.length - 1])
-    expect(downIdx).toBeLessThan(lastEnterIdx)
   })
 
-  test('B. trust dialog still showing on second poll → Down+Enter sent exactly once', async () => {
+  test('B. trust dialog still showing on second poll → trust-accept Enter sent exactly once, no Down', async () => {
     const stub = makeTmuxStub({
       capturePaneResults: [
         TRUST_PANE,    // first poll → trust dialog
@@ -2049,11 +2041,17 @@ describe('launchSession trust dialog handling', () => {
       { pollTimeout: 5_000 },
     )
 
-    const downCalls = stub.calls.filter(c => c.method === 'sendKeys' && c.args[1] === 'Down')
-    expect(downCalls).toHaveLength(1)
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+
+    const downCalls = sendKeysCalls.filter(c => c.args[1] === 'Down')
+    expect(downCalls).toHaveLength(0)
+
+    // launch Enter + trust-accept Enter (once, due to trustDialogHandled flag) + safety Enter = 3
+    const enterCalls = sendKeysCalls.filter(c => c.args[1] === 'Enter')
+    expect(enterCalls.length).toBe(3)
   })
 
-  test('C. trust dialog then ready banner (no safety prompt) → non-null record, Down+Enter sent once', async () => {
+  test('C. trust dialog then ready banner (no safety prompt) → non-null record, Enter sent once, no Down', async () => {
     const stub = makeTmuxStub({
       capturePaneResults: [
         TRUST_PANE,  // first poll → trust dialog
@@ -2070,16 +2068,23 @@ describe('launchSession trust dialog handling', () => {
     expect(result).not.toBeNull()
     expect(result!.sessionId).toBe('pending')
 
-    const downCalls = stub.calls.filter(c => c.method === 'sendKeys' && c.args[1] === 'Down')
-    expect(downCalls).toHaveLength(1)
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+
+    const downCalls = sendKeysCalls.filter(c => c.args[1] === 'Down')
+    expect(downCalls).toHaveLength(0)
+
+    // launch Enter + trust-accept Enter = 2 (no safety prompt, ready banner short-circuits)
+    const enterCalls = sendKeysCalls.filter(c => c.args[1] === 'Enter')
+    expect(enterCalls.length).toBe(2)
   })
 
-  test('D. trust marker text alone (no "Yes, proceed") does NOT trigger handler', async () => {
-    // Pane has the trust question but not the menu option — handler must NOT fire
+  test('D. trust marker text alone (no "Yes, I trust this folder") does NOT trigger handler', async () => {
+    // Pane has the trust question but not the confirm label — handler must NOT fire,
+    // so no trust-accept Enter is sent (only launch Enter + safety prompt Enter = 2).
     const PARTIAL_TRUST_PANE = 'Do you trust the files in this folder'
     const stub = makeTmuxStub({
       capturePaneResults: [
-        PARTIAL_TRUST_PANE,  // first poll → only question text, no menu
+        PARTIAL_TRUST_PANE,  // first poll → only question text, no confirm label
         SAFETY_PANE,         // second poll → safety prompt
       ],
     })
@@ -2092,7 +2097,13 @@ describe('launchSession trust dialog handling', () => {
 
     expect(result).not.toBeNull()
 
-    const downCalls = stub.calls.filter(c => c.method === 'sendKeys' && c.args[1] === 'Down')
+    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+
+    const downCalls = sendKeysCalls.filter(c => c.args[1] === 'Down')
     expect(downCalls).toHaveLength(0)
+
+    // launch Enter + safety Enter = 2 (no extra trust-accept Enter)
+    const enterCalls = sendKeysCalls.filter(c => c.args[1] === 'Enter')
+    expect(enterCalls.length).toBe(2)
   })
 })
