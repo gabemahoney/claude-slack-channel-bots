@@ -56,6 +56,7 @@ import { initHealthCheck, startHealthCheck, stopHealthCheck } from './health-che
 import { loadTokens, isDryRun } from './tokens.ts'
 import { bootstrapTrust } from './trust-bootstrap.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
+import { runStartupGates } from './claude-director-probe.ts'
 import { trackAck, consumeAck } from './ack-tracker.ts'
 import {
   openArchiveDatabase,
@@ -930,9 +931,10 @@ process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
 // ---------------------------------------------------------------------------
 
 export async function main(): Promise<void> {
-  // Check for existing server BEFORE rotating sessions.json.
-  // If we rotate first, a failed start (e.g., server already running) destroys sessions.json.
-  checkPidConflict(PID_FILE)
+  // Run startup gates in order: dep-probe (CE1) → state.db same-user (CE2) → checkPidConflict.
+  // These run before any disruptive side effects (sessions.json rotation, Socket Mode connect,
+  // PID file write). A missing or broken claude-director binary exits here with a clear message.
+  runStartupGates({ checkPidConflict, pidFile: PID_FILE })
 
   // Rotate sessions.json → sessions.json.last now that we know we're the only server.
   // This preserves last-known session IDs for resume logic below.

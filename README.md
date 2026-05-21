@@ -39,10 +39,35 @@ See the sections below for manual configuration details if you prefer not to use
 - [Bun](https://bun.sh) v1.0+
 - [tmux](https://github.com/tmux/tmux) (required for server-managed sessions)
 - [Claude Code](https://claude.ai/code) installed and authenticated
+- [claude-director](https://github.com/gabemahoney/claude-director#install) installed and on your `PATH` (required for spawning and relaying bot sessions; CSCB probes for it at startup and refuses to start if it is missing)
 - `ss` from [iproute2](https://github.com/iproute2/iproute2) on your `PATH` (required for session ID discovery; pre-installed on most Linux distributions)
 - `curl` and `jq` on your `PATH` (required for the permission relay hooks)
 - Slack workspace admin access (to create and configure the Slack app)
 - **cozempic** (optional) — Python 3.10+ and `pip install cozempic` — enables session file cleaning before `--resume` for faster load times
+
+---
+
+## Runtime Requirements
+
+### Same-user invariant
+
+CSCB and the `claude-director`-managed bot sessions must run as the same OS user. `claude-director` stores its state database at `~/.claude-director/state.db` with mode `0600`. At startup, CSCB stats that file and refuses to start if its owner UID does not match the UID of the running CSCB process.
+
+**Supported configurations:**
+
+- Both CSCB and `claude-director` running as `root` — supported.
+- Both running as the same dedicated service user — supported, and recommended for production.
+
+**Explicitly unsupported:**
+
+Shared-homedir / NFS-home multi-host configurations — where multiple machines mount the same `$HOME` and run CSCB or `claude-director` from different hosts — are not supported and not tested. If you are considering an NFS-mounted home directory setup, do not proceed; the UID ownership invariant cannot be satisfied reliably across hosts.
+
+### Startup-fatal failure modes
+
+Two conditions cause a fatal error at startup. In both cases the error is written to stderr and appended to `~/.claude/channels/slack/startup-errors.log` (see `docs/logrotate-startup-errors.conf` for rotation guidance).
+
+- **`claude-director` not on `PATH`** — CSCB probes for the binary at startup and refuses to start if it is not found.
+- **`state.db` owner UID mismatch** — CSCB stats `~/.claude-director/state.db` and refuses to start if the file is not owned by the running process user.
 
 ---
 
