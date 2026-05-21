@@ -1,2109 +1,1072 @@
 /**
- * session-manager.test.ts — Tests for startupSessionManager and launchSession
+ * session-manager.test.ts — Tests for startupSessionManager and related helpers.
+ *
+ * Uses ClaudeDirectorStub as the sole fake CLI surface.
+ * No real subprocesses, no tmux, no Slack web client.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, afterEach } from 'bun:test'
-import { mkdtempSync, mkdirSync, copyFileSync, chmodSync, existsSync, rmSync, writeFileSync, unlinkSync } from 'fs'
-import { tmpdir, homedir } from 'os'
-import { join } from 'path'
-import { sessionName } from '../src/tmux.ts'
-import { type SessionsMap } from '../src/sessions.ts'
-import { startupSessionManager, launchSession, jsonlExistsForSession } from '../src/session-manager.ts'
-import { type CleanSessionFn } from '../src/cozempic.ts'
-import { makeTmuxStub } from './test-helpers/tmux-stub.ts'
-import { makeRoutingConfig } from './test-helpers/routing-config.ts'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import {
+  spawnForRoute,
+  reconcileOrphans,
+  reconnectMcp,
+  waitForWaitingAndReconnect,
+  postSpawnFailureToChannel,
+  flushSpawnFailureQueue,
+  startupSessionManager,
+  _setWaitForWaitingTimeoutMs,
+  _resetWaitForWaitingTimeoutMs,
+} from '../src/session-manager.ts'
 import { MCP_SERVER_NAME } from '../src/config.ts'
+import { ClaudeDirectorStub, makeSpawnRow, makeGetPayload } from './test-helpers/claude-director-stub.ts'
+import { makeRoutingConfig, makeRouteEntry } from './test-helpers/routing-config.ts'
+import type { WebClient } from '@slack/web-api'
 
 // ---------------------------------------------------------------------------
-// Helper: spawn a real process named "claude" so isClaudeRunning returns true
-// (used only by reconnect-path tests that call startupSessionManager)
+// Stub WebClient factory
 // ---------------------------------------------------------------------------
 
-let spawnedTmpDir = ''
-const jsonlCleanupFiles: string[] = []
+interface PostMessageCall {
+  channel: string
+  text: string
+}
 
-afterEach(() => {
-  if (spawnedTmpDir) {
-    rmSync(spawnedTmpDir, { recursive: true, force: true })
-    spawnedTmpDir = ''
-  }
-  for (const f of jsonlCleanupFiles) {
-    try { unlinkSync(f) } catch { /* ignore */ }
-  }
-  jsonlCleanupFiles.length = 0
-})
-
-async function spawnClaudeProcess() {
-  const sleepBin = existsSync('/usr/bin/sleep') ? '/usr/bin/sleep' : '/bin/sleep'
-  spawnedTmpDir = mkdtempSync(join(tmpdir(), 'session-mgr-test-'))
-  const claudePath = join(spawnedTmpDir, 'claude')
-  copyFileSync(sleepBin, claudePath)
-  chmodSync(claudePath, 0o755)
-  const proc = Bun.spawn([claudePath, '60'])
-  await Bun.sleep(100)
-  return proc
+function makeWebStub(): { web: WebClient; posts: PostMessageCall[] } {
+  const posts: PostMessageCall[] = []
+  const web = {
+    chat: {
+      postMessage: async (args: { channel: string; text: string }) => {
+        posts.push({ channel: args.channel, text: args.text })
+        return { ok: true }
+      },
+    },
+  } as unknown as WebClient
+  return { web, posts }
 }
 
 // ---------------------------------------------------------------------------
-// startupSessionManager
+// Shared stub + env setup
+// ---------------------------------------------------------------------------
+
+let stub: ClaudeDirectorStub
+
+beforeEach(() => {
+  stub = new ClaudeDirectorStub()
+  stub.install()
+  // Ensure dry-run is off
+  delete process.env['SLACK_DRY_RUN']
+  _resetWaitForWaitingTimeoutMs()
+})
+
+afterEach(() => {
+  stub.uninstall()
+  delete process.env['SLACK_DRY_RUN']
+  _resetWaitForWaitingTimeoutMs()
+})
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const CH = 'C_TEST'
+const CWD = '/tmp/test-cwd'
+const INSTANCE_ID = `cscb_${CH}`
+
+function singleRoute(overrides?: Partial<ReturnType<typeof makeRoutingConfig>>) {
+  return makeRoutingConfig({
+    routes: { [CH]: makeRouteEntry({ cwd: CWD }) },
+    ...overrides,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// spawnForRoute — happy path (fresh spawn)
+// ---------------------------------------------------------------------------
+
+describe('spawnForRoute — fresh spawn', () => {
+  test('no collision → cliSpawn called once with correct argv, returns spawned', async () => {
+    const config = singleRoute()
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+
+    expect(result.action).toBe('spawned')
+    expect(result.channelId).toBe(CH)
+
+    const spawnCalls = stub.calls.filter(c => c.verb === 'spawn')
+    expect(spawnCalls).toHaveLength(1)
+    const argv = spawnCalls[0].argv
+
+    expect(argv).toContain('spawn')
+    expect(argv).toContain('--template')
+    expect(argv[argv.indexOf('--template') + 1]).toBe('slack-channel-bot')
+    expect(argv).toContain('--cwd')
+    expect(argv[argv.indexOf('--cwd') + 1]).toBe(CWD)
+    expect(argv).toContain('--claude-instance-id')
+    expect(argv[argv.indexOf('--claude-instance-id') + 1]).toBe(INSTANCE_ID)
+    expect(argv).toContain('--relay-mode')
+    expect(argv[argv.indexOf('--relay-mode') + 1]).toBe('on')
+    expect(argv).toContain('--tmux-session-name')
+    expect(argv[argv.indexOf('--tmux-session-name') + 1]).toBe(`slack_bot_${CH}`)
+    expect(argv).toContain('--label')
+    // service label
+    const labelIdx1 = argv.indexOf('service=cscb')
+    expect(labelIdx1).toBeGreaterThan(-1)
+    expect(argv[labelIdx1 - 1]).toBe('--label')
+    // channel label
+    const labelIdx2 = argv.indexOf(`channel=${CH}`)
+    expect(labelIdx2).toBeGreaterThan(-1)
+    expect(argv[labelIdx2 - 1]).toBe('--label')
+  })
+
+  test('spawn argv does NOT contain --append-system-prompt-file (Epic 1 boundary canary)', async () => {
+    const config = singleRoute()
+    await spawnForRoute(CH, { cwd: CWD }, config)
+    const spawnCalls = stub.calls.filter(c => c.verb === 'spawn')
+    expect(spawnCalls).toHaveLength(1)
+    expect(spawnCalls[0].argv).not.toContain('--append-system-prompt-file')
+  })
+
+  test('no claude_config_dir → no --extra-env in argv', async () => {
+    const config = singleRoute({ claude_config_dir: undefined })
+    await spawnForRoute(CH, { cwd: CWD }, config)
+    const argv = stub.calls.filter(c => c.verb === 'spawn')[0].argv
+    expect(argv).not.toContain('--extra-env')
+  })
+
+  test('top-level claude_config_dir → --extra-env CLAUDE_CONFIG_DIR=<dir> in spawn argv', async () => {
+    const config = singleRoute({ claude_config_dir: '/home/user/.claude-alt' })
+    await spawnForRoute(CH, { cwd: CWD }, config)
+    const argv = stub.calls.filter(c => c.verb === 'spawn')[0].argv
+    expect(argv).toContain('--extra-env')
+    const envIdx = argv.indexOf('--extra-env')
+    expect(argv[envIdx + 1]).toBe('CLAUDE_CONFIG_DIR=/home/user/.claude-alt')
+  })
+
+  test('per-route claude_config_dir overrides top-level', async () => {
+    const config = makeRoutingConfig({
+      routes: { [CH]: makeRouteEntry({ cwd: CWD, claude_config_dir: '/route-specific/.claude' }) },
+      claude_config_dir: '/top-level/.claude',
+    })
+    await spawnForRoute(CH, { cwd: CWD }, config)
+    const argv = stub.calls.filter(c => c.verb === 'spawn')[0].argv
+    const envIdx = argv.indexOf('--extra-env')
+    expect(envIdx).toBeGreaterThan(-1)
+    expect(argv[envIdx + 1]).toBe('CLAUDE_CONFIG_DIR=/route-specific/.claude')
+  })
+
+  test('two-route config → each route spawns once', async () => {
+    const CH2 = 'C_TEST2'
+    const config = makeRoutingConfig({
+      routes: {
+        [CH]: makeRouteEntry({ cwd: '/tmp/cwd1' }),
+        [CH2]: makeRouteEntry({ cwd: '/tmp/cwd2' }),
+      },
+    })
+    const result = await startupSessionManager(config)
+    expect(result.succeeded).toBe(2)
+    expect(result.failed).toBe(0)
+
+    const spawnCalls = stub.calls.filter(c => c.verb === 'spawn')
+    expect(spawnCalls).toHaveLength(2)
+
+    const instanceIds = spawnCalls.map(c => {
+      const idx = c.argv.indexOf('--claude-instance-id')
+      return c.argv[idx + 1]
+    })
+    expect(instanceIds).toContain(`cscb_${CH}`)
+    expect(instanceIds).toContain(`cscb_${CH2}`)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// spawnForRoute — collision then get then act
+// ---------------------------------------------------------------------------
+
+describe('spawnForRoute — collision: ended state → resume', () => {
+  test('ErrInstanceIdCollision + get returns ended + resume_enabled → resume called, no second spawn', async () => {
+    const row = makeSpawnRow({ channelId: CH, state: 'ended' })
+    stub.setSpawnRows([row])
+    // get must also return ended state (getPayloads takes precedence over defaultGetPayload)
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'ended' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+
+    const config = singleRoute({ resume_enabled: true })
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+
+    expect(result.action).toBe('resumed')
+
+    const resumeCalls = stub.calls.filter(c => c.verb === 'resume')
+    expect(resumeCalls).toHaveLength(1)
+
+    // No second spawn beyond the first
+    const spawnCalls = stub.calls.filter(c => c.verb === 'spawn')
+    expect(spawnCalls).toHaveLength(1)
+  })
+})
+
+describe('spawnForRoute — collision: missing state → resume', () => {
+  test('ErrInstanceIdCollision + get returns missing + resume_enabled → resume called', async () => {
+    const row = makeSpawnRow({ channelId: CH, state: 'missing' })
+    stub.setSpawnRows([row])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'missing' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+
+    const config = singleRoute({ resume_enabled: true })
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+
+    expect(result.action).toBe('resumed')
+    const resumeCalls = stub.calls.filter(c => c.verb === 'resume')
+    expect(resumeCalls).toHaveLength(1)
+  })
+})
+
+describe('spawnForRoute — collision: terminal + ErrNoSessionId on resume → delete+spawn', () => {
+  test('ended + resume returns ErrNoSessionId → delete then fresh spawn', async () => {
+    const row = makeSpawnRow({ channelId: CH, state: 'ended' })
+    stub.setSpawnRows([row])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'ended' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+    stub.setNextResumeError(INSTANCE_ID, { ok: false, error: { kind: 'ErrNoSessionId', message: 'no session' } })
+
+    const config = singleRoute({ resume_enabled: true })
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+
+    expect(result.action).toBe('spawned')
+
+    const deleteCalls = stub.calls.filter(c => c.verb === 'delete')
+    expect(deleteCalls).toHaveLength(1)
+
+    // Second spawn after delete
+    const spawnCalls = stub.calls.filter(c => c.verb === 'spawn')
+    expect(spawnCalls).toHaveLength(2)
+
+    // delete must come before second spawn
+    const deleteIdx = stub.calls.findIndex(c => c.verb === 'delete')
+    const lastSpawnIdx = stub.calls.map((c, i) => c.verb === 'spawn' ? i : -1).filter(i => i >= 0).at(-1)!
+    expect(deleteIdx).toBeLessThan(lastSpawnIdx)
+  })
+})
+
+describe('spawnForRoute — collision: terminal + ErrJsonlMissing on resume → delete+spawn', () => {
+  test('ended + resume returns ErrJsonlMissing → delete then fresh spawn', async () => {
+    const row = makeSpawnRow({ channelId: CH, state: 'ended' })
+    stub.setSpawnRows([row])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'ended' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+    stub.setNextResumeError(INSTANCE_ID, { ok: false, error: { kind: 'ErrJsonlMissing', message: 'no jsonl' } })
+
+    const config = singleRoute({ resume_enabled: true })
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+
+    expect(result.action).toBe('spawned')
+
+    const deleteCalls = stub.calls.filter(c => c.verb === 'delete')
+    expect(deleteCalls).toHaveLength(1)
+
+    const spawnCalls = stub.calls.filter(c => c.verb === 'spawn')
+    expect(spawnCalls).toHaveLength(2)
+  })
+})
+
+describe('spawnForRoute — collision: waiting state → send-keys reconnect', () => {
+  test('ErrInstanceIdCollision + get returns waiting → send-keys with MCP reconnect payload', async () => {
+    const row = makeSpawnRow({ channelId: CH, state: 'waiting' })
+    stub.setSpawnRows([row])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'waiting' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+
+    const config = singleRoute()
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+
+    expect(result.action).toBe('reconnected')
+
+    const sendKeysCalls = stub.calls.filter(c => c.verb === 'send-keys')
+    expect(sendKeysCalls).toHaveLength(1)
+    const argv = sendKeysCalls[0].argv
+
+    // Should have --text /mcp reconnect <MCP_SERVER_NAME>
+    const textIdx = argv.indexOf('--text')
+    expect(textIdx).toBeGreaterThan(-1)
+    expect(argv[textIdx + 1]).toBe(`/mcp reconnect ${MCP_SERVER_NAME}`)
+  })
+})
+
+describe('spawnForRoute — collision: working state → poll-then-reconnect', () => {
+  test('ErrInstanceIdCollision + get returns working → poll status until waiting, then send-keys', async () => {
+    // Start with working state in both spawnRows and getPayload
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'working' })])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'working' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+
+    _setWaitForWaitingTimeoutMs(500)
+    const config = singleRoute({ claude_director_poll_interval_ms: 10 })
+
+    // After a short delay, mutate the row to waiting so the poller transitions
+    const changeTimer = setTimeout(() => {
+      stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'waiting' })])
+    }, 30)
+
+    try {
+      const result = await spawnForRoute(CH, { cwd: CWD }, config)
+      expect(result.action).toBe('reconnected')
+
+      // Send-keys must have been called
+      const sendKeysCalls = stub.calls.filter(c => c.verb === 'send-keys')
+      expect(sendKeysCalls).toHaveLength(1)
+
+      // At least one status call before send-keys
+      const statusCalls = stub.calls.filter(c => c.verb === 'status')
+      expect(statusCalls.length).toBeGreaterThanOrEqual(1)
+
+      // Verify send-keys was NOT called before at least one status call
+      const firstStatusIdx = stub.calls.findIndex(c => c.verb === 'status')
+      const sendKeysIdx = stub.calls.findIndex(c => c.verb === 'send-keys')
+      expect(firstStatusIdx).toBeLessThan(sendKeysIdx)
+    } finally {
+      clearTimeout(changeTimer)
+    }
+  })
+
+  test('working state: assert at least two status polls before send-keys when working persists briefly', async () => {
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'working' })])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'working' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+
+    _setWaitForWaitingTimeoutMs(500)
+    const config = singleRoute({ claude_director_poll_interval_ms: 10 })
+
+    // Delay transition so we get multiple status polls
+    const changeTimer = setTimeout(() => {
+      stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'waiting' })])
+    }, 60)
+
+    try {
+      const result = await spawnForRoute(CH, { cwd: CWD }, config)
+      expect(result.action).toBe('reconnected')
+
+      // Multiple status polls expected before transition
+      const statusCalls = stub.calls.filter(c => c.verb === 'status')
+      expect(statusCalls.length).toBeGreaterThanOrEqual(2)
+
+      // send-keys called exactly once after all the polling
+      expect(stub.calls.filter(c => c.verb === 'send-keys')).toHaveLength(1)
+
+      // send-keys appears AFTER the last status call
+      const sendKeysIdx = stub.calls.findIndex(c => c.verb === 'send-keys')
+      const firstStatusIdx = stub.calls.findIndex(c => c.verb === 'status')
+      expect(firstStatusIdx).toBeLessThan(sendKeysIdx)
+    } finally {
+      clearTimeout(changeTimer)
+    }
+  })
+})
+
+describe('spawnForRoute — collision: pending state → no-op', () => {
+  test('ErrInstanceIdCollision + get returns pending → no action taken', async () => {
+    // Need both spawnRows (for instanceExists) and getPayload (for get response state)
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'pending' })])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'pending' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+
+    const config = singleRoute()
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+
+    expect(result.action).toBe('no-op')
+
+    // No resume, no send-keys, no kill, no delete
+    expect(stub.calls.filter(c => c.verb === 'resume')).toHaveLength(0)
+    expect(stub.calls.filter(c => c.verb === 'send-keys')).toHaveLength(0)
+    expect(stub.calls.filter(c => c.verb === 'kill')).toHaveLength(0)
+    expect(stub.calls.filter(c => c.verb === 'delete')).toHaveLength(0)
+  })
+})
+
+describe('spawnForRoute — collision: check_permission state → no-op', () => {
+  test('ErrInstanceIdCollision + get returns check_permission → no action taken', async () => {
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'check_permission' })])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'check_permission' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+
+    const config = singleRoute()
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+
+    expect(result.action).toBe('no-op')
+    expect(stub.calls.filter(c => c.verb === 'resume')).toHaveLength(0)
+    expect(stub.calls.filter(c => c.verb === 'send-keys')).toHaveLength(0)
+  })
+})
+
+describe('spawnForRoute — collision: ask_user state → no-op', () => {
+  test('ErrInstanceIdCollision + get returns ask_user → no action taken', async () => {
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'ask_user' })])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'ask_user' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+
+    const config = singleRoute()
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+
+    expect(result.action).toBe('no-op')
+    expect(stub.calls.filter(c => c.verb === 'resume')).toHaveLength(0)
+    expect(stub.calls.filter(c => c.verb === 'send-keys')).toHaveLength(0)
+  })
+})
+
+describe('spawnForRoute — resume_enabled=false + terminal state → kill+delete+spawn', () => {
+  test('resume_enabled=false + ended → kill+delete+fresh spawn, no resume', async () => {
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'ended' })])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'ended' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+
+    const config = singleRoute({ resume_enabled: false })
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+
+    expect(result.action).toBe('spawned')
+
+    const killCalls = stub.calls.filter(c => c.verb === 'kill')
+    expect(killCalls).toHaveLength(1)
+
+    const deleteCalls = stub.calls.filter(c => c.verb === 'delete')
+    expect(deleteCalls).toHaveLength(1)
+
+    const resumeCalls = stub.calls.filter(c => c.verb === 'resume')
+    expect(resumeCalls).toHaveLength(0)
+
+    const spawnCalls = stub.calls.filter(c => c.verb === 'spawn')
+    expect(spawnCalls).toHaveLength(2) // initial (collision) + fresh
+
+    // kill before delete before second spawn
+    const killIdx = stub.calls.findIndex(c => c.verb === 'kill')
+    const deleteIdx = stub.calls.findIndex(c => c.verb === 'delete')
+    const lastSpawnIdx = stub.calls.map((c, i) => c.verb === 'spawn' ? i : -1).filter(i => i >= 0).at(-1)!
+    expect(killIdx).toBeLessThan(deleteIdx)
+    expect(deleteIdx).toBeLessThan(lastSpawnIdx)
+  })
+
+  test('resume_enabled=false + no pre-existing row → spawn only (no spurious kill+delete)', async () => {
+    const config = singleRoute({ resume_enabled: false })
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+
+    expect(result.action).toBe('spawned')
+    expect(stub.calls.filter(c => c.verb === 'kill')).toHaveLength(0)
+    expect(stub.calls.filter(c => c.verb === 'delete')).toHaveLength(0)
+    expect(stub.calls.filter(c => c.verb === 'resume')).toHaveLength(0)
+    expect(stub.calls.filter(c => c.verb === 'spawn')).toHaveLength(1)
+  })
+
+  test('resume_enabled=true + no pre-existing row → spawn only', async () => {
+    const config = singleRoute({ resume_enabled: true })
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+
+    expect(result.action).toBe('spawned')
+    expect(stub.calls.filter(c => c.verb === 'resume')).toHaveLength(0)
+    expect(stub.calls.filter(c => c.verb === 'spawn')).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// reconcileOrphans
+// ---------------------------------------------------------------------------
+
+describe('reconcileOrphans', () => {
+  test('orphan channel NOT in config → kill+delete called, result reflects found=1 killed=1', async () => {
+    const orphanCh = 'C_ORPHAN'
+    const orphanRow = makeSpawnRow({ channelId: orphanCh, state: 'waiting' })
+    stub.setSpawnRows([orphanRow])
+
+    const config = singleRoute() // routes only has C_TEST, not C_ORPHAN
+
+    const result = await reconcileOrphans(config)
+
+    expect(result.found).toBe(1)
+    expect(result.killed).toBe(1)
+    expect(result.failed).toBe(0)
+
+    const killCalls = stub.calls.filter(c => c.verb === 'kill')
+    expect(killCalls).toHaveLength(1)
+    const killArgv = killCalls[0].argv
+    expect(killArgv).toContain(`cscb_${orphanCh}`)
+
+    const deleteCalls = stub.calls.filter(c => c.verb === 'delete')
+    expect(deleteCalls).toHaveLength(1)
+    const deleteArgv = deleteCalls[0].argv
+    expect(deleteArgv).toContain(`cscb_${orphanCh}`)
+  })
+
+  test('channel IN config → not killed, not deleted', async () => {
+    const row = makeSpawnRow({ channelId: CH, state: 'waiting' })
+    stub.setSpawnRows([row])
+
+    const config = singleRoute()
+    const result = await reconcileOrphans(config)
+
+    expect(result.found).toBe(0)
+    expect(result.killed).toBe(0)
+
+    expect(stub.calls.filter(c => c.verb === 'kill')).toHaveLength(0)
+    expect(stub.calls.filter(c => c.verb === 'delete')).toHaveLength(0)
+  })
+
+  test('mixed: one configured + one orphan → only orphan killed+deleted', async () => {
+    const orphanCh = 'C_ORPHAN'
+    const configuredRow = makeSpawnRow({ channelId: CH, state: 'waiting' })
+    const orphanRow = makeSpawnRow({ channelId: orphanCh, state: 'waiting' })
+    stub.setSpawnRows([configuredRow, orphanRow])
+
+    const config = singleRoute()
+    const result = await reconcileOrphans(config)
+
+    expect(result.found).toBe(1)
+    expect(result.killed).toBe(1)
+
+    const killCalls = stub.calls.filter(c => c.verb === 'kill')
+    expect(killCalls).toHaveLength(1)
+    expect(killCalls[0].argv).toContain(`cscb_${orphanCh}`)
+  })
+
+  test('no orphans → list called once, no kill/delete', async () => {
+    const row = makeSpawnRow({ channelId: CH, state: 'waiting' })
+    stub.setSpawnRows([row])
+
+    const config = singleRoute()
+    const result = await reconcileOrphans(config)
+
+    expect(result.found).toBe(0)
+
+    const listCalls = stub.calls.filter(c => c.verb === 'list')
+    expect(listCalls).toHaveLength(1)
+    expect(stub.calls.filter(c => c.verb === 'kill')).toHaveLength(0)
+    expect(stub.calls.filter(c => c.verb === 'delete')).toHaveLength(0)
+  })
+
+  test('kill error for orphan → does not throw, failed count increments after delete also fails', async () => {
+    const orphanCh = 'C_ORPHAN'
+    const orphanRow = makeSpawnRow({ channelId: orphanCh, state: 'waiting' })
+    stub.setSpawnRows([orphanRow])
+    // Kill fails
+    stub.setKillResponseQueue(`cscb_${orphanCh}`, [
+      { ok: false, error: { kind: 'ErrNonZeroExit', exitCode: 1, message: 'kill failed' } },
+    ])
+
+    const config = singleRoute()
+    // Should not throw
+    const result = await reconcileOrphans(config)
+    expect(result.found).toBe(1)
+    // delete still proceeds after kill failure — killed=1 since delete succeeded
+    const deleteCalls = stub.calls.filter(c => c.verb === 'delete')
+    expect(deleteCalls).toHaveLength(1)
+  })
+
+  test('cleanup failures do not crash startup — configured route still launches', async () => {
+    const orphanCh = 'C_ORPHAN'
+    const orphanRow = makeSpawnRow({ channelId: orphanCh, state: 'working' })
+    stub.setSpawnRows([orphanRow])
+    stub.setKillResponseQueue(`cscb_${orphanCh}`, [
+      { ok: false, error: { kind: 'ErrNonZeroExit', exitCode: 1, message: 'kill failed' } },
+    ])
+
+    const config = makeRoutingConfig({
+      routes: { [CH]: makeRouteEntry({ cwd: CWD }) },
+    })
+
+    // startupSessionManager calls reconcileOrphans then spawnForRoute
+    const result = await startupSessionManager(config)
+
+    // Should succeed for the configured route even if orphan cleanup had errors
+    expect(result.succeeded).toBeGreaterThanOrEqual(1)
+
+    const spawnCalls = stub.calls.filter(c => c.verb === 'spawn')
+    expect(spawnCalls).toHaveLength(1)
+    const spawnArgv = spawnCalls[0].argv
+    expect(spawnArgv[spawnArgv.indexOf('--claude-instance-id') + 1]).toBe(INSTANCE_ID)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// reconnectMcp
+// ---------------------------------------------------------------------------
+
+describe('reconnectMcp', () => {
+  test('send-keys called with correct reconnect payload', async () => {
+    const row = makeSpawnRow({ channelId: CH, state: 'waiting' })
+    stub.setSpawnRows([row])
+
+    const success = await reconnectMcp(CH)
+
+    expect(success).toBe(true)
+
+    const sendKeysCalls = stub.calls.filter(c => c.verb === 'send-keys')
+    expect(sendKeysCalls).toHaveLength(1)
+    const argv = sendKeysCalls[0].argv
+
+    // --text /mcp reconnect <MCP_SERVER_NAME>
+    const textIdx = argv.indexOf('--text')
+    expect(textIdx).toBeGreaterThan(-1)
+    expect(argv[textIdx + 1]).toBe(`/mcp reconnect ${MCP_SERVER_NAME}`)
+
+    // Also --text Enter
+    const enterIdx = argv.indexOf('Enter')
+    expect(enterIdx).toBeGreaterThan(-1)
+  })
+
+  test('reconnect payload sources MCP_SERVER_NAME from config import (not hardcoded)', async () => {
+    const row = makeSpawnRow({ channelId: CH, state: 'waiting' })
+    stub.setSpawnRows([row])
+
+    await reconnectMcp(CH)
+
+    const sendKeysCalls = stub.calls.filter(c => c.verb === 'send-keys')
+    const argv = sendKeysCalls[0].argv
+    const textIdx = argv.indexOf('--text')
+    const expectedPayload = `/mcp reconnect ${MCP_SERVER_NAME}`
+    expect(argv[textIdx + 1]).toBe(expectedPayload)
+    expect(MCP_SERVER_NAME).toBe('slack-channel-router')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// waitForWaitingAndReconnect
+// ---------------------------------------------------------------------------
+
+describe('waitForWaitingAndReconnect', () => {
+  test('status returns waiting on first poll → reconnectMcp called once', async () => {
+    const row = makeSpawnRow({ channelId: CH, state: 'waiting' })
+    stub.setSpawnRows([row])
+
+    const config = singleRoute({ claude_director_poll_interval_ms: 10 })
+    const result = await waitForWaitingAndReconnect(CH, config)
+
+    expect(result).toBe(true)
+
+    const sendKeysCalls = stub.calls.filter(c => c.verb === 'send-keys')
+    expect(sendKeysCalls).toHaveLength(1)
+  })
+
+  test('polls status until waiting, then reconnects', async () => {
+    // Start working, transition to waiting after a tick
+    const row = makeSpawnRow({ channelId: CH, state: 'working' })
+    stub.setSpawnRows([row])
+
+    const config = singleRoute({ claude_director_poll_interval_ms: 10 })
+    _setWaitForWaitingTimeoutMs(500)
+
+    // Transition to waiting after some polls
+    const timer = setTimeout(() => {
+      stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'waiting' })])
+    }, 30)
+
+    try {
+      const result = await waitForWaitingAndReconnect(CH, config)
+      expect(result).toBe(true)
+
+      const statusCalls = stub.calls.filter(c => c.verb === 'status')
+      expect(statusCalls.length).toBeGreaterThanOrEqual(1)
+
+      const sendKeysCalls = stub.calls.filter(c => c.verb === 'send-keys')
+      expect(sendKeysCalls).toHaveLength(1)
+    } finally {
+      clearTimeout(timer)
+    }
+  })
+
+  test('timeout expires → returns true (non-error), no send-keys called', async () => {
+    // Spawn stays in working state forever
+    const row = makeSpawnRow({ channelId: CH, state: 'working' })
+    stub.setSpawnRows([row])
+
+    _setWaitForWaitingTimeoutMs(50) // very short timeout
+    const config = singleRoute({ claude_director_poll_interval_ms: 10 })
+
+    const result = await waitForWaitingAndReconnect(CH, config)
+
+    expect(result).toBe(true) // timeout is not an error per spec
+    expect(stub.calls.filter(c => c.verb === 'send-keys')).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// postSpawnFailureToChannel
+// ---------------------------------------------------------------------------
+
+describe('postSpawnFailureToChannel', () => {
+  test('with web → posts to Slack with channelId + error info + remediation hint', async () => {
+    const { web, posts } = makeWebStub()
+
+    const error = { kind: 'ErrNonZeroExit' as const, exitCode: 1, stderr: 'Some error output' }
+    postSpawnFailureToChannel(CH, error, web)
+
+    // Allow async chat.postMessage to run
+    await new Promise(r => setTimeout(r, 10))
+
+    expect(posts).toHaveLength(1)
+    expect(posts[0].channel).toBe(CH)
+    expect(posts[0].text).toContain(CH)
+    expect(posts[0].text).toContain('ErrNonZeroExit')
+    expect(posts[0].text).toContain('Remediation')
+  })
+
+  test('with web → text contains stderr snippet', async () => {
+    const { web, posts } = makeWebStub()
+    const stderr = 'template not found: slack-channel-bot'
+    const error = { kind: 'ErrNonZeroExit' as const, exitCode: 1, stderr }
+    postSpawnFailureToChannel(CH, error, web)
+    await new Promise(r => setTimeout(r, 10))
+
+    expect(posts[0].text).toContain(stderr)
+  })
+
+  test('without web (pre-auth) → enqueued; flushSpawnFailureQueue posts later', async () => {
+    const error = { kind: 'ErrNonZeroExit' as const, exitCode: 1, stderr: 'queued error' }
+
+    // No web passed → should queue
+    postSpawnFailureToChannel(CH, error)
+
+    const { web, posts } = makeWebStub()
+
+    // Nothing posted yet
+    expect(posts).toHaveLength(0)
+
+    // Flush should post
+    flushSpawnFailureQueue(web)
+    await new Promise(r => setTimeout(r, 10))
+
+    expect(posts).toHaveLength(1)
+    expect(posts[0].channel).toBe(CH)
+  })
+
+  test('ErrBinaryMissing → remediation mentions install', async () => {
+    const { web, posts } = makeWebStub()
+    const error = { kind: 'ErrBinaryMissing' as const, message: 'binary not found' }
+    postSpawnFailureToChannel(CH, error, web)
+    await new Promise(r => setTimeout(r, 10))
+
+    expect(posts[0].text.toLowerCase()).toContain('install')
+  })
+
+  test('Slack postMessage failure → does not throw', async () => {
+    const web = {
+      chat: {
+        postMessage: async () => { throw new Error('Slack API down') },
+      },
+    } as unknown as WebClient
+
+    const error = { kind: 'ErrNonZeroExit' as const, exitCode: 1, stderr: 'test' }
+
+    // Should not throw
+    expect(() => {
+      postSpawnFailureToChannel(CH, error, web)
+    }).not.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// startupSessionManager — integration
 // ---------------------------------------------------------------------------
 
 describe('startupSessionManager', () => {
-  test('1. existing session + no stored session: killSession called, then newSession and sendKeys with launch command', async () => {
-    const stub = makeTmuxStub({
-      hasSessionResult: true,
-      getPanePidResult: '99999999',
-    })
-    const config = makeRoutingConfig()
-
-    await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
-
-    const killCalls = stub.calls.filter(c => c.method === 'killSession')
-    expect(killCalls).toHaveLength(1)
-    expect(killCalls[0].args[0]).toBe(sessionName('/tmp/test-cwd'))
-
-    const newCalls = stub.calls.filter(c => c.method === 'newSession')
-    expect(newCalls).toHaveLength(1)
-    expect(newCalls[0].args[0]).toBe(sessionName('/tmp/test-cwd'))
-
-    // killSession must appear before newSession in the call log
-    const killIdx = stub.calls.findIndex(c => c.method === 'killSession')
-    const newIdx = stub.calls.findIndex(c => c.method === 'newSession')
-    expect(killIdx).toBeLessThan(newIdx)
-  })
-
-  test('2. existing session + no stored session: newSession called with correct args and sendKeys includes launch command', async () => {
-    const stub = makeTmuxStub({
-      hasSessionResult: true,
-      getPanePidResult: '99999999',
-    })
-    const config = makeRoutingConfig()
-
-    await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
-
-    const name = sessionName('/tmp/test-cwd')
-
-    const killCalls = stub.calls.filter(c => c.method === 'killSession')
-    expect(killCalls).toHaveLength(1)
-    expect(killCalls[0].args[0]).toBe(name)
-
-    const newCalls = stub.calls.filter(c => c.method === 'newSession')
-    expect(newCalls).toHaveLength(1)
-    expect(newCalls[0].args[0]).toBe(name)
-    expect(newCalls[0].args[1]).toBe('/tmp/test-cwd')
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-
-    // killSession must appear before newSession in the call log
-    const killIdx = stub.calls.findIndex(c => c.method === 'killSession')
-    const newIdx = stub.calls.findIndex(c => c.method === 'newSession')
-    expect(killIdx).toBeLessThan(newIdx)
-  })
-
-  test('3. missing session: newSession and sendKeys with launch command, no killSession', async () => {
-    const stub = makeTmuxStub({
-      hasSessionResult: false,
-      getPanePidResult: '99999999',
-    })
-    const config = makeRoutingConfig()
-
-    await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
-
-    expect(stub.calls.filter(c => c.method === 'killSession')).toHaveLength(0)
-
-    const newCalls = stub.calls.filter(c => c.method === 'newSession')
-    expect(newCalls).toHaveLength(1)
-    expect(newCalls[0].args[0]).toBe(sessionName('/tmp/test-cwd'))
-    expect(newCalls[0].args[1]).toBe('/tmp/test-cwd')
-
-    const launchCmd = stub.calls.filter(c => c.method === 'sendKeys').find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-  })
-
-  test('7. tmux unavailable: returns empty Map immediately, no sessions touched', async () => {
-    const stub = makeTmuxStub({
-      checkAvailabilityResult: new Error('tmux not found'),
-    })
-    const config = makeRoutingConfig()
-
-    const result = await startupSessionManager(config, stub, {})
-
-    expect(result).toBeInstanceOf(Map)
-    expect(result.size).toBe(0)
-    const nonCheckCalls = stub.calls.filter(c => c.method !== 'checkAvailability')
-    expect(nonCheckCalls).toHaveLength(0)
-  })
-
-  test('9. no stored sessions: treated as empty, routes launched fresh', async () => {
-    const stub = makeTmuxStub({
-      hasSessionResult: false,
-      getPanePidResult: '99999999',
-    })
-    const config = makeRoutingConfig()
-
-    await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
-
-    // newSession called for the route even though storedSessions was empty
-    expect(stub.calls.filter(c => c.method === 'newSession')).toHaveLength(1)
-    expect(stub.calls.filter(c => c.method === 'newSession')[0].args[0]).toBe(sessionName('/tmp/test-cwd'))
-  })
-
-  test('14. live Claude process in tmux: reconnect path — sendKeys /mcp reconnect <server-name> and Enter as variadic args, no kill, no newSession', async () => {
-    const proc = await spawnClaudeProcess()
-    try {
-      const stub = makeTmuxStub({
-        hasSessionResult: true,
-        getPanePidResult: String(proc.pid),
-      })
-      const storedSessions: SessionsMap = {
-        'C_TEST1': {
-          tmuxSession: sessionName('/tmp/test-cwd'),
-          lastLaunch: '2026-01-01T00:00:00.000Z',
-          sessionId: 'reconnect-session-id',
-        },
-      }
-      const config = makeRoutingConfig()
-
-      const result = await startupSessionManager(config, stub, storedSessions, { pollTimeout: 0 })
-
-      // Reconnect path succeeds and returns a SessionRecord in the Map
-      expect(result).toBeInstanceOf(Map)
-      expect(result.size).toBe(1)
-      const record = result.get('C_TEST1')
-      expect(record).toBeDefined()
-      expect(record!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
-      expect(record!.sessionId).toBe('reconnect-session-id')
-      expect(typeof record!.lastLaunch).toBe('string')
-
-      expect(stub.calls.filter(c => c.method === 'killSession')).toHaveLength(0)
-      expect(stub.calls.filter(c => c.method === 'newSession')).toHaveLength(0)
-
-      // sendKeys called with variadic args: (session, '/mcp reconnect slack-channel-router', 'Enter')
-      const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-      const reconnectCall = sendKeysCalls.find(
-        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`/mcp reconnect ${MCP_SERVER_NAME}`),
-      )
-      expect(reconnectCall).toBeDefined()
-      // 'Enter' passed as variadic third arg (index 2)
-      expect(reconnectCall!.args[2]).toBe('Enter')
-    } finally {
-      proc.kill()
-    }
-  })
-
-  test('14b. live Claude process: reconnect with no stored sessionId — channel is in Map with sessionId "pending"', async () => {
-    const proc = await spawnClaudeProcess()
-    try {
-      // No stored session for this channel — reconnect falls back to 'pending'
-      const stub = makeTmuxStub({
-        hasSessionResult: true,
-        getPanePidResult: String(proc.pid),
-      })
-      const config = makeRoutingConfig()
-
-      const result = await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
-
-      // Reconnect still puts the channel in the Map (session is live)
-      expect(result).toBeInstanceOf(Map)
-      expect(result.size).toBe(1)
-      const record = result.get('C_TEST1')
-      expect(record).toBeDefined()
-      expect(record!.sessionId).toBe('pending')
-
-      // /mcp reconnect was still sent
-      const reconnectCall = stub.calls.filter(c => c.method === 'sendKeys').find(
-        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`/mcp reconnect ${MCP_SERVER_NAME}`),
-      )
-      expect(reconnectCall).toBeDefined()
-    } finally {
-      proc.kill()
-    }
-  })
-
-  test('14c. live Claude process: sendKeys throws during reconnect — channel not in returned Map', async () => {
-    const proc = await spawnClaudeProcess()
-    try {
-      const stub = makeTmuxStub({
-        hasSessionResult: true,
-        getPanePidResult: String(proc.pid),
-        sendKeysResult: new Error('sendKeys failed'),
-      })
-      const config = makeRoutingConfig()
-
-      const result = await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
-
-      // sendKeys threw → Promise.allSettled catches the rejection → channel not in Map
-      expect(result).toBeInstanceOf(Map)
-      expect(result.size).toBe(0)
-    } finally {
-      proc.kill()
-    }
-  })
-
-  test('15. dead process + stored session ID: resume path — sendKeys includes --resume, SessionRecord in returned Map', async () => {
-    // JSONL must exist for resume path to be taken
-    const jsonlDir = join(homedir(), '.claude', 'projects', '-tmp-test-cwd')
-    mkdirSync(jsonlDir, { recursive: true })
-    const jsonlPath = join(jsonlDir, 'resume-session-abc.jsonl')
-    writeFileSync(jsonlPath, '', 'utf-8')
-    jsonlCleanupFiles.push(jsonlPath)
-
-    const stub = makeTmuxStub({
-      hasSessionResult: false,
-      capturePaneResult: 'I am using this for local development',
-    })
-    const storedSessions: SessionsMap = {
-      'C_TEST1': {
-        tmuxSession: 'slack_bot_tmp_test_cwd_8497a1',
-        lastLaunch: '2026-01-01T00:00:00.000Z',
-        sessionId: 'resume-session-abc',
-      },
-    }
-    const config = makeRoutingConfig()
-
-    const result = await startupSessionManager(config, stub, storedSessions, {
-      pollTimeout: 2_000,
-    })
-
-    expect(result).toBeInstanceOf(Map)
-    expect(result.size).toBe(1)
-    const record = result.get('C_TEST1')
-    expect(record).toBeDefined()
-    expect(record!.sessionId).toBe('resume-session-abc')
-    expect(record!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
-    expect(typeof record!.lastLaunch).toBe('string')
-
-    // sendKeys was called with --resume <stored-session-id>
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const resumeCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume resume-session-abc'),
-    )
-    expect(resumeCmd).toBeDefined()
-  })
-
-  test('B. JSONL missing for stored session ID → skip to fresh path (no --resume)', async () => {
-    // Key regression test: with the JSONL pre-check fix, a stored session ID
-    // whose JSONL file does not exist must NOT attempt --resume.
-    const stub = makeTmuxStub({
-      hasSessionResult: false,
-      getPanePidResult: '99999999', // Claude never running → launch fails
-    })
-    const storedSessions: SessionsMap = {
-      'C_TEST1': {
-        tmuxSession: sessionName('/tmp/test-cwd'),
-        lastLaunch: '2026-01-01T00:00:00.000Z',
-        sessionId: 'missing-jsonl-session-id',
-      },
-    }
-    const config = makeRoutingConfig()
-
-    // Do NOT create the JSONL file — jsonlExistsForSession must return false
-    const result = await startupSessionManager(config, stub, storedSessions, {
-      pollTimeout: 0,
-    })
-
-    // Launch fails (pollTimeout:0, Claude not running), but the important thing is
-    // --resume was never sent.
-    expect(result).toBeInstanceOf(Map)
-    expect(result.size).toBe(0)
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const resumeCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume'),
-    )
-    expect(resumeCmd).toBeUndefined()
-
-    // A launch command was still sent (fresh path)
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-  })
-
-  test('C. resume picks up JSONL under custom claude_config_dir (top-level)', async () => {
-    // Regression test: when the route is configured with a custom CLAUDE_CONFIG_DIR,
-    // Claude writes its JSONL transcripts under <configDir>/projects/..., NOT under
-    // ${homedir()}/.claude/projects/... The pre-resume JSONL existence check must
-    // honor that, otherwise the resume is silently downgraded to a fresh launch.
-    const customConfigDir = mkdtempSync(join(tmpdir(), 'session-mgr-cfg-'))
-    try {
-      const jsonlDir = join(customConfigDir, 'projects', '-tmp-test-cwd')
-      mkdirSync(jsonlDir, { recursive: true })
-      const sessionId = 'custom-cfg-resume-id'
-      const jsonlPath = join(jsonlDir, `${sessionId}.jsonl`)
-      writeFileSync(jsonlPath, '', 'utf-8')
-      // No need to push to jsonlCleanupFiles — entire dir is rmSync'd in finally
-
-      const stub = makeTmuxStub({
-        hasSessionResult: false,
-        capturePaneResult: 'I am using this for local development',
-      })
-      const storedSessions: SessionsMap = {
-        'C_TEST1': {
-          tmuxSession: sessionName('/tmp/test-cwd'),
-          lastLaunch: '2026-01-01T00:00:00.000Z',
-          sessionId,
-        },
-      }
-      const config = makeRoutingConfig({ claude_config_dir: customConfigDir })
-
-      const result = await startupSessionManager(config, stub, storedSessions, {
-        pollTimeout: 2_000,
-      })
-
-      // Resume branch was taken: Map has the session and --resume <id> was sent
-      expect(result.size).toBe(1)
-      expect(result.get('C_TEST1')!.sessionId).toBe(sessionId)
-
-      const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-      const resumeCmd = sendKeysCalls.find(
-        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${sessionId}`),
-      )
-      expect(resumeCmd).toBeDefined()
-      // And the launch carried CLAUDE_CONFIG_DIR pointing at the custom dir
-      expect((resumeCmd!.args[1] as string).includes(`CLAUDE_CONFIG_DIR='${customConfigDir}'`)).toBe(true)
-    } finally {
-      rmSync(customConfigDir, { recursive: true, force: true })
-    }
-  })
-
-  test('D. resume picks up JSONL under per-route claude_config_dir override', async () => {
-    // Per-route claude_config_dir takes precedence over top-level. The JSONL
-    // pre-check must use the per-route value when set.
-    const topLevelDir = mkdtempSync(join(tmpdir(), 'session-mgr-cfg-top-'))
-    const perRouteDir = mkdtempSync(join(tmpdir(), 'session-mgr-cfg-route-'))
-    try {
-      // Place the JSONL ONLY under the per-route dir; top-level dir is empty.
-      const jsonlDir = join(perRouteDir, 'projects', '-tmp-test-cwd')
-      mkdirSync(jsonlDir, { recursive: true })
-      const sessionId = 'per-route-resume-id'
-      writeFileSync(join(jsonlDir, `${sessionId}.jsonl`), '', 'utf-8')
-
-      const stub = makeTmuxStub({
-        hasSessionResult: false,
-        capturePaneResult: 'I am using this for local development',
-      })
-      const storedSessions: SessionsMap = {
-        'C_TEST1': {
-          tmuxSession: sessionName('/tmp/test-cwd'),
-          lastLaunch: '2026-01-01T00:00:00.000Z',
-          sessionId,
-        },
-      }
-      const config = makeRoutingConfig({
-        claude_config_dir: topLevelDir,
-        routes: {
-          'C_TEST1': { cwd: '/tmp/test-cwd', claude_config_dir: perRouteDir },
-        },
-      })
-
-      const result = await startupSessionManager(config, stub, storedSessions, {
-        pollTimeout: 2_000,
-      })
-
-      expect(result.size).toBe(1)
-      expect(result.get('C_TEST1')!.sessionId).toBe(sessionId)
-
-      const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-      const resumeCmd = sendKeysCalls.find(
-        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${sessionId}`),
-      )
-      expect(resumeCmd).toBeDefined()
-      // Launch carried the per-route dir, not the top-level
-      expect((resumeCmd!.args[1] as string).includes(`CLAUDE_CONFIG_DIR='${perRouteDir}'`)).toBe(true)
-    } finally {
-      rmSync(topLevelDir, { recursive: true, force: true })
-      rmSync(perRouteDir, { recursive: true, force: true })
-    }
-  })
-
-  test('16. dead process + no stored session ID: fresh path — sendKeys does not include --resume, launch fails → empty Map', async () => {
-    const stub = makeTmuxStub({
-      hasSessionResult: false,
-      getPanePidResult: '99999999',
-    })
-    const config = makeRoutingConfig()
-
-    const result = await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
-
-    // pollTimeout: 0 with Claude not running → fresh launch fails → channel not in Map
-    expect(result).toBeInstanceOf(Map)
-    expect(result.size).toBe(0)
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).includes('--resume')).toBe(false)
-  })
-
-  test('stored session with sessionId "pending" → fresh path, no --resume', async () => {
-    const stub = makeTmuxStub({
-      hasSessionResult: false,
-      getPanePidResult: '99999999',
-    })
-    const config = makeRoutingConfig()
-    const storedSessions: SessionsMap = {
-      'C_TEST1': {
-        tmuxSession: sessionName('/tmp/test-cwd'),
-        lastLaunch: '2026-01-01T00:00:00.000Z',
-        sessionId: 'pending',
-      },
-    }
-
-    await startupSessionManager(config, stub, storedSessions, { pollTimeout: 0 })
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).includes('--resume')).toBe(false)
-  })
-
-  test('concurrent: all routes start concurrently — two routes both launch', async () => {
-    const stub = makeTmuxStub({
-      hasSessionResult: false,
-      capturePaneResult: 'I am using this for local development',
-    })
-
-    const config: typeof makeRoutingConfig extends () => infer R ? R : never = {
-      ...makeRoutingConfig(),
-      routes: {
-        'C_CH1': { cwd: '/tmp/test-cwd-ch1' },
-        'C_CH2': { cwd: '/tmp/test-cwd-ch2' },
-      },
-    }
-
-    const start = Date.now()
-    const result = await startupSessionManager(config, stub, {}, {
-      pollTimeout: 3_000,
-    })
-    const elapsed = Date.now() - start
-
-    expect(result).toBeInstanceOf(Map)
-    // Concurrency check: total time should be well under 2x pollTimeout
-    expect(elapsed).toBeLessThan(6_000)
-    // newSession called twice (one per route)
-    expect(stub.calls.filter(c => c.method === 'newSession')).toHaveLength(2)
-  })
-
-  test('mixed: reconnect + resume + fresh — correct records in returned Map', async () => {
-    // Route CH1: session exists, Claude running → reconnect
-    // Route CH2: session missing, stored session ID → resume (JSONL must exist for Fix 1)
-    // Route CH3: session missing, no stored session → fresh (fails with pollTimeout: 0)
-    const proc = await spawnClaudeProcess()
-    try {
-      // Create JSONL file for CH2 resume path
-      const ch2JsonlDir = join(homedir(), '.claude', 'projects', '-tmp-cwd-ch2')
-      mkdirSync(ch2JsonlDir, { recursive: true })
-      const ch2JsonlPath = join(ch2JsonlDir, 'stored-id-ch2.jsonl')
-      writeFileSync(ch2JsonlPath, '', 'utf-8')
-      jsonlCleanupFiles.push(ch2JsonlPath)
-
-      const stub = makeTmuxStub({
-        capturePaneResult: 'I am using this for local development',
-      })
-
-      // hasSession: true for CH1, false for CH2 and CH3
-      stub.hasSession = async (name: string) => {
-        stub.calls.push({ method: 'hasSession', args: [name] })
-        return name === sessionName('/tmp/cwd-ch1')
-      }
-
-      // getPanePid: proc.pid for CH1 (running), never-exists PID for others
-      stub.getPanePid = async (session: string) => {
-        stub.calls.push({ method: 'getPanePid', args: [session] })
-        if (session === sessionName('/tmp/cwd-ch1')) return String(proc.pid)
-        return '99999999'
-      }
-
-      const config = {
-        ...makeRoutingConfig(),
-        routes: {
-          'C_CH1': { cwd: '/tmp/cwd-ch1' },
-          'C_CH2': { cwd: '/tmp/cwd-ch2' },
-          'C_CH3': { cwd: '/tmp/cwd-ch3' },
-        },
-      }
-      const storedSessions: SessionsMap = {
-        'C_CH1': {
-          tmuxSession: sessionName('/tmp/cwd-ch1'),
-          lastLaunch: '2026-01-01T00:00:00.000Z',
-          sessionId: 'reconnect-id-ch1',
-        },
-        'C_CH2': {
-          tmuxSession: sessionName('/tmp/cwd-ch2'),
-          lastLaunch: '2026-01-01T00:00:00.000Z',
-          sessionId: 'stored-id-ch2',
-        },
-      }
-
-      const result = await startupSessionManager(config, stub, storedSessions, {
-        pollTimeout: 0,
-      })
-
-      expect(result).toBeInstanceOf(Map)
-
-      // CH1: reconnect path — uses stored session ID
-      const ch1 = result.get('C_CH1')
-      expect(ch1).toBeDefined()
-      expect(ch1!.sessionId).toBe('reconnect-id-ch1')
-
-      // CH2: resume path — verify sendKeys was called with --resume stored-id-ch2
-      const resumeCmd = stub.calls.filter(c => c.method === 'sendKeys').find(
-        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume stored-id-ch2'),
-      )
-      expect(resumeCmd).toBeDefined()
-
-      // CH3: fresh path — sendKeys command does NOT include --resume
-      const freshCmd = stub.calls.filter(c => c.method === 'sendKeys').find(
-        c => typeof c.args[1] === 'string' &&
-          (c.args[1] as string).includes('claude --mcp-config') &&
-          !(c.args[1] as string).includes('--resume'),
-      )
-      expect(freshCmd).toBeDefined()
-    } finally {
-      proc.kill()
-    }
-  })
-
-  test('T18: atomic write — startupSessionManager returns complete Map after all routes settle', async () => {
-    // T18: sessions.json must be written exactly once after all routes settle.
-    // startupSessionManager does NOT call writeSessions itself — it returns a
-    // complete Map after Promise.allSettled, so the caller writes exactly once.
-    // Both fresh launches succeed (prompt found) and return sessionId "pending".
-    const stub = makeTmuxStub({
-      hasSessionResult: false,
-      capturePaneResult: 'I am using this for local development',
-    })
-
-    const config = {
-      ...makeRoutingConfig(),
-      routes: {
-        'C_T18A': { cwd: '/tmp/test-cwd-t18a' },
-        'C_T18B': { cwd: '/tmp/test-cwd-t18b' },
-      },
-    }
-
-    const result = await startupSessionManager(config, stub, {}, {
-      pollTimeout: 3_000,
-    })
-
-    // Both routes must be present — write-once semantics: caller has complete data
-    expect(result).toBeInstanceOf(Map)
-    expect(result.size).toBe(2)
-    expect(result.has('C_T18A')).toBe(true)
-    expect(result.has('C_T18B')).toBe(true)
-    // Fresh launches return "pending"; sessionId is updated later by the tool-call hook
-    expect(result.get('C_T18A')!.sessionId).toBe('pending')
-    expect(result.get('C_T18B')!.sessionId).toBe('pending')
-  })
-
-  test('all-fail: all routes fail → returns empty Map', async () => {
-    const stub = makeTmuxStub({
-      hasSessionResult: false,
-      getPanePidResult: '99999999', // Claude never running
-    })
-    const config = makeRoutingConfig()
-
-    const result = await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
-
-    expect(result).toBeInstanceOf(Map)
-    expect(result.size).toBe(0)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// launchSession
-// ---------------------------------------------------------------------------
-
-describe('launchSession', () => {
-  test('4. safety prompt found — fresh launch returns SessionRecord with sessionId "pending"', async () => {
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const config = makeRoutingConfig()
-
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 2_000 },
-    )
-
-    expect(result).not.toBeNull()
-    expect(result!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
-    expect(result!.sessionId).toBe('pending')
-    expect(typeof result!.lastLaunch).toBe('string')
-
-    // Enter was sent to acknowledge the safety prompt
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const enterCalls = sendKeysCalls.filter(c => c.args[1] === 'Enter')
-    expect(enterCalls.length).toBeGreaterThanOrEqual(2) // one for launch + one for prompt ack
-  })
-
-  test('5. fresh launch with no resume ID returns sessionId "pending" when safety prompt is acknowledged', async () => {
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const config = makeRoutingConfig()
-
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 2_000 },
-    )
-
-    expect(result).not.toBeNull()
-    expect(result!.sessionId).toBe('pending')
-    expect(result!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
-  })
-
-  test('6. prompt not found, Claude not running: returns null', async () => {
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999', // isClaudeRunning → false
-    })
-    const config = makeRoutingConfig()
-
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 0 },
-    )
-
-    expect(result).toBeNull()
-  })
-
-  test('10. resume success: --resume <id> included in sendKeys command, returns SessionRecord with stored ID', async () => {
-    const resumeId = 'abc-session-123'
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const config = makeRoutingConfig()
-
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 2_000, sessionId: resumeId },
-    )
-
-    expect(result).not.toBeNull()
-    expect(result!.sessionId).toBe(resumeId)
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const resumeCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${resumeId}`),
-    )
-    expect(resumeCmd).toBeDefined()
-  })
-
-  test('11. resume fallback: resume fails then fresh command sent, kill and newSession called twice', async () => {
-    // pollTimeout: 0 → poll loop never runs, isClaudeRunning returns false → both attempts fail structurally
-    // This test verifies the fallback mechanism: kill + recreate + fresh launch command
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999', // isClaudeRunning → false
-    })
-    const config = makeRoutingConfig()
-    const resumeId = 'stale-session-456'
-
-    // Both attempts fail (no prompt, Claude not running), but fallback path is exercised
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 0, sessionId: resumeId },
-    )
-
-    expect(result).toBeNull()
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-
-    // First attempt: command includes --resume
-    const resumeCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${resumeId}`),
-    )
-    expect(resumeCmd).toBeDefined()
-
-    // Fallback attempt: command does NOT include --resume
-    const freshCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' &&
-        (c.args[1] as string).includes('claude --mcp-config') &&
-        !(c.args[1] as string).includes('--resume'),
-    )
-    expect(freshCmd).toBeDefined()
-
-    // killSession called during fallback (once)
-    const killCalls = stub.calls.filter(c => c.method === 'killSession')
-    expect(killCalls).toHaveLength(1)
-
-    // newSession called twice: initial + after kill
-    const newCalls = stub.calls.filter(c => c.method === 'newSession')
-    expect(newCalls).toHaveLength(2)
-  })
-
-  test('12. fresh launch when no session ID: command does not include --resume, returns sessionId "pending"', async () => {
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const config = makeRoutingConfig()
-
-    // No sessionId in options
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 2_000 },
-    )
-
-    expect(result).not.toBeNull()
-    expect(result!.sessionId).toBe('pending')
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).includes('--resume')).toBe(false)
-  })
-
-  test('fast-fail: "No conversation found" in pane triggers kill, recreate, and fresh retry', async () => {
-    // The fast-fail path: NO_CONVERSATION sentinel triggers kill+newSession+fresh attemptLaunch.
-    // If that fresh attempt also fails (null), the "resume timed out or failed" fallback ALSO fires
-    // (because resumeSessionId is still set), causing a second kill+newSession+fresh attempt.
-    // Total: initial newSession + 2 kills + 2 newSessions = 3 newSessions total.
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999', // Claude not running — all attempts fail
-      capturePaneResults: [
-        'No conversation found',
-        'some output',
-        'some output',
-      ],
-    })
-    const config = makeRoutingConfig()
-
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 600, sessionId: 'stale-id-xyz' },
-    )
-
-    // All attempts fail
-    expect(result).toBeNull()
-
-    // The NO_CONVERSATION fast-fail fires first (kill #1 + newSession #2),
-    // then the null resume fallback fires again (kill #2 + newSession #3)
-    const killCalls = stub.calls.filter(c => c.method === 'killSession')
-    expect(killCalls).toHaveLength(2)
-
-    const newCalls = stub.calls.filter(c => c.method === 'newSession')
-    expect(newCalls).toHaveLength(3)
-
-    // First sendKeys launch includes --resume
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const resumeCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume stale-id-xyz'),
-    )
-    expect(resumeCmd).toBeDefined()
-
-    // At least one fresh launch command (no --resume)
-    const freshCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' &&
-        (c.args[1] as string).includes('claude --mcp-config') &&
-        !(c.args[1] as string).includes('--resume'),
-    )
-    expect(freshCmd).toBeDefined()
-  })
-
-  test('fast-fail without resumeId: "No conversation found" without resumeId does not trigger kill/recreate', async () => {
-    // When there is no resumeId, detecting NO_CONVERSATION still triggers the sentinel return,
-    // but the outer logic only does kill/recreate when resumeSessionId is defined.
-    // So the session fails but does NOT kill and recreate.
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999',
-      capturePaneResult: 'No conversation found',
-    })
-    const config = makeRoutingConfig()
-
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 600 },
-    )
-
-    // NO_CONVERSATION without resumeId is treated as null by the outer logic
-    expect(result).toBeNull()
-
-    // newSession called exactly once (initial), no kill triggered for non-resume case
-    const newCalls = stub.calls.filter(c => c.method === 'newSession')
-    expect(newCalls).toHaveLength(1)
-  })
-
-  test('timeout: safety prompt never appears — returns null', async () => {
-    // capturePane returns unrelated output throughout; poll times out
-    const stub = makeTmuxStub({
-      capturePaneResult: 'some unrelated output',
-    })
-    const config = makeRoutingConfig()
-
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 600 },
-    )
-
-    expect(result).toBeNull()
-  })
-
-  // T23: Bare bash prompt detected — NOT IMPLEMENTED in launchSession.
-  // The SRD describes detecting a bare shell prompt (e.g. "$ ") in pane output
-  // as a signal that Claude exited unexpectedly during a --resume launch, which
-  // should trigger a fresh fallback. This detection path has not been added to
-  // launchSession. If implemented, the test would: stub capturePane to return
-  // a bare "$ " prompt after a --resume attempt, then verify killSession is
-  // called and a fresh launch is retried.
-  // test.todo('T23: bare bash prompt detection triggers kill and fresh retry')
-
-  test('launch command does not include SLACK_CHANNEL_BOT_SESSION env var', async () => {
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999',
-    })
-    const config = makeRoutingConfig()
-
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 0 },
-    )
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).includes('SLACK_CHANNEL_BOT_SESSION')).toBe(false)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// append_system_prompt_file
-// ---------------------------------------------------------------------------
-
-describe('append_system_prompt_file', () => {
-  let tmpPromptDir = ''
-
-  afterEach(() => {
-    if (tmpPromptDir) {
-      rmSync(tmpPromptDir, { recursive: true, force: true })
-      tmpPromptDir = ''
-    }
-  })
-
-  test('17. config field set + file exists: sendKeys command includes --append-system-prompt-file with path', async () => {
-    tmpPromptDir = mkdtempSync(join(tmpdir(), 'append-prompt-test-'))
-    const promptFile = join(tmpPromptDir, 'CLAUDE.md')
-    writeFileSync(promptFile, 'You are a helpful assistant.')
-
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const config = makeRoutingConfig({ append_system_prompt_file: promptFile })
-
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 2_000 },
-    )
-
-    expect(result).not.toBeNull()
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(true)
-    expect((launchCmd!.args[1] as string).includes(promptFile)).toBe(true)
-  })
-
-  test('18. config field set + file missing: flag omitted, launch proceeds', async () => {
-    const missingPath = '/tmp/nonexistent-prompt-file-that-does-not-exist.md'
-
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999',
-    })
-    const config = makeRoutingConfig({ append_system_prompt_file: missingPath })
-
-    // pollTimeout:0 → launch will fail (Claude not running), but command was still sent
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 0 },
-    )
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(false)
-  })
-
-  test('19. config field absent: flag omitted, launch command sent', async () => {
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999',
-    })
-    // No append_system_prompt_file in config
-    const config = makeRoutingConfig()
-
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 0 },
-    )
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(false)
-  })
-
-  test('20. path with single quotes: correctly shell-escaped in the command', async () => {
-    // Create a temp dir whose path contains a single quote character
-    const baseDir = mkdtempSync(join(tmpdir(), 'append-prompt-test-'))
-    tmpPromptDir = baseDir
-    // Create a subdirectory whose name contains a single quote
-    const quotedDir = join(baseDir, "it's a test")
-    mkdirSync(quotedDir, { recursive: true })
-    const promptFile = join(quotedDir, 'CLAUDE.md')
-    writeFileSync(promptFile, 'Prompt content.')
-
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999',
-    })
-    const config = makeRoutingConfig({ append_system_prompt_file: promptFile })
-
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 0 },
-    )
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--append-system-prompt-file'),
-    )
-    expect(launchCmd).toBeDefined()
-
-    const cmd = launchCmd!.args[1] as string
-    // The raw single quote in the path must be shell-escaped (rendered as '\'' in single-quote context)
-    expect(cmd.includes("'\\''")).toBe(true)
-    // After shell-escaping "it's a test", it becomes 'it'\''s a test'
-    const flagIndex = cmd.indexOf('--append-system-prompt-file')
-    const afterFlag = cmd.slice(flagIndex)
-    expect(afterFlag.includes("it'\\''s a test")).toBe(true)
-  })
-
-  test('21. resume launch with file present: --append-system-prompt-file appears alongside --resume', async () => {
-    tmpPromptDir = mkdtempSync(join(tmpdir(), 'append-prompt-test-'))
-    const promptFile = join(tmpPromptDir, 'CLAUDE.md')
-    writeFileSync(promptFile, 'You are a helpful assistant.')
-
-    const resumeId = 'resume-session-xyz'
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const config = makeRoutingConfig({ append_system_prompt_file: promptFile })
-
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 2_000, sessionId: resumeId },
-    )
-
-    expect(result).not.toBeNull()
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' &&
-        (c.args[1] as string).includes(`--resume ${resumeId}`),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(true)
-    expect((launchCmd!.args[1] as string).includes(promptFile)).toBe(true)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// system_prompt_mode
-// ---------------------------------------------------------------------------
-
-describe('system_prompt_mode', () => {
-  let tmpPromptDir = ''
-
-  afterEach(() => {
-    if (tmpPromptDir) {
-      rmSync(tmpPromptDir, { recursive: true, force: true })
-      tmpPromptDir = ''
-    }
-  })
-
-  test("'append' mode (default) with prompt file present: --append-system-prompt-file included in launch command", async () => {
-    tmpPromptDir = mkdtempSync(join(tmpdir(), 'spm-test-'))
-    const promptFile = join(tmpPromptDir, 'CLAUDE.md')
-    writeFileSync(promptFile, 'You are a helpful assistant.')
-
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999',
-    })
-    // system_prompt_mode defaults to 'append' in makeRoutingConfig
-    const config = makeRoutingConfig({ append_system_prompt_file: promptFile })
-
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 0 },
-    )
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(true)
-    expect((launchCmd!.args[1] as string).includes(promptFile)).toBe(true)
-  })
-
-  test("'none' mode with prompt file present: --append-system-prompt-file NOT included even though file is readable", async () => {
-    tmpPromptDir = mkdtempSync(join(tmpdir(), 'spm-test-'))
-    const promptFile = join(tmpPromptDir, 'CLAUDE.md')
-    writeFileSync(promptFile, 'You are a helpful assistant.')
-
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999',
-    })
-    const config = makeRoutingConfig({
-      system_prompt_mode: 'none',
-      append_system_prompt_file: promptFile,
-    })
-
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 0 },
-    )
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(false)
-  })
-
-  test("'none' mode with no file configured: launch proceeds normally, no --append-system-prompt-file flag", async () => {
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999',
-    })
-    // No append_system_prompt_file; system_prompt_mode 'none'
-    const config = makeRoutingConfig({ system_prompt_mode: 'none' })
-
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 0 },
-    )
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(false)
-  })
-
-  test("explicit 'append' mode with file present: behaves identically to default 'append' — flag included", async () => {
-    tmpPromptDir = mkdtempSync(join(tmpdir(), 'spm-test-'))
-    const promptFile = join(tmpPromptDir, 'CLAUDE.md')
-    writeFileSync(promptFile, 'You are a helpful assistant.')
-
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999',
-    })
-    // Explicitly set system_prompt_mode to 'append' (same as default)
-    const config = makeRoutingConfig({
-      system_prompt_mode: 'append',
-      append_system_prompt_file: promptFile,
-    })
-
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 0 },
-    )
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).includes('--append-system-prompt-file')).toBe(true)
-    expect((launchCmd!.args[1] as string).includes(promptFile)).toBe(true)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// claude_config_dir override
-// ---------------------------------------------------------------------------
-
-describe('claude_config_dir override', () => {
-  test('default config: no CLAUDE_CONFIG_DIR is added', async () => {
-    const stub = makeTmuxStub({ getPanePidResult: '99999999' })
-    const config = makeRoutingConfig()
-
-    await launchSession('C_TEST1', '/tmp/test-cwd', config, stub, { pollTimeout: 0 })
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    const cmd = launchCmd!.args[1] as string
-    expect(cmd.startsWith("CLAUDE_MANAGED_CHANNEL='C_TEST1' claude --mcp-config")).toBe(true)
-    expect(cmd.includes('CLAUDE_CONFIG_DIR=')).toBe(false)
-  })
-
-  test('top-level claude_config_dir: launch command is prefixed with CLAUDE_CONFIG_DIR=...', async () => {
-    const stub = makeTmuxStub({ getPanePidResult: '99999999' })
-    const config = makeRoutingConfig({
-      claude_config_dir: '/home/horde/.claude-maxauth',
-    })
-
-    await launchSession('C_TEST1', '/tmp/test-cwd', config, stub, { pollTimeout: 0 })
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    const cmd = launchCmd!.args[1] as string
-    expect(cmd.startsWith("CLAUDE_MANAGED_CHANNEL='C_TEST1' CLAUDE_CONFIG_DIR='/home/horde/.claude-maxauth' claude --mcp-config")).toBe(true)
-  })
-
-  test('per-route claude_config_dir applies only to its route', async () => {
-    const stub = makeTmuxStub({ getPanePidResult: '99999999' })
+  test('routes iterated, dispatcher called per route, returns results', async () => {
+    const CH2 = 'C_TEST2'
     const config = makeRoutingConfig({
       routes: {
-        C_TEST1: { cwd: '/tmp/test-cwd', claude_config_dir: '/p' },
+        [CH]: makeRouteEntry({ cwd: '/tmp/cwd1' }),
+        [CH2]: makeRouteEntry({ cwd: '/tmp/cwd2' }),
       },
     })
 
-    await launchSession('C_TEST1', '/tmp/test-cwd', config, stub, { pollTimeout: 0 })
+    const result = await startupSessionManager(config)
 
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).startsWith("CLAUDE_MANAGED_CHANNEL='C_TEST1' CLAUDE_CONFIG_DIR='/p' claude --mcp-config")).toBe(true)
+    expect(result.succeeded).toBe(2)
+    expect(result.failed).toBe(0)
+    expect(result.perChannel).toHaveLength(2)
+
+    const channelIds = result.perChannel.map(r => r.channelId)
+    expect(channelIds).toContain(CH)
+    expect(channelIds).toContain(CH2)
   })
 
-  test('per-route override takes priority over top-level claude_config_dir', async () => {
-    const stub = makeTmuxStub({ getPanePidResult: '99999999' })
+  test('spawn failure for one route → surfaced via Slack, other routes still launch', async () => {
+    const CH2 = 'C_FAIL'
     const config = makeRoutingConfig({
-      claude_config_dir: '/global',
       routes: {
-        C_TEST1: { cwd: '/tmp/test-cwd', claude_config_dir: '/route' },
+        [CH]: makeRouteEntry({ cwd: '/tmp/cwd1' }),
+        [CH2]: makeRouteEntry({ cwd: '/tmp/cwd2' }),
       },
     })
 
-    await launchSession('C_TEST1', '/tmp/test-cwd', config, stub, { pollTimeout: 0 })
+    const { web, posts } = makeWebStub()
 
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    const cmd = launchCmd!.args[1] as string
-    expect(cmd.startsWith("CLAUDE_MANAGED_CHANNEL='C_TEST1' CLAUDE_CONFIG_DIR='/route' claude --mcp-config")).toBe(true)
-    expect(cmd.includes('/global')).toBe(false)
+    // Second spawn will fail with non-collision error
+    stub.setNextSpawnError({ ok: true }) // first succeeds
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrNonZeroExit', exitCode: 1, message: 'template error', stderr: 'template rejected' } })
+
+    const result = await startupSessionManager(config, {}, web)
+
+    // At least one succeeded
+    expect(result.succeeded).toBeGreaterThanOrEqual(1)
+    expect(result.failed).toBeGreaterThanOrEqual(1)
+
+    // Wait for async posts
+    await new Promise(r => setTimeout(r, 20))
+
+    // Slack post for the failure
+    const failurePosts = posts.filter(p => p.channel === CH2)
+    expect(failurePosts.length).toBeGreaterThanOrEqual(1)
   })
 
-  test('falls back to top-level claude_config_dir when route does not override', async () => {
-    const stub = makeTmuxStub({ getPanePidResult: '99999999' })
-    const config = makeRoutingConfig({
-      claude_config_dir: '/global',
-      routes: {
-        C_TEST1: { cwd: '/tmp/test-cwd' },
-      },
-    })
+  test('reconcileOrphans + startupSessionManager called in sequence — orphan killed+deleted, configured route spawns', async () => {
+    const orphanCh = 'C_ORPHAN'
+    const orphanRow = makeSpawnRow({ channelId: orphanCh, state: 'waiting' })
+    stub.setSpawnRows([orphanRow])
 
-    await launchSession('C_TEST1', '/tmp/test-cwd', config, stub, { pollTimeout: 0 })
+    const config = singleRoute()
 
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).startsWith("CLAUDE_MANAGED_CHANNEL='C_TEST1' CLAUDE_CONFIG_DIR='/global' claude --mcp-config")).toBe(true)
-  })
+    // reconcileOrphans is a separate call — callers invoke it alongside startupSessionManager
+    const orphanResult = await reconcileOrphans(config)
+    expect(orphanResult.found).toBe(1)
+    expect(orphanResult.killed).toBe(1)
 
-  test('claude_config_dir composes correctly with --resume', async () => {
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const config = makeRoutingConfig({
-      claude_config_dir: '/maxauth',
-    })
-    const resumeId = 'session-resume-abc'
-
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 2_000, sessionId: resumeId },
-    )
-
-    expect(result).not.toBeNull()
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${resumeId}`),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).startsWith("CLAUDE_MANAGED_CHANNEL='C_TEST1' CLAUDE_CONFIG_DIR='/maxauth' claude --mcp-config")).toBe(true)
-  })
-
-  test('single-quote in claude_config_dir is shell-escaped safely', async () => {
-    const stub = makeTmuxStub({ getPanePidResult: '99999999' })
-    const config = makeRoutingConfig({
-      claude_config_dir: "/home/horde/it's-mine",
-    })
-
-    await launchSession('C_TEST1', '/tmp/test-cwd', config, stub, { pollTimeout: 0 })
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).startsWith(
-      "CLAUDE_MANAGED_CHANNEL='C_TEST1' CLAUDE_CONFIG_DIR='/home/horde/it'\\''s-mine' claude --mcp-config",
-    )).toBe(true)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Crash recovery
-// ---------------------------------------------------------------------------
-
-describe('crash recovery', () => {
-  // T24: Server crash before sessions.json write.
-  // sessions.json does NOT exist (crashed before it was persisted).
-  // Claude process is still alive in tmux. startupSessionManager reconnects
-  // and uses storedId (which is absent here), falling back to "pending".
-  // The tool-call hook will update sessionId on the next tool call.
-  test('T24: crash before sessions.json write — reconnect branch fires and returns record with sessionId "pending"', async () => {
-    const proc = await spawnClaudeProcess()
-    try {
-      // tmux session exists and Claude is alive — reconnect branch
-      const stub = makeTmuxStub({
-        hasSessionResult: true,
-        getPanePidResult: String(proc.pid),
-      })
-      const config = makeRoutingConfig()
-
-      // storedSessions is empty — sessions.json was never written (crashed before phase 11)
-      const result = await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
-
-      // Reconnect branch fires and returns a record; sessionId starts as "pending"
-      // (the tool-call hook will update it on the next tool call)
-      expect(result).toBeInstanceOf(Map)
-      expect(result.size).toBe(1)
-
-      const record = result.get('C_TEST1')
-      expect(record).toBeDefined()
-      expect(record!.sessionId).toBe('pending')
-      expect(record!.tmuxSession).toBe(sessionName('/tmp/test-cwd'))
-      expect(typeof record!.lastLaunch).toBe('string')
-
-      // No kill or newSession — reconnect path only sends /mcp reconnect
-      expect(stub.calls.filter(c => c.method === 'killSession')).toHaveLength(0)
-      expect(stub.calls.filter(c => c.method === 'newSession')).toHaveLength(0)
-    } finally {
-      proc.kill()
-    }
-  })
-
-  test('T24: crash before sessions.json write — reconnect sends /mcp reconnect to the live session', async () => {
-    const proc = await spawnClaudeProcess()
-    try {
-      const stub = makeTmuxStub({
-        hasSessionResult: true,
-        getPanePidResult: String(proc.pid),
-      })
-      const config = makeRoutingConfig()
-
-      await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
-
-      const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-      const reconnectCall = sendKeysCalls.find(
-        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`/mcp reconnect ${MCP_SERVER_NAME}`),
-      )
-      expect(reconnectCall).toBeDefined()
-      // 'Enter' passed as variadic third arg
-      expect(reconnectCall!.args[2]).toBe('Enter')
-    } finally {
-      proc.kill()
-    }
-  })
-
-  // T9: Force-killed session — stale ID in .last
-  // storedSessions has a stale session ID that causes "No conversation found".
-  // launchSession must detect the fast-fail, kill/recreate, then launch fresh.
-  // The returned record has sessionId "pending" (set by the fresh path).
-  test('T9: stale session ID fast-fails, fresh fallback launches and returns sessionId "pending"', async () => {
-    // capturePaneResults: first call returns "No conversation found" (fast-fail trigger),
-    // subsequent calls return the safety prompt so the fresh attempt succeeds.
-    const stub = makeTmuxStub({
-      capturePaneResults: [
-        'No conversation found',
-        'I am using this for local development',
-      ],
-    })
-    const config = makeRoutingConfig()
-
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 5_000, sessionId: 'stale-force-killed-id' },
-    )
-
-    // Fresh fallback must succeed and return a record
-    expect(result).not.toBeNull()
-
-    // The returned session ID is "pending" (fresh path); not the stale resume ID
-    expect(result!.sessionId).toBe('pending')
-    expect(result!.sessionId).not.toBe('stale-force-killed-id')
-
-    // Fast-fail path: kill was called at least once (to tear down the stale session)
-    const killCalls = stub.calls.filter(c => c.method === 'killSession')
+    const killCalls = stub.calls.filter(c => c.verb === 'kill')
     expect(killCalls.length).toBeGreaterThanOrEqual(1)
+    const killedInstanceIds = killCalls.map(c => {
+      const idx = c.argv.indexOf('--claude-instance-id')
+      return c.argv[idx + 1]
+    })
+    expect(killedInstanceIds).toContain(`cscb_${orphanCh}`)
 
-    // At least one fresh launch command (no --resume) was sent after the fast-fail
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const freshCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' &&
-        (c.args[1] as string).includes('claude --mcp-config') &&
-        !(c.args[1] as string).includes('--resume'),
-    )
-    expect(freshCmd).toBeDefined()
+    // startupSessionManager succeeds for configured route regardless
+    const result = await startupSessionManager(config)
+    expect(result.succeeded).toBeGreaterThanOrEqual(1)
   })
 
-  test('T9: stale session ID — initial launch command includes --resume with the stale ID', async () => {
-    // Verify the resume was actually attempted before the fast-fail
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999', // Claude never running — both attempts fail
-      capturePaneResults: [
-        'No conversation found',
-        'some output',
-      ],
-    })
-    const config = makeRoutingConfig()
+  test('dry-run: returns no-op actions, no CLI calls', async () => {
+    process.env['SLACK_DRY_RUN'] = 'true'
 
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 600, sessionId: 'stale-force-killed-id' },
-    )
+    const config = singleRoute()
+    const result = await startupSessionManager(config)
 
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const resumeCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume stale-force-killed-id'),
-    )
-    expect(resumeCmd).toBeDefined()
-  })
-})
+    // In dry-run, spawnForRoute returns no-op
+    expect(result.perChannel.every(r => r.action === 'no-op')).toBe(true)
 
-// ---------------------------------------------------------------------------
-// CLAUDE_MANAGED_CHANNEL env var injection
-// ---------------------------------------------------------------------------
-
-describe('CLAUDE_MANAGED_CHANNEL env var injection', () => {
-  test('fresh launch via launchSession: sendKeys command contains CLAUDE_MANAGED_CHANNEL=\'C_TEST1\' before claude', async () => {
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999',
-    })
-    const config = makeRoutingConfig()
-
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 0 },
-    )
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-
-    const cmd = launchCmd!.args[1] as string
-    expect(cmd.includes("CLAUDE_MANAGED_CHANNEL='C_TEST1'")).toBe(true)
-    // Env var must appear before 'claude'
-    expect(cmd.indexOf("CLAUDE_MANAGED_CHANNEL='C_TEST1'")).toBeLessThan(cmd.indexOf('claude '))
+    const spawnCalls = stub.calls.filter(c => c.verb === 'spawn')
+    expect(spawnCalls).toHaveLength(0)
   })
 
-  test('resume launch via launchSession: command includes env var prefix alongside --resume <id>', async () => {
-    const resumeId = 'resume-session-abc'
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const config = makeRoutingConfig()
-
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 2_000, sessionId: resumeId },
-    )
-
-    expect(result).not.toBeNull()
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const resumeCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${resumeId}`),
-    )
-    expect(resumeCmd).toBeDefined()
-
-    const cmd = resumeCmd!.args[1] as string
-    expect(cmd.includes("CLAUDE_MANAGED_CHANNEL='C_TEST1'")).toBe(true)
-    expect(cmd.includes(`--resume ${resumeId}`)).toBe(true)
-    // Env var still appears before 'claude'
-    expect(cmd.indexOf("CLAUDE_MANAGED_CHANNEL='C_TEST1'")).toBeLessThan(cmd.indexOf('claude '))
-  })
-
-  test('fresh launch via startupSessionManager: delegated sendKeys includes CLAUDE_MANAGED_CHANNEL for route channel ID', async () => {
-    const stub = makeTmuxStub({
-      hasSessionResult: false,
-      getPanePidResult: '99999999',
-    })
-    const config = makeRoutingConfig()
-
-    await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-    expect((launchCmd!.args[1] as string).includes("CLAUDE_MANAGED_CHANNEL='C_TEST1'")).toBe(true)
-  })
-
-  test('dynamic channel ID: env var value matches the route key used', async () => {
-    const stub = makeTmuxStub({
-      hasSessionResult: false,
-      getPanePidResult: '99999999',
-    })
-    const config = {
-      ...makeRoutingConfig(),
-      routes: {
-        'C_OTHERCHAN': { cwd: '/tmp/test-cwd-other' },
+  test('multi-route: Slack post failure does not throw; startup completes', async () => {
+    const failingWeb = {
+      chat: {
+        postMessage: async () => { throw new Error('Slack API down') },
       },
-    }
+    } as unknown as WebClient
 
-    await startupSessionManager(config, stub, {}, { pollTimeout: 0 })
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-
-    const cmd = launchCmd!.args[1] as string
-    expect(cmd.includes("CLAUDE_MANAGED_CHANNEL='C_OTHERCHAN'")).toBe(true)
-    // Must NOT contain the default channel ID
-    expect(cmd.includes("CLAUDE_MANAGED_CHANNEL='C_TEST1'")).toBe(false)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// jsonlExistsForSession
-// ---------------------------------------------------------------------------
-
-describe('jsonlExistsForSession', () => {
-  const jsonlUnitCleanup: string[] = []
-
-  afterEach(() => {
-    for (const f of jsonlUnitCleanup) {
-      try { unlinkSync(f) } catch { /* ignore */ }
-    }
-    jsonlUnitCleanup.length = 0
-  })
-
-  test('returns true when JSONL file exists', () => {
-    const cwd = '/tmp/test-cwd'
-    const sessionId = 'unit-test-session-exists'
-    const slug = '-tmp-test-cwd'
-    const dir = join(homedir(), '.claude', 'projects', slug)
-    mkdirSync(dir, { recursive: true })
-    const filePath = join(dir, `${sessionId}.jsonl`)
-    writeFileSync(filePath, '', 'utf-8')
-    jsonlUnitCleanup.push(filePath)
-
-    expect(jsonlExistsForSession(cwd, sessionId)).toBe(true)
-  })
-
-  test('returns false when JSONL file does not exist', () => {
-    const cwd = '/tmp/test-cwd'
-    const sessionId = 'unit-test-session-nonexistent-' + Date.now()
-
-    // Deliberately do not create the file
-    expect(jsonlExistsForSession(cwd, sessionId)).toBe(false)
-  })
-
-  test('slug computation: /tmp/test-cwd → -tmp-test-cwd', () => {
-    const sessionId = 'slug-test-session-' + Date.now()
-    const slug = '-tmp-test-cwd'
-    const dir = join(homedir(), '.claude', 'projects', slug)
-    mkdirSync(dir, { recursive: true })
-    const filePath = join(dir, `${sessionId}.jsonl`)
-    writeFileSync(filePath, '', 'utf-8')
-    jsonlUnitCleanup.push(filePath)
-
-    expect(jsonlExistsForSession('/tmp/test-cwd', sessionId)).toBe(true)
-  })
-
-  test('slug computation: /home/user/my_project → -home-user-my-project', () => {
-    const sessionId = 'slug-test-underscores-' + Date.now()
-    const slug = '-home-user-my-project'
-    const dir = join(homedir(), '.claude', 'projects', slug)
-    mkdirSync(dir, { recursive: true })
-    const filePath = join(dir, `${sessionId}.jsonl`)
-    writeFileSync(filePath, '', 'utf-8')
-    jsonlUnitCleanup.push(filePath)
-
-    expect(jsonlExistsForSession('/home/user/my_project', sessionId)).toBe(true)
-    // Verify a different slug would NOT find the file
-    expect(jsonlExistsForSession('/home/user/my_project_other', sessionId)).toBe(false)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// resume_enabled flag
-// ---------------------------------------------------------------------------
-
-describe('resume_enabled', () => {
-  test('resume_enabled: false — does fresh launch even when stored session ID and JSONL both exist', async () => {
-    // This test would FAIL before the fix: without the resume_enabled gate,
-    // a stored sessionId + existing JSONL would always take the resume branch.
-    const jsonlDir = join(homedir(), '.claude', 'projects', '-tmp-test-cwd')
-    mkdirSync(jsonlDir, { recursive: true })
-    const sessionId = 'stored-resume-disabled-id'
-    const jsonlPath = join(jsonlDir, `${sessionId}.jsonl`)
-    writeFileSync(jsonlPath, '', 'utf-8')
-    jsonlCleanupFiles.push(jsonlPath)
-
-    const stub = makeTmuxStub({
-      hasSessionResult: false,
-      getPanePidResult: '99999999', // Claude never running → fresh launch fails
+    // Force spawn error for the route
+    stub.setNextSpawnError({
+      ok: false,
+      error: { kind: 'ErrNonZeroExit', exitCode: 1, message: 'fail', stderr: 'fail stderr' },
     })
-    const storedSessions: SessionsMap = {
-      'C_TEST1': {
-        tmuxSession: sessionName('/tmp/test-cwd'),
-        lastLaunch: '2026-01-01T00:00:00.000Z',
-        sessionId,
-      },
-    }
-    // resume_enabled: false — bots must always launch fresh
-    const config = makeRoutingConfig({ resume_enabled: false })
 
-    await startupSessionManager(config, stub, storedSessions, { pollTimeout: 0 })
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-
-    // --resume must NOT appear anywhere in the sent commands
-    const resumeCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume'),
-    )
-    expect(resumeCmd).toBeUndefined()
-
-    // A fresh launch command (containing 'claude --mcp-config') must have been sent
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
+    const config = singleRoute()
+    // Should not throw even if Slack post fails
+    const result = await startupSessionManager(config, {}, failingWeb)
+    expect(result).toBeDefined()
   })
+})
 
-  test('resume_enabled: false has NO effect on reconnect path — live Claude process still gets /mcp reconnect', async () => {
-    // Reconnect fires when the tmux session is alive and Claude is running.
-    // resume_enabled controls whether --resume is used when Claude is dead and a
-    // stored session ID exists. It must not block the reconnect path at all.
-    const proc = await spawnClaudeProcess()
-    try {
-      const stub = makeTmuxStub({
-        hasSessionResult: true,
-        getPanePidResult: String(proc.pid),
-      })
-      const storedSessions: SessionsMap = {
-        'C_TEST1': {
-          tmuxSession: sessionName('/tmp/test-cwd'),
-          lastLaunch: '2026-01-01T00:00:00.000Z',
-          sessionId: 'live-session-id',
-        },
+// ---------------------------------------------------------------------------
+// Epic-1 boundary canary — no spawn argv includes --append-system-prompt-file
+// ---------------------------------------------------------------------------
+
+describe('Epic-1 boundary canary', () => {
+  test('no spawn argv across tests includes --append-system-prompt-file', async () => {
+    const config = singleRoute()
+    await spawnForRoute(CH, { cwd: CWD }, config)
+
+    for (const call of stub.calls) {
+      if (call.verb === 'spawn') {
+        expect(call.argv).not.toContain('--append-system-prompt-file')
       }
-      const config = makeRoutingConfig({ resume_enabled: false })
-
-      const result = await startupSessionManager(config, stub, storedSessions, { pollTimeout: 0 })
-
-      // Reconnect path succeeds regardless of resume_enabled
-      expect(result).toBeInstanceOf(Map)
-      expect(result.size).toBe(1)
-      const record = result.get('C_TEST1')
-      expect(record).toBeDefined()
-      expect(record!.sessionId).toBe('live-session-id')
-
-      // No kill or newSession — reconnect path only
-      expect(stub.calls.filter(c => c.method === 'killSession')).toHaveLength(0)
-      expect(stub.calls.filter(c => c.method === 'newSession')).toHaveLength(0)
-
-      // /mcp reconnect was sent as usual
-      const reconnectCall = stub.calls.filter(c => c.method === 'sendKeys').find(
-        c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`/mcp reconnect ${MCP_SERVER_NAME}`),
-      )
-      expect(reconnectCall).toBeDefined()
-    } finally {
-      proc.kill()
     }
-  })
-
-  test('resume_enabled: true (explicit) — resumes when stored session ID and JSONL both exist', async () => {
-    const jsonlDir = join(homedir(), '.claude', 'projects', '-tmp-test-cwd')
-    mkdirSync(jsonlDir, { recursive: true })
-    const sessionId = 'stored-resume-enabled-id'
-    const jsonlPath = join(jsonlDir, `${sessionId}.jsonl`)
-    writeFileSync(jsonlPath, '', 'utf-8')
-    jsonlCleanupFiles.push(jsonlPath)
-
-    const stub = makeTmuxStub({
-      hasSessionResult: false,
-      capturePaneResult: 'I am using this for local development',
-    })
-    const storedSessions: SessionsMap = {
-      'C_TEST1': {
-        tmuxSession: sessionName('/tmp/test-cwd'),
-        lastLaunch: '2026-01-01T00:00:00.000Z',
-        sessionId,
-      },
-    }
-    // resume_enabled: true (explicit) — normal resume path
-    const config = makeRoutingConfig({ resume_enabled: true })
-
-    const result = await startupSessionManager(config, stub, storedSessions, {
-      pollTimeout: 2_000,
-    })
-
-    expect(result).toBeInstanceOf(Map)
-    expect(result.size).toBe(1)
-    expect(result.get('C_TEST1')!.sessionId).toBe(sessionId)
-
-    // --resume <sessionId> must appear in the sent commands
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const resumeCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${sessionId}`),
-    )
-    expect(resumeCmd).toBeDefined()
   })
 })
 
 // ---------------------------------------------------------------------------
-// auto-restart launchSession: resume_enabled gating (bug b.own fix regression)
-//
-// The server.ts auto-restart closure (RestartDeps.launchSession) computes
-// resolvedSessionId as:
-//   routingConfig.resume_enabled !== false && stored !== 'pending' ? stored : undefined
-// then calls launchSession(channelId, cwd, config, tmux, resolvedSessionId !== undefined
-//   ? { sessionId: resolvedSessionId } : undefined)
-//
-// Before the fix, resume_enabled was ignored and stored was always used.
-// These tests exercise launchSession() directly, simulating what the
-// auto-restart closure does after applying the gate, so they confirm
-// the full end-to-end behaviour (no --resume / --resume in the tmux command).
+// Spawn invariants — SR-8.6
 // ---------------------------------------------------------------------------
 
-describe('auto-restart launchSession: resume_enabled gating', () => {
-  test('resume_enabled: false + stored session ID → auto-restart launches fresh (no --resume)', async () => {
-    // This test would FAIL before the fix: the pre-fix closure always forwarded
-    // `stored` as the sessionId, so launchSession received sessionId='stored-id'
-    // and emitted '--resume stored-id' even when resume_enabled was false.
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999', // Claude never running → launch fails quickly
-    })
-    // resume_enabled: false — the fixed closure resolves sessionId to undefined
-    const config = makeRoutingConfig({ resume_enabled: false })
-    const storedSessionId = 'auto-restart-resume-disabled-id'
+describe('spawn invariants (SR-8.6)', () => {
+  // -------------------------------------------------------------------------
+  // Invariant 1: every spawn argv contains --relay-mode on (adjacent elements)
+  // -------------------------------------------------------------------------
 
-    // Simulate what the fixed server.ts closure does:
-    //   resolvedSessionId = config.resume_enabled !== false && stored !== 'pending'
-    //                       ? stored : undefined
-    const resolvedSessionId = config.resume_enabled !== false && (storedSessionId as string) !== 'pending'
-      ? storedSessionId
-      : undefined
-
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      resolvedSessionId !== undefined ? { sessionId: resolvedSessionId, pollTimeout: 0 } : { pollTimeout: 0 },
-    )
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-
-    // No --resume in any sent command
-    const resumeCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume'),
-    )
-    expect(resumeCmd).toBeUndefined()
-
-    // A fresh launch command was still sent
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-  })
-
-  test('resume_enabled: true (default) + stored session ID → auto-restart uses --resume', async () => {
-    // With resume_enabled: true the fixed closure forwards the stored session ID,
-    // so launchSession receives sessionId and emits '--resume <id>' in the command.
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const config = makeRoutingConfig({ resume_enabled: true })
-    const storedSessionId = 'auto-restart-resume-enabled-id'
-
-    // Same gating logic as the fixed server.ts closure
-    const resolvedSessionId = config.resume_enabled !== false && (storedSessionId as string) !== 'pending'
-      ? storedSessionId
-      : undefined
-
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      resolvedSessionId !== undefined ? { sessionId: resolvedSessionId, pollTimeout: 2_000 } : { pollTimeout: 2_000 },
-    )
-
-    expect(result).not.toBeNull()
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-    const resumeCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes(`--resume ${storedSessionId}`),
-    )
-    expect(resumeCmd).toBeDefined()
-  })
-
-  test('resume_enabled: true + storedSessionId = "pending" → auto-restart launches fresh (no --resume)', async () => {
-    // When resume_enabled is true but the stored session ID is "pending" (session
-    // was still initialising when the server last shut down), the closure must
-    // treat it as an absent ID and do a fresh launch without --resume.
-    const stub = makeTmuxStub({
-      getPanePidResult: '99999999', // Claude never running → launch fails quickly
-    })
-    const config = makeRoutingConfig({ resume_enabled: true })
-    const storedSessionId = 'pending'
-
-    // Simulate what the fixed server.ts closure does:
-    //   resolvedSessionId = config.resume_enabled !== false && stored !== 'pending'
-    //                       ? stored : undefined
-    const resolvedSessionId = config.resume_enabled !== false && (storedSessionId as string) !== 'pending'
-      ? storedSessionId
-      : undefined
-
-    // resolvedSessionId must be undefined — "pending" is excluded even when resume_enabled: true
-    expect(resolvedSessionId).toBeUndefined()
-
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      resolvedSessionId !== undefined ? { sessionId: resolvedSessionId, pollTimeout: 0 } : { pollTimeout: 0 },
-    )
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-
-    // No --resume in any sent command
-    const resumeCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('--resume'),
-    )
-    expect(resumeCmd).toBeUndefined()
-
-    // A fresh launch command was still sent
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude --mcp-config'),
-    )
-    expect(launchCmd).toBeDefined()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// launchSession — cleaning integration
-// ---------------------------------------------------------------------------
-
-describe('launchSession — cleaning integration', () => {
-  test('cleaning called before --resume when sessionId is provided', async () => {
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const config = makeRoutingConfig()
-
-    const cleanCalls: Array<[string, string, string]> = []
-    const mockClean: CleanSessionFn = async (sessionId, cwd, prescription) => {
-      cleanCalls.push([sessionId, cwd, prescription])
+  function assertAllSpawnsHaveRelayModeOn(calls: typeof stub.calls): void {
+    const spawnCalls = calls.filter(c => c.verb === 'spawn')
+    expect(spawnCalls.length).toBeGreaterThan(0)
+    for (const call of spawnCalls) {
+      const idx = call.argv.indexOf('--relay-mode')
+      expect(idx).toBeGreaterThan(-1)
+      expect(call.argv[idx + 1]).toBe('on')
     }
+  }
 
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 2_000, sessionId: 'abc123', cleanSession: mockClean },
-    )
-
-    expect(cleanCalls).toHaveLength(1)
-    expect(cleanCalls[0][0]).toBe('abc123')
-    expect(cleanCalls[0][1]).toBe('/tmp/test-cwd')
-    expect(cleanCalls[0][2]).toBe('standard') // default prescription from makeRoutingConfig
+  test('happy path (fresh spawn) — spawn argv contains --relay-mode on', async () => {
+    const config = singleRoute()
+    await spawnForRoute(CH, { cwd: CWD }, config)
+    assertAllSpawnsHaveRelayModeOn(stub.calls)
   })
 
-  test('cleaning NOT called for fresh launches (no sessionId)', async () => {
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const config = makeRoutingConfig()
+  test('collision→terminal→resume→ErrNoSessionId→delete+spawn — all spawn calls contain --relay-mode on', async () => {
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'ended' })])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'ended' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+    stub.setNextResumeError(INSTANCE_ID, { ok: false, error: { kind: 'ErrNoSessionId', message: 'no session' } })
 
-    const cleanCalls: number[] = []
-    const mockClean: CleanSessionFn = async () => { cleanCalls.push(1) }
+    const config = singleRoute({ resume_enabled: true })
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+    expect(result.action).toBe('spawned')
 
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 2_000, cleanSession: mockClean }, // no sessionId
-    )
-
-    expect(cleanCalls).toHaveLength(0)
+    // Two spawn calls: initial collision + fresh spawn after delete
+    const spawnCalls = stub.calls.filter(c => c.verb === 'spawn')
+    expect(spawnCalls).toHaveLength(2)
+    assertAllSpawnsHaveRelayModeOn(stub.calls)
   })
 
-  test('cleaning NOT called when sessionId is "pending"', async () => {
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const config = makeRoutingConfig()
+  test('collision→terminal→resume→ErrJsonlMissing→delete+spawn — all spawn calls contain --relay-mode on', async () => {
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'ended' })])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'ended' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+    stub.setNextResumeError(INSTANCE_ID, { ok: false, error: { kind: 'ErrJsonlMissing', message: 'no jsonl' } })
 
-    const cleanCalls: number[] = []
-    const mockClean: CleanSessionFn = async () => { cleanCalls.push(1) }
+    const config = singleRoute({ resume_enabled: true })
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+    expect(result.action).toBe('spawned')
 
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 2_000, sessionId: 'pending', cleanSession: mockClean },
-    )
-
-    expect(cleanCalls).toHaveLength(0)
+    const spawnCalls = stub.calls.filter(c => c.verb === 'spawn')
+    expect(spawnCalls).toHaveLength(2)
+    assertAllSpawnsHaveRelayModeOn(stub.calls)
   })
 
-  test('cleaning error does not abort resume — SessionRecord still returned', async () => {
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const config = makeRoutingConfig()
+  test('resume_enabled=false + terminal state → kill+delete+spawn — all spawn calls contain --relay-mode on', async () => {
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'ended' })])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'ended' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
 
-    // Simulates an internal failure that still resolves (per CleanSessionFn contract)
-    const mockClean: CleanSessionFn = async () => {
-      console.error('[test] mock clean: simulated failure, resolving anyway')
-    }
+    const config = singleRoute({ resume_enabled: false })
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+    expect(result.action).toBe('spawned')
 
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 2_000, sessionId: 'abc123', cleanSession: mockClean },
-    )
-
-    expect(result).not.toBeNull()
-    expect(result!.sessionId).toBe('abc123')
+    const spawnCalls = stub.calls.filter(c => c.verb === 'spawn')
+    expect(spawnCalls).toHaveLength(2)
+    assertAllSpawnsHaveRelayModeOn(stub.calls)
   })
 
-  test('cleaning receives top-level claude_config_dir as 4th argument on resume', async () => {
-    // Regression guard for the cozempic configDir bug: when a route is launched
-    // with a custom CLAUDE_CONFIG_DIR, the cleanSession call must receive that
-    // configDir so its JSONL lookup matches where Claude actually wrote the file.
-    // Without this, the pre-resume clean silently no-ops.
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const customConfigDir = '/home/horde/.claude-maxauth'
-    const config = makeRoutingConfig({ claude_config_dir: customConfigDir })
+  // -------------------------------------------------------------------------
+  // Invariant 2: reconcile against existing service=cscb,channel=<id> row
+  // produces no duplicate spawn (idempotency)
+  // -------------------------------------------------------------------------
 
-    const cleanCalls: Array<[string, string, string, string | undefined]> = []
-    const mockClean: CleanSessionFn = async (sessionId, cwd, prescription, configDir) => {
-      cleanCalls.push([sessionId, cwd, prescription, configDir])
-    }
+  test('pre-existing waiting row → spawnForRoute collision path → spawn count 0 after collision, no duplicate', async () => {
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'waiting' })])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'waiting' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
 
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 2_000, sessionId: 'abc123', cleanSession: mockClean },
-    )
+    const config = singleRoute()
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+    expect(result.action).toBe('reconnected')
 
-    expect(cleanCalls).toHaveLength(1)
-    expect(cleanCalls[0][0]).toBe('abc123')
-    expect(cleanCalls[0][1]).toBe('/tmp/test-cwd')
-    expect(cleanCalls[0][2]).toBe('standard')
-    expect(cleanCalls[0][3]).toBe(customConfigDir)
+    // Collision path: initial spawn attempt collides but transitions to send-keys — no second spawn
+    expect(stub.calls.filter(c => c.verb === 'spawn')).toHaveLength(1)
   })
 
-  test('cleaning receives per-route claude_config_dir override (priority over top-level)', async () => {
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const topLevelDir = '/home/horde/.claude-global'
-    const perRouteDir = '/home/horde/.claude-route-specific'
-    const config = makeRoutingConfig({
-      claude_config_dir: topLevelDir,
-      routes: {
-        'C_TEST1': { cwd: '/tmp/test-cwd', claude_config_dir: perRouteDir },
-      },
-    })
+  test('startupSessionManager with pre-existing waiting row — cumulative spawn count stays 1 across two runs', async () => {
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'waiting' })])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'waiting' }))
 
-    const cleanCalls: Array<[string, string, string, string | undefined]> = []
-    const mockClean: CleanSessionFn = async (sessionId, cwd, prescription, configDir) => {
-      cleanCalls.push([sessionId, cwd, prescription, configDir])
-    }
+    const config = singleRoute()
 
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 2_000, sessionId: 'abc123', cleanSession: mockClean },
-    )
+    // First run: collision → reconnect (no fresh spawn)
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+    await startupSessionManager(config)
+    const afterFirstRun = stub.calls.filter(c => c.verb === 'spawn').length
+    expect(afterFirstRun).toBe(1)
 
-    expect(cleanCalls).toHaveLength(1)
-    // Per-route value wins over top-level
-    expect(cleanCalls[0][3]).toBe(perRouteDir)
+    // Second run: collision again → still no fresh spawn
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+    await startupSessionManager(config)
+    const afterSecondRun = stub.calls.filter(c => c.verb === 'spawn').length
+    expect(afterSecondRun).toBe(2) // one attempt per run, no extra duplicates
+    // No additional fresh spawns beyond the collision attempts
+    const resumeCalls = stub.calls.filter(c => c.verb === 'resume')
+    expect(resumeCalls).toHaveLength(0)
   })
 
-  test('cleaning receives undefined configDir when no claude_config_dir is configured', async () => {
-    // Sanity: routes without a custom CLAUDE_CONFIG_DIR pass undefined so that
-    // cleanSession falls back to the default ${homedir()}/.claude lookup.
-    const stub = makeTmuxStub({
-      capturePaneResult: 'I am using this for local development',
-    })
-    const config = makeRoutingConfig() // no claude_config_dir
+  test('pre-existing working row → no fresh spawn issued', async () => {
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'working' })])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'working' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
 
-    const cleanCalls: Array<[string, string, string, string | undefined]> = []
-    const mockClean: CleanSessionFn = async (sessionId, cwd, prescription, configDir) => {
-      cleanCalls.push([sessionId, cwd, prescription, configDir])
-    }
+    _setWaitForWaitingTimeoutMs(50)
+    const config = singleRoute({ claude_director_poll_interval_ms: 10 })
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
 
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 2_000, sessionId: 'abc123', cleanSession: mockClean },
-    )
-
-    expect(cleanCalls).toHaveLength(1)
-    expect(cleanCalls[0][3]).toBeUndefined()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Trust dialog handling in launchSession / attemptLaunch
-// ---------------------------------------------------------------------------
-
-describe('launchSession trust dialog handling', () => {
-  const TRUST_PANE = 'Do you trust the files in this folder?\n❯ 1. Yes, I trust this folder\n  2. No, exit'
-  const SAFETY_PANE = 'I am using this for local development'
-  const READY_PANE = 'Claude Code v2.0.0\n❯'
-
-  test('A. trust dialog before safety prompt: Enter sent (no Down), then Enter for safety prompt, returns pending record', async () => {
-    // Regression-guard: default focus on the trust dialog is "Yes, I trust this
-    // folder", so plain Enter accepts. Sending Down would move focus to
-    // "No, exit" and kill Claude — assert no Down keys are sent.
-    const stub = makeTmuxStub({
-      capturePaneResults: [
-        TRUST_PANE,    // first poll → trust dialog
-        SAFETY_PANE,   // second poll → safety prompt
-      ],
-    })
-    const config = makeRoutingConfig()
-
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 5_000 },
-    )
-
-    expect(result).not.toBeNull()
-    expect(result!.sessionId).toBe('pending')
-
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-
-    // Launch command was sent first
-    const launchCmd = sendKeysCalls.find(
-      c => typeof c.args[1] === 'string' && (c.args[1] as string).includes('claude'),
-    )
-    expect(launchCmd).toBeDefined()
-
-    // No Down keys must be sent — Down would select "No, exit"
-    const downCalls = sendKeysCalls.filter(c => c.args[1] === 'Down')
-    expect(downCalls).toHaveLength(0)
-
-    // Enters: launch + trust accept + safety prompt = 3
-    const enterCalls = sendKeysCalls.filter(c => c.args[1] === 'Enter')
-    expect(enterCalls.length).toBe(3)
+    // working state eventually times out → no fresh spawn, just the initial collision attempt
+    expect(stub.calls.filter(c => c.verb === 'spawn')).toHaveLength(1)
+    // No resume issued for working state
+    expect(stub.calls.filter(c => c.verb === 'resume')).toHaveLength(0)
   })
 
-  test('B. trust dialog still showing on second poll → trust-accept Enter sent exactly once, no Down', async () => {
-    const stub = makeTmuxStub({
-      capturePaneResults: [
-        TRUST_PANE,    // first poll → trust dialog
-        TRUST_PANE,    // second poll → still trust dialog (still rendering)
-        SAFETY_PANE,   // third poll → safety prompt
-      ],
-    })
-    const config = makeRoutingConfig()
+  test('pre-existing pending row → no fresh spawn issued', async () => {
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'pending' })])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'pending' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
 
-    await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 5_000 },
-    )
+    const config = singleRoute()
+    const result = await spawnForRoute(CH, { cwd: CWD }, config)
+    expect(result.action).toBe('no-op')
 
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-
-    const downCalls = sendKeysCalls.filter(c => c.args[1] === 'Down')
-    expect(downCalls).toHaveLength(0)
-
-    // launch Enter + trust-accept Enter (once, due to trustDialogHandled flag) + safety Enter = 3
-    const enterCalls = sendKeysCalls.filter(c => c.args[1] === 'Enter')
-    expect(enterCalls.length).toBe(3)
+    expect(stub.calls.filter(c => c.verb === 'spawn')).toHaveLength(1)
+    expect(stub.calls.filter(c => c.verb === 'resume')).toHaveLength(0)
   })
 
-  test('C. trust dialog then ready banner (no safety prompt) → non-null record, Enter sent once, no Down', async () => {
-    const stub = makeTmuxStub({
-      capturePaneResults: [
-        TRUST_PANE,  // first poll → trust dialog
-        READY_PANE,  // second poll → ready banner
-      ],
-    })
-    const config = makeRoutingConfig()
+  test('pre-existing ended row + resume_enabled: true — first run: spawn=1 attempt (collision), resume=1; second run with waiting row: no more spawns, no more resumes', async () => {
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'ended' })])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'ended' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
 
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 5_000 },
-    )
+    const config = singleRoute({ resume_enabled: true })
 
-    expect(result).not.toBeNull()
-    expect(result!.sessionId).toBe('pending')
+    // First run: collision → resume path
+    await spawnForRoute(CH, { cwd: CWD }, config)
+    expect(stub.calls.filter(c => c.verb === 'spawn')).toHaveLength(1)
+    expect(stub.calls.filter(c => c.verb === 'resume')).toHaveLength(1)
 
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
+    // Simulate post-resume state: row now in waiting
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH, state: 'waiting' })])
+    stub.setGetPayload(INSTANCE_ID, makeGetPayload({ channelId: CH, state: 'waiting' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
 
-    const downCalls = sendKeysCalls.filter(c => c.args[1] === 'Down')
-    expect(downCalls).toHaveLength(0)
-
-    // launch Enter + trust-accept Enter = 2 (no safety prompt, ready banner short-circuits)
-    const enterCalls = sendKeysCalls.filter(c => c.args[1] === 'Enter')
-    expect(enterCalls.length).toBe(2)
+    // Second run: waiting state → reconnect, no new spawns, no new resumes
+    await spawnForRoute(CH, { cwd: CWD }, config)
+    expect(stub.calls.filter(c => c.verb === 'spawn')).toHaveLength(2) // one collision attempt each run
+    expect(stub.calls.filter(c => c.verb === 'resume')).toHaveLength(1) // cumulative resume count unchanged
   })
 
-  test('D. trust marker text alone (no "Yes, I trust this folder") does NOT trigger handler', async () => {
-    // Pane has the trust question but not the confirm label — handler must NOT fire,
-    // so no trust-accept Enter is sent (only launch Enter + safety prompt Enter = 2).
-    const PARTIAL_TRUST_PANE = 'Do you trust the files in this folder'
-    const stub = makeTmuxStub({
-      capturePaneResults: [
-        PARTIAL_TRUST_PANE,  // first poll → only question text, no confirm label
-        SAFETY_PANE,         // second poll → safety prompt
-      ],
-    })
-    const config = makeRoutingConfig()
+  // -------------------------------------------------------------------------
+  // Invariant 3: argv-style — every stub call has an array argv
+  // -------------------------------------------------------------------------
 
-    const result = await launchSession(
-      'C_TEST1', '/tmp/test-cwd', config, stub,
-      { pollTimeout: 5_000 },
-    )
+  test('all claude-director calls recorded by stub are argv-style (Array.isArray(c.argv))', async () => {
+    // Drive multiple code paths to populate stub.calls
+    const config = singleRoute()
+    await spawnForRoute(CH, { cwd: CWD }, config)
 
-    expect(result).not.toBeNull()
+    // Collision → resume path
+    const CH2 = 'C_INV3'
+    const INSTANCE_ID2 = `cscb_${CH2}`
+    stub.setSpawnRows([makeSpawnRow({ channelId: CH2, state: 'ended' })])
+    stub.setGetPayload(INSTANCE_ID2, makeGetPayload({ channelId: CH2, state: 'ended' }))
+    stub.setNextSpawnError({ ok: false, error: { kind: 'ErrInstanceIdCollision', message: 'collision' } })
+    await spawnForRoute(CH2, { cwd: CWD }, singleRoute({ resume_enabled: true }))
 
-    const sendKeysCalls = stub.calls.filter(c => c.method === 'sendKeys')
-
-    const downCalls = sendKeysCalls.filter(c => c.args[1] === 'Down')
-    expect(downCalls).toHaveLength(0)
-
-    // launch Enter + safety Enter = 2 (no extra trust-accept Enter)
-    const enterCalls = sendKeysCalls.filter(c => c.args[1] === 'Enter')
-    expect(enterCalls.length).toBe(2)
+    expect(stub.calls.length).toBeGreaterThan(0)
+    expect(stub.calls.every(c => Array.isArray(c.argv))).toBe(true)
   })
 })

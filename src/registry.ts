@@ -16,8 +16,6 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { MCP_SERVER_NAME } from './config.ts'
 import { isDryRun } from './tokens.ts'
-import { getPeerPidByPort, getSessionIdForPid } from './peer-pid.ts'
-import { readSessions, writeSessions, type SessionsMap } from './sessions.ts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -40,12 +38,6 @@ export interface SessionEntry {
   deliveredChannels: Set<string>
   /** Whether the session is currently connected (transport alive) */
   connected: boolean
-  /**
-   * TCP peer port of the most recent MCP request from this session.
-   * Updated per-request in server.ts before transport.handleRequest().
-   * Used by the CallToolRequestSchema handler to identify the calling process.
-   */
-  peerPort: number
 }
 
 /**
@@ -160,7 +152,6 @@ export function registerSession(
     stub.server = resolvedServer
     stub.deliveredChannels = deliveredChannels
     stub.connected = true
-    // peerPort intentionally left as-is (stays 0 until first HTTP request)
     entry = stub
   } else {
     entry = {
@@ -170,7 +161,6 @@ export function registerSession(
       server: resolvedServer,
       deliveredChannels,
       connected: true,
-      peerPort: 0,
     }
   }
   registry.set(channelId, entry)
@@ -363,24 +353,6 @@ export interface SessionToolDeps {
   resolveUserName: (userId: string) => Promise<string>
   /** Consume a pending ack entry — returns true if it existed */
   consumeAck: (channelId: string, messageTs: string) => boolean
-  /** TCP port the MCP HTTP server is listening on — used for peer PID discovery */
-  serverPort: number
-  /** Injectable for testing: replaces getPeerPidByPort in the discovery hook */
-  getPeerPidByPort?: (peerPort: number, serverPort: number) => Promise<number | null>
-  /** Injectable for testing: replaces getSessionIdForPid in the discovery hook */
-  getSessionIdForPid?: (pid: number, claudeConfigDir?: string) => Promise<string | null>
-  /** Injectable for testing: replaces readSessions in the discovery hook */
-  readSessions?: () => SessionsMap
-  /** Injectable for testing: replaces writeSessions in the discovery hook */
-  writeSessions?: (sessions: SessionsMap) => void
-  /**
-   * Resolves the Claude on-disk config dir for a given channel, if one is
-   * configured (per-route or top-level `claude_config_dir`). Used by the
-   * post-call discovery hook so it reads `<dir>/sessions/<pid>.json` from
-   * the right directory when the managed session was launched with
-   * `CLAUDE_CONFIG_DIR=<dir>`.
-   */
-  getClaudeConfigDir?: (channelId: string) => string | undefined
 }
 
 const MCP_INSTRUCTIONS = [
@@ -409,10 +381,6 @@ export function createSessionServer(
   deps: SessionToolDeps,
 ): Server {
   const { web, assertOutboundAllowed, assertSendable, getAccess, resolveUserName, inboxDir, consumeAck } = deps
-  const _getPeerPid = deps.getPeerPidByPort ?? getPeerPidByPort
-  const _getSessionId = deps.getSessionIdForPid ?? getSessionIdForPid
-  const _readSessions = deps.readSessions ?? readSessions
-  const _writeSessions = deps.writeSessions ?? writeSessions
 
   const server = new Server(
     { name: MCP_SERVER_NAME, version: '0.1.0' },
@@ -757,34 +725,6 @@ export function createSessionServer(
           isError: true,
         }
     } })() // end IIFE
-
-    // -------------------------------------------------------------------------
-    // Post-call: fire-and-forget peer PID → session ID discovery (t2.nrd.so.a7)
-    // Never blocks or delays the tool call response.
-    // -------------------------------------------------------------------------
-    if (entry.peerPort > 0) {
-      const peerPort = entry.peerPort
-      const serverPort = deps.serverPort
-      const channelId = entry.channelId
-      const claudeConfigDir = deps.getClaudeConfigDir?.(channelId)
-      ;(async () => {
-        try {
-          const pid = await _getPeerPid(peerPort, serverPort)
-          if (pid === null) return
-          const sessionId = await _getSessionId(pid, claudeConfigDir)
-          if (!sessionId) return
-          const sessions = _readSessions()
-          const record = sessions[channelId]
-          if (!record) return
-          if (record.sessionId === sessionId) return
-          sessions[channelId] = { ...record, sessionId }
-          _writeSessions(sessions)
-          console.error(`[slack] peer-pid: updated sessionId for channel=${channelId} pid=${pid}`)
-        } catch (err) {
-          console.error('[slack] peer-pid: session discovery failed', err)
-        }
-      })()
-    }
 
     return result
   })

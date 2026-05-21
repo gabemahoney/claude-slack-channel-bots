@@ -14,6 +14,8 @@ import { join, resolve } from 'path'
 import { existsSync, openSync, readFileSync, unlinkSync } from 'fs'
 import { spawnSync } from 'child_process'
 import { isProcessRunning } from './pid.ts'
+// TODO(E2-T4): clean_restart still uses tmux helpers. Full cutover to claude-director is deferred to E2-T4.
+// The import below keeps cli.ts compiling without changes to clean_restart behaviour.
 import { defaultTmuxClient, isClaudeRunning as tmuxIsClaudeRunning, sessionName as tmuxSessionName } from './tmux.ts'
 import { readSessions, type SessionsMap } from './sessions.ts'
 import { loadConfig as configLoadConfig, type RoutingConfig } from './config.ts'

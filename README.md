@@ -69,6 +69,16 @@ Two conditions cause a fatal error at startup. In both cases the error is writte
 - **`claude-director` not on `PATH`** — CSCB probes for the binary at startup and refuses to start if it is not found.
 - **`state.db` owner UID mismatch** — CSCB stats `~/.claude-director/state.db` and refuses to start if the file is not owned by the running process user.
 
+### Orphan spawn reconciliation
+
+On every startup, after trust bootstrapping, CSCB enumerates all `claude-director` spawns carrying the label `service=cscb`. Any spawn whose `channel` label does not match a configured route in `config.json` is treated as an orphan: CSCB calls `kill` then `delete` on it and logs the channelId, `claude_instance_id`, and final state to `~/.claude/channels/slack/startup-errors.log`.
+
+This is intentional behavior when an operator removes a route from `config.json` and restarts CSCB — the stale bot is reaped automatically.
+
+**Warning:** do not create `claude-director` spawns with the label `service=cscb` outside of CSCB. CSCB treats itself as the sole owner of that label namespace. Any out-of-band spawn carrying `service=cscb` whose channel is not a configured route will be killed and deleted on the next startup.
+
+Reconciliation failures are non-fatal — a cleanup error is logged but does not block the server from starting.
+
 ---
 
 ## Configuration

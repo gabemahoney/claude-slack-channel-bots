@@ -138,7 +138,6 @@ function makeDeps(web: any, overrides: Partial<SessionToolDeps> = {}): SessionTo
     inboxDir: '/tmp',
     resolveUserName: async (userId: string) => userId,
     consumeAck,
-    serverPort: 0,
     ...overrides,
   }
 }
@@ -599,7 +598,6 @@ describe('registerSession — promotion path (pending → registered)', () => {
     expect(entry.transport).toBe(transport)
     expect(entry.server).toBe(server)
     expect(entry.connected).toBe(true)
-    expect(entry.peerPort).toBe(0)
 
     // deliveredChannels seeded with channelId on promotion
     expect(entry.deliveredChannels.has('C_SL')).toBe(true)

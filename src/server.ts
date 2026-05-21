@@ -40,10 +40,9 @@ import {
 } from './lib.ts'
 import { loadConfig, expandTilde, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
 import { recordStartupError } from './startup-errors.ts'
-import { readSessions, writeSessions, rotateSessions } from './sessions.ts'
+import { readSessions } from './sessions.ts'
 import { defaultTmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
-import { startupSessionManager, launchSession } from './session-manager.ts'
-import { cleanSession, getCozempicAvailable } from './cozempic.ts'
+import { startupSessionManager, reconcileOrphans, flushSpawnFailureQueue, spawnForRoute } from './session-manager.ts'
 import {
   initRestart,
   scheduleRestart,
@@ -324,10 +323,6 @@ const sessionToolDeps: SessionToolDeps = {
   inboxDir: INBOX_DIR,
   resolveUserName,
   consumeAck,
-  serverPort: 0, // updated to actual port in main() before Bun.serve
-  // Resolved at call time so reloads of routingConfig take effect immediately.
-  getClaudeConfigDir: (channelId) =>
-    routingConfig?.routes[channelId]?.claude_config_dir ?? routingConfig?.claude_config_dir,
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +348,6 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
     server: null as unknown as import('@modelcontextprotocol/sdk/server/index.js').Server,
     deliveredChannels,
     connected: true,
-    peerPort: 0,
   }
 
   const transport = new WebStandardStreamableHTTPServerTransport({
@@ -937,10 +931,6 @@ export async function main(): Promise<void> {
   // PID file write). A missing or broken claude-director binary exits here with a clear message.
   runStartupGates({ checkPidConflict, pidFile: PID_FILE })
 
-  // Rotate sessions.json → sessions.json.last now that we know we're the only server.
-  // This preserves last-known session IDs for resume logic below.
-  rotateSessions()
-
   let mcpHost: string
   let mcpPort: number
 
@@ -996,10 +986,10 @@ export async function main(): Promise<void> {
     // Connect Socket Mode
     await socket.start()
     console.error('[slack] Socket Mode connected')
-  }
 
-  // Propagate resolved port to tool deps for peer PID discovery
-  sessionToolDeps.serverPort = mcpPort
+    // Drain any spawn failure notifications queued before auth completed.
+    flushSpawnFailureQueue(web)
+  }
 
   // -------------------------------------------------------------------------
   // HTTP server — single /mcp endpoint, roots-based session identity
@@ -1459,12 +1449,6 @@ export async function main(): Promise<void> {
         }
         // entry is non-null here (null means init request, but we have a session ID)
 
-        // Propagate peer port to registered sessions for tool call PID discovery
-        if (entry !== null && 'channelId' in entry) {
-          const remoteAddr = server.requestIP(req) as { address: string; port: number } | null
-          if (remoteAddr?.port) (entry as SessionEntry).peerPort = remoteAddr.port
-        }
-
         // For GET requests (SSE streams), attach an abort listener to detect
         // client disconnections. The MCP SDK's onsessionclosed only fires on
         // explicit HTTP DELETE, so silent TCP/tmux kills are never detected
@@ -1544,61 +1528,33 @@ export async function main(): Promise<void> {
       const exists = await defaultTmuxClient.hasSession(name)
       if (exists) await defaultTmuxClient.killSession(name)
     },
-    launchSession: async (channelId, cwd, sessionId) => {
+    launchSession: async (channelId, cwd, _sessionId) => {
       if (!routingConfig) return false
-      const stored = sessionId ?? readSessions()[channelId]?.sessionId
-      // Treat "pending" as undefined — fall back to a fresh launch, not --resume.
-      // Also skip --resume when resume_enabled is explicitly false.
-      const resolvedSessionId = routingConfig.resume_enabled !== false && stored !== 'pending' ? stored : undefined
-      if (!resolvedSessionId && routingConfig.resume_enabled === false) {
-        console.error(`[slack] launchSession (restart): resume_enabled=false — launching fresh for channel=${channelId}`)
-      }
-      const record = await launchSession(
-        channelId, cwd, routingConfig, defaultTmuxClient,
-        resolvedSessionId !== undefined
-          ? { sessionId: resolvedSessionId, cleanSession: getCozempicAvailable() ? cleanSession : undefined }
-          : undefined,
-      )
-      if (record) {
-        const sessions = readSessions()
-        sessions[channelId] = record
-        writeSessions(sessions)
-        console.error(`[slack] Session recorded in sessions.json: channel=${channelId} sessionId=${record.sessionId}`)
-      }
-      return record !== null
+      // Restart path: use spawnForRoute (claude-director) to relaunch.
+      // The old tmux-based launchSession has been replaced by the E2 dispatcher.
+      const result = await spawnForRoute(channelId, { cwd }, routingConfig, isDryRun() ? undefined : web)
+      return result.action !== 'failed'
     },
     getRestartDelay: () => routingConfig?.session_restart_delay ?? 60,
     isShuttingDown: () => shuttingDown,
   })
 
-  // Start up managed tmux sessions for all configured routes.
-  // If tmux is unavailable or startup fails, log a warning and continue.
+  // Start up managed claude-director sessions for all configured routes.
   if (routingConfig) {
     // Write the claude-director template before trust bootstrap and session manager.
     // writeTemplate exits on failure via recordStartupError + process.exit(1).
     writeTemplate(routingConfig)
+
+    // Reconcile orphan spawns BEFORE launching routes (E1).
+    await reconcileOrphans(routingConfig)
+
     try {
       bootstrapTrust(routingConfig)
     } catch (err) {
       console.error('[slack] Warning: trust bootstrap failed — continuing without trust pre-acceptance:', err)
     }
     try {
-      const lastPath = join(STATE_DIR, 'sessions.json.last')
-      const storedSessions = readSessions(lastPath)
-      const records = await startupSessionManager(routingConfig, defaultTmuxClient, storedSessions)
-
-      // Build sessions map: start with stored IDs for failed routes so they
-      // survive to the next restart, then overwrite with successful launches.
-      const sessionsMap: Record<string, import('./sessions.ts').SessionRecord> = {}
-      for (const [channelId, stored] of Object.entries(storedSessions)) {
-        if (!records.has(channelId) && stored.sessionId && stored.sessionId !== 'pending') {
-          sessionsMap[channelId] = stored
-        }
-      }
-      for (const [channelId, record] of records) {
-        sessionsMap[channelId] = record
-      }
-      writeSessions(sessionsMap)
+      await startupSessionManager(routingConfig, undefined, isDryRun() ? undefined : web)
     } catch (err) {
       console.error('[slack] Warning: session startup failed — continuing without managed sessions:', err)
     }
