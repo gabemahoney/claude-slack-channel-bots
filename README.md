@@ -22,7 +22,7 @@ A single HTTP MCP server that holds one Slack Socket Mode connection and routes 
    claude /setup-slack-channel-bots
    ```
 
-   It handles Slack app creation, tokens, routing, access control, hooks, and validation — and skips anything already configured.
+   It handles Slack app creation, tokens, routing, access control, and validation — and skips anything already configured.
 
 3. **Start the server:**
 
@@ -39,7 +39,6 @@ See the sections below for manual configuration details if you prefer not to use
 - [Bun](https://bun.sh) v1.0+
 - [Claude Code](https://claude.ai/code) installed and authenticated
 - [claude-director](https://github.com/gabemahoney/claude-director#install) installed and on your `PATH` (required for spawning and relaying bot sessions; CSCB probes for it at startup and refuses to start if it is missing)
-- `ss` from [iproute2](https://github.com/iproute2/iproute2) on your `PATH` (required for session ID discovery; pre-installed on most Linux distributions)
 - Slack workspace admin access (to create and configure the Slack app)
 - **cozempic** (optional) — Python 3.10+ and `pip install cozempic` — enables session file cleaning before `--resume` for faster load times
 
@@ -396,7 +395,70 @@ On success, returns HTTP 200:
 
 ## Permission Relay
 
-Permission relay is described in `docs/architecture.md` (see the Permission Relay section). E2-T7 will expand this section with the full architecture and migration notes.
+CSCB polls `claude-director list --state check_permission --label service=cscb` on every `claude_director_poll_interval_ms` tick and posts Block Kit Allow/Deny buttons to the bot's Slack channel for each open permission request. When a user clicks a button, the click handler calls `claude-director decide` to relay the decision back to the running Claude session. See `docs/architecture.md` (Permission Relay section) for the full data flow.
+
+---
+
+## Migrating from pre-claude-director CSCB
+
+If you ran CSCB before the `claude-director`-based architecture was introduced, follow these steps after upgrading.
+
+### Remove old hook entries from Claude settings
+
+The `PermissionRequest` and `PreToolUse` (AskUserQuestion) hooks are no longer used. Remove them from `~/.claude/settings.json`:
+
+```json
+// Remove any entries like these from your "hooks" array:
+{ "matcher": "PermissionRequest", "hooks": [...] }
+{ "matcher": "PreToolUse", "event": "AskUserQuestion", "hooks": [...] }
+```
+
+Only remove hook entries that reference CSCB's old relay scripts. Leave any other hooks you have configured.
+
+### Remove old hook scripts
+
+```sh
+rm -f ~/.claude/hooks/permission-relay.sh
+rm -f ~/.claude/hooks/ask-relay.sh
+```
+
+These scripts are no longer installed by CSCB and will do nothing if left in place, but removing them avoids confusion.
+
+### Schedule claude-director find-missing
+
+`claude-director find-missing` reconciles the state DB against live OS processes and transitions unreachable spawn rows to `missing`. Add it to cron for ongoing cleanup:
+
+```sh
+# crontab -e
+*/5 * * * * claude-director find-missing >> ~/.claude-director/find-missing.log 2>&1
+```
+
+Adjust the interval to suit your workload. This is optional but recommended on long-running hosts.
+
+### Install logrotate for startup-errors.log
+
+```sh
+sudo cp docs/logrotate-startup-errors.conf /etc/logrotate.d/claude-slack-channel-bots
+```
+
+Without this, `~/.claude/channels/slack/startup-errors.log` grows without bound.
+
+### Verify claude-director is on PATH and state.db is owned correctly
+
+```sh
+which claude-director
+ls -la ~/.claude-director/state.db
+```
+
+`state.db` must be owned by the same OS user that runs CSCB. If the file is owned by root but CSCB runs as a non-root service user, fix the ownership:
+
+```sh
+sudo chown <service-user> ~/.claude-director/state.db
+```
+
+### Note on AskUserQuestion
+
+`AskUserQuestion` is now denied at the template level. Claude sessions managed by CSCB cannot invoke the AUQ tool — the request is blocked before it reaches the user. This is intentional: AUQ is an interactive prompt that cannot be properly handled in a headless bot session.
 
 ---
 

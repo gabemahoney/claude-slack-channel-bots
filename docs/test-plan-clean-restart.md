@@ -1,12 +1,14 @@
 # Test Plan: clean_restart Lifecycle
 
+> **Note (post-Epic-2):** This test plan was written before the claude-director-based architecture. Session operations now use `claude-director pause`/`status`/`kill` instead of tmux `sendKeys`/`isClaudeRunning`/`killSession`. Startup uses `spawnForRoute` (collision-then-act) instead of a three-branch tmux decision tree. Session ID discovery is owned by claude-director, not peer-PID. Test cases below that reference tmux operations should be interpreted as using the equivalent claude-director operations.
+
 Covers the 30 test cases (T1–T30) defined in the SRD for the `clean_restart` subcommand and its surrounding startup/shutdown lifecycle. Tests are grouped by functional area.
 
 Files under test:
 - `src/cli.ts` — `clean_restart` entry point
-- `src/session-manager.ts` — per-route startup state machine
+- `src/session-manager.ts` — per-route startup state machine (`spawnForRoute`, `reconcileOrphans`)
 - `src/sessions.ts` — `sessions.json` I/O and rotation
-- `src/tmux.ts` — tmux operations
+- `src/claude-director-cli.ts` — claude-director shell-out operations
 - `src/logging.ts` — log capture
 
 ---

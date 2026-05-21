@@ -16,7 +16,8 @@ Each source module has a corresponding test file in the project root:
 | config.ts | config.test.ts | applyDefaults, validateConfig, expandTilde, resolveConfig, loadConfig |
 | registry.ts | registry.test.ts | Session registry CRUD, routing, pending sessions |
 | server.ts (DM routing) | dm-routing.test.ts | DM routing via gate() + registry |
-| server.ts (permission relay) | permission-relay.test.ts | /permission endpoint with stubbed server |
+| permission-poller.ts | permission-poller.test.ts | livePrompts lifecycle, tick logic, finalized_at protocol |
+| permission-click-handler.ts | permission-click-handler.test.ts | parsePermissionActionId, handlePermissionClick flow |
 
 New features that add significant logic should get their own test file (e.g., `session-manager.test.ts`).
 
@@ -52,7 +53,7 @@ Use `beforeEach` to reset module-scoped state between tests:
 
 ### Self-Contained Test Servers
 
-When testing HTTP endpoints that live in server.ts, create a minimal Bun.serve() in the test file that replicates the endpoint logic with stubbed dependencies. This pattern is used by permission-relay.test.ts:
+When testing HTTP endpoints that live in server.ts, create a minimal Bun.serve() in the test file that replicates the endpoint logic with stubbed dependencies:
 
 - Bind to port 0 (random available port) to avoid conflicts
 - Share Maps between test code and server handler via closure

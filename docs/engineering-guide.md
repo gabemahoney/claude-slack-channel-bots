@@ -26,7 +26,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 
 ## Error Handling
 
-- Use `try/catch` around external calls (Slack API, file I/O, tmux commands)
+- Use `try/catch` around external calls (Slack API, file I/O, claude-director shell-outs)
 - Log errors to stderr with the `[slack]` prefix: `console.error('[slack] context: description', err)`
 - Non-critical failures (reaction add, message update) use empty catch blocks with `/* non-critical */` or `/* ignore */`
 - Critical failures (token loading, routing config) exit the process with a clear message
@@ -47,7 +47,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 
 ## Naming Conventions
 
-- Module-scoped Maps: camelCase (e.g., `pendingPermissions`, `completedDecisions`)
+- Module-scoped Maps: camelCase (e.g., `livePrompts`, `completedDecisions`)
 - Interfaces: PascalCase (e.g., `PendingPermission`, `SessionEntry`)
 - Constants: UPPER_SNAKE_CASE (e.g., `MAX_PENDING`, `STATE_DIR`)
 - Functions: camelCase, verb-first (e.g., `registerSession`, `buildPermissionBlocks`)
@@ -90,7 +90,7 @@ All restart activity is logged to stderr with the `[slack]` prefix:
 
 ### Async Interval Pattern
 
-Each tick fires an `async` callback. The callback iterates routes sequentially (not in parallel) to avoid flooding tmux with concurrent `isClaudeRunning` calls. Errors on a single channel are caught and logged; they do not abort the rest of the iteration.
+Each tick fires an `async` callback. The callback iterates routes sequentially (not in parallel) to avoid flooding `claude-director` with concurrent `status` calls. Errors on a single channel are caught and logged; they do not abort the rest of the iteration.
 
 ```typescript
 intervalId = setInterval(async () => {
@@ -115,7 +115,6 @@ When neither guard fires and the session is dead, the poller calls `scheduleRest
 
 ## Async Patterns
 
-- Use `async/await` throughout — no raw Promises except where explicitly holding connections open (permission relay long-poll)
-- Long-poll pattern: create a Promise, register a resolve callback in a waiters array, race against a setTimeout
+- Use `async/await` throughout — no raw Promises except at SSE connection boundaries
 - Always clean up on abort: `req.signal.addEventListener('abort', ...)` for held HTTP connections
 - Use `settled` flag pattern to prevent double-resolution in race conditions

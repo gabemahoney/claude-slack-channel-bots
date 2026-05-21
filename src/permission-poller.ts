@@ -186,10 +186,7 @@ async function doTick(): Promise<void> {
     const { claudeInstanceId } = row
     if (livePrompts.has(claudeInstanceId)) continue // already tracked
 
-    // SR-2.1 / CE7: use claudeInstanceId directly with directorGet (no prefix-stripping).
-    // TODO: once E2-T1's GetArgs.claudeInstanceId extension lands, remove strip logic.
-    // For now the wrapper resolves via resolveInstanceId which prepends cscb_ when only
-    // channelId is given, but we have claudeInstanceId directly, so pass it through.
+    // SR-2.1 / CE7: pass claudeInstanceId directly — GetArgs accepts it via InstanceRef.
     const getResult = directorGet({ claudeInstanceId })
     if (!getResult.ok) {
       if (getResult.error.kind === 'ErrSpawnNotFound') {

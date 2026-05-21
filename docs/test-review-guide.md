@@ -26,7 +26,7 @@ When reviewing tests, check for:
 
 ### Patterns
 - [ ] Factory functions used for fixtures (not inline object literals)
-- [ ] External dependencies stubbed (WebClient, tmux, etc.)
+- [ ] External dependencies stubbed (WebClient, claude-director CLI, etc.)
 - [ ] No real network calls or file I/O in unit tests
 - [ ] No `sleep` or timing-dependent assertions longer than 100ms
 - [ ] Capture arrays used to verify side effects (API calls, messages sent)
