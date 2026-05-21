@@ -21,7 +21,7 @@ import {
   sendKeys as cliSendKeys,
   type ClaudeDirectorError,
 } from './claude-director-cli.ts'
-import { checkCozempicAvailable, getCozempicAvailable, cleanSession as defaultCleanSession, resolveJsonlPath } from './cozempic.ts'
+import { checkCozempicAvailable, resolveJsonlPath } from './cozempic.ts'
 import { type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
 import { recordStartupError } from './startup-errors.ts'
 import { isDryRun } from './tokens.ts'

@@ -11,7 +11,6 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'fs'
 import { join } from 'path'
-import { homedir } from 'os'
 import { type RoutingConfig, expandTilde } from './config.ts'
 
 // ---------------------------------------------------------------------------

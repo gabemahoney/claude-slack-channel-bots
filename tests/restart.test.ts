@@ -82,7 +82,7 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     async killSession(channelId) {
       killSessionCalls.push(channelId)
     },
-    async launchSession(channelId, cwd, _sessionId) {
+    async launchSession(channelId, cwd) {
       const route = routingConfig.routes[channelId]
       const effectiveCwd = route?.cwd ?? cwd
       spawnForRouteCalls.push({ channelId, cwd: effectiveCwd })

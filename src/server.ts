@@ -40,7 +40,6 @@ import {
 } from './lib.ts'
 import { loadConfig, expandTilde, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
 import { recordStartupError } from './startup-errors.ts'
-import { readSessions } from './sessions.ts'
 import {
   status as cliStatus,
   kill as cliKill,
@@ -56,7 +55,6 @@ import {
   getLivePrompt,
   dropLivePrompt,
 } from './permission-poller.ts'
-import { parsePermissionActionId } from './permission-action-id.ts'
 import { handlePermissionClick, type PermissionClickDeps } from './permission-click-handler.ts'
 import {
   startupSessionManager,
@@ -362,8 +360,7 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
         const cwd = routingConfig?.routes[channelId]?.cwd
         if (cwd) {
           console.error(`[slack] Session disconnected: channel=${channelId} cwd="${cwd}"`)
-          const storedId = readSessions()[channelId]?.sessionId
-          scheduleRestart(channelId, cwd, storedId !== 'pending' ? storedId : undefined) // TODO(E2-T8): remove sessionId parameter (claude-director owns session IDs)
+          scheduleRestart(channelId, cwd)
         } else {
           console.error(`[slack] Session disconnected: channel=${channelId}`)
         }
@@ -1107,8 +1104,7 @@ export async function main(): Promise<void> {
             const cwd = routingConfig?.routes[channelId]?.cwd
             if (cwd) {
               console.error(`[slack] Session disconnected (SSE abort): channel=${channelId} cwd="${cwd}"`)
-              const storedId = readSessions()[channelId]?.sessionId
-              scheduleRestart(channelId, cwd, storedId !== 'pending' ? storedId : undefined) // TODO(E2-T8): remove sessionId parameter (claude-director owns session IDs)
+              scheduleRestart(channelId, cwd)
             } else {
               console.error(`[slack] Session disconnected (SSE abort): channel=${channelId}`)
             }
@@ -1178,7 +1174,7 @@ export async function main(): Promise<void> {
         console.error(`[slack] killSession: delete failed for channel=${channelId}: ${deleteResult.error.kind}`)
       }
     },
-    launchSession: async (channelId, _cwd, _sessionId) => { // TODO(E2-T8): remove sessionId parameter (claude-director owns session IDs)
+    launchSession: async (channelId, _cwd) => {
       if (!routingConfig) return false
       if (!routingConfig.routes[channelId]) return false
       const result = await spawnForRoute(channelId, routingConfig.routes[channelId], routingConfig, isDryRun() ? undefined : web)
