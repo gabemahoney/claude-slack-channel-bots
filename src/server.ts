@@ -1177,7 +1177,7 @@ export async function main(): Promise<void> {
     launchSession: async (channelId, _cwd) => {
       if (!routingConfig) return false
       if (!routingConfig.routes[channelId]) return false
-      const result = await spawnForRoute(channelId, routingConfig.routes[channelId], routingConfig, isDryRun() ? undefined : web)
+      const result = await spawnForRoute(channelId, routingConfig.routes[channelId], routingConfig, isDryRun() ? undefined : web, false)
       return result.action !== 'failed'
     },
     getRestartDelay: () => routingConfig?.session_restart_delay ?? 60,

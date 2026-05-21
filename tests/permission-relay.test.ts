@@ -33,6 +33,7 @@ import {
   makeGetPayload,
 } from './test-helpers/claude-director-stub.ts'
 import type { GetResult, DecideResult } from '../src/claude-director-cli.ts'
+import { _resetSpawnRunner } from '../src/claude-director-cli.ts'
 
 // ---------------------------------------------------------------------------
 // Block Kit builder replica (mirrors server.ts buildPermissionBlocks)
@@ -181,6 +182,13 @@ afterEach(() => {
     activeRestoreConsole()
     activeRestoreConsole = null
   }
+})
+
+// Safety net: reset the spawn runner after every test so a stale runner
+// installed by _setSpawnRunner (tests 4b/4c etc.) never leaks into the next test.
+// _resetSpawnRunner() is idempotent — safe to call even when no custom runner was set.
+afterEach(() => {
+  _resetSpawnRunner()
 })
 
 // ===========================================================================

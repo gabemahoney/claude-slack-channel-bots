@@ -72,12 +72,14 @@ const spawnFailureQueue: SpawnFailureEntry[] = []
  * Surface a spawn failure to the bot's configured Slack channel.
  * Pre-auth: pushed onto queue; flushed by flushSpawnFailureQueue after socket.start().
  * Dry-run: logs to stderr; does NOT call web.chat.postMessage.
- * chat.postMessage failure is logged to startup-errors.log; never thrown.
+ * chat.postMessage failure: logged via errorSink (startup-errors.log at startup,
+ * console.error at runtime). Never thrown.
  */
 export function postSpawnFailureToChannel(
   channelId: string,
   error: ClaudeDirectorError,
   web?: WebClient,
+  isStartup = true,
 ): void {
   const remediation = remediationHint(error)
 
@@ -103,7 +105,11 @@ export function postSpawnFailureToChannel(
     `  Remediation: ${remediation}`
 
   web.chat.postMessage({ channel: channelId, text }).catch((err) => {
-    recordStartupError('spawn-failure-post', `failed to post spawn failure to channel=${channelId}`, err)
+    if (isStartup) {
+      recordStartupError('spawn-failure-post', `failed to post spawn failure to channel=${channelId}`, err)
+    } else {
+      console.error(`[slack] spawn-failure-post: failed to post spawn failure to channel=${channelId}`, err)
+    }
   })
 }
 
@@ -244,6 +250,7 @@ export async function spawnForRoute(
   route: { cwd: string },
   routingConfig: RoutingConfig,
   web?: WebClient,
+  isStartup = true,
 ): Promise<SpawnRouteResult> {
   // E8: dry-run short-circuit
   if (isDryRun()) {
@@ -268,10 +275,14 @@ export async function spawnForRoute(
   }
 
   if (spawnResult.error.kind !== 'ErrInstanceIdCollision') {
-    // Non-collision failure — surface to Slack + startup-errors.log
+    // Non-collision failure — surface to Slack + error sink
     console.error(`[slack] spawnForRoute: spawn failed for channel=${channelId}: ${spawnResult.error.kind}`)
-    recordStartupError('spawn-failed', `spawn failed for channel=${channelId}: ${spawnResult.error.kind}`, spawnResult.error)
-    postSpawnFailureToChannel(channelId, spawnResult.error, web)
+    if (isStartup) {
+      recordStartupError('spawn-failed', `spawn failed for channel=${channelId}: ${spawnResult.error.kind}`, spawnResult.error)
+    } else {
+      console.error(`[slack] spawn-failed: spawn failed for channel=${channelId}: ${spawnResult.error.kind}`, spawnResult.error)
+    }
+    postSpawnFailureToChannel(channelId, spawnResult.error, web, isStartup)
     return { channelId, action: 'failed' }
   }
 
@@ -290,13 +301,17 @@ export async function spawnForRoute(
         return { channelId, action: 'spawned' }
       }
       console.error(`[slack] spawnForRoute: retry-spawn also failed for channel=${channelId}: ${retryResult.error.kind}`)
-      recordStartupError('spawn-failed', `retry-spawn failed for channel=${channelId}: ${retryResult.error.kind}`, retryResult.error)
-      postSpawnFailureToChannel(channelId, retryResult.error, web)
+      if (isStartup) {
+        recordStartupError('spawn-failed', `retry-spawn failed for channel=${channelId}: ${retryResult.error.kind}`, retryResult.error)
+      } else {
+        console.error(`[slack] spawn-failed: retry-spawn failed for channel=${channelId}: ${retryResult.error.kind}`, retryResult.error)
+      }
+      postSpawnFailureToChannel(channelId, retryResult.error, web, isStartup)
       return { channelId, action: 'failed' }
     }
 
     console.error(`[slack] spawnForRoute: get failed for channel=${channelId}: ${getResult.error.kind}`)
-    postSpawnFailureToChannel(channelId, getResult.error, web)
+    postSpawnFailureToChannel(channelId, getResult.error, web, isStartup)
     return { channelId, action: 'failed' }
   }
 
@@ -311,15 +326,23 @@ export async function spawnForRoute(
       const deleteResult = cliDeleteSpawn({ channelId })
       if (!deleteResult.ok) {
         console.error(`[slack] spawnForRoute: delete failed for channel=${channelId}: ${deleteResult.error.kind}`)
-        recordStartupError('spawn-failed', `delete failed for channel=${channelId}: ${deleteResult.error.kind}`, deleteResult.error)
-        postSpawnFailureToChannel(channelId, deleteResult.error, web)
+        if (isStartup) {
+          recordStartupError('spawn-failed', `delete failed for channel=${channelId}: ${deleteResult.error.kind}`, deleteResult.error)
+        } else {
+          console.error(`[slack] spawn-failed: delete failed for channel=${channelId}: ${deleteResult.error.kind}`, deleteResult.error)
+        }
+        postSpawnFailureToChannel(channelId, deleteResult.error, web, isStartup)
         return { channelId, action: 'failed' }
       }
       const freshResult = cliSpawn({ channelId, cwd: route.cwd, extraEnv: Object.keys(extraEnv).length > 0 ? extraEnv : undefined })
       if (!freshResult.ok) {
         console.error(`[slack] spawnForRoute: fresh spawn after delete failed for channel=${channelId}: ${freshResult.error.kind}`)
-        recordStartupError('spawn-failed', `fresh spawn after delete failed for channel=${channelId}: ${freshResult.error.kind}`, freshResult.error)
-        postSpawnFailureToChannel(channelId, freshResult.error, web)
+        if (isStartup) {
+          recordStartupError('spawn-failed', `fresh spawn after delete failed for channel=${channelId}: ${freshResult.error.kind}`, freshResult.error)
+        } else {
+          console.error(`[slack] spawn-failed: fresh spawn after delete failed for channel=${channelId}: ${freshResult.error.kind}`, freshResult.error)
+        }
+        postSpawnFailureToChannel(channelId, freshResult.error, web, isStartup)
         return { channelId, action: 'failed' }
       }
       console.error(`[slack] spawnForRoute: fresh-spawned (after kill+delete) for channel=${channelId}`)
@@ -351,15 +374,23 @@ export async function spawnForRoute(
       const deleteResult = cliDeleteSpawn({ channelId })
       if (!deleteResult.ok) {
         console.error(`[slack] spawnForRoute: delete failed for channel=${channelId}: ${deleteResult.error.kind}`)
-        recordStartupError('spawn-failed', `delete failed for channel=${channelId}: ${deleteResult.error.kind}`, deleteResult.error)
-        postSpawnFailureToChannel(channelId, deleteResult.error, web)
+        if (isStartup) {
+          recordStartupError('spawn-failed', `delete failed for channel=${channelId}: ${deleteResult.error.kind}`, deleteResult.error)
+        } else {
+          console.error(`[slack] spawn-failed: delete failed for channel=${channelId}: ${deleteResult.error.kind}`, deleteResult.error)
+        }
+        postSpawnFailureToChannel(channelId, deleteResult.error, web, isStartup)
         return { channelId, action: 'failed' }
       }
       const freshResult = cliSpawn({ channelId, cwd: route.cwd, extraEnv: Object.keys(extraEnv).length > 0 ? extraEnv : undefined })
       if (!freshResult.ok) {
         console.error(`[slack] spawnForRoute: fresh spawn after delete failed for channel=${channelId}: ${freshResult.error.kind}`)
-        recordStartupError('spawn-failed', `fresh spawn after delete failed for channel=${channelId}: ${freshResult.error.kind}`, freshResult.error)
-        postSpawnFailureToChannel(channelId, freshResult.error, web)
+        if (isStartup) {
+          recordStartupError('spawn-failed', `fresh spawn after delete failed for channel=${channelId}: ${freshResult.error.kind}`, freshResult.error)
+        } else {
+          console.error(`[slack] spawn-failed: fresh spawn after delete failed for channel=${channelId}: ${freshResult.error.kind}`, freshResult.error)
+        }
+        postSpawnFailureToChannel(channelId, freshResult.error, web, isStartup)
         return { channelId, action: 'failed' }
       }
       console.error(`[slack] spawnForRoute: fresh-spawned (after delete) for channel=${channelId}`)
@@ -368,7 +399,7 @@ export async function spawnForRoute(
 
     // Other resume errors
     console.error(`[slack] spawnForRoute: resume failed for channel=${channelId}: ${resumeResult.error.kind}`)
-    postSpawnFailureToChannel(channelId, resumeResult.error, web)
+    postSpawnFailureToChannel(channelId, resumeResult.error, web, isStartup)
     return { channelId, action: 'failed' }
   }
 
