@@ -210,6 +210,10 @@ export function createCli(deps: CliDeps): CliHandlers {
     try { initLogging(join(deps.resolveStateDir(), 'clean_restart.log')) } catch { /* best-effort */ }
 
     // Phase 1: Load config
+    // NOTE: clean_restart is not a fresh server startup — it intentionally logs failures to
+    // clean_restart.log (via initLogging above) rather than startup-errors.log. We do NOT
+    // call recordStartupError here to avoid double-logging: startup-errors.log is reserved
+    // for the `start` subcommand's daemon startup path (wired in server.ts main()).
     let config: RoutingConfig
     try {
       config = deps.loadConfig()

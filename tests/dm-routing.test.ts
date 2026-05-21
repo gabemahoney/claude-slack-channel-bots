@@ -97,6 +97,7 @@ function makeRoutingConfig(opts: {
     cozempic_prescription: 'standard',
     system_prompt_mode: 'append',
     resume_enabled: true,
+    claude_director_poll_interval_ms: 1000,
   }
 
   if (opts.default_dm_session !== undefined) {

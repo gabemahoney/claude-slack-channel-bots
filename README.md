@@ -97,7 +97,8 @@ A skeleton file is created by postinstall. Populate it before running `start`.
   "exit_timeout": 120,
   "stop_timeout": 30,
   "mcp_config_path": "~/.claude/slack-mcp.json",
-  "cozempic_prescription": "standard"
+  "cozempic_prescription": "standard",
+  "claude_director_poll_interval_ms": 1000
 }
 ```
 
@@ -121,6 +122,11 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | `message_archive_db` | string | — | Path to a SQLite DB where every inbound Slack message is archived in real time. Parent directories are created if missing; schema is initialized on first open. Compatible with the `archive-messages.py` backfill script — both can write concurrently. Feature is disabled when absent. |
 | `claude_config_dir` | string | — | Path to a Claude on-disk config directory. When set, managed sessions launch with `CLAUDE_CONFIG_DIR='<resolved-path>'` so the bot authenticates against a specific account. `~` is expanded and the path is resolved to absolute. Per-route `routes[id].claude_config_dir` overrides this top-level value for individual channels. When neither is set, Claude's own default applies. Must be non-empty when set. |
 | `resume_enabled` | boolean | `true` | When `false`, the session manager always performs a fresh Claude session launch instead of resuming, both on startup and on runtime auto-restart, even when a stored session ID exists. Disabling this skips the `--resume` flag entirely. Use this as a workaround if your Claude Code version crashes with "sandbox required but unavailable" on `--resume` (a known regression in v2.1.120). |
+| `claude_director_poll_interval_ms` | number | `1000` | Milliseconds between director poll ticks. Valid range: [200, 3_600_000]. Values outside this range are rejected at startup (error logged to `startup-errors.log` and stderr). |
+
+#### Tuning `claude_director_poll_interval_ms`
+
+Leave this at the default unless instrumented latency measurement shows a specific need to change it. Each tick is a subprocess fork, a SQLite read, and a JSON marshal — the 200 ms floor exists because high cadence accumulates non-trivial CPU on busy hosts. At the other extreme, very high values can introduce user-visible latency; avoid setting it above a few seconds unless you have a specific reason. Out-of-range values (below 200 ms or above 3,600,000 ms) cause a fatal startup error; the validation message is written to `~/.claude/channels/slack/startup-errors.log` and to stderr.
 
 #### Per-route `claude_config_dir` override
 

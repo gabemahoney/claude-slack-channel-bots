@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test'
-import { writeFileSync, mkdtempSync } from 'fs'
+import { writeFileSync, mkdtempSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { homedir } from 'os'
@@ -9,10 +9,13 @@ import {
   expandTilde,
   resolveConfig,
   loadConfig,
+  KNOWN_TOP_LEVEL_CONFIG_FIELDS,
+  LEGACY_RELAY_FIELD_NAMES,
   type RouteEntry,
   type RoutingConfigInput,
   type RoutingConfig,
 } from '../src/config.ts'
+import { recordStartupError } from '../src/startup-errors.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -264,6 +267,7 @@ function makeValidConfig(overrides: Partial<RoutingConfig> = {}): RoutingConfig 
     cozempic_prescription: 'standard',
     system_prompt_mode: 'append',
     resume_enabled: true,
+    claude_director_poll_interval_ms: 1000,
     ...overrides,
   }
 }
@@ -948,6 +952,296 @@ describe('loadConfig', () => {
     writeFileSync(configPath, JSON.stringify(config), 'utf-8')
     const result = loadConfig(configPath)
     expect(result.resume_enabled).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// claude_director_poll_interval_ms
+// ---------------------------------------------------------------------------
+
+describe('claude_director_poll_interval_ms — applyDefaults', () => {
+  test('returns 1000 when field is absent', () => {
+    const result = applyDefaults(makeRoutingConfig())
+    expect(result.claude_director_poll_interval_ms).toBe(1000)
+  })
+
+  test('preserves an explicit value', () => {
+    const result = applyDefaults(makeRoutingConfig({ claude_director_poll_interval_ms: 5000 }))
+    expect(result.claude_director_poll_interval_ms).toBe(5000)
+  })
+
+  test('preserves lower boundary 200', () => {
+    const result = applyDefaults(makeRoutingConfig({ claude_director_poll_interval_ms: 200 }))
+    expect(result.claude_director_poll_interval_ms).toBe(200)
+  })
+
+  test('preserves upper boundary 3_600_000', () => {
+    const result = applyDefaults(makeRoutingConfig({ claude_director_poll_interval_ms: 3_600_000 }))
+    expect(result.claude_director_poll_interval_ms).toBe(3_600_000)
+  })
+})
+
+describe('claude_director_poll_interval_ms — validateConfig', () => {
+  test('accepts lower boundary 200', () => {
+    const config = makeValidConfig({ claude_director_poll_interval_ms: 200 })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('accepts upper boundary 3_600_000', () => {
+    const config = makeValidConfig({ claude_director_poll_interval_ms: 3_600_000 })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('accepts mid-range value 2500', () => {
+    const config = makeValidConfig({ claude_director_poll_interval_ms: 2500 })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('rejects 199 — below lower boundary', () => {
+    const config = makeValidConfig({ claude_director_poll_interval_ms: 199 })
+    expect(() => validateConfig(config)).toThrow('claude_director_poll_interval_ms')
+  })
+
+  test('rejects 3_600_001 — above upper boundary', () => {
+    const config = makeValidConfig({ claude_director_poll_interval_ms: 3_600_001 })
+    expect(() => validateConfig(config)).toThrow('claude_director_poll_interval_ms')
+  })
+
+  test('rejects 0', () => {
+    const config = makeValidConfig({ claude_director_poll_interval_ms: 0 })
+    expect(() => validateConfig(config)).toThrow('claude_director_poll_interval_ms')
+  })
+
+  test('rejects negative value', () => {
+    const config = makeValidConfig({ claude_director_poll_interval_ms: -1 })
+    expect(() => validateConfig(config)).toThrow('claude_director_poll_interval_ms')
+  })
+
+  test('rejects non-integer 500.5', () => {
+    const config = makeValidConfig({ claude_director_poll_interval_ms: 500.5 })
+    expect(() => validateConfig(config)).toThrow('claude_director_poll_interval_ms')
+  })
+
+  test('rejects NaN', () => {
+    const config = makeValidConfig({ claude_director_poll_interval_ms: NaN })
+    expect(() => validateConfig(config)).toThrow('claude_director_poll_interval_ms')
+  })
+
+  test('rejects Infinity', () => {
+    const config = makeValidConfig({ claude_director_poll_interval_ms: Infinity })
+    expect(() => validateConfig(config)).toThrow('claude_director_poll_interval_ms')
+  })
+
+  test('rejects string value', () => {
+    const config = makeValidConfig({ claude_director_poll_interval_ms: '1000' as unknown as number })
+    expect(() => validateConfig(config)).toThrow('claude_director_poll_interval_ms')
+  })
+
+  test('rejects boolean value', () => {
+    const config = makeValidConfig({ claude_director_poll_interval_ms: true as unknown as number })
+    expect(() => validateConfig(config)).toThrow('claude_director_poll_interval_ms')
+  })
+
+  test('rejects null value', () => {
+    const config = makeValidConfig({ claude_director_poll_interval_ms: null as unknown as number })
+    expect(() => validateConfig(config)).toThrow('claude_director_poll_interval_ms')
+  })
+})
+
+describe('claude_director_poll_interval_ms — loadConfig round-trips', () => {
+  test('round-trips explicit value 2500 from disk', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+      claude_director_poll_interval_ms: 2500,
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.claude_director_poll_interval_ms).toBe(2500)
+  })
+
+  test('returns default 1000 when field absent from on-disk JSON', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.claude_director_poll_interval_ms).toBe(1000)
+  })
+})
+
+describe('claude_director_poll_interval_ms — factory default propagation', () => {
+  test('makeValidConfig() with no override has claude_director_poll_interval_ms === 1000', () => {
+    const config = makeValidConfig()
+    expect(config.claude_director_poll_interval_ms).toBe(1000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Unknown-field rejection (loadConfig)
+// ---------------------------------------------------------------------------
+
+describe('unknown-field rejection', () => {
+  test('arbitrary unknown field is rejected; error names the field', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const raw = { routes: { C_TEST: { cwd: '/tmp' } }, definitely_not_a_field: true }
+    writeFileSync(configPath, JSON.stringify(raw), 'utf-8')
+    let caught: Error | null = null
+    try { loadConfig(configPath) } catch (e) { caught = e as Error }
+    expect(caught).not.toBeNull()
+    expect(caught!.message).toContain('definitely_not_a_field')
+  })
+
+  test.each([...LEGACY_RELAY_FIELD_NAMES])('legacy field "%s" is rejected with "has been removed"', (fieldName) => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const raw: Record<string, unknown> = { routes: { C_TEST: { cwd: '/tmp' } } }
+    raw[fieldName] = 5000
+    writeFileSync(configPath, JSON.stringify(raw), 'utf-8')
+    let caught: Error | null = null
+    try { loadConfig(configPath) } catch (e) { caught = e as Error }
+    expect(caught).not.toBeNull()
+    expect(caught!.message).toContain(fieldName)
+    expect(caught!.message).toContain('has been removed')
+  })
+
+  test('multiple unknown fields produce a single error enumerating all of them', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const raw = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+      unknown_field_one: 1,
+      unknown_field_two: 2,
+    }
+    writeFileSync(configPath, JSON.stringify(raw), 'utf-8')
+    let caught: Error | null = null
+    try { loadConfig(configPath) } catch (e) { caught = e as Error }
+    expect(caught).not.toBeNull()
+    expect(caught!.message).toContain('unknown_field_one')
+    expect(caught!.message).toContain('unknown_field_two')
+  })
+
+  test('error message includes "Routing config validation error" prefix for validateConfig errors', () => {
+    const config = makeValidConfig({ routes: {} })
+    expect(() => validateConfig(config)).toThrow('Routing config validation error')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fatal-startup path: config-validation + recordStartupError
+// ---------------------------------------------------------------------------
+
+describe('fatal-startup config-validation path', () => {
+  // The server.ts main() function calls loadConfig(), catches validation errors,
+  // and passes them to recordStartupError('config-validation', msg, err).
+  // server.ts cannot be imported in tests (module-scope side effects).
+  // Instead we test the catch-block behavior directly by simulating the same
+  // pattern: call loadConfig() with a bad config, catch the error, then
+  // call recordStartupError as server.ts does, verifying the log output.
+
+  function writeBadConfig(dir: string, extra: Record<string, unknown> = {}): string {
+    const configPath = join(dir, 'config.json')
+    const raw = { routes: { C_TEST: { cwd: '/tmp' } }, ...extra }
+    writeFileSync(configPath, JSON.stringify(raw), 'utf-8')
+    return configPath
+  }
+
+  test('loadConfig with an unknown field throws; error includes field name', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = writeBadConfig(dir, { totally_unknown_key: 99 })
+    let caught: Error | null = null
+    try { loadConfig(configPath) } catch (e) { caught = e as Error }
+    expect(caught).not.toBeNull()
+    expect(caught!.message).toContain('totally_unknown_key')
+  })
+
+  test('recordStartupError called with config-validation label writes label to log', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const logDir = mkdtempSync(join(tmpdir(), 'startup-errors-test-'))
+    const configPath = writeBadConfig(dir, { bad_field: 1 })
+    let caught: Error | null = null
+    try { loadConfig(configPath) } catch (e) { caught = e as Error }
+    expect(caught).not.toBeNull()
+
+    // Simulate the server.ts catch block:
+    //   recordStartupError('config-validation', msg, err)
+    const msg = caught!.message
+    recordStartupError('config-validation', msg, caught!, { logDir })
+
+    const logPath = join(logDir, 'startup-errors.log')
+    const logContent = readFileSync(logPath, 'utf-8')
+    expect(logContent).toContain('[config-validation]')
+  })
+
+  test('log entry contains the offending field name from the validation error', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const logDir = mkdtempSync(join(tmpdir(), 'startup-errors-test-'))
+    const configPath = writeBadConfig(dir, { offending_field_xyz: 42 })
+    let caught: Error | null = null
+    try { loadConfig(configPath) } catch (e) { caught = e as Error }
+    expect(caught).not.toBeNull()
+
+    const msg = caught!.message
+    recordStartupError('config-validation', msg, caught!, { logDir })
+
+    const logPath = join(logDir, 'startup-errors.log')
+    const logContent = readFileSync(logPath, 'utf-8')
+    expect(logContent).toContain('offending_field_xyz')
+  })
+
+  test('log entry contains the original validation message text', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const logDir = mkdtempSync(join(tmpdir(), 'startup-errors-test-'))
+    const configPath = writeBadConfig(dir, { another_bad_field: true })
+    let caught: Error | null = null
+    try { loadConfig(configPath) } catch (e) { caught = e as Error }
+    expect(caught).not.toBeNull()
+
+    const msg = caught!.message
+    recordStartupError('config-validation', msg, caught!, { logDir })
+
+    const logPath = join(logDir, 'startup-errors.log')
+    const logContent = readFileSync(logPath, 'utf-8')
+    // The message itself must appear in the log (passed as the `message` arg)
+    expect(logContent).toContain('another_bad_field')
+  })
+
+  test('exactly one log line per validation failure', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const logDir = mkdtempSync(join(tmpdir(), 'startup-errors-test-'))
+    const configPath = writeBadConfig(dir, { single_failure_field: 1 })
+    let caught: Error | null = null
+    try { loadConfig(configPath) } catch (e) { caught = e as Error }
+    expect(caught).not.toBeNull()
+
+    recordStartupError('config-validation', caught!.message, caught!, { logDir })
+
+    const logPath = join(logDir, 'startup-errors.log')
+    const lines = readFileSync(logPath, 'utf-8').split('\n').filter(l => l.length > 0)
+    expect(lines).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Regression: valid config without new fields still validates
+// ---------------------------------------------------------------------------
+
+describe('regression — valid config without claude_director_poll_interval_ms or unknown fields', () => {
+  test('minimal valid config resolves and validates without errors', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    let result: RoutingConfig | null = null
+    expect(() => { result = loadConfig(configPath) }).not.toThrow()
+    expect(result).not.toBeNull()
+    expect(result!.claude_director_poll_interval_ms).toBe(1000)
   })
 })
 

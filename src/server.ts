@@ -39,6 +39,7 @@ import {
   type GateResult,
 } from './lib.ts'
 import { loadConfig, expandTilde, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
+import { recordStartupError } from './startup-errors.ts'
 import { readSessions, writeSessions, rotateSessions } from './sessions.ts'
 import { defaultTmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
 import { startupSessionManager, launchSession } from './session-manager.ts'
@@ -969,6 +970,9 @@ export async function main(): Promise<void> {
       mcpHost = process.env['MCP_HOST'] ?? '127.0.0.1'
       mcpPort = Number(process.env['MCP_PORT'] ?? 3100)
     } else {
+      // Fatal config-validation failure at startup: record to startup-errors.log (T-A module),
+      // then exit non-zero. recordStartupError never throws or exits — exit decision stays here.
+      recordStartupError('config-validation', msg, err)
       console.error(`[slack] Fatal: routing config error — ${msg}`)
       process.exit(1)
     }

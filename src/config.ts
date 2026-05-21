@@ -20,6 +20,46 @@ export const MCP_SERVER_NAME = 'slack-channel-router'
 export const ALLOWED_PRESCRIPTIONS = ['gentle', 'standard', 'aggressive']
 export const ALLOWED_SYSTEM_PROMPT_MODES = ['append', 'none']
 
+/**
+ * Authoritative allowlist of known top-level config fields.
+ * Typed against keyof RoutingConfigInput so that adding a field to the
+ * interface without updating this list causes a compile-time error.
+ * This is the single source of truth; extend it whenever RoutingConfigInput grows.
+ */
+export const KNOWN_TOP_LEVEL_CONFIG_FIELDS: ReadonlyArray<keyof RoutingConfigInput> = [
+  'routes',
+  'default_route',
+  'default_dm_session',
+  'bind',
+  'port',
+  'session_restart_delay',
+  'health_check_interval',
+  'exit_timeout',
+  'stop_timeout',
+  'mcp_config_path',
+  'append_system_prompt_file',
+  'cozempic_prescription',
+  'system_prompt_mode',
+  'message_archive_db',
+  'claude_config_dir',
+  'resume_enabled',
+  'claude_director_poll_interval_ms',
+]
+
+/**
+ * Legacy relay-tuning field names that were removed from the schema.
+ * Operator configs that still contain these fields get a targeted error
+ * message explaining the field has been removed.
+ * This constant is exported for use in tests.
+ */
+export const LEGACY_RELAY_FIELD_NAMES: ReadonlyArray<string> = [
+  'permission_long_poll_cycle_ms',
+  'permission_pending_ttl_ms',
+  'ask_long_poll_cycle_ms',
+  'relay_timeout_ms',
+  'pending_permission_ttl_ms',
+]
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -69,6 +109,13 @@ export interface RoutingConfigInput {
    * (e.g. Claude Code v2.1.120 "sandbox required but unavailable").
    */
   resume_enabled?: boolean
+  /**
+   * Poll interval in milliseconds for the claude-director poller (Epic 2).
+   * Unit: milliseconds. Default: 1000. Valid range: [200, 3_600_000].
+   * This field is reserved for the Epic 2 claude-director poller; it is
+   * parsed and validated now but not yet read by any runtime code.
+   */
+  claude_director_poll_interval_ms?: number
 }
 
 /** Validated, fully-resolved routing configuration with all defaults applied. */
@@ -91,6 +138,8 @@ export interface RoutingConfig {
   claude_config_dir?: string
   /** When false, --resume is skipped on startup and bots always launch fresh. Defaults to true. */
   resume_enabled: boolean
+  /** Poll interval in ms for the Epic 2 claude-director poller. Default 1000. Range [200, 3_600_000]. */
+  claude_director_poll_interval_ms: number
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +168,7 @@ export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
     message_archive_db: input.message_archive_db,
     claude_config_dir: input.claude_config_dir,
     resume_enabled: input.resume_enabled ?? true,
+    claude_director_poll_interval_ms: input.claude_director_poll_interval_ms ?? 1000,
   }
 }
 
@@ -222,6 +272,20 @@ export function validateConfig(config: RoutingConfig): void {
         'Routing config validation error: claude_config_dir must be a non-empty string when set.',
       )
     }
+  }
+
+  // claude_director_poll_interval_ms must be a finite integer in [200, 3_600_000]
+  const pollInterval = config.claude_director_poll_interval_ms
+  if (
+    typeof pollInterval !== 'number' ||
+    !Number.isFinite(pollInterval) ||
+    !Number.isInteger(pollInterval) ||
+    pollInterval < 200 ||
+    pollInterval > 3_600_000
+  ) {
+    throw new Error(
+      `Routing config validation error: claude_director_poll_interval_ms value ${JSON.stringify(pollInterval)} is invalid. Must be an integer in the closed range [200, 3_600_000].`,
+    )
   }
 
   // Per-route claude_config_dir, when set, must also be a non-empty (post-trim) string
@@ -334,6 +398,51 @@ export function loadConfig(path?: string): RoutingConfig {
     throw new Error(
       `loadConfig: routing config in "${configPath}" is missing a valid "routes" object.`,
     )
+  }
+
+  // Unknown top-level field check — runs on raw parsed JSON before defaults are applied.
+  // Inspects every key of the raw object; any key not in KNOWN_TOP_LEVEL_CONFIG_FIELDS is rejected.
+  // Legacy relay-tuning fields get a targeted "has been removed" message.
+  {
+    const allowedSet = new Set<string>(KNOWN_TOP_LEVEL_CONFIG_FIELDS)
+    const rawKeys = Object.keys(parsed as Record<string, unknown>)
+    const legacySet = new Set<string>(LEGACY_RELAY_FIELD_NAMES)
+
+    const legacyFound: string[] = []
+    const unknownFound: string[] = []
+
+    for (const key of rawKeys) {
+      if (!allowedSet.has(key)) {
+        if (legacySet.has(key)) {
+          legacyFound.push(key)
+        } else {
+          unknownFound.push(key)
+        }
+      }
+    }
+
+    const errorParts: string[] = []
+
+    if (legacyFound.length > 0) {
+      for (const key of legacyFound) {
+        errorParts.push(
+          `"${key}" has been removed and is no longer a valid config field`,
+        )
+      }
+    }
+
+    if (unknownFound.length > 0) {
+      errorParts.push(
+        `unknown top-level field(s): ${unknownFound.map((k) => `"${k}"`).join(', ')}. ` +
+        `Allowed fields are: ${[...allowedSet].map((k) => `"${k}"`).join(', ')}.`,
+      )
+    }
+
+    if (errorParts.length > 0) {
+      throw new Error(
+        `loadConfig: invalid routing config in "${configPath}": ${errorParts.join('; ')}`,
+      )
+    }
   }
 
   try {
