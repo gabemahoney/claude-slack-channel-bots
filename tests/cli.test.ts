@@ -15,7 +15,15 @@
 import { describe, test, expect, beforeAll, beforeEach, afterEach, jest } from 'bun:test'
 import { join } from 'path'
 import type { CliDeps, CliHandlers } from '../src/cli.ts'
-import type { SessionsMap } from '../src/sessions.ts'
+import {
+  status as directorStatusFn,
+  pause as directorPauseFn,
+  kill as directorKillFn,
+  type StatusResult,
+  type PauseResult,
+  type KillResult,
+} from '../src/claude-director-cli.ts'
+import { ClaudeDirectorStub, makeSpawnRow } from './test-helpers/claude-director-stub.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 
 // ---------------------------------------------------------------------------
@@ -64,13 +72,10 @@ interface DepsOverrides {
   existingPaths?: string[]
   pidFileContent?: string
   isProcessRunning?: (pid: number) => boolean
-  sessions?: SessionsMap
-  hasSession?: (name: string) => Promise<boolean>
   loadConfig?: () => ReturnType<typeof makeRoutingConfig>
-  sessionName?: (cwd: string) => string
-  sendKeys?: (session: string, ...keys: string[]) => Promise<void>
-  isClaudeRunning?: (session: string) => Promise<boolean>
-  killSession?: (session: string) => Promise<void>
+  directorStatus?: (channelId: string) => Promise<StatusResult>
+  directorPause?: (channelId: string) => Promise<PauseResult>
+  directorKill?: (channelId: string) => Promise<KillResult>
 }
 
 interface DepsBundle {
@@ -80,8 +85,6 @@ interface DepsBundle {
   killedPids: Array<{ pid: number; signal: string | number }>
   startServerCalled: boolean[]
   spawnCalls: Array<{ cmd: string; args: string[] }>
-  sendKeysCalls: Array<{ session: string; keys: string }>
-  killSessionCalls: string[]
 }
 
 /** Build a fully-stubbed CliDeps with sensible passing defaults. */
@@ -91,8 +94,6 @@ function makeDeps(overrides: DepsOverrides = {}): DepsBundle {
   const killedPids: Array<{ pid: number; signal: string | number }> = []
   const startServerCalled: boolean[] = []
   const spawnCalls: Array<{ cmd: string; args: string[] }> = []
-  const sendKeysCalls: Array<{ session: string; keys: string }> = []
-  const killSessionCalls: string[] = []
 
   const existingPaths = new Set(overrides.existingPaths ?? [CONFIG_JSON])
 
@@ -128,31 +129,20 @@ function makeDeps(overrides: DepsOverrides = {}): DepsBundle {
       exitCodes.push(code)
       throw new ExitError(code)
     },
-    hasSession: overrides.hasSession ?? (async (_name) => true),
     loadConfig: overrides.loadConfig ?? (() => makeRoutingConfig()),
-    sessionName: overrides.sessionName ?? ((cwd) => `slack_bot_stub_${cwd}`),
-    sendKeys: async (session, ...keys) => {
-      for (const key of keys) {
-        sendKeysCalls.push({ session, keys: key })
-      }
-      await (overrides.sendKeys ?? (() => Promise.resolve()))(session, ...keys)
-    },
-    isClaudeRunning: overrides.isClaudeRunning ?? (async (_session) => false),
-    killSession: async (session) => {
-      killSessionCalls.push(session)
-      await (overrides.killSession ?? (() => Promise.resolve()))(session)
-    },
-    readSessions: () => overrides.sessions ?? {},
+    directorStatus: overrides.directorStatus ?? ((_channelId) => Promise.resolve({ ok: true, data: { claudeInstanceId: `cscb_${_channelId}`, state: 'ended' } })),
+    directorPause: overrides.directorPause ?? ((_channelId) => Promise.resolve({ ok: true, data: {} })),
+    directorKill: overrides.directorKill ?? ((_channelId) => Promise.resolve({ ok: true, data: {} })),
   }
 
-  return { deps, exitCodes, unlinkedPaths, killedPids, startServerCalled, spawnCalls, sendKeysCalls, killSessionCalls }
+  return { deps, exitCodes, unlinkedPaths, killedPids, startServerCalled, spawnCalls }
 }
 
 /**
  * Drive fake timers forward until the given promise settles.
  * Alternates between advancing the fake clock by 5 s and flushing the
- * microtask queue so async continuations (await isClaudeRunning, etc.)
- * get a chance to run.  Must be called with jest.useFakeTimers() active.
+ * microtask queue so async continuations can run.
+ * Must be called with jest.useFakeTimers() active.
  */
 async function drainFakeTimers(p: Promise<void>): Promise<void> {
   let done = false
@@ -756,590 +746,647 @@ describe('stop — loadConfig throws, falls back to 30s default', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Shared fixtures for clean_restart tests
+// clean_restart — shared fixtures
 // ---------------------------------------------------------------------------
 
-// Deterministic session name helper — mirrors the sessionName stub default
-function fakeSessionName(cwd: string): string {
-  return `slack_bot_${cwd.replace(/\//g, '_')}`
-}
+// Channel IDs used across clean_restart tests
+const CH1 = 'C1'
+const CH2 = 'C2'
+const CH3 = 'C3'
 
-const CWD_C1 = '/cwd/c1'
-const CWD_C2 = '/cwd/c2'
-const CWD_C3 = '/cwd/c3'
-
-const SN_C1 = fakeSessionName(CWD_C1)
-const SN_C2 = fakeSessionName(CWD_C2)
-const SN_C3 = fakeSessionName(CWD_C3)
-
-// Two-route config used by most tests (exit_timeout=1 for fast tests)
+// Two-route config (exit_timeout=1s for fast tests)
 const TWO_ROUTE_CONFIG = () =>
   makeRoutingConfig({
-    routes: { C1: { cwd: CWD_C1 }, C2: { cwd: CWD_C2 } },
+    routes: { [CH1]: { cwd: '/cwd/c1' }, [CH2]: { cwd: '/cwd/c2' } },
     exit_timeout: 1,
   })
 
-// Three-route config for mixed tests
+// Three-route config for concurrent/mixed tests
 const THREE_ROUTE_CONFIG = () =>
   makeRoutingConfig({
-    routes: { C1: { cwd: CWD_C1 }, C2: { cwd: CWD_C2 }, C3: { cwd: CWD_C3 } },
+    routes: { [CH1]: { cwd: '/cwd/c1' }, [CH2]: { cwd: '/cwd/c2' }, [CH3]: { cwd: '/cwd/c3' } },
     exit_timeout: 1,
   })
 
-// ---------------------------------------------------------------------------
-// clean_restart — all sessions exit cleanly
-// ---------------------------------------------------------------------------
+/**
+ * Factory for clean_restart-specific deps.
+ * Creates a fresh ClaudeDirectorStub, wires directorStatus/Pause/Kill into CliDeps,
+ * and returns the stub alongside the standard DepsBundle for assertions.
+ */
+interface CleanRestartBundle extends DepsBundle {
+  stub: ClaudeDirectorStub
+}
 
-describe('clean_restart — all sessions exit cleanly', () => {
-  let cli: CliHandlers
-  let result: DepsBundle
+function makeCleanRestartDeps(opts: {
+  loadConfig?: () => ReturnType<typeof makeRoutingConfig>
+  spawnSyncFn?: (cmd: string, args: string[]) => { status: number | null }
+  stubOpts?: ConstructorParameters<typeof ClaudeDirectorStub>[0]
+} = {}): CleanRestartBundle {
+  const stub = new ClaudeDirectorStub(opts.stubOpts ?? {})
+  stub.install()
 
-  beforeEach(() => {
-    jest.useFakeTimers()
-    // isClaudeRunning: true on first call (guard passes → sendKeys fires),
-    // false on subsequent calls (poll detects clean exit)
-    const callCounts = new Map<string, number>()
-    result = makeDeps({
-      loadConfig: TWO_ROUTE_CONFIG,
-      sessionName: fakeSessionName,
-      hasSession: async () => true,
-      isClaudeRunning: async (session) => {
-        const n = (callCounts.get(session) ?? 0) + 1
-        callCounts.set(session, n)
-        return n === 1 // true first time (guard), false on poll
-      },
-    })
-    cli = createCli(result.deps)
+  const base = makeDeps({
+    loadConfig: opts.loadConfig ?? TWO_ROUTE_CONFIG,
+    spawnSyncFn: opts.spawnSyncFn,
+    // Route directorStatus/Pause/Kill through the real wrappers so they use
+    // the stub's installed SpawnRunner — this validates argv-style discipline.
+    directorStatus: (channelId) => Promise.resolve(directorStatusFn({ channelId })),
+    directorPause: (channelId) => Promise.resolve(directorPauseFn({ channelId })),
+    directorKill: (channelId) => Promise.resolve(directorKillFn({ channelId })),
   })
 
+  return { ...base, stub }
+}
+
+// ---------------------------------------------------------------------------
+// clean_restart — SR-1.5 invariant: no `delete` calls ever
+// (afterEach at describe-block level catches every test below)
+// ---------------------------------------------------------------------------
+
+describe('clean_restart', () => {
+  let result: CleanRestartBundle
+
   afterEach(() => {
+    // SR-1.5: clean_restart must NEVER call delete on any spawn
+    expect(result.stub.calls.filter((c) => c.verb === 'delete').length).toBe(0)
+    result.stub.uninstall()
     jest.useRealTimers()
   })
 
-  test('stop called before /exit is sent to sessions', async () => {
-    const p = cli.clean_restart()
-    await drainFakeTimers(p)
-    const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
-    const stopIdx = subcommands.indexOf('stop')
-    const startIdx = subcommands.indexOf('start')
-    expect(stopIdx).toBeGreaterThanOrEqual(0)
-    expect(startIdx).toBeGreaterThan(stopIdx)
-  })
+  // -------------------------------------------------------------------------
+  // stop/start delegation
+  // -------------------------------------------------------------------------
 
-  test('sends /exit atomically (single sendKeys call) to each session', async () => {
-    const p = cli.clean_restart()
-    await drainFakeTimers(p)
-    // Each session should have exactly one sendKeys call with '/exit' key and one with 'Enter'
-    for (const sn of [SN_C1, SN_C2]) {
-      const exitCalls = result.sendKeysCalls.filter((c) => c.session === sn && c.keys === '/exit')
-      const enterCalls = result.sendKeysCalls.filter((c) => c.session === sn && c.keys === 'Enter')
-      expect(exitCalls).toHaveLength(1)
-      expect(enterCalls).toHaveLength(1)
-    }
-  })
-
-  test('does not force-kill any session', async () => {
-    const p = cli.clean_restart()
-    await drainFakeTimers(p)
-    expect(result.killSessionCalls).toHaveLength(0)
-  })
-
-  test('start called after stop', async () => {
-    const p = cli.clean_restart()
-    await drainFakeTimers(p)
-    const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
-    expect(subcommands).toContain('stop')
-    expect(subcommands).toContain('start')
-  })
-
-  test('does not call exit with an error code', async () => {
-    const p = cli.clean_restart()
-    const err = await runHandler(() => drainFakeTimers(p))
-    expect(err).toBeNull()
-    expect(result.exitCodes).toHaveLength(0)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// clean_restart — one session times out, force-killed
-// ---------------------------------------------------------------------------
-
-describe('clean_restart — one session times out, force-killed', () => {
-  let cli: CliHandlers
-  let result: DepsBundle
-
-  beforeEach(() => {
-    jest.useFakeTimers()
-    // C1: true on first call (guard passes), false on poll → clean exit
-    // C2: always true → times out and gets force-killed
-    const callCounts = new Map<string, number>()
-    result = makeDeps({
-      loadConfig: TWO_ROUTE_CONFIG,
-      sessionName: fakeSessionName,
-      hasSession: async () => true,
-      isClaudeRunning: async (session) => {
-        const n = (callCounts.get(session) ?? 0) + 1
-        callCounts.set(session, n)
-        if (session === SN_C2) return true  // C2 never exits
-        return n === 1                       // C1: true first call, false on poll
-      },
+  describe('stop/start delegation', () => {
+    test('stop is called before start', async () => {
+      result = makeCleanRestartDeps({
+        loadConfig: () => makeRoutingConfig({ routes: {}, exit_timeout: 1 }),
+      })
+      await createCli(result.deps).clean_restart()
+      const subcmds = result.spawnCalls.map((c) => c.args[c.args.length - 1])
+      expect(subcmds.indexOf('stop')).toBeGreaterThanOrEqual(0)
+      expect(subcmds.indexOf('start')).toBeGreaterThan(subcmds.indexOf('stop'))
     })
-    cli = createCli(result.deps)
-  })
 
-  afterEach(() => {
-    jest.useRealTimers()
-  })
-
-  test('sendKeys called for both sessions', async () => {
-    const p = cli.clean_restart()
-    await drainFakeTimers(p)
-    const exitTargets = new Set(
-      result.sendKeysCalls.filter((c) => c.keys === '/exit').map((c) => c.session),
-    )
-    expect(exitTargets).toEqual(new Set([SN_C1, SN_C2]))
-  })
-
-  test('force-kills only the timed-out session', async () => {
-    const p = cli.clean_restart()
-    await drainFakeTimers(p)
-    expect(result.killSessionCalls).toEqual([SN_C2])
-  })
-
-  test('restart proceeds after the force-kill', async () => {
-    const p = cli.clean_restart()
-    await drainFakeTimers(p)
-    const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
-    expect(subcommands).toContain('stop')
-    expect(subcommands).toContain('start')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// clean_restart — no routes configured
-// ---------------------------------------------------------------------------
-
-describe('clean_restart — no routes configured', () => {
-  let cli: CliHandlers
-  let result: DepsBundle
-
-  beforeEach(() => {
-    result = makeDeps({
-      loadConfig: () => makeRoutingConfig({ routes: {}, exit_timeout: 1 }),
-      sessionName: fakeSessionName,
+    test('start fails → exits with start exit code', async () => {
+      result = makeCleanRestartDeps({
+        loadConfig: () => makeRoutingConfig({ routes: {}, exit_timeout: 1 }),
+        spawnSyncFn: (_cmd, args) => {
+          const sub = args[args.length - 1]
+          return { status: sub === 'stop' ? 0 : 1 }
+        },
+      })
+      const err = await runHandler(() => createCli(result.deps).clean_restart())
+      expect(err).not.toBeNull()
+      expect(err!.code).toBe(1)
+      expect(result.exitCodes).toEqual([1])
     })
-    cli = createCli(result.deps)
-  })
 
-  test('makes no tmux calls', async () => {
-    await cli.clean_restart()
-    expect(result.sendKeysCalls).toHaveLength(0)
-    expect(result.killSessionCalls).toHaveLength(0)
-  })
-
-  test('stop and start still proceed', async () => {
-    await cli.clean_restart()
-    const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
-    expect(subcommands).toContain('stop')
-    expect(subcommands).toContain('start')
-  })
-
-  test('does not call exit with an error', async () => {
-    const err = await runHandler(() => cli.clean_restart())
-    expect(err).toBeNull()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// clean_restart — missing tmux session (hasSession returns false)
-// ---------------------------------------------------------------------------
-
-describe('clean_restart — missing tmux session', () => {
-  let cli: CliHandlers
-  let result: DepsBundle
-
-  beforeEach(() => {
-    jest.useFakeTimers()
-    // C1 has no tmux session; C2 has a session and exits cleanly
-    const callCounts = new Map<string, number>()
-    result = makeDeps({
-      loadConfig: TWO_ROUTE_CONFIG,
-      sessionName: fakeSessionName,
-      hasSession: async (name) => name === SN_C2,
-      isClaudeRunning: async (session) => {
-        const n = (callCounts.get(session) ?? 0) + 1
-        callCounts.set(session, n)
-        return n === 1 // true on guard check, false on poll
-      },
+    test('stop was called before start when start fails', async () => {
+      result = makeCleanRestartDeps({
+        loadConfig: () => makeRoutingConfig({ routes: {}, exit_timeout: 1 }),
+        spawnSyncFn: (_cmd, args) => {
+          const sub = args[args.length - 1]
+          return { status: sub === 'stop' ? 0 : 1 }
+        },
+      })
+      await runHandler(() => createCli(result.deps).clean_restart())
+      const subcmds = result.spawnCalls.map((c) => c.args[c.args.length - 1])
+      expect(subcmds.indexOf('stop')).toBeLessThan(subcmds.indexOf('start'))
     })
-    cli = createCli(result.deps)
   })
 
-  afterEach(() => {
-    jest.useRealTimers()
-  })
+  // -------------------------------------------------------------------------
+  // config load failure
+  // -------------------------------------------------------------------------
 
-  test('skips sendKeys for the missing session', async () => {
-    const p = cli.clean_restart()
-    await drainFakeTimers(p)
-    const targets = new Set(result.sendKeysCalls.map((c) => c.session))
-    expect(targets).not.toContain(SN_C1)
-  })
-
-  test('still sends /exit to the present session', async () => {
-    const p = cli.clean_restart()
-    await drainFakeTimers(p)
-    const targets = new Set(
-      result.sendKeysCalls.filter((c) => c.keys === '/exit').map((c) => c.session),
-    )
-    expect(targets).toContain(SN_C2)
-  })
-
-  test('stop and start still proceed', async () => {
-    const p = cli.clean_restart()
-    await drainFakeTimers(p)
-    const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
-    expect(subcommands).toContain('stop')
-    expect(subcommands).toContain('start')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// clean_restart — Claude not running (isClaudeRunning returns false immediately)
-// ---------------------------------------------------------------------------
-
-describe('clean_restart — Claude not running', () => {
-  let cli: CliHandlers
-  let result: DepsBundle
-
-  beforeEach(() => {
-    result = makeDeps({
-      loadConfig: TWO_ROUTE_CONFIG,
-      sessionName: fakeSessionName,
-      hasSession: async () => true,
-      isClaudeRunning: async () => false, // returns false on first check → skipped
+  describe('config load fails', () => {
+    test('calls exit(1) immediately and skips stop/start', async () => {
+      result = makeCleanRestartDeps({
+        loadConfig: () => { throw new Error('config read error') },
+      })
+      const err = await runHandler(() => createCli(result.deps).clean_restart())
+      expect(err).not.toBeNull()
+      expect(err!.code).toBe(1)
+      const subcmds = result.spawnCalls.map((c) => c.args[c.args.length - 1])
+      expect(subcmds).not.toContain('stop')
+      expect(subcmds).not.toContain('start')
     })
-    cli = createCli(result.deps)
   })
 
-  test('skips sendKeys when Claude is not running', async () => {
-    await cli.clean_restart()
-    // isClaudeRunning is called before sendKeys; since false, sendKeys not called
-    expect(result.sendKeysCalls).toHaveLength(0)
-  })
+  // -------------------------------------------------------------------------
+  // no routes configured
+  // -------------------------------------------------------------------------
 
-  test('does not force-kill sessions when Claude was not running', async () => {
-    await cli.clean_restart()
-    expect(result.killSessionCalls).toHaveLength(0)
-  })
-
-  test('stop and start still proceed', async () => {
-    await cli.clean_restart()
-    const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
-    expect(subcommands).toContain('stop')
-    expect(subcommands).toContain('start')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// clean_restart — start fails
-// ---------------------------------------------------------------------------
-
-describe('clean_restart — start fails', () => {
-  let cli: CliHandlers
-  let result: DepsBundle
-
-  beforeEach(() => {
-    result = makeDeps({
-      loadConfig: () => makeRoutingConfig({ routes: {}, exit_timeout: 1 }),
-      sessionName: fakeSessionName,
-      spawnSyncFn: (_cmd, args) => {
-        const subcommand = args[args.length - 1]
-        return { status: subcommand === 'stop' ? 0 : 1 }
-      },
+  describe('no routes configured', () => {
+    test('makes no director calls; stop and start still proceed', async () => {
+      result = makeCleanRestartDeps({
+        loadConfig: () => makeRoutingConfig({ routes: {}, exit_timeout: 1 }),
+      })
+      await createCli(result.deps).clean_restart()
+      // No status/pause/kill calls when there are zero routes
+      const directorVerbs = result.stub.calls.map((c) => c.verb)
+      expect(directorVerbs).toHaveLength(0)
+      const subcmds = result.spawnCalls.map((c) => c.args[c.args.length - 1])
+      expect(subcmds).toContain('stop')
+      expect(subcmds).toContain('start')
     })
-    cli = createCli(result.deps)
-  })
 
-  test('surfaces the start failure as a non-zero exit', async () => {
-    const err = await runHandler(() => cli.clean_restart())
-    expect(err).not.toBeNull()
-    expect(err!.code).toBe(1)
-  })
-
-  test('exit code array contains the start failure code', async () => {
-    await runHandler(() => cli.clean_restart())
-    expect(result.exitCodes).toEqual([1])
-  })
-
-  test('stop was called before start', async () => {
-    await runHandler(() => cli.clean_restart())
-    const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
-    expect(subcommands.indexOf('stop')).toBeLessThan(subcommands.indexOf('start'))
-  })
-})
-
-// ---------------------------------------------------------------------------
-// clean_restart — config load fails
-// ---------------------------------------------------------------------------
-
-describe('clean_restart — config load fails', () => {
-  let cli: CliHandlers
-  let result: DepsBundle
-
-  beforeEach(() => {
-    result = makeDeps({
-      loadConfig: () => { throw new Error('config read error') },
-      sessionName: fakeSessionName,
+    test('does not call exit with an error', async () => {
+      result = makeCleanRestartDeps({
+        loadConfig: () => makeRoutingConfig({ routes: {}, exit_timeout: 1 }),
+      })
+      const err = await runHandler(() => createCli(result.deps).clean_restart())
+      expect(err).toBeNull()
     })
-    cli = createCli(result.deps)
   })
 
-  test('calls exit(1) immediately', async () => {
-    const err = await runHandler(() => cli.clean_restart())
-    expect(err).not.toBeNull()
-    expect(err!.code).toBe(1)
-  })
+  // -------------------------------------------------------------------------
+  // ErrSpawnNotFound precheck → skip (no pause, no kill)
+  // -------------------------------------------------------------------------
 
-  test('does not call stop or start when config fails', async () => {
-    await runHandler(() => cli.clean_restart())
-    const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
-    expect(subcommands).not.toContain('stop')
-    expect(subcommands).not.toContain('start')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// clean_restart — atomic /exit (single sendKeys call per session)
-// ---------------------------------------------------------------------------
-
-describe('clean_restart — atomic /exit per session', () => {
-  let cli: CliHandlers
-  let result: DepsBundle
-
-  beforeEach(() => {
-    jest.useFakeTimers()
-    // true on first call (guard passes → sendKeys fires), false on poll (clean exit)
-    const callCounts = new Map<string, number>()
-    result = makeDeps({
-      loadConfig: TWO_ROUTE_CONFIG,
-      sessionName: fakeSessionName,
-      hasSession: async () => true,
-      isClaudeRunning: async (session) => {
-        const n = (callCounts.get(session) ?? 0) + 1
-        callCounts.set(session, n)
-        return n === 1
-      },
+  describe('precheck: ErrSpawnNotFound → skip', () => {
+    test('no kill called when spawn row not found; start/stop proceed', async () => {
+      // No spawn rows in stub → status returns ErrSpawnNotFound for both channels
+      result = makeCleanRestartDeps()
+      await createCli(result.deps).clean_restart()
+      const killCalls = result.stub.calls.filter((c) => c.verb === 'kill')
+      expect(killCalls).toHaveLength(0)
+      const subcmds = result.spawnCalls.map((c) => c.args[c.args.length - 1])
+      expect(subcmds).toContain('stop')
+      expect(subcmds).toContain('start')
     })
-    cli = createCli(result.deps)
-  })
 
-  afterEach(() => {
-    jest.useRealTimers()
-  })
-
-  test('exactly one /exit key sent per session', async () => {
-    const p = cli.clean_restart()
-    await drainFakeTimers(p)
-    for (const sn of [SN_C1, SN_C2]) {
-      const count = result.sendKeysCalls.filter((c) => c.session === sn && c.keys === '/exit').length
-      expect(count).toBe(1)
-    }
-  })
-
-  test('exactly one Enter key sent per session', async () => {
-    const p = cli.clean_restart()
-    await drainFakeTimers(p)
-    for (const sn of [SN_C1, SN_C2]) {
-      const count = result.sendKeysCalls.filter((c) => c.session === sn && c.keys === 'Enter').length
-      expect(count).toBe(1)
-    }
-  })
-})
-
-// ---------------------------------------------------------------------------
-// clean_restart — all sessions force-killed (timeout)
-// ---------------------------------------------------------------------------
-
-describe('clean_restart — all sessions force-killed', () => {
-  let cli: CliHandlers
-  let result: DepsBundle
-
-  beforeEach(() => {
-    jest.useFakeTimers()
-    result = makeDeps({
-      loadConfig: TWO_ROUTE_CONFIG,
-      sessionName: fakeSessionName,
-      hasSession: async () => true,
-      isClaudeRunning: async () => true, // neither session ever exits
+    test('no pause called when spawn row not found', async () => {
+      result = makeCleanRestartDeps()
+      await createCli(result.deps).clean_restart()
+      const pauseCalls = result.stub.calls.filter((c) => c.verb === 'pause')
+      expect(pauseCalls).toHaveLength(0)
     })
-    cli = createCli(result.deps)
   })
 
-  afterEach(() => {
-    jest.useRealTimers()
+  // -------------------------------------------------------------------------
+  // terminal state precheck (ended / missing) → skip
+  // -------------------------------------------------------------------------
+
+  describe('precheck: ended/missing state → skip', () => {
+    test('ended state → no pause, no kill', async () => {
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [
+            makeSpawnRow({ channelId: CH1, state: 'ended' }),
+            makeSpawnRow({ channelId: CH2, state: 'missing' }),
+          ],
+        },
+      })
+      await createCli(result.deps).clean_restart()
+      const pauseCalls = result.stub.calls.filter((c) => c.verb === 'pause')
+      const killCalls = result.stub.calls.filter((c) => c.verb === 'kill')
+      expect(pauseCalls).toHaveLength(0)
+      expect(killCalls).toHaveLength(0)
+    })
+
+    test('stop and start still proceed when all channels are terminal', async () => {
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [
+            makeSpawnRow({ channelId: CH1, state: 'ended' }),
+            makeSpawnRow({ channelId: CH2, state: 'ended' }),
+          ],
+        },
+      })
+      await createCli(result.deps).clean_restart()
+      const subcmds = result.spawnCalls.map((c) => c.args[c.args.length - 1])
+      expect(subcmds).toContain('stop')
+      expect(subcmds).toContain('start')
+    })
   })
 
-  test('killSession called for every session', async () => {
-    const p = cli.clean_restart()
-    await drainFakeTimers(p)
-    expect(new Set(result.killSessionCalls)).toEqual(new Set([SN_C1, SN_C2]))
+  // -------------------------------------------------------------------------
+  // precheck other error → fall through to kill directly
+  // -------------------------------------------------------------------------
+
+  describe('precheck: other error → kill directly', () => {
+    test('status ErrNonZeroExit → kill called, no pause', async () => {
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [
+            makeSpawnRow({ channelId: CH1, state: 'waiting' }),
+            makeSpawnRow({ channelId: CH2, state: 'waiting' }),
+          ],
+        },
+      })
+      // Queue a non-ErrSpawnNotFound error on precheck status for both channels
+      result.stub.setStatusResponseQueue(`cscb_${CH1}`, [
+        { ok: false, error: { kind: 'ErrNonZeroExit', exitCode: 2, stderr: 'crash' } },
+      ])
+      result.stub.setStatusResponseQueue(`cscb_${CH2}`, [
+        { ok: false, error: { kind: 'ErrNonZeroExit', exitCode: 2, stderr: 'crash' } },
+      ])
+      await createCli(result.deps).clean_restart()
+      const pauseCalls = result.stub.calls.filter((c) => c.verb === 'pause')
+      expect(pauseCalls).toHaveLength(0)
+      const killCalls = result.stub.calls.filter((c) => c.verb === 'kill')
+      expect(killCalls.length).toBeGreaterThanOrEqual(1)
+    })
+
+    test('start/stop still proceed after precheck failure', async () => {
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [makeSpawnRow({ channelId: CH1, state: 'waiting' })],
+        },
+        loadConfig: () => makeRoutingConfig({
+          routes: { [CH1]: { cwd: '/cwd/c1' } },
+          exit_timeout: 1,
+        }),
+      })
+      result.stub.setStatusResponseQueue(`cscb_${CH1}`, [
+        { ok: false, error: { kind: 'ErrNonZeroExit', exitCode: 2, stderr: 'crash' } },
+      ])
+      await createCli(result.deps).clean_restart()
+      const subcmds = result.spawnCalls.map((c) => c.args[c.args.length - 1])
+      expect(subcmds).toContain('stop')
+      expect(subcmds).toContain('start')
+    })
   })
 
-  test('restart still proceeds after all force-kills', async () => {
-    const p = cli.clean_restart()
-    await drainFakeTimers(p)
-    const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
-    expect(subcommands).toContain('stop')
-    expect(subcommands).toContain('start')
+  // -------------------------------------------------------------------------
+  // waiting state → pause → poll until ended → clean exit
+  // -------------------------------------------------------------------------
+
+  describe('waiting state → pause → poll until ended', () => {
+    test('pause called, then poll resolves to ended → no kill', async () => {
+      jest.useFakeTimers()
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [makeSpawnRow({ channelId: CH1, state: 'waiting' })],
+        },
+        loadConfig: () => makeRoutingConfig({
+          routes: { [CH1]: { cwd: '/cwd/c1' } },
+          exit_timeout: 5,
+        }),
+      })
+      // Queue: [{ ok: true }] lets the precheck fall through to spawnRow state=waiting.
+      // The second entry (ErrSpawnNotFound) is consumed by the first poll → clean exit.
+      result.stub.setStatusResponseQueue(`cscb_${CH1}`, [
+        { ok: true },
+        { ok: false, error: { kind: 'ErrSpawnNotFound', message: 'gone' } },
+      ])
+      const p = createCli(result.deps).clean_restart()
+      await drainFakeTimers(p)
+      const pauseCalls = result.stub.calls.filter((c) => c.verb === 'pause')
+      expect(pauseCalls.length).toBeGreaterThanOrEqual(1)
+      const killCalls = result.stub.calls.filter((c) => c.verb === 'kill')
+      expect(killCalls).toHaveLength(0)
+    })
+
+    test('all calls go through the stub (argv-style discipline)', async () => {
+      jest.useFakeTimers()
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [makeSpawnRow({ channelId: CH1, state: 'waiting' })],
+        },
+        loadConfig: () => makeRoutingConfig({
+          routes: { [CH1]: { cwd: '/cwd/c1' } },
+          exit_timeout: 5,
+        }),
+      })
+      result.stub.setStatusResponseQueue(`cscb_${CH1}`, [
+        { ok: true },
+        { ok: false, error: { kind: 'ErrSpawnNotFound', message: 'gone' } },
+      ])
+      const p = createCli(result.deps).clean_restart()
+      await drainFakeTimers(p)
+      // Every director call must appear in stub.calls
+      const verbs = result.stub.calls.map((c) => c.verb)
+      expect(verbs).toContain('status')
+      expect(verbs).toContain('pause')
+    })
   })
-})
 
-// ---------------------------------------------------------------------------
-// clean_restart — mixed: clean exit, timeout, sendKeys error
-// ---------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // pause failure → fall through to kill
+  // -------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// clean_restart — T8: concurrent /exit fan-out
-// All sessions receive /exit before any session's timeout can expire.
-// With Promise.allSettled the fan-out is concurrent — /exit reaches every
-// session at approximately the same time regardless of per-session exit latency.
-// ---------------------------------------------------------------------------
+  describe('pause fails → kill escalation', () => {
+    test('kill called after pause failure', async () => {
+      jest.useFakeTimers()
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [makeSpawnRow({ channelId: CH1, state: 'waiting' })],
+        },
+        loadConfig: () => makeRoutingConfig({
+          routes: { [CH1]: { cwd: '/cwd/c1' } },
+          exit_timeout: 5,
+        }),
+      })
+      result.stub.setPauseResponseQueue(`cscb_${CH1}`, [
+        { ok: false, error: { kind: 'ErrNonZeroExit', exitCode: 1, stderr: 'pause failed' } },
+      ])
+      const p = createCli(result.deps).clean_restart()
+      await drainFakeTimers(p)
+      const killCalls = result.stub.calls.filter((c) => c.verb === 'kill')
+      expect(killCalls.length).toBeGreaterThanOrEqual(1)
+    })
 
-describe('clean_restart — T8: concurrent /exit fan-out', () => {
-  beforeEach(() => {
-    jest.useFakeTimers()
+    test('start/stop proceed after pause failure', async () => {
+      jest.useFakeTimers()
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [makeSpawnRow({ channelId: CH1, state: 'waiting' })],
+        },
+        loadConfig: () => makeRoutingConfig({
+          routes: { [CH1]: { cwd: '/cwd/c1' } },
+          exit_timeout: 5,
+        }),
+      })
+      result.stub.setPauseResponseQueue(`cscb_${CH1}`, [
+        { ok: false, error: { kind: 'ErrNonZeroExit', exitCode: 1, stderr: 'pause failed' } },
+      ])
+      const p = createCli(result.deps).clean_restart()
+      await drainFakeTimers(p)
+      const subcmds = result.spawnCalls.map((c) => c.args[c.args.length - 1])
+      expect(subcmds).toContain('stop')
+      expect(subcmds).toContain('start')
+    })
   })
 
-  afterEach(() => {
-    jest.useRealTimers()
+  // -------------------------------------------------------------------------
+  // poll timeout → directorKill + force-kill log
+  // -------------------------------------------------------------------------
+
+  describe('poll timeout → force kill', () => {
+    test('directorKill called after exit_timeout expires', async () => {
+      jest.useFakeTimers()
+      // CH1 stays in 'waiting' forever so poll never finds a terminal state
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [makeSpawnRow({ channelId: CH1, state: 'waiting' })],
+        },
+        loadConfig: () => makeRoutingConfig({
+          routes: { [CH1]: { cwd: '/cwd/c1' } },
+          exit_timeout: 1,
+        }),
+      })
+      const p = createCli(result.deps).clean_restart()
+      await drainFakeTimers(p)
+      const killCalls = result.stub.calls.filter((c) => c.verb === 'kill')
+      expect(killCalls.length).toBeGreaterThanOrEqual(1)
+    })
+
+    test('restart proceeds after kill escalation', async () => {
+      jest.useFakeTimers()
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [makeSpawnRow({ channelId: CH1, state: 'waiting' })],
+        },
+        loadConfig: () => makeRoutingConfig({
+          routes: { [CH1]: { cwd: '/cwd/c1' } },
+          exit_timeout: 1,
+        }),
+      })
+      const p = createCli(result.deps).clean_restart()
+      await drainFakeTimers(p)
+      const subcmds = result.spawnCalls.map((c) => c.args[c.args.length - 1])
+      expect(subcmds).toContain('stop')
+      expect(subcmds).toContain('start')
+    })
   })
 
-  test('T8: /exit sent to all sessions before any session timeout expires', async () => {
-    // Three sessions with different simulated exit latencies:
-    //   C1 exits after 1 poll cycle, C2 after 2, C3 never exits (force-killed)
-    const sendKeysTimes: Record<string, number> = {}
-    const callCounts = new Map<string, number>()
+  // -------------------------------------------------------------------------
+  // backoff cadence: 500ms start / 5000ms ceiling
+  // -------------------------------------------------------------------------
 
-    const result = makeDeps({
-      loadConfig: THREE_ROUTE_CONFIG,
-      sessionName: fakeSessionName,
-      hasSession: async () => true,
-      sendKeys: async (session, ...keys) => {
-        if (keys.includes('/exit')) {
-          sendKeysTimes[session] = Date.now()
+  describe('backoff cadence', () => {
+    test('first poll fires after 500ms delay (not immediately after pause)', async () => {
+      jest.useFakeTimers()
+      let pollCount = 0
+
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [makeSpawnRow({ channelId: CH1, state: 'waiting' })],
+        },
+        loadConfig: () => makeRoutingConfig({
+          routes: { [CH1]: { cwd: '/cwd/c1' } },
+          exit_timeout: 10,
+        }),
+      })
+
+      // Wrap directorStatus to count poll calls (after precheck)
+      let precheckDone = false
+      const origStatus = result.deps.directorStatus
+      result.deps.directorStatus = async (channelId) => {
+        if (!precheckDone) {
+          precheckDone = true
+        } else {
+          pollCount++
         }
-      },
-      isClaudeRunning: async (session) => {
-        const n = (callCounts.get(session) ?? 0) + 1
-        callCounts.set(session, n)
-        if (session === SN_C3) return true   // never exits — force-killed
-        if (session === SN_C2) return n <= 2 // exits after 2 polls
-        return n === 1                        // C1 exits after 1 poll
-      },
+        return origStatus(channelId)
+      }
+
+      const p = createCli(result.deps).clean_restart()
+      // Flush microtasks: precheck + pause should have run
+      for (let i = 0; i < 20; i++) await Promise.resolve()
+      // At t=0, no poll yet (first poll scheduled at t+500ms)
+      expect(pollCount).toBe(0)
+
+      // Advance only 400ms — still before the 500ms first poll
+      jest.advanceTimersByTime(400)
+      for (let i = 0; i < 10; i++) await Promise.resolve()
+      expect(pollCount).toBe(0)
+
+      // Advance past 500ms — first poll should now have fired
+      jest.advanceTimersByTime(200)
+      for (let i = 0; i < 10; i++) await Promise.resolve()
+      expect(pollCount).toBeGreaterThanOrEqual(1)
+
+      await drainFakeTimers(p)
     })
 
-    const p = createCli(result.deps).clean_restart()
-    await drainFakeTimers(p)
+    test('under exit_timeout multiple polls occur (backoff does not prevent progression)', async () => {
+      jest.useFakeTimers()
+      let pollCount = 0
+      let precheckDone = false
 
-    // All three sessions must have received /exit
-    expect(Object.keys(sendKeysTimes)).toHaveLength(3)
-    expect(Object.keys(sendKeysTimes)).toContain(SN_C1)
-    expect(Object.keys(sendKeysTimes)).toContain(SN_C2)
-    expect(Object.keys(sendKeysTimes)).toContain(SN_C3)
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [makeSpawnRow({ channelId: CH1, state: 'waiting' })],
+        },
+        loadConfig: () => makeRoutingConfig({
+          routes: { [CH1]: { cwd: '/cwd/c1' } },
+          exit_timeout: 30,
+        }),
+      })
+
+      const origStatus = result.deps.directorStatus
+      result.deps.directorStatus = async (channelId) => {
+        if (!precheckDone) { precheckDone = true } else { pollCount++ }
+        return origStatus(channelId)
+      }
+
+      const p = createCli(result.deps).clean_restart()
+      // Advance 30s (exit_timeout) in chunks to allow async polls to interleave
+      for (let step = 0; step < 10; step++) {
+        jest.advanceTimersByTime(3_000)
+        for (let i = 0; i < 15; i++) await Promise.resolve()
+      }
+      await drainFakeTimers(p)
+
+      // 30s with 500ms → 1s → 2s → 4s → 5s (ceiling) intervals:
+      // approx: 500+1000+2000+4000+5000+5000+5000+5000 = 27500 < 30000
+      // So at least 7 polls should have fired within exit_timeout
+      expect(pollCount).toBeGreaterThanOrEqual(5)
+      // But NOT more than 30s / 500ms = 60 polls (ceiling keeps count low)
+      expect(pollCount).toBeLessThan(60)
+    })
   })
 
-  test('T8: no session waits for another session to finish before receiving /exit', async () => {
-    // Verify /exit goes to both sessions even when one exits very quickly.
-    // If sessions were sequential, the second would not receive /exit before C1 exits.
-    const callCounts = new Map<string, number>()
-    const result = makeDeps({
-      loadConfig: TWO_ROUTE_CONFIG,
-      sessionName: fakeSessionName,
-      hasSession: async () => true,
-      isClaudeRunning: async (session) => {
-        const n = (callCounts.get(session) ?? 0) + 1
-        callCounts.set(session, n)
-        return n === 1 // each session exits after first poll check
-      },
+  // -------------------------------------------------------------------------
+  // concurrent fan-out: Promise.allSettled
+  // -------------------------------------------------------------------------
+
+  describe('concurrent fan-out (Promise.allSettled)', () => {
+    test('both channels get a status call (concurrent, not sequential)', async () => {
+      jest.useFakeTimers()
+      // Both channels in waiting state; each exits cleanly on first poll
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [
+            makeSpawnRow({ channelId: CH1, state: 'waiting' }),
+            makeSpawnRow({ channelId: CH2, state: 'waiting' }),
+          ],
+        },
+      })
+      // { ok: true } lets precheck fall through to spawnRow; ErrSpawnNotFound is consumed by first poll
+      result.stub.setStatusResponseQueue(`cscb_${CH1}`, [
+        { ok: true },
+        { ok: false, error: { kind: 'ErrSpawnNotFound', message: 'gone' } },
+      ])
+      result.stub.setStatusResponseQueue(`cscb_${CH2}`, [
+        { ok: true },
+        { ok: false, error: { kind: 'ErrSpawnNotFound', message: 'gone' } },
+      ])
+      const p = createCli(result.deps).clean_restart()
+      await drainFakeTimers(p)
+      const statusCalls = result.stub.calls.filter((c) => c.verb === 'status')
+      const channels = new Set(statusCalls.map((c) => {
+        const idx = c.argv.indexOf('--claude-instance-id')
+        return idx >= 0 ? c.argv[idx + 1] : ''
+      }))
+      expect(channels).toContain(`cscb_${CH1}`)
+      expect(channels).toContain(`cscb_${CH2}`)
     })
 
-    const p = createCli(result.deps).clean_restart()
-    await drainFakeTimers(p)
+    test('one channel failure does not block the other channel', async () => {
+      jest.useFakeTimers()
+      // CH1: pause fails → kill; CH2: exits cleanly after first poll
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [
+            makeSpawnRow({ channelId: CH1, state: 'waiting' }),
+            makeSpawnRow({ channelId: CH2, state: 'waiting' }),
+          ],
+        },
+      })
+      result.stub.setPauseResponseQueue(`cscb_${CH1}`, [
+        { ok: false, error: { kind: 'ErrNonZeroExit', exitCode: 1, stderr: 'pause fail' } },
+      ])
+      // { ok: true } lets precheck fall through; ErrSpawnNotFound is consumed by first poll
+      result.stub.setStatusResponseQueue(`cscb_${CH2}`, [
+        { ok: true },
+        { ok: false, error: { kind: 'ErrSpawnNotFound', message: 'gone' } },
+      ])
+      const p = createCli(result.deps).clean_restart()
+      await drainFakeTimers(p)
+      // CH1 kill happened
+      const killCalls = result.stub.calls.filter((c) => c.verb === 'kill')
+      const killedChannels = new Set(killCalls.map((c) => {
+        const idx = c.argv.indexOf('--claude-instance-id')
+        return idx >= 0 ? c.argv[idx + 1] : ''
+      }))
+      expect(killedChannels).toContain(`cscb_${CH1}`)
+      // CH2 handled independently — restart still happened
+      const subcmds = result.spawnCalls.map((c) => c.args[c.args.length - 1])
+      expect(subcmds).toContain('stop')
+      expect(subcmds).toContain('start')
+    })
 
-    // Both sessions must have received /exit (concurrent fan-out)
-    const exitTargets = new Set(
-      result.sendKeysCalls.filter((c) => c.keys === '/exit').map((c) => c.session),
-    )
-    expect(exitTargets).toEqual(new Set([SN_C1, SN_C2]))
+    test('does not surface per-channel errors as a process exit', async () => {
+      jest.useFakeTimers()
+      // All channels in 'waiting', pause fails on all → kill escalation
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [
+            makeSpawnRow({ channelId: CH1, state: 'waiting' }),
+            makeSpawnRow({ channelId: CH2, state: 'waiting' }),
+          ],
+        },
+      })
+      result.stub.setPauseResponseQueue(`cscb_${CH1}`, [
+        { ok: false, error: { kind: 'ErrNonZeroExit', exitCode: 1, stderr: 'oops' } },
+      ])
+      result.stub.setPauseResponseQueue(`cscb_${CH2}`, [
+        { ok: false, error: { kind: 'ErrNonZeroExit', exitCode: 1, stderr: 'oops' } },
+      ])
+      const p = createCli(result.deps).clean_restart()
+      const err = await runHandler(() => drainFakeTimers(p))
+      expect(err).toBeNull()
+      expect(result.exitCodes).toHaveLength(0)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // three-channel: mixed clean / timeout / precheck-error
+  // -------------------------------------------------------------------------
+
+  describe('mixed outcomes across three channels', () => {
+    test('CH1 clean, CH2 times out (kill), CH3 precheck error (kill) — restart proceeds', async () => {
+      jest.useFakeTimers()
+      result = makeCleanRestartDeps({
+        stubOpts: {
+          spawnRows: [
+            makeSpawnRow({ channelId: CH1, state: 'waiting' }),
+            makeSpawnRow({ channelId: CH2, state: 'waiting' }),
+            makeSpawnRow({ channelId: CH3, state: 'waiting' }),
+          ],
+        },
+        loadConfig: THREE_ROUTE_CONFIG,
+      })
+      // CH1: exits cleanly after pause — { ok: true } lets precheck fall through;
+      //       ErrSpawnNotFound is consumed by first poll → clean exit
+      result.stub.setStatusResponseQueue(`cscb_${CH1}`, [
+        { ok: true },
+        { ok: false, error: { kind: 'ErrSpawnNotFound', message: 'gone' } },
+      ])
+      // CH2: stays waiting → times out → kill
+      // (no queue override, status always returns current spawnRow state = waiting)
+      // CH3: precheck returns non-ErrSpawnNotFound error → kill directly
+      result.stub.setStatusResponseQueue(`cscb_${CH3}`, [
+        { ok: false, error: { kind: 'ErrNonZeroExit', exitCode: 2, stderr: 'bad' } },
+      ])
+
+      const p = createCli(result.deps).clean_restart()
+      await drainFakeTimers(p)
+
+      const subcmds = result.spawnCalls.map((c) => c.args[c.args.length - 1])
+      expect(subcmds).toContain('stop')
+      expect(subcmds).toContain('start')
+      // CH1 should have been paused
+      const pauseCalls = result.stub.calls.filter((c) => c.verb === 'pause')
+      const pausedChannels = new Set(pauseCalls.map((c) => {
+        const idx = c.argv.indexOf('--claude-instance-id')
+        return idx >= 0 ? c.argv[idx + 1] : ''
+      }))
+      expect(pausedChannels).toContain(`cscb_${CH1}`)
+      // No delete calls (SR-1.5 checked in afterEach)
+    })
   })
 })
 
 // ---------------------------------------------------------------------------
-// clean_restart — mixed: clean exit, timeout, sendKeys error
-// ---------------------------------------------------------------------------
-
-describe('clean_restart — mixed success/failure', () => {
-  // C1: exits cleanly; C2: times out, force-killed; C3: sendKeys throws, best-effort
-
-  beforeEach(() => {
-    jest.useFakeTimers()
-  })
-
-  afterEach(() => {
-    jest.useRealTimers()
-  })
-
-  function makeMixedDeps() {
-    return makeDeps({
-      loadConfig: THREE_ROUTE_CONFIG,
-      sessionName: fakeSessionName,
-      hasSession: async () => true,
-      sendKeys: async (session, ..._keys) => {
-        if (session === SN_C3) throw new Error('sendKeys failed')
-      },
-      // C1 exits immediately; C2 never exits; C3 throws before poll
-      isClaudeRunning: async (session) => session === SN_C2,
-    })
-  }
-
-  test('restart proceeds despite mixed errors', async () => {
-    const result = makeMixedDeps()
-    const p = createCli(result.deps).clean_restart()
-    await drainFakeTimers(p)
-    const subcommands = result.spawnCalls.map((c) => c.args[c.args.length - 1])
-    expect(subcommands).toContain('stop')
-    expect(subcommands).toContain('start')
-  })
-
-  test('C2 is force-killed, C1 and C3 are not', async () => {
-    const result = makeMixedDeps()
-    const p = createCli(result.deps).clean_restart()
-    await drainFakeTimers(p)
-    expect(result.killSessionCalls).toContain(SN_C2)
-    expect(result.killSessionCalls).not.toContain(SN_C1)
-    expect(result.killSessionCalls).not.toContain(SN_C3)
-  })
-
-  test('does not surface individual session errors as a process exit', async () => {
-    const result = makeMixedDeps()
-    const p = createCli(result.deps).clean_restart()
-    const err = await runHandler(() => drainFakeTimers(p))
-    expect(err).toBeNull()
-    expect(result.exitCodes).toHaveLength(0)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// T4 / T29 — Integration tests: intentionally not covered in unit tests
+// T4 — Integration test: intentionally not covered in unit tests
 // ---------------------------------------------------------------------------
 //
 // T4: clean_restart survives invoker death.
 //   Requires launching a real process in a real tmux session and killing the
 //   invoking shell mid-run. Not feasible as a unit test. Integration test only.
-//
-// T29: All lifecycle events logged (clean_restart.log + server.log contents).
-//   Requires a full end-to-end run with real tmux sessions and file I/O.
-//   The individual logging behaviors (timestamp format, append mode, etc.) are
-//   covered by logging.test.ts (T30). The full lifecycle log audit (T29) is an
-//   integration test that inspects log file output from a real clean_restart run.

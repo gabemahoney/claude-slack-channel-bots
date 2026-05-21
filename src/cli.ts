@@ -14,11 +14,15 @@ import { join, resolve } from 'path'
 import { existsSync, openSync, readFileSync, unlinkSync } from 'fs'
 import { spawnSync } from 'child_process'
 import { isProcessRunning } from './pid.ts'
-// TODO(E2-T4): clean_restart still uses tmux helpers. Full cutover to claude-director is deferred to E2-T4.
-// The import below keeps cli.ts compiling without changes to clean_restart behaviour.
-import { defaultTmuxClient, isClaudeRunning as tmuxIsClaudeRunning, sessionName as tmuxSessionName } from './tmux.ts'
-import { readSessions, type SessionsMap } from './sessions.ts'
 import { loadConfig as configLoadConfig, type RoutingConfig } from './config.ts'
+import {
+  status as directorStatusFn,
+  pause as directorPauseFn,
+  kill as directorKillFn,
+  type StatusResult,
+  type PauseResult,
+  type KillResult,
+} from './claude-director-cli.ts'
 import { initLogging } from './logging.ts'
 import { isDryRun } from './tokens.ts'
 
@@ -47,20 +51,14 @@ export interface CliDeps {
   startServer: () => Promise<void>
   /** Exit the process. */
   exit: (code: number) => never
-  /** Returns true if a tmux session with the given name exists. */
-  hasSession: (name: string) => Promise<boolean>
   /** Load the routing configuration. */
   loadConfig: () => RoutingConfig
-  /** Returns the canonical tmux session name for a given working directory path. */
-  sessionName: (cwd: string) => string
-  /** Sends keystrokes to the given tmux session. */
-  sendKeys: (session: string, ...keys: string[]) => Promise<void>
-  /** Returns true if a 'claude' process is running in the given tmux session. */
-  isClaudeRunning: (session: string) => Promise<boolean>
-  /** Kills the named tmux session. */
-  killSession: (session: string) => Promise<void>
-  /** Read the sessions registry. */
-  readSessions: () => SessionsMap
+  /** Return current state of a tracked Spawn. */
+  directorStatus: (channelId: string) => Promise<StatusResult>
+  /** Politely shut down a waiting Spawn by sending /exit. */
+  directorPause: (channelId: string) => Promise<PauseResult>
+  /** Terminate a Spawn via claude-director. */
+  directorKill: (channelId: string) => Promise<KillResult>
 }
 
 // ---------------------------------------------------------------------------
@@ -232,25 +230,42 @@ export function createCli(deps: CliDeps): CliHandlers {
       console.error(`[slack] clean_restart: stop returned non-zero exit code: ${stopResult.status}`)
     }
 
-    // Phases 3-4: Exit Claude sessions concurrently
-    await Promise.allSettled(Object.entries(routes).map(async ([channelId, route]) => {
-      const name = deps.sessionName(route.cwd)
+    // Phases 3-4: Pause Claude spawns concurrently via claude-director
+    await Promise.allSettled(Object.entries(routes).map(async ([channelId]) => {
       try {
-        // Phase 3: Check session exists
-        const exists = await deps.hasSession(name)
-        if (!exists) {
-          console.error(`[slack] clean_restart: session not found for channel=${channelId} session=${name}`)
+        // Phase 3: Precheck spawn state
+        const precheck = await deps.directorStatus(channelId)
+        if (!precheck.ok) {
+          if (precheck.error.kind === 'ErrSpawnNotFound') {
+            console.error(`[slack] clean_restart: no spawn row for channel=${channelId} — skipping`)
+            return
+          }
+          // Other status error — fall through directly to kill
+          const errMsg = 'message' in precheck.error ? precheck.error.message : ('stderr' in precheck.error ? precheck.error.stderr : String(precheck.error))
+          console.error(`[slack] clean_restart: status precheck failed for channel=${channelId} (${precheck.error.kind}: ${errMsg}) — proceeding to kill`)
+          const killResult = await deps.directorKill(channelId)
+          if (!killResult.ok && killResult.error.kind !== 'ErrSpawnNotFound') {
+            console.error(`[slack] clean_restart: kill failed for channel=${channelId}: ${killResult.error.kind}`)
+          }
           return
         }
 
-        const claudeRunning = await deps.isClaudeRunning(name)
-        if (!claudeRunning) {
-          console.error(`[slack] clean_restart: Claude not running for channel=${channelId} session=${name}`)
+        const { state } = precheck.data
+        if (state === 'ended' || state === 'missing') {
+          console.error(`[slack] clean_restart: channel=${channelId} already terminal (state=${state}) — skipping`)
           return
         }
 
-        // Phase 4: Send /exit atomically
-        await deps.sendKeys(name, '/exit', 'Enter')
+        // Phase 4: Pause and poll
+        const pauseResult = await deps.directorPause(channelId)
+        if (!pauseResult.ok) {
+          console.error(`[slack] clean_restart: pause failed for channel=${channelId}: ${pauseResult.error.kind} — proceeding to kill`)
+          const killResult = await deps.directorKill(channelId)
+          if (!killResult.ok && killResult.error.kind !== 'ErrSpawnNotFound') {
+            console.error(`[slack] clean_restart: kill failed for channel=${channelId}: ${killResult.error.kind}`)
+          }
+          return
+        }
 
         // Poll with exponential backoff until exit or timeout
         const timeoutMs = exit_timeout * 1000
@@ -261,20 +276,32 @@ export function createCli(deps: CliDeps): CliHandlers {
         while (Date.now() - start < timeoutMs) {
           await new Promise<void>((r) => setTimeout(r, delay))
           delay = Math.min(delay * 2, maxDelay)
-          const running = await deps.isClaudeRunning(name)
-          if (!running) {
+          const pollResult = await deps.directorStatus(channelId)
+          if (!pollResult.ok) {
+            if (pollResult.error.kind === 'ErrSpawnNotFound') {
+              const elapsed = Date.now() - start
+              console.error(`[slack] clean_restart: channel=${channelId} exited cleanly in ${elapsed}ms`)
+              return
+            }
+            // Other error — continue polling
+            continue
+          }
+          if (pollResult.data.state === 'ended' || pollResult.data.state === 'missing') {
             const elapsed = Date.now() - start
-            console.error(`[slack] clean_restart: channel=${channelId} session=${name} exited cleanly in ${elapsed}ms`)
+            console.error(`[slack] clean_restart: channel=${channelId} exited cleanly in ${elapsed}ms`)
             return
           }
         }
 
         // Timeout — force kill
         const elapsed = Date.now() - start
-        await deps.killSession(name)
-        console.error(`[slack] clean_restart: channel=${channelId} session=${name} force-killed after ${elapsed}ms`)
+        const killResult = await deps.directorKill(channelId)
+        if (!killResult.ok && killResult.error.kind !== 'ErrSpawnNotFound') {
+          console.error(`[slack] clean_restart: kill failed for channel=${channelId}: ${killResult.error.kind}`)
+        }
+        console.error(`[slack] clean_restart: channel=${channelId} force-killed via claude-director after ${elapsed}ms`)
       } catch (err) {
-        console.error(`[slack] clean_restart: error processing channel=${channelId} session=${name}:`, err)
+        console.error(`[slack] clean_restart: error processing channel=${channelId}:`, err)
       }
     }))
 
@@ -319,12 +346,9 @@ if (import.meta.main) {
     startServer: async () => { const { main } = await import('./server.ts'); return main() },
     exit: (code) => process.exit(code),
     loadConfig: () => configLoadConfig(),
-    sessionName: (cwd) => tmuxSessionName(cwd),
-    hasSession: (name) => defaultTmuxClient.hasSession(name),
-    sendKeys: (session, ...keys) => defaultTmuxClient.sendKeys(session, ...keys),
-    isClaudeRunning: (session) => tmuxIsClaudeRunning(session, defaultTmuxClient),
-    killSession: (session) => defaultTmuxClient.killSession(session),
-    readSessions: () => readSessions(),
+    directorStatus: (channelId) => Promise.resolve(directorStatusFn({ channelId })),
+    directorPause: (channelId) => Promise.resolve(directorPauseFn({ channelId })),
+    directorKill: (channelId) => Promise.resolve(directorKillFn({ channelId })),
   }
 
   const cli = createCli(realDeps)
