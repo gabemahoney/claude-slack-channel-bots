@@ -45,7 +45,19 @@ import {
   status as cliStatus,
   kill as cliKill,
   deleteSpawn as cliDeleteSpawn,
+  get as cliGet,
+  decide as cliDecide,
 } from './claude-director-cli.ts'
+import {
+  initPermissionPoller,
+  startPermissionPoller,
+  stopPermissionPoller,
+  markFinalized,
+  getLivePrompt,
+  dropLivePrompt,
+} from './permission-poller.ts'
+import { parsePermissionActionId } from './permission-action-id.ts'
+import { handlePermissionClick, type PermissionClickDeps } from './permission-click-handler.ts'
 import {
   startupSessionManager,
   reconcileOrphans,
@@ -697,6 +709,7 @@ async function handleMessage(event: unknown): Promise<void> {
 function buildPermissionBlocks(
   toolName: string,
   toolInput: Record<string, unknown>,
+  claudeInstanceId: string,
   requestId: string,
 ): any[] {
   let summary: string
@@ -709,6 +722,8 @@ function buildPermissionBlocks(
     summary = '`' + (raw.length > 500 ? raw.slice(0, 500) + '…' : raw) + '`'
   }
 
+  // SR-2.3: action_id format is perm_<allow|deny>_<claudeInstanceId>_<requestId>.
+  // requestId is always a string — NEVER coerced through Number.
   return [
     {
       type: 'section',
@@ -724,32 +739,15 @@ function buildPermissionBlocks(
           type: 'button',
           text: { type: 'plain_text', text: 'Allow' },
           style: 'primary',
-          action_id: `perm_allow_${requestId}`,
+          action_id: `perm_allow_${claudeInstanceId}_${requestId}`,
         },
         {
           type: 'button',
           text: { type: 'plain_text', text: 'Deny' },
           style: 'danger',
-          action_id: `perm_deny_${requestId}`,
+          action_id: `perm_deny_${claudeInstanceId}_${requestId}`,
         },
       ],
-    },
-  ]
-}
-
-function buildPermissionDecisionBlocks(
-  toolName: string,
-  decision: 'allow' | 'deny',
-  userName: string,
-): any[] {
-  const label = decision === 'allow' ? 'Allowed' : 'Denied'
-  return [
-    {
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: `*${toolName}* — ${label} by ${userName}`,
-      },
     },
   ]
 }
@@ -786,36 +784,37 @@ socket.on('interactive', async (evt) => {
   const { ack } = evt as { ack: () => Promise<void> }
   const p = ((evt as any).body ?? (evt as any).payload ?? evt) as Record<string, unknown>
   const actions = (Array.isArray(p['actions']) ? p['actions'] : []) as Array<{ action_id: string }>
+
+  // Build deps once per event (web is module-level; poller fns imported at top).
+  const clickDeps: PermissionClickDeps = {
+    getLivePrompt,
+    markFinalized,
+    dropLivePrompt,
+    cliGet,
+    cliDecide,
+    chatUpdate: (params) => web.chat.update(params).then(() => {}),
+    chatPostMessage: (params) => web.chat.postMessage(params).then(() => {}),
+    resolveUserName,
+  }
+
   for (const action of actions) {
     const actionId = action.action_id
-    if (actionId.startsWith('perm_allow_') || actionId.startsWith('perm_deny_')) {
-      const isAllow = actionId.startsWith('perm_allow_')
-      const prefix = isAllow ? 'perm_allow_' : 'perm_deny_'
-      const requestId = actionId.slice(prefix.length)
-      const pending = pendingPermissions.get(requestId)
-      if (pending) {
-        const decision: 'allow' | 'deny' = isAllow ? 'allow' : 'deny'
-        completedDecisions.set(requestId, decision)
-        for (const waiter of pending.waiters) waiter(decision)
-        await ack()
-        pendingPermissions.delete(requestId)
 
-        // Update the Slack message to remove buttons and show the decision
-        const userId = ((p['user'] as Record<string, unknown> | undefined)?.['id'] as string | undefined) ?? ''
-        const userName = userId ? await resolveUserName(userId) : 'unknown'
-        try {
-          await web.chat.update({
-            channel: pending.channelId,
-            ts: pending.messageTs,
-            text: `${pending.toolName} — ${decision === 'allow' ? 'Allowed' : 'Denied'} by ${userName}`,
-            blocks: buildPermissionDecisionBlocks(pending.toolName, decision, userName),
-          })
-        } catch (err) {
-          console.error('[slack] /permission: chat.update failed:', err)
-        }
-        return
-      }
+    // ---------------------------------------------------------------------------
+    // New claude-director permission branch (SR-2.2 / E4)
+    // Delegates to handlePermissionClick (extracted for testability).
+    // ---------------------------------------------------------------------------
+    const userId = ((p['user'] as Record<string, unknown> | undefined)?.['id'] as string | undefined) ?? ''
+    const result = await handlePermissionClick(clickDeps, actionId, userId)
+    if (result === 'handled' || result === 'malformed') {
+      await ack()
+      continue
     }
+    // result === 'not-permission' → fall through to ask_ / other handlers
+
+    // ---------------------------------------------------------------------------
+    // Handle ask_ action IDs (AskUserQuestion relay) — preserved unchanged.
+    // ---------------------------------------------------------------------------
     // Handle ask_ action IDs (AskUserQuestion relay)
     if (actionId.startsWith('ask_')) {
       // Format: ask_<requestId>_<optionIndex>
@@ -907,6 +906,8 @@ async function shutdown(signal: string): Promise<void> {
     }
   }
 
+  stopPermissionPoller()
+
   console.error('[slack] Disconnecting Socket Mode')
   try {
     await socket.disconnect()
@@ -951,6 +952,35 @@ export async function main(): Promise<void> {
     mcpPort = routingConfig.port
     const routeCount = Object.keys(routingConfig.routes).length
     console.error(`[slack] Loaded routing config: ${routeCount} route(s)`)
+
+    // Initialize permission poller with Slack posting deps (SR-2.1).
+    // Started after socket.start() below so we have a live Slack connection.
+    initPermissionPoller({
+      pollIntervalMs: routingConfig.claude_director_poll_interval_ms,
+      async postPermissionMessage(channelId, toolName, toolInput, claudeInstanceId, requestId) {
+        const blocks = buildPermissionBlocks(toolName, toolInput, claudeInstanceId, requestId)
+        const postResult = await web.chat.postMessage({
+          channel: channelId,
+          text: `Permission request: ${toolName}`,
+          blocks,
+        })
+        return postResult.ts as string
+      },
+      async expirePermissionMessage(channelId, messageTs, toolName) {
+        await web.chat.update({
+          channel: channelId,
+          ts: messageTs,
+          text: `${toolName} — expired (no decision)`,
+          blocks: [{
+            type: 'section',
+            text: {
+              type: 'mrkdwn',
+              text: `*${toolName}* — ⏱️ expired (no decision made)`,
+            },
+          }],
+        })
+      },
+    })
 
     // Initialize message archive if configured
     if (routingConfig.message_archive_db) {
@@ -998,6 +1028,9 @@ export async function main(): Promise<void> {
     await socket.start()
     console.error('[slack] Socket Mode connected')
 
+    // Start the claude-director permission poller now that Socket Mode is live (SR-2.1).
+    startPermissionPoller()
+
     // Drain any spawn failure notifications queued before auth completed.
     flushSpawnFailureQueue(web)
   }
@@ -1031,319 +1064,38 @@ export async function main(): Promise<void> {
           return new Response('Forbidden', { status: 403 })
         }
 
-        // GET /permission/<requestId> — long-poll for decision
+        // GET /permission/<requestId> — E5: legacy long-poll; fail-closed deny immediately.
+        // The poller (SR-2.1) is now the source of truth. E2-T6 deletes this route.
         if (req.method === 'GET' && url.pathname.startsWith('/permission/')) {
-          const pollRequestId = url.pathname.slice('/permission/'.length)
-
-          // Already decided — return immediately
-          const existingDecision = completedDecisions.get(pollRequestId)
-          if (existingDecision !== undefined) {
-            completedDecisions.delete(pollRequestId)
-            return new Response(JSON.stringify({ status: 'decided', decision: existingDecision }), {
-              status: 200,
-              headers: { 'Content-Type': 'application/json' },
-            })
-          }
-
-          const pendingEntry = pendingPermissions.get(pollRequestId)
-
-          // Unknown requestId — deny
-          if (!pendingEntry) {
-            return new Response(JSON.stringify({ status: 'decided', decision: 'deny' }), {
-              status: 200,
-              headers: { 'Content-Type': 'application/json' },
-            })
-          }
-
-          // Race 60s timeout vs waiter resolving
-          const decision = await new Promise<'allow' | 'deny' | null>((promiseResolve) => {
-            let settled = false
-            let timerId: ReturnType<typeof setTimeout>
-
-            const waiter = (d: 'allow' | 'deny') => {
-              if (settled) return
-              settled = true
-              clearTimeout(timerId)
-              promiseResolve(d)
-            }
-
-            pendingEntry.waiters.push(waiter)
-
-            timerId = setTimeout(() => {
-              if (settled) return
-              settled = true
-              const idx = pendingEntry.waiters.indexOf(waiter)
-              if (idx !== -1) pendingEntry.waiters.splice(idx, 1)
-              promiseResolve(null)
-            }, 60_000)
-
-            req.signal.addEventListener('abort', () => {
-              if (settled) return
-              settled = true
-              clearTimeout(timerId)
-              const idx = pendingEntry.waiters.indexOf(waiter)
-              if (idx !== -1) pendingEntry.waiters.splice(idx, 1)
-              promiseResolve(null)
-            })
-          })
-
-          if (decision === null) {
-            return new Response(JSON.stringify({ status: 'pending' }), {
-              status: 200,
-              headers: { 'Content-Type': 'application/json' },
-            })
-          }
-
-          completedDecisions.delete(pollRequestId)
-          return new Response(JSON.stringify({ status: 'decided', decision }), {
+          console.warn('[slack] /permission GET: legacy route invoked — claude-director migration in progress; returning fail-closed deny. Disable hooks/permission-relay.sh in ~/.claude/settings.json. See README Migration section.')
+          return new Response(JSON.stringify({ status: 'decided', decision: 'deny' }), {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
           })
         }
 
-        // POST /permission — create permission request and return requestId immediately
+        // POST /permission — E5: legacy route; fail-closed deny immediately. No map mutation, no postMessage.
+        // The poller (SR-2.1) is now the source of truth. E2-T6 deletes this route.
         if (req.method !== 'POST') {
           return new Response('Method Not Allowed', { status: 405 })
         }
-
-        // Parse and validate JSON body
-        let body: { tool_name?: unknown; tool_input?: unknown; channel?: unknown }
-        try {
-          body = await req.json()
-        } catch {
-          return new Response(JSON.stringify({ error: 'Invalid JSON' }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' },
-          })
-        }
-
-        const { tool_name, tool_input, channel } = body
-        if (
-          typeof tool_name !== 'string' ||
-          typeof tool_input !== 'object' ||
-          tool_input === null ||
-          typeof channel !== 'string'
-        ) {
-          return new Response(
-            JSON.stringify({ error: 'Missing or invalid fields: tool_name, tool_input, channel required' }),
-            { status: 400, headers: { 'Content-Type': 'application/json' } },
-          )
-        }
-
-        const matchedChannelId = routingConfig?.routes[channel] ? channel : undefined
-        if (!matchedChannelId) {
-          return new Response(JSON.stringify({ error: 'Unknown channel' }), {
-            status: 404, headers: { 'Content-Type': 'application/json' },
-          })
-        }
-
-        // Generate unique request ID
-        const requestId = crypto.randomUUID()
-
-        // Register pending entry BEFORE posting to Slack to avoid race condition:
-        // If the user clicks Allow/Deny before postMessage returns, the interactive
-        // handler needs the entry to already exist in pendingPermissions.
-        pendingPermissions.set(requestId, {
-          requestId,
-          channelId: matchedChannelId,
-          messageTs: '',
-          toolName: tool_name,
-          waiters: [],
-        })
-
-        // Post Block Kit message to channel
-        let messageTs: string
-        try {
-          const blocks = buildPermissionBlocks(tool_name, tool_input as Record<string, unknown>, requestId)
-          const postResult = await web.chat.postMessage({
-            channel: matchedChannelId,
-            text: `Permission request: ${tool_name}`,
-            blocks,
-          })
-          messageTs = postResult.ts as string
-        } catch (err) {
-          pendingPermissions.delete(requestId)
-          console.error('[slack] /permission: chat.postMessage failed:', err)
-          return new Response(JSON.stringify({ error: 'Failed to post message' }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json' },
-          })
-        }
-
-        // Update with the real message timestamp (needed for chat.update on decision)
-        const pending = pendingPermissions.get(requestId)
-        if (pending) pending.messageTs = messageTs
-
-        return new Response(JSON.stringify({ requestId }), {
+        console.warn('[slack] /permission: legacy route invoked — claude-director migration in progress; returning fail-closed deny. Disable hooks/permission-relay.sh in ~/.claude/settings.json. See README Migration section.')
+        return new Response(JSON.stringify({ status: 'decided', decision: 'deny' }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         })
       }
 
       // -----------------------------------------------------------------------
-      // /ask — AskUserQuestion relay endpoint (POST + GET long-poll)
+      // /ask — AskUserQuestion relay endpoint (E5: legacy; 410 Gone)
+      // E2-T6 deletes this route. AUQ is denied at template; claude-director owns.
       // -----------------------------------------------------------------------
       if (url.pathname === '/ask' || url.pathname.startsWith('/ask/')) {
-        if (req.method !== 'POST' && req.method !== 'GET') {
-          return new Response('Method Not Allowed', { status: 405 })
-        }
-
-        const remoteAddr = server.requestIP(req)
-        const remoteHost = remoteAddr?.address ?? ''
-        if (remoteHost !== '127.0.0.1' && remoteHost !== '::1' && !remoteHost.startsWith('::ffff:127.')) {
-          return new Response('Forbidden', { status: 403 })
-        }
-
-        // GET /ask/<requestId> — long-poll for answer
-        if (req.method === 'GET' && url.pathname.startsWith('/ask/')) {
-          const pollRequestId = url.pathname.slice('/ask/'.length)
-
-          const existingAnswer = completedAnswers.get(pollRequestId)
-          if (existingAnswer !== undefined) {
-            completedAnswers.delete(pollRequestId)
-            return new Response(JSON.stringify({ status: 'decided', answer: existingAnswer }), {
-              status: 200,
-              headers: { 'Content-Type': 'application/json' },
-            })
-          }
-
-          const pendingEntry = pendingQuestions.get(pollRequestId)
-          if (!pendingEntry) {
-            return new Response(JSON.stringify({ status: 'decided', answer: '' }), {
-              status: 200,
-              headers: { 'Content-Type': 'application/json' },
-            })
-          }
-
-          const answer = await new Promise<string | null>((promiseResolve) => {
-            let settled = false
-            let timerId: ReturnType<typeof setTimeout>
-
-            const waiter = (a: string) => {
-              if (settled) return
-              settled = true
-              clearTimeout(timerId)
-              promiseResolve(a)
-            }
-
-            pendingEntry.waiters.push(waiter)
-
-            timerId = setTimeout(() => {
-              if (settled) return
-              settled = true
-              const idx = pendingEntry.waiters.indexOf(waiter)
-              if (idx !== -1) pendingEntry.waiters.splice(idx, 1)
-              promiseResolve(null)
-            }, 60_000)
-
-            req.signal.addEventListener('abort', () => {
-              if (settled) return
-              settled = true
-              clearTimeout(timerId)
-              const idx = pendingEntry.waiters.indexOf(waiter)
-              if (idx !== -1) pendingEntry.waiters.splice(idx, 1)
-              promiseResolve(null)
-            })
-          })
-
-          if (answer !== null) {
-            completedAnswers.delete(pollRequestId)
-            return new Response(JSON.stringify({ status: 'decided', answer }), {
-              status: 200,
-              headers: { 'Content-Type': 'application/json' },
-            })
-          }
-          return new Response(JSON.stringify({ status: 'pending' }), {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' },
-          })
-        }
-
-        // POST /ask — create a new question
-        let body: { question?: unknown; options?: unknown; channel?: unknown }
-        try {
-          body = await req.json()
-        } catch {
-          return new Response(JSON.stringify({ error: 'Invalid JSON' }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' },
-          })
-        }
-
-        const { question, options, channel } = body
-        if (typeof question !== 'string' || !Array.isArray(options) || typeof channel !== 'string') {
-          return new Response(
-            JSON.stringify({ error: 'Missing or invalid fields: question, options, channel required' }),
-            { status: 400, headers: { 'Content-Type': 'application/json' } },
-          )
-        }
-
-        const matchedChannelId = routingConfig?.routes[channel] ? channel : undefined
-        if (!matchedChannelId) {
-          return new Response(JSON.stringify({ error: 'Unknown channel' }), {
-            status: 404, headers: { 'Content-Type': 'application/json' },
-          })
-        }
-
-        const requestId = crypto.randomUUID()
-
-        // Build Block Kit with option buttons
-        const optionButtons = (options as string[]).map((opt: string, i: number) => ({
-          type: 'button',
-          text: { type: 'plain_text', text: opt },
-          action_id: `ask_${requestId}_${i}`,
-        }))
-
-        const blocks = [
-          {
-            type: 'section',
-            text: {
-              type: 'mrkdwn',
-              text: `❓ *${question}*`,
-            },
-          },
-          {
-            type: 'actions',
-            elements: optionButtons,
-          },
-        ]
-
-        // Register pending entry BEFORE posting to Slack to avoid race condition:
-        // If the user clicks a button before postMessage returns, the interactive
-        // handler needs the entry to already exist in pendingQuestions.
-        pendingQuestions.set(requestId, {
-          requestId,
-          channelId: matchedChannelId,
-          messageTs: '',
-          question: question as string,
-          waiters: [],
-        })
-
-        let messageTs: string
-        try {
-          const postResult = await web.chat.postMessage({
-            channel: matchedChannelId,
-            text: `Question: ${question}`,
-            blocks,
-          })
-          messageTs = postResult.ts as string
-        } catch (err) {
-          pendingQuestions.delete(requestId)
-          console.error('[slack] /ask: chat.postMessage failed:', err)
-          return new Response(JSON.stringify({ error: 'Failed to post message' }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json' },
-          })
-        }
-
-        // Update with the real message timestamp
-        const pendingQ = pendingQuestions.get(requestId)
-        if (pendingQ) pendingQ.messageTs = messageTs
-
-        return new Response(JSON.stringify({ requestId }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        })
+        console.warn('[slack] /ask: legacy route invoked — claude-director migration in progress. AskUserQuestion is disabled. Disable hooks/permission-relay.sh in ~/.claude/settings.json. See README Migration section.')
+        return new Response(
+          JSON.stringify({ error: 'Gone: /ask endpoint removed. AskUserQuestion is now handled via claude-director. See README Migration section.' }),
+          { status: 410, headers: { 'Content-Type': 'application/json' } },
+        )
       }
 
 
