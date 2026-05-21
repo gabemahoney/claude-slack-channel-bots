@@ -15,6 +15,7 @@ import { join } from 'path'
 import { runPostinstall } from '../src/postinstall.ts'
 import { defaultAccess } from '../src/lib.ts'
 import { MCP_SERVER_NAME } from '../src/config.ts'
+import { CLAUDE_DIRECTOR_INSTALL_DOCS_URL, type DepProbeDeps } from '../src/claude-director-probe.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -420,5 +421,462 @@ describe('no-overwrite — running twice', () => {
     expect(existsSync(join(stateDir, 'config.json'))).toBe(true)
     expect(existsSync(join(stateDir, 'access.json'))).toBe(true)
     expect(existsSync(mcpConfigPath)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// claude-director probe — best-effort
+// ---------------------------------------------------------------------------
+
+describe('claude-director probe — best-effort', () => {
+  // Capture arrays reset in beforeEach
+  let stderrCapture: string[]
+  let recordStartupErrorCalls: Array<{ classLabel: string; message: string; cause?: unknown }>
+  let statSyncCalls: string[]
+  let capturedArgv: Array<[string, ...string[]]>
+
+  // Inline stub exec that records argv calls (equivalent to makeStubExec in
+  // dependency-check.test.ts — flagged for future consolidation if a shared
+  // helper emerges in tests/test-helpers/).
+  function makeStubExec(opts: {
+    exitCode: number | null
+    stdout: string
+    stderr: string
+    throwError?: NodeJS.ErrnoException
+  }): DepProbeDeps['exec'] {
+    return (argv: [string, ...string[]]) => {
+      capturedArgv.push(argv)
+      if (opts.throwError) throw opts.throwError
+      return { exitCode: opts.exitCode, stdout: opts.stdout, stderr: opts.stderr }
+    }
+  }
+
+  /**
+   * Factory for the injectable probe-deps bundle.
+   * Defaults: success exec, empty capture arrays, statSync spy that throws
+   * ENOTSUP to surface any accidental invocation.
+   */
+  function makeProbeDeps(overrides?: Partial<DepProbeDeps>): {
+    probeDeps: Partial<DepProbeDeps>
+    stderrWrite: (msg: string) => void
+  } {
+    const probeDeps: Partial<DepProbeDeps> = {
+      exec: makeStubExec({ exitCode: 0, stdout: 'claude-director 1.2.3\n', stderr: '' }),
+      recordStartupError: (classLabel: string, message: string, cause?: unknown) => {
+        recordStartupErrorCalls.push({ classLabel, message, cause })
+      },
+      statSync: (path: string) => {
+        statSyncCalls.push(path)
+        const err: NodeJS.ErrnoException = new Error('statSync should not be called in postinstall') as NodeJS.ErrnoException
+        err.code = 'ENOTSUP'
+        throw err
+      },
+      ...overrides,
+    }
+    const stderrWrite = (msg: string) => {
+      stderrCapture.push(msg)
+    }
+    return { probeDeps, stderrWrite }
+  }
+
+  beforeEach(() => {
+    stderrCapture = []
+    recordStartupErrorCalls = []
+    statSyncCalls = []
+    capturedArgv = []
+  })
+
+  // -------------------------------------------------------------------------
+  // Probe success
+  // -------------------------------------------------------------------------
+
+  test('probe success: runPostinstall does not throw', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps()
+
+    expect(() =>
+      runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite }),
+    ).not.toThrow()
+  })
+
+  test('probe success: stderr capture has no probe warning', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps()
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(stderrCapture).toEqual([])
+  })
+
+  test('probe success: recordStartupError spy calls is empty', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps()
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(recordStartupErrorCalls).toEqual([])
+  })
+
+  test('probe success: statSync spy calls is empty', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps()
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(statSyncCalls).toEqual([])
+  })
+
+  test('probe success: config.json, access.json, slack-mcp.json are created', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const mcpConfigPath = join(mcpDir, 'slack-mcp.json')
+    const { probeDeps, stderrWrite } = makeProbeDeps()
+
+    runPostinstall({ stateDir, mcpConfigPath, probeDeps, stderrWrite })
+
+    expect(existsSync(join(stateDir, 'config.json'))).toBe(true)
+    expect(existsSync(join(stateDir, 'access.json'))).toBe(true)
+    expect(existsSync(mcpConfigPath)).toBe(true)
+  })
+
+  // -------------------------------------------------------------------------
+  // Probe non-zero exit
+  // -------------------------------------------------------------------------
+
+  test('probe non-zero exit: runPostinstall does not throw', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: 1, stdout: '', stderr: 'command failed' }),
+    })
+
+    expect(() =>
+      runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite }),
+    ).not.toThrow()
+  })
+
+  test('probe non-zero exit: stderr capture has exactly one warning', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: 1, stdout: '', stderr: 'command failed' }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(stderrCapture).toHaveLength(1)
+  })
+
+  test('probe non-zero exit: warning contains "claude-director" and install docs URL', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: 1, stdout: '', stderr: 'command failed' }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(stderrCapture[0]).toContain('claude-director')
+    expect(stderrCapture[0]).toContain(CLAUDE_DIRECTOR_INSTALL_DOCS_URL)
+  })
+
+  test('probe non-zero exit: recordStartupError spy calls is empty', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: 1, stdout: '', stderr: 'command failed' }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(recordStartupErrorCalls).toEqual([])
+  })
+
+  test('probe non-zero exit: statSync spy calls is empty', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: 1, stdout: '', stderr: 'command failed' }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(statSyncCalls).toEqual([])
+  })
+
+  test('probe non-zero exit: existing side effects still occur', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const mcpConfigPath = join(mcpDir, 'slack-mcp.json')
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: 1, stdout: '', stderr: 'command failed' }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath, probeDeps, stderrWrite })
+
+    expect(existsSync(join(stateDir, 'config.json'))).toBe(true)
+    expect(existsSync(join(stateDir, 'access.json'))).toBe(true)
+    expect(existsSync(mcpConfigPath)).toBe(true)
+  })
+
+  // -------------------------------------------------------------------------
+  // Probe ENOENT / spawn-error
+  // -------------------------------------------------------------------------
+
+  test('probe ENOENT: runPostinstall does not throw', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const enoentErr = Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) as NodeJS.ErrnoException
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: null, stdout: '', stderr: '', throwError: enoentErr }),
+    })
+
+    expect(() =>
+      runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite }),
+    ).not.toThrow()
+  })
+
+  test('probe ENOENT: stderr capture has exactly one warning', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const enoentErr = Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) as NodeJS.ErrnoException
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: null, stdout: '', stderr: '', throwError: enoentErr }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(stderrCapture).toHaveLength(1)
+  })
+
+  test('probe ENOENT: warning contains "claude-director" and install docs URL', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const enoentErr = Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) as NodeJS.ErrnoException
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: null, stdout: '', stderr: '', throwError: enoentErr }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(stderrCapture[0]).toContain('claude-director')
+    expect(stderrCapture[0]).toContain(CLAUDE_DIRECTOR_INSTALL_DOCS_URL)
+  })
+
+  test('probe ENOENT: recordStartupError spy calls is empty', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const enoentErr = Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) as NodeJS.ErrnoException
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: null, stdout: '', stderr: '', throwError: enoentErr }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(recordStartupErrorCalls).toEqual([])
+  })
+
+  test('probe ENOENT: statSync spy calls is empty', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const enoentErr = Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) as NodeJS.ErrnoException
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: null, stdout: '', stderr: '', throwError: enoentErr }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(statSyncCalls).toEqual([])
+  })
+
+  test('probe ENOENT: existing side effects still occur', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const mcpConfigPath = join(mcpDir, 'slack-mcp.json')
+    const enoentErr = Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) as NodeJS.ErrnoException
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: null, stdout: '', stderr: '', throwError: enoentErr }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath, probeDeps, stderrWrite })
+
+    expect(existsSync(join(stateDir, 'config.json'))).toBe(true)
+    expect(existsSync(join(stateDir, 'access.json'))).toBe(true)
+    expect(existsSync(mcpConfigPath)).toBe(true)
+  })
+
+  // -------------------------------------------------------------------------
+  // Probe empty / unparseable stdout
+  // -------------------------------------------------------------------------
+
+  test('probe empty stdout: runPostinstall does not throw', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: 0, stdout: '   ', stderr: '' }),
+    })
+
+    expect(() =>
+      runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite }),
+    ).not.toThrow()
+  })
+
+  test('probe empty stdout: stderr capture has exactly one warning', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: 0, stdout: '   ', stderr: '' }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(stderrCapture).toHaveLength(1)
+  })
+
+  test('probe empty stdout: warning contains "claude-director" and install docs URL', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: 0, stdout: '   ', stderr: '' }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(stderrCapture[0]).toContain('claude-director')
+    expect(stderrCapture[0]).toContain(CLAUDE_DIRECTOR_INSTALL_DOCS_URL)
+  })
+
+  test('probe empty stdout: recordStartupError spy calls is empty', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: 0, stdout: '   ', stderr: '' }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(recordStartupErrorCalls).toEqual([])
+  })
+
+  test('probe empty stdout: statSync spy calls is empty', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: 0, stdout: '   ', stderr: '' }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(statSyncCalls).toEqual([])
+  })
+
+  test('probe empty stdout: existing side effects still occur', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const mcpConfigPath = join(mcpDir, 'slack-mcp.json')
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: 0, stdout: '   ', stderr: '' }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath, probeDeps, stderrWrite })
+
+    expect(existsSync(join(stateDir, 'config.json'))).toBe(true)
+    expect(existsSync(join(stateDir, 'access.json'))).toBe(true)
+    expect(existsSync(mcpConfigPath)).toBe(true)
+  })
+
+  // -------------------------------------------------------------------------
+  // Argv-style execution
+  // -------------------------------------------------------------------------
+
+  test('exec stub is invoked with argv ["claude-director", "version", ...]', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps()
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(capturedArgv).toHaveLength(1)
+    expect(capturedArgv[0][0]).toBe('claude-director')
+    expect(capturedArgv[0][1]).toBe('version')
+  })
+
+  test('no argv element contains shell metacharacters', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps()
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    const shellMeta = /[;&|$`()\n<>]/
+    for (const argv of capturedArgv) {
+      for (const arg of argv) {
+        expect(shellMeta.test(arg)).toBe(false)
+      }
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // Warning emitted exactly once per failure (no duplicates)
+  // -------------------------------------------------------------------------
+
+  test('non-zero exit: warning emitted exactly once (no duplicates)', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: 1, stdout: '', stderr: '' }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(stderrCapture).toHaveLength(1)
+  })
+
+  test('ENOENT: warning emitted exactly once (no duplicates)', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const enoentErr = Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) as NodeJS.ErrnoException
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: null, stdout: '', stderr: '', throwError: enoentErr }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(stderrCapture).toHaveLength(1)
+  })
+
+  test('empty stdout: warning emitted exactly once (no duplicates)', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: 0, stdout: '', stderr: '' }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    expect(stderrCapture).toHaveLength(1)
+  })
+
+  // -------------------------------------------------------------------------
+  // Warning is routed to stderrWrite (not stdout)
+  // -------------------------------------------------------------------------
+
+  test('warning is routed to the injected stderrWrite sink', () => {
+    const stateDir = makeTempDir()
+    const mcpDir = makeTempDir()
+    const { probeDeps, stderrWrite } = makeProbeDeps({
+      exec: makeStubExec({ exitCode: 1, stdout: '', stderr: 'failed' }),
+    })
+
+    runPostinstall({ stateDir, mcpConfigPath: join(mcpDir, 'slack-mcp.json'), probeDeps, stderrWrite })
+
+    // stderrCapture receives the write; it is not empty
+    expect(stderrCapture.length).toBeGreaterThan(0)
+    // The combined captured text contains the URL — confirming routing
+    expect(stderrCapture.join('')).toContain(CLAUDE_DIRECTOR_INSTALL_DOCS_URL)
   })
 })

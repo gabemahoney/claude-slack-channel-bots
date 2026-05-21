@@ -15,6 +15,11 @@ import { homedir } from 'os'
 import { dirname, join, resolve } from 'path'
 import { defaultAccess } from './lib.ts'
 import { MCP_SERVER_NAME } from './config.ts'
+import {
+  assertClaudeDirectorPresentBestEffort,
+  CLAUDE_DIRECTOR_INSTALL_DOCS_URL,
+  type DepProbeDeps,
+} from './claude-director-probe.ts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -25,6 +30,21 @@ export interface PostinstallOptions {
   stateDir?: string
   /** Override the MCP config path (defaults to ~/.claude/slack-mcp.json) */
   mcpConfigPath?: string
+
+  /**
+   * Injectable dependencies for testability.
+   *
+   * - `probeDeps`: forwarded to `assertClaudeDirectorPresentBestEffort(deps)`.
+   *   Supply `{ exec: stubExec }` to control the probe's binary invocation.
+   *   Supply `{ recordStartupError: spy }` to assert it is never called (the
+   *   best-effort wrapper never calls it, but the slot is available for tests).
+   *   Supply `{ statSync: spy }` to assert statSync is never called by
+   *   the probe path exercised in postinstall (best-effort never stat-checks).
+   * - `stderrWrite`: replaces `process.stderr.write` for warning capture in
+   *   tests. When omitted, warnings go to `process.stderr.write` as normal.
+   */
+  probeDeps?: Partial<DepProbeDeps>
+  stderrWrite?: (msg: string) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -39,6 +59,32 @@ export function runPostinstall(options: PostinstallOptions = {}): void {
 
   const mcpConfigPath =
     options.mcpConfigPath ?? join(homedir(), '.claude', 'slack-mcp.json')
+
+  const stderrWrite = options.stderrWrite ?? ((msg: string) => process.stderr.write(msg))
+
+  // ---------------------------------------------------------------------------
+  // Probe claude-director (best-effort — postinstall MUST always exit 0)
+  // ---------------------------------------------------------------------------
+  try {
+    const probe = assertClaudeDirectorPresentBestEffort(options.probeDeps)
+    if (probe.ok) {
+      console.error('[postinstall] claude-director: ok')
+    } else {
+      stderrWrite(
+        `[postinstall] WARNING: claude-director check failed.\n` +
+        `  Symptom    : ${probe.reason ?? 'unknown'}${probe.details ? ` — ${probe.details}` : ''}\n` +
+        `  Consequence: claude-slack-channel-bots start will refuse to run until claude-director is installed.\n` +
+        `  Install docs: ${CLAUDE_DIRECTOR_INSTALL_DOCS_URL}\n`,
+      )
+    }
+  } catch {
+    // Never let a probe failure break postinstall — warn and continue.
+    stderrWrite(
+      `[postinstall] WARNING: claude-director probe threw unexpectedly; skipping check.\n` +
+      `  Consequence: claude-slack-channel-bots start will refuse to run until claude-director is installed.\n` +
+      `  Install docs: ${CLAUDE_DIRECTOR_INSTALL_DOCS_URL}\n`,
+    )
+  }
 
   // Ensure directories exist
   mkdirSync(stateDir, { recursive: true })
