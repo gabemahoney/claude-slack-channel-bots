@@ -24,6 +24,8 @@ export interface SessionRecord {
   tmuxSession: string
   lastLaunch: string // ISO-8601, e.g. new Date().toISOString()
   sessionId: string // Claude session UUID; 'pending' until background verification discovers it
+  /** claude-director instance ID for this session (e.g. `cscb_C123`). Optional; populated by E2 poller. */
+  claude_instance_id?: string
 }
 
 export type SessionsMap = Record<string, SessionRecord>

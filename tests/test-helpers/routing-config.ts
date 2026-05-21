@@ -4,7 +4,19 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { type RoutingConfig } from '../../src/config.ts'
+import { type RoutingConfig, type RouteEntry } from '../../src/config.ts'
+
+/**
+ * Build a minimal RouteEntry for tests.
+ * Supply `claude_instance_id` when tests need to assert against the E2 poller field.
+ * Default behavior unchanged when not supplied.
+ */
+export function makeRouteEntry(overrides: Partial<RouteEntry> & { cwd?: string } = {}): RouteEntry {
+  return {
+    cwd: '/tmp/test-cwd',
+    ...overrides,
+  }
+}
 
 export function makeRoutingConfig(overrides?: Partial<RoutingConfig>): RoutingConfig {
   return {

@@ -26,7 +26,8 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@slack/socket-mode": "^2.0.0",
-    "@slack/web-api": "^7.0.0"
+    "@slack/web-api": "^7.0.0",
+    "lossless-json": "^4.0.0"
   },
   "devDependencies": {
     "@types/bun": "^1.0.0",

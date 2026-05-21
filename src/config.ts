@@ -75,6 +75,8 @@ export interface RouteEntry {
    * if neither is set).
    */
   claude_config_dir?: string
+  /** claude-director instance ID for this route (e.g. `cscb_C123`). Optional; populated by E2 poller. */
+  claude_instance_id?: string
 }
 
 /** Raw shape of config.json as parsed from disk. All optional fields may be absent. */
