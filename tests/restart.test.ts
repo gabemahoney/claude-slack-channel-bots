@@ -1,6 +1,11 @@
 /**
  * restart.test.ts — Tests for auto-restart scheduling logic.
  *
+ * Drives restart behavior through a spawnForRoute spy (not tmux-based mocks).
+ * The RestartDeps.launchSession slot is wired to this spy; all other deps
+ * (isSessionAlive, reconnectSession, killSession, isShuttingDown) remain
+ * individually injectable for targeted behavioral tests.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -16,6 +21,8 @@ import {
   type RestartDeps,
   MAX_CONSECUTIVE_FAILURES,
 } from '../src/restart.ts'
+import { ClaudeDirectorStub, makeSpawnRow } from './test-helpers/claude-director-stub.ts'
+import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -29,30 +36,37 @@ const WAIT_MS = 50         // wait after scheduling; long enough for FAST_DELAY_
 // Factory
 // ---------------------------------------------------------------------------
 
+type SpawnForRouteCall = {
+  channelId: string
+  cwd: string
+}
+
 type DepsOpts = {
-  isSessionAliveResult?: boolean  // default: false (session is dead)
-  isSessionConnectedResult?: boolean  // default: false (not yet reconnected)
-  launchSessionResult?: boolean   // default: true (launch succeeds)
-  launchSession?: (channelId: string, cwd: string, sessionId?: string) => Promise<boolean>  // override entire launchSession
-  restartDelay?: number           // default: FAST_DELAY_S
-  isShuttingDown?: boolean        // default: false
+  isSessionAliveResult?: boolean       // default: false (session is dead)
+  isSessionConnectedResult?: boolean   // default: false (not yet reconnected)
+  spawnForRouteResult?: boolean        // default: true (spawn succeeds)
+  spawnForRoute?: (channelId: string, cwd: string) => Promise<boolean>  // override entire spy
+  restartDelay?: number                // default: FAST_DELAY_S
+  isShuttingDown?: boolean             // default: false
 }
 
 function makeDeps(opts: DepsOpts = {}): RestartDeps & {
   isSessionAliveCalls: string[]
   killSessionCalls: string[]
-  launchSessionCalls: Array<{ channelId: string; cwd: string; sessionId: string | undefined }>
+  spawnForRouteCalls: SpawnForRouteCall[]
   reconnectSessionCalls: string[]
 } {
+  const routingConfig = makeRoutingConfig()
+
   const isSessionAliveCalls: string[] = []
   const killSessionCalls: string[] = []
-  const launchSessionCalls: Array<{ channelId: string; cwd: string; sessionId: string | undefined }> = []
+  const spawnForRouteCalls: SpawnForRouteCall[] = []
   const reconnectSessionCalls: string[] = []
 
   return {
     isSessionAliveCalls,
     killSessionCalls,
-    launchSessionCalls,
+    spawnForRouteCalls,
     reconnectSessionCalls,
 
     async isSessionAlive(channelId) {
@@ -68,10 +82,12 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     async killSession(channelId) {
       killSessionCalls.push(channelId)
     },
-    async launchSession(channelId, cwd, sessionId) {
-      launchSessionCalls.push({ channelId, cwd, sessionId })
-      if (opts.launchSession) return opts.launchSession(channelId, cwd, sessionId)
-      return opts.launchSessionResult ?? true
+    async launchSession(channelId, cwd, _sessionId) {
+      const route = routingConfig.routes[channelId]
+      const effectiveCwd = route?.cwd ?? cwd
+      spawnForRouteCalls.push({ channelId, cwd: effectiveCwd })
+      if (opts.spawnForRoute) return opts.spawnForRoute(channelId, effectiveCwd)
+      return opts.spawnForRouteResult ?? true
     },
     getRestartDelay: () => opts.restartDelay ?? FAST_DELAY_S,
     isShuttingDown: () => opts.isShuttingDown ?? false,
@@ -91,29 +107,28 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('scheduleRestart', () => {
-  test('1. delay > 0 — timer fires, launchSession called with correct args', async () => {
+  test('delay > 0 — timer fires, spawnForRoute called with correct args', async () => {
     const deps = makeDeps()
     initRestart(deps)
 
     scheduleRestart('C_TEST1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
-    expect(deps.launchSessionCalls).toHaveLength(1)
-    expect(deps.launchSessionCalls[0].channelId).toBe('C_TEST1')
-    expect(deps.launchSessionCalls[0].cwd).toBe('/cwd/test')
+    expect(deps.spawnForRouteCalls).toHaveLength(1)
+    expect(deps.spawnForRouteCalls[0].channelId).toBe('C_TEST1')
   })
 
-  test('2. delay = 0 — no timer scheduled, launchSession never called', async () => {
+  test('delay = 0 — no timer scheduled, spawnForRoute never called', async () => {
     const deps = makeDeps({ restartDelay: 0 })
     initRestart(deps)
 
     scheduleRestart('C_TEST1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
-    expect(deps.launchSessionCalls).toHaveLength(0)
+    expect(deps.spawnForRouteCalls).toHaveLength(0)
   })
 
-  test('3. timer fires, session already alive — reconnectSession called, launchSession NOT called', async () => {
+  test('timer fires, session already alive — reconnectSession called, spawnForRoute NOT called', async () => {
     const deps = makeDeps({ isSessionAliveResult: true })
     initRestart(deps)
 
@@ -123,10 +138,10 @@ describe('scheduleRestart', () => {
     expect(deps.isSessionAliveCalls).toHaveLength(1)
     expect(deps.reconnectSessionCalls).toHaveLength(1)
     expect(deps.reconnectSessionCalls[0]).toBe('C_TEST1')
-    expect(deps.launchSessionCalls).toHaveLength(0)
+    expect(deps.spawnForRouteCalls).toHaveLength(0)
   })
 
-  test('3b. session alive but reconnectSession throws — does not propagate, launchSession NOT called', async () => {
+  test('session alive but reconnectSession throws — does not propagate, spawnForRoute NOT called', async () => {
     const deps = makeDeps({ isSessionAliveResult: true })
     let reconnectCalled = false
     deps.reconnectSession = async () => {
@@ -139,20 +154,20 @@ describe('scheduleRestart', () => {
     await Bun.sleep(WAIT_MS)
 
     expect(reconnectCalled).toBe(true)
-    expect(deps.launchSessionCalls).toHaveLength(0)
+    expect(deps.spawnForRouteCalls).toHaveLength(0)
   })
 
-  test('timer fires but isShuttingDown=true — launchSession never called', async () => {
+  test('timer fires but isShuttingDown=true — spawnForRoute never called', async () => {
     const deps = makeDeps({ isShuttingDown: true })
     initRestart(deps)
 
     scheduleRestart('C_TEST1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
-    expect(deps.launchSessionCalls).toHaveLength(0)
+    expect(deps.spawnForRouteCalls).toHaveLength(0)
   })
 
-  test('4. timer fires, session dead — killSession then launchSession called', async () => {
+  test('timer fires, session dead — killSession then spawnForRoute called', async () => {
     const deps = makeDeps({ isSessionAliveResult: false })
     initRestart(deps)
 
@@ -161,12 +176,12 @@ describe('scheduleRestart', () => {
 
     expect(deps.killSessionCalls).toHaveLength(1)
     expect(deps.killSessionCalls[0]).toBe('C_TEST1')
-    expect(deps.launchSessionCalls).toHaveLength(1)
-    expect(deps.launchSessionCalls[0].channelId).toBe('C_TEST1')
+    expect(deps.spawnForRouteCalls).toHaveLength(1)
+    expect(deps.spawnForRouteCalls[0].channelId).toBe('C_TEST1')
   })
 
-  test('5. 3 consecutive launch failures — scheduleRestart on 4th death skips timer', async () => {
-    const deps = makeDeps({ launchSessionResult: false })
+  test('3 consecutive launch failures — scheduleRestart on 4th death skips timer', async () => {
+    const deps = makeDeps({ spawnForRouteResult: false })
     initRestart(deps)
 
     // Drive MAX_CONSECUTIVE_FAILURES failures
@@ -174,18 +189,18 @@ describe('scheduleRestart', () => {
       scheduleRestart('C_TEST1', '/cwd/test')
       await Bun.sleep(WAIT_MS)
     }
-    expect(deps.launchSessionCalls).toHaveLength(MAX_CONSECUTIVE_FAILURES)
+    expect(deps.spawnForRouteCalls).toHaveLength(MAX_CONSECUTIVE_FAILURES)
 
     // 4th death: failure count is now >= MAX, timer must NOT be scheduled
-    const callsBefore = deps.launchSessionCalls.length
+    const callsBefore = deps.spawnForRouteCalls.length
     scheduleRestart('C_TEST1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
-    expect(deps.launchSessionCalls.length).toBe(callsBefore)
+    expect(deps.spawnForRouteCalls.length).toBe(callsBefore)
   })
 
-  test('6. resetFailureCounter between failures — counter resets, next death schedules timer normally', async () => {
-    const deps = makeDeps({ launchSessionResult: false })
+  test('resetFailureCounter between failures — counter resets, next death schedules timer normally', async () => {
+    const deps = makeDeps({ spawnForRouteResult: false })
     initRestart(deps)
 
     // Drive MAX_CONSECUTIVE_FAILURES failures
@@ -195,22 +210,22 @@ describe('scheduleRestart', () => {
     }
 
     // Confirm 4th is blocked
-    const callsBeforeReset = deps.launchSessionCalls.length
+    const callsBeforeReset = deps.spawnForRouteCalls.length
     scheduleRestart('C_TEST1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
-    expect(deps.launchSessionCalls.length).toBe(callsBeforeReset)
+    expect(deps.spawnForRouteCalls.length).toBe(callsBeforeReset)
 
     // Reset counter — next restart should succeed
     resetFailureCounter('C_TEST1')
     scheduleRestart('C_TEST1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
-    expect(deps.launchSessionCalls.length).toBe(callsBeforeReset + 1)
+    expect(deps.spawnForRouteCalls.length).toBe(callsBeforeReset + 1)
   })
 
-  test('7. failure counter does NOT increment on session death — only on failed launchSession', async () => {
-    // launchSession always succeeds — failure counter must never accumulate
-    const deps = makeDeps({ launchSessionResult: true })
+  test('failure counter does NOT increment on success — scheduling continues past MAX', async () => {
+    // spawnForRoute always succeeds — failure counter must never accumulate
+    const deps = makeDeps({ spawnForRouteResult: true })
     initRestart(deps)
 
     // Call scheduleRestart more times than MAX_CONSECUTIVE_FAILURES allows
@@ -220,44 +235,40 @@ describe('scheduleRestart', () => {
       await Bun.sleep(WAIT_MS)
     }
 
-    // Every death should have produced a launchSession call
-    expect(deps.launchSessionCalls.length).toBe(iterations)
+    // Every death should have produced a spawnForRoute call
+    expect(deps.spawnForRouteCalls.length).toBe(iterations)
   })
 
-  test('8. restart with stored session ID — launchSession receives session ID argument', async () => {
-    const deps = makeDeps()
-    initRestart(deps)
+  test('delegation invariant — scheduleRestart never calls wrapper subcommands directly', async () => {
+    // Install a real ClaudeDirectorStub to capture any CLI invocations.
+    // spawnForRoute in the spy never reaches the wrapper — the stub should
+    // record zero calls for spawn/resume/kill/delete after timer-fire.
+    const stub = new ClaudeDirectorStub({
+      spawnRows: [makeSpawnRow({ channelId: 'C_TEST1', state: 'waiting' })],
+    })
+    stub.install()
 
-    scheduleRestart('C_TEST1', '/cwd/test', 'saved-session-123')
-    await Bun.sleep(WAIT_MS)
-
-    expect(deps.launchSessionCalls).toHaveLength(1)
-    expect(deps.launchSessionCalls[0].channelId).toBe('C_TEST1')
-    expect(deps.launchSessionCalls[0].cwd).toBe('/cwd/test')
-    expect(deps.launchSessionCalls[0].sessionId).toBe('saved-session-123')
-  })
-
-  test('9. restart without stored session ID — launchSession called without session ID', async () => {
-    const deps = makeDeps()
+    const deps = makeDeps({ spawnForRouteResult: true })
     initRestart(deps)
 
     scheduleRestart('C_TEST1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
-    expect(deps.launchSessionCalls).toHaveLength(1)
-    expect(deps.launchSessionCalls[0].sessionId).toBeUndefined()
-  })
+    // spawnForRoute spy was called (verifies timer fired)
+    expect(deps.spawnForRouteCalls).toHaveLength(1)
 
-  test('10. launchSession succeeds with session ID — failure counter not incremented', async () => {
-    const deps = makeDeps({ launchSessionResult: true })
-    initRestart(deps)
+    // The stub must have received zero CLI calls
+    const spawnCalls = stub.calls.filter((c) => c.verb === 'spawn')
+    const resumeCalls = stub.calls.filter((c) => c.verb === 'resume')
+    const killCalls = stub.calls.filter((c) => c.verb === 'kill')
+    const deleteCalls = stub.calls.filter((c) => c.verb === 'delete')
 
-    scheduleRestart('C_TEST1', '/cwd/test', 'saved-session-123')
-    await Bun.sleep(WAIT_MS)
+    expect(spawnCalls).toHaveLength(0)
+    expect(resumeCalls).toHaveLength(0)
+    expect(killCalls).toHaveLength(0)
+    expect(deleteCalls).toHaveLength(0)
 
-    expect(deps.launchSessionCalls).toHaveLength(1)
-    expect(deps.launchSessionCalls[0].sessionId).toBe('saved-session-123')
-    expect(hasReachedMaxFailures('C_TEST1')).toBe(false)
+    stub.uninstall()
   })
 })
 
@@ -266,7 +277,7 @@ describe('scheduleRestart', () => {
 // ---------------------------------------------------------------------------
 
 describe('cancelAllRestartTimers', () => {
-  test('8. clears all pending timers — launchSession never called after cancel', async () => {
+  test('clears all pending timers — spawnForRoute never called after cancel', async () => {
     const deps = makeDeps() // FAST_DELAY_S = 10 ms
     initRestart(deps)
 
@@ -279,7 +290,7 @@ describe('cancelAllRestartTimers', () => {
     // Wait longer than the timer delay to confirm they did not fire
     await Bun.sleep(WAIT_MS)
 
-    expect(deps.launchSessionCalls).toHaveLength(0)
+    expect(deps.spawnForRouteCalls).toHaveLength(0)
   })
 })
 
@@ -301,59 +312,59 @@ describe('isRestartPendingOrActive', () => {
     expect(isRestartPendingOrActive('C_TEST1')).toBe(true)
   })
 
-  test('returns true while launchSession is in progress', async () => {
-    let launchResolve!: (ok: boolean) => void
-    const launchPromise = new Promise<boolean>((res) => { launchResolve = res })
+  test('returns true while spawnForRoute is in progress', async () => {
+    let spawnResolve!: (ok: boolean) => void
+    const spawnPromise = new Promise<boolean>((res) => { spawnResolve = res })
 
-    const deps = makeDeps({ launchSession: () => launchPromise })
+    const deps = makeDeps({ spawnForRoute: () => spawnPromise })
     initRestart(deps)
 
     scheduleRestart('C_TEST1', '/cwd/test')
-    await Bun.sleep(WAIT_MS) // timer has fired; launchSession is now awaiting
+    await Bun.sleep(WAIT_MS) // timer has fired; launchSession (spawnForRoute) is now awaiting
 
     expect(isRestartPendingOrActive('C_TEST1')).toBe(true)
 
-    launchResolve(true)
+    spawnResolve(true)
     await Bun.sleep(1) // let finally block run
   })
 
-  test('returns false after launchSession completes successfully', async () => {
-    let launchResolve!: (ok: boolean) => void
-    const launchPromise = new Promise<boolean>((res) => { launchResolve = res })
+  test('returns false after spawnForRoute completes successfully', async () => {
+    let spawnResolve!: (ok: boolean) => void
+    const spawnPromise = new Promise<boolean>((res) => { spawnResolve = res })
 
-    const deps = makeDeps({ launchSession: () => launchPromise })
+    const deps = makeDeps({ spawnForRoute: () => spawnPromise })
     initRestart(deps)
 
     scheduleRestart('C_TEST1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
-    launchResolve(true)
+    spawnResolve(true)
     await Bun.sleep(1)
 
     expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
   })
 
-  test('returns false after launchSession completes with failure', async () => {
-    let launchResolve!: (ok: boolean) => void
-    const launchPromise = new Promise<boolean>((res) => { launchResolve = res })
+  test('returns false after spawnForRoute completes with failure', async () => {
+    let spawnResolve!: (ok: boolean) => void
+    const spawnPromise = new Promise<boolean>((res) => { spawnResolve = res })
 
-    const deps = makeDeps({ launchSession: () => launchPromise })
+    const deps = makeDeps({ spawnForRoute: () => spawnPromise })
     initRestart(deps)
 
     scheduleRestart('C_TEST1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
-    launchResolve(false)
+    spawnResolve(false)
     await Bun.sleep(1)
 
     expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
   })
 
   test('returns false for different channel while another has restart in progress', async () => {
-    let launchResolve!: (ok: boolean) => void
-    const launchPromise = new Promise<boolean>((res) => { launchResolve = res })
+    let spawnResolve!: (ok: boolean) => void
+    const spawnPromise = new Promise<boolean>((res) => { spawnResolve = res })
 
-    const deps = makeDeps({ launchSession: () => launchPromise })
+    const deps = makeDeps({ spawnForRoute: () => spawnPromise })
     initRestart(deps)
 
     scheduleRestart('C_TEST1', '/cwd/test')
@@ -362,7 +373,7 @@ describe('isRestartPendingOrActive', () => {
     expect(isRestartPendingOrActive('C_TEST1')).toBe(true)
     expect(isRestartPendingOrActive('C_TEST2')).toBe(false)
 
-    launchResolve(true)
+    spawnResolve(true)
     await Bun.sleep(1)
   })
 
@@ -420,7 +431,7 @@ describe('hasReachedMaxFailures', () => {
   })
 
   test('returns false after fewer than MAX_CONSECUTIVE_FAILURES failures', async () => {
-    const deps = makeDeps({ launchSessionResult: false })
+    const deps = makeDeps({ spawnForRouteResult: false })
     initRestart(deps)
 
     for (let i = 0; i < MAX_CONSECUTIVE_FAILURES - 1; i++) {
@@ -432,7 +443,7 @@ describe('hasReachedMaxFailures', () => {
   })
 
   test('returns true after exactly MAX_CONSECUTIVE_FAILURES failures', async () => {
-    const deps = makeDeps({ launchSessionResult: false })
+    const deps = makeDeps({ spawnForRouteResult: false })
     initRestart(deps)
 
     for (let i = 0; i < MAX_CONSECUTIVE_FAILURES; i++) {
@@ -444,7 +455,7 @@ describe('hasReachedMaxFailures', () => {
   })
 
   test('returns false after resetFailureCounter is called', async () => {
-    const deps = makeDeps({ launchSessionResult: false })
+    const deps = makeDeps({ spawnForRouteResult: false })
     initRestart(deps)
 
     for (let i = 0; i < MAX_CONSECUTIVE_FAILURES; i++) {
@@ -465,10 +476,10 @@ describe('hasReachedMaxFailures', () => {
 
 describe('_resetRestartState', () => {
   test('clears activeLaunches — isRestartPendingOrActive returns false after reset', async () => {
-    let launchResolve!: (ok: boolean) => void
-    const launchPromise = new Promise<boolean>((res) => { launchResolve = res })
+    let spawnResolve!: (ok: boolean) => void
+    const spawnPromise = new Promise<boolean>((res) => { spawnResolve = res })
 
-    const deps = makeDeps({ launchSession: () => launchPromise })
+    const deps = makeDeps({ spawnForRoute: () => spawnPromise })
     initRestart(deps)
 
     scheduleRestart('C_TEST1', '/cwd/test')
@@ -480,6 +491,6 @@ describe('_resetRestartState', () => {
 
     expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
 
-    launchResolve(true) // resolve to avoid dangling promise
+    spawnResolve(true) // resolve to avoid dangling promise
   })
 })

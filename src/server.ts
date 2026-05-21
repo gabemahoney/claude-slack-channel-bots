@@ -41,8 +41,19 @@ import {
 import { loadConfig, expandTilde, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
 import { recordStartupError } from './startup-errors.ts'
 import { readSessions } from './sessions.ts'
-import { defaultTmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
-import { startupSessionManager, reconcileOrphans, flushSpawnFailureQueue, spawnForRoute } from './session-manager.ts'
+import {
+  status as cliStatus,
+  kill as cliKill,
+  deleteSpawn as cliDeleteSpawn,
+} from './claude-director-cli.ts'
+import {
+  startupSessionManager,
+  reconcileOrphans,
+  flushSpawnFailureQueue,
+  spawnForRoute,
+  reconnectMcp,
+  CLAUDE_DIRECTOR_LIVE_STATES,
+} from './session-manager.ts'
 import {
   initRestart,
   scheduleRestart,
@@ -370,7 +381,7 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
         if (cwd) {
           console.error(`[slack] Session disconnected: channel=${channelId} cwd="${cwd}"`)
           const storedId = readSessions()[channelId]?.sessionId
-          scheduleRestart(channelId, cwd, storedId !== 'pending' ? storedId : undefined)
+          scheduleRestart(channelId, cwd, storedId !== 'pending' ? storedId : undefined) // TODO(E2-T8): remove sessionId parameter (claude-director owns session IDs)
         } else {
           console.error(`[slack] Session disconnected: channel=${channelId}`)
         }
@@ -1469,7 +1480,7 @@ export async function main(): Promise<void> {
             if (cwd) {
               console.error(`[slack] Session disconnected (SSE abort): channel=${channelId} cwd="${cwd}"`)
               const storedId = readSessions()[channelId]?.sessionId
-              scheduleRestart(channelId, cwd, storedId !== 'pending' ? storedId : undefined)
+              scheduleRestart(channelId, cwd, storedId !== 'pending' ? storedId : undefined) // TODO(E2-T8): remove sessionId parameter (claude-director owns session IDs)
             } else {
               console.error(`[slack] Session disconnected (SSE abort): channel=${channelId}`)
             }
@@ -1497,17 +1508,29 @@ export async function main(): Promise<void> {
   console.error(`  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:${MCP_SERVER_NAME}`)
   console.error('')
 
-  // Shared adapter: checks whether a tmux session for the given channel has Claude running.
+  // Shared adapter: calls claude-director status to determine if a spawn is alive.
   const isSessionAliveAdapter = async (channelId: string): Promise<boolean> => {
-    const cwd = routingConfig?.routes[channelId]?.cwd
-    if (!cwd) return false
-    const name = sessionName(cwd)
-    const exists = await defaultTmuxClient.hasSession(name)
-    if (!exists) return false
-    return isClaudeRunning(name, defaultTmuxClient)
+    if (!routingConfig?.routes[channelId]) return false
+    try {
+      const result = cliStatus({ channelId })
+      if (result.ok) {
+        const { state } = result.data
+        if ((CLAUDE_DIRECTOR_LIVE_STATES as Set<string>).has(state)) return true
+        if (state === 'ended' || state === 'missing') return false
+        // Unexpected state
+        console.error(`[slack] isSessionAlive: unexpected state '${state}' for channel=${channelId} — treating as dead`)
+        return false
+      }
+      if (result.error.kind === 'ErrSpawnNotFound') return false
+      console.error(`[slack] isSessionAlive: status error for channel=${channelId}: ${result.error.kind} — treating as dead`)
+      return false
+    } catch (err) {
+      console.error(`[slack] isSessionAlive: unexpected throw for channel=${channelId}:`, err)
+      return false
+    }
   }
 
-  // Initialize restart module with adapters bridging tmux + session-manager
+  // Initialize restart module with adapters bridging claude-director + session-manager
   initRestart({
     isSessionAlive: isSessionAliveAdapter,
     isSessionConnected: (channelId) => {
@@ -1515,24 +1538,22 @@ export async function main(): Promise<void> {
       return session?.connected === true
     },
     reconnectSession: async (channelId) => {
-      const cwd = routingConfig?.routes[channelId]?.cwd
-      if (!cwd) return
-      const name = sessionName(cwd)
-      await defaultTmuxClient.sendKeys(name, `/mcp reconnect ${MCP_SERVER_NAME}`)
-      await defaultTmuxClient.sendKeys(name, 'Enter')
+      await reconnectMcp(channelId, isDryRun() ? undefined : web)
     },
     killSession: async (channelId) => {
-      const cwd = routingConfig?.routes[channelId]?.cwd
-      if (!cwd) return
-      const name = sessionName(cwd)
-      const exists = await defaultTmuxClient.hasSession(name)
-      if (exists) await defaultTmuxClient.killSession(name)
+      const killResult = cliKill({ channelId })
+      if (!killResult.ok && killResult.error.kind !== 'ErrSpawnNotFound') {
+        console.error(`[slack] killSession: kill failed for channel=${channelId}: ${killResult.error.kind}`)
+      }
+      const deleteResult = cliDeleteSpawn({ channelId })
+      if (!deleteResult.ok && deleteResult.error.kind !== 'ErrSpawnNotFound') {
+        console.error(`[slack] killSession: delete failed for channel=${channelId}: ${deleteResult.error.kind}`)
+      }
     },
-    launchSession: async (channelId, cwd, _sessionId) => {
+    launchSession: async (channelId, _cwd, _sessionId) => { // TODO(E2-T8): remove sessionId parameter (claude-director owns session IDs)
       if (!routingConfig) return false
-      // Restart path: use spawnForRoute (claude-director) to relaunch.
-      // The old tmux-based launchSession has been replaced by the E2 dispatcher.
-      const result = await spawnForRoute(channelId, { cwd }, routingConfig, isDryRun() ? undefined : web)
+      if (!routingConfig.routes[channelId]) return false
+      const result = await spawnForRoute(channelId, routingConfig.routes[channelId], routingConfig, isDryRun() ? undefined : web)
       return result.action !== 'failed'
     },
     getRestartDelay: () => routingConfig?.session_restart_delay ?? 60,

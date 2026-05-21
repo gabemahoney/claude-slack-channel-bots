@@ -28,6 +28,22 @@ import { isDryRun } from './tokens.ts'
 import { type WebClient } from '@slack/web-api'
 
 // ---------------------------------------------------------------------------
+// Live-state set — reused by isSessionAliveAdapter (server.ts) and the E2-T5 poller
+// ---------------------------------------------------------------------------
+
+/**
+ * claude-director states in which a spawn is considered alive.
+ * Terminal states (ended, missing) and ErrSpawnNotFound are treated as dead.
+ */
+export const CLAUDE_DIRECTOR_LIVE_STATES = new Set([
+  'pending',
+  'waiting',
+  'working',
+  'ask_user',
+  'check_permission',
+] as const)
+
+// ---------------------------------------------------------------------------
 // JSONL existence helper (kept for resume pre-check)
 // ---------------------------------------------------------------------------
 
