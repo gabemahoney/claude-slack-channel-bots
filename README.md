@@ -238,6 +238,18 @@ If you changed `port` or `bind` in `config.json`, update the `url` here to match
 
 ---
 
+### Claude Director Template (slack-channel-bot.toml)
+
+On every server start, CSCB writes `~/.claude-director/templates/slack-channel-bot.toml`. The file is overwritten unconditionally — no merge, no diff.
+
+If the `~/.claude-director/templates/` directory tree does not exist, CSCB creates it recursively with mode `0700` on any directories it creates. CSCB does **not** modify the permissions of directories that already exist in that path.
+
+**Do not hand-edit this file.** Any local edits are silently clobbered the next time the server starts.
+
+To change what ends up in the template, edit `config.json`. The fields `mcp_config_path`, `system_prompt_mode`, and `append_system_prompt_file` flow through into the regenerated template automatically on the next boot.
+
+---
+
 ## CLI Reference
 
 The `claude-slack-channel-bots` binary exposes three subcommands.

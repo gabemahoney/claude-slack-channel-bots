@@ -55,6 +55,7 @@ import {
 import { initHealthCheck, startHealthCheck, stopHealthCheck } from './health-check.ts'
 import { loadTokens, isDryRun } from './tokens.ts'
 import { bootstrapTrust } from './trust-bootstrap.ts'
+import { writeTemplate } from './claude-director-template.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
 import { runStartupGates } from './claude-director-probe.ts'
 import { trackAck, consumeAck } from './ack-tracker.ts'
@@ -1573,6 +1574,9 @@ export async function main(): Promise<void> {
   // Start up managed tmux sessions for all configured routes.
   // If tmux is unavailable or startup fails, log a warning and continue.
   if (routingConfig) {
+    // Write the claude-director template before trust bootstrap and session manager.
+    // writeTemplate exits on failure via recordStartupError + process.exit(1).
+    writeTemplate(routingConfig)
     try {
       bootstrapTrust(routingConfig)
     } catch (err) {
