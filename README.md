@@ -409,6 +409,22 @@ The `update-config` skill can automate hook installation. It copies or symlinks 
 
 ---
 
+## Log Files
+
+### Startup error log
+
+CSCB writes startup errors to both stderr and a persistent log file at `~/.claude/channels/slack/startup-errors.log` (or `$SLACK_STATE_DIR/startup-errors.log` when `SLACK_STATE_DIR` is set). The file is opened in append mode on each run. CSCB does **not** rotate it — left unmanaged, it will grow without bound.
+
+Install the bundled logrotate snippet to rotate the file automatically:
+
+```sh
+sudo cp docs/logrotate-startup-errors.conf /etc/logrotate.d/claude-slack-channel-bots
+```
+
+The snippet at `docs/logrotate-startup-errors.conf` is a tunable starting point — adjust the rotation frequency, retention count, or compression settings to match your environment.
+
+---
+
 ## Troubleshooting
 
 **Missing environment variables**
