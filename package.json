@@ -9,7 +9,6 @@
   "files": [
     "src/*.ts",
     "!src/*.test.ts",
-    "hooks/",
     "slack-app-manifest.yml",
     "README.md",
     "skills/"

@@ -199,36 +199,6 @@ function archiveInboundMessage(event: unknown): void {
 }
 
 // ---------------------------------------------------------------------------
-// Permission relay — pending request registry
-// ---------------------------------------------------------------------------
-
-interface PendingPermission {
-  requestId: string
-  channelId: string
-  messageTs: string
-  toolName: string
-  waiters: Array<(decision: 'allow' | 'deny') => void>
-}
-
-const pendingPermissions = new Map<string, PendingPermission>()
-const completedDecisions = new Map<string, 'allow' | 'deny'>()
-
-// ---------------------------------------------------------------------------
-// AskUserQuestion relay — pending question registry
-// ---------------------------------------------------------------------------
-
-interface PendingQuestion {
-  requestId: string
-  channelId: string
-  messageTs: string
-  question: string
-  waiters: Array<(answer: string) => void>
-}
-
-const pendingQuestions = new Map<string, PendingQuestion>()
-const completedAnswers = new Map<string, string>()
-
-// ---------------------------------------------------------------------------
 // Access control — load / save / prune
 // ---------------------------------------------------------------------------
 
@@ -810,50 +780,7 @@ socket.on('interactive', async (evt) => {
       await ack()
       continue
     }
-    // result === 'not-permission' → fall through to ask_ / other handlers
-
-    // ---------------------------------------------------------------------------
-    // Handle ask_ action IDs (AskUserQuestion relay) — preserved unchanged.
-    // ---------------------------------------------------------------------------
-    // Handle ask_ action IDs (AskUserQuestion relay)
-    if (actionId.startsWith('ask_')) {
-      // Format: ask_<requestId>_<optionIndex>
-      const rest = actionId.slice('ask_'.length)
-      const lastUnderscore = rest.lastIndexOf('_')
-      if (lastUnderscore !== -1) {
-        const requestId = rest.slice(0, lastUnderscore)
-        const optionIndex = parseInt(rest.slice(lastUnderscore + 1), 10)
-        const pending = pendingQuestions.get(requestId)
-        if (pending) {
-          // Get the button text as the answer
-          const buttonText = (action as any).text?.text ?? `Option ${optionIndex + 1}`
-          completedAnswers.set(requestId, buttonText)
-          for (const waiter of pending.waiters) waiter(buttonText)
-          await ack()
-          pendingQuestions.delete(requestId)
-
-          const userId = ((p['user'] as Record<string, unknown> | undefined)?.['id'] as string | undefined) ?? ''
-          const userName = userId ? await resolveUserName(userId) : 'unknown'
-          try {
-            await web.chat.update({
-              channel: pending.channelId,
-              ts: pending.messageTs,
-              text: `${pending.question} — "${buttonText}" selected by ${userName}`,
-              blocks: [{
-                type: 'section',
-                text: {
-                  type: 'mrkdwn',
-                  text: `❓ *${pending.question}*\n✅ _"${buttonText}"_ — selected by ${userName}`,
-                },
-              }],
-            })
-          } catch (err) {
-            console.error('[slack] /ask: chat.update failed:', err)
-          }
-          return
-        }
-      }
-    }
+    // result === 'not-permission' → fall through to other handlers
   }
   await ack()
 })
@@ -1047,57 +974,6 @@ export async function main(): Promise<void> {
       const url = new URL(req.url)
       const mcpSid = req.headers.get('mcp-session-id')
       console.error(`[slack] HTTP ${req.method} ${url.pathname} session=${mcpSid ?? '(none)'}`)
-
-      // -----------------------------------------------------------------------
-      // /permission — permission relay endpoint (POST + GET long-poll)
-      // -----------------------------------------------------------------------
-      if (url.pathname === '/permission' || url.pathname.startsWith('/permission/')) {
-        // Reject non-GET/POST methods on /permission paths
-        if (req.method !== 'POST' && req.method !== 'GET') {
-          return new Response('Method Not Allowed', { status: 405 })
-        }
-
-        // Validate request from localhost
-        const remoteAddr = server.requestIP(req)
-        const remoteHost = remoteAddr?.address ?? ''
-        if (remoteHost !== '127.0.0.1' && remoteHost !== '::1' && !remoteHost.startsWith('::ffff:127.')) {
-          return new Response('Forbidden', { status: 403 })
-        }
-
-        // GET /permission/<requestId> — E5: legacy long-poll; fail-closed deny immediately.
-        // The poller (SR-2.1) is now the source of truth. E2-T6 deletes this route.
-        if (req.method === 'GET' && url.pathname.startsWith('/permission/')) {
-          console.warn('[slack] /permission GET: legacy route invoked — claude-director migration in progress; returning fail-closed deny. Disable hooks/permission-relay.sh in ~/.claude/settings.json. See README Migration section.')
-          return new Response(JSON.stringify({ status: 'decided', decision: 'deny' }), {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' },
-          })
-        }
-
-        // POST /permission — E5: legacy route; fail-closed deny immediately. No map mutation, no postMessage.
-        // The poller (SR-2.1) is now the source of truth. E2-T6 deletes this route.
-        if (req.method !== 'POST') {
-          return new Response('Method Not Allowed', { status: 405 })
-        }
-        console.warn('[slack] /permission: legacy route invoked — claude-director migration in progress; returning fail-closed deny. Disable hooks/permission-relay.sh in ~/.claude/settings.json. See README Migration section.')
-        return new Response(JSON.stringify({ status: 'decided', decision: 'deny' }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        })
-      }
-
-      // -----------------------------------------------------------------------
-      // /ask — AskUserQuestion relay endpoint (E5: legacy; 410 Gone)
-      // E2-T6 deletes this route. AUQ is denied at template; claude-director owns.
-      // -----------------------------------------------------------------------
-      if (url.pathname === '/ask' || url.pathname.startsWith('/ask/')) {
-        console.warn('[slack] /ask: legacy route invoked — claude-director migration in progress. AskUserQuestion is disabled. Disable hooks/permission-relay.sh in ~/.claude/settings.json. See README Migration section.')
-        return new Response(
-          JSON.stringify({ error: 'Gone: /ask endpoint removed. AskUserQuestion is now handled via claude-director. See README Migration section.' }),
-          { status: 410, headers: { 'Content-Type': 'application/json' } },
-        )
-      }
-
 
       // -----------------------------------------------------------------------
       // /interject — inject a message into an active session from localhost

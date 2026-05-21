@@ -37,11 +37,9 @@ See the sections below for manual configuration details if you prefer not to use
 ## Prerequisites
 
 - [Bun](https://bun.sh) v1.0+
-- [tmux](https://github.com/tmux/tmux) (required for server-managed sessions)
 - [Claude Code](https://claude.ai/code) installed and authenticated
 - [claude-director](https://github.com/gabemahoney/claude-director#install) installed and on your `PATH` (required for spawning and relaying bot sessions; CSCB probes for it at startup and refuses to start if it is missing)
 - `ss` from [iproute2](https://github.com/iproute2/iproute2) on your `PATH` (required for session ID discovery; pre-installed on most Linux distributions)
-- `curl` and `jq` on your `PATH` (required for the permission relay hooks)
 - Slack workspace admin access (to create and configure the Slack app)
 - **cozempic** (optional) — Python 3.10+ and `pip install cozempic` — enables session file cleaning before `--resume` for faster load times
 
@@ -148,7 +146,7 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | `port` | number | `3100` | Port the HTTP server listens on. |
 | `session_restart_delay` | number | `60` | Seconds to wait before auto-restarting a dead session. Set to `0` to disable auto-restart. Must be non-negative. |
 | `health_check_interval` | number | `120` | Seconds between periodic liveness polls. Set to `0` to disable. Must be non-negative. |
-| `exit_timeout` | number | `120` | Seconds to wait for a managed Claude Code session to exit gracefully during `clean_restart` before force-killing its tmux session. |
+| `exit_timeout` | number | `120` | Seconds to wait for a managed Claude Code session to exit gracefully during `clean_restart` before force-killing it via `claude-director kill`. |
 | `stop_timeout` | number | `30` | Seconds to wait for the server process to exit after `SIGTERM` before escalating to `SIGKILL`. |
 | `mcp_config_path` | string | `~/.claude/slack-mcp.json` | Path to the MCP config file passed to Claude Code when launching managed sessions. |
 | `append_system_prompt_file` | string | — | Path to a file appended to every managed session's system prompt via `--append-system-prompt-file`. Missing file silently skipped. See `skills/EXAMPLE_CLAUDE.md` for a template. |
@@ -270,7 +268,7 @@ Checks prerequisites, then daemonizes the server.
 
 **Prerequisite checks (in order):**
 
-1. `tmux` is on `PATH` — fails with `missing prerequisite: tmux` if not found.
+1. `claude-director` is on `PATH` — fails with `missing prerequisite: claude-director` if not found.
 2. `SLACK_BOT_TOKEN` is set — fails with `missing prerequisite: SLACK_BOT_TOKEN environment variable` if absent.
 3. `SLACK_APP_TOKEN` is set — fails with `missing prerequisite: SLACK_APP_TOKEN environment variable` if absent.
 4. `config.json` exists at `STATE_DIR/config.json` — fails with the full path if not found.
@@ -299,7 +297,7 @@ Gracefully exits all managed Claude Code sessions, then stops and starts the ser
 claude-slack-channel-bots clean_restart
 ```
 
-For each session in `sessions.json`, sends `/exit` to the tmux session and polls until Claude exits. All sessions are processed in parallel. If a session does not exit within `exit_timeout` seconds (default 120s), its tmux session is force-killed. Individual session errors are logged and do not abort the restart. After the server restarts, sessions are relaunched using the stored session IDs in `sessions.json`. When `resume_enabled` is `true` (the default), sessions resume with `--resume`, preserving conversation context. When `resume_enabled` is `false`, sessions always launch fresh without `--resume`.
+For each active session, issues a `claude-director pause` request and polls until the spawn exits. All sessions are processed in parallel. If a session does not exit within `exit_timeout` seconds (default 120s), CSCB escalates to `claude-director kill` on that spawn. Individual session errors are logged and do not abort the restart. After the server restarts, sessions are relaunched using the stored session IDs in `sessions.json`. When `resume_enabled` is `true` (the default), sessions resume with `--resume`, preserving conversation context. When `resume_enabled` is `false`, sessions always launch fresh without `--resume`.
 
 Behavior by case:
 
@@ -398,67 +396,7 @@ On success, returns HTTP 200:
 
 ## Permission Relay
 
-When Claude Code requires tool approval, the permission relay surfaces an interactive Slack message with **Allow** and **Deny** buttons instead of blocking the TUI. The Claude Code hook POSTs the pending request to the server, then long-polls for the user's response. Once the user clicks a button, the result is returned to Claude Code and execution continues.
-
-The `ask-relay.sh` hook intercepts `AskUserQuestion` tool calls via `PreToolUse`, posts the question and its options to Slack as interactive buttons, and waits for the user's selection. The answer is returned to Claude Code via `updatedInput` without blocking the TUI.
-
-Both hooks are **scope-guarded**: they check the `CLAUDE_MANAGED_CHANNEL` environment variable, which is set as an inline env var (no `export`) on the `claude` command at launch. If the variable is absent, the hooks exit silently (no-op). This means installing the hooks globally in `settings.json` is safe — they will not activate for Claude sessions you run outside the bot. If the variable is present but the server is unreachable, hooks fail closed (deny the tool call) to prevent indefinite hangs in headless sessions.
-
-Both hooks use a **two-phase long-poll protocol**:
-
-1. **Phase 1 — Create request:** The hook POSTs to `/permission` (or `/ask`) with the tool name, input, and channel ID (from `$CLAUDE_MANAGED_CHANNEL`). The server posts an interactive Slack message and returns a `requestId`.
-2. **Phase 2 — Long-poll:** The hook GETs `/permission/{requestId}` (or `/ask/{requestId}`) in a loop with a 90-second `curl` timeout. The server holds the connection for up to 60 seconds waiting for a button click, then returns `{"status":"pending"}` if no decision has arrived. The hook retries immediately. Once the user clicks, the server returns `{"status":"decided","decision":"allow"|"deny"}` and the hook exits.
-
-### Slack app prerequisites
-
-The Slack app must have **interactivity enabled** with **Socket Mode** as the delivery method. Without this, button-click payloads are never delivered and the relay will not work.
-
-To enable it: open your Slack app config → **Interactivity & Shortcuts** → toggle **Interactivity** on. No Request URL is needed — Socket Mode delivers interaction payloads over the existing socket connection. This is included automatically if you created the app from `slack-app-manifest.yml`.
-
-### Hook installation
-
-1. Copy the hook scripts from the repo to `~/.claude/hooks/`:
-
-   ```sh
-   cp hooks/permission-relay.sh hooks/ask-relay.sh ~/.claude/hooks/
-   chmod +x ~/.claude/hooks/permission-relay.sh ~/.claude/hooks/ask-relay.sh
-   ```
-
-   Alternatively, symlink them so updates to the repo are reflected automatically:
-
-   ```sh
-   ln -sf /path/to/repo/hooks/permission-relay.sh ~/.claude/hooks/permission-relay.sh
-   ln -sf /path/to/repo/hooks/ask-relay.sh ~/.claude/hooks/ask-relay.sh
-   ```
-
-2. Ensure `curl` and `jq` are on your `PATH`.
-
-3. Add the following to your Claude Code `settings.json`:
-
-   ```jsonc
-   "PermissionRequest": [
-     {
-       "matcher": ".*",
-       "timeout": 2000000,
-       "hooks": [{ "type": "command", "command": "~/.claude/hooks/permission-relay.sh" }]
-     }
-   ],
-   "PreToolUse": [
-     {
-       "matcher": "AskUserQuestion",
-       "timeout": 2000000,
-       "hooks": [{ "type": "command", "command": "~/.claude/hooks/ask-relay.sh" }]
-     }
-   ]
-   ```
-
-   `permission-relay.sh` relays tool permission requests (Allow/Deny) to Slack via `PermissionRequest`. `ask-relay.sh` relays `AskUserQuestion` calls to Slack via `PreToolUse`, returning the user's selection without blocking the TUI.
-
-Both hooks auto-detect the server port from `config.json`. They read `${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/config.json` and use the `port` field (defaulting to `3100`), so they stay in sync if you change the port in routing config.
-
-### Setup skill
-
-The `update-config` skill can automate hook installation. It copies or symlinks the hooks and writes the `settings.json` entries in one step — use it if you prefer not to configure hooks manually.
+Permission relay is described in `docs/architecture.md` (see the Permission Relay section). E2-T7 will expand this section with the full architecture and migration notes.
 
 ---
 
@@ -496,13 +434,27 @@ After inviting the bot to a channel, Slack may not deliver messages until the bo
 Messages to channels not listed in `access.json → channels` and not present in `config.json → routes` are silently dropped. Use the `claude-slack-channels-config` skill or edit `access.json` directly to add the channel ID with a `ChannelPolicy` entry.
 
 **Permission relay not working**
-Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify `curl` and `jq` are on your `PATH`. Confirm the hook scripts are executable (`chmod +x`). If the port was changed in `config.json`, ensure `SLACK_STATE_DIR` is set correctly so the hooks can read the updated port. If the hooks are silently doing nothing, confirm the session was launched by the server — the hooks check the `CLAUDE_MANAGED_CHANNEL` env var and exit silently if it is not set. Sessions launched manually will not have this variable and will not trigger the relay.
+Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Without this, button-click payloads are never delivered over Socket Mode and the relay will not work. See `docs/architecture.md` (Permission Relay section) for full setup details.
 
 **Session not restarting after crash**
 After 3 consecutive launch failures for a route, auto-restart is suspended until the server is restarted. Restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`. To disable auto-restart entirely, set `session_restart_delay` to `0` in `config.json`.
 
 **Session stuck during clean_restart**
-If a session does not exit within `exit_timeout` seconds (default 120s), `clean_restart` force-kills its tmux session and proceeds. To manually recover, run `tmux kill-session -t <session-name>` for any remaining sessions, then `claude-slack-channel-bots stop && claude-slack-channel-bots start`.
+`clean_restart` uses `claude-director pause` to request a graceful exit and polls until the spawn exits. If the session does not exit within `exit_timeout` seconds (default 120s), CSCB escalates to `claude-director kill` on that spawn and proceeds.
+
+To manually inspect a stuck session, check the spawn list and status:
+
+```sh
+claude-director list --label service=cscb
+claude-director status --claude-instance-id cscb_<channelId>
+```
+
+If a spawn is still live after the restart, kill it manually and let the next `start` recover via orphan reconciliation and `spawnForRoute`:
+
+```sh
+claude-director kill --claude-instance-id cscb_<channelId>
+claude-slack-channel-bots stop && claude-slack-channel-bots start
+```
 
 **Session crashes on resume with "sandbox required but unavailable"**
 This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json` to disable `--resume` entirely — the bot will always start a fresh Claude session instead of resuming a prior conversation, both on startup and on runtime auto-restart:
