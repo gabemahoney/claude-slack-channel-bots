@@ -151,5 +151,7 @@ export async function installSlackChannelBotTemplate(
       `Failed to install agent-director template '${params.name}'. Detail: ${detail}`,
     )
     d.exit(1)
+    // unreachable; placates TS when exit() is mocked in tests
+    return { path: '' }
   }
 }

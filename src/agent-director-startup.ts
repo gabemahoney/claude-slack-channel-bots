@@ -315,7 +315,9 @@ export async function runAgentDirectorStartupGate(
   const outcome = await runStartupGate(deps)
   if (!outcome.ok) {
     d.recordStartupError(outcome.classLabel, outcome.message)
-    d.exit(1)
+    d.exit(1) // never returns; the cast below silences TS narrowing
+    // unreachable; satisfies TS when exit() is mocked in tests
+    return { client: null, adVersion: '' }
   }
   return { client: outcome.client, adVersion: outcome.adVersion }
 }
