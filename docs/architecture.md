@@ -7,27 +7,31 @@ The Slack Channel Router is a two-way bridge between Slack and Claude Code sessi
 ## Module Map
 
 ```
-cli.ts                  CLI entry point for the claude-slack-channel-bots command, dispatches start/stop/clean_restart subcommands, performs prerequisite checks, thin wrapper around server.ts main()
-└── server.ts           Main entry point — HTTP server, Socket Mode, session lifecycle, message routing
-    ├── config.ts           Routing configuration — load, validate, defaults, tilde expansion
-    ├── registry.ts         Session registry — pending/registered sessions, MCP Server factory, transport routing
-    ├── lib.ts              Pure utilities — gate, access control, chunking, sanitization
-    ├── logging.ts          Log file setup — overrides console.error/console.log with timestamped writeSync to a log file
-    ├── session-manager.ts  Startup orchestration — per-route state detection, kill/relaunch logic
-    ├── restart.ts          Auto-restart — delayed relaunch on disconnect, failure counting, timer cancellation
-    ├── health-check.ts     Periodic liveness poller — checks routes on a timer, schedules restarts for dead sessions
-    ├── tmux.ts             TmuxClient interface and defaultTmuxClient — tmux shell ops, isClaudeRunning
-    ├── sessions.ts         sessions.json I/O — readSessions/writeSessions, SessionRecord, SessionsMap
-    ├── pid.ts              PID file management — write, read, conflict detection, isProcessRunning
-    ├── peer-pid.ts         Post-call session ID discovery — getPeerPidByPort (ss -tnp) + getSessionIdForPid (~/.claude/sessions/<pid>.json)
-    ├── cozempic.ts         Optional cozempic CLI integration: PATH check, JSONL path resolution, file size helpers, async session cleaner
-    ├── tokens.ts           Token loading — reads SLACK_BOT_TOKEN/SLACK_APP_TOKEN from env, validates prefixes
-    ├── ack-tracker.ts      In-memory ack reaction state — Map keyed by channelId:messageTs, trackAck/consumeAck API, 30-day expiry pruning
-    ├── message-archive.ts  Optional SQLite archive of every inbound Slack message — opened when `message_archive_db` is set in config, writes fire-and-forget from socket.on('message'|'app_mention'), schema compatible with the Python nightly backfill script
-    └── hooks/
-        ├── permission-relay.sh   PermissionRequest hook — POST + long-poll for Allow/Deny
-        └── ask-relay.sh          AskUserQuestion hook — POST + long-poll for option selection
+cli.ts                          CLI entry point — start/stop/clean_restart subcommands. clean_restart uses agent-director pause/kill/status verbs (SR-11 Event 12).
+└── server.ts                   Main entry point — HTTP server, Socket Mode, message routing. Embeds the SR-5.1 startup gate, SR-3.2 template install, SR-1.6 orphan reconcile, SR-2.1 poller.
+    ├── config.ts               Routing configuration — load, validate, defaults, tilde expansion. SR-4.1 agent_director_poll_interval_ms field. SR-4.2 unknown-field rejection.
+    ├── registry.ts             Session registry — pending/registered sessions, MCP Server factory, transport routing. No session-id discovery (AD owns it).
+    ├── lib.ts                  Pure utilities — gate, access control, chunking, sanitization.
+    ├── logging.ts              Log file setup — overrides console.error/console.log with timestamped writeSync to a log file.
+    ├── startup-errors.ts       SR-5.1a startup-errors log — append-only to ~/.claude/channels/slack/startup-errors.log + stderr.
+    ├── agent-director-client.ts   SR-0.1 singleton Client wrapper. getClient()/closeClient(); MIN_AD_VERSION sourced from package.json.
+    ├── agent-director-errors.ts   SR-0.2 typed Err* re-exports for instanceof branching.
+    ├── agent-director-startup.ts  SR-5.1 startup gate — import / construct Client / version probe / same-user stat.
+    ├── agent-director-template.ts SR-3.1 / SR-3.2 — builds the slack-channel-bot MakeTemplateParams and calls client.makeTemplate({ overwrite: true }) at boot.
+    ├── session-manager.ts      SR-1 in full — spawnForRoute (SR-1.4 collision-then-act), reconcileOrphans (SR-1.6), reconnectMcp/waitForWaitingAndReconnect, postSpawnFailureToChannel.
+    ├── permission-poller.ts    SR-2.1 polling loop + SR-2.2 Block Kit emitter. Owns the live LivePermission map shared with the click handler.
+    ├── permission-click-handler.ts  SR-2.2 click → decide path; coordinates with the poller via finalizedAt claim window.
+    ├── permission-action-id.ts SR-2.2 encode/decode helpers; anchored-regex parser (SR-8.6).
+    ├── restart.ts              Auto-restart — delayed relaunch on disconnect, failure counting, timer cancellation.
+    ├── health-check.ts         Periodic liveness poller — checks routes on a timer via client.status; schedules restarts for dead sessions.
+    ├── pid.ts                  PID file management — write, read, conflict detection, isProcessRunning.
+    ├── cozempic.ts             Optional cozempic CLI integration — path resolution helpers retained for downstream callers.
+    ├── tokens.ts               Token loading — reads SLACK_BOT_TOKEN/SLACK_APP_TOKEN from env, validates prefixes.
+    ├── ack-tracker.ts          In-memory ack reaction state.
+    └── message-archive.ts      Optional SQLite archive of every inbound Slack message.
 ```
+
+The deleted files from the pre-Epic-2 architecture (`src/tmux.ts`, `src/peer-pid.ts`, `src/sessions.ts`, `hooks/permission-relay.sh`, `hooks/ask-relay.sh`) are absent: agent-director owns the tmux integration and Claude session-id state, the SR-2.1 poller replaces the hook-based long-poll relay, and AskUserQuestion is denied at the template level (SR-3.1).
 
 ## Data Flow
 
@@ -46,26 +50,18 @@ cli.ts                  CLI entry point for the claude-slack-channel-bots comman
 3. Tool calls the Slack Web API (`web.chat.postMessage`, `web.reactions.add`, etc.)
 4. After the first chunk posts, if `message_id` was provided and `consumeAck(channelId, messageTs)` finds a tracked entry, the ack reaction is removed via `reactions.remove`
 
-### Permission Relay
+### Permission Relay (SR-2)
 
-1. Claude Code hits a permission prompt → `PermissionRequest` hook fires
-2. `permission-relay.sh` checks `$CLAUDE_MANAGED_CHANNEL` — if unset, exits silently (not a managed session)
-3. Hook POSTs to `/permission` with the channel ID directly → server posts Block Kit message to Slack
-4. Hook long-polls `GET /permission/<requestId>` (60s per poll)
-5. User clicks Allow/Deny button → Socket Mode interactive event → server resolves the decision
-6. Hook returns decision to Claude Code
-7. **Fail-closed**: if the server is unreachable or returns an error, the hook emits a deny response rather than falling through to terminal (which would hang in a headless tmux session)
+Driven by polling against the agent-director Client + Block Kit click → `decide()`. The previous HTTP long-poll + hook script architecture has been deleted.
 
-### AskUserQuestion Relay
+1. agent-director moves a spawn into `check_permission` when Claude requests a tool permission. CSCB's poller (`permission-poller.ts`) runs `client.list({ state: ['check_permission'], label: ['service=cscb'] })` every `agent_director_poll_interval_ms` (default 1000 ms).
+2. For each newly-seen `claude_instance_id`, `client.get(...)` returns the row's typed `permission_request` payload (`tool_name`, raw-JSON `tool_input`, integer `request_id`). The poller posts the SR-2.2 Block Kit message to the channel from the spawn's `channel` label and records the live entry `(messageTs, channelId, request_id)`.
+3. Action IDs follow SR-2.2's shape `perm_(allow|deny)_<claude_instance_id>_<request_id>` (parsed by the anchored regex in `permission-action-id.ts`).
+4. On click, `permission-click-handler.ts` claims the live entry (`finalizedAt = now()`), `client.get(...)` to verify the encoded `request_id` still matches the open prompt's, calls `client.decide({ claude_instance_id, decision })`, and `chat.update`s the Slack message to "Allowed/Denied by <user>". `ErrAlreadyDecided` is treated as success.
+5. If a tracked instance drops out of the next list result (timeout / external decide / crash) and the `finalizedAt` claim is older than 30 s, the poller `chat.update`s the message to "expired" and removes the buttons.
+6. Slack-side UX (Block Kit structure, decision-update text) is byte-identical to the pre-Epic-2 implementation. Only the action_id shape and the polling/decide machinery differ.
 
-Same pattern as permission relay but via `PreToolUse` hook on `AskUserQuestion`:
-1. `ask-relay.sh` checks `$CLAUDE_MANAGED_CHANNEL` — if unset, exits silently
-2. Hook intercepts via PreToolUse → POSTs question + options + channel ID to `/ask`
-3. Server posts Block Kit message with option buttons
-4. Hook long-polls `GET /ask/<requestId>`
-5. User clicks option → server resolves
-6. Hook returns `allow` with `updatedInput.answers` containing the user's selection
-7. **Fail-closed**: same deny-on-error behavior as the permission hook
+AskUserQuestion is denied at the agent-director template (SR-3.1's `deny: ['AskUserQuestion']`) — the tool is unavailable to every CSCB-spawned bot and the prior `/ask` HTTP route + hook script have been removed.
 
 ## Session Lifecycle
 
@@ -77,43 +73,30 @@ Same pattern as permission relay but via `PreToolUse` hook on `AskUserQuestion`:
 4. Session receives messages from its assigned Slack channel
 5. A keep-alive timer is started (`startSseKeepAlive`) that writes SSE comment frames (`:ping\n\n`) every ~30 s to prevent idle connection drops from proxies or load balancers
 
-### Server-Managed Startup
+### Server-Managed Startup (SR-11 Event 1)
 
-Called from `main()` in `server.ts`. `rotateSessions()` runs as the very first action, renaming `sessions.json` → `sessions.json.last` to preserve last-known session IDs before any state is overwritten.
+Called from `main()` in `server.ts`. The order is:
 
-1. **Rotate sessions** — `rotateSessions()` renames `sessions.json` → `sessions.json.last`. If `sessions.json` does not exist, this is a no-op.
-2. **Read stored IDs** — `sessions.json.last` is read via `readSessions(lastPath)` to obtain the previous session IDs used for `--resume` logic.
-3. **tmux availability check** — `startupSessionManager()` calls `tmuxClient.checkAvailability()` (`tmux -V`). If tmux is not installed, startup is skipped with a warning and the server continues.
-4. **Concurrent route launch** — all routes are processed concurrently via `Promise.allSettled`. Each route applies a three-branch decision tree:
-   - **Reconnect** — tmux session exists AND `isClaudeRunning()` returns true → send `/mcp reconnect <server-name>` (from `MCP_SERVER_NAME` in `config.ts`) to the running session; the stored `sessionId` from `sessions.json.last` is carried forward (or `"pending"` if absent); no relaunch
-   - **Resume** — dead or missing process with a stored `sessionId` in `sessions.json.last` AND `resume_enabled` is `true` (default) → verify `~/.claude/projects/<slug>/<sessionId>.jsonl` exists; if the file is absent, fall through to **Fresh** immediately (no tmux launch attempted); otherwise kill any stale tmux session, call `cleanSession()` if cozempic is available (cleans the JSONL file before resume to reduce load times), then call `launchSession()` with the stored session ID (passes `--resume <id>` to Claude). If `resume_enabled` is `false`, this branch is bypassed entirely and the route falls through to **Fresh** regardless of the stored session ID.
-   - **Fresh** — dead or missing process without a stored session ID, or `resume_enabled` is `false` → kill any stale tmux session, call `launchSession()` with no session ID
-5. **Atomic sessions.json write** — after all routes settle, results are collected into a `SessionsMap` and written atomically via `writeSessions()`. This is the only write to `sessions.json` during startup.
-6. **Launch flow** (`launchSession()`) — signature: `(channelId, cwd, routingConfig, tmuxClient, options?) → Promise<SessionRecord | null>`:
-   - `tmuxClient.newSession(name, cwd)` creates a detached tmux session
-   - If `options.cleanSession` is provided and `options.sessionId` is set, `cleanSession()` is called before the tmux launch to clean the JSONL file (cozempic integration; no-op if cozempic is not installed)
-   - The `claude` CLI command is launched with an inline `CLAUDE_MANAGED_CHANNEL=<channelId>` env var prefix. This propagates to child processes (including subagents) but not to tmux split-panes or separate sessions. Hook scripts check this variable to identify managed sessions and route permissions to the correct Slack channel. When a per-route `routes[id].claude_config_dir` is set (or, as a fallback, the top-level `claude_config_dir`), `CLAUDE_CONFIG_DIR='<resolved-path>'` is added to the same prefix so different routes can authenticate against different on-disk Claude accounts. The path is `~`-expanded, resolved to absolute, and single-quote-escaped before being sent to tmux.
-   - If `options.sessionId` is provided, appends `--resume <id>` to the CLI command; otherwise launches fresh
-   - If `system_prompt_mode` is `"append"` and `append_system_prompt_file` is set, appends `--append-system-prompt-file <path>` to the CLI command; if `system_prompt_mode` is `"none"`, the flag is omitted and only `CLAUDE.md` is used
-   - Polls `capturePane()` with exponential backoff (500 ms start, 2× per step, 5 s cap, 120 s total timeout) waiting for the safety prompt text
-   - On prompt found: sends Enter to acknowledge
-   - Early detection: after 5 s have elapsed since launch, each poll iteration also calls `isClaudeRunning()`; if Claude is running with no prompt (e.g. `--resume` skips the safety prompt), the session is accepted immediately
-   - **Session ID** — fresh launches write `sessionId: "pending"` immediately after the safety prompt ACK. The real UUID is discovered later, after the session's first MCP tool call, via the post-call discovery path in `registry.ts` (see [Session ID Discovery](#session-id-discovery)). Resume launches carry the stored UUID from `sessions.json.last` directly and `sessionId` is never `"pending"`.
-   - **Resume failure fallback** — if `"No conversation found"` is detected in the pane, or if the `--resume` attempt times out, the tmux session is killed, recreated, and retried once with a fresh launch (no `--resume`). Note: the JSONL pre-check in the startup decision tree gates this path — if the file is absent, startup falls through to Fresh before any tmux launch is attempted
-   - Returns a `SessionRecord` on success, or `null` on failure
+1. **SR-5.1 startup gate** — `runAgentDirectorStartupGate()` imports the library, constructs the singleton Client, runs `client.version()` + semver-gte against `MIN_AD_VERSION`, and stats `~/.agent-director/state.db` against `geteuid()`. Failure writes to `startup-errors.log` and exits non-zero.
+2. **PID conflict check** — existing `checkPidConflict(PID_FILE)` invariant. CSCB enforces one instance per host.
+3. **SR-3.2 template refresh** — `installSlackChannelBotTemplate(routingConfig)` builds the SR-3.1 `MakeTemplateParams` and calls `client.makeTemplate({ ..., overwrite: true })`. Atomic replacement is the library's responsibility (sibling-tempfile + `rename(2)`). Fatal on rejection.
+4. **SR-1.6 orphan reconciliation** — `reconcileOrphans(routingConfig)`. `client.list({ label: ['service=cscb'] })` enumerates every CSCB spawn; rows whose `channel` label is missing or not in `routingConfig.routes` are killed + deleted. Per-orphan failure logged to `startup-errors.log` but does not block.
+5. **Per-route reconcile** — `startupSessionManager(routingConfig, { concurrency: 3 })` iterates each configured route concurrently and calls `spawnForRoute` (SR-1.4 collision-then-act dispatcher):
+   - Attempt `client.spawn(SR-1.1 params)` — `template: 'slack-channel-bot'`, `relay_mode: 'on'`, `label: ['service=cscb', 'channel=<id>']`, `claude_instance_id: cscb_<channelId>`, optional `extra_env.CLAUDE_CONFIG_DIR`.
+   - On `ErrInstanceIdCollision`, call `client.get({claude_instance_id})` and branch on state per the [SR-11 substitution table](#sr-11-substitution-table):
+     - `ended` / `missing` + `resume_enabled` → `client.resume(...)`; `ErrNoSessionId` / `ErrJsonlMissing` → `client.delete(...)` + fresh `client.spawn(...)`.
+     - `ended` / `missing` + `resume_enabled=false` → `client.kill(...)` + `client.delete(...)` + fresh `client.spawn(...)`.
+     - `waiting` → `client.sendKeys({ text: '/mcp reconnect slack-channel-router' })`.
+     - `working` → poll `client.status(...)` until `waiting`, then sendKeys.
+     - `pending` / `check_permission` / `ask_user` → no-op (poller picks it up).
+   - `ErrSpawnNotFound` race after collision → single retry-spawn.
+   - Other errors → `postSpawnFailureToChannel(channelId, error)` queues a Slack-channel post (drained after `socket.start()`).
+6. **Slack auth + Socket Mode connect** — `web.auth.test()` resolves the bot user; `socket.start()` opens the WebSocket.
+7. **SR-2.1 poller start** — `startPermissionPoller({ getClient, web, intervalMs: routingConfig.agent_director_poll_interval_ms })`. Single-threaded interval loop; skipped-tick WARN at 5+ consecutive skips.
+8. **Drain pre-auth spawn-failure queue** — `flushSpawnFailureQueue(web)` posts any errors that surfaced during steps 1–5 to their configured channel.
+9. **Health-check poller** — `startHealthCheck()` begins backstop liveness checks via `client.status(...)`.
 
-### Session ID Discovery
-
-After every MCP tool call by a registered session, `registry.ts` fires a fire-and-forget async block that discovers and persists the real Claude session UUID without blocking the tool call response:
-
-1. **Peer port** — the TCP peer port of the MCP request is recorded on `SessionEntry.peerPort` before each `handleRequest()` call (via `server.requestIP(req)` in `server.ts`).
-2. **PID lookup** — `getPeerPidByPort(peerPort, serverPort)` runs `ss -tnp` and finds the Claude process PID by matching the TCP connection's local/peer port pair on the loopback interface.
-3. **Session file read** — `getSessionIdForPid(pid)` reads `~/.claude/sessions/<pid>.json` and extracts the `sessionId` string field.
-4. **Atomic write** — if the discovered UUID differs from the stored one, `sessions.json` is updated via `writeSessions()`. On the next server startup, the UUID is available immediately for `--resume`.
-
-This path is skipped if `peerPort` is 0 (not yet set), if the `ss` command fails, or if the session file does not yet exist. For resume launches the stored UUID is already correct; for fresh launches `"pending"` is replaced with the real UUID on the first successful discovery.
-
-**Object identity invariant**: the `SessionEntry` stub created by `initPendingSession` in `server.ts` — the object that `createSessionServer`'s tool handlers close over — must be the same object stored in the registry after `registerSession` promotes the pending entry. `registerSession` mutates this stub in place and stores it directly, so that the `peerPort` write from the HTTP fetch handler (step 1 above) is immediately visible to the tool handler closure. If the registry and the closure held separate objects, `peerPort` would remain 0 and peer-PID discovery would never fire.
+CSCB does NOT maintain its own `sessions.json` registry. agent-director owns Claude session-id state internally, surfaced via `client.resume(...)` and the SR-11 state machine.
 
 ### Disconnection
 
@@ -126,50 +109,80 @@ This path is skipped if `peerPort` is 0 (not yet set), if the `ss` command fails
 
 After `scheduleRestart` is called:
 
-1. **Delay check** — if `session_restart_delay` is 0, restart is skipped immediately
-2. **Failure guard** — if the channel has reached `MAX_CONSECUTIVE_FAILURES` (3), restart is abandoned
-3. **Timer** — a `setTimeout` fires after `session_restart_delay` seconds
-4. **Liveness check** — `isSessionAlive()` checks whether Claude is already running in tmux; if alive, `reconnectSession()` sends `/mcp reconnect <server-name>` to the running tmux session and returns — no relaunch needed
-5. **Kill zombie** — any dead tmux session for the channel is cleaned up (errors ignored)
-6. **Relaunch** — `launchSession()` is called with the stored `sessionId` from sessions.json if one exists, is not `"pending"`, and `resume_enabled` is `true` (default); when a real UUID is available and resume is enabled, Claude launches with `--resume <id>`, preserving conversation context across the restart. If the stored ID is absent, `"pending"`, or `resume_enabled` is `false`, a fresh launch is performed. On failure the per-channel failure counter increments.
-7. **Success reset** — when a session successfully reconnects and registers, `resetFailureCounter()` clears the counter for that channel
+1. **Delay check** — if `session_restart_delay` is 0, restart is skipped immediately.
+2. **Failure guard** — if the channel has reached `MAX_CONSECUTIVE_FAILURES` (3), restart is abandoned.
+3. **Timer** — a `setTimeout` fires after `session_restart_delay` seconds.
+4. **Liveness check** — `isSessionAlive(channelId)` calls `client.status({claude_instance_id})` and returns true when the state is in `AGENT_DIRECTOR_LIVE_STATES`; `ErrSpawnNotFound` → dead. If alive, `reconnectSession()` calls `reconnectMcp(channelId)` which sends `/mcp reconnect slack-channel-router` via `client.sendKeys(...)`.
+5. **Kill zombie** — `client.kill({claude_instance_id})` is best-effort; `ErrSpawnNotFound` is ignored.
+6. **Relaunch** — `launchSession(channelId, cwd, routingConfig)` collapses `spawnForRoute`'s richer outcome to a boolean. Resume vs fresh is decided by the SR-1.4 collision-then-act dispatch (no separate `sessionId` arg from CSCB — agent-director owns resume state). On failure the per-channel failure counter increments.
+7. **Success reset** — when a session successfully reconnects and registers, `resetFailureCounter()` clears the counter for that channel.
 
 ### Health-Check Poller
 
-A periodic backstop that runs alongside the reactive disconnect path. Where `onsessionclosed` handles restarts after MCP disconnects, the health-check poller catches sessions that die without triggering a close event (e.g., a tmux session killed externally).
+A periodic backstop that runs alongside the reactive disconnect path. Where `onsessionclosed` handles restarts after MCP disconnects, the health-check poller catches sessions that die without triggering a close event (e.g., an externally-killed tmux session).
 
 On each tick:
 
 1. **Route iteration** — for each `channelId`/`cwd` pair in `routingConfig.routes`:
-   - **Skip if restart pending/active** — `isRestartPendingOrActive(channelId)` returns true; a relaunch is already in flight
-   - **Skip if max failures reached** — `hasReachedMaxFailures(channelId)` returns true; the channel has been abandoned
-   - **Liveness check** — `isClaudeRunning()` via `tmux.ts` checks whether Claude is alive in the session's tmux window
-2. **Dead session** — if the liveness check fails, `scheduleRestart(channelId, cwd)` is called, delegating to the same restart path used by `onsessionclosed`
+   - **Skip if restart pending/active** — `isRestartPendingOrActive(channelId)` returns true; a relaunch is already in flight.
+   - **Skip if max failures reached** — `hasReachedMaxFailures(channelId)` returns true; the channel has been abandoned.
+   - **Liveness check** — `isSessionAlive(channelId)` calls `client.status({claude_instance_id})`; the state is checked against `AGENT_DIRECTOR_LIVE_STATES`.
+2. **Dead session** — if the liveness check fails, `scheduleRestart(channelId, cwd)` is called, delegating to the same restart path used by `onsessionclosed`.
 
 The interval is controlled by `health_check_interval` in `config.json`. If the value is `0`, `startHealthCheck()` returns immediately and no interval is created. `stopHealthCheck()` clears the interval during graceful shutdown, before `cancelAllRestartTimers()` runs.
 
-**Ordering invariant**: `startHealthCheck()` is called only after `startupSessionManager()` returns and `sessions.json` has been written. `Promise.allSettled` in startup ensures all route launches have settled before the health-check poller begins. Moving `startHealthCheck()` earlier in the startup sequence would risk the poller racing with in-progress launches.
+**Ordering invariant**: `startHealthCheck()` is called only after `startupSessionManager()` returns. Moving it earlier in the startup sequence would risk the poller racing with in-progress launches.
 
 ### stop command
 
 `stop` (CLI subcommand) sends SIGTERM to the running server via the PID file at `STATE_DIR/server.pid`. If the process does not exit within `stop_timeout` seconds (default 30 s, configurable in `config.json`), a SIGKILL is sent. A brief 2 s confirmation poll follows the SIGKILL. Stale PID files (process no longer running) are silently removed. A non-zero exit from this phase causes `stop` to exit 1.
 
-### clean_restart
+### clean_restart (SR-11 Event 12)
 
-`clean_restart` (CLI subcommand) stops the server daemon first, then concurrently exits all managed Claude Code sessions, then starts a fresh server. The stop-first ordering prevents the health-check poller and auto-restart logic from interfering with session teardown. It logs to `STATE_DIR/clean_restart.log` via `initLogging()` (see [Logging](#logging)). `CliDeps` is extended with injectable tmux operations (`hasSession`, `sendKeys`, `isClaudeRunning`, `killSession`) and a `loadConfig` function for route and timeout discovery.
+`clean_restart` (CLI subcommand) stops the server daemon first, then concurrently pauses every managed Claude Code spawn via agent-director, then starts a fresh server. The stop-first ordering prevents the health-check poller and auto-restart logic from interfering with the teardown. It logs to `STATE_DIR/clean_restart.log` via `initLogging()`. `CliDeps` exposes injectable `directorStatus`, `directorPause`, and `directorKill` adapters (the production implementations call `getClient().status/pause/kill`).
 
 Algorithm:
 
-1. **Init logging + load config** — `initLogging()` redirects output to `clean_restart.log`. `loadConfig()` reads `config.json` and provides the `routes` map and `exit_timeout` value used in subsequent phases. Config load failure is fatal.
-2. **Stop server daemon** — shells out to `claude-slack-channel-bots stop`, which sends SIGTERM and escalates to SIGKILL after `stop_timeout` (see [stop command](#stop-command)).
-3. **Exit sessions** — iterates `routingConfig.routes`. For each route, `sessionName(route.cwd)` derives the tmux session name. `hasSession()` and `isClaudeRunning()` gate the attempt; if either check fails the session is skipped. All routes are fanned out in parallel via `Promise.allSettled`. Per-session errors are caught and logged; they never abort the restart.
-4. **Force-kill on timeout** — within each per-session goroutine, `/exit` + Enter is sent as a single atomic `sendKeys` call. `isClaudeRunning()` is then polled with exponential backoff (500 ms start, doubles each step, 5 s cap) for up to `exit_timeout` seconds (default 120 s). If the session does not exit within the timeout, `killSession()` is called.
+1. **Init logging + load config** — `initLogging()` redirects output to `clean_restart.log`. `loadConfig()` provides the `routes` map and `exit_timeout`. Config load failure is fatal.
+2. **Stop server daemon** — shells out to `claude-slack-channel-bots stop`, which sends SIGTERM and escalates to SIGKILL after `stop_timeout`.
+3. **Per-route precheck** — `directorStatus(channelId)` returns `null` on `ErrSpawnNotFound` (no row → skip); terminal states (`ended`, `missing`) → skip; otherwise proceed.
+4. **Pause + poll** — `directorPause(channelId)` is called; if it rejects, escalate immediately to `directorKill(channelId)`. After a successful pause, `directorStatus(channelId)` is polled with exponential backoff (100 ms start, capped at 2 s, total budget `exit_timeout`). The first poll observing `null` / `ended` / `missing` is treated as clean exit. If the budget is exhausted, `directorKill(channelId)` force-terminates the spawn.
 5. **Start new server daemon** — shells out to `claude-slack-channel-bots start`.
 6. **Exit** — a non-zero exit code from `start` is propagated and the process exits with that code.
 
-### Graceful Shutdown
+Per-channel polling cadence (100 ms → 2 s cap, `exit_timeout` total) is unrelated to the SR-2.1 permission poller's `agent_director_poll_interval_ms`.
 
-On `SIGTERM` or `SIGINT`, the shutdown handler calls `stopAllKeepAliveTimers()` and `cancelAllRestartTimers()` before tearing down Socket Mode and the HTTP server. All pending keep-alive and restart timers are cleared so no work fires during shutdown. The PID file (`STATE_DIR/server.pid`) is removed as the final step of shutdown.
+### Graceful Shutdown (SR-11 Event 11)
+
+On `SIGTERM` or `SIGINT`, the shutdown handler:
+1. Flips the `shuttingDown` flag (idempotent guard).
+2. Calls `stopPermissionPoller()` to stop the SR-2.1 tick.
+3. Calls `stopHealthCheck()`, `cancelAllRestartTimers()`, `stopAllKeepAliveTimers()`.
+4. Stops the HTTP server, drains pending + active MCP transports.
+5. Disconnects Socket Mode.
+6. Calls `closeClient()` inside a try/catch to release the agent-director FFI handle. The library's `close()` is idempotent and never throws; the catch is belt-and-suspenders.
+7. Removes the PID file.
+
+The bots themselves are NOT killed or paused on shutdown — same as the prior behavior and consistent with SR-11 Event 11.
+
+## SR-11 Substitution Table
+
+State transitions and event triggers follow `t1.qfc.bg` SR-11 in full. Where the predecessor SRD references a CLI verb, this implementation calls the equivalent typed library method:
+
+| `t1.fp3.63` CLI verb | This implementation's library equivalent |
+|---|---|
+| `claude-director spawn` | `client.spawn(SpawnParams)` |
+| `claude-director resume` | `client.resume({ claude_instance_id })` |
+| `claude-director kill` | `client.kill({ claude_instance_id })` |
+| `claude-director pause` | `client.pause({ claude_instance_id })` |
+| `claude-director delete` | `client.delete({ claude_instance_id: [...] })` |
+| `claude-director list --label/--state` | `client.list({ label, state })` |
+| `claude-director get` | `client.get({ claude_instance_id })` |
+| `claude-director status` | `client.status({ claude_instance_id })` |
+| `claude-director send-keys` | `client.sendKeys({ claude_instance_id, text })` |
+| `claude-director decide` | `client.decide({ claude_instance_id, decision })` |
+| `claude-director version` | `client.version({})` |
+| `claude-director find-missing` | `client.findMissing({ timeout_ms })` — operator's responsibility (SR-5.4); CSCB does not invoke. |
 
 ## Configuration
 
@@ -194,27 +207,17 @@ Key fields:
 - `claude_config_dir` — optional path to a Claude on-disk config directory used for managed sessions; when set, launches are prefixed with `CLAUDE_CONFIG_DIR='<resolved-path>'` so the route authenticates against a specific account. `~` is expanded and the path is resolved to absolute. Per-route `routes[id].claude_config_dir` overrides this top-level value. When neither is set, Claude's own default applies.
 - `resume_enabled` — boolean (default: `true`). When `false`, the session manager skips `--resume` entirely and always performs a fresh launch, even when a stored session ID exists. Use this to work around versions of Claude Code that crash on `--resume` (e.g. the v2.1.120 "sandbox required but unavailable" regression). Affects both startup (step 4, **Resume** branch) and auto-restart (step 6).
 
-### sessions.json (~/.claude/channels/slack/sessions.json)
+### agent-director state.db (~/.agent-director/state.db)
 
-Persistent registry of server-managed tmux sessions. Maps channel IDs to session records. Survives server restarts.
+Persistent CSCB-spawn registry — owned by agent-director, not CSCB. CSCB reads this transitively via `client.list/status/get/resume(...)`. Same-user invariant verified at SR-5.1 startup gate.
 
-Each record has the shape:
+### startup-errors.log (~/.claude/channels/slack/startup-errors.log)
 
-```typescript
-{
-  tmuxSession: string   // tmux session name
-  lastLaunch:  string   // ISO-8601 timestamp of the most recent launch
-  sessionId:   string   // Claude session UUID, or "pending" for fresh launches awaiting first tool call
-}
-```
+Append-only log of fatal startup errors written by `recordStartupError` (`src/startup-errors.ts`). One timestamped line per entry; includes the agent-director `errName` when surfacing typed library errors. Rotation is operator-owned via `docs/logrotate-startup-errors.conf`.
 
-`sessionId` is `"pending"` for fresh launches immediately after startup. It transitions to a real UUID after the session's first MCP tool call, via the post-call discovery path in `registry.ts` (see [Session ID Discovery](#session-id-discovery)). For resume launches, the stored UUID from `sessions.json.last` is used immediately. The UUID is passed as `--resume <id>` on the next startup to preserve conversation context across restarts. The guards in `server.ts` treat `"pending"` as absent — no `--resume` is attempted for sessions that have not yet discovered their UUID.
+### Removed pre-Epic-2 files
 
-`sessions.json` is written once atomically after all routes finish launching at startup. Individual route launches do not write to `sessions.json`.
-
-### sessions.json.last (STATE_DIR/sessions.json.last)
-
-Created by `rotateSessions()` at the start of every server startup run. Contains the `sessions.json` snapshot from the previous run, used by the startup manager to read stored session IDs for `--resume` without risking a partially-written current `sessions.json`. Overwritten on each startup. If no `sessions.json` existed when the server last started, this file is absent (treated as an empty map by `readSessions()`).
+The previous tmux-direct architecture wrote `~/.claude/channels/slack/sessions.json` to persist tmux session names and discovered Claude session UUIDs. Both responsibilities have moved to agent-director — `sessions.json` and `sessions.json.last` no longer exist. Operators upgrading from a pre-Epic-2 install can safely delete the stale files; CSCB will not read them.
 
 ### server.pid (STATE_DIR/server.pid)
 
@@ -233,9 +236,7 @@ Optional:
 
 - `SLACK_DRY_RUN` — set to `1`, `true`, or `yes` to enable dry-run mode. Bypasses token validation, skips `socket.start()` and `web.auth.test()`, and stubs all MCP tool calls (`reply`, `react`, `edit_message`, `fetch_messages`, `download_attachment`) — each returns a `[dry-run]` placeholder and logs the call to the server log. The HTTP/MCP server still starts normally so Claude Code sessions can connect and exercise tool calls without a Slack workspace.
 
-Set by the session manager at launch time:
-
-- `CLAUDE_MANAGED_CHANNEL` — inline env var (no `export`) set on the `claude` CLI command. Contains the Slack channel ID for the managed session. Inherited by child processes (including Explore/Plan subagents) but not by tmux split-panes or separate sessions. The permission and ask relay hooks check this variable to determine if they are in a managed session and which channel to route to. If unset, hooks exit silently (not a managed session). If set but the server is unreachable, hooks fail closed (deny).
+Optional CLAUDE_CONFIG_DIR (set at spawn time via SpawnParams.extra_env when configured per-route or top-level) is propagated by agent-director to the spawn's tmux session, enabling per-route Claude account selection.
 
 ### access.json (~/.claude/channels/slack/access.json)
 

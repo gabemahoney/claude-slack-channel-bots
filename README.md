@@ -37,13 +37,10 @@ See the sections below for manual configuration details if you prefer not to use
 ## Prerequisites
 
 - [Bun](https://bun.sh) `>= 1.0.21` (agent-director minimum)
-- [tmux](https://github.com/tmux/tmux) (required for server-managed sessions)
 - [Claude Code](https://claude.ai/code) installed and authenticated
-- [`agent-director`](https://github.com/gabemahoney/agent-director) **runtime dependency** — pulled in transitively when you install this package. Hard required at server boot: CSCB refuses to start if the library is missing, the host platform is unsupported, Bun is too old, or the installed version is below `MIN_AD_VERSION` (`^0.4.3`).
-- `ss` from [iproute2](https://github.com/iproute2/iproute2) on your `PATH` (required for session ID discovery; pre-installed on most Linux distributions)
-- `curl` and `jq` on your `PATH` (required for the permission relay hooks)
+- [`agent-director`](https://github.com/gabemahoney/agent-director) **runtime dependency** — pulled in transitively when you install this package. Hard required at server boot: CSCB refuses to start if the library is missing, the host platform is unsupported, Bun is too old, or the installed version is below `MIN_AD_VERSION` (`^0.4.3`). agent-director itself requires [tmux](https://github.com/tmux/tmux) on the operator's PATH; CSCB no longer probes for it directly.
 - Slack workspace admin access (to create and configure the Slack app)
-- **cozempic** (optional) — Python 3.10+ and `pip install cozempic` — enables session file cleaning before `--resume` for faster load times
+- **cozempic** (optional) — Python 3.10+ and `pip install cozempic` — used by JSONL path resolution helpers retained for downstream callers.
 
 ### Supported platforms (inherited from agent-director)
 
@@ -233,10 +230,11 @@ Checks prerequisites, then daemonizes the server.
 
 **Prerequisite checks (in order):**
 
-1. `tmux` is on `PATH` — fails with `missing prerequisite: tmux` if not found.
-2. `SLACK_BOT_TOKEN` is set — fails with `missing prerequisite: SLACK_BOT_TOKEN environment variable` if absent.
-3. `SLACK_APP_TOKEN` is set — fails with `missing prerequisite: SLACK_APP_TOKEN environment variable` if absent.
-4. `config.json` exists at `STATE_DIR/config.json` — fails with the full path if not found.
+1. `SLACK_BOT_TOKEN` is set — fails with `missing prerequisite: SLACK_BOT_TOKEN environment variable` if absent.
+2. `SLACK_APP_TOKEN` is set — fails with `missing prerequisite: SLACK_APP_TOKEN environment variable` if absent.
+3. `config.json` exists at `STATE_DIR/config.json` — fails with the full path if not found.
+
+Once the server daemonizes, the SR-5.1 startup gate runs inside the child process: it imports `agent-director`, constructs the singleton Client, runs `client.version()`, and verifies `~/.agent-director/state.db` is owned by the current user. Failures land in `startup-errors.log` (see [Startup errors](#startup-errors)). The previous `tmux -V` probe at the CLI level has been removed — agent-director enforces tmux availability at spawn time.
 
 If all checks pass, the parent process spawns a detached child process and exits immediately, printing the child PID. The child starts the server and writes its PID to `STATE_DIR/server.pid`. Conversation context is preserved across server restarts when possible.
 
@@ -262,11 +260,11 @@ Gracefully exits all managed Claude Code sessions, then stops and starts the ser
 claude-slack-channel-bots clean_restart
 ```
 
-For each session in `sessions.json`, sends `/exit` to the tmux session and polls until Claude exits. All sessions are processed in parallel. If a session does not exit within `exit_timeout` seconds (default 120s), its tmux session is force-killed. Individual session errors are logged and do not abort the restart. After the server restarts, sessions are relaunched using the stored session IDs in `sessions.json`. When `resume_enabled` is `true` (the default), sessions resume with `--resume`, preserving conversation context. When `resume_enabled` is `false`, sessions always launch fresh without `--resume`.
+For each configured route, calls `client.pause({claude_instance_id})` via agent-director and polls `client.status(...)` until the spawn transitions to `ended` / `missing` (or `client.list(...)` returns no row). If the spawn does not exit within `exit_timeout` seconds (default 120s), the spawn is force-killed via `client.kill(...)`. All routes are processed in parallel. Individual session errors are logged and do not abort the restart. After the server restarts, the SR-1.4 collision-then-act dispatcher decides resume-vs-fresh per route — agent-director owns Claude session-id state, not CSCB.
 
 Behavior by case:
 
-- **No sessions.json or no sessions:** skips the shutdown phase and proceeds directly to stop/start.
+- **No configured routes:** skips the shutdown phase and proceeds directly to stop/start.
 - **Server already stopped:** `stop` reports `server is not running`; `start` then brings up a fresh server.
 
 ### PID file
@@ -361,67 +359,23 @@ On success, returns HTTP 200:
 
 ## Permission Relay
 
-When Claude Code requires tool approval, the permission relay surfaces an interactive Slack message with **Allow** and **Deny** buttons instead of blocking the TUI. The Claude Code hook POSTs the pending request to the server, then long-polls for the user's response. Once the user clicks a button, the result is returned to Claude Code and execution continues.
+When Claude Code requires tool approval, the permission relay surfaces an interactive Slack message with **Allow** and **Deny** buttons instead of blocking the TUI. Architecture is polling-based on the `agent-director` library — there are **no hook scripts to install** and no HTTP long-poll loops.
 
-The `ask-relay.sh` hook intercepts `AskUserQuestion` tool calls via `PreToolUse`, posts the question and its options to Slack as interactive buttons, and waits for the user's selection. The answer is returned to Claude Code via `updatedInput` without blocking the TUI.
+Flow:
 
-Both hooks are **scope-guarded**: they check the `CLAUDE_MANAGED_CHANNEL` environment variable, which is set as an inline env var (no `export`) on the `claude` command at launch. If the variable is absent, the hooks exit silently (no-op). This means installing the hooks globally in `settings.json` is safe — they will not activate for Claude sessions you run outside the bot. If the variable is present but the server is unreachable, hooks fail closed (deny the tool call) to prevent indefinite hangs in headless sessions.
-
-Both hooks use a **two-phase long-poll protocol**:
-
-1. **Phase 1 — Create request:** The hook POSTs to `/permission` (or `/ask`) with the tool name, input, and channel ID (from `$CLAUDE_MANAGED_CHANNEL`). The server posts an interactive Slack message and returns a `requestId`.
-2. **Phase 2 — Long-poll:** The hook GETs `/permission/{requestId}` (or `/ask/{requestId}`) in a loop with a 90-second `curl` timeout. The server holds the connection for up to 60 seconds waiting for a button click, then returns `{"status":"pending"}` if no decision has arrived. The hook retries immediately. Once the user clicks, the server returns `{"status":"decided","decision":"allow"|"deny"}` and the hook exits.
+1. agent-director moves the spawn into `check_permission` state when Claude requests a tool permission.
+2. CSCB's poller (`src/permission-poller.ts`) runs `client.list({ state: ['check_permission'], label: ['service=cscb'] })` at the `agent_director_poll_interval_ms` cadence (default 1000 ms).
+3. For each new spawn, `client.get(...)` returns the open `permission_request` (tool name + tool input + integer `request_id`). CSCB `chat.postMessage`s the Block Kit prompt to the spawn's `channel` label.
+4. The operator clicks Allow / Deny in Slack. CSCB's interactive handler calls `client.decide({ claude_instance_id, decision })` and `chat.update`s the message to "Allowed/Denied by <user>".
+5. If a tracked prompt drops out of `check_permission` for any reason other than a Slack click (timeout, external `decide`, crash), the next poller tick replaces the buttons with "expired".
 
 ### Slack app prerequisites
 
-The Slack app must have **interactivity enabled** with **Socket Mode** as the delivery method. Without this, button-click payloads are never delivered and the relay will not work.
+The Slack app must have **interactivity enabled** with **Socket Mode** as the delivery method. Open your Slack app config → **Interactivity & Shortcuts** → toggle **Interactivity** on. No Request URL is needed; Socket Mode delivers interaction payloads over the existing socket. This is included automatically if you created the app from `slack-app-manifest.yml`.
 
-To enable it: open your Slack app config → **Interactivity & Shortcuts** → toggle **Interactivity** on. No Request URL is needed — Socket Mode delivers interaction payloads over the existing socket connection. This is included automatically if you created the app from `slack-app-manifest.yml`.
+### AskUserQuestion
 
-### Hook installation
-
-1. Copy the hook scripts from the repo to `~/.claude/hooks/`:
-
-   ```sh
-   cp hooks/permission-relay.sh hooks/ask-relay.sh ~/.claude/hooks/
-   chmod +x ~/.claude/hooks/permission-relay.sh ~/.claude/hooks/ask-relay.sh
-   ```
-
-   Alternatively, symlink them so updates to the repo are reflected automatically:
-
-   ```sh
-   ln -sf /path/to/repo/hooks/permission-relay.sh ~/.claude/hooks/permission-relay.sh
-   ln -sf /path/to/repo/hooks/ask-relay.sh ~/.claude/hooks/ask-relay.sh
-   ```
-
-2. Ensure `curl` and `jq` are on your `PATH`.
-
-3. Add the following to your Claude Code `settings.json`:
-
-   ```jsonc
-   "PermissionRequest": [
-     {
-       "matcher": ".*",
-       "timeout": 2000000,
-       "hooks": [{ "type": "command", "command": "~/.claude/hooks/permission-relay.sh" }]
-     }
-   ],
-   "PreToolUse": [
-     {
-       "matcher": "AskUserQuestion",
-       "timeout": 2000000,
-       "hooks": [{ "type": "command", "command": "~/.claude/hooks/ask-relay.sh" }]
-     }
-   ]
-   ```
-
-   `permission-relay.sh` relays tool permission requests (Allow/Deny) to Slack via `PermissionRequest`. `ask-relay.sh` relays `AskUserQuestion` calls to Slack via `PreToolUse`, returning the user's selection without blocking the TUI.
-
-Both hooks auto-detect the server port from `config.json`. They read `${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/config.json` and use the `port` field (defaulting to `3100`), so they stay in sync if you change the port in routing config.
-
-### Setup skill
-
-The `update-config` skill can automate hook installation. It copies or symlinks the hooks and writes the `settings.json` entries in one step — use it if you prefer not to configure hooks manually.
+The `AskUserQuestion` tool is denied for every CSCB-spawned bot via the agent-director template (`deny: ['AskUserQuestion']`). Bots respond to operator questions via the Slack `reply` MCP tool instead. There is no `ask-relay.sh` hook and no `/ask` HTTP route.
 
 ---
 
@@ -443,13 +397,13 @@ After inviting the bot to a channel, Slack may not deliver messages until the bo
 Messages to channels not listed in `access.json → channels` and not present in `config.json → routes` are silently dropped. Use the `claude-slack-channels-config` skill or edit `access.json` directly to add the channel ID with a `ChannelPolicy` entry.
 
 **Permission relay not working**
-Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify `curl` and `jq` are on your `PATH`. Confirm the hook scripts are executable (`chmod +x`). If the port was changed in `config.json`, ensure `SLACK_STATE_DIR` is set correctly so the hooks can read the updated port. If the hooks are silently doing nothing, confirm the session was launched by the server — the hooks check the `CLAUDE_MANAGED_CHANNEL` env var and exit silently if it is not set. Sessions launched manually will not have this variable and will not trigger the relay.
+Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json`.
 
 **Session not restarting after crash**
 After 3 consecutive launch failures for a route, auto-restart is suspended until the server is restarted. Restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`. To disable auto-restart entirely, set `session_restart_delay` to `0` in `config.json`.
 
 **Session stuck during clean_restart**
-If a session does not exit within `exit_timeout` seconds (default 120s), `clean_restart` force-kills its tmux session and proceeds. To manually recover, run `tmux kill-session -t <session-name>` for any remaining sessions, then `claude-slack-channel-bots stop && claude-slack-channel-bots start`.
+If a session does not exit within `exit_timeout` seconds (default 120s), `clean_restart` force-kills the spawn via `agent-director kill` and proceeds. To manually recover, run `agent-director list --label service=cscb` to find lingering spawns and `agent-director kill <claude_instance_id>` to clear them, then `claude-slack-channel-bots stop && claude-slack-channel-bots start`.
 
 **Session crashes on resume with "sandbox required but unavailable"**
 This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json` to disable `--resume` entirely — the bot will always start a fresh Claude session instead of resuming a prior conversation, both on startup and on runtime auto-restart:
@@ -482,5 +436,25 @@ Classes you may see:
 
 ## Migration
 
-> **Stub (finalized in Epic 2).** Epic 1 has wired CSCB onto the typed `agent-director` library at boot — every install now pulls AD in transitively, the SR-5.1 startup gate runs before anything else, and the SR-3.2 template refresh writes `~/.agent-director/templates/slack-channel-bot.toml` on every boot. The spawn path and the permission-relay path are unchanged in Epic 1; they still use the homegrown tmux + HTTP long-poll code and continue to work byte-identically. Epic 2 atomically swaps both paths onto the library and finalizes this section with the full operator migration checklist (remove old hooks, configure AD's `find-missing` sweep, rename `claude_director_poll_interval_ms`, etc).
+For operators upgrading from a pre-`agent-director` install:
+
+1. **Install the new CSCB**: `bun remove claude-director` (if present) and `bun install -g claude-slack-channel-bots@^<new>`. The `agent-director` library is pulled in transitively — no separate install step.
+2. **Delete any old relay hooks** (CSCB no longer ships them — agent-director's relay machinery owns the tool-permission flow):
+   ```sh
+   rm -f ~/.claude/hooks/permission-relay.sh ~/.claude/hooks/ask-relay.sh
+   ```
+   Also remove their entries from `~/.claude/settings.json` if you wired them in by hand previously.
+3. **Configure agent-director's `find-missing` sweep**. CSCB does NOT call `client.findMissing(...)`; reconciling stuck rows is the operator's responsibility. Add a cron entry (or systemd timer) that runs `agent-director find-missing` on a cadence that matches your tolerance — e.g. every minute on a busy host:
+   ```cron
+   * * * * * /usr/local/bin/agent-director find-missing --timeout 30s
+   ```
+4. **Install the startup-errors logrotate snippet** so `~/.claude/channels/slack/startup-errors.log` doesn't grow unboundedly. Edit `USER` in the file to match the OS account running CSCB:
+   ```sh
+   sudo cp docs/logrotate-startup-errors.conf /etc/logrotate.d/claude-slack-channel-bots
+   ```
+5. **Rename your config field**. Pre-Epic-2 configs used `claude_director_poll_interval_ms`; CSCB now expects `agent_director_poll_interval_ms` and rejects the old name (no silent alias). Edit `~/.claude/channels/slack/config.json` accordingly. Unknown top-level fields are also rejected — clear any other deprecated keys.
+6. **Optional cleanup**: `~/.claude/channels/slack/sessions.json` and `sessions.json.last` are no longer read or written. CSCB ignores them; you can safely `rm` them after a successful boot.
+7. **`tmux` is no longer a CSCB-direct prereq** but is still required transitively via agent-director — keep it installed.
+
+After step 1, every CSCB bot is spawned through `client.spawn(...)` with `relay_mode='on'`. The green/red Slack button UX is byte-identical to the pre-migration behavior; the action_id shape changes from `perm_(allow|deny)_<uuid>` to `perm_(allow|deny)_cscb_<channelId>_<request_id>` but this is invisible to end users.
 

@@ -26,7 +26,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 
 ## Error Handling
 
-- Use `try/catch` around external calls (Slack API, file I/O, tmux commands)
+- Use `try/catch` around external calls (Slack API, file I/O, agent-director library verbs). For agent-director rejections, branch on `instanceof Err*` rather than parsing strings — see `src/agent-director-errors.ts` for the typed re-exports.
 - Log errors to stderr with the `[slack]` prefix: `console.error('[slack] context: description', err)`
 - Non-critical failures (reaction add, message update) use empty catch blocks with `/* non-critical */` or `/* ignore */`
 - Critical failures (token loading, routing config) exit the process with a clear message
@@ -42,7 +42,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 
 - Localhost-only endpoints: check `server.requestIP(req)` for `127.0.0.1`, `::1`, and `::ffff:127.*`
 - Sensitive files (`access.json`): `chmod 0o600`
-- No secrets in config files that don't need them (config.json, sessions.json)
+- No secrets in config files that don't need them (config.json)
 - Gate all inbound Slack messages through the `gate()` function before processing
 
 ## Naming Conventions
@@ -90,7 +90,7 @@ All restart activity is logged to stderr with the `[slack]` prefix:
 
 ### Async Interval Pattern
 
-Each tick fires an `async` callback. The callback iterates routes sequentially (not in parallel) to avoid flooding tmux with concurrent `isClaudeRunning` calls. Errors on a single channel are caught and logged; they do not abort the rest of the iteration.
+Each tick fires an `async` callback. The callback iterates routes sequentially to keep concurrent `client.status(...)` traffic predictable. Errors on a single channel are caught and logged; they do not abort the rest of the iteration. agent-director's library Client is internally safe for concurrent verb calls (a single worker thread serializes FFI dispatch — see SR-0.1).
 
 ```typescript
 intervalId = setInterval(async () => {
