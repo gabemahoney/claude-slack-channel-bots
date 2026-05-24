@@ -1,402 +1,620 @@
 /**
- * session-manager.ts — Startup orchestration for tmux-managed Claude Code sessions.
+ * session-manager.ts — Library-backed startup orchestration for CSCB.
  *
- * Handles three cases per route at server startup:
- *   reconnect — tmux session exists AND Claude is running → send /mcp reconnect, do not relaunch
- *   resume    — dead or missing process with stored session ID → kill stale session, relaunch with --resume
- *   fresh     — dead or missing process without stored session ID → kill stale session, launch fresh
+ * The previous tmux-direct implementation has been replaced with calls to the
+ * agent-director TypeScript library `Client` singleton (SR-1). Every spawn
+ * carries `relay_mode='on'` and `service=cscb` / `channel=<id>` labels.
+ * Per-route reconciliation uses the SR-1.4 collision-then-act dispatch:
+ *
+ *   1. Try `client.spawn(...)` directly.
+ *   2. On `ErrInstanceIdCollision`, call `client.get(...)` and branch on the
+ *      observed state (ended/missing → resume or kill+delete+spawn; waiting
+ *      → /mcp reconnect via sendKeys; working → wait for waiting then
+ *      reconnect; pending/check_permission/ask_user → no-op).
+ *   3. Any other error surfaces to the affected Slack channel via
+ *      `postSpawnFailureToChannel` and is logged.
+ *
+ * Orphan reconciliation (SR-1.6) lists every `service=cscb` spawn and
+ * kills+deletes any whose `channel` label is missing or not in
+ * `routingConfig.routes`.
+ *
+ * No tmux process-tree walks, no JSONL existence checks for resume eligibility:
+ * the library encapsulates both.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { accessSync, existsSync, constants } from 'fs'
-import { type TmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
-import { type CleanSessionFn, checkCozempicAvailable, getCozempicAvailable, cleanSession as defaultCleanSession, resolveJsonlPath } from './cozempic.ts'
-import { type SessionsMap, type SessionRecord } from './sessions.ts'
+import {
+  AgentDirectorError,
+  ErrInstanceIdCollision,
+  ErrJsonlMissing,
+  ErrNoSessionId,
+  ErrSpawnNotFound,
+  ErrSpawnNotResumable,
+} from 'agent-director'
+import type { ListRow, SpawnParams } from 'agent-director'
+import type { WebClient } from '@slack/web-api'
+
+import { checkCozempicAvailable } from './cozempic.ts'
 import { type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
+import { getClient } from './agent-director-client.ts'
+import { recordStartupError } from './startup-errors.ts'
 import { isDryRun } from './tokens.ts'
 
 // ---------------------------------------------------------------------------
-// JSONL existence helper
+// Constants
 // ---------------------------------------------------------------------------
 
 /**
- * Returns true if the JSONL conversation file exists for the given session.
- * The slug is computed from the CWD by replacing all non-alphanumeric-or-hyphen
- * characters with hyphens, matching Claude's project directory naming.
- *
- * When `configDir` is provided, looks under `${configDir}/projects/...` instead
- * of the default `${homedir()}/.claude/projects/...`. This is required for
- * managed bots launched with a custom `CLAUDE_CONFIG_DIR`, since Claude writes
- * its transcripts there rather than the server's home directory.
+ * Live states per SR-11 (agent-director Spawn state machine). Terminal states
+ * (`ended`, `missing`) and the typed `ErrSpawnNotFound` rejection from
+ * `client.status(...)` are treated as dead by callers.
  */
-export function jsonlExistsForSession(cwd: string, sessionId: string, configDir?: string): boolean {
-  if (!/^[a-zA-Z0-9_-]+$/.test(sessionId)) return false
-  const path = resolveJsonlPath(cwd, sessionId, configDir)
-  return existsSync(path)
+export const AGENT_DIRECTOR_LIVE_STATES: ReadonlySet<string> = new Set([
+  'pending',
+  'waiting',
+  'working',
+  'ask_user',
+  'check_permission',
+])
+
+/** The CSCB-shipped template name (mirrors agent-director-client). */
+const TEMPLATE_NAME = 'slack-channel-bot'
+
+/** Build the deterministic claude_instance_id for a channelId. */
+export function instanceIdFor(channelId: string): string {
+  return `cscb_${channelId}`
+}
+
+/** Build the canonical tmux session name for a channelId. */
+export function tmuxSessionNameFor(channelId: string): string {
+  return `slack_bot_${channelId}`
 }
 
 // ---------------------------------------------------------------------------
-// Types
+// Spawn-failure queue — Slack-error surface (SR-1.1 channel-post path)
 // ---------------------------------------------------------------------------
 
-export interface LaunchOptions {
-  /** Maximum time in ms to poll for the safety prompt. Default: 120000. */
-  pollTimeout?: number
-  /** Claude session UUID to resume. When provided, --resume <id> is appended to the CLI command. */
-  sessionId?: string
-  /** Optional session cleaning function to run before --resume launches. */
-  cleanSession?: CleanSessionFn
-}
-
-export interface SessionStateResult {
+interface SpawnFailureEntry {
   channelId: string
-  action: 'reconnected' | 'launched' | 'resumed' | 'failed'
-  sessionName: string
+  error: AgentDirectorError
+  remediation: string
 }
 
-// ---------------------------------------------------------------------------
-// launchSession
-// ---------------------------------------------------------------------------
+const spawnFailureQueue: SpawnFailureEntry[] = []
 
 /**
- * Creates a new tmux session for a Slack channel, launches Claude with the
- * correct MCP config, polls for the safety prompt, discovers the Claude
- * session ID via PID-based file lookup, and returns a SessionRecord on success.
- *
- * When options.sessionId is provided, appends --resume <id> to the CLI
- * command. If "No conversation found" is detected, kills the tmux session,
- * recreates it, and retries with a fresh launch. If the poll timeout is
- * reached with Claude running but no session ID discovered, returns null.
- *
- * Returns a SessionRecord on success, null on failure.
+ * Surface a spawn-related failure to the bot's configured Slack channel.
+ * Before Socket Mode is up, queue the entry; `flushSpawnFailureQueue` drains
+ * the queue once the WebClient is authenticated. Dry-run logs to stderr only.
  */
-export async function launchSession(
+export function postSpawnFailureToChannel(
   channelId: string,
-  cwd: string,
-  routingConfig: RoutingConfig,
-  tmuxClient: TmuxClient,
-  options?: LaunchOptions,
-): Promise<SessionRecord | null> {
-  const name = sessionName(cwd)
-  const pollTimeout = options?.pollTimeout ?? 120_000
-  const launchDeadline = Date.now() + pollTimeout
-  const resumeSessionId = options?.sessionId
+  error: AgentDirectorError,
+  web?: WebClient,
+  isStartup = true,
+): void {
+  const remediation = remediationHint(error)
 
-  const escapedConfigPath = routingConfig.mcp_config_path.replace(/'/g, "'\\''")
-  const escapedChannelId = channelId.replace(/'/g, "'\\''")
-  // Per-route claude_config_dir overrides the top-level one. When set, the launch
-  // env is augmented with `CLAUDE_CONFIG_DIR='<dir>'` so the route authenticates
-  // against a specific on-disk Claude account.
-  const claudeConfigDir =
-    routingConfig.routes[channelId]?.claude_config_dir ?? routingConfig.claude_config_dir
-  const envPrefix = claudeConfigDir
-    ? `CLAUDE_MANAGED_CHANNEL='${escapedChannelId}' CLAUDE_CONFIG_DIR='${claudeConfigDir.replace(/'/g, "'\\''")}'`
-    : `CLAUDE_MANAGED_CHANNEL='${escapedChannelId}'`
-  // In dry-run mode, skip --dangerously-load-development-channels (requires OAuth which isn't
-  // available in Docker/CI). MCP still connects via --mcp-config; only channel routing is lost.
-  let baseCmd = isDryRun()
-    ? `${envPrefix} claude --mcp-config '${escapedConfigPath}'`
-    : `${envPrefix} claude --mcp-config '${escapedConfigPath}' --dangerously-load-development-channels server:${MCP_SERVER_NAME}`
-
-  if (routingConfig.system_prompt_mode === 'append' && routingConfig.append_system_prompt_file !== undefined) {
-    try {
-      accessSync(routingConfig.append_system_prompt_file, constants.R_OK)
-      const escapedPromptPath = routingConfig.append_system_prompt_file.replace(/'/g, "'\\''")
-      baseCmd += ` --append-system-prompt-file '${escapedPromptPath}'`
-    } catch {
-      // file missing or unreadable — skip
-    }
+  if (!web) {
+    spawnFailureQueue.push({ channelId, error, remediation })
+    return
   }
 
-  const POLL_START_MS = 500
-  const POLL_CAP_MS = 5_000
-  const PROMPT_TEXT = 'I am using this for local development'
-  const NO_CONVERSATION_TEXT = 'No conversation found'
+  if (isDryRun()) {
+    console.error(
+      `[slack] dry-run: would post spawn failure for channel=${channelId} errName=${error.errName} remediation="${remediation}"`,
+    )
+    return
+  }
 
-  // Inner helper: sends the launch command and polls for the safety prompt.
-  // Returns a SessionRecord immediately after the safety prompt is acknowledged.
-  // Resume path: sessionId = safeResumeId. Fresh path: sessionId = "pending".
-  // Returns null on timeout (safety prompt never appeared) or capturePane failure.
-  async function attemptLaunch(
-    withResumeId: string | undefined,
-    sessionName_: string,
-  ): Promise<SessionRecord | null> {
-    const safeResumeId = withResumeId && /^[a-zA-Z0-9_-]+$/.test(withResumeId) ? withResumeId : undefined
-    if (withResumeId && !safeResumeId) {
-      console.error(`[slack] Invalid session ID format — ignoring resume for channel=${channelId}`)
-    }
-    const launchCmd = safeResumeId ? `${baseCmd} --resume ${safeResumeId}` : baseCmd
-    console.error(`[slack] launchSession: launchCmd=${launchCmd}`)
-    if (safeResumeId) {
-      console.error(`[slack] Attempting resume launch for channel=${channelId} sessionId=${safeResumeId}`)
+  const text =
+    `Spawn failure for channel \`${channelId}\`:\n` +
+    `  Error: \`${error.errName}\` — ${error.errDescription.slice(0, 300)}\n` +
+    `  Remediation: ${remediation}`
+
+  web.chat.postMessage({ channel: channelId, text }).catch((err) => {
+    if (isStartup) {
+      recordStartupError('spawn-failure-post', `failed to post spawn failure to channel=${channelId}`, err)
     } else {
-      console.error(`[slack] Attempting fresh launch for channel=${channelId}`)
+      console.error(`[slack] spawn-failure-post: failed to post spawn failure to channel=${channelId}`, err)
     }
-    await tmuxClient.sendKeys(sessionName_, launchCmd)
-    await tmuxClient.sendKeys(sessionName_, 'Enter')
-    console.error(`[slack] Claude launch command sent to session: ${sessionName_}`)
+  })
+}
 
-    let delay = POLL_START_MS
+function remediationHint(error: AgentDirectorError): string {
+  if (error instanceof ErrInstanceIdCollision) return 'spawn dispatcher bug — please report'
+  if (error instanceof ErrSpawnNotFound) return 'transient — restarting the server should resolve'
+  return 'Check server.log for details.'
+}
 
-    while (Date.now() < launchDeadline) {
-      await new Promise<void>((resolve) => setTimeout(resolve, delay))
-      delay = Math.min(delay * 2, POLL_CAP_MS)
-
-      let pane: string
-      try {
-        pane = await tmuxClient.capturePane(sessionName_)
-      } catch {
-        // capturePane failure is terminal — session may have died
-        return null
-      }
-
-      // Fast-fail: "No conversation found" means the resume failed
-      if (pane.includes(NO_CONVERSATION_TEXT)) {
-        console.error(`[slack] "No conversation found" detected — fast-fail resume for channel=${channelId}`)
-        return 'NO_CONVERSATION' as unknown as SessionRecord
-      }
-
-      if (pane.includes(PROMPT_TEXT)) {
-        await tmuxClient.sendKeys(sessionName_, 'Enter')
-        console.error(`[slack] Safety prompt acknowledged in session: ${sessionName_}`)
-        return {
-          tmuxSession: sessionName_,
-          lastLaunch: new Date().toISOString(),
-          sessionId: safeResumeId ?? 'pending',
-        }
-      }
-
-      // If trust was pre-accepted (e.g. in Docker CI), Claude skips the safety
-      // prompt and goes straight to the ready prompt. Detect the Claude Code
-      // welcome banner which appears when Claude is fully loaded and ready.
-      if (pane.includes('Claude Code v') && pane.includes('❯')) {
-        console.error(`[slack] Claude ready (no safety prompt) in session: ${sessionName_}`)
-        return {
-          tmuxSession: sessionName_,
-          lastLaunch: new Date().toISOString(),
-          sessionId: safeResumeId ?? 'pending',
-        }
-      }
-    }
-
-    return null
+/** Drain the pre-auth queue once Socket Mode is up. Called from server.ts main(). */
+export function flushSpawnFailureQueue(web: WebClient): void {
+  while (spawnFailureQueue.length > 0) {
+    const entry = spawnFailureQueue.shift()!
+    postSpawnFailureToChannel(entry.channelId, entry.error, web)
   }
-
-  // Create detached tmux session with the channel's CWD
-  await tmuxClient.newSession(name, cwd)
-  console.error(`[slack] Session created: ${name} (cwd="${cwd}")`)
-
-  // Clean JSONL before resuming (if a cleanSession fn was provided).
-  // Pass `claudeConfigDir` so the JSONL lookup matches where Claude actually
-  // writes its transcripts for routes that override `CLAUDE_CONFIG_DIR` —
-  // otherwise cleaning silently no-ops because the file isn't found.
-  if (resumeSessionId && resumeSessionId !== 'pending' && options?.cleanSession) {
-    await options.cleanSession(resumeSessionId, cwd, routingConfig.cozempic_prescription, claudeConfigDir)
-  }
-
-  // Attempt launch (with --resume if sessionId provided)
-  let result = await attemptLaunch(resumeSessionId, name)
-
-  // "No conversation found" fast-fail on resume — kill, recreate, relaunch fresh
-  if (result !== null && (result as unknown as string) === 'NO_CONVERSATION' && resumeSessionId !== undefined) {
-    console.error(`[slack] Fast-fail resume for channel=${channelId} — killing session and relaunching fresh`)
-    try {
-      await tmuxClient.killSession(name)
-    } catch {
-      // ignore kill errors
-    }
-    await tmuxClient.newSession(name, cwd)
-    console.error(`[slack] Session recreated for fresh fallback: ${name} (cwd="${cwd}")`)
-    result = await attemptLaunch(undefined, name)
-  }
-
-  // Resume timed out or failed (not NO_CONVERSATION) — fall back to fresh
-  if (result === null && resumeSessionId !== undefined) {
-    console.error(`[slack] Resume failed for channel=${channelId} — killing session and retrying with fresh launch`)
-    try {
-      await tmuxClient.killSession(name)
-    } catch {
-      // ignore kill errors; proceed with fresh session creation
-    }
-    await tmuxClient.newSession(name, cwd)
-    console.error(`[slack] Session recreated for fresh fallback: ${name} (cwd="${cwd}")`)
-    result = await attemptLaunch(undefined, name)
-  }
-
-  if (result === null || (result as unknown as string) === 'NO_CONVERSATION') {
-    console.error(`[slack] Session launch failed — Claude not running or no session ID in session: ${name}`)
-    return null
-  }
-
-  return result
 }
 
 // ---------------------------------------------------------------------------
-// startupSessionManager
+// reconnectMcp — send `/mcp reconnect <server-name>` via library sendKeys
 // ---------------------------------------------------------------------------
 
 /**
- * On server startup, inspects all configured routes concurrently and takes
- * action using a three-branch decision tree per route:
- *   - Reconnect: tmux session exists AND Claude is running → send /mcp reconnect,
- *                discover session ID via PID-based file lookup, return SessionRecord
- *   - Resume: dead or missing process with stored session ID → kill stale session,
- *             relaunch with --resume, return SessionRecord
- *   - Fresh: dead or missing process without stored session ID → kill stale session,
- *            launch fresh, return SessionRecord
+ * Send `/mcp reconnect <MCP_SERVER_NAME>` to the spawn's pane. Library's
+ * sendKeys appends Enter automatically per its contract.
+ */
+export async function reconnectMcp(channelId: string, web?: WebClient): Promise<boolean> {
+  const claude_instance_id = instanceIdFor(channelId)
+  console.error(`[slack] reconnecting MCP server "${MCP_SERVER_NAME}": channel=${channelId}`)
+  try {
+    await getClient().sendKeys({
+      claude_instance_id,
+      text: `/mcp reconnect ${MCP_SERVER_NAME}`,
+    })
+    return true
+  } catch (err) {
+    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('send-keys', 'UnknownError', String(err))
+    console.error(`[slack] reconnectMcp: send-keys failed for channel=${channelId}: ${e.errName}`)
+    postSpawnFailureToChannel(channelId, e, web)
+    return false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// waitForWaitingAndReconnect — used when a colliding spawn is in `working`
+// ---------------------------------------------------------------------------
+
+/** Hard cap on the wait-for-waiting poller (10 minutes). Test-only override below. */
+export const WAIT_FOR_WAITING_TIMEOUT_MS = 10 * 60 * 1000
+
+let _waitForWaitingTimeoutMs = WAIT_FOR_WAITING_TIMEOUT_MS
+
+/** Test-only seam: override the wait-for-waiting timeout. */
+export function _setWaitForWaitingTimeoutMs(ms: number): void {
+  _waitForWaitingTimeoutMs = ms
+}
+
+/** Test-only seam: restore the default. */
+export function _resetWaitForWaitingTimeoutMs(): void {
+  _waitForWaitingTimeoutMs = WAIT_FOR_WAITING_TIMEOUT_MS
+}
+
+/**
+ * Poll `status({claude_instance_id})` until the spawn transitions to
+ * `waiting`, then call reconnectMcp. On other terminal transitions (ended,
+ * missing, etc) return true without sending — health-check picks it up.
+ * On timeout, log and return true (long turns aren't errors).
+ */
+export async function waitForWaitingAndReconnect(
+  channelId: string,
+  routingConfig: RoutingConfig,
+  web?: WebClient,
+): Promise<boolean> {
+  const claude_instance_id = instanceIdFor(channelId)
+  const pollIntervalMs = routingConfig.agent_director_poll_interval_ms
+  const deadline = Date.now() + _waitForWaitingTimeoutMs
+
+  while (Date.now() < deadline) {
+    let state: string
+    try {
+      const r = await getClient().status({ claude_instance_id })
+      state = r.state
+    } catch (err) {
+      if (err instanceof ErrSpawnNotFound) {
+        console.error(`[slack] waitForWaitingAndReconnect: spawn not found for channel=${channelId} — aborting poll`)
+        return true
+      }
+      const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('status', 'UnknownError', String(err))
+      console.error(`[slack] waitForWaitingAndReconnect: status error for channel=${channelId}: ${e.errName}`)
+      postSpawnFailureToChannel(channelId, e, web)
+      return false
+    }
+
+    if (state === 'waiting') {
+      return reconnectMcp(channelId, web)
+    }
+
+    if (state === 'working') {
+      await new Promise<void>((resolve) => setTimeout(resolve, pollIntervalMs))
+      continue
+    }
+
+    console.error(`[slack] waitForWaitingAndReconnect: channel=${channelId} transitioned to state=${state} — aborting (health-check will handle)`)
+    return true
+  }
+
+  console.error(
+    `[slack] reconnect: gave up waiting for channel=${channelId} after ${_waitForWaitingTimeoutMs}ms — health-check will retry`,
+  )
+  return true
+}
+
+// ---------------------------------------------------------------------------
+// spawnForRoute — SR-1.4 collision-then-act dispatcher
+// ---------------------------------------------------------------------------
+
+export interface SpawnRouteResult {
+  channelId: string
+  action: 'spawned' | 'resumed' | 'reconnected' | 'no-op' | 'failed'
+}
+
+/** Build SpawnParams for a route (SR-1.1). Per-route claude_config_dir wins. */
+function buildSpawnParams(
+  channelId: string,
+  route: { cwd: string },
+  routingConfig: RoutingConfig,
+): SpawnParams {
+  const effectiveConfigDir =
+    routingConfig.routes[channelId]?.claude_config_dir ?? routingConfig.claude_config_dir
+  const params: SpawnParams = {
+    template: TEMPLATE_NAME,
+    cwd: route.cwd,
+    claude_instance_id: instanceIdFor(channelId),
+    relay_mode: 'on',
+    tmux_session_name: tmuxSessionNameFor(channelId),
+    label: ['service=cscb', `channel=${channelId}`],
+  }
+  if (effectiveConfigDir) {
+    params.extra_env = { CLAUDE_CONFIG_DIR: effectiveConfigDir }
+  }
+  return params
+}
+
+/** Best-effort kill — never throws. */
+async function tryKill(channelId: string): Promise<void> {
+  try {
+    await getClient().kill({ claude_instance_id: instanceIdFor(channelId) })
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Delete the spawn row; surface failures. Returns whether the delete succeeded. */
+async function tryDelete(channelId: string, web: WebClient | undefined, isStartup: boolean): Promise<boolean> {
+  try {
+    await getClient().delete({ claude_instance_id: [instanceIdFor(channelId)] })
+    return true
+  } catch (err) {
+    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('delete', 'UnknownError', String(err))
+    console.error(`[slack] tryDelete: failed for channel=${channelId}: ${e.errName}`)
+    if (isStartup) recordStartupError('spawn-failed', `delete failed for channel=${channelId}: ${e.errName}`, e)
+    postSpawnFailureToChannel(channelId, e, web, isStartup)
+    return false
+  }
+}
+
+/**
+ * Core per-route spawn dispatcher (SR-1.4):
  *
- * Accepts stored sessions externally (caller is responsible for reading them).
- * Returns a Map of channelId → SessionRecord for all successfully launched routes.
- * Returns early with a warning if tmux is unavailable.
+ * 1. Dry-run: skip entirely, return synthetic success.
+ * 2. Attempt `client.spawn(...)`. On success → done.
+ * 3. `ErrInstanceIdCollision` → `client.get(...)` then branch on state:
+ *    - ended/missing + resume_enabled → resume; on ErrNoSessionId/
+ *      ErrJsonlMissing → delete + fresh spawn.
+ *    - ended/missing + !resume_enabled → kill + delete + fresh spawn.
+ *    - waiting → reconnectMcp.
+ *    - working → waitForWaitingAndReconnect.
+ *    - pending/check_permission/ask_user → no-op.
+ * 4. Other errors → surface to Slack + (when isStartup) startup-errors.log.
+ */
+export async function spawnForRoute(
+  channelId: string,
+  route: { cwd: string },
+  routingConfig: RoutingConfig,
+  web?: WebClient,
+  isStartup = true,
+): Promise<SpawnRouteResult> {
+  if (isDryRun()) {
+    console.error(`[slack] dry-run: skipping spawn for channel=${channelId} cwd=${route.cwd}`)
+    return { channelId, action: 'no-op' }
+  }
+
+  const params = buildSpawnParams(channelId, route, routingConfig)
+  const client = getClient()
+
+  // Attempt fresh spawn ---
+  try {
+    const r = await client.spawn(params)
+    console.error(`[slack] spawnForRoute: spawned channel=${channelId} instanceId=${r.claude_instance_id}`)
+    return { channelId, action: 'spawned' }
+  } catch (err) {
+    if (!(err instanceof ErrInstanceIdCollision)) {
+      const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
+      console.error(`[slack] spawnForRoute: spawn failed for channel=${channelId}: ${e.errName}`)
+      if (isStartup) recordStartupError('spawn-failed', `spawn failed for channel=${channelId}: ${e.errName}`, e)
+      postSpawnFailureToChannel(channelId, e, web, isStartup)
+      return { channelId, action: 'failed' }
+    }
+    // Collision → fall through to get-then-act
+    console.error(`[slack] spawnForRoute: ErrInstanceIdCollision for channel=${channelId} — fetching current state`)
+  }
+
+  // Collision-handling: get-then-act ---
+  let state: string
+  try {
+    const r = await client.get({ claude_instance_id: instanceIdFor(channelId) })
+    state = r.state
+  } catch (err) {
+    if (err instanceof ErrSpawnNotFound) {
+      // Race: row deleted between spawn-collision and get. Retry spawn once.
+      console.error(`[slack] spawnForRoute: ErrSpawnNotFound after collision for channel=${channelId} — retrying spawn (single retry)`)
+      try {
+        const r = await client.spawn(params)
+        console.error(`[slack] spawnForRoute: retry-spawn succeeded for channel=${channelId} instanceId=${r.claude_instance_id}`)
+        return { channelId, action: 'spawned' }
+      } catch (err2) {
+        const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
+        console.error(`[slack] spawnForRoute: retry-spawn also failed for channel=${channelId}: ${e.errName}`)
+        if (isStartup) recordStartupError('spawn-failed', `retry-spawn failed for channel=${channelId}: ${e.errName}`, e)
+        postSpawnFailureToChannel(channelId, e, web, isStartup)
+        return { channelId, action: 'failed' }
+      }
+    }
+    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('get', 'UnknownError', String(err))
+    console.error(`[slack] spawnForRoute: get failed for channel=${channelId}: ${e.errName}`)
+    postSpawnFailureToChannel(channelId, e, web, isStartup)
+    return { channelId, action: 'failed' }
+  }
+
+  console.error(`[slack] spawnForRoute: collision resolved, state=${state} for channel=${channelId}`)
+
+  if (state === 'ended' || state === 'missing') {
+    if (routingConfig.resume_enabled === false) {
+      console.error(`[slack] spawnForRoute: resume_enabled=false — kill+delete+fresh for channel=${channelId}`)
+      await tryKill(channelId)
+      if (!(await tryDelete(channelId, web, isStartup))) return { channelId, action: 'failed' }
+      try {
+        await client.spawn(params)
+        console.error(`[slack] spawnForRoute: fresh-spawned (after kill+delete) for channel=${channelId}`)
+        return { channelId, action: 'spawned' }
+      } catch (err) {
+        const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
+        console.error(`[slack] spawnForRoute: fresh spawn after delete failed for channel=${channelId}: ${e.errName}`)
+        if (isStartup) recordStartupError('spawn-failed', `fresh spawn after delete failed for channel=${channelId}: ${e.errName}`, e)
+        postSpawnFailureToChannel(channelId, e, web, isStartup)
+        return { channelId, action: 'failed' }
+      }
+    }
+
+    // resume_enabled: attempt resume
+    console.error(`[slack] spawnForRoute: attempting resume for channel=${channelId}`)
+    try {
+      await client.resume({ claude_instance_id: instanceIdFor(channelId) })
+      console.error(`[slack] spawnForRoute: resumed channel=${channelId}`)
+      return { channelId, action: 'resumed' }
+    } catch (err) {
+      if (err instanceof ErrNoSessionId || err instanceof ErrJsonlMissing) {
+        console.error(`[slack] spawnForRoute: ${err.errName} on resume for channel=${channelId} — delete+fresh`)
+        if (!(await tryDelete(channelId, web, isStartup))) return { channelId, action: 'failed' }
+        try {
+          await client.spawn(params)
+          console.error(`[slack] spawnForRoute: fresh-spawned (after delete) for channel=${channelId}`)
+          return { channelId, action: 'spawned' }
+        } catch (err2) {
+          const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
+          console.error(`[slack] spawnForRoute: fresh spawn after delete failed for channel=${channelId}: ${e.errName}`)
+          if (isStartup) recordStartupError('spawn-failed', `fresh spawn after delete failed for channel=${channelId}: ${e.errName}`, e)
+          postSpawnFailureToChannel(channelId, e, web, isStartup)
+          return { channelId, action: 'failed' }
+        }
+      }
+      if (err instanceof ErrSpawnNotResumable) {
+        // Row is non-terminal but resume rejected — defensive: kill + delete + spawn
+        console.error(`[slack] spawnForRoute: ErrSpawnNotResumable for channel=${channelId} — kill+delete+fresh`)
+        await tryKill(channelId)
+        if (!(await tryDelete(channelId, web, isStartup))) return { channelId, action: 'failed' }
+        try {
+          await client.spawn(params)
+          return { channelId, action: 'spawned' }
+        } catch (err2) {
+          const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
+          if (isStartup) recordStartupError('spawn-failed', `fresh spawn failed for channel=${channelId}: ${e.errName}`, e)
+          postSpawnFailureToChannel(channelId, e, web, isStartup)
+          return { channelId, action: 'failed' }
+        }
+      }
+      const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('resume', 'UnknownError', String(err))
+      console.error(`[slack] spawnForRoute: resume failed for channel=${channelId}: ${e.errName}`)
+      postSpawnFailureToChannel(channelId, e, web, isStartup)
+      return { channelId, action: 'failed' }
+    }
+  }
+
+  if (state === 'waiting') {
+    await reconnectMcp(channelId, web)
+    return { channelId, action: 'reconnected' }
+  }
+
+  if (state === 'working') {
+    await waitForWaitingAndReconnect(channelId, routingConfig, web)
+    return { channelId, action: 'reconnected' }
+  }
+
+  if (state === 'pending' || state === 'check_permission' || state === 'ask_user') {
+    console.error(`[slack] spawnForRoute: no action — state=${state} for channel=${channelId}`)
+    return { channelId, action: 'no-op' }
+  }
+
+  console.error(`[slack] spawnForRoute: unexpected state=${state} for channel=${channelId} — no action`)
+  return { channelId, action: 'no-op' }
+}
+
+// ---------------------------------------------------------------------------
+// reconcileOrphans — SR-1.6 startup orphan reconciliation
+// ---------------------------------------------------------------------------
+
+export interface OrphanReconcileResult {
+  found: number
+  killed: number
+  failed: number
+}
+
+/**
+ * Enumerate all `service=cscb` spawns and kill+delete any whose `channel`
+ * label is missing or not in routingConfig.routes. List-level failure is
+ * logged but does not block startup.
+ */
+export async function reconcileOrphans(
+  routingConfig: RoutingConfig,
+): Promise<OrphanReconcileResult> {
+  if (isDryRun()) {
+    console.error('[slack] dry-run: skipping orphan reconciliation')
+    return { found: 0, killed: 0, failed: 0 }
+  }
+
+  const client = getClient()
+  let rows: ListRow[]
+  try {
+    const r = await client.list({ label: ['service=cscb'] })
+    rows = r.spawns
+  } catch (err) {
+    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('list', 'UnknownError', String(err))
+    recordStartupError(
+      'orphan-cleanup-list-failed',
+      `failed to list spawns for orphan reconciliation: ${e.errName}`,
+      e,
+    )
+    return { found: 0, killed: 0, failed: 0 }
+  }
+
+  const configuredChannels = new Set(Object.keys(routingConfig.routes))
+
+  let found = 0
+  let killed = 0
+  let failed = 0
+
+  for (const row of rows) {
+    const channelLabel = row.labels['channel']
+    const isOrphan = !channelLabel || !configuredChannels.has(channelLabel)
+    if (!isOrphan) continue
+
+    found++
+    const displayChannel = channelLabel ?? '<no channel label>'
+    console.error(
+      `[slack] reconcileOrphans: orphan found channel=${displayChannel} instanceId=${row.claude_instance_id} state=${row.state} — killing and deleting`,
+    )
+
+    try {
+      await client.kill({ claude_instance_id: row.claude_instance_id })
+    } catch (err) {
+      const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('kill', 'UnknownError', String(err))
+      recordStartupError(
+        'orphan-cleanup',
+        `kill failed for orphan instanceId=${row.claude_instance_id} channel=${displayChannel}: ${e.errName}`,
+        e,
+      )
+      // continue to delete attempt
+    }
+
+    try {
+      await client.delete({ claude_instance_id: [row.claude_instance_id] })
+      killed++
+    } catch (err) {
+      const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('delete', 'UnknownError', String(err))
+      recordStartupError(
+        'orphan-cleanup',
+        `delete failed for orphan instanceId=${row.claude_instance_id} channel=${displayChannel}: ${e.errName}`,
+        e,
+      )
+      failed++
+    }
+  }
+
+  console.error(`[slack] reconcileOrphans: found=${found} killed=${killed} failed=${failed}`)
+  return { found, killed, failed }
+}
+
+// ---------------------------------------------------------------------------
+// startupSessionManager — iterate routes and dispatch per-channel
+// ---------------------------------------------------------------------------
+
+export interface StartupSessionManagerResult {
+  succeeded: number
+  failed: number
+  perChannel: Array<{ channelId: string; action: SpawnRouteResult['action'] }>
+}
+
+/**
+ * On server startup, iterate all configured routes and call spawnForRoute
+ * for each. Uses a worker-pool pattern to limit concurrency.
+ *
+ * Per-route failures are logged and recorded in startup-errors.log but never
+ * crash the server. cozempic availability is probed in the background
+ * (non-blocking).
  */
 export async function startupSessionManager(
   routingConfig: RoutingConfig,
-  tmuxClient: TmuxClient,
-  storedSessions: SessionsMap,
-  options?: { pollTimeout?: number; concurrency?: number; startupTimeout?: number },
-): Promise<Map<string, SessionRecord>> {
-  // Verify tmux is installed before proceeding
-  try {
-    const version = await tmuxClient.checkAvailability()
-    console.error(`[slack] tmux available: ${version}`)
-  } catch {
-    console.error('[slack] Warning: tmux not available — skipping session startup')
-    return new Map()
-  }
-
-  console.error(`[slack] startupSessionManager: storedSessions=${JSON.stringify(storedSessions)}`)
-
+  options?: { concurrency?: number },
+  web?: WebClient,
+): Promise<StartupSessionManagerResult> {
   await checkCozempicAvailable()
 
   const routeEntries = Object.entries(routingConfig.routes)
   const concurrency = options?.concurrency ?? 3
-  const startupTimeout = options?.startupTimeout ?? 60_000
 
-  console.error(`[slack] startupSessionManager: ${routeEntries.length} route(s), concurrency=${concurrency}, per-route timeout=${startupTimeout}ms`)
+  console.error(
+    `[slack] startupSessionManager: ${routeEntries.length} route(s), concurrency=${concurrency}`,
+  )
 
-  const resultMap = new Map<string, SessionRecord>()
+  const perChannel: Array<{ channelId: string; action: SpawnRouteResult['action'] }> = []
   let succeeded = 0
   let failed = 0
   let nextIdx = 0
 
-  // Process a single route: reconnect, resume, or fresh launch
   async function processRoute(channelId: string, route: { cwd: string }): Promise<void> {
-    const routeStart = Date.now()
-    const name = sessionName(route.cwd)
-    const exists = await tmuxClient.hasSession(name)
-
-    if (exists) {
-      const running = await isClaudeRunning(name, tmuxClient)
-
-      if (running) {
-        // Branch 1: Reconnect — session live, send /mcp reconnect <server-name>
-        const storedId = storedSessions[channelId]?.sessionId
-        const reconnectSessionId = storedId ?? 'none'
-        console.error(`[slack] startupSessionManager: branch=reconnect channel=${channelId} sessionId=${reconnectSessionId}`)
-        console.error(`[slack] Session live — reconnecting MCP server "${MCP_SERVER_NAME}": channel=${channelId} session=${name}`)
-        await tmuxClient.sendKeys(name, `/mcp reconnect ${MCP_SERVER_NAME}`, 'Enter')
-
-        // Use stored session ID; fall back to "pending" if absent or already pending.
-        // The tool call hook (Epic 1) will update it to the real ID on the next tool call.
-        const sessionId = (storedId && storedId !== 'pending') ? storedId : 'pending'
-        console.error(`[slack] startupSessionManager: reconnect using sessionId=${sessionId} for channel=${channelId} (${Date.now() - routeStart}ms)`)
-        resultMap.set(channelId, {
-          tmuxSession: name,
-          lastLaunch: new Date().toISOString(),
-          sessionId,
-        })
-        succeeded++
-        return
-      }
-    }
-
-    // Branch 2 or 3: Dead or missing process — check for stored session ID
-    const storedSessionId = storedSessions[channelId]?.sessionId
-
-    if (exists) {
-      // Kill stale tmux session before relaunching
-      console.error(`[slack] Bare tmux session detected (Claude not running) — will relaunch: channel=${channelId} session=${name}`)
-      console.error(`[slack] Stale session found — killing before relaunch: channel=${channelId} session=${name}`)
-      await tmuxClient.killSession(name)
-    }
-
-    // Each route gets the full startupTimeout as its poll window
-    const effectiveTimeout = Math.min(options?.pollTimeout ?? 120_000, startupTimeout)
-    const launchOpts = { ...options, pollTimeout: effectiveTimeout }
-
-    // Resolve effective claude_config_dir using the same precedence as the launcher:
-    // per-route override → top-level → undefined (Claude's default ~/.claude).
-    // This must match launchSession so the JSONL pre-check looks in the same place
-    // Claude actually writes its transcripts.
-    const effectiveConfigDir =
-      routingConfig.routes[channelId]?.claude_config_dir ?? routingConfig.claude_config_dir
-
-    const shouldResume = routingConfig.resume_enabled !== false && !!(storedSessionId && storedSessionId !== 'pending' && jsonlExistsForSession(route.cwd, storedSessionId, effectiveConfigDir))
-    if (!routingConfig.resume_enabled) {
-      console.error(`[slack] startupSessionManager: resume_enabled=false — skipping resume for channel=${channelId}`)
-    }
-    if (routingConfig.resume_enabled !== false && !shouldResume && storedSessionId && storedSessionId !== 'pending') {
-      console.error(`[slack] startupSessionManager: no JSONL for stored session — skipping resume: channel=${channelId} sessionId=${storedSessionId}`)
-    }
-
-    if (shouldResume) {
-      // Branch 2: Resume — launch with stored session ID
-      console.error(`[slack] startupSessionManager: branch=resume channel=${channelId} sessionId=${storedSessionId}`)
-      console.error(`[slack] Dead/missing process with stored session ID — resuming: channel=${channelId} session=${name} sessionId=${storedSessionId}`)
-      const record = await launchSession(
-        channelId, route.cwd, routingConfig, tmuxClient,
-        { ...launchOpts, sessionId: storedSessionId, cleanSession: getCozempicAvailable() ? defaultCleanSession : undefined },
+    try {
+      const result = await spawnForRoute(channelId, route, routingConfig, web)
+      perChannel.push({ channelId, action: result.action })
+      if (result.action === 'failed') failed++
+      else succeeded++
+    } catch (err) {
+      console.error(`[slack] startupSessionManager: unexpected error for channel=${channelId}:`, err)
+      recordStartupError(
+        'spawn-failed',
+        `unexpected error spawning channel=${channelId}: ${String(err)}`,
+        err,
       )
-      const elapsed = Date.now() - routeStart
-      if (record !== null) {
-        console.error(`[slack] startupSessionManager: channel=${channelId} resumed in ${elapsed}ms (storedId=${storedSessionId} discoveredId=${record.sessionId})`)
-        resultMap.set(channelId, record)
-        succeeded++
-      } else {
-        console.error(`[slack] startupSessionManager: channel=${channelId} resume failed after ${elapsed}ms`)
-        failed++
-      }
-    } else {
-      // Branch 3: Fresh — launch without session ID
-      console.error(`[slack] startupSessionManager: branch=fresh channel=${channelId} sessionId=none`)
-      console.error(`[slack] No stored session ID — launching fresh: channel=${channelId} session=${name}`)
-      const record = await launchSession(
-        channelId, route.cwd, routingConfig, tmuxClient,
-        launchOpts,
-      )
-      const elapsed = Date.now() - routeStart
-      if (record !== null) {
-        console.error(`[slack] startupSessionManager: channel=${channelId} launched fresh in ${elapsed}ms`)
-        resultMap.set(channelId, record)
-        succeeded++
-      } else {
-        console.error(`[slack] startupSessionManager: channel=${channelId} fresh launch failed after ${elapsed}ms`)
-        failed++
-      }
+      perChannel.push({ channelId, action: 'failed' })
+      failed++
     }
   }
 
-  // Worker pool — each worker grabs the next unprocessed route until done
   async function worker(): Promise<void> {
     while (nextIdx < routeEntries.length) {
       const idx = nextIdx++
       if (idx >= routeEntries.length) break
       const [channelId, route] = routeEntries[idx]
-      try {
-        await processRoute(channelId, route)
-      } catch (err) {
-        console.error('[slack] Session startup error:', err)
-        failed++
-      }
+      await processRoute(channelId, route)
     }
   }
 
   await Promise.all(
-    Array.from({ length: Math.min(concurrency, routeEntries.length) }, () => worker()),
+    Array.from({ length: Math.min(concurrency, routeEntries.length || 1) }, () => worker()),
   )
 
-  console.error(`[slack] Session startup complete: ${succeeded} ok, ${failed} failed`)
+  console.error(`[slack] startupSessionManager: complete — ${succeeded} ok, ${failed} failed`)
 
-  return resultMap
+  return { succeeded, failed, perChannel }
+}
+
+// ---------------------------------------------------------------------------
+// launchSession — restart.ts adapter
+// ---------------------------------------------------------------------------
+
+/**
+ * Restart-adapter shim for restart.ts (`RestartDeps.launchSession`).
+ *
+ * Returns true on any non-failed action (spawned / resumed / reconnected /
+ * no-op), false on `failed`. The richer `SpawnRouteResult` is collapsed
+ * here because the restart subsystem only cares about did-it-relaunch.
+ */
+export async function launchSession(
+  channelId: string,
+  cwd: string,
+  routingConfig: RoutingConfig,
+  web?: WebClient,
+): Promise<boolean> {
+  const result = await spawnForRoute(channelId, { cwd }, routingConfig, web, false)
+  return result.action !== 'failed'
 }

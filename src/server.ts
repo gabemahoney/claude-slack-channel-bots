@@ -39,10 +39,18 @@ import {
   type GateResult,
 } from './lib.ts'
 import { loadConfig, expandTilde, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
-import { readSessions, writeSessions, rotateSessions } from './sessions.ts'
-import { defaultTmuxClient, sessionName, isClaudeRunning } from './tmux.ts'
-import { startupSessionManager, launchSession } from './session-manager.ts'
+import {
+  AGENT_DIRECTOR_LIVE_STATES,
+  flushSpawnFailureQueue,
+  instanceIdFor,
+  launchSession,
+  reconcileOrphans,
+  reconnectMcp,
+  startupSessionManager,
+} from './session-manager.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
+import { ErrSpawnNotFound } from 'agent-director'
+import { getClient } from './agent-director-client.ts'
 import {
   initRestart,
   scheduleRestart,
@@ -376,8 +384,10 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
           : undefined
         if (channelId) {
           console.error(`[slack] Session disconnected: channel=${channelId} cwd="${cwd}"`)
-          const storedId = readSessions()[channelId]?.sessionId
-          scheduleRestart(channelId, cwd, storedId !== 'pending' ? storedId : undefined)
+          // Session-id resume is now owned by agent-director (SR-1.3); the
+          // sessionId arg to scheduleRestart is retained for API stability
+          // but ignored by launchSession.
+          scheduleRestart(channelId, cwd)
         } else {
           console.error(`[slack] Session disconnected: cwd="${cwd}"`)
         }
@@ -944,9 +954,8 @@ export async function main(): Promise<void> {
   // If we rotate first, a failed start (e.g., server already running) destroys sessions.json.
   checkPidConflict(PID_FILE)
 
-  // Rotate sessions.json → sessions.json.last now that we know we're the only server.
-  // This preserves last-known session IDs for resume logic below.
-  rotateSessions()
+  // The agent-director store owns session-id state now; CSCB no longer
+  // maintains its own sessions.json registry (SR-7.1 deletion in Epic 2).
 
   let mcpHost: string
   let mcpPort: number
@@ -1495,8 +1504,7 @@ export async function main(): Promise<void> {
               : undefined
             if (channelId) {
               console.error(`[slack] Session disconnected (SSE abort): channel=${channelId} cwd="${cwd}"`)
-              const storedId = readSessions()[channelId]?.sessionId
-              scheduleRestart(channelId, cwd, storedId !== 'pending' ? storedId : undefined)
+              scheduleRestart(channelId, cwd)
             } else {
               console.error(`[slack] Session disconnected (SSE abort): cwd="${cwd}"`)
             }
@@ -1524,17 +1532,24 @@ export async function main(): Promise<void> {
   console.error(`  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:${MCP_SERVER_NAME}`)
   console.error('')
 
-  // Shared adapter: checks whether a tmux session for the given channel has Claude running.
+  // Shared adapter: probes agent-director for the spawn's current state per
+  // SR-11 Event 6a. Any AGENT_DIRECTOR_LIVE_STATES value → alive; terminal
+  // states (ended, missing) and ErrSpawnNotFound → dead. Other errors fall
+  // back to "dead" defensively — health-check will retry.
   const isSessionAliveAdapter = async (channelId: string): Promise<boolean> => {
-    const cwd = routingConfig?.routes[channelId]?.cwd
-    if (!cwd) return false
-    const name = sessionName(cwd)
-    const exists = await defaultTmuxClient.hasSession(name)
-    if (!exists) return false
-    return isClaudeRunning(name, defaultTmuxClient)
+    if (!routingConfig?.routes[channelId]) return false
+    const claude_instance_id = instanceIdFor(channelId)
+    try {
+      const r = await getClient().status({ claude_instance_id })
+      return AGENT_DIRECTOR_LIVE_STATES.has(r.state)
+    } catch (err) {
+      if (err instanceof ErrSpawnNotFound) return false
+      console.error(`[slack] isSessionAlive: status error for channel=${channelId}:`, err)
+      return false
+    }
   }
 
-  // Initialize restart module with adapters bridging tmux + session-manager
+  // Initialize restart module with library-backed adapters
   initRestart({
     isSessionAlive: isSessionAliveAdapter,
     isSessionConnected: (channelId) => {
@@ -1544,68 +1559,45 @@ export async function main(): Promise<void> {
       return session?.connected === true
     },
     reconnectSession: async (channelId) => {
-      const cwd = routingConfig?.routes[channelId]?.cwd
-      if (!cwd) return
-      const name = sessionName(cwd)
-      await defaultTmuxClient.sendKeys(name, `/mcp reconnect ${MCP_SERVER_NAME}`)
-      await defaultTmuxClient.sendKeys(name, 'Enter')
+      await reconnectMcp(channelId, isDryRun() ? undefined : web)
     },
     killSession: async (channelId) => {
-      const cwd = routingConfig?.routes[channelId]?.cwd
-      if (!cwd) return
-      const name = sessionName(cwd)
-      const exists = await defaultTmuxClient.hasSession(name)
-      if (exists) await defaultTmuxClient.killSession(name)
+      try {
+        await getClient().kill({ claude_instance_id: instanceIdFor(channelId) })
+      } catch (err) {
+        if (err instanceof ErrSpawnNotFound) return
+        console.error(`[slack] killSession (restart adapter): error for channel=${channelId}:`, err)
+      }
     },
-    launchSession: async (channelId, cwd, sessionId) => {
+    launchSession: async (channelId, cwd) => {
       if (!routingConfig) return false
-      const stored = sessionId ?? readSessions()[channelId]?.sessionId
-      // Treat "pending" as undefined — fall back to a fresh launch, not --resume.
-      // Also skip --resume when resume_enabled is explicitly false.
-      const resolvedSessionId = routingConfig.resume_enabled !== false && stored !== 'pending' ? stored : undefined
-      if (!resolvedSessionId && routingConfig.resume_enabled === false) {
-        console.error(`[slack] launchSession (restart): resume_enabled=false — launching fresh for channel=${channelId}`)
-      }
-      const record = await launchSession(
-        channelId, cwd, routingConfig, defaultTmuxClient,
-        resolvedSessionId !== undefined
-          ? { sessionId: resolvedSessionId, cleanSession: getCozempicAvailable() ? cleanSession : undefined }
-          : undefined,
-      )
-      if (record) {
-        const sessions = readSessions()
-        sessions[channelId] = record
-        writeSessions(sessions)
-        console.error(`[slack] Session recorded in sessions.json: channel=${channelId} sessionId=${record.sessionId}`)
-      }
-      return record !== null
+      // resume vs fresh is handled inside spawnForRoute (SR-1.4 collision-then-act).
+      // The session-id argument from the legacy restart deps is now ignored — AD
+      // owns the resume state, not CSCB.
+      return await launchSession(channelId, cwd, routingConfig, isDryRun() ? undefined : web)
     },
     getRestartDelay: () => routingConfig?.session_restart_delay ?? 60,
     isShuttingDown: () => shuttingDown,
   })
 
-  // Start up managed tmux sessions for all configured routes.
-  // If tmux is unavailable or startup fails, log a warning and continue.
+  // SR-1.6: orphan reconciliation BEFORE per-route reconcile. Spawns whose
+  // `channel` label is not in routingConfig.routes get killed + deleted.
   if (routingConfig) {
     try {
-      const lastPath = join(STATE_DIR, 'sessions.json.last')
-      const storedSessions = readSessions(lastPath)
-      const records = await startupSessionManager(routingConfig, defaultTmuxClient, storedSessions)
-
-      // Build sessions map: start with stored IDs for failed routes so they
-      // survive to the next restart, then overwrite with successful launches.
-      const sessionsMap: Record<string, import('./sessions.ts').SessionRecord> = {}
-      for (const [channelId, stored] of Object.entries(storedSessions)) {
-        if (!records.has(channelId) && stored.sessionId && stored.sessionId !== 'pending') {
-          sessionsMap[channelId] = stored
-        }
-      }
-      for (const [channelId, record] of records) {
-        sessionsMap[channelId] = record
-      }
-      writeSessions(sessionsMap)
+      await reconcileOrphans(routingConfig)
     } catch (err) {
-      console.error('[slack] Warning: session startup failed — continuing without managed sessions:', err)
+      console.error('[slack] Warning: orphan reconciliation failed:', err)
+    }
+  }
+
+  // Per-route reconcile via library: spawnForRoute dispatches fresh-spawn or
+  // collision-handling per SR-1.4. Failures are surfaced to the affected Slack
+  // channel; the server stays up.
+  if (routingConfig) {
+    try {
+      await startupSessionManager(routingConfig, undefined, isDryRun() ? undefined : web)
+    } catch (err) {
+      console.error('[slack] Warning: session startup failed — continuing:', err)
     }
   }
 
