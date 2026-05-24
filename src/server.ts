@@ -79,6 +79,8 @@ import {
   type SessionToolDeps,
   type SessionEntry,
 } from './registry.ts'
+import { runAgentDirectorStartupGate } from './agent-director-startup.ts'
+import { installSlackChannelBotTemplate } from './agent-director-template.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -931,6 +933,13 @@ process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
 // ---------------------------------------------------------------------------
 
 export async function main(): Promise<void> {
+  // SR-5.1: agent-director startup gate.
+  // Runs before any other CSCB work — imports the library, constructs the
+  // singleton Client, performs the version probe, and verifies that the
+  // existing ~/.agent-director/state.db (if any) is owned by the current
+  // user. Any failure records to startup-errors.log and exits non-zero.
+  await runAgentDirectorStartupGate()
+
   // Check for existing server BEFORE rotating sessions.json.
   // If we rotate first, a failed start (e.g., server already running) destroys sessions.json.
   checkPidConflict(PID_FILE)
@@ -948,6 +957,11 @@ export async function main(): Promise<void> {
     mcpPort = routingConfig.port
     const routeCount = Object.keys(routingConfig.routes).length
     console.error(`[slack] Loaded routing config: ${routeCount} route(s)`)
+
+    // SR-3.2: refresh the slack-channel-bot agent-director template on every
+    // boot. Atomic replacement via Client.makeTemplate(..., overwrite: true)
+    // gives us "ensure post-state" semantics. Fatal startup error on failure.
+    await installSlackChannelBotTemplate(routingConfig)
 
     // Initialize message archive if configured
     if (routingConfig.message_archive_db) {
