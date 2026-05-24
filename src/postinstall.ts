@@ -120,10 +120,54 @@ export function runPostinstall(options: PostinstallOptions = {}): void {
   }
 }
 
+/**
+ * Best-effort import + Client construction + version() probe. Logs success
+ * or a one-line warning; never throws, never exits non-zero.
+ *
+ * The probe is deliberately wrapped in a top-level try/catch so a missing
+ * `agent-director` package (ENOENT during dynamic import) surfaces as a
+ * remediation message rather than crashing the postinstall script.
+ */
+export async function runAgentDirectorPostinstallProbe(): Promise<void> {
+  try {
+    const ad = await import('agent-director')
+    // Construct + version() probe. Client construction is synchronous FFI;
+    // any platform/Bun/FFI error fires here and is caught below.
+    const client = new ad.Client({
+      storePath: '~/.agent-director/state.db',
+      createIfMissing: true,
+    })
+    try {
+      const v = await client.version({})
+      const adVersion = v.version.replace(/^v/, '')
+      console.log(`postinstall: agent-director ${adVersion} OK`)
+    } finally {
+      try { client.close() } catch { /* close never throws but be defensive */ }
+    }
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    console.warn(
+      `postinstall warning: agent-director probe failed (${detail}). ` +
+      `Install agent-director (\`bun add agent-director@^0.4.3\`) before running ` +
+      `\`claude-slack-channel-bots start\`; the startup gate will fail otherwise.`,
+    )
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 if (import.meta.main) {
   runPostinstall()
+  // SR-5.2: best-effort agent-director presence probe. Bun blocks
+  // postinstall by default — this script only runs when the operator has
+  // added claude-slack-channel-bots to `trustedDependencies`. Probe
+  // failures emit a one-line warning but do NOT fail the install; the
+  // real dependency enforcement is the SR-5.1 startup gate at server boot.
+  runAgentDirectorPostinstallProbe().catch(() => {
+    // The probe itself swallows all errors and logs a warning; this
+    // .catch is a belt-and-suspenders defensive layer for any future
+    // refactor that lets an error escape.
+  })
 }

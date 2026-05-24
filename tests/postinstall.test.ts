@@ -12,7 +12,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync, renameSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { runPostinstall } from '../src/postinstall.ts'
+import { runPostinstall, runAgentDirectorPostinstallProbe } from '../src/postinstall.ts'
 import { defaultAccess } from '../src/lib.ts'
 import { MCP_SERVER_NAME } from '../src/config.ts'
 
@@ -420,5 +420,19 @@ describe('no-overwrite — running twice', () => {
     expect(existsSync(join(stateDir, 'config.json'))).toBe(true)
     expect(existsSync(join(stateDir, 'access.json'))).toBe(true)
     expect(existsSync(mcpConfigPath)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SR-5.2: best-effort agent-director probe
+// ---------------------------------------------------------------------------
+
+describe('runAgentDirectorPostinstallProbe (SR-5.2)', () => {
+  test('never throws; failures surface only as warnings', async () => {
+    // Whatever the host's state, the probe must complete without throwing —
+    // postinstall must NEVER fail the npm install. We can't reliably make
+    // the probe succeed in unit tests (real FFI + native libs), but we can
+    // verify the no-throw contract under both happy and unhappy paths.
+    await expect(runAgentDirectorPostinstallProbe()).resolves.toBeUndefined()
   })
 })
