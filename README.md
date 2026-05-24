@@ -36,13 +36,28 @@ See the sections below for manual configuration details if you prefer not to use
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) v1.0+
+- [Bun](https://bun.sh) `>= 1.0.21` (agent-director minimum)
 - [tmux](https://github.com/tmux/tmux) (required for server-managed sessions)
 - [Claude Code](https://claude.ai/code) installed and authenticated
+- [`agent-director`](https://github.com/gabemahoney/agent-director) **runtime dependency** — pulled in transitively when you install this package. Hard required at server boot: CSCB refuses to start if the library is missing, the host platform is unsupported, Bun is too old, or the installed version is below `MIN_AD_VERSION` (`^0.4.3`).
 - `ss` from [iproute2](https://github.com/iproute2/iproute2) on your `PATH` (required for session ID discovery; pre-installed on most Linux distributions)
 - `curl` and `jq` on your `PATH` (required for the permission relay hooks)
 - Slack workspace admin access (to create and configure the Slack app)
 - **cozempic** (optional) — Python 3.10+ and `pip install cozempic` — enables session file cleaning before `--resume` for faster load times
+
+### Supported platforms (inherited from agent-director)
+
+| Platform | Status |
+|---|---|
+| `linux-x64` | Supported |
+| `darwin-arm64` (Apple Silicon Mac) | Supported |
+| `linux-arm64` | **Not supported** by agent-director |
+| `darwin-x64` (Intel Mac) | **Not supported** by agent-director |
+| Windows | **Not supported** by agent-director |
+
+If the host is unsupported, the SR-5.1 startup gate exits non-zero at server boot with a typed error from agent-director (`ErrPlatformPackageMissing` or `ErrUnsupportedPlatform`) and writes the failure to `~/.claude/channels/slack/startup-errors.log` and stderr. See [Startup errors](#startup-errors) below.
+
+> **Note on agent-director versions.** v0.4.1 is a zombie release (the published tarball is missing `dist/` and cannot be imported). v0.4.2 lacks the `MakeTemplateParams.overwrite` field CSCB needs for the boot-time template refresh. CSCB pins `^0.4.3` to get past both.
 
 ---
 
@@ -121,6 +136,7 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | `message_archive_db` | string | — | Path to a SQLite DB where every inbound Slack message is archived in real time. Parent directories are created if missing; schema is initialized on first open. Compatible with the `archive-messages.py` backfill script — both can write concurrently. Feature is disabled when absent. |
 | `claude_config_dir` | string | — | Path to a Claude on-disk config directory. When set, managed sessions launch with `CLAUDE_CONFIG_DIR='<resolved-path>'` so the bot authenticates against a specific account. `~` is expanded and the path is resolved to absolute. Per-route `routes[id].claude_config_dir` overrides this top-level value for individual channels. When neither is set, Claude's own default applies. Must be non-empty when set. |
 | `resume_enabled` | boolean | `true` | When `false`, the session manager always performs a fresh Claude session launch instead of resuming, both on startup and on runtime auto-restart, even when a stored session ID exists. Disabling this skips the `--resume` flag entirely. Use this as a workaround if your Claude Code version crashes with "sandbox required but unavailable" on `--resume` (a known regression in v2.1.120). |
+| `agent_director_poll_interval_ms` | number | `1000` | Poll interval (ms) for the agent-director permission relay tick. Must be a positive integer in `[200, 3_600_000]`. Replaces the pre-rename `claude_director_poll_interval_ms` — the old name is rejected at startup. Unknown top-level config fields are also rejected to surface stale configs after the rename. |
 
 #### Per-route `claude_config_dir` override
 
@@ -444,3 +460,27 @@ This is a known regression in certain Claude Code releases (e.g. v2.1.120) where
   "resume_enabled": false
 }
 ```
+
+---
+
+## Startup errors
+
+CSCB writes fatal startup errors to `~/.claude/channels/slack/startup-errors.log` (override the directory with `SLACK_STATE_DIR`) in addition to stderr. Each entry is a single timestamped line. The file is append-only and never rotated by CSCB — copy `docs/logrotate-startup-errors.conf` into `/etc/logrotate.d/` if you want host-level rotation.
+
+Classes you may see:
+
+- `ad-platform-package-missing` — agent-director's platform-native peer dependency is absent. The host is unsupported by agent-director.
+- `ad-unsupported-platform` — agent-director's runtime check rejected the host's `process.platform`/`process.arch` tuple.
+- `ad-bun-version-too-old` — agent-director needs Bun `>= 1.0.21`. Upgrade Bun.
+- `ad-version-probe` — `agent-director` was loaded but the `version()` probe failed (FFI handle, native lib, etc.).
+- `ad-version-stale` — installed `agent-director` is below the minimum version this CSCB requires. Run `bun add agent-director@^<minimum>`.
+- `ad-same-user` — `~/.agent-director/state.db` is owned by a different UID than the CSCB process. Reinstall agent-director as the correct user or remove the mismatched file.
+- `ad-same-user-stat` — Non-ENOENT stat error on the state DB (permissions, I/O). Investigate the file before re-launching.
+- `ad-template-install` — `client.makeTemplate(...)` rejected the boot-time refresh of the `slack-channel-bot` template. The line includes the agent-director `errName`.
+
+---
+
+## Migration
+
+> **Stub (finalized in Epic 2).** Epic 1 has wired CSCB onto the typed `agent-director` library at boot — every install now pulls AD in transitively, the SR-5.1 startup gate runs before anything else, and the SR-3.2 template refresh writes `~/.agent-director/templates/slack-channel-bot.toml` on every boot. The spawn path and the permission-relay path are unchanged in Epic 1; they still use the homegrown tmux + HTTP long-poll code and continue to work byte-identically. Epic 2 atomically swaps both paths onto the library and finalizes this section with the full operator migration checklist (remove old hooks, configure AD's `find-missing` sweep, rename `claude_director_poll_interval_ms`, etc).
+
