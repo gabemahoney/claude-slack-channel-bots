@@ -20,6 +20,47 @@ export const MCP_SERVER_NAME = 'slack-channel-router'
 export const ALLOWED_PRESCRIPTIONS = ['gentle', 'standard', 'aggressive']
 export const ALLOWED_SYSTEM_PROMPT_MODES = ['append', 'none']
 
+/** Default agent-director poll interval (SR-4.1), milliseconds. */
+export const DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS = 1000
+
+/** Inclusive lower bound on agent_director_poll_interval_ms (SR-4.1). */
+export const MIN_AGENT_DIRECTOR_POLL_INTERVAL_MS = 200
+
+/** Inclusive upper bound on agent_director_poll_interval_ms (SR-4.1). */
+export const MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS = 3_600_000
+
+/**
+ * The canonical set of top-level keys allowed in config.json. Anything else
+ * is rejected at startup per SR-4.2; the rename of
+ * claude_director_poll_interval_ms → agent_director_poll_interval_ms (SR-4.1)
+ * relies on this rejection to surface stale operator configs loudly.
+ */
+const KNOWN_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
+  'routes',
+  'default_route',
+  'default_dm_session',
+  'bind',
+  'port',
+  'session_restart_delay',
+  'health_check_interval',
+  'exit_timeout',
+  'stop_timeout',
+  'mcp_config_path',
+  'append_system_prompt_file',
+  'cozempic_prescription',
+  'system_prompt_mode',
+  'message_archive_db',
+  'claude_config_dir',
+  'resume_enabled',
+  'agent_director_poll_interval_ms',
+])
+
+/** The canonical set of per-route keys allowed inside a routes[<channel>] entry. */
+const KNOWN_ROUTE_KEYS: ReadonlySet<string> = new Set([
+  'cwd',
+  'claude_config_dir',
+])
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -69,6 +110,13 @@ export interface RoutingConfigInput {
    * (e.g. Claude Code v2.1.120 "sandbox required but unavailable").
    */
   resume_enabled?: boolean
+  /**
+   * Poll interval (ms) for the SR-2.1 permission-relay tick. Must be a
+   * positive integer in the closed range [200, 3_600_000]; defaults to 1000.
+   * Replaces the old `claude_director_poll_interval_ms` field — the old name
+   * is rejected explicitly at startup per SR-4.1.
+   */
+  agent_director_poll_interval_ms?: number
 }
 
 /** Validated, fully-resolved routing configuration with all defaults applied. */
@@ -91,6 +139,8 @@ export interface RoutingConfig {
   claude_config_dir?: string
   /** When false, --resume is skipped on startup and bots always launch fresh. Defaults to true. */
   resume_enabled: boolean
+  /** Poll interval (ms) for the SR-2.1 permission-relay tick. */
+  agent_director_poll_interval_ms: number
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +169,8 @@ export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
     message_archive_db: input.message_archive_db,
     claude_config_dir: input.claude_config_dir,
     resume_enabled: input.resume_enabled ?? true,
+    agent_director_poll_interval_ms:
+      input.agent_director_poll_interval_ms ?? DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS,
   }
 }
 
@@ -234,6 +286,65 @@ export function validateConfig(config: RoutingConfig): void {
       }
     }
   }
+
+  // SR-4.1: agent_director_poll_interval_ms must be a positive integer in
+  // the closed range [200, 3_600_000].
+  const pollMs = config.agent_director_poll_interval_ms
+  if (
+    typeof pollMs !== 'number' ||
+    !Number.isFinite(pollMs) ||
+    !Number.isInteger(pollMs) ||
+    pollMs < MIN_AGENT_DIRECTOR_POLL_INTERVAL_MS ||
+    pollMs > MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS
+  ) {
+    throw new Error(
+      `Routing config validation error: agent_director_poll_interval_ms must be a positive integer in [${MIN_AGENT_DIRECTOR_POLL_INTERVAL_MS}, ${MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS}]; got ${JSON.stringify(pollMs)}.`,
+    )
+  }
+}
+
+/**
+ * Reject config.json shapes that carry fields CSCB does not know about
+ * (SR-4.2). The pre-rename field name `claude_director_poll_interval_ms`
+ * gets a targeted error message that names the new field, per SR-4.1's
+ * migration guidance.
+ *
+ * Operates on the raw parsed object so we can see fields that would otherwise
+ * be dropped by RoutingConfigInput's structural casting.
+ */
+function rejectUnknownFields(parsed: Record<string, unknown>): void {
+  const unknown: string[] = []
+  for (const key of Object.keys(parsed)) {
+    if (KNOWN_TOP_LEVEL_KEYS.has(key)) continue
+    if (key === 'claude_director_poll_interval_ms') {
+      throw new Error(
+        `Routing config validation error: claude_director_poll_interval_ms has been renamed to agent_director_poll_interval_ms (SR-4.1). Rename the field in config.json — the old name is not accepted as an alias.`,
+      )
+    }
+    unknown.push(key)
+  }
+  if (unknown.length > 0) {
+    throw new Error(
+      `Routing config validation error: unknown top-level field(s) in config.json: ${unknown.map((k) => JSON.stringify(k)).join(', ')}.`,
+    )
+  }
+
+  // Per-route unknown-field check
+  const routes = parsed['routes']
+  if (routes !== null && typeof routes === 'object' && !Array.isArray(routes)) {
+    for (const [channelId, entry] of Object.entries(routes as Record<string, unknown>)) {
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
+      const routeUnknown: string[] = []
+      for (const key of Object.keys(entry as Record<string, unknown>)) {
+        if (!KNOWN_ROUTE_KEYS.has(key)) routeUnknown.push(key)
+      }
+      if (routeUnknown.length > 0) {
+        throw new Error(
+          `Routing config validation error: unknown field(s) in routes["${channelId}"]: ${routeUnknown.map((k) => JSON.stringify(k)).join(', ')}.`,
+        )
+      }
+    }
+  }
 }
 
 /**
@@ -337,6 +448,7 @@ export function loadConfig(path?: string): RoutingConfig {
   }
 
   try {
+    rejectUnknownFields(parsed as Record<string, unknown>)
     return resolveConfig(input)
   } catch (err) {
     const cause = err instanceof Error ? err.message : String(err)

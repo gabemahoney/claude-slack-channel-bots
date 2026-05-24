@@ -264,6 +264,7 @@ function makeValidConfig(overrides: Partial<RoutingConfig> = {}): RoutingConfig 
     cozempic_prescription: 'standard',
     system_prompt_mode: 'append',
     resume_enabled: true,
+    agent_director_poll_interval_ms: 1000,
     ...overrides,
   }
 }
@@ -948,6 +949,114 @@ describe('loadConfig', () => {
     writeFileSync(configPath, JSON.stringify(config), 'utf-8')
     const result = loadConfig(configPath)
     expect(result.resume_enabled).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SR-4.1: agent_director_poll_interval_ms
+// ---------------------------------------------------------------------------
+
+describe('agent_director_poll_interval_ms (SR-4.1)', () => {
+  test('defaults to 1000 when absent', () => {
+    const result = resolveConfig({ routes: { C: { cwd: '/tmp' } } })
+    expect(result.agent_director_poll_interval_ms).toBe(1000)
+  })
+
+  test('accepts the lower bound (200)', () => {
+    const result = resolveConfig({
+      routes: { C: { cwd: '/tmp' } },
+      agent_director_poll_interval_ms: 200,
+    })
+    expect(result.agent_director_poll_interval_ms).toBe(200)
+  })
+
+  test('accepts the upper bound (3_600_000)', () => {
+    const result = resolveConfig({
+      routes: { C: { cwd: '/tmp' } },
+      agent_director_poll_interval_ms: 3_600_000,
+    })
+    expect(result.agent_director_poll_interval_ms).toBe(3_600_000)
+  })
+
+  test('rejects values below 200', () => {
+    expect(() =>
+      resolveConfig({ routes: { C: { cwd: '/tmp' } }, agent_director_poll_interval_ms: 199 }),
+    ).toThrow(/agent_director_poll_interval_ms must be a positive integer/)
+  })
+
+  test('rejects values above 3_600_000', () => {
+    expect(() =>
+      resolveConfig({ routes: { C: { cwd: '/tmp' } }, agent_director_poll_interval_ms: 3_600_001 }),
+    ).toThrow(/agent_director_poll_interval_ms must be a positive integer/)
+  })
+
+  test('rejects non-integer values', () => {
+    expect(() =>
+      resolveConfig({ routes: { C: { cwd: '/tmp' } }, agent_director_poll_interval_ms: 1.5 }),
+    ).toThrow(/must be a positive integer/)
+  })
+
+  test('rejects non-number values', () => {
+    expect(() =>
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      resolveConfig({ routes: { C: { cwd: '/tmp' } }, agent_director_poll_interval_ms: '1000' as any }),
+    ).toThrow(/must be a positive integer/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SR-4.2: unknown-field rejection
+// ---------------------------------------------------------------------------
+
+describe('loadConfig — unknown-field rejection (SR-4.2)', () => {
+  test('rejects unknown top-level fields', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    writeFileSync(
+      configPath,
+      JSON.stringify({ routes: { C: { cwd: '/tmp' } }, blorp: 1 }),
+      'utf-8',
+    )
+    expect(() => loadConfig(configPath)).toThrow(/unknown top-level field/)
+  })
+
+  test('rejects the pre-rename claude_director_poll_interval_ms with a directed error', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    writeFileSync(
+      configPath,
+      JSON.stringify({ routes: { C: { cwd: '/tmp' } }, claude_director_poll_interval_ms: 500 }),
+      'utf-8',
+    )
+    expect(() => loadConfig(configPath)).toThrow(
+      /claude_director_poll_interval_ms has been renamed to agent_director_poll_interval_ms/,
+    )
+  })
+
+  test('rejects unknown per-route fields', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    writeFileSync(
+      configPath,
+      JSON.stringify({ routes: { C: { cwd: '/tmp', extra: 'no' } } }),
+      'utf-8',
+    )
+    expect(() => loadConfig(configPath)).toThrow(/unknown field\(s\) in routes\["C"\]/)
+  })
+
+  test('accepts a config with only known fields', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        routes: { C: { cwd: '/tmp', claude_config_dir: '/x' } },
+        agent_director_poll_interval_ms: 500,
+        resume_enabled: false,
+      }),
+      'utf-8',
+    )
+    expect(() => loadConfig(configPath)).not.toThrow()
   })
 })
 
