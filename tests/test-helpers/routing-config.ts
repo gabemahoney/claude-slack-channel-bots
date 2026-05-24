@@ -21,6 +21,7 @@ export function makeRoutingConfig(overrides?: Partial<RoutingConfig>): RoutingCo
     cozempic_prescription: 'standard',
     system_prompt_mode: 'append',
     resume_enabled: true,
+    agent_director_poll_interval_ms: 1000,
     ...overrides,
   }
 }
