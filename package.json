@@ -27,7 +27,7 @@
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@slack/socket-mode": "^2.0.0",
     "@slack/web-api": "^7.0.0",
-    "agent-director": "^0.4.3"
+    "agent-director": "^0.4.5"
   },
   "devDependencies": {
     "@types/bun": "^1.0.0",
