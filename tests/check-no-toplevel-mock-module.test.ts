@@ -83,4 +83,31 @@ describe('check-no-toplevel-mock-module CI gate', () => {
     expect(stderr).toContain('violation')
     expect(stderr).toContain('leaky.test.ts')
   })
+
+  test('dirty temp dir with top-level mock.restore(): exits 1 and reports violation', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'b5wd-gate-test-'))
+    const testsDir = join(tempDir, 'tests')
+    mkdirSync(testsDir, { recursive: true })
+
+    // Write a leaky test file — top-level mock.restore() at column 0
+    writeFileSync(
+      join(testsDir, 'leaky-restore.test.ts'),
+      [
+        "import { describe, test, expect } from 'bun:test'",
+        "import { mock } from 'bun:test'",
+        '',
+        'mock.restore()',
+        '',
+        "describe('leaky-restore', () => {",
+        "  test('noop', () => { expect(true).toBe(true) })",
+        '})',
+      ].join('\n'),
+    )
+
+    const { exitCode, stderr } = runScript(tempDir)
+    expect(exitCode).toBe(1)
+    expect(stderr).toContain('violation')
+    expect(stderr).toContain('mock.restore')
+    expect(stderr).toContain('leaky-restore.test.ts')
+  })
 })
