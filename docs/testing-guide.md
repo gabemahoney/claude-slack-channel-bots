@@ -56,13 +56,13 @@ Use `beforeEach` to reset module-scoped state between tests:
 
 **The b.b8s incident.** A top-level mock in one file replaced `child_process` with only `{ spawn: fakeSpawn }`. A later file did `import { spawnSync } from 'child_process'` and failed with:
 
-```
+```text
 SyntaxError: Export named 'spawnSync' not found in module 'node:child_process'
 ```
 
 The root cause and class-of-bug fix are tracked in bugs b.b8s and b.5wd.
 
-**The rule.** Every `mock.module(...)` call must live inside a `beforeEach` or `beforeAll` block, paired with a matching `afterEach` or `afterAll` that calls `mock.restore()`. Never call `mock.module(...)` or `mock.restore()` at file top-level.
+**The rule.** Every `mock.module(...)` call must live inside a `beforeEach` or `beforeAll` block, paired with a matching `afterEach` or `afterAll` that calls `mock.restore()`. Never call `mock.module(...)` or `mock.restore()` at file top-level. This includes calls inside a `describe(...)` body but outside hooks — those run at import/registration time and leak the same way.
 
 **Don't:**
 
