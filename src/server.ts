@@ -35,6 +35,7 @@ import {
   assertSendable as libAssertSendable,
   assertOutboundAllowed as libAssertOutboundAllowed,
   gate as libGate,
+  hasGetStreamKey,
   type Access,
   type GateResult,
 } from './lib.ts'
@@ -661,7 +662,23 @@ async function handleMessage(event: unknown): Promise<void> {
       }
 
       // Dispatch to the session's Server instance
-      console.error(`[slack] Dispatching to session cwd="${targetSession.cwd}" channel=${channelId} text="${text.slice(0, 80)}"`)
+      const transport = targetSession.transport as any
+      const hasGetStream = hasGetStreamKey(transport)
+      const mcpSessionId = targetSession.transport.sessionId ?? '(unset)'
+      console.error(
+        `[slack] Dispatching to session cwd="${targetSession.cwd}" channel=${channelId} ` +
+        `mcpSessionId=${mcpSessionId} hasGetStream=${hasGetStream} ` +
+        `connected=${targetSession.connected} text="${text.slice(0, 80)}"`
+      )
+      if (!hasGetStream) {
+        console.error(
+          `[slack] DROP: no _GET_stream for cwd="${targetSession.cwd}" channel=${channelId} ` +
+          `mcpSessionId=${mcpSessionId} — message will not reach the bot; scheduling restart`
+        )
+        scheduleRestart(channelId, targetSession.cwd)
+        // Continue with the .notification() call anyway, so behavior in this PR is
+        // strictly observe + restart-on-miss; not yet a behavior change for the normal path.
+      }
       targetSession.server.notification({
         method: 'notifications/claude/channel',
         params: { content: text, meta },

@@ -14,6 +14,14 @@ import { resolve } from 'path'
 // Constants (re-exported so server.ts and tests share the same values)
 // ---------------------------------------------------------------------------
 
+// True iff the standalone GET SSE stream entry "_GET_stream" is present in the
+// MCP SDK transport's internal _streamMapping — used by handleMessage to detect
+// silent-drop conditions before forwarding a Slack message.
+export function hasGetStreamKey(transport: unknown): boolean {
+  const mapping = (transport as any)?._streamMapping
+  return typeof mapping?.has === 'function' && mapping.has('_GET_stream')
+}
+
 export const MAX_PENDING = 3
 export const MAX_PAIRING_REPLIES = 2
 export const PAIRING_EXPIRY_MS = 60 * 60 * 1000 // 1 hour
