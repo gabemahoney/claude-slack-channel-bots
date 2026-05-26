@@ -10,6 +10,7 @@
  *   - ErrUnsupportedPlatform    (Client constructor / platform gate)
  *   - ErrBunVersionTooOld       (Client constructor / Bun version gate)
  *   - ErrPlatformPackageMissing (Client constructor / @agent-director/<plat>)
+ *   - ErrCliNotExecutable       (Client constructor / CLI binary lacks +x)
  *   - ErrInstanceIdCollision    (spawn / SR-1.4 idempotency)
  *   - ErrSpawnNotFound          (get / status / decide on missing row)
  *   - ErrNoSessionId            (resume / SR-1.3 fallthrough)
@@ -24,6 +25,7 @@
  *   - ErrTemplateNotFound       (defensive — not raised by makeTemplate)
  *   - ErrTemplateNameUnsafe     (makeTemplate / SR-3.2 fatal)
  *   - ErrClientClosed           (post-close verb call; TS-only)
+ *   - ErrCallTimeout            (any verb / per-call timeout exceeded)
  *
  * ErrPauseTimeout is intentionally omitted (SR-0.2): SR-11 Event 12 owns its
  * own pause timeout via CSCB-side polling and never relies on the library's
@@ -38,6 +40,8 @@ export {
   ErrUnsupportedPlatform,
   ErrPlatformPackageMissing,
   ErrBunVersionTooOld,
+  ErrCliNotExecutable,
+  ErrCallTimeout,
   ErrInstanceIdCollision,
   ErrSpawnNotFound,
   ErrNoSessionId,

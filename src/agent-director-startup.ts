@@ -31,6 +31,8 @@ import { join } from 'node:path'
 
 import {
   ErrBunVersionTooOld,
+  ErrCallTimeout,
+  ErrCliNotExecutable,
   ErrPlatformPackageMissing,
   ErrUnsupportedPlatform,
   AgentDirectorError,
@@ -212,6 +214,17 @@ export async function runStartupGate(
           `Upgrade Bun (https://bun.sh) and retry. Detail: ${err.errDescription}`,
       }
     }
+    if (err instanceof ErrCliNotExecutable) {
+      return {
+        ok: false,
+        phase: 'construct',
+        classLabel: 'ad-cli-not-executable',
+        message:
+          `agent-director CLI binary is not executable. ` +
+          `Detail: ${err.errDescription}. ` +
+          `Remediation: chmod +x the binary referenced above, then retry.`,
+      }
+    }
     const detail = err instanceof Error ? err.message : String(err)
     return {
       ok: false,
@@ -226,6 +239,19 @@ export async function runStartupGate(
   try {
     versionResult = await d.callVersion(client)
   } catch (err) {
+    if (err instanceof ErrCallTimeout) {
+      d.closeClient(client)
+      return {
+        ok: false,
+        phase: 'version',
+        classLabel: 'ad-call-timeout',
+        message:
+          `agent-director ${err.verb}() timed out after ${err.elapsedMs}ms ` +
+          `(configured callTimeoutMs: ${err.timeoutMs}ms). ` +
+          `Either the subprocess hung or the timeout is set too low; ` +
+          `set ClientOptions.callTimeoutMs higher (default 30000) or investigate the agent-director subprocess.`,
+      }
+    }
     d.closeClient(client)
     const detail =
       err instanceof AgentDirectorError

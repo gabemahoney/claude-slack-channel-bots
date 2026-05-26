@@ -21,6 +21,8 @@ import {
   AgentDirectorError,
   ErrAlreadyDecided,
   ErrBunVersionTooOld,
+  ErrCallTimeout,
+  ErrCliNotExecutable,
   ErrInstanceIdCollision,
   ErrJsonlMissing,
   ErrNoOpenPermissionRequest,
@@ -91,6 +93,16 @@ export function errUnsupportedPlatform(tuple: string = 'win32-x64'): ErrUnsuppor
 /** Build an ErrBunVersionTooOld (Client-constructor failure mode). */
 export function errBunVersionTooOld(actual: string = '0.9.0', minimum: string = '1.0.21'): ErrBunVersionTooOld {
   return new ErrBunVersionTooOld(actual, minimum)
+}
+
+/** Build an ErrCliNotExecutable (Client-constructor failure mode). */
+export function errCliNotExecutable(path: string = '/path/to/agent-director-bin'): ErrCliNotExecutable {
+  return new ErrCliNotExecutable(path)
+}
+
+/** Build an ErrCallTimeout (any verb; per-call timeout exceeded). */
+export function errCallTimeout(verb: string = 'version', elapsedMs: number = 35000, timeoutMs: number = 30000): ErrCallTimeout {
+  return new ErrCallTimeout(verb, elapsedMs, timeoutMs)
 }
 
 /** Build an ErrTemplateExists (makeTemplate failure mode pre-overwrite). */

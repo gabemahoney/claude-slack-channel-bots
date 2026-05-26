@@ -28,6 +28,8 @@ import {
 import {
   cannedVersion,
   errBunVersionTooOld,
+  errCallTimeout,
+  errCliNotExecutable,
   errPlatformPackageMissing,
   errUnsupportedPlatform,
   errGeneric,
@@ -144,6 +146,22 @@ describe('SR-5.1: Client constructor failure modes', () => {
     }
   })
 
+  test('ErrCliNotExecutable → ok=false, classLabel=ad-cli-not-executable', async () => {
+    const outcome = await runStartupGate({
+      getClient: () => { throw errCliNotExecutable('/path/to/agent-director-bin') },
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.phase).toBe('construct')
+      expect(outcome.classLabel).toBe('ad-cli-not-executable')
+      expect(outcome.message).toContain('/path/to/agent-director-bin')
+      expect(outcome.message).toContain('chmod +x')
+    }
+  })
+
   test('non-typed throw surfaces verbatim → classLabel=ad-client-construct', async () => {
     const outcome = await runStartupGate({
       getClient: () => { throw new Error('some unexpected boom') },
@@ -199,6 +217,26 @@ describe('SR-5.1: version-probe failure modes', () => {
       expect(outcome.phase).toBe('version')
       expect(outcome.classLabel).toBe('ad-version-probe')
       expect(outcome.message).toContain('ErrSomething')
+    }
+  })
+
+  test('ErrCallTimeout at version step → ok=false, classLabel=ad-call-timeout', async () => {
+    const stub = makeStubClient({ versionError: errCallTimeout('version', 35000, 30000) })
+    const outcome = await runStartupGate({
+      getClient: () => stub,
+      callVersion: (c) => (c as typeof stub).version({}),
+      closeClient: (c) => (c as typeof stub).close(),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.phase).toBe('version')
+      expect(outcome.classLabel).toBe('ad-call-timeout')
+      expect(outcome.message).toContain('version')
+      expect(outcome.message).toContain('35000')
+      expect(outcome.message).toContain('30000')
     }
   })
 })
