@@ -50,6 +50,51 @@ Use `beforeEach` to reset module-scoped state between tests:
 - **SocketModeClient**: Simulate events by directly calling the handler logic with mock payloads
 - **server.ts side effects**: Cannot import server.ts in tests (module-scope side effects). Instead, replicate the relevant logic in a self-contained test server or test the extracted pure functions
 
+### Module Mocks (mock.module)
+
+**The hazard.** `bun test` runs every test file in a single process. `mock.module(...)` patches the module registry at the process level — it is process-global state. A top-level `mock.module(...)` call fires at import time and is never cleaned up, so the patched module leaks into every subsequent test file that imports the same module. If the mock factory omits an export that a later file imports, the later file crashes at runtime.
+
+**The b.b8s incident.** A top-level mock in one file replaced `child_process` with only `{ spawn: fakeSpawn }`. A later file did `import { spawnSync } from 'child_process'` and failed with:
+
+```
+SyntaxError: Export named 'spawnSync' not found in module 'node:child_process'
+```
+
+The root cause and class-of-bug fix are tracked in bugs b.b8s and b.5wd.
+
+**The rule.** Every `mock.module(...)` call must live inside a `beforeEach` or `beforeAll` block, paired with a matching `afterEach` or `afterAll` that calls `mock.restore()`. Never call `mock.module(...)` or `mock.restore()` at file top-level.
+
+**Don't:**
+
+```typescript
+// BAD — top-level, leaks into all subsequent test files
+mock.module('child_process', () => ({ spawn: fakeSpawn }))
+
+describe('MyTest', () => { ... })
+```
+
+**Do:**
+
+```typescript
+import { mock } from 'bun:test'
+
+describe('MyTest', () => {
+  beforeEach(async () => {
+    // Spread the real module so later imports get all original exports unchanged
+    const real = await import('node:child_process')
+    mock.module('node:child_process', () => ({ ...real, spawn: fakeSpawn }))
+  })
+
+  afterEach(() => {
+    mock.restore()
+  })
+
+  test('uses fakeSpawn', () => { ... })
+})
+```
+
+**Enforcement.** `scripts/check-no-toplevel-mock-module.ts` runs as part of `pretest`. It scans all files under `tests/` and fails the test run if any line at column 0 (zero leading whitespace) contains `mock.module(` or `mock.restore(`.
+
 ### Self-Contained Test Servers
 
 When testing HTTP endpoints that live in server.ts, create a minimal Bun.serve() in the test file that replicates the endpoint logic with stubbed dependencies. This pattern is used by permission-relay.test.ts:
