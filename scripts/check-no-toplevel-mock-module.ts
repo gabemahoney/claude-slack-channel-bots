@@ -12,10 +12,10 @@
  * ----------------
  * bun runs all test files in a single process. `mock.module()` patches the
  * module registry at the process level — it is process-global state. A
- * top-level (or describe-body-level) `mock.module()` call fires at import
- * time and is never cleaned up, which causes the patched module to leak into
- * every subsequent test file loaded in the same process. This produces
- * non-deterministic failures that are extremely hard to diagnose.
+ * top-level `mock.module()` call fires at import time and is never cleaned
+ * up, which causes the patched module to leak into every subsequent test
+ * file loaded in the same process. This produces non-deterministic failures
+ * that are extremely hard to diagnose.
  *
  * THE RULE
  * --------
