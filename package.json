@@ -21,7 +21,8 @@
   "scripts": {
     "postinstall": "bun src/postinstall.ts && bun scripts/fixup-bun-cache.ts",
     "start": "bun install --no-summary && bun src/server.ts",
-    "pretest": "bun scripts/fixup-bun-cache.ts",
+    "pretest": "bun scripts/fixup-bun-cache.ts && bun scripts/check-no-toplevel-mock-module.ts",
+    "check:mocks": "bun scripts/check-no-toplevel-mock-module.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
