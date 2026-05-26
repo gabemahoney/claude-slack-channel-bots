@@ -90,7 +90,7 @@ All restart activity is logged to stderr with the `[slack]` prefix:
 
 ### Async Interval Pattern
 
-Each tick fires an `async` callback. The callback iterates routes sequentially to keep concurrent `client.status(...)` traffic predictable. Errors on a single channel are caught and logged; they do not abort the rest of the iteration. agent-director's library Client is internally safe for concurrent verb calls (a single worker thread serializes FFI dispatch — see SR-0.1).
+Each tick fires an `async` callback. The callback iterates routes sequentially to keep concurrent `client.status(...)` traffic predictable. Errors on a single channel are caught and logged; they do not abort the rest of the iteration. agent-director's library Client is internally safe for concurrent verb calls (see SR-0.1).
 
 ```typescript
 intervalId = setInterval(async () => {

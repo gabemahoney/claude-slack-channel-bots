@@ -17,8 +17,9 @@
  * Construction uses `{ storePath, createIfMissing: true, logger: console }`
  * per SR-0.1; tilde expansion is the library's responsibility.
  *
- * Concurrency: AD's Client is internally safe (single shared worker thread
- * serializes FFI calls) per SR-0.1, so CSCB does NOT add its own mutex.
+ * Concurrency: AD's Client is internally safe for concurrent verb calls
+ * (the subprocess-CLI transport serializes its own dispatch) per SR-0.1,
+ * so CSCB does NOT add its own mutex.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -81,10 +82,10 @@ let singleton: Client | null = null
 /**
  * Return the singleton Client, lazy-constructing it on first call.
  *
- * Construction is synchronous and FFI-backed: all platform / Bun / FFI errors
- * fire eagerly here per SR-0.1, not at first verb call. Typed `Err*` subclasses
- * propagate; the SR-5.1 startup gate is the only intended caller-of-record
- * that branches them.
+ * Construction is synchronous: all platform / Bun / subprocess-resolution
+ * errors fire eagerly here per SR-0.1, not at first verb call. Typed `Err*`
+ * subclasses propagate; the SR-5.1 startup gate is the only intended
+ * caller-of-record that branches them.
  */
 export function getClient(): Client {
   if (singleton === null) {
@@ -98,7 +99,7 @@ export function getClient(): Client {
 }
 
 /**
- * Release the FFI handle if open. Idempotent: a second call is a no-op.
+ * Release the Client handle if open. Idempotent: a second call is a no-op.
  * `client.close()` itself never throws per the library contract.
  *
  * Called from SR-11 Event 11 (graceful shutdown) inside a try/finally.
@@ -123,7 +124,7 @@ export function resetClientForTests(): void {
 
 /**
  * Test-only helper: install a pre-built Client (typically a stub) as the
- * singleton. Skip the FFI construction path entirely.
+ * singleton. Skip the Client construction path entirely.
  *
  * @internal
  */

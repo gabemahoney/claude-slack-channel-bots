@@ -426,7 +426,7 @@ Classes you may see:
 - `ad-platform-package-missing` — agent-director's platform-native peer dependency is absent. The host is unsupported by agent-director.
 - `ad-unsupported-platform` — agent-director's runtime check rejected the host's `process.platform`/`process.arch` tuple.
 - `ad-bun-version-too-old` — agent-director needs Bun `>= 1.0.21`. Upgrade Bun.
-- `ad-version-probe` — `agent-director` was loaded but the `version()` probe failed (FFI handle, native lib, etc.).
+- `ad-version-probe` — `agent-director` was loaded but the `version()` probe failed (subprocess invocation, platform binary, etc.).
 - `ad-version-stale` — installed `agent-director` is below the minimum version this CSCB requires. Run `bun add agent-director@^<minimum>`.
 - `ad-same-user` — `~/.agent-director/state.db` is owned by a different UID than the CSCB process. Reinstall agent-director as the correct user or remove the mismatched file.
 - `ad-same-user-stat` — Non-ENOENT stat error on the state DB (permissions, I/O). Investigate the file before re-launching.

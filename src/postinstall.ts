@@ -131,8 +131,9 @@ export function runPostinstall(options: PostinstallOptions = {}): void {
 export async function runAgentDirectorPostinstallProbe(): Promise<void> {
   try {
     const ad = await import('agent-director')
-    // Construct + version() probe. Client construction is synchronous FFI;
-    // any platform/Bun/FFI error fires here and is caught below.
+    // Construct + version() probe. Client construction is synchronous;
+    // any platform / Bun / subprocess-resolution error fires here and is
+    // caught below.
     const client = new ad.Client({
       storePath: '~/.agent-director/state.db',
       createIfMissing: true,

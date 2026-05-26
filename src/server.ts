@@ -775,7 +775,7 @@ async function shutdown(signal: string): Promise<void> {
     await socket.disconnect()
   } catch { /* ignore */ }
 
-  // SR-11 Event 11: release the agent-director FFI handle. close() is
+  // SR-11 Event 11: release the agent-director Client handle. close() is
   // idempotent + never throws per the library contract, but wrap defensively.
   try {
     closeClient()

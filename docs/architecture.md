@@ -160,7 +160,7 @@ On `SIGTERM` or `SIGINT`, the shutdown handler:
 3. Calls `stopHealthCheck()`, `cancelAllRestartTimers()`, `stopAllKeepAliveTimers()`.
 4. Stops the HTTP server, drains pending + active MCP transports.
 5. Disconnects Socket Mode.
-6. Calls `closeClient()` inside a try/catch to release the agent-director FFI handle. The library's `close()` is idempotent and never throws; the catch is belt-and-suspenders.
+6. Calls `closeClient()` inside a try/catch to release the agent-director Client handle. The library's `close()` is idempotent and never throws; the catch is belt-and-suspenders.
 7. Removes the PID file.
 
 The bots themselves are NOT killed or paused on shutdown — same as the prior behavior and consistent with SR-11 Event 11.

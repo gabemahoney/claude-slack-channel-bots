@@ -94,7 +94,7 @@ export function semverGte(a: string, b: string): boolean {
 export interface StartupGateDeps {
   /**
    * Hook that resolves to the singleton Client. Construction failures
-   * surface as throws here (the synchronous FFI path) — production code
+   * surface as throws here (the synchronous construction path) — production code
    * passes getClient from src/agent-director-client.ts; tests pass either
    * `() => makeStubClient(...)` or a thrower that simulates the typed
    * Err* constructor failure modes.
@@ -172,7 +172,7 @@ export async function runStartupGate(
 ): Promise<StartupGateOutcome> {
   const d = mergeDeps(deps)
 
-  // Step 2: construct Client (synchronous FFI path).
+  // Step 2: construct Client (synchronous construction path).
   let client: unknown
   try {
     client = d.getClient()
