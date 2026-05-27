@@ -162,6 +162,110 @@ export async function reconnectMcp(channelId: string, web?: WebClient): Promise<
 }
 
 // ---------------------------------------------------------------------------
+// approveDevChannelsDialog — auto-approve the dev-channels warning on spawn
+// ---------------------------------------------------------------------------
+
+/**
+ * Verified against Claude Code 2.1.120 (2026-05-27). If this stops matching,
+ * the dev-channels dialog has drifted — see b.yy6. Match the option label
+ * (semantic, stable) rather than the header (cosmetic, drifts).
+ */
+export const DEV_CHANNELS_DIALOG_NEEDLE = 'I am using this for local development'
+
+/** Default poll interval while watching for the dev-channels dialog. */
+export const DIALOG_POLL_INTERVAL_MS = 500
+
+/** Default deadline for both the appearance poll and the still-visible poll. */
+export const DIALOG_POLL_TIMEOUT_MS = 30_000
+
+/** Number of consecutive "needle absent" reads required to confirm approval. */
+export const DIALOG_GONE_CONFIRMS_REQUIRED = 2
+
+let _dialogPollIntervalMs = DIALOG_POLL_INTERVAL_MS
+let _dialogPollTimeoutMs = DIALOG_POLL_TIMEOUT_MS
+
+/** Test-only seam: override the dev-channels poll interval. */
+export function _setDialogPollIntervalMs(ms: number): void {
+  _dialogPollIntervalMs = ms
+}
+
+/** Test-only seam: restore the default poll interval. */
+export function _resetDialogPollIntervalMs(): void {
+  _dialogPollIntervalMs = DIALOG_POLL_INTERVAL_MS
+}
+
+/** Test-only seam: override the dev-channels poll timeout. */
+export function _setDialogPollTimeoutMs(ms: number): void {
+  _dialogPollTimeoutMs = ms
+}
+
+/** Test-only seam: restore the default poll timeout. */
+export function _resetDialogPollTimeoutMs(): void {
+  _dialogPollTimeoutMs = DIALOG_POLL_TIMEOUT_MS
+}
+
+/**
+ * Poll the freshly-spawned bot's tmux pane until the dev-channels approval
+ * dialog appears, send Enter to accept the pre-selected
+ * "I am using this for local development" option, then confirm the dialog
+ * has cleared. All errors caught locally — never throws to the caller.
+ *
+ * Two distinct failure modes are recorded via `recordStartupError` so a
+ * future Claude Code release that changes the dialog cannot silently break
+ * fresh-spawn approval:
+ *   - `dev-channels-approve-no-dialog`   — needle never observed
+ *   - `dev-channels-approve-still-visible` — needle persists after Enter
+ */
+export async function approveDevChannelsDialog(
+  channelId: string,
+  web: WebClient | undefined,
+  isStartup: boolean,
+): Promise<void> {
+  void web
+  const claude_instance_id = instanceIdFor(channelId)
+  const client = getClient()
+  const deadline = Date.now() + _dialogPollTimeoutMs
+
+  let approved = false
+  while (Date.now() < deadline) {
+    try {
+      const { pane } = await client.readPane({ claude_instance_id, n_lines: 40 })
+      if (pane.includes(DEV_CHANNELS_DIALOG_NEEDLE)) {
+        await client.sendKeys({ claude_instance_id, text: '' })
+        approved = true
+        break
+      }
+    } catch (err) {
+      console.error(`[slack] approveDevChannelsDialog: readPane error channel=${channelId}: ${String(err)}`)
+    }
+    await new Promise((r) => setTimeout(r, _dialogPollIntervalMs))
+  }
+
+  if (!approved) {
+    const msg = `dev-channels dialog never appeared for channel=${channelId} within ${_dialogPollTimeoutMs}ms (dialog text may have drifted — see b.yy6)`
+    console.error(`[slack] approveDevChannelsDialog: ${msg}`)
+    if (isStartup) recordStartupError('dev-channels-approve-no-dialog', msg)
+    return
+  }
+
+  let misses = 0
+  while (Date.now() < deadline && misses < DIALOG_GONE_CONFIRMS_REQUIRED) {
+    await new Promise((r) => setTimeout(r, _dialogPollIntervalMs))
+    try {
+      const { pane } = await client.readPane({ claude_instance_id, n_lines: 40 })
+      misses = pane.includes(DEV_CHANNELS_DIALOG_NEEDLE) ? 0 : misses + 1
+    } catch {
+      /* tolerate transient readPane failure */
+    }
+  }
+  if (misses < DIALOG_GONE_CONFIRMS_REQUIRED) {
+    const msg = `dev-channels dialog still visible after Enter for channel=${channelId} (sendKeys may not have reached pane)`
+    console.error(`[slack] approveDevChannelsDialog: ${msg}`)
+    if (isStartup) recordStartupError('dev-channels-approve-still-visible', msg)
+  }
+}
+
+// ---------------------------------------------------------------------------
 // waitForWaitingAndReconnect — used when a colliding spawn is in `working`
 // ---------------------------------------------------------------------------
 
@@ -317,6 +421,7 @@ export async function spawnForRoute(
   try {
     const r = await client.spawn(params)
     console.error(`[slack] spawnForRoute: spawned channel=${channelId} instanceId=${r.claude_instance_id}`)
+    await approveDevChannelsDialog(channelId, web, isStartup)
     return { channelId, action: 'spawned' }
   } catch (err) {
     if (!(err instanceof ErrInstanceIdCollision)) {
@@ -342,6 +447,7 @@ export async function spawnForRoute(
       try {
         const r = await client.spawn(params)
         console.error(`[slack] spawnForRoute: retry-spawn succeeded for channel=${channelId} instanceId=${r.claude_instance_id}`)
+        await approveDevChannelsDialog(channelId, web, isStartup)
         return { channelId, action: 'spawned' }
       } catch (err2) {
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
@@ -367,6 +473,7 @@ export async function spawnForRoute(
       try {
         await client.spawn(params)
         console.error(`[slack] spawnForRoute: fresh-spawned (after kill+delete) for channel=${channelId}`)
+        await approveDevChannelsDialog(channelId, web, isStartup)
         return { channelId, action: 'spawned' }
       } catch (err) {
         const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
@@ -390,6 +497,7 @@ export async function spawnForRoute(
         try {
           await client.spawn(params)
           console.error(`[slack] spawnForRoute: fresh-spawned (after delete) for channel=${channelId}`)
+          await approveDevChannelsDialog(channelId, web, isStartup)
           return { channelId, action: 'spawned' }
         } catch (err2) {
           const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
@@ -406,6 +514,7 @@ export async function spawnForRoute(
         if (!(await tryDelete(channelId, web, isStartup))) return { channelId, action: 'failed' }
         try {
           await client.spawn(params)
+          await approveDevChannelsDialog(channelId, web, isStartup)
           return { channelId, action: 'spawned' }
         } catch (err2) {
           const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))

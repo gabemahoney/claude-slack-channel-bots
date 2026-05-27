@@ -18,12 +18,20 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, readFileSync, existsSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import {
   reconcileOrphans,
   spawnForRoute,
   startupSessionManager,
   instanceIdFor,
   AGENT_DIRECTOR_LIVE_STATES,
+  DEV_CHANNELS_DIALOG_NEEDLE,
+  _setDialogPollTimeoutMs,
+  _setDialogPollIntervalMs,
+  _resetDialogPollTimeoutMs,
+  _resetDialogPollIntervalMs,
 } from '../src/session-manager.ts'
 import { resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
 import {
@@ -49,8 +57,22 @@ function installStub(opts?: Parameters<typeof makeStubClient>[0]): StubClient {
   return stub
 }
 
+let savedEnv: NodeJS.ProcessEnv
+
+beforeEach(() => {
+  savedEnv = { ...process.env }
+  // Keep dev-channels approval polling tight so the helper firing on every
+  // fresh-spawn test doesn't add seconds to the suite. Individual tests can
+  // override these as needed.
+  _setDialogPollIntervalMs(1)
+  _setDialogPollTimeoutMs(20)
+})
+
 afterEach(() => {
   resetClientForTests()
+  _resetDialogPollIntervalMs()
+  _resetDialogPollTimeoutMs()
+  process.env = savedEnv as NodeJS.ProcessEnv
 })
 
 // ---------------------------------------------------------------------------
@@ -315,5 +337,155 @@ describe('SR-8.6 invariants', () => {
     for (const p of spawnCalls) {
       expect(p.relay_mode).toBe('on')
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.yy6 — dev-channels dialog auto-approve
+// ---------------------------------------------------------------------------
+
+describe('approveDevChannelsDialog (b.yy6)', () => {
+  const DEV_CHANNELS_PANE = readFileSync(
+    join(import.meta.dir, 'fixtures', 'dev-channels-pane-2.1.120.txt'),
+    'utf-8',
+  )
+  const WELCOME_PANE = 'Listening for channel messages from: server:slack-channel-router'
+
+  /**
+   * Redirect startup-errors.log into a temp dir for this test and return a
+   * helper that reads back recorded entries. Restores the previous
+   * SLACK_STATE_DIR via the file-level afterEach.
+   */
+  function captureStartupErrors(): () => string {
+    const dir = mkdtempSync(join(tmpdir(), 'cscb-yy6-'))
+    process.env['SLACK_STATE_DIR'] = dir
+    const logPath = join(dir, 'startup-errors.log')
+    return () => (existsSync(logPath) ? readFileSync(logPath, 'utf-8') : '')
+  }
+
+  test('happy path: dialog detected → Enter sent → confirmed gone', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+    installStub({
+      sendKeysCalls,
+      readPaneCalls,
+      readPaneResults: [
+        { pane: DEV_CHANNELS_PANE },
+        { pane: WELCOME_PANE },
+        { pane: WELCOME_PANE },
+      ],
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+    expect(result.action).toBe('spawned')
+    expect(sendKeysCalls).toHaveLength(1)
+    expect(sendKeysCalls[0].text).toBe('')
+    expect(sendKeysCalls[0].claude_instance_id).toBe('cscb_C')
+    // readPane should have been invoked at least once for detection and
+    // twice more to confirm the dialog cleared.
+    expect(readPaneCalls.length).toBeGreaterThanOrEqual(3)
+    for (const r of readPaneCalls) {
+      expect(r.claude_instance_id).toBe('cscb_C')
+      expect(r.n_lines).toBe(40)
+    }
+  })
+
+  test('timeout: no dialog → no sendKeys → records dev-channels-approve-no-dialog', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({
+      sendKeysCalls,
+      readPaneResults: [{ pane: 'unrelated pane text' }],
+    })
+    const readLog = captureStartupErrors()
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+    expect(result.action).toBe('spawned')
+    expect(sendKeysCalls).toHaveLength(0)
+    const log = readLog()
+    expect(log).toContain('[dev-channels-approve-no-dialog]')
+    expect(log).toContain('channel=C')
+    expect(log).toContain('b.yy6')
+  })
+
+  test('still-visible after Enter → records dev-channels-approve-still-visible', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({
+      sendKeysCalls,
+      // Sticky needle: every read returns the dialog → after sendKeys the
+      // post-approval confirmation loop never sees the needle clear.
+      readPaneResults: [{ pane: DEV_CHANNELS_PANE }],
+    })
+    const readLog = captureStartupErrors()
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+    expect(result.action).toBe('spawned')
+    expect(sendKeysCalls).toHaveLength(1)
+    expect(sendKeysCalls[0].text).toBe('')
+    const log = readLog()
+    expect(log).toContain('[dev-channels-approve-still-visible]')
+    expect(log).toContain('channel=C')
+  })
+
+  test('needle lock-in: matches the verified Claude Code 2.1.120 label', () => {
+    expect(DEV_CHANNELS_DIALOG_NEEDLE).toBe('I am using this for local development')
+    expect(DEV_CHANNELS_PANE).toContain(DEV_CHANNELS_DIALOG_NEEDLE)
+  })
+
+  test('skipped on collision-resume path (no fresh spawn → no readPane)', async () => {
+    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+    installStub({
+      readPaneCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+    expect(result.action).toBe('resumed')
+    expect(readPaneCalls).toHaveLength(0)
+  })
+
+  test('skipped on collision-reconnect path (waiting state → no readPane)', async () => {
+    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+    installStub({
+      readPaneCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+    expect(result.action).toBe('reconnected')
+    expect(readPaneCalls).toHaveLength(0)
+  })
+
+  test('skipped on collision-noop path (pending state → no readPane)', async () => {
+    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+    installStub({
+      readPaneCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'pending' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+    expect(result.action).toBe('no-op')
+    expect(readPaneCalls).toHaveLength(0)
+  })
+
+  test('launchSession (restart path, isStartup=false): does not record startup error on timeout', async () => {
+    installStub({
+      readPaneResults: [{ pane: 'no dialog' }],
+    })
+    const readLog = captureStartupErrors()
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    // Drive the non-startup branch explicitly.
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, false)
+
+    expect(result.action).toBe('spawned')
+    expect(readLog()).toBe('')
   })
 })
