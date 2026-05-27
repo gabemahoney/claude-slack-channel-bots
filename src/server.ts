@@ -44,8 +44,11 @@ import {
   flushSpawnFailureQueue,
   instanceIdFor,
   launchSession,
+  reconcileInstanceIds,
   reconcileOrphans,
   reconnectMcp,
+  refreshRouteNameFromEvent,
+  resolveChannelNames,
   startupSessionManager,
 } from './session-manager.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
@@ -682,6 +685,7 @@ socket.on('message', async ({ event, ack }) => {
   await ack()
   if (!event) return
   archiveInboundMessage(event)
+  if (routingConfig) refreshRouteNameFromEvent(routingConfig, event)
   try {
     await handleMessage(event)
   } catch (err) {
@@ -694,11 +698,21 @@ socket.on('app_mention', async ({ event, ack }) => {
   await ack()
   if (!event) return
   archiveInboundMessage(event)
+  if (routingConfig) refreshRouteNameFromEvent(routingConfig, event)
   try {
     await handleMessage(event)
   } catch (err) {
     console.error('[slack] Error handling mention:', err)
   }
+})
+
+// Capture channel renames as a separate event — Slack delivers a channel_name
+// field here that lets us refresh the cached name without waiting for the next
+// message on the channel.
+socket.on('channel_rename', async ({ event, ack }) => {
+  await ack()
+  if (!event) return
+  if (routingConfig) refreshRouteNameFromEvent(routingConfig, event)
 })
 
 socket.on('interactive', async (evt) => {
@@ -1085,7 +1099,7 @@ export async function main(): Promise<void> {
   // back to "dead" defensively — health-check will retry.
   const isSessionAliveAdapter = async (channelId: string): Promise<boolean> => {
     if (!routingConfig?.routes[channelId]) return false
-    const claude_instance_id = instanceIdFor(channelId)
+    const claude_instance_id = instanceIdFor(channelId, routingConfig.routes[channelId]?.normalizedName)
     try {
       const r = await getClient().status({ claude_instance_id })
       return AGENT_DIRECTOR_LIVE_STATES.has(r.state)
@@ -1106,11 +1120,12 @@ export async function main(): Promise<void> {
       return session?.connected === true
     },
     reconnectSession: async (channelId) => {
-      await reconnectMcp(channelId, isDryRun() ? undefined : web)
+      await reconnectMcp(channelId, isDryRun() ? undefined : web, routingConfig ?? undefined)
     },
     killSession: async (channelId) => {
       try {
-        await getClient().kill({ claude_instance_id: instanceIdFor(channelId) })
+        const normalizedName = routingConfig?.routes[channelId]?.normalizedName
+        await getClient().kill({ claude_instance_id: instanceIdFor(channelId, normalizedName) })
       } catch (err) {
         if (err instanceof ErrSpawnNotFound) return
         console.error(`[slack] killSession (restart adapter): error for channel=${channelId}:`, err)
@@ -1134,6 +1149,30 @@ export async function main(): Promise<void> {
       await reconcileOrphans(routingConfig)
     } catch (err) {
       console.error('[slack] Warning: orphan reconciliation failed:', err)
+    }
+  }
+
+  // b.1m9: resolve channel names from Slack so per-route spawns get the
+  // glanceable `cscb_<name>_<id>` / `slack_bot_<name>_<id>` naming. Failures
+  // are non-fatal: nameless routes fall back to the legacy bare-ID form.
+  if (routingConfig) {
+    try {
+      await resolveChannelNames(routingConfig, isDryRun() ? undefined : web)
+    } catch (err) {
+      console.error('[slack] Warning: channel-name resolution failed:', err)
+    }
+  }
+
+  // b.1m9: warn about (or, with --reconcile-instance-ids, delete) stale
+  // pre-rename rows whose claude_instance_id doesn't match the new naming.
+  // Must run AFTER name resolution so the expected ids are right.
+  if (routingConfig) {
+    const autoDelete = process.argv.includes('--reconcile-instance-ids') ||
+      process.env['CSCB_RECONCILE_INSTANCE_IDS'] === '1'
+    try {
+      await reconcileInstanceIds(routingConfig, autoDelete)
+    } catch (err) {
+      console.error('[slack] Warning: instance-id reconcile failed:', err)
     }
   }
 

@@ -76,6 +76,30 @@ export interface RouteEntry {
    * if neither is set).
    */
   claude_config_dir?: string
+  /**
+   * Runtime-resolved Slack channel name (e.g. "horde-agent-director").
+   * Populated by the startup `conversations.info` resolver and refreshed
+   * opportunistically by event handlers. Never read from config.json — these
+   * fields exist on the in-memory record only and the validator rejects them
+   * if present in the JSON payload.
+   */
+  name?: string
+  /**
+   * Runtime-resolved normalized channel name suitable for use in tmux
+   * session names and agent-director `claude_instance_id`. Produced by
+   * `normalizeChannelName(name)` whenever `name` is set.
+   */
+  normalizedName?: string
+}
+
+/**
+ * Normalize a Slack channel name into a token safe for tmux session names
+ * and agent-director `claude_instance_id` values: lowercased, all non
+ * `[a-z0-9]` runs collapsed to a single `_`, and any leading or trailing
+ * underscores stripped. Returns `''` when the input contains no alnum chars.
+ */
+export function normalizeChannelName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '')
 }
 
 /** Raw shape of config.json as parsed from disk. All optional fields may be absent. */

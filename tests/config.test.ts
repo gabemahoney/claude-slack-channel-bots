@@ -7,6 +7,7 @@ import {
   applyDefaults,
   validateConfig,
   expandTilde,
+  normalizeChannelName,
   resolveConfig,
   loadConfig,
   type RouteEntry,
@@ -1060,3 +1061,77 @@ describe('loadConfig — unknown-field rejection (SR-4.2)', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// normalizeChannelName (b.1m9)
+// ---------------------------------------------------------------------------
+
+describe('normalizeChannelName (b.1m9)', () => {
+  test('passes through already-normalized names', () => {
+    expect(normalizeChannelName('general')).toBe('general')
+    expect(normalizeChannelName('horde')).toBe('horde')
+    expect(normalizeChannelName('all_hands')).toBe('all_hands')
+  })
+
+  test('lowercases', () => {
+    expect(normalizeChannelName('General')).toBe('general')
+    expect(normalizeChannelName('CamelCase')).toBe('camelcase')
+  })
+
+  test('collapses hyphens to single underscores', () => {
+    expect(normalizeChannelName('horde-agent-director')).toBe('horde_agent_director')
+    expect(normalizeChannelName('claude-slack-channel-bots')).toBe('claude_slack_channel_bots')
+  })
+
+  test('collapses runs of separators to a single underscore', () => {
+    expect(normalizeChannelName('foo---bar')).toBe('foo_bar')
+    expect(normalizeChannelName('foo. .bar')).toBe('foo_bar')
+    expect(normalizeChannelName('a..b__c--d')).toBe('a_b_c_d')
+  })
+
+  test('strips leading and trailing non-alnum', () => {
+    expect(normalizeChannelName('-leading')).toBe('leading')
+    expect(normalizeChannelName('trailing-')).toBe('trailing')
+    expect(normalizeChannelName('-both-')).toBe('both')
+    expect(normalizeChannelName('___underscored___')).toBe('underscored')
+  })
+
+  test('keeps all-numeric names', () => {
+    expect(normalizeChannelName('2026-numbers')).toBe('2026_numbers')
+    expect(normalizeChannelName('42')).toBe('42')
+  })
+
+  test('strips Unicode and emoji', () => {
+    // Café → ascii-only normalization yields "caf" + run-collapse for é
+    expect(normalizeChannelName('café-talk')).toBe('caf_talk')
+    expect(normalizeChannelName('🎉-party-time')).toBe('party_time')
+  })
+
+  test('returns empty string when input has no alnum chars', () => {
+    expect(normalizeChannelName('')).toBe('')
+    expect(normalizeChannelName('---')).toBe('')
+    expect(normalizeChannelName('!@#$%^')).toBe('')
+    expect(normalizeChannelName('🎉')).toBe('')
+  })
+
+  test('handles slack-style leading # gracefully', () => {
+    expect(normalizeChannelName('#general')).toBe('general')
+  })
+
+  test('result is always a valid tmux/AD token (no special chars, no leading/trailing _)', () => {
+    const inputs = [
+      'horde-agent-director',
+      '#general',
+      'a..b',
+      '...edge-case...',
+      'café-talk',
+      '2026',
+    ]
+    for (const input of inputs) {
+      const out = normalizeChannelName(input)
+      if (out.length === 0) continue
+      expect(/^[a-z0-9_]+$/.test(out)).toBe(true)
+      expect(out.startsWith('_')).toBe(false)
+      expect(out.endsWith('_')).toBe(false)
+    }
+  })
+})

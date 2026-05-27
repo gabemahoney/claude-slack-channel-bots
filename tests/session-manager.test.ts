@@ -19,10 +19,14 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
+  reconcileInstanceIds,
   reconcileOrphans,
+  refreshRouteNameFromEvent,
+  resolveChannelNames,
   spawnForRoute,
   startupSessionManager,
   instanceIdFor,
+  tmuxSessionNameFor,
   AGENT_DIRECTOR_LIVE_STATES,
 } from '../src/session-manager.ts'
 import { resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
@@ -293,8 +297,18 @@ describe('SR-8.6 invariants', () => {
     expect(AGENT_DIRECTOR_LIVE_STATES.has('missing')).toBe(false)
   })
 
-  test('instanceIdFor produces deterministic cscb_<channelId>', () => {
+  test('instanceIdFor produces deterministic cscb_<channelId> (no name)', () => {
     expect(instanceIdFor('C012345')).toBe('cscb_C012345')
+  })
+
+  test('instanceIdFor composes cscb_<name>_<channelId> when name is provided', () => {
+    expect(instanceIdFor('C012345', 'general')).toBe('cscb_general_C012345')
+    expect(instanceIdFor('C0B3X876XSB', 'horde_agent_director')).toBe('cscb_horde_agent_director_C0B3X876XSB')
+  })
+
+  test('instanceIdFor falls back to bare-ID for empty/undefined name', () => {
+    expect(instanceIdFor('C012345', '')).toBe('cscb_C012345')
+    expect(instanceIdFor('C012345', undefined)).toBe('cscb_C012345')
   })
 
   test('every spawn call site emits relay_mode=on', async () => {
@@ -315,5 +329,422 @@ describe('SR-8.6 invariants', () => {
     for (const p of spawnCalls) {
       expect(p.relay_mode).toBe('on')
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.1m9 — tmuxSessionNameFor naming layer
+// ---------------------------------------------------------------------------
+
+describe('tmuxSessionNameFor (b.1m9)', () => {
+  test('falls back to slack_bot_<id> when no normalized name', () => {
+    expect(tmuxSessionNameFor('C0AMDDZEHCY')).toBe('slack_bot_C0AMDDZEHCY')
+    expect(tmuxSessionNameFor('C0AMDDZEHCY', undefined)).toBe('slack_bot_C0AMDDZEHCY')
+    expect(tmuxSessionNameFor('C0AMDDZEHCY', '')).toBe('slack_bot_C0AMDDZEHCY')
+  })
+
+  test('composes slack_bot_<name>_<id> when name is provided', () => {
+    expect(tmuxSessionNameFor('C0AMDDZEHCY', 'general')).toBe('slack_bot_general_C0AMDDZEHCY')
+    expect(tmuxSessionNameFor('C0B3X876XSB', 'horde_agent_director'))
+      .toBe('slack_bot_horde_agent_director_C0B3X876XSB')
+  })
+
+  test('does not normalize internally — caller must pre-normalize', () => {
+    // Whatever string the caller passes is concatenated verbatim. (Production
+    // callers go through normalizeChannelName before this; the function trusts
+    // its argument.)
+    expect(tmuxSessionNameFor('C', 'has space')).toBe('slack_bot_has space_C')
+  })
+
+  test('output is glanceable for realistic channel names', () => {
+    // Mirrors the acceptance examples from b.1m9 body.
+    const cases: [string, string, string][] = [
+      ['C0AMDDZEHCY', 'general', 'slack_bot_general_C0AMDDZEHCY'],
+      ['C0B2A9D2THT', 'horde', 'slack_bot_horde_C0B2A9D2THT'],
+      ['C0B3X876XSB', 'horde_agent_director', 'slack_bot_horde_agent_director_C0B3X876XSB'],
+      ['C0B2UB0LR9A', 'horde_apiary', 'slack_bot_horde_apiary_C0B2UB0LR9A'],
+    ]
+    for (const [id, name, expected] of cases) {
+      expect(tmuxSessionNameFor(id, name)).toBe(expected)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.1m9 — spawn-params composition uses normalizedName from the route
+// ---------------------------------------------------------------------------
+
+describe('spawnForRoute: name-aware composition (b.1m9)', () => {
+  test('uses cscb_<name>_<id> and slack_bot_<name>_<id> when route has normalizedName', async () => {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    const cfg = makeRoutingConfig({
+      routes: {
+        C0AMDDZEHCY: { cwd: '/repo/general', name: 'general', normalizedName: 'general' },
+      },
+    })
+    await spawnForRoute('C0AMDDZEHCY', { cwd: '/repo/general' }, cfg)
+    expect(spawnCalls).toHaveLength(1)
+    expect(spawnCalls[0].claude_instance_id).toBe('cscb_general_C0AMDDZEHCY')
+    expect(spawnCalls[0].tmux_session_name).toBe('slack_bot_general_C0AMDDZEHCY')
+  })
+
+  test('falls back to bare-ID when route has no normalizedName', async () => {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    const cfg = makeRoutingConfig({
+      routes: { C_BARE: { cwd: '/repo' } },
+    })
+    await spawnForRoute('C_BARE', { cwd: '/repo' }, cfg)
+    expect(spawnCalls[0].claude_instance_id).toBe('cscb_C_BARE')
+    expect(spawnCalls[0].tmux_session_name).toBe('slack_bot_C_BARE')
+  })
+
+  test('collision-handling uses the same composed id for get/resume/delete', async () => {
+    const getCalls: import('agent-director').GetParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    installStub({
+      getCalls,
+      resumeCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_general_C', state: 'ended' }),
+    })
+    const cfg = makeRoutingConfig({
+      routes: { C: { cwd: '/x', name: 'general', normalizedName: 'general' } },
+    })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('resumed')
+    expect(getCalls[0].claude_instance_id).toBe('cscb_general_C')
+    expect(resumeCalls[0].claude_instance_id).toBe('cscb_general_C')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.1m9 — resolveChannelNames flow
+// ---------------------------------------------------------------------------
+
+describe('resolveChannelNames (b.1m9)', () => {
+  test('populates route.name + route.normalizedName from conversations.info', async () => {
+    const infoCalls: Array<{ channel: string }> = []
+    const fakeWeb = {
+      conversations: {
+        info: async ({ channel }: { channel: string }) => {
+          infoCalls.push({ channel })
+          const nameMap: Record<string, string> = {
+            C0AMDDZEHCY: 'general',
+            C0B3X876XSB: 'horde-agent-director',
+          }
+          const name = nameMap[channel]
+          return name ? { channel: { name } } : {}
+        },
+      },
+    }
+    const cfg = makeRoutingConfig({
+      routes: {
+        C0AMDDZEHCY: { cwd: '/repo/general' },
+        C0B3X876XSB: { cwd: '/repo/agent-director' },
+      },
+    })
+    const results = await resolveChannelNames(cfg, fakeWeb)
+    expect(infoCalls.map((c) => c.channel).sort()).toEqual(['C0AMDDZEHCY', 'C0B3X876XSB'])
+    expect(cfg.routes['C0AMDDZEHCY'].name).toBe('general')
+    expect(cfg.routes['C0AMDDZEHCY'].normalizedName).toBe('general')
+    expect(cfg.routes['C0B3X876XSB'].name).toBe('horde-agent-director')
+    expect(cfg.routes['C0B3X876XSB'].normalizedName).toBe('horde_agent_director')
+    expect(results).toHaveLength(2)
+    for (const r of results) expect(r.error).toBeUndefined()
+  })
+
+  test('graceful fallback: conversations.info rejection leaves the route nameless', async () => {
+    const fakeWeb = {
+      conversations: {
+        info: async ({ channel }: { channel: string }) => {
+          if (channel === 'C_OK') return { channel: { name: 'okchan' } }
+          throw new Error('not_authorized')
+        },
+      },
+    }
+    const cfg = makeRoutingConfig({
+      routes: {
+        C_OK: { cwd: '/a' },
+        C_FAIL: { cwd: '/b' },
+      },
+    })
+    const results = await resolveChannelNames(cfg, fakeWeb)
+    expect(cfg.routes['C_OK'].normalizedName).toBe('okchan')
+    expect(cfg.routes['C_FAIL'].name).toBeUndefined()
+    expect(cfg.routes['C_FAIL'].normalizedName).toBeUndefined()
+    const failResult = results.find((r) => r.channelId === 'C_FAIL')!
+    expect(failResult.error).toContain('not_authorized')
+  })
+
+  test('graceful fallback: response without a channel.name leaves the route nameless', async () => {
+    const fakeWeb = {
+      conversations: {
+        info: async () => ({}), // no channel field
+      },
+    }
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const results = await resolveChannelNames(cfg, fakeWeb)
+    expect(cfg.routes['C'].normalizedName).toBeUndefined()
+    expect(results[0].error).toContain('no name')
+  })
+
+  test('subsequent spawn for a name-fallback route uses bare-ID naming', async () => {
+    // Composite: resolve fails → spawn falls back to cscb_<id>.
+    const fakeWeb = {
+      conversations: { info: async () => { throw new Error('boom') } },
+    }
+    const cfg = makeRoutingConfig({ routes: { C_X: { cwd: '/x' } } })
+    await resolveChannelNames(cfg, fakeWeb)
+
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    await spawnForRoute('C_X', { cwd: '/x' }, cfg)
+    expect(spawnCalls[0].claude_instance_id).toBe('cscb_C_X')
+    expect(spawnCalls[0].tmux_session_name).toBe('slack_bot_C_X')
+  })
+
+  test('undefined web → no-op (no rejections)', async () => {
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const results = await resolveChannelNames(cfg, undefined)
+    expect(results).toEqual([])
+    expect(cfg.routes['C'].name).toBeUndefined()
+  })
+
+  test('normalizes empty-string normalize result back to undefined', async () => {
+    // Channel name with no alnum chars → normalize returns '', which would
+    // produce ugly "slack_bot__C…" suffixes. The resolver should leave
+    // normalizedName undefined in that case so the bare-ID fallback kicks in.
+    const fakeWeb = {
+      conversations: { info: async () => ({ channel: { name: '🎉' } }) },
+    }
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    await resolveChannelNames(cfg, fakeWeb)
+    expect(cfg.routes['C'].name).toBe('🎉')
+    expect(cfg.routes['C'].normalizedName).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.1m9 — refreshRouteNameFromEvent
+// ---------------------------------------------------------------------------
+
+describe('refreshRouteNameFromEvent (b.1m9)', () => {
+  test('updates route on channel_rename-shape event (channel + channel_name fields)', () => {
+    const cfg = makeRoutingConfig({
+      routes: { C0AMDDZEHCY: { cwd: '/x', name: 'oldname', normalizedName: 'oldname' } },
+    })
+    refreshRouteNameFromEvent(cfg, { channel: 'C0AMDDZEHCY', channel_name: 'new-name' })
+    expect(cfg.routes['C0AMDDZEHCY'].name).toBe('new-name')
+    expect(cfg.routes['C0AMDDZEHCY'].normalizedName).toBe('new_name')
+  })
+
+  test('updates route on nested-channel-object event shape', () => {
+    const cfg = makeRoutingConfig({ routes: { C0AMDDZEHCY: { cwd: '/x' } } })
+    refreshRouteNameFromEvent(cfg, { channel: { id: 'C0AMDDZEHCY', name: 'general' } })
+    expect(cfg.routes['C0AMDDZEHCY'].name).toBe('general')
+    expect(cfg.routes['C0AMDDZEHCY'].normalizedName).toBe('general')
+  })
+
+  test('no-ops when event has no channel name', () => {
+    const cfg = makeRoutingConfig({
+      routes: { C: { cwd: '/x', name: 'unchanged', normalizedName: 'unchanged' } },
+    })
+    refreshRouteNameFromEvent(cfg, { channel: 'C', type: 'message', text: 'hi' })
+    expect(cfg.routes['C'].name).toBe('unchanged')
+  })
+
+  test('no-ops when channel is not in routes', () => {
+    const cfg = makeRoutingConfig({ routes: { C_OTHER: { cwd: '/x' } } })
+    refreshRouteNameFromEvent(cfg, { channel: 'C_NOT_ROUTED', channel_name: 'foo' })
+    expect(cfg.routes['C_OTHER'].name).toBeUndefined()
+  })
+
+  test('no-ops when cached name already matches', () => {
+    const cfg = makeRoutingConfig({
+      routes: { C: { cwd: '/x', name: 'general', normalizedName: 'general' } },
+    })
+    refreshRouteNameFromEvent(cfg, { channel: 'C', channel_name: 'general' })
+    expect(cfg.routes['C'].name).toBe('general')
+    expect(cfg.routes['C'].normalizedName).toBe('general')
+  })
+
+  test('handles malformed event input safely', () => {
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    refreshRouteNameFromEvent(cfg, null)
+    refreshRouteNameFromEvent(cfg, undefined)
+    refreshRouteNameFromEvent(cfg, 'not-an-object')
+    refreshRouteNameFromEvent(cfg, 42)
+    expect(cfg.routes['C'].name).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.1m9 — reconcileInstanceIds migration warner / auto-delete
+// ---------------------------------------------------------------------------
+
+describe('reconcileInstanceIds (b.1m9)', () => {
+  test('warns about stale bare-ID rows when new naming differs (no delete by default)', async () => {
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const warnings: string[] = []
+    const originalErr = console.error
+    console.error = ((...args: unknown[]) => {
+      warnings.push(args.map(String).join(' '))
+    }) as typeof console.error
+    try {
+      installStub({
+        deleteCalls,
+        listResult: {
+          spawns: [
+            // Stale: cscb_C0AMDDZEHCY but route now expects cscb_general_C0AMDDZEHCY
+            cannedListRow({
+              claude_instance_id: 'cscb_C0AMDDZEHCY',
+              labels: { service: 'cscb', channel: 'C0AMDDZEHCY' },
+            }),
+            // Already new-style: cscb_horde_C0B2A9D2THT — should not flag.
+            cannedListRow({
+              claude_instance_id: 'cscb_horde_C0B2A9D2THT',
+              labels: { service: 'cscb', channel: 'C0B2A9D2THT' },
+            }),
+          ],
+        },
+      })
+      const cfg = makeRoutingConfig({
+        routes: {
+          C0AMDDZEHCY: { cwd: '/a', name: 'general', normalizedName: 'general' },
+          C0B2A9D2THT: { cwd: '/b', name: 'horde', normalizedName: 'horde' },
+        },
+      })
+      const r = await reconcileInstanceIds(cfg, false)
+      expect(r.orphans).toHaveLength(1)
+      expect(r.orphans[0]).toEqual({
+        channelId: 'C0AMDDZEHCY',
+        oldInstanceId: 'cscb_C0AMDDZEHCY',
+        expectedInstanceId: 'cscb_general_C0AMDDZEHCY',
+      })
+      expect(r.deleted).toBe(0)
+      expect(deleteCalls).toHaveLength(0)
+      // The operator-facing one-liner with the exact delete command must be present.
+      const combined = warnings.join('\n')
+      expect(combined).toContain('agent-director delete --claude-instance-id cscb_C0AMDDZEHCY')
+    } finally {
+      console.error = originalErr
+    }
+  })
+
+  test('autoDelete=true issues delete for each orphan', async () => {
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      deleteCalls,
+      listResult: {
+        spawns: [
+          cannedListRow({
+            claude_instance_id: 'cscb_C0AMDDZEHCY',
+            labels: { service: 'cscb', channel: 'C0AMDDZEHCY' },
+          }),
+          cannedListRow({
+            claude_instance_id: 'cscb_C0B2A9D2THT',
+            labels: { service: 'cscb', channel: 'C0B2A9D2THT' },
+          }),
+        ],
+      },
+    })
+    const cfg = makeRoutingConfig({
+      routes: {
+        C0AMDDZEHCY: { cwd: '/a', name: 'general', normalizedName: 'general' },
+        C0B2A9D2THT: { cwd: '/b', name: 'horde', normalizedName: 'horde' },
+      },
+    })
+    const r = await reconcileInstanceIds(cfg, true)
+    expect(r.orphans).toHaveLength(2)
+    expect(r.deleted).toBe(2)
+    expect(r.failed).toBe(0)
+    const deletedIds = deleteCalls.flatMap((d) => d.claude_instance_id).sort()
+    expect(deletedIds).toEqual(['cscb_C0AMDDZEHCY', 'cscb_C0B2A9D2THT'])
+  })
+
+  test('no orphans when every row matches the expected new naming', async () => {
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      deleteCalls,
+      listResult: {
+        spawns: [
+          cannedListRow({
+            claude_instance_id: 'cscb_general_C0AMDDZEHCY',
+            labels: { service: 'cscb', channel: 'C0AMDDZEHCY' },
+          }),
+        ],
+      },
+    })
+    const cfg = makeRoutingConfig({
+      routes: { C0AMDDZEHCY: { cwd: '/a', name: 'general', normalizedName: 'general' } },
+    })
+    const r = await reconcileInstanceIds(cfg, true)
+    expect(r.orphans).toEqual([])
+    expect(r.deleted).toBe(0)
+    expect(deleteCalls).toHaveLength(0)
+  })
+
+  test('rows without a route entry are skipped (handled by reconcileOrphans)', async () => {
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      deleteCalls,
+      listResult: {
+        spawns: [
+          cannedListRow({
+            claude_instance_id: 'cscb_C_NOT_CONFIGURED',
+            labels: { service: 'cscb', channel: 'C_NOT_CONFIGURED' },
+          }),
+        ],
+      },
+    })
+    const cfg = makeRoutingConfig({ routes: { C_OTHER: { cwd: '/x' } } })
+    const r = await reconcileInstanceIds(cfg, true)
+    expect(r.orphans).toEqual([])
+    expect(deleteCalls).toHaveLength(0)
+  })
+
+  test('list failure → empty result, no crash', async () => {
+    installStub({ listError: new Error('AD down') })
+    const cfg = makeRoutingConfig({
+      routes: { C: { cwd: '/x', name: 'g', normalizedName: 'g' } },
+    })
+    const r = await reconcileInstanceIds(cfg, true)
+    expect(r.orphans).toEqual([])
+    expect(r.deleted).toBe(0)
+  })
+
+  test('mixed routes: some new, some bare — only the bare get flagged', async () => {
+    installStub({
+      listResult: {
+        spawns: [
+          cannedListRow({
+            claude_instance_id: 'cscb_general_C1',
+            labels: { service: 'cscb', channel: 'C1' },
+          }),
+          cannedListRow({
+            claude_instance_id: 'cscb_C2',
+            labels: { service: 'cscb', channel: 'C2' },
+          }),
+          cannedListRow({
+            claude_instance_id: 'cscb_horde_C3',
+            labels: { service: 'cscb', channel: 'C3' },
+          }),
+        ],
+      },
+    })
+    const cfg = makeRoutingConfig({
+      routes: {
+        C1: { cwd: '/1', name: 'general', normalizedName: 'general' },
+        C2: { cwd: '/2', name: 'horde', normalizedName: 'horde' },
+        C3: { cwd: '/3', name: 'horde', normalizedName: 'horde' },
+      },
+    })
+    const r = await reconcileInstanceIds(cfg, false)
+    expect(r.orphans).toHaveLength(1)
+    expect(r.orphans[0].channelId).toBe('C2')
+    expect(r.orphans[0].oldInstanceId).toBe('cscb_C2')
+    expect(r.orphans[0].expectedInstanceId).toBe('cscb_horde_C2')
   })
 })
