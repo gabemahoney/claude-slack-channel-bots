@@ -54,6 +54,8 @@ import type {
   PauseParams,
   PauseResult,
   PermissionRequestInfo,
+  ReadPaneParams,
+  ReadPaneResult,
   ResumeParams,
   ResumeResult,
   SendKeysParams,
@@ -285,6 +287,12 @@ export interface StubClientOptions {
   sendKeysError?: Error
   sendKeysCalls?: SendKeysParams[]
 
+  // readPane() — FIFO sequence of canned panes; last entry sticks once
+  // consumed. Mutually exclusive with `readPaneError`.
+  readPaneResults?: ReadPaneResult[]
+  readPaneError?: Error
+  readPaneCalls?: ReadPaneParams[]
+
   // kill()
   killResult?: KillResult
   killError?: Error
@@ -327,6 +335,7 @@ export type StubClient = {
   status(params: StatusParams): Promise<StatusResult>
   get(params: GetParams): Promise<GetResult>
   sendKeys(params: SendKeysParams): Promise<SendKeysResult>
+  readPane(params: ReadPaneParams): Promise<ReadPaneResult>
   kill(params: KillParams): Promise<KillResult>
   decide(params: DecideParams): Promise<DecideResult>
   resume(params: ResumeParams): Promise<ResumeResult>
@@ -391,6 +400,16 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
       opts.sendKeysCalls?.push(params)
       if (opts.sendKeysError) throw opts.sendKeysError
       return opts.sendKeysResult ?? {}
+    },
+    async readPane(params: ReadPaneParams): Promise<ReadPaneResult> {
+      opts.readPaneCalls?.push(params)
+      if (opts.readPaneError) throw opts.readPaneError
+      const seq = opts.readPaneResults
+      if (seq && seq.length > 0) {
+        // FIFO; the last remaining entry sticks (do not pop the tail).
+        return seq.length === 1 ? seq[0] : seq.shift()!
+      }
+      return { pane: '' }
     },
     async kill(params: KillParams): Promise<KillResult> {
       opts.killCalls?.push(params)
