@@ -8,7 +8,7 @@
         "@modelcontextprotocol/sdk": "^1.0.0",
         "@slack/socket-mode": "^2.0.0",
         "@slack/web-api": "^7.0.0",
-        "agent-director": "^0.5.1",
+        "agent-director": "^0.5.5",
       },
       "devDependencies": {
         "@types/bun": "^1.0.0",
@@ -17,9 +17,9 @@
     },
   },
   "packages": {
-    "@agent-director/darwin-arm64": ["@agent-director/darwin-arm64@0.5.1", "", { "os": "darwin", "cpu": "arm64" }, "sha512-KP/bgTTN/J0mapQSXGlarXperP/obGVPREOqZxAoEvWlybtHOpHNcLGfzhnDGnoHMeITkh1C9vEGGXJCWzPsfA=="],
+    "@agent-director/darwin-arm64": ["@agent-director/darwin-arm64@0.5.5", "", { "os": "darwin", "cpu": "arm64" }, "sha512-MNKtheiGMEL+IW0YSoJ8tWrKyQ6BWUMnvfuNmAm6g5ZMDhDDonGLcXqnEKKSESVsyR6SX/NgTHZQgD7JMlGVAg=="],
 
-    "@agent-director/linux-x64": ["@agent-director/linux-x64@0.5.1", "", { "os": "linux", "cpu": "x64" }, "sha512-NmDFfkZw0PcpTZKJPtiF9VGzeoELH0zS7GQXK3QF1aZ6it6NwnK94IHGNqpvq/mzYI7sAa2qzF5C+7q5oiy/zA=="],
+    "@agent-director/linux-x64": ["@agent-director/linux-x64@0.5.5", "", { "os": "linux", "cpu": "x64" }, "sha512-seW4NDITsmjZ5n0j8jZ0nEJvn8SjjVCS9/CDjlFk1rmAUqsrEVy0LJf0CzM5ec4ExlsXJqfQ5Mz3JsnSO0qRhg=="],
 
     "@hono/node-server": ["@hono/node-server@1.19.11", "", { "peerDependencies": { "hono": "^4" } }, "sha512-dr8/3zEaB+p0D2n/IUrlPF1HZm586qgJNXK1a9fhg/PzdtkK7Ksd5l312tJX2yBuALqDYBlG20QEbayqPyxn+g=="],
 
@@ -43,7 +43,7 @@
 
     "accepts": ["accepts@2.0.0", "", { "dependencies": { "mime-types": "^3.0.0", "negotiator": "^1.0.0" } }, "sha512-5cvg6CtKwfgdmVqY1WIiXKc3Q1bkRqGLi+2W/6ao+6Y7gu/RCwRuAhGEzh5B4KlszSuTLgZYuqFqo5bImjNKng=="],
 
-    "agent-director": ["agent-director@0.5.1", "", { "optionalDependencies": { "@agent-director/darwin-arm64": "^0.5.1", "@agent-director/linux-x64": "^0.5.1" }, "os": [ "linux", "darwin", ], "cpu": [ "x64", "arm64", ] }, "sha512-a11H8rC3YM5tUD486mxYdvcrxl4sh2q/AvKdUs02CW7uKGD7WOr0B2iucJzParpYprgmrekiACYB+oYnWYnBsw=="],
+    "agent-director": ["agent-director@0.5.5", "", { "optionalDependencies": { "@agent-director/darwin-arm64": "^0.5.5", "@agent-director/linux-x64": "^0.5.5" }, "os": [ "linux", "darwin", ], "cpu": [ "x64", "arm64", ] }, "sha512-Nk6E03OIH266RjrZJKaVQvIDJku3wp2XnMzUy9I39MfOVYKArBlbsCRrj9D3iH5ZtJYocXngMBUR04omzV/sRQ=="],
 
     "ajv": ["ajv@8.18.0", "", { "dependencies": { "fast-deep-equal": "^3.1.3", "fast-uri": "^3.0.1", "json-schema-traverse": "^1.0.0", "require-from-string": "^2.0.2" } }, "sha512-PlXPeEWMXMZ7sPYOHqmDyCJzcfNrUr3fGNKtezX14ykXOEIvyK81d+qydx89KY5O71FKMPaQ2vBfBFI5NHR63A=="],
 

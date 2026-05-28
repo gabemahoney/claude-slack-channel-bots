@@ -210,6 +210,9 @@ export function _resetDialogPollTimeoutMs(): void {
  * "I am using this for local development" option, then confirm the dialog
  * has cleared. All errors caught locally — never throws to the caller.
  *
+ * readPane/sendKeys use `allow_pending: true` because the bot is still in
+ * `pending` AD state when this runs (b.98w — formerly caused ErrSpawnNotInteractive).
+ *
  * Two distinct failure modes are recorded via `recordStartupError` so a
  * future Claude Code release that changes the dialog cannot silently break
  * fresh-spawn approval:
@@ -229,9 +232,9 @@ export async function approveDevChannelsDialog(
   let approved = false
   while (Date.now() < deadline) {
     try {
-      const { pane } = await client.readPane({ claude_instance_id, n_lines: 40 })
+      const { pane } = await client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true })
       if (pane.includes(DEV_CHANNELS_DIALOG_NEEDLE)) {
-        await client.sendKeys({ claude_instance_id, text: '' })
+        await client.sendKeys({ claude_instance_id, text: '', allow_pending: true })
         approved = true
         break
       }
@@ -252,7 +255,7 @@ export async function approveDevChannelsDialog(
   while (Date.now() < deadline && misses < DIALOG_GONE_CONFIRMS_REQUIRED) {
     await new Promise((r) => setTimeout(r, _dialogPollIntervalMs))
     try {
-      const { pane } = await client.readPane({ claude_instance_id, n_lines: 40 })
+      const { pane } = await client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true })
       misses = pane.includes(DEV_CHANNELS_DIALOG_NEEDLE) ? 0 : misses + 1
     } catch {
       /* tolerate transient readPane failure */
