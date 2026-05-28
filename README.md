@@ -38,7 +38,7 @@ See the sections below for manual configuration details if you prefer not to use
 
 - [Bun](https://bun.sh) `>= 1.0.21` (agent-director minimum)
 - [Claude Code](https://claude.ai/code) installed and authenticated
-- [`agent-director`](https://github.com/gabemahoney/agent-director) **runtime dependency** — pulled in transitively when you install this package. Hard required at server boot: CSCB refuses to start if the library is missing, the host platform is unsupported, Bun is too old, or the installed version is below `MIN_AD_VERSION` (`^0.4.3`). agent-director itself requires [tmux](https://github.com/tmux/tmux) on the operator's PATH; CSCB no longer probes for it directly.
+- [`agent-director`](https://github.com/gabemahoney/agent-director) **runtime dependency** — pulled in transitively when you install this package. Hard required at server boot: CSCB refuses to start if the library is missing, the host platform is unsupported, Bun is too old, or the installed version is below `MIN_AD_VERSION` (`^0.5.5`). agent-director itself requires [tmux](https://github.com/tmux/tmux) on the operator's PATH; CSCB no longer probes for it directly.
 - Slack workspace admin access (to create and configure the Slack app)
 - **cozempic** (optional) — Python 3.10+ and `pip install cozempic` — used by JSONL path resolution helpers retained for downstream callers.
 
@@ -54,7 +54,7 @@ See the sections below for manual configuration details if you prefer not to use
 
 If the host is unsupported, the SR-5.1 startup gate exits non-zero at server boot with a typed error from agent-director (`ErrPlatformPackageMissing` or `ErrUnsupportedPlatform`) and writes the failure to `~/.claude/channels/slack/startup-errors.log` and stderr. See [Startup errors](#startup-errors) below.
 
-> **Note on agent-director versions.** v0.4.1 is a zombie release (the published tarball is missing `dist/` and cannot be imported). v0.4.2 lacks the `MakeTemplateParams.overwrite` field CSCB needs for the boot-time template refresh. CSCB pins `^0.4.3` to get past both.
+> **Note on agent-director versions.** v0.4.1 is a zombie release (the published tarball is missing `dist/` and cannot be imported). v0.4.2 lacks the `MakeTemplateParams.overwrite` field CSCB needs for the boot-time template refresh. v0.5.4 and earlier lack `allow_pending` on `readPane`/`sendKeys`, causing `ErrSpawnNotInteractive` during dev-channels dialog approval on freshly-spawned bots. CSCB pins `^0.5.5` to get past all three.
 
 ---
 

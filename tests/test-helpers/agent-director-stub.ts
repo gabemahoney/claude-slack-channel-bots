@@ -31,6 +31,7 @@ import {
   ErrPlatformPackageMissing,
   ErrRelayModeOff,
   ErrSpawnNotFound,
+  ErrSpawnNotInteractive,
   ErrSpawnNotResumable,
   ErrTemplateExists,
   ErrTemplateMalformed,
@@ -130,6 +131,11 @@ export function errGeneric(verb: string, errName: string, message: string = 'oop
 /** Build an ErrSpawnNotFound (spawn/get/decide on missing row). */
 export function errSpawnNotFound(): ErrSpawnNotFound {
   return new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'spawn not found')
+}
+
+/** Build an ErrSpawnNotInteractive (readPane/sendKeys while spawn is still pending). */
+export function errSpawnNotInteractive(verb: string = 'read-pane'): ErrSpawnNotInteractive {
+  return new ErrSpawnNotInteractive(verb, 'ErrSpawnNotInteractive', 'spawn not interactive — not in pending/waiting state')
 }
 
 /** Build an ErrInstanceIdCollision (spawn / SR-1.4 collision path). */

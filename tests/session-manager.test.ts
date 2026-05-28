@@ -42,6 +42,7 @@ import {
   errInstanceIdCollision,
   errNoSessionId,
   errSpawnNotFound,
+  errSpawnNotInteractive,
   makeStubClient,
   type StubClient,
 } from './test-helpers/agent-director-stub.ts'
@@ -388,6 +389,13 @@ describe('approveDevChannelsDialog (b.yy6)', () => {
     for (const r of readPaneCalls) {
       expect(r.claude_instance_id).toBe('cscb_C')
       expect(r.n_lines).toBe(40)
+      // b.98w: every readPane call must carry allow_pending=true so the verb
+      // succeeds while the spawn is still in 'pending' state.
+      expect(r.allow_pending).toBe(true)
+    }
+    // b.98w: the sendKeys call that presses Enter must also carry allow_pending=true.
+    for (const s of sendKeysCalls) {
+      expect(s.allow_pending).toBe(true)
     }
   })
 
@@ -487,5 +495,50 @@ describe('approveDevChannelsDialog (b.yy6)', () => {
 
     expect(result.action).toBe('spawned')
     expect(readLog()).toBe('')
+  })
+
+  // -------------------------------------------------------------------------
+  // b.98w regression: readPane/sendKeys must pass allow_pending:true or the
+  // agent-director rejects with ErrSpawnNotInteractive while still pending.
+  // -------------------------------------------------------------------------
+
+  test('b.98w / ErrSpawnNotInteractive: rejects if readPane or sendKeys omit allow_pending', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+
+    // Install a baseline stub, then override readPane and sendKeys to simulate
+    // the agent-director rejecting calls that lack allow_pending:true.
+    const stub = installStub({ sendKeysCalls, readPaneCalls })
+
+    stub.readPane = async (params: import('agent-director').ReadPaneParams): Promise<import('agent-director').ReadPaneResult> => {
+      readPaneCalls.push(params)
+      if (!params.allow_pending) {
+        throw errSpawnNotInteractive('read-pane')
+      }
+      // Return the dialog needle on the first detection call, then clear it.
+      const callIdx = readPaneCalls.length
+      if (callIdx === 1) return { pane: DEV_CHANNELS_PANE }
+      return { pane: WELCOME_PANE }
+    }
+
+    stub.sendKeys = async (params: import('agent-director').SendKeysParams): Promise<import('agent-director').SendKeysResult> => {
+      sendKeysCalls.push(params)
+      if (!params.allow_pending) {
+        throw errSpawnNotInteractive('send-keys')
+      }
+      return {}
+    }
+
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+    // If allow_pending is present everywhere the spawn must complete cleanly.
+    expect(result.action).toBe('spawned')
+    // Exactly one sendKeys (the Enter key that dismisses the dialog).
+    const enterCalls = sendKeysCalls.filter((s) => s.text === '')
+    expect(enterCalls).toHaveLength(1)
+    // The sendKeys call must carry allow_pending:true — without it the mock
+    // throws ErrSpawnNotInteractive and the dialog approval silently fails.
+    expect(enterCalls[0].allow_pending).toBe(true)
   })
 })
