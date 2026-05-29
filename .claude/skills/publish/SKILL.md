@@ -305,6 +305,40 @@ if [ "${VERIFIED}" != "1" ]; then
   exit 1
 fi
 
+# SR-7.1 — sanitize the bun-1.3.13 empty-string-dependency-key poison from the global package.json
+# (mirror of scripts/install-local.sh; do not invent a new sanitizer)
+GLOBAL_DIR="${BUN_INSTALL:-$HOME/.bun}/install/global"
+GLOBAL_PKG="${GLOBAL_DIR}/package.json"
+if [ -f "${GLOBAL_PKG}" ]; then
+  GLOBAL_PKG="${GLOBAL_PKG}" PKG_NAME="claude-slack-channel-bots" bun -e '
+    const fs = require("node:fs");
+    const p = process.env.GLOBAL_PKG;
+    const name = process.env.PKG_NAME;
+    const j = JSON.parse(fs.readFileSync(p, "utf8"));
+    const changed = [];
+    if (j.dependencies) {
+      if (Object.prototype.hasOwnProperty.call(j.dependencies, "")) {
+        delete j.dependencies[""];
+        changed.push("empty-string entry");
+      }
+      if (name && Object.prototype.hasOwnProperty.call(j.dependencies, name)) {
+        delete j.dependencies[name];
+        changed.push("pre-existing " + name + " entry");
+      }
+    }
+    if (changed.length) {
+      fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
+      console.log("[publish] sanitized: " + changed.join(", ") + " in " + p);
+    }
+  '
+fi
+
+# SR-7.2 — remove any existing global install (tolerate non-zero exit; nothing may be installed).
+# Then defensively rm the leftover node_modules entry to clean up dangling files or symlinks the
+# remove step may not have cleared (e.g. a prior `install-local.sh` symlink farm).
+bun remove -g claude-slack-channel-bots > /dev/null 2>&1 || true
+rm -rf "${GLOBAL_DIR}/node_modules/claude-slack-channel-bots"
+
 echo "release complete; local sync pending"
 exit 0
 ```
