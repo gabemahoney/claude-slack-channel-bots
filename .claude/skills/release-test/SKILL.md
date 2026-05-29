@@ -56,10 +56,25 @@ If a test fails, skip all downstream dependents: print `SKIP: <title>` for each.
 1. Print the FAIL line
 2. Print: `TEST FAILED: <title> — <error>`
 3. Stop. Do not continue. Do not debug. Do not retry.
+4. End the in-container Claude session so the docker container can exit
+   cleanly. The CI entrypoint's outer loop is
+   `while tmux has-session -t ci; do sleep 5; done`, so killing the `ci`
+   tmux session is what releases the container:
+   ```bash
+   tmux kill-session -t ci 2>/dev/null || true
+   ```
+   Without this, the container hangs until the outer `/ci` Monitor's
+   15-minute timeout fires even on a deterministic test failure.
 
 ## Step 4 — On full pass
 
 After all tests pass:
 ```
 RELEASE TEST PASSED
+```
+
+Then immediately end the in-container Claude session for the same reason as
+Step 3 — the container only exits when the `ci` tmux session dies:
+```bash
+tmux kill-session -t ci 2>/dev/null || true
 ```

@@ -20,13 +20,14 @@ Install the package from the pre-built tarball:
 cd /test-repo
 bun install /tmp/package.tgz
 ```
-Verify the binary is available:
+Verify the binary was installed:
 ```bash
-./node_modules/.bin/claude-slack-channel-bots --help
+test -x ./node_modules/.bin/claude-slack-channel-bots && echo "binary OK"
 ```
 
 ### Create routing config
-Create the state directory and config.json:
+Create the state directory and config.json (the live filename — `routing.json` is
+only a migration source the postinstall renames):
 ```bash
 mkdir -p ~/.claude/channels/slack
 cat > ~/.claude/channels/slack/config.json << 'EOF'
@@ -48,17 +49,21 @@ git -C /tmp/test-repo-a init
 ```
 
 ### Start server in dry-run mode
+The `start` subcommand daemonizes: the parent process forks a detached child and
+exits. The child writes its own PID to `~/.claude/channels/slack/server.pid` and
+appends all stderr/stdout to `~/.claude/channels/slack/server.log`. So we do NOT
+need `nohup`, do NOT shell-redirect stderr, and do NOT trust `$!` — those refer
+to the parent which has already exited.
 ```bash
 cd /test-repo
-SLACK_DRY_RUN=1 nohup ./node_modules/.bin/claude-slack-channel-bots start > /tmp/server.log 2>&1 &
-echo $! > /tmp/server.pid
+SLACK_DRY_RUN=1 ./node_modules/.bin/claude-slack-channel-bots start
 sleep 10
 ```
 
 ### Verify startup
-Check that the server started without error:
+Check that the daemon started without error:
 ```bash
-cat /tmp/server.log
+cat ~/.claude/channels/slack/server.log
 ```
 Expected: log contains "[slack] Running in dry-run mode" and no error stack traces.
 
@@ -68,6 +73,7 @@ curl -sf http://127.0.0.1:3100/mcp -X POST -H "Content-Type: application/json" -
 ```
 
 ### Pass criteria
-- Server process is running (check with `kill -0 $(cat /tmp/server.pid)`)
-- Log contains "[slack] Running in dry-run mode"
+- Daemon PID file exists and points at a live process:
+  `kill -0 $(cat ~/.claude/channels/slack/server.pid)`
+- `~/.claude/channels/slack/server.log` contains "[slack] Running in dry-run mode"
 - MCP endpoint responds on port 3100

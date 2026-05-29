@@ -1,7 +1,7 @@
 ---
 id: b.set
 type: bee
-title: 'Test 3: Cozempic cleaning and session resume after restart'
+title: 'Test 3: Cozempic availability and clean server restart'
 up_dependencies:
 - b.3hy
 parent: null
@@ -12,10 +12,10 @@ schema_version: '0.1'
 guid: setkutjznmwpgemdxschnjtrhqz23kun
 ---
 
-## Test 3: Cozempic cleaning and session resume after restart
+## Test 3: Cozempic availability and clean server restart
 
 ### Prerequisites
-Server from Test 1 must be running. Sessions from Test 2 must exist.
+Server from Test 1 must be running. Test 2 must have passed.
 
 ### Check cozempic is available
 ```bash
@@ -29,34 +29,40 @@ wc -l ~/.claude/channels/slack/server.log
 ```
 
 ### Stop server
+Use the CLI's own `stop` subcommand — it reads the daemon PID from
+`~/.claude/channels/slack/server.pid` (the only authoritative location) and
+sends SIGTERM, polling until exit:
 ```bash
-kill $(cat ~/.claude/channels/slack/server.pid 2>/dev/null) 2>/dev/null || true
+./node_modules/.bin/claude-slack-channel-bots stop
 sleep 3
 ```
 
-### Restart server (cozempic runs before --resume on startup)
+### Restart server in dry-run mode
 ```bash
 cd /test-repo
-SLACK_DRY_RUN=1 nohup ./node_modules/.bin/claude-slack-channel-bots start > /tmp/server-restart.log 2>&1 &
-echo $! > /tmp/server.pid
+SLACK_DRY_RUN=1 ./node_modules/.bin/claude-slack-channel-bots start
 sleep 15
 ```
 
-### Verify cozempic ran
-Check restart log for cozempic activity:
+### Verify cozempic was probed during startup
+`checkCozempicAvailable` runs at the top of `startupSessionManager` on every
+boot. In dry-run mode `spawnForRoute` is a no-op so no JSONL files are produced
+or cleaned, but the availability probe still logs:
 ```bash
-cat ~/.claude/channels/slack/server.log | grep -i cozempic
+grep -i cozempic ~/.claude/channels/slack/server.log | tail -5
 ```
-If sessions had JSONL files, expected: log shows "cozempic: cleaning started" or "cozempic not found on PATH" (warning is OK if no JSONL exists to clean).
+Expected: log contains "[slack] cozempic available" (or, if cozempic was
+missing from PATH, the "cozempic not found on PATH" warning — both are valid
+evidence that the probe ran).
 
-### Verify server restarted
+### Verify server restarted cleanly
 ```bash
-cat /tmp/server-restart.log | tail -5
+tail -5 ~/.claude/channels/slack/server.log
 kill -0 $(cat ~/.claude/channels/slack/server.pid 2>/dev/null) 2>/dev/null && echo "server running" || echo "server not running"
 ```
 
 ### Pass criteria
-- Server restarted without errors
-- Server process is alive after restart
-- Server log shows dry-run mode on restart
-- If session JSONL files existed, cozempic cleaning entries appear in log (or warning that cozempic was not found)
+- Server restarted without an error stack trace
+- Daemon process is alive (`kill -0 $(cat ~/.claude/channels/slack/server.pid)`)
+- Server log shows "Running in dry-run mode" after the restart
+- Server log contains a cozempic probe entry ("cozempic available" or "cozempic not found on PATH")
