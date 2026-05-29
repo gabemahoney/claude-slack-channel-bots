@@ -23,19 +23,6 @@ Run the integration test suite inside Docker. Builds the image, packs the tarbal
    ```
    If missing: "Set ANTHROPIC_API_KEY and re-run `/ci`."
 
-3. Check the bees MCP server is running (the container needs it to read test plans):
-   ```bash
-   curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1
-   ```
-   If not running, start it:
-   ```bash
-   bees serve --http > /tmp/bees_server.log 2>&1 &
-   ```
-   Wait up to 10 seconds for it to become healthy:
-   ```bash
-   for i in $(seq 1 10); do curl -sf http://127.0.0.1:8000/health && break || sleep 1; done
-   ```
-
 ## Step 2 — Pack tarball
 
 From the repo root:
@@ -60,9 +47,7 @@ docker rm -f cscb-ci 2>/dev/null || true
 TARBALL=<tarball-filename>
 docker run -d --name cscb-ci \
   -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}" \
-  -e BEES_MCP_URL="http://host.docker.internal:8000" \
   -v "$(pwd)/${TARBALL}:/tmp/package.tgz:ro" \
-  --add-host host.docker.internal:host-gateway \
   claude-slack-channel-bots-test
 ```
 

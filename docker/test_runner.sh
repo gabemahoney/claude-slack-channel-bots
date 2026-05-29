@@ -27,8 +27,5 @@ with open('$(echo ~)/.bees/config.json', 'w') as f:
 print('Created bees config')
 "
 
-echo "=== Registering bees MCP server ==="
-claude mcp add bees -- bees serve --stdio 2>&1 || echo "WARN: claude mcp add failed"
-
 echo "=== Running integration tests ==="
 exec claude "/release-test"

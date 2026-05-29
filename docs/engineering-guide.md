@@ -132,7 +132,6 @@ Before invoking `/publish`, confirm:
 - `bun install --frozen-lockfile`, `bun test`, and `bun run typecheck` all pass locally.
 - Docker daemon is running (required by the `/ci` gate).
 - `ANTHROPIC_API_KEY` is exported in the environment (required by `/ci`).
-- The bees MCP server is running (required by `/ci`).
 - `npm whoami` returns a `claude-slack-channel-bots` maintainer account (`npm login` if not).
 
 If any precondition fails, `/publish` will abort at the corresponding preflight gate with an `SR-2.x` diagnostic — you do not need to pre-check by hand, but knowing the list helps diagnose a failure quickly.
@@ -167,7 +166,7 @@ Every failure path in `/publish` emits a diagnostic identifying the failing SR s
 | No tests / failing tests / failing typecheck | `SR-2.3 (preflight)` | Add or fix tests / types, commit to main, rerun. |
 | `npm whoami` fails | `SR-2.4 (preflight)` | `npm login`, rerun. |
 | Version already on npm | `SR-2.4 (preflight)` | Pull latest main (or pick a larger bump), rerun. |
-| `/ci` not runnable or non-PASS | `SR-2.5 (/ci gate)` | Start Docker / export `ANTHROPIC_API_KEY` / start bees MCP, or fix the integration regression, then rerun. |
+| `/ci` not runnable or non-PASS | `SR-2.5 (/ci gate)` | Start Docker / export `ANTHROPIC_API_KEY`, or fix the integration regression, then rerun. |
 | Bump / pack / scratch-install / smoke failure | `SR-3.1` or `SR-4.x` | Working tree is rolled back automatically. Investigate the upstream error, then rerun. |
 | `git push origin main` failure | `SR-5.2 (push commit)` | The release commit + tag are local-only; resolve the push issue and re-run `git push origin main` manually + `npm publish <tarball>` + `git push origin v<version>`, OR `git reset --hard HEAD~1 && git tag -d v<version>` to abandon and rerun `/publish`. |
 | `npm publish` failure | `SR-5.3 (npm publish)` | Commit is on origin; npm does not have the version. Fix the publish issue (e.g., `npm login`) and re-run `npm publish <tarball>` manually, then `git push origin v<version>`. The smoke-tested tarball is preserved in CWD for the manual re-publish. |

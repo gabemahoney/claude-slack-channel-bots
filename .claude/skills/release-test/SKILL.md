@@ -2,7 +2,7 @@
 name: release-test
 description: Execute integration test plans from the testplans hive. Run inside Docker CI container.
 user-invocable: true
-allowed-tools: [Bash, mcp__bees__show_ticket, mcp__bees__list_hives, mcp__bees__execute_freeform_query]
+allowed-tools: [Bash, Read]
 ---
 
 # /release-test
@@ -12,11 +12,27 @@ You are a strict test runner. Execute each test from the testplans hive one at a
 
 ## Step 1 — Fetch test tickets
 
-1. Call `list_hives()` to confirm testplans hive exists
-2. Query all tickets in the testplans hive using `execute_freeform_query()`, or call `show_ticket()` on the root bee (b.en1) to get the suite root
-3. The test tickets are: any tickets in the hive whose title starts with "Test " — these are the tests to run
-4. Load all test ticket details via `show_ticket(all_ids)`
-5. Sort tests in topological order by `up_dependencies` (tickets with no deps first, followed by their dependents)
+1. Confirm the testplans hive exists by running:
+   ```bash
+   bees list-hives | jq '.'
+   ```
+   Parse `.hives[]` from the JSON object and verify a hive with `normalized_name == "testplans"` is present.
+
+2. Query all tickets in the testplans hive:
+   ```bash
+   bees execute-freeform-query --query-yaml $'stages:\n- [hive=testplans]' | jq '.ticket_ids'
+   ```
+   Parse the `.ticket_ids` array from the JSON response `{"status":"success","result_count":N,"ticket_ids":[...],...}` to find all ticket IDs in the hive.
+
+3. The test tickets are: any tickets whose `title` starts with `"Test "` — these are the tests to run.
+
+4. Load full details for all test ticket IDs in a single call:
+   ```bash
+   bees show-ticket --ids <id1> <id2> ... | jq '.tickets'
+   ```
+   Parse the `tickets` array from the JSON output `{"tickets": [...]}`.
+
+5. Sort tests in topological order by `up_dependencies` (tickets with no deps first, followed by their dependents).
 
 Each ticket has:
 - `title`: test name (e.g. "Test 1: ...")
