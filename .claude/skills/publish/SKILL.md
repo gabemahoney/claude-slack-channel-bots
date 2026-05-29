@@ -176,7 +176,36 @@ fi
 
 ## Smoke Test
 
-Placeholder — populated by Epic 2.
+After the bump lands, build the release artifact and exercise it in an isolated environment before any commit, push, or publish step runs. The phase has two parts: pack the tarball and verify its internal version (below), then scratch-install the tarball and smoke-check the bin (next subsection).
+
+### SR-4.1 — Pack and verify internal version
+
+Defensively remove any pre-existing `claude-slack-channel-bots-*.tgz` in CWD before packing. `*.tgz` is gitignored, so a leftover from a prior aborted run would not have surfaced in the preflight clean-tree check.
+
+Pack with `bun pm pack`. The produced filename is `claude-slack-channel-bots-<bumped-version>.tgz`. Record it in `TARBALL` so the `EXIT` trap covers it on every exit path.
+
+Verify the tarball's internal `package.json` `version` equals the bumped version. The path inside the tarball is `package/package.json` (the conventional npm-pack layout). A mismatch aborts with a named diagnostic; the `EXIT` trap removes the (possibly partial) tarball.
+
+```bash
+rm -f claude-slack-channel-bots-*.tgz
+
+if ! bun pm pack > /dev/null; then
+  echo "pack failed: bun pm pack did not produce a tarball" >&2
+  exit 1
+fi
+
+TARBALL="claude-slack-channel-bots-${NEXT_VERSION}.tgz"
+if [ ! -f "${TARBALL}" ]; then
+  echo "pack failed: expected tarball ${TARBALL} not found" >&2
+  exit 1
+fi
+
+TARBALL_VERSION="$(tar -xzOf "${TARBALL}" package/package.json | jq -r .version)"
+if [ "${TARBALL_VERSION}" != "${NEXT_VERSION}" ]; then
+  echo "pack failed: tarball internal version '${TARBALL_VERSION}' != bumped ${NEXT_VERSION}" >&2
+  exit 1
+fi
+```
 
 ## Release
 
