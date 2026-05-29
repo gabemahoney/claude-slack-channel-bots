@@ -26,10 +26,10 @@ Verify the binary is available:
 ```
 
 ### Create routing config
-Create the state directory and routing.json:
+Create the state directory and config.json:
 ```bash
 mkdir -p ~/.claude/channels/slack
-cat > ~/.claude/channels/slack/routing.json << 'EOF'
+cat > ~/.claude/channels/slack/config.json << 'EOF'
 {
   "routes": {
     "C_TEST1": { "cwd": "/tmp/test-repo-a" }
