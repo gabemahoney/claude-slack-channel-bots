@@ -10,7 +10,7 @@ allowed-tools: [Bash, Read, Skill]
 
 Cut a release of `claude-slack-channel-bots` end-to-end: preflight gates, version bump, smoke test of the release artifact, publish, and dev-box reinstall.
 
-On a release-ready repo, the skill bumps the version, packs the tarball, scratch-installs it, runs the bin smoke check, commits + tags `Release v<version>` locally, pushes the commit to `origin/main`, publishes the smoke-tested tarball to npm, pushes the tag, polls the registry until the new version is visible, then exits with `release complete; local sync pending`. Epic 4 will replace that terminal message with the dev-box reinstall + final summary.
+On a release-ready repo, the skill bumps the version, packs the tarball, scratch-installs it, runs the bin smoke check, commits + tags `Release v<version>` locally, pushes the commit to `origin/main`, publishes the smoke-tested tarball to npm, pushes the tag, polls the registry until the new version is visible, sanitizes the bun-1.3.13 poison from the global package.json, removes any pre-existing global install, reinstalls the just-published version from npm (the exact command an end user runs), verifies the install resolves under the global prefix at the published version, and prints a success summary identifying the published version, npm URL, GitHub tag URL, local install path, and the `clean_restart` instruction for the operator.
 
 ## Structural note for the LLM running this skill
 
@@ -134,7 +134,9 @@ After Phase 1 + Phase 2 pass, this single bash block:
 3. Pushes the commit to `origin/main` (SR-5.2). The tag is intentionally held back.
 4. Publishes the smoke-tested tarball with `npm publish <tarball-path>` — NOT `bun publish`, which would repack from CWD (SR-5.3).
 5. Pushes the tag to `origin` (SR-5.4), bringing github and npm into agreement.
-6. Polls `npm view claude-slack-channel-bots@<version> version` every 5 seconds for up to 60 seconds until the registry surfaces the new version (SR-6.1), then exits with `release complete; local sync pending`.
+6. Polls `npm view claude-slack-channel-bots@<version> version` every 5 seconds for up to 60 seconds until the registry surfaces the new version (SR-6.1).
+7. Sanitizes the bun-1.3.13 empty-string-dependency-key poison from `${BUN_INSTALL:-$HOME/.bun}/install/global/package.json` (SR-7.1), removes any pre-existing global install of `claude-slack-channel-bots` (SR-7.2), runs `bun install -g claude-slack-channel-bots@<version>` (SR-7.3), and verifies the bin resolves under the global prefix at the published version (SR-7.4).
+8. Prints the success summary (SR-9.1) — published version, npm URL, GitHub tag URL, resolved local install path, `clean_restart` instruction — and exits zero.
 
 The SR-5.1 → SR-5.4 ordering is load-bearing: if `npm publish` fails after the commit is pushed, the tag is NOT pushed, so the git remote and npm never disagree about whether the version exists.
 
@@ -373,14 +375,32 @@ if [ "${INSTALLED_VERSION}" != "${NEXT_VERSION}" ]; then
   exit 1
 fi
 
-echo "release complete; local sync pending"
+# SR-9.1 — success summary (the terminal output on every successful run)
+NPM_URL="https://www.npmjs.com/package/claude-slack-channel-bots/v/${NEXT_VERSION}"
+GITHUB_TAG_URL="https://github.com/gabemahoney/claude-slack-channel-bots/releases/tag/v${NEXT_VERSION}"
+cat <<EOF
+
+Release complete: claude-slack-channel-bots@${NEXT_VERSION}
+
+  Published version: ${NEXT_VERSION}
+  npm:               ${NPM_URL}
+  GitHub tag:        ${GITHUB_TAG_URL}
+  Local install:     ${RESOLVED_BIN}
+
+Next: run \`claude-slack-channel-bots clean_restart\` to swap the running daemon over to v${NEXT_VERSION}.
+EOF
 exit 0
 ```
 
 ## Local Sync
 
-Placeholder — populated by Epic 4.
+After registry verification, the same Phase 3 bash block resets the dev box to a clean real-copy install of the just-published version, so the operator's installed CSCB matches the published artifact byte-for-byte. The steps:
+
+1. Sanitize `${BUN_INSTALL:-$HOME/.bun}/install/global/package.json` against the bun-1.3.13 empty-string-dependency-key poison. The sanitize logic mirrors `scripts/install-local.sh` (do not invent a separate sanitizer).
+2. `bun remove -g claude-slack-channel-bots` (non-zero exit tolerated — nothing may have been installed) and a defensive `rm -rf` of the leftover `node_modules/claude-slack-channel-bots` entry to clear any residual files or symlinks from a prior real-copy install OR a prior `install-local.sh` symlink farm.
+3. `bun install -g claude-slack-channel-bots@<version>` — the exact command an end user would run. No flags, no path tricks, no `--global` substitute. Failure aborts with explicit manual recovery instructions (`bun install -g claude-slack-channel-bots@<version>`); the skill does not retry automatically.
+4. Verify the install: `command -v claude-slack-channel-bots` finds the bin, `readlink -f` resolves it under `${BUN_INSTALL:-$HOME/.bun}/install/global/`, and the installed `package.json` version equals `<version>`. `readlink -f` resolves all symlinks, so a worktree-pointing symlink farm would resolve outside the global prefix and fail the check — no separate worktree-pattern check is needed.
 
 ## Summary
 
-Placeholder — populated by Epic 4.
+On a fully successful run, the skill prints a final summary identifying the published version, the npm package URL, the GitHub release tag URL, the resolved local install path, and the explicit next-operator-action instruction `claude-slack-channel-bots clean_restart`. The summary printing is unconditional on success — every successful release ends with these five items shown. The skill exits zero immediately after printing.
