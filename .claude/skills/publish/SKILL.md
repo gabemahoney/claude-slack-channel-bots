@@ -245,8 +245,24 @@ if ! grep -q "Usage:" <<< "${SMOKE_STDERR}"; then
   exit 1
 fi
 
-# Epic 2 closure: rollback on success + terminal message
-rollback_working_tree
+# SR-5.1 — release commit + annotated tag (no push yet)
+if ! git add package.json bun.lock; then
+  echo "release commit failed: git add package.json bun.lock did not succeed" >&2
+  rollback_working_tree
+  exit 1
+fi
+
+if ! git commit -m "Release v${NEXT_VERSION}" > /dev/null; then
+  echo "release commit failed: git commit -m \"Release v${NEXT_VERSION}\" did not succeed" >&2
+  rollback_working_tree
+  exit 1
+fi
+
+if ! git tag -a "v${NEXT_VERSION}" -m "Release v${NEXT_VERSION}"; then
+  echo "release tag failed: git tag -a v${NEXT_VERSION} did not succeed; release commit remains on disk (run 'git reset --hard HEAD~1' to revert)" >&2
+  exit 1
+fi
+
 echo "smoke test passed; release phases pending"
 exit 0
 ```
