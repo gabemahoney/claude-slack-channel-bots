@@ -269,6 +269,13 @@ if ! git push origin main; then
   exit 1
 fi
 
+# SR-5.3 — publish the smoke-tested tarball to npm (explicit path; NOT 'bun publish' which repacks)
+if ! npm publish "${TARBALL_ABS}"; then
+  echo "npm publish failed: 'npm publish ${TARBALL_ABS}' did not succeed. State: release commit IS on origin/main; npm does NOT have v${NEXT_VERSION}; tag is NOT pushed. Recovery options: (a) fix the publish issue (e.g., 'npm login') and re-run 'npm publish ${TARBALL_ABS}' manually, then 'git push origin v${NEXT_VERSION}'; (b) revert the remote with 'git push origin +HEAD~1:main', delete the local tag 'git tag -d v${NEXT_VERSION}', then restart /publish" >&2
+  TARBALL=""  # preserve tarball so the operator can re-run npm publish against it
+  exit 1
+fi
+
 echo "smoke test passed; release phases pending"
 exit 0
 ```
