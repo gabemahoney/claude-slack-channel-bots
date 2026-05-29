@@ -112,10 +112,15 @@ export function createCli(deps: CliDeps): CliHandlers {
       const { spawn } = await import('child_process')
       const logPath = join(stateDir, 'server.log')
       const logFd = openSync(logPath, 'a')
+      // b.1m9: propagate --reconcile-instance-ids to the daemon child via env.
+      const childEnv: NodeJS.ProcessEnv = { ...process.env, _CLI_DAEMON_CHILD: '1' }
+      if (process.argv.includes('--reconcile-instance-ids')) {
+        childEnv['CSCB_RECONCILE_INSTANCE_IDS'] = '1'
+      }
       const child = spawn(process.execPath, [import.meta.filename, 'start'], {
         detached: true,
         stdio: ['ignore', logFd, logFd],
-        env: { ...process.env, _CLI_DAEMON_CHILD: '1' },
+        env: childEnv,
       })
       child.unref()
       console.error(`[slack] Server starting in background (PID ${child.pid})`)
@@ -294,12 +299,32 @@ if (import.meta.main) {
   const subcommand = process.argv[2]
 
   if (subcommand !== 'start' && subcommand !== 'stop' && subcommand !== 'clean_restart') {
-    console.error('Usage: cli.ts <start|stop|clean_restart>')
+    console.error('Usage: cli.ts <start|stop|clean_restart> [flags]')
     console.error('')
     console.error('  start          Validate prerequisites and start the server in the background')
     console.error('  stop           Send SIGTERM to a running server')
     console.error('  clean_restart  Exit all managed sessions, then stop and start the server')
+    console.error('')
+    console.error('Flags (b.1m9):')
+    console.error('  --reconcile-instance-ids   Auto-delete stale pre-rename cscb_<id> AD rows on startup')
     process.exit(1)
+  }
+
+  // Resolve a channel's actual claude_instance_id by querying agent-director's
+  // label index. Survives the b.1m9 naming change (cscb_<name>_<id>) without
+  // requiring the CLI to know the route's normalizedName. Returns null when
+  // no cscb row exists for the channel; falls back to bare-ID on a list-level
+  // error so legacy behavior is preserved.
+  async function resolveCscbInstanceId(channelId: string): Promise<string | null> {
+    try {
+      const r = await getClient().list({ label: ['service=cscb', `channel=${channelId}`] })
+      if (r.spawns.length === 0) return null
+      // Prefer the new-naming row if both old and new exist mid-migration.
+      const newStyle = r.spawns.find((s) => s.claude_instance_id !== `cscb_${channelId}`)
+      return (newStyle ?? r.spawns[0]).claude_instance_id
+    } catch {
+      return null
+    }
   }
 
   const realDeps: CliDeps = {
@@ -315,8 +340,13 @@ if (import.meta.main) {
     exit: (code) => process.exit(code),
     loadConfig: () => configLoadConfig(),
     directorStatus: async (channelId) => {
+      // Resolve the actual claude_instance_id by label (cscb_<name>_<id> after b.1m9,
+      // or cscb_<id> on pre-rename installs). Falls back to bare-ID lookup if
+      // listing isn't possible, preserving compatibility with single-row stubs.
+      const id = await resolveCscbInstanceId(channelId)
+      if (id === null) return null
       try {
-        const r = await getClient().status({ claude_instance_id: instanceIdFor(channelId) })
+        const r = await getClient().status({ claude_instance_id: id })
         return { state: r.state }
       } catch (err) {
         if (err instanceof ErrSpawnNotFound) return null
@@ -324,11 +354,13 @@ if (import.meta.main) {
       }
     },
     directorPause: async (channelId) => {
-      await getClient().pause({ claude_instance_id: instanceIdFor(channelId) })
+      const id = (await resolveCscbInstanceId(channelId)) ?? instanceIdFor(channelId)
+      await getClient().pause({ claude_instance_id: id })
     },
     directorKill: async (channelId) => {
       try {
-        await getClient().kill({ claude_instance_id: instanceIdFor(channelId) })
+        const id = (await resolveCscbInstanceId(channelId)) ?? instanceIdFor(channelId)
+        await getClient().kill({ claude_instance_id: id })
       } catch (err) {
         if (err instanceof ErrSpawnNotFound) return
         throw err

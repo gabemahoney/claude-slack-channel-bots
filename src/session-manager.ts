@@ -36,7 +36,7 @@ import type { ListRow, SpawnParams } from 'agent-director'
 import type { WebClient } from '@slack/web-api'
 
 import { checkCozempicAvailable } from './cozempic.ts'
-import { type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
+import { type RoutingConfig, MCP_SERVER_NAME, normalizeChannelName } from './config.ts'
 import { getClient } from './agent-director-client.ts'
 import { recordStartupError } from './startup-errors.ts'
 import { isDryRun } from './tokens.ts'
@@ -61,14 +61,46 @@ export const AGENT_DIRECTOR_LIVE_STATES: ReadonlySet<string> = new Set([
 /** The CSCB-shipped template name (mirrors agent-director-client). */
 const TEMPLATE_NAME = 'slack-channel-bot'
 
-/** Build the deterministic claude_instance_id for a channelId. */
-export function instanceIdFor(channelId: string): string {
+/**
+ * Build the deterministic claude_instance_id for a channelId.
+ *
+ * When `normalizedName` is a non-empty string, the id is composed as
+ * `cscb_${normalizedName}_${channelId}` for operator glanceability in
+ * `agent-director list`. When omitted or empty, falls back to the bare
+ * `cscb_${channelId}` form so callers without a resolved name still produce
+ * a stable id. The channelId always suffixes — it is the canonical key
+ * and survives channel renames.
+ */
+export function instanceIdFor(channelId: string, normalizedName?: string): string {
+  if (normalizedName && normalizedName.length > 0) {
+    return `cscb_${normalizedName}_${channelId}`
+  }
   return `cscb_${channelId}`
 }
 
-/** Build the canonical tmux session name for a channelId. */
-export function tmuxSessionNameFor(channelId: string): string {
+/**
+ * Build the canonical tmux session name for a channelId.
+ *
+ * Mirrors `instanceIdFor` composition: with a name, `slack_bot_${name}_${id}`;
+ * without, `slack_bot_${id}`. The id suffix keeps sessions unique across
+ * channel renames or collisions between channels that normalize identically.
+ */
+export function tmuxSessionNameFor(channelId: string, normalizedName?: string): string {
+  if (normalizedName && normalizedName.length > 0) {
+    return `slack_bot_${normalizedName}_${channelId}`
+  }
   return `slack_bot_${channelId}`
+}
+
+/**
+ * Look up the cached normalized channel name on a route. Returns undefined
+ * when the route is missing or the name has not been resolved yet.
+ */
+export function getNormalizedNameForChannel(
+  channelId: string,
+  routingConfig: RoutingConfig,
+): string | undefined {
+  return routingConfig.routes[channelId]?.normalizedName
 }
 
 // ---------------------------------------------------------------------------
@@ -144,8 +176,12 @@ export function flushSpawnFailureQueue(web: WebClient): void {
  * Send `/mcp reconnect <MCP_SERVER_NAME>` to the spawn's pane. Library's
  * sendKeys appends Enter automatically per its contract.
  */
-export async function reconnectMcp(channelId: string, web?: WebClient): Promise<boolean> {
-  const claude_instance_id = instanceIdFor(channelId)
+export async function reconnectMcp(
+  channelId: string,
+  web?: WebClient,
+  routingConfig?: RoutingConfig,
+): Promise<boolean> {
+  const claude_instance_id = instanceIdFor(channelId, routingConfig?.routes[channelId]?.normalizedName)
   console.error(`[slack] reconnecting MCP server "${MCP_SERVER_NAME}": channel=${channelId}`)
   try {
     await getClient().sendKeys({
@@ -298,7 +334,7 @@ export async function waitForWaitingAndReconnect(
   routingConfig: RoutingConfig,
   web?: WebClient,
 ): Promise<boolean> {
-  const claude_instance_id = instanceIdFor(channelId)
+  const claude_instance_id = instanceIdFor(channelId, routingConfig.routes[channelId]?.normalizedName)
   const pollIntervalMs = routingConfig.agent_director_poll_interval_ms
   const deadline = Date.now() + _waitForWaitingTimeoutMs
 
@@ -319,7 +355,7 @@ export async function waitForWaitingAndReconnect(
     }
 
     if (state === 'waiting') {
-      return reconnectMcp(channelId, web)
+      return reconnectMcp(channelId, web, routingConfig)
     }
 
     if (state === 'working') {
@@ -354,12 +390,13 @@ function buildSpawnParams(
 ): SpawnParams {
   const effectiveConfigDir =
     routingConfig.routes[channelId]?.claude_config_dir ?? routingConfig.claude_config_dir
+  const normalizedName = routingConfig.routes[channelId]?.normalizedName
   const params: SpawnParams = {
     template: TEMPLATE_NAME,
     cwd: route.cwd,
-    claude_instance_id: instanceIdFor(channelId),
+    claude_instance_id: instanceIdFor(channelId, normalizedName),
     relay_mode: 'on',
-    tmux_session_name: tmuxSessionNameFor(channelId),
+    tmux_session_name: tmuxSessionNameFor(channelId, normalizedName),
     label: ['service=cscb', `channel=${channelId}`],
   }
   if (effectiveConfigDir) {
@@ -369,18 +406,23 @@ function buildSpawnParams(
 }
 
 /** Best-effort kill — never throws. */
-async function tryKill(channelId: string): Promise<void> {
+async function tryKill(channelId: string, normalizedName: string | undefined): Promise<void> {
   try {
-    await getClient().kill({ claude_instance_id: instanceIdFor(channelId) })
+    await getClient().kill({ claude_instance_id: instanceIdFor(channelId, normalizedName) })
   } catch {
     /* ignore */
   }
 }
 
 /** Delete the spawn row; surface failures. Returns whether the delete succeeded. */
-async function tryDelete(channelId: string, web: WebClient | undefined, isStartup: boolean): Promise<boolean> {
+async function tryDelete(
+  channelId: string,
+  normalizedName: string | undefined,
+  web: WebClient | undefined,
+  isStartup: boolean,
+): Promise<boolean> {
   try {
-    await getClient().delete({ claude_instance_id: [instanceIdFor(channelId)] })
+    await getClient().delete({ claude_instance_id: [instanceIdFor(channelId, normalizedName)] })
     return true
   } catch (err) {
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('delete', 'UnknownError', String(err))
@@ -418,6 +460,7 @@ export async function spawnForRoute(
   }
 
   const params = buildSpawnParams(channelId, route, routingConfig)
+  const normalizedName = routingConfig.routes[channelId]?.normalizedName
   const client = getClient()
 
   // Attempt fresh spawn ---
@@ -441,7 +484,7 @@ export async function spawnForRoute(
   // Collision-handling: get-then-act ---
   let state: string
   try {
-    const r = await client.get({ claude_instance_id: instanceIdFor(channelId) })
+    const r = await client.get({ claude_instance_id: instanceIdFor(channelId, normalizedName) })
     state = r.state
   } catch (err) {
     if (err instanceof ErrSpawnNotFound) {
@@ -471,8 +514,8 @@ export async function spawnForRoute(
   if (state === 'ended' || state === 'missing') {
     if (routingConfig.resume_enabled === false) {
       console.error(`[slack] spawnForRoute: resume_enabled=false — kill+delete+fresh for channel=${channelId}`)
-      await tryKill(channelId)
-      if (!(await tryDelete(channelId, web, isStartup))) return { channelId, action: 'failed' }
+      await tryKill(channelId, normalizedName)
+      if (!(await tryDelete(channelId, normalizedName, web, isStartup))) return { channelId, action: 'failed' }
       try {
         await client.spawn(params)
         console.error(`[slack] spawnForRoute: fresh-spawned (after kill+delete) for channel=${channelId}`)
@@ -490,13 +533,13 @@ export async function spawnForRoute(
     // resume_enabled: attempt resume
     console.error(`[slack] spawnForRoute: attempting resume for channel=${channelId}`)
     try {
-      await client.resume({ claude_instance_id: instanceIdFor(channelId) })
+      await client.resume({ claude_instance_id: instanceIdFor(channelId, normalizedName) })
       console.error(`[slack] spawnForRoute: resumed channel=${channelId}`)
       return { channelId, action: 'resumed' }
     } catch (err) {
       if (err instanceof ErrNoSessionId || err instanceof ErrJsonlMissing) {
         console.error(`[slack] spawnForRoute: ${err.errName} on resume for channel=${channelId} — delete+fresh`)
-        if (!(await tryDelete(channelId, web, isStartup))) return { channelId, action: 'failed' }
+        if (!(await tryDelete(channelId, normalizedName, web, isStartup))) return { channelId, action: 'failed' }
         try {
           await client.spawn(params)
           console.error(`[slack] spawnForRoute: fresh-spawned (after delete) for channel=${channelId}`)
@@ -513,8 +556,8 @@ export async function spawnForRoute(
       if (err instanceof ErrSpawnNotResumable) {
         // Row is non-terminal but resume rejected — defensive: kill + delete + spawn
         console.error(`[slack] spawnForRoute: ErrSpawnNotResumable for channel=${channelId} — kill+delete+fresh`)
-        await tryKill(channelId)
-        if (!(await tryDelete(channelId, web, isStartup))) return { channelId, action: 'failed' }
+        await tryKill(channelId, normalizedName)
+        if (!(await tryDelete(channelId, normalizedName, web, isStartup))) return { channelId, action: 'failed' }
         try {
           await client.spawn(params)
           await approveDevChannelsDialog(channelId, web, isStartup)
@@ -534,7 +577,7 @@ export async function spawnForRoute(
   }
 
   if (state === 'waiting') {
-    await reconnectMcp(channelId, web)
+    await reconnectMcp(channelId, web, routingConfig)
     return { channelId, action: 'reconnected' }
   }
 
@@ -635,6 +678,220 @@ export async function reconcileOrphans(
 
   console.error(`[slack] reconcileOrphans: found=${found} killed=${killed} failed=${failed}`)
   return { found, killed, failed }
+}
+
+// ---------------------------------------------------------------------------
+// Channel-name resolution (b.1m9)
+// ---------------------------------------------------------------------------
+
+export interface ChannelNameResolveResult {
+  channelId: string
+  name?: string
+  normalizedName?: string
+  /** When set, conversations.info failed; route stays nameless and falls back to bare-ID naming. */
+  error?: string
+}
+
+/** Minimal WebClient surface this module needs — just conversations.info. */
+export type ChannelInfoClient = {
+  conversations: {
+    info: (args: { channel: string }) => Promise<{ channel?: { name?: string } }>
+  }
+}
+
+/**
+ * Resolve and cache Slack channel names for every route at startup.
+ *
+ * For each `routingConfig.routes[channelId]`, call `conversations.info` once
+ * and stash the result on `route.name` + `route.normalizedName`. Sessions
+ * spawned during startup then carry the new `slack_bot_<name>_<id>` /
+ * `cscb_<name>_<id>` naming for operator glanceability.
+ *
+ * Failure is non-fatal: any per-route rejection (network, missing scope,
+ * unknown channel, no `channel.name` field) logs a single line and leaves
+ * the route nameless. `instanceIdFor` / `tmuxSessionNameFor` then fall back
+ * to bare-ID naming, preserving pre-b.1m9 behavior for that one route.
+ *
+ * Mutates `routingConfig.routes` in place. Returns per-route diagnostics for
+ * the operator and for tests.
+ */
+export async function resolveChannelNames(
+  routingConfig: RoutingConfig,
+  web: ChannelInfoClient | undefined,
+): Promise<ChannelNameResolveResult[]> {
+  const results: ChannelNameResolveResult[] = []
+  if (!web) {
+    // Dry-run or otherwise no WebClient — leave every route nameless.
+    console.error('[slack] resolveChannelNames: no WebClient available — skipping')
+    return results
+  }
+  for (const [channelId, route] of Object.entries(routingConfig.routes)) {
+    try {
+      const resp = await web.conversations.info({ channel: channelId })
+      const name = resp.channel?.name
+      if (!name) {
+        const r: ChannelNameResolveResult = { channelId, error: 'no name on conversations.info response' }
+        console.error(`[slack] resolveChannelNames: channel=${channelId} → (no name) — falling back to bare-ID`)
+        results.push(r)
+        continue
+      }
+      const normalizedName = normalizeChannelName(name)
+      route.name = name
+      route.normalizedName = normalizedName.length > 0 ? normalizedName : undefined
+      console.error(
+        `[slack] resolveChannelNames: channel=${channelId} → "${name}" (normalized="${route.normalizedName ?? ''}")`,
+      )
+      results.push({ channelId, name, normalizedName: route.normalizedName })
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.error(`[slack] resolveChannelNames: channel=${channelId} → error: ${msg} — falling back to bare-ID`)
+      results.push({ channelId, error: msg })
+    }
+  }
+  return results
+}
+
+/**
+ * Opportunistically refresh a route's cached channel name from an incoming
+ * Slack event. Slack only includes `channel.name` on some event types
+ * (channel_rename, channel_archive, etc.); message events typically don't
+ * carry it. When it IS present, refreshing here covers channel renames
+ * without a CSCB restart.
+ *
+ * No-ops when the event has no channel name, no matching route, or the
+ * cached name is already up to date.
+ */
+export function refreshRouteNameFromEvent(
+  routingConfig: RoutingConfig,
+  event: unknown,
+): void {
+  if (!event || typeof event !== 'object') return
+  const ev = event as Record<string, unknown>
+
+  let channelId: string | undefined
+  let channelName: string | undefined
+
+  // Form A: { channel: 'C…', channel_name: 'foo' } — used by channel_rename
+  if (typeof ev['channel'] === 'string') {
+    channelId = ev['channel'] as string
+    if (typeof ev['channel_name'] === 'string') channelName = ev['channel_name'] as string
+  }
+  // Form B: { channel: { id: 'C…', name: 'foo' } } — used by channel_archive, etc.
+  if (channelName === undefined && ev['channel'] && typeof ev['channel'] === 'object') {
+    const ch = ev['channel'] as Record<string, unknown>
+    if (typeof ch['id'] === 'string') channelId = ch['id'] as string
+    if (typeof ch['name'] === 'string') channelName = ch['name'] as string
+  }
+
+  if (!channelId || !channelName) return
+  const route = routingConfig.routes[channelId]
+  if (!route) return
+  if (route.name === channelName) return
+
+  const normalizedName = normalizeChannelName(channelName)
+  route.name = channelName
+  route.normalizedName = normalizedName.length > 0 ? normalizedName : undefined
+  console.error(
+    `[slack] refreshRouteNameFromEvent: channel=${channelId} → "${channelName}" (normalized="${route.normalizedName ?? ''}")`,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Instance-id migration (b.1m9)
+// ---------------------------------------------------------------------------
+
+export interface InstanceIdMigrationResult {
+  /** Rows whose claude_instance_id doesn't match the route's expected new-naming id. */
+  orphans: Array<{ channelId: string; oldInstanceId: string; expectedInstanceId: string }>
+  /** When auto-delete is on: count of rows we successfully removed. */
+  deleted: number
+  /** When auto-delete is on: count of rows whose delete failed. */
+  failed: number
+}
+
+/**
+ * Detect agent-director rows whose `claude_instance_id` predates the b.1m9
+ * naming change (`cscb_<id>`) for channels we now spawn as
+ * `cscb_<name>_<id>`. The bare-ID rows are orphans the next time the server
+ * starts; the new-naming spawn won't collide with them, so they linger.
+ *
+ * Default behavior: warn only, one line per orphan listing the exact
+ * `agent-director delete --claude-instance-id …` command the operator can
+ * paste. With `autoDelete=true`, this function calls `client.delete` for
+ * each orphan instead.
+ *
+ * Note: a row whose channel label is not in `routingConfig.routes` at all
+ * is handled by `reconcileOrphans` (SR-1.6), not here.
+ */
+export async function reconcileInstanceIds(
+  routingConfig: RoutingConfig,
+  autoDelete: boolean,
+): Promise<InstanceIdMigrationResult> {
+  const empty: InstanceIdMigrationResult = { orphans: [], deleted: 0, failed: 0 }
+  if (isDryRun()) {
+    console.error('[slack] dry-run: skipping instance-id reconcile')
+    return empty
+  }
+
+  const client = getClient()
+  let rows: ListRow[]
+  try {
+    const r = await client.list({ label: ['service=cscb'] })
+    rows = r.spawns
+  } catch (err) {
+    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('list', 'UnknownError', String(err))
+    console.error(`[slack] reconcileInstanceIds: list failed — skipping: ${e.errName}`)
+    return empty
+  }
+
+  const orphans: InstanceIdMigrationResult['orphans'] = []
+  for (const row of rows) {
+    const channelId = row.labels['channel']
+    if (!channelId) continue
+    const route = routingConfig.routes[channelId]
+    if (!route) continue // covered by reconcileOrphans
+    const expected = instanceIdFor(channelId, route.normalizedName)
+    if (row.claude_instance_id === expected) continue
+    orphans.push({ channelId, oldInstanceId: row.claude_instance_id, expectedInstanceId: expected })
+  }
+
+  if (orphans.length === 0) {
+    return empty
+  }
+
+  if (!autoDelete) {
+    console.error(
+      `[slack] reconcileInstanceIds: found ${orphans.length} row(s) with stale claude_instance_id ` +
+        `(pre-b.1m9 naming). The new spawn(s) will not collide; the old row(s) will linger. ` +
+        `Pass --reconcile-instance-ids to auto-delete, or run the commands below:`,
+    )
+    for (const o of orphans) {
+      console.error(
+        `[slack] reconcileInstanceIds: channel=${o.channelId} stale=${o.oldInstanceId} ` +
+          `expected=${o.expectedInstanceId} — agent-director delete --claude-instance-id ${o.oldInstanceId}`,
+      )
+    }
+    return { orphans, deleted: 0, failed: 0 }
+  }
+
+  let deleted = 0
+  let failed = 0
+  for (const o of orphans) {
+    console.error(
+      `[slack] reconcileInstanceIds: deleting stale row channel=${o.channelId} instanceId=${o.oldInstanceId}`,
+    )
+    try {
+      await client.delete({ claude_instance_id: [o.oldInstanceId] })
+      deleted++
+    } catch (err) {
+      const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('delete', 'UnknownError', String(err))
+      console.error(
+        `[slack] reconcileInstanceIds: delete failed for channel=${o.channelId} instanceId=${o.oldInstanceId}: ${e.errName}`,
+      )
+      failed++
+    }
+  }
+  return { orphans, deleted, failed }
 }
 
 // ---------------------------------------------------------------------------
