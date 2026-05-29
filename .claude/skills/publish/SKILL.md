@@ -43,20 +43,20 @@ BUMP_KIND="<BUMP_KIND>"
 case "${BUMP_KIND}" in
   patch|minor|major) ;;
   *)
-    echo "Usage: /publish <patch|minor|major>" >&2
+    echo "SR-1.2 (argument): missing or invalid bump kind '${BUMP_KIND}'. Rerun: /publish <patch|minor|major>" >&2
     exit 1
     ;;
 esac
 
 # SR-2.1 — repository state
 if [ -n "$(git status --porcelain)" ]; then
-  echo "preflight failed: working tree not clean" >&2
+  echo "SR-2.1 (preflight): working tree not clean. Commit or stash your changes, then rerun '/publish ${BUMP_KIND}'." >&2
   exit 1
 fi
 
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 if [ "${CURRENT_BRANCH}" != "main" ]; then
-  echo "preflight failed: not on main (HEAD branch is '${CURRENT_BRANCH}')" >&2
+  echo "SR-2.1 (preflight): not on main (HEAD branch is '${CURRENT_BRANCH}'). Run 'git checkout main' (or invoke /publish from a worktree whose HEAD is main and in sync with origin/main), then rerun '/publish ${BUMP_KIND}'." >&2
   exit 1
 fi
 
@@ -64,36 +64,36 @@ git fetch origin
 LOCAL_SHA="$(git rev-parse main)"
 REMOTE_SHA="$(git rev-parse origin/main)"
 if [ "${LOCAL_SHA}" != "${REMOTE_SHA}" ]; then
-  echo "preflight failed: local main is not exactly equal to origin/main" >&2
+  echo "SR-2.1 (preflight): local main (${LOCAL_SHA}) is not exactly equal to origin/main (${REMOTE_SHA}). Run 'git pull --ff-only origin main' (or 'git push origin main' if you have unpushed local commits) until the two SHAs match, then rerun '/publish ${BUMP_KIND}'." >&2
   exit 1
 fi
 
 # SR-2.2 — dependency consistency
 if ! bun install --frozen-lockfile; then
-  echo "preflight failed: frozen-lockfile install failed" >&2
+  echo "SR-2.2 (preflight): 'bun install --frozen-lockfile' failed — bun.lock is out of sync with package.json. Run 'bun install' to regenerate the lockfile, commit the updated bun.lock to main, then rerun '/publish ${BUMP_KIND}'." >&2
   exit 1
 fi
 
 # SR-2.3 — test discovery and execution
 TEST_FILES=$(find tests -name '*.test.ts' -type f 2>/dev/null | head -n 1)
 if [ -z "${TEST_FILES}" ]; then
-  echo "preflight failed: no *.test.ts files found under tests/" >&2
+  echo "SR-2.3 (preflight): no *.test.ts files found under tests/. Add at least one test file under tests/, commit it to main, then rerun '/publish ${BUMP_KIND}'." >&2
   exit 1
 fi
 
 if ! bun test; then
-  echo "preflight failed: bun test did not pass" >&2
+  echo "SR-2.3 (preflight): 'bun test' did not pass. Fix the failing tests, commit to main, then rerun '/publish ${BUMP_KIND}'." >&2
   exit 1
 fi
 
 if ! bun run typecheck; then
-  echo "preflight failed: bun run typecheck did not pass" >&2
+  echo "SR-2.3 (preflight): 'bun run typecheck' did not pass. Fix the type errors, commit to main, then rerun '/publish ${BUMP_KIND}'." >&2
   exit 1
 fi
 
 # SR-2.4 — npm authentication and version availability
 if ! npm whoami > /dev/null 2>&1; then
-  echo "preflight failed: not authenticated to npm (run 'npm login')" >&2
+  echo "SR-2.4 (preflight): not authenticated to npm. Run 'npm login' as a claude-slack-channel-bots maintainer, then rerun '/publish ${BUMP_KIND}'." >&2
   exit 1
 fi
 
@@ -106,7 +106,7 @@ case "${BUMP_KIND}" in
 esac
 
 if npm view "claude-slack-channel-bots@${NEXT_VERSION}" version > /dev/null 2>&1; then
-  echo "preflight failed: claude-slack-channel-bots@${NEXT_VERSION} is already published" >&2
+  echo "SR-2.4 (preflight): claude-slack-channel-bots@${NEXT_VERSION} is already published on npm. Local package.json is at ${CURRENT_VERSION}; the published version is ahead. Run 'git pull --ff-only origin main' to sync (or pick a larger bump kind), then rerun /publish." >&2
   exit 1
 fi
 
@@ -117,13 +117,13 @@ echo "Phase 1 (local preflight) passed. Next version will be: ${NEXT_VERSION}"
 
 Invoke the `/ci` skill via the **Skill tool** (not a bash subprocess). Require it to report PASS. Any other outcome — fail, error, or non-runnable — aborts. There is no opt-out flag.
 
-If `/ci` cannot run, surface the same diagnostic `/ci` itself would have produced. The known non-runnable conditions are:
+If `/ci` cannot run or does not return PASS, the skill aborts with a message of the form `SR-2.5 (/ci gate): <upstream diagnostic>. Resolve the /ci failure, then rerun '/publish <bump_kind>'.` — preserving the upstream `/ci` text so the operator does not need to consult the skill source. The known non-runnable conditions, all surfaced by `/ci` itself, are:
 
-- Docker daemon not running.
-- `ANTHROPIC_API_KEY` environment variable not set.
-- bees MCP server not running.
+- Docker daemon not running. **Recovery**: start Docker, then rerun `/publish`.
+- `ANTHROPIC_API_KEY` environment variable not set. **Recovery**: export the key, then rerun `/publish`.
+- bees MCP server not running. **Recovery**: start the bees MCP server, then rerun `/publish`.
 
-In each case the skill aborts; the message identifies that `/ci` was the failing gate and includes the upstream diagnostic.
+For a `/ci` run that returns FAIL or ERROR, the recovery is the standard one: fix the integration regression on `main` (commit + push), then rerun `/publish`.
 
 ## Phase 3 — Bump, smoke test, release, verify
 
@@ -165,7 +165,7 @@ BUMP_KIND="<BUMP_KIND>"
 case "${BUMP_KIND}" in
   patch|minor|major) ;;
   *)
-    echo "Usage: /publish <patch|minor|major>" >&2
+    echo "SR-1.2 (argument): missing or invalid bump kind '${BUMP_KIND}'. Rerun: /publish <patch|minor|major>" >&2
     exit 1
     ;;
 esac
@@ -180,7 +180,7 @@ esac
 
 # SR-3.1 — bump (no commit; npm version --no-git-tag-version)
 if ! npm version "${BUMP_KIND}" --no-git-tag-version > /dev/null; then
-  echo "bump failed: npm version ${BUMP_KIND} did not apply" >&2
+  echo "SR-3.1 (bump): 'npm version ${BUMP_KIND} --no-git-tag-version' did not apply. Working tree has been rolled back (package.json + bun.lock restored). Investigate the npm error above, then rerun '/publish ${BUMP_KIND}'." >&2
   rollback_working_tree
   exit 1
 fi
@@ -189,21 +189,21 @@ fi
 rm -f claude-slack-channel-bots-*.tgz
 
 if ! bun pm pack > /dev/null; then
-  echo "pack failed: bun pm pack did not produce a tarball" >&2
+  echo "SR-4.1 (pack): 'bun pm pack' did not produce a tarball. Working tree has been rolled back. Investigate the bun error above, then rerun '/publish ${BUMP_KIND}'." >&2
   rollback_working_tree
   exit 1
 fi
 
 TARBALL="claude-slack-channel-bots-${NEXT_VERSION}.tgz"
 if [ ! -f "${TARBALL}" ]; then
-  echo "pack failed: expected tarball ${TARBALL} not found" >&2
+  echo "SR-4.1 (pack): expected tarball '${TARBALL}' not found in CWD after 'bun pm pack'. Working tree has been rolled back. Inspect the CWD for stray *.tgz files, resolve the cause, then rerun '/publish ${BUMP_KIND}'." >&2
   rollback_working_tree
   exit 1
 fi
 
 TARBALL_VERSION="$(tar -xzOf "${TARBALL}" package/package.json | jq -r .version)"
 if [ "${TARBALL_VERSION}" != "${NEXT_VERSION}" ]; then
-  echo "pack failed: tarball internal version '${TARBALL_VERSION}' != bumped ${NEXT_VERSION}" >&2
+  echo "SR-4.1 (pack): tarball internal version '${TARBALL_VERSION}' != bumped ${NEXT_VERSION}. Working tree has been rolled back. This indicates a packing bug — investigate 'bun pm pack' output and package.json contents, then rerun '/publish ${BUMP_KIND}'." >&2
   rollback_working_tree
   exit 1
 fi
@@ -213,28 +213,28 @@ SCRATCH_DIR="$(mktemp -d)"
 TARBALL_ABS="$(pwd)/${TARBALL}"
 
 if ! BUN_INSTALL="${SCRATCH_DIR}" bun install -g "${TARBALL_ABS}" > /dev/null 2>&1; then
-  echo "scratch install failed: bun install -g ${TARBALL} did not succeed" >&2
+  echo "SR-4.2 (scratch install): 'bun install -g ${TARBALL}' into scratch BUN_INSTALL did not succeed. Working tree has been rolled back. Rerun the failing command manually to inspect the bun output, then rerun '/publish ${BUMP_KIND}'." >&2
   rollback_working_tree
   exit 1
 fi
 
 INSTALLED_PKG="${SCRATCH_DIR}/install/global/node_modules/claude-slack-channel-bots/package.json"
 if [ ! -f "${INSTALLED_PKG}" ]; then
-  echo "scratch install failed: installed package.json not found at ${INSTALLED_PKG}" >&2
+  echo "SR-4.2 (scratch install): installed package.json not found at ${INSTALLED_PKG}. Working tree has been rolled back. The tarball layout may be malformed — inspect the tarball with 'tar -tzf ${TARBALL_ABS}', then rerun '/publish ${BUMP_KIND}'." >&2
   rollback_working_tree
   exit 1
 fi
 
 INSTALLED_VERSION="$(jq -r .version "${INSTALLED_PKG}")"
 if [ "${INSTALLED_VERSION}" != "${NEXT_VERSION}" ]; then
-  echo "scratch install failed: installed version '${INSTALLED_VERSION}' != bumped ${NEXT_VERSION}" >&2
+  echo "SR-4.2 (scratch install): installed version '${INSTALLED_VERSION}' != bumped ${NEXT_VERSION}. Working tree has been rolled back. This indicates a tarball/install inconsistency — investigate, then rerun '/publish ${BUMP_KIND}'." >&2
   rollback_working_tree
   exit 1
 fi
 
 INSTALLED_BIN="${SCRATCH_DIR}/bin/claude-slack-channel-bots"
 if [ ! -x "${INSTALLED_BIN}" ]; then
-  echo "smoke check failed: installed bin not found or not executable at ${INSTALLED_BIN}" >&2
+  echo "SR-4.3 (smoke check): installed bin not found or not executable at ${INSTALLED_BIN}. Working tree has been rolled back. Inspect package.json's 'bin' field and the tarball contents, then rerun '/publish ${BUMP_KIND}'." >&2
   rollback_working_tree
   exit 1
 fi
@@ -243,51 +243,51 @@ SMOKE_EXIT=0
 SMOKE_STDERR="$("${INSTALLED_BIN}" 2>&1 >/dev/null)" || SMOKE_EXIT=$?
 
 if [ "${SMOKE_EXIT}" = "0" ]; then
-  echo "smoke check failed: bin exited zero with no arguments (expected non-zero)" >&2
+  echo "SR-4.3 (smoke check): bin exited zero with no arguments (expected non-zero). Working tree has been rolled back. The CLI's no-args behavior has changed — update src/cli.ts to exit non-zero on missing arguments (the smoke check assumes this contract; see the SRD), then rerun '/publish ${BUMP_KIND}'." >&2
   rollback_working_tree
   exit 1
 fi
 
 if ! grep -q "Usage:" <<< "${SMOKE_STDERR}"; then
-  echo "smoke check failed: bin stderr did not contain 'Usage:'" >&2
+  echo "SR-4.3 (smoke check): bin stderr did not contain 'Usage:' (the smoke contract). Working tree has been rolled back. Update src/cli.ts to emit a 'Usage:' line on no-args (or update this skill to match the new CLI contract — see the SRD), then rerun '/publish ${BUMP_KIND}'." >&2
   rollback_working_tree
   exit 1
 fi
 
 # SR-5.1 — release commit + annotated tag (no push yet)
 if ! git add package.json bun.lock; then
-  echo "release commit failed: git add package.json bun.lock did not succeed" >&2
+  echo "SR-5.1 (release commit): 'git add package.json bun.lock' did not succeed. Working tree has been rolled back. Inspect git status, then rerun '/publish ${BUMP_KIND}'." >&2
   rollback_working_tree
   exit 1
 fi
 
 if ! git commit -m "Release v${NEXT_VERSION}" > /dev/null; then
-  echo "release commit failed: git commit -m \"Release v${NEXT_VERSION}\" did not succeed" >&2
+  echo "SR-5.1 (release commit): 'git commit -m \"Release v${NEXT_VERSION}\"' did not succeed. Working tree has been rolled back (nothing is committed). Inspect git status (a pre-commit hook may have failed), then rerun '/publish ${BUMP_KIND}'." >&2
   rollback_working_tree
   exit 1
 fi
 
 if ! git tag -a "v${NEXT_VERSION}" -m "Release v${NEXT_VERSION}"; then
-  echo "release tag failed: git tag -a v${NEXT_VERSION} did not succeed; release commit remains on disk (run 'git reset --hard HEAD~1' to revert)" >&2
+  echo "SR-5.1 (release tag): 'git tag -a v${NEXT_VERSION}' did not succeed. State: the release commit IS on the local main branch but has NOT been pushed. Recovery: run 'git reset --hard HEAD~1' to revert the local release commit, then rerun '/publish ${BUMP_KIND}'." >&2
   exit 1
 fi
 
 # SR-5.2 — push release commit to origin/main (tag is held back until after npm publish)
 if ! git push origin main; then
-  echo "git push origin main failed: release commit + tag remain on disk; resolve the push issue (auth, non-fast-forward, etc.) and either re-run 'git push origin main' followed by manual 'npm publish' + 'git push origin v${NEXT_VERSION}', or run 'git reset --hard HEAD~1 && git tag -d v${NEXT_VERSION}' to abandon and restart" >&2
+  echo "SR-5.2 (push commit): 'git push origin main' failed. State: release commit + annotated tag exist locally; nothing has been pushed or published. Recovery: resolve the push failure (auth, non-fast-forward, etc.) and either (a) re-run 'git push origin main' followed by 'npm publish ${TARBALL_ABS}' and 'git push origin v${NEXT_VERSION}' manually, or (b) abandon and restart by running 'git reset --hard HEAD~1 && git tag -d v${NEXT_VERSION}' then rerun '/publish ${BUMP_KIND}'." >&2
   exit 1
 fi
 
 # SR-5.3 — publish the smoke-tested tarball to npm (explicit path; NOT 'bun publish' which repacks)
 if ! npm publish "${TARBALL_ABS}"; then
-  echo "npm publish failed: 'npm publish ${TARBALL_ABS}' did not succeed. State: release commit IS on origin/main; npm does NOT have v${NEXT_VERSION}; tag is NOT pushed. Recovery options: (a) fix the publish issue (e.g., 'npm login') and re-run 'npm publish ${TARBALL_ABS}' manually, then 'git push origin v${NEXT_VERSION}'; (b) revert the remote with 'git push origin +HEAD~1:main', delete the local tag 'git tag -d v${NEXT_VERSION}', then restart /publish" >&2
+  echo "SR-5.3 (npm publish): 'npm publish ${TARBALL_ABS}' did not succeed. State: release commit IS on origin/main; npm does NOT have v${NEXT_VERSION}; tag is NOT pushed. Recovery options: (a) fix the publish issue (e.g., 'npm login') and re-run 'npm publish ${TARBALL_ABS}' manually, then 'git push origin v${NEXT_VERSION}'; (b) revert the remote with 'git push origin +HEAD~1:main', delete the local tag 'git tag -d v${NEXT_VERSION}', then rerun '/publish ${BUMP_KIND}'. The smoke-tested tarball at ${TARBALL_ABS} has been preserved on disk for option (a)." >&2
   TARBALL=""  # preserve tarball so the operator can re-run npm publish against it
   exit 1
 fi
 
 # SR-5.4 — push the version tag to origin (final write to the git remote; brings github + npm into agreement)
 if ! git push origin "v${NEXT_VERSION}"; then
-  echo "git push origin v${NEXT_VERSION} failed: npm HAS v${NEXT_VERSION} and origin HAS the release commit; only the tag is missing. Recovery: run 'git push origin v${NEXT_VERSION}' manually once the push issue is resolved" >&2
+  echo "SR-5.4 (push tag): 'git push origin v${NEXT_VERSION}' failed. State: npm HAS v${NEXT_VERSION} and origin/main HAS the release commit; only the git tag is missing. Recovery: resolve the push issue, then run 'git push origin v${NEXT_VERSION}' manually. Do NOT rerun /publish — the release is otherwise complete." >&2
   exit 1
 fi
 
@@ -303,7 +303,7 @@ for ATTEMPT in 1 2 3 4 5 6 7 8 9 10 11 12; do
 done
 
 if [ "${VERIFIED}" != "1" ]; then
-  echo "registry verification failed: claude-slack-channel-bots@${NEXT_VERSION} was not visible within 60s. The release succeeded (commit, publish, and tag all pushed) — this is a propagation verification failure only. Re-confirm with 'npm view claude-slack-channel-bots@${NEXT_VERSION} version'" >&2
+  echo "SR-6.1 (registry verification): claude-slack-channel-bots@${NEXT_VERSION} was not visible within the 60-second polling window. The release succeeded (commit, publish, and tag all pushed) — this is a propagation-verification failure only, not a release failure. Recovery: re-confirm with 'npm view claude-slack-channel-bots@${NEXT_VERSION} version'. Once visible, proceed with 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually and then run 'claude-slack-channel-bots clean_restart' — do NOT rerun /publish." >&2
   exit 1
 fi
 
@@ -343,14 +343,14 @@ rm -rf "${GLOBAL_DIR}/node_modules/claude-slack-channel-bots"
 
 # SR-7.3 — install the just-published version from npm (the exact command an end user would run)
 if ! bun install -g "claude-slack-channel-bots@${NEXT_VERSION}"; then
-  echo "post-publish install failed: 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' did not succeed. The dev box now has no install; re-run 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually to recover. Do NOT retry automatically." >&2
+  echo "SR-7.3 (post-publish install): 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' did not succeed. State: the release IS published (v${NEXT_VERSION} is on npm, commit + tag are on origin) but the dev box has NO global install at this point. Recovery: re-run 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually until it succeeds, then run 'claude-slack-channel-bots clean_restart'. Do NOT rerun /publish." >&2
   exit 1
 fi
 
 # SR-7.4 — verify the install: bin resolves under the global install prefix, and installed version matches
 INSTALLED_BIN_PATH="$(command -v claude-slack-channel-bots || true)"
 if [ -z "${INSTALLED_BIN_PATH}" ]; then
-  echo "post-publish verification failed: 'claude-slack-channel-bots' not found on PATH after install" >&2
+  echo "SR-7.4 (post-publish verification): 'claude-slack-channel-bots' not found on PATH after install. State: the release IS published. Recovery: confirm '${GLOBAL_DIR}/bin' is on your PATH, then run 'claude-slack-channel-bots clean_restart' manually. Do NOT rerun /publish." >&2
   exit 1
 fi
 
@@ -358,20 +358,20 @@ RESOLVED_BIN="$(readlink -f "${INSTALLED_BIN_PATH}")"
 case "${RESOLVED_BIN}" in
   "${GLOBAL_DIR}"/*) ;;
   *)
-    echo "post-publish verification failed: resolved bin '${RESOLVED_BIN}' is not under '${GLOBAL_DIR}/' (a worktree-pointing symlink farm would resolve outside this prefix and fail this check)" >&2
+    echo "SR-7.4 (post-publish verification): resolved bin '${RESOLVED_BIN}' is not under '${GLOBAL_DIR}/' — a worktree-pointing symlink farm would resolve outside this prefix and fail this check. State: the release IS published. Recovery: run 'bun remove -g claude-slack-channel-bots' followed by 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' to replace the symlink farm with a real-copy install, then run 'claude-slack-channel-bots clean_restart'. Do NOT rerun /publish." >&2
     exit 1
     ;;
 esac
 
 INSTALLED_PKG_JSON="${GLOBAL_DIR}/node_modules/claude-slack-channel-bots/package.json"
 if [ ! -f "${INSTALLED_PKG_JSON}" ]; then
-  echo "post-publish verification failed: installed package.json not found at ${INSTALLED_PKG_JSON}" >&2
+  echo "SR-7.4 (post-publish verification): installed package.json not found at ${INSTALLED_PKG_JSON}. State: the release IS published but the global install layout is malformed. Recovery: run 'bun remove -g claude-slack-channel-bots' and then 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually. Do NOT rerun /publish." >&2
   exit 1
 fi
 
 INSTALLED_VERSION="$(jq -r .version "${INSTALLED_PKG_JSON}")"
 if [ "${INSTALLED_VERSION}" != "${NEXT_VERSION}" ]; then
-  echo "post-publish verification failed: installed version '${INSTALLED_VERSION}' != published ${NEXT_VERSION}" >&2
+  echo "SR-7.4 (post-publish verification): installed version '${INSTALLED_VERSION}' != published ${NEXT_VERSION}. State: the release IS published but the local install resolved to a stale version. Recovery: run 'bun remove -g claude-slack-channel-bots' followed by 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually until the installed version matches, then run 'claude-slack-channel-bots clean_restart'. Do NOT rerun /publish." >&2
   exit 1
 fi
 
