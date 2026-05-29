@@ -87,6 +87,58 @@ if ! bun install --frozen-lockfile; then
 fi
 ```
 
+### SR-2.3 — Test discovery and execution
+
+The "tests exist" check runs BEFORE invoking the runner — an empty test directory is its own failure mode with its own diagnostic. After that, `bun test` and `bun run typecheck` must each exit zero, in that order.
+
+```bash
+TEST_FILES=$(find tests -name '*.test.ts' -type f 2>/dev/null | head -n 1)
+if [ -z "${TEST_FILES}" ]; then
+  echo "preflight failed: no *.test.ts files found under tests/" >&2
+  exit 1
+fi
+
+if ! bun test; then
+  echo "preflight failed: bun test did not pass" >&2
+  exit 1
+fi
+
+if ! bun run typecheck; then
+  echo "preflight failed: bun run typecheck did not pass" >&2
+  exit 1
+fi
+```
+
+### SR-2.4 — npm authentication and version availability
+
+Two sub-checks. First, the operator must be authenticated against the default npm registry (`npm whoami` exits zero). Second, compute the next version by applying the supplied bump kind to the current `package.json` version using semver rules consistent with `npm version`:
+
+- `major` — increment the major segment; set minor and patch to `0`.
+- `minor` — increment the minor segment; set patch to `0`.
+- `patch` — increment the patch segment.
+
+Then verify the next version is not already published: `npm view claude-slack-channel-bots@<next>` must return non-zero. Returning zero means npm already knows about that version, which is itself a failure.
+
+```bash
+if ! npm whoami > /dev/null 2>&1; then
+  echo "preflight failed: not authenticated to npm (run 'npm login')" >&2
+  exit 1
+fi
+
+CURRENT_VERSION="$(node -p "require('./package.json').version")"
+IFS='.' read -r MAJOR MINOR PATCH <<< "${CURRENT_VERSION}"
+case "${BUMP_KIND}" in
+  major) NEXT_VERSION="$((MAJOR + 1)).0.0" ;;
+  minor) NEXT_VERSION="${MAJOR}.$((MINOR + 1)).0" ;;
+  patch) NEXT_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
+esac
+
+if npm view "claude-slack-channel-bots@${NEXT_VERSION}" version > /dev/null 2>&1; then
+  echo "preflight failed: claude-slack-channel-bots@${NEXT_VERSION} is already published" >&2
+  exit 1
+fi
+```
+
 ## Bump
 
 Placeholder — populated by Epic 2.
