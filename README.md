@@ -446,6 +446,56 @@ Classes you may see:
 
 ---
 
+## Release process
+
+CSCB releases are cut with the `/publish` skill from a clean checkout of `main` on a dev box that has `npm login` against the publishing account. The skill bumps the version, packs and smoke-tests the release tarball, commits and tags the release, pushes to GitHub, publishes to npm, polls the registry until the new version is visible, reinstalls the just-published version on the dev box, and prints a final summary.
+
+### Invocation
+
+```
+/publish <patch|minor|major>
+```
+
+The bump kind is **required** — there is no default. The skill exits with a usage line if the argument is missing or not one of `patch`, `minor`, `major`.
+
+### Preflight gates
+
+Before any side-effecting step runs, `/publish` enforces six fail-fast gates. Any failure aborts before the version is bumped, the tarball is packed, or anything is committed:
+
+1. **Clean working tree on `main` in sync with origin/main.** No uncommitted changes; HEAD branch is `main`; `main` is exactly equal to `origin/main` after `git fetch origin`.
+2. **Tests exist and pass.** At least one `*.test.ts` file under `tests/` and `bun test` exits zero.
+3. **Typecheck passes.** `bun run typecheck` exits zero.
+4. **npm authenticated.** `npm whoami` exits zero (run `npm login` first if not).
+5. **Next version not already published.** `npm view claude-slack-channel-bots@<next-version> version` must report nothing.
+6. **`/ci` integration suite passes.** The full Docker-based integration test suite is run via the `/ci` skill and must report PASS. **`/ci` is mandatory and has no opt-out flag** — release without an unbroken integration run is not possible through this skill.
+
+### What happens during a release
+
+After all gates pass, the skill, in this order:
+
+1. Bumps `package.json` and `bun.lock` to `<next-version>` (no commit, no tag yet).
+2. Packs the release tarball with `bun pm pack` and verifies its internal version matches.
+3. Scratch-installs the tarball into a temp `BUN_INSTALL` and runs the bin smoke check (non-zero exit + `Usage:` in stderr). Any failure here rolls back the working tree and aborts — no commit, no push, no publish.
+4. Creates the `Release v<version>` commit and the annotated `v<version>` tag locally.
+5. Pushes the release commit to `origin/main`.
+6. Publishes the smoke-tested tarball with `npm publish <tarball-path>` (the smoke-tested artifact bytes — not a repack from CWD).
+7. Pushes the `v<version>` tag to `origin`, bringing GitHub and npm into agreement.
+8. Polls the npm registry every 5 seconds for up to 60 seconds until the new version is visible.
+9. Sanitizes the bun-1.3.13 empty-string-dependency-key poison from the global `package.json` (see [Installing from a local worktree](#installing-from-a-local-worktree)), removes any pre-existing global install, then runs `bun install -g claude-slack-channel-bots@<version>` — the exact command an end user would run — and verifies the installed bin resolves under `~/.bun/install/global/` at the published version.
+10. Prints a success summary identifying the published version, npm URL, GitHub release tag URL, resolved local install path, and the next-operator-action command.
+
+### After the skill exits
+
+The dev box now has the freshly-published version installed globally as a real copy, but the running CSCB daemon is still on the prior version. Swap the daemon over:
+
+```sh
+claude-slack-channel-bots clean_restart
+```
+
+This gracefully exits the managed Claude Code sessions, stops and restarts the server on the new binary, and brings each session back up. See [`clean_restart`](#claude-slack-channel-bots-clean_restart) above for full behavior.
+
+---
+
 ## Migration
 
 For operators upgrading from a pre-`agent-director` install:

@@ -119,3 +119,69 @@ When neither guard fires and the session is dead, the poller calls `scheduleRest
 - Long-poll pattern: create a Promise, register a resolve callback in a waiters array, race against a setTimeout
 - Always clean up on abort: `req.signal.addEventListener('abort', ...)` for held HTTP connections
 - Use `settled` flag pattern to prevent double-resolution in race conditions
+
+## Releasing CSCB
+
+Releases are cut with the `/publish` skill from a Claude Code session whose CWD is any checkout of the `claude-slack-channel-bots` repo on `main`. The skill is **invocation-location-neutral** — it runs identically from the primary checkout of the main clone, from any feature worktree (so long as that worktree's HEAD is `main` and in sync with `origin/main`), or from a throwaway `git clone` under `/tmp` or anywhere else. No step depends on a specific directory layout.
+
+### Preconditions
+
+Before invoking `/publish`, confirm:
+
+- Working tree is clean and HEAD is `main`, exactly equal to `origin/main` (run `git fetch origin && git status` and `git log origin/main..HEAD` to verify).
+- `bun install --frozen-lockfile`, `bun test`, and `bun run typecheck` all pass locally.
+- Docker daemon is running (required by the `/ci` gate).
+- `ANTHROPIC_API_KEY` is exported in the environment (required by `/ci`).
+- The bees MCP server is running (required by `/ci`).
+- `npm whoami` returns a `claude-slack-channel-bots` maintainer account (`npm login` if not).
+
+If any precondition fails, `/publish` will abort at the corresponding preflight gate with an `SR-2.x` diagnostic — you do not need to pre-check by hand, but knowing the list helps diagnose a failure quickly.
+
+### Invocation
+
+```
+/publish <patch|minor|major>
+```
+
+The bump kind is **required** — there is no default. The skill exits with `SR-1.2 (argument)` if the argument is missing or not one of the three keywords.
+
+### Phases of execution
+
+`/publish` runs four phases in order. Each phase has a well-defined abort behavior:
+
+1. **Phase 1 — Local preflight (SR-2.1–SR-2.4).** Clean tree on `main` in sync with origin; frozen-lockfile install; at least one `*.test.ts` file under `tests/`; `bun test` and `bun run typecheck` pass; `npm whoami` succeeds; the next version is not already on npm. **Abort behavior:** the skill exits before any side-effecting step. The working tree is untouched.
+2. **Phase 2 — `/ci` integration gate (SR-2.5).** The `/ci` skill runs the full Docker-based integration suite. It must report PASS. **Abort behavior:** identical to Phase 1 — no side-effecting step has run yet.
+3. **Phase 3a — Bump and smoke test (SR-3.1, SR-4.1–SR-4.3).** `npm version <bump> --no-git-tag-version` applies the bump; `bun pm pack` produces the release tarball; the tarball is scratch-installed into a temp `BUN_INSTALL`; the installed bin is invoked with no args and must exit non-zero with `Usage:` in stderr. **Abort behavior:** the working tree is rolled back (`git checkout -- package.json bun.lock`). Nothing is committed, pushed, or published.
+4. **Phase 3b — Real release (SR-5.1–SR-5.4, SR-6.1, SR-7.1–SR-7.4).** Commit `Release v<version>`, create the annotated `v<version>` tag locally, push the commit to `origin/main`, publish the smoke-tested tarball with `npm publish <tarball-path>` (the byte-identical artifact, not a repack), push the tag to `origin`, poll the npm registry until the version is visible, sanitize the global `package.json` of the bun-1.3.13 empty-string-dependency-key poison, remove any pre-existing global install, run `bun install -g claude-slack-channel-bots@<version>`, and verify the install resolves under `${BUN_INSTALL:-$HOME/.bun}/install/global/` at the published version.
+
+The SR-5.1 → SR-5.4 ordering is load-bearing: the tag is pushed only after `npm publish` succeeds, so the git remote and npm never disagree about whether `v<version>` exists.
+
+### Recovery actions by failure mode
+
+Every failure path in `/publish` emits a diagnostic identifying the failing SR sub-step and the operator's recovery action — the operator should not need to read the skill source. Common modes:
+
+| Failure | Diagnostic prefix | Recovery |
+|---|---|---|
+| Dirty tree / wrong branch / diverged main | `SR-2.1 (preflight)` | Commit/stash, checkout main, or sync with `git pull --ff-only origin main`; rerun `/publish`. |
+| Lockfile out of sync | `SR-2.2 (preflight)` | Run `bun install`, commit the updated `bun.lock` to main, rerun. |
+| No tests / failing tests / failing typecheck | `SR-2.3 (preflight)` | Add or fix tests / types, commit to main, rerun. |
+| `npm whoami` fails | `SR-2.4 (preflight)` | `npm login`, rerun. |
+| Version already on npm | `SR-2.4 (preflight)` | Pull latest main (or pick a larger bump), rerun. |
+| `/ci` not runnable or non-PASS | `SR-2.5 (/ci gate)` | Start Docker / export `ANTHROPIC_API_KEY` / start bees MCP, or fix the integration regression, then rerun. |
+| Bump / pack / scratch-install / smoke failure | `SR-3.1` or `SR-4.x` | Working tree is rolled back automatically. Investigate the upstream error, then rerun. |
+| `git push origin main` failure | `SR-5.2 (push commit)` | The release commit + tag are local-only; resolve the push issue and re-run `git push origin main` manually + `npm publish <tarball>` + `git push origin v<version>`, OR `git reset --hard HEAD~1 && git tag -d v<version>` to abandon and rerun `/publish`. |
+| `npm publish` failure | `SR-5.3 (npm publish)` | Commit is on origin; npm does not have the version. Fix the publish issue (e.g., `npm login`) and re-run `npm publish <tarball>` manually, then `git push origin v<version>`. The smoke-tested tarball is preserved in CWD for the manual re-publish. |
+| `git push origin v<version>` failure | `SR-5.4 (push tag)` | The release is otherwise complete — only the tag is missing. Resolve the push issue and re-run `git push origin v<version>` manually. Do not rerun `/publish`. |
+| Registry not visible within 60s | `SR-6.1 (registry verification)` | Propagation lag only; the release succeeded. Re-confirm with `npm view claude-slack-channel-bots@<version> version`, then proceed manually with `bun install -g` and `clean_restart`. |
+| Post-publish install failure | `SR-7.3 (post-publish install)` | Dev box has no global install. Re-run `bun install -g claude-slack-channel-bots@<version>` manually until it succeeds, then `clean_restart`. |
+| Post-publish verification failure (wrong location, wrong version, bin not on PATH) | `SR-7.4 (post-publish verification)` | The release is published; only the local install is wrong. `bun remove -g claude-slack-channel-bots && bun install -g claude-slack-channel-bots@<version>`, then `clean_restart`. |
+
+### Post-publish
+
+`/publish` ends with a success summary listing the published version, npm URL, GitHub tag URL, the resolved local install path, and a final instruction. Run that final instruction to swap the running CSCB daemon onto the new binary:
+
+```sh
+claude-slack-channel-bots clean_restart
+```
+
+This gracefully exits the managed Claude Code sessions, stops and restarts the server on the new binary, and brings each session back up. See `clean_restart` in the README for behavior details.
