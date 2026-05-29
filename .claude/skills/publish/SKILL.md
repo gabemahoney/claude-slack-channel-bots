@@ -1,65 +1,68 @@
 ---
 name: publish
 description: Build, verify, and publish claude-slack-channel-bots to npm
-version: 1.0.0
 user-invocable: true
-argument-hint: "[patch|minor|major]"
-allowed-tools: [Bash, Read]
+argument-hint: "patch|minor|major"
+allowed-tools: [Bash, Read, Skill]
 ---
 
 # /publish
 
-Publish claude-slack-channel-bots to npm. Runs pre-publish checks, bumps the
-version, commits, tags, pushes, and publishes.
+Cut a release of `claude-slack-channel-bots` end-to-end: preflight gates, version bump, smoke test of the release artifact, publish, and dev-box reinstall.
 
-## Steps
+This document is structured so each phase has its own section. Phases beyond preflight are placeholders at this point in the build-out — they will be filled in by subsequent Epics. The skill is runnable end-to-end today; on a release-ready repo it currently exits after preflight with `preflight complete; further phases pending`.
 
-### 1 — Pre-publish checks
+## Argument Parsing
 
-Run all of these. Stop if any fail.
+The skill requires exactly one positional argument: `patch`, `minor`, or `major`. Argument parsing runs BEFORE any state inspection — no `git`, `bun`, or `npm` invocations on the invalid-input path.
 
-```bash
-bun test
-bun run typecheck
-```
-
-### 2 — Version bump
-
-The user can pass `patch`, `minor`, or `major` as an argument. Default to
-`patch` if no argument is given.
-
-Read the current version from `package.json`, compute the next version, and
-update the `version` field. Use `npm version <patch|minor|major> --no-git-tag-version`
-to bump it cleanly.
-
-Show the user: `Publishing x.y.z → a.b.c`
-
-### 3 — Commit and tag
+Missing or invalid input prints a usage line listing the three accepted values and exits with no other action.
 
 ```bash
-git add package.json
-git commit -m "Release vA.B.C"
-git tag vA.B.C
+set -euo pipefail
+
+SCRATCH_DIR=""
+TARBALL=""
+cleanup() {
+  if [ -n "${SCRATCH_DIR}" ] && [ -d "${SCRATCH_DIR}" ]; then
+    rm -rf "${SCRATCH_DIR}"
+  fi
+  if [ -n "${TARBALL}" ] && [ -f "${TARBALL}" ]; then
+    rm -f "${TARBALL}"
+  fi
+}
+trap cleanup EXIT
+
+BUMP_KIND="${1:-}"
+case "${BUMP_KIND}" in
+  patch|minor|major) ;;
+  *)
+    echo "Usage: /publish <patch|minor|major>" >&2
+    exit 1
+    ;;
+esac
 ```
 
-### 4 — Publish to npm
+## Preflight
 
-```bash
-npm publish
-```
+Placeholder — populated by later Subtasks in this Epic.
 
-If this fails (e.g. not logged in), show the user `npm login` instructions and
-stop. Do not push the tag if publish fails.
+## Bump
 
-### 5 — Push to GitHub
+Placeholder — populated by Epic 2.
 
-```bash
-git push origin main --tags
-```
+## Smoke Test
 
-### 6 — Summary
+Placeholder — populated by Epic 2.
 
-Print:
-- Published version
-- npm URL: https://www.npmjs.com/package/claude-slack-channel-bots
-- GitHub tag URL
+## Release
+
+Placeholder — populated by Epic 3.
+
+## Local Sync
+
+Placeholder — populated by Epic 4.
+
+## Summary
+
+Placeholder — populated by Epic 4.
