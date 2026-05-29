@@ -339,6 +339,40 @@ fi
 bun remove -g claude-slack-channel-bots > /dev/null 2>&1 || true
 rm -rf "${GLOBAL_DIR}/node_modules/claude-slack-channel-bots"
 
+# SR-7.3 — install the just-published version from npm (the exact command an end user would run)
+if ! bun install -g "claude-slack-channel-bots@${NEXT_VERSION}"; then
+  echo "post-publish install failed: 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' did not succeed. The dev box now has no install; re-run 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually to recover. Do NOT retry automatically." >&2
+  exit 1
+fi
+
+# SR-7.4 — verify the install: bin resolves under the global install prefix, and installed version matches
+INSTALLED_BIN_PATH="$(command -v claude-slack-channel-bots || true)"
+if [ -z "${INSTALLED_BIN_PATH}" ]; then
+  echo "post-publish verification failed: 'claude-slack-channel-bots' not found on PATH after install" >&2
+  exit 1
+fi
+
+RESOLVED_BIN="$(readlink -f "${INSTALLED_BIN_PATH}")"
+case "${RESOLVED_BIN}" in
+  "${GLOBAL_DIR}"/*) ;;
+  *)
+    echo "post-publish verification failed: resolved bin '${RESOLVED_BIN}' is not under '${GLOBAL_DIR}/' (a worktree-pointing symlink farm would resolve outside this prefix and fail this check)" >&2
+    exit 1
+    ;;
+esac
+
+INSTALLED_PKG_JSON="${GLOBAL_DIR}/node_modules/claude-slack-channel-bots/package.json"
+if [ ! -f "${INSTALLED_PKG_JSON}" ]; then
+  echo "post-publish verification failed: installed package.json not found at ${INSTALLED_PKG_JSON}" >&2
+  exit 1
+fi
+
+INSTALLED_VERSION="$(jq -r .version "${INSTALLED_PKG_JSON}")"
+if [ "${INSTALLED_VERSION}" != "${NEXT_VERSION}" ]; then
+  echo "post-publish verification failed: installed version '${INSTALLED_VERSION}' != published ${NEXT_VERSION}" >&2
+  exit 1
+fi
+
 echo "release complete; local sync pending"
 exit 0
 ```
