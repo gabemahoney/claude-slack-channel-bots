@@ -86,7 +86,7 @@ if ! bun install --frozen-lockfile; then
 fi
 
 # SR-2.3 — test discovery and execution
-TEST_FILES=$(find tests -name '*.test.ts' -type f 2>/dev/null | head -n 1)
+TEST_FILES=$(find tests -name '*.test.ts' -type f -print -quit 2>/dev/null)
 if [ -z "${TEST_FILES}" ]; then
   echo "SR-2.3 (preflight): no *.test.ts files found under tests/. Add at least one test file under tests/, commit it to main, then rerun '/publish ${BUMP_KIND}'." >&2
   exit 1
