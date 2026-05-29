@@ -10,7 +10,7 @@ allowed-tools: [Bash, Read, Skill]
 
 Cut a release of `claude-slack-channel-bots` end-to-end: preflight gates, version bump, smoke test of the release artifact, publish, and dev-box reinstall.
 
-The skill is runnable end-to-end today; on a release-ready repo it currently bumps the version, packs the tarball, scratch-installs it, runs the bin smoke check, then rolls the bump back and exits with `smoke test passed; release phases pending`. The rollback-on-success is an intentional Epic 2 design: Epic 3 will replace it with the commit + push + publish step.
+On a release-ready repo, the skill bumps the version, packs the tarball, scratch-installs it, runs the bin smoke check, commits + tags `Release v<version>` locally, pushes the commit to `origin/main`, publishes the smoke-tested tarball to npm, pushes the tag, polls the registry until the new version is visible, then exits with `release complete; local sync pending`. Epic 4 will replace that terminal message with the dev-box reinstall + final summary.
 
 ## Structural note for the LLM running this skill
 
@@ -125,15 +125,22 @@ If `/ci` cannot run, surface the same diagnostic `/ci` itself would have produce
 
 In each case the skill aborts; the message identifies that `/ci` was the failing gate and includes the upstream diagnostic.
 
-## Phase 3 — Bump, smoke test, and rollback (Epic 2 closure)
+## Phase 3 — Bump, smoke test, release, verify
 
-After Phase 1 + Phase 2 pass, apply the bump, pack the artifact, install it in an isolated `BUN_INSTALL` prefix, exercise the bin's no-args smoke signal, then **roll the bump back** and exit. The rollback-on-success is the Epic 2 architectural decision — Epic 3 will replace it with commit + push + publish.
+After Phase 1 + Phase 2 pass, this single bash block:
 
-This bash block re-derives `BUMP_KIND` and `NEXT_VERSION` (it runs in a fresh shell from Phase 1) and uses the same `cleanup` / `trap` pattern so its scratch dir and tarball are removed on every exit path.
+1. Applies the bump (SR-3.1), packs the tarball, scratch-installs it, and runs the bin smoke check (SR-4.1–SR-4.3). Any failure here triggers a working-tree rollback (`git checkout -- package.json bun.lock`) and abort — no commit, no push, no publish.
+2. Commits `Release v<version>` staging exactly `package.json` and `bun.lock`, and creates an annotated tag `v<version>` (SR-5.1).
+3. Pushes the commit to `origin/main` (SR-5.2). The tag is intentionally held back.
+4. Publishes the smoke-tested tarball with `npm publish <tarball-path>` — NOT `bun publish`, which would repack from CWD (SR-5.3).
+5. Pushes the tag to `origin` (SR-5.4), bringing github and npm into agreement.
+6. Polls `npm view claude-slack-channel-bots@<version> version` every 5 seconds for up to 60 seconds until the registry surfaces the new version (SR-6.1), then exits with `release complete; local sync pending`.
+
+The SR-5.1 → SR-5.4 ordering is load-bearing: if `npm publish` fails after the commit is pushed, the tag is NOT pushed, so the git remote and npm never disagree about whether the version exists.
+
+This bash block re-derives `BUMP_KIND` and `NEXT_VERSION` (it runs in a fresh shell from Phase 1) and uses the same `cleanup` / `trap` pattern so its scratch dir and tarball are removed on every exit path. On `npm publish` failure, `TARBALL` is cleared before exit so the trap preserves the tarball for the operator's manual re-publish.
 
 Bin smoke check assumes the current `src/cli.ts` no-args behavior: non-zero exit + `Usage:` in stderr. If the CLI surface changes, this check must be revisited. The SRD documents this coupling.
-
-The terminal exit string is exactly `smoke test passed; release phases pending`.
 
 ```bash
 set -euo pipefail
@@ -282,13 +289,25 @@ if ! git push origin "v${NEXT_VERSION}"; then
   exit 1
 fi
 
-echo "smoke test passed; release phases pending"
+# SR-6.1 — poll npm registry until v${NEXT_VERSION} is visible (5s cadence, up to 12 attempts = 60s)
+VERIFIED=0
+for ATTEMPT in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  REGISTRY_VERSION="$(npm view "claude-slack-channel-bots@${NEXT_VERSION}" version 2>/dev/null | tr -d '[:space:]')"
+  if [ "${REGISTRY_VERSION}" = "${NEXT_VERSION}" ]; then
+    VERIFIED=1
+    break
+  fi
+  sleep 5
+done
+
+if [ "${VERIFIED}" != "1" ]; then
+  echo "registry verification failed: claude-slack-channel-bots@${NEXT_VERSION} was not visible within 60s. The release succeeded (commit, publish, and tag all pushed) — this is a propagation verification failure only. Re-confirm with 'npm view claude-slack-channel-bots@${NEXT_VERSION} version'" >&2
+  exit 1
+fi
+
+echo "release complete; local sync pending"
 exit 0
 ```
-
-## Release
-
-Placeholder — populated by Epic 3.
 
 ## Local Sync
 
