@@ -139,6 +139,28 @@ if npm view "claude-slack-channel-bots@${NEXT_VERSION}" version > /dev/null 2>&1
 fi
 ```
 
+### SR-2.5 — Integration suite via `/ci`
+
+Invoke the `/ci` skill via the Skill tool (not as a bash subprocess) and require it to report PASS. Any other outcome — fail, error, or non-runnable — aborts. There is no opt-out flag.
+
+If `/ci` cannot run, surface the same diagnostic `/ci` itself would have produced. The known non-runnable conditions are:
+
+- Docker daemon not running.
+- `ANTHROPIC_API_KEY` environment variable not set.
+- bees MCP server not running.
+
+In each case the skill aborts; the message identifies that `/ci` was the failing gate and includes the upstream diagnostic so the operator can act on it without reading `/ci`'s source.
+
+## Terminal exit
+
+Once SR-2.5 reports PASS, preflight is complete. The release-cutting phases (Bump, Smoke Test, Release, Local Sync, Summary) are not yet implemented in this Epic. Print exactly:
+
+```
+preflight complete; further phases pending
+```
+
+and exit zero. No version bump, commit, tag, tarball, or scratch directory is created at this point.
+
 ## Bump
 
 Placeholder — populated by Epic 2.
