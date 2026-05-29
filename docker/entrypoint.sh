@@ -41,7 +41,7 @@ python3 -c "
 import json
 d = {
     'permissions': {
-        'allow': ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'mcp__bees__*'],
+        'allow': ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'],
         'defaultMode': 'acceptEdits'
     },
     'skipDangerousModePermissionPrompt': True

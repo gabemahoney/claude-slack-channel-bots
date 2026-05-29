@@ -27,7 +27,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 RUN npm install -g @anthropic-ai/claude-code
 
 # Install cozempic and bees
-RUN pip install cozempic bees-md[serve]
+RUN pip install cozempic bees-md
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY docker/auto_approve.sh /usr/local/bin/auto_approve.sh
