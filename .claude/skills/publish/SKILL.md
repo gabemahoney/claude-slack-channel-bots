@@ -45,7 +45,47 @@ esac
 
 ## Preflight
 
-Placeholder — populated by later Subtasks in this Epic.
+Preflight is a sequence of fail-fast gates. The first failing sub-check aborts the skill; nothing after it runs. Each failure must emit a distinct diagnostic line so the operator knows exactly which gate tripped.
+
+### SR-2.1 — Repository state
+
+Three sub-checks in this order:
+
+1. Working tree is clean — `git status --porcelain` produces empty output (no modified, staged, or untracked files in CWD).
+2. HEAD branch is `main`.
+3. After `git fetch origin`, local `main` equals `origin/main` exactly. This is exact equality, not fast-forwardability or ancestry: a fast-forward-pending local main (behind) or a local main that is ahead of the remote is itself a failure.
+
+```bash
+if [ -n "$(git status --porcelain)" ]; then
+  echo "preflight failed: working tree not clean" >&2
+  exit 1
+fi
+
+CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [ "${CURRENT_BRANCH}" != "main" ]; then
+  echo "preflight failed: not on main (HEAD branch is '${CURRENT_BRANCH}')" >&2
+  exit 1
+fi
+
+git fetch origin
+LOCAL_SHA="$(git rev-parse main)"
+REMOTE_SHA="$(git rev-parse origin/main)"
+if [ "${LOCAL_SHA}" != "${REMOTE_SHA}" ]; then
+  echo "preflight failed: local main is not exactly equal to origin/main" >&2
+  exit 1
+fi
+```
+
+### SR-2.2 — Dependency consistency
+
+Verify `node_modules` matches `bun.lock` and that `bun.lock` is consistent with `package.json`. Plain `bun install` would silently rewrite `bun.lock` on drift; `--frozen-lockfile` makes drift an explicit failure.
+
+```bash
+if ! bun install --frozen-lockfile; then
+  echo "preflight failed: frozen-lockfile install failed" >&2
+  exit 1
+fi
+```
 
 ## Bump
 
