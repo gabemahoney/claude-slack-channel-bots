@@ -263,6 +263,12 @@ if ! git tag -a "v${NEXT_VERSION}" -m "Release v${NEXT_VERSION}"; then
   exit 1
 fi
 
+# SR-5.2 — push release commit to origin/main (tag is held back until after npm publish)
+if ! git push origin main; then
+  echo "git push origin main failed: release commit + tag remain on disk; resolve the push issue (auth, non-fast-forward, etc.) and either re-run 'git push origin main' followed by manual 'npm publish' + 'git push origin v${NEXT_VERSION}', or run 'git reset --hard HEAD~1 && git tag -d v${NEXT_VERSION}' to abandon and restart" >&2
+  exit 1
+fi
+
 echo "smoke test passed; release phases pending"
 exit 0
 ```
