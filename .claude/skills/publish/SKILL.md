@@ -48,6 +48,14 @@ case "${BUMP_KIND}" in
     ;;
 esac
 
+# SR-10.1 — operate from the repo root regardless of the invocation CWD.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "${REPO_ROOT}" ]; then
+  echo "SR-10.1 (location): not inside a git working tree. Rerun '/publish ${BUMP_KIND}' from any directory inside a clone or worktree of claude-slack-channel-bots." >&2
+  exit 1
+fi
+cd "${REPO_ROOT}"
+
 # SR-2.1 — repository state
 if [ -n "$(git status --porcelain)" ]; then
   echo "SR-2.1 (preflight): working tree not clean. Commit or stash your changes, then rerun '/publish ${BUMP_KIND}'." >&2
@@ -60,7 +68,10 @@ if [ "${CURRENT_BRANCH}" != "main" ]; then
   exit 1
 fi
 
-git fetch origin
+if ! git fetch origin; then
+  echo "SR-2.1 (preflight): 'git fetch origin' failed (network down, auth problem, or remote unavailable). Verify the remote is reachable, then rerun '/publish ${BUMP_KIND}'." >&2
+  exit 1
+fi
 LOCAL_SHA="$(git rev-parse main)"
 REMOTE_SHA="$(git rev-parse origin/main)"
 if [ "${LOCAL_SHA}" != "${REMOTE_SHA}" ]; then
@@ -157,7 +168,12 @@ cleanup() {
 trap cleanup EXIT
 
 rollback_working_tree() {
-  git checkout -- package.json bun.lock 2>/dev/null || true
+  # SR-3.2: restore package.json and bun.lock to HEAD state. If git checkout itself
+  # errors (e.g. ref lookup failed), surface that — silently swallowing it would
+  # leave the working tree in a half-bumped state with no diagnostic.
+  if ! git checkout -- package.json bun.lock; then
+    echo "SR-3.2 (rollback): 'git checkout -- package.json bun.lock' failed. Working tree may still contain the bumped version. Run 'git status' to inspect, then 'git checkout -- package.json bun.lock' manually." >&2
+  fi
 }
 
 # Re-derive BUMP_KIND and NEXT_VERSION from a fresh shell.
@@ -169,6 +185,14 @@ case "${BUMP_KIND}" in
     exit 1
     ;;
 esac
+
+# SR-10.1 — operate from the repo root regardless of invocation CWD.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "${REPO_ROOT}" ]; then
+  echo "SR-10.1 (location): not inside a git working tree. Rerun '/publish ${BUMP_KIND}' from any directory inside a clone or worktree of claude-slack-channel-bots." >&2
+  exit 1
+fi
+cd "${REPO_ROOT}"
 
 CURRENT_VERSION="$(node -p "require('./package.json').version")"
 IFS='.' read -r MAJOR MINOR PATCH <<< "${CURRENT_VERSION}"
