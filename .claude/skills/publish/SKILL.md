@@ -276,6 +276,12 @@ if ! npm publish "${TARBALL_ABS}"; then
   exit 1
 fi
 
+# SR-5.4 — push the version tag to origin (final write to the git remote; brings github + npm into agreement)
+if ! git push origin "v${NEXT_VERSION}"; then
+  echo "git push origin v${NEXT_VERSION} failed: npm HAS v${NEXT_VERSION} and origin HAS the release commit; only the tag is missing. Recovery: run 'git push origin v${NEXT_VERSION}' manually once the push issue is resolved" >&2
+  exit 1
+fi
+
 echo "smoke test passed; release phases pending"
 exit 0
 ```
