@@ -207,6 +207,56 @@ if [ "${TARBALL_VERSION}" != "${NEXT_VERSION}" ]; then
 fi
 ```
 
+### SR-4.2/SR-4.3 — Scratch install and bin smoke check
+
+Install the packed tarball into an isolated `BUN_INSTALL` prefix so the real global install at `~/.bun/install/global/` is not touched. Create the prefix via `mktemp -d` and record it in `SCRATCH_DIR` — the `EXIT` trap removes the directory on every exit path. The install command is run with `BUN_INSTALL` inlined for that single invocation; the environment of the surrounding skill is not modified.
+
+After install, two assertions:
+
+1. The installed `package.json`'s `version` equals the bumped version. Mismatch aborts with a named diagnostic.
+2. The installed bin, invoked with no arguments, must exit non-zero AND print `Usage:` to stderr. This is the current `src/cli.ts` no-args behavior and is the smoke signal per SR-4.3. The check couples to that CLI surface: if the no-args output changes, this assertion must be revisited. The SRD documents this coupling as a known acceptable risk.
+
+```bash
+SCRATCH_DIR="$(mktemp -d)"
+TARBALL_ABS="$(pwd)/${TARBALL}"
+
+if ! BUN_INSTALL="${SCRATCH_DIR}" bun install -g "${TARBALL_ABS}" > /dev/null 2>&1; then
+  echo "scratch install failed: bun install -g ${TARBALL} did not succeed" >&2
+  exit 1
+fi
+
+INSTALLED_PKG="${SCRATCH_DIR}/install/global/node_modules/claude-slack-channel-bots/package.json"
+if [ ! -f "${INSTALLED_PKG}" ]; then
+  echo "scratch install failed: installed package.json not found at ${INSTALLED_PKG}" >&2
+  exit 1
+fi
+
+INSTALLED_VERSION="$(jq -r .version "${INSTALLED_PKG}")"
+if [ "${INSTALLED_VERSION}" != "${NEXT_VERSION}" ]; then
+  echo "scratch install failed: installed version '${INSTALLED_VERSION}' != bumped ${NEXT_VERSION}" >&2
+  exit 1
+fi
+
+INSTALLED_BIN="${SCRATCH_DIR}/bin/claude-slack-channel-bots"
+if [ ! -x "${INSTALLED_BIN}" ]; then
+  echo "smoke check failed: installed bin not found or not executable at ${INSTALLED_BIN}" >&2
+  exit 1
+fi
+
+SMOKE_EXIT=0
+SMOKE_STDERR="$("${INSTALLED_BIN}" 2>&1 >/dev/null)" || SMOKE_EXIT=$?
+
+if [ "${SMOKE_EXIT}" = "0" ]; then
+  echo "smoke check failed: bin exited zero with no arguments (expected non-zero)" >&2
+  exit 1
+fi
+
+if ! grep -q "Usage:" <<< "${SMOKE_STDERR}"; then
+  echo "smoke check failed: bin stderr did not contain 'Usage:'" >&2
+  exit 1
+fi
+```
+
 ## Release
 
 Placeholder — populated by Epic 3.
