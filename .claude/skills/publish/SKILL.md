@@ -163,7 +163,16 @@ and exit zero. No version bump, commit, tag, tarball, or scratch directory is cr
 
 ## Bump
 
-Placeholder — populated by Epic 2.
+After preflight passes, apply the bump to `package.json` using `npm version`. The semver rules match `npm version` itself: `major` increments the major segment and zeroes minor and patch; `minor` increments minor and zeroes patch; `patch` increments patch.
+
+`--no-git-tag-version` skips commit and tag creation — the bumped `package.json` is intentionally left in the working tree (uncommitted) so the smoke test below can pack and verify it. `bun.lock` does not track the root package's own version, so it is normally unaffected by a bump; the spec still allows for it to change if a future bun version starts tracking it.
+
+```bash
+if ! npm version "${BUMP_KIND}" --no-git-tag-version > /dev/null; then
+  echo "bump failed: npm version ${BUMP_KIND} did not apply" >&2
+  exit 1
+fi
+```
 
 ## Smoke Test
 
