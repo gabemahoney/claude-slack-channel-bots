@@ -25,6 +25,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 # Cozempic — Test 3 probes for it on PATH.
 RUN pip install cozempic
 
+# agent-director — explicit install at the range CSCB declares in package.json.
+# Own layer so CSCB source changes don't bust the AD pull; populates bun's cache
+# so test-1's `bun install /tmp/package.tgz` resolves AD without network.
+COPY package.json /tmp/package-for-ad-resolve.json
+RUN AD_RANGE=$(jq -r '.dependencies["agent-director"]' /tmp/package-for-ad-resolve.json) && \
+    bun add -g "agent-director@${AD_RANGE}" && \
+    rm /tmp/package-for-ad-resolve.json
+
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
