@@ -132,7 +132,6 @@ If `/ci` cannot run or does not return PASS, the skill aborts with a message of 
 
 - Docker daemon not running. **Recovery**: start Docker, then rerun `/publish`.
 - `ANTHROPIC_API_KEY` environment variable not set. **Recovery**: export the key, then rerun `/publish`.
-- bees MCP server not running. **Recovery**: start the bees MCP server, then rerun `/publish`.
 
 For a `/ci` run that returns FAIL or ERROR, the recovery is the standard one: fix the integration regression on `main` (commit + push), then rerun `/publish`.
 
@@ -201,6 +200,23 @@ case "${BUMP_KIND}" in
   minor) NEXT_VERSION="${MAJOR}.$((MINOR + 1)).0" ;;
   patch) NEXT_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
 esac
+
+# Auto-route GH_CONFIG_DIR for HTTPS origins on hosts with per-org gh credential routing.
+# When ~/.gitconfig uses credential.useHttpPath=true + per-org [credential] blocks, the
+# git credential helper needs GH_CONFIG_DIR pointed at the right gh config to find the
+# token for the org. If $HOME/.config/gh-<org> exists we use it; otherwise fall through
+# to gh-personal; otherwise leave GH_CONFIG_DIR untouched (host doesn't use routing).
+ORIGIN_URL="$(git remote get-url origin 2>/dev/null || true)"
+if [[ "${ORIGIN_URL}" =~ ^https://github.com/([^/]+)/ ]]; then
+  ORG="${BASH_REMATCH[1]}"
+  for candidate in "$HOME/.config/gh-${ORG}" "$HOME/.config/gh-personal"; do
+    if [ -d "${candidate}" ]; then
+      export GH_CONFIG_DIR="${candidate}"
+      echo "Phase 3: routed GH_CONFIG_DIR=${candidate} for origin org '${ORG}'"
+      break
+    fi
+  done
+fi
 
 # SR-3.1 — bump (no commit; npm version --no-git-tag-version)
 if ! npm version "${BUMP_KIND}" --no-git-tag-version > /dev/null; then
@@ -298,7 +314,7 @@ fi
 
 # SR-5.2 — push release commit to origin/main (tag is held back until after npm publish)
 if ! git push origin main; then
-  echo "SR-5.2 (push commit): 'git push origin main' failed. State: release commit + annotated tag exist locally; nothing has been pushed or published. Recovery: resolve the push failure (auth, non-fast-forward, etc.) and either (a) re-run 'git push origin main' followed by 'npm publish ${TARBALL_ABS}' and 'git push origin v${NEXT_VERSION}' manually, or (b) abandon and restart by running 'git reset --hard HEAD~1 && git tag -d v${NEXT_VERSION}' then rerun '/publish ${BUMP_KIND}'. The smoke-tested tarball at ${TARBALL_ABS} has been preserved on disk for option (a)." >&2
+  echo "SR-5.2 (push commit): 'git push origin main' failed. State: release commit + annotated tag exist locally; nothing has been pushed or published. Recovery: resolve the push failure and either (a) re-run 'git push origin main' followed by 'npm publish ${TARBALL_ABS}' and 'git push origin v${NEXT_VERSION}' manually, or (b) abandon and restart by running 'git reset --hard HEAD~1 && git tag -d v${NEXT_VERSION}' then rerun '/publish ${BUMP_KIND}'. The smoke-tested tarball at ${TARBALL_ABS} has been preserved on disk for option (a). Common causes: (1) auth — if origin is HTTPS and the host uses per-org GH_CONFIG_DIR routing (~/.gitconfig with credential.useHttpPath=true + per-org [credential] blocks), retry with 'GH_CONFIG_DIR=\$HOME/.config/gh-<org> git push origin main' where <org> is the GitHub org from the origin URL (the skill auto-detects this but may miss a non-standard layout); (2) non-fast-forward — local main is behind origin/main, run 'git pull --rebase origin main' and retry." >&2
   TARBALL=""  # preserve tarball so the operator can re-run npm publish against it
   exit 1
 fi
@@ -319,7 +335,7 @@ fi
 # SR-6.1 — poll npm registry until v${NEXT_VERSION} is visible (5s cadence, up to 12 attempts = 60s)
 VERIFIED=0
 for ATTEMPT in 1 2 3 4 5 6 7 8 9 10 11 12; do
-  REGISTRY_VERSION="$(npm view "claude-slack-channel-bots@${NEXT_VERSION}" version 2>/dev/null | tr -d '[:space:]')"
+  REGISTRY_VERSION="$(npm view "claude-slack-channel-bots@${NEXT_VERSION}" version 2>/dev/null | command tr -d '[:space:]')"
   if [ "${REGISTRY_VERSION}" = "${NEXT_VERSION}" ]; then
     VERIFIED=1
     break
@@ -403,7 +419,7 @@ fi
 # SR-9.1 — success summary (the terminal output on every successful run)
 NPM_URL="https://www.npmjs.com/package/claude-slack-channel-bots/v/${NEXT_VERSION}"
 GITHUB_TAG_URL="https://github.com/gabemahoney/claude-slack-channel-bots/releases/tag/v${NEXT_VERSION}"
-cat <<EOF
+command cat <<EOF
 
 Release complete: claude-slack-channel-bots@${NEXT_VERSION}
 

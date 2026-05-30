@@ -74,13 +74,13 @@ When status becomes `exited`, locate the latest JSONL transcript on the host and
 
 ```bash
 HOST_PROJECTS_DIR=/tmp/cscb-ci-projects
-LATEST_JSONL=$(command ls -t "${HOST_PROJECTS_DIR}"/-test-repo/*.jsonl 2>/dev/null | head -1)
+LATEST_JSONL=$(command ls -t "${HOST_PROJECTS_DIR}"/-test-repo/*.jsonl 2>/dev/null | command head -1)
 if [ -z "${LATEST_JSONL}" ]; then
   echo "No JSONL transcript found under ${HOST_PROJECTS_DIR}/-test-repo/."
   exit 1
 fi
 ASSISTANT_TEXT=$(jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' "${LATEST_JSONL}")
-echo "${ASSISTANT_TEXT}" | tail -100
+echo "${ASSISTANT_TEXT}" | command tail -100
 ```
 
 Look for these signals in `ASSISTANT_TEXT`:

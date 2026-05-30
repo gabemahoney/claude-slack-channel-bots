@@ -46,6 +46,15 @@ while true; do
         sleep 0.2
         tmux send-keys -t "$PANE" "Enter"
         echo "[$SESSION] $(date +%H:%M:%S) APPROVED create prompt"
+
+    # Generic selector fallback: any dialog with a Claude-style selected-option marker
+    # ("❯ 1." or "> 1.") next to a numbered "Yes"/"allow"/"proceed" affirmative.
+    # Catches dialog forms we haven't enumerated above (e.g. cozempic hook-injection).
+    elif echo "$content" | grep -qE "(❯|>)\s+1\.\s" && echo "$content" | grep -qiE "(yes|allow|proceed|approve|accept|continue)"; then
+        tmux send-keys -t "$PANE" "1"
+        sleep 0.2
+        tmux send-keys -t "$PANE" "Enter"
+        echo "[$SESSION] $(date +%H:%M:%S) APPROVED generic numbered prompt"
     fi
 
     sleep 3
