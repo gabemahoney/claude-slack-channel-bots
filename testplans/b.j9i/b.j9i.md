@@ -67,9 +67,13 @@ cat ~/.claude/channels/slack/server.log
 ```
 Expected: log contains "[slack] Running in dry-run mode" and no error stack traces.
 
-Check that the MCP endpoint is responding:
+Check that the MCP endpoint is responding. The server uses `StreamableHTTPServerTransport`, which requires both an `Accept: application/json, text/event-stream` header AND a `params` block on `initialize` (protocolVersion, capabilities, clientInfo). Without them the server returns HTTP 406 or a "Server not initialized" error.
 ```bash
-curl -sf http://127.0.0.1:3100/mcp -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"initialize","id":1}' | head -c 200
+curl -sf -X POST \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"cscb-test","version":"1.0"}}}' \
+  http://127.0.0.1:3100/mcp | head -c 200
 ```
 
 ### Pass criteria
