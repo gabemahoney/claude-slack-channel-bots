@@ -5,7 +5,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
     curl \
     git \
-    tmux \
     gosu \
     ca-certificates \
     gnupg \
@@ -15,29 +14,25 @@ RUN apt-get update && apt-get install -y \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Bun
+# Bun — Test 1 uses `bun install /tmp/package.tgz`.
 RUN curl -fsSL https://bun.sh/install | bash && cp /root/.bun/bin/bun /usr/local/bin/bun
 
-# Install Node 20 via nodesource
+# Node 20 — daemon-under-test runs on Node.
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Claude Code globally
-RUN npm install -g @anthropic-ai/claude-code
-
-# Install cozempic and bees
-RUN pip install cozempic bees-md
+# Cozempic — Test 3 probes for it on PATH.
+RUN pip install cozempic
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY docker/auto_approve.sh /usr/local/bin/auto_approve.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/auto_approve.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
-COPY .claude/skills /test-repo/.claude/skills
-COPY docker/test_runner.sh /usr/local/bin/test_runner.sh
-RUN chmod +x /usr/local/bin/test_runner.sh
+# Bash integration tests — runner.sh + the three test scripts.
+COPY tests /tests
+RUN chmod +x /tests/runner.sh /tests/integration/*.sh
 
-# Copy testplans hive into the image
+# Testplans hive — human-prose source of truth for what gets tested.
 COPY testplans /test-repo/testplans
 
 RUN useradd -m -s /bin/bash testuser && chown -R testuser:testuser /test-repo
