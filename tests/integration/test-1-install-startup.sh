@@ -54,8 +54,10 @@ if grep -qE 'Error:|Traceback|Uncaught' "${LOG}"; then
     fail "server.log contains error stack trace"
 fi
 
-curl -sf -X POST -H 'Content-Type: application/json' \
-    -d '{"jsonrpc":"2.0","method":"initialize","id":1}' \
+curl -sf -X POST \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"cscb-test","version":"1.0"}}}' \
     http://127.0.0.1:3100/mcp \
     | grep -q '"result"' \
     || fail "MCP endpoint on 127.0.0.1:3100 did not return a JSON-RPC result"
