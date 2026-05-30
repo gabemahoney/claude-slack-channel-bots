@@ -14,8 +14,8 @@
 # SUNSET: This script exists to work around a defect in bun 1.3.13's global
 # install. When the dev fleet is on a bun release that no longer writes the
 # empty-string key (≥ 1.3.14 once that ships) AND no operator still has a
-# poisoned global package.json on disk, this file and the publish.sh call
-# site should be deleted.
+# poisoned global package.json on disk, this file and the publish-promote.sh
+# call site should be deleted.
 #
 # Inputs: none. Reads ${BUN_INSTALL:-$HOME/.bun}/install/global/package.json.
 #
