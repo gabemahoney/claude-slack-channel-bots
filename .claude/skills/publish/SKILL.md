@@ -272,7 +272,7 @@ if [ "${SMOKE_EXIT}" = "0" ]; then
   exit 1
 fi
 
-if ! grep -q "Usage:" <<< "${SMOKE_STDERR}"; then
+if ! command grep -q "Usage:" <<< "${SMOKE_STDERR}"; then
   echo "SR-4.3 (smoke check): bin stderr did not contain 'Usage:' (the smoke contract). Working tree has been rolled back. Update src/cli.ts to emit a 'Usage:' line on no-args (or update this skill to match the new CLI contract — see the SRD), then rerun '/publish ${BUMP_KIND}'." >&2
   rollback_working_tree
   exit 1
@@ -298,7 +298,8 @@ fi
 
 # SR-5.2 — push release commit to origin/main (tag is held back until after npm publish)
 if ! git push origin main; then
-  echo "SR-5.2 (push commit): 'git push origin main' failed. State: release commit + annotated tag exist locally; nothing has been pushed or published. Recovery: resolve the push failure (auth, non-fast-forward, etc.) and either (a) re-run 'git push origin main' followed by 'npm publish ${TARBALL_ABS}' and 'git push origin v${NEXT_VERSION}' manually, or (b) abandon and restart by running 'git reset --hard HEAD~1 && git tag -d v${NEXT_VERSION}' then rerun '/publish ${BUMP_KIND}'." >&2
+  echo "SR-5.2 (push commit): 'git push origin main' failed. State: release commit + annotated tag exist locally; nothing has been pushed or published. Recovery: resolve the push failure (auth, non-fast-forward, etc.) and either (a) re-run 'git push origin main' followed by 'npm publish ${TARBALL_ABS}' and 'git push origin v${NEXT_VERSION}' manually, or (b) abandon and restart by running 'git reset --hard HEAD~1 && git tag -d v${NEXT_VERSION}' then rerun '/publish ${BUMP_KIND}'. The smoke-tested tarball at ${TARBALL_ABS} has been preserved on disk for option (a)." >&2
+  TARBALL=""  # preserve tarball so the operator can re-run npm publish against it
   exit 1
 fi
 
