@@ -11,7 +11,18 @@ allowed-tools: [Bash]
 
 1. `RUN_ID=$(date +%s)`
 2. `npm pack` from repo root; capture tarball filename.
-3. `docker build -f docker/Dockerfile.test -t cscb-ci .`
+3. Lazy-build the base image, then build the top image:
+   ```bash
+   BASE_TAG=cscb-ci-base:v1  # bump when docker/Dockerfile.test.base changes
+   if ! docker image inspect "${BASE_TAG}" >/dev/null 2>&1; then
+     docker build -f docker/Dockerfile.test.base -t "${BASE_TAG}" .
+   fi
+   docker build -f docker/Dockerfile.test -t cscb-ci .
+   ```
+   The base image holds source-independent layers (apt, bun, nodejs, cozempic,
+   agent-director) and is built once per host. `docker/Dockerfile.test`'s
+   `FROM` line pins the same tag — keep them in sync. See `docker/README.md`
+   for the base-image bump procedure.
 4. `RESULTS_DIR=$(mktemp -d -t cscb-ci-${RUN_ID}-XXXXXX)` — outside the repo working tree so `/publish prepare`'s SR-2.1 cleanliness check stays happy. Respects `$TMPDIR`; falls back to `/tmp`.
 5. ```bash
    docker run --rm --name cscb-ci-${RUN_ID} \

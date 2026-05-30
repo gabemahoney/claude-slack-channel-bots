@@ -1,0 +1,34 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    gosu \
+    ca-certificates \
+    gnupg \
+    python3 \
+    python3-pip \
+    jq \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Bun — Test 1 uses `bun install /tmp/package.tgz`.
+RUN curl -fsSL https://bun.sh/install | bash && cp /root/.bun/bin/bun /usr/local/bin/bun
+
+# Node 20 — daemon-under-test runs on Node.
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Cozempic — Test 3 probes for it on PATH.
+RUN pip install cozempic
+
+# agent-director — explicit install at the range CSCB declares in package.json.
+# Reading package.json here makes this layer dependent on the AD range. When
+# the range changes, bump cscb-ci-base's version tag (see docker/README.md).
+COPY package.json /tmp/package-for-ad-resolve.json
+RUN AD_RANGE=$(jq -r '.dependencies["agent-director"]' /tmp/package-for-ad-resolve.json) && \
+    bun add -g "agent-director@${AD_RANGE}" && \
+    rm /tmp/package-for-ad-resolve.json
