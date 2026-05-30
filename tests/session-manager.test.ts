@@ -555,6 +555,41 @@ describe('approveDevChannelsDialog (b.yy6)', () => {
     // throws ErrSpawnNotInteractive and the dialog approval silently fails.
     expect(enterCalls[0].allow_pending).toBe(true)
   })
+
+  // -------------------------------------------------------------------------
+  // b.ben regression: approveDevChannelsDialog must use the composed instance
+  // id (cscb_<name>_<id>) when the route carries a normalizedName. The bug
+  // produced cscb_<id> here, polling a non-existent spawn and leaving the
+  // real bot pane stuck on the dev-channels dialog after every clean_restart.
+  // -------------------------------------------------------------------------
+
+  test('b.ben: uses composed instance id when route has normalizedName', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+    installStub({
+      sendKeysCalls,
+      readPaneCalls,
+      readPaneResults: [
+        { pane: DEV_CHANNELS_PANE },
+        { pane: WELCOME_PANE },
+        { pane: WELCOME_PANE },
+      ],
+    })
+    const cfg = makeRoutingConfig({
+      routes: { C_TEST1: { cwd: '/x', name: 'my_chan', normalizedName: 'my_chan' } },
+    })
+    const result = await spawnForRoute('C_TEST1', { cwd: '/x' }, cfg)
+
+    expect(result.action).toBe('spawned')
+    // Approver must address the composed id, not the bare cscb_<id>.
+    expect(readPaneCalls.length).toBeGreaterThanOrEqual(1)
+    for (const r of readPaneCalls) {
+      expect(r.claude_instance_id).toBe('cscb_my_chan_C_TEST1')
+    }
+    expect(sendKeysCalls).toHaveLength(1)
+    expect(sendKeysCalls[0].claude_instance_id).toBe('cscb_my_chan_C_TEST1')
+    expect(sendKeysCalls[0].text).toBe('')
+  })
 })
 
 // b.1m9 — tmuxSessionNameFor naming layer
