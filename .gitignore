@@ -4,3 +4,4 @@
 node_modules/
 *.tgz
 ._*
+.publish-state.json

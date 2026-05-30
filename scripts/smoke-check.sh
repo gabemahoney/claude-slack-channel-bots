@@ -7,7 +7,7 @@
 #
 # The scratch BUN_INSTALL directory is created via mktemp and removed on
 # every exit path via a trap. The caller's working tree is NOT touched —
-# rollback on smoke failure is the caller's responsibility (publish.sh
+# rollback on smoke failure is the caller's responsibility (publish-prepare.sh
 # runs `git checkout -- package.json bun.lock` after a non-zero exit here).
 #
 # Inputs (env vars):
