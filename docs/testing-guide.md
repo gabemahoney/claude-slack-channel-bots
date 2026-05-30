@@ -16,7 +16,7 @@ Each source module has a corresponding test file in the project root:
 | config.ts | config.test.ts | applyDefaults, validateConfig, expandTilde, resolveConfig, loadConfig |
 | registry.ts | registry.test.ts | Session registry CRUD, routing, pending sessions |
 | server.ts (DM routing) | dm-routing.test.ts | DM routing via gate() + registry |
-| server.ts (permission relay) | permission-relay.test.ts | /permission endpoint with stubbed server |
+| server.ts (permission relay) | permission-poller.test.ts, permission-click-handler.test.ts | SR-2.1 poller loop and Block Kit click handler |
 
 New features that add significant logic should get their own test file (e.g., `session-manager.test.ts`).
 
@@ -97,7 +97,7 @@ describe('MyTest', () => {
 
 ### Self-Contained Test Servers
 
-When testing HTTP endpoints that live in server.ts, create a minimal Bun.serve() in the test file that replicates the endpoint logic with stubbed dependencies. This pattern is used by permission-relay.test.ts:
+When testing HTTP endpoints that live in server.ts, create a minimal Bun.serve() in the test file that replicates the endpoint logic with stubbed dependencies. This pattern is used by interject.test.ts:
 
 - Bind to port 0 (random available port) to avoid conflicts
 - Share Maps between test code and server handler via closure

@@ -343,104 +343,53 @@ Do not modify `access.json` during setup unless the user asks to.
 
 ---
 
-### Step 7 — Check hooks
+### Step 7 — Verify agent-director is installed
 
-Check whether the relay hooks exist and are executable:
+The modern permission relay runs automatically via agent-director — no
+operator action is required for permission-relay or ask-handling.
+`AskUserQuestion` is denied at the agent-director template level (SR-3.1).
 
-```bash
-ls -la ~/.claude/hooks/permission-relay.sh ~/.claude/hooks/ask-relay.sh 2>/dev/null || echo "NOT_FOUND"
-```
-
-**If either hook is missing:**
-
-Provide the copy and chmod commands. The source path depends on how the
-package was installed. Try to detect it:
+Check that agent-director is installed and the `slack-channel-bot` template
+is registered:
 
 ```bash
-# Attempt to find the package hooks directory
-bun pm ls -g 2>/dev/null | grep -o "claude-slack-channel-bots.*" | head -1 || true
+agent-director --version
 ```
 
-Show the user the exact commands:
+The `slack-channel-bot` template is registered automatically at CSCB startup
+via `client.makeTemplate(...)`. Confirm the template exists after a successful
+`claude-slack-channel-bots start` by checking the agent-director template
+registry. If the startup log shows `ad-template-install` in
+`$STATE_DIR/startup-errors.log`, the template registration
+failed — investigate that error before proceeding.
 
-```bash
-mkdir -p ~/.claude/hooks
-
-# Copy from the installed package (adjust path if needed):
-cp "$(npm root -g)/claude-slack-channel-bots/hooks/permission-relay.sh" ~/.claude/hooks/
-cp "$(npm root -g)/claude-slack-channel-bots/hooks/ask-relay.sh" ~/.claude/hooks/
-chmod +x ~/.claude/hooks/permission-relay.sh ~/.claude/hooks/ask-relay.sh
-```
-
-Or, to keep them in sync with future package updates, symlink instead:
-
-```bash
-HOOKS_DIR="$(npm root -g)/claude-slack-channel-bots/hooks"
-ln -sf "$HOOKS_DIR/permission-relay.sh" ~/.claude/hooks/permission-relay.sh
-ln -sf "$HOOKS_DIR/ask-relay.sh" ~/.claude/hooks/ask-relay.sh
-```
-
-Also remind the user that `curl` and `jq` must be on `PATH` for the hooks to
-work.
-
-**If both hooks exist**, confirm they are executable (`-x`). If not, show:
-
-```bash
-chmod +x ~/.claude/hooks/permission-relay.sh ~/.claude/hooks/ask-relay.sh
-```
+If `agent-director` is not on `PATH`, postinstall did not complete successfully.
+Re-run `bun postinstall.ts` from the installed package directory, or reinstall
+CSCB with `bun install -g claude-slack-channel-bots`.
 
 ---
 
-### Step 8 — Check Claude Code settings.json for hook entries
+### Step 8 — Check settings.json for orphan legacy hook entries
 
-Read `~/.claude/settings.json` and check whether the `PermissionRequest` and
-`PreToolUse` hook entries for the relay scripts are present.
+Operators upgrading from pre-Epic-2 (v0.5.x) may have `PermissionRequest` or
+`PreToolUse` `AskUserQuestion` entries in `~/.claude/settings.json` that point
+at the old `.sh` files. These are harmless but stale — the `.sh` files no
+longer exist and agent-director owns the relay machinery now.
 
-**Check for `PermissionRequest` entry:**
+Check for orphan entries:
 
-Look for an entry inside `hooks.PermissionRequest` with:
-```json
-{ "type": "command", "command": "~/.claude/hooks/permission-relay.sh" }
+```bash
+jq '
+  (.hooks.PermissionRequest // [] | map(select(.hooks[]?.command | strings | test("\\.sh$")))),
+  (.hooks.PreToolUse // [] | map(select(.matcher == "AskUserQuestion" and (.hooks[]?.command | strings | test("\\.sh$")))))
+' ~/.claude/settings.json 2>/dev/null
 ```
 
-**Check for `PreToolUse` entry:**
-
-Look for an entry inside `hooks.PreToolUse` with:
-```json
-{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "~/.claude/hooks/ask-relay.sh" }] }
-```
-
-**If either entry is missing OR exists but is missing `"timeout": 2000000`**,
-show the user the exact JSON to add or fix. The timeout is critical — without
-it Claude Code uses a short default timeout, kills the hook before the
-long-poll completes, and falls back to TUI approval. This is the complete
-block for both entries:
-
-```jsonc
-"PermissionRequest": [
-  {
-    "matcher": ".*",
-    "timeout": 2000000,
-    "hooks": [{ "type": "command", "command": "~/.claude/hooks/permission-relay.sh" }]
-  }
-],
-"PreToolUse": [
-  {
-    "matcher": "AskUserQuestion",
-    "timeout": 2000000,
-    "hooks": [{ "type": "command", "command": "~/.claude/hooks/ask-relay.sh" }]
-  }
-]
-```
-
-Add these under the top-level `"hooks"` key in `settings.json`. Existing
-entries in those arrays should be preserved — append, do not replace.
-
-If `settings.json` does not exist or does not have a `"hooks"` key, show the
-user the full minimal structure to add.
-
-Offer to write the missing entries automatically to `~/.claude/settings.json`.
-If the user agrees, make the targeted edits, preserving all existing content.
+If either output array is non-empty, orphan entries are present. Show the user
+the relevant block from `settings.json` and advise manual removal of any
+`PermissionRequest` entries whose `hooks[].command` ends in `permission-relay.sh`,
+and any `PreToolUse` entries with `matcher: "AskUserQuestion"` whose
+`hooks[].command` ends in `ask-relay.sh`.
 
 ---
 
@@ -450,13 +399,13 @@ Print a final summary of what was checked and configured:
 
 - Environment variables: set / missing
 - Token format: valid / invalid
-- config.json: populated (N routes) / skeleton
+- ~/.claude/channels/slack/config.json: present and valid (N routes) / missing or skeleton
 - append_system_prompt_file: configured / skipped
 - access.json: present / missing
-- permission-relay.sh hook: present and executable / missing
-- ask-relay.sh hook: present and executable / missing
-- settings.json PermissionRequest hook: present / missing
-- settings.json PreToolUse hook: present / missing
+- agent-director: installed (version X) / missing
+- slack-channel-bot template: registered (confirmed at startup) / unconfirmed
+- settings.json orphan PermissionRequest (.sh) hooks: none / found (needs cleanup)
+- settings.json orphan PreToolUse AskUserQuestion (.sh) hooks: none / found (needs cleanup)
 
 Remind the user:
 

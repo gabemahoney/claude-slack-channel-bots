@@ -115,8 +115,8 @@ When neither guard fires and the session is dead, the poller calls `scheduleRest
 
 ## Async Patterns
 
-- Use `async/await` throughout — no raw Promises except where explicitly holding connections open (permission relay long-poll)
-- Long-poll pattern: create a Promise, register a resolve callback in a waiters array, race against a setTimeout
+- Use `async/await` throughout — no raw Promises except where explicitly holding connections open (e.g., SSE keep-alive streams)
+- SSE keep-alive pattern: hold the response open with a `Promise` that resolves on `req.signal` abort; stream events by writing to `res` directly; clean up on abort via `req.signal.addEventListener('abort', ...)`
 - Always clean up on abort: `req.signal.addEventListener('abort', ...)` for held HTTP connections
 - Use `settled` flag pattern to prevent double-resolution in race conditions
 

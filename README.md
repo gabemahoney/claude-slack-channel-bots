@@ -501,11 +501,7 @@ This gracefully exits the managed Claude Code sessions, stops and restarts the s
 For operators upgrading from a pre-`agent-director` install:
 
 1. **Install the new CSCB**: `bun remove claude-director` (if present) and `bun install -g claude-slack-channel-bots@^<new>`. The `agent-director` library is pulled in transitively — no separate install step.
-2. **Delete any old relay hooks** (CSCB no longer ships them — agent-director's relay machinery owns the tool-permission flow):
-   ```sh
-   rm -f ~/.claude/hooks/permission-relay.sh ~/.claude/hooks/ask-relay.sh
-   ```
-   Also remove their entries from `~/.claude/settings.json` if you wired them in by hand previously.
+2. **Delete any old relay hooks** — see [Upgrading from pre-Epic-2 (v0.5.x → v0.6.x)](#upgrading-from-pre-epic-2-v05x--v06x) for the cleanup commands.
 3. **Configure agent-director's `find-missing` sweep**. CSCB does NOT call `client.findMissing(...)`; reconciling stuck rows is the operator's responsibility. Add a cron entry (or systemd timer) that runs `agent-director find-missing` on a cadence that matches your tolerance — e.g. every minute on a busy host:
    ```cron
    * * * * * /usr/local/bin/agent-director find-missing --timeout 30s
@@ -519,4 +515,40 @@ For operators upgrading from a pre-`agent-director` install:
 7. **`tmux` is no longer a CSCB-direct prereq** but is still required transitively via agent-director — keep it installed.
 
 After step 1, every CSCB bot is spawned through `client.spawn(...)` with `relay_mode='on'`. The green/red Slack button UX is byte-identical to the pre-migration behavior; the action_id shape changes from `perm_(allow|deny)_<uuid>` to `perm_(allow|deny)_cscb_<channelId>_<request_id>` but this is invisible to end users.
+
+---
+
+## Upgrading from pre-Epic-2 (v0.5.x → v0.6.x)
+
+If you installed CSCB before v0.6.0 you may have legacy artifacts on disk that are no longer needed. Clean them up manually — automatic postinstall migration is tracked under idea b.irf and not yet implemented.
+
+### 1. Remove old relay hook files
+
+The `.sh` relay hooks are no longer shipped by CSCB. Delete them if present:
+
+```sh
+rm -f ~/.claude/hooks/permission-relay.sh ~/.claude/hooks/ask-relay.sh
+```
+
+### 2. Remove orphan settings.json hook entries
+
+If you wired the hooks into `~/.claude/settings.json` by hand, remove the stale entries. Use this `jq` filter to check whether any are present:
+
+```sh
+jq '
+  (.hooks.PermissionRequest // [] | map(select(.hooks[]?.command | strings | test("\\.sh$")))),
+  (.hooks.PreToolUse // [] | map(select(.matcher == "AskUserQuestion" and (.hooks[]?.command | strings | test("\\.sh$")))))
+' ~/.claude/settings.json 2>/dev/null
+```
+
+Any non-empty arrays in the output are orphan entries. Remove:
+
+- Any object inside `hooks.PermissionRequest` whose `hooks[].command` ends in `permission-relay.sh`.
+- Any object inside `hooks.PreToolUse` with `"matcher": "AskUserQuestion"` whose `hooks[].command` ends in `ask-relay.sh`.
+
+The modern permission relay runs automatically via agent-director — no `PermissionRequest` or `PreToolUse` hook entries for `.sh` files are needed.
+
+### 3. Note on automated migration
+
+A postinstall step that performs this cleanup automatically is tracked under idea b.irf. Until that lands, the steps above are manual.
 

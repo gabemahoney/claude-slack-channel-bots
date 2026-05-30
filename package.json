@@ -9,7 +9,6 @@
   "files": [
     "src/*.ts",
     "!src/*.test.ts",
-    "hooks/",
     "scripts/fixup-bun-cache.ts",
     "slack-app-manifest.yml",
     "README.md",
