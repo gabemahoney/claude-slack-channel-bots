@@ -12,22 +12,22 @@ allowed-tools: [Bash]
 1. `RUN_ID=$(date +%s)`
 2. `npm pack` from repo root; capture tarball filename.
 3. `docker build -f docker/Dockerfile.test -t cscb-ci .`
-4. `mkdir -p ${PWD}/test-results`
+4. `RESULTS_DIR=$(mktemp -d -t cscb-ci-${RUN_ID}-XXXXXX)` — outside the repo working tree so `/publish prepare`'s SR-2.1 cleanliness check stays happy. Respects `$TMPDIR`; falls back to `/tmp`.
 5. ```bash
    docker run --rm --name cscb-ci-${RUN_ID} \
-     -v ${PWD}/test-results:/test-results \
+     -v ${RESULTS_DIR}:/test-results \
      -v ${PWD}/<TARBALL>:/tmp/package.tgz:ro \
      --env ANTHROPIC_API_KEY \
      cscb-ci
    ```
 6. Container exits when `/tests/runner.sh` exits.
-7. Read first line of `${PWD}/test-results/verdict.txt`:
+7. Read first line of `${RESULTS_DIR}/verdict.txt`:
    - `PASS` → exit 0, report `✓ Integration tests passed.`
-   - `FAIL: …` → relay the verdict line verbatim, exit 1.
+   - `FAIL: …` → relay the verdict line verbatim, **and echo the path** `${RESULTS_DIR}` so the operator can inspect the verdict + docker logs after the fact. Exit 1.
    - File missing or first line is neither → exit 1 with
      `test container did not write verdict.txt` and include
-     `docker logs cscb-ci-${RUN_ID}` tail in the report.
-8. Cleanup: `docker rm cscb-ci-${RUN_ID} 2>/dev/null || true`
+     `docker logs cscb-ci-${RUN_ID}` tail in the report. Echo `${RESULTS_DIR}` path so the operator can inspect.
+8. Cleanup: `docker rm cscb-ci-${RUN_ID} 2>/dev/null || true`. On `PASS`, also `rm -rf "${RESULTS_DIR}"`. On `FAIL` or missing-verdict, **leave `${RESULTS_DIR}` for operator inspection** — the operator removes it once they're done debugging.
 
 ## Non-runnable conditions
 
