@@ -51,4 +51,7 @@ GLOBAL_PKG="${GLOBAL_PKG}" PKG_NAME="claude-slack-channel-bots" bun -e '
     fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
     console.log("[publish] sanitized: " + changed.join(", ") + " in " + p);
   }
-'
+' || {
+  echo "[publish] sanitize-global: bun -e failed; leaving global package.json untouched and continuing" >&2
+  exit 0
+}
