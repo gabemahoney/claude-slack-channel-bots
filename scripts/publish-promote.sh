@@ -73,12 +73,15 @@ if [ "${HEAD_SHA}" != "${COMMIT_SHA}" ]; then
 fi
 
 # Verify tag exists locally and points at the same commit.
-if ! TAG_SHA="$(git rev-parse --verify "refs/tags/${TAG_NAME}" 2>/dev/null)"; then
+# Use ^{commit} to dereference annotated tags to the underlying commit SHA;
+# bare 'git rev-parse refs/tags/<tag>' returns the tag-object SHA for annotated
+# tags, which never matches a commit SHA. /publish prepare creates annotated tags.
+if ! TAG_SHA="$(git rev-parse --verify "refs/tags/${TAG_NAME}^{commit}" 2>/dev/null)"; then
   echo "promote (precondition): manifest expects local tag ${TAG_NAME} but it does not exist. Operator recovery (the LLM driving /publish promote MUST NOT create the tag): delete .publish-state.json and rerun '/publish prepare ${BUMP_KIND}'." >&2
   exit 1
 fi
 if [ "${TAG_SHA}" != "${COMMIT_SHA}" ]; then
-  echo "promote (precondition): manifest tag ${TAG_NAME} points to ${TAG_SHA}, not the manifest commit ${COMMIT_SHA}. Operator recovery (the LLM driving /publish promote MUST NOT move the tag): have the operator inspect 'git show ${TAG_NAME}', then delete .publish-state.json and rerun '/publish prepare ${BUMP_KIND}'." >&2
+  echo "promote (precondition): manifest tag ${TAG_NAME} points to commit ${TAG_SHA}, not the manifest commit ${COMMIT_SHA}. The tag has been moved or the manifest is stale. Operator recovery (the LLM driving /publish promote MUST NOT move the tag): have the operator inspect 'git show ${TAG_NAME}' to understand the drift, then run 'git tag -d ${TAG_NAME} && rm -f .publish-state.json' to clear the prepared state, then rerun '/publish prepare ${BUMP_KIND}' to produce a fresh consistent set." >&2
   exit 1
 fi
 
