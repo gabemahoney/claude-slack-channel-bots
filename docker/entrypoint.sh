@@ -42,7 +42,7 @@ import json
 d = {
     'permissions': {
         'allow': ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'],
-        'defaultMode': 'acceptEdits'
+        'defaultMode': 'bypassPermissions'
     },
     'skipDangerousModePermissionPrompt': True
 }
