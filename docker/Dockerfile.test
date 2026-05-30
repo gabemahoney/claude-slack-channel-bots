@@ -1,16 +1,20 @@
 FROM cscb-ci-base:v1
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Bash integration tests — runner.sh + the three test scripts.
 COPY tests /tests
-RUN chmod +x /tests/runner.sh /tests/integration/*.sh
 
 # Testplans hive — human-prose source of truth for what gets tested.
 COPY testplans /test-repo/testplans
 
-RUN useradd -m -s /bin/bash testuser && chown -R testuser:testuser /test-repo
+# Consolidated into one RUN: each separate RUN incurs ~25s of docker-daemon
+# container-lifecycle overhead on this host (per b.5oh). Chained chmods +
+# useradd + chown pay that overhead once.
+RUN chmod +x /usr/local/bin/entrypoint.sh && \
+    chmod +x /tests/runner.sh /tests/integration/*.sh && \
+    useradd -m -s /bin/bash testuser && \
+    chown -R testuser:testuser /test-repo
 
 WORKDIR /test-repo
 
