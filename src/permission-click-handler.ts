@@ -4,21 +4,16 @@
  * Consumes Socket Mode interactive events whose action_id matches the
  * SR-2.2 shape `perm_(allow|deny)_<claude_instance_id>_<request_id>`.
  *
- * Sequence per click (SR-2.2):
- *   1. Parse the action_id; if malformed, treat as stale-click no-op.
- *   2. Look up the live entry in permission-poller's module-scoped map and
- *      set its `finalizedAt = now()` to claim the message (suppresses the
- *      poller's "expired" update for 30 s).
- *   3. `client.get({claude_instance_id})` and compare the typed
- *      `permission_request.request_id` to the encoded value. Mismatch →
- *      `chat.update` to "already decided" without calling decide().
- *   4. `client.decide({ claude_instance_id, decision })`. `ErrAlreadyDecided`
- *      is treated as success (idempotent).
- *   5. `chat.update` the live message to "Allowed/Denied by <user>".
- *      Drop the live entry.
- *
- * Errors after the claim leave `finalizedAt` set so the poller skips the
- * entry for the 30 s window; the operator can re-click.
+ * Sequence per click:
+ *   1. Parse the action_id; if malformed, return false (not our event).
+ *   2. Look up the live entry; if absent, log stale click and return true.
+ *   3. client.get() + compare request_id. Mismatch or spawn gone →
+ *      chat.update "already decided"; set handled=true only if that update
+ *      succeeds. Do NOT call dropPermission — tick owns the entry.
+ *   4. client.decide(). ErrAlreadyDecided treated as success.
+ *   5. chat.update "Allowed/Denied by <user>". ONLY on success: markHandled().
+ *      If chat.update throws, leave handled=false so the tick's expire path
+ *      fires a second-chance update on next interval.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -32,9 +27,8 @@ import type { WebClient } from '@slack/web-api'
 
 import { parsePermissionActionId, type PermissionDecision } from './permission-action-id.ts'
 import {
-  claimPermission,
-  dropPermission,
   getLivePermission,
+  markHandled,
 } from './permission-poller.ts'
 
 export interface ClickDeps {
@@ -97,8 +91,13 @@ export async function handlePermissionClick(
     return true
   }
 
-  // Step 2: claim the message so the poller doesn't race us.
-  claimPermission(claudeInstanceId)
+  if (entry.requestId !== requestId) {
+    // The live entry has already moved on to a later request_id — this is a
+    // stale click against a message the tick has already replaced or dropped.
+    // Do not touch the entry; the tick is the sole owner of the new message.
+    logDeps(deps, `[slack] permission-click: live entry has advanced past request_id=${requestId} for ${claudeInstanceId} — stale click, no-op`)
+    return true
+  }
 
   // Step 3: refetch + compare request_id to detect stale-button clicks.
   let currentRequestId: number | null
@@ -112,13 +111,13 @@ export async function handlePermissionClick(
     } else {
       const e = err instanceof AgentDirectorError ? err : null
       logDeps(deps, `[slack] permission-click: get failed for ${claudeInstanceId}: ${e?.errName ?? String(err)}`)
-      // Leave finalizedAt set so the poller skips the entry for 30 s.
+      // Do not touch handled. Tick will re-evaluate next interval.
       return true
     }
   }
 
   if (currentRequestId === null || currentRequestId !== requestId) {
-    // Stale click — no decide() call.
+    // Stale click — no decide() call. Tick owns the entry drop.
     try {
       await deps.web.chat.update({
         channel: entry.channelId,
@@ -126,10 +125,11 @@ export async function handlePermissionClick(
         text: 'already decided — stale prompt',
         blocks: buildAlreadyDecidedBlocks() as never,
       })
+      markHandled(claudeInstanceId)
     } catch (err) {
       logDeps(deps, `[slack] permission-click: stale-click chat.update failed for ${claudeInstanceId}:`, err)
+      // Leave handled=false so tick's expire path fires on next interval.
     }
-    dropPermission(claudeInstanceId)
     return true
   }
 
@@ -140,8 +140,7 @@ export async function handlePermissionClick(
     if (!(err instanceof ErrAlreadyDecided)) {
       const e = err instanceof AgentDirectorError ? err : null
       logDeps(deps, `[slack] permission-click: decide failed for ${claudeInstanceId}: ${e?.errName ?? String(err)}`)
-      // Leave finalizedAt set; the operator can re-click. Don't update the
-      // Slack message — the buttons are still visible.
+      // Leave handled=false; the operator can re-click. Buttons still visible.
       return true
     }
   }
@@ -160,9 +159,11 @@ export async function handlePermissionClick(
       text: `Permission — ${decision === 'allow' ? 'Allowed' : 'Denied'} by ${userName}`,
       blocks: buildDecisionBlocks(decision, userName) as never,
     })
+    // Only mark handled after the update succeeds. If update throws, handled
+    // stays false so the tick's expire path fires a second-chance update.
+    markHandled(claudeInstanceId)
   } catch (err) {
     logDeps(deps, `[slack] permission-click: decision chat.update failed for ${claudeInstanceId}:`, err)
   }
-  dropPermission(claudeInstanceId)
   return true
 }

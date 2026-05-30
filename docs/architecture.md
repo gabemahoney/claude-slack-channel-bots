@@ -20,7 +20,7 @@ cli.ts                          CLI entry point — start/stop/clean_restart sub
     ├── agent-director-template.ts SR-3.1 / SR-3.2 — builds the slack-channel-bot MakeTemplateParams and calls client.makeTemplate({ overwrite: true }) at boot.
     ├── session-manager.ts      SR-1 in full — spawnForRoute (SR-1.4 collision-then-act), reconcileOrphans (SR-1.6), reconnectMcp/waitForWaitingAndReconnect, postSpawnFailureToChannel.
     ├── permission-poller.ts    SR-2.1 polling loop + SR-2.2 Block Kit emitter. Owns the live LivePermission map shared with the click handler.
-    ├── permission-click-handler.ts  SR-2.2 click → decide path; coordinates with the poller via finalizedAt claim window.
+    ├── permission-click-handler.ts  SR-2.2 click → decide path; compares request_id before deciding, then sets the handled flag after chat.update succeeds.
     ├── permission-action-id.ts SR-2.2 encode/decode helpers; anchored-regex parser (SR-8.6).
     ├── restart.ts              Auto-restart — delayed relaunch on disconnect, failure counting, timer cancellation.
     ├── health-check.ts         Periodic liveness poller — checks routes on a timer via client.status; schedules restarts for dead sessions.
@@ -54,12 +54,16 @@ The deleted files from the pre-Epic-2 architecture (`src/tmux.ts`, `src/peer-pid
 
 Driven by polling against the agent-director Client + Block Kit click → `decide()`. The previous HTTP long-poll + hook script architecture has been deleted.
 
-1. agent-director moves a spawn into `check_permission` when Claude requests a tool permission. CSCB's poller (`permission-poller.ts`) runs `client.list({ state: ['check_permission'], label: ['service=cscb'] })` every `agent_director_poll_interval_ms` (default 1000 ms).
-2. For each newly-seen `claude_instance_id`, `client.get(...)` returns the row's typed `permission_request` payload (`tool_name`, raw-JSON `tool_input`, integer `request_id`). The poller posts the SR-2.2 Block Kit message to the channel from the spawn's `channel` label and records the live entry `(messageTs, channelId, request_id)`.
-3. Action IDs follow SR-2.2's shape `perm_(allow|deny)_<claude_instance_id>_<request_id>` (parsed by the anchored regex in `permission-action-id.ts`).
-4. On click, `permission-click-handler.ts` claims the live entry (`finalizedAt = now()`), `client.get(...)` to verify the encoded `request_id` still matches the open prompt's, calls `client.decide({ claude_instance_id, decision })`, and `chat.update`s the Slack message to "Allowed/Denied by <user>". `ErrAlreadyDecided` is treated as success.
-5. If a tracked instance drops out of the next list result (timeout / external decide / crash) and the `finalizedAt` claim is older than 30 s, the poller `chat.update`s the message to "expired" and removes the buttons.
-6. Slack-side UX (Block Kit structure, decision-update text) is byte-identical to the pre-Epic-2 implementation. Only the action_id shape and the polling/decide machinery differ.
+1. (SR-2.1) On every tick, the poller runs `client.list({ state: ['check_permission'], label: ['service=cscb'] })`. For each spawn in the result it calls `client.get(...)` and reads `permission_request.request_id`. CSCB never reads `decision` or `decision_reason` — DB state (request_id and presence in `check_permission`) is definitive.
+2. Per-spawn reconciliation follows a four-case matrix keyed on the live-entry map and request_id comparison:
+   - No live entry → post Block Kit; record `(channelId, messageTs, requestId, handled=false)`.
+   - Live entry, `requestId` matches (handled true or false) → no-op; already tracked.
+   - Live entry, `requestId` advanced: if `handled=false`, `chat.update` old message to "no longer active"; if `handled=true`, suppress (click handler already wrote "Allowed/Denied"). Either way: drop entry, post fresh Block Kit for the new request.
+   - Spawn absent from list result: if `handled=false`, `chat.update` "expired"; if `handled=true`, suppress. Drop entry.
+3. (SR-2.2) Action IDs follow the shape `perm_(allow|deny)_<claude_instance_id>_<request_id>` (parsed by the anchored regex in `permission-action-id.ts`).
+4. On click, `permission-click-handler.ts` calls `client.get(...)` and compares the live entry's `requestId` to the button's encoded `request_id`; a mismatch or missing spawn → `chat.update` "already decided" and, on success, `markHandled()` (so the tick's expire path stays suppressed). On a match, `client.decide(...)` is called (`ErrAlreadyDecided` treated as success), then `chat.update` "Allowed/Denied by <user>". `markHandled()` is called **only after that `chat.update` succeeds** — if it throws, `handled` stays false so the next tick's expire path fires a recovery update and buttons are never orphaned. The click handler does NOT call `dropPermission`; the tick is the sole owner of clearing entries.
+5. The old 30-second `finalizedAt` claim window has been removed. Reconciliation is now per-tick and request_id-driven, which subsumes `b.5um` (consecutive-request stall) and `b.yuy` (click-handler error stall).
+6. Slack-side UX (Block Kit structure, decision-update text) is unchanged from the pre-Epic-2 implementation. Only the action_id shape and the polling/decide machinery differ.
 
 AskUserQuestion is denied at the agent-director template (SR-3.1's `deny: ['AskUserQuestion']`) — the tool is unavailable to every CSCB-spawned bot and the prior `/ask` HTTP route + hook script have been removed.
 

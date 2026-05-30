@@ -1,26 +1,24 @@
 /**
  * permission-poller.ts — SR-2.1 permission-state poller.
  *
- * Single-threaded interval loop that calls
+ * Every tick, for each spawn in check_permission, calls client.get() and
+ * compares the returned request_id to the live entry's stored requestId.
+ * DB state is definitive; CSCB reconciles its Slack UI against it.
  *
- *   client.list({ state: ['check_permission'], label: ['service=cscb'] })
+ * Behavior matrix per tick:
+ *   1. No live entry → post Block Kit.
+ *   2. Live entry, request_id matches, handled=false → no-op.
+ *   3. Live entry, request_id matches, handled=true  → no-op.
+ *   4. Live entry, request_id changed:
+ *        handled=false → chat.update "no longer active" + dropPermission + post fresh Block Kit.
+ *        handled=true  → dropPermission only, then post fresh Block Kit.
+ *   5. Spawn drops from list:
+ *        handled=false → expire chat.update + dropPermission.
+ *        handled=true  → dropPermission only (suppress chat.update).
  *
- * On each tick, for any newly-seen `claude_instance_id` we fetch the full row
- * via `client.get(...)`, parse the typed `permission_request` payload, build
- * the SR-2.2 Block Kit message via the existing `buildPermissionBlocks`
- * helper, and `chat.postMessage` it to the spawn's `channel` label. We
- * remember `(messageTs, channelId, requestId)` in a module-level map.
- *
- * For any tracked instance id that disappears from a later list result (the
- * spawn transitioned out of `check_permission` for any reason), we
- * `chat.update` the Slack message to "expired" and drop the entry — unless
- * the click handler has marked the entry as `finalized_at` within the last
- * 30 s. That window prevents poller / click-handler races on the same
- * message.
- *
- * If a tick is still in flight when the next interval fires, the new tick
- * is *skipped*. Skipping five or more times in a row logs a WARN —
- * tick-budget degradation observability.
+ * If get() returns permission_request===null while spawn is still in
+ * check_permission, treat as a transient race and skip reconciliation for
+ * that row this tick.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -47,8 +45,8 @@ export interface LivePermission {
   channelId: string
   messageTs: string
   requestId: number
-  /** Set to Date.now() by the click handler to claim the message. */
-  finalizedAt: number | null
+  /** Set to true by the click handler once its final chat.update succeeds. */
+  handled: boolean
 }
 
 /**
@@ -83,9 +81,6 @@ let tickInFlight = false
 let skippedTicks = 0
 let depsRef: PollerDeps | null = null
 
-/** Window during which a click handler's `finalizedAt` claim suppresses the poller's "expired" update. */
-const FINALIZED_WINDOW_MS = 30_000
-
 // ---------------------------------------------------------------------------
 // Module-state accessors (used by the click handler)
 // ---------------------------------------------------------------------------
@@ -95,15 +90,15 @@ export function getLivePermission(claudeInstanceId: string): LivePermission | un
   return livePermissions.get(claudeInstanceId)
 }
 
-/** Claim the message: set finalizedAt to now() — call from the click handler. */
-export function claimPermission(claudeInstanceId: string): boolean {
+/** Mark the entry as handled — call from the click handler after its chat.update succeeds. */
+export function markHandled(claudeInstanceId: string): boolean {
   const entry = livePermissions.get(claudeInstanceId)
   if (!entry) return false
-  entry.finalizedAt = Date.now()
+  entry.handled = true
   return true
 }
 
-/** Drop the entry — called from the click handler after the decision update lands. */
+/** Drop the entry — the tick is the sole owner of clearing entries. */
 export function dropPermission(claudeInstanceId: string): void {
   livePermissions.delete(claudeInstanceId)
 }
@@ -204,8 +199,8 @@ async function runTick(deps: PollerDeps): Promise<void> {
     const seenIds = new Set<string>()
     for (const row of rows) {
       seenIds.add(row.claude_instance_id)
-      if (livePermissions.has(row.claude_instance_id)) continue
-      // New instance id — fetch the full row.
+
+      // Always fetch the full row to compare request_id.
       let got: GetResult
       try {
         got = await client.get({ claude_instance_id: row.claude_instance_id })
@@ -215,23 +210,44 @@ async function runTick(deps: PollerDeps): Promise<void> {
         logViaDeps(deps, `[slack] permission-poller: get failed for ${row.claude_instance_id}: ${e?.errName ?? String(err)}`)
         continue
       }
+
       if (!got.permission_request) {
-        // Race: spawn is in check_permission but the row was decided between
-        // list and get. Skip; next tick picks it up.
+        // Transient race: spawn is in check_permission but permission_request is null.
+        // Leave existing entry alone; skip reconciliation for this row this tick.
         continue
       }
+
+      const incomingRequestId = got.permission_request.request_id
+      const existing = livePermissions.get(row.claude_instance_id)
+
+      if (!existing) {
+        // Case 1: No live entry — post Block Kit.
+        await postPermissionPrompt(deps, row, got.permission_request)
+        continue
+      }
+
+      if (existing.requestId === incomingRequestId) {
+        // Cases 2 & 3: request_id matches — no-op regardless of handled.
+        continue
+      }
+
+      // Case 4: request_id changed (advanced).
+      if (!existing.handled) {
+        // handled=false → update old message to "no longer active" + drop + post fresh.
+        await updateNoLongerActive(deps, row.claude_instance_id, existing)
+      }
+      // handled=true → drop only (click handler already wrote "Allowed/Denied").
+      dropPermission(row.claude_instance_id)
       await postPermissionPrompt(deps, row, got.permission_request)
     }
 
-    // Expire entries no longer in the result set.
+    // Case 5: Expire entries no longer in the result set.
     for (const [id, entry] of livePermissions) {
       if (seenIds.has(id)) continue
-      const claimedWithinWindow =
-        entry.finalizedAt !== null &&
-        Date.now() - entry.finalizedAt < FINALIZED_WINDOW_MS
-      if (!claimedWithinWindow) {
+      if (!entry.handled) {
         await expirePermissionPrompt(deps, id, entry)
       }
+      // handled=true → suppress chat.update; just drop.
       livePermissions.delete(id)
     }
   } finally {
@@ -285,10 +301,35 @@ async function postPermissionPrompt(
       channelId,
       messageTs,
       requestId: permission.request_id,
-      finalizedAt: null,
+      handled: false,
     })
   } catch (err) {
     logViaDeps(deps, `[slack] permission-poller: chat.postMessage failed for ${row.claude_instance_id}:`, err)
+  }
+}
+
+async function updateNoLongerActive(
+  deps: PollerDeps,
+  claudeInstanceId: string,
+  entry: LivePermission,
+): Promise<void> {
+  try {
+    await deps.web.chat.update({
+      channel: entry.channelId,
+      ts: entry.messageTs,
+      text: 'permission request no longer active',
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: '⏳ Permission request no longer active.',
+          },
+        },
+      ] as never,
+    })
+  } catch (err) {
+    logViaDeps(deps, `[slack] permission-poller: no-longer-active chat.update failed for ${claudeInstanceId}:`, err)
   }
 }
 
