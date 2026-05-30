@@ -29,6 +29,9 @@
 
 set -euo pipefail
 
+# shellcheck disable=SC2154
+trap 'rc=$?; if [ $rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
@@ -45,14 +48,26 @@ if [ ! -f "${MANIFEST}" ]; then
 fi
 
 # Parse manifest. jq returns null for missing fields, which we treat as
-# corruption; refuse to run rather than guess.
-BUMP_KIND="$(jq -r '.bump_kind // empty' "${MANIFEST}")"
-NEXT_VERSION="$(jq -r '.next_version // empty' "${MANIFEST}")"
-COMMIT_SHA="$(jq -r '.commit_sha // empty' "${MANIFEST}")"
-TAG_NAME="$(jq -r '.tag_name // empty' "${MANIFEST}")"
-TARBALL_ABS="$(jq -r '.tarball_path // empty' "${MANIFEST}")"
-TARBALL_SHA1_MANIFEST="$(jq -r '.tarball_sha1 // empty' "${MANIFEST}")"
-SMOKE_PASSED="$(jq -r '.smoke_passed // false' "${MANIFEST}")"
+# corruption; refuse to run rather than guess. Each read is wrapped so a
+# malformed-JSON jq crash surfaces an SR-precondition diagnostic instead of
+# silently exiting under set -e.
+_jq_manifest() {
+  local field="$1"
+  local default="${2-empty}"
+  local val
+  if ! val="$(jq -r ".${field} // ${default}" "${MANIFEST}")"; then
+    echo "promote (precondition): jq failed to read '.${field}' from ${MANIFEST}. The manifest is malformed JSON or jq is broken. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'jq . ${MANIFEST}' to inspect; if corrupt, delete it and rerun '/publish prepare <patch|minor|major>'." >&2
+    exit 1
+  fi
+  printf '%s' "${val}"
+}
+BUMP_KIND="$(_jq_manifest bump_kind)"
+NEXT_VERSION="$(_jq_manifest next_version)"
+COMMIT_SHA="$(_jq_manifest commit_sha)"
+TAG_NAME="$(_jq_manifest tag_name)"
+TARBALL_ABS="$(_jq_manifest tarball_path)"
+TARBALL_SHA1_MANIFEST="$(_jq_manifest tarball_sha1)"
+SMOKE_PASSED="$(_jq_manifest smoke_passed false)"
 
 for var in BUMP_KIND NEXT_VERSION COMMIT_SHA TAG_NAME TARBALL_ABS TARBALL_SHA1_MANIFEST; do
   if [ -z "${!var}" ]; then
@@ -67,7 +82,10 @@ if [ "${SMOKE_PASSED}" != "true" ]; then
 fi
 
 # Verify HEAD matches the manifest's commit_sha — refuse to push the wrong commit.
-HEAD_SHA="$(git rev-parse HEAD)"
+if ! HEAD_SHA="$(git rev-parse HEAD)"; then
+  echo "promote (precondition): 'git rev-parse HEAD' failed inside ${REPO_ROOT}. The repo is in an unusual state (detached/missing HEAD, corrupt .git). Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'git status' to inspect the repo, resolve the underlying issue, then rerun '/publish promote'." >&2
+  exit 1
+fi
 if [ "${HEAD_SHA}" != "${COMMIT_SHA}" ]; then
   echo "promote (precondition): manifest commit_sha is ${COMMIT_SHA} but HEAD is ${HEAD_SHA}. The repo has drifted since /publish prepare ran. Operator recovery (the LLM driving /publish promote MUST NOT mutate the repo): have the operator inspect 'git log --oneline ${COMMIT_SHA}..HEAD' to understand the drift, then either (a) 'git reset --hard ${COMMIT_SHA}' to return to the prepared state and rerun '/publish promote', or (b) delete .publish-state.json and rerun '/publish prepare ${BUMP_KIND}' from scratch." >&2
   exit 1
@@ -87,7 +105,10 @@ if [ "${TAG_SHA}" != "${COMMIT_SHA}" ]; then
 fi
 
 # Verify package.json version matches manifest's next_version.
-PKG_VERSION="$(node -p "require('./package.json').version")"
+if ! PKG_VERSION="$(node -p "require('./package.json').version")"; then
+  echo "promote (precondition): 'node -p \"require('./package.json').version\"' failed reading ${REPO_ROOT}/package.json. The file is missing, malformed, or has no .version field. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'cat ${REPO_ROOT}/package.json | jq .version' to inspect; if the working tree has drifted, delete ${MANIFEST} and rerun '/publish prepare ${BUMP_KIND}'." >&2
+  exit 1
+fi
 if [ "${PKG_VERSION}" != "${NEXT_VERSION}" ]; then
   echo "promote (precondition): manifest next_version is ${NEXT_VERSION} but package.json on disk is at ${PKG_VERSION}. The working tree drifted from the prepared state. Operator recovery (the LLM driving /publish promote MUST NOT edit package.json): delete .publish-state.json and rerun '/publish prepare ${BUMP_KIND}'." >&2
   exit 1
@@ -99,8 +120,11 @@ if [ ! -f "${TARBALL_ABS}" ]; then
   exit 1
 fi
 
-# Verify tarball content hasn't drifted since prepare.
-TARBALL_SHA1_DISK="$(sha1sum "${TARBALL_ABS}" | awk '{print $1}')"
+# Verify tarball content hasn't drifted since prepare. The `|| true` keeps a
+# sha1sum/awk pipeline failure from silently exiting under set -e + pipefail;
+# the next comparison treats an empty result as a mismatch and fires its own
+# precondition diagnostic.
+TARBALL_SHA1_DISK="$(sha1sum "${TARBALL_ABS}" | awk '{print $1}' || true)"
 if [ "${TARBALL_SHA1_DISK}" != "${TARBALL_SHA1_MANIFEST}" ]; then
   echo "promote (precondition): tarball at ${TARBALL_ABS} has sha1 ${TARBALL_SHA1_DISK} but manifest recorded ${TARBALL_SHA1_MANIFEST}. The tarball has been modified or replaced since prepare. Operator recovery (the LLM driving /publish promote MUST NOT repack): delete .publish-state.json and rerun '/publish prepare ${BUMP_KIND}'." >&2
   exit 1
@@ -129,7 +153,7 @@ fi
 # Conservative: if remote main is a different SHA (including a descendant we
 # weren't expecting), we still attempt the push — a non-fast-forward push will
 # fail loudly with the operator-recovery prose below.
-REMOTE_MAIN_SHA="$(git ls-remote origin refs/heads/main 2>/dev/null | awk '{print $1}')"
+REMOTE_MAIN_SHA="$(git ls-remote origin refs/heads/main 2>/dev/null | awk '{print $1}' || true)"
 if [ "${REMOTE_MAIN_SHA}" = "${COMMIT_SHA}" ]; then
   echo "SR-5.2 (push commit): origin/main is already at ${COMMIT_SHA} — skipping push (idempotent)."
 else
@@ -161,7 +185,7 @@ else
 fi
 
 # SR-5.4 — push the version tag to origin, idempotent.
-REMOTE_TAG_SHA="$(git ls-remote origin "refs/tags/${TAG_NAME}" 2>/dev/null | awk '{print $1}')"
+REMOTE_TAG_SHA="$(git ls-remote origin "refs/tags/${TAG_NAME}" 2>/dev/null | awk '{print $1}' || true)"
 if [ -n "${REMOTE_TAG_SHA}" ]; then
   echo "SR-5.4 (push tag): origin already has tag ${TAG_NAME} — skipping push (idempotent)."
 else
@@ -174,7 +198,11 @@ fi
 # SR-6.1 — poll npm registry until v${NEXT_VERSION} is visible (5s cadence, up to 12 attempts = 60s)
 VERIFIED=0
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-  REGISTRY_VERSION="$(npm view "claude-slack-channel-bots@${NEXT_VERSION}" version 2>/dev/null | tr -d '[:space:]')"
+  # `|| true` is load-bearing: when npm registry hasn't yet propagated v${NEXT_VERSION},
+  # `npm view` exits non-zero (E404), and under set -e + pipefail the bare pipeline-
+  # assignment kills the script with no SR-X.Y diagnostic. The empty-result case
+  # is the intended retry path, so we tolerate it explicitly here.
+  REGISTRY_VERSION="$(npm view "claude-slack-channel-bots@${NEXT_VERSION}" version 2>/dev/null | tr -d '[:space:]' || true)"
   if [ "${REGISTRY_VERSION}" = "${NEXT_VERSION}" ]; then
     VERIFIED=1
     break
@@ -198,7 +226,7 @@ fi
 # remove step may not have cleared (e.g. a prior `install-local.sh` symlink farm).
 GLOBAL_DIR="${BUN_INSTALL:-$HOME/.bun}/install/global"
 bun remove -g claude-slack-channel-bots > /dev/null 2>&1 || true
-rm -rf "${GLOBAL_DIR}/node_modules/claude-slack-channel-bots"
+rm -rf "${GLOBAL_DIR}/node_modules/claude-slack-channel-bots" || true
 
 # SR-7.3 — install the just-published version from npm (the exact command an end user would run)
 if ! bun install -g "claude-slack-channel-bots@${NEXT_VERSION}"; then
@@ -213,7 +241,10 @@ if [ -z "${INSTALLED_BIN_PATH}" ]; then
   exit 72
 fi
 
-RESOLVED_BIN="$(readlink -f "${INSTALLED_BIN_PATH}")"
+if ! RESOLVED_BIN="$(readlink -f "${INSTALLED_BIN_PATH}")"; then
+  echo "SR-7.4 (post-publish verification): 'readlink -f ${INSTALLED_BIN_PATH}' failed — the bin path on PATH does not resolve. State: the release IS published (v${NEXT_VERSION} is on npm + tag is on origin) but the local global install layout is broken. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'bun remove -g claude-slack-channel-bots' and then 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually, then 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
+  exit 72
+fi
 case "${RESOLVED_BIN}" in
   "${GLOBAL_DIR}"/*) ;;
   *)
@@ -228,7 +259,10 @@ if [ ! -f "${INSTALLED_PKG_JSON}" ]; then
   exit 72
 fi
 
-INSTALLED_VERSION="$(jq -r .version "${INSTALLED_PKG_JSON}")"
+if ! INSTALLED_VERSION="$(jq -r .version "${INSTALLED_PKG_JSON}")"; then
+  echo "SR-7.4 (post-publish verification): 'jq -r .version ${INSTALLED_PKG_JSON}' failed — installed package.json is malformed JSON. State: the release IS published but the local install is broken. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'bun remove -g claude-slack-channel-bots' and then 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually, then 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
+  exit 72
+fi
 if [ "${INSTALLED_VERSION}" != "${NEXT_VERSION}" ]; then
   echo "SR-7.4 (post-publish verification): installed version '${INSTALLED_VERSION}' != published ${NEXT_VERSION}. State: the release IS published but the local install resolved to a stale version. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'bun remove -g claude-slack-channel-bots' followed by 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually until the installed version matches, then 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
   exit 72
@@ -281,7 +315,7 @@ GITHUB_TAG_URL="https://github.com/gabemahoney/claude-slack-channel-bots/release
 # job is done. If anything post-success fails later (e.g. operator interrupts
 # the clean_restart they're supposed to run), the manifest staying around
 # would falsely suggest "there's a release in flight that needs promoting."
-rm -f "${MANIFEST}"
+rm -f "${MANIFEST}" || true
 
 cat <<EOF
 

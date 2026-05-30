@@ -23,6 +23,9 @@
 
 set -euo pipefail
 
+# shellcheck disable=SC2154
+trap 'rc=$?; if [ $rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+
 BUMP_KIND="${1:-}"
 case "${BUMP_KIND}" in
   patch|minor|major) ;;
@@ -46,7 +49,10 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 10
 fi
 
-CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if ! CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"; then
+  echo "SR-2.1 (preflight): 'git rev-parse --abbrev-ref HEAD' failed inside ${REPO_ROOT}. The repo is in an unusual state (e.g., HEAD points at a missing ref or .git is corrupt). Operator recovery: have the operator run 'git status' to inspect, resolve the underlying repo issue, then rerun '/publish ${BUMP_KIND}'." >&2
+  exit 10
+fi
 if [ "${CURRENT_BRANCH}" != "main" ]; then
   echo "SR-2.1 (preflight): not on main (HEAD branch is '${CURRENT_BRANCH}'). Run 'git checkout main' (or invoke /publish from a worktree whose HEAD is main and in sync with origin/main), then rerun '/publish ${BUMP_KIND}'." >&2
   exit 10
@@ -57,8 +63,14 @@ if ! git fetch origin; then
   exit 11
 fi
 
-LOCAL_SHA="$(git rev-parse main)"
-REMOTE_SHA="$(git rev-parse origin/main)"
+if ! LOCAL_SHA="$(git rev-parse main)"; then
+  echo "SR-2.1 (preflight): 'git rev-parse main' failed — the local 'main' ref is missing or corrupt. Operator recovery: have the operator run 'git branch' to confirm a 'main' branch exists locally and 'git status' to inspect; resolve the underlying ref issue, then rerun '/publish ${BUMP_KIND}'." >&2
+  exit 10
+fi
+if ! REMOTE_SHA="$(git rev-parse origin/main)"; then
+  echo "SR-2.1 (preflight): 'git rev-parse origin/main' failed — the 'origin/main' remote-tracking ref is missing despite 'git fetch origin' having just succeeded. Operator recovery: have the operator run 'git remote -v' to confirm origin is configured and 'git fetch origin' to refresh; resolve the underlying ref issue, then rerun '/publish ${BUMP_KIND}'." >&2
+  exit 10
+fi
 # Acceptable: local equals remote, OR local is fast-forward ahead of remote (the release-cutting case).
 # Unacceptable: local is behind remote, OR local and remote have diverged.
 if ! git merge-base --is-ancestor "${REMOTE_SHA}" HEAD; then
@@ -95,7 +107,10 @@ if ! npm whoami > /dev/null 2>&1; then
   exit 14
 fi
 
-CURRENT_VERSION="$(node -p "require('./package.json').version")"
+if ! CURRENT_VERSION="$(node -p "require('./package.json').version")"; then
+  echo "SR-2.1 (preflight): 'node -p \"require('./package.json').version\"' failed — package.json is missing, malformed, or has no .version field. Operator recovery: have the operator run 'cat package.json | jq .version' to inspect; fix the package.json defect on main, commit, then rerun '/publish ${BUMP_KIND}'." >&2
+  exit 10
+fi
 IFS='.' read -r MAJOR MINOR PATCH <<< "${CURRENT_VERSION}"
 case "${BUMP_KIND}" in
   major) NEXT_VERSION="$((MAJOR + 1)).0.0" ;;
@@ -110,7 +125,10 @@ fi
 
 # SR-2.5 — host's agent-director binary version satisfies package.json's declared range.
 # Skipped when no agent-director dependency is declared (preserves portability for forks).
-AD_RANGE="$(jq -r '.dependencies["agent-director"] // empty' package.json)"
+if ! AD_RANGE="$(jq -r '.dependencies["agent-director"] // empty' package.json)"; then
+  echo "SR-2.5 (preflight): 'jq -r .dependencies[\"agent-director\"]' on package.json failed — package.json is malformed JSON or jq is broken. Operator recovery: have the operator run 'jq . package.json' to verify the file parses; fix the JSON defect on main, commit, then rerun '/publish ${BUMP_KIND}'." >&2
+  exit 15
+fi
 if [ -n "${AD_RANGE}" ]; then
   AD_VERSION="$(agent-director version 2>/dev/null | jq -r '.version // empty' 2>/dev/null || true)"
   if [ -z "${AD_VERSION}" ]; then

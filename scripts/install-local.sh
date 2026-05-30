@@ -13,10 +13,16 @@
 # `bun install -g .` run.
 set -euo pipefail
 
+# shellcheck disable=SC2154
+trap 'rc=$?; if [ $rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
-pkg_name=$(bun -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync("package.json","utf8")).name)')
+if ! pkg_name=$(bun -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync("package.json","utf8")).name)'); then
+  echo "[install-local] failed to read package name from package.json via 'bun -e'. Cannot proceed with the global install. Inspect package.json and the bun installation, then rerun 'scripts/install-local.sh'." >&2
+  exit 1
+fi
 
 global_dir=${BUN_INSTALL_GLOBAL:-${BUN_INSTALL:-$HOME/.bun}/install/global}
 global_pkg=$global_dir/package.json
@@ -45,7 +51,10 @@ if [[ -f "$global_pkg" ]]; then
       fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
       console.log("[install-local] sanitized: " + changed.join(", ") + " in " + p);
     }
-  '
+  ' || {
+    echo "[install-local] sanitize bun -e failed; leaving global package.json untouched and exiting without installing. Inspect $global_pkg manually for the bun-1.3.13 empty-string-key poison, then rerun 'scripts/install-local.sh'." >&2
+    exit 0
+  }
 fi
 
 echo "[install-local] running: bun add -g file:$repo_root"
