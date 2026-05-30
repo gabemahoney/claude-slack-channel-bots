@@ -10,11 +10,29 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { existsSync, mkdirSync, writeFileSync, symlinkSync, readlinkSync, unlinkSync, renameSync } from 'fs'
+import { existsSync, mkdirSync, writeFileSync, symlinkSync, readlinkSync, unlinkSync, renameSync, readFileSync } from 'fs'
 import { homedir } from 'os'
 import { dirname, join, resolve } from 'path'
 import { defaultAccess } from './lib.ts'
 import { MCP_SERVER_NAME } from './config.ts'
+
+/**
+ * Read the agent-director dependency range from the shipping package.json.
+ * Same pattern as src/agent-director-client.ts's MIN_AD_VERSION derivation —
+ * one source of truth for the AD version requirement.
+ */
+export function readAdDependencyRange(): string {
+  const pkgPath = resolve(dirname(import.meta.filename), '..', 'package.json')
+  const raw = readFileSync(pkgPath, 'utf-8')
+  const pkg = JSON.parse(raw) as { dependencies?: Record<string, string> }
+  const range = pkg.dependencies?.['agent-director']
+  if (typeof range !== 'string' || range.length === 0) {
+    throw new Error(
+      `postinstall: package.json dependencies['agent-director'] is missing or empty`,
+    )
+  }
+  return range
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -147,9 +165,10 @@ export async function runAgentDirectorPostinstallProbe(): Promise<void> {
     }
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err)
+    const adRange = readAdDependencyRange()
     console.warn(
       `postinstall warning: agent-director probe failed (${detail}). ` +
-      `Install agent-director (\`bun add agent-director@^0.4.3\`) before running ` +
+      `Install agent-director (\`bun add agent-director@${adRange}\`) before running ` +
       `\`claude-slack-channel-bots start\`; the startup gate will fail otherwise.`,
     )
   }

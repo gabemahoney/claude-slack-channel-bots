@@ -12,7 +12,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync, renameSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { runPostinstall, runAgentDirectorPostinstallProbe } from '../src/postinstall.ts'
+import { runPostinstall, runAgentDirectorPostinstallProbe, readAdDependencyRange } from '../src/postinstall.ts'
 import { defaultAccess } from '../src/lib.ts'
 import { MCP_SERVER_NAME } from '../src/config.ts'
 
@@ -434,5 +434,22 @@ describe('runAgentDirectorPostinstallProbe (SR-5.2)', () => {
     // the probe succeed in unit tests (real FFI + native libs), but we can
     // verify the no-throw contract under both happy and unhappy paths.
     await expect(runAgentDirectorPostinstallProbe()).resolves.toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.s4f: AD-missing warning derives range from package.json (no hard-coding)
+// ---------------------------------------------------------------------------
+
+describe('readAdDependencyRange (b.s4f)', () => {
+  test('returns the range declared in this package.json', () => {
+    const pkgPath = join(import.meta.dir, '..', 'package.json')
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as {
+      dependencies?: Record<string, string>
+    }
+    const expected = pkg.dependencies?.['agent-director']
+
+    expect(typeof expected).toBe('string')
+    expect(readAdDependencyRange()).toBe(expected as string)
   })
 })
