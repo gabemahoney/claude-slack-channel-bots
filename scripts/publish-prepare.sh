@@ -40,6 +40,9 @@
 
 set -euo pipefail
 
+# shellcheck disable=SC2154
+trap 'rc=$?; if [ $rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BUMP_KIND="${1:-}"
@@ -69,7 +72,12 @@ cleanup() {
     rm -f "${TARBALL}"
   fi
 }
-trap cleanup EXIT
+# Composite EXIT trap: capture rc + BASH_COMMAND before cleanup mutates them,
+# run cleanup (drop any preserved tarball on failure paths), then fire the
+# SR-99.0 backstop if the script is exiting non-zero. Replaces the top-of-script
+# SR-99-only trap so the backstop coverage persists past this point.
+# shellcheck disable=SC2154
+trap '_rc=$?; _cmd="${BASH_COMMAND}"; cleanup; if [ $_rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $_rc at command: $_cmd. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
 rollback_working_tree() {
   # SR-3.2: restore package.json and bun.lock to HEAD. If git checkout itself
@@ -106,7 +114,7 @@ if ! npm version "${BUMP_KIND}" --no-git-tag-version > /dev/null; then
 fi
 
 # SR-4.1 — pack tarball + verify internal version
-rm -f claude-slack-channel-bots-*.tgz
+rm -f claude-slack-channel-bots-*.tgz || true
 
 if ! bun pm pack > /dev/null; then
   echo "SR-4.1 (pack): 'bun pm pack' did not produce a tarball. Working tree has been rolled back. Investigate the bun error above, then rerun '/publish prepare ${BUMP_KIND}'." >&2
@@ -121,7 +129,11 @@ if [ ! -f "${TARBALL}" ]; then
   exit 21
 fi
 
-TARBALL_VERSION="$(tar -xzOf "${TARBALL}" package/package.json | jq -r .version)"
+if ! TARBALL_VERSION="$(tar -xzOf "${TARBALL}" package/package.json | jq -r .version)"; then
+  echo "SR-4.1 (pack): could not read package/package.json from ${TARBALL} (tar or jq failed). Working tree has been rolled back. The tarball is malformed or jq could not parse the embedded package.json. Operator recovery: inspect 'tar -tzf ${TARBALL}' to confirm the layout and 'tar -xzOf ${TARBALL} package/package.json' to view the embedded manifest, then rerun '/publish prepare ${BUMP_KIND}'." >&2
+  rollback_working_tree
+  exit 21
+fi
 if [ "${TARBALL_VERSION}" != "${NEXT_VERSION}" ]; then
   echo "SR-4.1 (pack): tarball internal version '${TARBALL_VERSION}' != bumped ${NEXT_VERSION}. Working tree has been rolled back. This indicates a packing bug — investigate 'bun pm pack' output and package.json contents, then rerun '/publish prepare ${BUMP_KIND}'." >&2
   rollback_working_tree
@@ -161,7 +173,10 @@ if ! git tag -a "${TAG_NAME}" -m "Release v${NEXT_VERSION}"; then
 fi
 
 COMMIT_SHA="$(git rev-parse HEAD)"
-TARBALL_SHA1="$(sha1sum "${TARBALL_ABS}" | awk '{print $1}')"
+if ! TARBALL_SHA1="$(sha1sum "${TARBALL_ABS}" | awk '{print $1}')" || [ -z "${TARBALL_SHA1}" ]; then
+  echo "SR-8.1 (manifest write): could not compute sha1 of ${TARBALL_ABS} (sha1sum or awk failed, or produced no output). State: the release commit + annotated tag are on the local main branch; the tarball is on disk at ${TARBALL_ABS}; nothing has been pushed; .publish-state.json was NOT written. Operator recovery (the LLM driving /publish prepare MUST NOT execute these commands itself): have the operator inspect the tarball ('ls -l ${TARBALL_ABS}' and 'file ${TARBALL_ABS}') and confirm sha1sum is functional, then roll back with 'git reset --hard origin/main && git tag -d ${TAG_NAME} && rm -f ${TARBALL_ABS}' and rerun '/publish prepare ${BUMP_KIND}'." >&2
+  exit 90
+fi
 PREPARED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
 # SR-8.1 — write the handoff manifest. publish-promote.sh reads this as its

@@ -22,6 +22,9 @@
 
 set -euo pipefail
 
+# shellcheck disable=SC2154
+trap 'rc=$?; if [ $rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+
 TARBALL_ABS="${TARBALL_ABS:?TARBALL_ABS must be set}"
 NEXT_VERSION="${NEXT_VERSION:?NEXT_VERSION must be set}"
 BUMP_KIND="${BUMP_KIND:?BUMP_KIND must be set}"
@@ -32,7 +35,11 @@ cleanup() {
     rm -rf "${SCRATCH_DIR}"
   fi
 }
-trap cleanup EXIT
+# Composite EXIT trap: capture rc + BASH_COMMAND before cleanup mutates them,
+# run cleanup (remove the scratch BUN_INSTALL prefix), then fire the SR-99.0
+# backstop on non-zero exit. Replaces the top-of-script SR-99-only trap.
+# shellcheck disable=SC2154
+trap '_rc=$?; _cmd="${BASH_COMMAND}"; cleanup; if [ $_rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $_rc at command: $_cmd. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
 SCRATCH_DIR="$(mktemp -d)"
 
@@ -47,7 +54,10 @@ if [ ! -f "${INSTALLED_PKG}" ]; then
   exit 22
 fi
 
-INSTALLED_VERSION="$(jq -r .version "${INSTALLED_PKG}")"
+if ! INSTALLED_VERSION="$(jq -r .version "${INSTALLED_PKG}")"; then
+  echo "SR-4.2 (scratch install): 'jq -r .version ${INSTALLED_PKG}' failed — the installed package.json is malformed JSON or jq is broken. Working tree has been rolled back. Inspect the tarball with 'tar -tzf ${TARBALL_ABS}' and the extracted manifest, then rerun '/publish ${BUMP_KIND}'." >&2
+  exit 22
+fi
 if [ "${INSTALLED_VERSION}" != "${NEXT_VERSION}" ]; then
   echo "SR-4.2 (scratch install): installed version '${INSTALLED_VERSION}' != bumped ${NEXT_VERSION}. Working tree has been rolled back. This indicates a tarball/install inconsistency — investigate, then rerun '/publish ${BUMP_KIND}'." >&2
   exit 22

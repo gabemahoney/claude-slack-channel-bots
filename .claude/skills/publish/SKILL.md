@@ -87,6 +87,12 @@ Promote-phase exit codes (script: `scripts/publish-promote.sh`):
 | 71   | SR-7.3 | post-publish `bun install -g` failed | release IS published; manifest preserved; operator reruns install manually + deletes manifest. Do NOT rerun /publish promote. |
 | 72   | SR-7.4 | post-publish verification failed | release IS published; manifest preserved; operator follows stderr recovery. Do NOT rerun /publish promote. |
 
+Any script — backstop:
+
+| Code | SR | Failure | Recovery owner |
+|------|----|---------|----------------|
+| 99   | SR-99.0 (uncaught) | script terminated with no per-step SR-X.Y diagnostic. State indeterminate; report and pause. | operator: report the SR-99.0 trap output verbatim so the unguarded site can be wrapped; do NOT rerun /publish |
+
 The LLM's response on any non-zero exit is the same: relay the script's stderr verbatim, identify the recovery owner from the table above, and stop. The LLM is never the recovery owner.
 
 ## File pointers
