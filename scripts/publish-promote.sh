@@ -23,6 +23,7 @@
 #   51  SR-5.3  npm publish failed (or version exists with mismatched content)
 #   52  SR-5.4  git push tag failed
 #   60  SR-6.1  registry did not surface new version within 60s
+#   70  SR-7.1  sanitize-global.sh failed
 #   71  SR-7.3  post-publish bun install -g failed
 #   72  SR-7.4  post-publish verification failed
 
@@ -187,7 +188,10 @@ if [ "${VERIFIED}" != "1" ]; then
 fi
 
 # SR-7.1 — sanitize the bun-1.3.13 empty-string-dependency-key poison from the global package.json
-bash "${SCRIPT_DIR}/sanitize-global.sh"
+if ! bash "${SCRIPT_DIR}/sanitize-global.sh"; then
+  echo "SR-7.1 (sanitize global): 'scripts/sanitize-global.sh' exited non-zero. State: the release IS published (v${NEXT_VERSION} is on npm, commit + tag are on origin) but the local global package.json may contain bun-1.3.13 poison. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator inspect '\${BUN_INSTALL:-\$HOME/.bun}/install/global/package.json', remove any empty-string-key entry and any pre-existing claude-slack-channel-bots entry manually, then run 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' and 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
+  exit 70
+fi
 
 # SR-7.2 — remove any existing global install (tolerate non-zero exit; nothing may be installed).
 # Then defensively rm the leftover node_modules entry to clean up dangling files or symlinks the
@@ -230,6 +234,45 @@ if [ "${INSTALLED_VERSION}" != "${NEXT_VERSION}" ]; then
   exit 72
 fi
 
+# SR-8.1 — daemon-bounce handoff.
+# Addressed to the orchestrating LLM, NOT the operator. The skill itself does
+# not execute the bounce (clean_restart is operator-state-mutating; the b.1wi
+# contract forbids the LLM from running such commands without explicit operator
+# confirmation). The orchestrator's job on seeing this message: ask the
+# operator, and run clean_restart only on confirmation.
+DAEMON_PID_FILE="${HOME}/.claude/channels/slack/server.pid"
+DAEMON_PID=""
+DAEMON_ALIVE=0
+if [ -f "${DAEMON_PID_FILE}" ]; then
+  DAEMON_PID="$(cat "${DAEMON_PID_FILE}" 2>/dev/null || true)"
+  if [ -n "${DAEMON_PID}" ] && kill -0 "${DAEMON_PID}" 2>/dev/null; then
+    DAEMON_ALIVE=1
+  fi
+fi
+if [ "${DAEMON_ALIVE}" = "1" ]; then
+  cat <<EOF >&2
+
+SR-8.1 (daemon-bounce handoff): /publish promote complete. Release v${NEXT_VERSION} is on npm + GitHub + your global install.
+
+DAEMON STATE: the daemon at PID ${DAEMON_PID} is still running the previous version. It MUST be bounced to pick up v${NEXT_VERSION}.
+
+ORCHESTRATOR INSTRUCTION: confirm with the operator that they want the daemon bounced now. On confirmation, run:
+
+    claude-slack-channel-bots clean_restart
+
+Side effects of clean_restart: per-channel bot Claude sessions are killed and respawned. If a slack conversation is mid-flight, the bot will restart fresh.
+
+If the operator declines, leave the daemon on the previous version. The release is fully delivered; only the local dev box is one bounce behind.
+EOF
+else
+  cat <<EOF >&2
+
+SR-8.1 (daemon-bounce handoff): /publish promote complete. Release v${NEXT_VERSION} is on npm + GitHub + your global install.
+
+DAEMON STATE: no daemon currently running (PID file ${DAEMON_PID_FILE} is missing or its PID is dead). No bounce needed; the next 'claude-slack-channel-bots start' will pick up v${NEXT_VERSION} automatically.
+EOF
+fi
+
 # SR-9.1 — success summary (the terminal output on every successful run)
 NPM_URL="https://www.npmjs.com/package/claude-slack-channel-bots/v/${NEXT_VERSION}"
 GITHUB_TAG_URL="https://github.com/gabemahoney/claude-slack-channel-bots/releases/tag/${TAG_NAME}"
@@ -251,4 +294,12 @@ Release complete: claude-slack-channel-bots@${NEXT_VERSION}
 
 Next: run \`claude-slack-channel-bots clean_restart\` to swap the running daemon over to v${NEXT_VERSION}.
 EOF
+
+# Success-only tarball cleanup. The smoke-tested tarball's job is done once
+# the release is on npm + verified locally. Failure paths above all 'exit'
+# without reaching here, preserving the tarball for operator recovery.
+if [ -n "${TARBALL_ABS:-}" ] && [ -f "${TARBALL_ABS}" ]; then
+  rm -f "${TARBALL_ABS}"
+fi
+
 exit 0
