@@ -22,6 +22,20 @@ Replace `<BUMP_KIND>` in both bash blocks with the operator's argument (`patch`,
 Usage: /publish <patch|minor|major>
 ```
 
+## Skill Contract — HARD RULES
+
+The Bash blocks below are this skill's body. They are the ONLY authorized side-effecting commands in a release. When any SR-X.Y guard fires, the skill exits with a diagnostic describing the failure state and operator-facing recovery options.
+
+The LLM driving /publish MUST NOT, in response to any SR-X.Y failure:
+
+- Execute side-effecting commands outside the skill's own Bash blocks. No manual `git push`, `git pull`, `git reset`, `git tag`, `npm publish`, `npm login`, `bun install -g`, no manual edits to `package.json`, `bun.lock`, the global package.json, or any config file. This applies even when the failure prose *names* the command — the named command is for the operator, not the LLM.
+- Invoke /publish a second time within a session without first either (a) the operator fixing the precondition that the failure prose names, or (b) filing a bee against the skill and waiting for human guidance. The LLM must not "try again to see if it works now" or rerun /publish after performing its own out-of-band fix.
+- Paraphrase, omit, soften, or "interpret around" an SR-X.Y diagnostic. Report the failure verbatim to the orchestrator/operator and stop.
+
+Throughout this skill, "the operator" means the human who invoked /publish (or, when /publish is run via an orchestrator, the human responsible for that orchestrator). Every "Recovery:" / "Operator recovery:" block addresses the operator. The LLM's only job on an SR-X.Y failure is to surface the diagnostic and stop.
+
+These rules are non-negotiable. The skill is the source of truth on what a release is; any LLM-driven bypass is a release-integrity violation. If a rule appears wrong in context, file a bee against this contract rather than bend it.
+
 ## Phase 1 — Argument validation and preflight (local)
 
 Five fail-fast gates: SR-2.1 (clean tree, on `main`, exact equality with `origin/main`), SR-2.2 (frozen-lockfile install), SR-2.3 (at least one test file, `bun test` passes, `bun run typecheck` passes), SR-2.4 (`npm whoami` succeeds, next version is not already on npm).
@@ -74,8 +88,10 @@ if ! git fetch origin; then
 fi
 LOCAL_SHA="$(git rev-parse main)"
 REMOTE_SHA="$(git rev-parse origin/main)"
-if [ "${LOCAL_SHA}" != "${REMOTE_SHA}" ]; then
-  echo "SR-2.1 (preflight): local main (${LOCAL_SHA}) is not exactly equal to origin/main (${REMOTE_SHA}). Run 'git pull --ff-only origin main' (or 'git push origin main' if you have unpushed local commits) until the two SHAs match, then rerun '/publish ${BUMP_KIND}'." >&2
+# Acceptable: local equals remote, OR local is fast-forward ahead of remote (the release-cutting case).
+# Unacceptable: local is behind remote, OR local and remote have diverged.
+if ! git merge-base --is-ancestor "${REMOTE_SHA}" HEAD; then
+  echo "SR-2.1 (preflight): local main (${LOCAL_SHA}) is not a fast-forward of origin/main (${REMOTE_SHA}) — local is behind or diverged. Operator recovery: if behind, have the operator run 'git pull --ff-only origin main'; if diverged, have the operator resolve manually (do NOT use /publish or any LLM-driven workaround as a recovery tool). Then have the operator rerun '/publish ${BUMP_KIND}'. The LLM driving /publish must NOT push, pull, reset, or otherwise mutate this repo in response to this failure." >&2
   exit 1
 fi
 
@@ -308,27 +324,27 @@ if ! git commit -m "Release v${NEXT_VERSION}" > /dev/null; then
 fi
 
 if ! git tag -a "v${NEXT_VERSION}" -m "Release v${NEXT_VERSION}"; then
-  echo "SR-5.1 (release tag): 'git tag -a v${NEXT_VERSION}' did not succeed. State: the release commit IS on the local main branch but has NOT been pushed. Recovery: run 'git reset --hard HEAD~1' to revert the local release commit, then rerun '/publish ${BUMP_KIND}'." >&2
+  echo "SR-5.1 (release tag): 'git tag -a v${NEXT_VERSION}' did not succeed. State: the release commit IS on the local main branch but has NOT been pushed. Operator recovery (LLM driving /publish MUST NOT execute these commands itself): have the operator run 'git reset --hard HEAD~1' to revert the local release commit, then have the operator rerun '/publish ${BUMP_KIND}'." >&2
   exit 1
 fi
 
 # SR-5.2 — push release commit to origin/main (tag is held back until after npm publish)
 if ! git push origin main; then
-  echo "SR-5.2 (push commit): 'git push origin main' failed. State: release commit + annotated tag exist locally; nothing has been pushed or published. Recovery: resolve the push failure and either (a) re-run 'git push origin main' followed by 'npm publish ${TARBALL_ABS}' and 'git push origin v${NEXT_VERSION}' manually, or (b) abandon and restart by running 'git reset --hard HEAD~1 && git tag -d v${NEXT_VERSION}' then rerun '/publish ${BUMP_KIND}'. The smoke-tested tarball at ${TARBALL_ABS} has been preserved on disk for option (a). Common causes: (1) auth — if origin is HTTPS and the host uses per-org GH_CONFIG_DIR routing (~/.gitconfig with credential.useHttpPath=true + per-org [credential] blocks), retry with 'GH_CONFIG_DIR=\$HOME/.config/gh-<org> git push origin main' where <org> is the GitHub org from the origin URL (the skill auto-detects this but may miss a non-standard layout); (2) non-fast-forward — local main is behind origin/main, run 'git pull --rebase origin main' and retry." >&2
+  echo "SR-5.2 (push commit): 'git push origin main' failed. State: release commit + annotated tag exist locally; nothing has been pushed or published. Operator recovery — the LLM driving /publish MUST NOT execute any of the commands below itself. Either (a) the operator resolves the push failure and runs 'git push origin main' followed by 'npm publish ${TARBALL_ABS}' and 'git push origin v${NEXT_VERSION}' manually, or (b) the operator abandons and restarts by running 'git reset --hard HEAD~1 && git tag -d v${NEXT_VERSION}' then rerunning '/publish ${BUMP_KIND}'. The smoke-tested tarball at ${TARBALL_ABS} has been preserved on disk for option (a). Common causes the operator should check: (1) auth — if origin is HTTPS and the host uses per-org GH_CONFIG_DIR routing (~/.gitconfig with credential.useHttpPath=true + per-org [credential] blocks), the operator can retry with 'GH_CONFIG_DIR=\$HOME/.config/gh-<org> git push origin main' where <org> is the GitHub org from the origin URL (the skill auto-detects this but may miss a non-standard layout); (2) non-fast-forward — local main is behind origin/main, the operator runs 'git pull --rebase origin main' and retries." >&2
   TARBALL=""  # preserve tarball so the operator can re-run npm publish against it
   exit 1
 fi
 
 # SR-5.3 — publish the smoke-tested tarball to npm (explicit path; NOT 'bun publish' which repacks)
 if ! npm publish "${TARBALL_ABS}"; then
-  echo "SR-5.3 (npm publish): 'npm publish ${TARBALL_ABS}' did not succeed. State: release commit IS on origin/main; npm does NOT have v${NEXT_VERSION}; tag is NOT pushed. Recovery options: (a) fix the publish issue (e.g., 'npm login') and re-run 'npm publish ${TARBALL_ABS}' manually, then 'git push origin v${NEXT_VERSION}'; (b) revert the remote with 'git push origin +HEAD~1:main', delete the local tag 'git tag -d v${NEXT_VERSION}', then rerun '/publish ${BUMP_KIND}'. The smoke-tested tarball at ${TARBALL_ABS} has been preserved on disk for option (a)." >&2
+  echo "SR-5.3 (npm publish): 'npm publish ${TARBALL_ABS}' did not succeed. State: release commit IS on origin/main; npm does NOT have v${NEXT_VERSION}; tag is NOT pushed. Operator recovery — the LLM driving /publish MUST NOT execute any of the commands below itself: (a) the operator fixes the publish issue (e.g., 'npm login') and re-runs 'npm publish ${TARBALL_ABS}' manually, then 'git push origin v${NEXT_VERSION}'; or (b) the operator reverts the remote with 'git push origin +HEAD~1:main', deletes the local tag with 'git tag -d v${NEXT_VERSION}', then reruns '/publish ${BUMP_KIND}'. The smoke-tested tarball at ${TARBALL_ABS} has been preserved on disk for option (a)." >&2
   TARBALL=""  # preserve tarball so the operator can re-run npm publish against it
   exit 1
 fi
 
 # SR-5.4 — push the version tag to origin (final write to the git remote; brings github + npm into agreement)
 if ! git push origin "v${NEXT_VERSION}"; then
-  echo "SR-5.4 (push tag): 'git push origin v${NEXT_VERSION}' failed. State: npm HAS v${NEXT_VERSION} and origin/main HAS the release commit; only the git tag is missing. Recovery: resolve the push issue, then run 'git push origin v${NEXT_VERSION}' manually. Do NOT rerun /publish — the release is otherwise complete." >&2
+  echo "SR-5.4 (push tag): 'git push origin v${NEXT_VERSION}' failed. State: npm HAS v${NEXT_VERSION} and origin/main HAS the release commit; only the git tag is missing. Operator recovery (the LLM driving /publish MUST NOT push the tag itself): have the operator resolve the push issue and run 'git push origin v${NEXT_VERSION}' manually. Do NOT rerun /publish — the release is otherwise complete." >&2
   exit 1
 fi
 
@@ -344,7 +360,7 @@ for ATTEMPT in 1 2 3 4 5 6 7 8 9 10 11 12; do
 done
 
 if [ "${VERIFIED}" != "1" ]; then
-  echo "SR-6.1 (registry verification): claude-slack-channel-bots@${NEXT_VERSION} was not visible within the 60-second polling window. The release succeeded (commit, publish, and tag all pushed) — this is a propagation-verification failure only, not a release failure. Recovery: re-confirm with 'npm view claude-slack-channel-bots@${NEXT_VERSION} version'. Once visible, proceed with 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually and then run 'claude-slack-channel-bots clean_restart' — do NOT rerun /publish." >&2
+  echo "SR-6.1 (registry verification): claude-slack-channel-bots@${NEXT_VERSION} was not visible within the 60-second polling window. The release succeeded (commit, publish, and tag all pushed) — this is a propagation-verification failure only, not a release failure. Operator recovery (the LLM driving /publish MUST NOT execute the install or restart itself): have the operator re-confirm with 'npm view claude-slack-channel-bots@${NEXT_VERSION} version'; once visible, have the operator run 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually and then 'claude-slack-channel-bots clean_restart'. Do NOT rerun /publish." >&2
   exit 1
 fi
 
@@ -384,14 +400,14 @@ rm -rf "${GLOBAL_DIR}/node_modules/claude-slack-channel-bots"
 
 # SR-7.3 — install the just-published version from npm (the exact command an end user would run)
 if ! bun install -g "claude-slack-channel-bots@${NEXT_VERSION}"; then
-  echo "SR-7.3 (post-publish install): 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' did not succeed. State: the release IS published (v${NEXT_VERSION} is on npm, commit + tag are on origin) but the dev box has NO global install at this point. Recovery: re-run 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually until it succeeds, then run 'claude-slack-channel-bots clean_restart'. Do NOT rerun /publish." >&2
+  echo "SR-7.3 (post-publish install): 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' did not succeed. State: the release IS published (v${NEXT_VERSION} is on npm, commit + tag are on origin) but the dev box has NO global install at this point. Operator recovery (the LLM driving /publish MUST NOT execute these commands itself): have the operator re-run 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually until it succeeds, then 'claude-slack-channel-bots clean_restart'. Do NOT rerun /publish." >&2
   exit 1
 fi
 
 # SR-7.4 — verify the install: bin resolves under the global install prefix, and installed version matches
 INSTALLED_BIN_PATH="$(command -v claude-slack-channel-bots || true)"
 if [ -z "${INSTALLED_BIN_PATH}" ]; then
-  echo "SR-7.4 (post-publish verification): 'claude-slack-channel-bots' not found on PATH after install. State: the release IS published. Recovery: confirm '${GLOBAL_DIR}/bin' is on your PATH, then run 'claude-slack-channel-bots clean_restart' manually. Do NOT rerun /publish." >&2
+  echo "SR-7.4 (post-publish verification): 'claude-slack-channel-bots' not found on PATH after install. State: the release IS published. Operator recovery (the LLM driving /publish MUST NOT mutate PATH or run clean_restart itself): have the operator confirm '${GLOBAL_DIR}/bin' is on PATH, then run 'claude-slack-channel-bots clean_restart' manually. Do NOT rerun /publish." >&2
   exit 1
 fi
 
@@ -399,20 +415,20 @@ RESOLVED_BIN="$(readlink -f "${INSTALLED_BIN_PATH}")"
 case "${RESOLVED_BIN}" in
   "${GLOBAL_DIR}"/*) ;;
   *)
-    echo "SR-7.4 (post-publish verification): resolved bin '${RESOLVED_BIN}' is not under '${GLOBAL_DIR}/' — a worktree-pointing symlink farm would resolve outside this prefix and fail this check. State: the release IS published. Recovery: run 'bun remove -g claude-slack-channel-bots' followed by 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' to replace the symlink farm with a real-copy install, then run 'claude-slack-channel-bots clean_restart'. Do NOT rerun /publish." >&2
+    echo "SR-7.4 (post-publish verification): resolved bin '${RESOLVED_BIN}' is not under '${GLOBAL_DIR}/' — a worktree-pointing symlink farm would resolve outside this prefix and fail this check. State: the release IS published. Operator recovery (the LLM driving /publish MUST NOT execute these commands itself): have the operator run 'bun remove -g claude-slack-channel-bots' followed by 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' to replace the symlink farm with a real-copy install, then 'claude-slack-channel-bots clean_restart'. Do NOT rerun /publish." >&2
     exit 1
     ;;
 esac
 
 INSTALLED_PKG_JSON="${GLOBAL_DIR}/node_modules/claude-slack-channel-bots/package.json"
 if [ ! -f "${INSTALLED_PKG_JSON}" ]; then
-  echo "SR-7.4 (post-publish verification): installed package.json not found at ${INSTALLED_PKG_JSON}. State: the release IS published but the global install layout is malformed. Recovery: run 'bun remove -g claude-slack-channel-bots' and then 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually. Do NOT rerun /publish." >&2
+  echo "SR-7.4 (post-publish verification): installed package.json not found at ${INSTALLED_PKG_JSON}. State: the release IS published but the global install layout is malformed. Operator recovery (the LLM driving /publish MUST NOT execute these commands itself): have the operator run 'bun remove -g claude-slack-channel-bots' and then 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually. Do NOT rerun /publish." >&2
   exit 1
 fi
 
 INSTALLED_VERSION="$(jq -r .version "${INSTALLED_PKG_JSON}")"
 if [ "${INSTALLED_VERSION}" != "${NEXT_VERSION}" ]; then
-  echo "SR-7.4 (post-publish verification): installed version '${INSTALLED_VERSION}' != published ${NEXT_VERSION}. State: the release IS published but the local install resolved to a stale version. Recovery: run 'bun remove -g claude-slack-channel-bots' followed by 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually until the installed version matches, then run 'claude-slack-channel-bots clean_restart'. Do NOT rerun /publish." >&2
+  echo "SR-7.4 (post-publish verification): installed version '${INSTALLED_VERSION}' != published ${NEXT_VERSION}. State: the release IS published but the local install resolved to a stale version. Operator recovery (the LLM driving /publish MUST NOT execute these commands itself): have the operator run 'bun remove -g claude-slack-channel-bots' followed by 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually until the installed version matches, then 'claude-slack-channel-bots clean_restart'. Do NOT rerun /publish." >&2
   exit 1
 fi
 
