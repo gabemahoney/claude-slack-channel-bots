@@ -27,6 +27,22 @@ set -euo pipefail
 # shellcheck disable=SC2154
 trap 'rc=$?; if [ $rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
+# Runtime sunset check: if bun is past the 1.3.13 defect, the empty-string
+# poison can't reproduce. Skip the sanitize (warn once so operators on old
+# bun know to upgrade or that the script is now dead).
+BUN_VERSION="$(bun --version 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+if [ -n "${BUN_VERSION}" ]; then
+  if BUN_VERSION="${BUN_VERSION}" node -e "
+    const v = process.env.BUN_VERSION.split('.').map(Number);
+    const t = [1,3,14];
+    const cmp = (v[0]-t[0]) || (v[1]-t[1]) || (v[2]-t[2]);
+    process.exit(cmp >= 0 ? 0 : 1)
+  " 2>/dev/null; then
+    echo "[publish] sanitize-global: bun ${BUN_VERSION} is past the 1.3.13 defect — skipping sanitize. (This script and its call site at publish-promote.sh:190 can be deleted once no operator host runs bun < 1.3.14.)" >&2
+    exit 0
+  fi
+fi
+
 GLOBAL_DIR="${BUN_INSTALL:-$HOME/.bun}/install/global"
 GLOBAL_PKG="${GLOBAL_DIR}/package.json"
 
