@@ -259,9 +259,10 @@ export async function approveDevChannelsDialog(
   channelId: string,
   web: WebClient | undefined,
   isStartup: boolean,
+  normalizedName?: string,
 ): Promise<void> {
   void web
-  const claude_instance_id = instanceIdFor(channelId)
+  const claude_instance_id = instanceIdFor(channelId, normalizedName)
   const client = getClient()
   const deadline = Date.now() + _dialogPollTimeoutMs
 
@@ -467,7 +468,7 @@ export async function spawnForRoute(
   try {
     const r = await client.spawn(params)
     console.error(`[slack] spawnForRoute: spawned channel=${channelId} instanceId=${r.claude_instance_id}`)
-    await approveDevChannelsDialog(channelId, web, isStartup)
+    await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
     return { channelId, action: 'spawned' }
   } catch (err) {
     if (!(err instanceof ErrInstanceIdCollision)) {
@@ -493,7 +494,7 @@ export async function spawnForRoute(
       try {
         const r = await client.spawn(params)
         console.error(`[slack] spawnForRoute: retry-spawn succeeded for channel=${channelId} instanceId=${r.claude_instance_id}`)
-        await approveDevChannelsDialog(channelId, web, isStartup)
+        await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
         return { channelId, action: 'spawned' }
       } catch (err2) {
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
@@ -519,7 +520,7 @@ export async function spawnForRoute(
       try {
         await client.spawn(params)
         console.error(`[slack] spawnForRoute: fresh-spawned (after kill+delete) for channel=${channelId}`)
-        await approveDevChannelsDialog(channelId, web, isStartup)
+        await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
         return { channelId, action: 'spawned' }
       } catch (err) {
         const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
@@ -543,7 +544,7 @@ export async function spawnForRoute(
         try {
           await client.spawn(params)
           console.error(`[slack] spawnForRoute: fresh-spawned (after delete) for channel=${channelId}`)
-          await approveDevChannelsDialog(channelId, web, isStartup)
+          await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
           return { channelId, action: 'spawned' }
         } catch (err2) {
           const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
@@ -560,7 +561,7 @@ export async function spawnForRoute(
         if (!(await tryDelete(channelId, normalizedName, web, isStartup))) return { channelId, action: 'failed' }
         try {
           await client.spawn(params)
-          await approveDevChannelsDialog(channelId, web, isStartup)
+          await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
           return { channelId, action: 'spawned' }
         } catch (err2) {
           const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
