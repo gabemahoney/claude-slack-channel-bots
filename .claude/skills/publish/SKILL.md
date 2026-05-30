@@ -64,7 +64,7 @@ Prepare-phase exit codes (script: `scripts/publish-prepare.sh`):
 | 11   | SR-2.1 | `git fetch origin` failed | operator: fix network/auth; rerun /publish |
 | 12   | SR-2.1 | local `main` behind/diverged from origin/main | operator: `git pull --ff-only` (behind) or resolve manually (diverged); LLM must NOT push/pull/reset |
 | 13   | SR-2.2 / SR-2.3 | install/test/typecheck/no-test-files failed | operator: fix on `main`, commit, rerun /publish |
-| 14   | SR-2.4 | not authenticated to npm, OR next version already on npm | operator: `npm login`, or pull/larger bump |
+| 14   | SR-2.4 / SR-2.4a / SR-2.4b | not authenticated to npm, OR next version already on npm, OR npm registry is non-canonical (SR-2.4a), OR `bun pm whoami` did not succeed (SR-2.4b) | operator: `npm login` / `npm config set registry https://registry.npmjs.org/` / `bun pm login`, or pull/larger bump |
 | 15   | SR-2.5 | host's agent-director binary missing/broken, OR its version does not satisfy package.json's declared range | operator: upgrade agent-director to match the declared range, or edit the range in package.json |
 | 20   | SR-3.1 | `npm version <bump>` failed | working tree rolled back; operator investigates |
 | 21   | SR-4.1 | `bun pm pack` failed or tarball internal version mismatch | working tree rolled back; operator investigates |

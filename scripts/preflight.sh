@@ -17,7 +17,9 @@
 #   11  SR-2.1  git fetch origin failed
 #   12  SR-2.1  local main is not a fast-forward of origin/main
 #   13  SR-2.2/SR-2.3  install/test/typecheck failed (incl. zero test files)
-#   14  SR-2.4  npm not authenticated, OR next version already on npm
+#   14  SR-2.4  npm not authenticated, OR next version already on npm,
+#                OR npm registry is non-canonical (SR-2.4a),
+#                OR 'bun pm whoami' did not succeed (SR-2.4b)
 #   15  SR-2.5  host's agent-director binary missing/broken, OR its version
 #                does not satisfy package.json's declared range
 
@@ -104,6 +106,24 @@ fi
 # SR-2.4 — npm authentication and version availability
 if ! npm whoami > /dev/null 2>&1; then
   echo "SR-2.4 (preflight): not authenticated to npm. Run 'npm login' as a claude-slack-channel-bots maintainer, then rerun '/publish ${BUMP_KIND}'." >&2
+  exit 14
+fi
+
+# SR-2.4a — registry config sanity
+NPM_REGISTRY="$(npm config get registry 2>/dev/null | tr -d '[:space:]' || true)"
+case "${NPM_REGISTRY}" in
+  https://registry.npmjs.org/|https://registry.npmjs.org)
+    : # canonical, pass
+    ;;
+  *)
+    echo "SR-2.4a (preflight): npm registry is '${NPM_REGISTRY}', not https://registry.npmjs.org/. The release would publish to a non-canonical registry. Operator recovery: 'npm config set registry https://registry.npmjs.org/' (or confirm intent — e.g., this is deliberately a fork). Rerun '/publish ${BUMP_KIND}' after." >&2
+    exit 14
+    ;;
+esac
+
+# SR-2.4b — bun identity for the post-publish reinstall step
+if ! bun pm whoami >/dev/null 2>&1; then
+  echo "SR-2.4b (preflight): 'bun pm whoami' did not succeed. The post-publish 'bun install -g' step (SR-7.3) would run with no bun identity. Operator recovery: 'bun pm login' (note: bun's auth is separate from npm's; both must be in place). Rerun '/publish ${BUMP_KIND}' after." >&2
   exit 14
 fi
 
