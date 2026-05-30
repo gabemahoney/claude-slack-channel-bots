@@ -65,6 +65,7 @@ Prepare-phase exit codes (script: `scripts/publish-prepare.sh`):
 | 12   | SR-2.1 | local `main` behind/diverged from origin/main | operator: `git pull --ff-only` (behind) or resolve manually (diverged); LLM must NOT push/pull/reset |
 | 13   | SR-2.2 / SR-2.3 | install/test/typecheck/no-test-files failed | operator: fix on `main`, commit, rerun /publish |
 | 14   | SR-2.4 | not authenticated to npm, OR next version already on npm | operator: `npm login`, or pull/larger bump |
+| 15   | SR-2.5 | host's agent-director binary missing/broken, OR its version does not satisfy package.json's declared range | operator: upgrade agent-director to match the declared range, or edit the range in package.json |
 | 20   | SR-3.1 | `npm version <bump>` failed | working tree rolled back; operator investigates |
 | 21   | SR-4.1 | `bun pm pack` failed or tarball internal version mismatch | working tree rolled back; operator investigates |
 | 22   | SR-4.2 | scratch install failed or installed version mismatch | working tree rolled back; operator inspects bun install / tarball layout |
