@@ -440,8 +440,8 @@ export async function runStartupGate(
       message:
         `agent-director TS error catalog is missing required err_names: ` +
         `${catalogProbe.missing.join(', ')}. ` +
-        `Envelopes with these names would be wrapped as ErrUnknownErrorName and ` +
-        `CSCB's errName predicates would silently miss. ` +
+        `Envelopes with these names would surface as the base AgentDirectorError ` +
+        `instead of typed subclasses, breaking CSCB's instanceof Err<Name> branches. ` +
         `Run: bun add agent-director@^${MIN_AD_VERSION} (confirm the resolved package ships the full catalog).`,
     }
   }
