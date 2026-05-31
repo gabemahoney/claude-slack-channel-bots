@@ -953,7 +953,10 @@ describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', ()
         return cannedGetPermissionResponse({
           request_token: params.request_token,
           decision: 'deny',
-          decision_reason: 'something-new',
+          // Intentionally outside the canonical enum to exercise the SR-5.2
+          // fail-closed path. AD 0.6.1+ types decision_reason as a strict
+          // union; cast through unknown so the literal lands at runtime.
+          decision_reason: 'something-new' as unknown as GetPermissionResult['decision_reason'],
         })
       },
     })

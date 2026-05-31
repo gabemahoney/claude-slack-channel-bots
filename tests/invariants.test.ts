@@ -75,6 +75,7 @@ describe('SR-8.6: PermissionRequestInfo.request_id type', () => {
     // No runtime expectation; the existence of the assignment is the test.
     const info: PermissionRequestInfo = {
       request_id: Number.MAX_SAFE_INTEGER,
+      request_token: '00000000-0000-4000-8000-000000000000',
       tool_name: 'Bash',
       tool_input: '{}',
       requested_at: '2026-01-01T00:00:00Z',

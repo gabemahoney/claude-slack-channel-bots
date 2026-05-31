@@ -237,11 +237,11 @@ describe('SR-5.1: version-probe failure modes', () => {
     }
   })
 
-  test("version returned as '0.6.0' passes the version gate (paired release minimum)", async () => {
+  test(`version returned as '${MIN_AD_VERSION}' passes the version gate (paired release minimum)`, async () => {
     // Note: the same-user check downstream may still fail in the test env; we only assert the
     // version step passes by checking the outcome is either ok=true OR ok=false with a phase
     // OTHER than 'version'.
-    const stub = makeStubClient({ versionResult: cannedVersion('0.6.0') })
+    const stub = makeStubClient({ versionResult: cannedVersion(MIN_AD_VERSION) })
     const outcome = await runStartupGate({
       getClient: () => stub,
       callVersion: (c) => (c as typeof stub).version({}),

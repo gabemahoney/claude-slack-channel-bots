@@ -28,7 +28,12 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AgentDirectorError, Client } from 'agent-director'
-import type { DecideParams as ADDecideParams, DecideResult } from 'agent-director'
+import type {
+  DecideParams as ADDecideParams,
+  DecideResult,
+  GetPermissionParams as ADGetPermissionParams,
+  GetPermissionResult as ADGetPermissionResult,
+} from 'agent-director'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -172,27 +177,17 @@ export async function decideWithToken(
 // get-permission wrapper (SR-7.1)
 // ---------------------------------------------------------------------------
 
-/** Params for AD's `get-permission` verb (shipped in `^0.6.0`+). */
-export interface GetPermissionParams {
-  request_token: string
-}
-
 /**
- * Response shape of AD's `get-permission` verb: the full PermissionRequestInfo
- * plus closure metadata. `decision_reason` is a string enum
- * (`'operator' | 'timeout' | 'find_missing'`) or `null` for allow / open rows;
- * CSCB treats any other value as fail-closed (SR-5.2).
+ * Params + result for AD's `get-permission` verb (shipped in `^0.6.1`+).
+ * Re-exported from `agent-director` so the local consumers
+ * (`permission-poller`, `permission-click-handler`, tests) reference one
+ * source of truth. `decision` / `decision_reason` / `decided_at` are
+ * optional + nullable on AD's type because the same row shape covers both
+ * open and closed states; `classifyVerdict` collapses any non-canonical
+ * combination into the SR-5.2 fail-closed generic-deny path.
  */
-export interface GetPermissionResult {
-  request_token: string
-  request_id: number
-  tool_name: string
-  tool_input: string
-  requested_at: string
-  decision: 'allow' | 'deny'
-  decision_reason: string | null
-  decided_at: string
-}
+export type GetPermissionParams = ADGetPermissionParams
+export type GetPermissionResult = ADGetPermissionResult
 
 /**
  * Local sentinel matcher for AD's `ErrPermissionRequestNotFound`. Matches on
