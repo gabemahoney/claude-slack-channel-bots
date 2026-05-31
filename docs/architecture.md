@@ -14,14 +14,14 @@ cli.ts                          CLI entry point — start/stop/clean_restart sub
     ├── lib.ts                  Pure utilities — gate, access control, chunking, sanitization.
     ├── logging.ts              Log file setup — overrides console.error/console.log with timestamped writeSync to a log file.
     ├── startup-errors.ts       SR-5.1a startup-errors log — append-only to ~/.claude/channels/slack/startup-errors.log + stderr.
-    ├── agent-director-client.ts   SR-0.1 singleton Client wrapper. getClient()/closeClient(); MIN_AD_VERSION sourced from package.json.
+    ├── agent-director-client.ts   SR-0.1 singleton Client wrapper. getClient()/closeClient(); MIN_AD_VERSION sourced from package.json. Exposes `decideWithToken` (SR-7.2 — single source of truth for the snake-case `request_token` field on the decide wire) and `getPermission` + `isErrPermissionRequestNotFound` (SR-7.1 — wraps the paired AD release's `get-permission --request-token <uuid>` verb).
     ├── agent-director-errors.ts   SR-0.2 typed Err* re-exports for instanceof branching.
     ├── agent-director-startup.ts  SR-5.1 startup gate — import / construct Client / version probe / same-user stat.
     ├── agent-director-template.ts SR-3.1 / SR-3.2 — builds the slack-channel-bot MakeTemplateParams and calls client.makeTemplate({ overwrite: true }) at boot.
     ├── session-manager.ts      SR-1 in full — spawnForRoute (SR-1.4 collision-then-act), reconcileOrphans (SR-1.6), reconnectMcp/waitForWaitingAndReconnect, postSpawnFailureToChannel.
-    ├── permission-poller.ts    SR-2.1 polling loop + SR-2.2 Block Kit emitter. Owns the live LivePermission map shared with the click handler.
-    ├── permission-click-handler.ts  SR-2.2 click → decide path; compares request_id before deciding, then sets the handled flag after chat.update succeeds.
-    ├── permission-action-id.ts SR-2.2 encode/decode helpers; anchored-regex parser (SR-8.6).
+    ├── permission-poller.ts    SR-2.1 polling loop + SR-2.2 Block Kit emitter. Owns the live LivePermission map, keyed on the composite `(claude_instance_id, request_token)` pair, consumes AD's plural `permission_requests` projection, posts one Slack message per open row, and runs the SR-2.4 set-diff + `get-permission` closure reconciliation with four verdict-distinct chat.update renderings (operator-allow / operator-deny / timeout / find_missing) plus a fail-closed generic-deny fallback for unknown decision_reason and `ErrPermissionRequestNotFound`.
+    ├── permission-click-handler.ts  SR-4 single-decide-call relay; parses the action_id, calls `decideWithToken` unconditionally (always carrying the decoded `request_token`), renders the "by <user>" operator-feedback chat.update only when a live entry is present, calls `markHandled` on success, swallows `ErrAlreadyDecided` silently, logs `ErrInvalidFlags` / `ErrAmbiguousRequest` without retry. Never calls `get` or `getPermission`; never mutates the pending map directly.
+    ├── permission-action-id.ts SR-3 encode/decode helpers; anchored regex `^perm_(allow|deny)_(cscb_.+)_(<UUIDv4>)$` where the trailing UUIDv4-shape group is an outer-structure anchor disambiguating the underscore-bearing claude_instance_id capture — NOT a token-content validator (SR-1.3).
     ├── restart.ts              Auto-restart — delayed relaunch on disconnect, failure counting, timer cancellation.
     ├── health-check.ts         Periodic liveness poller — checks routes on a timer via client.status; schedules restarts for dead sessions.
     ├── pid.ts                  PID file management — write, read, conflict detection, isProcessRunning.
@@ -52,18 +52,72 @@ The deleted files from the pre-Epic-2 architecture (`src/tmux.ts`, `src/peer-pid
 
 ### Permission Relay (SR-2)
 
-Driven by polling against the agent-director Client + Block Kit click → `decide()`. The previous HTTP long-poll + hook script architecture has been deleted.
+Driven by polling against the agent-director Client + Block Kit click → `decide()`. The previous HTTP long-poll + hook script architecture has been deleted. Per-row Slack prompts: N concurrent `tool_use` blocks in one Claude Code assistant response produce N Slack messages, each independently allow/deny-able.
 
-1. (SR-2.1) On every tick, the poller runs `client.list({ state: ['check_permission'], label: ['service=cscb'] })`. For each spawn in the result it calls `client.get(...)` and reads `permission_request.request_id`. CSCB never reads `decision` or `decision_reason` — DB state (request_id and presence in `check_permission`) is definitive.
-2. Per-spawn reconciliation follows a four-case matrix keyed on the live-entry map and request_id comparison:
-   - No live entry → post Block Kit; record `(channelId, messageTs, requestId, handled=false)`.
-   - Live entry, `requestId` matches (handled true or false) → no-op; already tracked.
-   - Live entry, `requestId` advanced: if `handled=false`, `chat.update` old message to "no longer active"; if `handled=true`, suppress (click handler already wrote "Allowed/Denied"). Either way: drop entry, post fresh Block Kit for the new request.
-   - Spawn absent from list result: if `handled=false`, `chat.update` "expired"; if `handled=true`, suppress. Drop entry.
-3. (SR-2.2) Action IDs follow the shape `perm_(allow|deny)_<claude_instance_id>_<request_id>` (parsed by the anchored regex in `permission-action-id.ts`).
-4. On click, `permission-click-handler.ts` calls `client.get(...)` and compares the live entry's `requestId` to the button's encoded `request_id`; a mismatch or missing spawn → `chat.update` "already decided" and, on success, `markHandled()` (so the tick's expire path stays suppressed). On a match, `client.decide(...)` is called (`ErrAlreadyDecided` treated as success), then `chat.update` "Allowed/Denied by <user>". `markHandled()` is called **only after that `chat.update` succeeds** — if it throws, `handled` stays false so the next tick's expire path fires a recovery update and buttons are never orphaned. The click handler does NOT call `dropPermission`; the tick is the sole owner of clearing entries.
-5. The old 30-second `finalizedAt` claim window has been removed. Reconciliation is now per-tick and request_id-driven, which subsumes `b.5um` (consecutive-request stall) and `b.yuy` (click-handler error stall).
-6. Slack-side UX (Block Kit structure, decision-update text) is unchanged from the pre-Epic-2 implementation. Only the action_id shape and the polling/decide machinery differ.
+#### Wire surface (paired AD release)
+
+CSCB consumes four AD verbs:
+
+- `client.list({ state: ['check_permission'], label: ['service=cscb'] })` — returns spawn rows in the permission state.
+- `client.get({ claude_instance_id })` — returns the row plus a plural `permission_requests` projection. Each element carries `request_token`, `request_id`, `tool_name`, `tool_input`, `requested_at`. The array may be empty (spawn has no open prompts). `null` / `undefined` in the slot is non-conforming.
+- `client.decide({ claude_instance_id, decision, request_token })` — JSON snake `request_token`, CLI `--request-token`. Always required; absence yields `ErrInvalidFlags`. The wrapper `decideWithToken` in `agent-director-client.ts` is the single decide-wire serializer (SR-7.2).
+- `client.getPermission({ request_token })` — single-row read, no state filter. Returns full PermissionRequestInfo plus `decision`, `decision_reason`, and `decided_at`. Not-found surfaces as `ErrPermissionRequestNotFound` (matched via `isErrPermissionRequestNotFound`).
+
+#### In-memory state (SR-1)
+
+`livePermissions: Map<string, LivePermission>` keyed on a composite `(claude_instance_id, request_token)` encoded by `makeCompositeKey` (null-byte separator — neither component can contain `\x00`). One entry per outstanding Slack prompt. `LivePermission` carries `claudeInstanceId`, `requestToken`, `channelId`, `messageTs`, `requestId` (log-only — never used for routing, keying, action-id encoding, or decide-wire payload per SR-1.4), and a `handled` flag. Lifecycle helpers `getLivePermission(cid, token)`, `markHandled(cid, token)`, and `dropPermission(cid, token)` all operate on the composite key. The tick is the sole owner of `dropPermission`; the click handler may only call `markHandled` (SR-1.2).
+
+#### Per-tick flow (SR-2)
+
+1. `list()` → spawns currently in `check_permission`.
+2. For each spawn, `get()` returns the plural `permission_requests` projection.
+3. Non-conforming response (`permission_requests` is `null` or `undefined`): log + skip processing for that spawn this tick. The spawn's existing live entries are excluded from the closure sweep below (no state mutation — SR-2.1).
+4. For each row in `permission_requests`, compute the composite key. If not in `livePermissions`: post one `chat.postMessage` per row (no coalescing — SR-2.2) and insert one map entry. If already present: no-op (duplicate-tick safe). An empty projection produces no posting activity but does not exclude the spawn's live entries from closure reconciliation.
+5. **Set-diff closure reconciliation (SR-2.4):** `tokens_in_livePermissions − tokens_seen_this_tick = newly_closed_tokens` (with non-conforming spawns' entries protected per step 3). For each newly-closed token, call `getPermission(request_token)`. On success, render the verdict (below) via one `chat.update` against `entry.messageTs`, then drop the entry. On `ErrPermissionRequestNotFound`: render generic deny, drop, do not retry. On transient error: leave the entry alive — the next tick retries.
+
+#### Verdict rendering (SR-5)
+
+The closure `chat.update` produces four visually-distinct surfaces driven by `decision` + `decision_reason`:
+
+| `decision` | `decision_reason` | Rendering |
+|---|---|---|
+| `allow` | `null` | `*Permission* — Allowed` |
+| `deny` | `'operator'` | `*Permission* — Denied by operator` |
+| `deny` | `'timeout'` | `⏱ *Permission* — Timed out` |
+| `deny` | `'find_missing'` | `🪦 *Permission* — Session ended` |
+| anything else | anything else | `*Permission* — Denied (closed)` (fail-closed, log) |
+
+`ErrPermissionRequestNotFound` collapses to the same generic-deny rendering (fail-closed log + drop, no retry). `decision_reason` is read verbatim from AD; CSCB does not derive, override, or infer it (SR-5.1). Unknown enum values do not crash the poller (SR-5.2). The `chat.update` targets only the closed row's `messageTs`; sibling rows are never touched in response to one row's closure (SR-5.3).
+
+#### Click handler (SR-4)
+
+`handlePermissionClick` decodes `(decision, claude_instance_id, request_token)` from the action_id and calls `decideWithToken(client, { claude_instance_id, decision, request_token })` unconditionally — this is the click's only AD interaction (SR-4.3). No `get` refetch, no "already decided" branch.
+
+- `ErrAlreadyDecided` → swallowed silently. The next tick's reconciliation (SR-2.4) owns the visible Slack state.
+- `ErrInvalidFlags` / `ErrAmbiguousRequest` → logged once, no retry, no operator-visible signal.
+- Unknown error types → logged, no retry.
+
+On a successful decide *and* a live entry present, the handler renders one `chat.update` carrying `*Permission* — Allowed by <user>` / `Denied by <user>` against just that row's `messageTs` (SR-4.5), then calls `markHandled`. A stale click (no entry in `livePermissions`) still fires the decide call with the decoded token — AD is the source of truth and returns idempotent results — but produces no `chat.update` from the click path; the next tick's verdict rendering handles the message.
+
+#### Operator attribution overwrite (deliberate tradeoff)
+
+After a successful click, the handler renders `*Permission* — Allowed by alice` immediately as operator feedback. On the next tick, the SR-2.4 reconciler observes the token has closed, calls `getPermission`, and overwrites the same Slack message with the verdict surface (`*Permission* — Allowed`). The "by alice" suffix is intentionally lost cross-tick: preserving operator attribution would require new cross-tick state, which is out of scope per `b.qpj`. Operators see the attribution briefly (one poll interval, typically <2 s); the verdict rendering is the authoritative closed state.
+
+#### Action ID encoding (SR-3)
+
+Block Kit buttons emit `action_id` strings of the shape `perm_(allow|deny)_<claude_instance_id>_<request_token>`, where `<request_token>` is a UUIDv4. The anchored decoder regex uses the UUIDv4 character class (`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`) as an outer-structure anchor — it disambiguates the rightmost boundary of the middle (underscore-bearing) `claude_instance_id` capture so embedded underscores in `cscb_<channel>` remain safe. CSCB does NOT validate the token's bytes; the regex shape only fixes the parse boundary (SR-1.3 + SR-3.1). The `request_id` field is no longer part of the action_id payload and is retained on `LivePermission` for logging only (SR-1.4).
+
+#### Version pin (SR-6)
+
+`MIN_AD_VERSION` is `0.6.0`, sourced from `package.json` `dependencies['agent-director']` (declared as `^0.6.0`) via `readMinAdVersion()` in `src/agent-director-client.ts`. The startup gate (`runStartupGate` in `src/agent-director-startup.ts`) fails closed on a sub-pin AD: the operator-visible error lands in `startup-errors.log` and the process exits non-zero. The startup gate is the sole compatibility boundary — no runtime code path degrades to the prior singular-projection or coalesced-prompt behavior on version mismatch (SR-6.2).
+
+#### What this replaces
+
+Three pre-Epic-4 mechanisms have been retired:
+
+- The four-case per-spawn reconciliation matrix (and its sibling-stomping `updateNoLongerActive()` helper that edited a prior row's Slack message in response to another row's arrival) is gone. Sibling rows are now first-class state from the moment they appear in the plural projection.
+- The click handler's prior get-then-stale-rerender branch (a refetch + "already decided" `chat.update` issued without calling decide) is gone. `decideWithToken` is the click's only AD interaction.
+- The single-prompt coalescing of multiple concurrent `tool_use` blocks is gone. N parallel tool_uses → N Slack prompts.
 
 AskUserQuestion is denied at the agent-director template (SR-3.1's `deny: ['AskUserQuestion']`) — the tool is unavailable to every CSCB-spawned bot and the prior `/ask` HTTP route + hook script have been removed.
 

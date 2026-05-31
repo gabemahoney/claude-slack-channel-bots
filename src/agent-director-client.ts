@@ -138,10 +138,9 @@ export function setClientForTests(client: Client): void {
 // ---------------------------------------------------------------------------
 
 /**
- * CSCB decide params — extends the published `DecideParams` with the
- * `request_token` field that the paired AD release adds (SR-7.2). The
- * snake-case JSON field flows through the subprocess-CLI transport without
- * further marshaling on this side.
+ * CSCB decide params — extends `DecideParams` with the `request_token` field
+ * (SR-7.2). The snake-case JSON field flows through the subprocess-CLI
+ * transport without further marshaling on this side.
  *
  * Typing `request_token` as a required field at the wrapper boundary is how
  * SR-4.1 (unconditional pass-through) is enforced statically — every CSCB
@@ -152,10 +151,12 @@ export interface DecideParamsWithToken extends ADDecideParams {
 }
 
 /**
- * Always-include-token decide wrapper. The published `agent-director@0.5.6`
- * `DecideParams` type does not yet carry `request_token`; the paired AD
- * release ships the wire field. Until the published types catch up, the
- * cast is the same pattern Epic 1 used for `GetResultWithPermissionRequests`.
+ * Always-include-token decide wrapper. MIN_AD_VERSION is now pinned at
+ * `^0.6.0`, which carries `request_token` on `DecideParams` natively. The
+ * structural cast is retained because, until the lockfile is refreshed to
+ * resolve the bumped pin, the imported `DecideParams` type still comes from
+ * the locked `0.5.6` package — same lockfile-lag pattern as
+ * `GetResultWithPermissionRequests`.
  *
  * Routing the single CSCB decide call site through this function gives the
  * codebase one definitive serializer for the decide wire shape (SR-7.2).
@@ -171,16 +172,16 @@ export async function decideWithToken(
 // get-permission wrapper (SR-7.1)
 // ---------------------------------------------------------------------------
 
-/** Params for the paired AD release's `get-permission` verb. */
+/** Params for AD's `get-permission` verb (shipped in `^0.6.0`+). */
 export interface GetPermissionParams {
   request_token: string
 }
 
 /**
- * Response shape of the paired AD release's `get-permission` verb: the full
- * PermissionRequestInfo plus closure metadata. `decision_reason` is a string
- * enum (`'operator' | 'timeout' | 'find_missing'`) or `null` for allow / open
- * rows; CSCB treats any other value as fail-closed (SR-5.2).
+ * Response shape of AD's `get-permission` verb: the full PermissionRequestInfo
+ * plus closure metadata. `decision_reason` is a string enum
+ * (`'operator' | 'timeout' | 'find_missing'`) or `null` for allow / open rows;
+ * CSCB treats any other value as fail-closed (SR-5.2).
  */
 export interface GetPermissionResult {
   request_token: string
@@ -194,29 +195,34 @@ export interface GetPermissionResult {
 }
 
 /**
- * Local sentinel matcher for AD's `ErrPermissionRequestNotFound`. The paired
- * AD release exposes the typed class; until MIN_AD_VERSION is bumped to that
- * release (Epic 4), match on `errName` so the predicate routes the same way
- * for both the real class and the stub error factory (same pattern Epic 2
- * uses for `ErrInvalidFlags`).
+ * Local sentinel matcher for AD's `ErrPermissionRequestNotFound`. Matches on
+ * `errName` so both the typed class (`^0.6.0`+ exposes it) and the stub's
+ * AgentDirectorError-shape resolve cleanly. The errName-based predicate keeps
+ * working with the typed class when the lockfile catches up to the bumped
+ * pin (same pattern as `ErrInvalidFlags`).
  */
 export function isErrPermissionRequestNotFound(err: unknown): boolean {
   return err instanceof AgentDirectorError && err.errName === 'ErrPermissionRequestNotFound'
 }
 
 /**
- * `get-permission` wrapper (SR-7.1). The published `agent-director@0.5.6`
- * Client does not yet carry this verb; the paired AD release adds it. Until
- * the published types catch up the wrapper accepts a structural client and
- * fails loudly at runtime when the verb is missing — the SR-6.1 startup gate
- * is the intended compatibility boundary.
+ * `get-permission` wrapper (SR-7.1). MIN_AD_VERSION is pinned at `^0.6.0`,
+ * which carries the verb; the SR-6.1 startup gate is the compatibility
+ * boundary that keeps stale-version installs from reaching this path. The
+ * wrapper takes a structural client (rather than `Pick<Client, 'getPermission'>`)
+ * because the locked `0.5.6` types do not yet expose the method shape, and
+ * fails loudly at runtime when the verb is missing as defense-in-depth for
+ * the dev/test edge (e.g. stub clients that omit it on purpose).
  */
 export async function getPermission(
   client: { getPermission?: (params: GetPermissionParams) => Promise<GetPermissionResult> },
   params: GetPermissionParams,
 ): Promise<GetPermissionResult> {
   if (typeof client.getPermission !== 'function') {
-    throw new Error('agent-director-client: getPermission verb unavailable — bump MIN_AD_VERSION (Epic 4)')
+    throw new Error(
+      'agent-director-client: getPermission verb unavailable — ' +
+        'confirm installed agent-director version meets the MIN_AD_VERSION pin',
+    )
   }
   return client.getPermission(params)
 }

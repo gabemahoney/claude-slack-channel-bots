@@ -25,9 +25,9 @@
  *      retry. Other transient errors → leave entry alive, retry next tick.
  *      Unknown `decision_reason` → fail-closed generic deny (SR-5.2).
  *
- * Case 4 (per-spawn request_id advancement) is GONE — the composite key
- * means a "new" token simply appears as an unseen entry and the old token
- * naturally falls out of the seen-set on the next tick.
+ * Per-spawn request_id advancement is no longer a special path — the
+ * composite key means a "new" token simply appears as an unseen entry and
+ * the old token naturally falls out of the seen-set on the next tick.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -53,13 +53,13 @@ import type {
 import { encodePermissionActionId } from './permission-action-id.ts'
 
 // ---------------------------------------------------------------------------
-// Wire-shape types (local — paired AD release ships the matching wire)
+// Wire-shape types (local — mirrors the `^0.6.0` wire)
 // ---------------------------------------------------------------------------
 
 /**
- * A single open permission_requests row per the paired agent-director
- * release's plural projection wire. CSCB treats `request_token` as opaque
- * (no parsing, no validation of the bytes themselves).
+ * A single open permission_requests row from agent-director's plural
+ * projection (`^0.6.0`+). CSCB treats `request_token` as opaque (no parsing,
+ * no validation of the bytes themselves).
  */
 export interface PermissionRequestRow {
   /** Opaque per-request token minted by agent-director. */
@@ -73,10 +73,11 @@ export interface PermissionRequestRow {
 }
 
 /**
- * Local view of the paired-release `GetResult`. The published package still
- * carries singular `permission_request`; the paired release replaces it
- * with plural `permission_requests`. We strip the singular field via Omit
- * and re-add the plural one so we never accidentally read the old shape.
+ * Local view of the `^0.6.0` `GetResult`. The locked `0.5.6` types still
+ * carry singular `permission_request`; `^0.6.0` replaces it with the plural
+ * `permission_requests`. We strip the singular field via Omit and re-add the
+ * plural one so we never accidentally read the old shape until the lockfile
+ * catches up.
  */
 export interface GetResultWithPermissionRequests extends Omit<ADGetResult, 'permission_request'> {
   permission_requests?: PermissionRequestRow[] | null
@@ -119,9 +120,10 @@ export interface PollerDeps {
     list: (params: import('agent-director').ListParams) => Promise<import('agent-director').ListResult>
     get: (params: import('agent-director').GetParams) => Promise<import('agent-director').GetResult>
     /**
-     * Paired-AD-release verb (SR-7.1). Optional on the structural type so the
-     * runtime path compiles against the published `agent-director@0.5.6`
-     * Client (which has no such method) and so tests can supply a stub.
+     * AD `get-permission` verb (SR-7.1; shipped in `^0.6.0`). Optional on the
+     * structural type so the runtime path compiles against the locked
+     * `0.5.6` Client types (which have no such method) and so tests can
+     * supply a stub.
      */
     getPermission?: (params: GetPermissionParams) => Promise<GetPermissionResult>
   }

@@ -202,6 +202,44 @@ describe('SR-5.1: version-probe failure modes', () => {
     }
   })
 
+  test("version returned as '0.5.99' is rejected (just-below-pin sanity)", async () => {
+    const stub = makeStubClient({ versionResult: cannedVersion('0.5.99') })
+    const outcome = await runStartupGate({
+      getClient: () => stub,
+      callVersion: (c) => (c as typeof stub).version({}),
+      closeClient: (c) => (c as typeof stub).close(),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.phase).toBe('version')
+      expect(outcome.classLabel).toBe('ad-version-stale')
+      expect(outcome.message).toContain('0.5.99')
+      expect(outcome.message).toContain(MIN_AD_VERSION)
+    }
+  })
+
+  test("version returned as '0.6.0' passes the version gate (paired release minimum)", async () => {
+    // Note: the same-user check downstream may still fail in the test env; we only assert the
+    // version step passes by checking the outcome is either ok=true OR ok=false with a phase
+    // OTHER than 'version'.
+    const stub = makeStubClient({ versionResult: cannedVersion('0.6.0') })
+    const outcome = await runStartupGate({
+      getClient: () => stub,
+      callVersion: (c) => (c as typeof stub).version({}),
+      closeClient: (c) => (c as typeof stub).close(),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    if (!outcome.ok) {
+      expect(outcome.phase).not.toBe('version')
+    }
+    // outcome.ok=true is also acceptable; depends on defaultStat shape.
+  })
+
   test('version() rejection surfaces as ad-version-probe', async () => {
     const stub = makeStubClient({ versionError: errGeneric('version', 'ErrSomething', 'oops') })
     const outcome = await runStartupGate({
