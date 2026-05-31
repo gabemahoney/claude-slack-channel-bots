@@ -11,7 +11,7 @@
  *   - Stale click (no live entry): decide still fires; NO chat.update from
  *     the click handler. The next poller tick reconciles the rendering
  *     (SR-4.2).
- *   - Happy path: decide → chat.update "Allowed/Denied by X" → markHandled
+ *   - Happy path: decide → chat.update verdict text → markHandled
  *     ONLY after the chat.update lands (SR-5.4).
  *   - Happy path with chat.update throwing → markHandled NOT called.
  *   - ErrAlreadyDecided → silent swallow. No chat.update, no markHandled
@@ -56,9 +56,6 @@ const CHANNEL_CH = 'CH'
 const TOKEN_A = '11111111-1111-4111-8111-111111111111'
 const TOKEN_B = '22222222-2222-4222-8222-222222222222'
 const TOKEN_C = '33333333-3333-4333-8333-333333333333'
-const USER_ID = 'U_USER1'
-const USER_NAME_ALICE = 'alice'
-const USER_NAME_BOB = 'bob'
 
 interface ChatCall { kind: 'postMessage' | 'update'; channel: string; ts?: string; text?: string }
 
@@ -241,7 +238,6 @@ function makeDecideStub(opts: { throwOn?: Error } = {}): {
 interface ClickHandlerDepsShape {
   getClient: () => { decide: (params: DecideParams) => Promise<DecideResult> }
   web: { chat: { update: (args: unknown) => Promise<unknown> } }
-  resolveUserName: (userId: string) => Promise<string>
   log?: (...args: unknown[]) => void
 }
 
@@ -260,11 +256,9 @@ describe('handlePermissionClick — non-matching action ids', () => {
     const decide = makeDecideStub()
     const handled = await handlePermissionClick(
       'some_other_action',
-      USER_ID,
       {
         getClient: () => decide.client,
         web: chat.web as never,
-        resolveUserName: async () => USER_NAME_ALICE,
       } satisfies ClickHandlerDepsShape as never,
     )
     expect(handled).toBe(false)
@@ -277,11 +271,9 @@ describe('handlePermissionClick — non-matching action ids', () => {
     const decide = makeDecideStub()
     const handled = await handlePermissionClick(
       `perm_allow_NOT_CSCB_PREFIX_${TOKEN_A}`,
-      USER_ID,
       {
         getClient: () => decide.client,
         web: chat.web as never,
-        resolveUserName: async () => USER_NAME_ALICE,
       } satisfies ClickHandlerDepsShape as never,
     )
     expect(handled).toBe(false)
@@ -294,11 +286,9 @@ describe('handlePermissionClick — non-matching action ids', () => {
     const decide = makeDecideStub()
     const handled = await handlePermissionClick(
       `perm_allow_${INSTANCE_C}_42`,
-      USER_ID,
       {
         getClient: () => decide.client,
         web: chat.web as never,
-        resolveUserName: async () => USER_NAME_ALICE,
       } satisfies ClickHandlerDepsShape as never,
     )
     expect(handled).toBe(false)
@@ -312,7 +302,7 @@ describe('handlePermissionClick — non-matching action ids', () => {
 // ---------------------------------------------------------------------------
 
 describe('handlePermissionClick — happy path', () => {
-  test('allow → decide(allow, request_token) → chat.update "Allowed by X" → markHandled', async () => {
+  test('allow → decide(allow, request_token) → chat.update "Allowed" → markHandled', async () => {
     const seed = await seedLiveEntry({
       instanceId: INSTANCE_C,
       channelId: CHANNEL_CH,
@@ -325,11 +315,9 @@ describe('handlePermissionClick — happy path', () => {
     const decide = makeDecideStub()
     const handled = await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      USER_ID,
       {
         getClient: () => decide.client,
         web: seed.chat.web as never,
-        resolveUserName: async () => USER_NAME_ALICE,
       } satisfies ClickHandlerDepsShape as never,
     )
 
@@ -346,12 +334,12 @@ describe('handlePermissionClick — happy path', () => {
     expect(updates).toHaveLength(1)
     expect(updates[0].channel).toBe(CHANNEL_CH)
     expect(updates[0].ts).toBe(messageTs)
-    expect(updates[0].text).toContain(`Allowed by ${USER_NAME_ALICE}`)
+    expect(updates[0].text).toBe('*Permission* — Allowed')
 
     expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(true)
   })
 
-  test('deny → decide(deny, request_token) → chat.update "Denied by X" → markHandled', async () => {
+  test('deny → decide(deny, request_token) → chat.update "Denied by operator" → markHandled', async () => {
     const seed = await seedLiveEntry({
       instanceId: INSTANCE_C,
       channelId: CHANNEL_CH,
@@ -361,11 +349,9 @@ describe('handlePermissionClick — happy path', () => {
 
     await handlePermissionClick(
       encodePermissionActionId('deny', INSTANCE_C, TOKEN_A),
-      USER_ID,
       {
         getClient: () => decide.client,
         web: seed.chat.web as never,
-        resolveUserName: async () => USER_NAME_BOB,
       } satisfies ClickHandlerDepsShape as never,
     )
 
@@ -375,7 +361,7 @@ describe('handlePermissionClick — happy path', () => {
 
     const updates = seed.chat.calls.filter((c) => c.kind === 'update')
     expect(updates).toHaveLength(1)
-    expect(updates[0].text).toContain(`Denied by ${USER_NAME_BOB}`)
+    expect(updates[0].text).toBe('*Permission* — Denied by operator')
     expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(true)
   })
 
@@ -393,11 +379,9 @@ describe('handlePermissionClick — happy path', () => {
     const logs: unknown[][] = []
     const result = await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      USER_ID,
       {
         getClient: () => decide.client,
         web: chatForClick.web as never,
-        resolveUserName: async () => USER_NAME_ALICE,
         log: (...args: unknown[]) => logs.push(args),
       } satisfies ClickHandlerDepsShape as never,
     )
@@ -434,11 +418,9 @@ describe('handlePermissionClick — decide-wire invariant (SR-4.1 / SR-7.2)', ()
     const decide = makeDecideStub()
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      USER_ID,
       {
         getClient: () => decide.client,
         web: seed.chat.web as never,
-        resolveUserName: async () => USER_NAME_ALICE,
       } satisfies ClickHandlerDepsShape as never,
     )
     expect(decide.calls).toHaveLength(1)
@@ -460,11 +442,9 @@ describe('handlePermissionClick — stale click (SR-4.2)', () => {
     const decide = makeDecideStub()
     const result = await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_C),
-      USER_ID,
       {
         getClient: () => decide.client,
         web: chat.web as never,
-        resolveUserName: async () => USER_NAME_ALICE,
         log: () => { /* swallow */ },
       } satisfies ClickHandlerDepsShape as never,
     )
@@ -494,11 +474,9 @@ describe('handlePermissionClick — stale click (SR-4.2)', () => {
     const decide = makeDecideStub()
     await handlePermissionClick(
       encodePermissionActionId('deny', INSTANCE_C, TOKEN_C),
-      USER_ID,
       {
         getClient: () => decide.client,
         web: seed.chat.web as never,
-        resolveUserName: async () => USER_NAME_ALICE,
         log: () => { /* swallow */ },
       } satisfies ClickHandlerDepsShape as never,
     )
@@ -527,11 +505,9 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
 
     const result = await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      USER_ID,
       {
         getClient: () => decide.client,
         web: seed.chat.web as never,
-        resolveUserName: async () => USER_NAME_ALICE,
         log: (...args: unknown[]) => logs.push(args),
       } satisfies ClickHandlerDepsShape as never,
     )
@@ -557,11 +533,9 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
 
     const result = await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      USER_ID,
       {
         getClient: () => decide.client,
         web: seed.chat.web as never,
-        resolveUserName: async () => USER_NAME_ALICE,
         log: (...args: unknown[]) => logs.push(args),
       } satisfies ClickHandlerDepsShape as never,
     )
@@ -590,11 +564,9 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
 
     const result = await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      USER_ID,
       {
         getClient: () => decide.client,
         web: seed.chat.web as never,
-        resolveUserName: async () => USER_NAME_ALICE,
         log: (...args: unknown[]) => logs.push(args),
       } satisfies ClickHandlerDepsShape as never,
     )
@@ -618,11 +590,9 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
 
     const result = await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      USER_ID,
       {
         getClient: () => decide.client,
         web: seed.chat.web as never,
-        resolveUserName: async () => USER_NAME_ALICE,
         log: (...args: unknown[]) => logs.push(args),
       } satisfies ClickHandlerDepsShape as never,
     )
@@ -660,11 +630,9 @@ describe('handlePermissionClick — sibling independence (SR-4.5)', () => {
     const decide = makeDecideStub()
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      USER_ID,
       {
         getClient: () => decide.client,
         web: seed.chat.web as never,
-        resolveUserName: async () => USER_NAME_ALICE,
       } satisfies ClickHandlerDepsShape as never,
     )
 

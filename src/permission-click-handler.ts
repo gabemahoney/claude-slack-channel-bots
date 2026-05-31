@@ -28,8 +28,6 @@ export interface ClickDeps {
   /** Returns an AD Client whose `decide` method this handler will invoke. */
   getClient: () => Pick<Client, 'decide'>
   web: Pick<WebClient, 'chat'>
-  /** Returns the display name for a Slack user id; used to label decision updates. */
-  resolveUserName: (userId: string) => Promise<string>
   log?: (...args: unknown[]) => void
 }
 
@@ -38,13 +36,17 @@ function logDeps(deps: ClickDeps, ...args: unknown[]): void {
   else console.error(...args)
 }
 
-/** Block Kit body for the "decided by X" operator-decide rendering (SR-5.4). */
-function buildDecisionBlocks(decision: PermissionDecision, userName: string): unknown[] {
-  const label = decision === 'allow' ? 'Allowed' : 'Denied'
+// Match the poller's SR-2.4 terminal verdict text exactly so the click-handler
+// render and the next-tick reconciliation render are byte-identical — no
+// visible flicker.
+function buildDecisionBlocks(decision: PermissionDecision): unknown[] {
+  const text = decision === 'allow'
+    ? '*Permission* — Allowed'
+    : '*Permission* — Denied by operator'
   return [
     {
       type: 'section',
-      text: { type: 'mrkdwn', text: `*Permission* — ${label} by ${userName}` },
+      text: { type: 'mrkdwn', text },
     },
   ]
 }
@@ -56,7 +58,6 @@ function buildDecisionBlocks(decision: PermissionDecision, userName: string): un
  */
 export async function handlePermissionClick(
   actionId: string,
-  slackUserId: string,
   deps: ClickDeps,
 ): Promise<boolean> {
   const parsed = parsePermissionActionId(actionId)
@@ -99,20 +100,16 @@ export async function handlePermissionClick(
   const entry = getLivePermission(claudeInstanceId, requestToken)
   if (!entry) return true
 
-  let userName: string
-  try {
-    userName = slackUserId ? await deps.resolveUserName(slackUserId) : 'unknown'
-  } catch {
-    userName = slackUserId || 'unknown'
-  }
-
   // SR-4.5 sibling independence: target only this row's messageTs.
+  const text = decision === 'allow'
+    ? '*Permission* — Allowed'
+    : '*Permission* — Denied by operator'
   try {
     await deps.web.chat.update({
       channel: entry.channelId,
       ts: entry.messageTs,
-      text: `Permission — ${decision === 'allow' ? 'Allowed' : 'Denied'} by ${userName}`,
-      blocks: buildDecisionBlocks(decision, userName) as never,
+      text,
+      blocks: buildDecisionBlocks(decision) as never,
     })
     markHandled(claudeInstanceId, requestToken)
   } catch (err) {

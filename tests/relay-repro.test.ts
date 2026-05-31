@@ -12,12 +12,12 @@
  *
  *   Click row A as allow
  *     └── handlePermissionClick → decide({decision:'allow', request_token: TOK_A})
- *         → chat.update on row_A's messageTs ("Allowed by alice")
+ *         → chat.update on row_A's messageTs ("*Permission* — Allowed")
  *         → markHandled(TOK_A)
  *
  *   Click row B as deny
  *     └── handlePermissionClick → decide({decision:'deny',  request_token: TOK_B})
- *         → chat.update on row_B's messageTs ("Denied by bob")
+ *         → chat.update on row_B's messageTs ("*Permission* — Denied by operator")
  *         → markHandled(TOK_B)
  *
  *   Tick N+1
@@ -73,10 +73,6 @@ const POST_TS_B = 'TS.row_B'
 const TOK_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const TOK_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 
-const USER_ID_ALICE = 'U_ALICE'
-const USER_ID_BOB = 'U_BOB'
-const USER_NAME_ALICE = 'alice'
-const USER_NAME_BOB = 'bob'
 
 // ---------------------------------------------------------------------------
 // Shared test plumbing — manual interval + chat-recording stub
@@ -251,10 +247,9 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     // Click row A as ALLOW
     // -----------------------------------------------------------------
     const allowActionId = encodePermissionActionId('allow', INSTANCE_C, TOK_A)
-    const allowHandled = await handlePermissionClick(allowActionId, USER_ID_ALICE, {
+    const allowHandled = await handlePermissionClick(allowActionId, {
       getClient,
       web: chat.web as never,
-      resolveUserName: async (uid: string) => uid === USER_ID_ALICE ? USER_NAME_ALICE : 'unknown',
     })
     expect(allowHandled).toBe(true)
 
@@ -269,7 +264,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     const afterAllowUpdates = chat.calls.filter((c) => c.kind === 'update')
     expect(afterAllowUpdates).toHaveLength(1)
     expect(afterAllowUpdates[0].ts).toBe(POST_TS_A)
-    expect(afterAllowUpdates[0].text).toBe(`Permission — Allowed by ${USER_NAME_ALICE}`)
+    expect(afterAllowUpdates[0].text).toBe('*Permission* — Allowed')
     // markHandled landed on TOK_A only
     expect(getLivePermission(INSTANCE_C, TOK_A)?.handled).toBe(true)
     expect(getLivePermission(INSTANCE_C, TOK_B)?.handled).toBe(false)
@@ -278,10 +273,9 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     // Click row B as DENY
     // -----------------------------------------------------------------
     const denyActionId = encodePermissionActionId('deny', INSTANCE_C, TOK_B)
-    const denyHandled = await handlePermissionClick(denyActionId, USER_ID_BOB, {
+    const denyHandled = await handlePermissionClick(denyActionId, {
       getClient,
       web: chat.web as never,
-      resolveUserName: async (uid: string) => uid === USER_ID_BOB ? USER_NAME_BOB : 'unknown',
     })
     expect(denyHandled).toBe(true)
 
@@ -296,7 +290,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     const afterDenyUpdates = chat.calls.filter((c) => c.kind === 'update')
     expect(afterDenyUpdates).toHaveLength(2)
     expect(afterDenyUpdates[1].ts).toBe(POST_TS_B)
-    expect(afterDenyUpdates[1].text).toBe(`Permission — Denied by ${USER_NAME_BOB}`)
+    expect(afterDenyUpdates[1].text).toBe('*Permission* — Denied by operator')
     // markHandled landed on both now
     expect(getLivePermission(INSTANCE_C, TOK_A)?.handled).toBe(true)
     expect(getLivePermission(INSTANCE_C, TOK_B)?.handled).toBe(true)

@@ -719,13 +719,11 @@ socket.on('interactive', async (evt) => {
   const { ack } = evt as { ack: () => Promise<void> }
   const p = ((evt as any).body ?? (evt as any).payload ?? evt) as Record<string, unknown>
   const actions = (Array.isArray(p['actions']) ? p['actions'] : []) as Array<{ action_id: string }>
-  const userId = ((p['user'] as Record<string, unknown> | undefined)?.['id'] as string | undefined) ?? ''
   for (const action of actions) {
     const actionId = action.action_id
-    const handled = await handlePermissionClick(actionId, userId, {
+    const handled = await handlePermissionClick(actionId, {
       getClient,
       web,
-      resolveUserName,
     })
     if (handled) {
       await ack()
