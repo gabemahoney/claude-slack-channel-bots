@@ -44,7 +44,15 @@ allowed-tools: [Bash]
 
 - Docker is not running (`docker info` fails) — instruct operator to start
   Docker and re-run `/ci`.
-- `ANTHROPIC_API_KEY` is not set in the environment — instruct operator to
-  export it and re-run. The bot Claudes spawned by the daemon-under-test need
-  it to authenticate.
+- `ANTHROPIC_API_KEY` is not set in the environment. The bot Claudes
+  spawned by the daemon-under-test cannot use Claude Code's OAuth and need
+  a raw `sk-ant-api…` key. To find it, read Claude Code's own stored key:
+  ```bash
+  export ANTHROPIC_API_KEY="$(jq -r .primaryApiKey ~/.claude.json)"
+  ```
+  If `primaryApiKey` is null/absent, the operator has not provisioned an
+  API key — instruct them to do so before re-running `/ci`. When
+  invoking `/ci` from a worker spawned via `agent-director`, pass the
+  key through with `--extra-env ANTHROPIC_API_KEY="$KEY"` on the spawn
+  command — the worker session does not inherit the orchestrator's env.
 - `npm pack` fails — instruct operator to run `npm install` and re-run `/ci`.
