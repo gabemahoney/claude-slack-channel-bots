@@ -1,7 +1,6 @@
 .idea/
-.claude/settings.json
-.claude/settings.local.json
-.claude/scheduled_tasks.lock
+.claude/*
+!.claude/skills/
 node_modules/
 *.tgz
 ._*
