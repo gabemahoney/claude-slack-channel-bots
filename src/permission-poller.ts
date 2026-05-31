@@ -1,24 +1,28 @@
 /**
- * permission-poller.ts — SR-2.1 permission-state poller.
+ * permission-poller.ts — permission-state poller.
  *
- * Every tick, for each spawn in check_permission, calls client.get() and
- * compares the returned request_id to the live entry's stored requestId.
- * DB state is definitive; CSCB reconciles its Slack UI against it.
+ * Every tick, lists spawns in check_permission with the cscb service label
+ * and reconciles CSCB's live Slack-prompt state against agent-director's
+ * plural `permission_requests` projection. The pending map is keyed on a
+ * composite of (claude_instance_id, request_token) so concurrent open
+ * requests on the same spawn each get their own Slack prompt without
+ * colliding.
  *
- * Behavior matrix per tick:
- *   1. No live entry → post Block Kit.
- *   2. Live entry, request_id matches, handled=false → no-op.
- *   3. Live entry, request_id matches, handled=true  → no-op.
- *   4. Live entry, request_id changed:
- *        handled=false → chat.update "no longer active" + dropPermission + post fresh Block Kit.
- *        handled=true  → dropPermission only, then post fresh Block Kit.
- *   5. Spawn drops from list:
- *        handled=false → expire chat.update + dropPermission.
- *        handled=true  → dropPermission only (suppress chat.update).
+ * Behavior per tick:
+ *   1. list({state:['check_permission'], label:['service=cscb']}).
+ *   2. For each row, get({claude_instance_id}). When the plural projection
+ *      is absent (undefined/null), log non-conformance and skip — do not
+ *      mutate state for that row.
+ *   3. For each PermissionRequestRow in the plural projection, compute the
+ *      composite key. If already tracked → skip (duplicate-tick no-op).
+ *      Else post a fresh Block Kit prompt and register the live entry.
+ *   4. After all rows are processed, sweep: any tracked entry whose
+ *      composite key was NOT observed this tick is dropped; if it was
+ *      handled=false, send the expire chat.update first.
  *
- * If get() returns permission_request===null while spawn is still in
- * check_permission, treat as a transient race and skip reconciliation for
- * that row this tick.
+ * Case 4 (per-spawn request_id advancement) is GONE — the composite key
+ * means a "new" token simply appears as an unseen entry and the old token
+ * naturally falls out of the seen-set on the next tick.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -28,25 +32,67 @@ import {
   ErrSpawnNotFound,
 } from 'agent-director'
 import type {
-  GetResult,
+  GetResult as ADGetResult,
   ListRow,
-  PermissionRequestInfo,
 } from 'agent-director'
 import type { WebClient } from '@slack/web-api'
 
 import { encodePermissionActionId } from './permission-action-id.ts'
 
 // ---------------------------------------------------------------------------
-// Types — exported so the click handler can share the live map.
+// Wire-shape types (local — paired AD release ships the matching wire)
+// ---------------------------------------------------------------------------
+
+/**
+ * A single open permission_requests row per the paired agent-director
+ * release's plural projection wire. CSCB treats `request_token` as opaque
+ * (no parsing, no validation of the bytes themselves).
+ */
+export interface PermissionRequestRow {
+  /** Opaque per-request token minted by agent-director. */
+  request_token: string
+  /** AD autoincrement PK; retained for logging only. */
+  request_id: number
+  tool_name: string
+  /** Raw JSON string per the typed contract. */
+  tool_input: string
+  requested_at: string
+}
+
+/**
+ * Local view of the paired-release `GetResult`. The published package still
+ * carries singular `permission_request`; the paired release replaces it
+ * with plural `permission_requests`. We strip the singular field via Omit
+ * and re-add the plural one so we never accidentally read the old shape.
+ */
+export interface GetResultWithPermissionRequests extends Omit<ADGetResult, 'permission_request'> {
+  permission_requests?: PermissionRequestRow[] | null
+}
+
+// ---------------------------------------------------------------------------
+// Live-permission state
 // ---------------------------------------------------------------------------
 
 /** State CSCB tracks for each open Slack permission prompt. */
 export interface LivePermission {
+  claudeInstanceId: string
+  /** Opaque per-request token. */
+  requestToken: string
   channelId: string
   messageTs: string
+  /** Retained for logging only; never used for routing/keying/encoding. */
   requestId: number
   /** Set to true by the click handler once its final chat.update succeeds. */
   handled: boolean
+}
+
+/**
+ * Deterministic composite key for the pending map. The null byte
+ * separator is chosen because neither claude_instance_id nor a UUIDv4
+ * token can contain \x00.
+ */
+export function makeCompositeKey(claudeInstanceId: string, requestToken: string): string {
+  return `${claudeInstanceId}\x00${requestToken}`
 }
 
 /**
@@ -85,22 +131,25 @@ let depsRef: PollerDeps | null = null
 // Module-state accessors (used by the click handler)
 // ---------------------------------------------------------------------------
 
-/** Return the live entry for a claude_instance_id, or undefined. */
-export function getLivePermission(claudeInstanceId: string): LivePermission | undefined {
-  return livePermissions.get(claudeInstanceId)
+/** Return the live entry for a (claude_instance_id, request_token) pair. */
+export function getLivePermission(
+  claudeInstanceId: string,
+  requestToken: string,
+): LivePermission | undefined {
+  return livePermissions.get(makeCompositeKey(claudeInstanceId, requestToken))
 }
 
 /** Mark the entry as handled — call from the click handler after its chat.update succeeds. */
-export function markHandled(claudeInstanceId: string): boolean {
-  const entry = livePermissions.get(claudeInstanceId)
+export function markHandled(claudeInstanceId: string, requestToken: string): boolean {
+  const entry = livePermissions.get(makeCompositeKey(claudeInstanceId, requestToken))
   if (!entry) return false
   entry.handled = true
   return true
 }
 
 /** Drop the entry — the tick is the sole owner of clearing entries. */
-export function dropPermission(claudeInstanceId: string): void {
-  livePermissions.delete(claudeInstanceId)
+export function dropPermission(claudeInstanceId: string, requestToken: string): void {
+  livePermissions.delete(makeCompositeKey(claudeInstanceId, requestToken))
 }
 
 /** Test-only: reset module-scoped state. */
@@ -117,19 +166,19 @@ export function _resetPollerState(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Block Kit builder — local copy of the SR-2.2 Block Kit format
+// Block Kit builder
 // ---------------------------------------------------------------------------
 
 /**
- * Construct the Block Kit blocks for a permission prompt. Preserved
- * verbatim from the old server.ts implementation; only the action_id
- * shape changes (SR-2.2 — full claude_instance_id + request_id encoding).
+ * Construct the Block Kit blocks for a permission prompt. The body lines
+ * (tool name + summary) are unchanged from the prior implementation; only
+ * the action_id encoding swaps request_id for the opaque request_token.
  */
 export function buildPermissionBlocks(
   toolName: string,
   toolInput: Record<string, unknown>,
   claudeInstanceId: string,
-  requestId: number,
+  requestToken: string,
 ): unknown[] {
   let summary: string
   if (toolName === 'Bash') {
@@ -153,13 +202,13 @@ export function buildPermissionBlocks(
           type: 'button',
           text: { type: 'plain_text', text: 'Allow' },
           style: 'primary',
-          action_id: encodePermissionActionId('allow', claudeInstanceId, requestId),
+          action_id: encodePermissionActionId('allow', claudeInstanceId, requestToken),
         },
         {
           type: 'button',
           text: { type: 'plain_text', text: 'Deny' },
           style: 'danger',
-          action_id: encodePermissionActionId('deny', claudeInstanceId, requestId),
+          action_id: encodePermissionActionId('deny', claudeInstanceId, requestToken),
         },
       ],
     },
@@ -196,14 +245,14 @@ async function runTick(deps: PollerDeps): Promise<void> {
       return
     }
 
-    const seenIds = new Set<string>()
+    const seenComposite = new Set<string>()
+    const nonConformingInstanceIds = new Set<string>()
     for (const row of rows) {
-      seenIds.add(row.claude_instance_id)
-
-      // Always fetch the full row to compare request_id.
-      let got: GetResult
+      let got: GetResultWithPermissionRequests
       try {
-        got = await client.get({ claude_instance_id: row.claude_instance_id })
+        got = (await client.get({
+          claude_instance_id: row.claude_instance_id,
+        })) as unknown as GetResultWithPermissionRequests
       } catch (err) {
         if (err instanceof ErrSpawnNotFound) continue
         const e = err instanceof AgentDirectorError ? err : null
@@ -211,44 +260,27 @@ async function runTick(deps: PollerDeps): Promise<void> {
         continue
       }
 
-      if (!got.permission_request) {
-        // Transient race: spawn is in check_permission but permission_request is null.
-        // Leave existing entry alone; skip reconciliation for this row this tick.
+      if (got.permission_requests === null || got.permission_requests === undefined) {
+        logViaDeps(deps, `[slack] permission-poller: non-conforming open-rows response for ${row.claude_instance_id} — skipping`)
+        nonConformingInstanceIds.add(row.claude_instance_id)
         continue
       }
 
-      const incomingRequestId = got.permission_request.request_id
-      const existing = livePermissions.get(row.claude_instance_id)
-
-      if (!existing) {
-        // Case 1: No live entry — post Block Kit.
-        await postPermissionPrompt(deps, row, got.permission_request)
-        continue
+      for (const perm of got.permission_requests) {
+        const key = makeCompositeKey(row.claude_instance_id, perm.request_token)
+        seenComposite.add(key)
+        if (livePermissions.has(key)) continue
+        await postPermissionPrompt(deps, row, perm)
       }
-
-      if (existing.requestId === incomingRequestId) {
-        // Cases 2 & 3: request_id matches — no-op regardless of handled.
-        continue
-      }
-
-      // Case 4: request_id changed (advanced).
-      if (!existing.handled) {
-        // handled=false → update old message to "no longer active" + drop + post fresh.
-        await updateNoLongerActive(deps, row.claude_instance_id, existing)
-      }
-      // handled=true → drop only (click handler already wrote "Allowed/Denied").
-      dropPermission(row.claude_instance_id)
-      await postPermissionPrompt(deps, row, got.permission_request)
     }
 
-    // Case 5: Expire entries no longer in the result set.
-    for (const [id, entry] of livePermissions) {
-      if (seenIds.has(id)) continue
+    for (const [key, entry] of livePermissions) {
+      if (nonConformingInstanceIds.has(entry.claudeInstanceId)) continue
+      if (seenComposite.has(key)) continue
       if (!entry.handled) {
-        await expirePermissionPrompt(deps, id, entry)
+        await expirePermissionPrompt(deps, entry)
       }
-      // handled=true → suppress chat.update; just drop.
-      livePermissions.delete(id)
+      livePermissions.delete(key)
     }
   } finally {
     tickInFlight = false
@@ -258,7 +290,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
 async function postPermissionPrompt(
   deps: PollerDeps,
   row: ListRow,
-  permission: PermissionRequestInfo,
+  permission: PermissionRequestRow,
 ): Promise<void> {
   const channelId = row.labels['channel']
   if (!channelId) {
@@ -283,7 +315,7 @@ async function postPermissionPrompt(
     permission.tool_name,
     toolInput,
     row.claude_instance_id,
-    permission.request_id,
+    permission.request_token,
   )
 
   try {
@@ -297,7 +329,9 @@ async function postPermissionPrompt(
       logViaDeps(deps, `[slack] permission-poller: chat.postMessage returned no ts for ${row.claude_instance_id}`)
       return
     }
-    livePermissions.set(row.claude_instance_id, {
+    livePermissions.set(makeCompositeKey(row.claude_instance_id, permission.request_token), {
+      claudeInstanceId: row.claude_instance_id,
+      requestToken: permission.request_token,
       channelId,
       messageTs,
       requestId: permission.request_id,
@@ -308,34 +342,8 @@ async function postPermissionPrompt(
   }
 }
 
-async function updateNoLongerActive(
-  deps: PollerDeps,
-  claudeInstanceId: string,
-  entry: LivePermission,
-): Promise<void> {
-  try {
-    await deps.web.chat.update({
-      channel: entry.channelId,
-      ts: entry.messageTs,
-      text: 'permission request no longer active',
-      blocks: [
-        {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: '⏳ Permission request no longer active.',
-          },
-        },
-      ] as never,
-    })
-  } catch (err) {
-    logViaDeps(deps, `[slack] permission-poller: no-longer-active chat.update failed for ${claudeInstanceId}:`, err)
-  }
-}
-
 async function expirePermissionPrompt(
   deps: PollerDeps,
-  claudeInstanceId: string,
   entry: LivePermission,
 ): Promise<void> {
   try {
@@ -354,7 +362,7 @@ async function expirePermissionPrompt(
       ] as never,
     })
   } catch (err) {
-    logViaDeps(deps, `[slack] permission-poller: expire chat.update failed for ${claudeInstanceId}:`, err)
+    logViaDeps(deps, `[slack] permission-poller: expire chat.update failed for ${entry.claudeInstanceId}:`, err)
   }
 }
 

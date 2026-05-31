@@ -1,19 +1,13 @@
 /**
- * permission-click-handler.ts — SR-2.2 Block Kit decision relay.
+ * permission-click-handler.ts — Block Kit decision relay.
  *
- * Consumes Socket Mode interactive events whose action_id matches the
- * SR-2.2 shape `perm_(allow|deny)_<claude_instance_id>_<request_id>`.
+ * Consumes Socket Mode interactive events whose action_id matches
+ * `perm_(allow|deny)_<claude_instance_id>_<request_token>`.
  *
- * Sequence per click:
- *   1. Parse the action_id; if malformed, return false (not our event).
- *   2. Look up the live entry; if absent, log stale click and return true.
- *   3. client.get() + compare request_id. Mismatch or spawn gone →
- *      chat.update "already decided"; set handled=true only if that update
- *      succeeds. Do NOT call dropPermission — tick owns the entry.
- *   4. client.decide(). ErrAlreadyDecided treated as success.
- *   5. chat.update "Allowed/Denied by <user>". ONLY on success: markHandled().
- *      If chat.update throws, leave handled=false so the tick's expire path
- *      fires a second-chance update on next interval.
+ * Epic 1 keeps the legacy pre-decide reconciliation flow intact (rekeyed
+ * onto the composite key + plural projection); Epic 2 will rewrite this
+ * file to thread `request_token` through `decide()` and remove the
+ * pre-decide refetch entirely.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -29,6 +23,7 @@ import { parsePermissionActionId, type PermissionDecision } from './permission-a
 import {
   getLivePermission,
   markHandled,
+  type GetResultWithPermissionRequests,
 } from './permission-poller.ts'
 
 export interface ClickDeps {
@@ -71,7 +66,7 @@ function buildAlreadyDecidedBlocks(): unknown[] {
 /**
  * Handle a permission Block Kit click. Returns true when the action_id was a
  * valid permission decision (the caller has already ack'd); false when the
- * action_id did not match the SR-2.2 shape (caller should keep looking).
+ * action_id did not match the expected shape (caller should keep looking).
  */
 export async function handlePermissionClick(
   actionId: string,
@@ -81,43 +76,35 @@ export async function handlePermissionClick(
   const parsed = parsePermissionActionId(actionId)
   if (parsed === null) return false
 
-  const { decision, claudeInstanceId, requestId } = parsed
+  const { decision, claudeInstanceId, requestToken } = parsed
 
-  const entry = getLivePermission(claudeInstanceId)
+  const entry = getLivePermission(claudeInstanceId, requestToken)
   if (!entry) {
-    // No live entry — either the poller hasn't seen this yet, or it already
-    // expired. Either way, treat as a stale click no-op.
-    logDeps(deps, `[slack] permission-click: no live entry for ${claudeInstanceId} (request_id=${requestId}) — stale click`)
+    logDeps(deps, `[slack] permission-click: no live entry for ${claudeInstanceId} (request_token=${requestToken}) — stale click`)
     return true
   }
 
-  if (entry.requestId !== requestId) {
-    // The live entry has already moved on to a later request_id — this is a
-    // stale click against a message the tick has already replaced or dropped.
-    // Do not touch the entry; the tick is the sole owner of the new message.
-    logDeps(deps, `[slack] permission-click: live entry has advanced past request_id=${requestId} for ${claudeInstanceId} — stale click, no-op`)
-    return true
-  }
-
-  // Step 3: refetch + compare request_id to detect stale-button clicks.
-  let currentRequestId: number | null
+  // Refetch + check whether the token still appears in the open-rows
+  // projection to detect stale-button clicks.
+  let tokenStillOpen: boolean
   try {
-    const got = await deps.getClient().get({ claude_instance_id: claudeInstanceId })
-    currentRequestId = got.permission_request?.request_id ?? null
+    const got = (await deps.getClient().get({
+      claude_instance_id: claudeInstanceId,
+    })) as unknown as GetResultWithPermissionRequests
+    const rows = got.permission_requests
+    tokenStillOpen = Array.isArray(rows) && rows.some((r) => r.request_token === requestToken)
   } catch (err) {
     if (err instanceof ErrSpawnNotFound) {
       logDeps(deps, `[slack] permission-click: spawn ${claudeInstanceId} disappeared — marking stale`)
-      currentRequestId = null
+      tokenStillOpen = false
     } else {
       const e = err instanceof AgentDirectorError ? err : null
       logDeps(deps, `[slack] permission-click: get failed for ${claudeInstanceId}: ${e?.errName ?? String(err)}`)
-      // Do not touch handled. Tick will re-evaluate next interval.
       return true
     }
   }
 
-  if (currentRequestId === null || currentRequestId !== requestId) {
-    // Stale click — no decide() call. Tick owns the entry drop.
+  if (!tokenStillOpen) {
     try {
       await deps.web.chat.update({
         channel: entry.channelId,
@@ -125,27 +112,24 @@ export async function handlePermissionClick(
         text: 'already decided — stale prompt',
         blocks: buildAlreadyDecidedBlocks() as never,
       })
-      markHandled(claudeInstanceId)
+      markHandled(claudeInstanceId, requestToken)
     } catch (err) {
       logDeps(deps, `[slack] permission-click: stale-click chat.update failed for ${claudeInstanceId}:`, err)
-      // Leave handled=false so tick's expire path fires on next interval.
     }
     return true
   }
 
-  // Step 4: call client.decide(). Idempotent — ErrAlreadyDecided counts as success.
+  // decide() still takes the two-field shape; Epic 2 adds request_token.
   try {
     await deps.getClient().decide({ claude_instance_id: claudeInstanceId, decision })
   } catch (err) {
     if (!(err instanceof ErrAlreadyDecided)) {
       const e = err instanceof AgentDirectorError ? err : null
       logDeps(deps, `[slack] permission-click: decide failed for ${claudeInstanceId}: ${e?.errName ?? String(err)}`)
-      // Leave handled=false; the operator can re-click. Buttons still visible.
       return true
     }
   }
 
-  // Step 5: confirm via chat.update. Resolve the user name for the label.
   let userName: string
   try {
     userName = slackUserId ? await deps.resolveUserName(slackUserId) : 'unknown'
@@ -159,9 +143,7 @@ export async function handlePermissionClick(
       text: `Permission — ${decision === 'allow' ? 'Allowed' : 'Denied'} by ${userName}`,
       blocks: buildDecisionBlocks(decision, userName) as never,
     })
-    // Only mark handled after the update succeeds. If update throws, handled
-    // stays false so the tick's expire path fires a second-chance update.
-    markHandled(claudeInstanceId)
+    markHandled(claudeInstanceId, requestToken)
   } catch (err) {
     logDeps(deps, `[slack] permission-click: decision chat.update failed for ${claudeInstanceId}:`, err)
   }

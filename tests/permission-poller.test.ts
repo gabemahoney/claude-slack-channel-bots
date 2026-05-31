@@ -1,27 +1,22 @@
 /**
- * permission-poller.test.ts — SR-2.1 poller behavior.
+ * permission-poller.test.ts — SR-2.1 / SR-8.4 poller behavior under the
+ * plural-projection wire and composite-key live map.
  *
- * Drives the poller directly via injected setInterval/clearInterval stubs
- * + WebClient.chat stub + agent-director client stub. Coverage:
- *
- *   - New check_permission row → posts Block Kit message to spawn's
- *     `channel` label and records the live entry (case 1).
- *   - request_id matches, handled=false → no-op (case 2).
- *   - request_id matches, handled=true  → no-op (case 3).
- *   - request_id advances, handled=false → chat.update "no longer active"
- *     + dropPermission + fresh postMessage (case 4 handled=false).
- *   - request_id advances, handled=true  → dropPermission + fresh
- *     postMessage, NO chat.update (case 4 handled=true).
- *   - Spawn disappears, handled=false → expire chat.update + drop (case 5
- *     handled=false).
- *   - Spawn disappears, handled=true → drop only, NO chat.update (case 5
- *     handled=true).
- *   - permission_request===null in get() while in check_permission →
- *     transient race; no post, no drop, no update; existing entry untouched.
- *   - tool_input JSON-parses; un-parseable falls back to raw-string.
- *   - get() ErrSpawnNotFound → skip silently.
- *   - postMessage returns no ts → no live entry recorded.
- *   - Skipped-tick observability (5+ consecutive skips logs WARN).
+ * Coverage:
+ *   - New row in `permission_requests` → posts Block Kit prompt + records
+ *     live entry keyed on (claude_instance_id, request_token).
+ *   - Two concurrent rows on a single tick → two distinct postMessage calls,
+ *     two distinct map entries.
+ *   - Repeat tick with the same plural projection → no duplicate postMessage,
+ *     no map mutation (duplicate-tick no-op).
+ *   - Empty `permission_requests` array → zero postMessage activity from
+ *     the open-rows path; existing entries from prior ticks drop via the
+ *     sweep.
+ *   - `null` / `undefined` open-rows → logs and skips, no state change.
+ *   - Row disappearance (Case 5) → expire chat.update + drop.
+ *   - get() ErrSpawnNotFound → continue silently.
+ *   - Skipped-tick observability (5+ consecutive in-flight ticks → warn).
+ *   - buildPermissionBlocks emits the UUIDv4-anchored action_id shape.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -38,10 +33,25 @@ import {
 } from '../src/permission-poller.ts'
 import {
   cannedGetResult,
+  cannedGetResultPlural,
   cannedListRow,
   cannedPermissionRequest,
+  cannedTwoRowPluralProjection,
   errSpawnNotFound,
 } from './test-helpers/agent-director-stub.ts'
+
+// ---------------------------------------------------------------------------
+// Shared fixtures — no inline magic strings (SR-8.1)
+// ---------------------------------------------------------------------------
+
+const INSTANCE_C = 'cscb_C'
+const CHANNEL_CH = 'CH'
+const POST_TS = 'TS1'
+const POST_TS_2 = 'TS2'
+
+// A handful of reusable UUIDv4-shaped tokens. CSCB treats them as opaque.
+const TOKEN_A = '11111111-1111-4111-8111-111111111111'
+const TOKEN_B = '22222222-2222-4222-8222-222222222222'
 
 // ---------------------------------------------------------------------------
 // Test plumbing: a manual interval stub + a chat-only WebClient fake
@@ -53,7 +63,11 @@ interface ManualInterval {
   cleared: boolean
 }
 
-function makeInterval(): { setInterval: typeof globalThis.setInterval; clearInterval: typeof globalThis.clearInterval; pending: ManualInterval[] } {
+function makeInterval(): {
+  setInterval: typeof globalThis.setInterval
+  clearInterval: typeof globalThis.clearInterval
+  pending: ManualInterval[]
+} {
   const pending: ManualInterval[] = []
   return {
     setInterval: ((cb: () => void, ms: number) => {
@@ -74,23 +88,43 @@ interface ChatCall {
   channel: string
   ts?: string
   text?: string
+  blocks?: unknown
 }
 
-function makeChatStub(opts?: { postMessageTs?: string; postMessageError?: Error; updateError?: Error }): { web: { chat: { postMessage: (...args: unknown[]) => Promise<{ ts: string }>; update: (...args: unknown[]) => Promise<unknown> } }; calls: ChatCall[] } {
+interface ChatStub {
+  web: {
+    chat: {
+      postMessage: (a: unknown) => Promise<{ ts?: string }>
+      update: (a: unknown) => Promise<unknown>
+    }
+  }
+  calls: ChatCall[]
+}
+
+/**
+ * Chat stub where each successive `postMessage` consumes the next `ts` from
+ * `tsSequence` (undefined → returns `{}` to model the "no ts" failure). Once
+ * the sequence is exhausted, falls back to a generated ts.
+ */
+function makeChatStub(opts: { tsSequence?: Array<string | undefined>; postMessageError?: Error; updateError?: Error } = {}): ChatStub {
   const calls: ChatCall[] = []
+  const seq = [...(opts.tsSequence ?? [])]
+  let fallback = 0
   return {
     web: {
       chat: {
-        async postMessage(args: unknown): Promise<{ ts: string }> {
-          const a = args as { channel: string; text: string }
-          calls.push({ kind: 'postMessage', channel: a.channel, text: a.text })
-          if (opts?.postMessageError) throw opts.postMessageError
-          return { ts: opts?.postMessageTs ?? '1234.5678' }
+        async postMessage(args: unknown): Promise<{ ts?: string }> {
+          const a = args as { channel: string; text: string; blocks?: unknown }
+          calls.push({ kind: 'postMessage', channel: a.channel, text: a.text, blocks: a.blocks })
+          if (opts.postMessageError) throw opts.postMessageError
+          if (seq.length === 0) return { ts: `auto-${++fallback}` }
+          const next = seq.shift()
+          return next === undefined ? {} : { ts: next }
         },
         async update(args: unknown): Promise<unknown> {
           const a = args as { channel: string; ts: string; text: string }
           calls.push({ kind: 'update', channel: a.channel, ts: a.ts, text: a.text })
-          if (opts?.updateError) throw opts.updateError
+          if (opts.updateError) throw opts.updateError
           return {}
         },
       },
@@ -99,46 +133,46 @@ function makeChatStub(opts?: { postMessageTs?: string; postMessageError?: Error;
   }
 }
 
+const checkPermRow = (instance: string = INSTANCE_C, channel: string = CHANNEL_CH) =>
+  cannedListRow({
+    claude_instance_id: instance,
+    state: 'check_permission',
+    labels: { service: 'cscb', channel },
+  })
+
 afterEach(() => {
   stopPermissionPoller()
   _resetPollerState()
 })
 
 // ---------------------------------------------------------------------------
-// Building blocks
+// Block Kit builder
 // ---------------------------------------------------------------------------
 
-describe('buildPermissionBlocks (SR-2.2 action_id shape)', () => {
-  test('emits perm_allow_<instance>_<request_id> and perm_deny_<instance>_<request_id>', () => {
-    const blocks = buildPermissionBlocks('Bash', { command: 'rm -rf' }, 'cscb_C012345', 42) as Array<Record<string, unknown>>
+describe('buildPermissionBlocks (SR-2.2 action_id shape with request_token)', () => {
+  test('emits perm_allow_<instance>_<token> and perm_deny_<instance>_<token>', () => {
+    const blocks = buildPermissionBlocks('Bash', { command: 'rm -rf' }, INSTANCE_C, TOKEN_A) as Array<Record<string, unknown>>
     const actions = blocks[1] as { elements: Array<{ action_id: string }> }
-    expect(actions.elements[0].action_id).toBe('perm_allow_cscb_C012345_42')
-    expect(actions.elements[1].action_id).toBe('perm_deny_cscb_C012345_42')
+    expect(actions.elements[0].action_id).toBe(`perm_allow_${INSTANCE_C}_${TOKEN_A}`)
+    expect(actions.elements[1].action_id).toBe(`perm_deny_${INSTANCE_C}_${TOKEN_A}`)
   })
 })
 
 // ---------------------------------------------------------------------------
-// Tick behavior — case 1: no live entry
+// Tick behavior — Case 1: new entry
 // ---------------------------------------------------------------------------
 
-describe('poller tick — case 1: no live entry', () => {
+describe('poller tick — Case 1: new entry', () => {
   test('posts Block Kit message and records live entry with handled=false', async () => {
     const ivl = makeInterval()
-    const chat = makeChatStub({ postMessageTs: '99.88' })
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+    const row = cannedPermissionRequest({ request_token: TOKEN_A, request_id: 7 })
     const getClient = () => ({
-      list: async () => ({
-        spawns: [
-          cannedListRow({
-            claude_instance_id: 'cscb_C',
-            state: 'check_permission',
-            labels: { service: 'cscb', channel: 'CH123' },
-          }),
-        ],
-      }),
-      get: async () => cannedGetResult({
-        claude_instance_id: 'cscb_C',
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
         state: 'check_permission',
-        permission_request: cannedPermissionRequest({ request_id: 7 }),
+        permission_requests: [row],
       }),
     })
     startPermissionPoller({
@@ -153,18 +187,17 @@ describe('poller tick — case 1: no live entry', () => {
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
 
-    const live = getLivePermission('cscb_C')
+    const live = getLivePermission(INSTANCE_C, TOKEN_A)
     expect(live).toBeDefined()
-    expect(live?.channelId).toBe('CH123')
-    expect(live?.messageTs).toBe('99.88')
+    expect(live?.channelId).toBe(CHANNEL_CH)
+    expect(live?.messageTs).toBe(POST_TS)
+    expect(live?.requestToken).toBe(TOKEN_A)
     expect(live?.requestId).toBe(7)
     expect(live?.handled).toBe(false)
 
     const postCalls = chat.calls.filter((c) => c.kind === 'postMessage')
     expect(postCalls).toHaveLength(1)
-    expect(postCalls[0].channel).toBe('CH123')
-
-    stopPermissionPoller()
+    expect(postCalls[0].channel).toBe(CHANNEL_CH)
   })
 
   test('skips when channel label is missing', async () => {
@@ -174,16 +207,16 @@ describe('poller tick — case 1: no live entry', () => {
       list: async () => ({
         spawns: [
           cannedListRow({
-            claude_instance_id: 'cscb_C',
+            claude_instance_id: INSTANCE_C,
             state: 'check_permission',
-            labels: { service: 'cscb' }, // no channel
+            labels: { service: 'cscb' },
           }),
         ],
       }),
-      get: async () => cannedGetResult({
-        claude_instance_id: 'cscb_C',
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
         state: 'check_permission',
-        permission_request: cannedPermissionRequest({ request_id: 1 }),
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A })],
       }),
     })
     startPermissionPoller({
@@ -192,24 +225,22 @@ describe('poller tick — case 1: no live entry', () => {
       intervalMs: 1000,
       setInterval: ivl.setInterval,
       clearInterval: ivl.clearInterval,
+      log: () => { /* swallow */ },
     })
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
     expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(0)
-    stopPermissionPoller()
   })
 
   test('falls back to raw-string on unparseable tool_input', async () => {
     const ivl = makeInterval()
-    const chat = makeChatStub({ postMessageTs: '99.88' })
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
     const getClient = () => ({
-      list: async () => ({
-        spawns: [cannedListRow({ claude_instance_id: 'cscb_C', state: 'check_permission', labels: { service: 'cscb', channel: 'CH' } })],
-      }),
-      get: async () => cannedGetResult({
-        claude_instance_id: 'cscb_C',
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
         state: 'check_permission',
-        permission_request: cannedPermissionRequest({ tool_input: '{not json' }),
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, tool_input: '{not json' })],
       }),
     })
     startPermissionPoller({
@@ -222,17 +253,14 @@ describe('poller tick — case 1: no live entry', () => {
     })
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
-    expect(getLivePermission('cscb_C')).toBeDefined()
-    stopPermissionPoller()
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeDefined()
   })
 
   test('get() ErrSpawnNotFound → skip silently, no entry recorded', async () => {
     const ivl = makeInterval()
     const chat = makeChatStub()
     const getClient = () => ({
-      list: async () => ({
-        spawns: [cannedListRow({ claude_instance_id: 'cscb_C', state: 'check_permission', labels: { service: 'cscb', channel: 'CH' } })],
-      }),
+      list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => { throw errSpawnNotFound() },
     })
     startPermissionPoller({
@@ -244,71 +272,19 @@ describe('poller tick — case 1: no live entry', () => {
     })
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
-    expect(getLivePermission('cscb_C')).toBeUndefined()
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
     expect(chat.calls).toHaveLength(0)
-    stopPermissionPoller()
   })
 
   test('postMessage returns no ts → no live entry recorded', async () => {
     const ivl = makeInterval()
-    // Override postMessage to return no ts
-    const calls: ChatCall[] = []
-    const web = {
-      chat: {
-        async postMessage(args: unknown): Promise<{ ts?: string }> {
-          const a = args as { channel: string; text: string }
-          calls.push({ kind: 'postMessage', channel: a.channel, text: a.text })
-          return {} // no ts
-        },
-        async update(args: unknown): Promise<unknown> {
-          const a = args as { channel: string; ts: string; text: string }
-          calls.push({ kind: 'update', channel: a.channel, ts: a.ts, text: a.text })
-          return {}
-        },
-      },
-    }
+    const chat = makeChatStub({ tsSequence: [undefined] })
     const getClient = () => ({
-      list: async () => ({
-        spawns: [cannedListRow({ claude_instance_id: 'cscb_C', state: 'check_permission', labels: { service: 'cscb', channel: 'CH' } })],
-      }),
-      get: async () => cannedGetResult({
-        claude_instance_id: 'cscb_C',
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
         state: 'check_permission',
-        permission_request: cannedPermissionRequest({ request_id: 1 }),
-      }),
-    })
-    startPermissionPoller({
-      getClient,
-      web: web as never,
-      intervalMs: 1000,
-      setInterval: ivl.setInterval,
-      clearInterval: ivl.clearInterval,
-      log: () => { /* swallow */ },
-    })
-    ivl.pending[0].cb()
-    await new Promise((r) => setTimeout(r, 10))
-    expect(calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1)
-    expect(getLivePermission('cscb_C')).toBeUndefined()
-    stopPermissionPoller()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Tick behavior — cases 2 & 3: request_id matches → no-op
-// ---------------------------------------------------------------------------
-
-describe('poller tick — cases 2 & 3: request_id matches (no-op)', () => {
-  test('case 2: request_id matches, handled=false → no-op (no extra postMessage)', async () => {
-    const ivl = makeInterval()
-    const chat = makeChatStub({ postMessageTs: 'TS1' })
-    const getClient = () => ({
-      list: async () => ({
-        spawns: [cannedListRow({ claude_instance_id: 'cscb_C', state: 'check_permission', labels: { service: 'cscb', channel: 'CH' } })],
-      }),
-      get: async () => cannedGetResult({
-        claude_instance_id: 'cscb_C',
-        state: 'check_permission',
-        permission_request: cannedPermissionRequest({ request_id: 5 }),
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A })],
       }),
     })
     startPermissionPoller({
@@ -317,33 +293,30 @@ describe('poller tick — cases 2 & 3: request_id matches (no-op)', () => {
       intervalMs: 1000,
       setInterval: ivl.setInterval,
       clearInterval: ivl.clearInterval,
+      log: () => { /* swallow */ },
     })
-
-    // Tick 1: seeds the live entry (handled=false by default)
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
     expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1)
-    expect(getLivePermission('cscb_C')?.handled).toBe(false)
-
-    // Tick 2: same request_id, handled=false → no-op
-    ivl.pending[0].cb()
-    await new Promise((r) => setTimeout(r, 10))
-    expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1) // still 1
-    expect(chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
-    stopPermissionPoller()
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
   })
+})
 
-  test('case 3: request_id matches, handled=true → no-op (no extra postMessage, no chat.update)', async () => {
+// ---------------------------------------------------------------------------
+// Tick behavior — duplicate-tick no-op (Cases 2/3 collapsed)
+// ---------------------------------------------------------------------------
+
+describe('poller tick — duplicate (claude_instance_id, request_token) is a no-op', () => {
+  test('repeat tick with same plural projection → no extra postMessage, map entry unchanged', async () => {
     const ivl = makeInterval()
-    const chat = makeChatStub({ postMessageTs: 'TS1' })
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+    const row = cannedPermissionRequest({ request_token: TOKEN_A, request_id: 5 })
     const getClient = () => ({
-      list: async () => ({
-        spawns: [cannedListRow({ claude_instance_id: 'cscb_C', state: 'check_permission', labels: { service: 'cscb', channel: 'CH' } })],
-      }),
-      get: async () => cannedGetResult({
-        claude_instance_id: 'cscb_C',
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
         state: 'check_permission',
-        permission_request: cannedPermissionRequest({ request_id: 5 }),
+        permission_requests: [row],
       }),
     })
     startPermissionPoller({
@@ -358,163 +331,363 @@ describe('poller tick — cases 2 & 3: request_id matches (no-op)', () => {
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
     expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1)
+    const seeded = getLivePermission(INSTANCE_C, TOKEN_A)
+    expect(seeded?.handled).toBe(false)
+    expect(seeded?.messageTs).toBe(POST_TS)
+
+    // Tick 2: identical projection → no-op
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+    expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1)
+    expect(chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
+
+    // Entry untouched (ts and handled flag preserved)
+    const after = getLivePermission(INSTANCE_C, TOKEN_A)
+    expect(after?.messageTs).toBe(POST_TS)
+    expect(after?.handled).toBe(false)
+  })
+
+  test('handled=true + duplicate row appearance → still no-op (no fresh post, no extra chat.update)', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+    const row = cannedPermissionRequest({ request_token: TOKEN_A, request_id: 5 })
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: [row],
+      }),
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+    })
+
+    // Tick 1: seed
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+    expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1)
 
     // Simulate click handler marking handled
-    markHandled('cscb_C')
-    expect(getLivePermission('cscb_C')?.handled).toBe(true)
+    markHandled(INSTANCE_C, TOKEN_A)
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(true)
 
-    // Tick 2: same request_id, handled=true → no-op
+    // Tick 2: same projection, handled=true → still no-op
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
-    expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1) // still 1
+    expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1)
     expect(chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
-    stopPermissionPoller()
   })
 })
 
 // ---------------------------------------------------------------------------
-// Tick behavior — case 4: request_id advanced
+// Tick behavior — two concurrent rows on a single tick (Epic 1 AC)
 // ---------------------------------------------------------------------------
 
-describe('poller tick — case 4: request_id advanced', () => {
-  test('handled=false: chat.update "no longer active" fires + entry dropped + fresh postMessage', async () => {
+describe('poller tick — two concurrent open rows on a single tick', () => {
+  test('two `permission_requests` rows → two distinct postMessage calls + two distinct map entries', async () => {
     const ivl = makeInterval()
-    // Track postMessage ts: first post gets 'TS1', second gets 'TS2'
-    const tsList = ['TS1', 'TS2']
-    const calls: ChatCall[] = []
-    const web = {
-      chat: {
-        async postMessage(args: unknown): Promise<{ ts: string }> {
-          const a = args as { channel: string; text: string }
-          calls.push({ kind: 'postMessage', channel: a.channel, text: a.text })
-          return { ts: tsList.shift() ?? 'TS-fallback' }
-        },
-        async update(args: unknown): Promise<unknown> {
-          const a = args as { channel: string; ts: string; text: string }
-          calls.push({ kind: 'update', channel: a.channel, ts: a.ts, text: a.text })
-          return {}
-        },
-      },
-    }
+    const chat = makeChatStub({ tsSequence: [POST_TS, POST_TS_2] })
 
-    let currentRequestId = 10
+    // Use the canonical two-row builder, then re-tag the tokens so the test
+    // can assert specific keys.
+    const projection = cannedTwoRowPluralProjection(INSTANCE_C)
+    projection.permission_requests = [
+      { ...projection.permission_requests![0], request_token: TOKEN_A },
+      { ...projection.permission_requests![1], request_token: TOKEN_B },
+    ]
+
     const getClient = () => ({
-      list: async () => ({
-        spawns: [cannedListRow({ claude_instance_id: 'cscb_C', state: 'check_permission', labels: { service: 'cscb', channel: 'CH' } })],
-      }),
-      get: async () => cannedGetResult({
-        claude_instance_id: 'cscb_C',
-        state: 'check_permission',
-        permission_request: cannedPermissionRequest({ request_id: currentRequestId }),
-      }),
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => projection,
     })
-    startPermissionPoller({ getClient, web: web as never, intervalMs: 1000, setInterval: ivl.setInterval, clearInterval: ivl.clearInterval })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+    })
 
-    // Tick 1: post for request_id=10
-    ivl.pending[0].cb()
-    await new Promise((r) => setTimeout(r, 10))
-    expect(calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1)
-    expect(getLivePermission('cscb_C')?.handled).toBe(false)
-
-    // Advance request_id (entry still handled=false)
-    currentRequestId = 11
-
-    // Tick 2: request_id advanced, handled=false
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
 
-    const updates = calls.filter((c) => c.kind === 'update')
-    expect(updates).toHaveLength(1)
-    expect(updates[0].text).toContain('no longer active')
-    expect(updates[0].ts).toBe('TS1') // old ts
-
-    const posts = calls.filter((c) => c.kind === 'postMessage')
+    const posts = chat.calls.filter((c) => c.kind === 'postMessage')
     expect(posts).toHaveLength(2)
+    // Both prompts went to the same channel (same spawn)
+    expect(posts.every((c) => c.channel === CHANNEL_CH)).toBe(true)
 
-    // Old entry dropped; new entry for request_id=11 recorded
-    const live = getLivePermission('cscb_C')
-    expect(live).toBeDefined()
-    expect(live?.requestId).toBe(11)
-    expect(live?.messageTs).toBe('TS2')
-
-    stopPermissionPoller()
+    const entryA = getLivePermission(INSTANCE_C, TOKEN_A)
+    const entryB = getLivePermission(INSTANCE_C, TOKEN_B)
+    expect(entryA).toBeDefined()
+    expect(entryB).toBeDefined()
+    expect(entryA?.messageTs).toBe(POST_TS)
+    expect(entryB?.messageTs).toBe(POST_TS_2)
+    expect(entryA?.requestToken).toBe(TOKEN_A)
+    expect(entryB?.requestToken).toBe(TOKEN_B)
   })
 
-  test('handled=true: NO chat.update fires, entry dropped, fresh postMessage for new request_id', async () => {
+  test('repeat tick with the same two-row projection → zero additional postMessage, map unchanged', async () => {
     const ivl = makeInterval()
-    const tsList = ['TS1', 'TS2']
-    const calls: ChatCall[] = []
-    const web = {
-      chat: {
-        async postMessage(args: unknown): Promise<{ ts: string }> {
-          const a = args as { channel: string; text: string }
-          calls.push({ kind: 'postMessage', channel: a.channel, text: a.text })
-          return { ts: tsList.shift() ?? 'TS-fallback' }
-        },
-        async update(args: unknown): Promise<unknown> {
-          const a = args as { channel: string; ts: string; text: string }
-          calls.push({ kind: 'update', channel: a.channel, ts: a.ts, text: a.text })
-          return {}
-        },
-      },
-    }
+    const chat = makeChatStub({ tsSequence: [POST_TS, POST_TS_2] })
 
-    let currentRequestId = 10
+    const rows = [
+      cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 }),
+      cannedPermissionRequest({ request_token: TOKEN_B, request_id: 2 }),
+    ]
     const getClient = () => ({
-      list: async () => ({
-        spawns: [cannedListRow({ claude_instance_id: 'cscb_C', state: 'check_permission', labels: { service: 'cscb', channel: 'CH' } })],
-      }),
-      get: async () => cannedGetResult({
-        claude_instance_id: 'cscb_C',
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
         state: 'check_permission',
-        permission_request: cannedPermissionRequest({ request_id: currentRequestId }),
+        permission_requests: rows,
       }),
     })
-    startPermissionPoller({ getClient, web: web as never, intervalMs: 1000, setInterval: ivl.setInterval, clearInterval: ivl.clearInterval })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+    })
 
-    // Tick 1: post + mark handled (simulating click handler success)
+    // Tick 1: seed two entries
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
-    markHandled('cscb_C')
-    expect(getLivePermission('cscb_C')?.handled).toBe(true)
+    expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(2)
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.messageTs).toBe(POST_TS)
+    expect(getLivePermission(INSTANCE_C, TOKEN_B)?.messageTs).toBe(POST_TS_2)
 
-    // Advance request_id
-    currentRequestId = 11
-
-    // Tick 2: request_id advanced, handled=true → NO chat.update
+    // Tick 2: identical projection → no extra posts, no updates
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
-
-    const updates = calls.filter((c) => c.kind === 'update')
-    expect(updates).toHaveLength(0) // suppressed because handled=true
-
-    const posts = calls.filter((c) => c.kind === 'postMessage')
-    expect(posts).toHaveLength(2) // fresh post for new request_id
-
-    const live = getLivePermission('cscb_C')
-    expect(live?.requestId).toBe(11)
-
-    stopPermissionPoller()
+    expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(2)
+    expect(chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
   })
 })
 
 // ---------------------------------------------------------------------------
-// Tick behavior — case 5: spawn disappears
+// Tick behavior — empty / null / undefined open-rows
 // ---------------------------------------------------------------------------
 
-describe('poller tick — case 5: spawn disappears from list', () => {
+describe('poller tick — non-positive open-rows responses', () => {
+  test('empty `permission_requests` array → zero postMessage from open-rows path; prior entries drop via sweep', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+
+    let permissionsList: ReturnType<typeof cannedPermissionRequest>[] = [
+      cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 }),
+    ]
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: permissionsList,
+      }),
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+    })
+
+    // Tick 1: seed
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+    expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1)
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeDefined()
+
+    // Switch to empty array — Case 5 sweep should expire + drop the seeded entry.
+    permissionsList = []
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    // No new posts from the open-rows path
+    expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1)
+    // Expire chat.update fired (handled=false)
+    const updates = chat.calls.filter((c) => c.kind === 'update')
+    expect(updates).toHaveLength(1)
+    expect(updates[0].text).toContain('expired')
+    // Entry dropped
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
+  })
+
+  test('null `permission_requests` → logs and skips the row, no postMessage', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub()
+    const logCalls: unknown[][] = []
+
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResult({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: null,
+      }),
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+      log: (...args) => { logCalls.push(args) },
+    })
+
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    // No new posts: the open-rows path was skipped.
+    expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(0)
+    // No live entry was created from this row.
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
+    // Non-conformance was logged
+    const nonConfLogs = logCalls.filter((args) => String(args[0]).includes('non-conforming'))
+    expect(nonConfLogs.length).toBeGreaterThan(0)
+  })
+
+  test('null `permission_requests` preserves prior entries for that instance (SR-2.1)', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+
+    let projectionMode: 'present' | 'null' = 'present'
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => projectionMode === 'present'
+        ? cannedGetResultPlural({
+            claude_instance_id: INSTANCE_C,
+            state: 'check_permission',
+            permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 3 })],
+          })
+        : cannedGetResult({
+            claude_instance_id: INSTANCE_C,
+            state: 'check_permission',
+            permission_requests: null,
+          }),
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+      log: () => { /* swallow */ },
+    })
+
+    // Tick 1: seed entry (handled=false so a naive sweep would expire it)
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(false)
+
+    // Tick 2: get() returns null projection — SR-2.1 says the sweep must skip
+    // entries on the non-conforming instance.
+    projectionMode = 'null'
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeDefined()
+    expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1) // tick 1 only
+    expect(chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
+  })
+
+  test('undefined `permission_requests` preserves prior entries for that instance (SR-2.1)', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+
+    let projectionMode: 'present' | 'undefined' = 'present'
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => projectionMode === 'present'
+        ? cannedGetResultPlural({
+            claude_instance_id: INSTANCE_C,
+            state: 'check_permission',
+            permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 3 })],
+          })
+        // permission_requests field omitted entirely
+        : cannedGetResult({
+            claude_instance_id: INSTANCE_C,
+            state: 'check_permission',
+          }),
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+      log: () => { /* swallow */ },
+    })
+
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(false)
+
+    projectionMode = 'undefined'
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeDefined()
+    expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1)
+    expect(chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
+  })
+
+  test('undefined `permission_requests` → same as null (logs + skips)', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub()
+    const logCalls: unknown[][] = []
+
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      // permission_requests field omitted entirely
+      get: async () => cannedGetResult({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+      }),
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+      log: (...args) => { logCalls.push(args) },
+    })
+
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    expect(chat.calls).toHaveLength(0)
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
+    const nonConfLogs = logCalls.filter((args) => String(args[0]).includes('non-conforming'))
+    expect(nonConfLogs.length).toBeGreaterThan(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tick behavior — Case 5: row disappears
+// ---------------------------------------------------------------------------
+
+describe('poller tick — Case 5: row disappears from plural projection', () => {
   test('handled=false: expire chat.update fires + entry dropped', async () => {
     const ivl = makeInterval()
-    const chat = makeChatStub({ postMessageTs: 'TS1' })
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+
     let listReturn: import('agent-director').ListResult = {
-      spawns: [cannedListRow({ claude_instance_id: 'cscb_C', state: 'check_permission', labels: { service: 'cscb', channel: 'CH' } })],
+      spawns: [checkPermRow()],
     }
     const getClient = () => ({
       list: async () => listReturn,
-      get: async () => cannedGetResult({
-        claude_instance_id: 'cscb_C',
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
         state: 'check_permission',
-        permission_request: cannedPermissionRequest({ request_id: 1 }),
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
     startPermissionPoller({
@@ -528,10 +701,11 @@ describe('poller tick — case 5: spawn disappears from list', () => {
     // Tick 1: post the prompt
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
-    expect(getLivePermission('cscb_C')).toBeDefined()
-    expect(getLivePermission('cscb_C')?.handled).toBe(false)
+    const seeded = getLivePermission(INSTANCE_C, TOKEN_A)
+    expect(seeded).toBeDefined()
+    expect(seeded?.handled).toBe(false)
 
-    // Tick 2: spawn no longer in check_permission → expire
+    // Tick 2: spawn no longer in check_permission → expire path
     listReturn = { spawns: [] }
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
@@ -539,23 +713,22 @@ describe('poller tick — case 5: spawn disappears from list', () => {
     const updates = chat.calls.filter((c) => c.kind === 'update')
     expect(updates).toHaveLength(1)
     expect(updates[0].text).toContain('expired')
-    expect(getLivePermission('cscb_C')).toBeUndefined()
-
-    stopPermissionPoller()
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
   })
 
   test('handled=true: NO chat.update fires, entry dropped silently', async () => {
     const ivl = makeInterval()
-    const chat = makeChatStub({ postMessageTs: 'TS1' })
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+
     let listReturn: import('agent-director').ListResult = {
-      spawns: [cannedListRow({ claude_instance_id: 'cscb_C', state: 'check_permission', labels: { service: 'cscb', channel: 'CH' } })],
+      spawns: [checkPermRow()],
     }
     const getClient = () => ({
       list: async () => listReturn,
-      get: async () => cannedGetResult({
-        claude_instance_id: 'cscb_C',
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
         state: 'check_permission',
-        permission_request: cannedPermissionRequest({ request_id: 1 }),
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
     startPermissionPoller({
@@ -566,66 +739,19 @@ describe('poller tick — case 5: spawn disappears from list', () => {
       clearInterval: ivl.clearInterval,
     })
 
-    // Tick 1: post, then simulate click handler success (markHandled)
+    // Tick 1: post, then simulate click handler success
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
-    markHandled('cscb_C')
-    expect(getLivePermission('cscb_C')?.handled).toBe(true)
+    markHandled(INSTANCE_C, TOKEN_A)
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(true)
 
     // Tick 2: spawn disappears, handled=true → suppress chat.update
     listReturn = { spawns: [] }
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
 
-    const updates = chat.calls.filter((c) => c.kind === 'update')
-    expect(updates).toHaveLength(0) // suppressed
-    expect(getLivePermission('cscb_C')).toBeUndefined() // dropped regardless
-
-    stopPermissionPoller()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Tick behavior — transient race: permission_request===null
-// ---------------------------------------------------------------------------
-
-describe('poller tick — transient race: permission_request null', () => {
-  test('get() returns permission_request=null → no post, no drop, no update; existing entry untouched', async () => {
-    const ivl = makeInterval()
-    const chat = makeChatStub({ postMessageTs: 'TS1' })
-
-    let returnNullPermission = false
-    const getClient = () => ({
-      list: async () => ({
-        spawns: [cannedListRow({ claude_instance_id: 'cscb_C', state: 'check_permission', labels: { service: 'cscb', channel: 'CH' } })],
-      }),
-      get: async () => cannedGetResult({
-        claude_instance_id: 'cscb_C',
-        state: 'check_permission',
-        permission_request: returnNullPermission ? undefined : cannedPermissionRequest({ request_id: 3 }),
-      }),
-    })
-    startPermissionPoller({ getClient, web: chat.web as never, intervalMs: 1000, setInterval: ivl.setInterval, clearInterval: ivl.clearInterval })
-
-    // Tick 1: normal → entry seeded
-    ivl.pending[0].cb()
-    await new Promise((r) => setTimeout(r, 10))
-    expect(getLivePermission('cscb_C')).toBeDefined()
-    expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1)
-
-    // Now get() will return no permission_request (transient race)
-    returnNullPermission = true
-
-    // Tick 2: permission_request=null → skip; existing entry untouched
-    ivl.pending[0].cb()
-    await new Promise((r) => setTimeout(r, 10))
-    expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1) // no new post
-    expect(chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0) // no update
-    const live = getLivePermission('cscb_C')
-    expect(live).toBeDefined() // not dropped
-    expect(live?.requestId).toBe(3) // unchanged
-
-    stopPermissionPoller()
+    expect(chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
   })
 })
 
@@ -639,7 +765,6 @@ describe('poller tick — skipped-tick observability', () => {
     const chat = makeChatStub()
     const logCalls: unknown[][] = []
 
-    // Build a blocking tick: list() hangs forever (never resolves during test)
     let resolveTick: () => void = () => {}
     const getClient = () => ({
       list: async () => {
@@ -657,9 +782,9 @@ describe('poller tick — skipped-tick observability', () => {
       log: (...args) => { logCalls.push(args) },
     })
 
-    // Fire tick 1 — it goes in-flight (list() hangs) and never finishes
+    // Tick 1 goes in-flight (list() hangs) and never finishes
     ivl.pending[0].cb()
-    await new Promise((r) => setTimeout(r, 5)) // let tick start
+    await new Promise((r) => setTimeout(r, 5))
 
     // Fire 5 more ticks while the first is still in-flight → 5 skips
     for (let i = 0; i < 5; i++) {
@@ -667,14 +792,12 @@ describe('poller tick — skipped-tick observability', () => {
     }
     await new Promise((r) => setTimeout(r, 5))
 
-    // Should have logged at least one WARN about skipped ticks
     const warnLogs = logCalls.filter((args) => String(args[0]).includes('skipped'))
     expect(warnLogs.length).toBeGreaterThan(0)
 
     // Unblock the hanging tick so cleanup works
     resolveTick()
     await new Promise((r) => setTimeout(r, 10))
-    stopPermissionPoller()
   })
 })
 
@@ -686,13 +809,15 @@ describe('poller lifecycle', () => {
   test('startPermissionPoller is idempotent', () => {
     const ivl = makeInterval()
     const chat = makeChatStub()
-    const getClient = () => ({ list: async () => ({ spawns: [] }), get: async () => cannedGetResult({ claude_instance_id: 'x' }) })
+    const getClient = () => ({
+      list: async () => ({ spawns: [] }),
+      get: async () => cannedGetResult({ claude_instance_id: 'x' }),
+    })
     const deps = { getClient, web: chat.web as never, intervalMs: 1000, setInterval: ivl.setInterval, clearInterval: ivl.clearInterval }
     startPermissionPoller(deps)
     startPermissionPoller(deps)
     startPermissionPoller(deps)
     expect(ivl.pending).toHaveLength(1)
-    stopPermissionPoller()
   })
 
   test('stopPermissionPoller is safe when not started', () => {
@@ -701,39 +826,43 @@ describe('poller lifecycle', () => {
 
   test('dropPermission removes the live entry', async () => {
     const ivl = makeInterval()
-    const chat = makeChatStub({ postMessageTs: 'X' })
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
     const getClient = () => ({
-      list: async () => ({ spawns: [cannedListRow({ claude_instance_id: 'cscb_C', state: 'check_permission', labels: { service: 'cscb', channel: 'CH' } })] }),
-      get: async () => cannedGetResult({ claude_instance_id: 'cscb_C', state: 'check_permission', permission_request: cannedPermissionRequest({ request_id: 1 }) }),
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
+      }),
     })
     startPermissionPoller({ getClient, web: chat.web as never, intervalMs: 1000, setInterval: ivl.setInterval, clearInterval: ivl.clearInterval })
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
-    expect(getLivePermission('cscb_C')).toBeDefined()
-    dropPermission('cscb_C')
-    expect(getLivePermission('cscb_C')).toBeUndefined()
-    stopPermissionPoller()
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeDefined()
+    dropPermission(INSTANCE_C, TOKEN_A)
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
   })
 
   test('markHandled returns false when no live entry exists', () => {
-    const result = markHandled('nonexistent_id')
-    expect(result).toBe(false)
+    expect(markHandled('nonexistent_id', TOKEN_A)).toBe(false)
   })
 
   test('markHandled returns true and sets handled=true when entry exists', async () => {
     const ivl = makeInterval()
-    const chat = makeChatStub({ postMessageTs: 'X' })
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
     const getClient = () => ({
-      list: async () => ({ spawns: [cannedListRow({ claude_instance_id: 'cscb_C', state: 'check_permission', labels: { service: 'cscb', channel: 'CH' } })] }),
-      get: async () => cannedGetResult({ claude_instance_id: 'cscb_C', state: 'check_permission', permission_request: cannedPermissionRequest({ request_id: 1 }) }),
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
+      }),
     })
     startPermissionPoller({ getClient, web: chat.web as never, intervalMs: 1000, setInterval: ivl.setInterval, clearInterval: ivl.clearInterval })
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
-    expect(getLivePermission('cscb_C')?.handled).toBe(false)
-    const result = markHandled('cscb_C')
-    expect(result).toBe(true)
-    expect(getLivePermission('cscb_C')?.handled).toBe(true)
-    stopPermissionPoller()
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(false)
+    expect(markHandled(INSTANCE_C, TOKEN_A)).toBe(true)
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(true)
   })
 })

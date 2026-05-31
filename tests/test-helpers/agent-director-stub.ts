@@ -54,7 +54,6 @@ import type {
   MakeTemplateResult,
   PauseParams,
   PauseResult,
-  PermissionRequestInfo,
   ReadPaneParams,
   ReadPaneResult,
   ResumeParams,
@@ -68,6 +67,7 @@ import type {
   VersionParams,
   VersionResult,
 } from 'agent-director'
+import type { PermissionRequestRow } from '../../src/permission-poller.ts'
 
 // ---------------------------------------------------------------------------
 // Canned-result and canned-rejection factories
@@ -198,11 +198,17 @@ export function cannedListRow(overrides: Partial<ListRow> & { claude_instance_id
   }
 }
 
-/** Build a canned PermissionRequestInfo. */
+/**
+ * Build a canned `PermissionRequestRow` for the plural-projection wire. The
+ * default `request_token` is a fresh UUIDv4 (via `crypto.randomUUID()`) so
+ * the encoded action_id round-trips through the SR-2.2 anchored regex. CSCB
+ * test infrastructure mints opaque tokens; production CSCB code never does.
+ */
 export function cannedPermissionRequest(
-  overrides: Partial<PermissionRequestInfo> = {},
-): PermissionRequestInfo {
+  overrides: Partial<PermissionRequestRow> = {},
+): PermissionRequestRow {
   return {
+    request_token: crypto.randomUUID(),
     request_id: 1,
     tool_name: 'Bash',
     tool_input: JSON.stringify({ command: 'ls /tmp' }),
@@ -211,10 +217,33 @@ export function cannedPermissionRequest(
   }
 }
 
-/** Build a canned GetResult — pass `permission_request` for check_permission rows. */
-export function cannedGetResult(
-  overrides: Partial<GetResult> & { claude_instance_id: string },
-): GetResult {
+/**
+ * Overrides accepted by `cannedGetResult` / `cannedGetResultPlural`. The
+ * plural `permission_requests` field is not on the published agent-director
+ * `GetResult`; the paired AD release replaces the legacy singular field
+ * with the plural array, and CSCB consumes the new shape via a structural
+ * cast inside the poller.
+ */
+export type GetResultOverrides =
+  & Partial<GetResult>
+  & { claude_instance_id: string }
+  & { permission_requests?: PermissionRequestRow[] | null }
+
+/**
+ * `cannedGetResult` may carry a `permission_requests` field for check_permission
+ * rows. Production code (`permission-poller.ts`,
+ * `permission-click-handler.ts`) casts `GetResult` to
+ * `GetResultWithPermissionRequests` at the use site, so the extra field
+ * flows through without polluting the upstream type.
+ */
+export type CannedGetResult = GetResult & { permission_requests?: PermissionRequestRow[] | null }
+
+/**
+ * Build a canned `GetResult`. Pass `permission_requests` for check_permission
+ * rows under the new plural-projection wire. For the negative-test cases
+ * (poller skips when the plural field is absent), pass `null` or omit.
+ */
+export function cannedGetResult(overrides: GetResultOverrides): CannedGetResult {
   return {
     parent_id: '',
     state: 'waiting',
@@ -230,6 +259,41 @@ export function cannedGetResult(
     ended_at: null,
     ...overrides,
   }
+}
+
+/**
+ * Build a canned `GetResult` carrying a non-empty `permission_requests`
+ * array — the typical positive-test shape for poller / click-handler tests
+ * under the new wire.
+ */
+export function cannedGetResultPlural(
+  overrides: GetResultOverrides & { permission_requests: PermissionRequestRow[] },
+): CannedGetResult {
+  return cannedGetResult(overrides)
+}
+
+/**
+ * Build a canned plural projection with TWO open `permission_requests`
+ * rows on the same spawn — the Epic-1 acceptance fixture for
+ * "two concurrent prompts on one spawn each get their own Slack message
+ * keyed on the composite (claude_instance_id, request_token)".
+ *
+ * Both rows share `claude_instance_id` and differ on `request_token`,
+ * `request_id`, and `tool_name` so the test can identify them.
+ */
+export function cannedTwoRowPluralProjection(
+  claudeInstanceId: string,
+  overrides: Omit<GetResultOverrides, 'claude_instance_id' | 'permission_requests'> = {},
+): CannedGetResult {
+  return cannedGetResult({
+    claude_instance_id: claudeInstanceId,
+    state: 'check_permission',
+    ...overrides,
+    permission_requests: [
+      cannedPermissionRequest({ request_id: 1, tool_name: 'Bash', tool_input: JSON.stringify({ command: 'ls /tmp' }) }),
+      cannedPermissionRequest({ request_id: 2, tool_name: 'Edit', tool_input: JSON.stringify({ file_path: '/etc/hosts' }) }),
+    ],
+  })
 }
 
 // ---------------------------------------------------------------------------
