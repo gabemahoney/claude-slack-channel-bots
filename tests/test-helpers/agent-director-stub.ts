@@ -163,6 +163,28 @@ export function errAlreadyDecided(): ErrAlreadyDecided {
   return new ErrAlreadyDecided('decide', 'ErrAlreadyDecided', 'permission request already decided')
 }
 
+/**
+ * Build an ErrInvalidFlags (decide; missing required flag like
+ * `--request-token`). The published `agent-director` library does not yet
+ * export a typed subclass for this errName — the paired AD release ships it.
+ * Until then, return a base `AgentDirectorError` carrying the right
+ * `errName` so the click handler's `err.errName === 'ErrInvalidFlags'` match
+ * fires correctly.
+ */
+export function errInvalidFlags(): AgentDirectorError {
+  return new AgentDirectorError('decide', 'ErrInvalidFlags', 'invalid flags')
+}
+
+/**
+ * Build an ErrAmbiguousRequest (decide; defense-in-depth backstop, should be
+ * unreachable under contract). Same shape as `errInvalidFlags`: not yet a
+ * typed subclass in the published library, so we use the base class with the
+ * canonical `errName`.
+ */
+export function errAmbiguousRequest(): AgentDirectorError {
+  return new AgentDirectorError('decide', 'ErrAmbiguousRequest', 'ambiguous request')
+}
+
 /** Build an ErrNoOpenPermissionRequest (decide / poller race). */
 export function errNoOpenPermissionRequest(): ErrNoOpenPermissionRequest {
   return new ErrNoOpenPermissionRequest('decide', 'ErrNoOpenPermissionRequest', 'no open permission request')

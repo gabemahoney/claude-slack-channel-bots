@@ -1,36 +1,32 @@
 /**
  * permission-click-handler.ts — Block Kit decision relay.
  *
- * Consumes Socket Mode interactive events whose action_id matches
- * `perm_(allow|deny)_<claude_instance_id>_<request_token>`.
+ * Consumes Socket Mode interactive events whose `action_id` matches
+ * `perm_(allow|deny)_<claude_instance_id>_<request_token>`. The handler is
+ * a small, single-AD-call function: it parses the action_id, calls AD's
+ * `decide` (always carrying `request_token`), and — when a live entry is
+ * still present — renders the operator-decide verdict against just that
+ * row's Slack message.
  *
- * Epic 1 keeps the legacy pre-decide reconciliation flow intact (rekeyed
- * onto the composite key + plural projection); Epic 2 will rewrite this
- * file to thread `request_token` through `decide()` and remove the
- * pre-decide refetch entirely.
+ * Stale clicks (entry absent from the pending map) still hit AD so that
+ * AD remains the source of truth; the next poller tick reconciles the
+ * Slack rendering. `ErrAlreadyDecided` is the canonical race sentinel and
+ * is swallowed silently for the same reason.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import {
-  AgentDirectorError,
-  ErrAlreadyDecided,
-  ErrSpawnNotFound,
-} from 'agent-director'
+import { AgentDirectorError, ErrAlreadyDecided } from 'agent-director'
+import type { Client } from 'agent-director'
 import type { WebClient } from '@slack/web-api'
 
+import { decideWithToken } from './agent-director-client.ts'
 import { parsePermissionActionId, type PermissionDecision } from './permission-action-id.ts'
-import {
-  getLivePermission,
-  markHandled,
-  type GetResultWithPermissionRequests,
-} from './permission-poller.ts'
+import { getLivePermission, markHandled } from './permission-poller.ts'
 
 export interface ClickDeps {
-  getClient: () => {
-    get: (params: import('agent-director').GetParams) => Promise<import('agent-director').GetResult>
-    decide: (params: import('agent-director').DecideParams) => Promise<import('agent-director').DecideResult>
-  }
+  /** Returns an AD Client whose `decide` method this handler will invoke. */
+  getClient: () => Pick<Client, 'decide'>
   web: Pick<WebClient, 'chat'>
   /** Returns the display name for a Slack user id; used to label decision updates. */
   resolveUserName: (userId: string) => Promise<string>
@@ -42,23 +38,13 @@ function logDeps(deps: ClickDeps, ...args: unknown[]): void {
   else console.error(...args)
 }
 
-/** Build the Block Kit "decided" block for the chat.update payload. */
+/** Block Kit body for the "decided by X" operator-decide rendering (SR-5.4). */
 function buildDecisionBlocks(decision: PermissionDecision, userName: string): unknown[] {
   const label = decision === 'allow' ? 'Allowed' : 'Denied'
   return [
     {
       type: 'section',
       text: { type: 'mrkdwn', text: `*Permission* — ${label} by ${userName}` },
-    },
-  ]
-}
-
-/** Build the stale-click "already decided" Block Kit. */
-function buildAlreadyDecidedBlocks(): unknown[] {
-  return [
-    {
-      type: 'section',
-      text: { type: 'mrkdwn', text: '⏳ Already decided — this prompt is stale.' },
     },
   ]
 }
@@ -78,57 +64,40 @@ export async function handlePermissionClick(
 
   const { decision, claudeInstanceId, requestToken } = parsed
 
-  const entry = getLivePermission(claudeInstanceId, requestToken)
-  if (!entry) {
-    logDeps(deps, `[slack] permission-click: no live entry for ${claudeInstanceId} (request_token=${requestToken}) — stale click`)
-    return true
-  }
-
-  // Refetch + check whether the token still appears in the open-rows
-  // projection to detect stale-button clicks.
-  let tokenStillOpen: boolean
+  // SR-4.1, SR-4.2, SR-7.2: AD is the source of truth. Always call decide
+  // with the decoded request_token — including for stale clicks whose
+  // composite key is no longer in the pending map. This is the click's ONLY
+  // AD interaction (SR-4.3 retires the pre-decide get).
   try {
-    const got = (await deps.getClient().get({
+    await decideWithToken(deps.getClient(), {
       claude_instance_id: claudeInstanceId,
-    })) as unknown as GetResultWithPermissionRequests
-    const rows = got.permission_requests
-    tokenStillOpen = Array.isArray(rows) && rows.some((r) => r.request_token === requestToken)
+      decision,
+      request_token: requestToken,
+    })
   } catch (err) {
-    if (err instanceof ErrSpawnNotFound) {
-      logDeps(deps, `[slack] permission-click: spawn ${claudeInstanceId} disappeared — marking stale`)
-      tokenStillOpen = false
-    } else {
-      const e = err instanceof AgentDirectorError ? err : null
-      logDeps(deps, `[slack] permission-click: get failed for ${claudeInstanceId}: ${e?.errName ?? String(err)}`)
+    // SR-4.4: ErrAlreadyDecided is silently swallowed — the next poller tick
+    // reconciles the operator-visible Slack rendering via SR-2.4 / SR-5.
+    if (err instanceof ErrAlreadyDecided) return true
+    if (err instanceof AgentDirectorError && err.errName === 'ErrInvalidFlags') {
+      logDeps(deps, `[slack] permission-click: ErrInvalidFlags from decide for ${claudeInstanceId} (request_token=${requestToken})`)
       return true
     }
-  }
-
-  if (!tokenStillOpen) {
-    try {
-      await deps.web.chat.update({
-        channel: entry.channelId,
-        ts: entry.messageTs,
-        text: 'already decided — stale prompt',
-        blocks: buildAlreadyDecidedBlocks() as never,
-      })
-      markHandled(claudeInstanceId, requestToken)
-    } catch (err) {
-      logDeps(deps, `[slack] permission-click: stale-click chat.update failed for ${claudeInstanceId}:`, err)
+    // ErrAmbiguousRequest is a defense-in-depth backstop per SR-4.4; under
+    // contract it should be unreachable.
+    if (err instanceof AgentDirectorError && err.errName === 'ErrAmbiguousRequest') {
+      logDeps(deps, `[slack] permission-click: ErrAmbiguousRequest from decide for ${claudeInstanceId} (request_token=${requestToken})`)
+      return true
     }
+    const e = err instanceof AgentDirectorError ? err : null
+    logDeps(deps, `[slack] permission-click: decide failed for ${claudeInstanceId}: ${e?.errName ?? String(err)}`)
     return true
   }
 
-  // decide() still takes the two-field shape; Epic 2 adds request_token.
-  try {
-    await deps.getClient().decide({ claude_instance_id: claudeInstanceId, decision })
-  } catch (err) {
-    if (!(err instanceof ErrAlreadyDecided)) {
-      const e = err instanceof AgentDirectorError ? err : null
-      logDeps(deps, `[slack] permission-click: decide failed for ${claudeInstanceId}: ${e?.errName ?? String(err)}`)
-      return true
-    }
-  }
+  // SR-4.2 stale-click semantics: decide already fired; no live entry means
+  // nothing to render against here. (The poller's reconciliation tick will
+  // surface the closure on whichever Slack message currently tracks it.)
+  const entry = getLivePermission(claudeInstanceId, requestToken)
+  if (!entry) return true
 
   let userName: string
   try {
@@ -136,6 +105,8 @@ export async function handlePermissionClick(
   } catch {
     userName = slackUserId || 'unknown'
   }
+
+  // SR-4.5 sibling independence: target only this row's messageTs.
   try {
     await deps.web.chat.update({
       channel: entry.channelId,

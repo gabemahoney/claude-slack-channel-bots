@@ -28,6 +28,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Client } from 'agent-director'
+import type { DecideParams as ADDecideParams, DecideResult } from 'agent-director'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -130,4 +131,38 @@ export function resetClientForTests(): void {
  */
 export function setClientForTests(client: Client): void {
   singleton = client
+}
+
+// ---------------------------------------------------------------------------
+// decide-wire wrapper (SR-4.1, SR-7.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * CSCB decide params — extends the published `DecideParams` with the
+ * `request_token` field that the paired AD release adds (SR-7.2). The
+ * snake-case JSON field flows through the subprocess-CLI transport without
+ * further marshaling on this side.
+ *
+ * Typing `request_token` as a required field at the wrapper boundary is how
+ * SR-4.1 (unconditional pass-through) is enforced statically — every CSCB
+ * decide call site must construct one of these.
+ */
+export interface DecideParamsWithToken extends ADDecideParams {
+  request_token: string
+}
+
+/**
+ * Always-include-token decide wrapper. The published `agent-director@0.5.6`
+ * `DecideParams` type does not yet carry `request_token`; the paired AD
+ * release ships the wire field. Until the published types catch up, the
+ * cast is the same pattern Epic 1 used for `GetResultWithPermissionRequests`.
+ *
+ * Routing the single CSCB decide call site through this function gives the
+ * codebase one definitive serializer for the decide wire shape (SR-7.2).
+ */
+export async function decideWithToken(
+  client: Pick<Client, 'decide'>,
+  params: DecideParamsWithToken,
+): Promise<DecideResult> {
+  return client.decide(params as unknown as ADDecideParams)
 }
