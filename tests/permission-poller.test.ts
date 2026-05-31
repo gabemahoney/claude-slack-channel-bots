@@ -1,6 +1,7 @@
 /**
- * permission-poller.test.ts — SR-2.1 / SR-8.4 poller behavior under the
- * plural-projection wire and composite-key live map.
+ * permission-poller.test.ts — SR-2.1 / SR-2.4 / SR-5 / SR-8.4 poller behavior
+ * under the plural-projection wire, composite-key live map, and verdict-
+ * rendering newly-closed reconciliation.
  *
  * Coverage:
  *   - New row in `permission_requests` → posts Block Kit prompt + records
@@ -10,10 +11,22 @@
  *   - Repeat tick with the same plural projection → no duplicate postMessage,
  *     no map mutation (duplicate-tick no-op).
  *   - Empty `permission_requests` array → zero postMessage activity from
- *     the open-rows path; existing entries from prior ticks drop via the
- *     sweep.
+ *     the open-rows path; existing entries from prior ticks are reconciled
+ *     via `getPermission` + verdict-distinct `chat.update` + drop (SR-2.4).
  *   - `null` / `undefined` open-rows → logs and skips, no state change.
- *   - Row disappearance (Case 5) → expire chat.update + drop.
+ *   - Row disappearance → `getPermission` called for the disappeared token,
+ *     verdict-distinct `chat.update` lands on that row's messageTs only,
+ *     entry dropped from livePermissions (SR-2.4, SR-5.3).
+ *   - SR-5.1 four verdict renderings: operator_allow, operator_deny,
+ *     timeout, find_missing — each visually distinct.
+ *   - SR-5.2 unknown `decision_reason` → fail-closed generic deny, log,
+ *     no crash, sibling rows on the same tick still proceed.
+ *   - SR-2.4 not-found (`ErrPermissionRequestNotFound`) → generic deny, log,
+ *     drop, no retry on subsequent ticks.
+ *   - Transient `getPermission` error → entry preserved, retried next tick.
+ *   - SR-5.3 sibling independence on closure: chat.update targets only the
+ *     disappeared row's messageTs; the sibling's entry + messageTs are
+ *     untouched.
  *   - get() ErrSpawnNotFound → continue silently.
  *   - Skipped-tick observability (5+ consecutive in-flight ticks → warn).
  *   - buildPermissionBlocks emits the UUIDv4-anchored action_id shape.
@@ -32,13 +45,17 @@ import {
   stopPermissionPoller,
 } from '../src/permission-poller.ts'
 import {
+  cannedGetPermissionResponse,
   cannedGetResult,
   cannedGetResultPlural,
   cannedListRow,
   cannedPermissionRequest,
   cannedTwoRowPluralProjection,
+  errGeneric,
+  errPermissionRequestNotFound,
   errSpawnNotFound,
 } from './test-helpers/agent-director-stub.ts'
+import type { GetPermissionParams, GetPermissionResult } from '../src/agent-director-client.ts'
 
 // ---------------------------------------------------------------------------
 // Shared fixtures — no inline magic strings (SR-8.1)
@@ -475,13 +492,14 @@ describe('poller tick — two concurrent open rows on a single tick', () => {
 // ---------------------------------------------------------------------------
 
 describe('poller tick — non-positive open-rows responses', () => {
-  test('empty `permission_requests` array → zero postMessage from open-rows path; prior entries drop via sweep', async () => {
+  test('empty `permission_requests` array → zero postMessage; prior entry reconciled via getPermission + verdict chat.update + drop (SR-2.4)', async () => {
     const ivl = makeInterval()
     const chat = makeChatStub({ tsSequence: [POST_TS] })
 
     let permissionsList: ReturnType<typeof cannedPermissionRequest>[] = [
       cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 }),
     ]
+    const getPermissionCalls: GetPermissionParams[] = []
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => cannedGetResultPlural({
@@ -489,6 +507,10 @@ describe('poller tick — non-positive open-rows responses', () => {
         state: 'check_permission',
         permission_requests: permissionsList,
       }),
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
+        getPermissionCalls.push(params)
+        return cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null })
+      },
     })
     startPermissionPoller({
       getClient,
@@ -504,17 +526,23 @@ describe('poller tick — non-positive open-rows responses', () => {
     expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1)
     expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeDefined()
 
-    // Switch to empty array — Case 5 sweep should expire + drop the seeded entry.
+    // Tick 2: empty array → SR-2.4 set-diff sees TOK_A missing → getPermission
+    // fires for TOK_A → verdict chat.update lands → entry dropped.
     permissionsList = []
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
 
     // No new posts from the open-rows path
     expect(chat.calls.filter((c) => c.kind === 'postMessage')).toHaveLength(1)
-    // Expire chat.update fired (handled=false)
+    // getPermission was called exactly once for the disappeared token
+    expect(getPermissionCalls).toHaveLength(1)
+    expect(getPermissionCalls[0].request_token).toBe(TOKEN_A)
+    // Verdict chat.update landed on the seeded entry's messageTs
     const updates = chat.calls.filter((c) => c.kind === 'update')
     expect(updates).toHaveLength(1)
-    expect(updates[0].text).toContain('expired')
+    expect(updates[0].ts).toBe(POST_TS)
+    expect(updates[0].channel).toBe(CHANNEL_CH)
+    expect(updates[0].text).toBe('*Permission* — Allowed')
     // Entry dropped
     expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
   })
@@ -674,14 +702,15 @@ describe('poller tick — non-positive open-rows responses', () => {
 // Tick behavior — Case 5: row disappears
 // ---------------------------------------------------------------------------
 
-describe('poller tick — Case 5: row disappears from plural projection', () => {
-  test('handled=false: expire chat.update fires + entry dropped', async () => {
+describe('poller tick — row disappears from plural projection (SR-2.4 closure reconciliation)', () => {
+  test('handled=false: getPermission called → verdict chat.update fires on disappeared row → entry dropped', async () => {
     const ivl = makeInterval()
     const chat = makeChatStub({ tsSequence: [POST_TS] })
 
     let listReturn: import('agent-director').ListResult = {
       spawns: [checkPermRow()],
     }
+    const getPermissionCalls: GetPermissionParams[] = []
     const getClient = () => ({
       list: async () => listReturn,
       get: async () => cannedGetResultPlural({
@@ -689,6 +718,10 @@ describe('poller tick — Case 5: row disappears from plural projection', () => 
         state: 'check_permission',
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
+        getPermissionCalls.push(params)
+        return cannedGetPermissionResponse({ request_token: params.request_token, decision: 'deny', decision_reason: 'timeout' })
+      },
     })
     startPermissionPoller({
       getClient,
@@ -705,24 +738,34 @@ describe('poller tick — Case 5: row disappears from plural projection', () => 
     expect(seeded).toBeDefined()
     expect(seeded?.handled).toBe(false)
 
-    // Tick 2: spawn no longer in check_permission → expire path
+    // Tick 2: spawn no longer in check_permission → SR-2.4 reconciliation
     listReturn = { spawns: [] }
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
 
+    expect(getPermissionCalls).toHaveLength(1)
+    expect(getPermissionCalls[0].request_token).toBe(TOKEN_A)
     const updates = chat.calls.filter((c) => c.kind === 'update')
     expect(updates).toHaveLength(1)
-    expect(updates[0].text).toContain('expired')
+    expect(updates[0].ts).toBe(POST_TS)
+    expect(updates[0].text).toBe('⏱ *Permission* — Timed out')
     expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
   })
 
-  test('handled=true: NO chat.update fires, entry dropped silently', async () => {
+  test('handled=true: SR-2.4 reconciliation still fires verdict chat.update + drops entry', async () => {
+    // Epic 3 design note: the poller-side verdict rendering is unconditional —
+    // it stands in for the case where the click handler's chat.update didn't
+    // land. With handled=true the click's "Allowed by X" rendering is the
+    // authoritative happy-path rendering; the poller-side overwrite with the
+    // verdict surface is a known, acceptable tradeoff (see source comment on
+    // `buildVerdictRendering`).
     const ivl = makeInterval()
     const chat = makeChatStub({ tsSequence: [POST_TS] })
 
     let listReturn: import('agent-director').ListResult = {
       spawns: [checkPermRow()],
     }
+    const getPermissionCalls: GetPermissionParams[] = []
     const getClient = () => ({
       list: async () => listReturn,
       get: async () => cannedGetResultPlural({
@@ -730,6 +773,10 @@ describe('poller tick — Case 5: row disappears from plural projection', () => 
         state: 'check_permission',
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
+        getPermissionCalls.push(params)
+        return cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null })
+      },
     })
     startPermissionPoller({
       getClient,
@@ -745,12 +792,387 @@ describe('poller tick — Case 5: row disappears from plural projection', () => 
     markHandled(INSTANCE_C, TOKEN_A)
     expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(true)
 
-    // Tick 2: spawn disappears, handled=true → suppress chat.update
+    // Tick 2: spawn disappears → reconciliation runs regardless of handled.
     listReturn = { spawns: [] }
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 10))
 
+    expect(getPermissionCalls).toHaveLength(1)
+    expect(getPermissionCalls[0].request_token).toBe(TOKEN_A)
+    const updates = chat.calls.filter((c) => c.kind === 'update')
+    expect(updates).toHaveLength(1)
+    expect(updates[0].ts).toBe(POST_TS)
+    expect(updates[0].text).toBe('*Permission* — Allowed')
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SR-2.4 / SR-5 — verdict-driven newly-closed reconciliation
+// ---------------------------------------------------------------------------
+
+/**
+ * Drive one full tick of the closure-reconciliation path: seed a single live
+ * entry by running the poll once with the row present, then run a second tick
+ * with the row absent and a canned `getPermission` response. Returns the
+ * chat stub + recorded `getPermission` params so individual tests can assert
+ * verdict-rendering specifics.
+ */
+async function seedAndClose(opts: {
+  getPermissionResult?: GetPermissionResult
+  getPermissionError?: Error
+  postTs?: string
+  token?: string
+}): Promise<{
+  chat: ChatStub
+  ivl: ReturnType<typeof makeInterval>
+  getPermissionCalls: GetPermissionParams[]
+  token: string
+}> {
+  const ivl = makeInterval()
+  const chat = makeChatStub({ tsSequence: [opts.postTs ?? POST_TS] })
+  const token = opts.token ?? TOKEN_A
+  const getPermissionCalls: GetPermissionParams[] = []
+
+  let rowsPresent = true
+  const getClient = () => ({
+    list: async () => ({ spawns: [checkPermRow()] }),
+    get: async () => cannedGetResultPlural({
+      claude_instance_id: INSTANCE_C,
+      state: 'check_permission',
+      permission_requests: rowsPresent
+        ? [cannedPermissionRequest({ request_token: token, request_id: 1 })]
+        : [],
+    }),
+    getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
+      getPermissionCalls.push(params)
+      if (opts.getPermissionError) throw opts.getPermissionError
+      return opts.getPermissionResult
+        ?? cannedGetPermissionResponse({ request_token: params.request_token })
+    },
+  })
+  startPermissionPoller({
+    getClient,
+    web: chat.web as never,
+    intervalMs: 1000,
+    setInterval: ivl.setInterval,
+    clearInterval: ivl.clearInterval,
+    log: () => { /* swallow */ },
+  })
+
+  // Tick 1: seed
+  ivl.pending[0].cb()
+  await new Promise((r) => setTimeout(r, 10))
+
+  // Tick 2: row disappears → closure path
+  rowsPresent = false
+  ivl.pending[0].cb()
+  await new Promise((r) => setTimeout(r, 10))
+
+  return { chat, ivl, getPermissionCalls, token }
+}
+
+describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', () => {
+  test('SR-5.1 operator_allow rendering — decision=allow, decision_reason=null → "*Permission* — Allowed"', async () => {
+    const { chat, getPermissionCalls, token } = await seedAndClose({
+      getPermissionResult: cannedGetPermissionResponse({ decision: 'allow', decision_reason: null }),
+    })
+
+    expect(getPermissionCalls).toHaveLength(1)
+    expect(getPermissionCalls[0].request_token).toBe(token)
+    const updates = chat.calls.filter((c) => c.kind === 'update')
+    expect(updates).toHaveLength(1)
+    expect(updates[0].channel).toBe(CHANNEL_CH)
+    expect(updates[0].ts).toBe(POST_TS)
+    expect(updates[0].text).toBe('*Permission* — Allowed')
+    expect(getLivePermission(INSTANCE_C, token)).toBeUndefined()
+  })
+
+  test('SR-5.1 operator_deny rendering — decision=deny, decision_reason="operator" → "*Permission* — Denied by operator"', async () => {
+    const { chat, token } = await seedAndClose({
+      getPermissionResult: cannedGetPermissionResponse({ decision: 'deny', decision_reason: 'operator' }),
+    })
+
+    const updates = chat.calls.filter((c) => c.kind === 'update')
+    expect(updates).toHaveLength(1)
+    expect(updates[0].text).toBe('*Permission* — Denied by operator')
+    expect(getLivePermission(INSTANCE_C, token)).toBeUndefined()
+  })
+
+  test('SR-5.1 timeout rendering — decision=deny, decision_reason="timeout" → "⏱ *Permission* — Timed out"', async () => {
+    const { chat, token } = await seedAndClose({
+      getPermissionResult: cannedGetPermissionResponse({ decision: 'deny', decision_reason: 'timeout' }),
+    })
+
+    const updates = chat.calls.filter((c) => c.kind === 'update')
+    expect(updates).toHaveLength(1)
+    expect(updates[0].text).toBe('⏱ *Permission* — Timed out')
+    expect(getLivePermission(INSTANCE_C, token)).toBeUndefined()
+  })
+
+  test('SR-5.1 find_missing rendering — decision=deny, decision_reason="find_missing" → distinct "session ended" text', async () => {
+    const { chat, token } = await seedAndClose({
+      getPermissionResult: cannedGetPermissionResponse({ decision: 'deny', decision_reason: 'find_missing' }),
+    })
+
+    const updates = chat.calls.filter((c) => c.kind === 'update')
+    expect(updates).toHaveLength(1)
+    const findMissingText = updates[0].text
+    expect(findMissingText).toBe('🪦 *Permission* — Session ended')
+
+    // SR-5.1 distinctness: find_missing must NOT collapse to operator-deny or timeout text.
+    expect(findMissingText).not.toBe('*Permission* — Denied by operator')
+    expect(findMissingText).not.toBe('⏱ *Permission* — Timed out')
+    expect(findMissingText).not.toBe('*Permission* — Denied (closed)')
+    expect(getLivePermission(INSTANCE_C, token)).toBeUndefined()
+  })
+
+  test('SR-5.2 unknown decision_reason → fail-closed generic deny, log fires, poller does not crash; sibling fresh-post still happens', async () => {
+    // This test specifically exercises the "bad branch did not crash the
+    // tick" assertion. Seed a live entry under TOK_A, then on the next tick
+    // present a fresh row under TOK_B AND drop TOK_A from the projection.
+    // The dropped TOK_A goes through the unknown-enum path; TOK_B should
+    // still produce a chat.postMessage.
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS, POST_TS_2] })
+    const logCalls: unknown[][] = []
+    const getPermissionCalls: GetPermissionParams[] = []
+
+    let rowsPresent: Array<{ token: string; req_id: number }> = [{ token: TOKEN_A, req_id: 1 }]
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: rowsPresent.map((r) =>
+          cannedPermissionRequest({ request_token: r.token, request_id: r.req_id }),
+        ),
+      }),
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
+        getPermissionCalls.push(params)
+        return cannedGetPermissionResponse({
+          request_token: params.request_token,
+          decision: 'deny',
+          decision_reason: 'something-new',
+        })
+      },
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+      log: (...args) => { logCalls.push(args) },
+    })
+
+    // Tick 1: seed TOK_A
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.messageTs).toBe(POST_TS)
+
+    // Tick 2: TOK_A disappears (closure with unknown decision_reason),
+    // TOK_B is a fresh open row. The unknown-enum branch must NOT crash the
+    // tick; TOK_B's fresh-post must still land.
+    rowsPresent = [{ token: TOKEN_B, req_id: 2 }]
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    // Generic-deny rendering for TOK_A
+    const updates = chat.calls.filter((c) => c.kind === 'update')
+    expect(updates).toHaveLength(1)
+    expect(updates[0].ts).toBe(POST_TS)
+    expect(updates[0].text).toBe('*Permission* — Denied (closed)')
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
+
+    // Log fired with the unknown value
+    const unknownLogs = logCalls.filter((args) => String(args[0]).includes('unknown verdict'))
+    expect(unknownLogs.length).toBe(1)
+
+    // SR-5.2 sanity — sibling fresh-post happened despite the bad branch
+    const posts = chat.calls.filter((c) => c.kind === 'postMessage')
+    expect(posts).toHaveLength(2) // tick 1 (TOK_A) + tick 2 (TOK_B)
+    expect(getLivePermission(INSTANCE_C, TOKEN_B)?.messageTs).toBe(POST_TS_2)
+  })
+
+  test('SR-2.4 ErrPermissionRequestNotFound → generic deny, log fires, drop, no retry on the next tick', async () => {
+    // Round 1: seed TOK_A, then close with not-found.
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+    const logCalls: unknown[][] = []
+    const getPermissionCalls: GetPermissionParams[] = []
+
+    let rowsPresent = true
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: rowsPresent
+          ? [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })]
+          : [],
+      }),
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
+        getPermissionCalls.push(params)
+        throw errPermissionRequestNotFound()
+      },
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+      log: (...args) => { logCalls.push(args) },
+    })
+
+    // Tick 1: seed
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    // Tick 2: row disappears → not-found path
+    rowsPresent = false
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    expect(getPermissionCalls).toHaveLength(1)
+    const updates = chat.calls.filter((c) => c.kind === 'update')
+    expect(updates).toHaveLength(1)
+    expect(updates[0].text).toBe('*Permission* — Denied (closed)')
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
+    const nfLogs = logCalls.filter((args) => String(args[0]).includes('not-found'))
+    expect(nfLogs.length).toBe(1)
+
+    // Tick 3: same shape — entry is gone, so no second getPermission call.
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+    expect(getPermissionCalls).toHaveLength(1)
+    expect(chat.calls.filter((c) => c.kind === 'update')).toHaveLength(1)
+  })
+
+  test('SR-2.4 transient getPermission error → entry preserved, retried next tick when call succeeds', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+    const getPermissionCalls: GetPermissionParams[] = []
+
+    let rowsPresent = true
+    let throwOnNext = true
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: rowsPresent
+          ? [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })]
+          : [],
+      }),
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
+        getPermissionCalls.push(params)
+        if (throwOnNext) throw errGeneric('get-permission', 'ErrSomethingTransient', 'oops')
+        return cannedGetPermissionResponse({
+          request_token: params.request_token,
+          decision: 'allow',
+          decision_reason: null,
+        })
+      },
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+      log: () => { /* swallow */ },
+    })
+
+    // Tick 1: seed
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    // Tick 2: row disappears → transient error → entry preserved, no chat.update
+    rowsPresent = false
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    expect(getPermissionCalls).toHaveLength(1)
     expect(chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeDefined()
+
+    // Tick 3: getPermission now succeeds → reconciliation completes
+    throwOnNext = false
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    expect(getPermissionCalls).toHaveLength(2)
+    const updates = chat.calls.filter((c) => c.kind === 'update')
+    expect(updates).toHaveLength(1)
+    expect(updates[0].text).toBe('*Permission* — Allowed')
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
+  })
+
+  test('SR-5.3 sibling independence on closure — only the disappeared row gets chat.update; sibling untouched', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS, POST_TS_2] })
+    const getPermissionCalls: GetPermissionParams[] = []
+
+    let presentRows: Array<{ token: string; req_id: number }> = [
+      { token: TOKEN_A, req_id: 1 },
+      { token: TOKEN_B, req_id: 2 },
+    ]
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: presentRows.map((r) =>
+          cannedPermissionRequest({ request_token: r.token, request_id: r.req_id }),
+        ),
+      }),
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
+        getPermissionCalls.push(params)
+        return cannedGetPermissionResponse({
+          request_token: params.request_token,
+          decision: 'allow',
+          decision_reason: null,
+        })
+      },
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+    })
+
+    // Tick 1: seed both siblings
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.messageTs).toBe(POST_TS)
+    expect(getLivePermission(INSTANCE_C, TOKEN_B)?.messageTs).toBe(POST_TS_2)
+
+    // Tick 2: TOK_A drops from the projection; TOK_B still present
+    presentRows = [{ token: TOKEN_B, req_id: 2 }]
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    // SR-5.3: getPermission fired exactly once for TOK_A only
+    expect(getPermissionCalls).toHaveLength(1)
+    expect(getPermissionCalls[0].request_token).toBe(TOKEN_A)
+
+    // SR-5.3: chat.update only on TOK_A's messageTs; sibling's ts never targeted
+    const updates = chat.calls.filter((c) => c.kind === 'update')
+    expect(updates).toHaveLength(1)
+    expect(updates[0].ts).toBe(POST_TS)
+    expect(updates.every((u) => u.ts !== POST_TS_2)).toBe(true)
+
+    // Sibling entry untouched
+    const siblingAfter = getLivePermission(INSTANCE_C, TOKEN_B)
+    expect(siblingAfter).toBeDefined()
+    expect(siblingAfter?.messageTs).toBe(POST_TS_2)
+    expect(siblingAfter?.handled).toBe(false)
+
+    // Closed entry dropped
     expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
   })
 })

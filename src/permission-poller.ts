@@ -12,13 +12,18 @@
  *   1. list({state:['check_permission'], label:['service=cscb']}).
  *   2. For each row, get({claude_instance_id}). When the plural projection
  *      is absent (undefined/null), log non-conformance and skip — do not
- *      mutate state for that row.
+ *      mutate state for that row, and exclude that spawn's live entries
+ *      from the newly-closed sweep this tick.
  *   3. For each PermissionRequestRow in the plural projection, compute the
  *      composite key. If already tracked → skip (duplicate-tick no-op).
  *      Else post a fresh Block Kit prompt and register the live entry.
- *   4. After all rows are processed, sweep: any tracked entry whose
- *      composite key was NOT observed this tick is dropped; if it was
- *      handled=false, send the expire chat.update first.
+ *   4. Newly-closed reconciliation (SR-2.4): for each live entry whose
+ *      composite key was NOT observed this tick (excluding non-conforming
+ *      spawns), call `get-permission`, render the verdict-distinct
+ *      chat.update against that row's messageTs, and drop the entry.
+ *      `ErrPermissionRequestNotFound` → render generic deny + drop + no
+ *      retry. Other transient errors → leave entry alive, retry next tick.
+ *      Unknown `decision_reason` → fail-closed generic deny (SR-5.2).
  *
  * Case 4 (per-spawn request_id advancement) is GONE — the composite key
  * means a "new" token simply appears as an unseen entry and the old token
@@ -37,6 +42,14 @@ import type {
 } from 'agent-director'
 import type { WebClient } from '@slack/web-api'
 
+import {
+  getPermission,
+  isErrPermissionRequestNotFound,
+} from './agent-director-client.ts'
+import type {
+  GetPermissionParams,
+  GetPermissionResult,
+} from './agent-director-client.ts'
 import { encodePermissionActionId } from './permission-action-id.ts'
 
 // ---------------------------------------------------------------------------
@@ -105,6 +118,12 @@ export interface PollerDeps {
   getClient: () => {
     list: (params: import('agent-director').ListParams) => Promise<import('agent-director').ListResult>
     get: (params: import('agent-director').GetParams) => Promise<import('agent-director').GetResult>
+    /**
+     * Paired-AD-release verb (SR-7.1). Optional on the structural type so the
+     * runtime path compiles against the published `agent-director@0.5.6`
+     * Client (which has no such method) and so tests can supply a stub.
+     */
+    getPermission?: (params: GetPermissionParams) => Promise<GetPermissionResult>
   }
   /** Slack WebClient (or a stub satisfying the chat.* surface). */
   web: Pick<WebClient, 'chat'>
@@ -274,13 +293,38 @@ async function runTick(deps: PollerDeps): Promise<void> {
       }
     }
 
+    // SR-2.4 newly-closed reconciliation. Collect first, then reconcile —
+    // avoids mutating the map while iterating it.
+    const closedEntries: LivePermission[] = []
     for (const [key, entry] of livePermissions) {
-      if (nonConformingInstanceIds.has(entry.claudeInstanceId)) continue
       if (seenComposite.has(key)) continue
-      if (!entry.handled) {
-        await expirePermissionPrompt(deps, entry)
+      if (nonConformingInstanceIds.has(entry.claudeInstanceId)) continue
+      closedEntries.push(entry)
+    }
+
+    for (const entry of closedEntries) {
+      let info: GetPermissionResult
+      try {
+        info = await getPermission(client, { request_token: entry.requestToken })
+      } catch (err) {
+        if (isErrPermissionRequestNotFound(err)) {
+          logViaDeps(deps, `[slack] permission-poller: get-permission not-found for ${entry.claudeInstanceId} token=${entry.requestToken} — generic deny + drop`)
+          await renderClosureUpdate(deps, entry, 'not_found')
+          dropPermission(entry.claudeInstanceId, entry.requestToken)
+          continue
+        }
+        const e = err instanceof AgentDirectorError ? err : null
+        logViaDeps(deps, `[slack] permission-poller: get-permission failed for ${entry.claudeInstanceId} token=${entry.requestToken}: ${e?.errName ?? String(err)}`)
+        // SR-2.4 transient retry: leave entry alive; next tick will retry.
+        continue
       }
-      livePermissions.delete(key)
+
+      const verdict = classifyVerdict(info)
+      if (verdict === 'unknown') {
+        logViaDeps(deps, `[slack] permission-poller: unknown verdict for ${entry.claudeInstanceId} token=${entry.requestToken} decision=${info.decision} decision_reason=${String(info.decision_reason)} — fail-closed generic deny`)
+      }
+      await renderClosureUpdate(deps, entry, verdict)
+      dropPermission(entry.claudeInstanceId, entry.requestToken)
     }
   } finally {
     tickInFlight = false
@@ -342,27 +386,99 @@ async function postPermissionPrompt(
   }
 }
 
-async function expirePermissionPrompt(
+// ---------------------------------------------------------------------------
+// Verdict classification + closure rendering (SR-5.1, SR-5.2, SR-5.3, SR-5.4)
+// ---------------------------------------------------------------------------
+
+/** Discriminated verdict tag produced from a `get-permission` response. */
+export type VerdictTag =
+  | 'operator_allow'
+  | 'operator_deny'
+  | 'timeout'
+  | 'find_missing'
+  | 'unknown'
+  | 'not_found'
+
+/**
+ * Map the AD `decision` + `decision_reason` pair to a verdict tag. The mapping
+ * is intentionally strict: ANY combination outside the four canonical pairs
+ * (including allow with non-null reason, or deny with an unrecognized reason)
+ * collapses to `'unknown'` — the SR-5.2 fail-closed generic deny path.
+ */
+export function classifyVerdict(info: GetPermissionResult): VerdictTag {
+  if (info.decision === 'allow' && info.decision_reason === null) return 'operator_allow'
+  if (info.decision === 'deny') {
+    if (info.decision_reason === 'operator') return 'operator_deny'
+    if (info.decision_reason === 'timeout') return 'timeout'
+    if (info.decision_reason === 'find_missing') return 'find_missing'
+  }
+  return 'unknown'
+}
+
+/**
+ * Block Kit body + text for a closure verdict. Each tag yields a visually
+ * distinct text so operators can tell from the message why the prompt closed
+ * (SR-5.1). The `not_found` and `unknown` tags share the generic-deny
+ * rendering (SR-2.4 not-found path and SR-5.2 fail-closed path).
+ *
+ * The poller-side `operator_allow` / `operator_deny` renderings stand in for
+ * the case where the click handler's chat.update did not land (e.g. failure,
+ * or the click came in too late and AD already had the row closed). The
+ * click handler's "by X" rendering (SR-5.4) is still authoritative for the
+ * happy path; the verdict surface only carries the closure state since the
+ * operator identity is unknown to the poller.
+ */
+function buildVerdictRendering(tag: VerdictTag): { text: string; blocks: unknown[] } {
+  let text: string
+  switch (tag) {
+    case 'operator_allow':
+      text = '*Permission* — Allowed'
+      break
+    case 'operator_deny':
+      text = '*Permission* — Denied by operator'
+      break
+    case 'timeout':
+      text = '⏱ *Permission* — Timed out'
+      break
+    case 'find_missing':
+      text = '🪦 *Permission* — Session ended'
+      break
+    case 'unknown':
+    case 'not_found':
+      text = '*Permission* — Denied (closed)'
+      break
+  }
+  return {
+    text,
+    blocks: [
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text },
+      },
+    ],
+  }
+}
+
+/**
+ * Issue exactly one `chat.update` carrying the verdict-distinct rendering
+ * against this entry's messageTs. Sibling-independent by construction: the
+ * call only ever names `entry.channelId` + `entry.messageTs` (SR-5.3).
+ */
+async function renderClosureUpdate(
   deps: PollerDeps,
   entry: LivePermission,
+  tag: VerdictTag,
 ): Promise<void> {
+  const { text, blocks } = buildVerdictRendering(tag)
   try {
     await deps.web.chat.update({
       channel: entry.channelId,
       ts: entry.messageTs,
-      text: 'permission request expired — no longer actionable',
-      blocks: [
-        {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: '⏳ Permission request expired — no longer actionable.',
-          },
-        },
-      ] as never,
+      text,
+      blocks: blocks as never,
     })
   } catch (err) {
-    logViaDeps(deps, `[slack] permission-poller: expire chat.update failed for ${entry.claudeInstanceId}:`, err)
+    logViaDeps(deps, `[slack] permission-poller: closure chat.update failed for ${entry.claudeInstanceId} token=${entry.requestToken} (verdict=${tag}):`, err)
   }
 }
 

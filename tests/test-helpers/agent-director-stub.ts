@@ -68,6 +68,10 @@ import type {
   VersionResult,
 } from 'agent-director'
 import type { PermissionRequestRow } from '../../src/permission-poller.ts'
+import type {
+  GetPermissionParams,
+  GetPermissionResult,
+} from '../../src/agent-director-client.ts'
 
 // ---------------------------------------------------------------------------
 // Canned-result and canned-rejection factories
@@ -183,6 +187,18 @@ export function errInvalidFlags(): AgentDirectorError {
  */
 export function errAmbiguousRequest(): AgentDirectorError {
   return new AgentDirectorError('decide', 'ErrAmbiguousRequest', 'ambiguous request')
+}
+
+/**
+ * Build the AD `ErrPermissionRequestNotFound` sentinel returned by the
+ * paired-release `get-permission` verb when the row has aged out of AD's
+ * store. The published library does not yet export a typed subclass; the
+ * poller's `isErrPermissionRequestNotFound` predicate matches on
+ * `errName === 'ErrPermissionRequestNotFound'`, so a base `AgentDirectorError`
+ * with the right `errName` routes the same way as the real sentinel.
+ */
+export function errPermissionRequestNotFound(): AgentDirectorError {
+  return new AgentDirectorError('get-permission', 'ErrPermissionRequestNotFound', 'permission request not found')
 }
 
 /** Build an ErrNoOpenPermissionRequest (decide / poller race). */
@@ -318,6 +334,30 @@ export function cannedTwoRowPluralProjection(
   })
 }
 
+/**
+ * Build a canned `GetPermissionResult` — the single-row response shape from
+ * the paired AD release's `get-permission --request-token <uuid>` verb
+ * (SR-7.1). Defaults to the operator-allow shape (`decision='allow'`,
+ * `decision_reason=null`); tests override `decision` + `decision_reason` to
+ * exercise the four verdict-rendering branches (SR-5.1) plus the unknown-enum
+ * fail-closed path (SR-5.2).
+ */
+export function cannedGetPermissionResponse(
+  overrides: Partial<GetPermissionResult> = {},
+): GetPermissionResult {
+  return {
+    request_token: crypto.randomUUID(),
+    request_id: 1,
+    tool_name: 'Bash',
+    tool_input: JSON.stringify({ command: 'ls /tmp' }),
+    requested_at: '2026-05-24T12:00:00Z',
+    decision: 'allow',
+    decision_reason: null,
+    decided_at: '2026-05-24T12:00:05Z',
+    ...overrides,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Stub Client
 // ---------------------------------------------------------------------------
@@ -417,6 +457,15 @@ export interface StubClientOptions {
   pauseResult?: PauseResult
   pauseError?: Error
   pauseCalls?: PauseParams[]
+
+  // getPermission() — paired-AD-release verb wrapping `get-permission
+  // --request-token <uuid>` (SR-7.1). The published `agent-director` Client
+  // doesn't ship this yet, so it lives on the stub via the optional
+  // structural-method surface PollerDeps#getClient already exposes.
+  getPermissionResult?: GetPermissionResult
+  getPermissionError?: Error
+  getPermissionQueue?: CannedResponse<GetPermissionResult>[]
+  getPermissionCalls?: GetPermissionParams[]
 }
 
 /** Structural-typed `Client` stub satisfying every verb CSCB uses. */
@@ -434,6 +483,12 @@ export type StubClient = {
   delete(params: DeleteParams): Promise<DeleteResult>
   list(params: ListParams): Promise<ListResult>
   pause(params: PauseParams): Promise<PauseResult>
+  /**
+   * Paired-AD-release `get-permission` verb (SR-7.1). Optional on the
+   * structural type so existing tests that don't configure it still satisfy
+   * the `PollerDeps#getClient` shape (where `getPermission` is also optional).
+   */
+  getPermission(params: GetPermissionParams): Promise<GetPermissionResult>
   close(): void
   [Symbol.dispose](): void
 }
@@ -531,6 +586,16 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
       opts.pauseCalls?.push(params)
       if (opts.pauseError) throw opts.pauseError
       return opts.pauseResult ?? {}
+    },
+    async getPermission(params: GetPermissionParams): Promise<GetPermissionResult> {
+      opts.getPermissionCalls?.push(params)
+      return nextResponse(
+        'get-permission',
+        opts.getPermissionQueue,
+        opts.getPermissionResult,
+        opts.getPermissionError,
+        cannedGetPermissionResponse({ request_token: params.request_token }),
+      )
     },
     close(): void { /* no-op */ },
     [Symbol.dispose](): void { /* no-op */ },

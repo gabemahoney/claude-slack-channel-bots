@@ -27,7 +27,7 @@
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { Client } from 'agent-director'
+import { AgentDirectorError, Client } from 'agent-director'
 import type { DecideParams as ADDecideParams, DecideResult } from 'agent-director'
 
 // ---------------------------------------------------------------------------
@@ -165,4 +165,58 @@ export async function decideWithToken(
   params: DecideParamsWithToken,
 ): Promise<DecideResult> {
   return client.decide(params as unknown as ADDecideParams)
+}
+
+// ---------------------------------------------------------------------------
+// get-permission wrapper (SR-7.1)
+// ---------------------------------------------------------------------------
+
+/** Params for the paired AD release's `get-permission` verb. */
+export interface GetPermissionParams {
+  request_token: string
+}
+
+/**
+ * Response shape of the paired AD release's `get-permission` verb: the full
+ * PermissionRequestInfo plus closure metadata. `decision_reason` is a string
+ * enum (`'operator' | 'timeout' | 'find_missing'`) or `null` for allow / open
+ * rows; CSCB treats any other value as fail-closed (SR-5.2).
+ */
+export interface GetPermissionResult {
+  request_token: string
+  request_id: number
+  tool_name: string
+  tool_input: string
+  requested_at: string
+  decision: 'allow' | 'deny'
+  decision_reason: string | null
+  decided_at: string
+}
+
+/**
+ * Local sentinel matcher for AD's `ErrPermissionRequestNotFound`. The paired
+ * AD release exposes the typed class; until MIN_AD_VERSION is bumped to that
+ * release (Epic 4), match on `errName` so the predicate routes the same way
+ * for both the real class and the stub error factory (same pattern Epic 2
+ * uses for `ErrInvalidFlags`).
+ */
+export function isErrPermissionRequestNotFound(err: unknown): boolean {
+  return err instanceof AgentDirectorError && err.errName === 'ErrPermissionRequestNotFound'
+}
+
+/**
+ * `get-permission` wrapper (SR-7.1). The published `agent-director@0.5.6`
+ * Client does not yet carry this verb; the paired AD release adds it. Until
+ * the published types catch up the wrapper accepts a structural client and
+ * fails loudly at runtime when the verb is missing — the SR-6.1 startup gate
+ * is the intended compatibility boundary.
+ */
+export async function getPermission(
+  client: { getPermission?: (params: GetPermissionParams) => Promise<GetPermissionResult> },
+  params: GetPermissionParams,
+): Promise<GetPermissionResult> {
+  if (typeof client.getPermission !== 'function') {
+    throw new Error('agent-director-client: getPermission verb unavailable — bump MIN_AD_VERSION (Epic 4)')
+  }
+  return client.getPermission(params)
 }
