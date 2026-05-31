@@ -2,8 +2,7 @@
  * agent-director-startup.ts — SR-5.1 startup gate for the agent-director
  * library dependency.
  *
- * Runs the four-step boot sequence the SRD requires before any other CSCB
- * work:
+ * Runs the boot sequence the SRD requires before any other CSCB work:
  *
  *   1. import { Client } from 'agent-director'   — covered at module load
  *      time; module-not-found surfaces as a top-level import error caught
@@ -14,6 +13,12 @@
  *      ErrBunVersionTooOld; other throws surface verbatim.
  *   3. await client.version({})                  — strip leading 'v',
  *      compare to MIN_AD_VERSION via semverGte.
+ *   3.5. API surface probes (SR-6.1 publish-skew defense)  — short-circuit,
+ *      run in order: probeGetPermission (ad-shim-missing-get-permission) →
+ *      probeErrorCatalog (ad-shim-catalog-incomplete) → probeDecideArgv
+ *      (ad-shim-decide-drops-token). These exist because a passing version
+ *      check does not prove the npm-shipped TS shim matches the bundled Go
+ *      binary; each missing surface silently breaks the permission relay.
  *   4. stat ~/.agent-director/state.db           — compare st_uid to
  *      geteuid(). ENOENT passes (the row is created on first verb call);
  *      other stat errors are fatal.
@@ -27,6 +32,7 @@
 
 import * as fs from 'node:fs'
 import * as os from 'node:os'
+import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 
 import {
@@ -56,6 +62,54 @@ const AD_STATE_DB_PATH = join(os.homedir(), '.agent-director', 'state.db')
 
 /** Supported platforms surfaced in operator-facing remediation text. */
 const SUPPORTED_PLATFORMS = ['linux-x64', 'darwin-arm64'] as const
+
+/**
+ * err_names CSCB's runtime branches on. The structural-drift indicator we
+ * guard against is whether the `agent-director` dist file ships a class
+ * declaration for each — i.e. matches `class <Name> extends ...`. The class
+ * declaration is the defining symptom of a shim that's caught up to the
+ * bundled Go binary: when one is missing, `instanceof Err<Name>` predicates
+ * silently downgrade and the runtime `errorFromEnvelope` falls back to a
+ * base `AgentDirectorError` instead of the typed subclass. A bare-identifier
+ * match in the dist source is too loose because the shipped shim also
+ * carries a metadata array (`{ name: "ErrPermissionRequestNotFound", ... }`)
+ * that mentions the names even when the class is absent — so the regex
+ * must anchor on `class <Name>\s`.
+ */
+const REQUIRED_ERR_NAMES = [
+  'ErrInvalidFlags',
+  'ErrPermissionRequestNotFound',
+  'ErrAmbiguousRequest',
+] as const
+
+// ---------------------------------------------------------------------------
+// Private helper: resolve + read the agent-director dist source (memoized)
+// ---------------------------------------------------------------------------
+
+/**
+ * Source-text cache for the resolved `agent-director` dist entry. Probes 2
+ * and 3 both grep the same file; reading it once keeps boot fast and avoids
+ * surprising operators with duplicate I/O failures.
+ */
+let cachedAdDistSource: string | Error | null = null
+
+/**
+ * Resolve `agent-director` via `import.meta.resolve`, convert the file:// URL
+ * to a filesystem path, and read the bundled JS as UTF-8. Memoized for the
+ * life of the process. Returns the cached `Error` on a previous failure so
+ * each probe can surface a uniform `detail` field.
+ */
+function readAdDistSource(): string | Error {
+  if (cachedAdDistSource !== null) return cachedAdDistSource
+  try {
+    const resolved = import.meta.resolve('agent-director')
+    const distPath = fileURLToPath(resolved)
+    cachedAdDistSource = fs.readFileSync(distPath, 'utf-8')
+  } catch (err) {
+    cachedAdDistSource = err instanceof Error ? err : new Error(String(err))
+  }
+  return cachedAdDistSource
+}
 
 // ---------------------------------------------------------------------------
 // Pure helper: semver-gte for the three-segment versions AD ships
@@ -114,6 +168,33 @@ export interface StartupGateDeps {
   recordStartupError: typeof recordStartupError
   /** Process exit hook (terminates by default). */
   exit: (code: number) => never
+  /**
+   * Probe 1 — verify the wrapper Client exposes the `getPermission` method.
+   * Production default checks `typeof client.getPermission === 'function'`.
+   * Tests inject a constant boolean.
+   */
+  probeGetPermission: (client: unknown) => boolean
+  /**
+   * Probe 2 — verify the AD error catalog includes the err_names CSCB
+   * branches on. Production default reads the resolved `agent-director`
+   * dist file and matches `class <Name>\s` for each required name — the
+   * class-declaration site is the structural symptom of a shim that's
+   * caught up to the bundled Go binary. A behavioral `errorFromEnvelope`
+   * round-trip is unusable (the helper falls back to a base
+   * `AgentDirectorError` with `.errName` copied verbatim from the input),
+   * and a bare-identifier match false-positives on the dist's metadata
+   * array that names err_names even when the class is missing.
+   */
+  probeErrorCatalog: () => { ok: true } | { ok: false; missing: string[] }
+  /**
+   * Probe 3 — verify the wrapper Client's `decide()` argv carries
+   * `--request-token`. Production default reads the resolved
+   * `agent-director` dist file and greps for the literal `request-token` —
+   * a static-file probe (no subprocess, no DB write) chosen over the
+   * subprocess fallback per the bug requirements. See the production
+   * defaults block for the resolution + read.
+   */
+  probeDecideArgv: (client: unknown) => Promise<{ ok: true } | { ok: false; detail: string }>
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +219,55 @@ const prodDeps: StartupGateDeps = {
   geteuid: () => process.geteuid?.(),
   recordStartupError,
   exit: (code) => process.exit(code),
+  probeGetPermission: (client) =>
+    typeof (client as { getPermission?: unknown }).getPermission === 'function',
+  probeErrorCatalog: () => {
+    // Static-file probe: the runtime `errorFromEnvelope` helper falls back
+    // to constructing a base `AgentDirectorError` (with `.errName` copied
+    // verbatim from the input) when err_name is absent from `ERROR_TABLE`,
+    // so a behavioral round-trip cannot tell catalog-present from
+    // catalog-absent. A bare-identifier regex is also too loose: the shim
+    // carries a metadata array whose `name: "Err..."` literals match every
+    // err_name regardless of whether the class is declared. Anchor instead
+    // on `class <Name>\s` — the class declaration site is emitted once per
+    // typed error and is the defining symptom of a caught-up shim.
+    const src = readAdDistSource()
+    if (src instanceof Error) {
+      // Surface this as "all required names missing" with a diagnostic
+      // detail in the first slot, so the operator sees a complete picture.
+      return { ok: false, missing: [`<read-failed: ${src.message}>`, ...REQUIRED_ERR_NAMES] }
+    }
+    const missing: string[] = []
+    for (const name of REQUIRED_ERR_NAMES) {
+      const re = new RegExp(`class\\s+${name}\\s`)
+      if (!re.test(src)) {
+        missing.push(name)
+      }
+    }
+    return missing.length === 0 ? { ok: true } : { ok: false, missing }
+  },
+  probeDecideArgv: async (_client) => {
+    // Static-file probe: grep the resolved agent-director dist for the
+    // literal `--request-token` flag. Chosen over the subprocess fallback
+    // because it's faster, touches no AD state, and a stale shipped shim
+    // is exactly the file-content condition we're detecting.
+    const src = readAdDistSource()
+    if (src instanceof Error) {
+      return {
+        ok: false,
+        detail: `failed to read agent-director dist for argv probe: ${src.message}`,
+      }
+    }
+    if (src.includes('--request-token')) {
+      return { ok: true }
+    }
+    return {
+      ok: false,
+      detail:
+        `agent-director dist does not include the literal '--request-token' — ` +
+        `buildDecide() is dropping the field.`,
+    }
+  },
 }
 
 function mergeDeps(overrides?: Partial<StartupGateDeps>): StartupGateDeps {
@@ -154,7 +284,7 @@ function mergeDeps(overrides?: Partial<StartupGateDeps>): StartupGateDeps {
  */
 export type StartupGateOutcome =
   | { ok: true; client: unknown; adVersion: string }
-  | { ok: false; phase: 'construct' | 'version' | 'same-user' | 'unexpected'; classLabel: string; message: string }
+  | { ok: false; phase: 'construct' | 'version' | 'api-surface' | 'same-user' | 'unexpected'; classLabel: string; message: string }
 
 /**
  * Run the SR-5.1 startup sequence without exiting. The dispatcher
@@ -277,6 +407,56 @@ export async function runStartupGate(
       message:
         `agent-director version ${adVersion} is below the required minimum ${MIN_AD_VERSION}. ` +
         `Run: bun add agent-director@^${MIN_AD_VERSION}`,
+    }
+  }
+
+  // Step 3.5: API surface probes. The version gate above confirms the AD
+  // binary meets MIN_AD_VERSION, but published agent-director npm packages
+  // have shipped a stale TS shim that drops methods (getPermission), drops
+  // CLI flags (--request-token in buildDecide), and misses err_names in the
+  // catalog. Each of those silently breaks CSCB at click-handling time. The
+  // probes run 1 → 2 → 3 and short-circuit on first failure so one operator
+  // message corresponds to one fix.
+  if (!d.probeGetPermission(client)) {
+    d.closeClient(client)
+    return {
+      ok: false,
+      phase: 'api-surface',
+      classLabel: 'ad-shim-missing-get-permission',
+      message:
+        `agent-director Client is missing the 'getPermission' method. ` +
+        `The installed shim is stale relative to the AD binary (${adVersion}). ` +
+        `Run: bun add agent-director@^${MIN_AD_VERSION} (and confirm the resolved version actually ships getPermission).`,
+    }
+  }
+
+  const catalogProbe = d.probeErrorCatalog()
+  if (!catalogProbe.ok) {
+    d.closeClient(client)
+    return {
+      ok: false,
+      phase: 'api-surface',
+      classLabel: 'ad-shim-catalog-incomplete',
+      message:
+        `agent-director TS error catalog is missing required err_names: ` +
+        `${catalogProbe.missing.join(', ')}. ` +
+        `Envelopes with these names would be wrapped as ErrUnknownErrorName and ` +
+        `CSCB's errName predicates would silently miss. ` +
+        `Run: bun add agent-director@^${MIN_AD_VERSION} (confirm the resolved package ships the full catalog).`,
+    }
+  }
+
+  const argvProbe = await d.probeDecideArgv(client)
+  if (!argvProbe.ok) {
+    d.closeClient(client)
+    return {
+      ok: false,
+      phase: 'api-surface',
+      classLabel: 'ad-shim-decide-drops-token',
+      message:
+        `agent-director shim's decide() does not pass --request-token to the CLI: ${argvProbe.detail} ` +
+        `Permission clicks would resolve against the wrong row. ` +
+        `Run: bun add agent-director@^${MIN_AD_VERSION} (confirm the resolved package's buildDecide includes the flag).`,
     }
   }
 

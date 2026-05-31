@@ -16,7 +16,7 @@ cli.ts                          CLI entry point — start/stop/clean_restart sub
     ├── startup-errors.ts       SR-5.1a startup-errors log — append-only to ~/.claude/channels/slack/startup-errors.log + stderr.
     ├── agent-director-client.ts   SR-0.1 singleton Client wrapper. getClient()/closeClient(); MIN_AD_VERSION sourced from package.json. Exposes `decideWithToken` (SR-7.2 — single source of truth for the snake-case `request_token` field on the decide wire) and `getPermission` + `isErrPermissionRequestNotFound` (SR-7.1 — wraps the paired AD release's `get-permission --request-token <uuid>` verb).
     ├── agent-director-errors.ts   SR-0.2 typed Err* re-exports for instanceof branching.
-    ├── agent-director-startup.ts  SR-5.1 startup gate — import / construct Client / version probe / same-user stat.
+    ├── agent-director-startup.ts  SR-5.1 startup gate — import / construct Client / version probe / SR-6.1 API surface probes / same-user stat.
     ├── agent-director-template.ts SR-3.1 / SR-3.2 — builds the slack-channel-bot MakeTemplateParams and calls client.makeTemplate({ overwrite: true }) at boot.
     ├── session-manager.ts      SR-1 in full — spawnForRoute (SR-1.4 collision-then-act), reconcileOrphans (SR-1.6), reconnectMcp/waitForWaitingAndReconnect, postSpawnFailureToChannel.
     ├── permission-poller.ts    SR-2.1 polling loop + SR-2.2 Block Kit emitter. Owns the live LivePermission map, keyed on the composite `(claude_instance_id, request_token)` pair, consumes AD's plural `permission_requests` projection, posts one Slack message per open row, and runs the SR-2.4 set-diff + `get-permission` closure reconciliation with four verdict-distinct chat.update renderings (operator-allow / operator-deny / timeout / find_missing) plus a fail-closed generic-deny fallback for unknown decision_reason and `ErrPermissionRequestNotFound`.
@@ -109,6 +109,18 @@ Block Kit buttons emit `action_id` strings of the shape `perm_(allow|deny)_<clau
 
 `MIN_AD_VERSION` is `0.6.0`, sourced from `package.json` `dependencies['agent-director']` (declared as `^0.6.0`) via `readMinAdVersion()` in `src/agent-director-client.ts`. The startup gate (`runStartupGate` in `src/agent-director-startup.ts`) fails closed on a sub-pin AD: the operator-visible error lands in `startup-errors.log` and the process exits non-zero. The startup gate is the sole compatibility boundary — no runtime code path degrades to the prior singular-projection or coalesced-prompt behavior on version mismatch (SR-6.2).
 
+#### API surface probe (SR-6.1)
+
+A passing semver gate proves only that the bundled AD Go binary reports `>= MIN_AD_VERSION`. It does NOT prove the published npm package's TS shim is in sync with that binary — agent-director's `0.6.0` release shipped a stale shim whose `Client` dropped `getPermission`, whose `buildDecide()` dropped `--request-token`, and whose error catalog omitted three err_names CSCB branches on. Each defect fails silently at runtime (clicks resolve against the wrong row, error-envelope branches miss because the shim's `errorFromEnvelope` fallback constructs a base `AgentDirectorError` with `.errName` copied verbatim from the input rather than raising), so the gate runs three short-circuit probes after the version check and before the same-user stat. The probes are dependency-injected via `StartupGateDeps` so tests can drive each failure path directly; the production defaults live alongside in `src/agent-director-startup.ts`.
+
+| Probe | Default check | Failure `classLabel` |
+|---|---|---|
+| `probeGetPermission` | `typeof client.getPermission === 'function'` | `ad-shim-missing-get-permission` |
+| `probeErrorCatalog` | Reads the resolved `agent-director` dist file and confirms each of `ErrInvalidFlags`, `ErrPermissionRequestNotFound`, `ErrAmbiguousRequest` appears as a word-boundary identifier in the bundled JS — same static-file approach as `probeDecideArgv` (a behavioral `errorFromEnvelope` round-trip cannot detect catalog drift because the shim's unknown-name fallback constructs a base `AgentDirectorError` with `.errName` copied verbatim from the input) | `ad-shim-catalog-incomplete` |
+| `probeDecideArgv` | `import.meta.resolve('agent-director')` → `readFileSync` of the dist entry → string-contains `--request-token` (no subprocess, no state-DB write) | `ad-shim-decide-drops-token` |
+
+On any probe failure, the gate closes the Client, records the operator-readable message to `startup-errors.log`, and exits non-zero — the same shape as the SR-6 version-pin failure. The remediation in every case is the same: reinstall a matching `agent-director` and confirm the resolved package actually carries the missing surface.
+
 #### What this replaces
 
 Three pre-Epic-4 mechanisms have been retired:
@@ -133,7 +145,7 @@ AskUserQuestion is denied at the agent-director template (SR-3.1's `deny: ['AskU
 
 Called from `main()` in `server.ts`. The order is:
 
-1. **SR-5.1 startup gate** — `runAgentDirectorStartupGate()` imports the library, constructs the singleton Client, runs `client.version()` + semver-gte against `MIN_AD_VERSION`, and stats `~/.agent-director/state.db` against `geteuid()`. Failure writes to `startup-errors.log` and exits non-zero.
+1. **SR-5.1 startup gate** — `runAgentDirectorStartupGate()` imports the library, constructs the singleton Client, runs `client.version()` + semver-gte against `MIN_AD_VERSION`, runs the SR-6.1 API surface probes (`getPermission` presence, error-catalog round-trip, `--request-token` in the dist), and stats `~/.agent-director/state.db` against `geteuid()`. Failure writes to `startup-errors.log` and exits non-zero.
 2. **PID conflict check** — existing `checkPidConflict(PID_FILE)` invariant. CSCB enforces one instance per host.
 3. **SR-3.2 template refresh** — `installSlackChannelBotTemplate(routingConfig)` builds the SR-3.1 `MakeTemplateParams` and calls `client.makeTemplate({ ..., overwrite: true })`. Atomic replacement is the library's responsibility (sibling-tempfile + `rename(2)`). Fatal on rejection.
 4. **SR-1.6 orphan reconciliation** — `reconcileOrphans(routingConfig)`. `client.list({ label: ['service=cscb'] })` enumerates every CSCB spawn; rows whose `channel` label is missing or not in `routingConfig.routes` are killed + deleted. Per-orphan failure logged to `startup-errors.log` but does not block.

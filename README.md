@@ -439,6 +439,9 @@ Classes you may see:
 - `ad-cli-not-executable` — the resolved agent-director CLI binary exists but is not executable. Run `chmod +x` on the binary referenced in the log line.
 - `ad-version-probe` — `agent-director` was loaded but the `version()` probe failed (subprocess invocation, platform binary, etc.).
 - `ad-version-stale` — installed `agent-director` is below the minimum version this CSCB requires. Run `bun add agent-director@^<minimum>`.
+- `ad-shim-missing-get-permission` — the installed `agent-director` TS shim's `Client` does not expose `getPermission`. The npm-published package is out of sync with its bundled binary. Reinstall and confirm the resolved version actually ships the method.
+- `ad-shim-catalog-incomplete` — the installed `agent-director` TS error catalog is missing one or more of `ErrInvalidFlags`, `ErrPermissionRequestNotFound`, `ErrAmbiguousRequest`. The log line lists the missing names. Same remediation as `ad-shim-missing-get-permission`.
+- `ad-shim-decide-drops-token` — the installed `agent-director` dist does not include `--request-token` in its bundled JS, meaning `buildDecide()` would resolve permission clicks against the wrong row. Reinstall and confirm `buildDecide` carries the flag.
 - `ad-call-timeout` — an agent-director verb call exceeded the configured `callTimeoutMs` (default 30 s). Investigate the subprocess or increase the timeout.
 - `ad-same-user` — `~/.agent-director/state.db` is owned by a different UID than the CSCB process. Reinstall agent-director as the correct user or remove the mismatched file.
 - `ad-same-user-stat` — Non-ENOENT stat error on the state DB (permissions, I/O). Investigate the file before re-launching.
