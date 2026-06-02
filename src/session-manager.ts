@@ -158,14 +158,12 @@ export async function launchSession(
         return 'NO_CONVERSATION' as unknown as SessionRecord
       }
 
-      // Trust dialog: "Do you trust the files in this folder?" — default focus
+      // Trust dialog ("Accessing workspace / Quick safety check"): default focus
       // is on "Yes, I trust this folder", so plain Enter accepts. Do NOT send
-      // Down — that would move focus to "No, exit" and kill Claude.
-      if (
-        !trustDialogHandled &&
-        pane.includes('Do you trust the files in this folder') &&
-        pane.includes('Yes, I trust this folder')
-      ) {
+      // Down — that would move focus to "No, exit" and kill Claude. The menu
+      // option text is unique to this dialog, so a single substring match is
+      // both necessary and sufficient.
+      if (!trustDialogHandled && pane.includes('Yes, I trust this folder')) {
         console.error(`[slack] Trust dialog detected — accepting (Enter) in session: ${sessionName_}`)
         await tmuxClient.sendKeys(sessionName_, 'Enter')
         trustDialogHandled = true
