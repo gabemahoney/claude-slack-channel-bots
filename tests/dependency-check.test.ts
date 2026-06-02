@@ -220,6 +220,25 @@ describe('SR-5.1: version-probe failure modes', () => {
     }
   })
 
+  test('AD 0.5.1 is rejected — message names 0.6.3 as the required minimum', async () => {
+    const stub = makeStubClient({ versionResult: cannedVersion('0.5.1') })
+    const outcome = await runStartupGate({
+      getClient: () => stub,
+      callVersion: (c) => (c as typeof stub).version({}),
+      closeClient: (c) => (c as typeof stub).close(),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.phase).toBe('version')
+      expect(outcome.classLabel).toBe('ad-version-stale')
+      expect(outcome.message).toContain('0.5.1')
+      expect(outcome.message).toContain('0.6.3')
+    }
+  })
+
   test('ErrCallTimeout at version step → ok=false, classLabel=ad-call-timeout', async () => {
     const stub = makeStubClient({ versionError: errCallTimeout('version', 35000, 30000) })
     const outcome = await runStartupGate({
@@ -359,6 +378,23 @@ describe('SR-5.1: happy path', () => {
       exit: noopExit,
     })
     expect(outcome.ok).toBe(true)
+  })
+
+  test('AD 0.6.3 is accepted at the exact minimum', async () => {
+    const stub = makeStubClient({ versionResult: cannedVersion('0.6.3') })
+    const outcome = await runStartupGate({
+      getClient: () => stub,
+      callVersion: (c) => (c as typeof stub).version({}),
+      closeClient: (c) => (c as typeof stub).close(),
+      statSync: defaultStat,
+      geteuid: () => 1000,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(true)
+    if (outcome.ok) {
+      expect(outcome.adVersion).toBe('0.6.3')
+    }
   })
 
   test('version newer than MIN_AD_VERSION → ok=true', async () => {
