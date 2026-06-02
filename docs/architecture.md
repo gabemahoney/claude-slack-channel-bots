@@ -107,7 +107,7 @@ Block Kit buttons emit `action_id` strings of the shape `perm_(allow|deny)_<clau
 
 #### Version pin (SR-6)
 
-`MIN_AD_VERSION` is `0.6.0`, sourced from `package.json` `dependencies['agent-director']` (declared as `^0.6.0`) via `readMinAdVersion()` in `src/agent-director-client.ts`. The startup gate (`runStartupGate` in `src/agent-director-startup.ts`) fails closed on a sub-pin AD: the operator-visible error lands in `startup-errors.log` and the process exits non-zero. The startup gate is the sole compatibility boundary — no runtime code path degrades to the prior singular-projection or coalesced-prompt behavior on version mismatch (SR-6.2).
+`MIN_AD_VERSION` is `0.6.3`, sourced from `package.json` `dependencies['agent-director']` (declared as `^0.6.3`) via `readMinAdVersion()` in `src/agent-director-client.ts`. The startup gate (`runStartupGate` in `src/agent-director-startup.ts`) fails closed on a sub-pin AD: the operator-visible error lands in `startup-errors.log` and the process exits non-zero. The startup gate is the sole compatibility boundary — no runtime code path degrades to the prior singular-projection or coalesced-prompt behavior on version mismatch (SR-6.2).
 
 #### API surface probe (SR-6.1)
 

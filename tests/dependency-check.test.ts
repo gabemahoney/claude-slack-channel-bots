@@ -243,14 +243,16 @@ describe('SR-5.1: version-probe failure modes', () => {
       getClient: () => stub,
       callVersion: (c) => (c as typeof stub).version({}),
       closeClient: (c) => (c as typeof stub).close(),
+      ...passingProbes,
       statSync: defaultStat,
+      geteuid: () => 1000,
       recordStartupError: noopRecord,
       exit: noopExit,
     })
-    if (!outcome.ok) {
-      expect(outcome.phase).not.toBe('version')
+    expect(outcome.ok).toBe(true)
+    if (outcome.ok) {
+      expect(outcome.adVersion).toBe('0.6.3')
     }
-    // outcome.ok=true is also acceptable; depends on defaultStat shape.
   })
 
   test("version returned as '0.5.99' is rejected (just-below-pin sanity)", async () => {
