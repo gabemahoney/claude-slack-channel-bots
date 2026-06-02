@@ -20,6 +20,7 @@
 import {
   AgentDirectorError,
   ErrAlreadyDecided,
+  ErrAmbiguousRequest,
   ErrBunVersionTooOld,
   ErrCallTimeout,
   ErrCliNotExecutable,
@@ -156,6 +157,11 @@ export function errSpawnNotResumable(): ErrSpawnNotResumable {
 /** Build an ErrAlreadyDecided (decide; treated-as-success). */
 export function errAlreadyDecided(): ErrAlreadyDecided {
   return new ErrAlreadyDecided('decide', 'ErrAlreadyDecided', 'permission request already decided')
+}
+
+/** Build an ErrAmbiguousRequest (decide; relay bug — leave buttons visible). */
+export function errAmbiguousRequest(): ErrAmbiguousRequest {
+  return new ErrAmbiguousRequest('decide', 'ErrAmbiguousRequest', 'ambiguous request — multiple open permission requests')
 }
 
 /** Build an ErrNoOpenPermissionRequest (decide / poller race). */

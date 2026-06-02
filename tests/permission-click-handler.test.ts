@@ -2,10 +2,11 @@
  * permission-click-handler.test.ts — SR-2.2 click → decide path.
  *
  * Covers:
- *   - Happy path: parse action_id → claim → get → decide → chat.update
- *     "Allowed/Denied by <user>" → drop entry.
- *   - Stale click (current request_id != action_id's): chat.update
- *     "already decided", no decide() call.
+ *   - Happy path: parse action_id → claim → getPermission → decide → chat.update
+ *     "Allowed/Denied" → drop entry.
+ *   - Stale click via ErrPermissionRequestNotFound: chat.update stale, no decide().
+ *   - Stale click via decided row (non-null decision): chat.update stale, no decide().
+ *   - ErrAmbiguousRequest on decide: no chat.update, buttons stay visible.
  *   - ErrAlreadyDecided treated as success.
  *   - Action ID that doesn't match the SR-2.2 shape → returns false.
  *   - No live entry → treated as stale-click no-op.
@@ -13,21 +14,33 @@
  * SPDX-License-Identifier: MIT
  */
 
-// TODO: Epic 3 — full rewrite: click-handler tests need composite-key UUID action_ids
 import { afterEach, describe, expect, test } from 'bun:test'
 import { handlePermissionClick } from '../src/permission-click-handler.ts'
 import {
   _resetPollerState,
+  getLivePermission,
+  makePermKey,
   startPermissionPoller,
   stopPermissionPoller,
 } from '../src/permission-poller.ts'
 import {
   cannedGetPermissionResult,
-  cannedGetResult,
   cannedListRow,
   cannedPermissionRequest,
   errAlreadyDecided,
+  errAmbiguousRequest,
+  errPermissionRequestNotFound,
 } from './test-helpers/agent-director-stub.ts'
+
+// ---------------------------------------------------------------------------
+// Test UUIDs
+// ---------------------------------------------------------------------------
+const TOKEN_1 = '550e8400-e29b-41d4-a716-446655440001'
+const TOKEN_2 = '550e8400-e29b-41d4-a716-446655440002'
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 interface ChatCall { kind: 'postMessage' | 'update'; channel: string; ts?: string; text?: string }
 function makeChatStub(): { web: { chat: { postMessage: (...a: unknown[]) => Promise<{ ts: string }>; update: (...a: unknown[]) => Promise<unknown> } }; calls: ChatCall[] } {
@@ -68,23 +81,25 @@ function makeIntervalStubs(): { setInterval: typeof globalThis.setInterval; clea
   }
 }
 
-/** Seed a live entry in the poller's module map by running one tick.
- * TODO: Epic 3 — update to composite-key UUID action_ids; using as any cast for now. */
-async function seedLiveEntry(opts: { instanceId: string; channelId: string; requestId: number }): Promise<{ web: ReturnType<typeof makeChatStub>; pending: ManualInterval[] }> {
+/**
+ * Seed a live entry in the poller's module map by running one tick.
+ * `requestToken` drives both the list row's permission_request and the
+ * getPermission pre-flight stub.
+ */
+async function seedLiveEntry(opts: { instanceId: string; channelId: string; requestToken: string }): Promise<{ web: ReturnType<typeof makeChatStub>; pending: ManualInterval[] }> {
   const ivl = makeIntervalStubs()
   const chat = makeChatStub()
-  const TOKEN = '00000000-0000-0000-0000-000000000001'
   const getClient = () => ({
     list: async () => ({
       spawns: [cannedListRow({
         claude_instance_id: opts.instanceId,
         state: 'check_permission',
         labels: { service: 'cscb', channel: opts.channelId },
-        permission_request: cannedPermissionRequest({ request_id: opts.requestId, request_token: TOKEN }),
+        permission_request: cannedPermissionRequest({ request_token: opts.requestToken }),
       } as never)],
     }),
-    // Return open (decision: null) so the entry stays alive after posting
-    getPermission: async () => cannedGetPermissionResult({ request_token: TOKEN, decision: null }),
+    // Return open (decision: null) so the seeded entry stays alive after posting.
+    getPermission: async () => cannedGetPermissionResult({ request_token: opts.requestToken, decision: null }),
   })
   startPermissionPoller({
     getClient,
@@ -107,17 +122,12 @@ afterEach(() => {
 // Happy path
 // ---------------------------------------------------------------------------
 
-// TODO: Epic 3 — rewrite with composite-key UUID action_ids
-describe.skip('handlePermissionClick — happy path', () => {
-  test('allow → claim → get (matching request_id) → decide(allow) → chat.update', async () => {
-    const seed = await seedLiveEntry({ instanceId: 'cscb_C', channelId: 'CH', requestId: 42 })
+describe('handlePermissionClick — happy path', () => {
+  test('allow → claim → getPermission (open) → decide(allow) → chat.update Allowed', async () => {
+    const seed = await seedLiveEntry({ instanceId: 'cscb_C', channelId: 'CH', requestToken: TOKEN_1 })
     const decideCalls: import('agent-director').DecideParams[] = []
     const getClient = () => ({
-      get: async () => cannedGetResult({
-        claude_instance_id: 'cscb_C',
-        state: 'check_permission',
-        permission_request: cannedPermissionRequest({ request_id: 42 }),
-      }),
+      getPermission: async () => cannedGetPermissionResult({ request_token: TOKEN_1, decision: null }),
       decide: async (params: import('agent-director').DecideParams) => {
         decideCalls.push(params)
         return {}
@@ -125,44 +135,38 @@ describe.skip('handlePermissionClick — happy path', () => {
     })
 
     const handled = await handlePermissionClick(
-      'perm_allow_cscb_C_42',
-      'U_USER1',
+      `perm_allow_cscb_C_${TOKEN_1}`,
       {
         getClient,
         web: seed.web.web as never,
-        resolveUserName: async () => 'alice',
       },
     )
     expect(handled).toBe(true)
     expect(decideCalls).toHaveLength(1)
-    expect(decideCalls[0]).toEqual({ claude_instance_id: 'cscb_C', decision: 'allow' })
+    expect(decideCalls[0]).toEqual({ claude_instance_id: 'cscb_C', request_token: TOKEN_1, decision: 'allow' })
     const updates = seed.web.calls.filter((c) => c.kind === 'update')
     expect(updates).toHaveLength(1)
-    expect(updates[0].text).toContain('Allowed by alice')
+    expect(updates[0].text).toContain('Allowed')
   })
 
-  test('deny → decide(deny) → chat.update "Denied by"', async () => {
-    const seed = await seedLiveEntry({ instanceId: 'cscb_C', channelId: 'CH', requestId: 7 })
+  test('deny → decide(deny) → chat.update Denied', async () => {
+    const seed = await seedLiveEntry({ instanceId: 'cscb_C', channelId: 'CH', requestToken: TOKEN_1 })
     const decideCalls: import('agent-director').DecideParams[] = []
     const getClient = () => ({
-      get: async () => cannedGetResult({
-        claude_instance_id: 'cscb_C',
-        state: 'check_permission',
-        permission_request: cannedPermissionRequest({ request_id: 7 }),
-      }),
+      getPermission: async () => cannedGetPermissionResult({ request_token: TOKEN_1, decision: null }),
       decide: async (params: import('agent-director').DecideParams) => {
         decideCalls.push(params)
         return {}
       },
     })
     await handlePermissionClick(
-      'perm_deny_cscb_C_7',
-      'U_USER1',
-      { getClient, web: seed.web.web as never, resolveUserName: async () => 'bob' },
+      `perm_deny_cscb_C_${TOKEN_1}`,
+      { getClient, web: seed.web.web as never },
     )
     expect(decideCalls[0].decision).toBe('deny')
+    expect(decideCalls[0].request_token).toBe(TOKEN_1)
     const updates = seed.web.calls.filter((c) => c.kind === 'update')
-    expect(updates[0].text).toContain('Denied by bob')
+    expect(updates[0].text).toContain('Denied')
   })
 })
 
@@ -170,81 +174,115 @@ describe.skip('handlePermissionClick — happy path', () => {
 // Stale clicks
 // ---------------------------------------------------------------------------
 
-// TODO: Epic 3 — rewrite with composite-key UUID action_ids
-describe.skip('handlePermissionClick — stale clicks', () => {
-  test('mismatched request_id → chat.update "already decided", no decide()', async () => {
-    const seed = await seedLiveEntry({ instanceId: 'cscb_C', channelId: 'CH', requestId: 5 })
-    const decideCalls: import('agent-director').DecideParams[] = []
-    const getClient = () => ({
-      get: async () => cannedGetResult({
-        claude_instance_id: 'cscb_C',
-        state: 'check_permission',
-        // Fresh request_id is now 99 — the action_id encoded 5 is stale.
-        permission_request: cannedPermissionRequest({ request_id: 99 }),
-      }),
-      decide: async (params: import('agent-director').DecideParams) => {
-        decideCalls.push(params)
-        return {}
-      },
-    })
-    await handlePermissionClick(
-      'perm_allow_cscb_C_5',
-      'U_USER1',
-      { getClient, web: seed.web.web as never, resolveUserName: async () => 'alice' },
-    )
-    expect(decideCalls).toHaveLength(0)
-    const updates = seed.web.calls.filter((c) => c.kind === 'update')
-    expect(updates).toHaveLength(1)
-    expect(updates[0].text).toContain('already decided')
-  })
-
+describe('handlePermissionClick — stale clicks', () => {
   test('no live entry → no-op (true return, no chat call)', async () => {
     const decideCalls: import('agent-director').DecideParams[] = []
     const chat = makeChatStub()
     const handled = await handlePermissionClick(
-      'perm_allow_cscb_NOTHERE_1',
-      'U_USER1',
+      `perm_allow_cscb_NOTHERE_${TOKEN_1}`,
       {
-        getClient: () => ({ get: async () => cannedGetResult({ claude_instance_id: 'x' }), decide: async () => { decideCalls.push({} as never); return {} } }),
+        getClient: () => ({
+          getPermission: async () => cannedGetPermissionResult({ request_token: TOKEN_1, decision: null }),
+          decide: async () => { decideCalls.push({} as never); return {} },
+        }),
         web: chat.web as never,
-        resolveUserName: async () => 'alice',
       },
     )
     expect(handled).toBe(true)
     expect(decideCalls).toHaveLength(0)
     expect(chat.calls).toHaveLength(0)
   })
+
+  test('ErrPermissionRequestNotFound → chat.update stale, no decide(), entry dropped', async () => {
+    const seed = await seedLiveEntry({ instanceId: 'cscb_C', channelId: 'CH', requestToken: TOKEN_1 })
+    const decideCalls: import('agent-director').DecideParams[] = []
+    const getClient = () => ({
+      getPermission: async () => { throw errPermissionRequestNotFound() },
+      decide: async (params: import('agent-director').DecideParams) => {
+        decideCalls.push(params)
+        return {}
+      },
+    })
+    const handled = await handlePermissionClick(
+      `perm_allow_cscb_C_${TOKEN_1}`,
+      { getClient, web: seed.web.web as never },
+    )
+    expect(handled).toBe(true)
+    expect(decideCalls).toHaveLength(0)
+    const updates = seed.web.calls.filter((c) => c.kind === 'update')
+    expect(updates).toHaveLength(1)
+    expect(updates[0].text).toMatch(/stale|already decided/i)
+    // Entry should be dropped
+    expect(getLivePermission(makePermKey('cscb_C', TOKEN_1))).toBeUndefined()
+  })
+
+  test('getPermission returns decided row → chat.update stale, no decide(), entry dropped', async () => {
+    const seed = await seedLiveEntry({ instanceId: 'cscb_C', channelId: 'CH', requestToken: TOKEN_1 })
+    const decideCalls: import('agent-director').DecideParams[] = []
+    const getClient = () => ({
+      getPermission: async () => cannedGetPermissionResult({ request_token: TOKEN_1, decision: 'allow' }),
+      decide: async (params: import('agent-director').DecideParams) => {
+        decideCalls.push(params)
+        return {}
+      },
+    })
+    const handled = await handlePermissionClick(
+      `perm_allow_cscb_C_${TOKEN_1}`,
+      { getClient, web: seed.web.web as never },
+    )
+    expect(handled).toBe(true)
+    expect(decideCalls).toHaveLength(0)
+    const updates = seed.web.calls.filter((c) => c.kind === 'update')
+    expect(updates).toHaveLength(1)
+    expect(updates[0].text).toMatch(/stale|already decided/i)
+    // Entry should be dropped
+    expect(getLivePermission(makePermKey('cscb_C', TOKEN_1))).toBeUndefined()
+  })
 })
 
 // ---------------------------------------------------------------------------
-// Decide idempotency
+// Decide error paths
 // ---------------------------------------------------------------------------
 
-// TODO: Epic 3 — rewrite with composite-key UUID action_ids
-describe.skip('handlePermissionClick — decide error paths', () => {
+describe('handlePermissionClick — decide error paths', () => {
   test('ErrAlreadyDecided → counted as success, chat.update lands', async () => {
-    const seed = await seedLiveEntry({ instanceId: 'cscb_C', channelId: 'CH', requestId: 3 })
+    const seed = await seedLiveEntry({ instanceId: 'cscb_C', channelId: 'CH', requestToken: TOKEN_1 })
     let decideCalled = 0
     const getClient = () => ({
-      get: async () => cannedGetResult({
-        claude_instance_id: 'cscb_C',
-        state: 'check_permission',
-        permission_request: cannedPermissionRequest({ request_id: 3 }),
-      }),
+      getPermission: async () => cannedGetPermissionResult({ request_token: TOKEN_1, decision: null }),
       decide: async () => {
         decideCalled++
         throw errAlreadyDecided()
       },
     })
     const handled = await handlePermissionClick(
-      'perm_allow_cscb_C_3',
-      'U_USER1',
-      { getClient, web: seed.web.web as never, resolveUserName: async () => 'eve' },
+      `perm_allow_cscb_C_${TOKEN_1}`,
+      { getClient, web: seed.web.web as never },
     )
     expect(handled).toBe(true)
     expect(decideCalled).toBe(1)
     const updates = seed.web.calls.filter((c) => c.kind === 'update')
-    expect(updates[0].text).toContain('Allowed by eve')
+    expect(updates[0].text).toContain('Allowed')
+  })
+
+  test('ErrAmbiguousRequest on decide → chat.update NOT called, buttons stay visible', async () => {
+    const seed = await seedLiveEntry({ instanceId: 'cscb_C', channelId: 'CH', requestToken: TOKEN_2 })
+    const logCalls: unknown[][] = []
+    const getClient = () => ({
+      getPermission: async () => cannedGetPermissionResult({ request_token: TOKEN_2, decision: null }),
+      decide: async () => { throw errAmbiguousRequest() },
+    })
+    const handled = await handlePermissionClick(
+      `perm_allow_cscb_C_${TOKEN_2}`,
+      {
+        getClient,
+        web: seed.web.web as never,
+        log: (...args: unknown[]) => { logCalls.push(args) },
+      },
+    )
+    expect(handled).toBe(true)
+    const updates = seed.web.calls.filter((c) => c.kind === 'update')
+    expect(updates).toHaveLength(0)
   })
 })
 
@@ -257,25 +295,27 @@ describe('handlePermissionClick — non-matching action ids', () => {
     const chat = makeChatStub()
     const handled = await handlePermissionClick(
       'some_other_action',
-      'U_USER1',
       {
-        getClient: () => ({ get: async () => cannedGetResult({ claude_instance_id: 'x' }), decide: async () => ({}) }),
+        getClient: () => ({
+          getPermission: async () => cannedGetPermissionResult({ request_token: TOKEN_1, decision: null }),
+          decide: async () => ({}),
+        }),
         web: chat.web as never,
-        resolveUserName: async () => 'alice',
       },
     )
     expect(handled).toBe(false)
   })
 
-  test('returns false on malformed perm action id', async () => {
+  test('returns false on malformed perm action id (no UUID suffix)', async () => {
     const chat = makeChatStub()
     const handled = await handlePermissionClick(
-      'perm_allow_NOT_CSCB_PREFIX_1',
-      'U_USER1',
+      'perm_allow_cscb_C_42',
       {
-        getClient: () => ({ get: async () => cannedGetResult({ claude_instance_id: 'x' }), decide: async () => ({}) }),
+        getClient: () => ({
+          getPermission: async () => cannedGetPermissionResult({ request_token: TOKEN_1, decision: null }),
+          decide: async () => ({}),
+        }),
         web: chat.web as never,
-        resolveUserName: async () => 'alice',
       },
     )
     expect(handled).toBe(false)
