@@ -78,6 +78,7 @@ describe('SR-8.6: PermissionRequestInfo.request_id type', () => {
       tool_name: 'Bash',
       tool_input: '{}',
       requested_at: '2026-01-01T00:00:00Z',
+      request_token: '00000000-0000-0000-0000-000000000001',
     }
     // Assignment back to a `number` variable confirms the type.
     const n: number = info.request_id

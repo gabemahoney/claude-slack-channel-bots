@@ -283,6 +283,7 @@ describe('handlePermissionClick — decide error paths', () => {
     expect(handled).toBe(true)
     const updates = seed.web.calls.filter((c) => c.kind === 'update')
     expect(updates).toHaveLength(0)
+    expect(logCalls.length).toBeGreaterThan(0)
   })
 })
 

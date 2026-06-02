@@ -129,7 +129,7 @@ export async function handlePermissionClick(
       return true
     }
     if (err instanceof AgentDirectorError) {
-      logDeps(deps, `[slack] permission-click: getPermission failed for key=${key}: ${(err as AgentDirectorError).errName}`)
+      logDeps(deps, `[slack] permission-click: getPermission failed for key=${key}: ${err.errName}`)
       // Leave finalizedAt set; operator can re-click.
       return true
     }
@@ -165,10 +165,10 @@ export async function handlePermissionClick(
       err instanceof ErrInvalidFlags
     ) {
       // Relay bug — log ERROR but leave buttons visible (do NOT update message).
-      logDeps(deps, `[slack] permission-click: ERROR relay bug for key=${key}: ${(err as AgentDirectorError).errName}`)
+      logDeps(deps, `[slack] permission-click: ERROR relay bug for key=${key}: ${err.errName}`)
       return true
     } else if (err instanceof AgentDirectorError) {
-      logDeps(deps, `[slack] permission-click: decide failed for key=${key}: ${(err as AgentDirectorError).errName}`)
+      logDeps(deps, `[slack] permission-click: decide failed for key=${key}: ${err.errName}`)
       // Leave finalizedAt set; operator can re-click.
       return true
     } else {
