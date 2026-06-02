@@ -87,13 +87,14 @@ export async function handlePermissionClick(
   const parsed = parsePermissionActionId(actionId)
   if (parsed === null) return false
 
-  const { decision, claudeInstanceId, requestId } = parsed
+  // TODO(b.oaj): remove in Epic 3 — requestToken replaces requestId; click handler will use requestToken
+  const { decision, claudeInstanceId, requestToken: requestId } = parsed
 
   const entry = getLivePermission(claudeInstanceId)
   if (!entry) {
     // No live entry — either the poller hasn't seen this yet, or it already
     // expired. Either way, treat as a stale click no-op.
-    logDeps(deps, `[slack] permission-click: no live entry for ${claudeInstanceId} (request_id=${requestId}) — stale click`)
+    logDeps(deps, `[slack] permission-click: no live entry for ${claudeInstanceId} (request_token=${requestId}) — stale click`)
     return true
   }
 
@@ -117,7 +118,8 @@ export async function handlePermissionClick(
     }
   }
 
-  if (currentRequestId === null || currentRequestId !== requestId) {
+  // TODO(b.oaj): remove in Epic 3 — comparison will use requestToken string directly
+  if (currentRequestId === null || String(currentRequestId) !== requestId) {
     // Stale click — no decide() call.
     try {
       await deps.web.chat.update({

@@ -130,11 +130,12 @@ export function _resetPollerState(): void {
  * verbatim from the old server.ts implementation; only the action_id
  * shape changes (SR-2.2 — full claude_instance_id + request_id encoding).
  */
+// TODO(b.oaj): remove in Epic 2 — signature will change to requestToken: string (UUID)
 export function buildPermissionBlocks(
   toolName: string,
   toolInput: Record<string, unknown>,
   claudeInstanceId: string,
-  requestId: number,
+  requestId: string,
 ): unknown[] {
   let summary: string
   if (toolName === 'Bash') {
@@ -267,7 +268,8 @@ async function postPermissionPrompt(
     permission.tool_name,
     toolInput,
     row.claude_instance_id,
-    permission.request_id,
+    // TODO(b.oaj): remove in Epic 2 — poller will pass request_token (string UUID) directly
+    String(permission.request_id),
   )
 
   try {
