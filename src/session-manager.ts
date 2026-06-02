@@ -306,6 +306,103 @@ export async function approveDevChannelsDialog(
 }
 
 // ---------------------------------------------------------------------------
+// approveTrustFolderDialog — auto-approve the folder-trust dialog on spawn
+// ---------------------------------------------------------------------------
+
+/**
+ * Verified against Claude Code 2.1.120 (2026-06-02). If this stops matching,
+ * the folder-trust dialog has drifted — see b.k54 / b.uhv. Match the option
+ * label (semantic, stable) rather than the header (cosmetic, drifts).
+ */
+export const TRUST_DIALOG_NEEDLE = 'Yes, I trust this folder'
+
+let _trustDialogPollIntervalMs = DIALOG_POLL_INTERVAL_MS
+let _trustDialogPollTimeoutMs = DIALOG_POLL_TIMEOUT_MS
+
+/** Test-only seam: override the trust-folder poll interval. */
+export function _setTrustDialogPollIntervalMs(ms: number): void {
+  _trustDialogPollIntervalMs = ms
+}
+
+/** Test-only seam: restore the default trust-folder poll interval. */
+export function _resetTrustDialogPollIntervalMs(): void {
+  _trustDialogPollIntervalMs = DIALOG_POLL_INTERVAL_MS
+}
+
+/** Test-only seam: override the trust-folder poll timeout. */
+export function _setTrustDialogPollTimeoutMs(ms: number): void {
+  _trustDialogPollTimeoutMs = ms
+}
+
+/** Test-only seam: restore the default trust-folder poll timeout. */
+export function _resetTrustDialogPollTimeoutMs(): void {
+  _trustDialogPollTimeoutMs = DIALOG_POLL_TIMEOUT_MS
+}
+
+/**
+ * Poll the freshly-spawned bot's tmux pane until the folder-trust dialog
+ * appears, send Enter to accept the pre-selected "Yes, I trust this folder"
+ * option, then confirm the dialog has cleared. All errors caught locally —
+ * never throws to the caller.
+ *
+ * readPane/sendKeys use `allow_pending: true` because the bot is still in
+ * `pending` AD state when this runs (b.98w).
+ *
+ * Divergence from `approveDevChannelsDialog`: if the needle never appears
+ * within the timeout, return silently (expected happy path once Fix A is in
+ * place — no `recordStartupError`). Only record an error when the needle
+ * persists after Enter:
+ *   - `trust-folder-approve-still-visible` — needle persists after Enter
+ */
+export async function approveTrustFolderDialog(
+  channelId: string,
+  web: WebClient | undefined,
+  isStartup: boolean,
+  normalizedName?: string,
+): Promise<void> {
+  void web
+  const claude_instance_id = instanceIdFor(channelId, normalizedName)
+  const client = getClient()
+  const deadline = Date.now() + _trustDialogPollTimeoutMs
+
+  let approved = false
+  while (Date.now() < deadline) {
+    try {
+      const { pane } = await client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true })
+      if (pane.includes(TRUST_DIALOG_NEEDLE)) {
+        await client.sendKeys({ claude_instance_id, text: '', allow_pending: true })
+        approved = true
+        break
+      }
+    } catch (err) {
+      console.error(`[slack] approveTrustFolderDialog: readPane error channel=${channelId}: ${String(err)}`)
+    }
+    await new Promise((r) => setTimeout(r, _trustDialogPollIntervalMs))
+  }
+
+  if (!approved) {
+    // Needle never appeared — silent return (expected happy path with Fix A)
+    return
+  }
+
+  let misses = 0
+  while (Date.now() < deadline && misses < DIALOG_GONE_CONFIRMS_REQUIRED) {
+    await new Promise((r) => setTimeout(r, _trustDialogPollIntervalMs))
+    try {
+      const { pane } = await client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true })
+      misses = pane.includes(TRUST_DIALOG_NEEDLE) ? 0 : misses + 1
+    } catch {
+      /* tolerate transient readPane failure */
+    }
+  }
+  if (misses < DIALOG_GONE_CONFIRMS_REQUIRED) {
+    const msg = `trust-folder dialog still visible after Enter for channel=${channelId} (sendKeys may not have reached pane)`
+    console.error(`[slack] approveTrustFolderDialog: ${msg}`)
+    if (isStartup) recordStartupError('trust-folder-approve-still-visible', msg)
+  }
+}
+
+// ---------------------------------------------------------------------------
 // waitForWaitingAndReconnect — used when a colliding spawn is in `working`
 // ---------------------------------------------------------------------------
 
@@ -468,6 +565,7 @@ export async function spawnForRoute(
   try {
     const r = await client.spawn(params)
     console.error(`[slack] spawnForRoute: spawned channel=${channelId} instanceId=${r.claude_instance_id}`)
+    await approveTrustFolderDialog(channelId, web, isStartup, normalizedName)
     await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
     return { channelId, action: 'spawned' }
   } catch (err) {
@@ -494,6 +592,7 @@ export async function spawnForRoute(
       try {
         const r = await client.spawn(params)
         console.error(`[slack] spawnForRoute: retry-spawn succeeded for channel=${channelId} instanceId=${r.claude_instance_id}`)
+        await approveTrustFolderDialog(channelId, web, isStartup, normalizedName)
         await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
         return { channelId, action: 'spawned' }
       } catch (err2) {
@@ -520,6 +619,7 @@ export async function spawnForRoute(
       try {
         await client.spawn(params)
         console.error(`[slack] spawnForRoute: fresh-spawned (after kill+delete) for channel=${channelId}`)
+        await approveTrustFolderDialog(channelId, web, isStartup, normalizedName)
         await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
         return { channelId, action: 'spawned' }
       } catch (err) {
@@ -544,6 +644,7 @@ export async function spawnForRoute(
         try {
           await client.spawn(params)
           console.error(`[slack] spawnForRoute: fresh-spawned (after delete) for channel=${channelId}`)
+          await approveTrustFolderDialog(channelId, web, isStartup, normalizedName)
           await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
           return { channelId, action: 'spawned' }
         } catch (err2) {
@@ -561,6 +662,7 @@ export async function spawnForRoute(
         if (!(await tryDelete(channelId, normalizedName, web, isStartup))) return { channelId, action: 'failed' }
         try {
           await client.spawn(params)
+          await approveTrustFolderDialog(channelId, web, isStartup, normalizedName)
           await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
           return { channelId, action: 'spawned' }
         } catch (err2) {
