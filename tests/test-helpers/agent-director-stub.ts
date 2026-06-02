@@ -28,6 +28,7 @@ import {
   ErrNoOpenPermissionRequest,
   ErrNoSessionId,
   ErrPauseTimeout,
+  ErrPermissionRequestNotFound,
   ErrPlatformPackageMissing,
   ErrRelayModeOff,
   ErrSpawnNotFound,
@@ -43,6 +44,8 @@ import type {
   DeleteParams,
   DeleteResult,
   GetParams,
+  GetPermissionParams,
+  GetPermissionResult,
   GetResult,
   KillParams,
   KillResult,
@@ -196,11 +199,33 @@ export function cannedPermissionRequest(
 ): PermissionRequestInfo {
   return {
     request_id: 1,
+    request_token: '00000000-0000-0000-0000-000000000001',
     tool_name: 'Bash',
     tool_input: JSON.stringify({ command: 'ls /tmp' }),
     requested_at: '2026-05-24T12:00:00Z',
     ...overrides,
   }
+}
+
+/** Build a canned GetPermissionResult. `request_token` is required. */
+export function cannedGetPermissionResult(
+  overrides: Partial<GetPermissionResult> & { request_token: string },
+): GetPermissionResult {
+  return {
+    request_id: 1,
+    tool_name: 'Bash',
+    tool_input: JSON.stringify({ command: 'ls /tmp' }),
+    requested_at: '2026-06-01T00:00:00Z',
+    decision: null,
+    decision_reason: null,
+    decided_at: null,
+    ...overrides,
+  }
+}
+
+/** Build an ErrPermissionRequestNotFound (getPermission on a missing row). */
+export function errPermissionRequestNotFound(): ErrPermissionRequestNotFound {
+  return new ErrPermissionRequestNotFound('getPermission', 'ErrPermissionRequestNotFound', 'permission request not found')
 }
 
 /** Build a canned GetResult — pass `permission_request` for check_permission rows. */
@@ -317,6 +342,12 @@ export interface StubClientOptions {
   pauseResult?: PauseResult
   pauseError?: Error
   pauseCalls?: PauseParams[]
+
+  // getPermission()
+  getPermissionResult?: GetPermissionResult
+  getPermissionError?: Error
+  getPermissionQueue?: CannedResponse<GetPermissionResult>[]
+  getPermissionCalls?: GetPermissionParams[]
 }
 
 /** Structural-typed `Client` stub satisfying every verb CSCB uses. */
@@ -333,6 +364,7 @@ export type StubClient = {
   delete(params: DeleteParams): Promise<DeleteResult>
   list(params: ListParams): Promise<ListResult>
   pause(params: PauseParams): Promise<PauseResult>
+  getPermission(params: GetPermissionParams): Promise<GetPermissionResult>
   close(): void
   [Symbol.dispose](): void
 }
@@ -420,6 +452,10 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
       opts.pauseCalls?.push(params)
       if (opts.pauseError) throw opts.pauseError
       return opts.pauseResult ?? {}
+    },
+    async getPermission(params: GetPermissionParams): Promise<GetPermissionResult> {
+      opts.getPermissionCalls?.push(params)
+      return nextResponse('getPermission', opts.getPermissionQueue, opts.getPermissionResult, opts.getPermissionError)
     },
     close(): void { /* no-op */ },
     [Symbol.dispose](): void { /* no-op */ },
