@@ -37,11 +37,9 @@ import {
   stopPermissionPoller,
 } from '../src/permission-poller.ts'
 import {
-  cannedGetResult,
   cannedGetResultPlural,
   cannedListRow,
   cannedPermissionRequest,
-  cannedTwoRowPluralProjection,
   errAlreadyDecided,
   errAmbiguousRequest,
   errInvalidFlags,
@@ -674,11 +672,4 @@ describe('handlePermissionClick — helper sanity', () => {
     expect(entry?.handled).toBe(false)
   })
 
-  // The cannedTwoRowPluralProjection import is exercised via seedTwoSiblings;
-  // this no-op assertion just keeps the helper-import surface live so the
-  // canonical two-row fixture's existence is asserted by the suite.
-  test('cannedTwoRowPluralProjection / cannedGetResult exports remain importable', () => {
-    expect(typeof cannedTwoRowPluralProjection).toBe('function')
-    expect(typeof cannedGetResult).toBe('function')
-  })
 })

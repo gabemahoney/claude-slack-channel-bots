@@ -218,6 +218,43 @@ describe('SR-5.1: version-probe failure modes', () => {
     }
   })
 
+  test("AD 0.5.1 is rejected", async () => {
+    const stub = makeStubClient({ versionResult: cannedVersion('0.5.1') })
+    const outcome = await runStartupGate({
+      getClient: () => stub,
+      callVersion: (c) => (c as typeof stub).version({}),
+      closeClient: (c) => (c as typeof stub).close(),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.phase).toBe('version')
+      expect(outcome.classLabel).toBe('ad-version-stale')
+      expect(outcome.message).toContain('0.5.1')
+      expect(outcome.message).toContain('0.6.3')
+    }
+  })
+
+  test("AD 0.6.3 is accepted", async () => {
+    const stub = makeStubClient({ versionResult: cannedVersion('0.6.3') })
+    const outcome = await runStartupGate({
+      getClient: () => stub,
+      callVersion: (c) => (c as typeof stub).version({}),
+      closeClient: (c) => (c as typeof stub).close(),
+      ...passingProbes,
+      statSync: defaultStat,
+      geteuid: () => 1000,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(true)
+    if (outcome.ok) {
+      expect(outcome.adVersion).toBe('0.6.3')
+    }
+  })
+
   test("version returned as '0.5.99' is rejected (just-below-pin sanity)", async () => {
     const stub = makeStubClient({ versionResult: cannedVersion('0.5.99') })
     const outcome = await runStartupGate({
