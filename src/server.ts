@@ -56,6 +56,7 @@ import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { ErrSpawnNotFound } from 'agent-director'
 import { getClient, closeClient } from './agent-director-client.ts'
 import { handlePermissionClick } from './permission-click-handler.ts'
+import { trustBootstrap } from './trust-bootstrap.ts'
 import { startPermissionPoller, stopPermissionPoller } from './permission-poller.ts'
 import {
   initRestart,
@@ -1169,6 +1170,13 @@ export async function main(): Promise<void> {
     } catch (err) {
       console.error('[slack] Warning: channel-name resolution failed:', err)
     }
+  }
+
+  // b.uhv / b.k54: patch .claude.json for every routed cwd so the trust dialog
+  // and project onboarding are pre-accepted before any spawn fires. Runs for
+  // both real and dry-run modes (config-file patch, not a session operation).
+  if (routingConfig) {
+    await trustBootstrap(routingConfig)
   }
 
   // b.1m9: warn about (or, with --reconcile-instance-ids, delete) stale

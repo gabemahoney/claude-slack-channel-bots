@@ -36,6 +36,10 @@ import {
   _setDialogPollIntervalMs,
   _resetDialogPollTimeoutMs,
   _resetDialogPollIntervalMs,
+  _setTrustDialogPollTimeoutMs,
+  _setTrustDialogPollIntervalMs,
+  _resetTrustDialogPollTimeoutMs,
+  _resetTrustDialogPollIntervalMs,
 } from '../src/session-manager.ts'
 import { resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
 import {
@@ -66,17 +70,29 @@ let savedEnv: NodeJS.ProcessEnv
 
 beforeEach(() => {
   savedEnv = { ...process.env }
-  // Keep dev-channels approval polling tight so the helper firing on every
-  // fresh-spawn test doesn't add seconds to the suite. Individual tests can
-  // override these as needed.
+  // Keep dialog approval polling tight so the helpers firing on every
+  // fresh-spawn test don't add seconds to the suite. Individual tests can
+  // override these as needed. Both approvers (dev-channels and trust-folder)
+  // run at every spawn site, so both seams must be set.
   _setDialogPollIntervalMs(1)
   _setDialogPollTimeoutMs(20)
+  // Trust-folder approver runs first at every spawn site (b.uhv Fix B). The
+  // existing `readPaneResults` sequences in this file were authored before
+  // the trust approver existed and assume the dev-channels approver gets the
+  // first reads. Set the trust timeout to 0 so its while-loop never enters and
+  // consumes no canned reads — the dedicated trust-approver tests live in
+  // tests/approve-trust-folder-dialog.test.ts where the seam is overridden
+  // with realistic values.
+  _setTrustDialogPollIntervalMs(1)
+  _setTrustDialogPollTimeoutMs(0)
 })
 
 afterEach(() => {
   resetClientForTests()
   _resetDialogPollIntervalMs()
   _resetDialogPollTimeoutMs()
+  _resetTrustDialogPollIntervalMs()
+  _resetTrustDialogPollTimeoutMs()
   process.env = savedEnv as NodeJS.ProcessEnv
 })
 
