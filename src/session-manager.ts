@@ -497,8 +497,9 @@ function buildSpawnParams(
     tmux_session_name: tmuxSessionNameFor(channelId, normalizedName),
     label: ['service=cscb', `channel=${channelId}`],
   }
-  if (effectiveConfigDir) {
-    params.extra_env = { CLAUDE_CONFIG_DIR: effectiveConfigDir }
+  params.extra_env = {
+    ...(effectiveConfigDir ? { CLAUDE_CONFIG_DIR: effectiveConfigDir } : {}),
+    CLAUDE_MANAGED_CHANNEL: channelId,
   }
   return params
 }

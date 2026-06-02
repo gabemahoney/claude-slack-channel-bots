@@ -120,7 +120,7 @@ describe('spawnForRoute: SR-1.1 fresh spawn', () => {
     expect(params.tmux_session_name).toBe('slack_bot_C012345')
     expect(params.relay_mode).toBe('on')
     expect(params.label).toEqual(['service=cscb', 'channel=C012345'])
-    expect(params.extra_env).toEqual({ CLAUDE_CONFIG_DIR: '/home/u/.claude-corp' })
+    expect(params.extra_env).toEqual({ CLAUDE_CONFIG_DIR: '/home/u/.claude-corp', CLAUDE_MANAGED_CHANNEL: 'C012345' })
     expect(params.claude_args).toBeUndefined()
   })
 
@@ -134,7 +134,7 @@ describe('spawnForRoute: SR-1.1 fresh spawn', () => {
       claude_config_dir: '/top-level',
     })
     await spawnForRoute('C', { cwd: '/repo' }, cfg)
-    expect(spawnCalls[0].extra_env).toEqual({ CLAUDE_CONFIG_DIR: '/per-route' })
+    expect(spawnCalls[0].extra_env).toEqual({ CLAUDE_CONFIG_DIR: '/per-route', CLAUDE_MANAGED_CHANNEL: 'C' })
   })
 
   test('omits extra_env when no claude_config_dir', async () => {
@@ -142,7 +142,7 @@ describe('spawnForRoute: SR-1.1 fresh spawn', () => {
     installStub({ spawnCalls })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
     await spawnForRoute('C', { cwd: '/x' }, cfg)
-    expect(spawnCalls[0].extra_env).toBeUndefined()
+    expect(spawnCalls[0].extra_env).toEqual({ CLAUDE_MANAGED_CHANNEL: 'C' })
   })
 })
 
