@@ -2,20 +2,19 @@
  * permission-click-handler.ts — SR-2.2 Block Kit decision relay.
  *
  * Consumes Socket Mode interactive events whose action_id matches the
- * SR-2.2 shape `perm_(allow|deny)_<claude_instance_id>_<request_id>`.
+ * SR-2.2 shape `perm_(allow|deny)_<claude_instance_id>_<request_token>`.
  *
- * Sequence per click (SR-2.2):
- *   1. Parse the action_id; if malformed, treat as stale-click no-op.
- *   2. Look up the live entry in permission-poller's module-scoped map and
- *      set its `finalizedAt = now()` to claim the message (suppresses the
- *      poller's "expired" update for 30 s).
- *   3. `client.get({claude_instance_id})` and compare the typed
- *      `permission_request.request_id` to the encoded value. Mismatch →
- *      `chat.update` to "already decided" without calling decide().
- *   4. `client.decide({ claude_instance_id, decision })`. `ErrAlreadyDecided`
- *      is treated as success (idempotent).
- *   5. `chat.update` the live message to "Allowed/Denied by <user>".
- *      Drop the live entry.
+ * Ten-step sequence per click (SR-2.2):
+ *   1. Parse the action_id; if malformed, return false (caller keeps looking).
+ *   2. Extract { decision, claudeInstanceId, requestToken }.
+ *   3. makePermKey(claudeInstanceId, requestToken) → key.
+ *   4. getLivePermission(key); if absent → log stale + return true.
+ *   5. claimPermission(key).
+ *   6. client.getPermission({ request_token }) pre-flight.
+ *   7. client.decide({ claude_instance_id, request_token, decision }).
+ *   8. chat.update with buildDecisionBlocks(decision).
+ *   9. dropPermission(key).
+ *  10. Return true.
  *
  * Errors after the claim leave `finalizedAt` set so the poller skips the
  * entry for the 30 s window; the operator can re-click.
@@ -26,7 +25,14 @@
 import {
   AgentDirectorError,
   ErrAlreadyDecided,
-  ErrSpawnNotFound,
+  ErrAmbiguousRequest,
+  ErrInvalidFlags,
+  ErrMissingRequestToken,
+  ErrPermissionRequestNotFound,
+} from 'agent-director'
+import type {
+  GetPermissionParams,
+  GetPermissionResult,
 } from 'agent-director'
 import type { WebClient } from '@slack/web-api'
 
@@ -35,16 +41,15 @@ import {
   claimPermission,
   dropPermission,
   getLivePermission,
+  makePermKey,
 } from './permission-poller.ts'
 
 export interface ClickDeps {
   getClient: () => {
-    get: (params: import('agent-director').GetParams) => Promise<import('agent-director').GetResult>
+    getPermission: (params: GetPermissionParams) => Promise<GetPermissionResult>
     decide: (params: import('agent-director').DecideParams) => Promise<import('agent-director').DecideResult>
   }
   web: Pick<WebClient, 'chat'>
-  /** Returns the display name for a Slack user id; used to label decision updates. */
-  resolveUserName: (userId: string) => Promise<string>
   log?: (...args: unknown[]) => void
 }
 
@@ -54,12 +59,12 @@ function logDeps(deps: ClickDeps, ...args: unknown[]): void {
 }
 
 /** Build the Block Kit "decided" block for the chat.update payload. */
-function buildDecisionBlocks(decision: PermissionDecision, userName: string): unknown[] {
+function buildDecisionBlocks(decision: PermissionDecision): unknown[] {
   const label = decision === 'allow' ? 'Allowed' : 'Denied'
   return [
     {
       type: 'section',
-      text: { type: 'mrkdwn', text: `*Permission* — ${label} by ${userName}` },
+      text: { type: 'mrkdwn', text: `*Permission* — ${label}` },
     },
   ]
 }
@@ -81,46 +86,59 @@ function buildAlreadyDecidedBlocks(): unknown[] {
  */
 export async function handlePermissionClick(
   actionId: string,
-  slackUserId: string,
   deps: ClickDeps,
 ): Promise<boolean> {
+  // Step 1: parse action_id.
   const parsed = parsePermissionActionId(actionId)
   if (parsed === null) return false
 
-  // TODO(b.oaj): remove in Epic 3 — requestToken replaces requestId; click handler will use requestToken
-  const { decision, claudeInstanceId, requestToken: requestId } = parsed
+  // Step 2: extract fields.
+  const { decision, claudeInstanceId, requestToken } = parsed
 
-  const entry = getLivePermission(claudeInstanceId)
+  // Step 3: composite key.
+  const key = makePermKey(claudeInstanceId, requestToken)
+
+  // Step 4: look up live entry.
+  const entry = getLivePermission(key)
   if (!entry) {
-    // No live entry — either the poller hasn't seen this yet, or it already
-    // expired. Either way, treat as a stale click no-op.
-    logDeps(deps, `[slack] permission-click: no live entry for ${claudeInstanceId} (request_token=${requestId}) — stale click`)
+    logDeps(deps, `[slack] permission-click: no live entry for key=${key} — stale click`)
     return true
   }
 
-  // Step 2: claim the message so the poller doesn't race us.
-  claimPermission(claudeInstanceId)
+  // Step 5: claim the message so the poller doesn't race us.
+  claimPermission(key)
 
-  // Step 3: refetch + compare request_id to detect stale-button clicks.
-  let currentRequestId: number | null
+  // Step 6: pre-flight getPermission to detect already-decided / not-found.
+  let result: GetPermissionResult
   try {
-    const got = await deps.getClient().get({ claude_instance_id: claudeInstanceId })
-    currentRequestId = got.permission_request?.request_id ?? null
+    result = await deps.getClient().getPermission({ request_token: requestToken })
   } catch (err) {
-    if (err instanceof ErrSpawnNotFound) {
-      logDeps(deps, `[slack] permission-click: spawn ${claudeInstanceId} disappeared — marking stale`)
-      currentRequestId = null
-    } else {
-      const e = err instanceof AgentDirectorError ? err : null
-      logDeps(deps, `[slack] permission-click: get failed for ${claudeInstanceId}: ${e?.errName ?? String(err)}`)
-      // Leave finalizedAt set so the poller skips the entry for 30 s.
+    if (err instanceof ErrPermissionRequestNotFound) {
+      // Row is gone — update message to stale and clean up.
+      try {
+        await deps.web.chat.update({
+          channel: entry.channelId,
+          ts: entry.messageTs,
+          text: 'already decided — stale prompt',
+          blocks: buildAlreadyDecidedBlocks() as never,
+        })
+      } catch (updateErr) {
+        logDeps(deps, `[slack] permission-click: stale chat.update failed for key=${key}:`, updateErr)
+      }
+      dropPermission(key)
       return true
     }
+    if (err instanceof AgentDirectorError) {
+      logDeps(deps, `[slack] permission-click: getPermission failed for key=${key}: ${(err as AgentDirectorError).errName}`)
+      // Leave finalizedAt set; operator can re-click.
+      return true
+    }
+    logDeps(deps, `[slack] permission-click: getPermission unexpected error for key=${key}:`, err)
+    return true
   }
 
-  // TODO(b.oaj): remove in Epic 3 — comparison will use requestToken string directly
-  if (currentRequestId === null || String(currentRequestId) !== requestId) {
-    // Stale click — no decide() call.
+  // Already decided — update message to stale and clean up.
+  if (result.decision != null) {
     try {
       await deps.web.chat.update({
         channel: entry.channelId,
@@ -128,43 +146,52 @@ export async function handlePermissionClick(
         text: 'already decided — stale prompt',
         blocks: buildAlreadyDecidedBlocks() as never,
       })
-    } catch (err) {
-      logDeps(deps, `[slack] permission-click: stale-click chat.update failed for ${claudeInstanceId}:`, err)
+    } catch (updateErr) {
+      logDeps(deps, `[slack] permission-click: stale chat.update failed for key=${key}:`, updateErr)
     }
-    dropPermission(claudeInstanceId)
+    dropPermission(key)
     return true
   }
 
-  // Step 4: call client.decide(). Idempotent — ErrAlreadyDecided counts as success.
+  // Step 7: call decide(). ErrAlreadyDecided is idempotent — fall through.
   try {
-    await deps.getClient().decide({ claude_instance_id: claudeInstanceId, decision })
+    await deps.getClient().decide({ claude_instance_id: claudeInstanceId, request_token: requestToken, decision })
   } catch (err) {
-    if (!(err instanceof ErrAlreadyDecided)) {
-      const e = err instanceof AgentDirectorError ? err : null
-      logDeps(deps, `[slack] permission-click: decide failed for ${claudeInstanceId}: ${e?.errName ?? String(err)}`)
-      // Leave finalizedAt set; the operator can re-click. Don't update the
-      // Slack message — the buttons are still visible.
+    if (err instanceof ErrAlreadyDecided) {
+      // Idempotent — treat as success and fall through to chat.update.
+    } else if (
+      err instanceof ErrAmbiguousRequest ||
+      err instanceof ErrMissingRequestToken ||
+      err instanceof ErrInvalidFlags
+    ) {
+      // Relay bug — log ERROR but leave buttons visible (do NOT update message).
+      logDeps(deps, `[slack] permission-click: ERROR relay bug for key=${key}: ${(err as AgentDirectorError).errName}`)
+      return true
+    } else if (err instanceof AgentDirectorError) {
+      logDeps(deps, `[slack] permission-click: decide failed for key=${key}: ${(err as AgentDirectorError).errName}`)
+      // Leave finalizedAt set; operator can re-click.
+      return true
+    } else {
+      logDeps(deps, `[slack] permission-click: decide unexpected error for key=${key}:`, err)
       return true
     }
   }
 
-  // Step 5: confirm via chat.update. Resolve the user name for the label.
-  let userName: string
-  try {
-    userName = slackUserId ? await deps.resolveUserName(slackUserId) : 'unknown'
-  } catch {
-    userName = slackUserId || 'unknown'
-  }
+  // Step 8: update message to reflect the decision.
   try {
     await deps.web.chat.update({
       channel: entry.channelId,
       ts: entry.messageTs,
-      text: `Permission — ${decision === 'allow' ? 'Allowed' : 'Denied'} by ${userName}`,
-      blocks: buildDecisionBlocks(decision, userName) as never,
+      text: `Permission — ${decision === 'allow' ? 'Allowed' : 'Denied'}`,
+      blocks: buildDecisionBlocks(decision) as never,
     })
   } catch (err) {
-    logDeps(deps, `[slack] permission-click: decision chat.update failed for ${claudeInstanceId}:`, err)
+    logDeps(deps, `[slack] permission-click: decision chat.update failed for key=${key}:`, err)
   }
-  dropPermission(claudeInstanceId)
+
+  // Step 9: drop the live entry.
+  dropPermission(key)
+
+  // Step 10: done.
   return true
 }

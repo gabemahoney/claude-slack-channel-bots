@@ -708,10 +708,12 @@ socket.on('interactive', async (evt) => {
   const userId = ((p['user'] as Record<string, unknown> | undefined)?.['id'] as string | undefined) ?? ''
   for (const action of actions) {
     const actionId = action.action_id
-    const handled = await handlePermissionClick(actionId, userId, {
-      getClient,
+    const handled = await handlePermissionClick(actionId, {
+      getClient: () => ({
+        getPermission: (params) => getClient().getPermission(params),
+        decide: (params) => getClient().decide(params),
+      }),
       web,
-      resolveUserName,
     })
     if (handled) {
       await ack()
