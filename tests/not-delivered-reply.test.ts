@@ -98,7 +98,7 @@ async function simulateChannelMessage(
   postMessageCalls: any[],
 ): Promise<{ dropped: boolean; notifiedSender: boolean }> {
   let targetSession = routingConfig
-    ? getSessionByChannel(channelId, routingConfig)
+    ? getSessionByChannel(channelId)
     : undefined
 
   // default_route fallback — only for channels NOT in routes

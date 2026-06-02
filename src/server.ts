@@ -353,20 +353,17 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
         console.error(`[slack] Session disconnected: pending (not yet routed)`)
         return
       }
-      const cwd = unregisterByMcpSessionId(mcpSessionId)
-      if (cwd) {
-        // Look up channelId by CWD — hook point for t1.uya.co (restart logic)
-        const channelId = routingConfig
-          ? Object.entries(routingConfig.routes).find(([, route]) => route.cwd === cwd)?.[0]
-          : undefined
-        if (channelId) {
+      const channelId = unregisterByMcpSessionId(mcpSessionId)
+      if (channelId) {
+        const cwd = routingConfig?.routes[channelId]?.cwd
+        if (cwd) {
           console.error(`[slack] Session disconnected: channel=${channelId} cwd="${cwd}"`)
           // Session-id resume is now owned by agent-director (SR-1.3); the
           // sessionId arg to scheduleRestart is retained for API stability
           // but ignored by launchSession.
           scheduleRestart(channelId, cwd)
         } else {
-          console.error(`[slack] Session disconnected: cwd="${cwd}"`)
+          console.error(`[slack] Session disconnected: channel=${channelId}`)
         }
       }
     },
@@ -513,7 +510,7 @@ async function handleInitialized(
   registerSession(normalizedCwd, matchedChannelId, pendingId)
 
   // Register MCP session ID for future HTTP request routing
-  registerMcpSessionId(pendingId, normalizedCwd)
+  registerMcpSessionId(pendingId, matchedChannelId)
 
   if (existingSession) {
     console.error(`[slack] Session replaced existing connection for CWD "${normalizedCwd}"`)
@@ -588,7 +585,7 @@ async function handleMessage(event: unknown): Promise<void> {
         // Task t2.c1r.zk.3d — Find the session for this channel
         // -----------------------------------------------------------------------
         targetSession = routingConfig
-          ? getSessionByChannel(channelId, routingConfig)
+          ? getSessionByChannel(channelId)
           : undefined
 
         // If no direct match, check default_route
@@ -978,7 +975,7 @@ export async function main(): Promise<void> {
         }
 
         // Check if a session is connected for this channel
-        const targetSession = getSessionByChannel(channel, routingConfig!)
+        const targetSession = getSessionByChannel(channel)
         if (!targetSession || !targetSession.connected) {
           return new Response(
             JSON.stringify({ error: 'No active session for this channel' }),
@@ -1055,17 +1052,15 @@ export async function main(): Promise<void> {
             // after this GET request started (the SSE stream opens before
             // roots/list completes). Also guards against double-fire if
             // onsessionclosed already ran from an explicit DELETE.
-            const cwd = unregisterByMcpSessionId(mcpSessionId)
-            if (!cwd) return
+            const channelId = unregisterByMcpSessionId(mcpSessionId)
+            if (!channelId) return
 
-            const channelId = routingConfig
-              ? Object.entries(routingConfig.routes).find(([, route]) => route.cwd === cwd)?.[0]
-              : undefined
-            if (channelId) {
+            const cwd = routingConfig?.routes[channelId]?.cwd
+            if (cwd) {
               console.error(`[slack] Session disconnected (SSE abort): channel=${channelId} cwd="${cwd}"`)
               scheduleRestart(channelId, cwd)
             } else {
-              console.error(`[slack] Session disconnected (SSE abort): cwd="${cwd}"`)
+              console.error(`[slack] Session disconnected (SSE abort): channel=${channelId}`)
             }
           })
         }
@@ -1112,9 +1107,7 @@ export async function main(): Promise<void> {
   initRestart({
     isSessionAlive: isSessionAliveAdapter,
     isSessionConnected: (channelId) => {
-      const cwd = routingConfig?.routes[channelId]?.cwd
-      if (!cwd) return false
-      const session = getSessionByCwd(cwd)
+      const session = getSessionByChannel(channelId)
       return session?.connected === true
     },
     reconnectSession: async (channelId) => {
