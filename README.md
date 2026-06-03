@@ -56,6 +56,23 @@ If the host is unsupported, the system-installed `agent-director` itself will re
 
 > **Note on agent-director versions.** v0.4.1 is a zombie release (the published tarball is missing `dist/` and cannot be imported). v0.4.2 lacks the `MakeTemplateParams.overwrite` field CSCB needs for the boot-time template refresh. v0.5.4 and earlier lack `allow_pending` on `readPane`/`sendKeys`, causing `ErrSpawnNotInteractive` during dev-channels dialog approval on freshly-spawned bots. v0.6.0 shipped a stale TS shim whose `Client` dropped `getPermission`, whose `buildDecide()` dropped `--request-token`, and whose error catalog omitted `ErrInvalidFlags` / `ErrPermissionRequestNotFound` / `ErrAmbiguousRequest` — each silently breaks the disambiguation relay. v0.6.1–0.6.2 still lack the full `permission_requests` plural projection + composite-key disambiguation surface CSCB depends on for concurrent open requests. From v0.7.0 onward, AD ships as a thin npm shim around a system-installed binary, and CSCB defers the minimum-AD-version decision to AD itself via `dist/version-floor.json` (AD's library-side `Client.create()` reads it). CSCB's `package.json` caret-pin on `agent-director` governs npm resolution of AD's TypeScript shim only — not the runtime floor, which is owned by the AD release the system binary belongs to.
 
+### Checking your agent-director install
+
+Before starting the server, you can confirm `agent-director` is installed system-wide and meets the declared minimum with:
+
+```sh
+bun run install-check
+```
+
+The script calls the same discovery + floor-comparison pipeline the startup gate uses (it reads AD's `dist/version-floor.json`, calls `resolveSystemBinary()`, and compares versions via `semver.gte`). It exits 0 on success with a single-line block naming `agent-director`, the absolute resolved binary path, the detected version, and the floor. On failure it writes one of the canonical class labels to stderr and exits non-zero:
+
+- `ad-system-install-not-found` — no agent-director on PATH or at the standard install path. Install AD and retry. The stderr also points at the install-cscb skill for interactive remediation.
+- `ad-system-install-too-old` — AD binary is below the floor. Upgrade AD and retry. The stderr points at the skill.
+- `ad-system-install-unreachable` — AD discovered but the probe could not invoke it (eight `.reason` values exposed verbatim). The stderr points at the skill.
+- `ad-version-floor-unreadable` — `dist/version-floor.json` is missing, malformed, or lacks `min_binary_version`. The remediation is to reinstall `agent-director` from npm; the install-cscb skill cannot fix a corrupt AD package, so this case does NOT append the skill instructions block.
+
+The script is purely diagnostic — it never prompts, never runs an install command, never fetches the skill. The startup gate enforces the same floor automatically at server boot via AD's `Client.create()`; `install-check` is for operators who want to confirm their setup ahead of time.
+
 ---
 
 ## Configuration
@@ -441,6 +458,7 @@ Classes you may see:
 - `ad-shim-missing-get-permission` — the installed `agent-director` TS shim's `Client` does not expose `getPermission`. The npm-published package is out of sync with the system-installed binary. Reinstall a matching `agent-director` version and confirm the resolved package actually ships the method.
 - `ad-shim-catalog-incomplete` — the installed `agent-director` TS error catalog is missing one or more of `ErrInvalidFlags`, `ErrPermissionRequestNotFound`, `ErrAmbiguousRequest`. The log line lists the missing names. Same remediation as `ad-shim-missing-get-permission`.
 - `ad-shim-decide-drops-token` — the installed `agent-director` dist does not include `--request-token` in its bundled JS, meaning `buildDecide()` would resolve permission clicks against the wrong row. Reinstall a matching `agent-director` version and confirm `buildDecide` carries the flag.
+- `ad-version-floor-unreadable` — `node_modules/agent-director/dist/version-floor.json` could not be read, parsed, or is missing `.min_binary_version`. This is a packaging defect — reinstall `agent-director` from npm. Surfaced by `bun run install-check`; the startup gate itself does not emit this label (it relies on `Client.create()`, which fails differently when the AD package is corrupt).
 - `ad-call-timeout` — an agent-director verb call exceeded the configured `callTimeoutMs` (default 30 s). Investigate the subprocess or increase the timeout.
 - `ad-same-user` — `~/.agent-director/state.db` is owned by a different UID than the CSCB process. Reinstall agent-director as the correct user or remove the mismatched file.
 - `ad-same-user-stat` — Non-ENOENT stat error on the state DB (permissions, I/O). Investigate the file before re-launching.
