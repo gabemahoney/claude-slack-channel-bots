@@ -73,6 +73,54 @@ The script calls the same discovery + floor-comparison pipeline the startup gate
 
 The script is purely diagnostic — it never prompts, never runs an install command, never fetches the skill. The startup gate enforces the same floor automatically at server boot via AD's `Client.create()`; `install-check` is for operators who want to confirm their setup ahead of time.
 
+### Installing the install-cscb skill
+
+If `bun run install-check` (or the startup gate) reports one of the
+`ad-system-install-*` failure classes, you can install the `install-cscb`
+Claude skill for an interactive walkthrough. The skill drives the same
+shared check module but walks you through install/upgrade and a
+per-reason remediation flow for each of the eight
+`ErrSystemInstallUnreachable.reason` values.
+
+The skill is NOT auto-installed by `bun install` — fetch it manually
+from CSCB's GitHub repo and place it in your local Claude skills
+folder:
+
+1. **Fetch** `SKILL.md` from:
+
+   ```
+   https://github.com/gabemahoney/claude-slack-channel-bots/blob/main/skills/install-cscb/SKILL.md
+   ```
+
+   (The startup gate's `ad-system-install-*` error log line includes
+   this URL automatically.)
+
+2. **Place** it at:
+
+   ```
+   ~/.claude/skills/install-cscb/SKILL.md
+   ```
+
+3. **Invoke** the skill from Claude Code:
+
+   ```
+   /install-cscb
+   ```
+
+The skill calls `bun run install-check` on each iteration, surfaces
+`agent-director`'s published install/upgrade command verbatim (no
+CSCB-owned install command — AD's documentation is the source of
+truth), prompts before running, and loops until the check passes or
+you decline. The `ad-version-floor-unreadable` class is handled
+separately: the skill prints reinstall-from-npm guidance and does NOT
+loop on it (the skill cannot fix a corrupt AD npm package).
+
+The published CSCB npm tarball includes `skills/install-cscb/SKILL.md`
+under its `files` array, so the skill source is also available via
+`node_modules/claude-slack-channel-bots/skills/install-cscb/SKILL.md`
+after `bun install`. The manual GitHub-fetch step above is for users
+who haven't yet installed CSCB at all.
+
 ---
 
 ## Configuration
