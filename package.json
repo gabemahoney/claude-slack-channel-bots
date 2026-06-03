@@ -29,11 +29,11 @@
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@slack/socket-mode": "^2.0.0",
     "@slack/web-api": "^7.0.0",
-    "agent-director": "^0.6.3"
+    "agent-director": "^0.7.0",
+    "semver": "^7.6.0"
   },
   "devDependencies": {
     "@types/bun": "^1.0.0",
-    "semver": "^7.6.0",
     "typescript": "^5.4.0"
   },
   "license": "MIT",
