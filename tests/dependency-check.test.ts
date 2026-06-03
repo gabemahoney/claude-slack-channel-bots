@@ -4,83 +4,46 @@
  * Exercises src/agent-director-startup.ts via the dep-injection seam — never
  * touches the real Bun FFI or the real ~/.agent-director/state.db. Covers:
  *
- *   1. ErrPlatformPackageMissing at Client construction.
- *   2. ErrUnsupportedPlatform at Client construction.
- *   3. ErrBunVersionTooOld at Client construction.
- *   4. Stale version (sub-MIN_AD_VERSION) from version() probe, including
- *      the leading-'v' stripping path.
+ *   1. ErrBunVersionTooOld at Client construction (Bun-version gate).
+ *   2. ErrSystemInstallNotFound / ErrSystemInstallTooOld /
+ *      ErrSystemInstallUnreachable from `Client.create` (AD 0.7.0 system-
+ *      install discovery trio).
+ *   3. Non-typed construct-step throws surface verbatim.
+ *   4. API-surface probes (getPermission / error catalog / decide argv).
  *   5. Same-user mismatch on ~/.agent-director/state.db.
- *   6. Happy path: gate passes silently.
- *
- * Also covers the pure semverGte() helper in isolation.
+ *   6. Happy path: gate passes silently and installs the Client into the
+ *      module-level singleton via setClient(...).
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect, beforeEach } from 'bun:test'
 
 import * as fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 import {
   runStartupGate,
-  semverGte,
-  MIN_AD_VERSION,
   DEFAULT_STATE_DB_PATH,
 } from '../src/agent-director-startup.ts'
+import { getClient, resetClientForTests } from '../src/agent-director-client.ts'
 import {
-  cannedVersion,
   errBunVersionTooOld,
-  errCallTimeout,
-  errCliNotExecutable,
-  errPlatformPackageMissing,
-  errUnsupportedPlatform,
-  errGeneric,
+  errSystemInstallNotFound,
+  errSystemInstallTooOld,
+  errSystemInstallUnreachable,
   makeStubClient,
+  makeStubCreateClient,
 } from './test-helpers/agent-director-stub.ts'
-
-// ---------------------------------------------------------------------------
-// semverGte
-// ---------------------------------------------------------------------------
-
-describe('semverGte', () => {
-  test('returns true when equal', () => {
-    expect(semverGte('1.2.3', '1.2.3')).toBe(true)
-  })
-
-  test('returns true when greater (major)', () => {
-    expect(semverGte('2.0.0', '1.99.99')).toBe(true)
-  })
-
-  test('returns true when greater (minor)', () => {
-    expect(semverGte('1.5.0', '1.4.99')).toBe(true)
-  })
-
-  test('returns true when greater (patch)', () => {
-    expect(semverGte('1.2.4', '1.2.3')).toBe(true)
-  })
-
-  test('returns false when less (patch)', () => {
-    expect(semverGte('1.2.2', '1.2.3')).toBe(false)
-  })
-
-  test('returns false when less (minor)', () => {
-    expect(semverGte('1.1.99', '1.2.0')).toBe(false)
-  })
-
-  test('treats missing trailing segments as zero', () => {
-    expect(semverGte('1', '1.0.0')).toBe(true)
-    expect(semverGte('1.0', '1.0.1')).toBe(false)
-  })
-})
 
 // ---------------------------------------------------------------------------
 // Helpers for SR-5.1 sub-cases
 // ---------------------------------------------------------------------------
 
 /**
- * Build the four dep-injection points that every sub-case needs to override:
- *   - `getClient` (often a thrower)
+ * Build the dep-injection points that every sub-case needs to override:
+ *   - `createClient` (async factory — throws for construct-step failures,
+ *     resolves with a stub Client for everything past step 2)
  *   - `statSync` (rarely reached, default → ENOENT)
  *   - `geteuid` (UID source for the same-user check)
  *   - `recordStartupError` capture (never invoked by runStartupGate in
@@ -115,41 +78,9 @@ const passingProbes = {
 // ---------------------------------------------------------------------------
 
 describe('SR-5.1: Client constructor failure modes', () => {
-  test('ErrPlatformPackageMissing → ok=false, classLabel=ad-platform-package-missing', async () => {
-    const outcome = await runStartupGate({
-      getClient: () => { throw errPlatformPackageMissing() },
-      statSync: defaultStat,
-      recordStartupError: noopRecord,
-      exit: noopExit,
-    })
-    expect(outcome.ok).toBe(false)
-    if (!outcome.ok) {
-      expect(outcome.phase).toBe('construct')
-      expect(outcome.classLabel).toBe('ad-platform-package-missing')
-      expect(outcome.message).toContain('platform-native peer dependency missing')
-      expect(outcome.message).toContain('linux-x64')
-      expect(outcome.message).toContain('darwin-arm64')
-    }
-  })
-
-  test('ErrUnsupportedPlatform → ok=false, classLabel=ad-unsupported-platform', async () => {
-    const outcome = await runStartupGate({
-      getClient: () => { throw errUnsupportedPlatform('win32-x64') },
-      statSync: defaultStat,
-      recordStartupError: noopRecord,
-      exit: noopExit,
-    })
-    expect(outcome.ok).toBe(false)
-    if (!outcome.ok) {
-      expect(outcome.phase).toBe('construct')
-      expect(outcome.classLabel).toBe('ad-unsupported-platform')
-      expect(outcome.message).toContain('does not support this platform')
-    }
-  })
-
   test('ErrBunVersionTooOld → ok=false, classLabel=ad-bun-version-too-old', async () => {
     const outcome = await runStartupGate({
-      getClient: () => { throw errBunVersionTooOld('0.9.0', '1.0.21') },
+      createClient: makeStubCreateClient({ error: errBunVersionTooOld('0.9.0', '1.0.21') }),
       statSync: defaultStat,
       recordStartupError: noopRecord,
       exit: noopExit,
@@ -162,25 +93,9 @@ describe('SR-5.1: Client constructor failure modes', () => {
     }
   })
 
-  test('ErrCliNotExecutable → ok=false, classLabel=ad-cli-not-executable', async () => {
-    const outcome = await runStartupGate({
-      getClient: () => { throw errCliNotExecutable('/path/to/agent-director-bin') },
-      statSync: defaultStat,
-      recordStartupError: noopRecord,
-      exit: noopExit,
-    })
-    expect(outcome.ok).toBe(false)
-    if (!outcome.ok) {
-      expect(outcome.phase).toBe('construct')
-      expect(outcome.classLabel).toBe('ad-cli-not-executable')
-      expect(outcome.message).toContain('/path/to/agent-director-bin')
-      expect(outcome.message).toContain('chmod +x')
-    }
-  })
-
   test('non-typed throw surfaces verbatim → classLabel=ad-client-construct', async () => {
     const outcome = await runStartupGate({
-      getClient: () => { throw new Error('some unexpected boom') },
+      createClient: makeStubCreateClient({ error: new Error('some unexpected boom') }),
       statSync: defaultStat,
       recordStartupError: noopRecord,
       exit: noopExit,
@@ -195,154 +110,14 @@ describe('SR-5.1: Client constructor failure modes', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-5.1 — version-step failure modes
-// ---------------------------------------------------------------------------
-
-describe('SR-5.1: version-probe failure modes', () => {
-  test("stale version returned as 'v0.4.2' is rejected (leading-v strip + semver-gte)", async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion('v0.4.2') })
-    const outcome = await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
-      closeClient: (c) => (c as typeof stub).close(),
-      statSync: defaultStat,
-      recordStartupError: noopRecord,
-      exit: noopExit,
-    })
-    expect(outcome.ok).toBe(false)
-    if (!outcome.ok) {
-      expect(outcome.phase).toBe('version')
-      expect(outcome.classLabel).toBe('ad-version-stale')
-      expect(outcome.message).toContain('0.4.2')
-      expect(outcome.message).toContain(MIN_AD_VERSION)
-    }
-  })
-
-  test("AD 0.5.1 is rejected", async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion('0.5.1') })
-    const outcome = await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
-      closeClient: (c) => (c as typeof stub).close(),
-      statSync: defaultStat,
-      recordStartupError: noopRecord,
-      exit: noopExit,
-    })
-    expect(outcome.ok).toBe(false)
-    if (!outcome.ok) {
-      expect(outcome.phase).toBe('version')
-      expect(outcome.classLabel).toBe('ad-version-stale')
-      expect(outcome.message).toContain('0.5.1')
-      expect(outcome.message).toContain('0.6.3')
-    }
-  })
-
-  test("AD 0.6.3 is accepted", async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion('0.6.3') })
-    const outcome = await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
-      closeClient: (c) => (c as typeof stub).close(),
-      ...passingProbes,
-      statSync: defaultStat,
-      geteuid: () => 1000,
-      recordStartupError: noopRecord,
-      exit: noopExit,
-    })
-    expect(outcome.ok).toBe(true)
-    if (outcome.ok) {
-      expect(outcome.adVersion).toBe('0.6.3')
-    }
-  })
-
-  test("version returned as '0.5.99' is rejected (just-below-pin sanity)", async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion('0.5.99') })
-    const outcome = await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
-      closeClient: (c) => (c as typeof stub).close(),
-      statSync: defaultStat,
-      recordStartupError: noopRecord,
-      exit: noopExit,
-    })
-    expect(outcome.ok).toBe(false)
-    if (!outcome.ok) {
-      expect(outcome.phase).toBe('version')
-      expect(outcome.classLabel).toBe('ad-version-stale')
-      expect(outcome.message).toContain('0.5.99')
-      expect(outcome.message).toContain(MIN_AD_VERSION)
-    }
-  })
-
-  test(`version returned as '${MIN_AD_VERSION}' passes the version gate (paired release minimum)`, async () => {
-    // Note: the same-user check downstream may still fail in the test env; we only assert the
-    // version step passes by checking the outcome is either ok=true OR ok=false with a phase
-    // OTHER than 'version'.
-    const stub = makeStubClient({ versionResult: cannedVersion(MIN_AD_VERSION) })
-    const outcome = await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
-      closeClient: (c) => (c as typeof stub).close(),
-      statSync: defaultStat,
-      recordStartupError: noopRecord,
-      exit: noopExit,
-    })
-    if (!outcome.ok) {
-      expect(outcome.phase).not.toBe('version')
-    }
-    // outcome.ok=true is also acceptable; depends on defaultStat shape.
-  })
-
-  test('version() rejection surfaces as ad-version-probe', async () => {
-    const stub = makeStubClient({ versionError: errGeneric('version', 'ErrSomething', 'oops') })
-    const outcome = await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
-      closeClient: (c) => (c as typeof stub).close(),
-      statSync: defaultStat,
-      recordStartupError: noopRecord,
-      exit: noopExit,
-    })
-    expect(outcome.ok).toBe(false)
-    if (!outcome.ok) {
-      expect(outcome.phase).toBe('version')
-      expect(outcome.classLabel).toBe('ad-version-probe')
-      expect(outcome.message).toContain('ErrSomething')
-    }
-  })
-
-  test('ErrCallTimeout at version step → ok=false, classLabel=ad-call-timeout', async () => {
-    const stub = makeStubClient({ versionError: errCallTimeout('version', 35000, 30000) })
-    const outcome = await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
-      closeClient: (c) => (c as typeof stub).close(),
-      statSync: defaultStat,
-      recordStartupError: noopRecord,
-      exit: noopExit,
-    })
-    expect(outcome.ok).toBe(false)
-    if (!outcome.ok) {
-      expect(outcome.phase).toBe('version')
-      expect(outcome.classLabel).toBe('ad-call-timeout')
-      expect(outcome.message).toContain('version')
-      expect(outcome.message).toContain('35000')
-      expect(outcome.message).toContain('30000')
-    }
-  })
-})
-
-// ---------------------------------------------------------------------------
 // SR-5.1 — same-user check
 // ---------------------------------------------------------------------------
 
 describe('SR-5.1: same-user check', () => {
   test('UID mismatch → ok=false, classLabel=ad-same-user', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     const outcome = await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
-      closeClient: (c) => (c as typeof stub).close(),
+      createClient: makeStubCreateClient({ client: stub }),
       ...passingProbes,
       statSync: (_p) => ({ uid: 7777 }),
       geteuid: () => 1000,
@@ -360,11 +135,9 @@ describe('SR-5.1: same-user check', () => {
   })
 
   test('ENOENT on state.db → silent pass (first-run case)', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     const outcome = await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
-      closeClient: (c) => (c as typeof stub).close(),
+      createClient: makeStubCreateClient({ client: stub }),
       ...passingProbes,
       statSync: defaultStat, // throws ENOENT
       geteuid: () => 1000,
@@ -375,16 +148,14 @@ describe('SR-5.1: same-user check', () => {
   })
 
   test('non-ENOENT stat error → ok=false, classLabel=ad-same-user-stat', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     const eacces = (): { uid: number } => {
       const err: NodeJS.ErrnoException = new Error('EACCES')
       err.code = 'EACCES'
       throw err
     }
     const outcome = await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
-      closeClient: (c) => (c as typeof stub).close(),
+      createClient: makeStubCreateClient({ client: stub }),
       ...passingProbes,
       statSync: eacces,
       geteuid: () => 1000,
@@ -399,12 +170,10 @@ describe('SR-5.1: same-user check', () => {
   })
 
   test('geteuid undefined → defensive warning + pass (no exit)', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     const warnings: { classLabel: string; message: string }[] = []
     const outcome = await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
-      closeClient: (c) => (c as typeof stub).close(),
+      createClient: makeStubCreateClient({ client: stub }),
       ...passingProbes,
       statSync: (_p) => ({ uid: 7777 }),
       geteuid: () => undefined,
@@ -423,12 +192,10 @@ describe('SR-5.1: same-user check', () => {
 // ---------------------------------------------------------------------------
 
 describe('SR-5.1: happy path', () => {
-  test('valid version + ENOENT state.db → ok=true', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+  test('valid binary + ENOENT state.db → ok=true', async () => {
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     const outcome = await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
-      closeClient: (c) => (c as typeof stub).close(),
+      createClient: makeStubCreateClient({ client: stub }),
       ...passingProbes,
       statSync: defaultStat,
       geteuid: () => 1000,
@@ -437,33 +204,14 @@ describe('SR-5.1: happy path', () => {
     })
     expect(outcome.ok).toBe(true)
     if (outcome.ok) {
-      expect(outcome.adVersion).toBe(MIN_AD_VERSION)
+      expect(outcome.adVersion).toBe('0.7.0')
     }
   })
 
-  test('version() string without leading v still parses + passes', async () => {
-    // Future-proof: AD has historically shipped 'v0.4.3' but the contract
-    // only requires the version field be a parseable semver string.
-    const stub = makeStubClient({ versionResult: cannedVersion(MIN_AD_VERSION) })
+  test('UID match on state.db → ok=true', async () => {
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     const outcome = await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
-      closeClient: (c) => (c as typeof stub).close(),
-      ...passingProbes,
-      statSync: defaultStat,
-      geteuid: () => 1000,
-      recordStartupError: noopRecord,
-      exit: noopExit,
-    })
-    expect(outcome.ok).toBe(true)
-  })
-
-  test('version newer than MIN_AD_VERSION → ok=true', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion('v99.99.99') })
-    const outcome = await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
-      closeClient: (c) => (c as typeof stub).close(),
+      createClient: makeStubCreateClient({ client: stub }),
       ...passingProbes,
       statSync: (_p) => ({ uid: 1000 }),
       geteuid: () => 1000,
@@ -478,24 +226,24 @@ describe('SR-5.1: happy path', () => {
 // SR-5.1 — API surface probes (b.avw)
 // ---------------------------------------------------------------------------
 //
-// The version gate confirms the AD binary meets MIN_AD_VERSION, but the
-// shipped TS shim has historically lagged the binary — dropping methods
+// `Client.create()` confirms the AD binary meets its declared
+// `min_binary_version`, but the shipped TS shim has historically lagged
+// the binary — dropping methods
 // (getPermission), dropping CLI flags (--request-token in buildDecide), and
 // missing err_names from the catalog. Each silently breaks CSCB at click-
 // handling time. The probes run 1 → 2 → 3 and short-circuit on first failure.
 //
-// All sub-cases below flow past the version gate, so each runStartupGate call
-// must pass the version stub plus override the specific probe(s) under test.
-// Same-user deps default to a passing config (geteuid=1000, statSync=ENOENT).
+// All sub-cases below flow past the construct step, so each runStartupGate
+// call must inject a successful createClient (via makeStubCreateClient)
+// plus override the specific probe(s) under test. Same-user deps default to
+// a passing config (geteuid=1000, statSync=ENOENT).
 
 describe('SR-5.1: API surface probes', () => {
   /** Stage the deps shared by every probe sub-case. The caller overrides the
    *  probe under test plus any additional knobs. */
   function probeRunDeps(stub: ReturnType<typeof makeStubClient>) {
     return {
-      getClient: () => stub,
-      callVersion: (c: unknown) => (c as typeof stub).version({}),
-      closeClient: (c: unknown) => (c as typeof stub).close(),
+      createClient: makeStubCreateClient({ client: stub }),
       statSync: defaultStat,
       geteuid: () => 1000,
       recordStartupError: noopRecord,
@@ -508,7 +256,7 @@ describe('SR-5.1: API surface probes', () => {
   // -------------------------------------------------------------------------
 
   test('probeGetPermission returns false → ad-shim-missing-get-permission', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     const outcome = await runStartupGate({
       ...probeRunDeps(stub),
       probeGetPermission: () => false,
@@ -520,8 +268,8 @@ describe('SR-5.1: API surface probes', () => {
       expect(outcome.phase).toBe('api-surface')
       expect(outcome.classLabel).toBe('ad-shim-missing-get-permission')
       expect(outcome.message).toContain('getPermission')
-      // Remediation must point at the version pin so operators know what to do.
-      expect(outcome.message).toContain(MIN_AD_VERSION)
+      // Generic remediation points operators at re-installing a matching shim.
+      expect(outcome.message).toContain('reinstall a matching')
     }
   })
 
@@ -530,7 +278,7 @@ describe('SR-5.1: API surface probes', () => {
   // -------------------------------------------------------------------------
 
   test('probeErrorCatalog reports a single missing name → ad-shim-catalog-incomplete', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     const outcome = await runStartupGate({
       ...probeRunDeps(stub),
       probeGetPermission: () => true,
@@ -542,12 +290,12 @@ describe('SR-5.1: API surface probes', () => {
       expect(outcome.phase).toBe('api-surface')
       expect(outcome.classLabel).toBe('ad-shim-catalog-incomplete')
       expect(outcome.message).toContain('ErrInvalidFlags')
-      expect(outcome.message).toContain(MIN_AD_VERSION)
+      expect(outcome.message).toContain('reinstall a matching')
     }
   })
 
   test('probeErrorCatalog reports all three missing → message lists each', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     const allMissing = ['ErrInvalidFlags', 'ErrPermissionRequestNotFound', 'ErrAmbiguousRequest']
     const outcome = await runStartupGate({
       ...probeRunDeps(stub),
@@ -569,7 +317,7 @@ describe('SR-5.1: API surface probes', () => {
   // -------------------------------------------------------------------------
 
   test('probeDecideArgv reports drop → ad-shim-decide-drops-token', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     const detail = "dist (node_modules/agent-director/dist/index.js) does not include the literal '--request-token'"
     const outcome = await runStartupGate({
       ...probeRunDeps(stub),
@@ -591,7 +339,7 @@ describe('SR-5.1: API surface probes', () => {
   // -------------------------------------------------------------------------
 
   test('probe-1 failure short-circuits before probes 2 and 3', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     const calls: string[] = []
     const outcome = await runStartupGate({
       ...probeRunDeps(stub),
@@ -613,7 +361,7 @@ describe('SR-5.1: API surface probes', () => {
   })
 
   test('probe-2 failure short-circuits before probe 3', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     const calls: string[] = []
     const outcome = await runStartupGate({
       ...probeRunDeps(stub),
@@ -639,11 +387,10 @@ describe('SR-5.1: API surface probes', () => {
   // -------------------------------------------------------------------------
 
   test('probe-1 failure closes client exactly once', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     let closeCount = 0
     await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
+      createClient: makeStubCreateClient({ client: stub }),
       closeClient: () => {
         closeCount += 1
       },
@@ -659,11 +406,10 @@ describe('SR-5.1: API surface probes', () => {
   })
 
   test('probe-2 failure closes client exactly once', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     let closeCount = 0
     await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
+      createClient: makeStubCreateClient({ client: stub }),
       closeClient: () => {
         closeCount += 1
       },
@@ -679,11 +425,10 @@ describe('SR-5.1: API surface probes', () => {
   })
 
   test('probe-3 failure closes client exactly once', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     let closeCount = 0
     await runStartupGate({
-      getClient: () => stub,
-      callVersion: (c) => (c as typeof stub).version({}),
+      createClient: makeStubCreateClient({ client: stub }),
       closeClient: () => {
         closeCount += 1
       },
@@ -703,7 +448,7 @@ describe('SR-5.1: API surface probes', () => {
   // -------------------------------------------------------------------------
 
   test('all three probes pass + ENOENT state.db → ok=true', async () => {
-    const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
     const outcome = await runStartupGate({
       ...probeRunDeps(stub),
       probeGetPermission: () => true,
@@ -712,7 +457,7 @@ describe('SR-5.1: API surface probes', () => {
     })
     expect(outcome.ok).toBe(true)
     if (outcome.ok) {
-      expect(outcome.adVersion).toBe(MIN_AD_VERSION)
+      expect(outcome.adVersion).toBe('0.7.0')
     }
   })
 
@@ -754,11 +499,9 @@ describe('SR-5.1: API surface probes', () => {
   test.skipIf(!shimDecideDropsToken())(
     'production-default probeDecideArgv rejects stale shipped shim (FAILS-BEFORE-FIX)',
     async () => {
-      const stub = makeStubClient({ versionResult: cannedVersion(`v${MIN_AD_VERSION}`) })
+      const stub = makeStubClient({ binaryVersion: '0.7.0' })
       const outcome = await runStartupGate({
-        getClient: () => stub,
-        callVersion: (c) => (c as typeof stub).version({}),
-        closeClient: (c) => (c as typeof stub).close(),
+        createClient: makeStubCreateClient({ client: stub }),
         statSync: defaultStat,
         geteuid: () => 1000,
         recordStartupError: noopRecord,
@@ -777,4 +520,307 @@ describe('SR-5.1: API surface probes', () => {
       }
     },
   )
+})
+
+// ---------------------------------------------------------------------------
+// SR-4.2 — AD 0.7.0 system-install discovery typed-error branches
+// ---------------------------------------------------------------------------
+//
+// `Client.create()` (production) / `makeStubCreateClient(...)` (tests) is the
+// async factory that surfaces the three new typed errors introduced in AD
+// 0.7.0: ErrSystemInstallNotFound (no binary on PATH or in standard install
+// path), ErrSystemInstallTooOld (detected binary below floor), and
+// ErrSystemInstallUnreachable (binary exists but cannot be invoked
+// successfully — eight reason values). Each must surface as its own
+// classLabel on the construct phase so the startup-errors.log entry tells the
+// operator exactly which install action to take.
+
+describe('SR-4.2: system-install typed-error branches', () => {
+  test('ErrSystemInstallNotFound → ad-system-install-not-found', async () => {
+    const outcome = await runStartupGate({
+      createClient: makeStubCreateClient({ error: errSystemInstallNotFound() }),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.phase).toBe('construct')
+      expect(outcome.classLabel).toBe('ad-system-install-not-found')
+      expect(outcome.message).toContain('agent-director')
+    }
+  })
+
+  test('ErrSystemInstallTooOld → ad-system-install-too-old (message carries detected + required versions)', async () => {
+    const outcome = await runStartupGate({
+      createClient: makeStubCreateClient({ error: errSystemInstallTooOld('0.5.0', '0.7.0') }),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.phase).toBe('construct')
+      expect(outcome.classLabel).toBe('ad-system-install-too-old')
+      expect(outcome.message).toContain('0.5.0')
+      expect(outcome.message).toContain('0.7.0')
+    }
+  })
+
+  // ErrSystemInstallUnreachable: one test per reason value. The 8 reasons are
+  // the full closed-with-escape-hatch enum from AD's UnreachableReason type;
+  // each is a distinct failure signature that translates directly into the
+  // operator-facing remediation step.
+
+  test("ErrSystemInstallUnreachable reason='not-executable' → ad-system-install-unreachable", async () => {
+    const outcome = await runStartupGate({
+      createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('not-executable') }),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.message).toContain('not-executable')
+    }
+  })
+
+  test("ErrSystemInstallUnreachable reason='not-a-regular-file' → ad-system-install-unreachable", async () => {
+    const outcome = await runStartupGate({
+      createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('not-a-regular-file') }),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.message).toContain('not-a-regular-file')
+    }
+  })
+
+  test("ErrSystemInstallUnreachable reason='probe-timeout' → ad-system-install-unreachable", async () => {
+    const outcome = await runStartupGate({
+      createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('probe-timeout') }),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.message).toContain('probe-timeout')
+    }
+  })
+
+  test("ErrSystemInstallUnreachable reason='probe-nonzero-exit' → ad-system-install-unreachable", async () => {
+    const outcome = await runStartupGate({
+      createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('probe-nonzero-exit') }),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.message).toContain('probe-nonzero-exit')
+    }
+  })
+
+  test("ErrSystemInstallUnreachable reason='probe-killed-by-signal' → ad-system-install-unreachable", async () => {
+    const outcome = await runStartupGate({
+      createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('probe-killed-by-signal') }),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.message).toContain('probe-killed-by-signal')
+    }
+  })
+
+  test("ErrSystemInstallUnreachable reason='unparseable-version' → ad-system-install-unreachable", async () => {
+    const outcome = await runStartupGate({
+      createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('unparseable-version') }),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.message).toContain('unparseable-version')
+    }
+  })
+
+  test("ErrSystemInstallUnreachable reason='spawn-failed' → ad-system-install-unreachable", async () => {
+    const outcome = await runStartupGate({
+      createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('spawn-failed') }),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.message).toContain('spawn-failed')
+    }
+  })
+
+  test("ErrSystemInstallUnreachable reason='other' → ad-system-install-unreachable", async () => {
+    const outcome = await runStartupGate({
+      createClient: makeStubCreateClient({ error: errSystemInstallUnreachable('other') }),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.classLabel).toBe('ad-system-install-unreachable')
+      expect(outcome.message).toContain('other')
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SR-4.1 — async createClient injection seam
+// ---------------------------------------------------------------------------
+//
+// The startup gate calls `await d.createClient(opts)` exactly once and (on
+// success) installs the resolved Client into the agent-director-client
+// singleton via `setClient(client)`. These tests pin three contracts: the
+// factory is awaited exactly once, the resulting Client is installed into the
+// module-level singleton (identity-equal to `getClient()`), and the success
+// arm's `outcome.adVersion` is sourced directly from `client.binaryVersion`.
+// The final test pins the catch-all path for an unknown (non-typed) error.
+
+describe('SR-4.1: async createClient injection', () => {
+  beforeEach(() => {
+    // Each test installs (or fails to install) its own Client into the
+    // module-level singleton; reset between tests so identity-equality
+    // assertions cannot leak across test boundaries.
+    resetClientForTests()
+  })
+
+  test('createClient is awaited exactly once on success', async () => {
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const calls: object[] = []
+    const outcome = await runStartupGate({
+      createClient: makeStubCreateClient({ client: stub, calls }),
+      ...passingProbes,
+      statSync: defaultStat,
+      geteuid: () => 1000,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(true)
+    expect(calls.length).toBe(1)
+  })
+
+  test('stub Client is installed into singleton post-createClient', async () => {
+    // Tag the stub with a sentinel field so we can prove identity-equality
+    // against whatever getClient() returns post-gate. The structural-typed
+    // StubClient permits extra fields at the use site.
+    const stub = makeStubClient({ binaryVersion: '0.7.0' })
+    const taggedStub = stub as typeof stub & { __sentinel: 'unique' }
+    taggedStub.__sentinel = 'unique'
+    const outcome = await runStartupGate({
+      createClient: makeStubCreateClient({ client: taggedStub }),
+      ...passingProbes,
+      statSync: defaultStat,
+      geteuid: () => 1000,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(true)
+    // getClient() returns the installed singleton (typed Client); the cast is
+    // safe because the gate hands the same object reference to setClient(...).
+    expect(getClient() as unknown).toBe(taggedStub)
+  })
+
+  test('success-arm adVersion sourced from client.binaryVersion', async () => {
+    const stub = makeStubClient({ binaryVersion: '1.2.3' })
+    const outcome = await runStartupGate({
+      createClient: makeStubCreateClient({ client: stub }),
+      ...passingProbes,
+      statSync: defaultStat,
+      geteuid: () => 1000,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(true)
+    if (outcome.ok) {
+      expect(outcome.adVersion).toBe('1.2.3')
+    }
+  })
+
+  test('unknown (non-typed) error type → classLabel=ad-client-construct', async () => {
+    const outcome = await runStartupGate({
+      createClient: makeStubCreateClient({ error: new Error('boom') }),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.phase).toBe('construct')
+      expect(outcome.classLabel).toBe('ad-client-construct')
+      expect(outcome.message).toContain('boom')
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Epic AC #7 — non-TTY behavior is identical to TTY behavior
+// ---------------------------------------------------------------------------
+//
+// The gate does NOT branch on `process.stdin.isTTY` (there is no readline
+// anywhere in the startup path). This test pins that invariant: forcing
+// isTTY=false and running a known-failing scenario yields the exact same
+// outcome.message and outcome.classLabel as the interactive (default) case.
+// Any future change that adds a TTY-conditional branch (e.g. interactive
+// prompts) would fail this test and force an explicit design decision.
+
+describe('SR-4.4 / Epic AC #7: non-TTY behavior identical to TTY', () => {
+  test('failure outcome identical with process.stdin.isTTY=false', async () => {
+    // Interactive (TTY=true) reference run.
+    const interactiveOutcome = await runStartupGate({
+      createClient: makeStubCreateClient({ error: errSystemInstallNotFound() }),
+      statSync: defaultStat,
+      recordStartupError: noopRecord,
+      exit: noopExit,
+    })
+
+    // Force non-TTY for the second run.
+    const originalIsTTY = process.stdin.isTTY
+    try {
+      Object.defineProperty(process.stdin, 'isTTY', {
+        value: false,
+        configurable: true,
+        writable: true,
+      })
+      const nonTtyOutcome = await runStartupGate({
+        createClient: makeStubCreateClient({ error: errSystemInstallNotFound() }),
+        statSync: defaultStat,
+        recordStartupError: noopRecord,
+        exit: noopExit,
+      })
+
+      expect(nonTtyOutcome.ok).toBe(false)
+      expect(interactiveOutcome.ok).toBe(false)
+      if (!nonTtyOutcome.ok && !interactiveOutcome.ok) {
+        expect(nonTtyOutcome.classLabel).toBe(interactiveOutcome.classLabel)
+        expect(nonTtyOutcome.message).toBe(interactiveOutcome.message)
+      }
+    } finally {
+      Object.defineProperty(process.stdin, 'isTTY', {
+        value: originalIsTTY,
+        configurable: true,
+        writable: true,
+      })
+    }
+  })
 })

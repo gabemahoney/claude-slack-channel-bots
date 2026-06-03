@@ -8,11 +8,11 @@
  *      time; module-not-found surfaces as a top-level import error caught
  *      by callers' try/catch (see runAgentDirectorStartupGate's
  *      module-load-error branch below).
- *   2. new Client(opts)                          — typed catches for
- *      ErrPlatformPackageMissing, ErrUnsupportedPlatform,
- *      ErrBunVersionTooOld; other throws surface verbatim.
- *   3. await client.version({})                  — strip leading 'v',
- *      compare to MIN_AD_VERSION via semverGte.
+ *   2. await d.createClient(opts)                — typed catches for
+ *      ErrBunVersionTooOld, ErrSystemInstallNotFound,
+ *      ErrSystemInstallTooOld, ErrSystemInstallUnreachable; other throws
+ *      surface verbatim. The factory resolves to a constructed Client
+ *      (production injects `Client.create`).
  *   3.5. API surface probes (SR-6.1 publish-skew defense)  — short-circuit,
  *      run in order: probeGetPermission (ad-shim-missing-get-permission) →
  *      probeErrorCatalog (ad-shim-catalog-incomplete) → probeDecideArgv
@@ -36,20 +36,18 @@ import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 
 import {
+  Client,
   ErrBunVersionTooOld,
-  ErrCallTimeout,
-  ErrCliNotExecutable,
-  ErrPlatformPackageMissing,
-  ErrUnsupportedPlatform,
-  AgentDirectorError,
+  ErrSystemInstallNotFound,
+  ErrSystemInstallTooOld,
+  ErrSystemInstallUnreachable,
 } from 'agent-director'
-import type { VersionResult } from 'agent-director'
+import type { ClientOptions } from 'agent-director'
 
 import { recordStartupError } from './startup-errors.ts'
 import {
-  MIN_AD_VERSION,
   DEFAULT_STORE_PATH,
-  getClient,
+  setClient,
   setClientForTests,
 } from './agent-director-client.ts'
 
@@ -112,52 +110,16 @@ function readAdDistSource(): string | Error {
 }
 
 // ---------------------------------------------------------------------------
-// Pure helper: semver-gte for the three-segment versions AD ships
-// ---------------------------------------------------------------------------
-
-/**
- * Compare two `MAJOR.MINOR.PATCH` strings (no pre-release/build suffix
- * handling needed: AD ships canonical three-segment numerics).
- *
- * Returns true when `a` is greater than or equal to `b`. Inputs must parse
- * as integers — any non-numeric segment makes the comparison treat the
- * value as below `b` (i.e. fail closed).
- *
- * Exported for direct testing.
- */
-export function semverGte(a: string, b: string): boolean {
-  const split = (s: string): number[] =>
-    s.split('.').map((seg) => {
-      const n = parseInt(seg, 10)
-      return Number.isFinite(n) ? n : -1
-    })
-  const av = split(a)
-  const bv = split(b)
-  const len = Math.max(av.length, bv.length)
-  for (let i = 0; i < len; i++) {
-    const ai = av[i] ?? 0
-    const bi = bv[i] ?? 0
-    if (ai > bi) return true
-    if (ai < bi) return false
-  }
-  return true
-}
-
-// ---------------------------------------------------------------------------
 // Injectable dependency surface
 // ---------------------------------------------------------------------------
 
 export interface StartupGateDeps {
   /**
-   * Hook that resolves to the singleton Client. Construction failures
-   * surface as throws here (the synchronous construction path) — production code
-   * passes getClient from src/agent-director-client.ts; tests pass either
-   * `() => makeStubClient(...)` or a thrower that simulates the typed
-   * Err* constructor failure modes.
+   * Async factory that resolves to a constructed Client. Production injects
+   * `Client.create`; tests inject `makeStubCreateClient({...})` from
+   * tests/test-helpers/agent-director-stub.ts to drive the catch ladder.
    */
-  getClient: () => unknown
-  /** Hook that returns the client's `version()` result. */
-  callVersion: (client: unknown) => Promise<VersionResult>
+  createClient: (opts: object) => Promise<unknown>
   /** Hook that returns the client's `close()` for the failure-path cleanup. */
   closeClient: (client: unknown) => void
   /** Stat hook for the SR-5.1 same-user check. */
@@ -202,11 +164,8 @@ export interface StartupGateDeps {
 // ---------------------------------------------------------------------------
 
 const prodDeps: StartupGateDeps = {
-  getClient: () => getClient(),
-  callVersion: async (client) => {
-    // Cast: production getClient returns the real Client; tests inject a stub
-    // with the same structural shape. Either way, .version({}) exists.
-    return await (client as { version: (p: object) => Promise<VersionResult> }).version({})
+  createClient: async (opts) => {
+    return await Client.create(opts as ClientOptions)
   },
   closeClient: (client) => {
     try {
@@ -304,36 +263,15 @@ export async function runStartupGate(
 ): Promise<StartupGateOutcome> {
   const d = mergeDeps(deps)
 
-  // Step 2: construct Client (synchronous construction path).
+  // Step 2: construct Client via async factory (Client.create in prod).
   let client: unknown
   try {
-    client = d.getClient()
+    client = await d.createClient({
+      storePath: DEFAULT_STORE_PATH,
+      createIfMissing: true,
+      logger: console,
+    })
   } catch (err) {
-    if (err instanceof ErrPlatformPackageMissing) {
-      return {
-        ok: false,
-        phase: 'construct',
-        classLabel: 'ad-platform-package-missing',
-        message:
-          `agent-director platform-native peer dependency missing — ` +
-          `your host is unsupported by agent-director. ` +
-          `Supported: ${SUPPORTED_PLATFORMS.join(', ')}. ` +
-          `Detected: ${process.platform}-${process.arch}. ` +
-          `Detail: ${err.errDescription}`,
-      }
-    }
-    if (err instanceof ErrUnsupportedPlatform) {
-      return {
-        ok: false,
-        phase: 'construct',
-        classLabel: 'ad-unsupported-platform',
-        message:
-          `agent-director does not support this platform. ` +
-          `Detected: ${process.platform}-${process.arch}. ` +
-          `Supported: ${SUPPORTED_PLATFORMS.join(', ')}. ` +
-          `Detail: ${err.errDescription}`,
-      }
-    }
     if (err instanceof ErrBunVersionTooOld) {
       return {
         ok: false,
@@ -344,15 +282,38 @@ export async function runStartupGate(
           `Upgrade Bun (https://bun.sh) and retry. Detail: ${err.errDescription}`,
       }
     }
-    if (err instanceof ErrCliNotExecutable) {
+    if (err instanceof ErrSystemInstallNotFound) {
       return {
         ok: false,
         phase: 'construct',
-        classLabel: 'ad-cli-not-executable',
+        classLabel: 'ad-system-install-not-found',
         message:
-          `agent-director CLI binary is not executable. ` +
-          `Detail: ${err.errDescription}. ` +
-          `Remediation: chmod +x the binary referenced above, then retry.`,
+          `agent-director system install not found. The startup gate searched ` +
+          `the standard install path and PATH but did not locate the agent-director ` +
+          `binary. Install agent-director (system-wide) and retry.`,
+      }
+    }
+    if (err instanceof ErrSystemInstallTooOld) {
+      return {
+        ok: false,
+        phase: 'construct',
+        classLabel: 'ad-system-install-too-old',
+        message:
+          `agent-director system install is too old. ` +
+          `Detected version ${err.actualVersion} is below the required floor ${err.requiredVersion} ` +
+          `(binary at ${err.binaryPath}). Upgrade agent-director and retry.`,
+      }
+    }
+    if (err instanceof ErrSystemInstallUnreachable) {
+      return {
+        ok: false,
+        phase: 'construct',
+        classLabel: 'ad-system-install-unreachable',
+        message:
+          `agent-director system install is unreachable. ` +
+          `Reason: ${err.reason}. ` +
+          `Binary at ${err.binaryPath} could not be invoked successfully. ` +
+          `Diagnose with the install-cscb skill or re-install agent-director.`,
       }
     }
     const detail = err instanceof Error ? err.message : String(err)
@@ -364,54 +325,17 @@ export async function runStartupGate(
     }
   }
 
-  // Step 3: version probe.
-  let versionResult: VersionResult
-  try {
-    versionResult = await d.callVersion(client)
-  } catch (err) {
-    if (err instanceof ErrCallTimeout) {
-      d.closeClient(client)
-      return {
-        ok: false,
-        phase: 'version',
-        classLabel: 'ad-call-timeout',
-        message:
-          `agent-director ${err.verb}() timed out after ${err.elapsedMs}ms ` +
-          `(configured callTimeoutMs: ${err.timeoutMs}ms). ` +
-          `Either the subprocess hung or the timeout is set too low; ` +
-          `set ClientOptions.callTimeoutMs higher (default 30000) or investigate the agent-director subprocess.`,
-      }
-    }
-    d.closeClient(client)
-    const detail =
-      err instanceof AgentDirectorError
-        ? `${err.errName}: ${err.errDescription}`
-        : err instanceof Error
-        ? err.message
-        : String(err)
-    return {
-      ok: false,
-      phase: 'version',
-      classLabel: 'ad-version-probe',
-      message: `agent-director version probe failed. Detail: ${detail}`,
-    }
-  }
+  // Construction succeeded: install the live Client into the module-level
+  // singleton so subsequent `getClient()` call sites resolve to it.
+  setClient(client as Client)
 
-  const adVersion = versionResult.version.replace(/^v/, '')
-  if (!semverGte(adVersion, MIN_AD_VERSION)) {
-    d.closeClient(client)
-    return {
-      ok: false,
-      phase: 'version',
-      classLabel: 'ad-version-stale',
-      message:
-        `agent-director version ${adVersion} is below the required minimum ${MIN_AD_VERSION}. ` +
-        `Run: bun add agent-director@^${MIN_AD_VERSION}`,
-    }
-  }
+  // adVersion is sourced directly from the constructed Client; AD 0.7.0
+  // exposes `binaryVersion` as a readonly getter populated during
+  // `Client.create()`'s version probe of the resolved system binary.
+  const adVersion = (client as { binaryVersion: string }).binaryVersion
 
-  // Step 3.5: API surface probes. The version gate above confirms the AD
-  // binary meets MIN_AD_VERSION, but published agent-director npm packages
+  // Step 3.5: API surface probes. `Client.create()` confirms the AD binary
+  // meets the required floor, but published agent-director npm packages
   // have shipped a stale TS shim that drops methods (getPermission), drops
   // CLI flags (--request-token in buildDecide), and misses err_names in the
   // catalog. Each of those silently breaks CSCB at click-handling time. The
@@ -426,7 +350,7 @@ export async function runStartupGate(
       message:
         `agent-director Client is missing the 'getPermission' method. ` +
         `The installed shim is stale relative to the AD binary (${adVersion}). ` +
-        `Run: bun add agent-director@^${MIN_AD_VERSION} (and confirm the resolved version actually ships getPermission).`,
+        `Run: reinstall a matching 'agent-director' version (confirm the resolved package ships getPermission).`,
     }
   }
 
@@ -442,7 +366,7 @@ export async function runStartupGate(
         `${catalogProbe.missing.join(', ')}. ` +
         `Envelopes with these names would surface as the base AgentDirectorError ` +
         `instead of typed subclasses, breaking CSCB's instanceof Err<Name> branches. ` +
-        `Run: bun add agent-director@^${MIN_AD_VERSION} (confirm the resolved package ships the full catalog).`,
+        `Run: reinstall a matching 'agent-director' version (confirm the resolved package ships the full catalog).`,
     }
   }
 
@@ -456,7 +380,7 @@ export async function runStartupGate(
       message:
         `agent-director shim's decide() does not pass --request-token to the CLI: ${argvProbe.detail} ` +
         `Permission clicks would resolve against the wrong row. ` +
-        `Run: bun add agent-director@^${MIN_AD_VERSION} (confirm the resolved package's buildDecide includes the flag).`,
+        `Run: reinstall a matching 'agent-director' version (confirm the resolved package's buildDecide includes the flag).`,
     }
   }
 
@@ -533,7 +457,6 @@ export async function runAgentDirectorStartupGate(
 // ---------------------------------------------------------------------------
 
 export {
-  MIN_AD_VERSION,
   DEFAULT_STORE_PATH,
   AD_STATE_DB_PATH as DEFAULT_STATE_DB_PATH,
   SUPPORTED_PLATFORMS,
