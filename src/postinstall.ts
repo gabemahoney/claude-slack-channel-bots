@@ -18,8 +18,8 @@ import { MCP_SERVER_NAME } from './config.ts'
 
 /**
  * Read the agent-director dependency range from the shipping package.json.
- * Same pattern as src/agent-director-client.ts's MIN_AD_VERSION derivation —
- * one source of truth for the AD version requirement.
+ * One source of truth for the AD version requirement; used in the
+ * postinstall-probe failure warning to point operators at the right pin.
  */
 export function readAdDependencyRange(): string {
   const pkgPath = resolve(dirname(import.meta.filename), '..', 'package.json')
@@ -149,19 +149,21 @@ export function runPostinstall(options: PostinstallOptions = {}): void {
 export async function runAgentDirectorPostinstallProbe(): Promise<void> {
   try {
     const ad = await import('agent-director')
-    // Construct + version() probe. Client construction is synchronous;
-    // any platform / Bun / subprocess-resolution error fires here and is
-    // caught below.
-    const client = new ad.Client({
+    // AD 0.7.0+ exposes an async `Client.create()` factory; the constructor
+    // is protected. Any platform / Bun / subprocess-resolution error fires
+    // here (Err* subclasses + system-install errors) and is caught below.
+    const client = await ad.Client.create({
       storePath: '~/.agent-director/state.db',
       createIfMissing: true,
     })
     try {
-      const v = await client.version({})
-      const adVersion = v.version.replace(/^v/, '')
+      // Now that Client.create() has resolved, the binary version is on the
+      // Client itself (binaryVersion getter, AD 0.7.0+). Skip the verb-call
+      // probe — the factory already enforced the floor.
+      const adVersion = client.binaryVersion.replace(/^v/, '')
       console.log(`postinstall: agent-director ${adVersion} OK`)
     } finally {
-      try { client.close() } catch { /* close never throws but be defensive */ }
+      try { client.close() } catch { /* defensive */ }
     }
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err)

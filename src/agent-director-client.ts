@@ -3,19 +3,20 @@
  * `agent-director` library Client (SR-0.1).
  *
  * Public API:
- *   - getClient(): Client                          — lazy-construct + return the singleton
+ *   - getClient(): Client                          — sync cached accessor for the singleton
+ *   - setClient(client): void                       — install a pre-built Client (startup gate only)
  *   - closeClient(): void                           — idempotent shutdown for SR-11 Event 11
- *   - MIN_AD_VERSION: string                        — semver string derived from package.json
  *   - DEFAULT_STORE_PATH / DEFAULT_TEMPLATE_NAME    — paths CSCB pins
  *   - resetClientForTests(): void                   — test-only handle reset
  *
- * MIN_AD_VERSION is read once at module init from this package.json's
- * `dependencies['agent-director']` range, stripping leading semver operators
- * (`^`, `~`, `>=`, etc.) so a single source of truth covers both the install-
- * time dep declaration (SR-5.3) and the runtime version gate (SR-5.1 step 3).
- *
- * Construction uses `{ storePath, createIfMissing: true, logger: console }`
- * per SR-0.1; tilde expansion is the library's responsibility.
+ * Construction: AD 0.7.0+ exposes an async `Client.create()` factory; the
+ * subprocess constructor is protected and `new Client(...)` is a compile-time
+ * TS error. The SR-5.1 startup gate (src/agent-director-startup.ts) awaits
+ * `Client.create({ storePath, createIfMissing: true, logger: console })` and
+ * then hands the resolved instance to `setClient()`. Verb call sites pull the
+ * installed singleton through `getClient()`; calling `getClient()` before the
+ * gate has installed a Client throws an internal bug-marker error (it
+ * indicates a caller-site bug, not a runtime condition).
  *
  * Concurrency: AD's Client is internally safe for concurrent verb calls
  * (the subprocess-CLI transport serializes its own dispatch) per SR-0.1,
@@ -24,9 +25,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { AgentDirectorError, Client } from 'agent-director'
 import type {
   DecideParams as ADDecideParams,
@@ -45,40 +43,6 @@ export const DEFAULT_STORE_PATH = '~/.agent-director/state.db'
 /** Name of the CSCB-shipped template (SR-3.1). */
 export const DEFAULT_TEMPLATE_NAME = 'slack-channel-bot'
 
-/**
- * Resolve the package.json that ships with this module, then extract and
- * normalize `dependencies['agent-director']` into a bare semver string.
- *
- * Throws at module init if the dep is missing or shaped wrong — that's a
- * packaging bug worth failing loudly on, not a runtime condition.
- */
-function readMinAdVersion(): string {
-  const moduleDir = dirname(fileURLToPath(import.meta.url))
-  // src/agent-director-client.ts → package.json lives one level up
-  const pkgPath = join(moduleDir, '..', 'package.json')
-  const raw = readFileSync(pkgPath, 'utf-8')
-  const pkg = JSON.parse(raw) as { dependencies?: Record<string, string> }
-  const range = pkg.dependencies?.['agent-director']
-  if (typeof range !== 'string' || range.length === 0) {
-    throw new Error(
-      `agent-director-client: package.json dependencies['agent-director'] is missing or empty — cannot derive MIN_AD_VERSION`,
-    )
-  }
-  // Strip leading semver operators: ^, ~, >=, >, =, v. Anything left should
-  // parse as semver; we don't validate further here — the SR-5.1 version gate
-  // does the actual comparison.
-  const stripped = range.replace(/^[\^~]|^>=|^>|^=/, '').replace(/^v/, '').trim()
-  if (stripped.length === 0) {
-    throw new Error(
-      `agent-director-client: dependencies['agent-director']=${range} reduced to empty string after stripping operators`,
-    )
-  }
-  return stripped
-}
-
-/** Minimum agent-director version CSCB requires at runtime (SR-5.3). */
-export const MIN_AD_VERSION: string = readMinAdVersion()
-
 // ---------------------------------------------------------------------------
 // Singleton state
 // ---------------------------------------------------------------------------
@@ -86,20 +50,19 @@ export const MIN_AD_VERSION: string = readMinAdVersion()
 let singleton: Client | null = null
 
 /**
- * Return the singleton Client, lazy-constructing it on first call.
+ * Return the singleton Client installed by the SR-5.1 startup gate.
  *
- * Construction is synchronous: all platform / Bun / subprocess-resolution
- * errors fire eagerly here per SR-0.1, not at first verb call. Typed `Err*`
- * subclasses propagate; the SR-5.1 startup gate is the only intended
- * caller-of-record that branches them.
+ * This is a sync cached accessor; it does NOT construct the Client. The
+ * startup gate (`runAgentDirectorStartupGate`) is responsible for awaiting
+ * `Client.create(...)` and installing the result via `setClient`. Calling
+ * `getClient()` before the gate has run is a caller-site bug and throws
+ * loudly — there is no lazy-construction fallback.
  */
 export function getClient(): Client {
   if (singleton === null) {
-    singleton = new Client({
-      storePath: DEFAULT_STORE_PATH,
-      createIfMissing: true,
-      logger: console,
-    })
+    throw new Error(
+      'agent-director-client: getClient() called before the startup gate installed a Client — caller-site bug. The startup gate must run first (via runAgentDirectorStartupGate).',
+    )
   }
   return singleton
 }
@@ -126,6 +89,17 @@ export function closeClient(): void {
  */
 export function resetClientForTests(): void {
   singleton = null
+}
+
+/**
+ * Install a pre-built Client into the singleton slot. Called once by the
+ * startup gate (src/agent-director-startup.ts) after `await Client.create(opts)`
+ * resolves. Production verb call sites never invoke this — they go through
+ * `getClient()`. Lexically distinct from `setClientForTests` so the test
+ * helper stays grep-discoverable.
+ */
+export function setClient(client: Client): void {
+  singleton = client
 }
 
 /**
@@ -156,9 +130,9 @@ export interface DecideParamsWithToken extends ADDecideParams {
 }
 
 /**
- * Always-include-token decide wrapper. MIN_AD_VERSION is now pinned at
- * `^0.6.0`, which carries `request_token` on `DecideParams` natively. The
- * structural cast is retained because, until the lockfile is refreshed to
+ * Always-include-token decide wrapper. The `agent-director` package.json pin
+ * is at `^0.6.0`+, which carries `request_token` on `DecideParams` natively.
+ * The structural cast is retained because, until the lockfile is refreshed to
  * resolve the bumped pin, the imported `DecideParams` type still comes from
  * the locked `0.5.6` package — same lockfile-lag pattern as
  * `GetResultWithPermissionRequests`.
@@ -201,13 +175,14 @@ export function isErrPermissionRequestNotFound(err: unknown): boolean {
 }
 
 /**
- * `get-permission` wrapper (SR-7.1). MIN_AD_VERSION is pinned at `^0.6.0`,
- * which carries the verb; the SR-6.1 startup gate is the compatibility
- * boundary that keeps stale-version installs from reaching this path. The
- * wrapper takes a structural client (rather than `Pick<Client, 'getPermission'>`)
- * because the locked `0.5.6` types do not yet expose the method shape, and
- * fails loudly at runtime when the verb is missing as defense-in-depth for
- * the dev/test edge (e.g. stub clients that omit it on purpose).
+ * `get-permission` wrapper (SR-7.1). The `agent-director` package.json pin is
+ * at `^0.6.0`+, which carries the verb; the SR-6.1 startup gate is the
+ * compatibility boundary that keeps stale-version installs from reaching this
+ * path. The wrapper takes a structural client (rather than
+ * `Pick<Client, 'getPermission'>`) because the locked `0.5.6` types do not yet
+ * expose the method shape, and fails loudly at runtime when the verb is
+ * missing as defense-in-depth for the dev/test edge (e.g. stub clients that
+ * omit it on purpose).
  */
 export async function getPermission(
   client: { getPermission?: (params: GetPermissionParams) => Promise<GetPermissionResult> },
@@ -216,7 +191,7 @@ export async function getPermission(
   if (typeof client.getPermission !== 'function') {
     throw new Error(
       'agent-director-client: getPermission verb unavailable — ' +
-        'confirm installed agent-director version meets the MIN_AD_VERSION pin',
+        'confirm installed agent-director version meets the package.json pin',
     )
   }
   return client.getPermission(params)
