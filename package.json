@@ -10,6 +10,7 @@
     "src/*.ts",
     "!src/*.test.ts",
     "scripts/fixup-bun-cache.ts",
+    "scripts/install-check.ts",
     "slack-app-manifest.yml",
     "README.md",
     "skills/"
