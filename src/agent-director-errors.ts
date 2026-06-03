@@ -7,10 +7,10 @@
  * keep the subset list in sync with SRD edits.
  *
  * Catalog (SR-0.2):
- *   - ErrUnsupportedPlatform    (Client constructor / platform gate)
  *   - ErrBunVersionTooOld       (Client constructor / Bun version gate)
- *   - ErrPlatformPackageMissing (Client constructor / @agent-director/<plat>)
- *   - ErrCliNotExecutable       (Client constructor / CLI binary lacks +x)
+ *   - ErrSystemInstallNotFound  (Client.create / resolveSystemBinary — no `agent-director` on PATH or at ~/.agent-director)
+ *   - ErrSystemInstallTooOld    (Client.create / resolveSystemBinary — system binary older than required minimum)
+ *   - ErrSystemInstallUnreachable (Client.create / resolveSystemBinary — system binary present but not executable or fails --version)
  *   - ErrInstanceIdCollision    (spawn / SR-1.4 idempotency)
  *   - ErrSpawnNotFound          (get / status / decide on missing row)
  *   - ErrNoSessionId            (resume / SR-1.3 fallthrough)
@@ -37,10 +37,10 @@
 export {
   AgentDirectorError,
   ErrClientClosed,
-  ErrUnsupportedPlatform,
-  ErrPlatformPackageMissing,
   ErrBunVersionTooOld,
-  ErrCliNotExecutable,
+  ErrSystemInstallNotFound,
+  ErrSystemInstallTooOld,
+  ErrSystemInstallUnreachable,
   ErrCallTimeout,
   ErrInstanceIdCollision,
   ErrSpawnNotFound,
