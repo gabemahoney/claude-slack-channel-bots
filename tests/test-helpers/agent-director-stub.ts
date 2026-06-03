@@ -3,14 +3,23 @@
  * `Client` instances for unit tests (SR-8.3).
  *
  * Epic 1 scope: only the verbs the foundation needs are wired up — the
- * `Client` constructor's throw-injection points (the four typed Err* classes
- * the SR-5.1 startup gate branches on), `version()` for the version-gate
- * sub-case matrix, and `makeTemplate()` for the SR-3.2 template install path.
- * Epic 2 extends this helper to cover the full spawn / list / get / decide
- * surface CSCB uses at runtime.
+ * typed Err* classes the SR-5.1 startup gate branches on (`ErrBunVersionTooOld`
+ * for the Bun-version gate, plus the AD 0.7.0 system-install discovery trio
+ * `ErrSystemInstallNotFound` / `ErrSystemInstallTooOld` /
+ * `ErrSystemInstallUnreachable` thrown by `Client.create` and
+ * `resolveSystemBinary`), `version()` for the version-gate sub-case matrix,
+ * and `makeTemplate()` for the SR-3.2 template install path. Epic 2 extends
+ * this helper to cover the full spawn / list / get / decide surface CSCB uses
+ * at runtime.
+ *
+ * Beyond `Client` instances, this module also exports `makeStubCreateClient`
+ * and `makeStubResolveSystemBinary` — stub factories shaped like
+ * `Client.create()` and `resolveSystemBinary()` respectively, used to drive
+ * the SR-5.1 startup gate's catch ladder for the three system-install errors.
  *
  * The stub does NOT extend `Client` — instantiating the real class would call
- * Bun FFI. Instead it satisfies the structural-typed verb surface CSCB calls.
+ * Bun FFI. Instead it satisfies the structural-typed verb surface CSCB calls,
+ * including the AD 0.7.0 readonly getters `binaryPath` / `binaryVersion`.
  * Production code under test injects the stub via the `getClient` factory
  * passed to the startup gate (see src/agent-director-startup.ts).
  *
@@ -22,22 +31,23 @@ import {
   ErrAlreadyDecided,
   ErrBunVersionTooOld,
   ErrCallTimeout,
-  ErrCliNotExecutable,
   ErrInstanceIdCollision,
   ErrJsonlMissing,
   ErrNoOpenPermissionRequest,
   ErrNoSessionId,
   ErrPauseTimeout,
-  ErrPlatformPackageMissing,
   ErrRelayModeOff,
   ErrSpawnNotFound,
   ErrSpawnNotInteractive,
   ErrSpawnNotResumable,
+  ErrSystemInstallNotFound,
+  ErrSystemInstallTooOld,
+  ErrSystemInstallUnreachable,
   ErrTemplateExists,
   ErrTemplateMalformed,
   ErrTemplateNameUnsafe,
-  ErrUnsupportedPlatform,
 } from 'agent-director'
+import type { UnreachableReason } from 'agent-director'
 import type {
   DecideParams,
   DecideResult,
@@ -87,24 +97,24 @@ export function cannedMakeTemplate(path: string): MakeTemplateResult {
   return { path }
 }
 
-/** Build an ErrPlatformPackageMissing (Client-constructor failure mode). */
-export function errPlatformPackageMissing(pkg: string = '@agent-director/linux-x64', detail?: string): ErrPlatformPackageMissing {
-  return new ErrPlatformPackageMissing(pkg, detail)
-}
-
-/** Build an ErrUnsupportedPlatform (Client-constructor failure mode). */
-export function errUnsupportedPlatform(tuple: string = 'win32-x64'): ErrUnsupportedPlatform {
-  return new ErrUnsupportedPlatform(tuple)
-}
-
 /** Build an ErrBunVersionTooOld (Client-constructor failure mode). */
 export function errBunVersionTooOld(actual: string = '0.9.0', minimum: string = '1.0.21'): ErrBunVersionTooOld {
   return new ErrBunVersionTooOld(actual, minimum)
 }
 
-/** Build an ErrCliNotExecutable (Client-constructor failure mode). */
-export function errCliNotExecutable(path: string = '/path/to/agent-director-bin'): ErrCliNotExecutable {
-  return new ErrCliNotExecutable(path)
+/** Build an ErrSystemInstallNotFound (Client.create / resolveSystemBinary failure mode). */
+export function errSystemInstallNotFound(checkedLocations: ReadonlyArray<{kind: 'standard-install-path'|'path-lookup'; detail: string|null}> = []): ErrSystemInstallNotFound {
+  return new ErrSystemInstallNotFound(checkedLocations)
+}
+
+/** Build an ErrSystemInstallTooOld with detected + required version strings (Client.create floor failure). */
+export function errSystemInstallTooOld(detected: string = '0.5.0', required: string = '0.7.0', binaryPath: string = '/usr/local/bin/agent-director'): ErrSystemInstallTooOld {
+  return new ErrSystemInstallTooOld(detected, required, binaryPath)
+}
+
+/** Build an ErrSystemInstallUnreachable with a UnreachableReason value. */
+export function errSystemInstallUnreachable(reason: UnreachableReason = 'other', diagnostic: string | null = null, binaryPath: string = '/usr/local/bin/agent-director'): ErrSystemInstallUnreachable {
+  return new ErrSystemInstallUnreachable(binaryPath, reason, { diagnostic })
 }
 
 /** Build an ErrCallTimeout (any verb; per-call timeout exceeded). */
@@ -386,6 +396,10 @@ export const cannedErr = <T>(error: Error): CannedResponse<T> => ({ kind: 'rejec
  * Plus capture arrays — `<verb>Calls` — for assertion against call shape.
  */
 export interface StubClientOptions {
+  // Client surface getters added in AD 0.7.0
+  binaryPath?: string
+  binaryVersion?: string
+
   // version()
   versionResult?: VersionResult
   versionError?: Error
@@ -470,6 +484,8 @@ export interface StubClientOptions {
 
 /** Structural-typed `Client` stub satisfying every verb CSCB uses. */
 export type StubClient = {
+  readonly binaryPath: string
+  readonly binaryVersion: string
   version(params: VersionParams): Promise<VersionResult>
   makeTemplate(params: MakeTemplateParams): Promise<MakeTemplateResult>
   spawn(params: SpawnParams): Promise<SpawnResult>
@@ -515,6 +531,12 @@ function nextResponse<T>(
 /** Build a stub Client driven by the supplied knobs. */
 export function makeStubClient(opts: StubClientOptions = {}): StubClient {
   return {
+    get binaryPath(): string {
+      return opts.binaryPath ?? '/usr/local/bin/agent-director'
+    },
+    get binaryVersion(): string {
+      return opts.binaryVersion ?? '0.7.0'
+    },
     async version(params: VersionParams): Promise<VersionResult> {
       opts.versionCalls?.push(params)
       if (opts.versionError) throw opts.versionError
@@ -599,5 +621,70 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
     },
     close(): void { /* no-op */ },
     [Symbol.dispose](): void { /* no-op */ },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stub Client.create / resolveSystemBinary factories (AD 0.7.0 startup surface)
+// ---------------------------------------------------------------------------
+
+/**
+ * Options for makeStubCreateClient. Mirrors the existing canned-result /
+ * canned-error pattern.
+ */
+export interface StubCreateClientOptions {
+  /** Reject the call with this error. Takes precedence over `client`. */
+  error?: Error
+  /** Resolve with this pre-built stub Client. If omitted, a default stub is created. */
+  client?: StubClient
+  /** Capture each createClient call's opts argument here. */
+  calls?: object[]
+}
+
+/**
+ * Build a stub `Client.create`-shaped factory function. Returns a function
+ * of shape `(opts: object) => Promise<StubClient>` that either resolves
+ * with the supplied stub or rejects with the supplied error. Drives the
+ * startup gate's catch ladder (Task 5 / a9) for the three new typed errors.
+ */
+export function makeStubCreateClient(opts: StubCreateClientOptions = {}): (clientOpts: object) => Promise<StubClient> {
+  return async (clientOpts: object): Promise<StubClient> => {
+    opts.calls?.push(clientOpts)
+    if (opts.error) throw opts.error
+    return opts.client ?? makeStubClient()
+  }
+}
+
+/**
+ * Options for makeStubResolveSystemBinary. Mirrors the canned-result /
+ * canned-error pattern.
+ */
+export interface StubResolveSystemBinaryOptions {
+  /** Throw this error instead of resolving. Takes precedence over path/version. */
+  throws?: Error
+  /** Resolve with this binary path (default: '/usr/local/bin/agent-director'). */
+  path?: string
+  /** Resolve with this binary version (default: '0.7.0'). */
+  version?: string
+  /** Capture each call's opts argument here. */
+  calls?: Array<object | undefined>
+}
+
+/**
+ * Build a stub `resolveSystemBinary`-shaped factory function. Returns a
+ * function of shape `(opts?) => Promise<{path, version}>` that either
+ * resolves with the canned `{path, version}` or rejects with the supplied
+ * error. Mirrors the AD library's `resolveSystemBinary()` shape.
+ */
+export function makeStubResolveSystemBinary(
+  opts: StubResolveSystemBinaryOptions = {},
+): (resolveOpts?: object) => Promise<{ path: string; version: string }> {
+  return async (resolveOpts?: object): Promise<{ path: string; version: string }> => {
+    opts.calls?.push(resolveOpts)
+    if (opts.throws) throw opts.throws
+    return {
+      path: opts.path ?? '/usr/local/bin/agent-director',
+      version: opts.version ?? '0.7.0',
+    }
   }
 }
