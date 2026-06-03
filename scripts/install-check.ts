@@ -23,7 +23,7 @@ import { runInstallCheck } from '../src/install-check.ts'
 import type { InstallCheckResult } from '../src/install-check.ts'
 import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
 
-function renderSuccess(result: InstallCheckResult & { ok: true }): string {
+export function renderSuccess(result: InstallCheckResult & { ok: true }): string {
   return [
     'agent-director install check: OK',
     `  binary:  ${result.binaryPath}`,
@@ -32,7 +32,7 @@ function renderSuccess(result: InstallCheckResult & { ok: true }): string {
   ].join('\n')
 }
 
-function renderFailure(result: InstallCheckResult & { ok: false }): string {
+export function renderFailure(result: InstallCheckResult & { ok: false }): string {
   const lines = [
     `agent-director install check: FAILED (${result.classLabel})`,
     result.message,
@@ -43,7 +43,7 @@ function renderFailure(result: InstallCheckResult & { ok: false }): string {
   return lines.join('\n')
 }
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   const result = await runInstallCheck()
 
   if (result.ok) {
@@ -62,4 +62,6 @@ async function main(): Promise<void> {
   process.exit(1)
 }
 
-void main()
+if (import.meta.main) {
+  void main()
+}
