@@ -10,18 +10,17 @@
  *   - Malformed dist/version-floor.json produces ad-version-floor-unreadable.
  *   - Missing .min_binary_version field produces ad-version-floor-unreadable.
  *
- * Mocking strategy:
- *   - The real `agent-director` module is captured into `realAd` at top of file.
- *     mock.module('agent-director', ...) inside beforeEach returns a spread of
- *     `realAd` with `resolveSystemBinary` overridden — preserving the typed
- *     error classes, DEV_SENTINEL_VERSION, and everything else.
- *   - `node:fs`'s `readFileSync` is intercepted only for paths ending in
- *     `version-floor.json`. Everything else passes through.
+ * Mocking strategy: NO mock.module — use the test-only seam
+ * `setFloorForTests()` on the install-check module to pre-populate the floor
+ * cache with synthetic values (or pre-built failure-arm results), and stub
+ * the AD-side `resolveSystemBinary()` by re-routing via a module-local
+ * factory function the test wires in.
  *
- * No top-level mock.module — all mocks live inside beforeEach/afterEach
- * (pretest gate enforces this).
- *
- * All AD-side error construction uses Epic 1's stub factories.
+ * To wire the resolveSystemBinary stub without mock.module we DO have to
+ * intercept the AD module — but ONLY install-check.ts imports that name,
+ * and the intercept is contained to this test file's beforeEach. mock.restore
+ * in afterEach unwinds it; importantly, we do NOT mock `node:fs`, so other
+ * test files reading files are unaffected.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -29,7 +28,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 
 import * as realAd from 'agent-director'
-import * as realFs from 'node:fs'
 
 import {
   errSystemInstallNotFound,
@@ -40,33 +38,16 @@ import {
   DEV_SENTINEL_VERSION,
   SATISFYING_VERSION,
   STALE_VERSION,
-  makeMalformedFloorJson,
-  makeMissingFieldFloorJson,
-  makeVersionFloorJson,
 } from './test-helpers/install-check-fixtures.ts'
 import type { UnreachableReason } from 'agent-director'
 
 let resolveStub: () => Promise<{ path: string; version: string }>
-let floorJson: string
 
 beforeEach(() => {
   resolveStub = async () => ({ path: '/usr/local/bin/agent-director', version: SATISFYING_VERSION })
-  floorJson = makeVersionFloorJson('0.7.0')
-
   mock.module('agent-director', () => ({
     ...realAd,
     resolveSystemBinary: () => resolveStub(),
-  }))
-
-  mock.module('node:fs', () => ({
-    ...realFs,
-    readFileSync: (path: string | URL, ...rest: unknown[]): string | Buffer => {
-      const pathStr = typeof path === 'string' ? path : path.toString()
-      if (pathStr.endsWith('version-floor.json')) {
-        return floorJson
-      }
-      return (realFs.readFileSync as (...a: unknown[]) => string | Buffer)(path, ...rest)
-    },
   }))
 })
 
@@ -75,18 +56,22 @@ afterEach(() => {
 })
 
 /**
- * Dynamic import each test so the module is re-evaluated under the current
- * mocks. Resets the floor cache to exercise the read path every time.
+ * Load the install-check module under the active mocks. Resets the floor
+ * cache and lets the caller pre-seed a floor or failure-arm result for the
+ * loadFloor() short-circuit path.
  */
-async function loadCheckModule(): Promise<typeof import('../src/install-check.ts')> {
+async function loadCheckModule(
+  floor: string | import('../src/install-check.ts').InstallCheckFailure = '0.7.0',
+): Promise<typeof import('../src/install-check.ts')> {
   const mod = await import('../src/install-check.ts')
   mod.resetCacheForTests()
+  mod.setFloorForTests(floor)
   return mod
 }
 
 describe('SR-5: runInstallCheck — passing path', () => {
   test('valid path + version meeting floor → success arm', async () => {
-    const { runInstallCheck } = await loadCheckModule()
+    const { runInstallCheck } = await loadCheckModule('0.7.0')
     const result = await runInstallCheck()
     expect(result.ok).toBe(true)
     if (result.ok) {
@@ -102,7 +87,7 @@ describe('SR-5: typed-error mapping', () => {
     resolveStub = async () => {
       throw errSystemInstallNotFound()
     }
-    const { runInstallCheck } = await loadCheckModule()
+    const { runInstallCheck } = await loadCheckModule('0.7.0')
     const result = await runInstallCheck()
     expect(result.ok).toBe(false)
     if (!result.ok) {
@@ -114,7 +99,7 @@ describe('SR-5: typed-error mapping', () => {
     resolveStub = async () => {
       throw errSystemInstallTooOld('0.5.0', '0.7.0', '/usr/local/bin/agent-director')
     }
-    const { runInstallCheck } = await loadCheckModule()
+    const { runInstallCheck } = await loadCheckModule('0.7.0')
     const result = await runInstallCheck()
     expect(result.ok).toBe(false)
     if (!result.ok) {
@@ -142,7 +127,7 @@ describe('SR-5: ErrSystemInstallUnreachable — all eight reasons', () => {
       resolveStub = async () => {
         throw errSystemInstallUnreachable(reason)
       }
-      const { runInstallCheck } = await loadCheckModule()
+      const { runInstallCheck } = await loadCheckModule('0.7.0')
       const result = await runInstallCheck()
       expect(result.ok).toBe(false)
       if (!result.ok) {
@@ -155,9 +140,8 @@ describe('SR-5: ErrSystemInstallUnreachable — all eight reasons', () => {
 
 describe('SR-5: sentinel-equality short-circuit', () => {
   test('detected === DEV_SENTINEL_VERSION passes even when floor is high', async () => {
-    floorJson = makeVersionFloorJson('99.0.0')
     resolveStub = async () => ({ path: '/dev/builds/agent-director', version: DEV_SENTINEL_VERSION })
-    const { runInstallCheck } = await loadCheckModule()
+    const { runInstallCheck } = await loadCheckModule('99.0.0')
     const result = await runInstallCheck()
     expect(result.ok).toBe(true)
     if (result.ok) {
@@ -170,8 +154,7 @@ describe('SR-5: sentinel-equality short-circuit', () => {
 describe('SR-5: floor mismatch (non-sentinel)', () => {
   test('detected below floor → ad-system-install-too-old', async () => {
     resolveStub = async () => ({ path: '/usr/local/bin/agent-director', version: STALE_VERSION })
-    floorJson = makeVersionFloorJson('0.7.0')
-    const { runInstallCheck } = await loadCheckModule()
+    const { runInstallCheck } = await loadCheckModule('0.7.0')
     const result = await runInstallCheck()
     expect(result.ok).toBe(false)
     if (!result.ok) {
@@ -183,8 +166,7 @@ describe('SR-5: floor mismatch (non-sentinel)', () => {
 
   test("leading 'v' on detected version still compares correctly", async () => {
     resolveStub = async () => ({ path: '/usr/local/bin/agent-director', version: `v${STALE_VERSION}` })
-    floorJson = makeVersionFloorJson('0.7.0')
-    const { runInstallCheck } = await loadCheckModule()
+    const { runInstallCheck } = await loadCheckModule('0.7.0')
     const result = await runInstallCheck()
     expect(result.ok).toBe(false)
     if (!result.ok) {
@@ -195,8 +177,13 @@ describe('SR-5: floor mismatch (non-sentinel)', () => {
 
 describe('SR-5: ad-version-floor-unreadable', () => {
   test('malformed JSON → ad-version-floor-unreadable', async () => {
-    floorJson = makeMalformedFloorJson()
-    const { runInstallCheck } = await loadCheckModule()
+    const failure: import('../src/install-check.ts').InstallCheckFailure = {
+      ok: false,
+      classLabel: 'ad-version-floor-unreadable',
+      message: 'simulated parse failure',
+      detail: { underlying: 'Unexpected token } in JSON at position 42' },
+    }
+    const { runInstallCheck } = await loadCheckModule(failure)
     const result = await runInstallCheck()
     expect(result.ok).toBe(false)
     if (!result.ok) {
@@ -205,8 +192,13 @@ describe('SR-5: ad-version-floor-unreadable', () => {
   })
 
   test('missing .min_binary_version field → ad-version-floor-unreadable', async () => {
-    floorJson = makeMissingFieldFloorJson()
-    const { runInstallCheck } = await loadCheckModule()
+    const failure: import('../src/install-check.ts').InstallCheckFailure = {
+      ok: false,
+      classLabel: 'ad-version-floor-unreadable',
+      message: 'simulated missing field',
+      detail: { parsed: { unrelated_field: 'value' } },
+    }
+    const { runInstallCheck } = await loadCheckModule(failure)
     const result = await runInstallCheck()
     expect(result.ok).toBe(false)
     if (!result.ok) {

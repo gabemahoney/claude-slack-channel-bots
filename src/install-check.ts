@@ -252,3 +252,17 @@ export async function runInstallCheck(): Promise<InstallCheckResult> {
 export function resetCacheForTests(): void {
   cachedFloor = null
 }
+
+/**
+ * @internal Test-only — pre-populate the floor cache with a synthetic value
+ * (or a pre-built failure-arm result) so tests can drive every code path
+ * without mocking `node:fs`. Tests must call `resetCacheForTests()` in
+ * teardown to leave the module in a clean state for the next test file.
+ *
+ * Pass a `string` to simulate a successful read of `dist/version-floor.json`
+ * with that `.min_binary_version` value. Pass an `InstallCheckFailure` to
+ * simulate a malformed-JSON / missing-field / unresolvable-subpath read.
+ */
+export function setFloorForTests(value: string | InstallCheckFailure): void {
+  cachedFloor = value
+}
