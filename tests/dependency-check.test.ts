@@ -90,6 +90,8 @@ describe('SR-5.1: Client constructor failure modes', () => {
       expect(outcome.phase).toBe('construct')
       expect(outcome.classLabel).toBe('ad-bun-version-too-old')
       expect(outcome.message).toContain('Bun >= 1.0.21')
+      // SR-4.5: ad-bun-version-too-old does NOT append the manual-skill-install block.
+      expect(outcome.message).not.toContain('skills/install-cscb/SKILL.md')
     }
   })
 
@@ -131,6 +133,8 @@ describe('SR-5.1: same-user check', () => {
       expect(outcome.message).toContain('UID 7777')
       expect(outcome.message).toContain('UID 1000')
       expect(outcome.message).toContain(DEFAULT_STATE_DB_PATH)
+      // SR-4.5: same-user mismatch does NOT append the manual-skill-install block.
+      expect(outcome.message).not.toContain('skills/install-cscb/SKILL.md')
     }
   })
 
@@ -166,6 +170,8 @@ describe('SR-5.1: same-user check', () => {
     if (!outcome.ok) {
       expect(outcome.classLabel).toBe('ad-same-user-stat')
       expect(outcome.message).toContain('EACCES')
+      // SR-4.5: same-user-stat does NOT append the manual-skill-install block.
+      expect(outcome.message).not.toContain('skills/install-cscb/SKILL.md')
     }
   })
 
@@ -270,6 +276,8 @@ describe('SR-5.1: API surface probes', () => {
       expect(outcome.message).toContain('getPermission')
       // Generic remediation points operators at re-installing a matching shim.
       expect(outcome.message).toContain('reinstall a matching')
+      // SR-4.5: ad-shim-* branches do NOT append the manual-skill-install block.
+      expect(outcome.message).not.toContain('skills/install-cscb/SKILL.md')
     }
   })
 
@@ -291,6 +299,8 @@ describe('SR-5.1: API surface probes', () => {
       expect(outcome.classLabel).toBe('ad-shim-catalog-incomplete')
       expect(outcome.message).toContain('ErrInvalidFlags')
       expect(outcome.message).toContain('reinstall a matching')
+      // SR-4.5: ad-shim-* branches do NOT append the manual-skill-install block.
+      expect(outcome.message).not.toContain('skills/install-cscb/SKILL.md')
     }
   })
 
@@ -331,6 +341,8 @@ describe('SR-5.1: API surface probes', () => {
       expect(outcome.classLabel).toBe('ad-shim-decide-drops-token')
       expect(outcome.message).toContain('--request-token')
       expect(outcome.message).toContain(detail)
+      // SR-4.5: ad-shim-* branches do NOT append the manual-skill-install block.
+      expect(outcome.message).not.toContain('skills/install-cscb/SKILL.md')
     }
   })
 
@@ -548,6 +560,8 @@ describe('SR-4.2: system-install typed-error branches', () => {
       expect(outcome.phase).toBe('construct')
       expect(outcome.classLabel).toBe('ad-system-install-not-found')
       expect(outcome.message).toContain('agent-director')
+      // SR-4.5: appends the manual-skill-install instructions block.
+      expect(outcome.message).toContain('skills/install-cscb/SKILL.md')
     }
   })
 
@@ -564,6 +578,8 @@ describe('SR-4.2: system-install typed-error branches', () => {
       expect(outcome.classLabel).toBe('ad-system-install-too-old')
       expect(outcome.message).toContain('0.5.0')
       expect(outcome.message).toContain('0.7.0')
+      // SR-4.5: appends the manual-skill-install instructions block.
+      expect(outcome.message).toContain('skills/install-cscb/SKILL.md')
     }
   })
 
@@ -583,6 +599,8 @@ describe('SR-4.2: system-install typed-error branches', () => {
     if (!outcome.ok) {
       expect(outcome.classLabel).toBe('ad-system-install-unreachable')
       expect(outcome.message).toContain('not-executable')
+      // SR-4.5: appends the manual-skill-install instructions block.
+      expect(outcome.message).toContain('skills/install-cscb/SKILL.md')
     }
   })
 

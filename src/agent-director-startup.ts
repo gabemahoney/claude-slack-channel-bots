@@ -50,6 +50,7 @@ import {
   setClient,
   setClientForTests,
 } from './agent-director-client.ts'
+import { renderInstallSkillInstructions } from './install-skill-pointer.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -290,7 +291,8 @@ export async function runStartupGate(
         message:
           `agent-director system install not found. The startup gate searched ` +
           `the standard install path and PATH but did not locate the agent-director ` +
-          `binary. Install agent-director (system-wide) and retry.`,
+          `binary. Install agent-director (system-wide) and retry.` +
+          renderInstallSkillInstructions(),
       }
     }
     if (err instanceof ErrSystemInstallTooOld) {
@@ -301,7 +303,8 @@ export async function runStartupGate(
         message:
           `agent-director system install is too old. ` +
           `Detected version ${err.actualVersion} is below the required floor ${err.requiredVersion} ` +
-          `(binary at ${err.binaryPath}). Upgrade agent-director and retry.`,
+          `(binary at ${err.binaryPath}). Upgrade agent-director and retry.` +
+          renderInstallSkillInstructions(),
       }
     }
     if (err instanceof ErrSystemInstallUnreachable) {
@@ -313,7 +316,8 @@ export async function runStartupGate(
           `agent-director system install is unreachable. ` +
           `Reason: ${err.reason}. ` +
           `Binary at ${err.binaryPath} could not be invoked successfully. ` +
-          `Diagnose with the install-cscb skill or re-install agent-director.`,
+          `Diagnose with the install-cscb skill or re-install agent-director.` +
+          renderInstallSkillInstructions(),
       }
     }
     const detail = err instanceof Error ? err.message : String(err)
