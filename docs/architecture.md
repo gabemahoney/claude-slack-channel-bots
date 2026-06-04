@@ -24,6 +24,7 @@ cli.ts                          CLI entry point — start/stop/clean_restart sub
     ├── permission-poller.ts    SR-2.1 polling loop + SR-2.2 Block Kit emitter. Owns the live LivePermission map, keyed on the composite `(claude_instance_id, request_token)` pair, consumes AD's plural `permission_requests` projection, posts one Slack message per open row, and runs the SR-2.4 set-diff + `get-permission` closure reconciliation with four verdict-distinct chat.update renderings (operator-allow / operator-deny / timeout / find_missing) plus a fail-closed generic-deny fallback for unknown decision_reason and `ErrPermissionRequestNotFound`.
     ├── permission-click-handler.ts  SR-4 single-decide-call relay; parses the action_id, calls `decideWithToken` unconditionally (always carrying the decoded `request_token`), renders one `chat.update` carrying the same verdict text the poller's SR-2.4 reconciliation produces (`*Permission* — Allowed` / `*Permission* — Denied by operator`) when a live entry is present, calls `markHandled` on success, swallows `ErrAlreadyDecided` silently, logs `ErrInvalidFlags` / `ErrAmbiguousRequest` without retry. Never calls `get` or `getPermission`; never mutates the pending map directly.
     ├── permission-action-id.ts SR-3 encode/decode helpers; anchored regex `^perm_(allow|deny)_(cscb_.+)_(<UUIDv4>)$` where the trailing UUIDv4-shape group is an outer-structure anchor disambiguating the underscore-bearing claude_instance_id capture — NOT a token-content validator (SR-1.3).
+    ├── permission-trail.ts    SR-V visibility trail emitter — append-only JSONL store at `~/.claude/channels/slack/permission-trail.jsonl`; lazy-open fd, `emitTrail()` / `emitTrailEvent()` API used by the poller, click handler, decide call, and closure render. See [permission-trail.jsonl](#permission-trailjsonl-claudechannelsslackpermission-trailjsonl).
     ├── restart.ts              Auto-restart — delayed relaunch on disconnect, failure counting, timer cancellation.
     ├── health-check.ts         Periodic liveness poller — checks routes on a timer via client.status; schedules restarts for dead sessions.
     ├── pid.ts                  PID file management — write, read, conflict detection, isProcessRunning.
@@ -290,6 +291,49 @@ Persistent CSCB-spawn registry — owned by agent-director, not CSCB. CSCB reads
 ### startup-errors.log (~/.claude/channels/slack/startup-errors.log)
 
 Append-only log of fatal startup errors written by `recordStartupError` (`src/startup-errors.ts`). One timestamped line per entry; includes the agent-director `errName` when surfacing typed library errors. Rotation is operator-owned via `docs/logrotate-startup-errors.conf`.
+
+### permission-trail.jsonl (~/.claude/channels/slack/permission-trail.jsonl)
+
+Append-only **JSON Lines** event store for the CSCB-side visibility trail of the AD↔CSCB tool-permission relay (SRD `t1.cdb.4g`). One JSON object per newline-terminated line. The file path honors `SLACK_STATE_DIR` — default `~/.claude/channels/slack/permission-trail.jsonl`. Owned by `src/permission-trail.ts`; every emit goes through `emitTrail()` (auto-stamps `ts`) or `emitTrailEvent()` (caller-supplied `ts`).
+
+**Line schema** (enforced at the emitter — SR-V-1 / SR-V-4.5):
+
+| Field | Type | When present | Notes |
+|---|---|---|---|
+| `ts` | string | always | RFC 3339 with ≥ ms precision (SR-V-4.3, SR-V-4.5). Substituted with a `[slack]` warning if missing/invalid. |
+| `event` | string | always | Stable hierarchical identifier in the `cscb.*` namespace (e.g. `cscb.chat_post.attempted`, `cscb.click_handler.invoked`, `cscb.chat_update.attempted`, `cscb.decide.attempted`, `cscb.block_actions.received`). |
+| `request_token` | string | when AD has minted one | AD-side UUID (SR-V-1.1). Absent for events emitted before token assignment (SR-V-1.2). |
+| `claude_instance_id` | string | whenever known | Primary join key when `request_token` is absent (SR-V-1.2). |
+| `channel` | string | events touching Slack | Slack channel id (SR-V-1.3). |
+| `message_ts` | string | events touching Slack | Slack message `ts` of the prompt or closure (SR-V-1.3). |
+| _per-event-class fields_ | any | event-class specific | Passed through verbatim — no truncation (SR-V-3). |
+
+**Example line** (a `chat.postMessage` attempt emitted by the SR-2.1 poller):
+
+```json
+{"ts":"2026-06-04T20:39:58.123Z","event":"cscb.chat_post.attempted","claude_instance_id":"cscb_demo_C0B1ZJJLJ9M","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","channel":"C0B1ZJJLJ9M","text":"*Permission* requested for `Bash`","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"…"}},{"type":"actions","elements":[{"type":"button","action_id":"perm_allow_cscb_demo_C0B1ZJJLJ9M_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","text":{"type":"plain_text","text":"Allow"}},{"type":"button","action_id":"perm_deny_cscb_demo_C0B1ZJJLJ9M_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","text":{"type":"plain_text","text":"Deny"}}]}],"ok":true,"slack_ts":"1717536002.000100"}
+```
+
+**No-truncation guarantee.** The canonical trail line persists every field at full fidelity (SR-V-3.1) — the full `blocks` array including every `action_id`, the full `text`, the full Slack API response. The 300-character `console.error('[slack] RAW message event:', JSON.stringify(...).slice(0, 300))` summaries at `src/server.ts:699` / `:712` are a **separate human-readable log** kept truncated intentionally per SR-V-3.2; they do not replace the canonical store and the two coexist.
+
+**`jq` smoke-check** — confirm the file is valid JSONL and pivot by correlation key:
+
+```sh
+# Every line parses as JSON
+jq -c . ~/.claude/channels/slack/permission-trail.jsonl | head -3
+
+# Every event for one request_token, in time order
+jq -c 'select(.request_token=="6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd")' \
+  ~/.claude/channels/slack/permission-trail.jsonl
+
+# Every event on a Slack channel within a time window (SR-V-5.2)
+jq -c 'select(.channel=="C0B1ZJJLJ9M" and .ts>="2026-06-04T20:00:00Z" and .ts<="2026-06-04T21:00:00Z")' \
+  ~/.claude/channels/slack/permission-trail.jsonl
+```
+
+**Federation.** AD emits a complementary JSONL log on its side (`t1.n4v.14`). The two logs join on `request_token` + `claude_instance_id` per SR-V-4. No shared store; the operator stitches the trail via `jq` or equivalent.
+
+**Retention.** None. The file is append-only and the system does not self-protect against disk pressure (SR-V-5.5). Operators rotate / archive / delete out-of-band.
 
 ### Removed pre-Epic-2 files
 
