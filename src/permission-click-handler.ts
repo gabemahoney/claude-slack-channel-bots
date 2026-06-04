@@ -23,17 +23,42 @@ import type { WebClient } from '@slack/web-api'
 import { decideWithToken } from './agent-director-client.ts'
 import { parsePermissionActionId, type PermissionDecision } from './permission-action-id.ts'
 import { getLivePermission, markHandled } from './permission-poller.ts'
+import { emitTrail as defaultEmitTrail } from './permission-trail.ts'
+import type { ClosureVerdictTag, TrailEventBase } from './permission-trail.ts'
 
 export interface ClickDeps {
   /** Returns an AD Client whose `decide` method this handler will invoke. */
   getClient: () => Pick<Client, 'decide'>
   web: Pick<WebClient, 'chat'>
   log?: (...args: unknown[]) => void
+  /**
+   * Trail emitter hook (SR-V). Defaults to `emitTrail` from
+   * `permission-trail.ts`. Tests override with a capture stub.
+   */
+  emitTrail?: (
+    partial: Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown },
+  ) => void
 }
 
 function logDeps(deps: ClickDeps, ...args: unknown[]): void {
   if (deps.log) deps.log(...args)
   else console.error(...args)
+}
+
+/** SR-V-2.5 Slack error class string (mirrors permission-poller.ts). */
+function classifySlackError(err: unknown): string {
+  if (err !== null && typeof err === 'object') {
+    const data = (err as { data?: unknown }).data
+    if (data !== null && typeof data === 'object') {
+      const e = (data as { error?: unknown }).error
+      if (typeof e === 'string' && e.length > 0) return e
+    }
+  }
+  if (err instanceof Error) {
+    if (err.name === 'AbortError') return 'aborted'
+    return 'network_error'
+  }
+  return 'unknown_error'
 }
 
 // Match the poller's SR-2.4 terminal verdict text exactly so the click-handler
@@ -104,16 +129,36 @@ export async function handlePermissionClick(
   const text = decision === 'allow'
     ? '*Permission* — Allowed'
     : '*Permission* — Denied by operator'
+  const blocks = buildDecisionBlocks(decision)
+  const verdictTag: ClosureVerdictTag = decision === 'allow'
+    ? 'click_handler_allow'
+    : 'click_handler_deny'
+  const emit = deps.emitTrail ?? defaultEmitTrail
+  const envelope = {
+    event: 'cscb.chat_update.attempted',
+    claude_instance_id: claudeInstanceId,
+    request_token: requestToken,
+    channel: entry.channelId,
+    message_ts: entry.messageTs,
+    text,
+    blocks,
+    verdict_tag: verdictTag,
+    triggered_by: 'click_handler' as const,
+  }
   try {
     await deps.web.chat.update({
       channel: entry.channelId,
       ts: entry.messageTs,
       text,
-      blocks: buildDecisionBlocks(decision) as never,
+      blocks: blocks as never,
     })
     markHandled(claudeInstanceId, requestToken)
+    emit({ ...envelope, ok: true })
   } catch (err) {
-    logDeps(deps, `[slack] permission-click: decision chat.update failed for ${claudeInstanceId}:`, err)
+    // SR-V-2.5: failure-only logDeps removed; ok=false event is now the
+    // first-class failure signal. error carries the Slack platform error
+    // class string, not JS Error.name.
+    emit({ ...envelope, ok: false, error: classifySlackError(err) })
   }
   return true
 }

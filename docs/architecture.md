@@ -369,6 +369,40 @@ Fields:
 {"ts":"2026-06-04T20:39:58.123Z","event":"cscb.chat_post.attempted","claude_instance_id":"cscb_demo_C0B1ZJJLJ9M","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","channel":"C0B1ZJJLJ9M","text":"🤖🛠️ permission request: Bash","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"🤖🛠️ *Bash*\n`ls`"}},{"type":"actions","elements":[{"type":"button","text":{"type":"plain_text","text":"Allow"},"style":"primary","action_id":"perm_allow_cscb_demo_C0B1ZJJLJ9M_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd"},{"type":"button","text":{"type":"plain_text","text":"Deny"},"style":"danger","action_id":"perm_deny_cscb_demo_C0B1ZJJLJ9M_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd"}]}],"ok":true,"slack_ts":"1780600244.439969"}
 ```
 
+#### `cscb.chat_update.attempted` (SR-V-2.5)
+
+Emitted for every `chat.update` that closes out a permission prompt. Two surfaces emit: the poller's `renderClosureUpdate` (`src/permission-poller.ts`) and the click handler's verdict-render (`src/permission-click-handler.ts`). Both success and failure emit. The pre-Epic-3 failure-only `logViaDeps` / `logDeps` paths for closure `chat.update` (in both modules) have been removed — failures now surface as `ok=false` with the Slack platform error class string.
+
+Fields:
+- `ts`, `event="cscb.chat_update.attempted"`, `claude_instance_id`, `request_token`, `channel`, `message_ts` (the prompt `ts` being updated).
+- `text` — the new closure text, untruncated.
+- `blocks` — the new closure blocks array, untruncated.
+- `verdict_tag` — one of the 8 values below.
+- `triggered_by` — `"poller"` or `"click_handler"`.
+- `ok` — `true` on success, `false` on failure.
+- On failure: `error` — Slack platform error class string (e.g. `"message_not_found"`); never JS `Error.name`.
+
+**Verdict tags** — closure rendering identity. The set is open to extension.
+
+| `verdict_tag` | Emitted from | Meaning |
+|---|---|---|
+| `operator_allow` | poller | `decision=allow`, `decision_reason=null` — operator allowed via click or TUI. |
+| `operator_deny` | poller | `decision=deny`, `decision_reason="operator"`. |
+| `timeout` | poller | `decision=deny`, `decision_reason="timeout"`. |
+| `find_missing` | poller | `decision=deny`, `decision_reason="find_missing"` — spawn ended before the human responded. |
+| `unknown` | poller | Any other `decision`/`decision_reason` pair — fail-closed generic deny per SR-5.2. |
+| `not_found` | poller | `getPermission` returned `ErrPermissionRequestNotFound`. |
+| `click_handler_allow` | click handler | Allow button click whose `chat.update` rendered the verdict. |
+| `click_handler_deny` | click handler | Deny button click whose `chat.update` rendered the verdict. |
+
+**`triggered_by` values** — `"poller"` (SR-2.4 reconciliation) or `"click_handler"` (SR-4.5 verdict render). Open to extension.
+
+**Example** — poller-reconciled `operator_allow` closure:
+
+```json
+{"ts":"2026-06-04T20:40:02.456Z","event":"cscb.chat_update.attempted","claude_instance_id":"cscb_demo_C0B1ZJJLJ9M","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","channel":"C0B1ZJJLJ9M","message_ts":"1780600244.439969","text":"*Permission* — Allowed","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"*Permission* — Allowed"}}],"verdict_tag":"operator_allow","triggered_by":"poller","ok":true}
+```
+
 ### Removed pre-Epic-2 files
 
 The previous tmux-direct architecture wrote `~/.claude/channels/slack/sessions.json` to persist tmux session names and discovered Claude session UUIDs. Both responsibilities have moved to agent-director — `sessions.json` and `sessions.json.last` no longer exist. Operators upgrading from a pre-Epic-2 install can safely delete the stale files; CSCB will not read them.

@@ -1669,3 +1669,128 @@ describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted
     expect(decision!.claude_instance_id).toBe(post!.claude_instance_id)
   })
 })
+
+// ---------------------------------------------------------------------------
+// SR-V Epic 3 — cscb.chat_update.attempted (poller-triggered)
+// ---------------------------------------------------------------------------
+
+describe('trail events — cscb.chat_update.attempted (poller-triggered)', () => {
+  function makeClosureScenario(
+    getPermissionImpl: (params: GetPermissionParams) => Promise<GetPermissionResult>,
+    updateError?: Error,
+  ): {
+    ivl: ReturnType<typeof makeInterval>
+    chat: ReturnType<typeof makeChatStub>
+    trail: ReturnType<typeof makeTrailCapture>
+    drive: () => Promise<void>
+  } {
+    const ivl = makeInterval()
+    const chatOpts: { tsSequence: [string]; updateError?: Error } = { tsSequence: [POST_TS] }
+    if (updateError !== undefined) chatOpts.updateError = updateError
+    const chat = makeChatStub(chatOpts)
+    const trail = makeTrailCapture()
+    let listProjection: ReturnType<typeof cannedPermissionRequest>[] = [
+      cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 }),
+    ]
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: listProjection,
+      }),
+      getPermission: getPermissionImpl,
+    })
+    startPermissionPoller({
+      getClient, web: chat.web as never, intervalMs: 1000,
+      setInterval: ivl.setInterval, clearInterval: ivl.clearInterval,
+      emitTrail: trail.emit,
+      log: () => { /* swallow */ },
+    })
+    const drive = async (): Promise<void> => {
+      ivl.pending[0].cb()
+      await new Promise(r => setTimeout(r, 10))
+      listProjection = []
+      ivl.pending[0].cb()
+      await new Promise(r => setTimeout(r, 10))
+    }
+    return { ivl, chat, trail, drive }
+  }
+
+  test('operator_allow → ok=true, triggered_by=poller, target ts matches prompt', async () => {
+    const scenario = makeClosureScenario(async (p) =>
+      cannedGetPermissionResponse({ request_token: p.request_token, decision: 'allow', decision_reason: null }),
+    )
+    await scenario.drive()
+    const closure = scenario.trail.events.find(e => e.event === 'cscb.chat_update.attempted')
+    expect(closure).toBeDefined()
+    expect(closure!['verdict_tag']).toBe('operator_allow')
+    expect(closure!['triggered_by']).toBe('poller')
+    expect(closure!['ok']).toBe(true)
+    expect(closure!.channel).toBe(CHANNEL_CH)
+    expect(closure!.message_ts).toBe(POST_TS)
+    expect(typeof closure!['text']).toBe('string')
+    expect(Array.isArray(closure!['blocks'])).toBe(true)
+  })
+
+  test('operator_deny verdict tag', async () => {
+    const scenario = makeClosureScenario(async (p) =>
+      cannedGetPermissionResponse({ request_token: p.request_token, decision: 'deny', decision_reason: 'operator' }),
+    )
+    await scenario.drive()
+    const closure = scenario.trail.events.find(e => e.event === 'cscb.chat_update.attempted')
+    expect(closure!['verdict_tag']).toBe('operator_deny')
+    expect(closure!['triggered_by']).toBe('poller')
+  })
+
+  test('timeout verdict tag', async () => {
+    const scenario = makeClosureScenario(async (p) =>
+      cannedGetPermissionResponse({ request_token: p.request_token, decision: 'deny', decision_reason: 'timeout' }),
+    )
+    await scenario.drive()
+    const closure = scenario.trail.events.find(e => e.event === 'cscb.chat_update.attempted')
+    expect(closure!['verdict_tag']).toBe('timeout')
+  })
+
+  test('find_missing verdict tag', async () => {
+    const scenario = makeClosureScenario(async (p) =>
+      cannedGetPermissionResponse({ request_token: p.request_token, decision: 'deny', decision_reason: 'find_missing' }),
+    )
+    await scenario.drive()
+    const closure = scenario.trail.events.find(e => e.event === 'cscb.chat_update.attempted')
+    expect(closure!['verdict_tag']).toBe('find_missing')
+  })
+
+  test('unknown verdict tag on weird decision/reason pair', async () => {
+    const scenario = makeClosureScenario(async (p) =>
+      cannedGetPermissionResponse({ request_token: p.request_token, decision: 'deny', decision_reason: 'someone_else' as never }),
+    )
+    await scenario.drive()
+    const closure = scenario.trail.events.find(e => e.event === 'cscb.chat_update.attempted')
+    expect(closure!['verdict_tag']).toBe('unknown')
+  })
+
+  test('not_found verdict tag when getPermission throws ErrPermissionRequestNotFound', async () => {
+    const scenario = makeClosureScenario(async (_) => { throw errPermissionRequestNotFound() })
+    await scenario.drive()
+    const closure = scenario.trail.events.find(e => e.event === 'cscb.chat_update.attempted')
+    expect(closure!['verdict_tag']).toBe('not_found')
+  })
+
+  test('closure chat.update failure → ok=false, error=Slack platform error class', async () => {
+    const platformError = Object.assign(new Error('platform error'), {
+      name: 'WebAPIPlatformError',
+      data: { ok: false, error: 'message_not_found' },
+    })
+    const scenario = makeClosureScenario(
+      async (p) => cannedGetPermissionResponse({ request_token: p.request_token, decision: 'allow', decision_reason: null }),
+      platformError,
+    )
+    await scenario.drive()
+    const closure = scenario.trail.events.find(e => e.event === 'cscb.chat_update.attempted')
+    expect(closure).toBeDefined()
+    expect(closure!['ok']).toBe(false)
+    expect(closure!['error']).toBe('message_not_found')
+    expect(closure!['triggered_by']).toBe('poller')
+  })
+})

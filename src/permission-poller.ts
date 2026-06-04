@@ -52,7 +52,11 @@ import type {
 } from './agent-director-client.ts'
 import { encodePermissionActionId } from './permission-action-id.ts'
 import { emitTrail as defaultEmitTrail } from './permission-trail.ts'
-import type { RowDecisionAction, TrailEventBase } from './permission-trail.ts'
+import type {
+  ClosureVerdictTag,
+  RowDecisionAction,
+  TrailEventBase,
+} from './permission-trail.ts'
 
 // ---------------------------------------------------------------------------
 // Wire-shape types (local — mirrors the `^0.6.0` wire)
@@ -558,6 +562,18 @@ async function renderClosureUpdate(
   tag: VerdictTag,
 ): Promise<void> {
   const { text, blocks } = buildVerdictRendering(tag)
+  const emit = deps.emitTrail ?? defaultEmitTrail
+  const envelope = {
+    event: 'cscb.chat_update.attempted',
+    claude_instance_id: entry.claudeInstanceId,
+    request_token: entry.requestToken,
+    channel: entry.channelId,
+    message_ts: entry.messageTs,
+    text,
+    blocks,
+    verdict_tag: tag as ClosureVerdictTag,
+    triggered_by: 'poller' as const,
+  }
   try {
     await deps.web.chat.update({
       channel: entry.channelId,
@@ -565,8 +581,12 @@ async function renderClosureUpdate(
       text,
       blocks: blocks as never,
     })
+    emit({ ...envelope, ok: true })
   } catch (err) {
-    logViaDeps(deps, `[slack] permission-poller: closure chat.update failed for ${entry.claudeInstanceId} token=${entry.requestToken} (verdict=${tag}):`, err)
+    // SR-V-2.5: failure-only logViaDeps removed; ok=false event is now the
+    // first-class failure signal. error carries the Slack platform error
+    // class string, not JS Error.name.
+    emit({ ...envelope, ok: false, error: classifySlackError(err) })
   }
 }
 

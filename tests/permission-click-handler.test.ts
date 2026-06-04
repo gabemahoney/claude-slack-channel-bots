@@ -26,7 +26,10 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import type { DecideParams, DecideResult } from 'agent-director'
 import { handlePermissionClick } from '../src/permission-click-handler.ts'
 import { encodePermissionActionId } from '../src/permission-action-id.ts'
@@ -36,6 +39,7 @@ import {
   startPermissionPoller,
   stopPermissionPoller,
 } from '../src/permission-poller.ts'
+import { _resetTrailFdForTests, type TrailEventBase } from '../src/permission-trail.ts'
 import {
   cannedGetResultPlural,
   cannedListRow,
@@ -44,6 +48,45 @@ import {
   errAmbiguousRequest,
   errInvalidFlags,
 } from './test-helpers/agent-director-stub.ts'
+
+// ---------------------------------------------------------------------------
+// SLACK_STATE_DIR isolation — default emitTrail in the click handler would
+// otherwise land on the operator's real ~/.claude/channels/slack/.
+// ---------------------------------------------------------------------------
+
+let trailTempDir: string
+let origStateDir: string | undefined
+
+beforeAll(() => {
+  trailTempDir = mkdtempSync(join(tmpdir(), 'click-trail-isolation-'))
+  origStateDir = process.env['SLACK_STATE_DIR']
+  process.env['SLACK_STATE_DIR'] = trailTempDir
+})
+
+afterAll(() => {
+  if (origStateDir === undefined) delete process.env['SLACK_STATE_DIR']
+  else process.env['SLACK_STATE_DIR'] = origStateDir
+  _resetTrailFdForTests()
+  rmSync(trailTempDir, { recursive: true, force: true })
+})
+
+beforeEach(() => {
+  _resetTrailFdForTests()
+})
+
+// ---------------------------------------------------------------------------
+// Trail event capture (Epic 3 closure tests)
+// ---------------------------------------------------------------------------
+
+type CapturedTrailEvent = Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown }
+
+function makeTrailCapture(): {
+  emit: (partial: CapturedTrailEvent) => void
+  events: CapturedTrailEvent[]
+} {
+  const events: CapturedTrailEvent[] = []
+  return { events, emit: (p) => { events.push(p) } }
+}
 
 // ---------------------------------------------------------------------------
 // Shared fixtures — no inline magic strings (SR-8.1)
@@ -237,6 +280,7 @@ interface ClickHandlerDepsShape {
   getClient: () => { decide: (params: DecideParams) => Promise<DecideResult> }
   web: { chat: { update: (args: unknown) => Promise<unknown> } }
   log?: (...args: unknown[]) => void
+  emitTrail?: (partial: CapturedTrailEvent) => void
 }
 
 afterEach(() => {
@@ -393,8 +437,9 @@ describe('handlePermissionClick — happy path', () => {
     const entry = getLivePermission(INSTANCE_C, TOKEN_A)
     expect(entry).toBeDefined()
     expect(entry?.handled).toBe(false)
-    // The failure was logged.
-    expect(logs.length).toBeGreaterThan(0)
+    // SR-V-2.5: the prior failure-only log was removed; the failure now
+    // surfaces via cscb.chat_update.attempted{ok=false}, asserted separately.
+    expect(logs.length).toBe(0)
     // The original seeded stub did not see the update (it landed on the
     // separately-stubbed chatForClick), so the poller's chat history is
     // untouched.
@@ -672,4 +717,110 @@ describe('handlePermissionClick — helper sanity', () => {
     expect(entry?.handled).toBe(false)
   })
 
+})
+
+// ---------------------------------------------------------------------------
+// SR-V Epic 3 — cscb.chat_update.attempted (click-handler-triggered)
+// ---------------------------------------------------------------------------
+
+describe('trail events — cscb.chat_update.attempted (click-handler-triggered)', () => {
+  test('Allow click → ok=true, verdict_tag=click_handler_allow, triggered_by=click_handler', async () => {
+    const seed = await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_A,
+    })
+    const entry = getLivePermission(INSTANCE_C, TOKEN_A)!
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub()
+    await handlePermissionClick(
+      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
+      {
+        getClient: () => decide.client,
+        web: seed.chat.web as never,
+        emitTrail: trail.emit,
+      } satisfies ClickHandlerDepsShape as never,
+    )
+    const closure = trail.events.find(e => e.event === 'cscb.chat_update.attempted')
+    expect(closure).toBeDefined()
+    expect(closure!['verdict_tag']).toBe('click_handler_allow')
+    expect(closure!['triggered_by']).toBe('click_handler')
+    expect(closure!['ok']).toBe(true)
+    expect(closure!.channel).toBe(CHANNEL_CH)
+    expect(closure!.message_ts).toBe(entry.messageTs)
+    expect(typeof closure!['text']).toBe('string')
+    expect(Array.isArray(closure!['blocks'])).toBe(true)
+    expect(closure!.request_token).toBe(TOKEN_A)
+  })
+
+  test('Deny click → ok=true, verdict_tag=click_handler_deny', async () => {
+    const seed = await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_A,
+    })
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub()
+    await handlePermissionClick(
+      encodePermissionActionId('deny', INSTANCE_C, TOKEN_A),
+      {
+        getClient: () => decide.client,
+        web: seed.chat.web as never,
+        emitTrail: trail.emit,
+      } satisfies ClickHandlerDepsShape as never,
+    )
+    const closure = trail.events.find(e => e.event === 'cscb.chat_update.attempted')
+    expect(closure!['verdict_tag']).toBe('click_handler_deny')
+    expect(closure!['triggered_by']).toBe('click_handler')
+    expect(closure!['ok']).toBe(true)
+  })
+
+  test('chat.update Slack platform error → ok=false, error=Slack platform error class', async () => {
+    await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_A,
+    })
+    const platformError = Object.assign(new Error('platform error'), {
+      name: 'WebAPIPlatformError',
+      data: { ok: false, error: 'message_not_found' },
+    })
+    const chatForClick = makeChatStub({ updateError: platformError })
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub()
+    await handlePermissionClick(
+      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
+      {
+        getClient: () => decide.client,
+        web: chatForClick.web as never,
+        emitTrail: trail.emit,
+      } satisfies ClickHandlerDepsShape as never,
+    )
+    const closure = trail.events.find(e => e.event === 'cscb.chat_update.attempted')
+    expect(closure).toBeDefined()
+    expect(closure!['ok']).toBe(false)
+    expect(closure!['error']).toBe('message_not_found')
+    expect(closure!['triggered_by']).toBe('click_handler')
+  })
+
+  test('request_token correlation: trail event request_token matches decoded action_id', async () => {
+    const seed = await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_C,
+    })
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub()
+    await handlePermissionClick(
+      encodePermissionActionId('allow', INSTANCE_C, TOKEN_C),
+      {
+        getClient: () => decide.client,
+        web: seed.chat.web as never,
+        emitTrail: trail.emit,
+      } satisfies ClickHandlerDepsShape as never,
+    )
+    const closure = trail.events.find(e => e.event === 'cscb.chat_update.attempted')
+    expect(closure!.request_token).toBe(TOKEN_C)
+    expect(closure!.claude_instance_id).toBe(INSTANCE_C)
+  })
 })

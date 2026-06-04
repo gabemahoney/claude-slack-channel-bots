@@ -81,6 +81,31 @@ export type CanonicalRowDecisionAction = (typeof ROW_DECISION_ACTIONS)[number]
 // eslint-disable-next-line @typescript-eslint/ban-types
 export type RowDecisionAction = CanonicalRowDecisionAction | (string & {})
 
+/**
+ * The 8 canonical verdict tags carried on `cscb.chat_update.attempted` events
+ * (SR-V-2.5). 6 are emitted by the poller's `renderClosureUpdate`; 2 are
+ * emitted by the click handler's verdict-render path. Open to extension.
+ */
+export const CLOSURE_VERDICT_TAGS = [
+  'operator_allow',
+  'operator_deny',
+  'timeout',
+  'find_missing',
+  'unknown',
+  'not_found',
+  'click_handler_allow',
+  'click_handler_deny',
+] as const
+
+export type CanonicalClosureVerdictTag = (typeof CLOSURE_VERDICT_TAGS)[number]
+
+// eslint-disable-next-line @typescript-eslint/ban-types
+export type ClosureVerdictTag = CanonicalClosureVerdictTag | (string & {})
+
+/** Which surface triggered a closure `chat.update` (SR-V-2.5). Open to extension. */
+// eslint-disable-next-line @typescript-eslint/ban-types
+export type TriggeredBy = 'poller' | 'click_handler' | (string & {})
+
 // ---------------------------------------------------------------------------
 // State-dir + path resolution
 // ---------------------------------------------------------------------------

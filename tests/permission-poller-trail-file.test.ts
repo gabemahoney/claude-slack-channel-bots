@@ -22,10 +22,12 @@ import {
 import { _resetTrailFdForTests } from '../src/permission-trail.ts'
 import { parsePermissionActionId } from '../src/permission-action-id.ts'
 import {
+  cannedGetPermissionResponse,
   cannedGetResultPlural,
   cannedListRow,
   cannedPermissionRequest,
 } from './test-helpers/agent-director-stub.ts'
+import type { GetPermissionParams, GetPermissionResult } from '../src/agent-director-client.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -216,6 +218,63 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
       claudeInstanceId: INSTANCE_C,
       requestToken: TOKEN_A,
     })
+  })
+
+  test('closure persists on disk: row_decision{reconciled_closed} + chat_update.attempted{operator_allow} land with the original prompt ts (SRD §10 Q5)', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ ts: SLACK_RETURNED_TS })
+    let listProjection: ReturnType<typeof cannedPermissionRequest>[] = [
+      cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 }),
+    ]
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: listProjection,
+      }),
+      getPermission: async (p: GetPermissionParams): Promise<GetPermissionResult> =>
+        cannedGetPermissionResponse({ request_token: p.request_token, decision: 'allow', decision_reason: null }),
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+    })
+
+    // Tick 1: post
+    ivl.pending[0]!.cb()
+    await new Promise(r => setTimeout(r, 20))
+    // Tick 2: closure
+    listProjection = []
+    ivl.pending[0]!.cb()
+    await new Promise(r => setTimeout(r, 20))
+
+    const matching = readAllLines().filter(e => e['request_token'] === TOKEN_A)
+    const events = matching.map(e => e['event'])
+    // Ordered subsequence: post first, then closure.
+    expect(events).toEqual([
+      'cscb.poller.row_decision',
+      'cscb.chat_post.attempted',
+      'cscb.poller.row_decision',
+      'cscb.chat_update.attempted',
+    ])
+
+    const post = matching.find(e => e['event'] === 'cscb.chat_post.attempted')!
+    const closureDecision = matching.find(
+      e => e['event'] === 'cscb.poller.row_decision' && e['action'] === 'reconciled_closed',
+    )
+    const closure = matching.find(e => e['event'] === 'cscb.chat_update.attempted')!
+
+    expect(closureDecision).toBeDefined()
+    expect(closure['verdict_tag']).toBe('operator_allow')
+    expect(closure['triggered_by']).toBe('poller')
+    expect(closure['ok']).toBe(true)
+    // SRD §10 Q5: closure renders on the same ts the original post returned.
+    expect(closure['message_ts']).toBe(post['slack_ts'])
+    expect(closure['channel']).toBe(CHANNEL_CH)
   })
 
   test('failure: Slack platform error → chat_post.attempted{ok=false,error="channel_not_found"} persisted', async () => {
