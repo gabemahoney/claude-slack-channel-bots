@@ -1,4 +1,4 @@
-FROM cscb-ci-base:v1
+FROM cscb-ci-base:v2
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 

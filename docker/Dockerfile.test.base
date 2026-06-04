@@ -32,3 +32,41 @@ COPY package.json /tmp/package-for-ad-resolve.json
 RUN AD_RANGE=$(jq -r '.dependencies["agent-director"]' /tmp/package-for-ad-resolve.json) && \
     bun add -g "agent-director@${AD_RANGE}" && \
     rm /tmp/package-for-ad-resolve.json
+
+# agent-director Go binary — the npm package above only ships the TS shim;
+# CSCB's startup gate (SR-5.1) requires the actual Go binary reachable on PATH.
+# Resolve the exact installed npm version from the shim's package.json, then
+# fetch the matching linux-amd64 release asset from GitHub. The release repo is
+# private, so a GH_TOKEN build-arg is required at build time (see SKILL.md /ci
+# step). The shim ships a version-floor at dist/version-floor.json; we install
+# the Go binary at the *same* version as the npm package, which by construction
+# satisfies the floor (npm publish path keeps them in lockstep).
+ARG GH_TOKEN=""
+RUN set -eu; \
+    AD_VERSION=$(jq -r '.version' /root/.bun/install/global/node_modules/agent-director/package.json); \
+    AD_TAG="v${AD_VERSION}"; \
+    if [ -z "${GH_TOKEN}" ]; then \
+        echo "ERROR: GH_TOKEN build-arg is required (agent-director release repo is private)." >&2; \
+        echo "       Pass with: docker build --build-arg GH_TOKEN=\"\$(gh auth token)\" ..." >&2; \
+        exit 1; \
+    fi; \
+    ASSET_ID=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+        "https://api.github.com/repos/gabemahoney/agent-director/releases/tags/${AD_TAG}" \
+        | jq -r '.assets[] | select(.name == "agent-director-linux-amd64") | .id'); \
+    if [ -z "${ASSET_ID}" ] || [ "${ASSET_ID}" = "null" ]; then \
+        echo "ERROR: no agent-director-linux-amd64 asset on release ${AD_TAG}" >&2; \
+        exit 1; \
+    fi; \
+    curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+        -H "Accept: application/octet-stream" \
+        -o /usr/local/bin/agent-director \
+        "https://api.github.com/repos/gabemahoney/agent-director/releases/assets/${ASSET_ID}"; \
+    chmod 0755 /usr/local/bin/agent-director; \
+    command -v agent-director >/dev/null; \
+    INSTALLED_VERSION=$(agent-director version | jq -r '.version'); \
+    if [ "${INSTALLED_VERSION}" != "${AD_VERSION}" ]; then \
+        echo "ERROR: binary version ${INSTALLED_VERSION} != npm version ${AD_VERSION}" >&2; \
+        exit 1; \
+    fi; \
+    FLOOR=$(jq -r '.min_binary_version' /root/.bun/install/global/node_modules/agent-director/dist/version-floor.json); \
+    echo "agent-director Go binary installed: ${INSTALLED_VERSION} (npm shim ${AD_VERSION}, floor ${FLOOR})"
