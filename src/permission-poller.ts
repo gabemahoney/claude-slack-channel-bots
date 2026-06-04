@@ -51,6 +51,8 @@ import type {
   GetPermissionResult,
 } from './agent-director-client.ts'
 import { encodePermissionActionId } from './permission-action-id.ts'
+import { emitTrail as defaultEmitTrail } from './permission-trail.ts'
+import type { RowDecisionAction, TrailEventBase } from './permission-trail.ts'
 
 // ---------------------------------------------------------------------------
 // Wire-shape types (local — mirrors the `^0.6.0` wire)
@@ -136,6 +138,14 @@ export interface PollerDeps {
   /** Hook factories so tests can stub timer scheduling. */
   setInterval?: (cb: () => void, ms: number) => ReturnType<typeof setInterval>
   clearInterval?: (handle: ReturnType<typeof setInterval>) => void
+  /**
+   * Trail emitter hook (SR-V). Defaults to `emitTrail` from
+   * `permission-trail.ts`. Tests override with a capture stub to assert
+   * emission shape without touching the on-disk JSONL.
+   */
+  emitTrail?: (
+    partial: Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown },
+  ) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +255,47 @@ function logViaDeps(deps: PollerDeps, ...args: unknown[]): void {
   else console.error(...args)
 }
 
+/**
+ * SR-V-2.3 row-decision emitter. Builds a `cscb.poller.row_decision` event
+ * with the canonical envelope fields and the action identifier. `request_token`
+ * is omitted (not empty) when absent per SR-V-1.1.
+ */
+function emitRowDecision(
+  deps: PollerDeps,
+  action: RowDecisionAction,
+  claudeInstanceId: string,
+  requestToken: string | undefined,
+): void {
+  const emit = deps.emitTrail ?? defaultEmitTrail
+  const event: Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown } = {
+    event: 'cscb.poller.row_decision',
+    claude_instance_id: claudeInstanceId,
+    action,
+  }
+  if (requestToken !== undefined) event.request_token = requestToken
+  emit(event)
+}
+
+/**
+ * Map an unknown Slack error to a stable error-class string per SR-V-2.4.
+ * Slack platform errors expose `data.error` (e.g. `channel_not_found`); other
+ * errors collapse to short class labels.
+ */
+function classifySlackError(err: unknown): string {
+  if (err !== null && typeof err === 'object') {
+    const data = (err as { data?: unknown }).data
+    if (data !== null && typeof data === 'object') {
+      const e = (data as { error?: unknown }).error
+      if (typeof e === 'string' && e.length > 0) return e
+    }
+  }
+  if (err instanceof Error) {
+    if (err.name === 'AbortError') return 'aborted'
+    return 'network_error'
+  }
+  return 'unknown_error'
+}
+
 async function runTick(deps: PollerDeps): Promise<void> {
   if (tickInFlight) {
     skippedTicks++
@@ -284,13 +335,19 @@ async function runTick(deps: PollerDeps): Promise<void> {
       if (got.permission_requests === null || got.permission_requests === undefined) {
         logViaDeps(deps, `[slack] permission-poller: non-conforming open-rows response for ${row.claude_instance_id} — skipping`)
         nonConformingInstanceIds.add(row.claude_instance_id)
+        // SR-V-2.3: request_token omitted (no row was readable) per SR-V-1.1.
+        emitRowDecision(deps, 'non_conforming_skipped', row.claude_instance_id, undefined)
         continue
       }
 
       for (const perm of got.permission_requests) {
         const key = makeCompositeKey(row.claude_instance_id, perm.request_token)
         seenComposite.add(key)
-        if (livePermissions.has(key)) continue
+        if (livePermissions.has(key)) {
+          emitRowDecision(deps, 'already_tracked', row.claude_instance_id, perm.request_token)
+          continue
+        }
+        emitRowDecision(deps, 'post_attempted', row.claude_instance_id, perm.request_token)
         await postPermissionPrompt(deps, row, perm)
       }
     }
@@ -311,6 +368,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
       } catch (err) {
         if (isErrPermissionRequestNotFound(err)) {
           logViaDeps(deps, `[slack] permission-poller: get-permission not-found for ${entry.claudeInstanceId} token=${entry.requestToken} — generic deny + drop`)
+          emitRowDecision(deps, 'not_found_generic_deny', entry.claudeInstanceId, entry.requestToken)
           await renderClosureUpdate(deps, entry, 'not_found')
           dropPermission(entry.claudeInstanceId, entry.requestToken)
           continue
@@ -318,6 +376,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
         const e = err instanceof AgentDirectorError ? err : null
         logViaDeps(deps, `[slack] permission-poller: get-permission failed for ${entry.claudeInstanceId} token=${entry.requestToken}: ${e?.errName ?? String(err)}`)
         // SR-2.4 transient retry: leave entry alive; next tick will retry.
+        emitRowDecision(deps, 'transient_retry', entry.claudeInstanceId, entry.requestToken)
         continue
       }
 
@@ -325,6 +384,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
       if (verdict === 'unknown') {
         logViaDeps(deps, `[slack] permission-poller: unknown verdict for ${entry.claudeInstanceId} token=${entry.requestToken} decision=${info.decision} decision_reason=${String(info.decision_reason)} — fail-closed generic deny`)
       }
+      emitRowDecision(deps, 'reconciled_closed', entry.claudeInstanceId, entry.requestToken)
       await renderClosureUpdate(deps, entry, verdict)
       dropPermission(entry.claudeInstanceId, entry.requestToken)
     }
@@ -364,13 +424,27 @@ async function postPermissionPrompt(
     permission.request_token,
   )
 
+  const text = `🤖🛠️ permission request: ${permission.tool_name}`
+  const emit = deps.emitTrail ?? defaultEmitTrail
   try {
     const response = await deps.web.chat.postMessage({
       channel: channelId,
-      text: `🤖🛠️ permission request: ${permission.tool_name}`,
+      text,
       blocks: blocks as never,
     })
     const messageTs = (response as { ts?: string }).ts
+    // SR-V-2.4: emit on success (and on the no-ts edge case below) with the
+    // Slack-returned ts. Full text + blocks pass through verbatim (SR-V-3.1).
+    emit({
+      event: 'cscb.chat_post.attempted',
+      claude_instance_id: row.claude_instance_id,
+      request_token: permission.request_token,
+      channel: channelId,
+      text,
+      blocks,
+      ok: true,
+      slack_ts: messageTs,
+    })
     if (!messageTs) {
       logViaDeps(deps, `[slack] permission-poller: chat.postMessage returned no ts for ${row.claude_instance_id}`)
       return
@@ -384,7 +458,19 @@ async function postPermissionPrompt(
       handled: false,
     })
   } catch (err) {
-    logViaDeps(deps, `[slack] permission-poller: chat.postMessage failed for ${row.claude_instance_id}:`, err)
+    // SR-V-2.4: failure-only logViaDeps removed; ok=false event is now the
+    // first-class failure signal. `error` carries the Slack platform error
+    // class string, not JS Error.name.
+    emit({
+      event: 'cscb.chat_post.attempted',
+      claude_instance_id: row.claude_instance_id,
+      request_token: permission.request_token,
+      channel: channelId,
+      text,
+      blocks,
+      ok: false,
+      error: classifySlackError(err),
+    })
   }
 }
 

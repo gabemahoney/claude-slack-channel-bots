@@ -34,7 +34,10 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import {
   _resetPollerState,
   buildPermissionBlocks,
@@ -44,6 +47,8 @@ import {
   startPermissionPoller,
   stopPermissionPoller,
 } from '../src/permission-poller.ts'
+import { _resetTrailFdForTests, type TrailEventBase } from '../src/permission-trail.ts'
+import { parsePermissionActionId } from '../src/permission-action-id.ts'
 import {
   cannedGetPermissionResponse,
   cannedGetResult,
@@ -56,6 +61,31 @@ import {
   errSpawnNotFound,
 } from './test-helpers/agent-director-stub.ts'
 import type { GetPermissionParams, GetPermissionResult } from '../src/agent-director-client.ts'
+
+// ---------------------------------------------------------------------------
+// SLACK_STATE_DIR isolation — any default emitTrail in the poller would
+// otherwise land on the operator's real ~/.claude/channels/slack/.
+// ---------------------------------------------------------------------------
+
+let trailTempDir: string
+let origStateDir: string | undefined
+
+beforeAll(() => {
+  trailTempDir = mkdtempSync(join(tmpdir(), 'poller-trail-isolation-'))
+  origStateDir = process.env['SLACK_STATE_DIR']
+  process.env['SLACK_STATE_DIR'] = trailTempDir
+})
+
+afterAll(() => {
+  if (origStateDir === undefined) delete process.env['SLACK_STATE_DIR']
+  else process.env['SLACK_STATE_DIR'] = origStateDir
+  _resetTrailFdForTests()
+  rmSync(trailTempDir, { recursive: true, force: true })
+})
+
+beforeEach(() => {
+  _resetTrailFdForTests()
+})
 
 // ---------------------------------------------------------------------------
 // Shared fixtures — no inline magic strings (SR-8.1)
@@ -147,6 +177,21 @@ function makeChatStub(opts: { tsSequence?: Array<string | undefined>; postMessag
       },
     },
     calls,
+  }
+}
+
+type CapturedTrailEvent = Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown }
+
+interface TrailCapture {
+  emit: (partial: CapturedTrailEvent) => void
+  events: CapturedTrailEvent[]
+}
+
+function makeTrailCapture(): TrailCapture {
+  const events: CapturedTrailEvent[] = []
+  return {
+    events,
+    emit: (partial) => { events.push(partial) },
   }
 }
 
@@ -1289,5 +1334,338 @@ describe('poller lifecycle', () => {
     expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(false)
     expect(markHandled(INSTANCE_C, TOKEN_A)).toBe(true)
     expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SR-V Epic 2 — cscb.poller.row_decision + cscb.chat_post.attempted
+// ---------------------------------------------------------------------------
+
+describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted', () => {
+  test('action=post_attempted on a brand-new row', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+    const trail = makeTrailCapture()
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
+      }),
+    })
+    startPermissionPoller({
+      getClient, web: chat.web as never, intervalMs: 1000,
+      setInterval: ivl.setInterval, clearInterval: ivl.clearInterval,
+      emitTrail: trail.emit,
+    })
+
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    const decisions = trail.events.filter(e => e.event === 'cscb.poller.row_decision')
+    expect(decisions).toHaveLength(1)
+    expect(decisions[0]!['action']).toBe('post_attempted')
+    expect(decisions[0]!.claude_instance_id).toBe(INSTANCE_C)
+    expect(decisions[0]!.request_token).toBe(TOKEN_A)
+  })
+
+  test('action=already_tracked on second tick over the same row', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+    const trail = makeTrailCapture()
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
+      }),
+    })
+    startPermissionPoller({
+      getClient, web: chat.web as never, intervalMs: 1000,
+      setInterval: ivl.setInterval, clearInterval: ivl.clearInterval,
+      emitTrail: trail.emit,
+    })
+
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    const decisions = trail.events.filter(e => e.event === 'cscb.poller.row_decision')
+    const actions = decisions.map(e => e['action'])
+    expect(actions).toEqual(['post_attempted', 'already_tracked'])
+  })
+
+  test('action=reconciled_closed when the row disappears with a verdict', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+    const trail = makeTrailCapture()
+    let listProjection: ReturnType<typeof cannedPermissionRequest>[] = [
+      cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 }),
+    ]
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: listProjection,
+      }),
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> =>
+        cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null }),
+    })
+    startPermissionPoller({
+      getClient, web: chat.web as never, intervalMs: 1000,
+      setInterval: ivl.setInterval, clearInterval: ivl.clearInterval,
+      emitTrail: trail.emit,
+    })
+
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+    listProjection = []
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    const reconciled = trail.events.find(
+      e => e.event === 'cscb.poller.row_decision' && e['action'] === 'reconciled_closed',
+    )
+    expect(reconciled).toBeDefined()
+    expect(reconciled!.request_token).toBe(TOKEN_A)
+    expect(reconciled!.claude_instance_id).toBe(INSTANCE_C)
+  })
+
+  test('action=not_found_generic_deny when getPermission throws ErrPermissionRequestNotFound', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+    const trail = makeTrailCapture()
+    let listProjection: ReturnType<typeof cannedPermissionRequest>[] = [
+      cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 }),
+    ]
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: listProjection,
+      }),
+      getPermission: async (_: GetPermissionParams): Promise<GetPermissionResult> => {
+        throw errPermissionRequestNotFound()
+      },
+    })
+    startPermissionPoller({
+      getClient, web: chat.web as never, intervalMs: 1000,
+      setInterval: ivl.setInterval, clearInterval: ivl.clearInterval,
+      emitTrail: trail.emit,
+      log: () => { /* swallow */ },
+    })
+
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+    listProjection = []
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    const notFound = trail.events.find(
+      e => e.event === 'cscb.poller.row_decision' && e['action'] === 'not_found_generic_deny',
+    )
+    expect(notFound).toBeDefined()
+    expect(notFound!.request_token).toBe(TOKEN_A)
+  })
+
+  test('action=non_conforming_skipped omits request_token entirely (SR-V-1.1)', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub()
+    const trail = makeTrailCapture()
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResult({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: null,
+      }),
+    })
+    startPermissionPoller({
+      getClient, web: chat.web as never, intervalMs: 1000,
+      setInterval: ivl.setInterval, clearInterval: ivl.clearInterval,
+      emitTrail: trail.emit,
+      log: () => { /* swallow */ },
+    })
+
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    const nc = trail.events.find(
+      e => e.event === 'cscb.poller.row_decision' && e['action'] === 'non_conforming_skipped',
+    )
+    expect(nc).toBeDefined()
+    expect(nc!.claude_instance_id).toBe(INSTANCE_C)
+    // request_token MUST be absent — not an empty string (SR-V-1.1).
+    expect('request_token' in nc!).toBe(false)
+  })
+
+  test('action=transient_retry when getPermission throws a non-not-found error', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+    const trail = makeTrailCapture()
+    let listProjection: ReturnType<typeof cannedPermissionRequest>[] = [
+      cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 }),
+    ]
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: listProjection,
+      }),
+      getPermission: async (_: GetPermissionParams): Promise<GetPermissionResult> => {
+        throw errGeneric('get-permission', 'ErrTransient', 'transient')
+      },
+    })
+    startPermissionPoller({
+      getClient, web: chat.web as never, intervalMs: 1000,
+      setInterval: ivl.setInterval, clearInterval: ivl.clearInterval,
+      emitTrail: trail.emit,
+      log: () => { /* swallow */ },
+    })
+
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+    listProjection = []
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    const transient = trail.events.find(
+      e => e.event === 'cscb.poller.row_decision' && e['action'] === 'transient_retry',
+    )
+    expect(transient).toBeDefined()
+    expect(transient!.request_token).toBe(TOKEN_A)
+  })
+
+  test('cscb.chat_post.attempted on success carries full text+blocks and Slack-returned ts', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+    const trail = makeTrailCapture()
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
+      }),
+    })
+    startPermissionPoller({
+      getClient, web: chat.web as never, intervalMs: 1000,
+      setInterval: ivl.setInterval, clearInterval: ivl.clearInterval,
+      emitTrail: trail.emit,
+    })
+
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    const post = trail.events.find(e => e.event === 'cscb.chat_post.attempted')
+    expect(post).toBeDefined()
+    expect(post!['ok']).toBe(true)
+    expect(post!['slack_ts']).toBe(POST_TS)
+    expect(post!.channel).toBe(CHANNEL_CH)
+    expect(typeof post!['text']).toBe('string')
+    expect(Array.isArray(post!['blocks'])).toBe(true)
+  })
+
+  test('SR-V-1.4 action_id decode round-trip from persisted blocks', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+    const trail = makeTrailCapture()
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
+      }),
+    })
+    startPermissionPoller({
+      getClient, web: chat.web as never, intervalMs: 1000,
+      setInterval: ivl.setInterval, clearInterval: ivl.clearInterval,
+      emitTrail: trail.emit,
+    })
+
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    const post = trail.events.find(e => e.event === 'cscb.chat_post.attempted')!
+    const blocks = post['blocks'] as Array<Record<string, unknown>>
+    const actions = blocks.find(b => b['type'] === 'actions') as
+      { elements: Array<{ action_id: string }> } | undefined
+    expect(actions).toBeDefined()
+    const allow = actions!.elements[0]!.action_id
+    const deny = actions!.elements[1]!.action_id
+
+    const decAllow = parsePermissionActionId(allow)
+    const decDeny = parsePermissionActionId(deny)
+    expect(decAllow).toEqual({ decision: 'allow', claudeInstanceId: INSTANCE_C, requestToken: TOKEN_A })
+    expect(decDeny).toEqual({ decision: 'deny', claudeInstanceId: INSTANCE_C, requestToken: TOKEN_A })
+  })
+
+  test('cscb.chat_post.attempted on Slack platform failure carries error class string, not Error.name', async () => {
+    const ivl = makeInterval()
+    const platformError = Object.assign(new Error('platform error'), {
+      name: 'WebAPIPlatformError',
+      data: { ok: false, error: 'channel_not_found' },
+    })
+    const chat = makeChatStub({ postMessageError: platformError })
+    const trail = makeTrailCapture()
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
+      }),
+    })
+    startPermissionPoller({
+      getClient, web: chat.web as never, intervalMs: 1000,
+      setInterval: ivl.setInterval, clearInterval: ivl.clearInterval,
+      emitTrail: trail.emit,
+      log: () => { /* swallow */ },
+    })
+
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    const post = trail.events.find(e => e.event === 'cscb.chat_post.attempted')
+    expect(post).toBeDefined()
+    expect(post!['ok']).toBe(false)
+    expect(post!['error']).toBe('channel_not_found')
+  })
+
+  test('row_decision and chat_post.attempted share request_token on the same tick', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+    const trail = makeTrailCapture()
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
+      }),
+    })
+    startPermissionPoller({
+      getClient, web: chat.web as never, intervalMs: 1000,
+      setInterval: ivl.setInterval, clearInterval: ivl.clearInterval,
+      emitTrail: trail.emit,
+    })
+
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    const decision = trail.events.find(
+      e => e.event === 'cscb.poller.row_decision' && e['action'] === 'post_attempted',
+    )
+    const post = trail.events.find(e => e.event === 'cscb.chat_post.attempted')
+    expect(decision!.request_token).toBe(TOKEN_A)
+    expect(post!.request_token).toBe(TOKEN_A)
+    expect(decision!.claude_instance_id).toBe(post!.claude_instance_id)
   })
 })

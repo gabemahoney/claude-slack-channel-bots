@@ -54,6 +54,34 @@ export interface TrailEventBase {
 export type TrailEvent = TrailEventBase & { [extra: string]: unknown }
 
 // ---------------------------------------------------------------------------
+// Per-event-class field types
+// ---------------------------------------------------------------------------
+
+/**
+ * The six canonical row-decision identifiers used as the `action` field on
+ * `cscb.poller.row_decision` events (SR-V-2.3). Exported for type-narrowing
+ * at the emission site.
+ *
+ * The set is open to extension per SR-V-2.3: the `(string & {})` widening
+ * keeps existing literals discoverable in editor completions while still
+ * accepting new identifiers without a type change.
+ */
+export const ROW_DECISION_ACTIONS = [
+  'post_attempted',
+  'already_tracked',
+  'reconciled_closed',
+  'not_found_generic_deny',
+  'non_conforming_skipped',
+  'transient_retry',
+] as const
+
+export type CanonicalRowDecisionAction = (typeof ROW_DECISION_ACTIONS)[number]
+
+/** Open string-literal union per SR-V-2.3 — canonical values plus any new identifier. */
+// eslint-disable-next-line @typescript-eslint/ban-types
+export type RowDecisionAction = CanonicalRowDecisionAction | (string & {})
+
+// ---------------------------------------------------------------------------
 // State-dir + path resolution
 // ---------------------------------------------------------------------------
 

@@ -335,6 +335,40 @@ jq -c 'select(.channel=="C0B1ZJJLJ9M" and .ts>="2026-06-04T20:00:00Z" and .ts<="
 
 **Retention.** None. The file is append-only and the system does not self-protect against disk pressure (SR-V-5.5). Operators rotate / archive / delete out-of-band.
 
+#### `cscb.poller.row_decision` (SR-V-2.3)
+
+Emitted once per `permission_requests` row per tick (and once per `non_conforming_skipped` spawn per tick) from `src/permission-poller.ts`. The `action` field is one of six stable identifiers; the set is open to extension per SR-V-2.3 — new poller branches may add identifiers without an SRD edit.
+
+| `action` | Meaning |
+|---|---|
+| `post_attempted` | New row seen this tick; `chat.postMessage` was issued for this `request_token`. |
+| `already_tracked` | Row's composite key already in `livePermissions`; no-op this tick. |
+| `reconciled_closed` | Row no longer in the tick's projection; `getPermission` returned a verdict and a closure `chat.update` was sent. |
+| `not_found_generic_deny` | `getPermission` threw `ErrPermissionRequestNotFound`; the generic-deny closure was sent and the entry dropped. |
+| `non_conforming_skipped` | The spawn's `permission_requests` was `null`/`undefined`; the row was excluded from the closure sweep this tick. `request_token` is **absent** on this event per SR-V-1.1. |
+| `transient_retry` | Transient error on `getPermission`; the entry was left alive for the next tick to retry. |
+
+Fields: `ts`, `event="cscb.poller.row_decision"`, `claude_instance_id`, `action`, and `request_token` (omitted on `non_conforming_skipped`). The envelope `ts` is the only timestamp on the event — there is no per-tick `tick_at` field.
+
+#### `cscb.chat_post.attempted` (SR-V-2.4)
+
+Emitted from `postPermissionPrompt` in `src/permission-poller.ts` for **every** permission-prompt `chat.postMessage` call — success **and** failure. The pre-Epic-2 failure-only `logViaDeps` for `chat.postMessage` has been removed; failures now surface as `ok=false` with a Slack error class string.
+
+Fields:
+- `ts`, `event="cscb.chat_post.attempted"`, `claude_instance_id`, `request_token`, `channel`.
+- `text` — the full posted text string, untruncated (SR-V-3.1).
+- `blocks` — the full posted Block Kit array, untruncated; both Allow and Deny `action_id`s are present and decodable via `parsePermissionActionId` (SR-V-1.4).
+- `ok` — `true` on success, `false` on failure.
+- On success: `slack_ts` — the `ts` Slack returned for the posted message (the Slack-side message id, distinct from the envelope `ts`).
+- On failure: `error` — the **Slack platform error class string** (e.g. `"channel_not_found"`) from `WebAPIPlatformError.data.error`; falls back to `"network_error"` / `"unknown_error"` for non-platform exceptions. Never the JS `Error.name`.
+
+**Combined example** — a row's first-tick emissions:
+
+```json
+{"ts":"2026-06-04T20:39:58.110Z","event":"cscb.poller.row_decision","claude_instance_id":"cscb_demo_C0B1ZJJLJ9M","action":"post_attempted","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd"}
+{"ts":"2026-06-04T20:39:58.123Z","event":"cscb.chat_post.attempted","claude_instance_id":"cscb_demo_C0B1ZJJLJ9M","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","channel":"C0B1ZJJLJ9M","text":"🤖🛠️ permission request: Bash","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"🤖🛠️ *Bash*\n`ls`"}},{"type":"actions","elements":[{"type":"button","text":{"type":"plain_text","text":"Allow"},"style":"primary","action_id":"perm_allow_cscb_demo_C0B1ZJJLJ9M_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd"},{"type":"button","text":{"type":"plain_text","text":"Deny"},"style":"danger","action_id":"perm_deny_cscb_demo_C0B1ZJJLJ9M_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd"}]}],"ok":true,"slack_ts":"1780600244.439969"}
+```
+
 ### Removed pre-Epic-2 files
 
 The previous tmux-direct architecture wrote `~/.claude/channels/slack/sessions.json` to persist tmux session names and discovered Claude session UUIDs. Both responsibilities have moved to agent-director — `sessions.json` and `sessions.json.last` no longer exist. Operators upgrading from a pre-Epic-2 install can safely delete the stale files; CSCB will not read them.
