@@ -462,9 +462,10 @@ async function postPermissionPrompt(
       handled: false,
     })
   } catch (err) {
-    // SR-V-2.4: failure-only logViaDeps removed; ok=false event is now the
-    // first-class failure signal. `error` carries the Slack platform error
-    // class string, not JS Error.name.
+    // b.emk: failures land in BOTH server.log (real-time visibility) AND the
+    // trail JSONL (after-the-fact debugging). Success paths stay trail-only,
+    // preserving the SR-V-2.4 asymmetric-behavior fix.
+    logViaDeps(deps, `[slack] permission-poller: chat.postMessage failed for ${row.claude_instance_id}:`, err)
     emit({
       event: 'cscb.chat_post.attempted',
       claude_instance_id: row.claude_instance_id,
@@ -583,9 +584,8 @@ async function renderClosureUpdate(
     })
     emit({ ...envelope, ok: true })
   } catch (err) {
-    // SR-V-2.5: failure-only logViaDeps removed; ok=false event is now the
-    // first-class failure signal. error carries the Slack platform error
-    // class string, not JS Error.name.
+    // b.emk: failures land in BOTH server.log and the trail JSONL.
+    logViaDeps(deps, `[slack] permission-poller: closure chat.update failed for ${entry.claudeInstanceId} token=${entry.requestToken} (verdict=${tag}):`, err)
     emit({ ...envelope, ok: false, error: classifySlackError(err) })
   }
 }

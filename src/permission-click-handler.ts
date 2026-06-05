@@ -230,9 +230,8 @@ export async function handlePermissionClick(
     markHandled(claudeInstanceId, requestToken)
     emit({ ...envelope, ok: true })
   } catch (err) {
-    // SR-V-2.5: failure-only logDeps removed; ok=false event is now the
-    // first-class failure signal. error carries the Slack platform error
-    // class string, not JS Error.name.
+    // b.emk: failures land in BOTH server.log and the trail JSONL.
+    logDeps(deps, `[slack] permission-click: decision chat.update failed for ${claudeInstanceId}:`, err)
     emit({ ...envelope, ok: false, error: classifySlackError(err) })
   }
   return true

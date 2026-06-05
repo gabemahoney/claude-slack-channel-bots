@@ -1623,11 +1623,12 @@ describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
+    const logCalls: unknown[][] = []
     startPermissionPoller({
       getClient, web: chat.web as never, intervalMs: 1000,
       setInterval: ivl.setInterval, clearInterval: ivl.clearInterval,
       emitTrail: trail.emit,
-      log: () => { /* swallow */ },
+      log: (...args) => { logCalls.push(args) },
     })
 
     ivl.pending[0].cb()
@@ -1637,6 +1638,9 @@ describe('trail events — cscb.poller.row_decision and cscb.chat_post.attempted
     expect(post).toBeDefined()
     expect(post!['ok']).toBe(false)
     expect(post!['error']).toBe('channel_not_found')
+    // b.emk: failure also lands in server.log alongside the trail event.
+    const postFailLogs = logCalls.filter((args) => String(args[0]).includes('chat.postMessage failed'))
+    expect(postFailLogs.length).toBeGreaterThan(0)
   })
 
   test('row_decision and chat_post.attempted share request_token on the same tick', async () => {
@@ -1682,6 +1686,7 @@ describe('trail events — cscb.chat_update.attempted (poller-triggered)', () =>
     ivl: ReturnType<typeof makeInterval>
     chat: ReturnType<typeof makeChatStub>
     trail: ReturnType<typeof makeTrailCapture>
+    logCalls: unknown[][]
     drive: () => Promise<void>
   } {
     const ivl = makeInterval()
@@ -1701,11 +1706,12 @@ describe('trail events — cscb.chat_update.attempted (poller-triggered)', () =>
       }),
       getPermission: getPermissionImpl,
     })
+    const logCalls: unknown[][] = []
     startPermissionPoller({
       getClient, web: chat.web as never, intervalMs: 1000,
       setInterval: ivl.setInterval, clearInterval: ivl.clearInterval,
       emitTrail: trail.emit,
-      log: () => { /* swallow */ },
+      log: (...args) => { logCalls.push(args) },
     })
     const drive = async (): Promise<void> => {
       ivl.pending[0].cb()
@@ -1714,7 +1720,7 @@ describe('trail events — cscb.chat_update.attempted (poller-triggered)', () =>
       ivl.pending[0].cb()
       await new Promise(r => setTimeout(r, 10))
     }
-    return { ivl, chat, trail, drive }
+    return { ivl, chat, trail, logCalls, drive }
   }
 
   test('operator_allow → ok=true, triggered_by=poller, target ts matches prompt', async () => {
@@ -1792,5 +1798,10 @@ describe('trail events — cscb.chat_update.attempted (poller-triggered)', () =>
     expect(closure!['ok']).toBe(false)
     expect(closure!['error']).toBe('message_not_found')
     expect(closure!['triggered_by']).toBe('poller')
+    // b.emk: failure also lands in server.log alongside the trail event.
+    const closureFailLogs = scenario.logCalls.filter(
+      (args) => String(args[0]).includes('closure chat.update failed'),
+    )
+    expect(closureFailLogs.length).toBeGreaterThan(0)
   })
 })

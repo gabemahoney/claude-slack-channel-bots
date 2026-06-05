@@ -352,7 +352,7 @@ Fields: `ts`, `event="cscb.poller.row_decision"`, `claude_instance_id`, `action`
 
 #### `cscb.chat_post.attempted` (SR-V-2.4)
 
-Emitted from `postPermissionPrompt` in `src/permission-poller.ts` for **every** permission-prompt `chat.postMessage` call — success **and** failure. The pre-Epic-2 failure-only `logViaDeps` for `chat.postMessage` has been removed; failures now surface as `ok=false` with a Slack error class string.
+Emitted from `postPermissionPrompt` in `src/permission-poller.ts` for **every** permission-prompt `chat.postMessage` call — success **and** failure. Successes are trail-only; failures land in BOTH the trail (as `ok=false` with a Slack error class string) AND `server.log` via `logViaDeps` (`b.emk` defense-in-depth — the trail is for after-the-fact debugging, `server.log` is for real-time operator visibility). The pre-`b.emk` asymmetry where only failures had a console log is gone — successes are still silent in `server.log`, but failures now appear on both surfaces.
 
 Fields:
 - `ts`, `event="cscb.chat_post.attempted"`, `claude_instance_id`, `request_token`, `channel`.
@@ -371,7 +371,7 @@ Fields:
 
 #### `cscb.chat_update.attempted` (SR-V-2.5)
 
-Emitted for every `chat.update` that closes out a permission prompt. Two surfaces emit: the poller's `renderClosureUpdate` (`src/permission-poller.ts`) and the click handler's verdict-render (`src/permission-click-handler.ts`). Both success and failure emit. The pre-Epic-3 failure-only `logViaDeps` / `logDeps` paths for closure `chat.update` (in both modules) have been removed — failures now surface as `ok=false` with the Slack platform error class string.
+Emitted for every `chat.update` that closes out a permission prompt. Two surfaces emit: the poller's `renderClosureUpdate` (`src/permission-poller.ts`) and the click handler's verdict-render (`src/permission-click-handler.ts`). Both success and failure emit. Successes are trail-only; failures land in BOTH the trail (as `ok=false` with the Slack platform error class string) AND `server.log` via `logViaDeps`/`logDeps` (`b.emk` defense-in-depth). Successes stay silent in `server.log`, preserving the original SR-V-2.5 asymmetric-behavior fix.
 
 Fields:
 - `ts`, `event="cscb.chat_update.attempted"`, `claude_instance_id`, `request_token`, `channel`, `message_ts` (the prompt `ts` being updated).

@@ -437,9 +437,9 @@ describe('handlePermissionClick — happy path', () => {
     const entry = getLivePermission(INSTANCE_C, TOKEN_A)
     expect(entry).toBeDefined()
     expect(entry?.handled).toBe(false)
-    // SR-V-2.5: the prior failure-only log was removed; the failure now
-    // surfaces via cscb.chat_update.attempted{ok=false}, asserted separately.
-    expect(logs.length).toBe(0)
+    // b.emk: failures land in BOTH server.log (via logDeps) and the trail
+    // JSONL (cscb.chat_update.attempted{ok=false}, asserted separately).
+    expect(logs.length).toBeGreaterThan(0)
     // The original seeded stub did not see the update (it landed on the
     // separately-stubbed chatForClick), so the poller's chat history is
     // untouched.
