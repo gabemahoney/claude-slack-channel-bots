@@ -25,6 +25,7 @@ import { parsePermissionActionId, type PermissionDecision } from './permission-a
 import { getLivePermission, markHandled } from './permission-poller.ts'
 import { emitTrail as defaultEmitTrail } from './permission-trail.ts'
 import type {
+  AdDecideResponseClass,
   ClosureVerdictTag,
   ParseFailureReason,
   TrailEventBase,
@@ -47,6 +48,18 @@ export interface ClickDeps {
 function logDeps(deps: ClickDeps, ...args: unknown[]): void {
   if (deps.log) deps.log(...args)
   else console.error(...args)
+}
+
+/**
+ * SR-V-2.7 call-side classification of an agent-director `decide` error.
+ * Mirrors the existing branches in `handlePermissionClick`'s catch so the
+ * trail's `result_class` is identical to the operational discriminator.
+ */
+function classifyAdDecideError(err: unknown): AdDecideResponseClass {
+  if (err instanceof ErrAlreadyDecided) return 'ErrAlreadyDecided'
+  if (err instanceof AgentDirectorError && err.errName === 'ErrInvalidFlags') return 'ErrInvalidFlags'
+  if (err instanceof AgentDirectorError && err.errName === 'ErrAmbiguousRequest') return 'ErrAmbiguousRequest'
+  return 'other'
 }
 
 /** SR-V-2.5 Slack error class string (mirrors permission-poller.ts). */
@@ -132,13 +145,38 @@ export async function handlePermissionClick(
   // with the decoded request_token — including for stale clicks whose
   // composite key is no longer in the pending map. This is the click's ONLY
   // AD interaction (SR-4.3 retires the pre-decide get).
+  const decideEnvelope = {
+    event: 'cscb.ad_decide.attempted',
+    claude_instance_id: claudeInstanceId,
+    request_token: requestToken,
+    decision,
+  }
   try {
     await decideWithToken(deps.getClient(), {
       claude_instance_id: claudeInstanceId,
       decision,
       request_token: requestToken,
     })
+    // SR-V-2.7 call-side success emission.
+    emit({ ...decideEnvelope, result_class: 'ok' satisfies AdDecideResponseClass })
   } catch (err) {
+    // SR-V-2.7 call-side failure emission. Classify against the same AD
+    // error names the existing branches discriminate on so the trail's
+    // result_class stays consistent with src/agent-director-errors.ts. The
+    // existing logDeps operational logging is preserved alongside the
+    // canonical trail event — the two serve different purposes (live
+    // stderr vs after-the-fact debugging).
+    const result_class: AdDecideResponseClass = classifyAdDecideError(err)
+    const emission: Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown } = {
+      ...decideEnvelope,
+      result_class,
+    }
+    if (result_class === 'other') {
+      const raw = err instanceof Error ? err.message : String(err)
+      emission['raw_error_message'] = raw
+    }
+    emit(emission)
+
     // SR-4.4: ErrAlreadyDecided is silently swallowed — the next poller tick
     // reconciles the operator-visible Slack rendering via SR-2.4 / SR-5.
     if (err instanceof ErrAlreadyDecided) return true

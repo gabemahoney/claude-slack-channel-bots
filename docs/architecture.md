@@ -438,6 +438,34 @@ Fields: `ts`, `event="cscb.click_handler.invoked"`, `claude_instance_id`, `reque
 
 **Note on the `src/server.ts:699` / `:712` truncation.** The existing `console.error('[slack] RAW message event:', JSON.stringify(...).slice(0, 300))` summaries are INTENTIONALLY preserved per SR-V-3.2 — they are a separate human-readable log. The canonical store is full-fidelity by construction (no `.slice` in the trail emit path).
 
+#### `cscb.ad_decide.attempted` (SR-V-2.7 call-side)
+
+Emitted from `handlePermissionClick` (`src/permission-click-handler.ts`) once per `decideWithToken` invocation, on success and on every error path. This is the CSCB-side half of SR-V-2.7; AD's complementary SR-A-2.4 emission lives in `t1.n4v.14`. The two halves join on `request_token` for after-the-fact debugging.
+
+Fields:
+- `ts`, `event="cscb.ad_decide.attempted"`, `claude_instance_id`, `request_token`, `decision` (submitted — `"allow"` | `"deny"`).
+- `result_class` — one of the 5 values below.
+- On `result_class="other"`: additionally `raw_error_message` (the original error's `.message` string, untruncated). For the four named classes, `raw_error_message` is OMITTED.
+- `submitted_decision_reason` — currently never sent on the wire from CSCB. Documented for future use per SR-V-2.7's "when present" rule.
+
+**Response-class set** — match the AD error identifiers in `src/agent-director-errors.ts` so the trail's classification stays consistent with the rest of the codebase. Open to extension.
+
+| `result_class` | Meaning |
+|---|---|
+| `ok` | `decideWithToken` returned without throwing. |
+| `ErrAlreadyDecided` | The request was already closed (race with poller reconciliation or peer click). |
+| `ErrInvalidFlags` | AD rejected the call shape — typically a missing required field. Should not happen under contract. |
+| `ErrAmbiguousRequest` | AD couldn't uniquely identify the request — defense-in-depth backstop per SR-4.4. |
+| `other` | Any other thrown value (non-AD error, transport, etc.). `raw_error_message` carries the original `.message`. |
+
+**Example** — happy-path `ad_decide.attempted` after a click:
+
+```json
+{"ts":"2026-06-04T20:40:01.130Z","event":"cscb.ad_decide.attempted","claude_instance_id":"cscb_demo_C0B1ZJJLJ9M","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","decision":"allow","result_class":"ok"}
+```
+
+**Operational logging.** The existing `[slack] permission-click: ErrInvalidFlags from decide for ...` / `ErrAmbiguousRequest` / `decide failed for ...` `console.error` lines stay alongside the trail event. They serve a different purpose — live stderr monitoring — and are intentionally not redundant with the canonical after-the-fact debugging surface.
+
 ### Removed pre-Epic-2 files
 
 The previous tmux-direct architecture wrote `~/.claude/channels/slack/sessions.json` to persist tmux session names and discovered Claude session UUIDs. Both responsibilities have moved to agent-director — `sessions.json` and `sessions.json.last` no longer exist. Operators upgrading from a pre-Epic-2 install can safely delete the stale files; CSCB will not read them.

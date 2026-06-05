@@ -378,6 +378,91 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     expect(idxBlock).toBeLessThan(idxInvoked)
   })
 
+  test('ad_decide.attempted{result_class="ok"} persists after click_handler.invoked for the same request_token', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ ts: SLACK_RETURNED_TS })
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
+      }),
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+    })
+    ivl.pending[0]!.cb()
+    await new Promise(r => setTimeout(r, 20))
+
+    const decideStub: { client: { decide: (p: DecideParams) => Promise<DecideResult> } } = {
+      client: { decide: async (_p: DecideParams) => ({}) },
+    }
+    await handlePermissionClick(
+      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
+      { getClient: () => decideStub.client, web: chat.web as never },
+      { channel: CHANNEL_CH, messageTs: SLACK_RETURNED_TS, user: 'U_OPERATOR' },
+    )
+
+    const matching = readAllLines().filter(e => e['request_token'] === TOKEN_A)
+    const invoked = matching.find(e => e['event'] === 'cscb.click_handler.invoked')
+    const decided = matching.find(e => e['event'] === 'cscb.ad_decide.attempted')
+    expect(invoked).toBeDefined()
+    expect(decided).toBeDefined()
+    expect(decided!['result_class']).toBe('ok')
+    expect(decided!['decision']).toBe('allow')
+    // Ordering on disk: click_handler.invoked precedes ad_decide.attempted.
+    expect(matching.indexOf(invoked!)).toBeLessThan(matching.indexOf(decided!))
+  })
+
+  test('ad_decide.attempted{result_class="ErrAlreadyDecided"} persists when decide throws', async () => {
+    // Inline import to keep the agent-director surface localized.
+    const { ErrAlreadyDecided } = await import('agent-director')
+    const ivl = makeInterval()
+    const chat = makeChatStub({ ts: SLACK_RETURNED_TS })
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
+      }),
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+    })
+    ivl.pending[0]!.cb()
+    await new Promise(r => setTimeout(r, 20))
+
+    const decideStub: { client: { decide: (p: DecideParams) => Promise<DecideResult> } } = {
+      client: {
+        decide: async (_p: DecideParams) => {
+          throw new ErrAlreadyDecided('decide', 'ErrAlreadyDecided', 'permission request already decided')
+        },
+      },
+    }
+    await handlePermissionClick(
+      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
+      { getClient: () => decideStub.client, web: chat.web as never },
+      { channel: CHANNEL_CH, messageTs: SLACK_RETURNED_TS, user: 'U_OPERATOR' },
+    )
+
+    const decided = readAllLines().find(
+      e => e['event'] === 'cscb.ad_decide.attempted' && e['request_token'] === TOKEN_A,
+    )
+    expect(decided).toBeDefined()
+    expect(decided!['result_class']).toBe('ErrAlreadyDecided')
+    expect('raw_error_message' in decided!).toBe(false)
+  })
+
   test('forged foreign action_id persists block_action.received{parse_failure_reason} and no click_handler.invoked', async () => {
     const FORGED_ID = 'forged_foreign_bot_action'
     const USER = 'U_OPERATOR'

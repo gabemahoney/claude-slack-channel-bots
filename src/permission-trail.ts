@@ -125,6 +125,26 @@ export type ParseFailureReason = CanonicalParseFailureReason | (string & {})
 /** Decoded permission decision carried on inbound click events (SR-V-2.6 / SR-V-2.9). */
 export type ClickDecision = 'allow' | 'deny'
 
+/**
+ * Classification of an agent-director `decide` response on the CSCB call
+ * side (SR-V-2.7). The four named error classes match the AD error
+ * identifiers in `src/agent-director-errors.ts`. `"other"` is the catch-all
+ * for any other thrown value; the emit additionally carries a
+ * `raw_error_message` string in that case. Open extension allowed.
+ */
+export const AD_DECIDE_RESPONSE_CLASSES = [
+  'ok',
+  'ErrAlreadyDecided',
+  'ErrInvalidFlags',
+  'ErrAmbiguousRequest',
+  'other',
+] as const
+
+export type CanonicalAdDecideResponseClass = (typeof AD_DECIDE_RESPONSE_CLASSES)[number]
+
+// eslint-disable-next-line @typescript-eslint/ban-types
+export type AdDecideResponseClass = CanonicalAdDecideResponseClass | (string & {})
+
 // ---------------------------------------------------------------------------
 // State-dir + path resolution
 // ---------------------------------------------------------------------------

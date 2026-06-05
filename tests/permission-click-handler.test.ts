@@ -927,3 +927,177 @@ describe('trail events — cscb.click_handler.invoked', () => {
     expect(invoked).toHaveLength(1)
   })
 })
+
+// ---------------------------------------------------------------------------
+// SR-V Epic 5 — cscb.ad_decide.attempted
+// ---------------------------------------------------------------------------
+
+describe('trail events — cscb.ad_decide.attempted', () => {
+  const USER = 'U_OPERATOR'
+
+  test('happy path → result_class="ok" with submitted decision', async () => {
+    const seed = await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_A,
+    })
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub()
+    await handlePermissionClick(
+      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
+      {
+        getClient: () => decide.client,
+        web: seed.chat.web as never,
+        emitTrail: trail.emit,
+      } satisfies ClickHandlerDepsShape as never,
+      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+    )
+    const event = trail.events.find(e => e.event === 'cscb.ad_decide.attempted')
+    expect(event).toBeDefined()
+    expect(event!['result_class']).toBe('ok')
+    expect(event!['decision']).toBe('allow')
+    expect(event!.claude_instance_id).toBe(INSTANCE_C)
+    expect(event!.request_token).toBe(TOKEN_A)
+    expect('raw_error_message' in event!).toBe(false)
+  })
+
+  test('happy path → submitted decision recorded for deny', async () => {
+    const seed = await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_A,
+    })
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub()
+    await handlePermissionClick(
+      encodePermissionActionId('deny', INSTANCE_C, TOKEN_A),
+      {
+        getClient: () => decide.client,
+        web: seed.chat.web as never,
+        emitTrail: trail.emit,
+      } satisfies ClickHandlerDepsShape as never,
+      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+    )
+    const event = trail.events.find(e => e.event === 'cscb.ad_decide.attempted')
+    expect(event!['decision']).toBe('deny')
+    expect(event!['result_class']).toBe('ok')
+  })
+
+  test('ErrAlreadyDecided → result_class="ErrAlreadyDecided", no raw_error_message', async () => {
+    const seed = await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_A,
+    })
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub({ throwOn: errAlreadyDecided() })
+    await handlePermissionClick(
+      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
+      {
+        getClient: () => decide.client,
+        web: seed.chat.web as never,
+        emitTrail: trail.emit,
+      } satisfies ClickHandlerDepsShape as never,
+      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+    )
+    const event = trail.events.find(e => e.event === 'cscb.ad_decide.attempted')
+    expect(event!['result_class']).toBe('ErrAlreadyDecided')
+    expect('raw_error_message' in event!).toBe(false)
+  })
+
+  test('ErrInvalidFlags → result_class="ErrInvalidFlags", no raw_error_message', async () => {
+    const seed = await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_A,
+    })
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub({ throwOn: errInvalidFlags() })
+    await handlePermissionClick(
+      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
+      {
+        getClient: () => decide.client,
+        web: seed.chat.web as never,
+        emitTrail: trail.emit,
+        log: () => { /* swallow */ },
+      } satisfies ClickHandlerDepsShape as never,
+      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+    )
+    const event = trail.events.find(e => e.event === 'cscb.ad_decide.attempted')
+    expect(event!['result_class']).toBe('ErrInvalidFlags')
+    expect('raw_error_message' in event!).toBe(false)
+  })
+
+  test('ErrAmbiguousRequest → result_class="ErrAmbiguousRequest", no raw_error_message', async () => {
+    const seed = await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_A,
+    })
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub({ throwOn: errAmbiguousRequest() })
+    await handlePermissionClick(
+      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
+      {
+        getClient: () => decide.client,
+        web: seed.chat.web as never,
+        emitTrail: trail.emit,
+        log: () => { /* swallow */ },
+      } satisfies ClickHandlerDepsShape as never,
+      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+    )
+    const event = trail.events.find(e => e.event === 'cscb.ad_decide.attempted')
+    expect(event!['result_class']).toBe('ErrAmbiguousRequest')
+    expect('raw_error_message' in event!).toBe(false)
+  })
+
+  test('generic Error → result_class="other" with raw_error_message', async () => {
+    const seed = await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_A,
+    })
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub({ throwOn: new Error('network timeout') })
+    await handlePermissionClick(
+      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
+      {
+        getClient: () => decide.client,
+        web: seed.chat.web as never,
+        emitTrail: trail.emit,
+        log: () => { /* swallow */ },
+      } satisfies ClickHandlerDepsShape as never,
+      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+    )
+    const event = trail.events.find(e => e.event === 'cscb.ad_decide.attempted')
+    expect(event!['result_class']).toBe('other')
+    expect(event!['raw_error_message']).toBe('network timeout')
+  })
+
+  test('request_token correlates with click_handler.invoked from Epic 4', async () => {
+    const seed = await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_B,
+    })
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub()
+    await handlePermissionClick(
+      encodePermissionActionId('allow', INSTANCE_C, TOKEN_B),
+      {
+        getClient: () => decide.client,
+        web: seed.chat.web as never,
+        emitTrail: trail.emit,
+      } satisfies ClickHandlerDepsShape as never,
+      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+    )
+    const invoked = trail.events.find(e => e.event === 'cscb.click_handler.invoked')
+    const decided = trail.events.find(e => e.event === 'cscb.ad_decide.attempted')
+    expect(invoked!.request_token).toBe(TOKEN_B)
+    expect(decided!.request_token).toBe(TOKEN_B)
+    // click_handler.invoked is emitted BEFORE ad_decide.attempted.
+    const idxInv = trail.events.indexOf(invoked!)
+    const idxDec = trail.events.indexOf(decided!)
+    expect(idxInv).toBeLessThan(idxDec)
+  })
+})
