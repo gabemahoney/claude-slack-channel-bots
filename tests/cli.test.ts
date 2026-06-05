@@ -9,7 +9,8 @@
  */
 
 import { afterEach, beforeAll, describe, expect, test } from 'bun:test'
-import { join } from 'path'
+import { spawnSync } from 'node:child_process'
+import { join, resolve } from 'path'
 import type { CliDeps, CliHandlers } from '../src/cli.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 
@@ -184,5 +185,27 @@ describe('clean_restart', () => {
     })
     await createCli(deps).clean_restart()
     expect(killCalls).toEqual(['C'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// unknown subcommand — regression for b.8tm (trail subcommand removed)
+// ---------------------------------------------------------------------------
+
+describe('unknown subcommand', () => {
+  const CLI_SCRIPT = resolve(import.meta.dir, '..', 'src', 'cli.ts')
+
+  test('`trail` subcommand hits the unknown-subcommand error path (non-zero exit, no "trail" in usage)', () => {
+    const result = spawnSync('bun', [CLI_SCRIPT, 'trail'], {
+      encoding: 'utf-8',
+      env: { ...process.env, SLACK_BOT_TOKEN: 'xoxb-test', SLACK_APP_TOKEN: 'xapp-test' },
+    })
+    // Must exit non-zero
+    expect(result.status).not.toBe(0)
+    // Usage text must not list `trail` as a valid subcommand
+    const output = (result.stderr ?? '') + (result.stdout ?? '')
+    expect(output).not.toMatch(/\btrail\b/)
+    // Usage text should mention the valid subcommands
+    expect(output).toContain('start')
   })
 })

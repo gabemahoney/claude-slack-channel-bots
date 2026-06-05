@@ -298,20 +298,12 @@ export function createCli(deps: CliDeps): CliHandlers {
 if (import.meta.main) {
   const subcommand = process.argv[2]
 
-  // SR-V Epic 6: `cscb trail` is read-only — no PID file, no agent-director
-  // client. Dispatch it before any of the start/stop/clean_restart wiring.
-  if (subcommand === 'trail') {
-    const { runTrailCli } = await import('./trail-cli.ts')
-    process.exit(runTrailCli(process.argv.slice(3)))
-  }
-
   if (subcommand !== 'start' && subcommand !== 'stop' && subcommand !== 'clean_restart') {
-    console.error('Usage: cli.ts <start|stop|clean_restart|trail> [flags]')
+    console.error('Usage: cli.ts <start|stop|clean_restart> [flags]')
     console.error('')
     console.error('  start          Validate prerequisites and start the server in the background')
     console.error('  stop           Send SIGTERM to a running server')
     console.error('  clean_restart  Exit all managed sessions, then stop and start the server')
-    console.error('  trail          Query the permission-trail JSONL store (see `cscb trail --help`)')
     console.error('')
     console.error('Flags (b.1m9):')
     console.error('  --reconcile-instance-ids   Auto-delete stale pre-rename cscb_<id> AD rows on startup')

@@ -34,7 +34,7 @@ cli.ts                          CLI entry point — start/stop/clean_restart sub
     └── message-archive.ts      Optional SQLite archive of every inbound Slack message.
 ```
 
-The deleted files from the pre-Epic-2 architecture (`src/tmux.ts`, `src/peer-pid.ts`, `src/sessions.ts`, `hooks/permission-relay.sh`, `hooks/ask-relay.sh`) are absent: agent-director owns the tmux integration and Claude session-id state, the SR-2.1 poller replaces the hook-based long-poll relay, and AskUserQuestion is denied at the template level (SR-3.1).
+The deleted files from the pre-Epic-2 architecture (`src/tmux.ts`, `src/peer-pid.ts`, `src/sessions.ts`, `hooks/permission-relay.sh`, `hooks/ask-relay.sh`) are absent: agent-director owns the tmux integration and Claude session-id state, the SR-2.1 poller replaces the hook-based long-poll relay, and AskUserQuestion is denied at the template level (SR-3.1). The `src/trail-cli.ts` and `src/trail-query.ts` CLI query wrappers (removed in `b.8tm`) are also absent — the trail file itself is the surface; see [Trail file location and query recipes](#trail-file-location-and-query-recipes--sr-v-5--sr-v-6).
 
 ## Data Flow
 
@@ -466,26 +466,33 @@ Fields:
 
 **Operational logging.** The existing `[slack] permission-click: ErrInvalidFlags from decide for ...` / `ErrAmbiguousRequest` / `decide failed for ...` `console.error` lines stay alongside the trail event. They serve a different purpose — live stderr monitoring — and are intentionally not redundant with the canonical after-the-fact debugging surface.
 
-#### Operator queries (`cscb trail`) — SR-V-5 / SR-V-6
+#### Trail file location and query recipes — SR-V-5 / SR-V-6
 
-The `cscb trail` CLI subcommand is the single discoverable operator entrypoint for querying the JSONL trail. It reads `permission-trail.jsonl` fresh on every invocation, does **not** require a running CSCB process, does **not** touch the PID file, and does **not** perturb the system being investigated (SR-V-6.2). Output is JSONL on stdout, one event per line, sorted by `ts` ascending — pipe to `jq` for pretty-printing.
+The file is the surface; `tail`, `grep`, and `jq` are the readers. No running CSCB process is required and nothing is perturbed (SR-V-6.2).
 
-**Two query shapes** (SR-V-5):
+**Path:** `~/.claude/channels/slack/permission-trail.jsonl`
+**Directory override:** `SLACK_STATE_DIR` (sets the directory; file name is always `permission-trail.jsonl`)
+
+**Single-side recipes:**
 
 ```sh
-# SR-V-5.1: every event for one interaction
-cscb trail --token 6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd
+# Live stream
+tail -f ~/.claude/channels/slack/permission-trail.jsonl
 
-# SR-V-5.2: every event on a Slack channel within a time window (inclusive)
-cscb trail \
-  --channel C0B1ZJJLJ9M \
-  --since 2026-06-04T20:00:00.000Z \
-  --until 2026-06-04T21:00:00.000Z
+# SR-V-5.1: every event for one interaction
+jq -c 'select(.request_token=="X")' ~/.claude/channels/slack/permission-trail.jsonl
+
+# SR-V-5.2: events on a channel within a time window
+jq -c 'select(.channel=="C..." and .ts >= "T1" and .ts <= "T2")' \
+  ~/.claude/channels/slack/permission-trail.jsonl
 ```
 
-`cscb trail --help` prints the same usage plus the resolved trail file path (in-shell discovery — SR-V-6.3). Invalid flag combinations (`--token` AND `--channel`, missing `--since`/`--until` for the channel mode, empty `--token` / `--channel`) exit non-zero with a stderr message.
+**Cross-side join** (AD trail + CSCB trail, ordered by `ts`, filtered to one interaction):
 
-**Implementation lives in `src/trail-query.ts`** (pure query module — `queryByToken`, `queryByChannelTimerange`, `resolveTrailPathForQuery`) and `src/trail-cli.ts` (argv parser + dispatch). The CLI is wired into `src/cli.ts`'s subcommand switch alongside `start` / `stop` / `clean_restart`.
+```sh
+cat ~/.agent-director/ad-trail.jsonl ~/.claude/channels/slack/permission-trail.jsonl \
+  | jq -sc 'sort_by(.ts) | map(select(.request_token=="X"))[]'
+```
 
 **Join keys** for stitching the CSCB trail against the AD trail (SR-V-4):
 
