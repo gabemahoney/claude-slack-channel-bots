@@ -24,7 +24,11 @@ import { decideWithToken } from './agent-director-client.ts'
 import { parsePermissionActionId, type PermissionDecision } from './permission-action-id.ts'
 import { getLivePermission, markHandled } from './permission-poller.ts'
 import { emitTrail as defaultEmitTrail } from './permission-trail.ts'
-import type { ClosureVerdictTag, TrailEventBase } from './permission-trail.ts'
+import type {
+  ClosureVerdictTag,
+  ParseFailureReason,
+  TrailEventBase,
+} from './permission-trail.ts'
 
 export interface ClickDeps {
   /** Returns an AD Client whose `decide` method this handler will invoke. */
@@ -77,6 +81,22 @@ function buildDecisionBlocks(decision: PermissionDecision): unknown[] {
 }
 
 /**
+ * Inbound context captured from the Socket Mode interactive payload. Used by
+ * the SR-V-2.6 `cscb.click_handler.invoked` event so investigations can
+ * pivot by clicking user or by the Slack message being clicked against.
+ * Optional so unit-test call sites can omit it; the trail event records the
+ * fields as undefined/missing when not supplied (open envelope per SR-V-1).
+ */
+export interface ClickInteractionContext {
+  /** Inbound Slack channel id from the interactive payload. */
+  channel?: string
+  /** The clicked-message ts from the interactive payload. */
+  messageTs?: string
+  /** Clicking user's Slack id from the interactive payload. */
+  user?: string
+}
+
+/**
  * Handle a permission Block Kit click. Returns true when the action_id was a
  * valid permission decision (the caller has already ack'd); false when the
  * action_id did not match the expected shape (caller should keep looking).
@@ -84,11 +104,29 @@ function buildDecisionBlocks(decision: PermissionDecision): unknown[] {
 export async function handlePermissionClick(
   actionId: string,
   deps: ClickDeps,
+  context: ClickInteractionContext = {},
 ): Promise<boolean> {
   const parsed = parsePermissionActionId(actionId)
   if (parsed === null) return false
 
   const { decision, claudeInstanceId, requestToken } = parsed
+  const emit = deps.emitTrail ?? defaultEmitTrail
+  // SR-V-2.6: live_pending captures the click-time state. Read the entry
+  // here so the trail event records the value at handler entry, before any
+  // markHandled / drop later in this function (or in the next tick) mutates
+  // the map.
+  const earlyEntry = getLivePermission(claudeInstanceId, requestToken)
+  emit({
+    event: 'cscb.click_handler.invoked',
+    claude_instance_id: claudeInstanceId,
+    request_token: requestToken,
+    channel: context.channel ?? earlyEntry?.channelId,
+    message_ts: context.messageTs ?? earlyEntry?.messageTs,
+    user: context.user,
+    raw_action_id: actionId,
+    decision,
+    live_pending: earlyEntry !== undefined,
+  })
 
   // SR-4.1, SR-4.2, SR-7.2: AD is the source of truth. Always call decide
   // with the decoded request_token — including for stale clicks whose
@@ -133,7 +171,6 @@ export async function handlePermissionClick(
   const verdictTag: ClosureVerdictTag = decision === 'allow'
     ? 'click_handler_allow'
     : 'click_handler_deny'
-  const emit = deps.emitTrail ?? defaultEmitTrail
   const envelope = {
     event: 'cscb.chat_update.attempted',
     claude_instance_id: claudeInstanceId,
@@ -161,4 +198,69 @@ export async function handlePermissionClick(
     emit({ ...envelope, ok: false, error: classifySlackError(err) })
   }
   return true
+}
+
+// ---------------------------------------------------------------------------
+// SR-V-2.9 inbound block_actions emission
+// ---------------------------------------------------------------------------
+
+/**
+ * Classify a `block_actions` action_id for the SR-V-2.9 trail event without
+ * mutating state. Exported so `src/server.ts`'s `socket.on('interactive')`
+ * handler stays a thin wiring layer and so this branch can be unit-tested
+ * in isolation (server.ts has module-load side effects and is not directly
+ * importable from tests).
+ *
+ * The decision split is intentional: a `perm_(allow|deny)_*` prefix
+ * indicates a CSCB permission button whose body failed to parse
+ * (`malformed_token`); anything else is foreign (`foreign_action_id`). Note
+ * that `stale_prompt` is NOT a parse-failure reason here — a stale click
+ * decodes fine and shows up as `cscb.click_handler.invoked{live_pending:false}`.
+ */
+const PERMISSION_BUTTON_PREFIX_RE = /^perm_(allow|deny)_/
+
+export interface BlockActionTrailContext {
+  /** Inbound Slack channel id from the interactive payload. */
+  channel?: string
+  /** Clicked message ts from the interactive payload. */
+  messageTs?: string
+  /** Clicking user's Slack id. */
+  user?: string
+}
+
+/**
+ * Emit one `cscb.block_action.received` event for an inbound `block_actions`
+ * action_id. Called once per action in the payload's `actions` array,
+ * regardless of whether the action_id decodes (SR-V-2.9 — the
+ * decode-failure case is the diagnostically critical surface for
+ * "I clicked Allow and nothing happened").
+ */
+export function emitBlockActionReceived(
+  actionId: string,
+  context: BlockActionTrailContext,
+  emit: (
+    partial: Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown },
+  ) => void = defaultEmitTrail,
+): void {
+  const parsed = parsePermissionActionId(actionId)
+  const base = {
+    event: 'cscb.block_action.received',
+    channel: context.channel,
+    message_ts: context.messageTs,
+    user: context.user,
+    raw_action_id: actionId,
+  }
+  if (parsed !== null) {
+    emit({
+      ...base,
+      claude_instance_id: parsed.claudeInstanceId,
+      request_token: parsed.requestToken,
+      decision: parsed.decision,
+    })
+    return
+  }
+  const reason: ParseFailureReason = PERMISSION_BUTTON_PREFIX_RE.test(actionId)
+    ? 'malformed_token'
+    : 'foreign_action_id'
+  emit({ ...base, parse_failure_reason: reason })
 }

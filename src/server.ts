@@ -55,7 +55,10 @@ import {
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { ErrSpawnNotFound } from 'agent-director'
 import { getClient, closeClient } from './agent-director-client.ts'
-import { handlePermissionClick } from './permission-click-handler.ts'
+import {
+  emitBlockActionReceived,
+  handlePermissionClick,
+} from './permission-click-handler.ts'
 import { trustBootstrap } from './trust-bootstrap.ts'
 import { startPermissionPoller, stopPermissionPoller } from './permission-poller.ts'
 import {
@@ -734,12 +737,28 @@ socket.on('interactive', async (evt) => {
   const { ack } = evt as { ack: () => Promise<void> }
   const p = ((evt as any).body ?? (evt as any).payload ?? evt) as Record<string, unknown>
   const actions = (Array.isArray(p['actions']) ? p['actions'] : []) as Array<{ action_id: string }>
+  // SR-V-2.6 / SR-V-2.9 envelope: pull the inbound channel / message ts /
+  // clicking user once per payload — all actions in this payload share them.
+  const channelId = ((p['channel'] as { id?: string } | undefined)?.id) ?? undefined
+  const messageTs = ((p['message'] as { ts?: string } | undefined)?.ts) ?? undefined
+  const userId = ((p['user'] as { id?: string } | undefined)?.id) ?? undefined
+
   for (const action of actions) {
     const actionId = action.action_id
-    const handled = await handlePermissionClick(actionId, {
-      getClient,
-      web,
+    // SR-V-2.9: emit cscb.block_action.received for every action regardless
+    // of whether handlePermissionClick decides to engage. Decode-failure
+    // cases are diagnostically critical for "I clicked and nothing happened".
+    emitBlockActionReceived(actionId, {
+      channel: channelId,
+      messageTs,
+      user: userId,
     })
+
+    const handled = await handlePermissionClick(
+      actionId,
+      { getClient, web },
+      { channel: channelId, messageTs, user: userId },
+    )
     if (handled) {
       await ack()
       return

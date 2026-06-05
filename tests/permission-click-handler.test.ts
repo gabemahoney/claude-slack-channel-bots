@@ -824,3 +824,106 @@ describe('trail events — cscb.chat_update.attempted (click-handler-triggered)'
     expect(closure!.claude_instance_id).toBe(INSTANCE_C)
   })
 })
+
+// ---------------------------------------------------------------------------
+// SR-V Epic 4 — cscb.click_handler.invoked
+// ---------------------------------------------------------------------------
+
+describe('trail events — cscb.click_handler.invoked', () => {
+  const USER = 'U_OPERATOR'
+
+  test('live_pending=true when a LivePermission entry exists at click time', async () => {
+    const seed = await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_A,
+    })
+    const entry = getLivePermission(INSTANCE_C, TOKEN_A)!
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub()
+    const actionId = encodePermissionActionId('allow', INSTANCE_C, TOKEN_A)
+    await handlePermissionClick(
+      actionId,
+      {
+        getClient: () => decide.client,
+        web: seed.chat.web as never,
+        emitTrail: trail.emit,
+      } satisfies ClickHandlerDepsShape as never,
+      { channel: CHANNEL_CH, messageTs: entry.messageTs, user: USER },
+    )
+    const invoked = trail.events.find(e => e.event === 'cscb.click_handler.invoked')
+    expect(invoked).toBeDefined()
+    expect(invoked!['live_pending']).toBe(true)
+    expect(invoked!['decision']).toBe('allow')
+    expect(invoked!.claude_instance_id).toBe(INSTANCE_C)
+    expect(invoked!.request_token).toBe(TOKEN_A)
+    expect(invoked!.channel).toBe(CHANNEL_CH)
+    expect(invoked!.message_ts).toBe(entry.messageTs)
+    expect(invoked!['user']).toBe(USER)
+    expect(invoked!['raw_action_id']).toBe(actionId)
+  })
+
+  test('live_pending=false when no LivePermission entry exists at click time', async () => {
+    // No seed — the live map is empty.
+    const decide = makeDecideStub()
+    const trail = makeTrailCapture()
+    const chatForClick = makeChatStub()
+    const actionId = encodePermissionActionId('deny', INSTANCE_C, TOKEN_A)
+    await handlePermissionClick(
+      actionId,
+      {
+        getClient: () => decide.client,
+        web: chatForClick.web as never,
+        emitTrail: trail.emit,
+      } satisfies ClickHandlerDepsShape as never,
+      { channel: CHANNEL_CH, messageTs: '0000.0000', user: USER },
+    )
+    const invoked = trail.events.find(e => e.event === 'cscb.click_handler.invoked')
+    expect(invoked).toBeDefined()
+    expect(invoked!['live_pending']).toBe(false)
+    expect(invoked!['decision']).toBe('deny')
+    expect(invoked!.claude_instance_id).toBe(INSTANCE_C)
+    expect(invoked!.request_token).toBe(TOKEN_A)
+  })
+
+  test('decode failure path does NOT emit cscb.click_handler.invoked', async () => {
+    const decide = makeDecideStub()
+    const trail = makeTrailCapture()
+    const chatForClick = makeChatStub()
+    const handled = await handlePermissionClick(
+      'foreign_bot_action',
+      {
+        getClient: () => decide.client,
+        web: chatForClick.web as never,
+        emitTrail: trail.emit,
+      } satisfies ClickHandlerDepsShape as never,
+      { channel: CHANNEL_CH, messageTs: '0.0', user: USER },
+    )
+    expect(handled).toBe(false)
+    const invoked = trail.events.find(e => e.event === 'cscb.click_handler.invoked')
+    expect(invoked).toBeUndefined()
+    // Defense in depth: the decide call must also NOT fire on decode failure.
+    expect(decide.calls).toHaveLength(0)
+  })
+
+  test('emitted once per call (no duplicate emissions per click)', async () => {
+    const seed = await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_A,
+    })
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub()
+    await handlePermissionClick(
+      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
+      {
+        getClient: () => decide.client,
+        web: seed.chat.web as never,
+        emitTrail: trail.emit,
+      } satisfies ClickHandlerDepsShape as never,
+      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+    )
+    const invoked = trail.events.filter(e => e.event === 'cscb.click_handler.invoked')
+    expect(invoked).toHaveLength(1)
+  })
+})

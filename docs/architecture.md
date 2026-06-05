@@ -403,6 +403,41 @@ Fields:
 {"ts":"2026-06-04T20:40:02.456Z","event":"cscb.chat_update.attempted","claude_instance_id":"cscb_demo_C0B1ZJJLJ9M","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","channel":"C0B1ZJJLJ9M","message_ts":"1780600244.439969","text":"*Permission* — Allowed","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"*Permission* — Allowed"}}],"verdict_tag":"operator_allow","triggered_by":"poller","ok":true}
 ```
 
+#### `cscb.block_action.received` (SR-V-2.9)
+
+Emitted once per inbound `block_actions` action from the Socket Mode interactive handler in `src/server.ts`, regardless of whether the `action_id` decodes. This is the diagnostically critical surface for **"I clicked Allow and nothing happened"** — decode-failure cases are explicitly in scope. The classification helper lives in `src/permission-click-handler.ts` (`emitBlockActionReceived`) so the server stays a thin wiring layer.
+
+Fields:
+- **Always present**: `ts`, `event="cscb.block_action.received"`, `channel`, `message_ts`, `user`, `raw_action_id`.
+- **On decode success**: `claude_instance_id`, `request_token`, `decision` (`"allow"` | `"deny"`). `parse_failure_reason` is omitted.
+- **On decode failure**: `parse_failure_reason` (table below). Decoded fields are omitted.
+
+**Parse-failure reason set** — open to extension per SR-V-2.9:
+
+| `parse_failure_reason` | Meaning |
+|---|---|
+| `foreign_action_id` | `action_id` does not match the `perm_(allow|deny)_*` prefix — not a CSCB permission button at all. |
+| `malformed_token` | `action_id` matches the `perm_(allow|deny)_*` prefix but `parsePermissionActionId` returns `null` (body broken). |
+
+**Not a parse failure: `stale_prompt`.** A click on a closed prompt decodes fine — the `action_id` is still well-formed. Stale clicks surface as `cscb.click_handler.invoked{live_pending: false}` instead.
+
+#### `cscb.click_handler.invoked` (SR-V-2.6)
+
+Emitted from `handlePermissionClick` in `src/permission-click-handler.ts` for every parsed-as-permission click. Emitted exactly once per call, after `parsePermissionActionId` succeeds and before the AD `decide` call. Decode-failure clicks (foreign or malformed action_id) do NOT emit this event — they show up only as `cscb.block_action.received{parse_failure_reason}`.
+
+Fields: `ts`, `event="cscb.click_handler.invoked"`, `claude_instance_id`, `request_token`, `decision`, `channel`, `message_ts`, `user`, `raw_action_id`, `live_pending` (boolean).
+
+`live_pending` is the result of `getLivePermission(claude_instance_id, request_token) !== undefined` at handler entry. `true` means a `LivePermission` entry existed (happy path); `false` means the click decoded fine but the entry had already aged out or been dropped — the operator's "I clicked but the prompt was already closed" diagnostic.
+
+**Example sequence** — happy-path Allow click:
+
+```json
+{"ts":"2026-06-04T20:40:01.111Z","event":"cscb.block_action.received","channel":"C0B1ZJJLJ9M","message_ts":"1780600244.439969","user":"U_OPERATOR","raw_action_id":"perm_allow_cscb_demo_C0B1ZJJLJ9M_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","claude_instance_id":"cscb_demo_C0B1ZJJLJ9M","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","decision":"allow"}
+{"ts":"2026-06-04T20:40:01.112Z","event":"cscb.click_handler.invoked","claude_instance_id":"cscb_demo_C0B1ZJJLJ9M","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","channel":"C0B1ZJJLJ9M","message_ts":"1780600244.439969","user":"U_OPERATOR","raw_action_id":"perm_allow_cscb_demo_C0B1ZJJLJ9M_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","decision":"allow","live_pending":true}
+```
+
+**Note on the `src/server.ts:699` / `:712` truncation.** The existing `console.error('[slack] RAW message event:', JSON.stringify(...).slice(0, 300))` summaries are INTENTIONALLY preserved per SR-V-3.2 — they are a separate human-readable log. The canonical store is full-fidelity by construction (no `.slice` in the trail emit path).
+
 ### Removed pre-Epic-2 files
 
 The previous tmux-direct architecture wrote `~/.claude/channels/slack/sessions.json` to persist tmux session names and discovered Claude session UUIDs. Both responsibilities have moved to agent-director — `sessions.json` and `sessions.json.last` no longer exist. Operators upgrading from a pre-Epic-2 install can safely delete the stale files; CSCB will not read them.

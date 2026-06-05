@@ -106,6 +106,25 @@ export type ClosureVerdictTag = CanonicalClosureVerdictTag | (string & {})
 // eslint-disable-next-line @typescript-eslint/ban-types
 export type TriggeredBy = 'poller' | 'click_handler' | (string & {})
 
+/**
+ * Stable reasons a `cscb.block_action.received` event records when the
+ * inbound `action_id` failed `parsePermissionActionId` (SR-V-2.9). Open to
+ * extension. `stale_prompt` is intentionally NOT in this set — stale clicks
+ * decode fine and show up as `cscb.click_handler.invoked{live_pending:false}`.
+ */
+export const PARSE_FAILURE_REASONS = [
+  'foreign_action_id',
+  'malformed_token',
+] as const
+
+export type CanonicalParseFailureReason = (typeof PARSE_FAILURE_REASONS)[number]
+
+// eslint-disable-next-line @typescript-eslint/ban-types
+export type ParseFailureReason = CanonicalParseFailureReason | (string & {})
+
+/** Decoded permission decision carried on inbound click events (SR-V-2.6 / SR-V-2.9). */
+export type ClickDecision = 'allow' | 'deny'
+
 // ---------------------------------------------------------------------------
 // State-dir + path resolution
 // ---------------------------------------------------------------------------

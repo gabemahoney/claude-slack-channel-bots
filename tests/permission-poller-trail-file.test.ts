@@ -20,7 +20,12 @@ import {
   stopPermissionPoller,
 } from '../src/permission-poller.ts'
 import { _resetTrailFdForTests } from '../src/permission-trail.ts'
-import { parsePermissionActionId } from '../src/permission-action-id.ts'
+import { encodePermissionActionId, parsePermissionActionId } from '../src/permission-action-id.ts'
+import {
+  emitBlockActionReceived,
+  handlePermissionClick,
+} from '../src/permission-click-handler.ts'
+import type { DecideParams, DecideResult } from 'agent-director'
 import {
   cannedGetPermissionResponse,
   cannedGetResultPlural,
@@ -310,5 +315,98 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     expect(post).toBeDefined()
     expect(post!['ok']).toBe(false)
     expect(post!['error']).toBe('channel_not_found')
+  })
+
+  test('inbound click persists block_action.received{success} + click_handler.invoked{live_pending=true} on disk', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub({ ts: SLACK_RETURNED_TS })
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
+      }),
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+    })
+
+    // Tick 1: seed the live entry
+    ivl.pending[0]!.cb()
+    await new Promise(r => setTimeout(r, 20))
+
+    // Simulate the inbound Slack click: SR-V-2.9 then SR-V-2.6
+    const USER = 'U_OPERATOR'
+    const actionId = encodePermissionActionId('allow', INSTANCE_C, TOKEN_A)
+    emitBlockActionReceived(actionId, {
+      channel: CHANNEL_CH,
+      messageTs: SLACK_RETURNED_TS,
+      user: USER,
+    })
+    const decideStub: { client: { decide: (p: DecideParams) => Promise<DecideResult> } } = {
+      client: { decide: async (_p: DecideParams) => ({}) },
+    }
+    await handlePermissionClick(
+      actionId,
+      { getClient: () => decideStub.client, web: chat.web as never },
+      { channel: CHANNEL_CH, messageTs: SLACK_RETURNED_TS, user: USER },
+    )
+
+    const matching = readAllLines().filter(e => e['request_token'] === TOKEN_A)
+    const blockEvt = matching.find(e => e['event'] === 'cscb.block_action.received')
+    expect(blockEvt).toBeDefined()
+    expect(blockEvt!['raw_action_id']).toBe(actionId)
+    expect(blockEvt!['decision']).toBe('allow')
+    expect(blockEvt!['user']).toBe(USER)
+    expect(blockEvt!['channel']).toBe(CHANNEL_CH)
+    expect('parse_failure_reason' in blockEvt!).toBe(false)
+
+    const invoked = matching.find(e => e['event'] === 'cscb.click_handler.invoked')
+    expect(invoked).toBeDefined()
+    expect(invoked!['live_pending']).toBe(true)
+    expect(invoked!['decision']).toBe('allow')
+    expect(invoked!['user']).toBe(USER)
+
+    // block_action.received MUST precede click_handler.invoked.
+    const idxBlock = matching.indexOf(blockEvt!)
+    const idxInvoked = matching.indexOf(invoked!)
+    expect(idxBlock).toBeLessThan(idxInvoked)
+  })
+
+  test('forged foreign action_id persists block_action.received{parse_failure_reason} and no click_handler.invoked', async () => {
+    const FORGED_ID = 'forged_foreign_bot_action'
+    const USER = 'U_OPERATOR'
+
+    emitBlockActionReceived(FORGED_ID, {
+      channel: CHANNEL_CH,
+      messageTs: '9999.0',
+      user: USER,
+    })
+    const decideStub: { client: { decide: (p: DecideParams) => Promise<DecideResult> } } = {
+      client: { decide: async (_p: DecideParams) => ({}) },
+    }
+    const chat = makeChatStub()
+    const handled = await handlePermissionClick(
+      FORGED_ID,
+      { getClient: () => decideStub.client, web: chat.web as never },
+      { channel: CHANNEL_CH, messageTs: '9999.0', user: USER },
+    )
+    expect(handled).toBe(false)
+
+    const all = readAllLines()
+    const forgedEvents = all.filter(e => e['raw_action_id'] === FORGED_ID)
+    expect(forgedEvents).toHaveLength(1)
+    expect(forgedEvents[0]!['event']).toBe('cscb.block_action.received')
+    expect(forgedEvents[0]!['parse_failure_reason']).toBe('foreign_action_id')
+
+    const invokedForForged = all.find(
+      e => e['event'] === 'cscb.click_handler.invoked' && e['raw_action_id'] === FORGED_ID,
+    )
+    expect(invokedForForged).toBeUndefined()
   })
 })
