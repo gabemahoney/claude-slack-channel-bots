@@ -466,6 +466,46 @@ Fields:
 
 **Operational logging.** The existing `[slack] permission-click: ErrInvalidFlags from decide for ...` / `ErrAmbiguousRequest` / `decide failed for ...` `console.error` lines stay alongside the trail event. They serve a different purpose — live stderr monitoring — and are intentionally not redundant with the canonical after-the-fact debugging surface.
 
+#### Operator queries (`cscb trail`) — SR-V-5 / SR-V-6
+
+The `cscb trail` CLI subcommand is the single discoverable operator entrypoint for querying the JSONL trail. It reads `permission-trail.jsonl` fresh on every invocation, does **not** require a running CSCB process, does **not** touch the PID file, and does **not** perturb the system being investigated (SR-V-6.2). Output is JSONL on stdout, one event per line, sorted by `ts` ascending — pipe to `jq` for pretty-printing.
+
+**Two query shapes** (SR-V-5):
+
+```sh
+# SR-V-5.1: every event for one interaction
+cscb trail --token 6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd
+
+# SR-V-5.2: every event on a Slack channel within a time window (inclusive)
+cscb trail \
+  --channel C0B1ZJJLJ9M \
+  --since 2026-06-04T20:00:00.000Z \
+  --until 2026-06-04T21:00:00.000Z
+```
+
+`cscb trail --help` prints the same usage plus the resolved trail file path (in-shell discovery — SR-V-6.3). Invalid flag combinations (`--token` AND `--channel`, missing `--since`/`--until` for the channel mode, empty `--token` / `--channel`) exit non-zero with a stderr message.
+
+**Implementation lives in `src/trail-query.ts`** (pure query module — `queryByToken`, `queryByChannelTimerange`, `resolveTrailPathForQuery`) and `src/trail-cli.ts` (argv parser + dispatch). The CLI is wired into `src/cli.ts`'s subcommand switch alongside `start` / `stop` / `clean_restart`.
+
+**Join keys** for stitching the CSCB trail against the AD trail (SR-V-4):
+
+| Key | Emitted by (CSCB surface) | When |
+|---|---|---|
+| `request_token` | every CSCB event after AD mints one | primary join key (SR-V-1.1) |
+| `claude_instance_id` | every CSCB event when known | join when no token yet (SR-V-1.2) |
+| `channel` + `message_ts` | every Slack-touching event (`chat_post.attempted`, `chat_update.attempted`, `block_action.received`, `click_handler.invoked`) | Slack pivot (SR-V-1.3) |
+
+The AD trail (file owned by agent-director — see `t1.n4v.14`) emits the complementary side; the operator joins by `request_token` and orders by `ts`.
+
+**SRD §10 question → answering event class** — CSCB side (questions 2–5; question 1 is AD's):
+
+| SRD §10 question | Answered by |
+|---|---|
+| Q2: Did CSCB issue a `chat.postMessage` carrying the expected Block Kit blocks? | `cscb.chat_post.attempted` — `text` and `blocks` fields. |
+| Q3: What `ts` did Slack return? | `cscb.chat_post.attempted` — `slack_ts` field. |
+| Q4: Was a `block_actions` click received against that `ts`? | `cscb.block_action.received` — `message_ts` field equals the post's `slack_ts`. |
+| Q5: Did the closure render on the original `ts`? | `cscb.chat_update.attempted` — `message_ts` field equals the post's `slack_ts`. |
+
 ### Removed pre-Epic-2 files
 
 The previous tmux-direct architecture wrote `~/.claude/channels/slack/sessions.json` to persist tmux session names and discovered Claude session UUIDs. Both responsibilities have moved to agent-director — `sessions.json` and `sessions.json.last` no longer exist. Operators upgrading from a pre-Epic-2 install can safely delete the stale files; CSCB will not read them.
