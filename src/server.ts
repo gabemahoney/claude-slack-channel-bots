@@ -99,6 +99,7 @@ import {
 } from './registry.ts'
 import { runAgentDirectorStartupGate } from './agent-director-startup.ts'
 import { installSlackChannelBotTemplate } from './agent-director-template.ts'
+import { initOutageState } from './outage-state.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -909,6 +910,15 @@ export async function main(): Promise<void> {
       process.exit(1)
     }
   }
+
+  initOutageState({
+    postToChannel: (channelId, text) => {
+      web.chat.postMessage({ channel: channelId, text }).catch((err) => {
+        console.error(`[slack] outage-state: postMessage failed for channel=${channelId}:`, err)
+      })
+    },
+    getClient,
+  })
 
   if (isDryRun()) {
     console.error('[slack] Running in dry-run mode — Slack disabled')
