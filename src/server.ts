@@ -54,6 +54,7 @@ import {
 } from './session-manager.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { ErrSpawnNotFound } from 'agent-director'
+import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from './agent-director-errors.ts'
 import { getClient, closeClient } from './agent-director-client.ts'
 import {
   emitBlockActionReceived,
@@ -99,7 +100,7 @@ import {
 } from './registry.ts'
 import { runAgentDirectorStartupGate } from './agent-director-startup.ts'
 import { installSlackChannelBotTemplate } from './agent-director-template.ts'
-import { initOutageState } from './outage-state.ts'
+import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy } from './outage-state.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -936,6 +937,10 @@ export async function main(): Promise<void> {
     await socket.start()
     console.error('[slack] Socket Mode connected')
 
+    if (routingConfig) {
+      resetAllToHealthy(Object.keys(routingConfig.routes))
+    }
+
     // SR-2.1 permission poller — single-threaded interval loop monitors AD
     // state for spawns in check_permission and posts Block Kit prompts.
     if (routingConfig) {
@@ -1142,9 +1147,23 @@ export async function main(): Promise<void> {
     const claude_instance_id = instanceIdFor(channelId, routingConfig.routes[channelId]?.normalizedName)
     try {
       const r = await getClient().status({ claude_instance_id })
+      clearOutageFlag(channelId, 'ad-unreachable')
+      clearOutageFlag(channelId, 'tmux-unavailable')
       return AGENT_DIRECTOR_LIVE_STATES.has(r.state)
     } catch (err) {
-      if (err instanceof ErrSpawnNotFound) return false
+      if (err instanceof ErrSpawnNotFound) {
+        clearOutageFlag(channelId, 'ad-unreachable')
+        clearOutageFlag(channelId, 'tmux-unavailable')
+        return false
+      }
+      if (err instanceof ErrSystemInstallDisappeared) {
+        setOutageFlag(channelId, 'ad-unreachable', err.binaryPath)
+        return false
+      }
+      if (err instanceof ErrTmuxNotAvailable) {
+        setOutageFlag(channelId, 'tmux-unavailable')
+        return false
+      }
       console.error(`[slack] isSessionAlive: status error for channel=${channelId}:`, err)
       return false
     }
