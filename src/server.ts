@@ -99,7 +99,7 @@ import {
 } from './registry.ts'
 import { runAgentDirectorStartupGate } from './agent-director-startup.ts'
 import { installSlackChannelBotTemplate } from './agent-director-template.ts'
-import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy } from './outage-state.ts'
+import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy, withOutageDetection } from './outage-state.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -1197,9 +1197,12 @@ export async function main(): Promise<void> {
     killSession: async (channelId) => {
       try {
         const normalizedName = routingConfig?.routes[channelId]?.normalizedName
-        await getClient().kill({ claude_instance_id: instanceIdFor(channelId, normalizedName) })
+        await withOutageDetection(channelId, undefined, (client) =>
+          client.kill({ claude_instance_id: instanceIdFor(channelId, normalizedName) })
+        )
       } catch (err) {
         if (err instanceof ErrSpawnNotFound) return
+        if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) return
         console.error(`[slack] killSession (restart adapter): error for channel=${channelId}:`, err)
       }
     },
