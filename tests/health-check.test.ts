@@ -11,6 +11,12 @@ import {
   _resetHealthCheckState,
   type HealthCheckDeps,
 } from '../src/health-check.ts'
+import {
+  _resetOutageState,
+  initOutageState,
+  getOutageFlags,
+  setOutageFlag,
+} from '../src/outage-state.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -24,13 +30,14 @@ const WAIT_MS = 50             // wait after starting; long enough for several t
 // ---------------------------------------------------------------------------
 
 type DepsOpts = {
-  isSessionAliveResult?: boolean           // default: false (session is dead)
-  isRestartPendingResult?: boolean         // simulates: timer scheduled, not yet fired
-  isActiveLaunchingResult?: boolean        // simulates: launchSession actively in progress
-  hasReachedMaxFailuresResult?: boolean    // default: false
-  isShuttingDownResult?: boolean           // default: false
-  routes?: Record<string, string>          // default: { C_TEST1: '/cwd/test' }
-  throwOnChannel?: string                  // isSessionAlive throws for this channel
+  isSessionAliveResult?: boolean     // default: false (session is dead)
+  isRestartPendingResult?: boolean   // simulates: timer scheduled, not yet fired
+  isActiveLaunchingResult?: boolean  // simulates: launchSession actively in progress
+  statRouteResult?: boolean          // default: true (route cwd is reachable)
+  statRouteHangs?: boolean           // if true, statRoute never resolves
+  isShuttingDownResult?: boolean     // default: false
+  routes?: Record<string, string>    // default: { C_TEST1: '/cwd/test' }
+  throwOnChannel?: string            // isSessionAlive throws for this channel
 }
 
 function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
@@ -54,8 +61,9 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
     isRestartPendingOrActive(_channelId) {
       return (opts.isRestartPendingResult ?? false) || (opts.isActiveLaunchingResult ?? false)
     },
-    hasReachedMaxFailures(_channelId) {
-      return opts.hasReachedMaxFailuresResult ?? false
+    statRoute(_cwd) {
+      if (opts.statRouteHangs) return new Promise<boolean>(() => {})
+      return Promise.resolve(opts.statRouteResult ?? true)
     },
     scheduleRestart(channelId, cwd) {
       scheduleRestartCalls.push({ channelId, cwd })
@@ -75,6 +83,13 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
 
 beforeEach(() => {
   _resetHealthCheckState()
+  _resetOutageState()
+  // Wire outage-state with no-op Slack emit so setOutageFlag / clearOutageFlag
+  // can mutate flags without side effects in tests that don't care about Slack.
+  initOutageState({
+    postToChannel: () => {},
+    getClient: () => null as any,
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -83,7 +98,7 @@ beforeEach(() => {
 
 describe('startHealthCheck', () => {
   test('1. normal dead-session detection — scheduleRestart called for dead session', async () => {
-    const deps = makeDeps()  // isSessionAlive defaults to false
+    const deps = makeDeps()  // isSessionAlive defaults to false; statRoute defaults to true
     initHealthCheck(deps)
 
     startHealthCheck(FAST_INTERVAL_S)
@@ -116,16 +131,6 @@ describe('startHealthCheck', () => {
 
   test('3. skip alive — isSessionAlive returns true → scheduleRestart never called', async () => {
     const deps = makeDeps({ isSessionAliveResult: true })
-    initHealthCheck(deps)
-
-    startHealthCheck(FAST_INTERVAL_S)
-    await Bun.sleep(WAIT_MS)
-
-    expect(deps.scheduleRestartCalls).toHaveLength(0)
-  })
-
-  test('4. skip at failure limit — hasReachedMaxFailures true → scheduleRestart never called', async () => {
-    const deps = makeDeps({ hasReachedMaxFailuresResult: true })
     initHealthCheck(deps)
 
     startHealthCheck(FAST_INTERVAL_S)
@@ -199,5 +204,145 @@ describe('startHealthCheck', () => {
 
     // Poller fired at least once after startHealthCheck was called
     expect(deps.isSessionAliveCalls.length).toBeGreaterThan(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// New cases: cwd-unreachable flag management, scheduleRestart, tick guard, timeout
+// ---------------------------------------------------------------------------
+
+describe('cwd-unreachable flag management + tick-in-flight guard', () => {
+  test('(a) statRoute returns true → clearOutageFlag("cwd-unreachable") called for that channel', async () => {
+    // Pre-raise the flag so clearOutageFlag has a visible effect
+    setOutageFlag('C_TEST1', 'cwd-unreachable', '/cwd/test')
+    expect(getOutageFlags('C_TEST1').has('cwd-unreachable')).toBe(true)
+
+    const deps = makeDeps({ statRouteResult: true, isSessionAliveResult: true })
+    initHealthCheck(deps)
+
+    startHealthCheck(FAST_INTERVAL_S)
+    await Bun.sleep(WAIT_MS)
+
+    expect(getOutageFlags('C_TEST1').has('cwd-unreachable')).toBe(false)
+  })
+
+  test('(b) statRoute returns false → setOutageFlag("cwd-unreachable", cwd) called for that channel', async () => {
+    expect(getOutageFlags('C_TEST1').has('cwd-unreachable')).toBe(false)
+
+    // isSessionAliveResult: true so scheduleRestart is NOT called — isolates statRoute effect
+    const deps = makeDeps({ statRouteResult: false, isSessionAliveResult: true })
+    initHealthCheck(deps)
+
+    startHealthCheck(FAST_INTERVAL_S)
+    await Bun.sleep(WAIT_MS)
+
+    expect(getOutageFlags('C_TEST1').has('cwd-unreachable')).toBe(true)
+  })
+
+  test('(c) scheduleRestart is called when isSessionAlive returns false', async () => {
+    const deps = makeDeps({ statRouteResult: true, isSessionAliveResult: false })
+    initHealthCheck(deps)
+
+    startHealthCheck(FAST_INTERVAL_S)
+    await Bun.sleep(WAIT_MS)
+
+    expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
+    expect(deps.scheduleRestartCalls[0].channelId).toBe('C_TEST1')
+    expect(deps.scheduleRestartCalls[0].cwd).toBe('/cwd/test')
+  })
+
+  test('(d) tick-in-flight guard: 5th consecutive skip emits exactly one warning', async () => {
+    // statRoute never resolves — first tick body hangs forever, all subsequent
+    // interval firings hit the tickInFlight guard and increment skippedTicks.
+    const deps = makeDeps({ statRouteHangs: true })
+    initHealthCheck(deps)
+
+    const capturedErrors: string[] = []
+    const origError = console.error
+    console.error = (...args: unknown[]) => {
+      capturedErrors.push(args.map(a => String(a)).join(' '))
+    }
+
+    try {
+      startHealthCheck(FAST_INTERVAL_S)  // 10 ms interval
+      // Need 6+ firings: 1 starts the hung body, then 5 are skips.
+      // At 10 ms/tick, 200 ms → ~20 firings → 1 body + 19 skips.
+      await Bun.sleep(200)
+    } finally {
+      console.error = origError
+    }
+
+    const warnings = capturedErrors.filter(e =>
+      e.includes('tick body in flight; skipped 5 consecutive ticks'),
+    )
+    // Warning fires exactly once at the 4→5 skip boundary; further skips are silent.
+    expect(warnings).toHaveLength(1)
+  })
+
+  // ---------------------------------------------------------------------------
+  // (e) default-impl 5 s timeout — hand-rolled fake-clock harness
+  //
+  // Bun 1.x useFakeTimers only fakes Date/Date.now, not setTimeout, so we
+  // inject a controlled setTimeout/clearTimeout pair directly into an isolated
+  // copy of the production statRoute factory (mirrors src/server.ts logic).
+  // ---------------------------------------------------------------------------
+  test('(e) default-impl 5s timeout: hung stat resolves false after 5s budget', async () => {
+    // Inline factory that mirrors the production statRoute from server.ts.
+    // Injectable timers let us trigger the timeout synchronously.
+    function makeStatRouteImpl(
+      statFn: (path: string) => Promise<{ isDirectory(): boolean }>,
+      setTimeoutFn: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>,
+      clearTimeoutFn: (handle: ReturnType<typeof setTimeout> | undefined) => void,
+    ): (cwd: string) => Promise<boolean> {
+      return async (cwd) => {
+        const STAT_TIMEOUT_MS = 5_000
+        const statPromise = (async () => {
+          try {
+            const st = await statFn(cwd)
+            return st.isDirectory()
+          } catch {
+            return false
+          }
+        })()
+        let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+        const timeoutPromise = new Promise<boolean>((resolve) => {
+          timeoutHandle = setTimeoutFn(() => { resolve(false) }, STAT_TIMEOUT_MS)
+        })
+        try {
+          return await Promise.race([statPromise, timeoutPromise])
+        } finally {
+          clearTimeoutFn(timeoutHandle)
+        }
+      }
+    }
+
+    // Capture the timeout callback so we can fire it manually.
+    let capturedCallback: (() => void) | undefined
+    let capturedDelay: number | undefined
+
+    const fakeSetTimeout = (fn: () => void, ms: number) => {
+      capturedCallback = fn
+      capturedDelay = ms
+      return 0 as unknown as ReturnType<typeof setTimeout>
+    }
+    const fakeClearTimeout = (_h: ReturnType<typeof setTimeout> | undefined) => {}
+
+    // stat that never resolves — simulates a hung NFS / unreachable mount
+    const hangingStat = (): Promise<{ isDirectory(): boolean }> =>
+      new Promise(() => {})
+
+    const statRoute = makeStatRouteImpl(hangingStat, fakeSetTimeout, fakeClearTimeout)
+
+    const resultPromise = statRoute('/some/cwd')
+
+    // Verify the timeout was registered with the correct budget
+    expect(capturedDelay).toBe(5_000)
+    expect(capturedCallback).toBeDefined()
+
+    // Fire the timeout — simulates 5 s elapsing
+    capturedCallback!()
+
+    const result = await resultPromise
+    expect(result).toBe(false)
   })
 })
