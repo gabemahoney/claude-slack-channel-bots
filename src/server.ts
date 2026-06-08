@@ -27,6 +27,7 @@ import {
   chmodSync,
   existsSync,
   renameSync,
+  promises as fsPromises,
 } from 'fs'
 
 import {
@@ -54,6 +55,7 @@ import {
 } from './session-manager.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { ErrSpawnNotFound } from 'agent-director'
+import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from './agent-director-errors.ts'
 import { getClient, closeClient } from './agent-director-client.ts'
 import {
   emitBlockActionReceived,
@@ -64,10 +66,8 @@ import { startPermissionPoller, stopPermissionPoller } from './permission-poller
 import {
   initRestart,
   scheduleRestart,
-  resetFailureCounter,
   cancelAllRestartTimers,
   isRestartPendingOrActive,
-  hasReachedMaxFailures,
 } from './restart.ts'
 import { initHealthCheck, startHealthCheck, stopHealthCheck } from './health-check.ts'
 import { loadTokens, isDryRun } from './tokens.ts'
@@ -99,6 +99,7 @@ import {
 } from './registry.ts'
 import { runAgentDirectorStartupGate } from './agent-director-startup.ts'
 import { installSlackChannelBotTemplate } from './agent-director-template.ts'
+import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy, withOutageDetection } from './outage-state.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -521,9 +522,6 @@ async function handleInitialized(
     console.error(`[slack] Session replaced existing connection for CWD "${normalizedCwd}"`)
   }
   console.error(`[slack] Session connected: channel=${matchedChannelId} cwd="${normalizedCwd}"`)
-
-  // Reset failure counter — session reconnected successfully
-  resetFailureCounter(matchedChannelId)
 }
 
 // ---------------------------------------------------------------------------
@@ -756,7 +754,7 @@ socket.on('interactive', async (evt) => {
 
     const handled = await handlePermissionClick(
       actionId,
-      { getClient, web },
+      { web },
       { channel: channelId, messageTs, user: userId },
     )
     if (handled) {
@@ -839,6 +837,97 @@ process.on('SIGTERM', () => { shutdown('SIGTERM').catch(() => process.exit(1)) }
 process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
 
 // ---------------------------------------------------------------------------
+// _buildIsSessionAliveAdapter
+// ---------------------------------------------------------------------------
+
+/**
+ * _buildIsSessionAliveAdapter — test-only factory for the tick-path liveness
+ * probe. Production code wires this via main() as `isSessionAliveAdapter`;
+ * tests call it directly to exercise the four SRD § Liveness probe branches
+ * without importing the private closure inside main().
+ *
+ * @internal
+ */
+export function _buildIsSessionAliveAdapter(
+  getRoutingConfig: () => RoutingConfig | null | undefined,
+): (channelId: string) => Promise<boolean> {
+  return async (channelId: string) => {
+    const routingConfig = getRoutingConfig()
+    if (!routingConfig?.routes[channelId]) return false
+    const claude_instance_id = instanceIdFor(channelId, routingConfig.routes[channelId]?.normalizedName)
+    try {
+      const r = await getClient().status({ claude_instance_id })
+      clearOutageFlag(channelId, 'ad-unreachable')
+      clearOutageFlag(channelId, 'tmux-unavailable')
+      return AGENT_DIRECTOR_LIVE_STATES.has(r.state)
+    } catch (err) {
+      if (err instanceof ErrSpawnNotFound) {
+        clearOutageFlag(channelId, 'ad-unreachable')
+        clearOutageFlag(channelId, 'tmux-unavailable')
+        return false
+      }
+      if (err instanceof ErrSystemInstallDisappeared) {
+        setOutageFlag(channelId, 'ad-unreachable', err.binaryPath)
+        return false
+      }
+      if (err instanceof ErrTmuxNotAvailable) {
+        setOutageFlag(channelId, 'tmux-unavailable')
+        return false
+      }
+      console.error(`[slack] isSessionAlive: status error for channel=${channelId}:`, err)
+      return false
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// _buildStatRouteImpl
+// ---------------------------------------------------------------------------
+
+/**
+ * _buildStatRouteImpl — test-only factory for the health-check tick's
+ * statRoute dependency. Production code wires this via main()'s
+ * initHealthCheck call with no deps; tests inject `stat` / `setTimeout` /
+ * `clearTimeout` to exercise the 5-second timeout budget and the
+ * fsPromises.stat error swallowing against the REAL factory (not a replica).
+ *
+ * @internal
+ */
+export function _buildStatRouteImpl(deps?: {
+  stat?: (path: string) => Promise<{ isDirectory(): boolean }>
+  setTimeout?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>
+  clearTimeout?: (handle: ReturnType<typeof setTimeout> | undefined) => void
+}): (cwd: string) => Promise<boolean> {
+  const stat = deps?.stat ?? ((p: string) => fsPromises.stat(p) as Promise<{ isDirectory(): boolean }>)
+  const setT = deps?.setTimeout ?? ((fn: () => void, ms: number) => setTimeout(fn, ms))
+  const clearT = deps?.clearTimeout ?? ((h: ReturnType<typeof setTimeout> | undefined) => clearTimeout(h))
+  const STAT_TIMEOUT_MS = 5_000
+  return async (cwd: string) => {
+    const statPromise = (async () => {
+      try {
+        const st = await stat(cwd)
+        return st.isDirectory()
+      } catch (err) {
+        console.error(`[slack] health-check: statRoute(${cwd}) failed:`, err)
+        return false
+      }
+    })()
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+    const timeoutPromise = new Promise<boolean>((resolve) => {
+      timeoutHandle = setT(() => {
+        console.error(`[slack] health-check: statRoute(${cwd}) timed out after ${STAT_TIMEOUT_MS}ms — treating as unreachable`)
+        resolve(false)
+      }, STAT_TIMEOUT_MS)
+    })
+    try {
+      return await Promise.race([statPromise, timeoutPromise])
+    } finally {
+      clearT(timeoutHandle)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 //
 // HTTP routing strategy (roots-based session identity):
@@ -910,6 +999,15 @@ export async function main(): Promise<void> {
     }
   }
 
+  initOutageState({
+    postToChannel: (channelId, text) => {
+      web.chat.postMessage({ channel: channelId, text }).catch((err) => {
+        console.error(`[slack] outage-state: postMessage failed for channel=${channelId}:`, err)
+      })
+    },
+    getClient,
+  })
+
   if (isDryRun()) {
     console.error('[slack] Running in dry-run mode — Slack disabled')
     botUserId = 'U000DRY'
@@ -925,6 +1023,10 @@ export async function main(): Promise<void> {
     // Connect Socket Mode
     await socket.start()
     console.error('[slack] Socket Mode connected')
+
+    if (routingConfig) {
+      resetAllToHealthy(Object.keys(routingConfig.routes))
+    }
 
     // SR-2.1 permission poller — single-threaded interval loop monitors AD
     // state for spawns in check_permission and posts Block Kit prompts.
@@ -1127,18 +1229,7 @@ export async function main(): Promise<void> {
   // SR-11 Event 6a. Any AGENT_DIRECTOR_LIVE_STATES value → alive; terminal
   // states (ended, missing) and ErrSpawnNotFound → dead. Other errors fall
   // back to "dead" defensively — health-check will retry.
-  const isSessionAliveAdapter = async (channelId: string): Promise<boolean> => {
-    if (!routingConfig?.routes[channelId]) return false
-    const claude_instance_id = instanceIdFor(channelId, routingConfig.routes[channelId]?.normalizedName)
-    try {
-      const r = await getClient().status({ claude_instance_id })
-      return AGENT_DIRECTOR_LIVE_STATES.has(r.state)
-    } catch (err) {
-      if (err instanceof ErrSpawnNotFound) return false
-      console.error(`[slack] isSessionAlive: status error for channel=${channelId}:`, err)
-      return false
-    }
-  }
+  const isSessionAliveAdapter = _buildIsSessionAliveAdapter(() => routingConfig)
 
   // Initialize restart module with library-backed adapters
   initRestart({
@@ -1153,9 +1244,12 @@ export async function main(): Promise<void> {
     killSession: async (channelId) => {
       try {
         const normalizedName = routingConfig?.routes[channelId]?.normalizedName
-        await getClient().kill({ claude_instance_id: instanceIdFor(channelId, normalizedName) })
+        await withOutageDetection(channelId, undefined, (client) =>
+          client.kill({ claude_instance_id: instanceIdFor(channelId, normalizedName) })
+        )
       } catch (err) {
         if (err instanceof ErrSpawnNotFound) return
+        if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) return
         console.error(`[slack] killSession (restart adapter): error for channel=${channelId}:`, err)
       }
     },
@@ -1226,7 +1320,7 @@ export async function main(): Promise<void> {
   initHealthCheck({
     isSessionAlive: isSessionAliveAdapter,
     isRestartPendingOrActive,
-    hasReachedMaxFailures,
+    statRoute: _buildStatRouteImpl(),
     scheduleRestart,
     isShuttingDown: () => shuttingDown,
     getRoutes: () => {

@@ -41,10 +41,11 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { afterEach, describe, expect, test } from 'bun:test'
-import type { DecideParams, DecideResult, ListResult } from 'agent-director'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import type { Client, DecideParams, DecideResult, ListResult } from 'agent-director'
 
 import { handlePermissionClick } from '../src/permission-click-handler.ts'
+import { _resetOutageState, initOutageState } from '../src/outage-state.ts'
 import { encodePermissionActionId } from '../src/permission-action-id.ts'
 import {
   _resetPollerState,
@@ -138,9 +139,17 @@ function makeChatStub(opts: { tsSequence: string[] }): {
   }
 }
 
+beforeEach(() => {
+  // Initialize outage-state so withOutageDetection does not throw during
+  // poller ticks. The test body overrides via initOutageState with the full
+  // sharedClient (which carries decide) before invoking handlePermissionClick.
+  initOutageState({ getClient: () => ({} as unknown as Client), postToChannel: () => {} })
+})
+
 afterEach(() => {
   stopPermissionPoller()
   _resetPollerState()
+  _resetOutageState()
 })
 
 // ---------------------------------------------------------------------------
@@ -212,6 +221,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     }
     const getClient = () => sharedClient
 
+    initOutageState({ getClient: getClient as unknown as () => Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -246,9 +256,9 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     // -----------------------------------------------------------------
     // Click row A as ALLOW
     // -----------------------------------------------------------------
+    initOutageState({ getClient: getClient as unknown as () => Client, postToChannel: () => {} })
     const allowActionId = encodePermissionActionId('allow', INSTANCE_C, TOK_A)
     const allowHandled = await handlePermissionClick(allowActionId, {
-      getClient,
       web: chat.web as never,
     })
     expect(allowHandled).toBe(true)
@@ -274,7 +284,6 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     // -----------------------------------------------------------------
     const denyActionId = encodePermissionActionId('deny', INSTANCE_C, TOK_B)
     const denyHandled = await handlePermissionClick(denyActionId, {
-      getClient,
       web: chat.web as never,
     })
     expect(denyHandled).toBe(true)

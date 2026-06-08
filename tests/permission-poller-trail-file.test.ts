@@ -14,12 +14,14 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import type { Client } from 'agent-director'
 import {
   _resetPollerState,
   startPermissionPoller,
   stopPermissionPoller,
 } from '../src/permission-poller.ts'
 import { _resetTrailFdForTests } from '../src/permission-trail.ts'
+import { _resetOutageState, initOutageState } from '../src/outage-state.ts'
 import { encodePermissionActionId, parsePermissionActionId } from '../src/permission-action-id.ts'
 import {
   emitBlockActionReceived,
@@ -55,11 +57,16 @@ beforeEach(() => {
   origStateDir = process.env['SLACK_STATE_DIR']
   process.env['SLACK_STATE_DIR'] = tempDir
   _resetTrailFdForTests()
+  // Initialize outage-state so withOutageDetection does not throw during ticks.
+  // Tests that need a specific client (e.g. decide) override via initOutageState
+  // inside the test body.
+  initOutageState({ getClient: () => ({} as unknown as Client), postToChannel: () => {} })
 })
 
 afterEach(() => {
   stopPermissionPoller()
   _resetPollerState()
+  _resetOutageState()
   if (origStateDir === undefined) delete process.env['SLACK_STATE_DIR']
   else process.env['SLACK_STATE_DIR'] = origStateDir
   _resetTrailFdForTests()
@@ -152,6 +159,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
+    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -191,6 +199,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
+    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -241,6 +250,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
       getPermission: async (p: GetPermissionParams): Promise<GetPermissionResult> =>
         cannedGetPermissionResponse({ request_token: p.request_token, decision: 'allow', decision_reason: null }),
     })
+    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -297,6 +307,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
+    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -328,6 +339,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
+    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -351,9 +363,10 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     const decideStub: { client: { decide: (p: DecideParams) => Promise<DecideResult> } } = {
       client: { decide: async (_p: DecideParams) => ({}) },
     }
+    initOutageState({ getClient: () => decideStub.client as unknown as Client, postToChannel: () => {} })
     await handlePermissionClick(
       actionId,
-      { getClient: () => decideStub.client, web: chat.web as never },
+      { web: chat.web as never },
       { channel: CHANNEL_CH, messageTs: SLACK_RETURNED_TS, user: USER },
     )
 
@@ -389,6 +402,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
+    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -402,9 +416,10 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     const decideStub: { client: { decide: (p: DecideParams) => Promise<DecideResult> } } = {
       client: { decide: async (_p: DecideParams) => ({}) },
     }
+    initOutageState({ getClient: () => decideStub.client as unknown as Client, postToChannel: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      { getClient: () => decideStub.client, web: chat.web as never },
+      { web: chat.web as never },
       { channel: CHANNEL_CH, messageTs: SLACK_RETURNED_TS, user: 'U_OPERATOR' },
     )
 
@@ -432,6 +447,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
+    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -449,9 +465,10 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         },
       },
     }
+    initOutageState({ getClient: () => decideStub.client as unknown as Client, postToChannel: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      { getClient: () => decideStub.client, web: chat.web as never },
+      { web: chat.web as never },
       { channel: CHANNEL_CH, messageTs: SLACK_RETURNED_TS, user: 'U_OPERATOR' },
     )
 
@@ -478,7 +495,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     const chat = makeChatStub()
     const handled = await handlePermissionClick(
       FORGED_ID,
-      { getClient: () => decideStub.client, web: chat.web as never },
+      { web: chat.web as never },
       { channel: CHANNEL_CH, messageTs: '9999.0', user: USER },
     )
     expect(handled).toBe(false)

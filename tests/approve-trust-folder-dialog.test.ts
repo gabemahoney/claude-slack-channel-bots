@@ -23,7 +23,8 @@ import {
   _resetTrustDialogPollIntervalMs,
   _resetTrustDialogPollTimeoutMs,
 } from '../src/session-manager.ts'
-import { resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
+import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
+import { initOutageState, _resetOutageState } from '../src/outage-state.ts'
 import {
   makeStubClient,
 } from './test-helpers/agent-director-stub.ts'
@@ -70,10 +71,12 @@ beforeEach(() => {
   savedEnv = { ...process.env }
   _setTrustDialogPollIntervalMs(1)
   _setTrustDialogPollTimeoutMs(50)
+  initOutageState({ postToChannel: () => {}, getClient })
 })
 
 afterEach(() => {
   resetClientForTests()
+  _resetOutageState()
   _resetTrustDialogPollIntervalMs()
   _resetTrustDialogPollTimeoutMs()
   process.env = savedEnv as NodeJS.ProcessEnv

@@ -8,13 +8,10 @@ import { describe, test, expect, beforeEach } from 'bun:test'
 import {
   initRestart,
   scheduleRestart,
-  resetFailureCounter,
   cancelAllRestartTimers,
   _resetRestartState,
   isRestartPendingOrActive,
-  hasReachedMaxFailures,
   type RestartDeps,
-  MAX_CONSECUTIVE_FAILURES,
 } from '../src/restart.ts'
 
 // ---------------------------------------------------------------------------
@@ -165,65 +162,6 @@ describe('scheduleRestart', () => {
     expect(deps.launchSessionCalls[0].channelId).toBe('C_TEST1')
   })
 
-  test('5. 3 consecutive launch failures — scheduleRestart on 4th death skips timer', async () => {
-    const deps = makeDeps({ launchSessionResult: false })
-    initRestart(deps)
-
-    // Drive MAX_CONSECUTIVE_FAILURES failures
-    for (let i = 0; i < MAX_CONSECUTIVE_FAILURES; i++) {
-      scheduleRestart('C_TEST1', '/cwd/test')
-      await Bun.sleep(WAIT_MS)
-    }
-    expect(deps.launchSessionCalls).toHaveLength(MAX_CONSECUTIVE_FAILURES)
-
-    // 4th death: failure count is now >= MAX, timer must NOT be scheduled
-    const callsBefore = deps.launchSessionCalls.length
-    scheduleRestart('C_TEST1', '/cwd/test')
-    await Bun.sleep(WAIT_MS)
-
-    expect(deps.launchSessionCalls.length).toBe(callsBefore)
-  })
-
-  test('6. resetFailureCounter between failures — counter resets, next death schedules timer normally', async () => {
-    const deps = makeDeps({ launchSessionResult: false })
-    initRestart(deps)
-
-    // Drive MAX_CONSECUTIVE_FAILURES failures
-    for (let i = 0; i < MAX_CONSECUTIVE_FAILURES; i++) {
-      scheduleRestart('C_TEST1', '/cwd/test')
-      await Bun.sleep(WAIT_MS)
-    }
-
-    // Confirm 4th is blocked
-    const callsBeforeReset = deps.launchSessionCalls.length
-    scheduleRestart('C_TEST1', '/cwd/test')
-    await Bun.sleep(WAIT_MS)
-    expect(deps.launchSessionCalls.length).toBe(callsBeforeReset)
-
-    // Reset counter — next restart should succeed
-    resetFailureCounter('C_TEST1')
-    scheduleRestart('C_TEST1', '/cwd/test')
-    await Bun.sleep(WAIT_MS)
-
-    expect(deps.launchSessionCalls.length).toBe(callsBeforeReset + 1)
-  })
-
-  test('7. failure counter does NOT increment on session death — only on failed launchSession', async () => {
-    // launchSession always succeeds — failure counter must never accumulate
-    const deps = makeDeps({ launchSessionResult: true })
-    initRestart(deps)
-
-    // Call scheduleRestart more times than MAX_CONSECUTIVE_FAILURES allows
-    const iterations = MAX_CONSECUTIVE_FAILURES + 1
-    for (let i = 0; i < iterations; i++) {
-      scheduleRestart('C_TEST1', '/cwd/test')
-      await Bun.sleep(WAIT_MS)
-    }
-
-    // Every death should have produced a launchSession call
-    expect(deps.launchSessionCalls.length).toBe(iterations)
-  })
-
   test('8. restart with stored session ID — launchSession receives session ID argument', async () => {
     const deps = makeDeps()
     initRestart(deps)
@@ -248,7 +186,7 @@ describe('scheduleRestart', () => {
     expect(deps.launchSessionCalls[0].sessionId).toBeUndefined()
   })
 
-  test('10. launchSession succeeds with session ID — failure counter not incremented', async () => {
+  test('10. launchSession succeeds — no failure state accumulates', async () => {
     const deps = makeDeps({ launchSessionResult: true })
     initRestart(deps)
 
@@ -257,7 +195,8 @@ describe('scheduleRestart', () => {
 
     expect(deps.launchSessionCalls).toHaveLength(1)
     expect(deps.launchSessionCalls[0].sessionId).toBe('saved-session-123')
-    expect(hasReachedMaxFailures('C_TEST1')).toBe(false)
+    // No failure tracking exists — restart retries indefinitely on death
+    expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
   })
 })
 
@@ -407,55 +346,6 @@ describe('isRestartPendingOrActive', () => {
 
     aliveResolve(false) // avoid dangling promise
     await Bun.sleep(1)  // let finally block run
-  })
-})
-
-// ---------------------------------------------------------------------------
-// hasReachedMaxFailures
-// ---------------------------------------------------------------------------
-
-describe('hasReachedMaxFailures', () => {
-  test('returns false for channel with no recorded failures', () => {
-    expect(hasReachedMaxFailures('C_TEST1')).toBe(false)
-  })
-
-  test('returns false after fewer than MAX_CONSECUTIVE_FAILURES failures', async () => {
-    const deps = makeDeps({ launchSessionResult: false })
-    initRestart(deps)
-
-    for (let i = 0; i < MAX_CONSECUTIVE_FAILURES - 1; i++) {
-      scheduleRestart('C_TEST1', '/cwd/test')
-      await Bun.sleep(WAIT_MS)
-    }
-
-    expect(hasReachedMaxFailures('C_TEST1')).toBe(false)
-  })
-
-  test('returns true after exactly MAX_CONSECUTIVE_FAILURES failures', async () => {
-    const deps = makeDeps({ launchSessionResult: false })
-    initRestart(deps)
-
-    for (let i = 0; i < MAX_CONSECUTIVE_FAILURES; i++) {
-      scheduleRestart('C_TEST1', '/cwd/test')
-      await Bun.sleep(WAIT_MS)
-    }
-
-    expect(hasReachedMaxFailures('C_TEST1')).toBe(true)
-  })
-
-  test('returns false after resetFailureCounter is called', async () => {
-    const deps = makeDeps({ launchSessionResult: false })
-    initRestart(deps)
-
-    for (let i = 0; i < MAX_CONSECUTIVE_FAILURES; i++) {
-      scheduleRestart('C_TEST1', '/cwd/test')
-      await Bun.sleep(WAIT_MS)
-    }
-    expect(hasReachedMaxFailures('C_TEST1')).toBe(true)
-
-    resetFailureCounter('C_TEST1')
-
-    expect(hasReachedMaxFailures('C_TEST1')).toBe(false)
   })
 })
 

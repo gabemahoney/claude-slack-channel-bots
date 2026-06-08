@@ -59,8 +59,22 @@ import {
   errGeneric,
   errPermissionRequestNotFound,
   errSpawnNotFound,
+  makeStubClient,
 } from './test-helpers/agent-director-stub.ts'
 import type { GetPermissionParams, GetPermissionResult } from '../src/agent-director-client.ts'
+import {
+  getClient as moduleGetClient,
+  resetClientForTests,
+  setClientForTests,
+} from '../src/agent-director-client.ts'
+import {
+  ErrSystemInstallDisappeared,
+} from 'agent-director'
+import {
+  _resetOutageState,
+  getOutageFlags,
+  initOutageState,
+} from '../src/outage-state.ts'
 
 // ---------------------------------------------------------------------------
 // SLACK_STATE_DIR isolation — any default emitTrail in the poller would
@@ -69,6 +83,7 @@ import type { GetPermissionParams, GetPermissionResult } from '../src/agent-dire
 
 let trailTempDir: string
 let origStateDir: string | undefined
+let outageEmissions: Array<{ channelId: string; text: string }> = []
 
 beforeAll(() => {
   trailTempDir = mkdtempSync(join(tmpdir(), 'poller-trail-isolation-'))
@@ -85,6 +100,17 @@ afterAll(() => {
 
 beforeEach(() => {
   _resetTrailFdForTests()
+  // Wire outage-state so withOutageDetection doesn't throw. Tests that use
+  // the closure form in permission-poller (captures outer deps.getClient()
+  // client) don't rely on outage-state's getClient for the actual AD call,
+  // but the module must be initialised. A default makeStubClient() satisfies
+  // the type; it is never invoked by the closure callbacks.
+  outageEmissions = []
+  setClientForTests(makeStubClient() as unknown as Parameters<typeof setClientForTests>[0])
+  initOutageState({
+    getClient: moduleGetClient,
+    postToChannel: (channelId, text) => { outageEmissions.push({ channelId, text }) },
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -205,6 +231,8 @@ const checkPermRow = (instance: string = INSTANCE_C, channel: string = CHANNEL_C
 afterEach(() => {
   stopPermissionPoller()
   _resetPollerState()
+  resetClientForTests()
+  _resetOutageState()
 })
 
 // ---------------------------------------------------------------------------
@@ -1230,7 +1258,7 @@ describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', ()
 // ---------------------------------------------------------------------------
 
 describe('poller tick — skipped-tick observability', () => {
-  test('5+ consecutive skips logs WARN', async () => {
+  test('exactly one WARN at the 5th skip; further skips in the same streak are silent', async () => {
     const ivl = makeInterval()
     const chat = makeChatStub()
     const logCalls: unknown[][] = []
@@ -1256,16 +1284,70 @@ describe('poller tick — skipped-tick observability', () => {
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 5))
 
-    // Fire 5 more ticks while the first is still in-flight → 5 skips
-    for (let i = 0; i < 5; i++) {
+    // Fire 7 more ticks while the first is still in-flight → 7 skips total.
+    // With `=== 5` semantics, the warning fires exactly once (at skip 5);
+    // with the older `>= 5` semantics it would fire 3 times (skips 5, 6, 7).
+    for (let i = 0; i < 7; i++) {
       ivl.pending[0].cb()
     }
     await new Promise((r) => setTimeout(r, 5))
 
     const warnLogs = logCalls.filter((args) => String(args[0]).includes('skipped'))
-    expect(warnLogs.length).toBeGreaterThan(0)
+    expect(warnLogs).toHaveLength(1)
+    expect(String(warnLogs[0][0])).toMatch(/skipped 5 consecutive ticks/)
 
     // Unblock the hanging tick so cleanup works
+    resolveTick()
+    await new Promise((r) => setTimeout(r, 10))
+  })
+
+  test('warning re-arms after a successful tick: a second stuck streak emits another single warning', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub()
+    const logCalls: unknown[][] = []
+
+    let hangTick = true
+    let resolveTick: () => void = () => {}
+    const getClient = () => ({
+      list: async () => {
+        if (hangTick) {
+          await new Promise<void>((resolve) => { resolveTick = resolve })
+        }
+        return { spawns: [] }
+      },
+      get: async () => cannedGetResult({ claude_instance_id: 'x' }),
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+      log: (...args) => { logCalls.push(args) },
+    })
+
+    // First streak: hang + 5 skips → one warning.
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 5))
+    for (let i = 0; i < 5; i++) ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 5))
+    expect(logCalls.filter((a) => String(a[0]).includes('skipped'))).toHaveLength(1)
+
+    // Resolve the hung tick + let any new tick run cleanly to reset skippedTicks.
+    hangTick = false
+    resolveTick()
+    await new Promise((r) => setTimeout(r, 10))
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    // Second streak: hang again + 5 skips → exactly one more warning (total 2).
+    hangTick = true
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 5))
+    for (let i = 0; i < 5; i++) ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 5))
+    expect(logCalls.filter((a) => String(a[0]).includes('skipped'))).toHaveLength(2)
+
     resolveTick()
     await new Promise((r) => setTimeout(r, 10))
   })
@@ -1803,5 +1885,157 @@ describe('trail events — cscb.chat_update.attempted (poller-triggered)', () =>
       (args) => String(args[0]).includes('closure chat.update failed'),
     )
     expect(closureFailLogs.length).toBeGreaterThan(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.en2 Epic 6 — withOutageDetection wrapper integration (3 new cases)
+// ---------------------------------------------------------------------------
+
+describe('b.en2 Epic 6 — withOutageDetection wrapper integration', () => {
+  // Case 1: per-row client.get raises ad-unreachable via wrapper.
+  test('per-row client.get: ErrSystemInstallDisappeared → ad-unreachable raised; no Slack postMessage', async () => {
+    const ROW_CHANNEL = 'COUT1'
+    const ivl = makeInterval()
+    const chat = makeChatStub()
+    const getCalls: unknown[] = []
+    const getClient = () => ({
+      list: async () => ({
+        spawns: [cannedListRow({
+          claude_instance_id: INSTANCE_C,
+          state: 'check_permission',
+          labels: { service: 'cscb', channel: ROW_CHANNEL },
+        })],
+      }),
+      get: async (params: unknown) => {
+        getCalls.push(params)
+        throw new ErrSystemInstallDisappeared('get', '/bin/ad')
+      },
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+    })
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 20))
+
+    // Wrapper invoked get() exactly once.
+    expect(getCalls).toHaveLength(1)
+    // ad-unreachable flag raised for the row's channel.
+    expect(getOutageFlags(ROW_CHANNEL).has('ad-unreachable')).toBe(true)
+    // Onset Slack message carries the binaryPath detail.
+    const onset = outageEmissions.find(e => e.channelId === ROW_CHANNEL)
+    expect(onset).toBeDefined()
+    expect(onset!.text).toContain('/bin/ad')
+    // Per-event Slack postMessage suppressed (no double-noise).
+    expect(chat.calls.filter(c => c.kind === 'postMessage')).toHaveLength(0)
+  })
+
+  // Case 2: per-entry getPermission raises ad-unreachable via wrapper.
+  test('per-entry getPermission: ErrSystemInstallDisappeared → ad-unreachable raised; entry preserved for retry', async () => {
+    const ROW_CHANNEL = 'COUT2'
+    const ivl = makeInterval()
+    const chat = makeChatStub({ tsSequence: [POST_TS] })
+    let rowsPresent = true
+    const getPermCalls: GetPermissionParams[] = []
+    const getClient = () => ({
+      list: async () => ({
+        spawns: rowsPresent
+          ? [cannedListRow({
+              claude_instance_id: INSTANCE_C,
+              state: 'check_permission',
+              labels: { service: 'cscb', channel: ROW_CHANNEL },
+            })]
+          : [],
+      }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: rowsPresent
+          ? [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })]
+          : [],
+      }),
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
+        getPermCalls.push(params)
+        throw new ErrSystemInstallDisappeared('get-permission', '/bin/ad')
+      },
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+    })
+    // Tick 1: seed the live entry.
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeDefined()
+
+    // Tick 2: row disappears → getPermission path fires with ErrSystemInstallDisappeared.
+    rowsPresent = false
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    expect(getPermCalls).toHaveLength(1)
+    // ad-unreachable flag raised for the entry's channel.
+    expect(getOutageFlags(ROW_CHANNEL).has('ad-unreachable')).toBe(true)
+    // Onset Slack message carries the binaryPath detail.
+    const onset = outageEmissions.find(e => e.channelId === ROW_CHANNEL)
+    expect(onset).toBeDefined()
+    expect(onset!.text).toContain('/bin/ad')
+    // Entry preserved — no chat.update (outage-class error is a skip, not a close).
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeDefined()
+    expect(chat.calls.filter(c => c.kind === 'update')).toHaveLength(0)
+  })
+
+  // Case 3: row with no channel label is logged-and-skipped before client.get.
+  test('row with no channel label → logged-and-skipped; zero client.get calls; no orphan state under "<unknown>"', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub()
+    const logCalls: unknown[][] = []
+    const getCalls: unknown[] = []
+    const getClient = () => ({
+      list: async () => ({
+        spawns: [cannedListRow({
+          claude_instance_id: INSTANCE_C,
+          state: 'check_permission',
+          labels: { service: 'cscb' },  // no 'channel' key
+        })],
+      }),
+      get: async (params: unknown) => {
+        getCalls.push(params)
+        return cannedGetResultPlural({
+          claude_instance_id: INSTANCE_C,
+          state: 'check_permission',
+          permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A })],
+        })
+      },
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+      log: (...args) => { logCalls.push(args) },
+    })
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    // Zero client.get calls for the no-channel-label row.
+    expect(getCalls).toHaveLength(0)
+    // Diagnostic log emitted including the claude_instance_id.
+    const skipLogs = logCalls.filter(args => String(args[0]).includes('has no channel label'))
+    expect(skipLogs.length).toBeGreaterThan(0)
+    expect(String(skipLogs[0][0])).toContain(INSTANCE_C)
+    // No orphan outage state created under '<unknown>'.
+    expect(getOutageFlags('<unknown>').size).toBe(0)
+    // No live permission entry, no Slack messages.
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
+    expect(chat.calls).toHaveLength(0)
   })
 })

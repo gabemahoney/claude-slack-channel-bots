@@ -35,6 +35,8 @@
 import {
   AgentDirectorError,
   ErrSpawnNotFound,
+  ErrSystemInstallDisappeared,
+  ErrTmuxNotAvailable,
 } from 'agent-director'
 import type {
   GetResult as ADGetResult,
@@ -50,6 +52,7 @@ import type {
   GetPermissionParams,
   GetPermissionResult,
 } from './agent-director-client.ts'
+import { withOutageDetection } from './outage-state.ts'
 import { encodePermissionActionId } from './permission-action-id.ts'
 import { emitTrail as defaultEmitTrail } from './permission-trail.ts'
 import type {
@@ -303,7 +306,12 @@ function classifySlackError(err: unknown): string {
 async function runTick(deps: PollerDeps): Promise<void> {
   if (tickInFlight) {
     skippedTicks++
-    if (skippedTicks >= 5) {
+    // Fire exactly once when the streak crosses 5 (4 → 5 transition). Further
+    // skips within the same streak are silent; the next successfully-started
+    // tick body resets skippedTicks to 0 and re-arms the warning for a future
+    // streak. Mirrors src/health-check.ts:55-62 — see that block for the
+    // budget-exhaustion rationale.
+    if (skippedTicks === 5) {
       logViaDeps(deps, `[slack] permission-poller: skipped ${skippedTicks} consecutive ticks — tick budget exceeded`)
     }
     return
@@ -324,13 +332,23 @@ async function runTick(deps: PollerDeps): Promise<void> {
     const seenComposite = new Set<string>()
     const nonConformingInstanceIds = new Set<string>()
     for (const row of rows) {
+      const rowChannelId = row.labels['channel']
+      if (!rowChannelId) {
+        logViaDeps(deps, `[slack] permission-poller: spawn ${row.claude_instance_id} has no channel label — skipping`)
+        continue
+      }
+
       let got: GetResultWithPermissionRequests
       try {
-        got = (await client.get({
-          claude_instance_id: row.claude_instance_id,
-        })) as unknown as GetResultWithPermissionRequests
+        got = (await withOutageDetection(rowChannelId, undefined, () =>
+          client.get({ claude_instance_id: row.claude_instance_id })
+        )) as unknown as GetResultWithPermissionRequests
       } catch (err) {
         if (err instanceof ErrSpawnNotFound) continue
+        if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
+          // Outage flag raised; skip per-event log.
+          continue
+        }
         const e = err instanceof AgentDirectorError ? err : null
         logViaDeps(deps, `[slack] permission-poller: get failed for ${row.claude_instance_id}: ${e?.errName ?? String(err)}`)
         continue
@@ -368,8 +386,14 @@ async function runTick(deps: PollerDeps): Promise<void> {
     for (const entry of closedEntries) {
       let info: GetPermissionResult
       try {
-        info = await getPermission(client, { request_token: entry.requestToken })
+        info = await withOutageDetection(entry.channelId, undefined, () =>
+          getPermission(client, { request_token: entry.requestToken })
+        )
       } catch (err) {
+        if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
+          // Outage flag raised; skip per-event log.
+          continue
+        }
         if (isErrPermissionRequestNotFound(err)) {
           logViaDeps(deps, `[slack] permission-poller: get-permission not-found for ${entry.claudeInstanceId} token=${entry.requestToken} — generic deny + drop`)
           emitRowDecision(deps, 'not_found_generic_deny', entry.claudeInstanceId, entry.requestToken)

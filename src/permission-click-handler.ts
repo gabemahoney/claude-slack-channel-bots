@@ -16,11 +16,11 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { AgentDirectorError, ErrAlreadyDecided } from 'agent-director'
-import type { Client } from 'agent-director'
+import { AgentDirectorError, ErrAlreadyDecided, ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from 'agent-director'
 import type { WebClient } from '@slack/web-api'
 
 import { decideWithToken } from './agent-director-client.ts'
+import { withOutageDetection } from './outage-state.ts'
 import { parsePermissionActionId, type PermissionDecision } from './permission-action-id.ts'
 import { getLivePermission, markHandled } from './permission-poller.ts'
 import { emitTrail as defaultEmitTrail } from './permission-trail.ts'
@@ -32,8 +32,6 @@ import type {
 } from './permission-trail.ts'
 
 export interface ClickDeps {
-  /** Returns an AD Client whose `decide` method this handler will invoke. */
-  getClient: () => Pick<Client, 'decide'>
   web: Pick<WebClient, 'chat'>
   log?: (...args: unknown[]) => void
   /**
@@ -141,6 +139,21 @@ export async function handlePermissionClick(
     live_pending: earlyEntry !== undefined,
   })
 
+  const ctxChannel = context.channel ?? earlyEntry?.channelId
+  if (!ctxChannel) {
+    logDeps(
+      deps,
+      `[slack] permission-click-handler: cannot resolve channelId ` +
+        `(context.channel=${context.channel ?? 'undefined'}, ` +
+        `earlyEntry.channelId=${earlyEntry?.channelId ?? 'undefined'}, ` +
+        `claude_instance_id=${claudeInstanceId}, ` +
+        `action_id=${actionId}, ` +
+        `request_token=${requestToken}) ` +
+        `— logging and bypassing this click. This is a CSCB bug — investigate.`,
+    )
+    return true
+  }
+
   // SR-4.1, SR-4.2, SR-7.2: AD is the source of truth. Always call decide
   // with the decoded request_token — including for stale clicks whose
   // composite key is no longer in the pending map. This is the click's ONLY
@@ -152,14 +165,29 @@ export async function handlePermissionClick(
     decision,
   }
   try {
-    await decideWithToken(deps.getClient(), {
-      claude_instance_id: claudeInstanceId,
-      decision,
-      request_token: requestToken,
-    })
+    await withOutageDetection(ctxChannel, undefined, (client) =>
+      decideWithToken(client, {
+        claude_instance_id: claudeInstanceId,
+        decision,
+        request_token: requestToken,
+      }),
+    )
     // SR-V-2.7 call-side success emission.
     emit({ ...decideEnvelope, result_class: 'ok' satisfies AdDecideResponseClass })
   } catch (err) {
+    if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
+      // SR-V-2.7 ad/tmux carve-out: the wrapper already raised the outage
+      // flag (one Slack onset alert via the state machine). Forensic
+      // requirement: the trail JSONL must still carry the typed error name
+      // and message so post-incident debugging can correlate the click
+      // attempt with the AD-down cause — the loud Slack alert tells the
+      // operator something is broken; the trail entry tells the engineer
+      // what was actually thrown.
+      const result_class: AdDecideResponseClass = err.errName as AdDecideResponseClass
+      const raw_error_message = err.message
+      emit({ ...decideEnvelope, result_class, raw_error_message })
+      return true
+    }
     // SR-V-2.7 call-side failure emission. Classify against the same AD
     // error names the existing branches discriminate on so the trail's
     // result_class stays consistent with src/agent-director-errors.ts. The

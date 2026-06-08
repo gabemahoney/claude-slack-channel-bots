@@ -11,6 +11,10 @@
  *   - ErrSystemInstallNotFound  (Client.create / resolveSystemBinary — no `agent-director` on PATH or at ~/.agent-director)
  *   - ErrSystemInstallTooOld    (Client.create / resolveSystemBinary — system binary older than required minimum)
  *   - ErrSystemInstallUnreachable (Client.create / resolveSystemBinary — system binary present but not executable or fails --version)
+ *   - ErrSystemInstallDisappeared (any verb / binary gone after valid construction — b.xht)
+ *   - ErrTmuxNotAvailable       (spawn / tmux binary not found or not executable)
+ *   - ErrCwdNotFound            (spawn / route cwd does not exist on disk)
+ *   - ErrCwdNotADirectory       (spawn / route cwd path exists but is not a directory)
  *   - ErrInstanceIdCollision    (spawn / SR-1.4 idempotency)
  *   - ErrSpawnNotFound          (get / status / decide on missing row)
  *   - ErrNoSessionId            (resume / SR-1.3 fallthrough)
@@ -41,6 +45,10 @@ export {
   ErrSystemInstallNotFound,
   ErrSystemInstallTooOld,
   ErrSystemInstallUnreachable,
+  ErrSystemInstallDisappeared,
+  ErrTmuxNotAvailable,
+  ErrCwdNotFound,
+  ErrCwdNotADirectory,
   ErrCallTimeout,
   ErrInstanceIdCollision,
   ErrSpawnNotFound,

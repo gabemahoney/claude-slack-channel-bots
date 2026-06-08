@@ -26,12 +26,17 @@ import {
   reconcileOrphans,
   refreshRouteNameFromEvent,
   resolveChannelNames,
+  reconnectMcp,
+  waitForWaitingAndReconnect,
+  approveDevChannelsDialog,
+  approveTrustFolderDialog,
   spawnForRoute,
   startupSessionManager,
   instanceIdFor,
   tmuxSessionNameFor,
   AGENT_DIRECTOR_LIVE_STATES,
   DEV_CHANNELS_DIALOG_NEEDLE,
+  TRUST_DIALOG_NEEDLE,
   _setDialogPollTimeoutMs,
   _setDialogPollIntervalMs,
   _resetDialogPollTimeoutMs,
@@ -40,8 +45,10 @@ import {
   _setTrustDialogPollIntervalMs,
   _resetTrustDialogPollTimeoutMs,
   _resetTrustDialogPollIntervalMs,
+  _setWaitForWaitingTimeoutMs,
+  _resetWaitForWaitingTimeoutMs,
 } from '../src/session-manager.ts'
-import { resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
+import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
 import {
   cannedGetResult,
   cannedListRow,
@@ -49,12 +56,25 @@ import {
   cannedErr,
   errInstanceIdCollision,
   errNoSessionId,
+  errJsonlMissing,
   errSpawnNotFound,
+  errSpawnNotResumable,
   errSpawnNotInteractive,
   makeStubClient,
   type StubClient,
 } from './test-helpers/agent-director-stub.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
+import {
+  initOutageState,
+  getOutageFlags,
+  setOutageFlag,
+  _resetOutageState,
+} from '../src/outage-state.ts'
+import {
+  ErrSystemInstallDisappeared,
+  ErrTmuxNotAvailable,
+  ErrCwdNotFound,
+} from '../src/agent-director-errors.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -65,6 +85,9 @@ function installStub(opts?: Parameters<typeof makeStubClient>[0]): StubClient {
   setClientForTests(stub as unknown as Parameters<typeof setClientForTests>[0])
   return stub
 }
+
+/** Capture of outage-state Slack emissions (onsets + all-clears) across each test. */
+let outageEmissions: Array<{ channelId: string; text: string }> = []
 
 let savedEnv: NodeJS.ProcessEnv
 
@@ -85,6 +108,13 @@ beforeEach(() => {
   // with realistic values.
   _setTrustDialogPollIntervalMs(1)
   _setTrustDialogPollTimeoutMs(0)
+  // Wire the outage-state module so withOutageDetection / withSpawnDetection
+  // can resolve the AD client and emit Slack onset/all-clear messages.
+  outageEmissions = []
+  initOutageState({
+    getClient,
+    postToChannel: (channelId, text) => { outageEmissions.push({ channelId, text }) },
+  })
 })
 
 afterEach(() => {
@@ -93,8 +123,31 @@ afterEach(() => {
   _resetDialogPollTimeoutMs()
   _resetTrustDialogPollIntervalMs()
   _resetTrustDialogPollTimeoutMs()
+  _resetWaitForWaitingTimeoutMs()
+  _resetOutageState()
   process.env = savedEnv as NodeJS.ProcessEnv
 })
+
+// ---------------------------------------------------------------------------
+// b.en2 Epic 4 shared helpers
+// ---------------------------------------------------------------------------
+
+/** Build a minimal mock WebClient to assert postSpawnFailureToChannel was NOT called. */
+function makeMockWeb(): {
+  web: { chat: { postMessage: (...a: unknown[]) => Promise<unknown> } }
+  calls: unknown[][]
+} {
+  const calls: unknown[][] = []
+  const web = { chat: { postMessage: async (...a: unknown[]) => { calls.push(a); return {} } } }
+  return { web, calls }
+}
+
+/** Pre-raise all three outage flags for a channel so success-clear tests start with full bad-stretch. */
+function preSetAllFlags(channelId: string): void {
+  setOutageFlag(channelId, 'cwd-unreachable', '/test/cwd')
+  setOutageFlag(channelId, 'ad-unreachable', '/bin/ad')
+  setOutageFlag(channelId, 'tmux-unavailable')
+}
 
 // ---------------------------------------------------------------------------
 // SR-1.1 — fresh spawn shape
@@ -1021,5 +1074,496 @@ describe('reconcileInstanceIds (b.1m9)', () => {
     expect(r.orphans[0].channelId).toBe('C2')
     expect(r.orphans[0].oldInstanceId).toBe('cscb_C2')
     expect(r.orphans[0].expectedInstanceId).toBe('cscb_horde_C2')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.en2 Epic 4 — wrapper-migration assertions
+// ---------------------------------------------------------------------------
+
+// Shared constants for wrapper tests
+const BIN = '/usr/bin/agent-director'
+const CWD = '/test/cwd'
+
+// ---------------------------------------------------------------------------
+// Group A: 13 non-dialog wrapped catch sites
+// Each asserts: outage-class typed error raises the matching flag AND
+// postSpawnFailureToChannel (web.chat.postMessage) is NOT invoked.
+// ---------------------------------------------------------------------------
+
+describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
+  // -------------------------------------------------------------------------
+  // Site #1 — reconnectMcp → sendKeys
+  // -------------------------------------------------------------------------
+
+  test('site #1: reconnectMcp ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
+    const { web, calls } = makeMockWeb()
+    installStub({ sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN) })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+    const result = await reconnectMcp('C', web as never, cfg)
+    expect(result).toBe(false)
+    expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+
+  test('site #1b: reconnectMcp ErrTmuxNotAvailable → tmux-unavailable, no postSpawnFailureToChannel', async () => {
+    const { web, calls } = makeMockWeb()
+    installStub({ sendKeysError: new ErrTmuxNotAvailable('send-keys', 'ErrTmuxNotAvailable', 'tmux not available') })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+    const result = await reconnectMcp('C', web as never, cfg)
+    expect(result).toBe(false)
+    expect(getOutageFlags('C').has('tmux-unavailable')).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #8 — waitForWaitingAndReconnect → status
+  // -------------------------------------------------------------------------
+
+  test('site #8: waitForWaitingAndReconnect ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
+    const { web, calls } = makeMockWeb()
+    _setWaitForWaitingTimeoutMs(50)
+    installStub({ statusError: new ErrSystemInstallDisappeared('status', BIN) })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+    const result = await waitForWaitingAndReconnect('C', cfg, web as never)
+    expect(result).toBe(false)
+    expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #9 — tryKill → kill (tested via spawnForRoute collision path)
+  // kill errors are silently ignored by tryKill, but the outage flag IS raised.
+  // -------------------------------------------------------------------------
+
+  test('site #9: tryKill kill ErrSystemInstallDisappeared → ad-unreachable, error ignored (no postSpawnFailureToChannel)', async () => {
+    const { web, calls } = makeMockWeb()
+    // collision → get=ended → resume_enabled=false → kill throws (flag set, ignored)
+    // delete also throws so flow terminates without a fresh spawn that would clear the flag
+    installStub({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      killError: new ErrSystemInstallDisappeared('kill', BIN),
+      deleteError: new ErrSystemInstallDisappeared('delete', BIN),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } }, resume_enabled: false })
+    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    expect(result.action).toBe('failed')
+    expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #10 — tryDelete → delete
+  // -------------------------------------------------------------------------
+
+  test('site #10: tryDelete delete ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
+    const { web, calls } = makeMockWeb()
+    installStub({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      // kill succeeds; delete fails with typed outage error
+      deleteError: new ErrSystemInstallDisappeared('delete', BIN),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } }, resume_enabled: false })
+    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    expect(result.action).toBe('failed')
+    expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #11 — spawnForRoute initial spawn (withSpawnDetection)
+  // -------------------------------------------------------------------------
+
+  test('site #11: initial spawn ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
+    const { web, calls } = makeMockWeb()
+    installStub({ spawnError: new ErrSystemInstallDisappeared('spawn', BIN) })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    expect(result.action).toBe('failed')
+    expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+
+  test('site #11b: initial spawn ErrCwdNotFound → cwd-unreachable with route.cwd as detail, no postSpawnFailureToChannel', async () => {
+    const { web, calls } = makeMockWeb()
+    installStub({ spawnError: new ErrCwdNotFound('spawn', 'ErrCwdNotFound', `cwd ${CWD} does not exist`) })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    expect(result.action).toBe('failed')
+    expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
+    // The detail should be route.cwd (from withSpawnDetection's routeCwd arg)
+    expect(outageEmissions.some(e => e.text.includes(CWD))).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #12 — spawnForRoute collision-get (withOutageDetection)
+  // -------------------------------------------------------------------------
+
+  test('site #12: collision-get ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
+    const { web, calls } = makeMockWeb()
+    installStub({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getError: new ErrSystemInstallDisappeared('get', BIN),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    expect(result.action).toBe('failed')
+    expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #13 — spawnForRoute retry-spawn after ErrSpawnNotFound
+  // -------------------------------------------------------------------------
+
+  test('site #13: retry-spawn after ErrSpawnNotFound ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
+    const { web, calls } = makeMockWeb()
+    installStub({
+      spawnQueue: [
+        cannedErr(errInstanceIdCollision()),
+        cannedErr(new ErrSystemInstallDisappeared('spawn', BIN)),
+      ],
+      getError: errSpawnNotFound(),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    expect(result.action).toBe('failed')
+    expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #14 — spawnForRoute fresh-spawn after kill+delete (resume_enabled=false)
+  // -------------------------------------------------------------------------
+
+  test('site #14: fresh-spawn after kill+delete ErrCwdNotFound → cwd-unreachable, no postSpawnFailureToChannel', async () => {
+    const { web, calls } = makeMockWeb()
+    installStub({
+      spawnQueue: [
+        cannedErr(errInstanceIdCollision()),
+        cannedErr(new ErrCwdNotFound('spawn', 'ErrCwdNotFound', `cwd ${CWD} does not exist`)),
+      ],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } }, resume_enabled: false })
+    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    expect(result.action).toBe('failed')
+    expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #15 — spawnForRoute resume (withSpawnDetection)
+  // -------------------------------------------------------------------------
+
+  test('site #15: resume ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
+    const { web, calls } = makeMockWeb()
+    installStub({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      resumeError: new ErrSystemInstallDisappeared('resume', BIN),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    expect(result.action).toBe('failed')
+    expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #16 — spawnForRoute spawn after ErrNoSessionId → delete → spawn
+  // -------------------------------------------------------------------------
+
+  test('site #16: spawn after ErrNoSessionId-delete ErrCwdNotFound → cwd-unreachable, no postSpawnFailureToChannel', async () => {
+    const { web, calls } = makeMockWeb()
+    installStub({
+      spawnQueue: [
+        cannedErr(errInstanceIdCollision()),
+        cannedErr(new ErrCwdNotFound('spawn', 'ErrCwdNotFound', `cwd ${CWD} does not exist`)),
+      ],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      resumeError: errNoSessionId(),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    expect(result.action).toBe('failed')
+    expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #17 — spawnForRoute spawn after ErrSpawnNotResumable → kill+delete → spawn
+  // -------------------------------------------------------------------------
+
+  test('site #17: spawn after ErrSpawnNotResumable kill+delete ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
+    const { web, calls } = makeMockWeb()
+    installStub({
+      spawnQueue: [
+        cannedErr(errInstanceIdCollision()),
+        cannedErr(new ErrSystemInstallDisappeared('spawn', BIN)),
+      ],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      resumeError: errSpawnNotResumable(),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    expect(result.action).toBe('failed')
+    expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #18 — reconcileInstanceIds per-orphan delete (withOutageDetection)
+  // -------------------------------------------------------------------------
+
+  test('site #18: reconcileInstanceIds per-orphan delete ErrSystemInstallDisappeared → ad-unreachable, counted as failed', async () => {
+    installStub({
+      listResult: {
+        spawns: [
+          cannedListRow({
+            claude_instance_id: 'cscb_C_OLD',
+            labels: { service: 'cscb', channel: 'C_REC' },
+          }),
+        ],
+      },
+      deleteError: new ErrSystemInstallDisappeared('delete', BIN),
+    })
+    const cfg = makeRoutingConfig({
+      routes: { C_REC: { cwd: CWD, name: 'new_name', normalizedName: 'new_name' } },
+    })
+    const result = await reconcileInstanceIds(cfg, true)
+    expect(result.deleted).toBe(0)
+    expect(result.failed).toBe(1)
+    expect(getOutageFlags('C_REC').has('ad-unreachable')).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Group B: 6 dialog wrapped catch sites (sites #2-#7)
+// Each asserts: (a) dialog function returns normally, (b) ad-unreachable flag
+// is raised, (c) binaryPath detail is captured in the onset emission.
+// Uses poll seams to keep tests near-instant.
+// ---------------------------------------------------------------------------
+
+describe('wrapper-migration: dialog outage cases (Group B)', () => {
+  const CH = 'C_DIALOG'
+  const errSID = () => new ErrSystemInstallDisappeared('read-pane', BIN)
+
+  // -------------------------------------------------------------------------
+  // Sites #2-#4 — approveDevChannelsDialog
+  // -------------------------------------------------------------------------
+
+  test('site #2: approveDevChannelsDialog readPane (detection loop) → ad-unreachable, returns normally', async () => {
+    _setDialogPollTimeoutMs(50)
+    installStub({ readPaneError: errSID() })
+    // Must not throw; catch inside approveDevChannelsDialog swallows the error
+    await expect(approveDevChannelsDialog(CH, undefined, false)).resolves.toBeUndefined()
+    expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
+    expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
+  })
+
+  test('site #3: approveDevChannelsDialog sendKeys → ad-unreachable, returns normally', async () => {
+    _setDialogPollTimeoutMs(50)
+    // readPane returns the dialog needle so sendKeys is reached; sendKeys throws
+    installStub({
+      readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_NEEDLE }],
+      sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN),
+    })
+    await expect(approveDevChannelsDialog(CH, undefined, false)).resolves.toBeUndefined()
+    expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
+    expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
+  })
+
+  test('site #4: approveDevChannelsDialog readPane (confirmation loop) → ad-unreachable, returns normally', async () => {
+    _setDialogPollTimeoutMs(50)
+    // First readPane returns needle (detection succeeds); sendKeys succeeds;
+    // confirmation-loop readPane throws ErrSystemInstallDisappeared
+    const stub = installStub({
+      readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_NEEDLE }],
+    })
+    // Override readPane: first call returns needle, subsequent calls throw
+    let paneCallCount = 0
+    stub.readPane = async (params: import('agent-director').ReadPaneParams) => {
+      paneCallCount++
+      if (paneCallCount === 1) return { pane: DEV_CHANNELS_DIALOG_NEEDLE }
+      throw new ErrSystemInstallDisappeared('read-pane', BIN)
+    }
+    await expect(approveDevChannelsDialog(CH, undefined, false)).resolves.toBeUndefined()
+    expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
+    expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
+  })
+
+  // -------------------------------------------------------------------------
+  // Sites #5-#7 — approveTrustFolderDialog
+  // -------------------------------------------------------------------------
+
+  test('site #5: approveTrustFolderDialog readPane (detection loop) → ad-unreachable, returns normally', async () => {
+    _setTrustDialogPollTimeoutMs(50)
+    installStub({ readPaneError: errSID() })
+    await expect(approveTrustFolderDialog(CH, undefined, false)).resolves.toBeUndefined()
+    expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
+    expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
+  })
+
+  test('site #6: approveTrustFolderDialog sendKeys → ad-unreachable, returns normally', async () => {
+    _setTrustDialogPollTimeoutMs(50)
+    installStub({
+      readPaneResults: [{ pane: 'Yes, I trust this folder' }],
+      sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN),
+    })
+    await expect(approveTrustFolderDialog(CH, undefined, false)).resolves.toBeUndefined()
+    expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
+    expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
+  })
+
+  test('site #7: approveTrustFolderDialog readPane (confirmation loop) → ad-unreachable, returns normally', async () => {
+    _setTrustDialogPollTimeoutMs(50)
+    const stub = installStub({
+      readPaneResults: [{ pane: 'Yes, I trust this folder' }],
+    })
+    let paneCallCount = 0
+    stub.readPane = async (_params: import('agent-director').ReadPaneParams) => {
+      paneCallCount++
+      if (paneCallCount === 1) return { pane: 'Yes, I trust this folder' }
+      throw new ErrSystemInstallDisappeared('read-pane', BIN)
+    }
+    await expect(approveTrustFolderDialog(CH, undefined, false)).resolves.toBeUndefined()
+    expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
+    expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Group C: spawn/resume success-clear (sites #11, #13, #14, #15, #16, #17)
+// Each pre-sets all three outage flags then exercises a spawn/resume success
+// path, asserting flags are empty and exactly one all-clear was emitted
+// naming all three classes.
+// ---------------------------------------------------------------------------
+
+describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
+  const CH = 'C_CLEAR'
+
+  function setupFlags(): void {
+    preSetAllFlags(CH)
+    outageEmissions = [] // reset after pre-set; only capture all-clear from success path
+  }
+
+  function assertAllClear(): void {
+    expect(getOutageFlags(CH).size).toBe(0)
+    const allClear = outageEmissions.filter(e => e.channelId === CH && e.text.includes('All clear'))
+    expect(allClear).toHaveLength(1)
+    expect(allClear[0].text).toContain('ad-unreachable')
+    expect(allClear[0].text).toContain('cwd-unreachable')
+    expect(allClear[0].text).toContain('tmux-unavailable')
+  }
+
+  // -------------------------------------------------------------------------
+  // Site #11 — initial spawn success
+  // -------------------------------------------------------------------------
+
+  test('site #11: initial spawn success clears all three flags + emits all-clear', async () => {
+    setupFlags()
+    installStub({})
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, false)
+    expect(result.action).toBe('spawned')
+    assertAllClear()
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #13 — retry-spawn after ErrSpawnNotFound success
+  // -------------------------------------------------------------------------
+
+  test('site #13: retry-spawn after ErrSpawnNotFound success clears all three flags', async () => {
+    setupFlags()
+    installStub({
+      spawnQueue: [
+        cannedErr(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+      ],
+      getError: errSpawnNotFound(),
+    })
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, false)
+    expect(result.action).toBe('spawned')
+    assertAllClear()
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #14 — fresh-spawn after kill+delete (resume_enabled=false) success
+  // -------------------------------------------------------------------------
+
+  test('site #14: fresh-spawn after kill+delete (resume_enabled=false) clears all three flags', async () => {
+    setupFlags()
+    installStub({
+      spawnQueue: [
+        cannedErr(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+      ],
+      getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } }, resume_enabled: false })
+    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, false)
+    expect(result.action).toBe('spawned')
+    assertAllClear()
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #15 — resume success
+  // -------------------------------------------------------------------------
+
+  test('site #15: resume success clears all three flags + emits all-clear', async () => {
+    setupFlags()
+    installStub({
+      spawnQueue: [cannedErr(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, false)
+    expect(result.action).toBe('resumed')
+    assertAllClear()
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #16 — fresh-spawn after ErrNoSessionId → delete → spawn success
+  // -------------------------------------------------------------------------
+
+  test('site #16: spawn after ErrNoSessionId-delete success clears all three flags', async () => {
+    setupFlags()
+    installStub({
+      spawnQueue: [
+        cannedErr(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+      ],
+      getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
+      resumeError: errNoSessionId(),
+    })
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, false)
+    expect(result.action).toBe('spawned')
+    assertAllClear()
+  })
+
+  // -------------------------------------------------------------------------
+  // Site #17 — fresh-spawn after ErrSpawnNotResumable → kill+delete → spawn success
+  // -------------------------------------------------------------------------
+
+  test('site #17: spawn after ErrSpawnNotResumable kill+delete success clears all three flags', async () => {
+    setupFlags()
+    installStub({
+      spawnQueue: [
+        cannedErr(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+      ],
+      getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
+      resumeError: errSpawnNotResumable(),
+    })
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, false)
+    expect(result.action).toBe('spawned')
+    assertAllClear()
   })
 })
