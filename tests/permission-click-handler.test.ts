@@ -1144,6 +1144,63 @@ describe('handlePermissionClick — wrapper outage short-circuit', () => {
     // must NOT fire — the ad/tmux short-circuit returns before those branches.
     expect(logCalls).toHaveLength(0)
   })
+
+  test('carve-out trail entry carries result_class=ErrSystemInstallDisappeared + raw_error_message', async () => {
+    const BINARY = '/usr/local/bin/agent-director'
+    const err = new ErrSystemInstallDisappeared('spawn', BINARY)
+    const decide = makeDecideStub({ throwOn: err })
+    const seed = await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_A,
+    })
+    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    const trail = makeTrailCapture()
+    await handlePermissionClick(
+      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
+      {
+        web: seed.chat.web as never,
+        emitTrail: trail.emit,
+      } satisfies ClickHandlerDepsShape as never,
+      { channel: CHANNEL_CH },
+    )
+    // Exactly one cscb.ad_decide.attempted entry should land — the carve-out
+    // emits before the early return. result_class names the typed AD error
+    // (not the generic 'other' bucket); raw_error_message preserves the
+    // forensic context the loud Slack alert can't carry by itself.
+    const adDecides = trail.events.filter(e => e['event'] === 'cscb.ad_decide.attempted')
+    expect(adDecides).toHaveLength(1)
+    expect(adDecides[0]['result_class']).toBe('ErrSystemInstallDisappeared')
+    expect(adDecides[0]['raw_error_message']).toBe(err.message)
+    expect(adDecides[0]['claude_instance_id']).toBe(INSTANCE_C)
+    expect(adDecides[0]['request_token']).toBe(TOKEN_A)
+  })
+
+  test('carve-out trail entry for ErrTmuxNotAvailable: result_class=ErrTmuxNotAvailable + raw_error_message', async () => {
+    const ErrTmuxCtor = (await import('agent-director')).ErrTmuxNotAvailable
+    const err = new ErrTmuxCtor('spawn', 'ErrTmuxNotAvailable', 'tmux not found on PATH')
+    const decide = makeDecideStub({ throwOn: err })
+    const seed = await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_A,
+    })
+    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    const trail = makeTrailCapture()
+    await handlePermissionClick(
+      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
+      {
+        web: seed.chat.web as never,
+        emitTrail: trail.emit,
+      } satisfies ClickHandlerDepsShape as never,
+      { channel: CHANNEL_CH },
+    )
+    const adDecides = trail.events.filter(e => e['event'] === 'cscb.ad_decide.attempted')
+    expect(adDecides).toHaveLength(1)
+    expect(adDecides[0]['result_class']).toBe('ErrTmuxNotAvailable')
+    expect(adDecides[0]['raw_error_message']).toBe(err.message)
+    expect(getOutageFlags(CHANNEL_CH).has('tmux-unavailable')).toBe(true)
+  })
 })
 
 describe('handlePermissionClick — log-and-bypass (no resolvable ctxChannel)', () => {

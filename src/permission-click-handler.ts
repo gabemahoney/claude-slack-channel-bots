@@ -176,8 +176,16 @@ export async function handlePermissionClick(
     emit({ ...decideEnvelope, result_class: 'ok' satisfies AdDecideResponseClass })
   } catch (err) {
     if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
-      const result_class: AdDecideResponseClass = classifyAdDecideError(err)
-      emit({ ...decideEnvelope, result_class })
+      // SR-V-2.7 ad/tmux carve-out: the wrapper already raised the outage
+      // flag (one Slack onset alert via the state machine). Forensic
+      // requirement: the trail JSONL must still carry the typed error name
+      // and message so post-incident debugging can correlate the click
+      // attempt with the AD-down cause — the loud Slack alert tells the
+      // operator something is broken; the trail entry tells the engineer
+      // what was actually thrown.
+      const result_class: AdDecideResponseClass = err.errName as AdDecideResponseClass
+      const raw_error_message = err.message
+      emit({ ...decideEnvelope, result_class, raw_error_message })
       return true
     }
     // SR-V-2.7 call-side failure emission. Classify against the same AD
