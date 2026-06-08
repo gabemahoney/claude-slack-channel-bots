@@ -38,6 +38,13 @@ import type { WebClient } from '@slack/web-api'
 import { checkCozempicAvailable } from './cozempic.ts'
 import { type RoutingConfig, MCP_SERVER_NAME, normalizeChannelName } from './config.ts'
 import { getClient } from './agent-director-client.ts'
+import { withOutageDetection, withSpawnDetection } from './outage-state.ts'
+import {
+  ErrSystemInstallDisappeared,
+  ErrTmuxNotAvailable,
+  ErrCwdNotFound,
+  ErrCwdNotADirectory,
+} from './agent-director-errors.ts'
 import { recordStartupError } from './startup-errors.ts'
 import { isDryRun } from './tokens.ts'
 
@@ -184,12 +191,13 @@ export async function reconnectMcp(
   const claude_instance_id = instanceIdFor(channelId, routingConfig?.routes[channelId]?.normalizedName)
   console.error(`[slack] reconnecting MCP server "${MCP_SERVER_NAME}": channel=${channelId}`)
   try {
-    await getClient().sendKeys({
+    await withOutageDetection(channelId, undefined, (client) => client.sendKeys({
       claude_instance_id,
       text: `/mcp reconnect ${MCP_SERVER_NAME}`,
-    })
+    }))
     return true
   } catch (err) {
+    if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) return false
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('send-keys', 'UnknownError', String(err))
     console.error(`[slack] reconnectMcp: send-keys failed for channel=${channelId}: ${e.errName}`)
     postSpawnFailureToChannel(channelId, e, web)
@@ -263,20 +271,23 @@ export async function approveDevChannelsDialog(
 ): Promise<void> {
   void web
   const claude_instance_id = instanceIdFor(channelId, normalizedName)
-  const client = getClient()
   const deadline = Date.now() + _dialogPollTimeoutMs
 
   let approved = false
   while (Date.now() < deadline) {
     try {
-      const { pane } = await client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true })
+      const { pane } = await withOutageDetection(channelId, undefined, (client) => client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true }))
       if (pane.includes(DEV_CHANNELS_DIALOG_NEEDLE)) {
-        await client.sendKeys({ claude_instance_id, text: '', allow_pending: true })
+        await withOutageDetection(channelId, undefined, (client) => client.sendKeys({ claude_instance_id, text: '', allow_pending: true }))
         approved = true
         break
       }
     } catch (err) {
-      console.error(`[slack] approveDevChannelsDialog: readPane error channel=${channelId}: ${String(err)}`)
+      if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
+        // Outage flag raised; continue polling
+      } else {
+        console.error(`[slack] approveDevChannelsDialog: readPane error channel=${channelId}: ${String(err)}`)
+      }
     }
     await new Promise((r) => setTimeout(r, _dialogPollIntervalMs))
   }
@@ -292,7 +303,7 @@ export async function approveDevChannelsDialog(
   while (Date.now() < deadline && misses < DIALOG_GONE_CONFIRMS_REQUIRED) {
     await new Promise((r) => setTimeout(r, _dialogPollIntervalMs))
     try {
-      const { pane } = await client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true })
+      const { pane } = await withOutageDetection(channelId, undefined, (client) => client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true }))
       misses = pane.includes(DEV_CHANNELS_DIALOG_NEEDLE) ? 0 : misses + 1
     } catch {
       /* tolerate transient readPane failure */
@@ -362,20 +373,23 @@ export async function approveTrustFolderDialog(
 ): Promise<void> {
   void web
   const claude_instance_id = instanceIdFor(channelId, normalizedName)
-  const client = getClient()
   const deadline = Date.now() + _trustDialogPollTimeoutMs
 
   let approved = false
   while (Date.now() < deadline) {
     try {
-      const { pane } = await client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true })
+      const { pane } = await withOutageDetection(channelId, undefined, (client) => client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true }))
       if (pane.includes(TRUST_DIALOG_NEEDLE)) {
-        await client.sendKeys({ claude_instance_id, text: '', allow_pending: true })
+        await withOutageDetection(channelId, undefined, (client) => client.sendKeys({ claude_instance_id, text: '', allow_pending: true }))
         approved = true
         break
       }
     } catch (err) {
-      console.error(`[slack] approveTrustFolderDialog: readPane error channel=${channelId}: ${String(err)}`)
+      if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
+        // Outage flag raised; continue polling
+      } else {
+        console.error(`[slack] approveTrustFolderDialog: readPane error channel=${channelId}: ${String(err)}`)
+      }
     }
     await new Promise((r) => setTimeout(r, _trustDialogPollIntervalMs))
   }
@@ -389,7 +403,7 @@ export async function approveTrustFolderDialog(
   while (Date.now() < deadline && misses < DIALOG_GONE_CONFIRMS_REQUIRED) {
     await new Promise((r) => setTimeout(r, _trustDialogPollIntervalMs))
     try {
-      const { pane } = await client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true })
+      const { pane } = await withOutageDetection(channelId, undefined, (client) => client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true }))
       misses = pane.includes(TRUST_DIALOG_NEEDLE) ? 0 : misses + 1
     } catch {
       /* tolerate transient readPane failure */
@@ -439,12 +453,15 @@ export async function waitForWaitingAndReconnect(
   while (Date.now() < deadline) {
     let state: string
     try {
-      const r = await getClient().status({ claude_instance_id })
+      const r = await withOutageDetection(channelId, undefined, (client) => client.status({ claude_instance_id }))
       state = r.state
     } catch (err) {
       if (err instanceof ErrSpawnNotFound) {
         console.error(`[slack] waitForWaitingAndReconnect: spawn not found for channel=${channelId} — aborting poll`)
         return true
+      }
+      if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
+        return false
       }
       const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('status', 'UnknownError', String(err))
       console.error(`[slack] waitForWaitingAndReconnect: status error for channel=${channelId}: ${e.errName}`)
@@ -507,7 +524,7 @@ function buildSpawnParams(
 /** Best-effort kill — never throws. */
 async function tryKill(channelId: string, normalizedName: string | undefined): Promise<void> {
   try {
-    await getClient().kill({ claude_instance_id: instanceIdFor(channelId, normalizedName) })
+    await withOutageDetection(channelId, undefined, (client) => client.kill({ claude_instance_id: instanceIdFor(channelId, normalizedName) }))
   } catch {
     /* ignore */
   }
@@ -521,9 +538,12 @@ async function tryDelete(
   isStartup: boolean,
 ): Promise<boolean> {
   try {
-    await getClient().delete({ claude_instance_id: [instanceIdFor(channelId, normalizedName)] })
+    await withOutageDetection(channelId, undefined, (client) => client.delete({ claude_instance_id: [instanceIdFor(channelId, normalizedName)] }))
     return true
   } catch (err) {
+    if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
+      return false
+    }
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('delete', 'UnknownError', String(err))
     console.error(`[slack] tryDelete: failed for channel=${channelId}: ${e.errName}`)
     if (isStartup) recordStartupError('spawn-failed', `delete failed for channel=${channelId}: ${e.errName}`, e)
@@ -560,49 +580,67 @@ export async function spawnForRoute(
 
   const params = buildSpawnParams(channelId, route, routingConfig)
   const normalizedName = routingConfig.routes[channelId]?.normalizedName
-  const client = getClient()
 
   // Attempt fresh spawn ---
   try {
-    const r = await client.spawn(params)
+    const r = await withSpawnDetection(channelId, route.cwd, (client) => client.spawn(params))
     console.error(`[slack] spawnForRoute: spawned channel=${channelId} instanceId=${r.claude_instance_id}`)
     await approveTrustFolderDialog(channelId, web, isStartup, normalizedName)
     await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
     return { channelId, action: 'spawned' }
   } catch (err) {
-    if (!(err instanceof ErrInstanceIdCollision)) {
+    if (err instanceof ErrInstanceIdCollision) {
+      // Collision → fall through to get-then-act
+      console.error(`[slack] spawnForRoute: ErrInstanceIdCollision for channel=${channelId} — fetching current state`)
+    } else if (
+      err instanceof ErrSystemInstallDisappeared ||
+      err instanceof ErrTmuxNotAvailable ||
+      err instanceof ErrCwdNotFound ||
+      err instanceof ErrCwdNotADirectory
+    ) {
+      return { channelId, action: 'failed' }
+    } else {
       const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
       console.error(`[slack] spawnForRoute: spawn failed for channel=${channelId}: ${e.errName}`)
       if (isStartup) recordStartupError('spawn-failed', `spawn failed for channel=${channelId}: ${e.errName}`, e)
       postSpawnFailureToChannel(channelId, e, web, isStartup)
       return { channelId, action: 'failed' }
     }
-    // Collision → fall through to get-then-act
-    console.error(`[slack] spawnForRoute: ErrInstanceIdCollision for channel=${channelId} — fetching current state`)
   }
 
   // Collision-handling: get-then-act ---
   let state: string
   try {
-    const r = await client.get({ claude_instance_id: instanceIdFor(channelId, normalizedName) })
+    const r = await withOutageDetection(channelId, undefined, (client) => client.get({ claude_instance_id: instanceIdFor(channelId, normalizedName) }))
     state = r.state
   } catch (err) {
     if (err instanceof ErrSpawnNotFound) {
       // Race: row deleted between spawn-collision and get. Retry spawn once.
       console.error(`[slack] spawnForRoute: ErrSpawnNotFound after collision for channel=${channelId} — retrying spawn (single retry)`)
       try {
-        const r = await client.spawn(params)
+        const r = await withSpawnDetection(channelId, route.cwd, (client) => client.spawn(params))
         console.error(`[slack] spawnForRoute: retry-spawn succeeded for channel=${channelId} instanceId=${r.claude_instance_id}`)
         await approveTrustFolderDialog(channelId, web, isStartup, normalizedName)
         await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
         return { channelId, action: 'spawned' }
       } catch (err2) {
+        if (
+          err2 instanceof ErrSystemInstallDisappeared ||
+          err2 instanceof ErrTmuxNotAvailable ||
+          err2 instanceof ErrCwdNotFound ||
+          err2 instanceof ErrCwdNotADirectory
+        ) {
+          return { channelId, action: 'failed' }
+        }
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForRoute: retry-spawn also failed for channel=${channelId}: ${e.errName}`)
         if (isStartup) recordStartupError('spawn-failed', `retry-spawn failed for channel=${channelId}: ${e.errName}`, e)
         postSpawnFailureToChannel(channelId, e, web, isStartup)
         return { channelId, action: 'failed' }
       }
+    }
+    if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
+      return { channelId, action: 'failed' }
     }
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('get', 'UnknownError', String(err))
     console.error(`[slack] spawnForRoute: get failed for channel=${channelId}: ${e.errName}`)
@@ -618,12 +656,20 @@ export async function spawnForRoute(
       await tryKill(channelId, normalizedName)
       if (!(await tryDelete(channelId, normalizedName, web, isStartup))) return { channelId, action: 'failed' }
       try {
-        await client.spawn(params)
+        await withSpawnDetection(channelId, route.cwd, (client) => client.spawn(params))
         console.error(`[slack] spawnForRoute: fresh-spawned (after kill+delete) for channel=${channelId}`)
         await approveTrustFolderDialog(channelId, web, isStartup, normalizedName)
         await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
         return { channelId, action: 'spawned' }
       } catch (err) {
+        if (
+          err instanceof ErrSystemInstallDisappeared ||
+          err instanceof ErrTmuxNotAvailable ||
+          err instanceof ErrCwdNotFound ||
+          err instanceof ErrCwdNotADirectory
+        ) {
+          return { channelId, action: 'failed' }
+        }
         const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
         console.error(`[slack] spawnForRoute: fresh spawn after delete failed for channel=${channelId}: ${e.errName}`)
         if (isStartup) recordStartupError('spawn-failed', `fresh spawn after delete failed for channel=${channelId}: ${e.errName}`, e)
@@ -635,7 +681,7 @@ export async function spawnForRoute(
     // resume_enabled: attempt resume
     console.error(`[slack] spawnForRoute: attempting resume for channel=${channelId}`)
     try {
-      await client.resume({ claude_instance_id: instanceIdFor(channelId, normalizedName) })
+      await withSpawnDetection(channelId, route.cwd, (client) => client.resume({ claude_instance_id: instanceIdFor(channelId, normalizedName) }))
       console.error(`[slack] spawnForRoute: resumed channel=${channelId}`)
       return { channelId, action: 'resumed' }
     } catch (err) {
@@ -643,12 +689,20 @@ export async function spawnForRoute(
         console.error(`[slack] spawnForRoute: ${err.errName} on resume for channel=${channelId} — delete+fresh`)
         if (!(await tryDelete(channelId, normalizedName, web, isStartup))) return { channelId, action: 'failed' }
         try {
-          await client.spawn(params)
+          await withSpawnDetection(channelId, route.cwd, (client) => client.spawn(params))
           console.error(`[slack] spawnForRoute: fresh-spawned (after delete) for channel=${channelId}`)
           await approveTrustFolderDialog(channelId, web, isStartup, normalizedName)
           await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
           return { channelId, action: 'spawned' }
         } catch (err2) {
+          if (
+            err2 instanceof ErrSystemInstallDisappeared ||
+            err2 instanceof ErrTmuxNotAvailable ||
+            err2 instanceof ErrCwdNotFound ||
+            err2 instanceof ErrCwdNotADirectory
+          ) {
+            return { channelId, action: 'failed' }
+          }
           const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
           console.error(`[slack] spawnForRoute: fresh spawn after delete failed for channel=${channelId}: ${e.errName}`)
           if (isStartup) recordStartupError('spawn-failed', `fresh spawn after delete failed for channel=${channelId}: ${e.errName}`, e)
@@ -662,16 +716,32 @@ export async function spawnForRoute(
         await tryKill(channelId, normalizedName)
         if (!(await tryDelete(channelId, normalizedName, web, isStartup))) return { channelId, action: 'failed' }
         try {
-          await client.spawn(params)
+          await withSpawnDetection(channelId, route.cwd, (client) => client.spawn(params))
           await approveTrustFolderDialog(channelId, web, isStartup, normalizedName)
           await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
           return { channelId, action: 'spawned' }
         } catch (err2) {
+          if (
+            err2 instanceof ErrSystemInstallDisappeared ||
+            err2 instanceof ErrTmuxNotAvailable ||
+            err2 instanceof ErrCwdNotFound ||
+            err2 instanceof ErrCwdNotADirectory
+          ) {
+            return { channelId, action: 'failed' }
+          }
           const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
           if (isStartup) recordStartupError('spawn-failed', `fresh spawn failed for channel=${channelId}: ${e.errName}`, e)
           postSpawnFailureToChannel(channelId, e, web, isStartup)
           return { channelId, action: 'failed' }
         }
+      }
+      if (
+        err instanceof ErrSystemInstallDisappeared ||
+        err instanceof ErrTmuxNotAvailable ||
+        err instanceof ErrCwdNotFound ||
+        err instanceof ErrCwdNotADirectory
+      ) {
+        return { channelId, action: 'failed' }
       }
       const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('resume', 'UnknownError', String(err))
       console.error(`[slack] spawnForRoute: resume failed for channel=${channelId}: ${e.errName}`)
@@ -985,9 +1055,13 @@ export async function reconcileInstanceIds(
       `[slack] reconcileInstanceIds: deleting stale row channel=${o.channelId} instanceId=${o.oldInstanceId}`,
     )
     try {
-      await client.delete({ claude_instance_id: [o.oldInstanceId] })
+      await withOutageDetection(o.channelId, undefined, (client) => client.delete({ claude_instance_id: [o.oldInstanceId] }))
       deleted++
     } catch (err) {
+      if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
+        failed++
+        continue
+      }
       const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('delete', 'UnknownError', String(err))
       console.error(
         `[slack] reconcileInstanceIds: delete failed for channel=${o.channelId} instanceId=${o.oldInstanceId}: ${e.errName}`,
