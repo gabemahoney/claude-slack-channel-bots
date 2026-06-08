@@ -408,3 +408,89 @@ describe('cases 20-21: flap cycles and never-set no-op', () => {
     expect(getOutageFlags('C9').size).toBe(0)
   })
 })
+
+// ---------------------------------------------------------------------------
+// SRD § Test plan case 22 — getClient() allowlist static audit
+// SRD § Test plan case 23 Part A — resetAllToHealthy single-call-site audit
+// ---------------------------------------------------------------------------
+
+describe('static audits', () => {
+  test('22. every getClient() match in src/ is in tests/getclient-allowlist.txt', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { execSync } = await import('node:child_process')
+
+    // Parse the allowlist: one `path:line  # reason` entry per non-comment line.
+    const allowlistRaw = readFileSync('tests/getclient-allowlist.txt', 'utf-8')
+    const allowed = new Set<string>()
+    for (const line of allowlistRaw.split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed || trimmed.startsWith('#')) continue
+      const m = trimmed.match(/^([^:#\s]+:\d+)/)
+      if (m) allowed.add(m[1])
+    }
+
+    // grep -nE '\bgetClient\(\)' src/ -r --include='*.ts' — capture path:line for every match.
+    let grepOut = ''
+    try {
+      grepOut = execSync(
+        `grep -rnE '\\bgetClient\\(\\)' src/ --include='*.ts'`,
+        { encoding: 'utf-8' },
+      )
+    } catch (err) {
+      // grep exits 1 if no match — treat as empty.
+      grepOut = ((err as { stdout?: Buffer }).stdout?.toString()) ?? ''
+    }
+
+    const violations: string[] = []
+    for (const line of grepOut.split('\n')) {
+      if (!line) continue
+      // grep format: src/path.ts:NN:content
+      const m = line.match(/^([^:]+):(\d+):(.*)$/)
+      if (!m) continue
+      const [, path, lineNo, content] = m
+      // Filter out comment / JSDoc lines: lines whose content begins with
+      // optional whitespace then `*` or `//`.
+      if (/^\s*(\*|\/\/)/.test(content)) continue
+      const key = `${path}:${lineNo}`
+      if (!allowed.has(key)) {
+        violations.push(`${key}  # content: ${content.trim()}`)
+      }
+    }
+
+    if (violations.length > 0) {
+      throw new Error(
+        `unsanctioned getClient() call(s) found in src/ not in tests/getclient-allowlist.txt:\n` +
+          violations.join('\n') +
+          `\n\nIf this is a legitimate sanctioned site, add it to tests/getclient-allowlist.txt.\n` +
+          `Otherwise migrate it to withOutageDetection / withSpawnDetection from src/outage-state.ts.`,
+      )
+    }
+  })
+
+  test('23 Part A. exactly one resetAllToHealthy(...) call site in src/ outside src/outage-state.ts', async () => {
+    const { execSync } = await import('node:child_process')
+
+    let grepOut = ''
+    try {
+      grepOut = execSync(
+        `grep -rn 'resetAllToHealthy(' src/ --include='*.ts'`,
+        { encoding: 'utf-8' },
+      )
+    } catch (err) {
+      grepOut = ((err as { stdout?: Buffer }).stdout?.toString()) ?? ''
+    }
+
+    const matches = grepOut
+      .split('\n')
+      .filter((l) => l && !l.startsWith('src/outage-state.ts:'))
+      // Filter out comment / JSDoc lines like the case-22 audit.
+      .filter((l) => {
+        const m = l.match(/^[^:]+:\d+:(.*)$/)
+        return m ? !/^\s*(\*|\/\/)/.test(m[1]) : false
+      })
+
+    expect(matches).toHaveLength(1)
+    // The one sanctioned call site lives in src/server.ts.
+    expect(matches[0]).toMatch(/^src\/server\.ts:\d+:/)
+  })
+})

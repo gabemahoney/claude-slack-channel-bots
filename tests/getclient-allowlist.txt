@@ -17,6 +17,8 @@
 
 src/agent-director-client.ts:61  # export function getClient() — the definition
 src/agent-director-client.ts:64  # error-message string literal naming getClient() (`throw new Error(...)` body)
+src/outage-state.ts:61  # JSDoc for OutageStateDeps.getClient() — type-surface reference, not a call
+src/outage-state.ts:62  # OutageStateDeps interface property declaration — type-surface, not a call
 src/outage-state.ts:237  # wrapper's deps.getClient() — sanctioned single entry point
 src/server.ts:859  # isSessionAliveAdapter tick-path bare getClient() — sanctioned tick-path exception
 src/agent-director-template.ts:47  # production-deps factory wiring: getClient: () => getClient()
