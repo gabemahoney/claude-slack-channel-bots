@@ -1258,7 +1258,7 @@ describe('SR-2.4 / SR-5 — newly-closed reconciliation + verdict rendering', ()
 // ---------------------------------------------------------------------------
 
 describe('poller tick — skipped-tick observability', () => {
-  test('5+ consecutive skips logs WARN', async () => {
+  test('exactly one WARN at the 5th skip; further skips in the same streak are silent', async () => {
     const ivl = makeInterval()
     const chat = makeChatStub()
     const logCalls: unknown[][] = []
@@ -1284,16 +1284,70 @@ describe('poller tick — skipped-tick observability', () => {
     ivl.pending[0].cb()
     await new Promise((r) => setTimeout(r, 5))
 
-    // Fire 5 more ticks while the first is still in-flight → 5 skips
-    for (let i = 0; i < 5; i++) {
+    // Fire 7 more ticks while the first is still in-flight → 7 skips total.
+    // With `=== 5` semantics, the warning fires exactly once (at skip 5);
+    // with the older `>= 5` semantics it would fire 3 times (skips 5, 6, 7).
+    for (let i = 0; i < 7; i++) {
       ivl.pending[0].cb()
     }
     await new Promise((r) => setTimeout(r, 5))
 
     const warnLogs = logCalls.filter((args) => String(args[0]).includes('skipped'))
-    expect(warnLogs.length).toBeGreaterThan(0)
+    expect(warnLogs).toHaveLength(1)
+    expect(String(warnLogs[0][0])).toMatch(/skipped 5 consecutive ticks/)
 
     // Unblock the hanging tick so cleanup works
+    resolveTick()
+    await new Promise((r) => setTimeout(r, 10))
+  })
+
+  test('warning re-arms after a successful tick: a second stuck streak emits another single warning', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub()
+    const logCalls: unknown[][] = []
+
+    let hangTick = true
+    let resolveTick: () => void = () => {}
+    const getClient = () => ({
+      list: async () => {
+        if (hangTick) {
+          await new Promise<void>((resolve) => { resolveTick = resolve })
+        }
+        return { spawns: [] }
+      },
+      get: async () => cannedGetResult({ claude_instance_id: 'x' }),
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: 1000,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+      log: (...args) => { logCalls.push(args) },
+    })
+
+    // First streak: hang + 5 skips → one warning.
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 5))
+    for (let i = 0; i < 5; i++) ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 5))
+    expect(logCalls.filter((a) => String(a[0]).includes('skipped'))).toHaveLength(1)
+
+    // Resolve the hung tick + let any new tick run cleanly to reset skippedTicks.
+    hangTick = false
+    resolveTick()
+    await new Promise((r) => setTimeout(r, 10))
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 10))
+
+    // Second streak: hang again + 5 skips → exactly one more warning (total 2).
+    hangTick = true
+    ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 5))
+    for (let i = 0; i < 5; i++) ivl.pending[0].cb()
+    await new Promise((r) => setTimeout(r, 5))
+    expect(logCalls.filter((a) => String(a[0]).includes('skipped'))).toHaveLength(2)
+
     resolveTick()
     await new Promise((r) => setTimeout(r, 10))
   })

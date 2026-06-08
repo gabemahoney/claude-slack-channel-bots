@@ -25,7 +25,7 @@ src/agent-director-template.ts:47  # production-deps factory wiring: getClient: 
 src/agent-director-template.ts:136  # startup-fatal makeTemplate install: const client = d.getClient()
 src/session-manager.ts:795  # const client = getClient() in reconcileOrphans (orphans have no routed-channel attribution)
 src/session-manager.ts:1010  # const client = getClient() in reconcileInstanceIds (binding used for client.list)
-src/permission-poller.ts:317  # const client = deps.getClient() — list-level client.list at top of runTick (no per-channel context)
+src/permission-poller.ts:322  # const client = deps.getClient() — list-level client.list at top of runTick (no per-channel context)
 src/cli.ts:320  # CLI subcommand: list
 src/cli.ts:349  # CLI subcommand: status
 src/cli.ts:358  # CLI subcommand: pause

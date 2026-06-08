@@ -306,7 +306,12 @@ function classifySlackError(err: unknown): string {
 async function runTick(deps: PollerDeps): Promise<void> {
   if (tickInFlight) {
     skippedTicks++
-    if (skippedTicks >= 5) {
+    // Fire exactly once when the streak crosses 5 (4 → 5 transition). Further
+    // skips within the same streak are silent; the next successfully-started
+    // tick body resets skippedTicks to 0 and re-arms the warning for a future
+    // streak. Mirrors src/health-check.ts:55-62 — see that block for the
+    // budget-exhaustion rationale.
+    if (skippedTicks === 5) {
       logViaDeps(deps, `[slack] permission-poller: skipped ${skippedTicks} consecutive ticks — tick budget exceeded`)
     }
     return
