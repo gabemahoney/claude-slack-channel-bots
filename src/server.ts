@@ -841,6 +841,50 @@ process.on('SIGTERM', () => { shutdown('SIGTERM').catch(() => process.exit(1)) }
 process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
 
 // ---------------------------------------------------------------------------
+// _buildIsSessionAliveAdapter
+// ---------------------------------------------------------------------------
+
+/**
+ * _buildIsSessionAliveAdapter — test-only factory for the tick-path liveness
+ * probe. Production code wires this via main() as `isSessionAliveAdapter`;
+ * tests call it directly to exercise the four SRD § Liveness probe branches
+ * without importing the private closure inside main().
+ *
+ * @internal
+ */
+export function _buildIsSessionAliveAdapter(
+  getRoutingConfig: () => RoutingConfig | null | undefined,
+): (channelId: string) => Promise<boolean> {
+  return async (channelId: string) => {
+    const routingConfig = getRoutingConfig()
+    if (!routingConfig?.routes[channelId]) return false
+    const claude_instance_id = instanceIdFor(channelId, routingConfig.routes[channelId]?.normalizedName)
+    try {
+      const r = await getClient().status({ claude_instance_id })
+      clearOutageFlag(channelId, 'ad-unreachable')
+      clearOutageFlag(channelId, 'tmux-unavailable')
+      return AGENT_DIRECTOR_LIVE_STATES.has(r.state)
+    } catch (err) {
+      if (err instanceof ErrSpawnNotFound) {
+        clearOutageFlag(channelId, 'ad-unreachable')
+        clearOutageFlag(channelId, 'tmux-unavailable')
+        return false
+      }
+      if (err instanceof ErrSystemInstallDisappeared) {
+        setOutageFlag(channelId, 'ad-unreachable', err.binaryPath)
+        return false
+      }
+      if (err instanceof ErrTmuxNotAvailable) {
+        setOutageFlag(channelId, 'tmux-unavailable')
+        return false
+      }
+      console.error(`[slack] isSessionAlive: status error for channel=${channelId}:`, err)
+      return false
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 //
 // HTTP routing strategy (roots-based session identity):
@@ -1142,32 +1186,7 @@ export async function main(): Promise<void> {
   // SR-11 Event 6a. Any AGENT_DIRECTOR_LIVE_STATES value → alive; terminal
   // states (ended, missing) and ErrSpawnNotFound → dead. Other errors fall
   // back to "dead" defensively — health-check will retry.
-  const isSessionAliveAdapter = async (channelId: string): Promise<boolean> => {
-    if (!routingConfig?.routes[channelId]) return false
-    const claude_instance_id = instanceIdFor(channelId, routingConfig.routes[channelId]?.normalizedName)
-    try {
-      const r = await getClient().status({ claude_instance_id })
-      clearOutageFlag(channelId, 'ad-unreachable')
-      clearOutageFlag(channelId, 'tmux-unavailable')
-      return AGENT_DIRECTOR_LIVE_STATES.has(r.state)
-    } catch (err) {
-      if (err instanceof ErrSpawnNotFound) {
-        clearOutageFlag(channelId, 'ad-unreachable')
-        clearOutageFlag(channelId, 'tmux-unavailable')
-        return false
-      }
-      if (err instanceof ErrSystemInstallDisappeared) {
-        setOutageFlag(channelId, 'ad-unreachable', err.binaryPath)
-        return false
-      }
-      if (err instanceof ErrTmuxNotAvailable) {
-        setOutageFlag(channelId, 'tmux-unavailable')
-        return false
-      }
-      console.error(`[slack] isSessionAlive: status error for channel=${channelId}:`, err)
-      return false
-    }
-  }
+  const isSessionAliveAdapter = _buildIsSessionAliveAdapter(() => routingConfig)
 
   // Initialize restart module with library-backed adapters
   initRestart({

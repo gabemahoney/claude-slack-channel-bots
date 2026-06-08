@@ -1,4 +1,4 @@
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import {
   gate,
   assertSendable,
@@ -14,6 +14,24 @@ import {
   type Access,
   type GateOptions,
 } from '../src/lib.ts'
+import type { Client } from 'agent-director'
+import {
+  ErrSpawnNotFound,
+  ErrSystemInstallDisappeared,
+  ErrTmuxNotAvailable,
+} from '../src/agent-director-errors.ts'
+import {
+  _resetOutageState,
+  initOutageState,
+  getOutageFlags,
+  setOutageFlag,
+} from '../src/outage-state.ts'
+import {
+  setClientForTests,
+  resetClientForTests,
+} from '../src/agent-director-client.ts'
+import { makeStubClient } from './test-helpers/agent-director-stub.ts'
+import { _buildIsSessionAliveAdapter } from '../src/server.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -580,5 +598,113 @@ describe('defaultAccess', () => {
 
   test('returns empty pending', () => {
     expect(defaultAccess().pending).toEqual({})
+  })
+})
+
+// ---------------------------------------------------------------------------
+// _buildIsSessionAliveAdapter (SRD § Liveness probe, Epic 2 Task 1)
+// ---------------------------------------------------------------------------
+
+describe('_buildIsSessionAliveAdapter', () => {
+  type Emission = { channelId: string; text: string }
+
+  /** Build per-test emission capture + stub client + outage-state harness. */
+  function makeHarness(statusError?: Error, statusState?: string): {
+    emissions: Emission[]
+    adapter: (channelId: string) => Promise<boolean>
+  } {
+    const emissions: Emission[] = []
+    _resetOutageState()
+    initOutageState({
+      postToChannel: (channelId, text) => { emissions.push({ channelId, text }) },
+      getClient: () => makeStubClient() as unknown as Client,
+    })
+    const stubOpts = statusError
+      ? { statusError }
+      : { statusResult: { state: statusState ?? 'waiting' } }
+    setClientForTests(makeStubClient(stubOpts) as unknown as Client)
+    // Minimal routing config: channel C1 is routed
+    const fakeConfig = { routes: { C1: { normalizedName: 'test-channel' } } }
+    return {
+      emissions,
+      adapter: _buildIsSessionAliveAdapter(() => fakeConfig as any),
+    }
+  }
+
+  afterEach(() => {
+    resetClientForTests()
+    _resetOutageState()
+  })
+
+  test('1. alive: status returns live state → clears ad-unreachable + tmux-unavailable; returns true', async () => {
+    const { emissions, adapter } = makeHarness(undefined, 'waiting')
+    // Pre-raise both flags so the clears are observable
+    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
+    setOutageFlag('C1', 'tmux-unavailable')
+    const before = emissions.length
+
+    const result = await adapter('C1')
+
+    expect(result).toBe(true)
+    expect(getOutageFlags('C1').size).toBe(0)
+    const newEmissions = emissions.slice(before)
+    expect(newEmissions).toHaveLength(1)
+    expect(newEmissions[0].channelId).toBe('C1')
+    expect(newEmissions[0].text).toMatch(/All clear/)
+    expect(newEmissions[0].text).toContain('ad-unreachable')
+    expect(newEmissions[0].text).toContain('tmux-unavailable')
+  })
+
+  test('2. ErrSpawnNotFound: status throws → clears ad-unreachable + tmux-unavailable; returns false', async () => {
+    const { emissions, adapter } = makeHarness(
+      new ErrSpawnNotFound('status', 'ErrSpawnNotFound', 'spawn not found'),
+    )
+    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
+    setOutageFlag('C1', 'tmux-unavailable')
+    const before = emissions.length
+
+    const result = await adapter('C1')
+
+    expect(result).toBe(false)
+    expect(getOutageFlags('C1').size).toBe(0)
+    const newEmissions = emissions.slice(before)
+    expect(newEmissions).toHaveLength(1)
+    expect(newEmissions[0].text).toMatch(/All clear/)
+    expect(newEmissions[0].text).toContain('ad-unreachable')
+    expect(newEmissions[0].text).toContain('tmux-unavailable')
+  })
+
+  test('3. ErrSystemInstallDisappeared: status throws → sets ad-unreachable with binaryPath as detail; returns false', async () => {
+    const binaryPath = '/home/horde/.agent-director/bin/agent-director'
+    const { emissions, adapter } = makeHarness(
+      new ErrSystemInstallDisappeared('status', binaryPath),
+    )
+
+    const result = await adapter('C1')
+
+    expect(result).toBe(false)
+    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
+    expect(getOutageFlags('C1').has('tmux-unavailable')).toBe(false)
+    expect(emissions).toHaveLength(1)
+    expect(emissions[0].channelId).toBe('C1')
+    expect(emissions[0].text).toMatch(/agent-director unreachable/)
+    expect(emissions[0].text).toContain(binaryPath)
+  })
+
+  test('4. ErrTmuxNotAvailable: status throws → sets tmux-unavailable (no detail); returns false', async () => {
+    const { emissions, adapter } = makeHarness(
+      new ErrTmuxNotAvailable('status', 'ErrTmuxNotAvailable', 'tmux not found'),
+    )
+
+    const result = await adapter('C1')
+
+    expect(result).toBe(false)
+    expect(getOutageFlags('C1').has('tmux-unavailable')).toBe(true)
+    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(false)
+    expect(emissions).toHaveLength(1)
+    expect(emissions[0].channelId).toBe('C1')
+    expect(emissions[0].text).toMatch(/tmux unavailable/)
+    // ONSET_TEMPLATES['tmux-unavailable'] ignores the detail arg — nothing extra
+    expect(emissions[0].text).not.toContain('undefined')
   })
 })
