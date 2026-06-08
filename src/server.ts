@@ -27,6 +27,7 @@ import {
   chmodSync,
   existsSync,
   renameSync,
+  promises as fsPromises,
 } from 'fs'
 
 import {
@@ -68,7 +69,6 @@ import {
   resetFailureCounter,
   cancelAllRestartTimers,
   isRestartPendingOrActive,
-  hasReachedMaxFailures,
 } from './restart.ts'
 import { initHealthCheck, startHealthCheck, stopHealthCheck } from './health-check.ts'
 import { loadTokens, isDryRun } from './tokens.ts'
@@ -1274,7 +1274,36 @@ export async function main(): Promise<void> {
   initHealthCheck({
     isSessionAlive: isSessionAliveAdapter,
     isRestartPendingOrActive,
-    hasReachedMaxFailures,
+    statRoute: async (cwd) => {
+      const STAT_TIMEOUT_MS = 5_000
+      const statPromise = (async () => {
+        try {
+          const st = await fsPromises.stat(cwd)
+          return st.isDirectory()
+        } catch (err) {
+          // Any access failure (ENOENT, ENOTDIR, EMFILE, EACCES, EIO, etc.) is
+          // the actionable signal — the OS cannot reach the folder, so the
+          // operator should be alerted. Transient errors (like EMFILE/fd
+          // exhaustion) clear naturally on the next tick's successful stat
+          // via the dedupe contract; persistent errors stay raised until the
+          // operator investigates. Log the underlying error for diagnostics.
+          console.error(`[slack] health-check: statRoute(${cwd}) failed:`, err)
+          return false
+        }
+      })()
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+      const timeoutPromise = new Promise<boolean>((resolve) => {
+        timeoutHandle = setTimeout(() => {
+          console.error(`[slack] health-check: statRoute(${cwd}) timed out after ${STAT_TIMEOUT_MS}ms — treating as unreachable`)
+          resolve(false)
+        }, STAT_TIMEOUT_MS)
+      })
+      try {
+        return await Promise.race([statPromise, timeoutPromise])
+      } finally {
+        clearTimeout(timeoutHandle)
+      }
+    },
     scheduleRestart,
     isShuttingDown: () => shuttingDown,
     getRoutes: () => {
