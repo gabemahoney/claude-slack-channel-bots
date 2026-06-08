@@ -754,7 +754,7 @@ socket.on('interactive', async (evt) => {
 
     const handled = await handlePermissionClick(
       actionId,
-      { getClient, web },
+      { web },
       { channel: channelId, messageTs, user: userId },
     )
     if (handled) {
