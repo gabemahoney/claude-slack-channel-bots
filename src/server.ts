@@ -66,7 +66,6 @@ import { startPermissionPoller, stopPermissionPoller } from './permission-poller
 import {
   initRestart,
   scheduleRestart,
-  resetFailureCounter,
   cancelAllRestartTimers,
   isRestartPendingOrActive,
 } from './restart.ts'
@@ -523,9 +522,6 @@ async function handleInitialized(
     console.error(`[slack] Session replaced existing connection for CWD "${normalizedCwd}"`)
   }
   console.error(`[slack] Session connected: channel=${matchedChannelId} cwd="${normalizedCwd}"`)
-
-  // Reset failure counter — session reconnected successfully
-  resetFailureCounter(matchedChannelId)
 }
 
 // ---------------------------------------------------------------------------
