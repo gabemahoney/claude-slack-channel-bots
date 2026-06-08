@@ -1,7 +1,7 @@
 /**
- * outage-state.test.ts — SRD §Test plan cases 1-21.
- *
- * Cases 22-24 are deferred to Epics 7 and 8 — not implemented here.
+ * outage-state.test.ts — SRD §Test plan cases 1-24, plus the
+ * tests/getclient-allowlist.txt static audit (case 22) and the
+ * resetAllToHealthy single-call-site audit (case 23 Part A).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -166,10 +166,11 @@ describe('cases 1-9: single-flag lifecycle', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Cases 10-14 — bad-stretch history, reset, template, post-failure
+// Cases 10-14 — bad-stretch history, reset, template, post-failure,
+//               startup bounded pair (case 14)
 // ---------------------------------------------------------------------------
 
-describe('cases 10-14: bad-stretch history, reset, template, post-failure', () => {
+describe('cases 10-14: bad-stretch history, reset, template, post-failure, startup pair', () => {
 
   test('10. intra-stretch flap: raise ad → raise cwd → clear ad (silent) → raise ad again → clear cwd (silent) → clear ad → all-clear names ad-unreachable once, no timestamp', () => {
     const { emissions } = makeHarness()
@@ -467,6 +468,33 @@ describe('static audits', () => {
     }
   })
 
+  test('23 Part A. exactly one resetAllToHealthy(...) call site in src/ outside src/outage-state.ts', async () => {
+    const { execSync } = await import('node:child_process')
+
+    let grepOut = ''
+    try {
+      grepOut = execSync(
+        `grep -rn 'resetAllToHealthy(' src/ --include='*.ts'`,
+        { encoding: 'utf-8' },
+      )
+    } catch (err) {
+      grepOut = ((err as { stdout?: Buffer }).stdout?.toString()) ?? ''
+    }
+
+    const matches = grepOut
+      .split('\n')
+      .filter((l) => l && !l.startsWith('src/outage-state.ts:'))
+      // Filter out comment / JSDoc lines like the case-22 audit.
+      .filter((l) => {
+        const m = l.match(/^[^:]+:\d+:(.*)$/)
+        return m ? !/^\s*(\*|\/\/)/.test(m[1]) : false
+      })
+
+    expect(matches).toHaveLength(1)
+    // The one sanctioned call site lives in src/server.ts.
+    expect(matches[0]).toMatch(/^src\/server\.ts:\d+:/)
+  })
+
   test('23 Part B. resetAllToHealthy is silent + idempotent across consecutive calls', () => {
     const { emissions } = makeHarness()
     setOutageFlag('C1', 'ad-unreachable', '/x')
@@ -528,32 +556,5 @@ describe('static audits', () => {
     expect(allClear.text).toContain('/bin/ad')
     expect(allClear.text).toContain('/route/cwd')
     expect(getOutageFlags('C1').size).toBe(0)
-  })
-
-  test('23 Part A. exactly one resetAllToHealthy(...) call site in src/ outside src/outage-state.ts', async () => {
-    const { execSync } = await import('node:child_process')
-
-    let grepOut = ''
-    try {
-      grepOut = execSync(
-        `grep -rn 'resetAllToHealthy(' src/ --include='*.ts'`,
-        { encoding: 'utf-8' },
-      )
-    } catch (err) {
-      grepOut = ((err as { stdout?: Buffer }).stdout?.toString()) ?? ''
-    }
-
-    const matches = grepOut
-      .split('\n')
-      .filter((l) => l && !l.startsWith('src/outage-state.ts:'))
-      // Filter out comment / JSDoc lines like the case-22 audit.
-      .filter((l) => {
-        const m = l.match(/^[^:]+:\d+:(.*)$/)
-        return m ? !/^\s*(\*|\/\/)/.test(m[1]) : false
-      })
-
-    expect(matches).toHaveLength(1)
-    // The one sanctioned call site lives in src/server.ts.
-    expect(matches[0]).toMatch(/^src\/server\.ts:\d+:/)
   })
 })

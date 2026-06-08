@@ -17,6 +17,7 @@ import {
   getOutageFlags,
   setOutageFlag,
 } from '../src/outage-state.ts'
+import { _buildStatRouteImpl } from '../src/server.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -280,42 +281,12 @@ describe('cwd-unreachable flag management + tick-in-flight guard', () => {
   })
 
   // ---------------------------------------------------------------------------
-  // (e) default-impl 5 s timeout — hand-rolled fake-clock harness
-  //
-  // Bun 1.x useFakeTimers only fakes Date/Date.now, not setTimeout, so we
-  // inject a controlled setTimeout/clearTimeout pair directly into an isolated
-  // copy of the production statRoute factory (mirrors src/server.ts logic).
+  // (e) default-impl 5 s timeout — exercises the REAL _buildStatRouteImpl
+  // factory from src/server.ts via its dep-injection seam (stat / setTimeout /
+  // clearTimeout). Bun 1.x useFakeTimers only fakes Date/Date.now, not
+  // setTimeout, so we inject a controlled setTimeout/clearTimeout pair directly.
   // ---------------------------------------------------------------------------
   test('(e) default-impl 5s timeout: hung stat resolves false after 5s budget', async () => {
-    // Inline factory that mirrors the production statRoute from server.ts.
-    // Injectable timers let us trigger the timeout synchronously.
-    function makeStatRouteImpl(
-      statFn: (path: string) => Promise<{ isDirectory(): boolean }>,
-      setTimeoutFn: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>,
-      clearTimeoutFn: (handle: ReturnType<typeof setTimeout> | undefined) => void,
-    ): (cwd: string) => Promise<boolean> {
-      return async (cwd) => {
-        const STAT_TIMEOUT_MS = 5_000
-        const statPromise = (async () => {
-          try {
-            const st = await statFn(cwd)
-            return st.isDirectory()
-          } catch {
-            return false
-          }
-        })()
-        let timeoutHandle: ReturnType<typeof setTimeout> | undefined
-        const timeoutPromise = new Promise<boolean>((resolve) => {
-          timeoutHandle = setTimeoutFn(() => { resolve(false) }, STAT_TIMEOUT_MS)
-        })
-        try {
-          return await Promise.race([statPromise, timeoutPromise])
-        } finally {
-          clearTimeoutFn(timeoutHandle)
-        }
-      }
-    }
-
     // Capture the timeout callback so we can fire it manually.
     let capturedCallback: (() => void) | undefined
     let capturedDelay: number | undefined
@@ -331,7 +302,11 @@ describe('cwd-unreachable flag management + tick-in-flight guard', () => {
     const hangingStat = (): Promise<{ isDirectory(): boolean }> =>
       new Promise(() => {})
 
-    const statRoute = makeStatRouteImpl(hangingStat, fakeSetTimeout, fakeClearTimeout)
+    const statRoute = _buildStatRouteImpl({
+      stat: hangingStat,
+      setTimeout: fakeSetTimeout,
+      clearTimeout: fakeClearTimeout,
+    })
 
     const resultPromise = statRoute('/some/cwd')
 

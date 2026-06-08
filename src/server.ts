@@ -881,6 +881,53 @@ export function _buildIsSessionAliveAdapter(
 }
 
 // ---------------------------------------------------------------------------
+// _buildStatRouteImpl
+// ---------------------------------------------------------------------------
+
+/**
+ * _buildStatRouteImpl — test-only factory for the health-check tick's
+ * statRoute dependency. Production code wires this via main()'s
+ * initHealthCheck call with no deps; tests inject `stat` / `setTimeout` /
+ * `clearTimeout` to exercise the 5-second timeout budget and the
+ * fsPromises.stat error swallowing against the REAL factory (not a replica).
+ *
+ * @internal
+ */
+export function _buildStatRouteImpl(deps?: {
+  stat?: (path: string) => Promise<{ isDirectory(): boolean }>
+  setTimeout?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>
+  clearTimeout?: (handle: ReturnType<typeof setTimeout> | undefined) => void
+}): (cwd: string) => Promise<boolean> {
+  const stat = deps?.stat ?? ((p: string) => fsPromises.stat(p) as Promise<{ isDirectory(): boolean }>)
+  const setT = deps?.setTimeout ?? ((fn: () => void, ms: number) => setTimeout(fn, ms))
+  const clearT = deps?.clearTimeout ?? ((h: ReturnType<typeof setTimeout> | undefined) => clearTimeout(h))
+  const STAT_TIMEOUT_MS = 5_000
+  return async (cwd: string) => {
+    const statPromise = (async () => {
+      try {
+        const st = await stat(cwd)
+        return st.isDirectory()
+      } catch (err) {
+        console.error(`[slack] health-check: statRoute(${cwd}) failed:`, err)
+        return false
+      }
+    })()
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+    const timeoutPromise = new Promise<boolean>((resolve) => {
+      timeoutHandle = setT(() => {
+        console.error(`[slack] health-check: statRoute(${cwd}) timed out after ${STAT_TIMEOUT_MS}ms — treating as unreachable`)
+        resolve(false)
+      }, STAT_TIMEOUT_MS)
+    })
+    try {
+      return await Promise.race([statPromise, timeoutPromise])
+    } finally {
+      clearT(timeoutHandle)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 //
 // HTTP routing strategy (roots-based session identity):
@@ -1273,36 +1320,7 @@ export async function main(): Promise<void> {
   initHealthCheck({
     isSessionAlive: isSessionAliveAdapter,
     isRestartPendingOrActive,
-    statRoute: async (cwd) => {
-      const STAT_TIMEOUT_MS = 5_000
-      const statPromise = (async () => {
-        try {
-          const st = await fsPromises.stat(cwd)
-          return st.isDirectory()
-        } catch (err) {
-          // Any access failure (ENOENT, ENOTDIR, EMFILE, EACCES, EIO, etc.) is
-          // the actionable signal — the OS cannot reach the folder, so the
-          // operator should be alerted. Transient errors (like EMFILE/fd
-          // exhaustion) clear naturally on the next tick's successful stat
-          // via the dedupe contract; persistent errors stay raised until the
-          // operator investigates. Log the underlying error for diagnostics.
-          console.error(`[slack] health-check: statRoute(${cwd}) failed:`, err)
-          return false
-        }
-      })()
-      let timeoutHandle: ReturnType<typeof setTimeout> | undefined
-      const timeoutPromise = new Promise<boolean>((resolve) => {
-        timeoutHandle = setTimeout(() => {
-          console.error(`[slack] health-check: statRoute(${cwd}) timed out after ${STAT_TIMEOUT_MS}ms — treating as unreachable`)
-          resolve(false)
-        }, STAT_TIMEOUT_MS)
-      })
-      try {
-        return await Promise.race([statPromise, timeoutPromise])
-      } finally {
-        clearTimeout(timeoutHandle)
-      }
-    },
+    statRoute: _buildStatRouteImpl(),
     scheduleRestart,
     isShuttingDown: () => shuttingDown,
     getRoutes: () => {
