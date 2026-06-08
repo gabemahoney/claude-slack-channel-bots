@@ -467,6 +467,69 @@ describe('static audits', () => {
     }
   })
 
+  test('23 Part B. resetAllToHealthy is silent + idempotent across consecutive calls', () => {
+    const { emissions } = makeHarness()
+    setOutageFlag('C1', 'ad-unreachable', '/x')
+    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
+    const beforeFirst = emissions.length
+
+    resetAllToHealthy(['C1'])
+    expect(getOutageFlags('C1').size).toBe(0)
+    expect(emissions.length).toBe(beforeFirst)  // silent: no emission
+
+    resetAllToHealthy(['C1'])
+    expect(getOutageFlags('C1').size).toBe(0)
+    expect(emissions.length).toBe(beforeFirst)  // still silent on second call
+  })
+
+  test('24. mixed-source two-flag composition: tick + wrapper raise both; spawn-success all-clear names both', async () => {
+    const { emissions } = makeHarness()
+
+    // Step 1: simulate the tick raising cwd-unreachable for C1.
+    // The tick's effect on the state machine is one setOutageFlag call —
+    // exercising it directly is semantically equivalent to driving the tick
+    // body, and keeps this case a pure outage-state composition test.
+    setOutageFlag('C1', 'cwd-unreachable', '/route/cwd')
+
+    // Step 2: drive the wrapper to raise ad-unreachable from a spawn throw.
+    const adErr = new ErrSystemInstallDisappeared('spawn', '/bin/ad')
+    const spawnStub = async () => { throw adErr }
+    await expect(
+      withSpawnDetection('C1', '/route/cwd', spawnStub),
+    ).rejects.toThrow(ErrSystemInstallDisappeared)
+
+    // Assert: two onsets in order.
+    expect(emissions).toHaveLength(2)
+    expect(emissions[0].channelId).toBe('C1')
+    expect(emissions[0].text).toMatch(/Route cwd unreachable/)
+    expect(emissions[0].text).toContain('/route/cwd')
+    expect(emissions[1].channelId).toBe('C1')
+    expect(emissions[1].text).toMatch(/agent-director unreachable/)
+    expect(emissions[1].text).toContain('/bin/ad')
+    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
+    expect(getOutageFlags('C1').has('cwd-unreachable')).toBe(true)
+
+    // Step 3: flip the spawn stub to succeed; withSpawnDetection clears both.
+    const successStub = async () => 'ok'
+    const result = await withSpawnDetection('C1', '/route/cwd', successStub)
+    expect(result).toBe('ok')
+
+    // Exactly one new emission (the all-clear). Three total now.
+    expect(emissions).toHaveLength(3)
+    const allClear = emissions[2]
+    expect(allClear.channelId).toBe('C1')
+    expect(allClear.text).toMatch(/All clear/)
+    // SRD stable rendering order: ad-unreachable BEFORE cwd-unreachable.
+    const adIdx = allClear.text.indexOf('ad-unreachable')
+    const cwdIdx = allClear.text.indexOf('cwd-unreachable')
+    expect(adIdx).toBeGreaterThan(-1)
+    expect(cwdIdx).toBeGreaterThan(-1)
+    expect(adIdx).toBeLessThan(cwdIdx)
+    expect(allClear.text).toContain('/bin/ad')
+    expect(allClear.text).toContain('/route/cwd')
+    expect(getOutageFlags('C1').size).toBe(0)
+  })
+
   test('23 Part A. exactly one resetAllToHealthy(...) call site in src/ outside src/outage-state.ts', async () => {
     const { execSync } = await import('node:child_process')
 
