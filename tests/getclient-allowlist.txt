@@ -1,0 +1,30 @@
+# Sanctioned getClient() call sites in CSCB src/.
+#
+# Format: path:line  # reason
+#
+# Test #22 in tests/outage-state.test.ts greps `\bgetClient\(\)` across src/
+# (filtering out lines beginning with whitespace + `*` or `//` to drop
+# JSDoc/comment matches). Every remaining path:line MUST be enumerated below.
+# Adding a non-allowlisted getClient() call will fail test #22 with a clear
+# "unsanctioned getClient() at path:line" message.
+#
+# After Epic 4 the wrapper (`withOutageDetection` / `withSpawnDetection`) in
+# src/outage-state.ts is the ONLY sanctioned entry point for CSCB→AD calls.
+# Each entry below is a documented exception.
+#
+# When src/ shifts and a sanctioned line moves, update the line number here
+# rather than dropping the entry.
+
+src/agent-director-client.ts:61  # export function getClient() — the definition
+src/agent-director-client.ts:64  # error-message string literal naming getClient() (`throw new Error(...)` body)
+src/outage-state.ts:237  # wrapper's deps.getClient() — sanctioned single entry point
+src/server.ts:859  # isSessionAliveAdapter tick-path bare getClient() — sanctioned tick-path exception
+src/agent-director-template.ts:47  # production-deps factory wiring: getClient: () => getClient()
+src/agent-director-template.ts:136  # startup-fatal makeTemplate install: const client = d.getClient()
+src/session-manager.ts:795  # const client = getClient() in reconcileOrphans (orphans have no routed-channel attribution)
+src/session-manager.ts:1010  # const client = getClient() in reconcileInstanceIds (binding used for client.list)
+src/permission-poller.ts:317  # const client = deps.getClient() — list-level client.list at top of runTick (no per-channel context)
+src/cli.ts:320  # CLI subcommand: list
+src/cli.ts:349  # CLI subcommand: status
+src/cli.ts:358  # CLI subcommand: pause
+src/cli.ts:363  # CLI subcommand: kill
