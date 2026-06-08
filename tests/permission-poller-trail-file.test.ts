@@ -57,6 +57,10 @@ beforeEach(() => {
   origStateDir = process.env['SLACK_STATE_DIR']
   process.env['SLACK_STATE_DIR'] = tempDir
   _resetTrailFdForTests()
+  // Initialize outage-state so withOutageDetection does not throw during ticks.
+  // Tests that need a specific client (e.g. decide) override via initOutageState
+  // inside the test body.
+  initOutageState({ getClient: () => ({} as unknown as Client), postToChannel: () => {} })
 })
 
 afterEach(() => {
@@ -155,6 +159,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
+    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -194,6 +199,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
+    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -244,6 +250,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
       getPermission: async (p: GetPermissionParams): Promise<GetPermissionResult> =>
         cannedGetPermissionResponse({ request_token: p.request_token, decision: 'allow', decision_reason: null }),
     })
+    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -300,6 +307,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
+    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -331,6 +339,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
+    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -393,6 +402,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
+    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -437,6 +447,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
+    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,

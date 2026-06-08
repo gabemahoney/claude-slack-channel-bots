@@ -77,6 +77,10 @@ afterAll(() => {
 
 beforeEach(() => {
   _resetTrailFdForTests()
+  // Initialize outage-state so withOutageDetection (used in the poller) does
+  // not throw during seedLiveEntry ticks. Per-test calls to initOutageState
+  // below override this with the decide-stub for click-handler assertions.
+  initOutageState({ getClient: () => ({} as unknown as Client), postToChannel: () => {} })
 })
 
 // ---------------------------------------------------------------------------
@@ -189,6 +193,7 @@ async function seedLiveEntry(opts: {
       ],
     }),
   })
+  initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
   startPermissionPoller({
     getClient,
     web: chat.web as never,
@@ -247,6 +252,7 @@ async function seedTwoSiblings(opts: {
       ],
     }),
   })
+  initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
   startPermissionPoller({
     getClient,
     web: chat.web as never,
@@ -1116,12 +1122,12 @@ describe('handlePermissionClick — wrapper outage short-circuit', () => {
     const BINARY = '/usr/local/bin/agent-director'
     const err = new ErrSystemInstallDisappeared('spawn', BINARY)
     const decide = makeDecideStub({ throwOn: err })
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
     const seed = await seedLiveEntry({
       instanceId: INSTANCE_C,
       channelId: CHANNEL_CH,
       requestToken: TOKEN_A,
     })
+    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
     const logCalls: unknown[][] = []
     const handled = await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),

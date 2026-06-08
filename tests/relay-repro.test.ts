@@ -41,7 +41,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import type { Client, DecideParams, DecideResult, ListResult } from 'agent-director'
 
 import { handlePermissionClick } from '../src/permission-click-handler.ts'
@@ -139,6 +139,13 @@ function makeChatStub(opts: { tsSequence: string[] }): {
   }
 }
 
+beforeEach(() => {
+  // Initialize outage-state so withOutageDetection does not throw during
+  // poller ticks. The test body overrides via initOutageState with the full
+  // sharedClient (which carries decide) before invoking handlePermissionClick.
+  initOutageState({ getClient: () => ({} as unknown as Client), postToChannel: () => {} })
+})
+
 afterEach(() => {
   stopPermissionPoller()
   _resetPollerState()
@@ -214,6 +221,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     }
     const getClient = () => sharedClient
 
+    initOutageState({ getClient: getClient as unknown as () => Client, postToChannel: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
