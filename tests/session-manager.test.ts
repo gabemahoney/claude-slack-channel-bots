@@ -28,8 +28,7 @@ import {
   resolveChannelNames,
   reconnectMcp,
   waitForWaitingAndReconnect,
-  approveDevChannelsDialog,
-  approveTrustFolderDialog,
+  approvePreSessionDialogs,
   spawnForRoute,
   startupSessionManager,
   instanceIdFor,
@@ -37,14 +36,10 @@ import {
   AGENT_DIRECTOR_LIVE_STATES,
   DEV_CHANNELS_DIALOG_NEEDLE,
   TRUST_DIALOG_NEEDLE,
-  _setDialogPollTimeoutMs,
+  _setDialogReadyTimeoutMs,
   _setDialogPollIntervalMs,
-  _resetDialogPollTimeoutMs,
+  _resetDialogReadyTimeoutMs,
   _resetDialogPollIntervalMs,
-  _setTrustDialogPollTimeoutMs,
-  _setTrustDialogPollIntervalMs,
-  _resetTrustDialogPollTimeoutMs,
-  _resetTrustDialogPollIntervalMs,
   _setWaitForWaitingTimeoutMs,
   _resetWaitForWaitingTimeoutMs,
 } from '../src/session-manager.ts'
@@ -93,21 +88,14 @@ let savedEnv: NodeJS.ProcessEnv
 
 beforeEach(() => {
   savedEnv = { ...process.env }
-  // Keep dialog approval polling tight so the helpers firing on every
-  // fresh-spawn test don't add seconds to the suite. Individual tests can
-  // override these as needed. Both approvers (dev-channels and trust-folder)
-  // run at every spawn site, so both seams must be set.
+  // Keep dialog approval polling tight so the merged approvePreSessionDialogs
+  // running on every fresh-spawn doesn't add seconds to the suite. Individual
+  // tests can override these as needed.
   _setDialogPollIntervalMs(1)
-  _setDialogPollTimeoutMs(20)
-  // Trust-folder approver runs first at every spawn site (b.uhv Fix B). The
-  // existing `readPaneResults` sequences in this file were authored before
-  // the trust approver existed and assume the dev-channels approver gets the
-  // first reads. Set the trust timeout to 0 so its while-loop never enters and
-  // consumes no canned reads — the dedicated trust-approver tests live in
-  // tests/approve-trust-folder-dialog.test.ts where the seam is overridden
-  // with realistic values.
-  _setTrustDialogPollIntervalMs(1)
-  _setTrustDialogPollTimeoutMs(0)
+  // Use a large-enough ready timeout that the happy path (statusQueue reaches
+  // 'waiting' in 2-3 polls at 1ms interval) completes before the cap. Tests
+  // that need to exercise the cap override this locally.
+  _setDialogReadyTimeoutMs(200)
   // Wire the outage-state module so withOutageDetection / withSpawnDetection
   // can resolve the AD client and emit Slack onset/all-clear messages.
   outageEmissions = []
@@ -120,9 +108,7 @@ beforeEach(() => {
 afterEach(() => {
   resetClientForTests()
   _resetDialogPollIntervalMs()
-  _resetDialogPollTimeoutMs()
-  _resetTrustDialogPollIntervalMs()
-  _resetTrustDialogPollTimeoutMs()
+  _resetDialogReadyTimeoutMs()
   _resetWaitForWaitingTimeoutMs()
   _resetOutageState()
   process.env = savedEnv as NodeJS.ProcessEnv
@@ -425,10 +411,10 @@ describe('SR-8.6 invariants', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.yy6 — dev-channels dialog auto-approve
+// b.4ie — merged approvePreSessionDialogs (dev-channels + trust needle)
 // ---------------------------------------------------------------------------
 
-describe('approveDevChannelsDialog (b.yy6)', () => {
+describe('approvePreSessionDialogs (b.4ie)', () => {
   const DEV_CHANNELS_PANE = readFileSync(
     join(import.meta.dir, 'fixtures', 'dev-channels-pane-2.1.120.txt'),
     'utf-8',
@@ -441,21 +427,31 @@ describe('approveDevChannelsDialog (b.yy6)', () => {
    * SLACK_STATE_DIR via the file-level afterEach.
    */
   function captureStartupErrors(): () => string {
-    const dir = mkdtempSync(join(tmpdir(), 'cscb-yy6-'))
+    const dir = mkdtempSync(join(tmpdir(), 'cscb-4ie-'))
     process.env['SLACK_STATE_DIR'] = dir
     const logPath = join(dir, 'startup-errors.log')
     return () => (existsSync(logPath) ? readFileSync(logPath, 'utf-8') : '')
   }
 
-  test('happy path: dialog detected → Enter sent → confirmed gone', async () => {
+  // -------------------------------------------------------------------------
+  // Happy path: dialog detected → Enter sent (via spawnForRoute, the SR-1.1
+  // fresh-spawn path that calls approvePreSessionDialogs).
+  // statusQueue drives pending→waiting so the approver presses Enter then exits.
+  // -------------------------------------------------------------------------
+
+  test('happy path: dialog detected → Enter sent (allow_pending true, id cscb_C)', async () => {
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     const readPaneCalls: import('agent-director').ReadPaneParams[] = []
     installStub({
       sendKeysCalls,
       readPaneCalls,
+      // pending → approver reads pane and presses Enter; then waiting → returns
+      statusQueue: [
+        cannedOk({ state: 'pending' }),
+        cannedOk({ state: 'waiting' }),
+      ],
       readPaneResults: [
         { pane: DEV_CHANNELS_PANE },
-        { pane: WELCOME_PANE },
         { pane: WELCOME_PANE },
       ],
     })
@@ -466,64 +462,32 @@ describe('approveDevChannelsDialog (b.yy6)', () => {
     expect(sendKeysCalls).toHaveLength(1)
     expect(sendKeysCalls[0].text).toBe('')
     expect(sendKeysCalls[0].claude_instance_id).toBe('cscb_C')
-    // readPane should have been invoked at least once for detection and
-    // twice more to confirm the dialog cleared.
-    expect(readPaneCalls.length).toBeGreaterThanOrEqual(3)
+    // readPane should have been invoked at least once while pending
+    expect(readPaneCalls.length).toBeGreaterThanOrEqual(1)
     for (const r of readPaneCalls) {
       expect(r.claude_instance_id).toBe('cscb_C')
       expect(r.n_lines).toBe(40)
-      // b.98w: every readPane call must carry allow_pending=true so the verb
-      // succeeds while the spawn is still in 'pending' state.
+      // b.98w: every readPane call must carry allow_pending=true
       expect(r.allow_pending).toBe(true)
     }
-    // b.98w: the sendKeys call that presses Enter must also carry allow_pending=true.
+    // b.98w: the sendKeys call that presses Enter must also carry allow_pending=true
     for (const s of sendKeysCalls) {
       expect(s.allow_pending).toBe(true)
     }
   })
 
-  test('timeout: no dialog → no sendKeys → records dev-channels-approve-no-dialog', async () => {
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    installStub({
-      sendKeysCalls,
-      readPaneResults: [{ pane: 'unrelated pane text' }],
-    })
-    const readLog = captureStartupErrors()
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
-
-    expect(result.action).toBe('spawned')
-    expect(sendKeysCalls).toHaveLength(0)
-    const log = readLog()
-    expect(log).toContain('[dev-channels-approve-no-dialog]')
-    expect(log).toContain('channel=C')
-    expect(log).toContain('b.yy6')
-  })
-
-  test('still-visible after Enter → records dev-channels-approve-still-visible', async () => {
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    installStub({
-      sendKeysCalls,
-      // Sticky needle: every read returns the dialog → after sendKeys the
-      // post-approval confirmation loop never sees the needle clear.
-      readPaneResults: [{ pane: DEV_CHANNELS_PANE }],
-    })
-    const readLog = captureStartupErrors()
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
-
-    expect(result.action).toBe('spawned')
-    expect(sendKeysCalls).toHaveLength(1)
-    expect(sendKeysCalls[0].text).toBe('')
-    const log = readLog()
-    expect(log).toContain('[dev-channels-approve-still-visible]')
-    expect(log).toContain('channel=C')
-  })
+  // -------------------------------------------------------------------------
+  // needle lock-in constant test
+  // -------------------------------------------------------------------------
 
   test('needle lock-in: matches the verified Claude Code 2.1.120 label', () => {
     expect(DEV_CHANNELS_DIALOG_NEEDLE).toBe('I am using this for local development')
     expect(DEV_CHANNELS_PANE).toContain(DEV_CHANNELS_DIALOG_NEEDLE)
   })
+
+  // -------------------------------------------------------------------------
+  // Collision/skip tests — no approvePreSessionDialogs on collision paths
+  // -------------------------------------------------------------------------
 
   test('skipped on collision-resume path (no fresh spawn → no readPane)', async () => {
     const readPaneCalls: import('agent-director').ReadPaneParams[] = []
@@ -567,13 +531,19 @@ describe('approveDevChannelsDialog (b.yy6)', () => {
     expect(readPaneCalls).toHaveLength(0)
   })
 
-  test('launchSession (restart path, isStartup=false): does not record startup error on timeout', async () => {
+  // -------------------------------------------------------------------------
+  // isStartup=false path: no startup error recorded on cap hit
+  // -------------------------------------------------------------------------
+
+  test('launchSession (restart path, isStartup=false): does not record startup error on cap hit', async () => {
+    // sticky pending → cap hit; isStartup=false means no startup error
+    _setDialogReadyTimeoutMs(20)
     installStub({
-      readPaneResults: [{ pane: 'no dialog' }],
+      statusResult: { state: 'pending' },
+      readPaneResults: [{ pane: 'unrelated' }],
     })
     const readLog = captureStartupErrors()
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    // Drive the non-startup branch explicitly.
     const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, false)
 
     expect(result.action).toBe('spawned')
@@ -581,11 +551,10 @@ describe('approveDevChannelsDialog (b.yy6)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // b.98w regression: readPane/sendKeys must pass allow_pending:true or the
-  // agent-director rejects with ErrSpawnNotInteractive while still pending.
+  // b.98w regression: readPane/sendKeys must pass allow_pending:true
   // -------------------------------------------------------------------------
 
-  test('b.98w / ErrSpawnNotInteractive: rejects if readPane or sendKeys omit allow_pending', async () => {
+  test('b.98w / allow_pending: Enter pressed with allow_pending:true while spawn is pending', async () => {
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     const readPaneCalls: import('agent-director').ReadPaneParams[] = []
 
@@ -612,6 +581,12 @@ describe('approveDevChannelsDialog (b.yy6)', () => {
       return {}
     }
 
+    // statusQueue: pending → (readPane+sendKeys fire) → waiting → exit
+    stub.status = async (_params: import('agent-director').StatusParams): Promise<import('agent-director').StatusResult> => {
+      const enterCount = sendKeysCalls.length
+      return { state: enterCount >= 1 ? 'waiting' : 'pending' }
+    }
+
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
     const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
 
@@ -620,16 +595,12 @@ describe('approveDevChannelsDialog (b.yy6)', () => {
     // Exactly one sendKeys (the Enter key that dismisses the dialog).
     const enterCalls = sendKeysCalls.filter((s) => s.text === '')
     expect(enterCalls).toHaveLength(1)
-    // The sendKeys call must carry allow_pending:true — without it the mock
-    // throws ErrSpawnNotInteractive and the dialog approval silently fails.
+    // The sendKeys call must carry allow_pending:true
     expect(enterCalls[0].allow_pending).toBe(true)
   })
 
   // -------------------------------------------------------------------------
-  // b.ben regression: approveDevChannelsDialog must use the composed instance
-  // id (cscb_<name>_<id>) when the route carries a normalizedName. The bug
-  // produced cscb_<id> here, polling a non-existent spawn and leaving the
-  // real bot pane stuck on the dev-channels dialog after every clean_restart.
+  // b.ben regression: composed instance id used when route has normalizedName
   // -------------------------------------------------------------------------
 
   test('b.ben: uses composed instance id when route has normalizedName', async () => {
@@ -638,9 +609,12 @@ describe('approveDevChannelsDialog (b.yy6)', () => {
     installStub({
       sendKeysCalls,
       readPaneCalls,
+      statusQueue: [
+        cannedOk({ state: 'pending' }),
+        cannedOk({ state: 'waiting' }),
+      ],
       readPaneResults: [
         { pane: DEV_CHANNELS_PANE },
-        { pane: WELCOME_PANE },
         { pane: WELCOME_PANE },
       ],
     })
@@ -658,6 +632,87 @@ describe('approveDevChannelsDialog (b.yy6)', () => {
     expect(sendKeysCalls).toHaveLength(1)
     expect(sendKeysCalls[0].claude_instance_id).toBe('cscb_my_chan_C_TEST1')
     expect(sendKeysCalls[0].text).toBe('')
+  })
+
+  // -------------------------------------------------------------------------
+  // New behavior tests for merged approver (b.4ie)
+  // -------------------------------------------------------------------------
+
+  test('cap hit: sticky pending + unrecognized pane → records dev-channels-approve-not-ready, no sendKeys, posts Slack failure (isStartup=true)', async () => {
+    _setDialogReadyTimeoutMs(30)
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({
+      sendKeysCalls,
+      // sticky pending: never becomes live
+      statusResult: { state: 'pending' },
+      readPaneResults: [{ pane: 'unrelated pane text' }],
+    })
+    const readLog = captureStartupErrors()
+    const { web, calls } = makeMockWeb()
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    await spawnForRoute('C', { cwd: '/x' }, cfg, web as never)
+
+    expect(sendKeysCalls).toHaveLength(0)
+    const log = readLog()
+    expect(log).toContain('[dev-channels-approve-not-ready]')
+    expect(log).toContain('channel=C')
+    // cap path must also fire postSpawnFailureToChannel (core requirement of b.4ie)
+    expect(calls.length).toBeGreaterThanOrEqual(1)
+  })
+
+  test('dead state: statusQueue [pending, ended] → records dev-channels-approve-spawn-died', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({
+      sendKeysCalls,
+      statusQueue: [
+        cannedOk({ state: 'pending' }),
+        cannedOk({ state: 'ended' }),
+      ],
+      // no needle on pane so Enter is not pressed, but state→ended triggers the dead-state path
+      readPaneResults: [{ pane: 'no needle here' }],
+    })
+    const readLog = captureStartupErrors()
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+    const log = readLog()
+    expect(log).toContain('[dev-channels-approve-spawn-died]')
+  })
+
+  test('already-live: statusQueue [waiting] → no readPane, no sendKeys, no startup error', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+    installStub({
+      sendKeysCalls,
+      readPaneCalls,
+      statusQueue: [cannedOk({ state: 'waiting' })],
+    })
+    const readLog = captureStartupErrors()
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+    expect(readPaneCalls).toHaveLength(0)
+    expect(sendKeysCalls).toHaveLength(0)
+    expect(readLog()).toBe('')
+  })
+
+  test('self-heal: statusQueue [pending, pending, waiting] + sticky dialog → Enter pressed ≥2 times', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({
+      sendKeysCalls,
+      statusQueue: [
+        cannedOk({ state: 'pending' }),
+        cannedOk({ state: 'pending' }),
+        cannedOk({ state: 'waiting' }),
+      ],
+      // sticky: every readPane returns the dialog needle
+      readPaneResults: [{ pane: DEV_CHANNELS_PANE }],
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+    // Enter pressed each time the pane shows the needle while pending
+    expect(sendKeysCalls.length).toBeGreaterThanOrEqual(2)
   })
 })
 
@@ -1353,84 +1408,40 @@ describe('wrapper-migration: dialog outage cases (Group B)', () => {
   const errSID = () => new ErrSystemInstallDisappeared('read-pane', BIN)
 
   // -------------------------------------------------------------------------
-  // Sites #2-#4 — approveDevChannelsDialog
+  // Merged approvePreSessionDialogs — 3 wrapped call sites: status, readPane,
+  // sendKeys. Each exercises an AD-outage error at one site, asserting the
+  // outage flag is raised and the function resolves normally.
   // -------------------------------------------------------------------------
 
-  test('site #2: approveDevChannelsDialog readPane (detection loop) → ad-unreachable, returns normally', async () => {
-    _setDialogPollTimeoutMs(50)
-    installStub({ readPaneError: errSID() })
-    // Must not throw; catch inside approveDevChannelsDialog swallows the error
-    await expect(approveDevChannelsDialog(CH, undefined, false)).resolves.toBeUndefined()
+  test('status outage: status always throws ErrSystemInstallDisappeared → ad-unreachable, resolves (cap hit)', async () => {
+    _setDialogReadyTimeoutMs(50)
+    installStub({ statusError: errSID() })
+    // status throws every poll → transient → cap hit → resolves
+    await expect(approvePreSessionDialogs(CH, undefined, false)).resolves.toBeUndefined()
     expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
     expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
   })
 
-  test('site #3: approveDevChannelsDialog sendKeys → ad-unreachable, returns normally', async () => {
-    _setDialogPollTimeoutMs(50)
+  test('readPane outage: status=pending, readPane throws ErrSystemInstallDisappeared → ad-unreachable, resolves (cap hit)', async () => {
+    _setDialogReadyTimeoutMs(50)
+    installStub({
+      statusResult: { state: 'pending' },
+      readPaneError: errSID(),
+    })
+    await expect(approvePreSessionDialogs(CH, undefined, false)).resolves.toBeUndefined()
+    expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
+    expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
+  })
+
+  test('sendKeys outage: status=pending + dialog pane, sendKeys throws ErrSystemInstallDisappeared → ad-unreachable, resolves (cap hit)', async () => {
+    _setDialogReadyTimeoutMs(50)
     // readPane returns the dialog needle so sendKeys is reached; sendKeys throws
     installStub({
+      statusResult: { state: 'pending' },
       readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_NEEDLE }],
       sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN),
     })
-    await expect(approveDevChannelsDialog(CH, undefined, false)).resolves.toBeUndefined()
-    expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
-    expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
-  })
-
-  test('site #4: approveDevChannelsDialog readPane (confirmation loop) → ad-unreachable, returns normally', async () => {
-    _setDialogPollTimeoutMs(50)
-    // First readPane returns needle (detection succeeds); sendKeys succeeds;
-    // confirmation-loop readPane throws ErrSystemInstallDisappeared
-    const stub = installStub({
-      readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_NEEDLE }],
-    })
-    // Override readPane: first call returns needle, subsequent calls throw
-    let paneCallCount = 0
-    stub.readPane = async (params: import('agent-director').ReadPaneParams) => {
-      paneCallCount++
-      if (paneCallCount === 1) return { pane: DEV_CHANNELS_DIALOG_NEEDLE }
-      throw new ErrSystemInstallDisappeared('read-pane', BIN)
-    }
-    await expect(approveDevChannelsDialog(CH, undefined, false)).resolves.toBeUndefined()
-    expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
-    expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
-  })
-
-  // -------------------------------------------------------------------------
-  // Sites #5-#7 — approveTrustFolderDialog
-  // -------------------------------------------------------------------------
-
-  test('site #5: approveTrustFolderDialog readPane (detection loop) → ad-unreachable, returns normally', async () => {
-    _setTrustDialogPollTimeoutMs(50)
-    installStub({ readPaneError: errSID() })
-    await expect(approveTrustFolderDialog(CH, undefined, false)).resolves.toBeUndefined()
-    expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
-    expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
-  })
-
-  test('site #6: approveTrustFolderDialog sendKeys → ad-unreachable, returns normally', async () => {
-    _setTrustDialogPollTimeoutMs(50)
-    installStub({
-      readPaneResults: [{ pane: 'Yes, I trust this folder' }],
-      sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN),
-    })
-    await expect(approveTrustFolderDialog(CH, undefined, false)).resolves.toBeUndefined()
-    expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
-    expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
-  })
-
-  test('site #7: approveTrustFolderDialog readPane (confirmation loop) → ad-unreachable, returns normally', async () => {
-    _setTrustDialogPollTimeoutMs(50)
-    const stub = installStub({
-      readPaneResults: [{ pane: 'Yes, I trust this folder' }],
-    })
-    let paneCallCount = 0
-    stub.readPane = async (_params: import('agent-director').ReadPaneParams) => {
-      paneCallCount++
-      if (paneCallCount === 1) return { pane: 'Yes, I trust this folder' }
-      throw new ErrSystemInstallDisappeared('read-pane', BIN)
-    }
-    await expect(approveTrustFolderDialog(CH, undefined, false)).resolves.toBeUndefined()
+    await expect(approvePreSessionDialogs(CH, undefined, false)).resolves.toBeUndefined()
     expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
     expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
   })

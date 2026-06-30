@@ -1,12 +1,15 @@
 /**
- * approve-trust-folder-dialog.test.ts — Unit tests for approveTrustFolderDialog
+ * approve-trust-folder-dialog.test.ts — Direct unit tests for
+ * approvePreSessionDialogs exercising the TRUST needle specifically (b.4ie).
  *
- * Mirrors the `approveDevChannelsDialog (b.yy6)` blocks in session-manager.test.ts:
- *   - Same `_setTrustDialogPollIntervalMs` / `_setTrustDialogPollTimeoutMs` seam driving
- *   - Same mocked `getClient()` via setClientForTests / makeStubClient
- *   - Same `captureStartupErrors` / `SLACK_STATE_DIR` pattern for recordStartupError assertions
+ * The session-manager.test.ts block covers the dev-channels needle via
+ * spawnForRoute. This file calls approvePreSessionDialogs directly to give
+ * focused coverage of the trust-folder path.
  *
- * No `mock.module('../src/startup-errors.ts', …)` — use SLACK_STATE_DIR log-file reads.
+ * Same mocked getClient() via setClientForTests / makeStubClient.
+ * Same captureStartupErrors / SLACK_STATE_DIR pattern for recordStartupError assertions.
+ *
+ * No mock.module() — use SLACK_STATE_DIR log-file reads.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -16,16 +19,17 @@ import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  approveTrustFolderDialog,
+  approvePreSessionDialogs,
   TRUST_DIALOG_NEEDLE,
-  _setTrustDialogPollIntervalMs,
-  _setTrustDialogPollTimeoutMs,
-  _resetTrustDialogPollIntervalMs,
-  _resetTrustDialogPollTimeoutMs,
+  _setDialogReadyTimeoutMs,
+  _resetDialogReadyTimeoutMs,
+  _setDialogPollIntervalMs,
+  _resetDialogPollIntervalMs,
 } from '../src/session-manager.ts'
 import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
 import { initOutageState, _resetOutageState } from '../src/outage-state.ts'
 import {
+  cannedOk,
   makeStubClient,
 } from './test-helpers/agent-director-stub.ts'
 
@@ -69,16 +73,16 @@ let savedEnv: NodeJS.ProcessEnv
 
 beforeEach(() => {
   savedEnv = { ...process.env }
-  _setTrustDialogPollIntervalMs(1)
-  _setTrustDialogPollTimeoutMs(50)
+  _setDialogPollIntervalMs(1)
+  _setDialogReadyTimeoutMs(50)
   initOutageState({ postToChannel: () => {}, getClient })
 })
 
 afterEach(() => {
   resetClientForTests()
   _resetOutageState()
-  _resetTrustDialogPollIntervalMs()
-  _resetTrustDialogPollTimeoutMs()
+  _resetDialogPollIntervalMs()
+  _resetDialogReadyTimeoutMs()
   process.env = savedEnv as NodeJS.ProcessEnv
   for (const d of tempDirs) {
     try { rmSync(d, { recursive: true }) } catch { /* ignore */ }
@@ -87,111 +91,143 @@ afterEach(() => {
 })
 
 // ---------------------------------------------------------------------------
-// approveTrustFolderDialog
+// approvePreSessionDialogs — trust needle focused tests
 // ---------------------------------------------------------------------------
 
-describe('approveTrustFolderDialog', () => {
+describe('approvePreSessionDialogs (trust needle, b.4ie)', () => {
   // -------------------------------------------------------------------------
-  // Case 1: Needle present → accept sequence sent and needle clears
+  // Case 1: Trust needle present while pending → Enter sent, then session live
   // -------------------------------------------------------------------------
 
-  test('needle present → Enter sent, needle clears, no recordStartupError', async () => {
+  test('trust needle present while pending → Enter sent (allow_pending true, id cscb_C); statusQueue reaches waiting → returns; no startup error', async () => {
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     const readPaneCalls: import('agent-director').ReadPaneParams[] = []
     installStub({
       sendKeysCalls,
       readPaneCalls,
+      // pending first → Enter gets pressed; then waiting → function returns
+      statusQueue: [
+        cannedOk({ state: 'pending' }),
+        cannedOk({ state: 'waiting' }),
+      ],
       readPaneResults: [
         { pane: TRUST_PANE },
-        { pane: CLEAR_PANE },
         { pane: CLEAR_PANE },
       ],
     })
     const readLog = captureStartupErrors()
 
-    await approveTrustFolderDialog('C', undefined, true)
+    await approvePreSessionDialogs('C', undefined, true)
 
-    // sendKeys called once with Enter
+    // Enter sent once with allow_pending:true and correct instance id
     expect(sendKeysCalls).toHaveLength(1)
     expect(sendKeysCalls[0].text).toBe('')
     expect(sendKeysCalls[0].allow_pending).toBe(true)
     expect(sendKeysCalls[0].claude_instance_id).toBe('cscb_C')
 
-    // readPane called at least 3 times (1 detection + 2+ confirm-gone)
-    expect(readPaneCalls.length).toBeGreaterThanOrEqual(3)
+    // readPane called with n_lines 40, allow_pending true, correct instance id
+    expect(readPaneCalls.length).toBeGreaterThanOrEqual(1)
     for (const r of readPaneCalls) {
       expect(r.claude_instance_id).toBe('cscb_C')
       expect(r.n_lines).toBe(40)
       expect(r.allow_pending).toBe(true)
     }
 
-    // No startup error
+    // No startup error recorded
     expect(readLog()).toBe('')
   })
 
   // -------------------------------------------------------------------------
-  // Case 2: Needle never present within timeout → silent return, no error
+  // Case 2: Already-live (statusQueue [waiting]) → no readPane, no sendKeys
   // -------------------------------------------------------------------------
 
-  test('needle never present within timeout → silent return, no sendKeys, no recordStartupError', async () => {
+  test('already-live (statusQueue [waiting]) → no readPane, no sendKeys, no startup error', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+    installStub({
+      sendKeysCalls,
+      readPaneCalls,
+      statusQueue: [cannedOk({ state: 'waiting' })],
+    })
+    const readLog = captureStartupErrors()
+
+    await approvePreSessionDialogs('C', undefined, true)
+
+    expect(sendKeysCalls).toHaveLength(0)
+    expect(readPaneCalls).toHaveLength(0)
+    expect(readLog()).toBe('')
+  })
+
+  // -------------------------------------------------------------------------
+  // Case 3: Cap hit with sticky pending + no needle → not-ready startup error
+  // -------------------------------------------------------------------------
+
+  test('cap hit: sticky pending + no trust needle → dev-channels-approve-not-ready recorded', async () => {
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     installStub({
       sendKeysCalls,
+      // sticky: status always returns pending, never reaches live
+      statusResult: { state: 'pending' },
       readPaneResults: [{ pane: 'unrelated pane text' }],
     })
     const readLog = captureStartupErrors()
 
-    await approveTrustFolderDialog('C', undefined, true)
+    await approvePreSessionDialogs('C', undefined, true)
 
-    // Silent return — no sendKeys, no error
+    // Never sent Enter (no needle)
     expect(sendKeysCalls).toHaveLength(0)
-    expect(readLog()).toBe('')
-  })
-
-  // -------------------------------------------------------------------------
-  // Case 3: Needle persists after Enter → trust-folder-approve-still-visible
-  // -------------------------------------------------------------------------
-
-  test('needle persists after Enter → trust-folder-approve-still-visible recorded', async () => {
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    installStub({
-      sendKeysCalls,
-      // Sticky needle: always returns the trust pane so confirm-gone loop never clears
-      readPaneResults: [{ pane: TRUST_PANE }],
-    })
-    const readLog = captureStartupErrors()
-
-    await approveTrustFolderDialog('C', undefined, true)
-
-    // Enter was sent once
-    expect(sendKeysCalls).toHaveLength(1)
-    expect(sendKeysCalls[0].text).toBe('')
-
-    // Startup error recorded with the correct tag
     const log = readLog()
-    expect(log).toContain('[trust-folder-approve-still-visible]')
+    expect(log).toContain('[dev-channels-approve-not-ready]')
     expect(log).toContain('channel=C')
   })
 
   // -------------------------------------------------------------------------
-  // Additional: isStartup=false → no recordStartupError even on still-visible
+  // Case 4: Dead state — statusQueue [pending, ended] + no needle → spawn-died
   // -------------------------------------------------------------------------
-  // Mirrors the dev-channels approver: recordStartupError is only called when
-  // isStartup=true. Verify the guard holds for the trust approver too.
 
-  test('still-visible with isStartup=false → no recordStartupError', async () => {
+  test('dead state: statusQueue [pending, ended] + non-needle pane → dev-channels-approve-spawn-died recorded', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     installStub({
-      readPaneResults: [{ pane: TRUST_PANE }],
+      sendKeysCalls,
+      statusQueue: [
+        cannedOk({ state: 'pending' }),
+        cannedOk({ state: 'ended' }),
+      ],
+      readPaneResults: [{ pane: 'no trust needle here' }],
     })
     const readLog = captureStartupErrors()
 
-    await approveTrustFolderDialog('C', undefined, false)
+    await approvePreSessionDialogs('C', undefined, true)
 
-    expect(readLog()).toBe('')
+    expect(sendKeysCalls).toHaveLength(0)
+    const log = readLog()
+    expect(log).toContain('[dev-channels-approve-spawn-died]')
   })
 
   // -------------------------------------------------------------------------
-  // Additional: needle constant matches the pane fixture
+  // Case 5: Self-heal — sticky TRUST_PANE while pending → Enter pressed ≥2×
+  // -------------------------------------------------------------------------
+
+  test('self-heal: statusQueue [pending, pending, waiting] + sticky TRUST_PANE → Enter pressed ≥2 times', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({
+      sendKeysCalls,
+      statusQueue: [
+        cannedOk({ state: 'pending' }),
+        cannedOk({ state: 'pending' }),
+        cannedOk({ state: 'waiting' }),
+      ],
+      // sticky: every readPane returns the trust pane
+      readPaneResults: [{ pane: TRUST_PANE }],
+    })
+
+    await approvePreSessionDialogs('C', undefined, true)
+
+    expect(sendKeysCalls.length).toBeGreaterThanOrEqual(2)
+  })
+
+  // -------------------------------------------------------------------------
+  // Additional: TRUST_DIALOG_NEEDLE constant matches the pane fixture
   // -------------------------------------------------------------------------
 
   test('TRUST_DIALOG_NEEDLE matches the verified Claude Code 2.1.120 label', () => {

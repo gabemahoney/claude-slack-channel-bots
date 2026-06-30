@@ -206,7 +206,7 @@ export async function reconnectMcp(
 }
 
 // ---------------------------------------------------------------------------
-// approveDevChannelsDialog — auto-approve the dev-channels warning on spawn
+// approvePreSessionDialogs — auto-approve pre-SessionStart dialogs on spawn
 // ---------------------------------------------------------------------------
 
 /**
@@ -216,19 +216,19 @@ export async function reconnectMcp(
  */
 export const DEV_CHANNELS_DIALOG_NEEDLE = 'I am using this for local development'
 
-/** Default poll interval while watching for the dev-channels dialog. */
+/**
+ * Verified against Claude Code 2.1.120 (2026-06-02). If this stops matching,
+ * the folder-trust dialog has drifted — see b.k54 / b.uhv. Match the option
+ * label (semantic, stable) rather than the header (cosmetic, drifts).
+ */
+export const TRUST_DIALOG_NEEDLE = 'Yes, I trust this folder'
+
+/** Default poll interval while watching for pre-session dialogs. */
 export const DIALOG_POLL_INTERVAL_MS = 500
 
-/** Default deadline for both the appearance poll and the still-visible poll. */
-export const DIALOG_POLL_TIMEOUT_MS = 30_000
-
-/** Number of consecutive "needle absent" reads required to confirm approval. */
-export const DIALOG_GONE_CONFIRMS_REQUIRED = 2
-
 let _dialogPollIntervalMs = DIALOG_POLL_INTERVAL_MS
-let _dialogPollTimeoutMs = DIALOG_POLL_TIMEOUT_MS
 
-/** Test-only seam: override the dev-channels poll interval. */
+/** Test-only seam: override the dialog poll interval. */
 export function _setDialogPollIntervalMs(ms: number): void {
   _dialogPollIntervalMs = ms
 }
@@ -238,182 +238,98 @@ export function _resetDialogPollIntervalMs(): void {
   _dialogPollIntervalMs = DIALOG_POLL_INTERVAL_MS
 }
 
-/** Test-only seam: override the dev-channels poll timeout. */
-export function _setDialogPollTimeoutMs(ms: number): void {
-  _dialogPollTimeoutMs = ms
+/** Hard cap: how long to wait for a fresh spawn to leave `pending` (reach a
+ *  live SessionStart state) while auto-dismissing pre-session dialogs. */
+export const DIALOG_READY_TIMEOUT_MS = 5 * 60_000
+
+let _dialogReadyTimeoutMs = DIALOG_READY_TIMEOUT_MS
+
+/** Test-only seam: override the ready cap. */
+export function _setDialogReadyTimeoutMs(ms: number): void {
+  _dialogReadyTimeoutMs = ms
 }
 
-/** Test-only seam: restore the default poll timeout. */
-export function _resetDialogPollTimeoutMs(): void {
-  _dialogPollTimeoutMs = DIALOG_POLL_TIMEOUT_MS
+/** Test-only seam: restore the default ready cap. */
+export function _resetDialogReadyTimeoutMs(): void {
+  _dialogReadyTimeoutMs = DIALOG_READY_TIMEOUT_MS
 }
+
+/** Live (post-SessionStart) states: the dialog is gone, the session is ready. */
+const DIALOG_READY_STATES = new Set(['waiting', 'working', 'ask_user', 'check_permission'])
+/** Terminal states: the spawn died before becoming ready. */
+const DIALOG_DEAD_STATES = new Set(['ended', 'missing'])
+/** Every pre-SessionStart dialog we can auto-approve (option 1 pre-selected; Enter accepts). */
+const PRE_SESSION_DIALOG_NEEDLES = [TRUST_DIALOG_NEEDLE, DEV_CHANNELS_DIALOG_NEEDLE]
 
 /**
- * Poll the freshly-spawned bot's tmux pane until the dev-channels approval
- * dialog appears, send Enter to accept the pre-selected
- * "I am using this for local development" option, then confirm the dialog
- * has cleared. All errors caught locally — never throws to the caller.
+ * Drive a freshly-spawned bot past its pre-SessionStart dialogs (folder-trust
+ * and/or dev-channels) by watching agent-director's state machine: while the
+ * spawn is `pending` (SessionStart not yet fired — a dialog may be blocking),
+ * poll the pane and press Enter whenever a known dialog needle is on screen.
+ * Exit the instant AD reports a live state (the dialog is gone). 5-minute hard
+ * cap; failure to reach ready is surfaced loudly — never a silent early quit.
  *
- * readPane/sendKeys use `allow_pending: true` because the bot is still in
- * `pending` AD state when this runs (b.98w — formerly caused ErrSpawnNotInteractive).
+ * status/readPane/sendKeys are wrapped in withOutageDetection so AD-outage
+ * flags keep working (b.en2). readPane/sendKeys use allow_pending:true because
+ * the bot is `pending` here (b.98w). The needle-gate guarantees Enter is sent
+ * ONLY when a dialog is actually displayed, so we never inject a stray Enter
+ * into a live prompt. Uses the composed instance id (b.ben).
  *
- * Two distinct failure modes are recorded via `recordStartupError` so a
- * future Claude Code release that changes the dialog cannot silently break
- * fresh-spawn approval:
- *   - `dev-channels-approve-no-dialog`   — needle never observed
- *   - `dev-channels-approve-still-visible` — needle persists after Enter
+ * Replaces the former two-function pair (trust-folder + dev-channels approvers):
+ * one loop from spawn+0 (no wasted 30s trust window) that self-heals a missed
+ * Enter (state stays pending, needle reappears, next iteration presses again)
+ * and never gives up silently at 30s.
  */
-export async function approveDevChannelsDialog(
+export async function approvePreSessionDialogs(
   channelId: string,
   web: WebClient | undefined,
   isStartup: boolean,
   normalizedName?: string,
 ): Promise<void> {
-  void web
   const claude_instance_id = instanceIdFor(channelId, normalizedName)
-  const deadline = Date.now() + _dialogPollTimeoutMs
+  const deadline = Date.now() + _dialogReadyTimeoutMs
 
-  let approved = false
   while (Date.now() < deadline) {
+    // 1) Readiness oracle.
+    let state: string
+    try {
+      const r = await withOutageDetection(channelId, undefined, (client) => client.status({ claude_instance_id }))
+      state = r.state
+    } catch (err) {
+      if (err instanceof ErrSpawnNotFound) {
+        console.error(`[slack] approvePreSessionDialogs: spawn not found for channel=${channelId} — aborting`)
+        return
+      }
+      // Transient (incl. AD-outage errors already flagged by withOutageDetection) — keep polling.
+      console.error(`[slack] approvePreSessionDialogs: status error channel=${channelId}: ${String(err)}`)
+      await new Promise((r) => setTimeout(r, _dialogPollIntervalMs))
+      continue
+    }
+    if (DIALOG_READY_STATES.has(state)) return // dialog cleared, session live
+    if (DIALOG_DEAD_STATES.has(state)) {
+      const msg = `spawn reached ${state} before clearing dev-channels dialog for channel=${channelId}`
+      console.error(`[slack] approvePreSessionDialogs: ${msg}`)
+      if (isStartup) recordStartupError('dev-channels-approve-spawn-died', msg)
+      return
+    }
+
+    // 2) state === 'pending' — dismiss any visible pre-session dialog.
     try {
       const { pane } = await withOutageDetection(channelId, undefined, (client) => client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true }))
-      if (pane.includes(DEV_CHANNELS_DIALOG_NEEDLE)) {
-        await withOutageDetection(channelId, undefined, (client) => client.sendKeys({ claude_instance_id, text: '', allow_pending: true }))
-        approved = true
-        break
+      if (PRE_SESSION_DIALOG_NEEDLES.some((n) => pane.includes(n))) {
+        await withOutageDetection(channelId, undefined, (client) => client.sendKeys({ claude_instance_id, text: '', allow_pending: true })) // Enter
       }
     } catch (err) {
-      if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
-        // Outage flag raised; continue polling
-      } else {
-        console.error(`[slack] approveDevChannelsDialog: readPane error channel=${channelId}: ${String(err)}`)
-      }
+      console.error(`[slack] approvePreSessionDialogs: readPane/sendKeys error channel=${channelId}: ${String(err)}`)
     }
     await new Promise((r) => setTimeout(r, _dialogPollIntervalMs))
   }
 
-  if (!approved) {
-    const msg = `dev-channels dialog never appeared for channel=${channelId} within ${_dialogPollTimeoutMs}ms (dialog text may have drifted — see b.yy6)`
-    console.error(`[slack] approveDevChannelsDialog: ${msg}`)
-    if (isStartup) recordStartupError('dev-channels-approve-no-dialog', msg)
-    return
-  }
-
-  let misses = 0
-  while (Date.now() < deadline && misses < DIALOG_GONE_CONFIRMS_REQUIRED) {
-    await new Promise((r) => setTimeout(r, _dialogPollIntervalMs))
-    try {
-      const { pane } = await withOutageDetection(channelId, undefined, (client) => client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true }))
-      misses = pane.includes(DEV_CHANNELS_DIALOG_NEEDLE) ? 0 : misses + 1
-    } catch {
-      /* tolerate transient readPane failure */
-    }
-  }
-  if (misses < DIALOG_GONE_CONFIRMS_REQUIRED) {
-    const msg = `dev-channels dialog still visible after Enter for channel=${channelId} (sendKeys may not have reached pane)`
-    console.error(`[slack] approveDevChannelsDialog: ${msg}`)
-    if (isStartup) recordStartupError('dev-channels-approve-still-visible', msg)
-  }
-}
-
-// ---------------------------------------------------------------------------
-// approveTrustFolderDialog — auto-approve the folder-trust dialog on spawn
-// ---------------------------------------------------------------------------
-
-/**
- * Verified against Claude Code 2.1.120 (2026-06-02). If this stops matching,
- * the folder-trust dialog has drifted — see b.k54 / b.uhv. Match the option
- * label (semantic, stable) rather than the header (cosmetic, drifts).
- */
-export const TRUST_DIALOG_NEEDLE = 'Yes, I trust this folder'
-
-let _trustDialogPollIntervalMs = DIALOG_POLL_INTERVAL_MS
-let _trustDialogPollTimeoutMs = DIALOG_POLL_TIMEOUT_MS
-
-/** Test-only seam: override the trust-folder poll interval. */
-export function _setTrustDialogPollIntervalMs(ms: number): void {
-  _trustDialogPollIntervalMs = ms
-}
-
-/** Test-only seam: restore the default trust-folder poll interval. */
-export function _resetTrustDialogPollIntervalMs(): void {
-  _trustDialogPollIntervalMs = DIALOG_POLL_INTERVAL_MS
-}
-
-/** Test-only seam: override the trust-folder poll timeout. */
-export function _setTrustDialogPollTimeoutMs(ms: number): void {
-  _trustDialogPollTimeoutMs = ms
-}
-
-/** Test-only seam: restore the default trust-folder poll timeout. */
-export function _resetTrustDialogPollTimeoutMs(): void {
-  _trustDialogPollTimeoutMs = DIALOG_POLL_TIMEOUT_MS
-}
-
-/**
- * Poll the freshly-spawned bot's tmux pane until the folder-trust dialog
- * appears, send Enter to accept the pre-selected "Yes, I trust this folder"
- * option, then confirm the dialog has cleared. All errors caught locally —
- * never throws to the caller.
- *
- * readPane/sendKeys use `allow_pending: true` because the bot is still in
- * `pending` AD state when this runs (b.98w).
- *
- * Divergence from `approveDevChannelsDialog`: if the needle never appears
- * within the timeout, return silently (expected happy path once Fix A is in
- * place — no `recordStartupError`). Only record an error when the needle
- * persists after Enter:
- *   - `trust-folder-approve-still-visible` — needle persists after Enter
- */
-export async function approveTrustFolderDialog(
-  channelId: string,
-  web: WebClient | undefined,
-  isStartup: boolean,
-  normalizedName?: string,
-): Promise<void> {
-  void web
-  const claude_instance_id = instanceIdFor(channelId, normalizedName)
-  const deadline = Date.now() + _trustDialogPollTimeoutMs
-
-  let approved = false
-  while (Date.now() < deadline) {
-    try {
-      const { pane } = await withOutageDetection(channelId, undefined, (client) => client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true }))
-      if (pane.includes(TRUST_DIALOG_NEEDLE)) {
-        await withOutageDetection(channelId, undefined, (client) => client.sendKeys({ claude_instance_id, text: '', allow_pending: true }))
-        approved = true
-        break
-      }
-    } catch (err) {
-      if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
-        // Outage flag raised; continue polling
-      } else {
-        console.error(`[slack] approveTrustFolderDialog: readPane error channel=${channelId}: ${String(err)}`)
-      }
-    }
-    await new Promise((r) => setTimeout(r, _trustDialogPollIntervalMs))
-  }
-
-  if (!approved) {
-    // Needle never appeared — silent return (expected happy path with Fix A)
-    return
-  }
-
-  let misses = 0
-  while (Date.now() < deadline && misses < DIALOG_GONE_CONFIRMS_REQUIRED) {
-    await new Promise((r) => setTimeout(r, _trustDialogPollIntervalMs))
-    try {
-      const { pane } = await withOutageDetection(channelId, undefined, (client) => client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true }))
-      misses = pane.includes(TRUST_DIALOG_NEEDLE) ? 0 : misses + 1
-    } catch {
-      /* tolerate transient readPane failure */
-    }
-  }
-  if (misses < DIALOG_GONE_CONFIRMS_REQUIRED) {
-    const msg = `trust-folder dialog still visible after Enter for channel=${channelId} (sendKeys may not have reached pane)`
-    console.error(`[slack] approveTrustFolderDialog: ${msg}`)
-    if (isStartup) recordStartupError('trust-folder-approve-still-visible', msg)
-  }
+  // 3) Hard cap hit — genuine failure, surfaced loudly (no silent give-up).
+  const msg = `spawn never reached a live state within ${_dialogReadyTimeoutMs}ms for channel=${channelId} — dialog unrecognized or session hung (dev-needle='${DEV_CHANNELS_DIALOG_NEEDLE}')`
+  console.error(`[slack] approvePreSessionDialogs: ${msg}`)
+  if (isStartup) recordStartupError('dev-channels-approve-not-ready', msg)
+  postSpawnFailureToChannel(channelId, new AgentDirectorError('status', 'DialogApprovalTimeout', msg), web, isStartup)
 }
 
 // ---------------------------------------------------------------------------
@@ -585,8 +501,7 @@ export async function spawnForRoute(
   try {
     const r = await withSpawnDetection(channelId, route.cwd, (client) => client.spawn(params))
     console.error(`[slack] spawnForRoute: spawned channel=${channelId} instanceId=${r.claude_instance_id}`)
-    await approveTrustFolderDialog(channelId, web, isStartup, normalizedName)
-    await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
+    await approvePreSessionDialogs(channelId, web, isStartup, normalizedName)
     return { channelId, action: 'spawned' }
   } catch (err) {
     if (err instanceof ErrInstanceIdCollision) {
@@ -620,8 +535,7 @@ export async function spawnForRoute(
       try {
         const r = await withSpawnDetection(channelId, route.cwd, (client) => client.spawn(params))
         console.error(`[slack] spawnForRoute: retry-spawn succeeded for channel=${channelId} instanceId=${r.claude_instance_id}`)
-        await approveTrustFolderDialog(channelId, web, isStartup, normalizedName)
-        await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
+        await approvePreSessionDialogs(channelId, web, isStartup, normalizedName)
         return { channelId, action: 'spawned' }
       } catch (err2) {
         if (
@@ -658,8 +572,7 @@ export async function spawnForRoute(
       try {
         await withSpawnDetection(channelId, route.cwd, (client) => client.spawn(params))
         console.error(`[slack] spawnForRoute: fresh-spawned (after kill+delete) for channel=${channelId}`)
-        await approveTrustFolderDialog(channelId, web, isStartup, normalizedName)
-        await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
+        await approvePreSessionDialogs(channelId, web, isStartup, normalizedName)
         return { channelId, action: 'spawned' }
       } catch (err) {
         if (
@@ -691,8 +604,7 @@ export async function spawnForRoute(
         try {
           await withSpawnDetection(channelId, route.cwd, (client) => client.spawn(params))
           console.error(`[slack] spawnForRoute: fresh-spawned (after delete) for channel=${channelId}`)
-          await approveTrustFolderDialog(channelId, web, isStartup, normalizedName)
-          await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
+          await approvePreSessionDialogs(channelId, web, isStartup, normalizedName)
           return { channelId, action: 'spawned' }
         } catch (err2) {
           if (
@@ -717,8 +629,7 @@ export async function spawnForRoute(
         if (!(await tryDelete(channelId, normalizedName, web, isStartup))) return { channelId, action: 'failed' }
         try {
           await withSpawnDetection(channelId, route.cwd, (client) => client.spawn(params))
-          await approveTrustFolderDialog(channelId, web, isStartup, normalizedName)
-          await approveDevChannelsDialog(channelId, web, isStartup, normalizedName)
+          await approvePreSessionDialogs(channelId, web, isStartup, normalizedName)
           return { channelId, action: 'spawned' }
         } catch (err2) {
           if (
