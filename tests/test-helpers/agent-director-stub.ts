@@ -43,6 +43,7 @@ import {
   ErrSystemInstallNotFound,
   ErrSystemInstallTooOld,
   ErrSystemInstallUnreachable,
+  ErrTmuxSendKeys,
   ErrTmuxSessionCreate,
   ErrTemplateExists,
   ErrTemplateMalformed,
@@ -165,6 +166,15 @@ export function errInstanceIdCollision(): ErrInstanceIdCollision {
  */
 export function errTmuxSessionCreate(verb: string = 'resume'): ErrTmuxSessionCreate {
   return new ErrTmuxSessionCreate(verb, 'ErrTmuxSessionCreate', 'tmux: new-session failed: tmux session already exists')
+}
+
+/**
+ * Build an ErrTmuxSendKeys (sendKeys / b.rmy post-reboot reconnect failure).
+ * The message mirrors the observed field failure: no tmux server exists at
+ * all after a container restart wipes /tmp.
+ */
+export function errTmuxSendKeys(): ErrTmuxSendKeys {
+  return new ErrTmuxSendKeys('send-keys', 'ErrTmuxSendKeys', 'tmux: send-keys failed: no server running on /tmp/tmux-1000/default: exit status 1')
 }
 
 /** Build an ErrNoSessionId (resume / SR-1.3 fall-through). */
@@ -441,6 +451,7 @@ export interface StubClientOptions {
   // sendKeys()
   sendKeysResult?: SendKeysResult
   sendKeysError?: Error
+  sendKeysQueue?: CannedResponse<SendKeysResult>[]
   sendKeysCalls?: SendKeysParams[]
 
   // readPane() — FIFO sequence of canned panes; last entry sticks once
@@ -577,8 +588,7 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
     },
     async sendKeys(params: SendKeysParams): Promise<SendKeysResult> {
       opts.sendKeysCalls?.push(params)
-      if (opts.sendKeysError) throw opts.sendKeysError
-      return opts.sendKeysResult ?? {}
+      return nextResponse('send-keys', opts.sendKeysQueue, opts.sendKeysResult, opts.sendKeysError, {})
     },
     async readPane(params: ReadPaneParams): Promise<ReadPaneResult> {
       opts.readPaneCalls?.push(params)

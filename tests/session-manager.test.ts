@@ -44,6 +44,8 @@ import {
   _resetWaitForWaitingTimeoutMs,
   _setTmuxSessionKiller,
   _resetTmuxSessionKiller,
+  _setTmuxServerEnsurer,
+  _resetTmuxServerEnsurer,
   _setTmuxCapturePane,
   _setTmuxSendEnter,
   _resetTmuxDialogHelpers,
@@ -61,7 +63,9 @@ import {
   errJsonlMissing,
   errSpawnNotFound,
   errSpawnNotResumable,
+  errGeneric,
   errSpawnNotInteractive,
+  errTmuxSendKeys,
   errTmuxSessionCreate,
   makeStubClient,
   type StubClient,
@@ -123,6 +127,7 @@ afterEach(() => {
   _resetDialogReadyTimeoutMs()
   _resetWaitForWaitingTimeoutMs()
   _resetTmuxSessionKiller()
+  _resetTmuxServerEnsurer()
   _resetTmuxDialogHelpers()
   _resetDialogDeadGracePolls()
   _resetOutageState()
@@ -372,6 +377,144 @@ describe('startupSessionManager', () => {
     expect(result.succeeded + result.failed).toBe(3)
     expect(result.failed).toBe(1)
     expect(result.succeeded).toBe(2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.rmy — ErrTmuxSendKeys self-heal + accurate reconnect outcome reporting
+// ---------------------------------------------------------------------------
+
+describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
+  /**
+   * Redirect startup-errors.log into a temp dir for this test and return a
+   * helper that reads back recorded entries. Restores the previous
+   * SLACK_STATE_DIR via the file-level afterEach.
+   */
+  function captureStartupErrors(): () => string {
+    const dir = mkdtempSync(join(tmpdir(), 'cscb-rmy-'))
+    process.env['SLACK_STATE_DIR'] = dir
+    const logPath = join(dir, 'startup-errors.log')
+    return () => (existsSync(logPath) ? readFileSync(logPath, 'utf-8') : '')
+  }
+
+  test('reconnectMcp: ErrTmuxSendKeys → ensure tmux server + retry once → success', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    let ensureCalls = 0
+    _setTmuxServerEnsurer(async () => { ensureCalls++ })
+    installStub({
+      sendKeysCalls,
+      sendKeysQueue: [
+        cannedErr<import('agent-director').SendKeysResult>(errTmuxSendKeys()),
+        cannedOk<import('agent-director').SendKeysResult>({}),
+      ],
+    })
+    const { web, calls } = makeMockWeb()
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await reconnectMcp('C', web as never, cfg)
+    expect(result).toBe(true)
+    expect(ensureCalls).toBe(1)
+    expect(sendKeysCalls).toHaveLength(2)
+    expect(sendKeysCalls[1].text).toContain('/mcp reconnect')
+    // Retry succeeded — no Slack failure post
+    expect(calls).toHaveLength(0)
+  })
+
+  test('reconnectMcp: retry after ErrTmuxSendKeys also fails → false + Slack failure post', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    let ensureCalls = 0
+    _setTmuxServerEnsurer(async () => { ensureCalls++ })
+    installStub({
+      sendKeysCalls,
+      sendKeysError: errTmuxSendKeys(), // persistent — first attempt AND retry fail
+    })
+    const { web, calls } = makeMockWeb()
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await reconnectMcp('C', web as never, cfg)
+    expect(result).toBe(false)
+    expect(ensureCalls).toBe(1) // self-heal attempted exactly once (single retry)
+    expect(sendKeysCalls).toHaveLength(2)
+    expect(calls).toHaveLength(1)
+  })
+
+  test('reconnectMcp: non-tmux sendKeys error → no self-heal, no retry', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    let ensureCalls = 0
+    _setTmuxServerEnsurer(async () => { ensureCalls++ })
+    installStub({
+      sendKeysCalls,
+      sendKeysError: errGeneric('send-keys', 'ErrSomethingElse'),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await reconnectMcp('C', undefined, cfg)
+    expect(result).toBe(false)
+    expect(ensureCalls).toBe(0)
+    expect(sendKeysCalls).toHaveLength(1)
+  })
+
+  test('spawnForRoute waiting branch: self-heal retry succeeds → reconnected', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    _setTmuxServerEnsurer(async () => {})
+    installStub({
+      sendKeysCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      sendKeysQueue: [
+        cannedErr<import('agent-director').SendKeysResult>(errTmuxSendKeys()),
+        cannedOk<import('agent-director').SendKeysResult>({}),
+      ],
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('reconnected')
+    expect(sendKeysCalls).toHaveLength(2)
+  })
+
+  test('spawnForRoute waiting branch: reconnect fails → action=failed + startup error recorded', async () => {
+    const readLog = captureStartupErrors()
+    _setTmuxServerEnsurer(async () => {})
+    installStub({
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      sendKeysError: errTmuxSendKeys(), // persistent — retry fails too
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('failed')
+    expect(readLog()).toContain('reconnect failed for channel=C (state=waiting)')
+  })
+
+  test('spawnForRoute waiting branch (isStartup=false): failed reconnect → failed, no startup error', async () => {
+    const readLog = captureStartupErrors()
+    _setTmuxServerEnsurer(async () => {})
+    installStub({
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      sendKeysError: errTmuxSendKeys(),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, false)
+    expect(result.action).toBe('failed')
+    expect(readLog()).toBe('')
+  })
+
+  test('startupSessionManager: failed reconnects are counted (no false "0 failed")', async () => {
+    captureStartupErrors() // keep startup-errors.log in a temp dir
+    _setTmuxServerEnsurer(async () => {})
+    // Both routes collide into `waiting` rows whose reconnect send-keys fails
+    // persistently — the 2026-09-18 post-reboot outage shape.
+    installStub({
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+      ],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_X', state: 'waiting' }),
+      sendKeysError: errTmuxSendKeys(),
+    })
+    const cfg = makeRoutingConfig({ routes: { C1: { cwd: '/x1' }, C2: { cwd: '/x2' } } })
+    const result = await startupSessionManager(cfg, { concurrency: 1 })
+    expect(result.failed).toBe(2)
+    expect(result.succeeded).toBe(0)
+    expect(result.perChannel.every((p) => p.action === 'failed')).toBe(true)
   })
 })
 
