@@ -70,6 +70,10 @@ import {
 } from './test-helpers/agent-director-stub.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 import {
+  makeStubTmuxProbe,
+  makeStubTmuxProbeQueue,
+} from './test-helpers/tmux-probe-stub.ts'
+import {
   initOutageState,
   getOutageFlags,
   setOutageFlag,
@@ -1810,5 +1814,734 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
     const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, false)
     expect(result.action).toBe('spawned')
     assertAllClear()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// t3.a3g.mb.95.i4 — Alive/transient escape-hatch closure (SR-20.4, SR-29.3)
+//
+// PM ruling 2: with the always-on probe, every pre-existing live-state
+// collision test must inject an explicit probe stub. This describe block
+// injects definitely-alive stubs into copies of those tests and adds:
+//  - Alive pins: waiting→reconnected; working→wait-then-reconnect; pending/
+//    check_permission/ask_user→no-op
+//  - Five transient pins (one per live state: zero mutation, zero kill/resume/delete)
+//
+// Note: "zero kills" here means zero AD client.kill() calls (killCalls) —
+// the probe bundle's killSession method is a separate utility and is never
+// called by production code paths tested here.
+// ---------------------------------------------------------------------------
+
+describe('SR-20.4 / SR-29.3: alive/transient escape-hatch closure (i4)', () => {
+  // -------------------------------------------------------------------------
+  // Alive pins: existing collision behaviors preserved with explicit probe stubs.
+  // The only addition vs. the originals above is the explicit probe injection.
+  // -------------------------------------------------------------------------
+
+  test('[alive-pin] waiting + definitely-alive → reconnectMcp (sendKeys /mcp reconnect)', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-alive')
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({
+      sendKeysCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    // Explicit alive probe — no escape hatch remains.
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+    expect(result.action).toBe('reconnected')
+    expect(sendKeysCalls).toHaveLength(1)
+    expect(sendKeysCalls[0].text).toContain('/mcp reconnect')
+  })
+
+  test('[alive-pin] working + definitely-alive → waitForWaitingAndReconnect path (action reconnected)', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-alive')
+    // waitForWaitingAndReconnect polls status at agent_director_poll_interval_ms.
+    // Set poll interval to 1ms so the test completes immediately.
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    _setWaitForWaitingTimeoutMs(500)
+    installStub({
+      sendKeysCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working' }),
+      statusQueue: [
+        cannedOk({ state: 'working' }),
+        cannedOk({ state: 'waiting' }),
+      ],
+    })
+    // agent_director_poll_interval_ms: 1 avoids the 1-second default poll sleep.
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+    expect(result.action).toBe('reconnected')
+    expect(sendKeysCalls).toHaveLength(1)
+  })
+
+  test('[alive-pin] pending + definitely-alive → no-op (zero AD kill/resume/delete calls)', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-alive')
+    const killCalls: import('agent-director').KillParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      killCalls,
+      resumeCalls,
+      deleteCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'pending' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+    expect(result.action).toBe('no-op')
+    expect(killCalls).toHaveLength(0)
+    expect(resumeCalls).toHaveLength(0)
+    expect(deleteCalls).toHaveLength(0)
+  })
+
+  test('[alive-pin] check_permission + definitely-alive → no-op (zero AD kill/resume/delete calls)', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-alive')
+    const killCalls: import('agent-director').KillParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      killCalls,
+      resumeCalls,
+      deleteCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'check_permission' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+    expect(result.action).toBe('no-op')
+    expect(killCalls).toHaveLength(0)
+    expect(resumeCalls).toHaveLength(0)
+    expect(deleteCalls).toHaveLength(0)
+  })
+
+  test('[alive-pin] ask_user + definitely-alive → no-op (zero AD kill/resume/delete calls)', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-alive')
+    const killCalls: import('agent-director').KillParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      killCalls,
+      resumeCalls,
+      deleteCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ask_user' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+    expect(result.action).toBe('no-op')
+    expect(killCalls).toHaveLength(0)
+    expect(resumeCalls).toHaveLength(0)
+    expect(deleteCalls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Five transient pins — one per live state.
+  // transient-inconclusive → today's exact action; zero AD kill/resume/delete.
+  // -------------------------------------------------------------------------
+
+  test('[transient-pin] waiting + transient → reconnected, zero AD kill/resume/delete calls', async () => {
+    const { probe } = makeStubTmuxProbe('transient-inconclusive')
+    const killCalls: import('agent-director').KillParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      killCalls,
+      resumeCalls,
+      deleteCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+    expect(result.action).toBe('reconnected')
+    expect(killCalls).toHaveLength(0)
+    expect(resumeCalls).toHaveLength(0)
+    expect(deleteCalls).toHaveLength(0)
+  })
+
+  test('[transient-pin] working + transient → reconnected, zero AD kill/resume/delete calls', async () => {
+    const { probe } = makeStubTmuxProbe('transient-inconclusive')
+    const killCalls: import('agent-director').KillParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    _setWaitForWaitingTimeoutMs(500)
+    installStub({
+      killCalls,
+      resumeCalls,
+      deleteCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working' }),
+      statusQueue: [
+        cannedOk({ state: 'working' }),
+        cannedOk({ state: 'waiting' }),
+      ],
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+    expect(result.action).toBe('reconnected')
+    expect(killCalls).toHaveLength(0)
+    expect(resumeCalls).toHaveLength(0)
+    expect(deleteCalls).toHaveLength(0)
+  })
+
+  test('[transient-pin] pending + transient → no-op, zero AD kill/resume/delete calls', async () => {
+    const { probe } = makeStubTmuxProbe('transient-inconclusive')
+    const killCalls: import('agent-director').KillParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      killCalls,
+      resumeCalls,
+      deleteCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'pending' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+    expect(result.action).toBe('no-op')
+    expect(killCalls).toHaveLength(0)
+    expect(resumeCalls).toHaveLength(0)
+    expect(deleteCalls).toHaveLength(0)
+  })
+
+  test('[transient-pin] check_permission + transient → no-op, zero AD kill/resume/delete calls', async () => {
+    const { probe } = makeStubTmuxProbe('transient-inconclusive')
+    const killCalls: import('agent-director').KillParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      killCalls,
+      resumeCalls,
+      deleteCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'check_permission' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+    expect(result.action).toBe('no-op')
+    expect(killCalls).toHaveLength(0)
+    expect(resumeCalls).toHaveLength(0)
+    expect(deleteCalls).toHaveLength(0)
+  })
+
+  test('[transient-pin] ask_user + transient → no-op, zero AD kill/resume/delete calls', async () => {
+    const { probe } = makeStubTmuxProbe('transient-inconclusive')
+    const killCalls: import('agent-director').KillParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      killCalls,
+      resumeCalls,
+      deleteCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ask_user' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+    expect(result.action).toBe('no-op')
+    expect(killCalls).toHaveLength(0)
+    expect(resumeCalls).toHaveLength(0)
+    expect(deleteCalls).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// t3.a3g.mb.95.tj — SR-29.2 #2: dead-probe waiting/working steered to resume
+//
+// Root-cause test pair. Pre-fix: waiting→reconnectMcp regardless of tmux
+// reality. Post-fix (2befca7): definitely-dead probe steers to resume.
+// These tests document the red→green transition.
+//
+// Pre-fix failure mode:
+//  - Test 1 (waiting + dead): would get action='reconnected', not 'resumed'
+//  - Test 2 (working + dead): would get action='reconnected', not 'resumed'
+//
+// Note on kill semantics: the "steering kill" is AD client.kill() (via tryKill),
+// captured by killCalls on the stub. The probe bundle's killSession utility is
+// separate and is never called by production spawnForRoute code.
+// ---------------------------------------------------------------------------
+
+describe('SR-29.2 #2: dead-probe waiting/working steered to resume (tj)', () => {
+  // SR-29.2 #2 test 1: waiting row + dead probe → resumed
+  // Pre-fix failure: waiting→reconnectMcp (sendKeys /mcp reconnect) regardless
+  // of tmux reality. Post-fix: definitely-dead probe steers to resume branch.
+  test('SR-29.2 #2.1: waiting + dead probe → resumed, one resume call, one steering kill, zero sendKeys', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-dead')
+    const killCalls: import('agent-director').KillParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({
+      killCalls,
+      resumeCalls,
+      sendKeysCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      // waiting state — non-empty claude_session_id (usable session id present)
+      getResult: cannedGetResult({
+        claude_instance_id: 'cscb_C',
+        state: 'waiting',
+        claude_session_id: 'sess-abc123',
+      }),
+      // approvePreSessionDialogs: status returns 'waiting' so it exits immediately
+      statusResult: { state: 'waiting' },
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+
+    // Post-fix: steered to resume branch.
+    expect(result.action).toBe('resumed')
+    // Exactly one steering kill (AD client.kill via tryKill, before state reassignment).
+    expect(killCalls).toHaveLength(1)
+    expect(killCalls[0].claude_instance_id).toBe('cscb_C')
+    expect(resumeCalls).toHaveLength(1)
+    expect(resumeCalls[0].claude_instance_id).toBe('cscb_C')
+    // Zero sendKeys — reconnectMcp was NOT called.
+    expect(sendKeysCalls).toHaveLength(0)
+  })
+
+  // SR-29.2 #2 test 2: working row + dead probe → resumed
+  // Pre-fix failure: working→waitForWaitingAndReconnect regardless of tmux
+  // reality. Post-fix: definitely-dead probe steers to resume branch, and
+  // waitForWaitingAndReconnect's status polling is never entered.
+  test('SR-29.2 #2.2: working + dead probe → resumed, one resume call, one steering kill, zero sendKeys', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-dead')
+    const killCalls: import('agent-director').KillParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const statusCalls: import('agent-director').StatusParams[] = []
+    installStub({
+      killCalls,
+      resumeCalls,
+      sendKeysCalls,
+      statusCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      // working state with usable claude_session_id
+      getResult: cannedGetResult({
+        claude_instance_id: 'cscb_C',
+        state: 'working',
+        claude_session_id: 'sess-def456',
+      }),
+      // approvePreSessionDialogs: status returns 'waiting' so it exits immediately.
+      // If dead-probe steering is correct, waitForWaitingAndReconnect is never entered
+      // (which would poll status multiple times before reconnectMcp fires sendKeys).
+      statusResult: { state: 'waiting' },
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+
+    // Post-fix: steered to resume branch.
+    expect(result.action).toBe('resumed')
+    // Exactly one steering kill (AD client.kill via tryKill).
+    expect(killCalls).toHaveLength(1)
+    expect(killCalls[0].claude_instance_id).toBe('cscb_C')
+    expect(resumeCalls).toHaveLength(1)
+    expect(resumeCalls[0].claude_instance_id).toBe('cscb_C')
+    // Zero sendKeys — waitForWaitingAndReconnect was NOT entered.
+    expect(sendKeysCalls).toHaveLength(0)
+    // Status calls come only from approvePreSessionDialogs (returns immediately
+    // on 'waiting'). No multi-poll waitForWaiting sequence.
+    expect(statusCalls.length).toBeLessThanOrEqual(2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// t3.a3g.mb.95.v5 — SR-21.3: pending-trio dead-probe resume and rejection fallbacks
+//
+// Dead-probed pending/check_permission/ask_user rows: resume ATTEMPTED (never
+// pre-guessed from DB state). Usable-id → 'resumed'. Rejection → delete+fresh.
+//
+// Kill semantics: the steering kill is AD client.kill() captured by killCalls.
+// ---------------------------------------------------------------------------
+
+describe('SR-21.3: pending-trio dead-probe resume and rejection fallbacks (v5)', () => {
+  // -------------------------------------------------------------------------
+  // Usable-id path: all three pending-trio states → resumed
+  // -------------------------------------------------------------------------
+
+  test('pending + dead probe + usable claude_session_id → resumed, one resume, one steering kill, zero deletes', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-dead')
+    const killCalls: import('agent-director').KillParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      killCalls,
+      resumeCalls,
+      deleteCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({
+        claude_instance_id: 'cscb_C',
+        state: 'pending',
+        claude_session_id: 'sess-pending-abc',
+      }),
+      statusResult: { state: 'waiting' },
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+
+    expect(result.action).toBe('resumed')
+    expect(killCalls).toHaveLength(1) // steering kill
+    expect(killCalls[0].claude_instance_id).toBe('cscb_C')
+    expect(resumeCalls).toHaveLength(1)
+    expect(resumeCalls[0].claude_instance_id).toBe('cscb_C')
+    expect(deleteCalls).toHaveLength(0) // no delete on resume success
+  })
+
+  test('check_permission + dead probe + usable claude_session_id → resumed, one resume, one steering kill, zero deletes', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-dead')
+    const killCalls: import('agent-director').KillParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      killCalls,
+      resumeCalls,
+      deleteCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({
+        claude_instance_id: 'cscb_C',
+        state: 'check_permission',
+        claude_session_id: 'sess-chkperm-abc',
+      }),
+      statusResult: { state: 'waiting' },
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+
+    expect(result.action).toBe('resumed')
+    expect(killCalls).toHaveLength(1)
+    expect(killCalls[0].claude_instance_id).toBe('cscb_C')
+    expect(resumeCalls).toHaveLength(1)
+    expect(resumeCalls[0].claude_instance_id).toBe('cscb_C')
+    expect(deleteCalls).toHaveLength(0)
+  })
+
+  test('ask_user + dead probe + usable claude_session_id → resumed, one resume, one steering kill, zero deletes', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-dead')
+    const killCalls: import('agent-director').KillParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      killCalls,
+      resumeCalls,
+      deleteCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({
+        claude_instance_id: 'cscb_C',
+        state: 'ask_user',
+        claude_session_id: 'sess-askuser-abc',
+      }),
+      statusResult: { state: 'waiting' },
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+
+    expect(result.action).toBe('resumed')
+    expect(killCalls).toHaveLength(1)
+    expect(killCalls[0].claude_instance_id).toBe('cscb_C')
+    expect(resumeCalls).toHaveLength(1)
+    expect(resumeCalls[0].claude_instance_id).toBe('cscb_C')
+    expect(deleteCalls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Rejection path: errNoSessionId → delete AFTER resume attempt + fresh spawn
+  // -------------------------------------------------------------------------
+
+  test('pending + dead probe + errNoSessionId → resume ATTEMPTED first, then delete + fresh spawn', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-dead')
+    const callOrder: string[] = []
+    // Instrument via stub overrides to capture call ordering.
+    const stub = installStub({
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      ],
+      getResult: cannedGetResult({
+        claude_instance_id: 'cscb_C',
+        state: 'pending',
+        claude_session_id: 'sess-pending-xyz',
+      }),
+      resumeError: errNoSessionId(),
+      statusResult: { state: 'waiting' },
+    })
+    const origResume = stub.resume.bind(stub)
+    stub.resume = async (params) => { callOrder.push('resume'); return origResume(params) }
+    const origDelete = stub.delete.bind(stub)
+    stub.delete = async (params) => { callOrder.push('delete'); return origDelete(params) }
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+
+    expect(result.action).toBe('spawned')
+    // Resume attempted first, then delete (ordering assertion via call-capture array).
+    const resumeDeleteOrder = callOrder.filter(k => k === 'resume' || k === 'delete')
+    expect(resumeDeleteOrder).toEqual(['resume', 'delete'])
+  })
+
+  // -------------------------------------------------------------------------
+  // Rejection path: errJsonlMissing → delete AFTER resume attempt + fresh spawn
+  // -------------------------------------------------------------------------
+
+  test('pending + dead probe + errJsonlMissing → resume ATTEMPTED first, then delete + fresh spawn', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-dead')
+    const callOrder: string[] = []
+    const stub = installStub({
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      ],
+      getResult: cannedGetResult({
+        claude_instance_id: 'cscb_C',
+        state: 'pending',
+        claude_session_id: 'sess-pending-jsonl',
+      }),
+      resumeError: errJsonlMissing(),
+      statusResult: { state: 'waiting' },
+    })
+    const origResume = stub.resume.bind(stub)
+    stub.resume = async (params) => { callOrder.push('resume'); return origResume(params) }
+    const origDelete = stub.delete.bind(stub)
+    stub.delete = async (params) => { callOrder.push('delete'); return origDelete(params) }
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+
+    expect(result.action).toBe('spawned')
+    // Resume attempted first, then delete.
+    const resumeDeleteOrder = callOrder.filter(k => k === 'resume' || k === 'delete')
+    expect(resumeDeleteOrder).toEqual(['resume', 'delete'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// t3.a3g.mb.95.jz — SR-23.1: delete-ordering invariant
+//
+// Hard invariant: delete only after resume rejection proves the id unusable.
+// Call ORDER matters (not just counts). All kill calls here are AD client.kill()
+// captured by killCalls; the probe bundle's killSession is a separate utility.
+// ---------------------------------------------------------------------------
+
+describe('SR-23.1: delete-ordering invariant (jz)', () => {
+  // (1) waiting + dead probe + resume succeeds → zero deletes
+  test('waiting + dead probe + resume succeeds → zero deletes', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-dead')
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      deleteCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({
+        claude_instance_id: 'cscb_C',
+        state: 'waiting',
+        claude_session_id: 'sess-abc',
+      }),
+      statusResult: { state: 'waiting' },
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+
+    expect(result.action).toBe('resumed')
+    expect(deleteCalls).toHaveLength(0)
+  })
+
+  // (2) waiting + dead probe + errNoSessionId → exactly one delete AFTER the resume call
+  test('waiting + dead probe + errNoSessionId → delete recorded AFTER resume call (sequence assertion)', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-dead')
+    const callOrder: string[] = []
+    const stub = installStub({
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      ],
+      getResult: cannedGetResult({
+        claude_instance_id: 'cscb_C',
+        state: 'waiting',
+        claude_session_id: 'sess-abc',
+      }),
+      resumeError: errNoSessionId(),
+      statusResult: { state: 'waiting' },
+    })
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const origResume = stub.resume.bind(stub)
+    stub.resume = async (params) => {
+      callOrder.push('resume')
+      resumeCalls.push(params)
+      return origResume(params)
+    }
+    const origDelete = stub.delete.bind(stub)
+    stub.delete = async (params) => {
+      callOrder.push('delete')
+      deleteCalls.push(params)
+      return origDelete(params)
+    }
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+
+    expect(result.action).toBe('spawned')
+    // Exactly one resume (which threw errNoSessionId).
+    expect(resumeCalls).toHaveLength(1)
+    // Exactly one delete.
+    expect(deleteCalls).toHaveLength(1)
+    // Critical ordering: resume is recorded BEFORE delete.
+    const idx_resume = callOrder.indexOf('resume')
+    const idx_delete = callOrder.indexOf('delete')
+    expect(idx_resume).toBeGreaterThanOrEqual(0)
+    expect(idx_delete).toBeGreaterThanOrEqual(0)
+    expect(idx_resume).toBeLessThan(idx_delete)
+  })
+
+  // (3) errSpawnNotResumable → steering kill, then resume attempt, then kill+delete after rejection
+  // Sequence: [kill(steering), resume(throws ErrSpawnNotResumable), kill(ladder), delete, spawn]
+  test('waiting + dead probe + errSpawnNotResumable → steering kill first, resume, then kill+delete+fresh', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-dead')
+    const callOrder: string[] = []
+    const stub = installStub({
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      ],
+      getResult: cannedGetResult({
+        claude_instance_id: 'cscb_C',
+        state: 'waiting',
+        claude_session_id: 'sess-abc',
+      }),
+      resumeError: errSpawnNotResumable(),
+      statusResult: { state: 'waiting' },
+    })
+    const killCalls: import('agent-director').KillParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const origKill = stub.kill.bind(stub)
+    stub.kill = async (params) => {
+      callOrder.push('kill')
+      killCalls.push(params)
+      return origKill(params)
+    }
+    const origResume = stub.resume.bind(stub)
+    stub.resume = async (params) => {
+      callOrder.push('resume')
+      resumeCalls.push(params)
+      return origResume(params)
+    }
+    const origDelete = stub.delete.bind(stub)
+    stub.delete = async (params) => {
+      callOrder.push('delete')
+      deleteCalls.push(params)
+      return origDelete(params)
+    }
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+
+    expect(result.action).toBe('spawned')
+    // Two AD kill calls: one steering (before resume), one from ErrSpawnNotResumable ladder.
+    expect(killCalls).toHaveLength(2)
+    expect(resumeCalls).toHaveLength(1)
+    expect(deleteCalls).toHaveLength(1)
+    // Ordering: steering kill → resume (throws) → ladder kill → delete.
+    const idx_first_kill = callOrder.indexOf('kill')
+    const idx_resume = callOrder.indexOf('resume')
+    const idx_last_kill = callOrder.lastIndexOf('kill')
+    const idx_delete = callOrder.indexOf('delete')
+    expect(idx_first_kill).toBeLessThan(idx_resume) // steering kill before resume
+    expect(idx_resume).toBeLessThan(idx_last_kill)  // ladder kill after resume rejection
+    expect(idx_last_kill).toBeLessThan(idx_delete)  // delete after ladder kill
+  })
+
+  // (4) resume_enabled=false with ended state → kill+delete+fresh unchanged
+  // ended state bypasses the probe (not in LIVE_STATES) so the always-alive
+  // beforeEach default handles it. This pin verifies the existing behavior.
+  test('resume_enabled=false + ended state → kill+delete+fresh unchanged (no probe concern)', async () => {
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const killCalls: import('agent-director').KillParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      resumeCalls,
+      killCalls,
+      deleteCalls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      ],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      // approvePreSessionDialogs: status returns 'waiting' immediately.
+      statusResult: { state: 'waiting' },
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, resume_enabled: false })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+    expect(result.action).toBe('spawned')
+    expect(resumeCalls).toHaveLength(0) // no resume on resume_enabled=false
+    expect(killCalls).toHaveLength(1)
+    expect(deleteCalls).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// t3.a3g.mb.95.fh — Whole-fleet reboot scenario
+//
+// PRD #1 success criterion as stubbed integration proof: all channels had
+// live-state AD rows with dead tmux sessions → all resume successfully.
+// Zero sendKeys fleet-wide; per-channel resume instance ids correct.
+//
+// Kill semantics: steering kills are AD client.kill() calls per channel.
+// We verify fleet-wide resume count and instance ids, and zero sendKeys.
+// ---------------------------------------------------------------------------
+
+describe('Whole-fleet reboot scenario (fh)', () => {
+  test('4 channels, all live-state, all dead probes → all resumed, zero sendKeys fleet-wide', async () => {
+    // Single dead probe used for all channels (per-call injection via spawnForRoute 6th param).
+    const { probe } = makeStubTmuxProbe('definitely-dead')
+
+    // Four channels: mix of waiting and pending-with-usable-id states.
+    const channels = ['C_FLEET1', 'C_FLEET2', 'C_FLEET3', 'C_FLEET4']
+    const stateMap: Record<string, string> = {
+      C_FLEET1: 'waiting',
+      C_FLEET2: 'pending',
+      C_FLEET3: 'waiting',
+      C_FLEET4: 'pending',
+    }
+
+    const routesConfig = Object.fromEntries(
+      channels.map(ch => [ch, { cwd: '/fleet/cwd' }])
+    )
+    const cfg = makeRoutingConfig({ routes: routesConfig })
+
+    const results: Array<{ channelId: string; action: string }> = []
+    const allResumeCalls: import('agent-director').ResumeParams[] = []
+    const allSendKeysCalls: import('agent-director').SendKeysParams[] = []
+
+    // Run spawnForRoute for each channel sequentially with per-call probe injection.
+    for (const ch of channels) {
+      const instanceId = `cscb_${ch}`
+      installStub({
+        resumeCalls: allResumeCalls,
+        sendKeysCalls: allSendKeysCalls,
+        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+        getResult: cannedGetResult({
+          claude_instance_id: instanceId,
+          state: stateMap[ch],
+          claude_session_id: `sess-${ch.toLowerCase()}`,
+        }),
+        // approvePreSessionDialogs: status returns 'waiting' immediately.
+        statusResult: { state: 'waiting' },
+      })
+      const result = await spawnForRoute(ch, { cwd: '/fleet/cwd' }, cfg, undefined, true, probe)
+      results.push(result)
+      resetClientForTests()
+    }
+
+    // All channels resumed.
+    expect(results).toHaveLength(4)
+    for (const r of results) {
+      expect(r.action).toBe('resumed')
+    }
+
+    // Zero sendKeys fleet-wide — reconnectMcp was never entered.
+    expect(allSendKeysCalls).toHaveLength(0)
+
+    // Exactly one resume call per channel.
+    expect(allResumeCalls).toHaveLength(4)
+
+    // Correct instance ids resumed, one per channel.
+    const resumedIds = allResumeCalls.map(r => r.claude_instance_id).sort()
+    expect(resumedIds).toEqual(channels.map(ch => `cscb_${ch}`).sort())
   })
 })
