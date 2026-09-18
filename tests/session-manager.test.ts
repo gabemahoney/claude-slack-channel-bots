@@ -61,6 +61,7 @@ import {
   errInstanceIdCollision,
   errNoSessionId,
   errJsonlMissing,
+  errGeneric,
   errSpawnNotFound,
   errSpawnNotResumable,
   errSpawnNotInteractive,
@@ -2543,5 +2544,77 @@ describe('Whole-fleet reboot scenario (fh)', () => {
     // Correct instance ids resumed, one per channel.
     const resumedIds = allResumeCalls.map(r => r.claude_instance_id).sort()
     expect(resumedIds).toEqual(channels.map(ch => `cscb_${ch}`).sort())
+  })
+})
+
+// ---------------------------------------------------------------------------
+// t3.a3g.mb.95.c6 — SR-24.2 pins: arbitrary-unknown resume error → 'failed'
+//
+// SR-24.2 has two pins:
+//
+// Pin 1 (this describe): arbitrary-unknown resume error.
+//   A dead-probed live-state row whose resume throws an unrecognised
+//   AgentDirectorError (e.g. ErrUnknownResumeError) falls through to the
+//   catch-all ladder arm and returns action='failed'.
+//   'failed' semantics: loud (postSpawnFailureToChannel → Slack post) and
+//   retry-eligible (the next cron tick or manual /start will retry spawnForRoute).
+//   It is NOT a wedge — the bot is not silently stuck; the operator sees the
+//   error in Slack and the next cycle re-enters the spawn ladder cleanly.
+//
+// Pin 2 (documentation assertion only — no test arm):
+//   The corrupt-JSONL case collapses into this pin per the SR-24.2 research
+//   (t3.a3g.mb.yy.bz). See the comment at src/session-manager.ts ~line 932
+//   ("SR-24.2 research") for the full explanation: AD v0.7.8 resume.go uses
+//   an os.Stat-only guard — corrupt-but-present JSONL passes the check and
+//   client.resume() returns success (exit 0). The failure surfaces later via
+//   the approvePreSessionDialogs 5-minute hard cap. Because client.resume()
+//   does NOT throw, no error arm is entered and no separate test pin exists.
+//   The errJsonlMissing arm (tested in v5) covers the MISSING-JSONL identity
+//   (ErrJsonlMissing), which is a distinct error with a distinct handler
+//   (delete+fresh). Corrupt-JSONL ≠ missing JSONL at the AD layer.
+// ---------------------------------------------------------------------------
+
+describe('SR-24.2: arbitrary-unknown resume error → failed, loud, retry-eligible (c6)', () => {
+  // Dead-probed live-state row (waiting) whose resume throws an arbitrary
+  // unknown error. The catch-all arm in spawnForRoute returns action='failed'.
+  // No retry loop: the test completes synchronously after the single resume
+  // attempt; the next launch cycle is what retries (cron / manual /start).
+  test('live-state waiting + dead probe + ErrUnknownResumeError → action failed, zero deletes, zero spawns', async () => {
+    const { probe } = makeStubTmuxProbe('definitely-dead')
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({
+      resumeCalls,
+      deleteCalls,
+      spawnCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({
+        claude_instance_id: 'cscb_C',
+        state: 'waiting',
+        claude_session_id: 'sess-unknown-resume',
+      }),
+      // Arbitrary unknown resume error — not ErrNoSessionId, not ErrJsonlMissing,
+      // not ErrSpawnNotResumable, not ErrTmuxSessionCreate. Falls through to the
+      // catch-all ladder arm: postSpawnFailureToChannel + action='failed'.
+      resumeError: errGeneric('resume', 'ErrUnknownResumeError', 'unexpected resume failure'),
+      statusResult: { state: 'waiting' },
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+
+    // Catch-all arm: loud failure (Slack post via postSpawnFailureToChannel).
+    // Retry-eligible: next spawnForRoute call re-enters the ladder from scratch.
+    // NOT a wedge: no silent stuck state.
+    expect(result.action).toBe('failed')
+    // Exactly one resume attempt — catch-all does not retry internally.
+    expect(resumeCalls).toHaveLength(1)
+    expect(resumeCalls[0].claude_instance_id).toBe('cscb_C')
+    // No delete — catch-all does not delete on unknown error (only known
+    // rejection identities trigger delete+fresh).
+    expect(deleteCalls).toHaveLength(0)
+    // Only the initial collision-triggering spawn call; no fresh spawn issued
+    // by the catch-all arm after the resume failure.
+    expect(spawnCalls).toHaveLength(1)
   })
 })
