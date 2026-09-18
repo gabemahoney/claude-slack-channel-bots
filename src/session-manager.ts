@@ -48,6 +48,7 @@ import {
 } from './agent-director-errors.ts'
 import { recordStartupError } from './startup-errors.ts'
 import { isDryRun } from './tokens.ts'
+import { defaultTmuxProbe, type TmuxProbeFn } from './tmux-probe.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -656,6 +657,36 @@ export function _resetTmuxSessionKiller(): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Injectable tmux-probe seam (t1.a3g.mb) — always-on collision-branch probe
+// ---------------------------------------------------------------------------
+
+/**
+ * Module-level probe used by spawnForRoute's collision branch. Defaults to the
+ * real defaultTmuxProbe (always-on; no opt-out). Tests override this to inject
+ * a stub probe and avoid shelling out to real tmux.
+ *
+ * Two override paths exist:
+ *  1. Module-level seam (_setTmuxProbeForTests / _resetTmuxProbeForTests):
+ *     sets the fallback for all spawnForRoute calls that do not supply an
+ *     explicit probe param. Mirrors the _killTmuxSession seam pattern.
+ *  2. Per-call probe param on spawnForRoute / launchSession: overrides the
+ *     module-level value for a single invocation. Tests that need per-call
+ *     control pass a probe directly; the beforeEach seam installation
+ *     (alive-stub default) is the global safety net.
+ */
+let _tmuxProbe: TmuxProbeFn = defaultTmuxProbe
+
+/** Test-only seam: override the module-level tmux probe used by spawnForRoute. */
+export function _setTmuxProbeForTests(fn: TmuxProbeFn): void {
+  _tmuxProbe = fn
+}
+
+/** Test-only seam: restore the default (real) tmux probe. */
+export function _resetTmuxProbeForTests(): void {
+  _tmuxProbe = defaultTmuxProbe
+}
+
 /**
  * Self-heal an `ErrTmuxSessionCreate` collision (b.vub): the deterministic tmux
  * session name is still held by an orphaned session while the AD row is
@@ -705,13 +736,28 @@ async function tryDelete(
  * 1. Dry-run: skip entirely, return synthetic success.
  * 2. Attempt `client.spawn(...)`. On success → done.
  * 3. `ErrInstanceIdCollision` → `client.get(...)` then branch on state:
+ *    - For ANY live state (waiting/working/pending/check_permission/ask_user):
+ *      probe real tmux liveness first (SR-21.1 always-on; t1.a3g.mb).
+ *      - definitely-dead → tryKill (to move the AD row to terminal before
+ *        resume, since AD's resume verb rejects live-state rows with
+ *        ErrSpawnNotResumable; kill is benign on a dead session and preserves
+ *        claude_session_id per SR-23.2), then steer into ended/missing block.
+ *      - definitely-alive → today's exact per-state behavior below.
+ *      - transient-inconclusive → row untouched, today's action for the state;
+ *        no new outage flags raised on this path (centralized fix owned by
+ *        Epic t1.a3g.yn; ErrCallTimeout/generic-AD-unreachable transients
+ *        raise no outage flag here — deferred per Flag-Gap Decision, task body).
  *    - ended/missing + resume_enabled → resume; on ErrNoSessionId/
  *      ErrJsonlMissing → delete + fresh spawn.
  *    - ended/missing + !resume_enabled → kill + delete + fresh spawn.
- *    - waiting → reconnectMcp.
- *    - working → waitForWaitingAndReconnect.
- *    - pending/check_permission/ask_user → no-op.
+ *    - waiting (alive) → reconnectMcp.
+ *    - working (alive) → waitForWaitingAndReconnect.
+ *    - pending/check_permission/ask_user (alive) → no-op.
  * 4. Other errors → surface to Slack + (when isStartup) startup-errors.log.
+ *
+ * @param probe Injectable tmux-probe function (SR-21.1). Defaults to the
+ *   module-level _tmuxProbe (which is the real defaultTmuxProbe in production
+ *   and a test stub in tests). Tests may also pass a per-call probe directly.
  */
 export async function spawnForRoute(
   channelId: string,
@@ -719,6 +765,7 @@ export async function spawnForRoute(
   routingConfig: RoutingConfig,
   web?: WebClient,
   isStartup = true,
+  probe: TmuxProbeFn = _tmuxProbe,
 ): Promise<SpawnRouteResult> {
   if (isDryRun()) {
     console.error(`[slack] dry-run: skipping spawn for channel=${channelId} cwd=${route.cwd}`)
@@ -818,6 +865,42 @@ export async function spawnForRoute(
   }
 
   console.error(`[slack] spawnForRoute: collision resolved, state=${state} for channel=${channelId}`)
+
+  // SR-21.1 (t1.a3g.mb): probe real tmux liveness for ALL live-state rows before
+  // dispatching. The DB state may be stale (whole-fleet-reboot scenario: process
+  // restarted, AD row is 'waiting' but the tmux session is gone).
+  //
+  // tryKill-first decision (SR-23.2): AD's resume verb requires the row to be in
+  // a terminal state; calling resume on a live-state row returns ErrSpawnNotResumable
+  // (which the existing handler below catches and escalates to kill+delete+spawn).
+  // To avoid that double-kill path, we call tryKill first whenever we steer a
+  // definitely-dead row into the ended/missing branch: tryKill moves the AD row
+  // to terminal, allowing resume to proceed cleanly. tryKill is benign on a
+  // dead tmux session (warns and continues) and preserves claude_session_id
+  // (confirmed from AD source; the row is updated in-place). SR-23.2 sanctions this.
+  if (AGENT_DIRECTOR_LIVE_STATES.has(state)) {
+    const sessionName = tmuxSessionNameFor(channelId, normalizedName)
+    const probeResult = await probe(sessionName)
+    if (probeResult.classification === 'definitely-dead') {
+      console.error(
+        `[slack] spawnForRoute: tmux probe=definitely-dead (signal=${probeResult.signal}) for channel=${channelId} state=${state} — steering to resume branch`,
+      )
+      // Kill before resume so the AD row transitions to terminal (resume rejects live rows).
+      await tryKill(channelId, normalizedName)
+      // Reassign local dispatch state to 'ended' so the EXISTING ended|missing
+      // resume block runs verbatim — no duplicated ladder logic (SR-23.1).
+      state = 'ended'
+    } else if (probeResult.classification === 'transient-inconclusive') {
+      // SR-20.4 conservatism: do not kill/resume/delete on a transient verdict.
+      // ErrCallTimeout/generic-AD-unreachable transients raise no outage flag on
+      // this path; centralized fix owned by Epic t1.a3g.yn.
+      console.error(
+        `[slack] spawnForRoute: tmux probe=transient-inconclusive (signal=${probeResult.signal}) for channel=${channelId} state=${state} — keeping today's action`,
+      )
+      // Fall through to today's per-state behavior (definitely-alive path below).
+    }
+    // definitely-alive: fall through to today's exact per-state behavior.
+  }
 
   if (state === 'ended' || state === 'missing') {
     if (routingConfig.resume_enabled === false) {
@@ -1351,6 +1434,9 @@ export async function startupSessionManager(
  * Returns true on any non-failed action (spawned / resumed / reconnected /
  * no-op), false on `failed`. The richer `SpawnRouteResult` is collapsed
  * here because the restart subsystem only cares about did-it-relaunch.
+ *
+ * Threads the module-level probe through to spawnForRoute so the restart path
+ * also benefits from the SR-21.1 always-on liveness check (t1.a3g.mb).
  */
 export async function launchSession(
   channelId: string,
@@ -1358,6 +1444,6 @@ export async function launchSession(
   routingConfig: RoutingConfig,
   web?: WebClient,
 ): Promise<boolean> {
-  const result = await spawnForRoute(channelId, { cwd }, routingConfig, web, false)
+  const result = await spawnForRoute(channelId, { cwd }, routingConfig, web, false, _tmuxProbe)
   return result.action !== 'failed'
 }

@@ -49,6 +49,8 @@ import {
   _resetTmuxDialogHelpers,
   _setDialogDeadGracePolls,
   _resetDialogDeadGracePolls,
+  _setTmuxProbeForTests,
+  _resetTmuxProbeForTests,
 } from '../src/session-manager.ts'
 import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
 import {
@@ -115,6 +117,15 @@ beforeEach(() => {
   // out to real tmux (b.vub). Dead-row tests override these to drive behavior.
   _setTmuxCapturePane(async () => '')
   _setTmuxSendEnter(async () => {})
+  // t1.a3g.mb: install a safe always-alive probe stub so the collision branch
+  // never shells out to real tmux in CI. Tests that exercise dead/transient
+  // probe behavior must install their own probe stub via _setTmuxProbeForTests
+  // or pass a per-call probe to spawnForRoute. The Test Writer (epic mb test
+  // subtasks) will complete per-test stubbing for the new probe-aware paths.
+  _setTmuxProbeForTests(async (_sessionName) => ({
+    classification: 'definitely-alive',
+    signal: 'exit-0',
+  }))
 })
 
 afterEach(() => {
@@ -125,6 +136,7 @@ afterEach(() => {
   _resetTmuxSessionKiller()
   _resetTmuxDialogHelpers()
   _resetDialogDeadGracePolls()
+  _resetTmuxProbeForTests()
   _resetOutageState()
   process.env = savedEnv as NodeJS.ProcessEnv
 })
