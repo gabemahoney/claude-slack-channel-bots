@@ -448,6 +448,22 @@ describe('scheduleRestart', () => {
 // ---------------------------------------------------------------------------
 
 describe('cancelAllRestartTimers', () => {
+  // SR-27.5 / SR-29.3 — shutdown-race assertion (traceability annotation)
+  //
+  // SR-27.5 invariant: when a clean_restart is in progress, any pending restart
+  // timers scheduled by server.ts must be cancelled before the server process
+  // terminates. The CLI-side half of this invariant is covered by the
+  // stop-before-teardown ordering test in cli.test.ts (the 'stop' spawnSync must
+  // precede the first directorPause call). The server-side half is the
+  // cancelAllRestartTimers() call in server.ts onBeforeExit / SIGTERM handler —
+  // this test verifies that cancelAllRestartTimers() actually suppresses pending
+  // timers so that launchSession is never invoked after cancel.
+  //
+  // SR-29.3 (backoff integration traceability): cancelAllRestartTimers clears
+  // pendingRestartTimers only; it does NOT reset activeLaunches or the backoff
+  // counter. A timer cancelled before firing does not contribute a failure count.
+  // The backoff integration tests in 'backoff integration (SR-29.3)' cover the
+  // counter semantics; this test is the shutdown-race regression anchor.
   test('8. clears all pending timers — launchSession never called after cancel', async () => {
     const deps = makeDeps() // FAST_DELAY_S = 10 ms
     initRestart(deps)

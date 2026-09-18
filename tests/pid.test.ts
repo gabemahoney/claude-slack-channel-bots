@@ -216,4 +216,43 @@ describe('checkPidConflict — running PID (conflict)', () => {
     runCheckPidConflict(pidFile)
     expect(existsSync(pidFile)).toBe(true)
   })
+
+  // SR-29.3 server-side start guard — "already running" message (traceability)
+  //
+  // checkPidConflict is the server-side guard invoked from server.ts main()
+  // before writePidFile(). When a second `cscb start` detached daemon child
+  // finds a live pidfile it calls process.exit(1) with an "already running"
+  // message. The exit is silent to the clean_restart caller because start
+  // spawns a detached child (the caller sees exit(0) from the parent shell
+  // immediately). This is acceptable pre-existing behavior: a lockfile would
+  // not close the race between the detached child writing the pidfile and a
+  // concurrent second start. The guard is best-effort defense-in-depth.
+  //
+  // Caveat: a second `cscb start` in detached mode exits silently from the
+  // first caller's perspective — the caller receives the parent's exit(0), not
+  // the daemon child's exit(1). Tests here validate the guard logic in isolation
+  // via direct checkPidConflict() calls, independent of the detached spawn path.
+  test('error message contains "already running" text', () => {
+    writeFileSync(pidFile, `${process.pid}\n`, 'utf-8')
+    runCheckPidConflict(pidFile)
+    expect(errorMessages.some(m => m.includes('already running'))).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// checkPidConflict() — stale PID cleaned and startup proceeds (combined)
+// ---------------------------------------------------------------------------
+
+describe('checkPidConflict — stale PID cleaned and proceeds', () => {
+  // SR-29.3: verifies the full stale-pidfile path as a unit: the file is
+  // removed AND checkPidConflict does not exit, allowing startup to continue.
+  test('stale PID: file removed and no exit (startup proceeds)', () => {
+    writeFileSync(pidFile, '999999999\n', 'utf-8')
+    const exitError = runCheckPidConflict(pidFile)
+    // Must not exit
+    expect(exitError).toBeNull()
+    expect(exitCodes).toHaveLength(0)
+    // Must clean up the stale file
+    expect(existsSync(pidFile)).toBe(false)
+  })
 })

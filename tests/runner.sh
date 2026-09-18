@@ -22,6 +22,7 @@ TESTS=(
     "test-2-dryrun-spawn-skip.sh"
     "test-3-cozempic-restart.sh"
     "test-4-resume-dialog.sh"
+    "test-5-clean-restart-resume.sh"
 )
 
 for test_script in "${TESTS[@]}"; do

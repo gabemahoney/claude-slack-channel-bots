@@ -220,6 +220,169 @@ describe('clean_restart', () => {
     await createCli(deps).clean_restart()
     expect(killCalls).toEqual(['C'])
   })
+
+  // ---------------------------------------------------------------------------
+  // SR-27.5 ordering: stop spawnSync fires BEFORE any pause verb
+  //
+  // Rationale: clean_restart must stop the server (Phase 2: 'stop' spawnSync)
+  // before it pauses individual channels (Phase 4: directorPause). If the
+  // ordering were reversed — teardown first, then stop — the server process
+  // could re-spawn sessions that we just paused, defeating the clean restart.
+  // This test would fail if Phase 2 and Phase 4 were swapped.
+  // ---------------------------------------------------------------------------
+  test('SR-27.5: stop spawnSync fires before the first pause verb (ordering invariant)', async () => {
+    // Use a shared chronological call log to compare spawnSync vs pause ordering
+    // across the two separate trackers (spawnCalls records spawnSync; pauseCalls
+    // records directorPause). Each entry is tagged so we can assert relative order.
+    const callOrder: Array<{ kind: 'spawn'; args: string[] } | { kind: 'pause'; channel: string }> = []
+
+    const { deps } = makeDeps({
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+      spawnSyncFn: (cmd, args) => {
+        callOrder.push({ kind: 'spawn', args })
+        return { status: 0 }
+      },
+      directorStatus: async () => ({ state: 'waiting' }),
+      directorPause: async (channelId) => {
+        callOrder.push({ kind: 'pause', channel: channelId })
+      },
+    })
+
+    // Wire the spawnSyncFn override through the standard deps but also record
+    // the directorPause. We need to wrap the deps built by makeDeps.
+    // Re-build manually so both callOrder references capture the same array.
+    const { deps: realDeps } = makeDeps({
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+    })
+    // Override spawnSync to push into callOrder
+    realDeps.spawnSync = (cmd, args) => {
+      callOrder.push({ kind: 'spawn', args })
+      return { status: 0 }
+    }
+    // Override directorStatus to return non-terminal (triggers pause path)
+    realDeps.directorStatus = async () => ({ state: 'waiting' })
+    // Override directorPause to push into callOrder and then return terminal on next status poll
+    let paused = false
+    realDeps.directorPause = async (channelId) => {
+      callOrder.push({ kind: 'pause', channel: channelId })
+      paused = true
+    }
+    // Override directorStatus to return 'ended' after pause so the poll loop exits
+    let statusCallCount = 0
+    realDeps.directorStatus = async () => {
+      statusCallCount++
+      if (paused && statusCallCount > 1) return { state: 'ended' }
+      return { state: 'waiting' }
+    }
+
+    await createCli(realDeps).clean_restart()
+
+    // The 'stop' spawnSync call must appear before the first 'pause' entry
+    const stopIndex = callOrder.findIndex((e) => e.kind === 'spawn' && e.args.includes('stop'))
+    const firstPauseIndex = callOrder.findIndex((e) => e.kind === 'pause')
+
+    expect(stopIndex).toBeGreaterThanOrEqual(0)       // 'stop' was called
+    expect(firstPauseIndex).toBeGreaterThanOrEqual(0) // at least one pause happened
+    expect(stopIndex).toBeLessThan(firstPauseIndex)   // stop BEFORE pause
+  })
+
+  // ---------------------------------------------------------------------------
+  // SR-27.6 slow-AD exit_timeout: force-kill fires when AD never reaches terminal
+  //
+  // If the agent-director status never transitions to a terminal state within
+  // exit_timeout seconds, clean_restart must escalate to directorKill. This
+  // test configures a tiny exit_timeout (0.05 s) so the poll budget elapses
+  // quickly and verifies that killCalls becomes non-empty.
+  // ---------------------------------------------------------------------------
+  test('SR-27.6: force-kill fires when directorStatus never reaches terminal (exit_timeout honored)', async () => {
+    // Use a tiny exit_timeout so the poll budget expires in test time.
+    // The poll loop starts with a 100 ms delay so set timeout to < 100 ms.
+    const exitCodes: number[] = []
+    const pauseCalls: string[] = []
+    const killCalls: string[] = []
+
+    // Build deps manually to control exit_timeout via loadConfig
+    const deps: CliDeps = {
+      spawnSync: () => ({ status: 0 }),
+      env: { SLACK_BOT_TOKEN: 'xoxb', SLACK_APP_TOKEN: 'xapp' },
+      existsSync: () => true,
+      readFileSync: () => { throw new Error('unexpected') },
+      unlinkSync: () => { /* no-op */ },
+      isProcessRunning: () => false,
+      kill: () => { /* no-op */ },
+      resolveStateDir: () => STATE_DIR,
+      startServer: async () => { /* no-op */ },
+      exit: (code) => { exitCodes.push(code); throw new ExitError(code) },
+      // exit_timeout=0 means the poll loop never gets a chance to run; use a
+      // small positive value (0.05 s = 50 ms) so at least one poll attempt is
+      // made but the budget expires quickly. The first poll delay is 100 ms so
+      // the loop exits immediately on the first timeout check.
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } }, exit_timeout: 0.05 }),
+      getClient: () => makeStubClient() as unknown as import('agent-director').Client,
+      // directorStatus always returns 'waiting' — never transitions to terminal
+      directorStatus: async () => ({ state: 'waiting' }),
+      directorPause: async (channelId) => { pauseCalls.push(channelId) },
+      directorKill: async (channelId) => { killCalls.push(channelId) },
+    }
+
+    await createCli(deps).clean_restart()
+
+    // pause was attempted (channel was non-terminal at precheck)
+    expect(pauseCalls).toContain('C')
+    // force-kill fired because exit_timeout budget elapsed
+    expect(killCalls).not.toHaveLength(0)
+    expect(killCalls).toContain('C')
+  })
+
+  // ---------------------------------------------------------------------------
+  // SR-27.6 concurrency: two concurrent clean_restart() both resolve without
+  // deadlock and each reaches the pause path.
+  //
+  // Validates that Promise.allSettled inside clean_restart handles multiple
+  // concurrent callers. Both invocations are run simultaneously via Promise.all.
+  // ---------------------------------------------------------------------------
+  test('SR-27.6 concurrency: two concurrent clean_restart() calls both resolve and reach pause', async () => {
+    // Track per-invocation call counts to detect deadlock (if either Promise.all
+    // hangs, the outer Promise.all will also hang and the test will timeout).
+    const pauseCalls: string[] = []
+
+    function makeRestartDeps(): CliDeps {
+      return {
+        spawnSync: () => ({ status: 0 }),
+        env: { SLACK_BOT_TOKEN: 'xoxb', SLACK_APP_TOKEN: 'xapp' },
+        existsSync: () => true,
+        readFileSync: () => { throw new Error('unexpected') },
+        unlinkSync: () => { /* no-op */ },
+        isProcessRunning: () => false,
+        kill: () => { /* no-op */ },
+        resolveStateDir: () => STATE_DIR,
+        startServer: async () => { /* no-op */ },
+        exit: (code) => { throw new ExitError(code) },
+        loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+        getClient: () => makeStubClient() as unknown as import('agent-director').Client,
+        // Each invocation sees the channel in 'waiting' on precheck, then 'ended'
+        // on the first poll — so the teardown completes without kill.
+        directorStatus: (() => {
+          let callCount = 0
+          return async () => {
+            callCount++
+            return callCount === 1 ? { state: 'waiting' } : { state: 'ended' }
+          }
+        })(),
+        directorPause: async (channelId) => { pauseCalls.push(channelId) },
+        directorKill: async () => { /* should not be called */ },
+      }
+    }
+
+    // Both must resolve without throwing (no deadlock, no unhandled rejection)
+    await Promise.all([
+      createCli(makeRestartDeps()).clean_restart(),
+      createCli(makeRestartDeps()).clean_restart(),
+    ])
+
+    // Both invocations reached the pause path
+    expect(pauseCalls.filter((c) => c === 'C')).toHaveLength(2)
+  })
 })
 
 // ---------------------------------------------------------------------------
