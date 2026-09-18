@@ -100,6 +100,7 @@ import {
 import { runAgentDirectorStartupGate } from './agent-director-startup.ts'
 import { installSlackChannelBotTemplate } from './agent-director-template.ts'
 import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy, withOutageDetection } from './outage-state.ts'
+import { _runJsonlPersistenceSafeguard } from './jsonl-persistence-check.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -1290,6 +1291,14 @@ export async function main(): Promise<void> {
   // both real and dry-run modes (config-file patch, not a session operation).
   if (routingConfig) {
     await trustBootstrap(routingConfig)
+  }
+
+  // SR-24.4: detect non-persistent (tmpfs/ramfs) JSONL storage at startup and
+  // fail loudly before sessions are launched. Fire-and-forget — never blocks startup.
+  if (routingConfig) {
+    _runJsonlPersistenceSafeguard(routingConfig, isDryRun() ? undefined : web).catch((err) => {
+      console.error('[slack] Warning: jsonl-persistence-check failed unexpectedly:', err)
+    })
   }
 
   // b.1m9: warn about (or, with --reconcile-instance-ids, delete) stale
