@@ -151,7 +151,7 @@ const NO_SERVER_PATTERNS = [
   'failed to connect to server',
 ]
 
-function matchesAny(stderr: string, patterns: string[]): boolean {
+function matchesAny(stderr: string, patterns: ReadonlyArray<string>): boolean {
   const lower = stderr.toLowerCase()
   return patterns.some((p) => lower.includes(p))
 }

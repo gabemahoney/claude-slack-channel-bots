@@ -1326,9 +1326,11 @@ export async function main(): Promise<void> {
       if (result === 'escalate-dead') {
         // SR-25.1: escalation is observable to Epic hi as a launch attempt via the scheduled-restart path.
         const cwd = routingConfig?.routes[channelId]?.cwd
-        if (!isRestartPendingOrActive(channelId)) {
+        if (cwd && !isRestartPendingOrActive(channelId)) {
           console.error(`[slack] reconnectSession: escalating channel=${channelId} (cause=ErrTmuxNotAvailable+dead) via scheduleRestart cwd="${cwd}"`)
           scheduleRestart(channelId, cwd)
+        } else if (!cwd) {
+          console.warn(`[slack] reconnectSession: escalate-dead for channel=${channelId} but cwd unknown — cannot scheduleRestart`)
         } else {
           console.error(`[slack] reconnectSession: escalate-dead for channel=${channelId} but restart already pending/active — skipping`)
         }

@@ -1177,7 +1177,16 @@ export async function spawnForRoute(
     // waitForWaitingAndReconnect threads the ReconnectMcpResult union up;
     // 'escalate-dead' is handled the same way as in the waiting branch above —
     // return 'reconnected' and let the scheduled-restart path recover.
-    await waitForWaitingAndReconnect(channelId, routingConfig, web)
+    const reconnectResult = await waitForWaitingAndReconnect(channelId, routingConfig, web)
+    if (reconnectResult === 'escalate-dead') {
+      // Session died between the probe above and the sendKeys attempt (race).
+      // Return 'reconnected' and let the scheduled-restart path handle recovery
+      // — this spawnForRoute call has already done its one send-keys attempt.
+      console.error(
+        `[slack] spawnForRoute: reconnectMcp escalate-dead for channel=${channelId} — deferring to scheduled-restart`,
+      )
+      return { channelId, action: 'reconnected' }
+    }
     return { channelId, action: 'reconnected' }
   }
 
