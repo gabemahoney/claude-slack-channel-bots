@@ -24,8 +24,6 @@ import {
 import type { Client } from 'agent-director'
 import {
   ErrSpawnNotFound,
-  ErrSystemInstallDisappeared,
-  ErrTmuxNotAvailable,
 } from '../src/agent-director-errors.ts'
 import {
   _resetOutageState,
@@ -40,6 +38,8 @@ import {
 import {
   makeStubClient,
   errCallTimeout,
+  errSystemInstallDisappeared,
+  errTmuxNotAvailable,
   cannedOk,
   cannedErr,
 } from './test-helpers/agent-director-stub.ts'
@@ -729,7 +729,7 @@ describe('_buildIsSessionAliveAdapter', () => {
   test('3. ErrSystemInstallDisappeared: status throws → sets ad-unreachable with binaryPath as detail; returns false', async () => {
     const binaryPath = '/home/horde/.agent-director/bin/agent-director'
     const { emissions, adapter } = makeHarness({
-      statusError: new ErrSystemInstallDisappeared('status', binaryPath),
+      statusError: errSystemInstallDisappeared('status', binaryPath),
     })
 
     const result = await adapter('C1')
@@ -748,7 +748,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     // tmux-unavailable flag. Reconcile with C3 is Epic u4's scope (reconnectMcp),
     // NOT this adapter's (PM ruling: byte-identical branch, no change).
     const { emissions, adapter } = makeHarness({
-      statusError: new ErrTmuxNotAvailable('status', 'ErrTmuxNotAvailable', 'tmux not found'),
+      statusError: errTmuxNotAvailable('status', 'tmux not found'),
     })
 
     const result = await adapter('C1')

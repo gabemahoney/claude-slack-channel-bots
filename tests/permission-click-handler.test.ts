@@ -30,7 +30,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { ErrSystemInstallDisappeared, type Client, type DecideParams, type DecideResult } from 'agent-director'
+import type { Client, DecideParams, DecideResult } from 'agent-director'
 import { handlePermissionClick } from '../src/permission-click-handler.ts'
 import { encodePermissionActionId } from '../src/permission-action-id.ts'
 import {
@@ -47,6 +47,7 @@ import {
   errAlreadyDecided,
   errAmbiguousRequest,
   errInvalidFlags,
+  errSystemInstallDisappeared,
 } from './test-helpers/agent-director-stub.ts'
 import {
   _resetOutageState,
@@ -1120,7 +1121,7 @@ describe('trail events — cscb.ad_decide.attempted', () => {
 describe('handlePermissionClick — wrapper outage short-circuit', () => {
   test('ErrSystemInstallDisappeared → ad-unreachable flag raised; no per-event logDeps call; returns true', async () => {
     const BINARY = '/usr/local/bin/agent-director'
-    const err = new ErrSystemInstallDisappeared('spawn', BINARY)
+    const err = errSystemInstallDisappeared('spawn', BINARY)
     const decide = makeDecideStub({ throwOn: err })
     const seed = await seedLiveEntry({
       instanceId: INSTANCE_C,
@@ -1147,7 +1148,7 @@ describe('handlePermissionClick — wrapper outage short-circuit', () => {
 
   test('carve-out trail entry carries result_class=ErrSystemInstallDisappeared + raw_error_message', async () => {
     const BINARY = '/usr/local/bin/agent-director'
-    const err = new ErrSystemInstallDisappeared('spawn', BINARY)
+    const err = errSystemInstallDisappeared('spawn', BINARY)
     const decide = makeDecideStub({ throwOn: err })
     const seed = await seedLiveEntry({
       instanceId: INSTANCE_C,

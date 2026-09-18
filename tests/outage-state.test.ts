@@ -10,7 +10,6 @@ import { describe, test, expect, beforeEach } from 'bun:test'
 import type { Client } from 'agent-director'
 import {
   ErrSystemInstallDisappeared,
-  ErrTmuxNotAvailable,
   ErrCwdNotFound,
   ErrSpawnNotFound,
 } from '../src/agent-director-errors.ts'
@@ -27,7 +26,11 @@ import {
   type ClassRecord,
   type OutageClass,
 } from '../src/outage-state.ts'
-import { makeStubClient } from './test-helpers/agent-director-stub.ts'
+import {
+  makeStubClient,
+  errSystemInstallDisappeared,
+  errCwdNotFound,
+} from './test-helpers/agent-director-stub.ts'
 
 // ---------------------------------------------------------------------------
 // Harness helpers
@@ -266,7 +269,7 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
 
   test('15a. withOutageDetection ErrSystemInstallDisappeared → ad-unreachable raised with binaryPath; error rethrows', async () => {
     const { emissions } = makeHarness()
-    const err = new ErrSystemInstallDisappeared('spawn', '/bin/ad')
+    const err = errSystemInstallDisappeared('spawn', '/bin/ad')
     await expect(
       withOutageDetection('C1', '/cwd', async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrSystemInstallDisappeared)
@@ -277,7 +280,7 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
 
   test('15b. withOutageDetection ErrCwdNotFound + routeCwd → cwd-unreachable raised; error rethrows', async () => {
     const { emissions } = makeHarness()
-    const err = new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd not found')
+    const err = errCwdNotFound('spawn', 'cwd not found')
     await expect(
       withOutageDetection('C1', '/foo', async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrCwdNotFound)
@@ -353,7 +356,7 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
     setOutageFlag('C1', 'tmux-unavailable')
     const before = emissions.length
-    const err = new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd not found')
+    const err = errCwdNotFound('spawn', 'cwd not found')
     await expect(
       withSpawnDetection('C1', '/foo', async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrCwdNotFound)
@@ -375,7 +378,7 @@ describe('cases 20-21: flap cycles and never-set no-op', () => {
 
   test('20. AD flap: throw → succeed → throw → succeed → exactly 4 emissions onset/all-clear/onset/all-clear', async () => {
     const { emissions } = makeHarness()
-    const err = new ErrSystemInstallDisappeared('spawn', '/bin/ad')
+    const err = errSystemInstallDisappeared('spawn', '/bin/ad')
 
     // Throw 1 → onset
     await expect(
@@ -520,7 +523,7 @@ describe('static audits', () => {
     setOutageFlag('C1', 'cwd-unreachable', '/route/cwd')
 
     // Step 2: drive the wrapper to raise ad-unreachable from a spawn throw.
-    const adErr = new ErrSystemInstallDisappeared('spawn', '/bin/ad')
+    const adErr = errSystemInstallDisappeared('spawn', '/bin/ad')
     const spawnStub = async () => { throw adErr }
     await expect(
       withSpawnDetection('C1', '/route/cwd', spawnStub),

@@ -69,6 +69,9 @@ import {
   errTmuxSendKeysNotFound,
   errTmuxSendKeysGeneric,
   errCallTimeout,
+  errSystemInstallDisappeared,
+  errTmuxNotAvailable,
+  errCwdNotFound,
   makeStubClient,
   type StubClient,
 } from './test-helpers/agent-director-stub.ts'
@@ -83,11 +86,6 @@ import {
   setOutageFlag,
   _resetOutageState,
 } from '../src/outage-state.ts'
-import {
-  ErrSystemInstallDisappeared,
-  ErrTmuxNotAvailable,
-  ErrCwdNotFound,
-} from '../src/agent-director-errors.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -1023,7 +1021,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
     const { web, calls } = makeMockWeb()
     installStub({
-      spawnError: new ErrSystemInstallDisappeared('spawn', '/usr/bin/agent-director'),
+      spawnError: errSystemInstallDisappeared('spawn', '/usr/bin/agent-director'),
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
     const result = await spawnForRoute('C', { cwd: '/x' }, cfg, web as never)
@@ -1040,7 +1038,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
     const { web, calls } = makeMockWeb()
     installStub({
-      spawnError: new ErrTmuxNotAvailable('spawn', 'ErrTmuxNotAvailable', 'tmux not available'),
+      spawnError: errTmuxNotAvailable('spawn'),
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
     const result = await spawnForRoute('C', { cwd: '/x' }, cfg, web as never)
@@ -1519,7 +1517,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
 
   test('site #1: reconnectMcp ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
     const { web, calls } = makeMockWeb()
-    installStub({ sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN) })
+    installStub({ sendKeysError: errSystemInstallDisappeared('send-keys', BIN) })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
     const result = await reconnectMcp('C', web as never, cfg)
     expect(result).toBe('transient') // was: false (u4 test subtask owns full migration)
@@ -1529,7 +1527,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
 
   test('site #1b: reconnectMcp ErrTmuxNotAvailable → tmux-unavailable, no postSpawnFailureToChannel', async () => {
     const { web, calls } = makeMockWeb()
-    installStub({ sendKeysError: new ErrTmuxNotAvailable('send-keys', 'ErrTmuxNotAvailable', 'tmux not available') })
+    installStub({ sendKeysError: errTmuxNotAvailable('send-keys') })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
     const result = await reconnectMcp('C', web as never, cfg)
     expect(result).toBe('transient') // was: false (u4 test subtask owns full migration)
@@ -1544,7 +1542,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   test('site #8: waitForWaitingAndReconnect ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
     const { web, calls } = makeMockWeb()
     _setWaitForWaitingTimeoutMs(50)
-    installStub({ statusError: new ErrSystemInstallDisappeared('status', BIN) })
+    installStub({ statusError: errSystemInstallDisappeared('status', BIN) })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
     const result = await waitForWaitingAndReconnect('C', cfg, web as never)
     expect(result).toBe('transient') // was: false (u4 test subtask owns full migration)
@@ -1564,8 +1562,8 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     installStub({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
-      killError: new ErrSystemInstallDisappeared('kill', BIN),
-      deleteError: new ErrSystemInstallDisappeared('delete', BIN),
+      killError: errSystemInstallDisappeared('kill', BIN),
+      deleteError: errSystemInstallDisappeared('delete', BIN),
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } }, resume_enabled: false })
     const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
@@ -1584,7 +1582,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
       // kill succeeds; delete fails with typed outage error
-      deleteError: new ErrSystemInstallDisappeared('delete', BIN),
+      deleteError: errSystemInstallDisappeared('delete', BIN),
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } }, resume_enabled: false })
     const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
@@ -1599,7 +1597,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
 
   test('site #11: initial spawn ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
     const { web, calls } = makeMockWeb()
-    installStub({ spawnError: new ErrSystemInstallDisappeared('spawn', BIN) })
+    installStub({ spawnError: errSystemInstallDisappeared('spawn', BIN) })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
     const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
     expect(result.action).toBe('failed')
@@ -1612,7 +1610,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   // (Self-heal arm is never entered when the cwd does not exist.)
   test('site #11b: initial spawn ErrCwdNotFound → cwd-unreachable with route.cwd as detail, no postSpawnFailureToChannel', async () => {
     const { web, calls } = makeMockWeb()
-    installStub({ spawnError: new ErrCwdNotFound('spawn', 'ErrCwdNotFound', `cwd ${CWD} does not exist`) })
+    installStub({ spawnError: errCwdNotFound('spawn', `cwd ${CWD} does not exist`) })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
     const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
     expect(result.action).toBe('failed')
@@ -1630,7 +1628,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     const { web, calls } = makeMockWeb()
     installStub({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getError: new ErrSystemInstallDisappeared('get', BIN),
+      getError: errSystemInstallDisappeared('get', BIN),
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
     const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
@@ -1648,7 +1646,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
-        cannedErr(new ErrSystemInstallDisappeared('spawn', BIN)),
+        cannedErr(errSystemInstallDisappeared('spawn', BIN)),
       ],
       getError: errSpawnNotFound(),
     })
@@ -1668,7 +1666,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
-        cannedErr(new ErrCwdNotFound('spawn', 'ErrCwdNotFound', `cwd ${CWD} does not exist`)),
+        cannedErr(errCwdNotFound('spawn', `cwd ${CWD} does not exist`)),
       ],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
     })
@@ -1688,7 +1686,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     installStub({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
-      resumeError: new ErrSystemInstallDisappeared('resume', BIN),
+      resumeError: errSystemInstallDisappeared('resume', BIN),
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
     const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
@@ -1706,7 +1704,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
-        cannedErr(new ErrCwdNotFound('spawn', 'ErrCwdNotFound', `cwd ${CWD} does not exist`)),
+        cannedErr(errCwdNotFound('spawn', `cwd ${CWD} does not exist`)),
       ],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
       resumeError: errNoSessionId(),
@@ -1727,7 +1725,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
-        cannedErr(new ErrSystemInstallDisappeared('spawn', BIN)),
+        cannedErr(errSystemInstallDisappeared('spawn', BIN)),
       ],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
       resumeError: errSpawnNotResumable(),
@@ -1753,7 +1751,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
           }),
         ],
       },
-      deleteError: new ErrSystemInstallDisappeared('delete', BIN),
+      deleteError: errSystemInstallDisappeared('delete', BIN),
     })
     const cfg = makeRoutingConfig({
       routes: { C_REC: { cwd: CWD, name: 'new_name', normalizedName: 'new_name' } },
@@ -1774,7 +1772,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
 
 describe('wrapper-migration: dialog outage cases (Group B)', () => {
   const CH = 'C_DIALOG'
-  const errSID = () => new ErrSystemInstallDisappeared('read-pane', BIN)
+  const errSID = () => errSystemInstallDisappeared('read-pane', BIN)
 
   // -------------------------------------------------------------------------
   // Merged approvePreSessionDialogs — 3 wrapped call sites: status, readPane,
@@ -1808,7 +1806,7 @@ describe('wrapper-migration: dialog outage cases (Group B)', () => {
     installStub({
       statusResult: { state: 'pending' },
       readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_NEEDLE }],
-      sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN),
+      sendKeysError: errSystemInstallDisappeared('send-keys', BIN),
     })
     await expect(approvePreSessionDialogs(CH, undefined, false)).resolves.toBeUndefined()
     expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
@@ -2920,7 +2918,7 @@ describe('SR-22 escalation matrix: reconnectMcp (t3.a3g.u4.mp.tn)', () => {
   test('SR-22.2: ErrTmuxNotAvailable + dead probe → escalate-dead', async () => {
     const { probe, probeCalls } = makeStubTmuxProbe('definitely-dead')
     const { web, calls } = makeMockWeb()
-    installStub({ sendKeysError: new ErrTmuxNotAvailable('send-keys', 'ErrTmuxNotAvailable', 'tmux not available') })
+    installStub({ sendKeysError: errTmuxNotAvailable('send-keys') })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
 
     const result = await reconnectMcp('C', web as never, cfg, probe)
@@ -2948,7 +2946,7 @@ describe('SR-22 escalation matrix: reconnectMcp (t3.a3g.u4.mp.tn)', () => {
 
   test('SR-22.2: ErrTmuxNotAvailable + transient probe → tmux-unavailable flag + transient', async () => {
     const { probe, probeCalls } = makeStubTmuxProbe('transient-inconclusive')
-    installStub({ sendKeysError: new ErrTmuxNotAvailable('send-keys', 'ErrTmuxNotAvailable', 'tmux not available') })
+    installStub({ sendKeysError: errTmuxNotAvailable('send-keys') })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
 
     const result = await reconnectMcp('C', undefined, cfg, probe)
@@ -2970,7 +2968,7 @@ describe('SR-22 escalation matrix: reconnectMcp (t3.a3g.u4.mp.tn)', () => {
   test('SR-22.2: ErrTmuxNotAvailable + alive probe → transient, conservative (contradictory signals, conservatism wins)', async () => {
     const { probe, probeCalls } = makeStubTmuxProbe('definitely-alive')
     const { web, calls } = makeMockWeb()
-    installStub({ sendKeysError: new ErrTmuxNotAvailable('send-keys', 'ErrTmuxNotAvailable', 'tmux not available') })
+    installStub({ sendKeysError: errTmuxNotAvailable('send-keys') })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
 
     const result = await reconnectMcp('C', web as never, cfg, probe)

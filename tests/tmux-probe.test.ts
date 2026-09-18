@@ -24,39 +24,17 @@ import {
 } from '../src/tmux-probe.ts'
 import type { AdErrorClassification, TmuxExecResult } from '../src/tmux-probe.ts'
 import {
-  ErrCwdNotFound,
-  ErrCwdNotADirectory,
-  ErrSystemInstallDisappeared,
-  ErrTmuxNotAvailable,
-} from '../src/agent-director-errors.ts'
-import {
   errSpawnNotFound,
   errCallTimeout,
   errTmuxSendKeysNotFound,
   errTmuxSendKeysGeneric,
   errTmuxSessionCreate,
   errInstanceIdCollision,
+  errSystemInstallDisappeared,
+  errTmuxNotAvailable,
+  errCwdNotFound,
+  errCwdNotADirectory,
 } from './test-helpers/agent-director-stub.ts'
-
-// ---------------------------------------------------------------------------
-// Helpers — factories for error classes that have no typed stub factory
-// ---------------------------------------------------------------------------
-
-/**
- * ErrSystemInstallDisappeared has no typed factory in agent-director-stub.ts.
- * Constructor: (verb: string, binaryPath: string)
- */
-function makeErrSystemInstallDisappeared(): ErrSystemInstallDisappeared {
-  return new ErrSystemInstallDisappeared('status', '/usr/local/bin/agent-director')
-}
-
-/**
- * ErrTmuxNotAvailable has no typed factory in agent-director-stub.ts.
- * Constructor: (verb: string, errName: string, message: string)
- */
-function makeErrTmuxNotAvailable(): ErrTmuxNotAvailable {
-  return new ErrTmuxNotAvailable('spawn', 'ErrTmuxNotAvailable', 'tmux not available')
-}
 
 // ---------------------------------------------------------------------------
 // classifyAdError — one test per SR-20.2 mapping row
@@ -71,11 +49,11 @@ describe('classifyAdError', () => {
 
   describe('transient-inconclusive mappings', () => {
     test('ErrSystemInstallDisappeared → transient-inconclusive', () => {
-      expect(classifyAdError(makeErrSystemInstallDisappeared())).toBe('transient-inconclusive')
+      expect(classifyAdError(errSystemInstallDisappeared('status', '/usr/local/bin/agent-director'))).toBe('transient-inconclusive')
     })
 
     test('ErrTmuxNotAvailable (AD-sourced) → transient-inconclusive', () => {
-      expect(classifyAdError(makeErrTmuxNotAvailable())).toBe('transient-inconclusive')
+      expect(classifyAdError(errTmuxNotAvailable('spawn'))).toBe('transient-inconclusive')
     })
 
     test('ErrCallTimeout → transient-inconclusive', () => {
@@ -115,12 +93,12 @@ describe('classifyAdError', () => {
     })
 
     test('ErrCwdNotFound → not-a-liveness-signal', () => {
-      const err = new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd not found')
+      const err = errCwdNotFound('spawn', 'cwd not found')
       expect(classifyAdError(err)).toBe('not-a-liveness-signal')
     })
 
     test('ErrCwdNotADirectory → not-a-liveness-signal', () => {
-      const err = new ErrCwdNotADirectory('spawn', 'ErrCwdNotADirectory', 'path is not a directory')
+      const err = errCwdNotADirectory('spawn', 'path is not a directory')
       expect(classifyAdError(err)).toBe('not-a-liveness-signal')
     })
   })
@@ -141,14 +119,14 @@ describe('classifyAdError', () => {
 
     const signalInputs: Array<{ label: string; err: unknown }> = [
       { label: 'ErrSpawnNotFound',            err: errSpawnNotFound() },
-      { label: 'ErrSystemInstallDisappeared', err: makeErrSystemInstallDisappeared() },
-      { label: 'ErrTmuxNotAvailable',         err: makeErrTmuxNotAvailable() },
+      { label: 'ErrSystemInstallDisappeared', err: errSystemInstallDisappeared('status', '/usr/local/bin/agent-director') },
+      { label: 'ErrTmuxNotAvailable',         err: errTmuxNotAvailable('spawn') },
       { label: 'ErrCallTimeout',              err: errCallTimeout() },
       { label: 'ErrTmuxSendKeys (generic)',   err: errTmuxSendKeysGeneric() },
       { label: 'ErrTmuxSendKeys (not-found)', err: errTmuxSendKeysNotFound() },
       { label: 'ErrTmuxSessionCreate',        err: errTmuxSessionCreate() },
-      { label: 'ErrCwdNotFound',              err: new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'x') },
-      { label: 'ErrCwdNotADirectory',         err: new ErrCwdNotADirectory('spawn', 'ErrCwdNotADirectory', 'x') },
+      { label: 'ErrCwdNotFound',              err: errCwdNotFound('spawn', 'x') },
+      { label: 'ErrCwdNotADirectory',         err: errCwdNotADirectory('spawn', 'x') },
       { label: 'plain Error',                 err: new Error('connection refused') },
       { label: 'ErrInstanceIdCollision (unrecognized AD sub)', err: errInstanceIdCollision() },
     ]
@@ -182,14 +160,14 @@ describe('classifyAdError', () => {
 
       // Call classifyAdError for every documented input variant.
       classifyAdError(errSpawnNotFound())
-      classifyAdError(makeErrSystemInstallDisappeared())
-      classifyAdError(makeErrTmuxNotAvailable())
+      classifyAdError(errSystemInstallDisappeared('status', '/usr/local/bin/agent-director'))
+      classifyAdError(errTmuxNotAvailable('spawn'))
       classifyAdError(errCallTimeout())
       classifyAdError(errTmuxSendKeysGeneric())
       classifyAdError(errTmuxSendKeysNotFound())
       classifyAdError(errTmuxSessionCreate())
-      classifyAdError(new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'x'))
-      classifyAdError(new ErrCwdNotADirectory('spawn', 'ErrCwdNotADirectory', 'x'))
+      classifyAdError(errCwdNotFound('spawn', 'x'))
+      classifyAdError(errCwdNotADirectory('spawn', 'x'))
       classifyAdError(new Error('connection refused'))
       classifyAdError(errInstanceIdCollision())
 

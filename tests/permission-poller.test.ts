@@ -59,6 +59,7 @@ import {
   errGeneric,
   errPermissionRequestNotFound,
   errSpawnNotFound,
+  errSystemInstallDisappeared,
   makeStubClient,
 } from './test-helpers/agent-director-stub.ts'
 import type { GetPermissionParams, GetPermissionResult } from '../src/agent-director-client.ts'
@@ -67,9 +68,6 @@ import {
   resetClientForTests,
   setClientForTests,
 } from '../src/agent-director-client.ts'
-import {
-  ErrSystemInstallDisappeared,
-} from 'agent-director'
 import {
   _resetOutageState,
   getOutageFlags,
@@ -1909,7 +1907,7 @@ describe('b.en2 Epic 6 — withOutageDetection wrapper integration', () => {
       }),
       get: async (params: unknown) => {
         getCalls.push(params)
-        throw new ErrSystemInstallDisappeared('get', '/bin/ad')
+        throw errSystemInstallDisappeared('get', '/bin/ad')
       },
     })
     startPermissionPoller({
@@ -1960,7 +1958,7 @@ describe('b.en2 Epic 6 — withOutageDetection wrapper integration', () => {
       }),
       getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
         getPermCalls.push(params)
-        throw new ErrSystemInstallDisappeared('get-permission', '/bin/ad')
+        throw errSystemInstallDisappeared('get-permission', '/bin/ad')
       },
     })
     startPermissionPoller({

@@ -16,11 +16,23 @@
  */
 
 import { describe, test, expect } from 'bun:test'
-import { AgentDirectorError, ErrTmuxSendKeys, ErrTmuxSessionCreate } from 'agent-director'
+import {
+  AgentDirectorError,
+  ErrCwdNotADirectory,
+  ErrCwdNotFound,
+  ErrSystemInstallDisappeared,
+  ErrTmuxNotAvailable,
+  ErrTmuxSendKeys,
+  ErrTmuxSessionCreate,
+} from 'agent-director'
 import {
   errTmuxSendKeysNotFound,
   errTmuxSendKeysGeneric,
   errTmuxSessionCreate,
+  errSystemInstallDisappeared,
+  errTmuxNotAvailable,
+  errCwdNotFound,
+  errCwdNotADirectory,
 } from './agent-director-stub.ts'
 
 // SR-22.2 discriminator string
@@ -105,5 +117,97 @@ describe('errTmuxSessionCreate()', () => {
 
   test('errDescription describes tmux session-already-exists failure', () => {
     expect(errTmuxSessionCreate().errDescription).toContain('tmux')
+  })
+})
+
+describe('errSystemInstallDisappeared()', () => {
+  test('is instanceof ErrSystemInstallDisappeared', () => {
+    expect(errSystemInstallDisappeared()).toBeInstanceOf(ErrSystemInstallDisappeared)
+  })
+
+  test('is instanceof AgentDirectorError', () => {
+    expect(errSystemInstallDisappeared()).toBeInstanceOf(AgentDirectorError)
+  })
+
+  test('errName is ErrSystemInstallDisappeared', () => {
+    expect(errSystemInstallDisappeared().errName).toBe('ErrSystemInstallDisappeared')
+  })
+
+  test('verb defaults to spawn', () => {
+    expect(errSystemInstallDisappeared().verb).toBe('spawn')
+  })
+
+  test('verb can be overridden', () => {
+    expect(errSystemInstallDisappeared('status').verb).toBe('status')
+  })
+
+  test('binaryPath is captured in the instance', () => {
+    expect(errSystemInstallDisappeared('spawn', '/test/bin/ad').binaryPath).toBe('/test/bin/ad')
+  })
+})
+
+describe('errTmuxNotAvailable()', () => {
+  test('is instanceof ErrTmuxNotAvailable', () => {
+    expect(errTmuxNotAvailable()).toBeInstanceOf(ErrTmuxNotAvailable)
+  })
+
+  test('is instanceof AgentDirectorError', () => {
+    expect(errTmuxNotAvailable()).toBeInstanceOf(AgentDirectorError)
+  })
+
+  test('errName is ErrTmuxNotAvailable', () => {
+    expect(errTmuxNotAvailable().errName).toBe('ErrTmuxNotAvailable')
+  })
+
+  test('verb defaults to spawn', () => {
+    expect(errTmuxNotAvailable().verb).toBe('spawn')
+  })
+
+  test('verb can be overridden', () => {
+    expect(errTmuxNotAvailable('send-keys').verb).toBe('send-keys')
+  })
+})
+
+describe('errCwdNotFound()', () => {
+  test('is instanceof ErrCwdNotFound', () => {
+    expect(errCwdNotFound()).toBeInstanceOf(ErrCwdNotFound)
+  })
+
+  test('is instanceof AgentDirectorError', () => {
+    expect(errCwdNotFound()).toBeInstanceOf(AgentDirectorError)
+  })
+
+  test('errName is ErrCwdNotFound', () => {
+    expect(errCwdNotFound().errName).toBe('ErrCwdNotFound')
+  })
+
+  test('verb defaults to spawn', () => {
+    expect(errCwdNotFound().verb).toBe('spawn')
+  })
+
+  test('accepts a custom description', () => {
+    expect(errCwdNotFound('spawn', 'cwd /foo does not exist').errDescription).toBe('cwd /foo does not exist')
+  })
+})
+
+describe('errCwdNotADirectory()', () => {
+  test('is instanceof ErrCwdNotADirectory', () => {
+    expect(errCwdNotADirectory()).toBeInstanceOf(ErrCwdNotADirectory)
+  })
+
+  test('is instanceof AgentDirectorError', () => {
+    expect(errCwdNotADirectory()).toBeInstanceOf(AgentDirectorError)
+  })
+
+  test('errName is ErrCwdNotADirectory', () => {
+    expect(errCwdNotADirectory().errName).toBe('ErrCwdNotADirectory')
+  })
+
+  test('verb defaults to spawn', () => {
+    expect(errCwdNotADirectory().verb).toBe('spawn')
+  })
+
+  test('accepts a custom description', () => {
+    expect(errCwdNotADirectory('spawn', '/foo is not a directory').errDescription).toBe('/foo is not a directory')
   })
 })

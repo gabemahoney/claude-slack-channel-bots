@@ -31,6 +31,8 @@ import {
   ErrAlreadyDecided,
   ErrBunVersionTooOld,
   ErrCallTimeout,
+  ErrCwdNotADirectory,
+  ErrCwdNotFound,
   ErrInstanceIdCollision,
   ErrJsonlMissing,
   ErrNoOpenPermissionRequest,
@@ -40,9 +42,11 @@ import {
   ErrSpawnNotFound,
   ErrSpawnNotInteractive,
   ErrSpawnNotResumable,
+  ErrSystemInstallDisappeared,
   ErrSystemInstallNotFound,
   ErrSystemInstallTooOld,
   ErrSystemInstallUnreachable,
+  ErrTmuxNotAvailable,
   ErrTmuxSendKeys,
   ErrTmuxSessionCreate,
   ErrTemplateExists,
@@ -235,6 +239,51 @@ export function errRelayModeOff(): ErrRelayModeOff {
 /** Build an ErrPauseTimeout (pause budget exceeded). */
 export function errPauseTimeout(): ErrPauseTimeout {
   return new ErrPauseTimeout('pause', 'ErrPauseTimeout', 'pause timed out')
+}
+
+/**
+ * Build an ErrSystemInstallDisappeared (mid-life binary-vanished failure mode).
+ * Constructor: (verb: string, binaryPath: string, cause?: unknown)
+ */
+export function errSystemInstallDisappeared(
+  verb: string = 'spawn',
+  binaryPath: string = '/usr/local/bin/agent-director',
+  cause?: unknown,
+): ErrSystemInstallDisappeared {
+  return new ErrSystemInstallDisappeared(verb, binaryPath, cause)
+}
+
+/**
+ * Build an ErrTmuxNotAvailable (tmux binary absent / not installed).
+ * Constructor: (verb: string, errName: string, errDescription: string)
+ */
+export function errTmuxNotAvailable(
+  verb: string = 'spawn',
+  description: string = 'tmux not available',
+): ErrTmuxNotAvailable {
+  return new ErrTmuxNotAvailable(verb, 'ErrTmuxNotAvailable', description)
+}
+
+/**
+ * Build an ErrCwdNotFound (spawn / cwd path does not exist on disk).
+ * Constructor: (verb: string, errName: string, errDescription: string)
+ */
+export function errCwdNotFound(
+  verb: string = 'spawn',
+  description: string = 'cwd not found',
+): ErrCwdNotFound {
+  return new ErrCwdNotFound(verb, 'ErrCwdNotFound', description)
+}
+
+/**
+ * Build an ErrCwdNotADirectory (spawn / cwd path exists but is not a directory).
+ * Constructor: (verb: string, errName: string, errDescription: string)
+ */
+export function errCwdNotADirectory(
+  verb: string = 'spawn',
+  description: string = 'path is not a directory',
+): ErrCwdNotADirectory {
+  return new ErrCwdNotADirectory(verb, 'ErrCwdNotADirectory', description)
 }
 
 /**
