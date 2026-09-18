@@ -52,7 +52,7 @@ Claude Code stores conversation history as JSONL files under each route's effect
 findmnt --target ~/.claude
 ```
 
-**Runtime safeguard (backstop only).** On startup, CSCB reads `/proc/self/mountinfo` and logs a startup error (`jsonl-non-persistent`) and posts a Slack warning if it detects that the JSONL root is on `tmpfs` or `ramfs`. This detection is best-effort — it does not cover all non-persistent configurations (e.g. network-mounted ephemeral storage, overlayfs). The runtime check is a backstop, not a substitute for confirming persistence on each host before deployment.
+**Runtime safeguard (backstop only).** On startup, CSCB posts a loud Slack warning to each configured channel if it detects that the JSONL storage root is non-persistent. This check is best-effort and does not cover every non-persistent configuration. It is a backstop — not a substitute for verifying persistence with `findmnt` on each host before deployment.
 
 ### Supported platforms (inherited from agent-director)
 
