@@ -31,6 +31,7 @@ import {
   ErrNoSessionId,
   ErrSpawnNotFound,
   ErrSpawnNotResumable,
+  ErrTmuxSendKeys,
   ErrTmuxSessionCreate,
 } from 'agent-director'
 import type { ListRow, SpawnParams } from 'agent-director'
@@ -181,8 +182,49 @@ export function flushSpawnFailureQueue(web: WebClient): void {
 // ---------------------------------------------------------------------------
 
 /**
+ * Ensure a tmux server exists on the default socket. Injectable seam so unit
+ * tests can assert the b.rmy self-heal path without spawning real processes.
+ * Default impl runs `tmux start-server` best-effort — never throws.
+ *
+ * b.rmy: after a container restart, /tmp (and thus the tmux socket) is wiped
+ * and nothing auto-starts tmux at boot, so every startup reconnect fails with
+ * `ErrTmuxSendKeys` ("no server running"). Starting the server before a retry
+ * gives the reconnect a chance to succeed instead of failing terminally.
+ */
+export type TmuxServerEnsurer = () => Promise<void>
+
+const defaultEnsureTmuxServer: TmuxServerEnsurer = async (): Promise<void> => {
+  const { spawn } = await import('child_process')
+  await new Promise<void>((resolve) => {
+    try {
+      const child = spawn('tmux', ['start-server'], { stdio: 'ignore' })
+      child.on('error', () => resolve()) // tmux missing — best-effort
+      child.on('close', () => resolve())
+    } catch {
+      resolve()
+    }
+  })
+}
+
+let _ensureTmuxServer: TmuxServerEnsurer = defaultEnsureTmuxServer
+
+/** Test-only seam: override the tmux-server ensurer. */
+export function _setTmuxServerEnsurer(fn: TmuxServerEnsurer): void {
+  _ensureTmuxServer = fn
+}
+
+/** Test-only seam: restore the default tmux-server ensurer. */
+export function _resetTmuxServerEnsurer(): void {
+  _ensureTmuxServer = defaultEnsureTmuxServer
+}
+
+/**
  * Send `/mcp reconnect <MCP_SERVER_NAME>` to the spawn's pane. Library's
  * sendKeys appends Enter automatically per its contract.
+ *
+ * b.rmy self-heal: on `ErrTmuxSendKeys` (no tmux server / session — the
+ * post-reboot field failure), ensure a tmux server exists and retry the
+ * send-keys ONCE. The retry's outcome is the returned outcome.
  */
 export async function reconnectMcp(
   channelId: string,
@@ -191,14 +233,33 @@ export async function reconnectMcp(
 ): Promise<boolean> {
   const claude_instance_id = instanceIdFor(channelId, routingConfig?.routes[channelId]?.normalizedName)
   console.error(`[slack] reconnecting MCP server "${MCP_SERVER_NAME}": channel=${channelId}`)
-  try {
-    await withOutageDetection(channelId, undefined, (client) => client.sendKeys({
+  const sendReconnect = (): Promise<unknown> =>
+    withOutageDetection(channelId, undefined, (client) => client.sendKeys({
       claude_instance_id,
       text: `/mcp reconnect ${MCP_SERVER_NAME}`,
     }))
+  try {
+    await sendReconnect()
     return true
   } catch (err) {
     if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) return false
+    if (err instanceof ErrTmuxSendKeys) {
+      console.error(
+        `[slack] reconnectMcp: ErrTmuxSendKeys for channel=${channelId} — ensuring tmux server exists and retrying send-keys once`,
+      )
+      await _ensureTmuxServer()
+      try {
+        await sendReconnect()
+        console.error(`[slack] reconnectMcp: retry succeeded after ErrTmuxSendKeys for channel=${channelId}`)
+        return true
+      } catch (err2) {
+        if (err2 instanceof ErrSystemInstallDisappeared || err2 instanceof ErrTmuxNotAvailable) return false
+        const e2 = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('send-keys', 'UnknownError', String(err2))
+        console.error(`[slack] reconnectMcp: retry after ErrTmuxSendKeys failed for channel=${channelId}: ${e2.errName}`)
+        postSpawnFailureToChannel(channelId, e2, web)
+        return false
+      }
+    }
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('send-keys', 'UnknownError', String(err))
     console.error(`[slack] reconnectMcp: send-keys failed for channel=${channelId}: ${e.errName}`)
     postSpawnFailureToChannel(channelId, e, web)
@@ -947,12 +1008,27 @@ export async function spawnForRoute(
   }
 
   if (state === 'waiting') {
-    await reconnectMcp(channelId, web, routingConfig)
+    // b.rmy: propagate the reconnect outcome — a failed reconnect must count
+    // as `failed` so startupSessionManager's ok/failed totals reflect reality
+    // (previously this reported 'reconnected' unconditionally, masking a
+    // total post-reboot outage as "0 failed").
+    if (!(await reconnectMcp(channelId, web, routingConfig))) {
+      console.error(`[slack] spawnForRoute: reconnect failed for channel=${channelId}`)
+      if (isStartup) recordStartupError('spawn-failed', `reconnect failed for channel=${channelId} (state=waiting)`)
+      return { channelId, action: 'failed' }
+    }
     return { channelId, action: 'reconnected' }
   }
 
   if (state === 'working') {
-    await waitForWaitingAndReconnect(channelId, routingConfig, web)
+    // b.rmy: same outcome propagation as the `waiting` branch. Note
+    // waitForWaitingAndReconnect returns true on timeout/terminal transitions
+    // by design (long turns aren't errors) — only real failures reach here.
+    if (!(await waitForWaitingAndReconnect(channelId, routingConfig, web))) {
+      console.error(`[slack] spawnForRoute: reconnect failed for channel=${channelId}`)
+      if (isStartup) recordStartupError('spawn-failed', `reconnect failed for channel=${channelId} (state=working)`)
+      return { channelId, action: 'failed' }
+    }
     return { channelId, action: 'reconnected' }
   }
 
