@@ -13,6 +13,8 @@
  *   - ErrSystemInstallUnreachable (Client.create / resolveSystemBinary — system binary present but not executable or fails --version)
  *   - ErrSystemInstallDisappeared (any verb / binary gone after valid construction — b.xht)
  *   - ErrTmuxNotAvailable       (spawn / tmux binary not found or not executable)
+ *   - ErrTmuxSendKeys           (spawn / tmux send-keys failure — SR-22.2 discriminator)
+ *   - ErrTmuxSessionCreate      (spawn / tmux session creation failure)
  *   - ErrCwdNotFound            (spawn / route cwd does not exist on disk)
  *   - ErrCwdNotADirectory       (spawn / route cwd path exists but is not a directory)
  *   - ErrInstanceIdCollision    (spawn / SR-1.4 idempotency)
@@ -57,6 +59,8 @@ export {
   ErrSpawnNotResumable,
   ErrAlreadyDecided,
   ErrNoOpenPermissionRequest,
+  ErrTmuxSendKeys,
+  ErrTmuxSessionCreate,
   ErrRelayModeOff,
   ErrRelayModeInvalid,
   ErrTemplateMalformed,

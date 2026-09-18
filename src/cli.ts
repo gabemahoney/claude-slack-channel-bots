@@ -48,6 +48,8 @@ export interface CliDeps {
   exit: (code: number) => never
   /** Load the routing configuration. */
   loadConfig: () => RoutingConfig
+  /** Return the agent-director Client singleton. */
+  getClient: () => import('agent-director').Client
   /** Query the agent-director state for a channel. Returns null when the row is absent. */
   directorStatus: (channelId: string) => Promise<{ state: string } | null>
   /** Politely shut down the spawn for a channel via client.pause. */
@@ -317,7 +319,7 @@ if (import.meta.main) {
   // error so legacy behavior is preserved.
   async function resolveCscbInstanceId(channelId: string): Promise<string | null> {
     try {
-      const r = await getClient().list({ label: ['service=cscb', `channel=${channelId}`] })
+      const r = await realDeps.getClient().list({ label: ['service=cscb', `channel=${channelId}`] })
       if (r.spawns.length === 0) return null
       // Prefer the new-naming row if both old and new exist mid-migration.
       const newStyle = r.spawns.find((s) => s.claude_instance_id !== `cscb_${channelId}`)
@@ -339,6 +341,7 @@ if (import.meta.main) {
     startServer: async () => { const { main } = await import('./server.ts'); return main() },
     exit: (code) => process.exit(code),
     loadConfig: () => configLoadConfig(),
+    getClient: () => getClient(),
     directorStatus: async (channelId) => {
       // Resolve the actual claude_instance_id by label (cscb_<name>_<id> after b.1m9,
       // or cscb_<id> on pre-rename installs). Falls back to bare-ID lookup if
@@ -346,7 +349,7 @@ if (import.meta.main) {
       const id = await resolveCscbInstanceId(channelId)
       if (id === null) return null
       try {
-        const r = await getClient().status({ claude_instance_id: id })
+        const r = await realDeps.getClient().status({ claude_instance_id: id })
         return { state: r.state }
       } catch (err) {
         if (err instanceof ErrSpawnNotFound) return null
@@ -355,12 +358,12 @@ if (import.meta.main) {
     },
     directorPause: async (channelId) => {
       const id = (await resolveCscbInstanceId(channelId)) ?? instanceIdFor(channelId)
-      await getClient().pause({ claude_instance_id: id })
+      await realDeps.getClient().pause({ claude_instance_id: id })
     },
     directorKill: async (channelId) => {
       try {
         const id = (await resolveCscbInstanceId(channelId)) ?? instanceIdFor(channelId)
-        await getClient().kill({ claude_instance_id: id })
+        await realDeps.getClient().kill({ claude_instance_id: id })
       } catch (err) {
         if (err instanceof ErrSpawnNotFound) return
         throw err
