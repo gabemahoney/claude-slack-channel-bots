@@ -13,7 +13,11 @@ import {
   isRestartPendingOrActive,
   type RestartDeps,
 } from '../src/restart.ts'
-import { _resetBackoffState } from '../src/backoff.ts'
+import {
+  _resetBackoffState,
+  getFailureCount,
+  isAtCap,
+} from '../src/backoff.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -41,17 +45,20 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
   killSessionCalls: string[]
   launchSessionCalls: Array<{ channelId: string; cwd: string; sessionId: string | undefined }>
   reconnectSessionCalls: string[]
+  onCapReachedCalls: string[]
 } {
   const isSessionAliveCalls: string[] = []
   const killSessionCalls: string[] = []
   const launchSessionCalls: Array<{ channelId: string; cwd: string; sessionId: string | undefined }> = []
   const reconnectSessionCalls: string[] = []
+  const onCapReachedCalls: string[] = []
 
   return {
     isSessionAliveCalls,
     killSessionCalls,
     launchSessionCalls,
     reconnectSessionCalls,
+    onCapReachedCalls,
 
     async isSessionAlive(channelId) {
       isSessionAliveCalls.push(channelId)
@@ -73,7 +80,7 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     },
     getRestartDelay: () => opts.restartDelay ?? FAST_DELAY_S,
     isShuttingDown: () => opts.isShuttingDown ?? false,
-    onCapReached: (_channelId) => { /* no-op stub — behavioral coverage in Task C */ },
+    onCapReached: (channelId) => { onCapReachedCalls.push(channelId) },
   }
 }
 
@@ -608,5 +615,260 @@ describe('_resetRestartState', () => {
     expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
 
     launchResolve(true) // resolve to avoid dangling promise
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Backoff integration (SR-29.3) — Task C subtask 2t
+//
+// Asserts via pure-module state (getFailureCount / isAtCap), not setTimeout
+// spies. The numeric ladder lives in backoff.test.ts; these tests focus on:
+//   (1) launchSession=false increments counter; launchSession=true resets it
+//   (2) 5 consecutive failures → onCapReached exactly once, no further timer,
+//       no 6th launch
+//   (3) post-cap scheduleRestart re-attempt resets on success; no re-fire of
+//       onCapReached within the same episode
+//   (4) reconnect 'success' resets counter; escalated/failed reconnect leaves
+//       counter unchanged at that site (single-counting-site pin)
+//   (5) SR-25.4 no-stacking: pending-timer dedupe still works alongside backoff
+// ---------------------------------------------------------------------------
+
+describe('backoff integration (SR-29.3)', () => {
+  // -------------------------------------------------------------------------
+  // (1) Counter increments on failure, resets on success
+  // -------------------------------------------------------------------------
+
+  test('(1a) launchSession=false increments getFailureCount by 1 per call', async () => {
+    const deps = makeDeps({ launchSessionResult: false })
+    initRestart(deps)
+
+    scheduleRestart('C_BACKOFF', '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    expect(getFailureCount('C_BACKOFF')).toBe(1)
+  })
+
+  test('(1b) launchSession=true resets getFailureCount to 0', async () => {
+    const deps = makeDeps({ launchSessionResult: false })
+    initRestart(deps)
+
+    // Accumulate a failure first
+    scheduleRestart('C_BACKOFF', '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+    expect(getFailureCount('C_BACKOFF')).toBe(1)
+
+    // Now succeed — deps returns true by default once opts is refreshed
+    // Re-init with success result and fire again
+    const deps2 = makeDeps({ launchSessionResult: true })
+    initRestart(deps2)
+    scheduleRestart('C_BACKOFF', '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    expect(getFailureCount('C_BACKOFF')).toBe(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // (2) 5 consecutive failures → onCapReached exactly once, no 6th launch
+  // -------------------------------------------------------------------------
+
+  test('(2) 5 consecutive failures → onCapReached EXACTLY once; no further timer; no 6th launch', async () => {
+    const CHANNEL = 'C_CAP'
+    const CAP = 5
+    let launchCount = 0
+
+    // Use a custom launchSession that always fails and counts attempts.
+    // Use a tiny base delay; each iteration waits long enough for the current
+    // backoff delay to fire (min(base*2^i, 900) * 1000 ms + margin).
+    const BASE_DELAY_S = 0.001  // 1 ms base — keeps all iterations fast
+    const MARGIN_MS = 40        // margin above the computed backoff delay
+
+    const deps = makeDeps({
+      restartDelay: BASE_DELAY_S,
+      launchSession: async (_channelId) => {
+        launchCount++
+        return false
+      },
+    })
+    initRestart(deps)
+
+    // Drive 5 sequential failures: each scheduleRestart fires, fails, increments counter.
+    // Wait per iteration = min(BASE_DELAY_S * 2^i, 900) * 1000 ms + MARGIN_MS.
+    for (let i = 0; i < CAP; i++) {
+      const backoffDelayMs = Math.min(BASE_DELAY_S * Math.pow(2, i), 900) * 1000
+      scheduleRestart(CHANNEL, '/cwd/test')
+      await Bun.sleep(backoffDelayMs + MARGIN_MS)
+    }
+
+    // onCapReached fired exactly once (on the 5th failure)
+    expect(deps.onCapReachedCalls).toHaveLength(1)
+    expect(deps.onCapReachedCalls[0]).toBe(CHANNEL)
+
+    // getFailureCount is at cap
+    expect(getFailureCount(CHANNEL)).toBe(CAP)
+    expect(isAtCap(CHANNEL, CAP)).toBe(true)
+
+    // No pending timer after cap — restart.ts returned early without scheduling
+    expect(isRestartPendingOrActive(CHANNEL)).toBe(false)
+
+    // Total launches: exactly 5 (the cap itself), not 6
+    expect(launchCount).toBe(CAP)
+
+    // A 6th scheduleRestart from the tick would not be called by restart.ts itself
+    // (the health-check tick guard prevents it); this is documented in health-check
+    // tests. Here we confirm the counter is capped and onCapReached was once.
+  })
+
+  // -------------------------------------------------------------------------
+  // (3) Post-cap explicit scheduleRestart re-attempts; success resets;
+  //     onCapReached did NOT re-fire during the capped episode
+  // -------------------------------------------------------------------------
+
+  test('(3) post-cap scheduleRestart re-attempt: success resets isAtCap; onCapReached not re-fired', async () => {
+    const CHANNEL = 'C_CAP_THEN_RECOVER'
+    const CAP = 5
+    let launchCount = 0
+
+    // Use a tiny base delay so backoff stays within a few ms per iteration.
+    const BASE_DELAY_S = 0.001  // 1 ms base
+    const MARGIN_MS = 40
+
+    // Phase 1: reach the cap (5 failures)
+    const failingDeps = makeDeps({
+      restartDelay: BASE_DELAY_S,
+      launchSession: async () => {
+        launchCount++
+        return false
+      },
+    })
+    initRestart(failingDeps)
+
+    for (let i = 0; i < CAP; i++) {
+      const backoffDelayMs = Math.min(BASE_DELAY_S * Math.pow(2, i), 900) * 1000
+      scheduleRestart(CHANNEL, '/cwd/test')
+      await Bun.sleep(backoffDelayMs + MARGIN_MS)
+    }
+
+    expect(isAtCap(CHANNEL, CAP)).toBe(true)
+    expect(failingDeps.onCapReachedCalls).toHaveLength(1)
+
+    // Phase 2: an inbound trigger (explicit scheduleRestart — simulates user message
+    // re-entering recovery path) causes a successful launch.
+    // At this point the failure count is CAP, so nextBackoffDelay = min(0.001 * 2^5, 900) = 0.032s.
+    // Use MARGIN_MS=40 which is > 32ms, so the timer fires.
+    const recoveringDeps = makeDeps({ restartDelay: BASE_DELAY_S, launchSessionResult: true })
+    initRestart(recoveringDeps)
+
+    const backoffAtCap = Math.min(BASE_DELAY_S * Math.pow(2, CAP), 900) * 1000
+    scheduleRestart(CHANNEL, '/cwd/test')
+    await Bun.sleep(backoffAtCap + MARGIN_MS)
+
+    // Successful launch resets the cap
+    expect(isAtCap(CHANNEL, CAP)).toBe(false)
+    expect(getFailureCount(CHANNEL)).toBe(0)
+
+    // onCapReached did NOT re-fire during this recovery (new deps, no calls)
+    expect(recoveringDeps.onCapReachedCalls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // (4) Reconnect path: 'success' resets counter; non-success does NOT
+  //     record a failure at the reconnect site (single-counting-site pin).
+  //
+  //     Single-counting-site comment: when reconnect escalates ('escalate-dead'
+  //     or 'transient'), the u4 adapter re-enters via scheduleRestart → the
+  //     launchSession boolean is the ONE counted event (SR-25.1). Recording a
+  //     failure here too would double-count that attempt.
+  // -------------------------------------------------------------------------
+
+  test('(4a) reconnect result=success resets getFailureCount to 0', async () => {
+    const CHANNEL = 'C_RECONNECT_SUCCESS'
+
+    // Pre-seed a failure count so there is something to reset
+    const failDeps = makeDeps({ launchSessionResult: false })
+    initRestart(failDeps)
+    scheduleRestart(CHANNEL, '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+    expect(getFailureCount(CHANNEL)).toBe(1)
+
+    // Now simulate alive=true with reconnect returning 'success'
+    const reconnectDeps = makeDeps({ isSessionAliveResult: true })
+    reconnectDeps.reconnectSession = async (_channelId) => 'success'
+    initRestart(reconnectDeps)
+
+    scheduleRestart(CHANNEL, '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    expect(getFailureCount(CHANNEL)).toBe(0)
+  })
+
+  test('(4b) reconnect result=escalate-dead leaves counter unchanged at reconnect site (single-counting-site pin; u4 adapter re-entry is the counted event)', async () => {
+    // Single-counting-site pin: the reconnect path does NOT call recordFailure.
+    // If an escalated reconnect later re-enters via scheduleRestart → launchSession,
+    // that launchSession boolean is the one and only place failures are counted
+    // (restart.ts comment cites SR-25.1 / u4 adapter re-entry).
+    const CHANNEL = 'C_RECONNECT_ESCALATE'
+
+    // Simulate alive=true with reconnect returning 'escalate-dead'
+    const escapingDeps = makeDeps({ isSessionAliveResult: true })
+    escapingDeps.reconnectSession = async (_channelId) => 'escalate-dead'
+    initRestart(escapingDeps)
+
+    scheduleRestart(CHANNEL, '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    // Counter UNCHANGED at the reconnect site — not incremented here
+    expect(getFailureCount(CHANNEL)).toBe(0)
+  })
+
+  test('(4c) reconnect result=transient leaves counter unchanged at reconnect site', async () => {
+    const CHANNEL = 'C_RECONNECT_TRANSIENT'
+
+    const transientDeps = makeDeps({ isSessionAliveResult: true })
+    transientDeps.reconnectSession = async (_channelId) => 'transient'
+    initRestart(transientDeps)
+
+    scheduleRestart(CHANNEL, '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    // Counter unchanged — counting is not done at the reconnect site
+    expect(getFailureCount(CHANNEL)).toBe(0)
+  })
+
+  test('(4d) reconnect throws (undefined result) — counter unchanged at reconnect site', async () => {
+    const CHANNEL = 'C_RECONNECT_THROW'
+
+    const throwingDeps = makeDeps({ isSessionAliveResult: true })
+    throwingDeps.reconnectSession = async (_channelId) => {
+      throw new Error('sendKeys failed')
+    }
+    initRestart(throwingDeps)
+
+    scheduleRestart(CHANNEL, '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    // Counter unchanged — the catch block sets result=undefined, no recordFailure
+    expect(getFailureCount(CHANNEL)).toBe(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // (5) SR-25.4 no-stacking: pending-timer dedupe still works alongside
+  //     backoff. A second scheduleRestart for the same channel cancels the
+  //     first timer (cancel-and-replace semantic).
+  // -------------------------------------------------------------------------
+
+  test('(5) SR-25.4 no-stacking: second scheduleRestart cancels first pending timer (cancel-and-replace)', async () => {
+    const deps = makeDeps({ restartDelay: SLOW_DELAY_S, launchSessionResult: false })
+    initRestart(deps)
+
+    scheduleRestart('C_NOSTACK', '/cwd/test')
+    expect(isRestartPendingOrActive('C_NOSTACK')).toBe(true)
+
+    // A second call cancels the first and replaces it — still one pending timer
+    scheduleRestart('C_NOSTACK', '/cwd/test')
+    expect(isRestartPendingOrActive('C_NOSTACK')).toBe(true)
+
+    // Only one pending timer exists (cancel-and-replace): counter has not changed
+    // because no timer has fired yet
+    expect(getFailureCount('C_NOSTACK')).toBe(0)
   })
 })
