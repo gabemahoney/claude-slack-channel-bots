@@ -930,6 +930,34 @@ export async function spawnForRoute(
     }
 
     // resume_enabled: attempt resume
+    //
+    // SR-24.2 research (t3.a3g.mb.yy.bz) — corrupt-JSONL identity confirmed on-host.
+    //
+    // Experiment: AD binary v0.7.8 (commit 2896dcfd7b94356fa71c5d3dc39856fa67fb6023).
+    // Method: spawned a throwaway row (cscb-independent, cwd=/tmp), killed it, ran
+    // find-missing to transition it to `missing`, created a corrupt JSONL (content:
+    // "not valid json {{{{") at the expected path (~/.claude/projects/-tmp/<session_id>.jsonl),
+    // then called `agent-director resume --claude-instance-id <id>`. Result: exit 0,
+    // {"claude_instance_id":"..."} — resume SUCCEEDS with no error thrown.
+    //
+    // Root cause (source-verified, pkg/api/resume.go): the JSONL guard at step 4 of
+    // resumeImpl is a pure os.Stat existence check — no content read, no parse. A
+    // corrupt-but-present JSONL passes the check. AD then fire-and-forgets
+    // `claude --resume <session_id>` in tmux; the actual JSONL corruption is only
+    // encountered by Claude Code itself when it tries to load the file. Claude Code
+    // exits, SessionStart never re-fires, and the row stays `missing`/`ended`
+    // indefinitely.
+    //
+    // Conclusion: the corrupt-JSONL case does NOT throw from client.resume() — it does
+    // not land in ANY error arm of this ladder (not ErrNoSessionId, not ErrJsonlMissing,
+    // not ErrSpawnNotResumable, not UnknownError). client.resume() returns successfully,
+    // and the action becomes 'resumed'. The failure manifests later as a stuck missing
+    // row; approvePreSessionDialogs hits the 5-minute hard cap and logs loudly.
+    //
+    // Per PM ruling (t2.a3g.mb.yy): corrupt-JSONL only gets a new arm if it lands in
+    // UnknownError. Since it does not throw at all, NO new catch arm is warranted.
+    // The existing loud timeout in approvePreSessionDialogs is the correct terminal
+    // signal. Arbitrary-unknown resume errors continue to hit the 'failed' arm as-is.
     console.error(`[slack] spawnForRoute: attempting resume for channel=${channelId}`)
     try {
       await withSpawnDetection(channelId, route.cwd, (client) => client.resume({ claude_instance_id: instanceIdFor(channelId, normalizedName) }))
