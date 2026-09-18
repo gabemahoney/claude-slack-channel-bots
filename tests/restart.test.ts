@@ -13,6 +13,7 @@ import {
   isRestartPendingOrActive,
   type RestartDeps,
 } from '../src/restart.ts'
+import { _resetBackoffState } from '../src/backoff.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -72,6 +73,7 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     },
     getRestartDelay: () => opts.restartDelay ?? FAST_DELAY_S,
     isShuttingDown: () => opts.isShuttingDown ?? false,
+    onCapReached: (_channelId) => { /* no-op stub — behavioral coverage in Task C */ },
   }
 }
 
@@ -81,6 +83,7 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
 
 beforeEach(() => {
   _resetRestartState()
+  _resetBackoffState()
 })
 
 // ---------------------------------------------------------------------------
@@ -385,6 +388,7 @@ describe('scheduleRestart', () => {
       },
       getRestartDelay: () => FAST_DELAY_S,
       isShuttingDown: () => false,
+      onCapReached: (_channelId) => { /* no-op stub */ },
     }
     initRestart(deps)
 
@@ -565,6 +569,7 @@ describe('isRestartPendingOrActive', () => {
       launchSession: async () => true,
       getRestartDelay: () => FAST_DELAY_S,
       isShuttingDown: () => false,
+      onCapReached: (_channelId) => { /* no-op stub */ },
     }
     initRestart(deps)
 

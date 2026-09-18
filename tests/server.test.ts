@@ -1143,6 +1143,7 @@ function makeRestartDeps(opts: {
     },
     getRestartDelay: () => opts.restartDelay ?? FAST_DELAY_S,
     isShuttingDown: () => false,
+    onCapReached: (_channelId) => { /* no-op stub */ },
   }
 }
 

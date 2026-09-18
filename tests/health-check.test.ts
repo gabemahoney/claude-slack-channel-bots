@@ -19,6 +19,7 @@ import {
 } from '../src/outage-state.ts'
 import { _buildStatRouteImpl } from '../src/server.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
+import { _resetBackoffState } from '../src/backoff.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -63,6 +64,10 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
     isRestartPendingOrActive(_channelId) {
       return (opts.isRestartPendingResult ?? false) || (opts.isActiveLaunchingResult ?? false)
     },
+    isAtCap(_channelId) {
+      // Stub: always returns false — behavioral coverage for isAtCap tick guard in Task C
+      return false
+    },
     statRoute(_cwd) {
       if (opts.statRouteHangs) return new Promise<boolean>(() => {})
       return Promise.resolve(opts.statRouteResult ?? true)
@@ -86,6 +91,7 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
 beforeEach(() => {
   _resetHealthCheckState()
   _resetOutageState()
+  _resetBackoffState()
   // Wire outage-state with no-op Slack emit so setOutageFlag / clearOutageFlag
   // can mutate flags without side effects in tests that don't care about Slack.
   initOutageState({
@@ -329,6 +335,10 @@ describe('cwd-unreachable flag management + tick-in-flight guard', () => {
       isRestartPendingOrActive(_channelId) {
         // Returns true after the first scheduleRestart — models the real guard
         return restartScheduledCount > 0
+      },
+      isAtCap(_channelId) {
+        // Stub: always false — behavioral coverage in Task C
+        return false
       },
       statRoute(_cwd) {
         return Promise.resolve(true)

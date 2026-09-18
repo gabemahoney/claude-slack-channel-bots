@@ -46,6 +46,7 @@ import {
   flushSpawnFailureQueue,
   instanceIdFor,
   launchSession,
+  postSpawnFailureToChannel,
   reconcileInstanceIds,
   reconcileOrphans,
   reconnectMcp,
@@ -56,7 +57,7 @@ import {
 } from './session-manager.ts'
 import { defaultTmuxProbe, classifyAdError, type TmuxProbeFn } from './tmux-probe.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
-import { ErrSpawnNotFound } from 'agent-director'
+import { AgentDirectorError, ErrSpawnNotFound } from 'agent-director'
 import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from './agent-director-errors.ts'
 import { getClient, closeClient } from './agent-director-client.ts'
 import {
@@ -72,6 +73,7 @@ import {
   isRestartPendingOrActive,
 } from './restart.ts'
 import { initHealthCheck, startHealthCheck, stopHealthCheck } from './health-check.ts'
+import { isAtCap as backoffIsAtCap } from './backoff.ts'
 import { loadTokens, isDryRun } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
 import { trackAck, consumeAck } from './ack-tracker.ts'
@@ -1335,6 +1337,9 @@ export async function main(): Promise<void> {
           console.error(`[slack] reconnectSession: escalate-dead for channel=${channelId} but restart already pending/active — skipping`)
         }
       }
+      // Return the union result so restart.ts can call recordSuccess on the
+      // 'success' path (SR-25.1 single counting site — widened return type).
+      return result
     },
     killSession: async (channelId) => {
       try {
@@ -1357,6 +1362,17 @@ export async function main(): Promise<void> {
     },
     getRestartDelay: () => routingConfig?.session_restart_delay ?? 60,
     isShuttingDown: () => shuttingDown,
+    onCapReached: (channelId) => {
+      // Post a synthetic spawn-failure message to the channel indicating the
+      // consecutive-failure cap has been reached (SR-25.3). Uses the distinct
+      // errName 'SpawnCapReached' so remediationHint can surface a specific hint.
+      const err = new AgentDirectorError(
+        'spawn',
+        'SpawnCapReached',
+        '5 consecutive session-launch failures — automatic restarts suspended',
+      )
+      postSpawnFailureToChannel(channelId, err, isDryRun() ? undefined : web, false)
+    },
   })
 
   // SR-1.6: orphan reconciliation BEFORE per-route reconcile. Spawns whose
@@ -1423,6 +1439,7 @@ export async function main(): Promise<void> {
   initHealthCheck({
     isSessionAlive: isSessionAliveAdapter,
     isRestartPendingOrActive,
+    isAtCap: (channelId) => backoffIsAtCap(channelId, 5),
     statRoute: _buildStatRouteImpl(),
     scheduleRestart,
     isShuttingDown: () => shuttingDown,

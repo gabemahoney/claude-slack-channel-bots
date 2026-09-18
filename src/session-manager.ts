@@ -167,6 +167,7 @@ export function postSpawnFailureToChannel(
 function remediationHint(error: AgentDirectorError): string {
   if (error instanceof ErrInstanceIdCollision) return 'spawn dispatcher bug — please report'
   if (error instanceof ErrSpawnNotFound) return 'transient — restarting the server should resolve'
+  if (error.errName === 'SpawnCapReached') return 'send a message in this channel or restart the server to retry'
   return 'Check server.log for details.'
 }
 
