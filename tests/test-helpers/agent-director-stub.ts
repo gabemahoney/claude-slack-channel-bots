@@ -43,6 +43,7 @@ import {
   ErrSystemInstallNotFound,
   ErrSystemInstallTooOld,
   ErrSystemInstallUnreachable,
+  ErrTmuxSendKeys,
   ErrTmuxSessionCreate,
   ErrTemplateExists,
   ErrTemplateMalformed,
@@ -234,6 +235,24 @@ export function errRelayModeOff(): ErrRelayModeOff {
 /** Build an ErrPauseTimeout (pause budget exceeded). */
 export function errPauseTimeout(): ErrPauseTimeout {
   return new ErrPauseTimeout('pause', 'ErrPauseTimeout', 'pause timed out')
+}
+
+/**
+ * Build an ErrTmuxSendKeys with the canonical "session not found" description
+ * (the SR-22.2 discriminator used to branch on tmux-session-missing vs other
+ * send-keys failures).
+ */
+export function errTmuxSendKeysNotFound(): ErrTmuxSendKeys {
+  return new ErrTmuxSendKeys('send-keys', 'ErrTmuxSendKeys', 'session not found')
+}
+
+/**
+ * Build an ErrTmuxSendKeys with a generic description that does NOT match the
+ * SR-22.2 "session not found" discriminator — represents any other send-keys
+ * failure (e.g. tmux exited unexpectedly).
+ */
+export function errTmuxSendKeysGeneric(description: string = 'tmux exited unexpectedly'): ErrTmuxSendKeys {
+  return new ErrTmuxSendKeys('send-keys', 'ErrTmuxSendKeys', description)
 }
 
 // ---------------------------------------------------------------------------
