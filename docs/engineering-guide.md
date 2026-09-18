@@ -63,7 +63,43 @@ When a managed session's MCP connection closes, `onsessionclosed` calls `schedul
 
 ### Failure Limiting
 
-The restart module tracks consecutive relaunch failures per channel. After 3 consecutive failures (`MAX_CONSECUTIVE_FAILURES`), the module stops retrying for that channel. The counter resets to 0 when the session successfully reconnects and registers. Restarting the server process also resets all counters — the state is module-scoped and not persisted.
+Consecutive relaunch failures are tracked per channel by `src/backoff.ts` — a pure, import-free module with no timers or I/O (see SR-25). The module exposes a simple counter API consumed one-way by restart/health-check/server wiring.
+
+#### Exponential backoff
+
+Each successive failure doubles the restart delay, starting from `session_restart_delay` (default 60 s), capped at 900 s (15 minutes):
+
+| Pre-failure count | Delay (base = 60 s) |
+|---|---|
+| 0 | 60 s |
+| 1 | 120 s |
+| 2 | 240 s |
+| 3 | 480 s |
+| 4 | 900 s |
+| 5+ | 900 s |
+
+Formula: `min(base * 2^preFailureCount, 900)`. `nextBackoffDelay(channelId, baseDelaySeconds)` returns this value using the count recorded before the current failure attempt.
+
+#### Cap at 5 consecutive failures
+
+After 5 consecutive failures, `isAtCap(channelId, 5)` returns `true`. Capped channels are skipped by the health-check tick — the poller calls `isAtCap` before `scheduleRestart` and skips the channel when it is true.
+
+Capped channels are **not permanently dead**. They remain retry-eligible via:
+
+- The next inbound Slack message for the channel (the reactive `onsessionclosed`/message path bypasses the cap guard and attempts a restart).
+- A server restart — the in-process counter is lost on restart by design. On restart, startup reconcile re-runs for all configured routes, giving each channel a fresh attempt.
+
+#### SpawnCapReached notification (once per episode)
+
+On the transition to 5 consecutive failures, a distinct `SpawnCapReached` message is posted to the channel's Slack thread exactly once per episode. Subsequent failures in the same capped episode are silent. `shouldNotifyCap(channelId, cap)` implements this latch: it returns `true` on the first call when `isAtCap` would also return `true`, then latches to `false` until the counter is reset.
+
+#### Counter reset semantics
+
+`recordSuccess(channelId)` resets the consecutive-failure count and clears the cap-notified latch. It is called on any successful spawn, resume, launch, or successful send-keys reconnect. Both state values reset together — a fresh episode starts from 0 failures with the cap-notification latch cleared.
+
+#### State lifetime
+
+The backoff state is in-process only — no persistence. A server restart resets all counters. This is intentional: the server re-runs startup reconcile on start, so each channel gets a clean shot at reconnection after a process restart.
 
 ### Log Messages
 
@@ -73,10 +109,9 @@ All restart activity is logged to stderr with the `[slack]` prefix:
 |---|---|
 | `[slack] Scheduling restart for channel=<id> in <N>s` | Restart timer queued |
 | `[slack] Auto-restart disabled (delay=0) — skipping restart for channel=<id>` | Restart skipped; feature disabled |
-| `[slack] Max consecutive failures (3) reached — giving up on channel=<id>` | Retry limit hit; no more attempts |
 | `[slack] Session already live — skipping restart for channel=<id>` | Liveness check passed; no action needed |
 | `[slack] Relaunching session for channel=<id> cwd="<path>"` | Relaunch attempt starting |
-| `[slack] Session relaunch failed for channel=<id> (failure N/3)` | Relaunch failed; failure counter incremented |
+| `[slack] Session relaunch failed for channel=<id>` | Relaunch failed; failure counter incremented |
 | `[slack] Skipping restart — server is shutting down (channel=<id>)` | Timer fired during shutdown; abort |
 | `[slack] Cancelled restart timer for channel=<id>` | Pending timer cleared on graceful shutdown |
 
@@ -104,12 +139,12 @@ intervalId = setInterval(async () => {
 }, intervalSeconds * 1000)
 ```
 
-### Coordination with restart.ts
+### Coordination with restart.ts and backoff.ts
 
-Before calling `scheduleRestart`, the poller queries two guards from `restart.ts`:
+Before calling `scheduleRestart`, the poller queries two guards:
 
-- `isRestartPendingOrActive(channelId)` — returns `true` if a restart timer is queued or a launch is in flight; skip to avoid double-launching
-- `hasReachedMaxFailures(channelId)` — returns `true` if the channel has hit `MAX_CONSECUTIVE_FAILURES`; skip to respect the failure limit
+- `isRestartPendingOrActive(channelId)` from `restart.ts` — returns `true` if a restart timer is queued or a launch is in flight; skip to avoid double-launching.
+- `isAtCap(channelId, 5)` from `backoff.ts` — returns `true` if the channel has reached the consecutive-failure cap; skip the tick for this channel. The channel remains retry-eligible via inbound messages or a server restart (see SR-25).
 
 When neither guard fires and the session is dead, the poller calls `scheduleRestart(channelId, cwd)` — the same function used by the reactive `onsessionclosed` path.
 
