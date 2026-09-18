@@ -66,6 +66,9 @@ import {
   errSpawnNotResumable,
   errSpawnNotInteractive,
   errTmuxSessionCreate,
+  errTmuxSendKeysNotFound,
+  errTmuxSendKeysGeneric,
+  errCallTimeout,
   makeStubClient,
   type StubClient,
 } from './test-helpers/agent-director-stub.ts'
@@ -2616,5 +2619,306 @@ describe('SR-24.2: arbitrary-unknown resume error → failed, loud, retry-eligib
     // Only the initial collision-triggering spawn call; no fresh spawn issued
     // by the catch-all arm after the resume failure.
     expect(spawnCalls).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// t3.a3g.u4.mp.tn — SR-22 escalation matrix for reconnectMcp
+//
+// Pins the full discriminated-result surface of reconnectMcp:
+//   SR-22.1 (ErrTmuxSendKeys path):
+//     (1) errTmuxSendKeysNotFound + dead probe   → 'escalate-dead'
+//         SR-29.2 #3 positive: was red pre-fix (escalation logic did not exist).
+//         Exactly ONE sendKeys call (SR-22.3 no-loop) — the escalation exits
+//         without retrying, deferring recovery to the scheduled-restart path.
+//     (2) errTmuxSendKeysNotFound + transient probe → 'transient', no escalation
+//     (3) errTmuxSendKeysGeneric  → 'transient', Slack post with typed errName
+//         'ErrTmuxSendKeys' (not rewrapped as UnknownError). Assert the post
+//         payload errName directly, not just the call count.
+//     (4) errCallTimeout          → 'transient'
+//     (5) success                 → 'success', probe NEVER called (zero probeCalls)
+//   SR-22.2 (ErrTmuxNotAvailable path):
+//     (6) ErrTmuxNotAvailable + dead probe  → 'escalate-dead'
+//         (red pre-fix: early-return fired; now defers to probe)
+//     (7) ErrTmuxNotAvailable + transient probe → tmux-unavailable flag + 'transient'
+//         (site #1b semantics: conservative, flag preserved)
+//     (8) ErrTmuxNotAvailable + alive probe → 'transient', conservative no-kill/no-delete
+//         (contradictory signals: tmux binary absent but has-session reports alive;
+//          conservatism wins — do not escalate on conflicting evidence)
+//   Waiting-branch race (SR-23.2, SR-22.3):
+//     (9) spawnForRoute waiting + collision-probe=alive + sendKeys errTmuxSendKeysNotFound
+//         + re-probe=dead → action='reconnected', zero resumeCalls.
+//         Session died between the collision-branch probe (alive) and the sendKeys
+//         attempt. spawnForRoute returns 'reconnected' and defers recovery to the
+//         scheduled-restart path — this call has already done its one send-keys
+//         attempt (SR-22.3 no-loop; no inline resume from the waiting branch).
+//
+// Helpers used: makeStubTmuxProbe (fixed result), makeStubTmuxProbeQueue (FIFO).
+// No mock.module. All injection via factories and the probe parameter of reconnectMcp
+// (4th positional) or the 6th positional of spawnForRoute.
+// ---------------------------------------------------------------------------
+
+describe('SR-22 escalation matrix: reconnectMcp (t3.a3g.u4.mp.tn)', () => {
+  // -------------------------------------------------------------------------
+  // (1) SR-22.1 positive / SR-29.2 #3: errTmuxSendKeysNotFound + dead probe
+  //     → 'escalate-dead', exactly ONE sendKeys call (SR-22.3 no-loop).
+  //
+  // Pre-fix failure (red): the ErrTmuxSendKeys path collapsed into UnknownError
+  // and returned 'transient' — no probe fired, no escalation. Post-fix (62ec245):
+  // the not-found description matches SEND_KEYS_NOT_FOUND_NEEDLES, the
+  // confirming probe returns definitely-dead, and reconnectMcp returns
+  // 'escalate-dead'. These are the ship pins.
+  // -------------------------------------------------------------------------
+
+  test('SR-22.1 positive (SR-29.2 #3): errTmuxSendKeysNotFound + dead probe → escalate-dead, one sendKeys call', async () => {
+    const { probe, probeCalls } = makeStubTmuxProbe('definitely-dead')
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({ sendKeysCalls, sendKeysError: errTmuxSendKeysNotFound() })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+
+    const result = await reconnectMcp('C', undefined, cfg, probe)
+
+    // Post-fix: escalate-dead (SR-22.1 positive).
+    expect(result).toBe('escalate-dead')
+    // Exactly one sendKeys call — no retry loop (SR-22.3).
+    expect(sendKeysCalls).toHaveLength(1)
+    expect(sendKeysCalls[0].text).toContain('/mcp reconnect')
+    // Confirming probe was called exactly once (session-name derived from channelId).
+    expect(probeCalls).toHaveLength(1)
+    expect(probeCalls[0]).toBe('slack_bot_C')
+  })
+
+  // -------------------------------------------------------------------------
+  // (2) SR-22.1 negative: errTmuxSendKeysNotFound + transient probe → 'transient'
+  //     Conservative conservatism (SR-20.4): inconclusive probe does NOT escalate.
+  // -------------------------------------------------------------------------
+
+  test('SR-22.1 negative: errTmuxSendKeysNotFound + transient probe → transient, no escalation', async () => {
+    const { probe, probeCalls } = makeStubTmuxProbe('transient-inconclusive')
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({ sendKeysCalls, sendKeysError: errTmuxSendKeysNotFound() })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+
+    const result = await reconnectMcp('C', undefined, cfg, probe)
+
+    // Transient verdict from probe → no escalation.
+    expect(result).toBe('transient')
+    // Probe was called (hint matched, confirming probe fired).
+    expect(probeCalls).toHaveLength(1)
+  })
+
+  // -------------------------------------------------------------------------
+  // (3) SR-22.1 generic send-keys: errTmuxSendKeysGeneric → 'transient',
+  //     Slack post preserved with typed errName 'ErrTmuxSendKeys' (not UnknownError).
+  //     Assert the post payload text contains the typed errName, not just call count.
+  // -------------------------------------------------------------------------
+
+  test('SR-22.1 generic: errTmuxSendKeysGeneric → transient, Slack post with typed ErrTmuxSendKeys errName', async () => {
+    const postCalls: unknown[][] = []
+    const web = { chat: { postMessage: async (...a: unknown[]) => { postCalls.push(a); return {} } } }
+    const { probe, probeCalls } = makeStubTmuxProbe('definitely-dead')
+    installStub({ sendKeysError: errTmuxSendKeysGeneric() })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+
+    const result = await reconnectMcp('C', web as never, cfg, probe)
+
+    // Generic send-keys error: transient, no escalation, probe NOT called
+    // (description does not match SEND_KEYS_NOT_FOUND_NEEDLES → hint branch skipped).
+    expect(result).toBe('transient')
+    // Probe must NOT have been called — the not-found hint did not match.
+    expect(probeCalls).toHaveLength(0)
+    // Slack post was made (postSpawnFailureToChannel called for generic ErrTmuxSendKeys).
+    expect(postCalls).toHaveLength(1)
+    // The post text must include the typed errName 'ErrTmuxSendKeys', not 'UnknownError'.
+    const postText = String(JSON.stringify(postCalls[0]))
+    expect(postText).toContain('ErrTmuxSendKeys')
+    expect(postText).not.toContain('UnknownError')
+  })
+
+  // -------------------------------------------------------------------------
+  // (4) errCallTimeout → 'transient'
+  //     ErrCallTimeout is not ErrTmuxSendKeys or ErrTmuxNotAvailable;
+  //     it falls through to the generic AgentDirectorError arm → 'transient'.
+  // -------------------------------------------------------------------------
+
+  test('errCallTimeout → transient (generic AD error arm)', async () => {
+    const { probe, probeCalls } = makeStubTmuxProbe('definitely-dead')
+    installStub({ sendKeysError: errCallTimeout('send-keys') })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+
+    const result = await reconnectMcp('C', undefined, cfg, probe)
+
+    expect(result).toBe('transient')
+    // Probe must NOT be called — ErrCallTimeout does not enter the ErrTmuxSendKeys branch.
+    expect(probeCalls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // (5) success → 'success', probe NEVER called (zero probeCalls)
+  //     The probe fires ONLY inside ErrTmuxSendKeys-not-found and ErrTmuxNotAvailable
+  //     branches; it is not called on the success path.
+  // -------------------------------------------------------------------------
+
+  test('success → success, probe never called (zero probeCalls)', async () => {
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const { probe, probeCalls } = makeStubTmuxProbe('definitely-dead')
+    installStub({ sendKeysCalls })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+
+    const result = await reconnectMcp('C', undefined, cfg, probe)
+
+    expect(result).toBe('success')
+    // sendKeys was called once (the /mcp reconnect command).
+    expect(sendKeysCalls).toHaveLength(1)
+    // Probe is NEVER called on the success path — no probe invocation.
+    expect(probeCalls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // (6) SR-22.2: ErrTmuxNotAvailable + dead probe → 'escalate-dead'
+  //     Red pre-fix: the ErrTmuxNotAvailable arm returned 'transient' (early-
+  //     return without probing). Post-fix: probe fires; definitely-dead → escalate.
+  //
+  // This pin extends site #1b (which uses the module-level probe set to alive
+  // in beforeEach). Here we pass an explicit dead probe to test the escalation
+  // arm — the existing site #1b covers the alive/transient semantics.
+  //
+  // Note on tmux-unavailable flag: withOutageDetection sets the tmux-unavailable
+  // flag when ErrTmuxNotAvailable is caught (before rethrowing to reconnectMcp).
+  // The flag is set regardless of the subsequent probe verdict — this is correct
+  // behavior: tmux IS unavailable (the binary failed), even if the escalation arm
+  // later determines the session is dead. The flag will be cleared on next success.
+  // -------------------------------------------------------------------------
+
+  test('SR-22.2: ErrTmuxNotAvailable + dead probe → escalate-dead', async () => {
+    const { probe, probeCalls } = makeStubTmuxProbe('definitely-dead')
+    const { web, calls } = makeMockWeb()
+    installStub({ sendKeysError: new ErrTmuxNotAvailable('send-keys', 'ErrTmuxNotAvailable', 'tmux not available') })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+
+    const result = await reconnectMcp('C', web as never, cfg, probe)
+
+    // Post-fix: escalate-dead (was 'transient' pre-fix — early-return without probe).
+    expect(result).toBe('escalate-dead')
+    // Probe was called exactly once.
+    expect(probeCalls).toHaveLength(1)
+    expect(probeCalls[0]).toBe('slack_bot_C')
+    // No Slack post on the escalate-dead arm (the caller, not reconnectMcp, handles UX).
+    expect(calls).toHaveLength(0)
+    // tmux-unavailable flag IS set: withOutageDetection raises it on ErrTmuxNotAvailable
+    // before rethrowing, regardless of the subsequent probe verdict. The escalation
+    // arm does not clear it — recovery via scheduled-restart will clear on next success.
+    expect(getOutageFlags('C').has('tmux-unavailable')).toBe(true)
+  })
+
+  // -------------------------------------------------------------------------
+  // (7) SR-22.2: ErrTmuxNotAvailable + transient probe → tmux-unavailable flag + 'transient'
+  //     Site #1b semantics preserved: the ErrTmuxNotAvailable branch sets the
+  //     outage flag and returns 'transient' when probe is inconclusive.
+  //     (Site #1b in Group A tests this with the module-level alive-default probe;
+  //     this pin exercises it explicitly with a transient probe.)
+  // -------------------------------------------------------------------------
+
+  test('SR-22.2: ErrTmuxNotAvailable + transient probe → tmux-unavailable flag + transient', async () => {
+    const { probe, probeCalls } = makeStubTmuxProbe('transient-inconclusive')
+    installStub({ sendKeysError: new ErrTmuxNotAvailable('send-keys', 'ErrTmuxNotAvailable', 'tmux not available') })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+
+    const result = await reconnectMcp('C', undefined, cfg, probe)
+
+    expect(result).toBe('transient')
+    // Probe was called (ErrTmuxNotAvailable arm always probes).
+    expect(probeCalls).toHaveLength(1)
+    // tmux-unavailable outage flag raised (site #1b semantics preserved).
+    expect(getOutageFlags('C').has('tmux-unavailable')).toBe(true)
+  })
+
+  // -------------------------------------------------------------------------
+  // (8) SR-22.2: ErrTmuxNotAvailable + alive probe → 'transient', conservative no-kill/no-delete
+  //     Contradictory signals: tmux binary absent/broken but has-session returns alive.
+  //     Conservatism wins — do not escalate on conflicting evidence. The function
+  //     returns 'transient' and sets the tmux-unavailable flag (same as transient-probe).
+  // -------------------------------------------------------------------------
+
+  test('SR-22.2: ErrTmuxNotAvailable + alive probe → transient, conservative (contradictory signals, conservatism wins)', async () => {
+    const { probe, probeCalls } = makeStubTmuxProbe('definitely-alive')
+    const { web, calls } = makeMockWeb()
+    installStub({ sendKeysError: new ErrTmuxNotAvailable('send-keys', 'ErrTmuxNotAvailable', 'tmux not available') })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+
+    const result = await reconnectMcp('C', web as never, cfg, probe)
+
+    // Contradictory signals (tmux binary absent but session alive) → conservative transient.
+    // Do NOT escalate-dead on conflicting evidence; do not kill or delete.
+    expect(result).toBe('transient')
+    // Probe was called to determine the classification.
+    expect(probeCalls).toHaveLength(1)
+    // tmux-unavailable flag raised (same as transient/alive: ErrTmuxNotAvailable fired).
+    expect(getOutageFlags('C').has('tmux-unavailable')).toBe(true)
+    // No Slack post on the ErrTmuxNotAvailable arm (postSpawnFailureToChannel not called).
+    expect(calls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // (9) Waiting-branch race (SR-23.2, SR-22.3):
+  //     spawnForRoute waiting + collision-probe=alive (first probe) + sendKeys
+  //     errTmuxSendKeysNotFound + confirming probe=dead (second probe, inside
+  //     reconnectMcp) → action='reconnected', zero resumeCalls.
+  //
+  //     Construct via makeStubTmuxProbeQueue:
+  //       queue[0] = alive   (collision-branch probe: session appears alive → proceed to reconnect)
+  //       queue[1] = dead    (reconnectMcp confirming probe: definitely-dead → escalate-dead)
+  //
+  //     spawnForRoute's waiting branch (line ~1160) catches escalate-dead and
+  //     returns action='reconnected', deferring recovery to the scheduled-restart
+  //     path (SR-23.2). This call has done its one send-keys attempt (SR-22.3
+  //     no-loop); no inline resume is attempted from the waiting branch.
+  // -------------------------------------------------------------------------
+
+  test('SR-22.3 waiting-branch race: alive collision-probe + errTmuxSendKeysNotFound + dead re-probe → action reconnected, zero resumeCalls', async () => {
+    // Probe queue installed via _setTmuxProbeForTests (the module-level seam).
+    // Both spawnForRoute's collision-branch probe AND reconnectMcp's confirming
+    // probe use this seam — installing via _setTmuxProbeForTests ensures both
+    // calls come from the same FIFO queue:
+    //   queue[0] = alive   (collision-branch: session appears alive → proceed to waiting branch)
+    //   queue[1] = dead    (reconnectMcp confirming probe: definitely-dead → escalate-dead)
+    // Note: spawnForRoute's waiting branch calls reconnectMcp without a probe arg,
+    // so reconnectMcp uses the module-level _tmuxProbe (this queue). The per-call
+    // probe param of spawnForRoute (6th arg) is NOT passed here — both probes use
+    // the installed module-level queue.
+    const { probe, probeCalls } = makeStubTmuxProbeQueue([
+      { classification: 'definitely-alive', signal: 'exit-0' },
+      { classification: 'definitely-dead', signal: 'exit-1-session-not-found' },
+    ])
+    _setTmuxProbeForTests(probe)
+
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    installStub({
+      sendKeysCalls,
+      resumeCalls,
+      // sendKeys throws errTmuxSendKeysNotFound (session died between probe and sendKeys).
+      sendKeysError: errTmuxSendKeysNotFound(),
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+
+    // Do NOT pass a per-call probe to spawnForRoute; both probes use the module-level queue.
+    const result = await spawnForRoute('C', { cwd: CWD }, cfg)
+
+    // Session died between the alive collision-branch probe and the sendKeys attempt
+    // (race condition). spawnForRoute's waiting branch returns 'reconnected' and defers
+    // recovery to the scheduled-restart path — this call has done its one send-keys
+    // attempt (SR-22.3 no-loop; no inline resume from the waiting branch).
+    expect(result.action).toBe('reconnected')
+    // Exactly one sendKeys call — no retry loop after escalation.
+    expect(sendKeysCalls).toHaveLength(1)
+    expect(sendKeysCalls[0].text).toContain('/mcp reconnect')
+    // Zero resume calls — the waiting branch does NOT inline-resume after escalation.
+    // Recovery is deferred to the scheduled-restart path (SR-23.2).
+    expect(resumeCalls).toHaveLength(0)
+    // Two probe calls: (1) collision-branch → alive; (2) reconnectMcp confirm → dead.
+    expect(probeCalls).toHaveLength(2)
   })
 })
