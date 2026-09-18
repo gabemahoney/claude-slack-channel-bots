@@ -17,7 +17,29 @@ import { makeStubClient, cannedListRow, type StubClientOptions } from './test-he
 import {
   setClientForTests,
   resetClientForTests,
+  getClient,
 } from '../src/agent-director-client.ts'
+
+// ---------------------------------------------------------------------------
+// SR-29.2 #1 — import the not-yet-existing export surface.
+//
+// The Engineer (subtasks t3.a3g.g5.mx.x1 / t3.a3g.g5.mx.ug) must extract
+// resolveCscbInstanceId + the director* lambdas from import.meta.main into a
+// named export:
+//
+//   export function buildRealDirectorDeps(
+//     getClientFn: () => import('agent-director').Client,
+//   ): Pick<CliDeps, 'directorStatus' | 'directorPause' | 'directorKill'>
+//
+// Until that extraction lands, the destructure below evaluates to `undefined`
+// at runtime and both SR-29.2 tests FAIL with the root-cause message:
+//
+//   TypeError: buildRealDirectorDeps is not a function
+//
+// This is the expected RED state. After the extraction lands, both tests must
+// turn GREEN without any other test changes.
+// ---------------------------------------------------------------------------
+import { buildRealDirectorDeps } from '../src/cli.ts'
 
 process.env['SLACK_BOT_TOKEN'] = 'xoxb-test-placeholder'
 process.env['SLACK_APP_TOKEN'] = 'xapp-test-placeholder'
@@ -356,6 +378,223 @@ describe('getClient seam', () => {
     expect(pauseCalls).toEqual([])
     // status() verb on the stub was NOT called (short-circuited at list=empty).
     expect(statusCalled).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SR-29.2 #1a — clean_restart rows-present: real getClient path
+//
+// Root-cause: resolveCscbInstanceId lives in import.meta.main, not called by
+// createCli(). Even with setClientForTests installing a stub, clean_restart
+// never reaches getClient() for directorStatus — the EXISTING tests stub
+// directorStatus directly and completely bypass the bug.
+//
+// Pre-fix failure mode (RED): buildRealDirectorDeps is not yet exported from
+// src/cli.ts, so this suite fails immediately with:
+//   TypeError: buildRealDirectorDeps is not a function
+//
+// Post-fix (GREEN): Engineer extracts resolveCscbInstanceId + director*
+// lambdas into buildRealDirectorDeps(getClientFn) and exports it. The stub
+// Client installed via setClientForTests is reached through getClientFn, the
+// list() call resolves a row, status() returns waiting→ended, and the test
+// asserts zero "no spawn row — skipping" messages.
+//
+// SR-29.2 root-cause #1: resolveCscbInstanceId not reachable from createCli
+// ---------------------------------------------------------------------------
+
+describe('SR-29.2 #1a — clean_restart rows-present via real getClient path', () => {
+  test('pause/poll loop executes and zero "no spawn row" for channels with rows', async () => {
+    // SR-29.2 root-cause #1: this test drives the REAL resolveCscbInstanceId
+    // path via buildRealDirectorDeps(getClientFn). The stub Client holds one
+    // cscb row for channel C. status() returns waiting (precheck) then ended
+    // (poll), so the teardown completes without kill.
+    //
+    // PRE-FIX RED RUN EXPECTATION:
+    //   TypeError: buildRealDirectorDeps is not a function
+    // The export does not exist until the Engineer lands subtask x1/ug.
+    //
+    // POST-FIX GREEN: pause is called for C, kill is never called, zero
+    // "no spawn row — skipping" log lines are emitted for channel C.
+
+    const listCalls: StubClientOptions['listCalls'] = []
+    const pauseParams: StubClientOptions['pauseCalls'] = []
+    const stub = makeStubClient({
+      // list() returns one row matching channel=C label.
+      listResult: {
+        spawns: [cannedListRow({
+          claude_instance_id: 'cscb_C_real_path',
+          labels: { service: 'cscb', channel: 'C' },
+        })],
+      },
+      listCalls,
+      // status(): first call → 'waiting' (precheck passes through to teardown);
+      // second call → 'ended' (poll exits cleanly, no escalation to kill).
+      statusQueue: [
+        { kind: 'resolve', value: { state: 'waiting' } },
+        { kind: 'resolve', value: { state: 'ended' } },
+      ],
+      pauseCalls: pauseParams,
+    })
+
+    // Install stub as the module-level singleton so getClientFn() returns it.
+    setClientForTests(stub as unknown as import('agent-director').Client)
+
+    // buildRealDirectorDeps(getClientFn) is the intended extraction:
+    // it returns { directorStatus, directorPause, directorKill } wired through
+    // the REAL resolveCscbInstanceId lambda (not a stub override).
+    // PRE-FIX: this throws TypeError — EXPECTED RED.
+    const realDirectorDeps = buildRealDirectorDeps(getClient)
+
+    const pauseCalls: string[] = []
+    const killCalls: string[] = []
+    const logLines: string[] = []
+    const origConsoleError = console.error.bind(console)
+    console.error = (...args: unknown[]) => {
+      logLines.push(args.join(' '))
+      origConsoleError(...args)
+    }
+
+    const deps: CliDeps = {
+      spawnSync: () => ({ status: 0 }),
+      env: { SLACK_BOT_TOKEN: 'xoxb', SLACK_APP_TOKEN: 'xapp' },
+      existsSync: () => true,
+      readFileSync: () => { throw new Error('unexpected') },
+      unlinkSync: () => { /* no-op */ },
+      isProcessRunning: () => false,
+      kill: () => { /* no-op */ },
+      resolveStateDir: () => STATE_DIR,
+      startServer: async () => { /* no-op */ },
+      exit: (code) => { throw new ExitError(code) },
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+      getClient: () => stub as unknown as import('agent-director').Client,
+      // Wire the REAL director* lambdas returned by the extracted factory.
+      directorStatus: realDirectorDeps.directorStatus,
+      directorPause: async (channelId) => {
+        pauseCalls.push(channelId)
+        return realDirectorDeps.directorPause(channelId)
+      },
+      directorKill: async (channelId) => {
+        killCalls.push(channelId)
+        return realDirectorDeps.directorKill(channelId)
+      },
+    }
+
+    try {
+      const { createCli: createCliLocal } = await import('../src/cli.ts')
+      await createCliLocal(deps).clean_restart()
+    } finally {
+      console.error = origConsoleError
+    }
+
+    // list() was reached via the real resolveCscbInstanceId path.
+    expect(listCalls.length).toBeGreaterThan(0)
+    // pause was called for channel C (teardown loop ran).
+    expect(pauseCalls).toContain('C')
+    // kill was NOT called (status ended cleanly).
+    expect(killCalls).toEqual([])
+    // No "no spawn row — skipping" log for channel C.
+    const skipLines = logLines.filter((l) => l.includes('no spawn row') && l.includes('channel=C'))
+    expect(skipLines).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SR-29.2 #1b — clean_restart AD-unreachable: distinct non-zero exit
+//
+// Root-cause: resolveCscbInstanceId has a bare `catch { return null }` that
+// swallows ALL errors including connection-refused. When AD is unreachable,
+// every channel silently skips ("no spawn row — skipping") and clean_restart
+// exits 0 as if everything was fine. SR-27.2 requires this path to exit
+// loudly with a non-zero code BEFORE entering the per-channel loop.
+//
+// Pre-fix failure mode (RED): buildRealDirectorDeps is not yet exported,
+// same as the rows-present suite above:
+//   TypeError: buildRealDirectorDeps is not a function
+//
+// Post-fix (GREEN): the narrowed catch rethrows connection-class errors;
+// clean_restart catches it at the outer level and exits non-zero before any
+// per-channel processing; no "start" spawnSync is called; the failure is
+// clearly distinct from the silent-skip path.
+//
+// SR-29.2 root-cause #1: bare catch in resolveCscbInstanceId collapses
+// AD-unreachable to silent null, indistinguishable from "no row".
+// ---------------------------------------------------------------------------
+
+describe('SR-29.2 #1b — clean_restart AD-unreachable: loud non-zero exit', () => {
+  test('connection-refused error → non-zero exit, no pause/kill, no start spawnSync', async () => {
+    // SR-29.2 root-cause #1: with AD unreachable, getClient().list() throws a
+    // connection-refused-class error. The REAL resolveCscbInstanceId (bare catch)
+    // swallows it and returns null → clean_restart silently skips the channel.
+    // After the SR-27.2 fix, the narrowed catch rethrows it, and clean_restart
+    // fails loudly with a non-zero exit BEFORE the per-channel start loop.
+    //
+    // PRE-FIX RED RUN EXPECTATION:
+    //   TypeError: buildRealDirectorDeps is not a function
+    // The export does not exist until the Engineer lands subtask x1/ug.
+    //
+    // POST-FIX GREEN: ExitError is thrown with code !== 0; no spawnSync call
+    // with 'start'; no directorPause/directorKill invocations; the error is
+    // distinguishable from the "no spawn row — skipping" silent path.
+
+    // Stub list() to throw a connection-refused-class error (the real error
+    // type from ECONNREFUSED / ErrSystemInstallUnreachable or equivalent).
+    const connectionError = new Error('connect ECONNREFUSED 127.0.0.1:7777')
+    connectionError.name = 'ConnectionRefusedError'
+    const stub = makeStubClient({
+      listError: connectionError,
+    })
+
+    setClientForTests(stub as unknown as import('agent-director').Client)
+
+    // PRE-FIX: this throws TypeError — EXPECTED RED.
+    const realDirectorDeps = buildRealDirectorDeps(getClient)
+
+    const pauseCalls: string[] = []
+    const killCalls: string[] = []
+    const spawnCalls: Array<{ cmd: string; args: string[] }> = []
+    const exitCodes: number[] = []
+
+    const deps: CliDeps = {
+      spawnSync: (cmd, args) => {
+        spawnCalls.push({ cmd, args })
+        return { status: 0 }
+      },
+      env: { SLACK_BOT_TOKEN: 'xoxb', SLACK_APP_TOKEN: 'xapp' },
+      existsSync: () => true,
+      readFileSync: () => { throw new Error('unexpected') },
+      unlinkSync: () => { /* no-op */ },
+      isProcessRunning: () => false,
+      kill: () => { /* no-op */ },
+      resolveStateDir: () => STATE_DIR,
+      startServer: async () => { /* no-op */ },
+      exit: (code) => { exitCodes.push(code); throw new ExitError(code) },
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+      getClient: () => stub as unknown as import('agent-director').Client,
+      directorStatus: realDirectorDeps.directorStatus,
+      directorPause: async (channelId) => {
+        pauseCalls.push(channelId)
+        return realDirectorDeps.directorPause(channelId)
+      },
+      directorKill: async (channelId) => {
+        killCalls.push(channelId)
+        return realDirectorDeps.directorKill(channelId)
+      },
+    }
+
+    const { createCli: createCliLocal } = await import('../src/cli.ts')
+    await expect(createCliLocal(deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+
+    // Non-zero exit code required (AD-unreachable must not be silent).
+    expect(exitCodes.length).toBeGreaterThan(0)
+    expect(exitCodes[0]).not.toBe(0)
+
+    // No pause or kill should have been called (fail BEFORE per-channel loop).
+    expect(pauseCalls).toEqual([])
+    expect(killCalls).toEqual([])
+
+    // No 'start' spawnSync (server must not restart after AD-unreachable failure).
+    const startCalls = spawnCalls.filter((c) => c.args.includes('start'))
+    expect(startCalls).toHaveLength(0)
   })
 })
 
