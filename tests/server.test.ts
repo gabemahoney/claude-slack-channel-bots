@@ -32,6 +32,8 @@ import {
 } from '../src/agent-director-client.ts'
 import { makeStubClient } from './test-helpers/agent-director-stub.ts'
 import { _buildIsSessionAliveAdapter } from '../src/server.ts'
+import { _runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
+import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -706,5 +708,238 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(emissions[0].text).toMatch(/tmux unavailable/)
     // ONSET_TEMPLATES['tmux-unavailable'] ignores the detail arg — nothing extra
     expect(emissions[0].text).not.toContain('undefined')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// _runJsonlPersistenceSafeguard — server-seam Slack/error matrix (SR-24.4)
+// ---------------------------------------------------------------------------
+
+describe('_runJsonlPersistenceSafeguard', () => {
+  // Realistic multi-mount mountinfo: root on ext4, /tmp on tmpfs
+  const MULTI_MOUNT_MOUNTINFO = `\
+23 0 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,data=ordered
+24 23 8:2 / /home rw,relatime shared:2 - ext4 /dev/sda2 rw,data=ordered
+25 23 0:20 / /tmp rw,nosuid,nodev shared:3 - tmpfs tmpfs rw,size=4096m
+`
+
+  /** Build a stub web client that records postFn calls. */
+  function makeMockWeb(): {
+    web: { chat: { postMessage: (...a: unknown[]) => Promise<unknown> } }
+    calls: Array<{ channel: string; text: string }>
+  } {
+    const calls: Array<{ channel: string; text: string }> = []
+    const web = {
+      chat: {
+        postMessage: async (...a: unknown[]) => {
+          const opts = a[0] as { channel: string; text: string }
+          calls.push({ channel: opts.channel, text: opts.text })
+          return {}
+        },
+      },
+    }
+    return { web, calls }
+  }
+
+  /** Build recording recordStartupError stub. */
+  function makeRecordStartupError(): {
+    recorded: Array<{ classLabel: string; message: string }>
+    fn: (classLabel: string, message: string) => void
+  } {
+    const recorded: Array<{ classLabel: string; message: string }> = []
+    return {
+      recorded,
+      fn: (classLabel: string, message: string) => { recorded.push({ classLabel, message }) },
+    }
+  }
+
+  /** Build recording postFn stub. */
+  function makePostFn(): {
+    posts: Array<{ channelId: string; text: string }>
+    fn: (_web: unknown, channelId: string, text: string) => Promise<void>
+  } {
+    const posts: Array<{ channelId: string; text: string }> = []
+    return {
+      posts,
+      fn: async (_web: unknown, channelId: string, text: string) => {
+        posts.push({ channelId, text })
+      },
+    }
+  }
+
+  test('1. tmpfs + web present → postFn called for every configured route channel + jsonl-non-persistent recorded', async () => {
+    // Config with two routes, both using /tmp/claude-config (tmpfs in fixture)
+    const config = makeRoutingConfig({
+      routes: {
+        C_CHAN1: { cwd: '/repo/a', claude_config_dir: '/tmp/claude-config' },
+        C_CHAN2: { cwd: '/repo/b', claude_config_dir: '/tmp/claude-config' },
+      },
+      claude_config_dir: undefined,
+    })
+    const { web } = makeMockWeb()
+    const errorTracker = makeRecordStartupError()
+    const postTracker = makePostFn()
+
+    await _runJsonlPersistenceSafeguard(
+      config,
+      web as unknown as import('@slack/web-api').WebClient,
+      {
+        readMountinfo: () => MULTI_MOUNT_MOUNTINFO,
+        recordStartupError: errorTracker.fn,
+        postFn: postTracker.fn as unknown as (web: import('@slack/web-api').WebClient, channelId: string, text: string) => Promise<void>,
+      },
+    )
+
+    // Wait for the fire-and-forget postFn promise to resolve
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    // Error must be recorded
+    expect(errorTracker.recorded).toHaveLength(1)
+    expect(errorTracker.recorded[0].classLabel).toBe('jsonl-non-persistent')
+    expect(errorTracker.recorded[0].message).toContain('/tmp/claude-config/projects')
+
+    // postFn must be called for every configured route channel
+    const channelIds = Object.keys(config.routes)
+    expect(postTracker.posts).toHaveLength(channelIds.length)
+    for (const channelId of channelIds) {
+      const post = postTracker.posts.find(p => p.channelId === channelId)
+      expect(post).toBeDefined()
+      expect(post!.text).toContain('/tmp/claude-config/projects')
+    }
+  })
+
+  test('2. tmpfs + web undefined → no postFn calls, error still recorded, no crash', async () => {
+    const config = makeRoutingConfig({
+      routes: {
+        C_CHAN1: { cwd: '/repo/a', claude_config_dir: '/tmp/claude-config' },
+      },
+      claude_config_dir: undefined,
+    })
+    const errorTracker = makeRecordStartupError()
+    const postTracker = makePostFn()
+
+    await _runJsonlPersistenceSafeguard(
+      config,
+      undefined, // web absent
+      {
+        readMountinfo: () => MULTI_MOUNT_MOUNTINFO,
+        recordStartupError: errorTracker.fn,
+        postFn: postTracker.fn as unknown as (web: import('@slack/web-api').WebClient, channelId: string, text: string) => Promise<void>,
+      },
+    )
+
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    // Error recorded
+    expect(errorTracker.recorded).toHaveLength(1)
+    expect(errorTracker.recorded[0].classLabel).toBe('jsonl-non-persistent')
+    // No Slack posts
+    expect(postTracker.posts).toHaveLength(0)
+  })
+
+  test('3. persistent fstype (ext4) → no postFn, no error recorded', async () => {
+    const config = makeRoutingConfig({
+      routes: {
+        C_CHAN1: { cwd: '/repo/a', claude_config_dir: '/home/user/.claude' },
+      },
+      claude_config_dir: undefined,
+    })
+    const { web } = makeMockWeb()
+    const errorTracker = makeRecordStartupError()
+    const postTracker = makePostFn()
+
+    await _runJsonlPersistenceSafeguard(
+      config,
+      web as unknown as import('@slack/web-api').WebClient,
+      {
+        readMountinfo: () => MULTI_MOUNT_MOUNTINFO,
+        recordStartupError: errorTracker.fn,
+        postFn: postTracker.fn as unknown as (web: import('@slack/web-api').WebClient, channelId: string, text: string) => Promise<void>,
+      },
+    )
+
+    expect(errorTracker.recorded).toHaveLength(0)
+    expect(postTracker.posts).toHaveLength(0)
+  })
+
+  test('4. warning path (unreadable mountinfo) → jsonl-persistence-check-warning recorded once per root, no postFn', async () => {
+    const config = makeRoutingConfig({
+      routes: {
+        C_CHAN1: { cwd: '/repo/a', claude_config_dir: '/home/user/.claude' },
+      },
+      claude_config_dir: undefined,
+    })
+    const { web } = makeMockWeb()
+    const errorTracker = makeRecordStartupError()
+    const postTracker = makePostFn()
+
+    await _runJsonlPersistenceSafeguard(
+      config,
+      web as unknown as import('@slack/web-api').WebClient,
+      {
+        readMountinfo: () => { throw new Error('EACCES: permission denied, open \'/proc/self/mountinfo\'') },
+        recordStartupError: errorTracker.fn,
+        postFn: postTracker.fn as unknown as (web: import('@slack/web-api').WebClient, channelId: string, text: string) => Promise<void>,
+      },
+    )
+
+    // One warning per root (one root in config)
+    expect(errorTracker.recorded).toHaveLength(1)
+    expect(errorTracker.recorded[0].classLabel).toBe('jsonl-persistence-check-warning')
+    // No Slack post for warning path
+    expect(postTracker.posts).toHaveLength(0)
+  })
+
+  test('4b. warning path: two routes with distinct roots → two warnings recorded', async () => {
+    const config = makeRoutingConfig({
+      routes: {
+        C_CHAN1: { cwd: '/repo/a', claude_config_dir: '/home/user/.claude-a' },
+        C_CHAN2: { cwd: '/repo/b', claude_config_dir: '/home/user/.claude-b' },
+      },
+      claude_config_dir: undefined,
+    })
+    const { web } = makeMockWeb()
+    const errorTracker = makeRecordStartupError()
+    const postTracker = makePostFn()
+
+    await _runJsonlPersistenceSafeguard(
+      config,
+      web as unknown as import('@slack/web-api').WebClient,
+      {
+        readMountinfo: () => { throw new Error('EACCES: cannot read mountinfo') },
+        recordStartupError: errorTracker.fn,
+        postFn: postTracker.fn as unknown as (web: import('@slack/web-api').WebClient, channelId: string, text: string) => Promise<void>,
+      },
+    )
+
+    // Two distinct roots → two warnings
+    expect(errorTracker.recorded).toHaveLength(2)
+    expect(errorTracker.recorded.every(r => r.classLabel === 'jsonl-persistence-check-warning')).toBe(true)
+    expect(postTracker.posts).toHaveLength(0)
+  })
+
+  test('5. helper own deps throwing unexpectedly → returns without throwing, single warning logged to stderr', async () => {
+    const config = makeRoutingConfig({
+      routes: {
+        C_CHAN1: { cwd: '/repo/a' },
+      },
+    })
+    const { web } = makeMockWeb()
+    // recordStartupError throws unexpectedly — helper must catch and not re-throw
+    const bombRecordError = (_classLabel: string, _message: string) => {
+      throw new Error('unexpected internal failure')
+    }
+
+    // Must not throw
+    await expect(
+      _runJsonlPersistenceSafeguard(
+        config,
+        web as unknown as import('@slack/web-api').WebClient,
+        {
+          readMountinfo: () => { throw new Error('simulate unreadable') },
+          recordStartupError: bombRecordError,
+        },
+      ),
+    ).resolves.toBeUndefined()
   })
 })
