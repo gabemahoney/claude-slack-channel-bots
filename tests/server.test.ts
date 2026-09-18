@@ -14,6 +14,13 @@ import {
   type Access,
   type GateOptions,
 } from '../src/lib.ts'
+import {
+  scheduleRestart,
+  isRestartPendingOrActive,
+  _resetRestartState,
+  initRestart,
+  type RestartDeps,
+} from '../src/restart.ts'
 import type { Client } from 'agent-director'
 import {
   ErrSpawnNotFound,
@@ -1085,5 +1092,148 @@ describe('_runJsonlPersistenceSafeguard', () => {
         },
       ),
     ).resolves.toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Inbound double-spawn guard — SR-26.1 (t3.a3g.yn.5o.2m)
+//
+// The three inbound guard sites in server.ts (onsessionclosed ~line 370,
+// dispatch no-GET-stream miss ~line 688, SSE-abort detector ~line 1278) are
+// all inside closures within initPendingSession() and handleMessage() that
+// require the full Socket Mode + MCP HTTP server stack — they are NOT directly
+// unit-reachable from the current server.test.ts harnesses.
+//
+// What IS unit-reachable: the restart.ts primitives (scheduleRestart,
+// isRestartPendingOrActive, _resetRestartState, initRestart) that the guard
+// sites call directly. These tests prove the exactly-one-launch invariant by
+// demonstrating that:
+//   (a) without pending/active state the inbound-path simulation schedules normally
+//   (b) with a pending timer already set, isRestartPendingOrActive returns true
+//       so the guard would skip (exactly as the server.ts sites do)
+//   (c) with an active launch in progress, the guard likewise fires
+//
+// If a server-harness is added in future that exposes onsessionclosed or
+// the dispatch path as a function, these tests should be replaced with
+// direct handler invocations — but the invariant assertions remain the same.
+// ---------------------------------------------------------------------------
+
+const FAST_DELAY_S = 0.01  // 10 ms — matches restart.test.ts convention
+const SLOW_DELAY_S = 9999  // never fires within a test
+const WAIT_MS = 50         // long enough for FAST_DELAY_S to fire
+
+function makeRestartDeps(opts: {
+  isSessionAliveResult?: boolean
+  launchSession?: (channelId: string, cwd: string, sessionId?: string) => Promise<boolean>
+  restartDelay?: number
+} = {}): RestartDeps & {
+  launchSessionCalls: Array<{ channelId: string; cwd: string }>
+} {
+  const launchSessionCalls: Array<{ channelId: string; cwd: string }> = []
+  return {
+    launchSessionCalls,
+    async isSessionAlive(_channelId) { return opts.isSessionAliveResult ?? false },
+    isSessionConnected(_channelId) { return false },
+    async reconnectSession(_channelId) {},
+    async killSession(_channelId) {},
+    async launchSession(channelId, cwd, sessionId) {
+      launchSessionCalls.push({ channelId, cwd })
+      if (opts.launchSession) return opts.launchSession(channelId, cwd, sessionId)
+      return true
+    },
+    getRestartDelay: () => opts.restartDelay ?? FAST_DELAY_S,
+    isShuttingDown: () => false,
+  }
+}
+
+describe('inbound double-spawn guard (SR-26.1)', () => {
+  beforeEach(() => {
+    _resetRestartState()
+  })
+
+  afterEach(() => {
+    _resetRestartState()
+  })
+
+  // ---- unguarded path: no pending/active → schedules normally ----
+
+  test('G1. no pending/active state — isRestartPendingOrActive is false, scheduleRestart fires (unguarded path)', async () => {
+    const deps = makeRestartDeps()
+    initRestart(deps)
+
+    // Guard check: no state yet
+    expect(isRestartPendingOrActive('C_GUARD')).toBe(false)
+
+    // Inbound path (simulated): guard is false, so scheduleRestart is called
+    if (!isRestartPendingOrActive('C_GUARD')) {
+      scheduleRestart('C_GUARD', '/cwd/guard')
+    }
+
+    await Bun.sleep(WAIT_MS)
+
+    // Exactly one launch — the unguarded path fires normally
+    expect(deps.launchSessionCalls).toHaveLength(1)
+    expect(deps.launchSessionCalls[0].channelId).toBe('C_GUARD')
+  })
+
+  // ---- guarded path: pending timer → guard fires, no second schedule ----
+
+  test('G2. pending timer already set — isRestartPendingOrActive is true, second schedule is skipped (exactly-one invariant)', async () => {
+    const deps = makeRestartDeps({ restartDelay: SLOW_DELAY_S })
+    initRestart(deps)
+
+    // First trigger sets the pending timer (e.g. health-check fires first)
+    scheduleRestart('C_GUARD', '/cwd/guard')
+    expect(isRestartPendingOrActive('C_GUARD')).toBe(true)
+
+    // Simulate inbound path (onsessionclosed / dispatch miss / SSE-abort):
+    // guard detects pending=true and skips
+    const wouldSchedule = !isRestartPendingOrActive('C_GUARD')
+    expect(wouldSchedule).toBe(false)
+
+    // Confirm no launch fires (SLOW_DELAY_S ensures timer never runs)
+    await Bun.sleep(WAIT_MS)
+    expect(deps.launchSessionCalls).toHaveLength(0)
+  })
+
+  // ---- guarded path: active launch in progress → guard fires ----
+
+  test('G3. active launch in progress — isRestartPendingOrActive is true, second schedule is skipped (exactly-one invariant)', async () => {
+    // Use a launch that we can hold open to create the activeLaunches window
+    let launchResolve!: (ok: boolean) => void
+    const launchPromise = new Promise<boolean>((res) => { launchResolve = res })
+
+    const deps = makeRestartDeps({ launchSession: () => launchPromise })
+    initRestart(deps)
+
+    // Start the first launch via fast timer
+    scheduleRestart('C_GUARD', '/cwd/guard')
+    await Bun.sleep(WAIT_MS)  // timer fires, activeLaunches now has C_GUARD
+
+    // Guard check: active launch → true
+    expect(isRestartPendingOrActive('C_GUARD')).toBe(true)
+
+    // Simulate inbound path: guard skips the second schedule
+    const wouldSchedule = !isRestartPendingOrActive('C_GUARD')
+    expect(wouldSchedule).toBe(false)
+
+    launchResolve(true)
+    await Bun.sleep(1)
+
+    // After launch completes: exactly one launch total
+    expect(deps.launchSessionCalls).toHaveLength(1)
+    expect(deps.launchSessionCalls[0].channelId).toBe('C_GUARD')
+  })
+
+  // ---- channel isolation: guard state is per-channel ----
+
+  test('G4. guard state is per-channel — pending on C_GUARD does not block C_OTHER', async () => {
+    const deps = makeRestartDeps({ restartDelay: SLOW_DELAY_S })
+    initRestart(deps)
+
+    scheduleRestart('C_GUARD', '/cwd/guard')
+
+    expect(isRestartPendingOrActive('C_GUARD')).toBe(true)
+    expect(isRestartPendingOrActive('C_OTHER')).toBe(false)
   })
 })
