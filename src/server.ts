@@ -367,6 +367,11 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
         const cwd = routingConfig?.routes[channelId]?.cwd
         if (cwd) {
           console.error(`[slack] Session disconnected: channel=${channelId} cwd="${cwd}"`)
+          // SR-26.1: skip if restart already pending or active (prevents double-spawn)
+          if (isRestartPendingOrActive(channelId)) {
+            console.error(`[slack] onsessionclosed: restart already pending/active for channel=${channelId}, skipping`)
+            return
+          }
           // Session-id resume is now owned by agent-director (SR-1.3); the
           // sessionId arg to scheduleRestart is retained for API stability
           // but ignored by launchSession.
@@ -680,7 +685,12 @@ async function handleMessage(event: unknown): Promise<void> {
           `[slack] DROP: no _GET_stream for cwd="${targetSession.cwd}" channel=${channelId} ` +
           `mcpSessionId=${mcpSessionId} — message will not reach the bot; scheduling restart`
         )
-        scheduleRestart(channelId, targetSession.cwd)
+        // SR-26.1: skip if restart already pending or active (prevents double-spawn)
+        if (isRestartPendingOrActive(channelId)) {
+          console.error(`[slack] dispatch: restart already pending/active for channel=${channelId}, skipping`)
+        } else {
+          scheduleRestart(channelId, targetSession.cwd)
+        }
         // Continue with the .notification() call anyway, so behavior in this PR is
         // strictly observe + restart-on-miss; not yet a behavior change for the normal path.
       }
@@ -1265,7 +1275,12 @@ export async function main(): Promise<void> {
             const cwd = routingConfig?.routes[channelId]?.cwd
             if (cwd) {
               console.error(`[slack] Session disconnected (SSE abort): channel=${channelId} cwd="${cwd}"`)
-              scheduleRestart(channelId, cwd)
+              // SR-26.1: skip if restart already pending or active (prevents double-spawn)
+              if (isRestartPendingOrActive(channelId)) {
+                console.error(`[slack] SSE-abort: restart already pending/active for channel=${channelId}, skipping`)
+              } else {
+                scheduleRestart(channelId, cwd)
+              }
             } else {
               console.error(`[slack] Session disconnected (SSE abort): channel=${channelId}`)
             }
