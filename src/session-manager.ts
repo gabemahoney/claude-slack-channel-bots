@@ -45,10 +45,11 @@ import {
   ErrTmuxNotAvailable,
   ErrCwdNotFound,
   ErrCwdNotADirectory,
+  ErrTmuxSendKeys,
 } from './agent-director-errors.ts'
 import { recordStartupError } from './startup-errors.ts'
 import { isDryRun } from './tokens.ts'
-import { defaultTmuxProbe, type TmuxProbeFn } from './tmux-probe.ts'
+import { defaultTmuxProbe, type TmuxProbeFn, SEND_KEYS_NOT_FOUND_NEEDLES } from './tmux-probe.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -182,28 +183,115 @@ export function flushSpawnFailureQueue(web: WebClient): void {
 // ---------------------------------------------------------------------------
 
 /**
+ * Discriminated result from reconnectMcp (SR-22.1):
+ *
+ *   'success'       — sendKeys succeeded; the MCP server reconnect was sent.
+ *   'escalate-dead' — ErrTmuxSendKeys with a not-found errDescription AND the
+ *                     confirming tmux has-session probe returned definitely-dead.
+ *                     The session is gone; the caller should defer to the
+ *                     scheduled-restart path for recovery.
+ *   'transient'     — Any other failure (ErrSystemInstallDisappeared,
+ *                     ErrTmuxNotAvailable, ErrTmuxSendKeys-but-probe-transient,
+ *                     generic AD errors, non-AD errors). Existing Slack surface
+ *                     applies; typed errName preserved where possible.
+ */
+export type ReconnectMcpResult = 'success' | 'escalate-dead' | 'transient'
+
+/**
  * Send `/mcp reconnect <MCP_SERVER_NAME>` to the spawn's pane. Library's
  * sendKeys appends Enter automatically per its contract.
+ *
+ * Returns a {@link ReconnectMcpResult} discriminated result.  Escalation to
+ * 'escalate-dead' is gated on both (a) a not-found substring match on
+ * `errDescription` and (b) a confirming has-session re-probe that returns
+ * `definitely-dead`; the string match is a hint only — the probe is
+ * authoritative (SR-22.1).
+ *
+ * The probe fires ONLY inside the ErrTmuxSendKeys-not-found branch.  It is
+ * never called on the success path or on generic/non-AD errors.
+ *
+ * The `probe` parameter defaults to the module-level `_tmuxProbe` seam so
+ * tests can inject a stub without spawning real tmux processes.  It is not
+ * exposed to callers that only need the default wiring.
+ *
+ * NOTE: the resume branch in spawnForRoute never calls reconnectMcp — resume
+ * creates a fresh tmux session and restarts Claude Code from scratch; there is
+ * no /mcp reconnect needed on a brand-new session (and calling reconnectMcp on
+ * a session that just restarted would be a no-op at best and confusing at worst).
  */
 export async function reconnectMcp(
   channelId: string,
   web?: WebClient,
   routingConfig?: RoutingConfig,
-): Promise<boolean> {
-  const claude_instance_id = instanceIdFor(channelId, routingConfig?.routes[channelId]?.normalizedName)
+  probe: TmuxProbeFn = _tmuxProbe,
+): Promise<ReconnectMcpResult> {
+  const normalizedName = routingConfig?.routes[channelId]?.normalizedName
+  const claude_instance_id = instanceIdFor(channelId, normalizedName)
   console.error(`[slack] reconnecting MCP server "${MCP_SERVER_NAME}": channel=${channelId}`)
   try {
     await withOutageDetection(channelId, undefined, (client) => client.sendKeys({
       claude_instance_id,
       text: `/mcp reconnect ${MCP_SERVER_NAME}`,
     }))
-    return true
+    return 'success'
   } catch (err) {
-    if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) return false
+    if (err instanceof ErrSystemInstallDisappeared) return 'transient'
+
+    if (err instanceof ErrTmuxNotAvailable) {
+      // Probe the session: tmux binary is absent/broken, but the socket may
+      // still be gone too (post-reboot socket-absent case, SR-22.2).
+      // If the probe confirms definitely-dead, escalate; otherwise preserve
+      // the existing tmux-unavailable semantics (transient).
+      const sessionName = tmuxSessionNameFor(channelId, normalizedName)
+      const probeResult = await probe(sessionName)
+      if (probeResult.classification === 'definitely-dead') {
+        console.error(
+          `[slack] reconnectMcp: ErrTmuxNotAvailable + probe=definitely-dead (signal=${probeResult.signal}) for channel=${channelId} — escalating`,
+        )
+        return 'escalate-dead'
+      }
+      console.error(
+        `[slack] reconnectMcp: ErrTmuxNotAvailable + probe=${probeResult.classification} (signal=${probeResult.signal}) for channel=${channelId} — transient`,
+      )
+      return 'transient'
+    }
+
+    // ErrTmuxSendKeys: check whether errDescription hints at session-not-found.
+    // If the hint matches, run the confirming has-session probe.  The probe is
+    // authoritative: only 'definitely-dead' escalates; 'transient-inconclusive'
+    // falls through to 'transient' (conservatism, SR-20.4).  The not-found
+    // needle set is the SAME one used by classifyHasSession in tmux-probe.ts —
+    // single definition (SEND_KEYS_NOT_FOUND_NEEDLES, exported from there).
+    if (err instanceof ErrTmuxSendKeys) {
+      const lowerDesc = err.errDescription.toLowerCase()
+      const hintMatches = SEND_KEYS_NOT_FOUND_NEEDLES.some((n) => lowerDesc.includes(n))
+      if (hintMatches) {
+        const sessionName = tmuxSessionNameFor(channelId, normalizedName)
+        const probeResult = await probe(sessionName)
+        if (probeResult.classification === 'definitely-dead') {
+          console.error(
+            `[slack] reconnectMcp: session definitely-dead (signal=${probeResult.signal}) after send-keys not-found for channel=${channelId} — escalating`,
+          )
+          return 'escalate-dead'
+        }
+        console.error(
+          `[slack] reconnectMcp: send-keys not-found hint but probe=${probeResult.classification} (signal=${probeResult.signal}) for channel=${channelId} — transient`,
+        )
+      } else {
+        console.error(
+          `[slack] reconnectMcp: ErrTmuxSendKeys (no not-found match) for channel=${channelId}: ${err.errName}`,
+        )
+      }
+      postSpawnFailureToChannel(channelId, err, web)
+      return 'transient'
+    }
+
+    // Generic AD or non-AD error: preserve typed errName where available
+    // (do NOT rewrap a typed AgentDirectorError into UnknownError).
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('send-keys', 'UnknownError', String(err))
     console.error(`[slack] reconnectMcp: send-keys failed for channel=${channelId}: ${e.errName}`)
     postSpawnFailureToChannel(channelId, e, web)
-    return false
+    return 'transient'
   }
 }
 
@@ -514,14 +602,19 @@ export function _resetWaitForWaitingTimeoutMs(): void {
 /**
  * Poll `status({claude_instance_id})` until the spawn transitions to
  * `waiting`, then call reconnectMcp. On other terminal transitions (ended,
- * missing, etc) return true without sending — health-check picks it up.
- * On timeout, log and return true (long turns aren't errors).
+ * missing, etc) return the result without sending — health-check picks it up.
+ * On timeout, log and return 'success' (long turns aren't errors; health-check retries).
+ *
+ * Threads the {@link ReconnectMcpResult} union up: 'success' | 'escalate-dead' |
+ * 'transient' from reconnectMcp propagate unchanged to the caller.  Non-waiting
+ * terminal state and timeout map to 'success' (existing behavior preserved;
+ * health-check owns recovery for those paths).
  */
 export async function waitForWaitingAndReconnect(
   channelId: string,
   routingConfig: RoutingConfig,
   web?: WebClient,
-): Promise<boolean> {
+): Promise<ReconnectMcpResult> {
   const claude_instance_id = instanceIdFor(channelId, routingConfig.routes[channelId]?.normalizedName)
   const pollIntervalMs = routingConfig.agent_director_poll_interval_ms
   const deadline = Date.now() + _waitForWaitingTimeoutMs
@@ -534,15 +627,15 @@ export async function waitForWaitingAndReconnect(
     } catch (err) {
       if (err instanceof ErrSpawnNotFound) {
         console.error(`[slack] waitForWaitingAndReconnect: spawn not found for channel=${channelId} — aborting poll`)
-        return true
+        return 'success'
       }
       if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
-        return false
+        return 'transient'
       }
       const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('status', 'UnknownError', String(err))
       console.error(`[slack] waitForWaitingAndReconnect: status error for channel=${channelId}: ${e.errName}`)
       postSpawnFailureToChannel(channelId, e, web)
-      return false
+      return 'transient'
     }
 
     if (state === 'waiting') {
@@ -555,13 +648,13 @@ export async function waitForWaitingAndReconnect(
     }
 
     console.error(`[slack] waitForWaitingAndReconnect: channel=${channelId} transitioned to state=${state} — aborting (health-check will handle)`)
-    return true
+    return 'success'
   }
 
   console.error(
     `[slack] reconnect: gave up waiting for channel=${channelId} after ${_waitForWaitingTimeoutMs}ms — health-check will retry`,
   )
-  return true
+  return 'success'
 }
 
 // ---------------------------------------------------------------------------
@@ -1058,11 +1151,28 @@ export async function spawnForRoute(
   }
 
   if (state === 'waiting') {
-    await reconnectMcp(channelId, web, routingConfig)
+    // Dead-row steering is owned by the collision-branch probe above; escalation
+    // here defers to the scheduled-restart path (SR-23.2, t1.a3g.u4 Task B).
+    // NOTE: the resume branch above never calls reconnectMcp — resume creates a
+    // fresh tmux session and restarts Claude Code from scratch; /mcp reconnect
+    // is not needed there (and calling it would be confusing).
+    const reconnectResult = await reconnectMcp(channelId, web, routingConfig)
+    if (reconnectResult === 'escalate-dead') {
+      // Session died between the probe above and the sendKeys attempt (race).
+      // Return 'reconnected' and let the scheduled-restart path handle recovery
+      // — this spawnForRoute call has already done its one send-keys attempt.
+      console.error(
+        `[slack] spawnForRoute: reconnectMcp escalate-dead for channel=${channelId} — deferring to scheduled-restart`,
+      )
+      return { channelId, action: 'reconnected' }
+    }
     return { channelId, action: 'reconnected' }
   }
 
   if (state === 'working') {
+    // waitForWaitingAndReconnect threads the ReconnectMcpResult union up;
+    // 'escalate-dead' is handled the same way as in the waiting branch above —
+    // return 'reconnected' and let the scheduled-restart path recover.
     await waitForWaitingAndReconnect(channelId, routingConfig, web)
     return { channelId, action: 'reconnected' }
   }

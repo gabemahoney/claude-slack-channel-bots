@@ -130,11 +130,20 @@ export type TmuxExecFn = (args: string[]) => Promise<TmuxExecResult>
 // Stderr pattern matching (SR-20.2)
 // ---------------------------------------------------------------------------
 
-/** Patterns that indicate the session name was not found. */
-const SESSION_NOT_FOUND_PATTERNS = [
+/**
+ * Lowercase substrings whose presence in stderr indicates the tmux session
+ * name was not found.  Shared between classifyHasSession (has-session probe)
+ * and reconnectMcp's ErrTmuxSendKeys discriminator (SR-22.1) so both use a
+ * SINGLE definition.  Import via `SEND_KEYS_NOT_FOUND_NEEDLES` for the
+ * send-keys use-case.
+ */
+export const SEND_KEYS_NOT_FOUND_NEEDLES: ReadonlyArray<string> = [
   "can't find session",
   'session not found',
 ]
+
+/** Internal alias — same reference, avoids rename churn in classifyHasSession. */
+const SESSION_NOT_FOUND_PATTERNS = SEND_KEYS_NOT_FOUND_NEEDLES
 
 /** Patterns that indicate tmux server / socket is absent. */
 const NO_SERVER_PATTERNS = [
