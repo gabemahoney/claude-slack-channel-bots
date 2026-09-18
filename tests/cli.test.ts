@@ -458,7 +458,6 @@ describe('getClient seam', () => {
       loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
       getClient: () => {
         // This is the seam: import from the singleton module, not a closure.
-        const { getClient } = require('../src/agent-director-client.ts')
         return getClient()
       },
       // directorStatus wired to call deps.getClient().list() then .status()
@@ -518,7 +517,6 @@ describe('getClient seam', () => {
       exit: (code) => { throw new ExitError(code) },
       loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
       getClient: () => {
-        const { getClient } = require('../src/agent-director-client.ts')
         return getClient()
       },
       directorStatus: async (_channelId) => {

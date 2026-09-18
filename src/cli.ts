@@ -49,7 +49,11 @@ export interface CliDeps {
   exit: (code: number) => never
   /** Load the routing configuration. */
   loadConfig: () => RoutingConfig
-  /** Return the agent-director Client singleton. */
+  /**
+   * Return the agent-director Client singleton.
+   * Test-seam affordance: production wiring goes through buildRealDirectorDeps(getClient);
+   * this slot lets test deps reach the same stub client without forking a subprocess.
+   */
   getClient: () => import('agent-director').Client
   /**
    * Initialize the AD Client singleton before per-channel work. Optional seam;
@@ -475,10 +479,9 @@ if (import.meta.main) {
     initClient: async () => {
       const outcome = await runStartupGate()
       if (!outcome.ok) {
-        console.error(
-          `[slack] clean_restart: agent-director startup gate failed (${outcome.classLabel}): ${outcome.message}`,
+        throw new Error(
+          `agent-director startup gate failed (${outcome.classLabel}): ${outcome.message}`,
         )
-        process.exit(1)
       }
     },
     directorStatus: realDirectorDeps.directorStatus,
