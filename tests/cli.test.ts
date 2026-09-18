@@ -13,6 +13,11 @@ import { spawnSync } from 'node:child_process'
 import { join, resolve } from 'path'
 import type { CliDeps, CliHandlers } from '../src/cli.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
+import { makeStubClient, cannedListRow, type StubClientOptions } from './test-helpers/agent-director-stub.ts'
+import {
+  setClientForTests,
+  resetClientForTests,
+} from '../src/agent-director-client.ts'
 
 process.env['SLACK_BOT_TOKEN'] = 'xoxb-test-placeholder'
 process.env['SLACK_APP_TOKEN'] = 'xapp-test-placeholder'
@@ -95,12 +100,19 @@ function makeDeps(o: Overrides = {}): Bundle {
       killCalls.push(channelId)
       if (o.directorKill) return o.directorKill(channelId)
     },
+    // Stub out the getClient seam with a minimal no-op client.
+    // Tests that exercise the seam directly (see "getClient seam" suite below)
+    // override this slot by wiring deps.getClient() to a real StubClient.
+    getClient: () => makeStubClient() as unknown as import('agent-director').Client,
   }
   return { deps, exitCodes, spawnCalls, pauseCalls, killCalls, statusCalls }
 }
 
 afterEach(() => {
   delete process.env['_CLI_DAEMON_CHILD']
+  // Reset the agent-director-client singleton so stub installs don't leak
+  // between tests (mirrors the contract for setClientForTests users).
+  resetClientForTests()
 })
 
 // ---------------------------------------------------------------------------
@@ -185,6 +197,165 @@ describe('clean_restart', () => {
     })
     await createCli(deps).clean_restart()
     expect(killCalls).toEqual(['C'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// getClient seam-routing — proves the stub installed via setClientForTests
+// is the same client that deps.getClient() returns, and that clean_restart
+// deps wired through deps.getClient() reach the stub's list/status verbs.
+//
+// SCOPE: plumbing-only. The real resolveCscbInstanceId (which calls
+// realDeps.getClient().list()) lives in the import.meta.main block and is NOT
+// reachable via createCli(). What IS reachable here:
+//
+//   1. getClient() (from agent-director-client.ts) returns whatever
+//      setClientForTests installed — identity test.
+//   2. CliDeps.getClient() slot is plumbed: when deps.directorStatus is wired
+//      to call deps.getClient().list() then deps.getClient().status(), the
+//      stub's list/status verbs are the ones clean_restart reaches.
+//   3. No "no spawn row — skipping" log for channels whose list() returns a
+//      real row (i.e. the teardown precheck does NOT short-circuit on null).
+//
+// Behavioral red→green tests (AD-unreachable loud-failure / exit-code
+// assertions) are deferred to Epic g5 (SR-27.2).
+// ---------------------------------------------------------------------------
+
+describe('getClient seam', () => {
+  test('setClientForTests installs the stub returned by getClient()', async () => {
+    const { getClient } = await import('../src/agent-director-client.ts')
+    const stub = makeStubClient()
+    setClientForTests(stub as unknown as import('agent-director').Client)
+    // getClient() must return the exact stub instance we installed.
+    expect(getClient() as unknown).toBe(stub)
+    // afterEach calls resetClientForTests() — no explicit reset needed here.
+  })
+
+  test('clean_restart reaches stub list() + status() when deps.getClient() routes through stub', async () => {
+    // Arrange: stub with one cscb row for channel C; status returns 'waiting'
+    // then 'ended' so clean_restart completes the teardown path without kill.
+    const listCalls: StubClientOptions['listCalls'] = []
+    const statusCalls: StubClientOptions['statusCalls'] = []
+    let statusCallCount = 0
+    const stub = makeStubClient({
+      // list() returns one row for the channel — resolveCscbInstanceId-equivalent
+      // in the wired deps returns the instance id from this row.
+      listResult: { spawns: [cannedListRow({ claude_instance_id: 'cscb_C_test' })] },
+      listCalls,
+      // status(): first call → 'waiting' (precheck passes); second → 'ended'
+      // (poll succeeds; no kill needed).
+      statusCalls,
+      statusQueue: [
+        { kind: 'resolve', value: { state: 'waiting' } },
+        { kind: 'resolve', value: { state: 'ended' } },
+      ],
+    })
+
+    // Install the stub as the module-level singleton.
+    setClientForTests(stub as unknown as import('agent-director').Client)
+
+    // Build deps whose director* verbs call deps.getClient() — this is
+    // structurally equivalent to the realDeps wiring in import.meta.main,
+    // minus resolveCscbInstanceId (which lives only in that block).
+    const pauseCalls: string[] = []
+    const killCalls: string[] = []
+    const deps: CliDeps = {
+      spawnSync: () => ({ status: 0 }),
+      env: { SLACK_BOT_TOKEN: 'xoxb', SLACK_APP_TOKEN: 'xapp' },
+      existsSync: () => true,
+      readFileSync: () => { throw new Error('unexpected') },
+      unlinkSync: () => { /* no-op */ },
+      isProcessRunning: () => false,
+      kill: () => { /* no-op */ },
+      resolveStateDir: () => STATE_DIR,
+      startServer: async () => { /* no-op */ },
+      exit: (code) => { throw new ExitError(code) },
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+      getClient: () => {
+        // This is the seam: import from the singleton module, not a closure.
+        const { getClient } = require('../src/agent-director-client.ts')
+        return getClient()
+      },
+      // directorStatus wired to call deps.getClient().list() then .status()
+      // (mirrors realDeps pattern: list to resolve instance id, then status).
+      directorStatus: async (_channelId) => {
+        const client = deps.getClient()
+        // Resolve instance id via list (mirrors resolveCscbInstanceId shape).
+        const listResult = await client.list({ label: ['service=cscb', `channel=${_channelId}`] })
+        if (listResult.spawns.length === 0) return null
+        const instanceId = listResult.spawns[0].claude_instance_id
+        const r = await client.status({ claude_instance_id: instanceId })
+        statusCallCount++
+        return { state: r.state }
+      },
+      directorPause: async (channelId) => {
+        pauseCalls.push(channelId)
+      },
+      directorKill: async (channelId) => {
+        killCalls.push(channelId)
+      },
+    }
+
+    // Act
+    const { createCli: createCliLocal } = await import('../src/cli.ts')
+    await createCliLocal(deps).clean_restart()
+
+    // Assert: list() was called (seam reached the stub)
+    expect(listCalls.length).toBeGreaterThan(0)
+    // Assert: status() was called (precheck did NOT short-circuit on null)
+    expect(statusCallCount).toBeGreaterThan(0)
+    // Assert: pause was called (non-terminal precheck → teardown path)
+    expect(pauseCalls).toContain('C')
+    // Assert: kill was NOT called (status transitioned to 'ended' cleanly)
+    expect(killCalls).toEqual([])
+  })
+
+  test('clean_restart logs "skipping" only for channels with NO list() rows', async () => {
+    // Stub returns empty list → resolveCscbInstanceId-equivalent returns null
+    // → directorStatus returns null → precheck hits the skip branch.
+    const stub = makeStubClient({
+      listResult: { spawns: [] },
+    })
+    setClientForTests(stub as unknown as import('agent-director').Client)
+
+    const pauseCalls: string[] = []
+    const statusCalled: boolean[] = []
+    const deps: CliDeps = {
+      spawnSync: () => ({ status: 0 }),
+      env: { SLACK_BOT_TOKEN: 'xoxb', SLACK_APP_TOKEN: 'xapp' },
+      existsSync: () => true,
+      readFileSync: () => { throw new Error('unexpected') },
+      unlinkSync: () => { /* no-op */ },
+      isProcessRunning: () => false,
+      kill: () => { /* no-op */ },
+      resolveStateDir: () => STATE_DIR,
+      startServer: async () => { /* no-op */ },
+      exit: (code) => { throw new ExitError(code) },
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+      getClient: () => {
+        const { getClient } = require('../src/agent-director-client.ts')
+        return getClient()
+      },
+      directorStatus: async (_channelId) => {
+        const client = deps.getClient()
+        const listResult = await client.list({ label: ['service=cscb', `channel=${_channelId}`] })
+        if (listResult.spawns.length === 0) return null
+        statusCalled.push(true)
+        const instanceId = listResult.spawns[0].claude_instance_id
+        const r = await client.status({ claude_instance_id: instanceId })
+        return { state: r.state }
+      },
+      directorPause: async (channelId) => { pauseCalls.push(channelId) },
+      directorKill: async () => { /* no-op */ },
+    }
+
+    const { createCli: createCliLocal } = await import('../src/cli.ts')
+    await createCliLocal(deps).clean_restart()
+
+    // No rows → directorStatus returned null → precheck skipped → no pause.
+    expect(pauseCalls).toEqual([])
+    // status() verb on the stub was NOT called (short-circuited at list=empty).
+    expect(statusCalled).toEqual([])
   })
 })
 
