@@ -879,9 +879,13 @@ export async function spawnForRoute(
       // Collision → fall through to get-then-act
       console.error(`[slack] spawnForRoute: ErrInstanceIdCollision for channel=${channelId} — fetching current state`)
     } else if (err instanceof ErrTmuxSessionCreate) {
-      // b.vub: fresh spawn collided on the deterministic tmux session name held
-      // by an orphan session (no instance-id collision → no AD row to resolve).
-      // Self-heal: kill the orphan by name, retry spawn once.
+      // SR-26.2 (b.vub): fresh spawn collided on the deterministic tmux session
+      // name held by an orphan session (no instance-id collision → no AD row).
+      // Self-heal: kill the orphan by name via _killTmuxSession, retry spawn once.
+      // Excluded sites: post-ladder fresh spawns (after kill+delete, ErrNoSessionId,
+      // ErrSpawnNotResumable) are each preceded by an AD kill/delete and a deeper
+      // problem if ErrTmuxSessionCreate fires there — hard failure, no self-heal.
+      // ErrSpawnNotFound retry site is already a retry — no double-retry allowed.
       try {
         const r = await selfHealTmuxCollisionAndRespawn(channelId, route, params, normalizedName)
         console.error(`[slack] spawnForRoute: self-heal spawn succeeded after ErrTmuxSessionCreate for channel=${channelId} instanceId=${r.claude_instance_id}`)
