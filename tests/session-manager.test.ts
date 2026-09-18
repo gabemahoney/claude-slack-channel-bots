@@ -869,6 +869,28 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
 
   // -------------------------------------------------------------------------
   // b.vub — ErrTmuxSessionCreate self-heal (kill orphan tmux + retry once)
+  //
+  // SR-26.2 / SR-29.2 #4 REGRESSION PIN
+  //
+  // These tests pin the shipped self-heal behavior (session-manager.ts,
+  // initial-fresh-spawn catch, ErrTmuxSessionCreate arm). They must stay green
+  // at HEAD so any regression in the kill+retry-once logic is caught immediately.
+  //
+  // Six-case list (SR-29.2 #4):
+  //   (1) Positive — fresh or resume path: kill orphan by exact tmuxSessionNameFor
+  //       name, retry-spawn succeeds, action='spawned', exactly 2 spawn calls,
+  //       exactly 1 kill-session invocation.
+  //   (2) Negative — double ErrTmuxSessionCreate: exactly 1 kill, 2 spawns,
+  //       action='failed', Slack failure post; no third attempt.
+  //   (3) Guard — tracked channel (ErrInstanceIdCollision path) never enters the
+  //       self-heal arm: zero _setTmuxSessionKiller invocations.
+  //   (4) Guard — ErrCwdNotFound at initial fresh-spawn catch: 'failed', sets
+  //       cwd-unreachable flag, zero kill-sessions. (Covered at wrapper-migration
+  //       site #11b below — annotated there as SR-29.2 #4 pin.)
+  //   (5) Guard (Addition A) — ErrSystemInstallDisappeared / ErrTmuxNotAvailable
+  //       at the initial fresh-spawn catch: 'failed' silently, zero kill-sessions.
+  //   (6) Guard (Addition B) — rowless collision under resume_enabled:false:
+  //       identical kill-then-retry-once behavior (SR-23.3-unchanged).
   // -------------------------------------------------------------------------
 
   test('b.vub: ErrTmuxSessionCreate on resume → kill orphan tmux by name + retry spawn once', async () => {
@@ -938,12 +960,17 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     expect(killedSessions).toEqual(['slack_bot_my_chan_C_T1'])
   })
 
+  // SR-29.2 #4 case (2): double ErrTmuxSessionCreate — exactly 1 kill, 2 spawns,
+  // action='failed', Slack failure post; no third attempt.
   test('b.vub: ErrTmuxSessionCreate self-heal that fails on retry → posts Slack failure', async () => {
-    _setTmuxSessionKiller(async () => { /* orphan killed but retry still fails */ })
+    const killedSessions: string[] = []
+    _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
+    const spawnCalls: import('agent-director').SpawnParams[] = []
     const { web, calls } = makeMockWeb()
     const readLog = captureStartupErrors()
     installStub({
-      // fresh spawn throws tmux-create; retry spawn also throws (generic)
+      spawnCalls,
+      // fresh spawn throws tmux-create; retry spawn also throws — no third attempt
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
         cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
@@ -955,6 +982,103 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     expect(result.action).toBe('failed')
     expect(calls.length).toBeGreaterThanOrEqual(1)
     expect(readLog()).toContain('[spawn-failed]')
+    // Exactly one kill-session (before the retry) — never a second kill.
+    expect(killedSessions).toHaveLength(1)
+    // Exactly two spawn calls — no third attempt.
+    expect(spawnCalls).toHaveLength(2)
+  })
+
+  // SR-29.2 #4 case (3): tracked channel (ErrInstanceIdCollision path) never
+  // enters the self-heal arm — zero _setTmuxSessionKiller invocations.
+  // A channel with an existing AD row collides on the instance-id, not on the
+  // tmux session name, so no kill-session call is made.
+  test('b.vub SR-29.2 #4 guard (3): tracked channel collision → zero kill-session invocations', async () => {
+    const killedSessions: string[] = []
+    _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
+    // Probe returns alive so the collision branch exits via reconnected / no-op
+    // without entering the ErrTmuxSessionCreate self-heal arm.
+    const { probe } = makeStubTmuxProbe('definitely-alive')
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({
+      spawnCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, true, probe)
+
+    // Collision path resolves as reconnected — no self-heal arm entered.
+    expect(result.action).toBe('reconnected')
+    // ZERO kill-session calls: the tmux session-name collision arm was never reached.
+    expect(killedSessions).toHaveLength(0)
+    // Only the initial spawn call (the collision) — no retry via self-heal.
+    expect(spawnCalls).toHaveLength(1)
+  })
+
+  // SR-29.2 #4 case (5) Addition A: ErrSystemInstallDisappeared and ErrTmuxNotAvailable
+  // at the initial fresh-spawn catch → 'failed' silently, zero kill-sessions.
+  // SR-20.2: transient system errors never trigger kill-session.
+  test('b.vub SR-29.2 #4 guard (5a): ErrSystemInstallDisappeared at initial spawn → failed silently, zero kill-sessions', async () => {
+    const killedSessions: string[] = []
+    _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
+    const { web, calls } = makeMockWeb()
+    installStub({
+      spawnError: new ErrSystemInstallDisappeared('spawn', '/usr/bin/agent-director'),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, web as never)
+
+    expect(result.action).toBe('failed')
+    // Silent: no Slack failure post for transient system errors.
+    expect(calls).toHaveLength(0)
+    // No kill-session: self-heal arm is never reached when install disappears.
+    expect(killedSessions).toHaveLength(0)
+  })
+
+  test('b.vub SR-29.2 #4 guard (5b): ErrTmuxNotAvailable at initial spawn → failed silently, zero kill-sessions', async () => {
+    const killedSessions: string[] = []
+    _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
+    const { web, calls } = makeMockWeb()
+    installStub({
+      spawnError: new ErrTmuxNotAvailable('spawn', 'ErrTmuxNotAvailable', 'tmux not available'),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, web as never)
+
+    expect(result.action).toBe('failed')
+    // Silent: no Slack failure post for transient system errors.
+    expect(calls).toHaveLength(0)
+    // No kill-session: self-heal arm is never reached when tmux is unavailable.
+    expect(killedSessions).toHaveLength(0)
+  })
+
+  // SR-29.2 #4 case (6) Addition B: rowless collision under resume_enabled:false
+  // behaves identically to the fresh-spawn self-heal (kill-then-retry-once).
+  // Pins SR-23.3-unchanged: the resume_enabled flag does not affect the
+  // ErrTmuxSessionCreate arm which fires BEFORE the collision-handling ladder.
+  test('b.vub SR-29.2 #4 guard (6): resume_enabled:false rowless ErrTmuxSessionCreate → kill+retry-once, spawned', async () => {
+    const killedSessions: string[] = []
+    _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({
+      spawnCalls,
+      // 1st fresh spawn (no collision) throws tmux-create → self-heal
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      ],
+      statusResult: { state: 'waiting' },
+    })
+    // resume_enabled:false — but the ErrTmuxSessionCreate arm fires before any
+    // collision-branch resume_enabled check, so behavior is identical.
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, resume_enabled: false })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+    expect(result.action).toBe('spawned')
+    // Exactly one kill-session before the retry — same as the resume_enabled:true path.
+    expect(killedSessions).toEqual(['slack_bot_C'])
+    // Exactly two spawn calls: initial + one retry.
+    expect(spawnCalls).toHaveLength(2)
   })
 })
 
@@ -1483,6 +1607,9 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     expect(calls).toHaveLength(0)
   })
 
+  // SR-29.2 #4 case (4) guard pin: ErrCwdNotFound at initial fresh-spawn catch →
+  // 'failed', cwd-unreachable flag set, zero Slack failure post, zero kill-sessions.
+  // (Self-heal arm is never entered when the cwd does not exist.)
   test('site #11b: initial spawn ErrCwdNotFound → cwd-unreachable with route.cwd as detail, no postSpawnFailureToChannel', async () => {
     const { web, calls } = makeMockWeb()
     installStub({ spawnError: new ErrCwdNotFound('spawn', 'ErrCwdNotFound', `cwd ${CWD} does not exist`) })
