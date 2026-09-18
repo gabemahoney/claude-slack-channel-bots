@@ -52,7 +52,9 @@ import {
   refreshRouteNameFromEvent,
   resolveChannelNames,
   startupSessionManager,
+  tmuxSessionNameFor,
 } from './session-manager.ts'
+import { defaultTmuxProbe, classifyAdError, type TmuxProbeFn } from './tmux-probe.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { ErrSpawnNotFound } from 'agent-director'
 import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from './agent-director-errors.ts'
@@ -842,25 +844,74 @@ process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
 // ---------------------------------------------------------------------------
 
 /**
+ * Module-level probe used by _buildIsSessionAliveAdapter when no probe is
+ * supplied via the deps param. Defaults to the real defaultTmuxProbe
+ * (always-on; no opt-out in production). Tests override this via
+ * _setAdapterProbeForTests to avoid shelling out to real tmux.
+ */
+let _adapterProbe: TmuxProbeFn = defaultTmuxProbe
+
+/** @internal Test-only seam: override the default probe for all adapter instances. */
+export function _setAdapterProbeForTests(fn: TmuxProbeFn): void {
+  _adapterProbe = fn
+}
+
+/** @internal Test-only seam: restore the real defaultTmuxProbe. */
+export function _resetAdapterProbeForTests(): void {
+  _adapterProbe = defaultTmuxProbe
+}
+
+/**
  * _buildIsSessionAliveAdapter — test-only factory for the tick-path liveness
  * probe. Production code wires this via main() as `isSessionAliveAdapter`;
- * tests call it directly to exercise the four SRD § Liveness probe branches
+ * tests call it directly to exercise the SRD § Liveness probe branches
  * without importing the private closure inside main().
+ *
+ * Probe integration (SR-21.4, SR-20.4):
+ *   - Non-live states and ErrSpawnNotFound → false without probing (existing).
+ *   - Live-state row: run `tmux has-session` via the injectable probe:
+ *       definitely-dead  → false (scheduleRestart's kill-then-launchSession fires)
+ *       transient        → true  (session may still be alive; avoid destructive restart)
+ *       definitely-alive → true
+ *   - Catch fallthrough delegates to classifyAdError:
+ *       transient → ad-unreachable flag raised + true returned (deferred from mb;
+ *         single owner: this adapter).
+ *       definitely-dead → false (classifyAdError maps ErrSpawnNotFound; already
+ *         handled by the explicit arm above, so this arm is theoretical).
+ *       not-a-liveness-signal → conservative false + log (must not occur for
+ *         status() errors; handled defensively).
+ *
+ * SR-21.5 bound holds by construction: tick interval (health_check_interval,
+ * default 120s) + restart delay (session_restart_delay, default 60s). The
+ * health-check guard (isRestartPendingOrActive) prevents concurrent restarts
+ * from stacking. See Task C's test for the bound assertion.
  *
  * @internal
  */
 export function _buildIsSessionAliveAdapter(
   getRoutingConfig: () => RoutingConfig | null | undefined,
+  deps?: { probe?: TmuxProbeFn },
 ): (channelId: string) => Promise<boolean> {
   return async (channelId: string) => {
+    const probe = deps?.probe ?? _adapterProbe
     const routingConfig = getRoutingConfig()
     if (!routingConfig?.routes[channelId]) return false
-    const claude_instance_id = instanceIdFor(channelId, routingConfig.routes[channelId]?.normalizedName)
+    const normalizedName = routingConfig.routes[channelId]?.normalizedName
+    const claude_instance_id = instanceIdFor(channelId, normalizedName)
     try {
       const r = await getClient().status({ claude_instance_id })
       clearOutageFlag(channelId, 'ad-unreachable')
       clearOutageFlag(channelId, 'tmux-unavailable')
-      return AGENT_DIRECTOR_LIVE_STATES.has(r.state)
+      if (!AGENT_DIRECTOR_LIVE_STATES.has(r.state)) return false
+      // Live-state row: consult the tmux probe (SR-21.4).
+      const sessionName = tmuxSessionNameFor(channelId, normalizedName)
+      const probeResult = await probe(sessionName)
+      if (probeResult.classification === 'definitely-dead') {
+        console.error(`[slack] isSessionAlive: tmux probe → definitely-dead for channel=${channelId} session=${sessionName} signal=${probeResult.signal}`)
+        return false
+      }
+      // transient-inconclusive or definitely-alive → report alive (SR-20.4)
+      return true
     } catch (err) {
       if (err instanceof ErrSpawnNotFound) {
         clearOutageFlag(channelId, 'ad-unreachable')
@@ -875,6 +926,22 @@ export function _buildIsSessionAliveAdapter(
         setOutageFlag(channelId, 'tmux-unavailable')
         return false
       }
+      // Classify the error and delegate: transient AD errors (ErrCallTimeout,
+      // connection-refused, unrecognized) → raise ad-unreachable and return true
+      // (SR-21.4/SR-20.4: deferred flag-raising from mb; single owner: this adapter).
+      const classification = classifyAdError(err)
+      if (classification === 'transient-inconclusive') {
+        console.error(`[slack] isSessionAlive: transient status error for channel=${channelId} — raising ad-unreachable:`, err)
+        setOutageFlag(channelId, 'ad-unreachable')
+        return true
+      }
+      if (classification === 'not-a-liveness-signal') {
+        // Should not occur for status() errors; handled conservatively.
+        console.error(`[slack] isSessionAlive: non-liveness status error for channel=${channelId} — treating as dead:`, err)
+        return false
+      }
+      // definitely-dead (e.g. classifyAdError(ErrSpawnNotFound) — already handled
+      // above by the explicit arm; this branch is theoretical but safe).
       console.error(`[slack] isSessionAlive: status error for channel=${channelId}:`, err)
       return false
     }
@@ -1240,7 +1307,17 @@ export async function main(): Promise<void> {
       return session?.connected === true
     },
     reconnectSession: async (channelId) => {
-      await reconnectMcp(channelId, isDryRun() ? undefined : web, routingConfig ?? undefined)
+      const result = await reconnectMcp(channelId, isDryRun() ? undefined : web, routingConfig ?? undefined)
+      if (result === 'escalate-dead') {
+        // SR-25.1: escalation is observable to Epic hi as a launch attempt via the scheduled-restart path.
+        const cwd = routingConfig?.routes[channelId]?.cwd
+        if (!isRestartPendingOrActive(channelId)) {
+          console.error(`[slack] reconnectSession: escalating channel=${channelId} (cause=ErrTmuxNotAvailable+dead) via scheduleRestart cwd="${cwd}"`)
+          scheduleRestart(channelId, cwd)
+        } else {
+          console.error(`[slack] reconnectSession: escalate-dead for channel=${channelId} but restart already pending/active — skipping`)
+        }
+      }
     },
     killSession: async (channelId) => {
       try {

@@ -30,10 +30,24 @@ import {
   setClientForTests,
   resetClientForTests,
 } from '../src/agent-director-client.ts'
-import { makeStubClient } from './test-helpers/agent-director-stub.ts'
-import { _buildIsSessionAliveAdapter } from '../src/server.ts'
+import {
+  makeStubClient,
+  errCallTimeout,
+  cannedOk,
+  cannedErr,
+} from './test-helpers/agent-director-stub.ts'
+import {
+  _buildIsSessionAliveAdapter,
+  _setAdapterProbeForTests,
+  _resetAdapterProbeForTests,
+} from '../src/server.ts'
 import { _runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
+import {
+  makeStubTmuxProbe,
+  makeStubTmuxProbeQueue,
+} from './test-helpers/tmux-probe-stub.ts'
+import type { TmuxProbeFn } from '../src/tmux-probe.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -610,8 +624,34 @@ describe('defaultAccess', () => {
 describe('_buildIsSessionAliveAdapter', () => {
   type Emission = { channelId: string; text: string }
 
-  /** Build per-test emission capture + stub client + outage-state harness. */
-  function makeHarness(statusError?: Error, statusState?: string): {
+  // Install a definitely-alive probe stub for the module seam so that the
+  // four pre-existing DB-state tests (which don't need to configure the probe)
+  // pass unmodified: the module probe is only reached for live-state rows, and
+  // a definitely-alive response there is the safe default for those tests that
+  // care only about the DB-state or error classification branches.
+  beforeEach(() => {
+    _setAdapterProbeForTests(makeStubTmuxProbe('definitely-alive').probe)
+  })
+
+  afterEach(() => {
+    _resetAdapterProbeForTests()
+    resetClientForTests()
+    _resetOutageState()
+  })
+
+  /**
+   * Build per-test emission capture + stub client + outage-state harness.
+   *
+   * Pass `probe` to inject a custom TmuxProbeFn via the adapter's deps seam
+   * (overrides the module-level probe for that adapter instance only).
+   * Pass `statusQueue` to drive sequential status() calls (onset + all-clear).
+   */
+  function makeHarness(opts: {
+    statusError?: Error
+    statusState?: string
+    statusQueue?: import('./test-helpers/agent-director-stub.ts').CannedResponse<import('agent-director').StatusResult>[]
+    probe?: TmuxProbeFn
+  } = {}): {
     emissions: Emission[]
     adapter: (channelId: string) => Promise<boolean>
   } {
@@ -621,25 +661,28 @@ describe('_buildIsSessionAliveAdapter', () => {
       postToChannel: (channelId, text) => { emissions.push({ channelId, text }) },
       getClient: () => makeStubClient() as unknown as Client,
     })
-    const stubOpts = statusError
-      ? { statusError }
-      : { statusResult: { state: statusState ?? 'waiting' } }
+    let stubOpts: import('./test-helpers/agent-director-stub.ts').StubClientOptions
+    if (opts.statusQueue) {
+      stubOpts = { statusQueue: opts.statusQueue }
+    } else if (opts.statusError) {
+      stubOpts = { statusError: opts.statusError }
+    } else {
+      stubOpts = { statusResult: { state: opts.statusState ?? 'waiting' } }
+    }
     setClientForTests(makeStubClient(stubOpts) as unknown as Client)
     // Minimal routing config: channel C1 is routed
     const fakeConfig = { routes: { C1: { normalizedName: 'test-channel' } } }
     return {
       emissions,
-      adapter: _buildIsSessionAliveAdapter(() => fakeConfig as any),
+      adapter: _buildIsSessionAliveAdapter(
+        () => fakeConfig as any,
+        opts.probe !== undefined ? { probe: opts.probe } : undefined,
+      ),
     }
   }
 
-  afterEach(() => {
-    resetClientForTests()
-    _resetOutageState()
-  })
-
   test('1. alive: status returns live state → clears ad-unreachable + tmux-unavailable; returns true', async () => {
-    const { emissions, adapter } = makeHarness(undefined, 'waiting')
+    const { emissions, adapter } = makeHarness({ statusState: 'waiting' })
     // Pre-raise both flags so the clears are observable
     setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
     setOutageFlag('C1', 'tmux-unavailable')
@@ -658,9 +701,9 @@ describe('_buildIsSessionAliveAdapter', () => {
   })
 
   test('2. ErrSpawnNotFound: status throws → clears ad-unreachable + tmux-unavailable; returns false', async () => {
-    const { emissions, adapter } = makeHarness(
-      new ErrSpawnNotFound('status', 'ErrSpawnNotFound', 'spawn not found'),
-    )
+    const { emissions, adapter } = makeHarness({
+      statusError: new ErrSpawnNotFound('status', 'ErrSpawnNotFound', 'spawn not found'),
+    })
     setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
     setOutageFlag('C1', 'tmux-unavailable')
     const before = emissions.length
@@ -678,9 +721,9 @@ describe('_buildIsSessionAliveAdapter', () => {
 
   test('3. ErrSystemInstallDisappeared: status throws → sets ad-unreachable with binaryPath as detail; returns false', async () => {
     const binaryPath = '/home/horde/.agent-director/bin/agent-director'
-    const { emissions, adapter } = makeHarness(
-      new ErrSystemInstallDisappeared('status', binaryPath),
-    )
+    const { emissions, adapter } = makeHarness({
+      statusError: new ErrSystemInstallDisappeared('status', binaryPath),
+    })
 
     const result = await adapter('C1')
 
@@ -693,10 +736,13 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(emissions[0].text).toContain(binaryPath)
   })
 
-  test('4. ErrTmuxNotAvailable: status throws → sets tmux-unavailable (no detail); returns false', async () => {
-    const { emissions, adapter } = makeHarness(
-      new ErrTmuxNotAvailable('status', 'ErrTmuxNotAvailable', 'tmux not found'),
-    )
+  test('4. ErrTmuxNotAvailable: status throws → sets tmux-unavailable (no detail); returns false (SR-20.3)', async () => {
+    // SR-20.3: ErrTmuxNotAvailable remains inconclusive — result is false +
+    // tmux-unavailable flag. Reconcile with C3 is Epic u4's scope (reconnectMcp),
+    // NOT this adapter's (PM ruling: byte-identical branch, no change).
+    const { emissions, adapter } = makeHarness({
+      statusError: new ErrTmuxNotAvailable('status', 'ErrTmuxNotAvailable', 'tmux not found'),
+    })
 
     const result = await adapter('C1')
 
@@ -708,6 +754,104 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(emissions[0].text).toMatch(/tmux unavailable/)
     // ONSET_TEMPLATES['tmux-unavailable'] ignores the detail arg — nothing extra
     expect(emissions[0].text).not.toContain('undefined')
+  })
+
+  // ---------------------------------------------------------------------------
+  // Probe matrix tests (SR-21.4, SR-20.4) — Task t2.a3g.yn.yh / t3.a3g.yn.yh.8s
+  // ---------------------------------------------------------------------------
+
+  test('5. live state + definitely-dead probe → false (scheduleRestart fires)', async () => {
+    // Live-state row ('waiting' ∈ AGENT_DIRECTOR_LIVE_STATES) + dead tmux session
+    // → adapter returns false so the tick path fires scheduleRestart (SR-21.4).
+    const { probe, probeCalls } = makeStubTmuxProbe('definitely-dead')
+    const { adapter } = makeHarness({ statusState: 'waiting', probe })
+
+    const result = await adapter('C1')
+
+    expect(result).toBe(false)
+    // Probe must have been invoked exactly once for the live-state row.
+    expect(probeCalls).toHaveLength(1)
+  })
+
+  test('6. live state + transient-inconclusive probe → true (SR-20.4 conservatism gate: avoid destructive restart)', async () => {
+    // SR-20.4: transient probe outcome is conservatively treated as alive so
+    // the tick path does NOT fire scheduleRestart — a still-alive session must
+    // not be killed because tmux returned an ambiguous exit code.
+    const { probe, probeCalls } = makeStubTmuxProbe('transient-inconclusive')
+    const { adapter } = makeHarness({ statusState: 'waiting', probe })
+
+    const result = await adapter('C1')
+
+    expect(result).toBe(true)
+    // Probe must have been invoked for the live-state row.
+    expect(probeCalls).toHaveLength(1)
+  })
+
+  test('7. live state + definitely-alive probe → true', async () => {
+    // Live-state row + confirmed alive tmux session → adapter returns true.
+    // SR-21.4: probe result 'definitely-alive' is the nominal happy path.
+    const { probe, probeCalls } = makeStubTmuxProbe('definitely-alive')
+    const { adapter } = makeHarness({ statusState: 'waiting', probe })
+
+    const result = await adapter('C1')
+
+    expect(result).toBe(true)
+    expect(probeCalls).toHaveLength(1)
+  })
+
+  test('8. non-live state + ErrSpawnNotFound → false, ZERO probe invocations', async () => {
+    // Non-live DB row: ErrSpawnNotFound is caught before the probe branch is
+    // ever reached, so the tmux probe must NOT be invoked (SR-21.4: probe is
+    // only consulted for live-state rows).
+    const { probe, probeCalls } = makeStubTmuxProbe('definitely-alive')
+    const { adapter } = makeHarness({
+      statusError: new ErrSpawnNotFound('status', 'ErrSpawnNotFound', 'spawn not found'),
+      probe,
+    })
+
+    const result = await adapter('C1')
+
+    expect(result).toBe(false)
+    // Assert ZERO probe invocations via call recording.
+    expect(probeCalls).toHaveLength(0)
+  })
+
+  test('9. ErrCallTimeout on status → ad-unreachable raised AND adapter returns true; follow-up success clears flag (SR-21.4/SR-20.4)', async () => {
+    // ErrCallTimeout is a classifyAdError-transient error: per SR-21.4/SR-20.4,
+    // the adapter raises ad-unreachable AND returns true (deferred flag-raising
+    // from mb; single owner: this adapter). A subsequent successful status()
+    // call clears the flag and emits an all-clear per outage conventions.
+    //
+    // The statusQueue drives two sequential adapter calls:
+    //   call 1: ErrCallTimeout → onset (ad-unreachable), return true
+    //   call 2: { state: 'waiting' } (live) → all-clear emitted, return true
+    const { probe } = makeStubTmuxProbe('definitely-alive')
+    const { emissions, adapter } = makeHarness({
+      statusQueue: [
+        cannedErr(errCallTimeout('status', 35000, 30000)),
+        cannedOk({ state: 'waiting' }),
+      ],
+      probe,
+    })
+
+    // --- call 1: ErrCallTimeout → onset ---
+    const result1 = await adapter('C1')
+    expect(result1).toBe(true)
+    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
+    // Exactly one onset emission after the first call.
+    expect(emissions).toHaveLength(1)
+    expect(emissions[0].channelId).toBe('C1')
+    expect(emissions[0].text).toMatch(/agent-director unreachable/)
+
+    // --- call 2: live state → all-clear ---
+    const result2 = await adapter('C1')
+    expect(result2).toBe(true)
+    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(false)
+    // All-clear emission appended after the second call.
+    expect(emissions).toHaveLength(2)
+    expect(emissions[1].channelId).toBe('C1')
+    expect(emissions[1].text).toMatch(/All clear/)
+    expect(emissions[1].text).toContain('ad-unreachable')
   })
 })
 
