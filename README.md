@@ -42,6 +42,18 @@ See the sections below for manual configuration details if you prefer not to use
 - Slack workspace admin access (to create and configure the Slack app)
 - **cozempic** (optional) — Python 3.10+ and `pip install cozempic` — used by JSONL path resolution helpers retained for downstream callers.
 
+### JSONL persistence (required for session resume)
+
+Claude Code stores conversation history as JSONL files under each route's effective `CLAUDE_CONFIG_DIR` (the per-route `claude_config_dir` if set, else the top-level value, else Claude's default `~/.claude`). The JSONL directory **must be on persistent (non-tmpfs) storage on every target host**. If the JSONL directory lives on a tmpfs or ramfs mount, session context is silently lost on reboot and resume becomes structurally impossible — bots always start fresh.
+
+**Confirm this on each machine before deployment.** The typical risk scenario is a host where `~/.claude` or a custom `CLAUDE_CONFIG_DIR` resolves to a tmpfs-backed path (e.g. a RAM-disk user home on a cloud instance or container). Check with:
+
+```sh
+findmnt --target ~/.claude
+```
+
+**Runtime safeguard (backstop only).** On startup, CSCB reads `/proc/self/mountinfo` and logs a startup error (`jsonl-non-persistent`) and posts a Slack warning if it detects that the JSONL root is on `tmpfs` or `ramfs`. This detection is best-effort — it does not cover all non-persistent configurations (e.g. network-mounted ephemeral storage, overlayfs). The runtime check is a backstop, not a substitute for confirming persistence on each host before deployment.
+
 ### Supported platforms (inherited from agent-director)
 
 | Platform | Status |
@@ -293,6 +305,8 @@ The `claude-slack-channel-bots` binary exposes three subcommands.
 
 Checks prerequisites, then daemonizes the server.
 
+**Idempotent and pidfile-guarded.** `start` checks `STATE_DIR/server.pid` at startup — if another server is already running against the same state directory, the child process exits immediately. This makes `start` safe to call unconditionally from boot scripts, systemd units, or cron without any bespoke "is it already running?" logic.
+
 **Prerequisite checks (in order):**
 
 1. `SLACK_BOT_TOKEN` is set — fails with `missing prerequisite: SLACK_BOT_TOKEN environment variable` if absent.
@@ -300,6 +314,8 @@ Checks prerequisites, then daemonizes the server.
 3. `config.json` exists at `STATE_DIR/config.json` — fails with the full path if not found.
 
 Once the server daemonizes, the SR-5.1 startup gate runs inside the child process: it imports `agent-director`, constructs the singleton Client, runs `client.version()`, and verifies `~/.agent-director/state.db` is owned by the current user. Failures land in `startup-errors.log` (see [Startup errors](#startup-errors)). The previous `tmux -V` probe at the CLI level has been removed — agent-director enforces tmux availability at spawn time.
+
+On startup, the server runs a **startup reconcile** across all configured routes: any channel whose session is in `ended` or `missing` state is resumed automatically (with conversation context when `resume_enabled` is `true`). This means a whole-fleet reboot restores all channels without manual intervention — boot the machine, run `start`, and channels come back up on their own.
 
 If all checks pass, the parent process spawns a detached child process and exits immediately, printing the child PID. The child starts the server and writes its PID to `STATE_DIR/server.pid`. Conversation context is preserved across server restarts when possible.
 
@@ -319,18 +335,30 @@ Behavior by case:
 
 ### `claude-slack-channel-bots clean_restart`
 
-Gracefully exits all managed Claude Code sessions, then stops and starts the server.
+Gracefully exits all managed Claude Code sessions, then stops and starts the server. Designed for zero-downtime upgrades — sessions **pause, not delete**: after the new server starts, each channel resumes with its prior conversation context.
 
 ```sh
 claude-slack-channel-bots clean_restart
 ```
 
-For each configured route, calls `client.pause({claude_instance_id})` via agent-director and polls `client.status(...)` until the spawn transitions to `ended` / `missing` (or `client.list(...)` returns no row). If the spawn does not exit within `exit_timeout` seconds (default 120s), the spawn is force-killed via `client.kill(...)`. All routes are processed in parallel. Individual session errors are logged and do not abort the restart. After the server restarts, the SR-1.4 collision-then-act dispatcher decides resume-vs-fresh per route — agent-director owns Claude session-id state, not CSCB.
+**Agent-director precheck.** Before tearing down any sessions, `clean_restart` initializes the agent-director client and verifies it is reachable. If AD is unreachable, the command fails loudly before touching any sessions — partial teardown never happens due to a broken AD client.
+
+**Resume-preserving teardown.** For each configured route, calls `client.pause({claude_instance_id})` via agent-director (pause, never delete) and polls `client.status(...)` until the spawn transitions to `ended` / `missing` (or `client.list(...)` returns no row). If the spawn does not exit within `exit_timeout` seconds (default 120s), the spawn is force-killed via `client.kill(...)`. All routes are processed in parallel. Individual session errors are logged and do not abort the restart. After the server restarts, the SR-1.4 collision-then-act dispatcher resumes each channel with conversation context — agent-director retains the Claude session-id state across the restart. The pre-v0.8.1 silent no-op behaviour (where `clean_restart` did nothing if the server was not in a specific internal state) is fixed — this command now truly tears down and resumes.
+
+**Dev-channels dialog auto-approval.** On both fresh spawn and resume after `clean_restart`, CSCB auto-approves the agent-director dev-channels dialog when it appears, so sessions come back live without operator interaction.
 
 Behavior by case:
 
 - **No configured routes:** skips the shutdown phase and proceeds directly to stop/start.
 - **Server already stopped:** `stop` reports `server is not running`; `start` then brings up a fresh server.
+
+**Smoke procedure.** After any CSCB upgrade that touches recovery or resume logic, validate `clean_restart` end-to-end on a sandbox host (never production bots):
+
+```sh
+tests/integration/test-5-clean-restart-resume.sh
+```
+
+This script validates the complete `clean_restart` lifecycle: healthy-fleet setup, teardown, server restart, and per-channel resume with conversation context. It also exercises the loud AD-unreachable failure path. See the script header for setup requirements.
 
 ### PID file
 
@@ -475,7 +503,7 @@ Messages to channels not listed in `access.json → channels` and not present in
 Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json`.
 
 **Session not restarting after crash**
-After 3 consecutive launch failures for a route, auto-restart is suspended until the server is restarted. Restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`. To disable auto-restart entirely, set `session_restart_delay` to `0` in `config.json`.
+Auto-restart uses exponential backoff starting at `session_restart_delay` (default 60 s), doubling on each failure: 60 s → 120 s → 240 s → 480 s → 15-minute ceiling. After **5 consecutive failures** the channel is capped: a `SpawnCapReached` message is posted once to the channel, and the health tick skips the channel until it recovers. The channel remains retry-eligible — send a message in that channel or restart the server to retry. On recovery, the failure counter resets and normal backoff resumes. To disable auto-restart entirely, set `session_restart_delay` to `0` in `config.json`.
 
 **Session stuck during clean_restart**
 If a session does not exit within `exit_timeout` seconds (default 120s), `clean_restart` force-kills the spawn via `agent-director kill` and proceeds. To manually recover, run `agent-director list --label service=cscb` to find lingering spawns and `agent-director kill <claude_instance_id>` to clear them, then `claude-slack-channel-bots stop && claude-slack-channel-bots start`.
@@ -489,6 +517,31 @@ This is a known regression in certain Claude Code releases (e.g. v2.1.120) where
   "resume_enabled": false
 }
 ```
+
+---
+
+## Self-healing behavior
+
+CSCB recovers from common failure modes without operator action.
+
+**Single dead channel.** When a managed session crashes or goes missing, the health tick (every `health_check_interval` seconds, default 120 s) detects the outage and schedules a restart. An inbound message to the affected channel also triggers an immediate restart attempt. Recovery is typically within one `health_check_interval` + `session_restart_delay`. No row hygiene or manual restart is required.
+
+**Whole-fleet reboot.** On server startup, the startup reconcile runs across all configured routes. Any channel whose session is in `ended` or `missing` state is resumed automatically (with conversation context when `resume_enabled` is `true`). Boot the host, run `start`, and all channels come back.
+
+**Orphan tmux session.** If an `ErrTmuxSessionCreate` error is returned during spawn (indicating a stale tmux session with the same name), the server kills the orphan session and retries the spawn once. No operator action required.
+
+**Capped channel.** A channel that hits the 5-failure cap (see [Session not restarting after crash](#troubleshooting)) remains retry-eligible. Sending any message to the channel or restarting the server clears the cap and triggers a new attempt.
+
+---
+
+## Host-script reducibility
+
+If your current boot setup uses a bespoke `start-all.sh` that includes a kill loop to stop old processes before starting, or a peer script such as `cscb_clean_restart.sh` that performs state-dir hygiene (removing session rows, resetting locks) before restarting the server, those steps are no longer needed:
+
+- **Boot / systemd / cron:** reduce to `claude-slack-channel-bots start`. The pidfile guard (`checkPidConflict`) prevents duplicate servers, and the startup reconcile restores all channels. No kill loop, no row hygiene.
+- **Upgrade:** reduce to `claude-slack-channel-bots clean_restart`. Sessions are paused (not deleted) and resume with conversation context after the new binary starts. No pre-restart state-dir cleanup required.
+
+No source changes are shipped for this reduction — it is an operator action: simplify your deployment scripts to call the two commands above directly.
 
 ---
 
