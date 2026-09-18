@@ -42,6 +42,13 @@ import {
   _resetDialogPollIntervalMs,
   _setWaitForWaitingTimeoutMs,
   _resetWaitForWaitingTimeoutMs,
+  _setTmuxSessionKiller,
+  _resetTmuxSessionKiller,
+  _setTmuxCapturePane,
+  _setTmuxSendEnter,
+  _resetTmuxDialogHelpers,
+  _setDialogDeadGracePolls,
+  _resetDialogDeadGracePolls,
 } from '../src/session-manager.ts'
 import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
 import {
@@ -55,6 +62,7 @@ import {
   errSpawnNotFound,
   errSpawnNotResumable,
   errSpawnNotInteractive,
+  errTmuxSessionCreate,
   makeStubClient,
   type StubClient,
 } from './test-helpers/agent-director-stub.ts'
@@ -103,6 +111,10 @@ beforeEach(() => {
     getClient,
     postToChannel: (channelId, text) => { outageEmissions.push({ channelId, text }) },
   })
+  // Default the raw-tmux dialog seams to safe no-ops so unit tests never shell
+  // out to real tmux (b.vub). Dead-row tests override these to drive behavior.
+  _setTmuxCapturePane(async () => '')
+  _setTmuxSendEnter(async () => {})
 })
 
 afterEach(() => {
@@ -110,6 +122,9 @@ afterEach(() => {
   _resetDialogPollIntervalMs()
   _resetDialogReadyTimeoutMs()
   _resetWaitForWaitingTimeoutMs()
+  _resetTmuxSessionKiller()
+  _resetTmuxDialogHelpers()
+  _resetDialogDeadGracePolls()
   _resetOutageState()
   process.env = savedEnv as NodeJS.ProcessEnv
 })
@@ -489,12 +504,16 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
   // Collision/skip tests — no approvePreSessionDialogs on collision paths
   // -------------------------------------------------------------------------
 
-  test('skipped on collision-resume path (no fresh spawn → no readPane)', async () => {
+  test('collision-resume path: approver runs but returns immediately when status is already live (no readPane)', async () => {
+    // b.vub: the resume-success path now calls approvePreSessionDialogs. When
+    // the resumed row is already live (default stub status='waiting'), the
+    // approver returns before ever reading the pane.
     const readPaneCalls: import('agent-director').ReadPaneParams[] = []
     installStub({
       readPaneCalls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      statusResult: { state: 'waiting' },
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
     const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
@@ -660,15 +679,21 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     expect(calls.length).toBeGreaterThanOrEqual(1)
   })
 
-  test('dead state: statusQueue [pending, ended] → records dev-channels-approve-spawn-died', async () => {
+  test('dead state: sticky ended + no needle (grace exhausted) → records dev-channels-approve-spawn-died', async () => {
+    // b.vub: dead rows are driven via RAW tmux (AD refuses missing/ended panes).
+    // With no needle in the raw pane and the grace streak set to 1, the first
+    // ended poll exhausts the grace and records the death.
+    _setDialogDeadGracePolls(1)
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    let rawEnterCount = 0
+    _setTmuxCapturePane(async () => 'no needle here') // raw pane, no dialog
+    _setTmuxSendEnter(async () => { rawEnterCount += 1 })
     installStub({
       sendKeysCalls,
       statusQueue: [
         cannedOk({ state: 'pending' }),
         cannedOk({ state: 'ended' }),
       ],
-      // no needle on pane so Enter is not pressed, but state→ended triggers the dead-state path
       readPaneResults: [{ pane: 'no needle here' }],
     })
     const readLog = captureStartupErrors()
@@ -677,6 +702,9 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
 
     const log = readLog()
     expect(log).toContain('[dev-channels-approve-spawn-died]')
+    // No needle anywhere → neither AD nor raw Enter was pressed.
+    expect(sendKeysCalls).toHaveLength(0)
+    expect(rawEnterCount).toBe(0)
   })
 
   test('already-live: statusQueue [waiting] → no readPane, no sendKeys, no startup error', async () => {
@@ -713,6 +741,200 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
 
     // Enter pressed each time the pane shows the needle while pending
     expect(sendKeysCalls.length).toBeGreaterThanOrEqual(2)
+  })
+
+  // -------------------------------------------------------------------------
+  // b.vub — pane-first / state-tolerant: press Enter despite missing/ended
+  // -------------------------------------------------------------------------
+
+  test('b.vub: dead row (missing) with needle → RAW tmux Enter, NOT agent-director sendKeys', async () => {
+    // A resumed bot blocked at the dialog reports state=missing while the pane
+    // still shows the needle. agent-director REFUSES read-pane/send-keys on a
+    // missing row (ErrSpawnNotInteractive), so the approver must drive the
+    // dialog via raw tmux keyed on the deterministic session name.
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+    const rawCaptured: string[] = []
+    const rawEntered: string[] = []
+    _setTmuxCapturePane(async (name) => { rawCaptured.push(name); return DEV_CHANNELS_PANE })
+    _setTmuxSendEnter(async (name) => { rawEntered.push(name) })
+    const readLog = captureStartupErrors()
+    installStub({
+      sendKeysCalls,
+      readPaneCalls,
+      // missing (raw needle → raw Enter) → then waiting → return
+      statusQueue: [
+        cannedOk({ state: 'missing' }),
+        cannedOk({ state: 'waiting' }),
+      ],
+    })
+
+    await approvePreSessionDialogs('C', undefined, true)
+
+    // Raw tmux was used, keyed on the deterministic session name.
+    expect(rawCaptured).toContain('slack_bot_C')
+    expect(rawEntered).toEqual(['slack_bot_C'])
+    // agent-director's interactive verbs were NOT used on the dead row.
+    expect(readPaneCalls).toHaveLength(0)
+    expect(sendKeysCalls).toHaveLength(0)
+    // Must NOT have recorded spawn-died — the needle was present, not dead.
+    expect(readLog()).not.toContain('[dev-channels-approve-spawn-died]')
+  })
+
+  test('b.vub: dead row (ended) with needle → RAW tmux Enter clears the dialog', async () => {
+    const rawEntered: string[] = []
+    _setTmuxCapturePane(async () => DEV_CHANNELS_PANE)
+    _setTmuxSendEnter(async (name) => { rawEntered.push(name) })
+    installStub({
+      statusQueue: [
+        cannedOk({ state: 'ended' }),
+        cannedOk({ state: 'waiting' }),
+      ],
+    })
+
+    await approvePreSessionDialogs('C', undefined, true)
+
+    expect(rawEntered).toEqual(['slack_bot_C'])
+  })
+
+  test('b.vub: dead row with NO needle in raw pane (grace exhausted) → terminal, no Enter', async () => {
+    // Without a needle in the RAW pane, a sticky missing row exhausts the grace
+    // streak and is recorded as dead — no stray Enter, AD verbs untouched.
+    _setDialogDeadGracePolls(1)
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const rawEntered: string[] = []
+    _setTmuxCapturePane(async () => 'no needle here')
+    _setTmuxSendEnter(async (name) => { rawEntered.push(name) })
+    installStub({
+      sendKeysCalls,
+      statusResult: { state: 'missing' },
+    })
+    const readLog = captureStartupErrors()
+
+    await approvePreSessionDialogs('C', undefined, true)
+
+    expect(sendKeysCalls).toHaveLength(0)
+    expect(rawEntered).toHaveLength(0)
+    expect(readLog()).toContain('[dev-channels-approve-spawn-died]')
+  })
+
+  // -------------------------------------------------------------------------
+  // b.vub — resume-success path invokes the approver
+  // -------------------------------------------------------------------------
+
+  test('b.vub: resume-success path drives the dialog approver via RAW tmux (missing row)', async () => {
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const rawEntered: string[] = []
+    _setTmuxCapturePane(async () => DEV_CHANNELS_PANE)
+    _setTmuxSendEnter(async (name) => { rawEntered.push(name) })
+    installStub({
+      resumeCalls,
+      // fresh spawn collides → get=missing → resume succeeds → approver runs
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'missing' }),
+      // resumed bot is still `missing` while blocked at the dialog, then waiting
+      statusQueue: [
+        cannedOk({ state: 'missing' }),
+        cannedOk({ state: 'waiting' }),
+      ],
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+    expect(result.action).toBe('resumed')
+    expect(resumeCalls).toHaveLength(1)
+    // The approver ran on the resume path and dismissed the dialog via raw tmux.
+    expect(rawEntered).toEqual(['slack_bot_C'])
+  })
+
+  // -------------------------------------------------------------------------
+  // b.vub — ErrTmuxSessionCreate self-heal (kill orphan tmux + retry once)
+  // -------------------------------------------------------------------------
+
+  test('b.vub: ErrTmuxSessionCreate on resume → kill orphan tmux by name + retry spawn once', async () => {
+    const killedSessions: string[] = []
+    _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({
+      spawnCalls,
+      // 1st spawn: instance-id collision → get=missing → resume throws tmux-create
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        // 2nd spawn (the self-heal retry) succeeds
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      ],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'missing' }),
+      resumeError: errTmuxSessionCreate('resume'),
+      // approver on the retry-spawn: already live → returns immediately
+      statusResult: { state: 'waiting' },
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+    expect(result.action).toBe('spawned')
+    // Orphan tmux killed by its deterministic per-channel name.
+    expect(killedSessions).toEqual(['slack_bot_C'])
+    // Exactly one retry spawn after the collision spawn (2 spawn calls total).
+    expect(spawnCalls).toHaveLength(2)
+  })
+
+  test('b.vub: ErrTmuxSessionCreate on fresh spawn → kill orphan tmux by name + retry spawn once', async () => {
+    const killedSessions: string[] = []
+    _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({
+      spawnCalls,
+      // 1st fresh spawn throws tmux-create (no instance-id collision) → self-heal
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      ],
+      statusResult: { state: 'waiting' },
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+
+    expect(result.action).toBe('spawned')
+    expect(killedSessions).toEqual(['slack_bot_C'])
+    expect(spawnCalls).toHaveLength(2)
+  })
+
+  test('b.vub: ErrTmuxSessionCreate self-heal uses composed tmux name when route has normalizedName', async () => {
+    const killedSessions: string[] = []
+    _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
+    installStub({
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_my_chan_C_T1' }),
+      ],
+      statusResult: { state: 'waiting' },
+    })
+    const cfg = makeRoutingConfig({
+      routes: { C_T1: { cwd: '/x', name: 'my chan', normalizedName: 'my_chan' } },
+    })
+    const result = await spawnForRoute('C_T1', { cwd: '/x' }, cfg)
+
+    expect(result.action).toBe('spawned')
+    expect(killedSessions).toEqual(['slack_bot_my_chan_C_T1'])
+  })
+
+  test('b.vub: ErrTmuxSessionCreate self-heal that fails on retry → posts Slack failure', async () => {
+    _setTmuxSessionKiller(async () => { /* orphan killed but retry still fails */ })
+    const { web, calls } = makeMockWeb()
+    const readLog = captureStartupErrors()
+    installStub({
+      // fresh spawn throws tmux-create; retry spawn also throws (generic)
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
+        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
+      ],
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, web as never)
+
+    expect(result.action).toBe('failed')
+    expect(calls.length).toBeGreaterThanOrEqual(1)
+    expect(readLog()).toContain('[spawn-failed]')
   })
 })
 

@@ -13,7 +13,7 @@ allowed-tools: [Bash]
 2. `npm pack` from repo root; capture tarball filename.
 3. Lazy-build the base image, then build the top image:
    ```bash
-   BASE_TAG=cscb-ci-base:v2  # bump when docker/Dockerfile.test.base changes
+   BASE_TAG=cscb-ci-base:v3  # bump when docker/Dockerfile.test.base changes
    if ! docker image inspect "${BASE_TAG}" >/dev/null 2>&1; then
      # The base layer fetches the agent-director Go binary from a private GitHub
      # release; supply a token at build time. Prefer the operator's gh CLI token.

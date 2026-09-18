@@ -25,6 +25,11 @@ import {
   _resetDialogReadyTimeoutMs,
   _setDialogPollIntervalMs,
   _resetDialogPollIntervalMs,
+  _setTmuxCapturePane,
+  _setTmuxSendEnter,
+  _resetTmuxDialogHelpers,
+  _setDialogDeadGracePolls,
+  _resetDialogDeadGracePolls,
 } from '../src/session-manager.ts'
 import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
 import { initOutageState, _resetOutageState } from '../src/outage-state.ts'
@@ -76,6 +81,9 @@ beforeEach(() => {
   _setDialogPollIntervalMs(1)
   _setDialogReadyTimeoutMs(50)
   initOutageState({ postToChannel: () => {}, getClient })
+  // Safe no-op raw-tmux seams so unit tests never shell out to real tmux (b.vub).
+  _setTmuxCapturePane(async () => '')
+  _setTmuxSendEnter(async () => {})
 })
 
 afterEach(() => {
@@ -83,6 +91,8 @@ afterEach(() => {
   _resetOutageState()
   _resetDialogPollIntervalMs()
   _resetDialogReadyTimeoutMs()
+  _resetTmuxDialogHelpers()
+  _resetDialogDeadGracePolls()
   process.env = savedEnv as NodeJS.ProcessEnv
   for (const d of tempDirs) {
     try { rmSync(d, { recursive: true }) } catch { /* ignore */ }
@@ -185,7 +195,11 @@ describe('approvePreSessionDialogs (trust needle, b.4ie)', () => {
   // Case 4: Dead state — statusQueue [pending, ended] + no needle → spawn-died
   // -------------------------------------------------------------------------
 
-  test('dead state: statusQueue [pending, ended] + non-needle pane → dev-channels-approve-spawn-died recorded', async () => {
+  test('dead state: sticky ended + non-needle raw pane (grace exhausted) → dev-channels-approve-spawn-died recorded', async () => {
+    // b.vub: dead rows are driven via raw tmux; with no needle in the raw pane
+    // and grace=1, the ended poll exhausts the grace and records the death.
+    _setDialogDeadGracePolls(1)
+    _setTmuxCapturePane(async () => 'no trust needle here')
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     installStub({
       sendKeysCalls,

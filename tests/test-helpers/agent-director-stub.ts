@@ -43,6 +43,7 @@ import {
   ErrSystemInstallNotFound,
   ErrSystemInstallTooOld,
   ErrSystemInstallUnreachable,
+  ErrTmuxSessionCreate,
   ErrTemplateExists,
   ErrTemplateMalformed,
   ErrTemplateNameUnsafe,
@@ -155,6 +156,15 @@ export function errSpawnNotInteractive(verb: string = 'read-pane'): ErrSpawnNotI
 /** Build an ErrInstanceIdCollision (spawn / SR-1.4 collision path). */
 export function errInstanceIdCollision(): ErrInstanceIdCollision {
   return new ErrInstanceIdCollision('spawn', 'ErrInstanceIdCollision', 'claude_instance_id already in use')
+}
+
+/**
+ * Build an ErrTmuxSessionCreate (spawn/resume / b.vub orphan-tmux collision).
+ * The `verb` defaults to 'resume' — the observed field failure path — but
+ * callers pass 'spawn' to exercise the fresh-spawn self-heal branch.
+ */
+export function errTmuxSessionCreate(verb: string = 'resume'): ErrTmuxSessionCreate {
+  return new ErrTmuxSessionCreate(verb, 'ErrTmuxSessionCreate', 'tmux: new-session failed: tmux session already exists')
 }
 
 /** Build an ErrNoSessionId (resume / SR-1.3 fall-through). */

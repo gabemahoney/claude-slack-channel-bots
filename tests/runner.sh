@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sequential integration-test runner. Executes tests 1 → 2 → 3 in order,
+# Sequential integration-test runner. Executes tests 1 → 2 → 3 → 4 in order,
 # short-circuits on first FAIL, writes a single-line verdict to
 # /test-results/verdict.txt: either "PASS" or "FAIL: <test>: <step>".
 # Exits 0 on PASS, 1 on FAIL.
@@ -21,6 +21,7 @@ TESTS=(
     "test-1-install-startup.sh"
     "test-2-dryrun-spawn-skip.sh"
     "test-3-cozempic-restart.sh"
+    "test-4-resume-dialog.sh"
 )
 
 for test_script in "${TESTS[@]}"; do

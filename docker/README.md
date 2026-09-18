@@ -6,14 +6,15 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
 
 ## Images
 
-- **`cscb-ci-base:v1`** (built from `docker/Dockerfile.test.base`) — slow base
-  layers. Built lazily once per host. ~1+ GB. No CSCB source inside.
-- **`cscb-ci:latest`** (built from `docker/Dockerfile.test`, `FROM cscb-ci-base:v1`)
+- **`cscb-ci-base:v3`** (built from `docker/Dockerfile.test.base`) — slow base
+  layers (apt deps incl. tmux, bun, nodejs, cozempic, agent-director). Built
+  lazily once per host. ~1+ GB. No CSCB source inside.
+- **`cscb-ci:latest`** (built from `docker/Dockerfile.test`, `FROM cscb-ci-base:v3`)
   — adds `docker/entrypoint.sh`, `tests/`, `testplans/`, the `testuser` account,
   and the `ENTRYPOINT`. Built on every `/ci` run; should complete in under 10 s
   on a warm base.
 
-`/ci` detects whether `cscb-ci-base:v1` exists locally; if absent, it builds the
+`/ci` detects whether `cscb-ci-base:v3` exists locally; if absent, it builds the
 base first, then builds `cscb-ci`. The base build is a one-time per-host cost
 per version tag.
 
@@ -37,7 +38,7 @@ After bumping, the next `/ci` on every host will rebuild the base.
 To simulate a fresh host:
 
 ```bash
-docker rmi cscb-ci-base:v1 cscb-ci:latest 2>/dev/null
+docker rmi cscb-ci-base:v3 cscb-ci:latest 2>/dev/null
 /ci   # or invoke the build sequence from the skill manually
 ```
 
@@ -50,7 +51,7 @@ issue.
 After a `/ci` run, confirm the base layers are intact:
 
 ```bash
-docker history cscb-ci-base:v1
+docker history cscb-ci-base:v3
 ```
 
 Then edit a comment in (e.g.) `tests/integration/test-1-install-startup.sh`
@@ -60,7 +61,7 @@ and re-run the build:
 docker build -f docker/Dockerfile.test -t cscb-ci .
 ```
 
-This should complete in seconds. `docker history cscb-ci-base:v1` should show
+This should complete in seconds. `docker history cscb-ci-base:v3` should show
 the same layer IDs as before — proof the source edit didn't invalidate the
 base.
 

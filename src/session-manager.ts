@@ -31,6 +31,7 @@ import {
   ErrNoSessionId,
   ErrSpawnNotFound,
   ErrSpawnNotResumable,
+  ErrTmuxSessionCreate,
 } from 'agent-director'
 import type { ListRow, SpawnParams } from 'agent-director'
 import type { WebClient } from '@slack/web-api'
@@ -254,12 +255,110 @@ export function _resetDialogReadyTimeoutMs(): void {
   _dialogReadyTimeoutMs = DIALOG_READY_TIMEOUT_MS
 }
 
+// ---------------------------------------------------------------------------
+// Raw-tmux dialog fallback (b.vub) — bypass agent-director when the row is in
+// a non-interactive state (missing/ended) but the pane still shows the dialog.
+// ---------------------------------------------------------------------------
+
+/**
+ * b.vub — the critical mechanism the ticket's manual mitigation used.
+ *
+ * On the RESUME lap, `client.resume` re-creates the tmux session but the AD row
+ * stays `missing`/`ended` until SessionStart re-fires — and SessionStart can't
+ * fire because the dev-channels dialog blocks it. Crucially, agent-director's
+ * `read-pane` / `send-keys` REFUSE to touch a `missing`/`ended` row
+ * (`ErrSpawnNotInteractive`, even with allow_pending), so the approver cannot
+ * clear the dialog through AD. A raw `tmux capture-pane` + `tmux send-keys …
+ * Enter` DOES clear it (verified against real AD/tmux; this is exactly the
+ * `tmux send-keys -t <session> Enter` the operator ran by hand in the ticket),
+ * after which AD flips to `waiting`.
+ *
+ * These two seams shell out to tmux directly, keyed on the deterministic
+ * per-channel session name. Injectable so unit tests stay hermetic.
+ */
+export type TmuxPaneReader = (sessionName: string) => Promise<string>
+export type TmuxEnterSender = (sessionName: string) => Promise<void>
+
+function defaultTmuxCapturePane(sessionName: string): Promise<string> {
+  return (async () => {
+    const { spawn } = await import('child_process')
+    return await new Promise<string>((resolve) => {
+      try {
+        const child = spawn('tmux', ['capture-pane', '-p', '-t', sessionName])
+        let out = ''
+        child.stdout?.on('data', (d: Buffer) => { out += d.toString('utf8') })
+        child.on('error', () => resolve(''))
+        child.on('close', () => resolve(out))
+      } catch {
+        resolve('')
+      }
+    })
+  })()
+}
+
+function defaultTmuxSendEnter(sessionName: string): Promise<void> {
+  return (async () => {
+    const { spawn } = await import('child_process')
+    await new Promise<void>((resolve) => {
+      try {
+        const child = spawn('tmux', ['send-keys', '-t', sessionName, 'Enter'], { stdio: 'ignore' })
+        child.on('error', () => resolve())
+        child.on('close', () => resolve())
+      } catch {
+        resolve()
+      }
+    })
+  })()
+}
+
+let _tmuxCapturePane: TmuxPaneReader = defaultTmuxCapturePane
+let _tmuxSendEnter: TmuxEnterSender = defaultTmuxSendEnter
+
+/** Test-only seam: override the raw tmux pane reader. */
+export function _setTmuxCapturePane(fn: TmuxPaneReader): void {
+  _tmuxCapturePane = fn
+}
+/** Test-only seam: override the raw tmux Enter sender. */
+export function _setTmuxSendEnter(fn: TmuxEnterSender): void {
+  _tmuxSendEnter = fn
+}
+/** Test-only seam: restore the default raw tmux helpers. */
+export function _resetTmuxDialogHelpers(): void {
+  _tmuxCapturePane = defaultTmuxCapturePane
+  _tmuxSendEnter = defaultTmuxSendEnter
+}
+
 /** Live (post-SessionStart) states: the dialog is gone, the session is ready. */
 const DIALOG_READY_STATES = new Set(['waiting', 'working', 'ask_user', 'check_permission'])
 /** Terminal states: the spawn died before becoming ready. */
 const DIALOG_DEAD_STATES = new Set(['ended', 'missing'])
 /** Every pre-SessionStart dialog we can auto-approve (option 1 pre-selected; Enter accepts). */
 const PRE_SESSION_DIALOG_NEEDLES = [TRUST_DIALOG_NEEDLE, DEV_CHANNELS_DIALOG_NEEDLE]
+
+/**
+ * b.vub: consecutive dead-state-with-no-needle polls required before treating a
+ * spawn as genuinely dead. A freshly resumed (or freshly spawned) row is
+ * legitimately `missing`/`ended` for a brief window: after `client.resume`, the
+ * tmux pane needs a moment to render the dev-channels dialog, and AD keeps
+ * reporting the prior terminal state until SessionStart re-fires. Bailing on the
+ * FIRST such poll (as the pre-b.vub code did) races the dialog and re-hangs the
+ * resume. Requiring a short grace streak lets the dialog appear (needle → Enter,
+ * which resets the streak) while still fast-failing a truly dead spawn without
+ * waiting the full 5-minute cap. Reset to 0 on any live state or needle sighting.
+ */
+export const DIALOG_DEAD_GRACE_POLLS = 20
+
+let _dialogDeadGracePolls = DIALOG_DEAD_GRACE_POLLS
+
+/** Test-only seam: override the dead-state grace streak. */
+export function _setDialogDeadGracePolls(n: number): void {
+  _dialogDeadGracePolls = n
+}
+
+/** Test-only seam: restore the default dead-state grace streak. */
+export function _resetDialogDeadGracePolls(): void {
+  _dialogDeadGracePolls = DIALOG_DEAD_GRACE_POLLS
+}
 
 /**
  * Drive a freshly-spawned bot past its pre-SessionStart dialogs (folder-trust
@@ -279,6 +378,21 @@ const PRE_SESSION_DIALOG_NEEDLES = [TRUST_DIALOG_NEEDLE, DEV_CHANNELS_DIALOG_NEE
  * one loop from spawn+0 (no wasted 30s trust window) that self-heals a missed
  * Enter (state stays pending, needle reappears, next iteration presses again)
  * and never gives up silently at 30s.
+ *
+ * b.vub: pane-first / state-tolerant, with a RAW-TMUX fallback for dead rows.
+ * A *resumed* bot faces the same `--dangerously-load-development-channels`
+ * dialog, but its AD row is `missing`/`ended` from the prior life while it sits
+ * blocked at the dialog (SessionStart never re-fires). Two compounding facts the
+ * pre-b.vub code missed: (1) it early-returned on DIALOG_DEAD_STATES before ever
+ * reading the pane; (2) even if it had tried, agent-director's read-pane/
+ * send-keys REFUSE a `missing`/`ended` row (ErrSpawnNotInteractive), so the
+ * dialog can only be cleared by talking to tmux directly. Fix: within the
+ * pre-SessionStart window, for a dead row read+Enter via raw tmux (keyed on the
+ * deterministic session name), for a pending row via AD; press Enter whenever a
+ * needle is visible regardless of AD state; treat missing/ended as terminal only
+ * after a short no-needle grace streak (DIALOG_DEAD_GRACE_POLLS), tolerating the
+ * brief post-resume window before the dialog renders. Still needle-gated (no
+ * stray Enter into a live session) and bounded by the hard cap.
  */
 export async function approvePreSessionDialogs(
   channelId: string,
@@ -288,6 +402,7 @@ export async function approvePreSessionDialogs(
 ): Promise<void> {
   const claude_instance_id = instanceIdFor(channelId, normalizedName)
   const deadline = Date.now() + _dialogReadyTimeoutMs
+  let deadStreak = 0
 
   while (Date.now() < deadline) {
     // 1) Readiness oracle.
@@ -306,22 +421,66 @@ export async function approvePreSessionDialogs(
       continue
     }
     if (DIALOG_READY_STATES.has(state)) return // dialog cleared, session live
+
+    // 2) Pane-first (b.vub): read the pane and dismiss any visible pre-session
+    // dialog BEFORE deciding whether a dead state is terminal.
+    //
+    // Two paths, because agent-director's read-pane/send-keys REFUSE a
+    // `missing`/`ended` row (ErrSpawnNotInteractive) even with allow_pending:
+    //   - Fresh spawn (state=pending): drive via AD read-pane/send-keys.
+    //   - Resumed row (state=missing/ended): AD won't touch the pane, but the
+    //     dialog IS on screen and blocking SessionStart. Fall back to RAW tmux
+    //     (capture-pane + send-keys Enter) keyed on the deterministic session
+    //     name — exactly the `tmux send-keys -t <session> Enter` the operator
+    //     ran by hand in the ticket. Once Enter lands, SessionStart fires and
+    //     AD flips to a live state on the next poll.
+    let needleVisible = false
     if (DIALOG_DEAD_STATES.has(state)) {
-      const msg = `spawn reached ${state} before clearing dev-channels dialog for channel=${channelId}`
-      console.error(`[slack] approvePreSessionDialogs: ${msg}`)
-      if (isStartup) recordStartupError('dev-channels-approve-spawn-died', msg)
-      return
+      // Raw-tmux fallback (agent-director cannot interact with a dead row).
+      const sessionName = tmuxSessionNameFor(channelId, normalizedName)
+      try {
+        const pane = await _tmuxCapturePane(sessionName)
+        needleVisible = PRE_SESSION_DIALOG_NEEDLES.some((n) => pane.includes(n))
+        if (needleVisible) {
+          await _tmuxSendEnter(sessionName)
+        }
+      } catch (err) {
+        console.error(`[slack] approvePreSessionDialogs: raw-tmux fallback error channel=${channelId}: ${String(err)}`)
+      }
+    } else {
+      // Interactive (pending) — drive via agent-director.
+      try {
+        const { pane } = await withOutageDetection(channelId, undefined, (client) => client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true }))
+        needleVisible = PRE_SESSION_DIALOG_NEEDLES.some((n) => pane.includes(n))
+        if (needleVisible) {
+          await withOutageDetection(channelId, undefined, (client) => client.sendKeys({ claude_instance_id, text: '', allow_pending: true })) // Enter
+        }
+      } catch (err) {
+        console.error(`[slack] approvePreSessionDialogs: readPane/sendKeys error channel=${channelId}: ${String(err)}`)
+      }
     }
 
-    // 2) state === 'pending' — dismiss any visible pre-session dialog.
-    try {
-      const { pane } = await withOutageDetection(channelId, undefined, (client) => client.readPane({ claude_instance_id, n_lines: 40, allow_pending: true }))
-      if (PRE_SESSION_DIALOG_NEEDLES.some((n) => pane.includes(n))) {
-        await withOutageDetection(channelId, undefined, (client) => client.sendKeys({ claude_instance_id, text: '', allow_pending: true })) // Enter
+    // 3) Dead-state handling (b.vub). A needle means "dialog-blocked, not dead":
+    // reset the streak and keep pressing Enter. Only treat missing/ended as
+    // terminal after it persists with NO needle for DIALOG_DEAD_GRACE_POLLS
+    // consecutive polls — this tolerates the brief post-spawn/post-resume window
+    // where the row is still terminal and the pane hasn't rendered the dialog
+    // yet, without racing the dialog and re-hanging the resume.
+    if (needleVisible) {
+      deadStreak = 0
+    } else if (DIALOG_DEAD_STATES.has(state)) {
+      deadStreak += 1
+      if (deadStreak >= _dialogDeadGracePolls) {
+        const msg = `spawn reached ${state} before clearing dev-channels dialog for channel=${channelId} (no needle for ${deadStreak} polls)`
+        console.error(`[slack] approvePreSessionDialogs: ${msg}`)
+        if (isStartup) recordStartupError('dev-channels-approve-spawn-died', msg)
+        return
       }
-    } catch (err) {
-      console.error(`[slack] approvePreSessionDialogs: readPane/sendKeys error channel=${channelId}: ${String(err)}`)
+    } else {
+      // pending (or any other non-dead, non-ready state) — reset the streak.
+      deadStreak = 0
     }
+
     await new Promise((r) => setTimeout(r, _dialogPollIntervalMs))
   }
 
@@ -446,6 +605,78 @@ async function tryKill(channelId: string, normalizedName: string | undefined): P
   }
 }
 
+// ---------------------------------------------------------------------------
+// Orphan-tmux self-heal (b.vub)
+// ---------------------------------------------------------------------------
+
+/**
+ * Kill a tmux session by its exact name. Injectable seam so unit tests can
+ * assert the self-heal path without spawning real processes. Default impl
+ * runs `tmux kill-session -t <name>` best-effort.
+ *
+ * b.vub: the field failure is an orphan tmux session that survives the AD row
+ * going `missing` — the AD `client.kill` verb does NOT reap it (observed across
+ * dozens of restart cycles). Killing the session directly by its deterministic,
+ * per-channel name (`tmuxSessionNameFor`) is the only reliable reap, and the
+ * name can only ever belong to this channel's spawn, so it is safe.
+ */
+export type TmuxSessionKiller = (sessionName: string) => Promise<void>
+
+let _killTmuxSession: TmuxSessionKiller = async (sessionName: string): Promise<void> => {
+  const { spawn } = await import('child_process')
+  await new Promise<void>((resolve) => {
+    try {
+      const child = spawn('tmux', ['kill-session', '-t', sessionName], { stdio: 'ignore' })
+      child.on('error', () => resolve()) // tmux missing / session absent — best-effort
+      child.on('close', () => resolve())
+    } catch {
+      resolve()
+    }
+  })
+}
+
+/** Test-only seam: override the tmux-session killer. */
+export function _setTmuxSessionKiller(fn: TmuxSessionKiller): void {
+  _killTmuxSession = fn
+}
+
+/** Test-only seam: restore the default tmux-session killer. */
+export function _resetTmuxSessionKiller(): void {
+  _killTmuxSession = async (sessionName: string): Promise<void> => {
+    const { spawn } = await import('child_process')
+    await new Promise<void>((resolve) => {
+      try {
+        const child = spawn('tmux', ['kill-session', '-t', sessionName], { stdio: 'ignore' })
+        child.on('error', () => resolve())
+        child.on('close', () => resolve())
+      } catch {
+        resolve()
+      }
+    })
+  }
+}
+
+/**
+ * Self-heal an `ErrTmuxSessionCreate` collision (b.vub): the deterministic tmux
+ * session name is still held by an orphaned session while the AD row is
+ * terminal/gone, so a fresh spawn/resume cannot create the session. Kill the
+ * orphan by name, then retry `client.spawn` ONCE. Returns the spawn result on
+ * success, or rethrows the retry's error (caller surfaces it).
+ */
+async function selfHealTmuxCollisionAndRespawn(
+  channelId: string,
+  route: { cwd: string },
+  params: SpawnParams,
+  normalizedName: string | undefined,
+): Promise<{ claude_instance_id: string }> {
+  const sessionName = tmuxSessionNameFor(channelId, normalizedName)
+  console.error(
+    `[slack] spawnForRoute: ErrTmuxSessionCreate for channel=${channelId} — killing orphan tmux session "${sessionName}" and retrying spawn once`,
+  )
+  await _killTmuxSession(sessionName)
+  return withSpawnDetection(channelId, route.cwd, (client) => client.spawn(params))
+}
+
 /** Delete the spawn row; surface failures. Returns whether the delete succeeded. */
 async function tryDelete(
   channelId: string,
@@ -507,6 +738,30 @@ export async function spawnForRoute(
     if (err instanceof ErrInstanceIdCollision) {
       // Collision → fall through to get-then-act
       console.error(`[slack] spawnForRoute: ErrInstanceIdCollision for channel=${channelId} — fetching current state`)
+    } else if (err instanceof ErrTmuxSessionCreate) {
+      // b.vub: fresh spawn collided on the deterministic tmux session name held
+      // by an orphan session (no instance-id collision → no AD row to resolve).
+      // Self-heal: kill the orphan by name, retry spawn once.
+      try {
+        const r = await selfHealTmuxCollisionAndRespawn(channelId, route, params, normalizedName)
+        console.error(`[slack] spawnForRoute: self-heal spawn succeeded after ErrTmuxSessionCreate for channel=${channelId} instanceId=${r.claude_instance_id}`)
+        await approvePreSessionDialogs(channelId, web, isStartup, normalizedName)
+        return { channelId, action: 'spawned' }
+      } catch (err2) {
+        if (
+          err2 instanceof ErrSystemInstallDisappeared ||
+          err2 instanceof ErrTmuxNotAvailable ||
+          err2 instanceof ErrCwdNotFound ||
+          err2 instanceof ErrCwdNotADirectory
+        ) {
+          return { channelId, action: 'failed' }
+        }
+        const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
+        console.error(`[slack] spawnForRoute: self-heal spawn after ErrTmuxSessionCreate failed for channel=${channelId}: ${e.errName}`)
+        if (isStartup) recordStartupError('spawn-failed', `self-heal spawn after ErrTmuxSessionCreate failed for channel=${channelId}: ${e.errName}`, e)
+        postSpawnFailureToChannel(channelId, e, web, isStartup)
+        return { channelId, action: 'failed' }
+      }
     } else if (
       err instanceof ErrSystemInstallDisappeared ||
       err instanceof ErrTmuxNotAvailable ||
@@ -596,8 +851,38 @@ export async function spawnForRoute(
     try {
       await withSpawnDetection(channelId, route.cwd, (client) => client.resume({ claude_instance_id: instanceIdFor(channelId, normalizedName) }))
       console.error(`[slack] spawnForRoute: resumed channel=${channelId}`)
+      // b.vub: a resumed bot faces the same --dangerously-load-development-channels
+      // dialog. Its AD row is still `missing`/`ended` while blocked at the dialog
+      // (SessionStart hasn't re-fired), so the pane-first approver drives it past.
+      await approvePreSessionDialogs(channelId, web, isStartup, normalizedName)
       return { channelId, action: 'resumed' }
     } catch (err) {
+      if (err instanceof ErrTmuxSessionCreate) {
+        // b.vub: the deterministic tmux session name is still held by an orphan
+        // session while the AD row is terminal — resume cannot re-create it.
+        // This is the observed field failure (resume throws ErrTmuxSessionCreate
+        // every ~2 min). Self-heal: kill the orphan by name, retry spawn once.
+        try {
+          const r = await selfHealTmuxCollisionAndRespawn(channelId, route, params, normalizedName)
+          console.error(`[slack] spawnForRoute: self-heal spawn succeeded after ErrTmuxSessionCreate for channel=${channelId} instanceId=${r.claude_instance_id}`)
+          await approvePreSessionDialogs(channelId, web, isStartup, normalizedName)
+          return { channelId, action: 'spawned' }
+        } catch (err2) {
+          if (
+            err2 instanceof ErrSystemInstallDisappeared ||
+            err2 instanceof ErrTmuxNotAvailable ||
+            err2 instanceof ErrCwdNotFound ||
+            err2 instanceof ErrCwdNotADirectory
+          ) {
+            return { channelId, action: 'failed' }
+          }
+          const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
+          console.error(`[slack] spawnForRoute: self-heal spawn after ErrTmuxSessionCreate failed for channel=${channelId}: ${e.errName}`)
+          if (isStartup) recordStartupError('spawn-failed', `self-heal spawn after ErrTmuxSessionCreate failed for channel=${channelId}: ${e.errName}`, e)
+          postSpawnFailureToChannel(channelId, e, web, isStartup)
+          return { channelId, action: 'failed' }
+        }
+      }
       if (err instanceof ErrNoSessionId || err instanceof ErrJsonlMissing) {
         console.error(`[slack] spawnForRoute: ${err.errName} on resume for channel=${channelId} — delete+fresh`)
         if (!(await tryDelete(channelId, normalizedName, web, isStartup))) return { channelId, action: 'failed' }
