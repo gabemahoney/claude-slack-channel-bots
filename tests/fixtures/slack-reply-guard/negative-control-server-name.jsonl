@@ -1,0 +1,5 @@
+{"type":"last-prompt","value":"earlier"}
+{"type":"mode","value":"default"}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":"a plain-string message discussing slack-channel-router configuration but not originating from Slack"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"got it"}]}}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"more context about the slack-channel-router server behavior; no <channel> tag here"}]}}

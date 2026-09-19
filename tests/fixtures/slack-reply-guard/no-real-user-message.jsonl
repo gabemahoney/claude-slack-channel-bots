@@ -1,0 +1,6 @@
+{"type":"last-prompt","value":"boot"}
+{"type":"mode","value":"default"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"system-initiated turn"}]}}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_z","content":"tool_result-only, not a real user message"}]}}
+{"type":"user","isSidechain":true,"message":{"role":"user","content":[{"type":"text","text":"sidechain-only message, should be skipped"}]}}
+{"type":"attachment","path":"/tmp/foo.txt"}

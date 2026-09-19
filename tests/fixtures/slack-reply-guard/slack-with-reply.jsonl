@@ -1,0 +1,9 @@
+{"type":"last-prompt","value":"prior"}
+{"type":"mode","value":"default"}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":"initial plain-string non-slack question from operator"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"acknowledged"}]}}
+{"type":"user","isSidechain":true,"message":{"role":"user","content":[{"type":"text","text":"sidechain noise <channel source=\"slack\" chat_id=\"C1\" message_id=\"m1\">ignored</channel>"}]}}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"<channel source=\"slack\" chat_id=\"C123\" message_id=\"1699999999.000100\" user=\"U42\" thread_ts=\"1699999999.000000\" ts=\"1699999999.000100\">hey bot, please help</channel>"}]}}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_x","content":"tool output only, not a real user message"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"replying now"},{"type":"tool_use","id":"tu_reply1","name":"mcp__slack-channel-router__reply","input":{"channel":"C123","text":"hi"}}]}}
+{"type":"attachment","path":"/tmp/x.txt"}

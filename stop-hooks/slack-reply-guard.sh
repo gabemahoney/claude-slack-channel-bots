@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # stop-hooks/slack-reply-guard.sh — Claude Code Stop hook that blocks a turn
 # from ending when the most recent real user message came from Slack (rendered
-# via the <channel source="slack" ...> wrapper) but the assistant did not call
-# the mcp__slack-channel-router__reply tool afterwards.
+# via the <channel source="slack..." ...> wrapper, e.g. source="slack" or
+# source="slack-channel-router") but the assistant did not call the
+# mcp__slack-channel-router__reply tool afterwards.
 #
 # Fail-open: any error, missing input, malformed transcript, or missing jq
 # results in exit 0. The ONLY exit-2 path is a Slack-originated latest real
@@ -49,7 +50,9 @@ TRANSCRIPT_PATH="$(printf '%s' "${INPUT}" | jq -r '.transcript_path // ""' 2>/de
 # real user message as the trigger.
 #
 # Slack-origination predicate = concatenated text contains the substring
-# `<channel source="slack"` (prefix match; tolerant of attributes after).
+# `<channel source="slack` (prefix match; tolerant of the rest of the source
+# attribute value and any following attributes — matches both the legacy
+# `source="slack"` form and the on-wire `source="slack-channel-router"` form).
 #
 # Reply predicate = later assistant entry has a content block with
 # type=="tool_use" and name=="mcp__slack-channel-router__reply".
@@ -95,7 +98,7 @@ JQ_OUT="$(jq -rRn '
     else
       ($user_idx[-1]) as $trigger
       | ($es[$trigger].message.content | text_of_content) as $txt
-      | if ($txt | contains("<channel source=\"slack\"")) then
+      | if ($txt | contains("<channel source=\"slack")) then
           if any($es[($trigger + 1):][]; is_reply_tool_use) then "OK"
           else "VIOLATION"
           end
