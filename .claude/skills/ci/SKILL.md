@@ -17,7 +17,12 @@ allowed-tools: [Bash]
    if ! docker image inspect "${BASE_TAG}" >/dev/null 2>&1; then
      # The base layer fetches the agent-director Go binary from a private GitHub
      # release; supply a token at build time. Prefer the operator's gh CLI token.
-     docker build -f docker/Dockerfile.test.base \
+     # --network=host: the base layer fetches bun and the agent-director binary
+     # from GitHub; on some hosts the default docker bridge network intermittently
+     # fails these fetches with SSL/timeout errors even when the host reaches the
+     # same URLs fine. Host networking sidesteps that. It only affects this
+     # one-time base build, so the blast radius is minimal.
+     docker build --network=host -f docker/Dockerfile.test.base \
        --build-arg GH_TOKEN="$(GH_CONFIG_DIR=$HOME/.config/gh-personal gh auth token 2>/dev/null || gh auth token 2>/dev/null || echo "")" \
        -t "${BASE_TAG}" .
    fi
@@ -33,6 +38,8 @@ allowed-tools: [Bash]
      -v ${RESULTS_DIR}:/test-results \
      -v ${PWD}/<TARBALL>:/tmp/package.tgz:ro \
      --env ANTHROPIC_API_KEY \
+     --env ANTHROPIC_BASE_URL \
+     --env ANTHROPIC_MODEL \
      cscb-ci
    ```
 6. Container exits when `/tests/runner.sh` exits.
@@ -50,13 +57,22 @@ allowed-tools: [Bash]
   Docker and re-run `/ci`.
 - `ANTHROPIC_API_KEY` is not set in the environment. The bot Claudes
   spawned by the daemon-under-test cannot use Claude Code's OAuth and need
-  a raw `sk-ant-api…` key. To find it, read Claude Code's own stored key:
+  an API key. This can be either a raw `sk-ant-api…` key (which authenticates
+  directly against `api.anthropic.com`) or a gateway credential (e.g. NVIDIA
+  InferenceHub), in which case `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL`
+  must also be set so the bot Claudes hit the gateway rather than
+  `api.anthropic.com`. The `docker run` step passes all three through when
+  present; when `ANTHROPIC_BASE_URL` is absent, Claude Code defaults to
+  `api.anthropic.com`, preserving raw-key behavior. To find a raw key, read
+  Claude Code's own stored key:
   ```bash
   export ANTHROPIC_API_KEY="$(jq -r .primaryApiKey ~/.claude.json)"
   ```
-  If `primaryApiKey` is null/absent, the operator has not provisioned an
-  API key — instruct them to do so before re-running `/ci`. When
-  invoking `/ci` from a worker spawned via `agent-director`, pass the
-  key through with `--extra-env ANTHROPIC_API_KEY="$KEY"` on the spawn
-  command — the worker session does not inherit the orchestrator's env.
+  If `primaryApiKey` is null/absent and no gateway credential is exported, the
+  operator has not provisioned an API key — instruct them to do so before
+  re-running `/ci`. When invoking `/ci` from a worker spawned via
+  `agent-director`, pass the credential through on the spawn command — the
+  worker session does not inherit the orchestrator's env — with
+  `--extra-env ANTHROPIC_API_KEY="$KEY"`, and for a gateway credential also
+  `--extra-env ANTHROPIC_BASE_URL="$BASE_URL" --extra-env ANTHROPIC_MODEL="$MODEL"`.
 - `npm pack` fails — instruct operator to run `npm install` and re-run `/ci`.

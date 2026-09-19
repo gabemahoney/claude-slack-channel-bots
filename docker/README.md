@@ -18,6 +18,26 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
 base first, then builds `cscb-ci`. The base build is a one-time per-host cost
 per version tag.
 
+The base build fetches bun and the agent-director binary from GitHub, and `/ci`
+runs it with `docker build --network=host`. On some hosts the default docker
+bridge network intermittently fails those fetches with SSL/timeout errors even
+when the host itself reaches the same URLs fine; host networking sidesteps that.
+It affects only the one-time base build, so the blast radius is minimal. If you
+invoke the base build by hand (e.g. the cold-cache path below), pass
+`--network=host` too if you hit a fetch failure.
+
+## Credential env vars passed to the container
+
+`/ci`'s `docker run` step forwards `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, and
+`ANTHROPIC_MODEL` from the host environment (each via the no-value `--env VAR`
+pass-through form). The bot Claudes spawned by the daemon-under-test consume
+these. A raw `sk-ant-api…` key needs only `ANTHROPIC_API_KEY` — Claude Code
+defaults to `api.anthropic.com` when `ANTHROPIC_BASE_URL` is absent. A gateway
+credential (e.g. NVIDIA InferenceHub) additionally requires `ANTHROPIC_BASE_URL`
+and `ANTHROPIC_MODEL` so the bot Claudes hit the gateway rather than
+`api.anthropic.com`; if only the key were forwarded, the gateway key would 401
+against Anthropic's direct endpoint.
+
 ## When to bump the base image version
 
 Bump `cscb-ci-base`'s version tag (e.g. `v1` → `v2`) whenever you change
