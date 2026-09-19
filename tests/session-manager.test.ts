@@ -46,6 +46,8 @@ import {
   _resetTmuxSessionKiller,
   _setTmuxServerEnsurer,
   _resetTmuxServerEnsurer,
+  _setTmuxSessionProber,
+  _resetTmuxSessionProber,
   _setTmuxCapturePane,
   _setTmuxSendEnter,
   _resetTmuxDialogHelpers,
@@ -119,6 +121,10 @@ beforeEach(() => {
   // out to real tmux (b.vub). Dead-row tests override these to drive behavior.
   _setTmuxCapturePane(async () => '')
   _setTmuxSendEnter(async () => {})
+  // Default the b.3ce timeout-liveness prober to "alive" so unit tests never
+  // shell out to real tmux and the timeout verdict stays 'ok' unless a test
+  // explicitly drives the dead-session path.
+  _setTmuxSessionProber(async () => true)
 })
 
 afterEach(() => {
@@ -128,6 +134,7 @@ afterEach(() => {
   _resetWaitForWaitingTimeoutMs()
   _resetTmuxSessionKiller()
   _resetTmuxServerEnsurer()
+  _resetTmuxSessionProber()
   _resetTmuxDialogHelpers()
   _resetDialogDeadGracePolls()
   _resetOutageState()
@@ -411,7 +418,7 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
     const { web, calls } = makeMockWeb()
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
     const result = await reconnectMcp('C', web as never, cfg)
-    expect(result).toBe(true)
+    expect(result).toBe('ok')
     expect(ensureCalls).toBe(1)
     expect(sendKeysCalls).toHaveLength(2)
     expect(sendKeysCalls[1].text).toContain('/mcp reconnect')
@@ -419,7 +426,7 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
     expect(calls).toHaveLength(0)
   })
 
-  test('reconnectMcp: retry after ErrTmuxSendKeys also fails → false + Slack failure post', async () => {
+  test('reconnectMcp: retry after ErrTmuxSendKeys also fails → dead-session (b.3ce: caller recovers, no failure post)', async () => {
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     let ensureCalls = 0
     _setTmuxServerEnsurer(async () => { ensureCalls++ })
@@ -430,10 +437,11 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
     const { web, calls } = makeMockWeb()
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
     const result = await reconnectMcp('C', web as never, cfg)
-    expect(result).toBe(false)
+    expect(result).toBe('dead-session')
     expect(ensureCalls).toBe(1) // self-heal attempted exactly once (single retry)
     expect(sendKeysCalls).toHaveLength(2)
-    expect(calls).toHaveLength(1)
+    // b.3ce: dead-session hands recovery to the caller — no premature failure post
+    expect(calls).toHaveLength(0)
   })
 
   test('reconnectMcp: non-tmux sendKeys error → no self-heal, no retry', async () => {
@@ -446,7 +454,7 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
     const result = await reconnectMcp('C', undefined, cfg)
-    expect(result).toBe(false)
+    expect(result).toBe('failed')
     expect(ensureCalls).toBe(0)
     expect(sendKeysCalls).toHaveLength(1)
   })
@@ -469,39 +477,71 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
     expect(sendKeysCalls).toHaveLength(2)
   })
 
-  test('spawnForRoute waiting branch: reconnect fails → action=failed + startup error recorded', async () => {
+  test('spawnForRoute waiting branch (b.3ce): persistent ErrTmuxSendKeys → resume recovery, not failed', async () => {
     const readLog = captureStartupErrors()
     _setTmuxServerEnsurer(async () => {})
+    const resumeCalls: import('agent-director').ResumeParams[] = []
     installStub({
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
-      sendKeysError: errTmuxSendKeys(), // persistent — retry fails too
+      sendKeysError: errTmuxSendKeys(), // persistent — self-heal retry fails too (dead session)
+      resumeCalls,
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
     const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
-    expect(result.action).toBe('failed')
-    expect(readLog()).toContain('reconnect failed for channel=C (state=waiting)')
+    // b.3ce: pre-fix this reported 'failed' and gave up; now the dead session
+    // falls through to the ended/missing recovery logic (resume-first).
+    expect(result.action).toBe('resumed')
+    expect(resumeCalls).toHaveLength(1)
+    expect(readLog()).toBe('')
   })
 
-  test('spawnForRoute waiting branch (isStartup=false): failed reconnect → failed, no startup error', async () => {
+  test('spawnForRoute waiting branch (b.3ce): dead session + resume not resumable → kill+delete+fresh spawn', async () => {
+    _setTmuxServerEnsurer(async () => {})
+    const killCalls: import('agent-director').KillParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({
+      spawnCalls,
+      killCalls,
+      deleteCalls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
+      ],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      sendKeysError: errTmuxSendKeys(),
+      resumeError: errSpawnNotResumable(), // stale `waiting` row rejects resume
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('spawned')
+    expect(killCalls).toHaveLength(1)
+    expect(deleteCalls).toHaveLength(1)
+    expect(spawnCalls).toHaveLength(2) // initial collision + fresh spawn
+  })
+
+  test('spawnForRoute waiting branch: dead session and recovery also fails → action=failed', async () => {
     const readLog = captureStartupErrors()
     _setTmuxServerEnsurer(async () => {})
     installStub({
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(),
+      resumeError: errGeneric('resume', 'ErrResumeBroken'), // recovery fails too
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, false)
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
     expect(result.action).toBe('failed')
-    expect(readLog()).toBe('')
+    expect(readLog()).toBe('') // resume-failure path posts to Slack; no reconnect-failed startup entry
   })
 
-  test('startupSessionManager: failed reconnects are counted (no false "0 failed")', async () => {
+  test('startupSessionManager: unrecoverable channels are counted (no false "0 failed")', async () => {
     captureStartupErrors() // keep startup-errors.log in a temp dir
     _setTmuxServerEnsurer(async () => {})
     // Both routes collide into `waiting` rows whose reconnect send-keys fails
-    // persistently — the 2026-09-18 post-reboot outage shape.
+    // persistently — the 2026-09-18 post-reboot outage shape — AND the b.3ce
+    // resume recovery fails, so both must land in the failed bucket.
     installStub({
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
@@ -509,12 +549,175 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
       ],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_X', state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(),
+      resumeError: errGeneric('resume', 'ErrResumeBroken'),
     })
     const cfg = makeRoutingConfig({ routes: { C1: { cwd: '/x1' }, C2: { cwd: '/x2' } } })
     const result = await startupSessionManager(cfg, { concurrency: 1 })
     expect(result.failed).toBe(2)
     expect(result.succeeded).toBe(0)
     expect(result.perChannel.every((p) => p.action === 'failed')).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.3ce — waitForWaitingAndReconnect timeout liveness verdict + working-branch
+// dead-session recovery
+// ---------------------------------------------------------------------------
+
+describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session recovery', () => {
+  test('timeout with tmux session alive → ok (long turns are not errors — regression guard)', async () => {
+    _setWaitForWaitingTimeoutMs(30)
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return true })
+    installStub({
+      statusResult: { state: 'working' } as import('agent-director').StatusResult, // frozen mid-long-turn
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await waitForWaitingAndReconnect('C', cfg)
+    expect(result).toBe('ok')
+    expect(probed).toEqual([tmuxSessionNameFor('C', undefined)])
+  })
+
+  test('timeout with tmux session gone → dead-session', async () => {
+    _setWaitForWaitingTimeoutMs(30)
+    _setTmuxSessionProber(async () => false)
+    installStub({
+      statusResult: { state: 'working' } as import('agent-director').StatusResult, // DB row frozen post-reboot
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await waitForWaitingAndReconnect('C', cfg)
+    expect(result).toBe('dead-session')
+  })
+
+  test('spawnForRoute working branch: timeout + dead session → resume recovery instead of reconnected', async () => {
+    _setWaitForWaitingTimeoutMs(30)
+    _setTmuxSessionProber(async () => false)
+    _setTmuxServerEnsurer(async () => {})
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    installStub({
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working' }),
+      statusResult: { state: 'working' } as import('agent-director').StatusResult,
+      resumeCalls,
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('resumed')
+    expect(resumeCalls).toHaveLength(1)
+  })
+
+  test('spawnForRoute working branch: timeout + session alive → reconnected (no kill/resume/spawn)', async () => {
+    _setWaitForWaitingTimeoutMs(30)
+    _setTmuxSessionProber(async () => true)
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const killCalls: import('agent-director').KillParams[] = []
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({
+      spawnCalls,
+      killCalls,
+      resumeCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working' }),
+      statusResult: { state: 'working' } as import('agent-director').StatusResult,
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('reconnected')
+    expect(resumeCalls).toHaveLength(0)
+    expect(killCalls).toHaveLength(0)
+    expect(spawnCalls).toHaveLength(1) // only the initial colliding spawn
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.c3o — waitForWaitingAndReconnect early-abort liveness verdict
+// ---------------------------------------------------------------------------
+
+describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () => {
+  test('transition to missing + tmux gone → dead-session', async () => {
+    _setTmuxSessionProber(async () => false)
+    installStub({
+      statusResult: { state: 'missing' } as import('agent-director').StatusResult,
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await waitForWaitingAndReconnect('C', cfg)
+    expect(result).toBe('dead-session')
+  })
+
+  test('transition to ended + tmux gone → dead-session', async () => {
+    _setTmuxSessionProber(async () => false)
+    installStub({
+      statusResult: { state: 'ended' } as import('agent-director').StatusResult,
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await waitForWaitingAndReconnect('C', cfg)
+    expect(result).toBe('dead-session')
+  })
+
+  test('transition to missing + tmux alive → ok (probe decides, not the DB row)', async () => {
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return true })
+    installStub({
+      statusResult: { state: 'missing' } as import('agent-director').StatusResult,
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await waitForWaitingAndReconnect('C', cfg)
+    expect(result).toBe('ok')
+    expect(probed).toEqual([tmuxSessionNameFor('C', undefined)])
+  })
+
+  test('transition to live transient state (ask_user) → ok without probing or recovery (regression guard)', async () => {
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return false }) // even a "dead" probe must not matter
+    installStub({
+      statusResult: { state: 'ask_user' } as import('agent-director').StatusResult,
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await waitForWaitingAndReconnect('C', cfg)
+    expect(result).toBe('ok')
+    expect(probed).toEqual([]) // live transient states never reach the prober
+  })
+
+  test('transition to live transient state (check_permission) → ok, never dead-session', async () => {
+    _setTmuxSessionProber(async () => false)
+    installStub({
+      statusResult: { state: 'check_permission' } as import('agent-director').StatusResult,
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await waitForWaitingAndReconnect('C', cfg)
+    expect(result).toBe('ok')
+  })
+
+  test('ErrSpawnNotFound + tmux gone → dead-session', async () => {
+    _setTmuxSessionProber(async () => false)
+    installStub({ statusError: errSpawnNotFound() })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await waitForWaitingAndReconnect('C', cfg)
+    expect(result).toBe('dead-session')
+  })
+
+  test('ErrSpawnNotFound + tmux alive → ok', async () => {
+    _setTmuxSessionProber(async () => true)
+    installStub({ statusError: errSpawnNotFound() })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await waitForWaitingAndReconnect('C', cfg)
+    expect(result).toBe('ok')
+  })
+
+  test('spawnForRoute working branch: transition to missing + dead tmux → resume recovery instead of misreported ok', async () => {
+    _setTmuxSessionProber(async () => false)
+    _setTmuxServerEnsurer(async () => {})
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    installStub({
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working' }),
+      statusResult: { state: 'missing' } as import('agent-director').StatusResult,
+      resumeCalls,
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('resumed')
+    expect(resumeCalls).toHaveLength(1)
   })
 })
 
@@ -1521,7 +1724,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     installStub({ sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN) })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
     const result = await reconnectMcp('C', web as never, cfg)
-    expect(result).toBe(false)
+    expect(result).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(calls).toHaveLength(0)
   })
@@ -1531,7 +1734,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     installStub({ sendKeysError: new ErrTmuxNotAvailable('send-keys', 'ErrTmuxNotAvailable', 'tmux not available') })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
     const result = await reconnectMcp('C', web as never, cfg)
-    expect(result).toBe(false)
+    expect(result).toBe('failed')
     expect(getOutageFlags('C').has('tmux-unavailable')).toBe(true)
     expect(calls).toHaveLength(0)
   })
@@ -1546,7 +1749,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     installStub({ statusError: new ErrSystemInstallDisappeared('status', BIN) })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
     const result = await waitForWaitingAndReconnect('C', cfg, web as never)
-    expect(result).toBe(false)
+    expect(result).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(calls).toHaveLength(0)
   })
