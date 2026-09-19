@@ -45,6 +45,7 @@ function makeConfig(overrides: Partial<RoutingConfig> = {}): RoutingConfig {
     cozempic_prescription: 'standard',
     system_prompt_mode: 'append',
     resume_enabled: true,
+    stop_hook_bootstrap: true,
     agent_director_poll_interval_ms: 1000,
     ...overrides,
   }

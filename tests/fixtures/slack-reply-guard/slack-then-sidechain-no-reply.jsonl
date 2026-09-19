@@ -1,0 +1,8 @@
+{"type":"last-prompt","value":"prior"}
+{"type":"mode","value":"default"}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":"non-slack lead-in as plain string"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ready"}]}}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"<channel source=\"slack\" chat_id=\"C777\" message_id=\"1700002222.000300\" user=\"U3\" thread_ts=\"1700002222.000000\" ts=\"1700002222.000300\">the real slack trigger</channel>"}]}}
+{"type":"user","isSidechain":true,"message":{"role":"user","content":[{"type":"text","text":"sidechain: do a research task"}]}}
+{"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"sidechain assistant reply"}]}}
+{"type":"user","isSidechain":true,"message":{"role":"user","content":[{"type":"text","text":"sidechain follow-up"}]}}

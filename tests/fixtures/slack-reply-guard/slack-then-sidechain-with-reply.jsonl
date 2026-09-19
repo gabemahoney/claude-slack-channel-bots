@@ -1,0 +1,8 @@
+{"type":"last-prompt","value":"prior"}
+{"type":"mode","value":"default"}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":"non-slack lead-in plain string"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"<channel source=\"slack\" chat_id=\"C888\" message_id=\"1700003333.000400\" user=\"U4\" thread_ts=\"1700003333.000000\" ts=\"1700003333.000400\">real slack question</channel>"}]}}
+{"type":"user","isSidechain":true,"message":{"role":"user","content":[{"type":"text","text":"sidechain: do a research task"}]}}
+{"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"sidechain assistant reply"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"answering"},{"type":"tool_use","id":"tu_reply2","name":"mcp__slack-channel-router__reply","input":{"channel":"C888","text":"hi"}}]}}

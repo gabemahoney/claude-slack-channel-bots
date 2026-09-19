@@ -1,0 +1,8 @@
+{"type":"last-prompt","value":"prior"}
+{"type":"mode","value":"default"}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":"prior plain-string operator msg"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"<channel source=\"slack\" chat_id=\"C321\" message_id=\"1700001111.000100\" user=\"U7\" thread_ts=\"1700001110.000000\" ts=\"1700001111.000100\">please respond</channel>"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_read1","name":"Read","input":{"file_path":"/tmp/foo"}}]}}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_read1","content":"file contents..."}]}}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_read1b","content":"more tool output, still no real user msg here"}]}}

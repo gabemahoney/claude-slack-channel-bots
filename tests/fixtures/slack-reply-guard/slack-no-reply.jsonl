@@ -1,0 +1,7 @@
+{"type":"last-prompt","value":"earlier"}
+{"type":"mode","value":"default"}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":"plain string user msg, not slack"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"<channel source=\"slack\" chat_id=\"C555\" message_id=\"1700000000.000200\" user=\"U9\" thread_ts=\"1700000000.000100\" ts=\"1700000000.000200\">still waiting for you</channel>"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"thinking, no tool call"}]}}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_y","content":"some tool result, tool_result-only entries do not displace trigger"}]}}

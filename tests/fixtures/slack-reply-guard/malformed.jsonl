@@ -1,0 +1,3 @@
+this is not json at all }}}
+{broken: json, missing quotes}
+{"almost": "valid", but not really,

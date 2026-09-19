@@ -1,0 +1,5 @@
+{"type":"last-prompt","value":"x"}
+{"type":"mode","value":"default"}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":"plain-string user message, human-typed, no slack tag"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"acknowledged"}]}}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"another block-array user message, still no slack origin"}]}}

@@ -20,7 +20,7 @@ src/agent-director-client.ts:64  # error-message string literal naming getClient
 src/outage-state.ts:61  # JSDoc for OutageStateDeps.getClient() — type-surface reference, not a call
 src/outage-state.ts:62  # OutageStateDeps interface property declaration — type-surface, not a call
 src/outage-state.ts:237  # wrapper's deps.getClient() — sanctioned single entry point
-src/server.ts:859  # isSessionAliveAdapter tick-path bare getClient() — sanctioned tick-path exception
+src/server.ts:860  # isSessionAliveAdapter tick-path bare getClient() — sanctioned tick-path exception
 src/agent-director-template.ts:47  # production-deps factory wiring: getClient: () => getClient()
 src/agent-director-template.ts:136  # startup-fatal makeTemplate install: const client = d.getClient()
 src/session-manager.ts:1188  # const client = getClient() in reconcileOrphans (orphans have no routed-channel attribution)

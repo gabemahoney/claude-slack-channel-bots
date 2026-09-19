@@ -13,7 +13,8 @@
     "scripts/install-check.ts",
     "slack-app-manifest.yml",
     "README.md",
-    "skills/"
+    "skills/",
+    "stop-hooks/"
   ],
   "engines": {
     "bun": ">=1.0.0"
