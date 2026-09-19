@@ -242,7 +242,7 @@ Set `stop_hook_bootstrap` on an individual route to override the top-level defau
 }
 ```
 
-A per-route opt-out only *fully* disables the guard for that bot when the route owns a **dedicated** `claude_config_dir`. If two routes share a `claude_config_dir`, the shared-dir aggregation described in [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook) applies — the managed entry stays installed on that shared dir as long as at least one route resolving to it has the guard enabled.
+A per-route opt-out only *fully* disables the guard for that bot when the route owns a **dedicated** `claude_config_dir` — see [Shared-dir aggregation](#shared-dir-aggregation) for the interaction when routes share a dir.
 
 ---
 
@@ -517,7 +517,7 @@ Routes with no effective `claude_config_dir` — neither per-route nor top-level
 
 ### v1 limitations — opt these bots out
 
-The v1 guard only recognises a reply via `mcp__slack-channel-router__reply`. Bots whose only Slack surface is `edit_message` or `react` will end their turn without producing a matching `tool_use`, and the guard will block them and force one useless retry every turn. **Opt these bots out** by setting `stop_hook_bootstrap: false` on the route (see the field reference below), and give the route a dedicated `claude_config_dir` so the shared-dir aggregation rule does not re-enable the guard for it.
+The v1 guard only recognises a reply via `mcp__slack-channel-router__reply`. Bots whose only Slack surface is `edit_message` or `react` will end their turn without producing a matching `tool_use`, and the guard will block them and force one useless retry every turn. **Opt these bots out** by setting `stop_hook_bootstrap: false` on the route (see the field reference below), and give the route a dedicated `claude_config_dir` — see [Shared-dir aggregation](#shared-dir-aggregation).
 
 ### Opting out
 
@@ -525,7 +525,7 @@ The `stop_hook_bootstrap` boolean lives on the top level of `config.json` and on
 
 ### Tag drift — fail-open, verify after upgrades
 
-The guard's Slack-origination predicate is a substring match on the prefix `<channel source="slack` in the transcript entry Claude Code writes for every Slack-delivered turn. CSCB only sends `{content, meta}` over MCP; the `<channel source="…">` wrapper is rendered by the **Claude Code harness itself** when it serialises the MCP tool result into the transcript, and the `source` attribute is the MCP server name (e.g. `slack-channel-router`). That tag is therefore an **external, harness-owned contract** — a future Claude Code release can rename it or restructure the wrapper without touching CSCB, and the guard's predicate would silently stop matching. Its exact bytes have already drifted once: an earlier draft of the predicate matched `source="slack"` (closing quote inside the predicate) and never triggered against the real on-wire tag `source="slack-channel-router"` — the predicate was broadened to the prefix form to cover both spellings. Because the contract sits outside CSCB, the guard is designed to fail open on drift, and a post-upgrade verification recipe (below) exists so operators catch a silent-dark guard the next time the harness changes the tag.
+The guard's Slack-origination predicate is a substring match on the prefix `<channel source="slack` in the transcript entry Claude Code writes for every Slack-delivered turn. CSCB only sends `{content, meta}` over MCP; the `<channel source="…">` wrapper is rendered by the **Claude Code harness itself** when it serialises the MCP tool result into the transcript, and the `source` attribute is the MCP server name (e.g. `slack-channel-router`). That tag is therefore an **external, harness-owned contract** — a future Claude Code release can rename it or restructure the wrapper without touching CSCB, and the guard's predicate would silently stop matching. Because the contract sits outside CSCB, the guard is designed to fail open on drift, and a post-upgrade verification recipe (below) exists so operators catch a silent-dark guard the next time the harness changes the tag.
 
 The guard is **fail-open by design**: any error, missing transcript, missing `jq`, or absence of the tag results in `exit 0` (turn allowed). This means a future rename of the `<channel>` tag will silently disable the guard rather than break the bot. After every CSCB or Claude Code upgrade, verify the guard end-to-end:
 
