@@ -12,7 +12,8 @@ cli.ts                          CLI entry point — start/stop/clean_restart sub
     ├── config.ts               Routing configuration — load, validate, defaults, tilde expansion. SR-4.1 agent_director_poll_interval_ms field. SR-4.2 unknown-field rejection.
     ├── registry.ts             Session registry — pending/registered sessions, MCP Server factory, transport routing. No session-id discovery (AD owns it).
     ├── lib.ts                  Pure utilities — gate, access control, chunking, sanitization.
-    ├── logging.ts              Log file setup — overrides console.error/console.log with timestamped writeSync to a log file.
+    ├── logging.ts              Log file setup — overrides console.error/console.log with timestamped writeSync to a log file. Size-based rotation on every write (b.brv): rotates server.log/clean_restart.log at CSCB_LOG_MAX_BYTES (default 10 MiB), keeps CSCB_LOG_KEEP generations (default 5; 0 = truncate).
+    ├── agent-director-logger.ts  b.brv verbosity filter for the agent-director Client's diagnostic logger. `makeFilteredAdLogger(base)` drops routine `SubprocessClient: <verb> ok` per-poll success dumps at info/log level; warn/error always pass through. CSCB_AD_VERBOSE (truthy: 1/true/yes/on) returns the base logger unwrapped. Injected into `Client.create()` by `agent-director-startup.ts`.
     ├── startup-errors.ts       SR-5.1a startup-errors log — append-only to ~/.claude/channels/slack/startup-errors.log + stderr.
     ├── agent-director-client.ts   SR-0.1 singleton Client wrapper. `getClient()` is a sync cached accessor returning the Client previously installed by the startup gate via the production `setClient()` setter; calling `getClient()` before the gate runs throws a CSCB-internal "called before startup gate" error. CSCB no longer owns a runtime version pin — AD's library-side `Client.create()` enforces the floor from `dist/version-floor.json`. Exposes `decideWithToken` (SR-7.2 — single source of truth for the snake-case `request_token` field on the decide wire) and `getPermission` + `isErrPermissionRequestNotFound` (SR-7.1 — wraps the paired AD release's `get-permission --request-token <uuid>` verb).
     ├── agent-director-errors.ts   SR-0.2 typed Err* re-exports for instanceof branching.
@@ -154,7 +155,7 @@ AskUserQuestion is denied at the agent-director template (SR-3.1's `deny: ['AskU
 
 Called from `main()` in `server.ts`. The order is:
 
-1. **SR-5.1 startup gate** — `runAgentDirectorStartupGate()` awaits `createClient(opts)` (production injects `Client.create`), which runs AD's library-side discovery + floor enforcement against `dist/version-floor.json`. On success the gate installs the constructed Client into the singleton via `setClient(client)` so subsequent `getClient()` call sites resolve to it, and the success-arm `adVersion` is read from `client.binaryVersion`. The construct-step catch ladder `instanceof`-matches `ErrBunVersionTooOld` (→ `ad-bun-version-too-old`), `ErrSystemInstallNotFound` (→ `ad-system-install-not-found`), `ErrSystemInstallTooOld` (→ `ad-system-install-too-old`, message names detected + required versions), and `ErrSystemInstallUnreachable` (→ `ad-system-install-unreachable`, message surfaces AD's `err.reason` verbatim); the three `ad-system-install-*` branches append the `install-skill-pointer.ts` manual-skill-install instructions block to their `recordStartupError` output. CSCB no longer performs a post-Client floor check — AD owns it. Then runs the SR-6.1 API surface probes (`getPermission` presence, error-catalog round-trip, `--request-token` in the dist) and stats `~/.agent-director/state.db` against `geteuid()`. Failure writes to `startup-errors.log` and exits non-zero.
+1. **SR-5.1 startup gate** — `runAgentDirectorStartupGate()` awaits `createClient(opts)` (production injects `Client.create`), which runs AD's library-side discovery + floor enforcement against `dist/version-floor.json`. The opts carry `logger: makeFilteredAdLogger(console)` (b.brv) so the Client's per-poll `SubprocessClient: <verb> ok` success dumps are dropped from `server.log` unless `CSCB_AD_VERBOSE` is set — see [Logging](#logging). On success the gate installs the constructed Client into the singleton via `setClient(client)` so subsequent `getClient()` call sites resolve to it, and the success-arm `adVersion` is read from `client.binaryVersion`. The construct-step catch ladder `instanceof`-matches `ErrBunVersionTooOld` (→ `ad-bun-version-too-old`), `ErrSystemInstallNotFound` (→ `ad-system-install-not-found`), `ErrSystemInstallTooOld` (→ `ad-system-install-too-old`, message names detected + required versions), and `ErrSystemInstallUnreachable` (→ `ad-system-install-unreachable`, message surfaces AD's `err.reason` verbatim); the three `ad-system-install-*` branches append the `install-skill-pointer.ts` manual-skill-install instructions block to their `recordStartupError` output. CSCB no longer performs a post-Client floor check — AD owns it. Then runs the SR-6.1 API surface probes (`getPermission` presence, error-catalog round-trip, `--request-token` in the dist) and stats `~/.agent-director/state.db` against `geteuid()`. Failure writes to `startup-errors.log` and exits non-zero.
 2. **PID conflict check** — existing `checkPidConflict(PID_FILE)` invariant. CSCB enforces one instance per host.
 3. **SR-3.2 template refresh** — `installSlackChannelBotTemplate(routingConfig)` builds the SR-3.1 `MakeTemplateParams` and calls `client.makeTemplate({ ..., overwrite: true })`. Atomic replacement is the library's responsibility (sibling-tempfile + `rename(2)`). Fatal on rejection.
 4. **SR-1.6 orphan reconciliation** — `reconcileOrphans(routingConfig)`. `client.list({ label: ['service=cscb'] })` enumerates every CSCB spawn; rows whose `channel` label is missing or not in `routingConfig.routes` are killed + deleted. Per-orphan failure logged to `startup-errors.log` but does not block.
@@ -578,10 +579,26 @@ Bun bypasses `process.stderr.write` overrides — the runtime writes directly to
 
 1. Format all arguments to a single string (JSON-serializing objects)
 2. Prepend an ISO-8601 timestamp: `[2024-01-01T00:00:00.000Z] message`
-3. Write the line synchronously via `writeSync` to the open file descriptor
-4. Fall back to the original `console.error`/`console.log` if the write fails
+3. Roll the file if it has grown past the threshold (see **Rotation** below)
+4. Write the line synchronously via `writeSync` to the open file descriptor
+5. Fall back to the original `console.error`/`console.log` if the write fails
 
 The originals are captured at module load time so the fallback always refers to Bun's native output.
+
+### Rotation (b.brv)
+
+Rotation is built into `src/logging.ts` so it applies on every machine that runs CSCB — no per-host logrotate config. `maybeRotate()` runs before each write: it `fstat`s the active fd and, when the size crosses the threshold, closes the fd, shifts `<path>.N-1 → <path>.N` down to `<path>.1`, renames the active file to `<path>.1`, discards the oldest generation beyond `CSCB_LOG_KEEP`, and reopens a fresh active file. It is best-effort — any filesystem error is swallowed rather than thrown into the caller's hot path, and a failed reopen after rotation is recovered on a subsequent write rather than disabling file logging.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `CSCB_LOG_MAX_BYTES` | 10 MiB (`10485760`) | Rotate when the active file reaches N bytes. Values `<= 0` or non-numeric ignored. |
+| `CSCB_LOG_KEEP` | 5 | Rotated generations retained. `0` = keep none (the active file is `rm`ed on rotation, i.e. truncate). Values `< 0` or non-numeric ignored. |
+
+Rotated generations are **not** compressed. Applies to both `server.log` and `clean_restart.log` (any file passed to `initLogging`). This is distinct from `startup-errors.log`, whose rotation remains operator-owned via `docs/logrotate-startup-errors.conf`.
+
+### agent-director logger filter (b.brv)
+
+The agent-director `Client` is constructed with a `logger` in `src/agent-director-startup.ts`, and since `initLogging()` patches `console`, everything the Client logs lands in `server.log`. At info level the Client emits a per-poll `SubprocessClient: <verb> ok { … }` success dump for every `list`/`status`/`get`/`decide` call — with CSCB polling continuously, these dumps historically dominated the log (2 GB / 137 MB observed in b.brv). `makeFilteredAdLogger(console)` in `src/agent-director-logger.ts` wraps the console: it drops those routine `SubprocessClient: <verb> ok` records at `log`/`info` level while passing `warn`/`error` through unfiltered. Setting `CSCB_AD_VERBOSE` to a truthy value (`1`/`true`/`yes`/`on`) returns the base logger unwrapped, restoring the full chatter for debugging.
 
 ### Log file locations
 
@@ -592,7 +609,7 @@ Both paths are rooted in `SLACK_STATE_DIR` (default: `~/.claude/channels/slack/`
 | Server daemon (`server.ts`) | `STATE_DIR/server.log` |
 | `clean_restart` subcommand | `STATE_DIR/clean_restart.log` |
 
-Both files are opened in append mode — multiple restarts accumulate in the same file rather than overwriting it.
+Both files are opened in append mode — multiple restarts accumulate in the same file rather than overwriting it (subject to the size-based rotation above).
 
 ## Endpoint Inventory
 
