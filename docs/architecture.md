@@ -8,7 +8,7 @@ The Slack Channel Router is a two-way bridge between Slack and Claude Code sessi
 
 ```
 cli.ts                          CLI entry point — start/stop/clean_restart subcommands. clean_restart uses agent-director pause/kill/status verbs (SR-11 Event 12).
-└── server.ts                   Main entry point — HTTP server, Socket Mode, message routing. Embeds the SR-5.1 startup gate, SR-3.2 template install, SR-1.6 orphan reconcile, SR-2.1 poller.
+└── server.ts                   Main entry point — HTTP server, Socket Mode, message routing. Embeds the SR-5.1 startup gate, SR-3.2 template install, SR-1.6 orphan reconcile, SR-2.1 poller. `isHttpVerbose()` (b.3k6) gates the per-request `/mcp` access line behind `CSCB_HTTP_VERBOSE` (truthy: 1/true/yes/on) — off by default, checked per request.
     ├── config.ts               Routing configuration — load, validate, defaults, tilde expansion. SR-4.1 agent_director_poll_interval_ms field. SR-4.2 unknown-field rejection.
     ├── registry.ts             Session registry — pending/registered sessions, MCP Server factory, transport routing. No session-id discovery (AD owns it).
     ├── lib.ts                  Pure utilities — gate, access control, chunking, sanitization.
@@ -599,6 +599,10 @@ Rotated generations are **not** compressed. Applies to both `server.log` and `cl
 ### agent-director logger filter (b.brv)
 
 The agent-director `Client` is constructed with a `logger` in `src/agent-director-startup.ts`, and since `initLogging()` patches `console`, everything the Client logs lands in `server.log`. At info level the Client emits a per-poll `SubprocessClient: <verb> ok { … }` success dump for every `list`/`status`/`get`/`decide` call — with CSCB polling continuously, these dumps historically dominated the log (2 GB / 137 MB observed in b.brv). `makeFilteredAdLogger(console)` in `src/agent-director-logger.ts` wraps the console: it drops those routine `SubprocessClient: <verb> ok` records at `log`/`info` level while passing `warn`/`error` through unfiltered. Setting `CSCB_AD_VERBOSE` to a truthy value (`1`/`true`/`yes`/`on`) returns the base logger unwrapped, restoring the full chatter for debugging.
+
+### HTTP request access line (b.3k6)
+
+The `/mcp` endpoint's `fetch` handler in `src/server.ts` is hit on every MCP round-trip — client polls, notifications, tool-call responses, and each SSE stream open — so its one-line-per-request access log (`[slack] HTTP <method> <path> session=…`) is the highest-frequency routine success line left in `server.log` after b.brv silenced the `SubprocessClient` dumps. It shares their signal/noise profile: routine and continuous at steady state, useful only when debugging a specific transport/session-routing problem. It is gated behind `isHttpVerbose()`, which reads `CSCB_HTTP_VERBOSE` (truthy: `1`/`true`/`yes`/`on`, case-insensitive) — off by default. Unlike `CSCB_AD_VERBOSE`, the env var is checked per request rather than once at startup, so toggling it takes effect without a restart. Real events (session connect/disconnect, route mismatch, errors) are logged unconditionally elsewhere and are unaffected by this flag.
 
 ### Log file locations
 
