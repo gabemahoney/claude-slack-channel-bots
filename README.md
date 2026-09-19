@@ -199,6 +199,7 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | `claude_config_dir` | string | — | Path to a Claude on-disk config directory. When set, managed sessions launch with `CLAUDE_CONFIG_DIR='<resolved-path>'` so the bot authenticates against a specific account. `~` is expanded and the path is resolved to absolute. Per-route `routes[id].claude_config_dir` overrides this top-level value for individual channels. When neither is set, Claude's own default applies. Must be non-empty when set. |
 | `resume_enabled` | boolean | `true` | When `false`, the session manager always performs a fresh Claude session launch instead of resuming, both on startup and on runtime auto-restart, even when a stored session ID exists. Disabling this skips the `--resume` flag entirely. Use this as a workaround if your Claude Code version crashes with "sandbox required but unavailable" on `--resume` (a known regression in v2.1.120). |
 | `agent_director_poll_interval_ms` | number | `1000` | Poll interval (ms) for the agent-director permission relay tick. Must be a positive integer in `[200, 3_600_000]`. Replaces the pre-rename `claude_director_poll_interval_ms` — the old name is rejected at startup. Unknown top-level config fields are also rejected to surface stale configs after the rename. |
+| `stop_hook_bootstrap` | boolean | `true` | Controls whether the server installs the CSCB-managed Slack Reply Guard Stop hook into `<claude_config_dir>/settings.json` at boot (see [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook)). Set to `false` to disable installation for every route and to actively remove any previously-installed managed entry. Per-route `routes[id].stop_hook_bootstrap` overrides this top-level value. Non-boolean values are rejected by config validation at startup. |
 
 #### Per-route `claude_config_dir` override
 
@@ -220,6 +221,28 @@ When you want different bot sessions to authenticate as different Claude account
 ```
 
 `C_PERSONAL` launches with the Max account; `C_CORPORATE` falls through to the top-level value and uses the corporate account. Use `claude auth login --claudeai` (or `--console`) with `CLAUDE_CONFIG_DIR` set to the same directory to populate each config dir before starting the server.
+
+#### Per-route `stop_hook_bootstrap` override
+
+Set `stop_hook_bootstrap` on an individual route to override the top-level default for that one bot. Per-route values win over the top-level value; routes without their own value inherit the top-level default (which is itself `true` when absent).
+
+```json
+{
+  "routes": {
+    "C_EDIT_ONLY_BOT": {
+      "cwd": "~/projects/gamma",
+      "claude_config_dir": "~/.claude-gamma",
+      "stop_hook_bootstrap": false
+    },
+    "C_NORMAL_BOT": {
+      "cwd": "~/projects/delta",
+      "claude_config_dir": "~/.claude-delta"
+    }
+  }
+}
+```
+
+A per-route opt-out only *fully* disables the guard for that bot when the route owns a **dedicated** `claude_config_dir`. If two routes share a `claude_config_dir`, the shared-dir aggregation described in [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook) applies — the managed entry stays installed on that shared dir as long as at least one route resolving to it has the guard enabled.
 
 ---
 
@@ -451,6 +474,66 @@ The Slack app must have **interactivity enabled** with **Socket Mode** as the de
 ### AskUserQuestion
 
 The `AskUserQuestion` tool is denied for every CSCB-spawned bot via the agent-director template (`deny: ['AskUserQuestion']`). Bots respond to operator questions via the Slack `reply` MCP tool instead. There is no `ask-relay.sh` hook and no `/ask` HTTP route.
+
+---
+
+## Slack Reply Guard (Stop hook)
+
+CSCB ships a Claude Code Stop hook that enforces a simple rule for every bot session it manages: **when the most recent real user message on the turn came from Slack, the assistant must call the `mcp__slack-channel-router__reply` tool before ending the turn**. If it does not, the Stop hook exits `2`, and Claude Code shows the assistant the reminder `Slack user is waiting for a reply. You must respond by calling the mcp__slack-channel-router__reply tool before ending your turn.` and re-runs it once. The retry sets `stop_hook_active=true`, which short-circuits the guard, so exactly one forced retry occurs per turn — never an infinite block loop.
+
+### What the server writes, and where
+
+CSCB owns installing the hook on your behalf. On every server boot, alongside the trust-folder bootstrap, the server walks every route, groups them by effective `claude_config_dir` (per-route override falls back to the top-level value), and patches `<claude_config_dir>/settings.json` in place. For each dir it ensures **exactly one** managed Stop-hook group of the shape:
+
+```jsonc
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "<absolute path>/stop-hooks/slack-reply-guard.sh" } ] }
+    ]
+  }
+}
+```
+
+The command is an absolute path to the script inside CSCB's installed package tree. There is no `matcher` field — Stop is not a tool-scoped event. Any other Stop hooks you have configured, and every other key in `settings.json`, are preserved. Writes are atomic (`.tmp` + `rename`). A missing `settings.json` is created with just this group; a malformed `settings.json` is left untouched and a startup error is recorded.
+
+**Recognition rule.** The server treats *any* Stop-hook `command` string containing the substring `slack-reply-guard.sh` as CSCB-managed. Duplicates from prior boots are collapsed to one canonical entry; stale entries (from an older install path) are rewritten to the current absolute path — this is the self-heal path across upgrades.
+
+### Timing: on-disk at every boot, effective at next Claude process start
+
+The bootstrap rewrites `settings.json` on **every** CSCB boot, so the on-disk entry always reflects the currently-installed release's absolute path. Claude Code, however, only reads hook configuration when a Claude process starts. On a CSCB restart, live sessions are reconnected and keep their already-running Claude processes — they will not pick up an updated hook path until the next fresh spawn or the next resume of a dead/missing session for that route.
+
+### Shared-dir aggregation
+
+The install/remove decision is per **directory**, not per route. If two routes resolve to the same `claude_config_dir`, the managed entry is installed when at least one of them has the guard enabled, and removed only when all of them have it disabled. Consequence: a per-route opt-out fully disables the guard for a bot only when that route owns a *dedicated* `claude_config_dir`. A route that shares a dir with any enabled route still gets the guard on that shared dir.
+
+### Personal-dir refusal
+
+The bootstrap refuses to touch the operator's own `~/.claude` directory. If a route's effective `claude_config_dir` resolves (via `realpathSync`, with a lexical fallback for paths that do not exist on disk) to your home `.claude` dir, nothing is written and a startup error is recorded. This prevents CSCB from ever installing a bot-oriented Stop hook into your interactive Claude Code config.
+
+### Bots without a `claude_config_dir`
+
+Routes with no effective `claude_config_dir` — neither per-route nor top-level — are skipped. Empty or whitespace-only values are treated as absent (so `resolve("")` never lands in the process cwd). If you want the guard on a bot, give its route a real `claude_config_dir`.
+
+### v1 limitations — opt these bots out
+
+The v1 guard only recognises a reply via `mcp__slack-channel-router__reply`. Bots whose only Slack surface is `edit_message` or `react` will end their turn without producing a matching `tool_use`, and the guard will block them and force one useless retry every turn. **Opt these bots out** by setting `stop_hook_bootstrap: false` on the route (see the field reference below), and give the route a dedicated `claude_config_dir` so the shared-dir aggregation rule does not re-enable the guard for it.
+
+### Opting out
+
+The `stop_hook_bootstrap` boolean lives on the top level of `config.json` and on individual routes. It defaults to `true`. Set it to `false` at the top level to disable the bootstrap for every route; set it on an individual route to override the top-level default for one bot. See the [Field reference](#field-reference) and [Per-route `stop_hook_bootstrap` override](#per-route-stop_hook_bootstrap-override) below for the field details and the per-route-vs-shared-dir interaction.
+
+### Tag drift — fail-open, verify after upgrades
+
+The guard's Slack-origination predicate is a substring match on the prefix `<channel source="slack` in the transcript entry Claude Code writes for every Slack-delivered turn. CSCB only sends `{content, meta}` over MCP; the `<channel source="…">` wrapper is rendered by the **Claude Code harness itself** when it serialises the MCP tool result into the transcript, and the `source` attribute is the MCP server name (e.g. `slack-channel-router`). That tag is therefore an **external, harness-owned contract** — a future Claude Code release can rename it or restructure the wrapper without touching CSCB, and the guard's predicate would silently stop matching. Its exact bytes have already drifted once: an earlier draft of the predicate matched `source="slack"` (closing quote inside the predicate) and never triggered against the real on-wire tag `source="slack-channel-router"` — the predicate was broadened to the prefix form to cover both spellings. Because the contract sits outside CSCB, the guard is designed to fail open on drift, and a post-upgrade verification recipe (below) exists so operators catch a silent-dark guard the next time the harness changes the tag.
+
+The guard is **fail-open by design**: any error, missing transcript, missing `jq`, or absence of the tag results in `exit 0` (turn allowed). This means a future rename of the `<channel>` tag will silently disable the guard rather than break the bot. After every CSCB or Claude Code upgrade, verify the guard end-to-end:
+
+1. Send the bot a Slack message that requires a reply.
+2. Confirm the reply lands in Slack.
+3. In the bot's transcript file (`<claude_config_dir>/projects/<slug>/*.jsonl` — guard-covered bots always run with a dedicated `claude_config_dir`, since the bootstrap refuses the operator's personal `~/.claude`), grep for `<channel source="slack` on the triggering message and for a subsequent assistant entry containing `"name":"mcp__slack-channel-router__reply"` in a `tool_use` block.
+
+If the tag prefix no longer appears, the guard is dark — file an issue.
 
 ---
 
