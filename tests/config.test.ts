@@ -265,6 +265,7 @@ function makeValidConfig(overrides: Partial<RoutingConfig> = {}): RoutingConfig 
     cozempic_prescription: 'standard',
     system_prompt_mode: 'append',
     resume_enabled: true,
+    stop_hook_bootstrap: true,
     agent_director_poll_interval_ms: 1000,
     ...overrides,
   }
@@ -1054,6 +1055,163 @@ describe('loadConfig — unknown-field rejection (SR-4.2)', () => {
         routes: { C: { cwd: '/tmp', claude_config_dir: '/x' } },
         agent_director_poll_interval_ms: 500,
         resume_enabled: false,
+      }),
+      'utf-8',
+    )
+    expect(() => loadConfig(configPath)).not.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SR-4.1–SR-4.5: stop_hook_bootstrap
+// ---------------------------------------------------------------------------
+
+describe('stop_hook_bootstrap (SR-4.1–SR-4.5)', () => {
+  // applyDefaults --------------------------------------------------------
+
+  test('applyDefaults fills top-level stop_hook_bootstrap with true when absent', () => {
+    const result = applyDefaults(makeRoutingConfig())
+    expect(result.stop_hook_bootstrap).toBe(true)
+  })
+
+  test('applyDefaults preserves stop_hook_bootstrap: true when explicitly set', () => {
+    const result = applyDefaults(makeRoutingConfig({ stop_hook_bootstrap: true }))
+    expect(result.stop_hook_bootstrap).toBe(true)
+  })
+
+  test('applyDefaults preserves stop_hook_bootstrap: false when explicitly set', () => {
+    const result = applyDefaults(makeRoutingConfig({ stop_hook_bootstrap: false }))
+    expect(result.stop_hook_bootstrap).toBe(false)
+  })
+
+  test('applyDefaults leaves per-route stop_hook_bootstrap undefined when absent (inherit)', () => {
+    const result = applyDefaults(makeRoutingConfig({
+      routes: {
+        C_GENERAL: makeRoute({ cwd: '/tmp/general' }),
+      },
+    }))
+    expect(result.routes['C_GENERAL'].stop_hook_bootstrap).toBeUndefined()
+  })
+
+  test('applyDefaults preserves per-route stop_hook_bootstrap: false verbatim', () => {
+    const result = applyDefaults(makeRoutingConfig({
+      routes: {
+        C_GENERAL: makeRoute({ cwd: '/tmp/general', stop_hook_bootstrap: false }),
+      },
+    }))
+    expect(result.routes['C_GENERAL'].stop_hook_bootstrap).toBe(false)
+  })
+
+  test('applyDefaults preserves per-route stop_hook_bootstrap: true verbatim', () => {
+    const result = applyDefaults(makeRoutingConfig({
+      routes: {
+        C_GENERAL: makeRoute({ cwd: '/tmp/general', stop_hook_bootstrap: true }),
+      },
+    }))
+    expect(result.routes['C_GENERAL'].stop_hook_bootstrap).toBe(true)
+  })
+
+  // validateConfig -------------------------------------------------------
+
+  test('validateConfig passes when stop_hook_bootstrap is set at top level', () => {
+    const config = makeValidConfig({ stop_hook_bootstrap: false })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('validateConfig passes when stop_hook_bootstrap is set per route', () => {
+    const config = makeValidConfig({
+      routes: {
+        C_GENERAL: makeRoute({ cwd: '/tmp/general', stop_hook_bootstrap: false }),
+      },
+    })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
+  test('validateConfig throws for non-boolean top-level stop_hook_bootstrap', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const config = makeValidConfig({ stop_hook_bootstrap: 'yes' as any })
+    expect(() => validateConfig(config)).toThrow('Routing config validation error')
+    expect(() => validateConfig(config)).toThrow('stop_hook_bootstrap must be a boolean')
+  })
+
+  test('validateConfig throws for non-boolean per-route stop_hook_bootstrap and names the route', () => {
+    const config = makeValidConfig({
+      routes: {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        C_GENERAL: { cwd: '/tmp/general', stop_hook_bootstrap: 1 as any },
+      },
+    })
+    expect(() => validateConfig(config)).toThrow('Routing config validation error')
+    expect(() => validateConfig(config)).toThrow('routes["C_GENERAL"].stop_hook_bootstrap must be a boolean')
+  })
+
+  // Per-route-wins effective value --------------------------------------
+
+  test('per-route stop_hook_bootstrap: false wins over top-level default of true', () => {
+    const result = resolveConfig({
+      routes: {
+        C_OFF: { cwd: '/tmp/off', stop_hook_bootstrap: false },
+        C_INHERIT: { cwd: '/tmp/inherit' },
+      },
+    })
+    expect(result.stop_hook_bootstrap).toBe(true)
+    expect(result.routes['C_OFF'].stop_hook_bootstrap ?? result.stop_hook_bootstrap).toBe(false)
+    expect(result.routes['C_INHERIT'].stop_hook_bootstrap ?? result.stop_hook_bootstrap).toBe(true)
+  })
+
+  test('per-route stop_hook_bootstrap: true wins over top-level false', () => {
+    const result = resolveConfig({
+      routes: {
+        C_ON: { cwd: '/tmp/on', stop_hook_bootstrap: true },
+        C_INHERIT: { cwd: '/tmp/inherit' },
+      },
+      stop_hook_bootstrap: false,
+    })
+    expect(result.stop_hook_bootstrap).toBe(false)
+    expect(result.routes['C_ON'].stop_hook_bootstrap ?? result.stop_hook_bootstrap).toBe(true)
+    expect(result.routes['C_INHERIT'].stop_hook_bootstrap ?? result.stop_hook_bootstrap).toBe(false)
+  })
+
+  // loadConfig round-trip -----------------------------------------------
+
+  test('loadConfig round-trips stop_hook_bootstrap: false at top level and true/false per route', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const config: RoutingConfigInput = {
+      routes: {
+        C_ON: { cwd: '/tmp/on', stop_hook_bootstrap: true },
+        C_OFF: { cwd: '/tmp/off', stop_hook_bootstrap: false },
+        C_INHERIT: { cwd: '/tmp/inherit' },
+      },
+      stop_hook_bootstrap: false,
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.stop_hook_bootstrap).toBe(false)
+    expect(result.routes['C_ON'].stop_hook_bootstrap).toBe(true)
+    expect(result.routes['C_OFF'].stop_hook_bootstrap).toBe(false)
+    expect(result.routes['C_INHERIT'].stop_hook_bootstrap).toBeUndefined()
+  })
+
+  test('loadConfig resolves top-level stop_hook_bootstrap to true when absent', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    const config: RoutingConfigInput = {
+      routes: { C_TEST: { cwd: '/tmp' } },
+    }
+    writeFileSync(configPath, JSON.stringify(config), 'utf-8')
+    const result = loadConfig(configPath)
+    expect(result.stop_hook_bootstrap).toBe(true)
+  })
+
+  test('loadConfig does not fire unknown-field rejection for stop_hook_bootstrap at either level', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'config-test-'))
+    const configPath = join(dir, 'config.json')
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        routes: { C: { cwd: '/tmp', stop_hook_bootstrap: false } },
+        stop_hook_bootstrap: true,
       }),
       'utf-8',
     )

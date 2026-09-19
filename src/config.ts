@@ -53,12 +53,14 @@ const KNOWN_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
   'claude_config_dir',
   'resume_enabled',
   'agent_director_poll_interval_ms',
+  'stop_hook_bootstrap',
 ])
 
 /** The canonical set of per-route keys allowed inside a routes[<channel>] entry. */
 const KNOWN_ROUTE_KEYS: ReadonlySet<string> = new Set([
   'cwd',
   'claude_config_dir',
+  'stop_hook_bootstrap',
 ])
 
 // ---------------------------------------------------------------------------
@@ -76,6 +78,14 @@ export interface RouteEntry {
    * if neither is set).
    */
   claude_config_dir?: string
+  /**
+   * Per-route override for the Stop-hook bootstrap guard (SR-4.1–SR-4.5).
+   * Optional (undefined = inherit): when unset, the effective value is the
+   * top-level `stop_hook_bootstrap`. Per-route wins via
+   * `route.stop_hook_bootstrap ?? routingConfig.stop_hook_bootstrap`,
+   * mirroring the existing claude_config_dir precedence.
+   */
+  stop_hook_bootstrap?: boolean
   /**
    * Runtime-resolved Slack channel name (e.g. "horde-agent-director").
    * Populated by the startup `conversations.info` resolver and refreshed
@@ -135,6 +145,13 @@ export interface RoutingConfigInput {
    */
   resume_enabled?: boolean
   /**
+   * Stop-hook bootstrap guard opt-out (SR-4.1–SR-4.5). Defaults to true when
+   * absent at the top level. Per-route override stays optional (undefined =
+   * inherit). The effective value for a given route is
+   * `route.stop_hook_bootstrap ?? routingConfig.stop_hook_bootstrap`.
+   */
+  stop_hook_bootstrap?: boolean
+  /**
    * Poll interval (ms) for the SR-2.1 permission-relay tick. Must be a
    * positive integer in the closed range [200, 3_600_000]; defaults to 1000.
    * Replaces the old `claude_director_poll_interval_ms` field — the old name
@@ -163,6 +180,13 @@ export interface RoutingConfig {
   claude_config_dir?: string
   /** When false, --resume is skipped on startup and bots always launch fresh. Defaults to true. */
   resume_enabled: boolean
+  /**
+   * Resolved Stop-hook bootstrap guard flag (SR-4.1–SR-4.5). Defaults to true
+   * when absent at the top level. Per-route override lives on RouteEntry and
+   * remains optional (undefined = inherit); the effective value for a route is
+   * `route.stop_hook_bootstrap ?? routingConfig.stop_hook_bootstrap`.
+   */
+  stop_hook_bootstrap: boolean
   /** Poll interval (ms) for the SR-2.1 permission-relay tick. */
   agent_director_poll_interval_ms: number
 }
@@ -193,6 +217,7 @@ export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
     message_archive_db: input.message_archive_db,
     claude_config_dir: input.claude_config_dir,
     resume_enabled: input.resume_enabled ?? true,
+    stop_hook_bootstrap: input.stop_hook_bootstrap ?? true,
     agent_director_poll_interval_ms:
       input.agent_director_poll_interval_ms ?? DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS,
   }
@@ -308,6 +333,22 @@ export function validateConfig(config: RoutingConfig): void {
           `Routing config validation error: routes["${channelId}"].claude_config_dir must be a non-empty string when set.`,
         )
       }
+    }
+  }
+
+  // Top-level stop_hook_bootstrap must be a boolean (SR-4.1–SR-4.5).
+  if (typeof config.stop_hook_bootstrap !== 'boolean') {
+    throw new Error(
+      `Routing config validation error: stop_hook_bootstrap must be a boolean; got ${JSON.stringify(config.stop_hook_bootstrap)}.`,
+    )
+  }
+
+  // Per-route stop_hook_bootstrap, when set, must also be a boolean.
+  for (const [channelId, route] of Object.entries(config.routes)) {
+    if (route.stop_hook_bootstrap !== undefined && typeof route.stop_hook_bootstrap !== 'boolean') {
+      throw new Error(
+        `Routing config validation error: routes["${channelId}"].stop_hook_bootstrap must be a boolean when set; got ${JSON.stringify(route.stop_hook_bootstrap)}.`,
+      )
     }
   }
 
