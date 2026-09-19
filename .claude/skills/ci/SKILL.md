@@ -75,4 +75,12 @@ allowed-tools: [Bash]
   worker session does not inherit the orchestrator's env — with
   `--extra-env ANTHROPIC_API_KEY="$KEY"`, and for a gateway credential also
   `--extra-env ANTHROPIC_BASE_URL="$BASE_URL" --extra-env ANTHROPIC_MODEL="$MODEL"`.
+- `ANTHROPIC_API_KEY` is set to a gateway credential but `ANTHROPIC_BASE_URL`
+  is unset. A key that does not start with `sk-ant-` (e.g. an NVIDIA
+  InferenceHub credential) is not a raw Anthropic key and cannot authenticate
+  against `api.anthropic.com`; without `ANTHROPIC_BASE_URL` the bot Claudes
+  default to that host and fail mid-run with opaque 401s. This is non-runnable:
+  instruct the operator to also export `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL`
+  for the gateway (passing all three through on the `agent-director` spawn as
+  above) before re-running `/ci`.
 - `npm pack` fails — instruct operator to run `npm install` and re-run `/ci`.
