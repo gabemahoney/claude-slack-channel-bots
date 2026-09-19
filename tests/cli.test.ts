@@ -8,8 +8,10 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { afterEach, beforeAll, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, resolve } from 'path'
 import type { CliDeps, CliHandlers } from '../src/cli.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
@@ -39,8 +41,12 @@ interface Overrides {
   spawnSyncFn?: (cmd: string, args: string[]) => { status: number | null }
   env?: NodeJS.ProcessEnv
   existingPaths?: string[]
+  /** When true, existsSync returns true for every path (e.g. daemonize needs the state dir + config). */
+  existsAll?: boolean
   pidFileContent?: string
   isProcessRunning?: (pid: number) => boolean
+  /** Override the resolved state dir (daemonize openSync()s <stateDir>/server.log for real). */
+  resolveStateDir?: () => string
   loadConfig?: () => ReturnType<typeof makeRoutingConfig>
   directorStatus?: (channelId: string) => Promise<{ state: string } | null>
   directorPause?: (channelId: string) => Promise<void>
@@ -54,6 +60,8 @@ interface Bundle {
   pauseCalls: string[]
   killCalls: string[]
   statusCalls: string[]
+  /** Whether deps.startServer() was invoked (in-place server run). */
+  readonly startServerCalled: boolean
 }
 
 function makeDeps(o: Overrides = {}): Bundle {
@@ -62,6 +70,7 @@ function makeDeps(o: Overrides = {}): Bundle {
   const pauseCalls: string[] = []
   const killCalls: string[] = []
   const statusCalls: string[] = []
+  let startServerCalled = false
   const existing = new Set(o.existingPaths ?? [CONFIG_JSON])
   const deps: CliDeps = {
     spawnSync: (cmd, args) => {
@@ -70,7 +79,7 @@ function makeDeps(o: Overrides = {}): Bundle {
       return { status: o.spawnSyncStatus !== undefined ? o.spawnSyncStatus : 0 }
     },
     env: o.env ?? { SLACK_BOT_TOKEN: 'xoxb', SLACK_APP_TOKEN: 'xapp' },
-    existsSync: (p) => existing.has(p),
+    existsSync: (p) => (o.existsAll ? true : existing.has(p)),
     readFileSync: (p) => {
       if (p === PID_FILE && o.pidFileContent !== undefined) return o.pidFileContent
       throw new Error('unexpected readFileSync ' + p)
@@ -78,8 +87,8 @@ function makeDeps(o: Overrides = {}): Bundle {
     unlinkSync: () => { /* no-op */ },
     isProcessRunning: o.isProcessRunning ?? (() => false),
     kill: () => { /* no-op */ },
-    resolveStateDir: () => STATE_DIR,
-    startServer: async () => { /* no-op */ },
+    resolveStateDir: o.resolveStateDir ?? (() => STATE_DIR),
+    startServer: async () => { startServerCalled = true },
     exit: (code) => { exitCodes.push(code); throw new ExitError(code) },
     loadConfig: o.loadConfig ?? (() => makeRoutingConfig()),
     directorStatus: async (channelId) => {
@@ -96,7 +105,10 @@ function makeDeps(o: Overrides = {}): Bundle {
       if (o.directorKill) return o.directorKill(channelId)
     },
   }
-  return { deps, exitCodes, spawnCalls, pauseCalls, killCalls, statusCalls }
+  return {
+    deps, exitCodes, spawnCalls, pauseCalls, killCalls, statusCalls,
+    get startServerCalled() { return startServerCalled },
+  }
 }
 
 afterEach(() => {
@@ -134,6 +146,142 @@ describe('start', () => {
     } catch { /* daemonized path */ }
     const tmuxProbes = spawnCalls.filter((c) => c.cmd === 'tmux')
     expect(tmuxProbes).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// start — session-leader daemonize guard (b.acn)
+//
+// The bug: a leaked _CLI_DAEMON_CHILD marker in the launcher's environment made
+// `start` trust the marker and run the server in-place (child path), inheriting
+// the launcher's session/PGID so killing the launcher's group killed the server.
+// The fix: only trust the marker when the process is ALSO a session leader; a
+// set-but-not-leader marker is treated as a leak, cleared, and the parent path
+// re-detaches via a real detached spawn.
+//
+// Under `bun test` the test process is NOT a session leader (its session id
+// differs from its pid — verified: a real daemon child spawned with
+// detached:true would be a leader, we are not). So with the marker preset we
+// exercise exactly the leaked-marker scenario the bug describes:
+//   - fixed code  -> parent path: detached spawn + exit(0), startServer NOT run
+//   - pre-fix code -> child path: startServer run in-place (the bug)
+//
+// child_process.spawn is stubbed so no real server process is ever launched
+// (shared-infra safety); the daemonize path uses a dynamic import of
+// child_process, which mock.module intercepts.
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the session id (field 4 after comm) from /proc/self/stat, the same way
+ * src/cli.ts isSessionLeader() does. Returns null when /proc is unavailable.
+ */
+function readOwnSessionId(): number | null {
+  try {
+    const stat = require('node:fs').readFileSync('/proc/self/stat', 'utf8') as string
+    const fields = stat.slice(stat.lastIndexOf(') ') + 2).split(' ')
+    const session = parseInt(fields[3] ?? '', 10)
+    return Number.isNaN(session) ? null : session
+  } catch {
+    return null
+  }
+}
+
+describe('start — daemonize session-leader guard (b.acn)', () => {
+  let scratchDir: string
+  // Each fake-spawn call records the real detach arguments so tests can assert
+  // that the respawn is a genuine `detached:true` background launch.
+  let spawnedCalls: Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }>
+
+  beforeAll(async () => {
+    const real = await import('node:child_process')
+    // Fake spawn: record (cmd, args, opts), never launch a real process; return
+    // a minimal child with unref() and a pid so the parent path completes.
+    const fakeSpawn = (cmd: string, args: string[], opts: Record<string, unknown>) => {
+      spawnedCalls.push({ cmd, args, opts })
+      return { unref: () => { /* no-op */ }, pid: 999999 }
+    }
+    mock.module('node:child_process', () => ({ ...real, spawn: fakeSpawn }))
+    mock.module('child_process', () => ({ ...real, spawn: fakeSpawn }))
+  })
+
+  afterAll(() => {
+    mock.restore()
+  })
+
+  beforeEach(() => {
+    // PRECONDITION (b.acn, reviewer finding #2): both leaked-marker tests below
+    // assume the `bun test` runner is NOT a session leader (its session id
+    // differs from its pid) — that is what makes a preset marker look "leaked".
+    // If the suite ever runs with bun AS a session leader (e.g. PID 1 under
+    // docker), the guard would trust the marker and run in-place, and these
+    // tests would fail confusingly. Fail loudly with a self-diagnosing message.
+    const sid = readOwnSessionId()
+    if (sid !== null && sid === process.pid) {
+      throw new Error(
+        `b.acn precondition violated: the test runner IS a session leader ` +
+        `(session id ${sid} === pid ${process.pid}). The leaked-marker guard ` +
+        `tests require a non-session-leader runner. Run the suite as a child ` +
+        `process (not PID 1 / not a session leader).`,
+      )
+    }
+
+    spawnedCalls = []
+    scratchDir = mkdtempSync(join(tmpdir(), 'cscb-acn-'))
+    // The daemonize parent path openSync()s <stateDir>/server.log for real, so
+    // the state dir must exist on disk.
+  })
+
+  afterEach(() => {
+    delete process.env['_CLI_DAEMON_CHILD']
+    try { rmSync(scratchDir, { recursive: true, force: true }) } catch { /* ignore */ }
+  })
+
+  // Assert the recorded spawn is a real detach matching src/cli.ts (~line 159):
+  // detached:true, the _CLI_DAEMON_CHILD marker set in the child env, and stdio
+  // NOT inherited (so the child survives its parent's exit).
+  function expectRealDetach(call: { cmd: string; args: string[]; opts: Record<string, unknown> }) {
+    expect(call.opts['detached']).toBe(true)
+    const childEnv = call.opts['env'] as NodeJS.ProcessEnv
+    expect(childEnv['_CLI_DAEMON_CHILD']).toBe('1')
+    const stdio = call.opts['stdio']
+    expect(stdio).not.toBe('inherit')
+    if (Array.isArray(stdio)) {
+      expect(stdio).not.toContain('inherit')
+    }
+    // Respawn re-invokes this CLI with the `start` subcommand.
+    expect(call.args).toContain('start')
+  }
+
+  // REGRESSION (b.acn): fails with pre-fix code, passes with the fix.
+  test('leaked _CLI_DAEMON_CHILD marker (not a session leader) re-detaches instead of running in-place', async () => {
+    const bundle = makeDeps({ existsAll: true, resolveStateDir: () => scratchDir })
+    // Simulate the leaked marker inherited from a launcher wrapper.
+    process.env['_CLI_DAEMON_CHILD'] = '1'
+
+    await expect(createCli(bundle.deps).start()).rejects.toBeInstanceOf(ExitError)
+
+    // Fix: parent (re-detach) path — a detached child is spawned and we exit(0).
+    expect(spawnedCalls).toHaveLength(1)
+    expectRealDetach(spawnedCalls[0]!)
+    expect(bundle.exitCodes).toContain(0)
+    // The server must NOT be started in-place under the leaked marker.
+    expect(bundle.startServerCalled).toBe(false)
+  })
+
+  // Baseline: with no marker, the parent always detaches (unchanged by the fix).
+  // This anchors the regression test — it proves the spawn/exit(0) reflect the
+  // detach path and not some unrelated failure, and that the leaked-marker case
+  // above ends up in the SAME detach path a fresh launch takes.
+  test('no marker at all: parent detaches and exits (baseline)', async () => {
+    const bundle = makeDeps({ existsAll: true, resolveStateDir: () => scratchDir })
+    delete process.env['_CLI_DAEMON_CHILD']
+
+    await expect(createCli(bundle.deps).start()).rejects.toBeInstanceOf(ExitError)
+
+    expect(spawnedCalls).toHaveLength(1)
+    expectRealDetach(spawnedCalls[0]!)
+    expect(bundle.exitCodes).toContain(0)
+    expect(bundle.startServerCalled).toBe(false)
   })
 })
 

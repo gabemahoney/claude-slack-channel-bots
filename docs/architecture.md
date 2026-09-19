@@ -227,6 +227,14 @@ The interval is controlled by `health_check_interval` in `config.json`. If the v
 
 **Ordering invariant**: `startHealthCheck()` is called only after `startupSessionManager()` returns. Moving it earlier in the startup sequence would risk the poller racing with in-progress launches.
 
+### start command
+
+`start` (CLI subcommand) checks prerequisites (Slack tokens, `config.json`), then **self-daemonizes**: the parent process spawns a detached background child and exits, leaving the child running as the server. Detection of parent vs. child is via the `_CLI_DAEMON_CHILD` env marker.
+
+The parent spawn uses `detached: true` (child becomes its own session leader via `setsid`), `stdio: ['ignore', logFd, logFd]` (stdin from `/dev/null`, stdout/stderr to `STATE_DIR/server.log` — no inherited pipes), and `child.unref()`. This isolates the server from the launcher's session and process group, so killing the launching shell's group does not kill the server. The child re-execs `start` with the marker set, redirects logging to `server.log`, and calls `startServer()`.
+
+**Marker-leak guard (b.acn)**: the `_CLI_DAEMON_CHILD` marker alone is untrusted, because it can leak from an operator wrapper script (e.g. `start-all.sh` / `cscb-up`) into the launching environment. If leaked, the parent daemonize branch would be skipped and the server would run in-place inside the launcher's session — dying when that process group is killed. A genuine daemon child is always a session leader, so `start` requires the marker **and** session-leadership to trust it. `isSessionLeader()` reads the session id (field 4 after `comm`) from `/proc/self/stat` on Linux and compares it to the pid; it fails open (treats the process as a leader) where `/proc` is unavailable, preserving prior behavior on non-Linux platforms. A set-but-not-leader marker is treated as a leak: it is deleted and `start` falls through to the parent path to re-detach properly.
+
 ### stop command
 
 `stop` (CLI subcommand) sends SIGTERM to the running server via the PID file at `STATE_DIR/server.pid`. If the process does not exit within `stop_timeout` seconds (default 30 s, configurable in `config.json`), a SIGKILL is sent. A brief 2 s confirmation poll follows the SIGKILL. Stale PID files (process no longer running) are silently removed. A non-zero exit from this phase causes `stop` to exit 1.

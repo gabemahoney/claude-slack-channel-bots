@@ -66,6 +66,33 @@ function defaultStateDir(): string {
 }
 
 // ---------------------------------------------------------------------------
+// Session-leader detection (b.acn)
+// ---------------------------------------------------------------------------
+
+/**
+ * True if this process is a session leader (its own session id equals its pid).
+ * A daemon spawned with detached:true is a session leader; a process that merely
+ * inherited a leaked _CLI_DAEMON_CHILD marker from its launcher is not.
+ *
+ * Bun lacks process.getsid, so read the session id (field 6) from
+ * /proc/self/stat on Linux. The comm field (2) may contain spaces/parens, so
+ * split on the LAST ") " to safely reach the space-delimited numeric fields.
+ * If the platform has no /proc (non-Linux) the detection is unavailable; fail
+ * open (treat as leader) so the marker is trusted as before on those platforms.
+ */
+function isSessionLeader(): boolean {
+  try {
+    const stat = readFileSync('/proc/self/stat', 'utf8')
+    const fields = stat.slice(stat.lastIndexOf(') ') + 2).split(' ')
+    // After comm: [0]=state [1]=ppid [2]=pgrp [3]=session
+    const session = parseInt(fields[3] ?? '', 10)
+    return Number.isNaN(session) ? true : session === process.pid
+  } catch {
+    return true
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Factory — createCli
 // ---------------------------------------------------------------------------
 
@@ -107,6 +134,18 @@ export function createCli(deps: CliDeps): CliHandlers {
 
     // All checks passed — daemonize: parent exits, child continues as server
     // In Bun, we detect the child vs parent by an env marker.
+    //
+    // b.acn: the marker alone is untrustworthy. If _CLI_DAEMON_CHILD leaks into
+    // the launching environment (e.g. from an operator wrapper like start-all.sh
+    // / cscb-up), the parent daemonize branch is skipped and the server runs
+    // in-place as a direct child of the launching shell — inheriting its
+    // session/PGID and dying when that group is killed. A real daemon child
+    // (spawned with detached:true) is always a session leader, so require the
+    // marker AND session-leadership to trust it. A set-but-not-leader marker is
+    // a leak: clear it and fall through to the parent path to re-detach.
+    if (process.env['_CLI_DAEMON_CHILD'] && !isSessionLeader()) {
+      delete process.env['_CLI_DAEMON_CHILD']
+    }
     if (!process.env['_CLI_DAEMON_CHILD']) {
       // Parent: spawn a detached background child and exit
       const { spawn } = await import('child_process')
