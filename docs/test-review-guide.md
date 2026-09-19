@@ -31,7 +31,20 @@ When reviewing tests, check for:
 - [ ] No `sleep` or timing-dependent assertions longer than 100ms
 - [ ] Capture arrays used to verify side effects (API calls, messages sent)
 
+### Conciseness
+- [ ] 3+ tests with the same structure and different inputs use `test.each`
+- [ ] No meta-tests — tests of factories, stubs, or other test infrastructure add no value; real tests validate them
+- [ ] No constants wrapping simple domain strings (`const STATUS_OPEN = 'open'`) — inline them
+- [ ] Tests assert behavior (outputs, state, captured calls), not implementation (which internal function was called, with what encoding)
+- [ ] No gold-plating — 80/20 rule; redundant permutations of an already-covered behavior should be removed
+- [ ] No repeated multi-line setup blocks — extract to a factory or `beforeEach`
+
 ### Maintenance
 - [ ] Tests are DRY but not over-abstracted — prefer clarity over brevity
 - [ ] No skipped or `.todo` tests without explanation
 - [ ] No commented-out tests
+
+### Red Flags
+- Test file > 500 lines with no `test.each` — likely copy-paste variants that should be parametrized
+- More than 3 stubs/mocks in a single test — testing implementation, not behavior; test at a higher level instead
+- Same 10+ line setup block appearing in multiple tests — belongs in a factory function or fixture

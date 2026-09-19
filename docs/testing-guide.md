@@ -37,6 +37,21 @@ makeServer() — minimal MCP server stub
 
 Always use factory functions instead of hardcoding fixture values in individual tests. When a new field is added to a type, update the factory function — all tests automatically pick up the default.
 
+### Parametrization
+
+When 3+ tests follow the same structure with different inputs, collapse them with `test.each`:
+
+```typescript
+test.each([
+  ['', 'empty string'],
+  ['no-prefix', 'missing type prefix'],
+])('rejects invalid id %s (%s)', (id) => {
+  expect(() => validateId(id)).toThrow()
+})
+```
+
+Don't wrap simple domain strings in constants (`const STATUS_OPEN = 'open'`) — inline them. Constants earn their keep only for complex formats or values used in 5+ places.
+
 ### State Reset
 
 Use `beforeEach` to reset module-scoped state between tests:
@@ -125,3 +140,13 @@ When testing HTTP endpoints that live in server.ts, create a minimal Bun.serve()
 - Internal implementation details (private helper functions)
 - Exact log output (test behavior, not logging)
 - Timing-dependent behavior with real delays — use short configurable timeouts in tests
+- Test infrastructure itself (factories, stubs, reset helpers) — if a fixture breaks, the real tests that use it will fail anyway
+
+## Keeping the Suite Lean
+
+The goal is good coverage with as few lines of test code as possible. Apply the 80/20 rule: strong coverage of behavior does not require testing every input permutation — don't gold-plate.
+
+- Test behavior, not implementation: assert on what a function produces (return values, state changes, captured calls), not on how it got there. A test needing 3+ stubs to run is usually testing implementation details and will break on harmless refactors.
+- Prefer removing a redundant test over keeping it "just in case"
+- Prefer `test.each` over copy-pasted test functions
+- Prefer factory functions over repeated inline setup blocks

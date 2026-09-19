@@ -38,12 +38,23 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 - New config fields: add to `RoutingConfigInput` (optional), `RoutingConfig` (with default), `applyDefaults()`, and `validateConfig()`
 - Atomic file writes: write to `.tmp` file, then `renameSync` to final path
 
+## Code Quality
+
+- **Remove dead code.** No commented-out blocks, unused exports/imports, or leftover debug `console.log`. Version control is the safety net — delete with confidence.
+- **YAGNI.** Don't build abstractions for hypothetical future requirements. Three similar lines are better than a premature helper.
+- **Match existing patterns.** If the codebase has a convention for something, follow it — don't introduce a second way of doing the same thing.
+- **Keep functions readable.** Over ~50 lines or more than 3 levels of nesting: extract helpers.
+- **Magic values.** Named constants over mystery numbers and strings (see Naming Conventions).
+- **DRY.** Copying a block of code a second time means it's time for a shared function.
+
 ## Security
 
 - Localhost-only endpoints: check `server.requestIP(req)` for `127.0.0.1`, `::1`, and `::ffff:127.*`
 - Sensitive files (`access.json`): `chmod 0o600`
-- No secrets in config files that don't need them (config.json)
+- No secrets in config files that don't need them (config.json); never hardcode tokens or keys in source — load from environment or config
 - Gate all inbound Slack messages through the `gate()` function before processing
+- Validate all external input at system boundaries (HTTP endpoints, Slack payloads, config files) before acting on it
+- Error responses to external callers must not expose stack traces, internal paths, or sensitive data — log detail to stderr, return a generic message
 
 ## Naming Conventions
 
@@ -119,6 +130,17 @@ When neither guard fires and the session is dead, the poller calls `scheduleRest
 - SSE keep-alive pattern: hold the response open with a `Promise` that resolves on `req.signal` abort; stream events by writing to `res` directly; clean up on abort via `req.signal.addEventListener('abort', ...)`
 - Always clean up on abort: `req.signal.addEventListener('abort', ...)` for held HTTP connections
 - Use `settled` flag pattern to prevent double-resolution in race conditions
+
+## Review Prioritization
+
+Not all issues are equal. When writing or reviewing code, focus in this order:
+
+1. **Security vulnerabilities** — fix immediately
+2. **Logic errors** — fix immediately
+3. **Missing tests** — add before merging
+4. **Architecture problems** — address in current work if feasible
+5. **Code quality** — address if touched, don't go hunting
+6. **Style nits** — let the linter handle it
 
 ## Releasing CSCB
 
