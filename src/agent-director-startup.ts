@@ -44,6 +44,7 @@ import {
 } from 'agent-director'
 import type { ClientOptions } from 'agent-director'
 
+import { makeFilteredAdLogger } from './agent-director-logger.ts'
 import { recordStartupError } from './startup-errors.ts'
 import {
   DEFAULT_STORE_PATH,
@@ -270,7 +271,10 @@ export async function runStartupGate(
     client = await d.createClient({
       storePath: DEFAULT_STORE_PATH,
       createIfMissing: true,
-      logger: console,
+      // b.brv: filter AD's per-poll `SubprocessClient: <verb> ok` success
+      // dumps out of server.log at default verbosity (CSCB_AD_VERBOSE
+      // restores them). Failures/warnings still pass through.
+      logger: makeFilteredAdLogger(console),
     })
   } catch (err) {
     if (err instanceof ErrBunVersionTooOld) {
