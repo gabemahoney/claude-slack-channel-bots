@@ -41,6 +41,23 @@ if [ -z "${REPO_ROOT}" ]; then
 fi
 cd "${REPO_ROOT}"
 
+# Snapshot the working-tree dirt at script start so SR-7.5 (below) can tell
+# promote-INDUCED package.json/bun.lock dirt (safe to revert) apart from
+# dirt an operator deliberately staged BEFORE promote ran (must NOT be
+# clobbered — that is exactly the load-bearing-dirt scenario b.bpp warns of).
+# `|| true` keeps a git failure here from killing the script under set -e;
+# an empty snapshot just means "treat everything as promote-induced", which
+# is the safe default for a clean start.
+START_DIRTY="$(git diff --name-only 2>/dev/null || true)"
+START_PKG_JSON_DIRTY=0
+START_BUN_LOCK_DIRTY=0
+if printf '%s\n' "${START_DIRTY}" | grep -qxF 'package.json'; then
+  START_PKG_JSON_DIRTY=1
+fi
+if printf '%s\n' "${START_DIRTY}" | grep -qxF 'bun.lock'; then
+  START_BUN_LOCK_DIRTY=1
+fi
+
 MANIFEST="${REPO_ROOT}/.publish-state.json"
 if [ ! -f "${MANIFEST}" ]; then
   echo "promote (precondition): no .publish-state.json at ${MANIFEST}. /publish promote runs only after /publish prepare has succeeded. Operator recovery: run '/publish prepare <patch|minor|major>' first, or — if you intended to run a release end-to-end without the split — run '/publish <bump>' which invokes prepare then promote in one shot." >&2
@@ -225,11 +242,11 @@ fi
 # Then defensively rm the leftover node_modules entry to clean up dangling files or symlinks the
 # remove step may not have cleared (e.g. a prior `install-local.sh` symlink farm).
 GLOBAL_DIR="${BUN_INSTALL:-$HOME/.bun}/install/global"
-bun remove -g claude-slack-channel-bots > /dev/null 2>&1 || true
+(cd "$HOME" && bun remove -g claude-slack-channel-bots) > /dev/null 2>&1 || true
 rm -rf "${GLOBAL_DIR}/node_modules/claude-slack-channel-bots" || true
 
 # SR-7.3 — install the just-published version from npm (the exact command an end user would run)
-if ! bun install -g "claude-slack-channel-bots@${NEXT_VERSION}"; then
+if ! (cd "$HOME" && bun install -g "claude-slack-channel-bots@${NEXT_VERSION}"); then
   echo "SR-7.3 (post-publish install): 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' did not succeed. State: the release IS published (v${NEXT_VERSION} is on npm, commit + tag are on origin) but the dev box has NO global install at this point. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator rerun 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually until it succeeds, then 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
   exit 71
 fi
@@ -266,6 +283,64 @@ fi
 if [ "${INSTALLED_VERSION}" != "${NEXT_VERSION}" ]; then
   echo "SR-7.4 (post-publish verification): installed version '${INSTALLED_VERSION}' != published ${NEXT_VERSION}. State: the release IS published but the local install resolved to a stale version. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'bun remove -g claude-slack-channel-bots' followed by 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually until the installed version matches, then 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
   exit 72
+fi
+
+# SR-7.5 — belt-and-suspenders: post-verify working-tree snapshot.
+# The CWD-isolation fix above ($HOME subshells around every `bun -g`) is the
+# primary defense against this script dirtying the local package.json / bun.lock.
+# This block is a complementary safety net: if a future change re-introduces the
+# escape, catch it here.
+#
+# We revert ONLY package.json / bun.lock, and ONLY those of the two that were
+# CLEAN at script start (START_*_DIRTY==0) — because dirt that appeared during
+# promote is necessarily promote-induced (owned by the prepare-phase commit,
+# never by promote), whereas dirt already present at start is deliberate
+# operator work and must NOT be clobbered (the load-bearing-dirt scenario
+# b.bpp guards against). Anything the revert leaves behind — a file dirty at
+# start, a non-pkg/lock file, or a checkout that failed to clean — takes the
+# loud-stderr-warning path instead. Either arm keeps exit 0: the release is
+# already published, tagged, and verified, so this late stage never fails it.
+POST_VERIFY_DIRTY="$(git diff --name-only 2>/dev/null || true)"
+if [ -n "${POST_VERIFY_DIRTY}" ]; then
+  # Build the list of pkg/lock files that are promote-INDUCED (dirty now but
+  # clean at start) and therefore safe to revert.
+  REVERTABLE=()
+  if [ "${START_PKG_JSON_DIRTY}" = "0" ] && printf '%s\n' "${POST_VERIFY_DIRTY}" | grep -qxF 'package.json'; then
+    REVERTABLE+=("package.json")
+  fi
+  if [ "${START_BUN_LOCK_DIRTY}" = "0" ] && printf '%s\n' "${POST_VERIFY_DIRTY}" | grep -qxF 'bun.lock'; then
+    REVERTABLE+=("bun.lock")
+  fi
+
+  REVERT_OK=1
+  REVERTED_NOTE=""
+  if [ "${#REVERTABLE[@]}" -gt 0 ]; then
+    if git checkout -- "${REVERTABLE[@]}" 2>/dev/null; then
+      REVERTED_NOTE="$(printf '%s ' "${REVERTABLE[@]}")"
+      REVERTED_NOTE="${REVERTED_NOTE% }"
+    else
+      REVERT_OK=0
+    fi
+  fi
+
+  # Recompute what is still dirty after the (attempted) revert. Whatever remains
+  # is either operator dirt from before promote, a non-pkg/lock stray, or a
+  # revert that failed — all of which warrant the loud warning, not a success line.
+  REMAINING_DIRTY="$(git diff --name-only 2>/dev/null || true)"
+
+  if [ "${REVERT_OK}" = "1" ] && [ -z "${REMAINING_DIRTY}" ] && [ -n "${REVERTED_NOTE}" ]; then
+    echo "SR-7.5 (post-verify snapshot): reverted promote-induced dirt in ${REVERTED_NOTE} (transitive-dep range drift from the post-publish 'bun install -g'). These files are owned by the prepare-phase commit; promote must leave the working tree clean."
+  else
+    echo "SR-7.5 (post-verify snapshot): WARNING — the working tree is still dirty after a completed release:" >&2
+    printf '%s\n' "${REMAINING_DIRTY}" | sed 's/^/  /' >&2
+    if [ "${REVERT_OK}" != "1" ]; then
+      echo "(A 'git checkout -- ${REVERTED_NOTE:-package.json bun.lock}' to discard promote-induced dirt FAILED — the files above were NOT reverted.)" >&2
+    fi
+    if [ "${START_PKG_JSON_DIRTY}" = "1" ] || [ "${START_BUN_LOCK_DIRTY}" = "1" ]; then
+      echo "(NOTE: package.json and/or bun.lock were already dirty BEFORE promote ran, so they were left untouched — that pre-existing operator dirt is deliberate and load-bearing; promote will not discard it.)" >&2
+    fi
+    echo "The release IS fully delivered (v${NEXT_VERSION} is on npm + tag on origin + verified locally); this is NOT a release failure, so the script does not exit non-zero here. Operator recovery: inspect these changes with 'git status' / 'git diff' and decide whether they are load-bearing (commit them) or stray promote side-effects (discard). Do NOT rerun /publish promote." >&2
+  fi
 fi
 
 # SR-8.1 — daemon-bounce handoff.

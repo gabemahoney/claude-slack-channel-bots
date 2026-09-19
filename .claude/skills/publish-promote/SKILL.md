@@ -11,6 +11,8 @@ Irreversible-but-short half of a `claude-slack-channel-bots` release. Reads `.pu
 
 Idempotent where possible: an already-pushed commit, an already-published version (with matching `dist.shasum`), and an already-pushed tag are all treated as successful skips. The post-install + verify always runs.
 
+On success the working tree is left free of promote-induced `package.json` / `bun.lock` drift: the post-publish `bun -g` calls run from `$HOME` (a directory with no `package.json`) so bun cannot rewrite the local `package.json` / `bun.lock` during the global install, and a post-verify snapshot (SR-7.5) reverts any residual `package.json` / `bun.lock` drift the global install did induce, as a belt-and-suspenders safety net. Dirt in other files, or `package.json` / `bun.lock` dirt that pre-existed the release, is left untouched (SR-7.5 warns but still exits 0).
+
 ## Skill Contract — HARD RULES
 
 The shell script `scripts/publish-promote.sh` is this skill's body. It is the ONLY authorized side-effecting command. When any precondition or SR-X.Y guard fires, the script exits non-zero with a diagnostic on stderr describing the failure state and operator-facing recovery options.
@@ -33,7 +35,7 @@ No arguments. The bump kind, target version, commit SHA, tag, and tarball path a
 
 ## Procedure
 
-1. **Run `bash scripts/publish-promote.sh`.** The script reads `.publish-state.json`, verifies every precondition (manifest present and well-formed, HEAD matches, tag exists locally, package.json version matches, tarball file exists on disk with matching sha1), then idempotently pushes the commit, publishes the tarball, pushes the tag, polls the registry, sanitizes the global package.json, removes any prior global install, reinstalls from npm, and verifies. On exit 0, relay the success summary the script printed to stdout (the manifest has been deleted — the release is complete). On any non-zero exit, relay stderr verbatim and stop.
+1. **Run `bash scripts/publish-promote.sh`.** The script reads `.publish-state.json`, verifies every precondition (manifest present and well-formed, HEAD matches, tag exists locally, package.json version matches, tarball file exists on disk with matching sha1), then idempotently pushes the commit, publishes the tarball, pushes the tag, polls the registry, sanitizes the global package.json, removes any prior global install, reinstalls from npm, verifies, and snapshots the working tree (SR-7.5). On exit 0, relay the success summary the script printed to stdout (the manifest has been deleted — the release is complete). On any non-zero exit, relay stderr verbatim and stop.
 
 The LLM driving /publish promote MUST NOT execute any bash command outside of `bash scripts/publish-promote.sh`. Recovery commands named in stderr are for the operator.
 
@@ -50,6 +52,8 @@ The LLM driving /publish promote MUST NOT execute any bash command outside of `b
 | 70   | SR-7.1 | `scripts/sanitize-global.sh` exited non-zero (belt-and-suspenders — sanitize itself also enforces exit 0 always) | release IS published; local global `package.json` may still contain bun-1.3.13 poison; manifest preserved; operator inspects `${BUN_INSTALL:-$HOME/.bun}/install/global/package.json`, removes empty-string and pre-existing `claude-slack-channel-bots` entries manually, then reruns `bun install -g` + `clean_restart`, then deletes the manifest. Do NOT rerun /publish promote. |
 | 71   | SR-7.3 | post-publish `bun install -g` failed | release IS published; dev box has no global install; manifest preserved; operator reruns `bun install -g` manually, then deletes the manifest. Do NOT rerun /publish promote. |
 | 72   | SR-7.4 | post-publish verification failed (bin missing on PATH, resolved outside global prefix, package.json missing, or installed version stale) | release IS published; manifest preserved; operator follows the recovery in stderr; do NOT rerun /publish promote. |
+
+SR-7.5 (post-verify working-tree snapshot) has no exit code of its own — it runs after verification succeeds and never fails the release. The script snapshots which files are dirty at start, so it can distinguish promote-induced dirt from operator dirt. It reverts `package.json` / `bun.lock` only when they were clean at start and dirty after (promote-induced transitive-dep range drift), printing the success line only if that `git checkout` actually succeeded. `package.json` / `bun.lock` dirt that pre-existed promote is deliberately left untouched with a stderr NOTE, protecting intentional operator edits. Any other dirty file, or a revert that failed, gets a loud stderr warning. Every path still exits 0 (the release is already published, tagged, and verified); the operator decides whether the remaining dirt is load-bearing.
 
 The LLM's response on any non-zero exit is the same: relay the script's stderr verbatim, identify the recovery owner from the table above, and stop. The LLM is never the recovery owner.
 
