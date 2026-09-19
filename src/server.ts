@@ -109,6 +109,33 @@ export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Per-request HTTP access-line verbosity gate (b.3k6).
+ *
+ * The `/mcp` endpoint's `fetch` handler is hit on every MCP round-trip — client
+ * polls, notifications, tool-call responses, and each SSE stream open — so a
+ * one-line-per-request access log is the highest-frequency routine "success"
+ * line left in server.log after b.brv silenced the SubprocessClient dumps. It
+ * has the same signal/noise profile: routine and continuous at steady state,
+ * useful only when debugging a specific transport/session-routing problem.
+ *
+ * OFF by default (mirrors b.brv's CSCB_AD_VERBOSE). Set CSCB_HTTP_VERBOSE to a
+ * truthy value (`1`, `true`, `yes`, `on`, case-insensitive) to restore the
+ * per-request line for transport debugging. Real events (session connect /
+ * disconnect / route mismatch / errors) are logged unconditionally elsewhere.
+ *
+ * Exported as an env-parameterized seam (mirrors b.brv's isVerbose in
+ * agent-director-logger.ts) so behavior can be tested by injecting `env`;
+ * the call site passes no argument and reads process.env per request.
+ */
+export const HTTP_VERBOSE_ENV = 'CSCB_HTTP_VERBOSE'
+
+export function isHttpVerbose(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[HTTP_VERBOSE_ENV]
+  if (raw === undefined) return false
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase())
+}
+
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1057,7 +1084,9 @@ export async function main(): Promise<void> {
     async fetch(req: Request, server: { requestIP(r: Request): { address: string } | null; timeout(req: Request, seconds: number): void }): Promise<Response> {
       const url = new URL(req.url)
       const mcpSid = req.headers.get('mcp-session-id')
-      console.error(`[slack] HTTP ${req.method} ${url.pathname} session=${mcpSid ?? '(none)'}`)
+      if (isHttpVerbose()) {
+        console.error(`[slack] HTTP ${req.method} ${url.pathname} session=${mcpSid ?? '(none)'}`)
+      }
 
 
       // -----------------------------------------------------------------------
