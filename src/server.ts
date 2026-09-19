@@ -62,6 +62,7 @@ import {
   handlePermissionClick,
 } from './permission-click-handler.ts'
 import { trustBootstrap } from './trust-bootstrap.ts'
+import { stopHookBootstrap } from './stop-hook-bootstrap.ts'
 import { startPermissionPoller, stopPermissionPoller } from './permission-poller.ts'
 import {
   initRestart,
@@ -1290,6 +1291,14 @@ export async function main(): Promise<void> {
   // both real and dry-run modes (config-file patch, not a session operation).
   if (routingConfig) {
     await trustBootstrap(routingConfig)
+  }
+
+  // b.osj: install (or remove) the CSCB-managed Stop hook in each effective
+  // claude_config_dir's settings.json before any spawn fires. Runs for both
+  // real and dry-run modes (config-file patch, not a session operation).
+  // Never throws — per-dir failures are recorded via recordStartupError.
+  if (routingConfig) {
+    stopHookBootstrap(routingConfig)
   }
 
   // b.1m9: warn about (or, with --reconcile-instance-ids, delete) stale
