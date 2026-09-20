@@ -201,7 +201,7 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | `cozempic_prescription` | string | `"standard"` | Cozempic cleaning intensity before resume. Valid values: `gentle`, `standard`, `aggressive`. Has no effect if cozempic is not installed. |
 | `message_archive_db` | string | — | Path to a SQLite DB where every inbound Slack message is archived in real time. Parent directories are created if missing; schema is initialized on first open. Compatible with the `archive-messages.py` backfill script — both can write concurrently. Feature is disabled when absent. |
 | `claude_config_dir` | string | — | Path to a Claude on-disk config directory. When set, managed sessions launch with `CLAUDE_CONFIG_DIR='<resolved-path>'` so the bot authenticates against a specific account. `~` is expanded and the path is resolved to absolute. Per-route `routes[id].claude_config_dir` overrides this top-level value for individual channels. When neither is set, Claude's own default applies. Must be non-empty when set. |
-| `resume_enabled` | boolean | `true` | When `false`, the session manager always performs a fresh Claude session launch instead of resuming, both on startup and on runtime auto-restart, even when a stored session ID exists. Disabling this skips the `--resume` flag entirely. Use this as a workaround if your Claude Code version crashes with "sandbox required but unavailable" on `--resume` (a known regression in v2.1.120). |
+| `resume_enabled` | boolean | `true` | When `true` (default), a bot whose session died — including after a host reboot or pod resume — comes back with its prior conversation history intact instead of starting fresh. When `false`, the session manager always performs a fresh launch instead of resuming, both on startup and on runtime auto-restart, even when a stored session exists. Set `false` as a workaround if your Claude Code version crashes with "sandbox required but unavailable" on resume (a known regression in v2.1.120). Requires a system-installed `agent-director` ≥ 0.8.0 for reboot recovery to actually restore history. |
 | `agent_director_poll_interval_ms` | number | `1000` | Poll interval (ms) for the agent-director permission relay tick. Must be a positive integer in `[200, 3_600_000]`. Replaces the pre-rename `claude_director_poll_interval_ms` — the old name is rejected at startup. Unknown top-level config fields are also rejected to surface stale configs after the rename. |
 | `stop_hook_bootstrap` | boolean | `true` | Controls whether the server installs the CSCB-managed Slack Reply Guard Stop hook into `<claude_config_dir>/settings.json` at boot (see [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook)). Set to `false` to disable installation for every route and to actively remove any previously-installed managed entry. Per-route `routes[id].stop_hook_bootstrap` overrides this top-level value. Non-boolean values are rejected by config validation at startup. |
 
@@ -343,6 +343,14 @@ Behavior by case:
 - **PID file missing:** prints `server is not running` and exits 0.
 - **Stale PID file** (process no longer running): removes the PID file, prints `server is not running (removed stale PID file)`, exits 0.
 - **Live process:** sends `SIGTERM`, polls for exit for up to `stop_timeout` seconds (default 30s). Prints `[slack] Server stopped.` on clean exit. Escalates to `SIGKILL` if the process does not exit within `stop_timeout`.
+
+Plain `stop` leaves the managed bots running — they are meant to survive a server restart. Pass `--stop-bots` to gracefully exit the bots first:
+
+```sh
+claude-slack-channel-bots stop --stop-bots
+```
+
+This mirrors `clean_restart`'s order: the server is stopped **first**, then the bot teardown runs for each route — pause the bot, poll until it exits (or up to `exit_timeout` seconds), then force-kill on timeout. Stopping the server first prevents its `onsessionclosed`/`scheduleRestart` handler from respawning a just-exited bot mid-teardown (which would delete its `ended` row and history). Use it when you want a clean, flushed shutdown of the bots (for example before a host reboot) so they can resume their conversation history on the next start.
 
 ### `claude-slack-channel-bots clean_restart`
 
@@ -567,6 +575,9 @@ After 3 consecutive launch failures for a route, auto-restart is suspended until
 **Session stuck during clean_restart**
 If a session does not exit within `exit_timeout` seconds (default 120s), `clean_restart` force-kills the spawn via `agent-director kill` and proceeds. To manually recover, run `agent-director list --label service=cscb` to find lingering spawns and `agent-director kill <claude_instance_id>` to clear them, then `claude-slack-channel-bots stop && claude-slack-channel-bots start`.
 
+**Bots come back with no memory of the prior conversation after a reboot**
+With `resume_enabled: true`, a bot whose host rebooted (or pod resumed) should return with its conversation history. If it comes back amnesiac, confirm the system-installed `agent-director` is **≥ 0.8.0** (`agent-director version`) — reboot recovery relies on capabilities added in that release. Note that `bun run install-check` does **not** confirm this: its client floor is `0.7.0`, lower than the reboot-recovery requirement, so install-check passes on a `0.7.x` binary that still yields amnesiac bots. Verify the resume requirement directly with `agent-director version`. Note: legacy sessions created before upgrading to 0.8.0 may lose history exactly once on their first post-upgrade recovery, then resume cleanly thereafter.
+
 **Session crashes on resume with "sandbox required but unavailable"**
 This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json` to disable `--resume` entirely — the bot will always start a fresh Claude session instead of resuming a prior conversation, both on startup and on runtime auto-restart:
 
@@ -665,7 +676,7 @@ For operators upgrading from a pre-`agent-director` install:
 
 1. **Install the new CSCB**: `bun remove claude-director` (if present) and `bun install -g claude-slack-channel-bots@^<new>`. The `agent-director` library is pulled in transitively — no separate install step.
 2. **Delete any old relay hooks** — see [Upgrading from pre-Epic-2 (v0.5.x → v0.6.x)](#upgrading-from-pre-epic-2-v05x--v06x) for the cleanup commands.
-3. **Configure agent-director's `find-missing` sweep**. CSCB does NOT call `client.findMissing(...)`; reconciling stuck rows is the operator's responsibility. Add a cron entry (or systemd timer) that runs `agent-director find-missing` on a cadence that matches your tolerance — e.g. every minute on a busy host:
+3. **(Optional) Configure an agent-director `find-missing` sweep**. CSCB itself runs `find-missing` once before a resume during dead-session recovery, so a bot that died on reboot comes back with its history intact. A standalone periodic sweep is no longer required for CSCB recovery, but remains useful if you want stuck rows from non-CSCB spawns reconciled on a cadence. To add one, use a cron entry (or systemd timer):
    ```cron
    * * * * * /usr/local/bin/agent-director find-missing --timeout 30s
    ```

@@ -58,6 +58,7 @@ import { resetClientForTests, setClientForTests, getClient } from '../src/agent-
 import {
   cannedGetResult,
   cannedListRow,
+  cannedFindMissing,
   cannedOk,
   cannedErr,
   errInstanceIdCollision,
@@ -704,6 +705,188 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(resumeCalls).toHaveLength(0)
     expect(killCalls).toHaveLength(0)
     expect(spawnCalls).toHaveLength(1) // only the initial colliding spawn
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.4dk — findMissing-before-resume on the dead-session recovery path
+//
+// AD's resume verb requires a terminal (ended/missing) row. A dead-session
+// verdict arrives with a LIVE-state row (waiting/working), so pre-fix resume
+// was structurally guaranteed to throw ErrSpawnNotResumable → kill+delete+
+// fresh, destroying the session_id resume needed. The fix runs one
+// client.findMissing({}) BEFORE resume (only on the dead-session callers) so
+// AD transitions the dead row to `missing` and resume can succeed.
+//
+// The `callLog` capture proves relative ordering; `findMissingCalls` proves
+// the call count and that it carries an empty-params sweep ({}).
+// ---------------------------------------------------------------------------
+
+describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
+  // Drive the WAITING-branch dead-session verdict: reconnectMcp send-keys fails
+  // persistently even after the b.vub self-heal (tmux server ensurer no-op),
+  // which is the 'dead-session' signal for a waiting row.
+  test('waiting dead-session: findMissing runs exactly once BEFORE resume → resumed', async () => {
+    _setTmuxServerEnsurer(async () => {})
+    const callLog: string[] = []
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    installStub({
+      callLog,
+      findMissingCalls,
+      resumeCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      sendKeysError: errTmuxSendKeys(), // persistent → dead session
+      findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('resumed')
+    expect(findMissingCalls).toHaveLength(1)
+    expect(findMissingCalls[0]).toEqual({})
+    expect(resumeCalls).toHaveLength(1)
+    // Ordering: findMissing must be the immediately-preceding verb before resume.
+    expect(callLog.indexOf('findMissing')).toBeGreaterThanOrEqual(0)
+    expect(callLog.indexOf('findMissing')).toBeLessThan(callLog.indexOf('resume'))
+  })
+
+  // Drive the WORKING-branch dead-session verdict: waitForWaitingAndReconnect
+  // times out with the tmux session gone (prober false).
+  test('working dead-session: findMissing runs exactly once BEFORE resume → resumed', async () => {
+    _setWaitForWaitingTimeoutMs(30)
+    _setTmuxSessionProber(async () => false)
+    _setTmuxServerEnsurer(async () => {})
+    const callLog: string[] = []
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    installStub({
+      callLog,
+      findMissingCalls,
+      resumeCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working' }),
+      statusResult: { state: 'working' } as import('agent-director').StatusResult,
+      findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('resumed')
+    expect(findMissingCalls).toHaveLength(1)
+    expect(resumeCalls).toHaveLength(1)
+    expect(callLog.indexOf('findMissing')).toBeLessThan(callLog.indexOf('resume'))
+  })
+
+  // ended/missing caller (SR-1.4 collision resolved to a terminal row) does NOT
+  // set reconcileMissingFirst — the row is already terminal, straight to resume.
+  test('ended/missing path: resume called with NO findMissing call', async () => {
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    installStub({
+      findMissingCalls,
+      resumeCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('resumed')
+    expect(findMissingCalls).toHaveLength(0)
+    expect(resumeCalls).toHaveLength(1)
+  })
+
+  // findMissing rejects → still attempt resume anyway → on a still-live row AD
+  // throws ErrSpawnNotResumable → existing defensive kill+delete+fresh preserved.
+  test('waiting dead-session: findMissing rejects → resume attempted → ErrSpawnNotResumable → kill+delete+fresh', async () => {
+    _setTmuxServerEnsurer(async () => {})
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const killCalls: import('agent-director').KillParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({
+      findMissingCalls,
+      resumeCalls,
+      killCalls,
+      deleteCalls,
+      spawnCalls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
+      ],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      sendKeysError: errTmuxSendKeys(),
+      findMissingError: errGeneric('find-missing', 'ErrProbeFailed'),
+      resumeError: errSpawnNotResumable(), // row still live-state → resume rejects
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('spawned')
+    expect(findMissingCalls).toHaveLength(1)
+    expect(resumeCalls).toHaveLength(1) // resume still attempted despite findMissing failure
+    expect(killCalls).toHaveLength(1)
+    expect(deleteCalls).toHaveLength(1)
+    expect(spawnCalls).toHaveLength(2)
+  })
+
+  // resume_enabled=false short-circuits BEFORE the findMissing block —
+  // kill+delete+fresh as before, no findMissing, no resume.
+  test('resume_enabled=false dead-session: no findMissing, no resume (kill+delete+fresh)', async () => {
+    _setTmuxServerEnsurer(async () => {})
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const killCalls: import('agent-director').KillParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      findMissingCalls,
+      resumeCalls,
+      killCalls,
+      deleteCalls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
+      ],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      sendKeysError: errTmuxSendKeys(),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, resume_enabled: false })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('spawned')
+    expect(findMissingCalls).toHaveLength(0)
+    expect(resumeCalls).toHaveLength(0)
+    expect(killCalls).toHaveLength(1)
+    expect(deleteCalls).toHaveLength(1)
+  })
+
+  // Regression guard for b.vub self-heal: an ErrTmuxSessionCreate on resume in
+  // the dead-session path must still trigger the orphan-tmux-kill self-heal and
+  // a fresh respawn — unchanged by the findMissing insertion.
+  test('waiting dead-session: findMissing then resume ErrTmuxSessionCreate → b.vub self-heal respawn → spawned', async () => {
+    _setTmuxServerEnsurer(async () => {})
+    const killedSessions: string[] = []
+    _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({
+      findMissingCalls,
+      resumeCalls,
+      spawnCalls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
+      ],
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      sendKeysError: errTmuxSendKeys(),
+      resumeError: errTmuxSessionCreate('resume'),
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(result.action).toBe('spawned')
+    expect(findMissingCalls).toHaveLength(1) // findMissing still runs once, before resume
+    expect(resumeCalls).toHaveLength(1) // resume attempted once, threw ErrTmuxSessionCreate
+    expect(killedSessions).toHaveLength(1) // b.vub self-heal killed the orphan tmux session
+    expect(spawnCalls).toHaveLength(2) // initial collision + self-heal fresh spawn
   })
 })
 

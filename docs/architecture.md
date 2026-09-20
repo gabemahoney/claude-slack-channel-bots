@@ -7,7 +7,7 @@ The Slack Channel Router is a two-way bridge between Slack and Claude Code sessi
 ## Module Map
 
 ```
-cli.ts                          CLI entry point — start/stop/clean_restart subcommands. clean_restart uses agent-director pause/kill/status verbs (SR-11 Event 12).
+cli.ts                          CLI entry point — start/stop/clean_restart subcommands. `stop --stop-bots` and clean_restart share a `teardownBots` closure that uses agent-director pause/status/kill verbs (SR-11 Event 12).
 └── server.ts                   Main entry point — HTTP server, Socket Mode, message routing. Embeds the SR-5.1 startup gate, SR-3.2 template install, SR-1.6 orphan reconcile, SR-2.1 poller. `isHttpVerbose()` (b.3k6) gates the per-request `/mcp` access line behind `CSCB_HTTP_VERBOSE` (truthy: 1/true/yes/on) — off by default, checked per request.
     ├── config.ts               Routing configuration — load, validate, defaults, tilde expansion. SR-4.1 agent_director_poll_interval_ms field. SR-4.2 unknown-field rejection.
     ├── registry.ts             Session registry — pending/registered sessions, MCP Server factory, transport routing. No session-id discovery (AD owns it).
@@ -180,8 +180,9 @@ Called from `main()` in `server.ts`. The order is:
    - On `ErrInstanceIdCollision`, call `client.get({claude_instance_id})` and branch on state per the [SR-11 substitution table](#sr-11-substitution-table):
      - `ended` / `missing` + `resume_enabled` → `client.resume(...)`; `ErrNoSessionId` / `ErrJsonlMissing` → `client.delete(...)` + fresh `client.spawn(...)`; `ErrSpawnNotFound` (row vanished between the dead-session verdict and resume — operator delete, expire, race) → fresh `client.spawn(...)` directly with no delete (the row is already gone), action `spawned`.
      - `ended` / `missing` + `resume_enabled=false` → `client.kill(...)` + `client.delete(...)` + fresh `client.spawn(...)`.
-     - `waiting` → `client.sendKeys({ text: '/mcp reconnect slack-channel-router' })`.
-     - `working` → poll `client.status(...)` until `waiting`, then sendKeys.
+     - `waiting` → `reconnectMcp(channelId)` sends `/mcp reconnect slack-channel-router` via `client.sendKeys(...)`. If that reconnect finds the tmux session dead (`'dead-session'` verdict), fall through to `resumeOrFreshSpawn(..., { reconcileMissingFirst: true })` — see the note below.
+     - `working` → `waitForWaitingAndReconnect(...)` polls `client.status(...)` until `waiting`, then sendKeys; a `'dead-session'` verdict likewise falls through to `resumeOrFreshSpawn(..., { reconcileMissingFirst: true })`.
+     - **b.4dk dead-session recovery — `reconcileMissingFirst`.** After a reboot/pod-resume a `waiting`/`working` row is frozen live-state but its tmux session is gone. AD's `resume` verb only accepts a terminal (`ended`/`missing`) row, so on such a row it throws `ErrSpawnNotResumable` and the defensive branch (line above) kill+delete+fresh-spawns — losing all history. When `reconcileMissingFirst` is set (only the two dead-session callers set it), `resumeOrFreshSpawn` calls `client.findMissing({})` once before `resume`. AD's per-row, evidence-based sweep (requires agent-director ≥ 0.8.0, plan b.93m t1.93m.hp: degraded-mode guard removed) transitions the dead row to `missing`, so the subsequent `resume` succeeds and restores the pre-reboot transcript. Skipped when `resume_enabled=false`. A `findMissing` error → fall through to `resume` anyway (which then kill+delete+fresh-spawns, today's behavior). The `ended`/`missing` collision branch above does NOT set the flag (row already terminal).
      - `pending` / `check_permission` / `ask_user` → no-op (poller picks it up).
    - `ErrSpawnNotFound` race after collision → single retry-spawn.
    - Other errors → `postSpawnFailureToChannel(channelId, error)` queues a Slack-channel post (drained after `socket.start()`).
@@ -240,9 +241,11 @@ The parent spawn uses `detached: true` (child becomes its own session leader via
 
 `stop` (CLI subcommand) sends SIGTERM to the running server via the PID file at `STATE_DIR/server.pid`. If the process does not exit within `stop_timeout` seconds (default 30 s, configurable in `config.json`), a SIGKILL is sent. A brief 2 s confirmation poll follows the SIGKILL. Stale PID files (process no longer running) are silently removed. A non-zero exit from this phase causes `stop` to exit 1.
 
+Plain `stop` leaves the managed bots running (they are meant to survive server restarts — see [Graceful Shutdown](#graceful-shutdown-sr-11-event-11)). The **`--stop-bots`** flag (b.4dk) additionally exits the bots gracefully, mirroring `clean_restart`'s order: the server daemon is stopped **first**, then the shared `teardownBots` closure runs (the same per-route pause/poll/kill sequence as `clean_restart`, minus the restart phase). Stopping the server first prevents its `onsessionclosed`/`scheduleRestart` handler (`src/server.ts:381-403`) from respawning a just-exited bot mid-teardown — the respawn would delete the bot's `ended` row and history before SIGTERM lands. `directorPause` is an agent-director client subprocess that needs no live CSCB daemon (SessionEnd hooks are wired by agent-director into the spawned claude process and call the AD binary), so teardown works fine after the server is down. Teardown errors are logged and do not block the server stop. A pause-timeout kill escalation does NOT guarantee an `ended` row — that residual case is recovered later by the dead-session `findMissing`→`resume` path.
+
 ### clean_restart (SR-11 Event 12)
 
-`clean_restart` (CLI subcommand) stops the server daemon first, then concurrently pauses every managed Claude Code spawn via agent-director, then starts a fresh server. The stop-first ordering prevents the health-check poller and auto-restart logic from interfering with the teardown. It logs to `STATE_DIR/clean_restart.log` via `initLogging()`. `CliDeps` exposes injectable `directorStatus`, `directorPause`, and `directorKill` adapters (the production implementations call `getClient().status/pause/kill`).
+`clean_restart` (CLI subcommand) stops the server daemon first, then concurrently pauses every managed Claude Code spawn via agent-director, then starts a fresh server. The stop-first ordering prevents the health-check poller and auto-restart logic from interfering with the teardown. It logs to `STATE_DIR/clean_restart.log` via `initLogging()`. `CliDeps` exposes injectable `directorStatus`, `directorPause`, and `directorKill` adapters (the production implementations call `getClient().status/pause/kill`). The per-route teardown (steps 3–4 below) lives in a shared `teardownBots(routes, exit_timeout)` closure reused by `stop --stop-bots` (b.4dk).
 
 Algorithm:
 
@@ -285,7 +288,7 @@ State transitions and event triggers follow `t1.qfc.bg` SR-11 in full. Where the
 | `claude-director send-keys` | `client.sendKeys({ claude_instance_id, text })` |
 | `claude-director decide` | `client.decide({ claude_instance_id, decision })` |
 | `claude-director version` | `client.version({})` |
-| `claude-director find-missing` | `client.findMissing({ timeout_ms })` — operator's responsibility (SR-5.4); CSCB does not invoke. |
+| `claude-director find-missing` | `client.findMissing({})` — called once by the dead-session recovery path before `resume` (b.4dk, `reconcileMissingFirst`). Also runnable by operators as a periodic sweep (SR-5.4). |
 
 ## Configuration
 

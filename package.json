@@ -32,7 +32,7 @@
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@slack/socket-mode": "^2.0.0",
     "@slack/web-api": "^7.0.0",
-    "agent-director": "^0.7.8",
+    "agent-director": "^0.8.0",
     "semver": "^7.6.0"
   },
   "devDependencies": {

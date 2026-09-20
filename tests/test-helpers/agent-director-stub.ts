@@ -55,6 +55,8 @@ import type {
   DecideResult,
   DeleteParams,
   DeleteResult,
+  FindMissingParams,
+  FindMissingResult,
   GetParams,
   GetResult,
   KillParams,
@@ -97,6 +99,23 @@ export function cannedVersion(version: string, commit: string = 'deadbeef'): Ver
 /** Build a canned MakeTemplateResult. */
 export function cannedMakeTemplate(path: string): MakeTemplateResult {
   return { path }
+}
+
+/**
+ * Build a canned `FindMissingResult` in the agent-director 0.8.0 shape
+ * (b.4dk / plan b.93m: `{ count, ids, unverified, unverified_ids }`). All
+ * four fields are read by the CSCB findMissing-before-resume log line. The
+ * default is the empty/zero result (count 0, empty id arrays); tests that need
+ * missing rows pass overrides.
+ */
+export function cannedFindMissing(overrides: Partial<FindMissingResult> = {}): FindMissingResult {
+  return {
+    count: 0,
+    ids: [],
+    unverified: 0,
+    unverified_ids: [],
+    ...overrides,
+  }
 }
 
 /** Build an ErrBunVersionTooOld (Client-constructor failure mode). */
@@ -477,6 +496,13 @@ export interface StubClientOptions {
   resumeQueue?: CannedResponse<ResumeResult>[]
   resumeCalls?: ResumeParams[]
 
+  // findMissing() — b.4dk: dead-session recovery runs one findMissing before
+  // resume so AD transitions the dead live-state row to `missing`. Defaults to
+  // the 0.8.0 zero-transition shape.
+  findMissingResult?: FindMissingResult
+  findMissingError?: Error
+  findMissingCalls?: FindMissingParams[]
+
   // delete()
   deleteResult?: DeleteResult
   deleteError?: Error
@@ -501,6 +527,14 @@ export interface StubClientOptions {
   getPermissionError?: Error
   getPermissionQueue?: CannedResponse<GetPermissionResult>[]
   getPermissionCalls?: GetPermissionParams[]
+
+  /**
+   * Ordered verb-name log. When supplied, only the two instrumented verbs —
+   * `findMissing` and `resume` — push their name before returning, letting a
+   * test assert their relative ordering (b.4dk: findMissing must precede
+   * resume). Other verbs are not instrumented.
+   */
+  callLog?: string[]
 }
 
 /** Structural-typed `Client` stub satisfying every verb CSCB uses. */
@@ -517,6 +551,7 @@ export type StubClient = {
   kill(params: KillParams): Promise<KillResult>
   decide(params: DecideParams): Promise<DecideResult>
   resume(params: ResumeParams): Promise<ResumeResult>
+  findMissing(params: FindMissingParams): Promise<FindMissingResult>
   delete(params: DeleteParams): Promise<DeleteResult>
   list(params: ListParams): Promise<ListResult>
   pause(params: PauseParams): Promise<PauseResult>
@@ -610,10 +645,17 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
       return nextResponse('decide', opts.decideQueue, opts.decideResult, opts.decideError, {})
     },
     async resume(params: ResumeParams): Promise<ResumeResult> {
+      opts.callLog?.push('resume')
       opts.resumeCalls?.push(params)
       return nextResponse('resume', opts.resumeQueue, opts.resumeResult, opts.resumeError, {
         claude_instance_id: params.claude_instance_id,
       })
+    },
+    async findMissing(params: FindMissingParams): Promise<FindMissingResult> {
+      opts.callLog?.push('findMissing')
+      opts.findMissingCalls?.push(params)
+      if (opts.findMissingError) throw opts.findMissingError
+      return opts.findMissingResult ?? cannedFindMissing()
     },
     async delete(params: DeleteParams): Promise<DeleteResult> {
       opts.deleteCalls?.push(params)
