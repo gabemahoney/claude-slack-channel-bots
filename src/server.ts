@@ -633,13 +633,85 @@ async function handleMessage(event: unknown): Promise<void> {
           console.error(
             `[slack] No live session for channel ${channelId} — dropping message`,
           )
-          // If the channel has a route but no registered session, notify the sender
-          if (routingConfig?.routes[channelId]) {
+          // b.kvq: recover a dead/capped route on an explicit inbound message.
+          // Determine the configured cwd for this channel AND the channel that
+          // OWNS the session on that cwd. A channel is "configured" if it has a
+          // direct route OR falls under default_route (same precedence used
+          // above when resolving targetSession).
+          //
+          // Recovery must be keyed to the OWNING channel, not the inbound one:
+          // buildSpawnParams/instanceIdFor derive the instance id + tmux name
+          // from the channelId, and the restart guards/backoff are keyed by
+          // channelId. For a direct route the owning channel IS the inbound
+          // channel. For default_route the session is owned by the direct route
+          // whose cwd === default_route (config.ts guarantees such a route
+          // exists — default_route must match a defined route CWD, and CWDs are
+          // unique per channel). Keying to the inbound channel there would spawn
+          // a SECOND instance on the shared cwd and its guards could not see the
+          // owning session's in-flight restart or cap state.
+          const directRoute = routingConfig?.routes[channelId]
+          let cwd: string | undefined
+          let ownerChannelId: string | undefined
+          if (directRoute) {
+            cwd = directRoute.cwd
+            ownerChannelId = channelId
+          } else if (routingConfig?.default_route && !routingConfig.routes[channelId]) {
+            cwd = routingConfig.default_route
+            // Resolve the direct route that owns the session on default_route.
+            for (const [ownerId, route] of Object.entries(routingConfig.routes)) {
+              if (route.cwd === cwd) {
+                ownerChannelId = ownerId
+                break
+              }
+            }
+            // If no owning route is found (should be impossible per config
+            // validation), drop silently rather than schedule under the inbound
+            // channelId and spawn a duplicate/unrecoverable instance.
+            if (!ownerChannelId) {
+              cwd = undefined
+            }
+          }
+
+          if (cwd && ownerChannelId) {
+            // The dropped message itself is lost — recovery only starts a
+            // session; it does NOT deliver or replay this message. The reply
+            // below must never imply otherwise.
+            const alreadyRestarting = isRestartPendingOrActive(ownerChannelId)
+            const autoRestartDisabled = (routingConfig?.session_restart_delay ?? 60) === 0
+            const capped = backoffIsAtCap(ownerChannelId, RESTART_FAILURE_CAP)
+
+            let replyText: string
+            if (alreadyRestarting) {
+              // A restart is already pending/active — do not stack a second
+              // launch. Telling the sender to retry shortly is honest here.
+              replyText =
+                'Your message was not delivered. The session is restarting — please retry in a moment.'
+            } else if (autoRestartDisabled) {
+              // getRestartDelay()===0: auto-restart is off. scheduleRestart
+              // would early-return, so do not pretend recovery is underway.
+              replyText =
+                'Your message was not delivered and was not saved. Auto-restart is disabled for this channel, ' +
+                'so it will NOT recover on its own — an operator must restart the server.'
+            } else if (capped) {
+              // At the consecutive-failure cap: firing another launch would only
+              // burn a spawn attempt against a route that cannot come up (the cap
+              // exists precisely to stop that), and in-process backoff clears only
+              // on a server restart. Bound the human trigger here rather than
+              // spawn-looping, and say so plainly.
+              replyText =
+                'Your message was not delivered and was not saved. This channel has hit its restart-failure limit ' +
+                'and will NOT recover on its own — an operator must restart the server.'
+            } else {
+              // Live route, no session, under cap, auto-restart enabled: trigger
+              // a fast human-clamped recovery. This message is still lost.
+              scheduleRestart(ownerChannelId, cwd, undefined, { humanTrigger: true })
+              replyText =
+                'Your message was not delivered and was not saved. I have started the session for this channel — ' +
+                'please retry in a moment.'
+            }
+
             try {
-              await web.chat.postMessage({
-                channel: channelId,
-                text: 'Message not delivered — session starting up, please retry in a moment.',
-              })
+              await web.chat.postMessage({ channel: channelId, text: replyText })
             } catch { /* non-critical */ }
           }
           return
