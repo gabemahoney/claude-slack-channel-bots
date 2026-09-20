@@ -98,7 +98,7 @@ function isSessionLeader(): boolean {
 
 export interface CliHandlers {
   start: () => Promise<void>
-  stop: () => Promise<void>
+  stop: (opts?: { stopBots?: boolean }) => Promise<void>
   clean_restart: () => Promise<void>
 }
 
@@ -107,6 +107,72 @@ export interface CliHandlers {
  * Call with real deps from top-level code; call with stubs in tests.
  */
 export function createCli(deps: CliDeps): CliHandlers {
+  /**
+   * b.4dk: per-route graceful bot teardown — SR-11 Event 12's pause/poll/kill
+   * sequence, extracted so both clean_restart and `stop --stop-bots` reuse the
+   * exact same tested logic instead of duplicating it.
+   *
+   * For each route: precheck the row state; skip absent/terminal rows;
+   * client.pause() (sends `/exit` → SessionEnd reason prompt_input_exit → the
+   * row reaches `ended`); poll client.status() with exponential backoff until
+   * ended/missing or exit_timeout elapses; on timeout escalate to
+   * client.kill(). NOTE: a kill escalation does NOT guarantee an `ended` row —
+   * that residual case is recovered later via the findMissing→resume path.
+   */
+  async function teardownBots(routes: RoutingConfig['routes'], exit_timeout: number): Promise<void> {
+    await Promise.allSettled(Object.entries(routes).map(async ([channelId]) => {
+      try {
+        // Precheck: any row? If not, nothing to do.
+        const precheck = await deps.directorStatus(channelId)
+        if (precheck === null) {
+          console.error(`[slack] teardownBots: no spawn row for channel=${channelId} — skipping`)
+          return
+        }
+        const state = precheck.state
+        if (state === 'ended' || state === 'missing') {
+          console.error(`[slack] teardownBots: channel=${channelId} already terminal (state=${state}) — skipping`)
+          return
+        }
+
+        // pause and poll for terminal transition
+        try {
+          await deps.directorPause(channelId)
+        } catch (err) {
+          console.error(`[slack] teardownBots: pause failed for channel=${channelId} — escalating to kill:`, err)
+          try { await deps.directorKill(channelId) } catch { /* ignore */ }
+          return
+        }
+
+        const timeoutMs = exit_timeout * 1000
+        const startTime = Date.now()
+        let delay = 100
+        const maxDelay = 2_000
+
+        while (Date.now() - startTime < timeoutMs) {
+          await new Promise<void>((r) => setTimeout(r, delay))
+          delay = Math.min(delay * 2, maxDelay)
+          const pollResult = await deps.directorStatus(channelId)
+          if (pollResult === null || pollResult.state === 'ended' || pollResult.state === 'missing') {
+            const elapsed = Date.now() - startTime
+            console.error(`[slack] teardownBots: channel=${channelId} exited cleanly in ${elapsed}ms`)
+            return
+          }
+        }
+
+        // Timeout — force kill via agent-director
+        const elapsed = Date.now() - startTime
+        try {
+          await deps.directorKill(channelId)
+          console.error(`[slack] teardownBots: channel=${channelId} force-killed after ${elapsed}ms`)
+        } catch (err) {
+          console.error(`[slack] teardownBots: kill failed for channel=${channelId}:`, err)
+        }
+      } catch (err) {
+        console.error(`[slack] teardownBots: error processing channel=${channelId}:`, err)
+      }
+    }))
+  }
+
   async function start(): Promise<void> {
     // tmux is no longer a CSCB-direct prerequisite — agent-director owns the
     // tmux integration. CSCB still requires it transitively but the
@@ -173,13 +239,51 @@ export function createCli(deps: CliDeps): CliHandlers {
     await deps.startServer()
   }
 
-  async function stop(): Promise<void> {
+  async function stop(opts?: { stopBots?: boolean }): Promise<void> {
+    // b.4dk: `stop --stop-bots` gracefully exits the managed bots (reusing
+    // clean_restart's tested pause/poll/kill teardown) AND stops the server,
+    // WITHOUT the restart phase. Plain `stop` leaves the bots running (they
+    // are meant to survive server restarts).
+    //
+    // Order matters: stop the server FIRST, then run teardownBots — mirroring
+    // clean_restart's production-proven order (phase 2 server stop before
+    // teardown). If teardown ran while the daemon were still alive, a bot's
+    // graceful `/exit` would close its MCP session and the live server's
+    // onsessionclosed handler (src/server.ts:381-403) would scheduleRestart the
+    // channel, respawning it fresh (deleting its `ended` row and history) before
+    // SIGTERM lands. directorPause is an agent-director client subprocess that
+    // needs no live CSCB daemon (SessionEnd hooks are wired by agent-director
+    // into the spawned claude process and call the AD binary), so teardown works
+    // fine after the server is down.
+
+    // Phase 1: stop the server daemon. Returns the intended exit code so
+    // teardown can run before we actually exit.
+    const stopServerCode = await stopServer()
+
+    // Phase 2: gracefully exit managed bots (only for --stop-bots).
+    if (opts?.stopBots) {
+      try {
+        const config = deps.loadConfig()
+        console.error('[slack] stop --stop-bots: gracefully exiting managed bots')
+        await teardownBots(config.routes, config.exit_timeout)
+      } catch (err) {
+        console.error('[slack] stop --stop-bots: bot teardown error:', err)
+      }
+    }
+
+    deps.exit(stopServerCode)
+  }
+
+  // Stop the server daemon. Returns the intended process exit code instead of
+  // calling deps.exit() directly, so callers can run additional teardown work
+  // (e.g. --stop-bots) before exiting.
+  async function stopServer(): Promise<number> {
     const stateDir = deps.resolveStateDir()
     const pidFile = join(stateDir, 'server.pid')
 
     if (!deps.existsSync(pidFile)) {
       console.error('server is not running')
-      deps.exit(0)
+      return 0
     }
 
     let pid: number
@@ -189,7 +293,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       if (isNaN(pid)) throw new Error(`invalid PID: ${raw}`)
     } catch (err) {
       console.error(`[slack] Could not read PID file: ${err}`)
-      deps.exit(1)
+      return 1
     }
 
     if (!deps.isProcessRunning(pid!)) {
@@ -198,7 +302,7 @@ export function createCli(deps: CliDeps): CliHandlers {
         deps.unlinkSync(pidFile)
       } catch { /* ignore */ }
       console.error('server is not running (removed stale PID file)')
-      deps.exit(0)
+      return 0
     }
 
     // Load stop_timeout from config (fall back to 30s if unavailable)
@@ -219,7 +323,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       if (!deps.isProcessRunning(pid!)) {
         try { deps.unlinkSync(pidFile) } catch { /* ignore */ }
         console.error('[slack] Server stopped.')
-        deps.exit(0)
+        return 0
       }
     }
 
@@ -234,12 +338,12 @@ export function createCli(deps: CliDeps): CliHandlers {
       if (!deps.isProcessRunning(pid!)) {
         try { deps.unlinkSync(pidFile) } catch { /* ignore */ }
         console.error('[slack] Server killed.')
-        deps.exit(0)
+        return 0
       }
     }
 
     console.error('[slack] Warning: server did not die after SIGKILL.')
-    deps.exit(1)
+    return 1
   }
 
   async function clean_restart(): Promise<void> {
@@ -262,60 +366,9 @@ export function createCli(deps: CliDeps): CliHandlers {
       console.error(`[slack] clean_restart: stop returned non-zero exit code: ${stopResult.status}`)
     }
 
-    // Phases 3-4: SR-11 Event 12 — pause + poll via agent-director.
-    // Per-route teardown: client.pause(), then poll client.status() until
-    // ended/missing or exit_timeout elapses; escalate to client.kill().
-    await Promise.allSettled(Object.entries(routes).map(async ([channelId]) => {
-      try {
-        // Precheck: any row? If not, nothing to do.
-        const precheck = await deps.directorStatus(channelId)
-        if (precheck === null) {
-          console.error(`[slack] clean_restart: no spawn row for channel=${channelId} — skipping`)
-          return
-        }
-        const state = precheck.state
-        if (state === 'ended' || state === 'missing') {
-          console.error(`[slack] clean_restart: channel=${channelId} already terminal (state=${state}) — skipping`)
-          return
-        }
-
-        // Phase 4: pause and poll for terminal transition
-        try {
-          await deps.directorPause(channelId)
-        } catch (err) {
-          console.error(`[slack] clean_restart: pause failed for channel=${channelId} — escalating to kill:`, err)
-          try { await deps.directorKill(channelId) } catch { /* ignore */ }
-          return
-        }
-
-        const timeoutMs = exit_timeout * 1000
-        const startTime = Date.now()
-        let delay = 100
-        const maxDelay = 2_000
-
-        while (Date.now() - startTime < timeoutMs) {
-          await new Promise<void>((r) => setTimeout(r, delay))
-          delay = Math.min(delay * 2, maxDelay)
-          const pollResult = await deps.directorStatus(channelId)
-          if (pollResult === null || pollResult.state === 'ended' || pollResult.state === 'missing') {
-            const elapsed = Date.now() - startTime
-            console.error(`[slack] clean_restart: channel=${channelId} exited cleanly in ${elapsed}ms`)
-            return
-          }
-        }
-
-        // Timeout — force kill via agent-director
-        const elapsed = Date.now() - startTime
-        try {
-          await deps.directorKill(channelId)
-          console.error(`[slack] clean_restart: channel=${channelId} force-killed after ${elapsed}ms`)
-        } catch (err) {
-          console.error(`[slack] clean_restart: kill failed for channel=${channelId}:`, err)
-        }
-      } catch (err) {
-        console.error(`[slack] clean_restart: error processing channel=${channelId}:`, err)
-      }
-    }))
+    // Phases 3-4: SR-11 Event 12 — per-route pause/poll/kill teardown via
+    // agent-director (shared with `stop --stop-bots`).
+    await teardownBots(routes, exit_timeout)
 
     // Phases 5-6: Start new server and exit
     console.error('[slack] clean_restart: starting server')
@@ -343,6 +396,9 @@ if (import.meta.main) {
     console.error('  start          Validate prerequisites and start the server in the background')
     console.error('  stop           Send SIGTERM to a running server')
     console.error('  clean_restart  Exit all managed sessions, then stop and start the server')
+    console.error('')
+    console.error('stop flags:')
+    console.error('  --stop-bots    Gracefully exit all managed bots before stopping the server')
     console.error('')
     console.error('Flags (b.1m9):')
     console.error('  --reconcile-instance-ids   Auto-delete stale pre-rename cscb_<id> AD rows on startup')
@@ -415,7 +471,8 @@ if (import.meta.main) {
       process.exit(1)
     })
   } else if (subcommand === 'stop') {
-    cli.stop().catch((err) => {
+    const stopBots = process.argv.slice(3).includes('--stop-bots')
+    cli.stop({ stopBots }).catch((err) => {
       console.error('[slack] Fatal:', err)
       process.exit(1)
     })

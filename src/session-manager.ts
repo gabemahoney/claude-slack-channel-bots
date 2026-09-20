@@ -864,6 +864,7 @@ async function resumeOrFreshSpawn(
   normalizedName: string | undefined,
   web: WebClient | undefined,
   isStartup: boolean,
+  opts?: { reconcileMissingFirst?: boolean },
 ): Promise<SpawnRouteResult> {
   if (routingConfig.resume_enabled === false) {
     console.error(`[slack] spawnForRoute: resume_enabled=false — kill+delete+fresh for channel=${channelId}`)
@@ -888,6 +889,28 @@ async function resumeOrFreshSpawn(
       if (isStartup) recordStartupError('spawn-failed', `fresh spawn after delete failed for channel=${channelId}: ${e.errName}`, e)
       postSpawnFailureToChannel(channelId, e, web, isStartup)
       return { channelId, action: 'failed' }
+    }
+  }
+
+  // b.4dk: dead-session callers (state=waiting/working with a verified-dead
+  // tmux session) arrive with a LIVE-state AD row. AD's resume verb requires
+  // a terminal row (ended/missing) — otherwise ErrSpawnNotResumable. Run
+  // findMissing first so AD's per-row, evidence-based sweep (agent-director
+  // plan b.93m, t1.93m.hp: degraded-mode guard removed) transitions the dead
+  // row to `missing`, letting resume succeed and preserve session history.
+  // The ended/missing caller does NOT set reconcileMissingFirst (row already
+  // terminal). On any findMissing error, fall through to attempting resume
+  // anyway — resume was never going to succeed on a still-live row, so the
+  // existing ErrSpawnNotResumable → kill+delete+fresh branch is the correct
+  // (today's) fallback. Prefer AD's findMissing verb over CSCB-side tmux
+  // probing per docs/engineering-guide.md ("Avoiding Duplicated Effort").
+  if (opts?.reconcileMissingFirst) {
+    try {
+      const r = await withOutageDetection(channelId, undefined, (client) => client.findMissing({}))
+      console.error(`[slack] spawnForRoute: findMissing before resume for channel=${channelId} — count=${r.count} ids=[${r.ids.join(',')}] unverified=${r.unverified} unverified_ids=[${r.unverified_ids.join(',')}]`)
+    } catch (err) {
+      const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('findMissing', 'UnknownError', String(err))
+      console.error(`[slack] spawnForRoute: findMissing before resume failed for channel=${channelId}: ${e.errName} — attempting resume anyway`)
     }
   }
 
@@ -1152,7 +1175,7 @@ export async function spawnForRoute(
     const outcome = await reconnectMcp(channelId, web, routingConfig)
     if (outcome === 'dead-session') {
       console.error(`[slack] spawnForRoute: dead tmux session for channel=${channelId} (state=waiting) — recovering via resume/fresh-spawn`)
-      return resumeOrFreshSpawn(channelId, route, params, routingConfig, normalizedName, web, isStartup)
+      return resumeOrFreshSpawn(channelId, route, params, routingConfig, normalizedName, web, isStartup, { reconcileMissingFirst: true })
     }
     if (outcome !== 'ok') {
       console.error(`[slack] spawnForRoute: reconnect failed for channel=${channelId}`)
@@ -1171,7 +1194,7 @@ export async function spawnForRoute(
     const outcome = await waitForWaitingAndReconnect(channelId, routingConfig, web)
     if (outcome === 'dead-session') {
       console.error(`[slack] spawnForRoute: dead tmux session for channel=${channelId} (state=working) — recovering via resume/fresh-spawn`)
-      return resumeOrFreshSpawn(channelId, route, params, routingConfig, normalizedName, web, isStartup)
+      return resumeOrFreshSpawn(channelId, route, params, routingConfig, normalizedName, web, isStartup, { reconcileMissingFirst: true })
     }
     if (outcome !== 'ok') {
       console.error(`[slack] spawnForRoute: reconnect failed for channel=${channelId}`)

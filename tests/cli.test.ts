@@ -51,6 +51,8 @@ interface Overrides {
   directorStatus?: (channelId: string) => Promise<{ state: string } | null>
   directorPause?: (channelId: string) => Promise<void>
   directorKill?: (channelId: string) => Promise<void>
+  /** Called on every deps.kill(pid, signal) — lets tests observe SIGTERM/SIGKILL to the server pid. */
+  killFn?: (pid: number, signal: string) => void
 }
 
 interface Bundle {
@@ -60,6 +62,10 @@ interface Bundle {
   pauseCalls: string[]
   killCalls: string[]
   statusCalls: string[]
+  /** Signals sent to the server pid via deps.kill(), in order (e.g. 'SIGTERM'). */
+  serverSignals: string[]
+  /** Named side-effect events in call order — used to pin server-stop-vs-teardown ordering. */
+  events: string[]
   /** Whether deps.startServer() was invoked (in-place server run). */
   readonly startServerCalled: boolean
 }
@@ -70,6 +76,8 @@ function makeDeps(o: Overrides = {}): Bundle {
   const pauseCalls: string[] = []
   const killCalls: string[] = []
   const statusCalls: string[] = []
+  const serverSignals: string[] = []
+  const events: string[] = []
   let startServerCalled = false
   const existing = new Set(o.existingPaths ?? [CONFIG_JSON])
   const deps: CliDeps = {
@@ -86,7 +94,11 @@ function makeDeps(o: Overrides = {}): Bundle {
     },
     unlinkSync: () => { /* no-op */ },
     isProcessRunning: o.isProcessRunning ?? (() => false),
-    kill: () => { /* no-op */ },
+    kill: (pid, signal) => {
+      serverSignals.push(String(signal))
+      events.push(`server:${String(signal)}`)
+      o.killFn?.(pid as number, String(signal))
+    },
     resolveStateDir: o.resolveStateDir ?? (() => STATE_DIR),
     startServer: async () => { startServerCalled = true },
     exit: (code) => { exitCodes.push(code); throw new ExitError(code) },
@@ -98,15 +110,17 @@ function makeDeps(o: Overrides = {}): Bundle {
     },
     directorPause: async (channelId) => {
       pauseCalls.push(channelId)
+      events.push(`pause:${channelId}`)
       if (o.directorPause) return o.directorPause(channelId)
     },
     directorKill: async (channelId) => {
       killCalls.push(channelId)
+      events.push(`kill:${channelId}`)
       if (o.directorKill) return o.directorKill(channelId)
     },
   }
   return {
-    deps, exitCodes, spawnCalls, pauseCalls, killCalls, statusCalls,
+    deps, exitCodes, spawnCalls, pauseCalls, killCalls, statusCalls, serverSignals, events,
     get startServerCalled() { return startServerCalled },
   }
 }
@@ -333,6 +347,125 @@ describe('clean_restart', () => {
     })
     await createCli(deps).clean_restart()
     expect(killCalls).toEqual(['C'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// stop — b.4dk `--stop-bots` graceful bot teardown before server stop
+//
+// `stop({ stopBots: true })` reuses clean_restart's per-route pause/poll/kill
+// teardown (extracted into teardownBots) BEFORE stopping the server. Plain
+// `stop()` must never touch the director verbs — bots survive server restarts.
+// ---------------------------------------------------------------------------
+
+describe('stop --stop-bots (b.4dk)', () => {
+  /**
+   * Configure a `stop` bundle whose server is already gone (stale PID file →
+   * exit(0)) so the test focuses on the pre-stop bot-teardown behavior. The
+   * teardown runs BEFORE the server-stop block, so it completes regardless.
+   */
+  function makeStopDeps(o: Overrides = {}): Bundle {
+    return makeDeps({
+      // existsAll makes the PID file "present"; isProcessRunning defaults false
+      // → stale-PID branch → exit(0). No real signals are ever sent.
+      existsAll: true,
+      pidFileContent: '4242',
+      isProcessRunning: () => false,
+      ...o,
+    })
+  }
+
+  test('stopBots: per-route pause runs and server still stops', async () => {
+    let n = 0
+    const { deps, pauseCalls, killCalls, statusCalls, exitCodes } = makeStopDeps({
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+      directorStatus: async () => {
+        n++
+        return n === 1 ? { state: 'waiting' } : { state: 'ended' } // precheck → post-pause terminal
+      },
+    })
+    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect(pauseCalls).toEqual(['C'])
+    expect(killCalls).toEqual([])
+    expect(statusCalls[0]).toBe('C') // teardown precheck ran
+    expect(exitCodes).toContain(0) // server stop still reached (stale PID → exit 0)
+  })
+
+  test('stopBots: pause timeout escalates to kill, server still stops', async () => {
+    const { deps, pauseCalls, killCalls, exitCodes } = makeStopDeps({
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } }, exit_timeout: 0 }),
+      directorStatus: async () => ({ state: 'waiting' }), // never reaches terminal
+    })
+    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect(pauseCalls).toEqual(['C'])
+    expect(killCalls).toEqual(['C']) // exit_timeout=0 → immediate kill escalation
+    expect(exitCodes).toContain(0)
+  })
+
+  test('stopBots: teardown error does NOT block server stop', async () => {
+    const { deps, exitCodes } = makeStopDeps({
+      // loadConfig throws inside the stopBots block → caught, logged, server stop proceeds.
+      loadConfig: () => { throw new Error('config boom') },
+    })
+    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect(exitCodes).toContain(0)
+  })
+
+  // b.4dk ordering guarantee: the server must be stopped BEFORE any bot teardown
+  // begins, so the live daemon's onsessionclosed→scheduleRestart cannot respawn a
+  // bot mid-teardown. A regression to teardown-first would put pause:C before the
+  // server SIGTERM and fail this test. A LIVE server pid (isProcessRunning true
+  // then false) forces a real SIGTERM through deps.kill so the ordering is
+  // observable in the shared `events` log.
+  test('stopBots: server SIGTERM precedes any director verb (teardown-first regression guard)', async () => {
+    let alive = true
+    const { deps, events } = makeDeps({
+      existsAll: true,
+      pidFileContent: '4242',
+      isProcessRunning: () => { const was = alive; alive = false; return was }, // live once, then gone
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } }, stop_timeout: 1, exit_timeout: 0 }),
+      directorStatus: async () => ({ state: 'waiting' }), // stays live → pause fires, poll times out fast (exit_timeout=0)
+    })
+    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    const firstServer = events.indexOf('server:SIGTERM')
+    const firstPause = events.findIndex((e) => e.startsWith('pause:'))
+    expect(firstServer).toBeGreaterThanOrEqual(0) // server was signalled
+    expect(firstPause).toBeGreaterThanOrEqual(0) // bot teardown ran
+    expect(firstServer).toBeLessThan(firstPause) // server stop happened FIRST
+  })
+
+  test.each([[undefined], [{}]])(
+    'plain stop(%p) never touches director verbs (bots survive server restarts)',
+    async (opts) => {
+      const { deps, pauseCalls, killCalls, statusCalls } = makeStopDeps({
+        loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+        directorStatus: async () => ({ state: 'waiting' }),
+      })
+      await expect(createCli(deps).stop(opts)).rejects.toBeInstanceOf(ExitError)
+      expect(pauseCalls).toEqual([])
+      expect(killCalls).toEqual([])
+      expect(statusCalls).toEqual([]) // no teardown precheck at all
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
+// clean_restart — regression: teardown still runs via the extracted closure
+// ---------------------------------------------------------------------------
+
+describe('clean_restart teardown-via-closure regression (b.4dk)', () => {
+  test('clean_restart still pauses each live route (shared teardownBots closure)', async () => {
+    let n = 0
+    const { deps, pauseCalls, killCalls } = makeDeps({
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+      directorStatus: async () => {
+        n++
+        return n === 1 ? { state: 'waiting' } : { state: 'ended' }
+      },
+    })
+    await createCli(deps).clean_restart()
+    expect(pauseCalls).toEqual(['C']) // same pause/poll/kill teardown as before the extraction
+    expect(killCalls).toEqual([])
   })
 })
 
