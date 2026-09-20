@@ -252,10 +252,14 @@ export function _resetTmuxSessionProber(): void {
 }
 
 /**
- * Reconnect outcome (b.3ce). `dead-session` means the target tmux session
- * provably no longer exists (send-keys retry failed with ErrTmuxSendKeys, or
- * a wait-for-waiting timeout found no live tmux session) — callers should
- * recover via the resume/fresh-spawn path rather than report a bare failure.
+ * Reconnect outcome (b.3ce). `dead-session` means the session is provably
+ * unusable — callers should recover via the resume/fresh-spawn path rather than
+ * report a bare failure. Two classes of proof qualify:
+ *   - the claude PROCESS is provably gone per AD's evidence-based
+ *     findMissing + status verdict (waitForWaitingAndReconnect's ended/missing
+ *     branch and its timeout branch; b.ecw), or
+ *   - the tmux SESSION provably doesn't exist (the ErrSpawnNotFound paths where
+ *     AD has no row to consult, and reconnectMcp's double-ErrTmuxSendKeys).
  */
 export type ReconnectOutcome = 'ok' | 'failed' | 'dead-session'
 
@@ -718,17 +722,56 @@ async function reconcileMissingSweep(channelId: string, logPrefix: string): Prom
 }
 
 /**
+ * b.ecw: the timeout-branch tmux-probe fallback. When the timeout status call
+ * throws and AD therefore has nothing to say, key on the tmux SESSION (the only
+ * object left) so an AD outage can't manufacture a false 'dead-session' — the
+ * b.rmy invariant. `reason` is the log fragment describing why we fell back
+ * (e.g. `spawn not found`, `status error ${errName}`): alive → 'ok', gone →
+ * 'dead-session'.
+ */
+async function tmuxFallbackVerdict(
+  sessionName: string,
+  channelId: string,
+  reason: string,
+): Promise<ReconnectOutcome> {
+  if (await _hasTmuxSession(sessionName)) {
+    console.error(
+      `[slack] waitForWaitingAndReconnect: timed out for channel=${channelId} after ${_waitForWaitingTimeoutMs}ms — ${reason}, tmux session alive, health-check will retry`,
+    )
+    return 'ok'
+  }
+  console.error(
+    `[slack] waitForWaitingAndReconnect: timed out for channel=${channelId} after ${_waitForWaitingTimeoutMs}ms — ${reason} and tmux session "${sessionName}" is gone — dead session`,
+  )
+  return 'dead-session'
+}
+
+/**
  * Poll `status({claude_instance_id})` until the spawn transitions to
  * `waiting`, then call reconnectMcp. Transitions to live transient states
  * (ask_user, check_permission, pending) return 'ok' — health-check picks it
- * up. Terminal transitions (ended/missing, or ErrSpawnNotFound) are decided
- * by a tmux liveness probe: alive → 'ok', gone → 'dead-session' (b.c3o).
+ * up.
  *
- * b.3ce timeout verdict: post-reboot the AD row can be frozen at `working`
- * while the tmux session is gone, so the poll can never progress. Trusting
- * the DB here masked a total outage as "ok". On timeout, probe the actual
- * tmux session: alive → 'ok' (long turns aren't errors — the b.rmy regression
- * guard); gone → 'dead-session' so the caller recovers via resume/fresh-spawn.
+ * b.ecw — which object each terminal branch keys on. AD probes the claude
+ * PROCESS; CSCB's `_hasTmuxSession` probes the TMUX SESSION. A lingering tmux
+ * shell with a dead claude process would flip the two verdicts, so the choice
+ * is made per branch (requires AD ≥ 0.8.0 / b.93m Part E — degraded-mode guard
+ * removed, findMissing verdicts per-row and evidence-based):
+ *   - ended/missing branch: keys on the claude process. `ended` means
+ *     SessionEnd fired (process exited); `missing` after the up-front sweep is
+ *     an evidence-based verdict that the process is provably gone. Returns
+ *     'dead-session' directly — no tmux probe. A dead process in a live tmux
+ *     shell is a dead bot; the resume/fresh-spawn path's b.vub self-heal reaps
+ *     the orphan tmux session.
+ *   - timeout branch: keys on the claude process via a FRESH findMissing sweep
+ *     (the 10s memo has long expired at the 10-minute deadline) + one status
+ *     call. A process mid-long-turn stays 'ok' (the b.rmy/b.3ce long-turn
+ *     guard, now keyed on the process); only a provably-gone process returns
+ *     'dead-session'. On ErrSpawnNotFound or any other status error it falls
+ *     back to the raw tmux probe so an AD outage can't manufacture a false
+ *     'dead-session' (b.rmy invariant).
+ *   - ErrSpawnNotFound branch: keys on the TMUX SESSION by design — no AD row
+ *     exists, so there is nothing to reconcile or consult (b.c3o).
  */
 export async function waitForWaitingAndReconnect(
   channelId: string,
@@ -742,14 +785,15 @@ export async function waitForWaitingAndReconnect(
 
   // b.m4r: a bot killed mid-turn never fires SessionEnd, so its AD row freezes
   // at `working`. Without a reconcile, the poll below spins on `status` for the
-  // full 10-minute window before the timeout tmux probe finally decides — the
-  // channel stays down that whole time. Run AD's per-row, evidence-based
-  // findMissing sweep ONCE up front (agent-director plan b.93m, t1.93m.hp:
-  // degraded-mode guard removed, shipped ≥ 0.8.0). A genuinely-dead row
-  // reconciles to `missing`, so the FIRST status poll below hits the
-  // ended/missing tmux-confirm branch and returns 'dead-session' in seconds; a
-  // genuinely-alive long-turn row is untouched by the evidence-based sweep and
-  // keeps today's polling behavior (b.rmy long-turn guard preserved). Prefer
+  // full 10-minute window before the timeout branch's sweep + status finally
+  // decides — the channel stays down that whole time. Run AD's per-row,
+  // evidence-based findMissing sweep ONCE up front (agent-director plan b.93m,
+  // t1.93m.hp: degraded-mode guard removed, shipped ≥ 0.8.0). A genuinely-dead
+  // row reconciles to `missing`, so the FIRST status poll below hits the
+  // ended/missing branch and returns 'dead-session' directly in seconds (b.ecw:
+  // process-keyed, no tmux probe); a genuinely-alive long-turn row is untouched
+  // by the evidence-based sweep and keeps today's polling behavior (b.rmy
+  // long-turn guard preserved). Prefer
   // AD's findMissing verb over a CSCB-side tmux reconcile per
   // docs/engineering-guide.md ("Avoiding Duplicated Effort"), mirroring
   // resumeOrFreshSpawn's reconcileMissingFirst branch. On any findMissing
@@ -765,7 +809,8 @@ export async function waitForWaitingAndReconnect(
       if (err instanceof ErrSpawnNotFound) {
         // b.c3o: spawn-not-found means the AD row is gone — same class as
         // `missing`. Only the tmux session's actual existence decides the
-        // verdict, mirroring the timeout branch below.
+        // verdict, mirroring the timeout branch's own ErrSpawnNotFound
+        // sub-branch below.
         if (await _hasTmuxSession(sessionName)) {
           console.error(`[slack] waitForWaitingAndReconnect: spawn not found for channel=${channelId} but tmux session alive — aborting poll (health-check will handle)`)
           return 'ok'
@@ -791,16 +836,19 @@ export async function waitForWaitingAndReconnect(
       continue
     }
 
-    // b.c3o: only genuinely-terminal states (`ended`/`missing`) may be judged
-    // dead, and even then only after the tmux probe confirms the session is
-    // gone — a live session in a transient state (ask_user, check_permission,
-    // pending) must NOT be recovered as if dead.
+    // b.ecw: post-b.93m (AD ≥ 0.8.0) this branch keys on the claude PROCESS,
+    // not the tmux session. `ended` means SessionEnd fired (the process
+    // exited); `missing` — after the up-front reconcileMissingSweep — is an
+    // evidence-based verdict that the process was probed and is provably gone.
+    // Either way the bot is dead, so return 'dead-session' directly with no
+    // tmux probe. A dead claude process in a lingering tmux shell is still a
+    // dead bot; routing it to resumeOrFreshSpawn lets b.vub's
+    // selfHealTmuxCollisionAndRespawn reap the orphan tmux session on
+    // ErrTmuxSessionCreate. (The old tmux-alive → 'ok' behavior deferred a dead
+    // channel to the health-check for minutes.) Live transient states
+    // (ask_user, check_permission, pending) still fall through to 'ok' below.
     if (state === 'ended' || state === 'missing') {
-      if (await _hasTmuxSession(sessionName)) {
-        console.error(`[slack] waitForWaitingAndReconnect: channel=${channelId} transitioned to state=${state} but tmux session alive — aborting (health-check will handle)`)
-        return 'ok'
-      }
-      console.error(`[slack] waitForWaitingAndReconnect: channel=${channelId} transitioned to state=${state} and tmux session "${sessionName}" is gone — dead session`)
+      console.error(`[slack] waitForWaitingAndReconnect: channel=${channelId} transitioned to state=${state} (claude process gone) — dead session`)
       return 'dead-session'
     }
 
@@ -808,18 +856,50 @@ export async function waitForWaitingAndReconnect(
     return 'ok'
   }
 
-  // b.3ce: timed out — only the tmux session's actual existence decides the
-  // verdict. A live session that is merely mid-long-turn must stay 'ok'.
-  if (await _hasTmuxSession(sessionName)) {
+  // b.ecw: timed out — key on the claude PROCESS via AD, not the raw tmux
+  // session. The up-front sweep's 10s memo has long expired at the 10-minute
+  // deadline, so run a FRESH reconcileMissingSweep (a real whole-store
+  // findMissing) to reconcile a row frozen at `working`, then one status call.
+  // - ended/missing → the process is provably gone → 'dead-session'.
+  // - any live state (working/waiting/ask_user/check_permission/pending) → a
+  //   process merely mid-long-turn stays 'ok' (b.rmy/b.3ce long-turn guard,
+  //   now keyed on the process rather than the tmux session).
+  // - ErrSpawnNotFound → the AD row is gone and AD has nothing to say, so fall
+  //   back to the tmux session (the only object left to key on), exactly like
+  //   the poll loop's ErrSpawnNotFound branch: alive → 'ok', gone →
+  //   'dead-session'.
+  // - any other status error → fall back to the raw tmux probe (today's
+  //   verdict) so an AD outage can't manufacture a false 'dead-session' — the
+  //   b.rmy invariant that only a provably-gone session may go 'dead-session'.
+  await reconcileMissingSweep(channelId, 'waitForWaitingAndReconnect: timeout')
+  let timeoutState: string
+  try {
+    const r = await withOutageDetection(channelId, undefined, (client) => client.status({ claude_instance_id }))
+    timeoutState = r.state
+  } catch (err) {
+    if (err instanceof ErrSpawnNotFound) {
+      return tmuxFallbackVerdict(sessionName, channelId, 'spawn not found')
+    }
+    // Any other status error — including ErrSystemInstallDisappeared /
+    // ErrTmuxNotAvailable, which the poll loop returns 'failed' for. At the
+    // timeout deadline a probe-based verdict is deliberately preferred: it's
+    // safe (probe-alive → 'ok' preserves the b.rmy invariant that only a
+    // provably-gone session goes 'dead-session') and simpler than propagating
+    // 'failed' through here.
+    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('status', 'UnknownError', String(err))
+    return tmuxFallbackVerdict(sessionName, channelId, `status error ${e.errName}`)
+  }
+
+  if (timeoutState === 'ended' || timeoutState === 'missing') {
     console.error(
-      `[slack] reconnect: gave up waiting for channel=${channelId} after ${_waitForWaitingTimeoutMs}ms — tmux session alive, health-check will retry`,
+      `[slack] waitForWaitingAndReconnect: timed out for channel=${channelId} after ${_waitForWaitingTimeoutMs}ms — claude process state=${timeoutState} (gone) — dead session`,
     )
-    return 'ok'
+    return 'dead-session'
   }
   console.error(
-    `[slack] waitForWaitingAndReconnect: timed out for channel=${channelId} after ${_waitForWaitingTimeoutMs}ms and tmux session "${sessionName}" is gone — dead session`,
+    `[slack] reconnect: gave up waiting for channel=${channelId} after ${_waitForWaitingTimeoutMs}ms — claude process state=${timeoutState} (alive), health-check will retry`,
   )
-  return 'dead-session'
+  return 'ok'
 }
 
 // ---------------------------------------------------------------------------
@@ -1292,11 +1372,12 @@ export async function spawnForRoute(
   }
 
   if (state === 'working') {
-    // b.rmy/b.3ce: same outcome propagation and dead-session recovery as the
-    // `waiting` branch. waitForWaitingAndReconnect returns 'ok' on live
-    // transient transitions and whenever the tmux session is verifiably alive
-    // (long turns aren't errors); 'dead-session' when the session is gone
-    // (timeout, ended/missing transition, or spawn-not-found — b.3ce/b.c3o).
+    // b.rmy/b.3ce/b.ecw: same outcome propagation and dead-session recovery as
+    // the `waiting` branch. waitForWaitingAndReconnect returns 'ok' on live
+    // transient transitions and whenever the claude PROCESS is verifiably alive
+    // (a long turn isn't an error); 'dead-session' when the process is provably
+    // gone (ended/missing, or the timeout sweep + status verdict — b.ecw) or the
+    // tmux session provably doesn't exist (spawn-not-found — b.c3o).
     const outcome = await waitForWaitingAndReconnect(channelId, routingConfig, web)
     if (outcome === 'dead-session') {
       console.error(`[slack] spawnForRoute: dead tmux session for channel=${channelId} (state=working) — recovering via resume/fresh-spawn`)

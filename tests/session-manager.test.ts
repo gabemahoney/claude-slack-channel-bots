@@ -647,7 +647,11 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
 // ---------------------------------------------------------------------------
 
 describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session recovery', () => {
-  test('timeout with tmux session alive → ok (long turns are not errors — regression guard)', async () => {
+  // b.ecw: the timeout branch now keys on the claude PROCESS via a fresh
+  // findMissing sweep + one status call, NOT the raw tmux probe. A process
+  // merely mid-long-turn reports a live state and stays 'ok' — the tmux prober
+  // is never consulted on the happy/live path.
+  test('timeout with claude process alive (status working) → ok, tmux NOT probed (long turns are not errors — regression guard)', async () => {
     _setWaitForWaitingTimeoutMs(30)
     const probed: string[] = []
     _setTmuxSessionProber(async (name) => { probed.push(name); return true })
@@ -655,37 +659,116 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     installStub({
       findMissingCalls,
       findMissingResult: cannedFindMissing(), // b.m4r: empty sweep — a genuinely-alive long-turn row is untouched
-      statusResult: { state: 'working' } as import('agent-director').StatusResult, // frozen mid-long-turn
+      statusResult: { state: 'working' } as import('agent-director').StatusResult, // process mid-long-turn
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
     expect(result).toBe('ok')
-    expect(probed).toEqual([tmuxSessionNameFor('C', undefined)])
-    // b.m4r: the up-front sweep runs once and, returning empty, does not disturb
-    // the long-turn path — status stays `working`, the timeout probe decides.
+    // b.ecw: the live-status verdict is authoritative — the raw tmux probe is
+    // NOT called on this path.
+    expect(probed).toEqual([])
     expect(findMissingCalls).toHaveLength(1)
   })
 
-  test('timeout with tmux session gone → dead-session', async () => {
+  // b.ecw: at the 10-minute deadline the 10s memo has expired, so a FRESH
+  // whole-store findMissing sweep fires before the timeout status call. TTL=0
+  // forces the memo to expire so the second (timeout) sweep is observable.
+  test('timeout fires a FRESH findMissing sweep before the timeout status call', async () => {
     _setWaitForWaitingTimeoutMs(30)
+    _setFindMissingMemoTtlMs(0) // memo expired by the deadline → timeout re-sweeps
     _setTmuxSessionProber(async () => false)
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
     installStub({
-      statusResult: { state: 'working' } as import('agent-director').StatusResult, // DB row frozen post-reboot
+      findMissingCalls,
+      findMissingResult: cannedFindMissing(),
+      statusResult: { state: 'working' } as import('agent-director').StatusResult, // stays live → up-front sweep does not short-circuit the loop
+    })
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const result = await waitForWaitingAndReconnect('C', cfg)
+    expect(result).toBe('ok') // status live at timeout → ok
+    // Up-front sweep + fresh timeout sweep = 2 (TTL=0 defeats memo reuse).
+    expect(findMissingCalls).toHaveLength(2)
+  })
+
+  // b.ecw: the timeout status reports the process is gone (`missing`) → provably
+  // dead → 'dead-session', with NO tmux probe. The poll loop stays `working`
+  // (frozen mid-turn) until the deadline; only the timeout status flips to
+  // `missing`, so the timeout branch (not the ended/missing loop branch) decides.
+  test('timeout with claude process gone (status missing at deadline) → dead-session, tmux NOT probed', async () => {
+    _setWaitForWaitingTimeoutMs(30)
+    _setFindMissingMemoTtlMs(0) // memo expired by the deadline → the timeout re-sweeps
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return true }) // even an "alive" tmux shell must not save a dead process
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    installStub({
+      findMissingCalls,
+      findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
+      // Poll loop (after the up-front sweep, findMissingCalls===1) still sees a
+      // frozen `working`; only after the FRESH timeout sweep (findMissingCalls===2)
+      // does the row reconcile to `missing`, so the timeout branch decides.
+      statusFn: () =>
+        ({ state: findMissingCalls.length >= 2 ? 'missing' : 'working' }) as import('agent-director').StatusResult,
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
     expect(result).toBe('dead-session')
+    expect(probed).toEqual([]) // process verdict is authoritative; tmux never consulted
   })
 
-  test('spawnForRoute working branch: timeout + dead session → resume recovery instead of reconnected', async () => {
+  // b.ecw: at the TIMEOUT CALL AD reports a status error — either ErrSpawnNotFound
+  // (no row to reconcile) or any other status error (an AD outage at the deadline).
+  // Either way CSCB must NOT manufacture a verdict from the AD gap; it falls back
+  // to the raw tmux probe (b.rmy invariant): tmux gone → dead-session, tmux alive
+  // → ok. The poll loop stays `working` and exits on the deadline; only the timeout
+  // status call throws (TTL=0 makes the timeout sweep bump findMissingCalls to 2,
+  // which flips statusFn into its error branch).
+  test.each([
+    ['ErrSpawnNotFound', () => errSpawnNotFound(), false, 'dead-session'],
+    ['ErrSpawnNotFound', () => errSpawnNotFound(), true, 'ok'],
+    ['generic status error', () => errGeneric('status', 'ErrTimeout'), true, 'ok'],
+    ['generic status error', () => errGeneric('status', 'ErrTimeout'), false, 'dead-session'],
+  ] as const)(
+    'timeout with %s + tmux %s → %s (tmux fallback)',
+    async (_label, errorFactory, tmuxAlive, expected) => {
+      _setWaitForWaitingTimeoutMs(30)
+      _setFindMissingMemoTtlMs(0)
+      const probed: string[] = []
+      _setTmuxSessionProber(async (name) => { probed.push(name); return tmuxAlive })
+      const findMissingCalls: import('agent-director').FindMissingParams[] = []
+      installStub({
+        findMissingCalls,
+        findMissingResult: cannedFindMissing(),
+        statusFn: () =>
+          findMissingCalls.length >= 2
+            ? errorFactory()
+            : ({ state: 'working' } as import('agent-director').StatusResult),
+      })
+      const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+      const result = await waitForWaitingAndReconnect('C', cfg)
+      expect(result).toBe(expected)
+      expect(probed).toEqual([tmuxSessionNameFor('C', undefined)]) // fell back to tmux
+    },
+  )
+
+  // b.ecw: the poll loop's ended/missing branch aborts early. `statusFn` flips to
+  // `missing` on the FIRST poll after the up-front sweep (findMissingCalls >= 1),
+  // so waitForWaitingAndReconnect returns dead-session from the loop branch WITHOUT
+  // ever reaching the deadline — the timeout branch never runs. spawnForRoute then
+  // drives the dead-session recovery (findMissing-before-resume → resume).
+  test('spawnForRoute working branch: loop ended/missing early-abort → dead-session → resume recovery', async () => {
     _setWaitForWaitingTimeoutMs(30)
-    _setTmuxSessionProber(async () => false)
     _setTmuxServerEnsurer(async () => {})
     const resumeCalls: import('agent-director').ResumeParams[] = []
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
     installStub({
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working' }),
-      statusResult: { state: 'working' } as import('agent-director').StatusResult,
+      // Up-front sweep reconciles the frozen row; the first poll then sees `missing`,
+      // so the loop's ended/missing branch returns dead-session before the deadline.
+      findMissingCalls,
+      findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
+      statusFn: () =>
+        ({ state: findMissingCalls.length >= 1 ? 'missing' : 'working' }) as import('agent-director').StatusResult,
       resumeCalls,
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
@@ -696,7 +779,10 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
 
   test('spawnForRoute working branch: timeout + session alive → reconnected (no kill/resume/spawn)', async () => {
     _setWaitForWaitingTimeoutMs(30)
-    _setTmuxSessionProber(async () => true)
+    // The timeout live path decides on the fresh status call alone and never
+    // consults tmux; capture the prober to prove it is not called.
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return true })
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
     const spawnCalls: import('agent-director').SpawnParams[] = []
@@ -714,6 +800,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(resumeCalls).toHaveLength(0)
     expect(killCalls).toHaveLength(0)
     expect(spawnCalls).toHaveLength(1) // only the initial colliding spawn
+    expect(probed).toEqual([]) // live timeout verdict never consults tmux
   })
 })
 
@@ -761,10 +848,13 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
   })
 
   // Drive the WORKING-branch dead-session verdict: waitForWaitingAndReconnect
-  // times out with the tmux session gone (prober false).
+  // times out and the timeout status reports the claude process gone (b.ecw —
+  // the timeout branch now keys on the process via a fresh findMissing sweep +
+  // status, not the raw tmux probe). TTL=0 makes the timeout sweep observable
+  // and lets the reconciled `missing` verdict flip in.
   test('working dead-session: findMissing runs (sweep + reconcile) BEFORE resume → resumed', async () => {
     _setWaitForWaitingTimeoutMs(30)
-    _setTmuxSessionProber(async () => false)
+    _setFindMissingMemoTtlMs(0)
     _setTmuxServerEnsurer(async () => {})
     const callLog: string[] = []
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
@@ -775,18 +865,20 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
       resumeCalls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working' }),
-      statusResult: { state: 'working' } as import('agent-director').StatusResult,
+      // Poll loop stays `working`; only after the fresh timeout sweep does the
+      // row reconcile to `missing` → dead-session → resume recovery.
+      statusFn: () =>
+        ({ state: findMissingCalls.length >= 2 ? 'missing' : 'working' }) as import('agent-director').StatusResult,
       findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
     const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
     expect(result.action).toBe('resumed')
-    // b.m4r: waitForWaitingAndReconnect runs an up-front findMissing sweep before
-    // the poll loop; resumeOrFreshSpawn then calls reconcileMissingFirst. Both go
-    // through the shared reconcileMissingSweep helper, whose 10s-TTL memo means
-    // the second caller reuses the first sweep's result — so exactly ONE actual
-    // client.findMissing({}) fires on this path, and it precedes resume.
-    expect(findMissingCalls).toHaveLength(1)
+    // findMissing fires and precedes resume. (With TTL=0 the up-front sweep, the
+    // timeout sweep, and resumeOrFreshSpawn's reconcileMissingFirst each sweep,
+    // so the count is >1; the ordering assertion is what matters here.)
+    expect(findMissingCalls.length).toBeGreaterThanOrEqual(1)
+    expect(findMissingCalls[0]).toEqual({})
     expect(resumeCalls).toHaveLength(1)
     expect(callLog.indexOf('findMissing')).toBeGreaterThanOrEqual(0)
     expect(callLog.indexOf('findMissing')).toBeLessThan(callLog.indexOf('resume'))
@@ -1061,27 +1153,31 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
 // ---------------------------------------------------------------------------
 
 describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () => {
-  test('transition to missing + tmux gone → dead-session', async () => {
-    _setTmuxSessionProber(async () => false)
+  // b.ecw: the ended/missing loop branch now keys on the claude PROCESS. After
+  // the up-front evidence-based sweep, `missing`/`ended` is a provably-gone
+  // process → 'dead-session' DIRECTLY, with NO raw tmux probe. The tmux prober
+  // is stubbed here to blow up if touched.
+  test.each([
+    ['missing'],
+    ['ended'],
+  ])('transition to %s → dead-session directly, tmux NOT probed', async (state) => {
+    const probed: string[] = []
+    _setTmuxSessionProber(async (name) => { probed.push(name); return false })
     installStub({
-      statusResult: { state: 'missing' } as import('agent-director').StatusResult,
+      statusResult: { state } as import('agent-director').StatusResult,
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
     expect(result).toBe('dead-session')
+    expect(probed).toEqual([]) // process verdict is authoritative — no tmux probe
   })
 
-  test('transition to ended + tmux gone → dead-session', async () => {
-    _setTmuxSessionProber(async () => false)
-    installStub({
-      statusResult: { state: 'ended' } as import('agent-director').StatusResult,
-    })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
-    const result = await waitForWaitingAndReconnect('C', cfg)
-    expect(result).toBe('dead-session')
-  })
-
-  test('transition to missing + tmux alive → ok (probe decides, not the DB row)', async () => {
+  // b.ecw REGRESSION GUARD — FAILS on main's old code, PASSES with the fix.
+  // Pre-fix, an ended/missing row with a *live* tmux shell returned 'ok' (the
+  // tmux probe overruled the DB row). Post-fix a dead claude process in a
+  // lingering tmux shell is a dead bot: 'dead-session', and the tmux prober is
+  // NEVER called in this branch.
+  test('transition to missing + tmux ALIVE → dead-session (process gone overrules a lingering tmux shell)', async () => {
     const probed: string[] = []
     _setTmuxSessionProber(async (name) => { probed.push(name); return true })
     installStub({
@@ -1089,8 +1185,8 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
     })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
-    expect(result).toBe('ok')
-    expect(probed).toEqual([tmuxSessionNameFor('C', undefined)])
+    expect(result).toBe('dead-session')
+    expect(probed).toEqual([]) // the ended/missing branch no longer probes tmux
   })
 
   test('transition to live transient state (ask_user) → ok without probing or recovery (regression guard)', async () => {
