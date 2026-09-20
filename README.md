@@ -608,7 +608,7 @@ Note this covers only `server.log` / `clean_restart.log`. `startup-errors.log` a
 
 ## Startup errors
 
-CSCB writes fatal startup errors to `~/.claude/channels/slack/startup-errors.log` (override the directory with `SLACK_STATE_DIR`) in addition to stderr. Each entry is a single timestamped line. The file is append-only and never rotated by CSCB — copy `docs/logrotate-startup-errors.conf` into `/etc/logrotate.d/` if you want host-level rotation.
+CSCB writes startup errors to `~/.claude/channels/slack/startup-errors.log` (override the directory with `SLACK_STATE_DIR`) in addition to stderr. Each entry is a single timestamped line. The file is append-only and never rotated by CSCB — copy `docs/logrotate-startup-errors.conf` into `/etc/logrotate.d/` if you want host-level rotation. Most classes below are fatal (the process exits non-zero); the JSONL-persistence warnings at the end are non-fatal and do not block startup.
 
 Classes you may see:
 
@@ -625,6 +625,13 @@ Classes you may see:
 - `ad-same-user` — `~/.agent-director/state.db` is owned by a different UID than the CSCB process. Reinstall agent-director as the correct user or remove the mismatched file.
 - `ad-same-user-stat` — Non-ENOENT stat error on the state DB (permissions, I/O). Investigate the file before re-launching.
 - `ad-template-install` — `client.makeTemplate(...)` rejected the boot-time refresh of the `slack-channel-bot` template. The line includes the agent-director `errName`.
+
+The following four classes are **non-fatal warnings** written by the JSONL-persistence safeguard, which runs before the resume path to warn about impending conversation-memory loss. They are recorded to the same log but never exit the process or block startup:
+
+- `jsonl-non-persistent` — a session-transcript storage root (`<claude_config_dir>/projects`) is on a `tmpfs`/`ramfs` mount, so nothing there survives a reboot and session resume is structurally impossible on this host. A warning is also posted to the affected channels — those whose transcript storage root is the flagged mount, not every routed channel. Move the config dir to a persistent filesystem.
+- `jsonl-persistence-check-warning` — the safeguard could not determine the filesystem type of a transcript storage root (unreadable/unparseable `/proc/self/mountinfo`, or an unresolvable path), so persistence is unverified. No Slack post is made. Investigate the mount before relying on resume.
+- `jsonl-transcript-stale-path` — a channel's saved transcript exists on disk at the resolved fallback path, but agent-director's recorded `jsonl_path` points elsewhere (missing/empty). On the next restart the resume path would treat it as missing and wipe the channel's memory. A warning is posted to that channel; an operator should reconcile the path before restarting.
+- `jsonl-transcript-lost` — a channel's transcript is gone from disk (neither the recorded nor the fallback path exists), yet the message archive shows messages in that channel since the bot spawned. Conversation history has been lost and resume will start the bot fresh. A warning is posted to that channel. Requires `message_archive_db` to be configured for the archive evidence.
 
 ---
 

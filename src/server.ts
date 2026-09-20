@@ -62,6 +62,7 @@ import {
   handlePermissionClick,
 } from './permission-click-handler.ts'
 import { trustBootstrap } from './trust-bootstrap.ts'
+import { runJsonlPersistenceSafeguard } from './jsonl-persistence-check.ts'
 import { stopHookBootstrap } from './stop-hook-bootstrap.ts'
 import { startPermissionPoller, stopPermissionPoller } from './permission-poller.ts'
 import {
@@ -1320,6 +1321,20 @@ export async function main(): Promise<void> {
   // both real and dry-run modes (config-file patch, not a session operation).
   if (routingConfig) {
     await trustBootstrap(routingConfig)
+  }
+
+  // b.zak: preventative JSONL-persistence safeguard. Detect non-persistent
+  // storage roots (Layer 1) and channels whose transcript would be treated as
+  // missing on resume (Layer 2) and say so LOUDLY, BEFORE startupSessionManager
+  // runs the resume path that silently deletes+fresh-spawns on ErrJsonlMissing.
+  // Awaited but wrapped so a rejection can never kill startup; dry-run passes
+  // undefined web to suppress Slack posts (same pattern as startupSessionManager).
+  if (routingConfig) {
+    try {
+      await runJsonlPersistenceSafeguard(routingConfig, isDryRun() ? undefined : web)
+    } catch (err) {
+      console.error('[slack] Warning: jsonl-persistence safeguard failed — continuing:', err)
+    }
   }
 
   // b.osj: install (or remove) the CSCB-managed Stop hook in each effective
