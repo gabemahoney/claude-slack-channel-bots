@@ -7,6 +7,20 @@
  * SPDX-License-Identifier: MIT
  */
 
+import {
+  recordFailure,
+  recordSuccess,
+  nextBackoffDelay,
+  shouldNotifyCap,
+} from './backoff.ts'
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Consecutive-failure cap before onCapReached fires and restarts stop. */
+export const RESTART_FAILURE_CAP = 5
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -15,11 +29,29 @@ export interface RestartDeps {
   isSessionAlive(channelId: string): Promise<boolean>
   /** Check if the session already has a live MCP connection in the registry. */
   isSessionConnected(channelId: string): boolean
-  reconnectSession(channelId: string): Promise<void>
+  /**
+   * Attempt to reconnect the MCP session. Returns a discriminated result so
+   * restart.ts can call recordSuccess on the 'success' path.
+   *
+   * The return type is widened from void: the server.ts adapter already
+   * computes reconnectMcp's ReconnectMcpResult union internally and now
+   * surfaces it here so restart.ts has a success signal (SR-25.1).
+   *
+   * Returning void (e.g. from a reconnect that throws and is caught by the
+   * adapter) is treated as non-success — no recordSuccess, no recordFailure
+   * (see comment below on why failure is NOT counted here).
+   */
+  reconnectSession(channelId: string): Promise<'success' | 'escalate-dead' | 'transient' | void>
   killSession(channelId: string): Promise<void>
   launchSession(channelId: string, cwd: string, sessionId?: string): Promise<boolean>
   getRestartDelay(): number
   isShuttingDown(): boolean
+  /**
+   * Called exactly once per cap episode when consecutive failures reach the
+   * cap (RESTART_FAILURE_CAP). After this fires, scheduleRestart stops
+   * queuing new timers for this channel until recordSuccess clears the latch.
+   */
+  onCapReached(channelId: string): void
 }
 
 // ---------------------------------------------------------------------------
@@ -48,11 +80,16 @@ export function scheduleRestart(channelId: string, cwd: string, sessionId?: stri
     return
   }
 
-  const delay = deps.getRestartDelay()
-  if (delay === 0) {
+  const baseDelay = deps.getRestartDelay()
+  if (baseDelay === 0) {
     console.error(`[slack] Auto-restart disabled (delay=0) — skipping restart for channel=${channelId}`)
     return
   }
+
+  // Compute exponential backoff delay from the pre-failure count (SR-25.2).
+  // nextBackoffDelay reads the CURRENT count (before this attempt's failure is
+  // recorded) so the first failure uses base*2^0 = base, the second base*2^1, etc.
+  const delay = nextBackoffDelay(channelId, baseDelay)
 
   // Cancel any existing timer for this channel
   const existing = pendingRestartTimers.get(channelId)
@@ -61,7 +98,7 @@ export function scheduleRestart(channelId: string, cwd: string, sessionId?: stri
     pendingRestartTimers.delete(channelId)
   }
 
-  console.error(`[slack] Scheduling restart for channel=${channelId} in ${delay}s`)
+  console.error(`[slack] Scheduling restart for channel=${channelId} in ${delay}s (backoff)`)
 
   const timer = setTimeout(async () => {
     pendingRestartTimers.delete(channelId)
@@ -91,11 +128,25 @@ export function scheduleRestart(channelId: string, cwd: string, sessionId?: stri
           return
         }
         console.error(`[slack] Session alive but disconnected — reconnecting MCP for channel=${channelId}`)
+        let reconnectResult: 'success' | 'escalate-dead' | 'transient' | void
         try {
-          await deps.reconnectSession(channelId)
+          reconnectResult = await deps.reconnectSession(channelId)
         } catch (err) {
           console.error(`[slack] restart: reconnectSession failed for channel=${channelId}:`, err)
+          reconnectResult = undefined
         }
+
+        if (reconnectResult === 'success') {
+          // Reconnect succeeded — reset the failure counter and cap latch.
+          recordSuccess(channelId)
+        }
+        // Non-success/non-void branches ('escalate-dead', 'transient', or undefined):
+        // do NOT recordFailure here. SR-25.1 / single counting site: counting
+        // lives only at the launchSession boolean below. 'escalate-dead' is
+        // currently a no-op — nothing re-enters scheduleRestart on that outcome,
+        // so restart.ts simply returns and recovery waits for a future health
+        // tick or a server restart. Not counting here keeps the failure count
+        // tied to actual launch attempts rather than a non-launch reconnect site.
         return
       }
 
@@ -114,8 +165,26 @@ export function scheduleRestart(channelId: string, cwd: string, sessionId?: stri
         ok = false
       }
 
-      if (!ok) {
+      if (ok) {
+        // Successful launch — reset consecutive-failure counter and cap latch.
+        recordSuccess(channelId)
+      } else {
+        // Launch failed — increment the failure counter (SINGLE COUNTING SITE:
+        // SR-25.1; counting happens only here at the launchSession boolean).
+        recordFailure(channelId)
         console.error(`[slack] Session relaunch failed for channel=${channelId}`)
+
+        // Once-per-episode cap notification: fires exactly once when the failure
+        // count reaches RESTART_FAILURE_CAP. Subsequent calls return false (latched).
+        if (shouldNotifyCap(channelId, RESTART_FAILURE_CAP)) {
+          console.error(`[slack] Cap reached for channel=${channelId} — notifying and stopping restarts`)
+          deps.onCapReached(channelId)
+          // Do NOT schedule another timer — the channel is capped. The
+          // activeLaunches entry is removed in the finally block below.
+          // The tick guard (isAtCap in health-check.ts) prevents future ticks
+          // from re-scheduling while capped (SR-25.3/25.4).
+          return
+        }
       }
     } finally {
       activeLaunches.delete(channelId)

@@ -46,6 +46,7 @@ import {
   ErrTmuxNotAvailable,
   ErrCwdNotFound,
   ErrCwdNotADirectory,
+  ErrSpawnCapReached,
 } from './agent-director-errors.ts'
 import { recordStartupError } from './startup-errors.ts'
 import { isDryRun } from './tokens.ts'
@@ -172,6 +173,7 @@ export function postSpawnFailureToChannel(
 function remediationHint(error: AgentDirectorError): string {
   if (error instanceof ErrInstanceIdCollision) return 'spawn dispatcher bug — please report'
   if (error instanceof ErrSpawnNotFound) return 'transient — restarting the server should resolve'
+  if (error instanceof ErrSpawnCapReached) return 'restart the server to retry — automatic restarts are suspended for this channel'
   return 'Check server.log for details.'
 }
 

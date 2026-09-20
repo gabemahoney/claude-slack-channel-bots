@@ -35,8 +35,27 @@
  * own pause timeout via CSCB-side polling and never relies on the library's
  * pause budget, so the class never reaches a CSCB handler.
  *
+ * CSCB-synthetic subclasses (NOT emitted by the agent-director library — minted
+ * inside CSCB and dispatched through the same instanceof-branching convention so
+ * SR-0.2 holds for them too):
+ *   - ErrSpawnCapReached        (restart backoff / consecutive-failure cap latch)
+ *
  * SPDX-License-Identifier: MIT
  */
+
+import { AgentDirectorError } from 'agent-director'
+
+/**
+ * CSCB-synthetic error — never emitted by the agent-director library. Minted by
+ * the restart backoff cap path (server.ts onCapReached) when a channel hits the
+ * consecutive session-launch failure cap and automatic restarts are suspended.
+ * Branched on via `instanceof` in remediationHint (SR-0.2 — no string matching).
+ */
+export class ErrSpawnCapReached extends AgentDirectorError {
+  constructor(description: string) {
+    super('spawn', 'SpawnCapReached', description)
+  }
+}
 
 export {
   AgentDirectorError,
