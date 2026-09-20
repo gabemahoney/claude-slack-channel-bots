@@ -76,6 +76,7 @@ import {
   type StubClient,
 } from './test-helpers/agent-director-stub.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
+import { openArchiveDatabase } from '../src/message-archive.ts'
 import {
   initOutageState,
   getOutageFlags,
@@ -2667,5 +2668,319 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
     const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, false)
     expect(result.action).toBe('spawned')
     assertAllClear()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.wrb — ErrJsonlMissing amnesia: legible diagnostic + honest startup counters
+//
+// When resume throws ErrJsonlMissing, CSCB still delete+fresh-spawns (policy
+// unchanged), but must now: (1) log which transcript path(s) were tried and
+// their source; (2) classify never-created (quiet, lossless) vs lost
+// (operator-visible) vs unknown (row fetch failed); (3) count the fresh-spawn
+// as its own 'fresh-after-amnesia' bucket instead of folding it into "ok".
+// ---------------------------------------------------------------------------
+
+describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
+  const CH = 'C_WRB'
+  const CWD = '/repo/wrb'
+
+  /**
+   * Redirect startup-errors.log into a temp dir and return a reader. The
+   * 'lost' classification records to startup-errors ONLY when isStartup=true,
+   * so the lost test drives spawnForRoute(..., isStartup=true).
+   */
+  function captureStartupErrors(): () => string {
+    const dir = mkdtempSync(join(tmpdir(), 'cscb-wrb-'))
+    process.env['SLACK_STATE_DIR'] = dir
+    const logPath = join(dir, 'startup-errors.log')
+    return () => (existsSync(logPath) ? readFileSync(logPath, 'utf-8') : '')
+  }
+
+  /** Capture console.error output for the duration of `fn`, then restore. */
+  async function withCapturedErr(fn: () => Promise<void>): Promise<string> {
+    const lines: string[] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+    try {
+      await fn()
+    } finally {
+      console.error = orig
+    }
+    return lines.join('\n')
+  }
+
+  /** Build a temp archive DB holding `count` post-spawn messages for CH. */
+  function makeArchiveWithMessagesSince(startedAt: string, count: number): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cscb-wrb-archive-'))
+    const dbPath = join(dir, 'archive.db')
+    const db = openArchiveDatabase(dbPath)
+    const boundary = Date.parse(startedAt) / 1000
+    const insert = db.query(
+      'INSERT INTO messages (id, channel_id, channel_name, timestamp, sender_id, sender_name, message_text, thread_ts) ' +
+        'VALUES (?, ?, ?, ?, ?, ?, ?, NULL)',
+    )
+    for (let i = 0; i < count; i++) {
+      insert.run(`${CH}:${boundary + 1 + i}:${i}`, CH, '#chan', boundary + 1 + i, 'U1', 'user', 'hi')
+    }
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE);')
+    db.close()
+    return dbPath
+  }
+
+  /**
+   * Install a stub that drives the ErrJsonlMissing amnesia path: a colliding
+   * spawn resolves to an `ended` row, resume rejects with ErrJsonlMissing, then
+   * delete + a fresh spawn succeeds. `getResult` is returned for both the
+   * collision-recovery get and the diagnostic get.
+   */
+  function installAmnesia(opts: {
+    jsonlDescription?: string
+    getResult?: Omit<Parameters<typeof cannedGetResult>[0], 'claude_instance_id'>
+    getError?: Error
+    spawnCalls?: import('agent-director').SpawnParams[]
+    deleteCalls?: import('agent-director').DeleteParams[]
+  }) {
+    return installStub({
+      spawnCalls: opts.spawnCalls,
+      deleteCalls: opts.deleteCalls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+      ],
+      resumeError: errJsonlMissing(opts.jsonlDescription),
+      getResult: opts.getError
+        ? undefined
+        : cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended', ...opts.getResult }),
+      getError: opts.getError,
+    })
+  }
+
+  // --- Regression requirement (designated) --------------------------------
+  // Pre-fix: ErrJsonlMissing → action 'spawned', folded into succeeded/"ok",
+  // and StartupSessionManagerResult had no freshAfterAmnesia field. This test
+  // asserts the dedicated 'fresh-after-amnesia' action AND the separate
+  // freshAfterAmnesia counter — both undefined/wrong pre-fix, so it FAILS pre-fix
+  // and PASSES post-fix. (Verified by inspecting HEAD:src/session-manager.ts,
+  // whose ErrJsonlMissing branch returns { action: 'spawned' } and whose result
+  // shape is { succeeded, failed, perChannel } only.)
+  test('REGRESSION: ErrJsonlMissing fresh-spawn is counted as fresh-after-amnesia, not "ok"', async () => {
+    captureStartupErrors()
+    installAmnesia({
+      getResult: { jsonl_path: '/data/proj/sess-1.jsonl', claude_session_id: 'sess-1', cwd: CWD },
+    })
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+    const result = await startupSessionManager(cfg, { concurrency: 1 })
+
+    expect(result.freshAfterAmnesia).toBe(1)
+    expect(result.freshSpawned).toBe(0)
+    expect(result.resumed).toBe(0)
+    expect(result.failed).toBe(0)
+    // Still counted toward liveness, but distinctly bucketed.
+    expect(result.succeeded).toBe(1)
+    expect(result.perChannel).toEqual([{ channelId: CH, action: 'fresh-after-amnesia' }])
+  })
+
+  // --- Honest counters tallied separately ---------------------------------
+  test('startup counters: resumed / fresh-spawned / fresh-after-amnesia / failed are tallied separately', async () => {
+    captureStartupErrors()
+    let getIdx = 0
+    const stub = installStub({
+      // C1 fresh (clean spawn), C2 collision→resumed, C3 collision→ErrJsonlMissing
+      // amnesia, C4 spawn throws → failed.
+      spawnQueue: [
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C1' }),
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C3' }),
+        cannedErr<import('agent-director').SpawnResult>(errGeneric('spawn', 'ErrSpawnBroken')),
+      ],
+    })
+    // C2 resumes cleanly; C3 resume throws ErrJsonlMissing.
+    stub.resume = async (params) => {
+      if (params.claude_instance_id === 'cscb_C3') throw errJsonlMissing()
+      return { claude_instance_id: params.claude_instance_id }
+    }
+    // Both collision gets return an `ended` row for their own instance id.
+    stub.get = async (params) => {
+      getIdx++
+      return cannedGetResult({ claude_instance_id: params.claude_instance_id, state: 'ended' })
+    }
+    const cfg = makeRoutingConfig({
+      routes: { C1: { cwd: '/x1' }, C2: { cwd: '/x2' }, C3: { cwd: '/x3' }, C4: { cwd: '/x4' } },
+    })
+    let result!: Awaited<ReturnType<typeof startupSessionManager>>
+    const errLog = await withCapturedErr(async () => {
+      result = await startupSessionManager(cfg, { concurrency: 1 })
+    })
+
+    expect(result.freshSpawned).toBe(1) // C1
+    expect(result.resumed).toBe(1) // C2
+    expect(result.freshAfterAmnesia).toBe(1) // C3
+    expect(result.failed).toBe(1) // C4
+    expect(result.succeeded).toBe(3)
+    // C2's collision recovery does one get(); C3's collision recovery plus its
+    // ErrJsonlMissing diagnostic each do one → 3 get() calls total.
+    expect(getIdx).toBe(3)
+
+    // AC 3: the honest summary line reports every bucket separately (never
+    // folding fresh-after-amnesia into a generic "ok"), and — because
+    // freshAfterAmnesia > 0 — the loud grep-friendly follow-up line fires.
+    expect(errLog).toContain(
+      'startupSessionManager: complete — 1 resumed, 1 fresh-spawned, ' +
+        '1 fresh-after-amnesia, 0 reconnected, 0 no-op, 1 failed',
+    )
+    expect(errLog).toContain(
+      '1 channel(s) were fresh-spawned after ErrJsonlMissing',
+    )
+  })
+
+  // --- Message-shape coverage: rich future format -------------------------
+  // AD b.1ba rich enumeration `<source> <path> (<err>)` — the diagnostic must
+  // extract each path AND its source verbatim.
+  test('rich ErrJsonlMissing message: extracts both persisted and fallback paths with sources', async () => {
+    captureStartupErrors()
+    const desc =
+      'no transcript found: persisted /data/proj/sess-1.jsonl (no such file or directory); ' +
+      'fallback /home/u/.claude/projects/-repo-wrb/sess-1.jsonl (no such file or directory)'
+    const log = await withCapturedErr(async () => {
+      installAmnesia({
+        jsonlDescription: desc,
+        getResult: { jsonl_path: '/data/proj/sess-1.jsonl', claude_session_id: 'sess-1', cwd: CWD },
+      })
+      const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+      await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, true)
+    })
+    // Both AD-reported paths, with AD's source tokens, surface in the diagnostic.
+    expect(log).toContain('persisted /data/proj/sess-1.jsonl')
+    expect(log).toContain('fallback /home/u/.claude/projects/-repo-wrb/sess-1.jsonl')
+    // Provenance is honestly attributed to AD, not locally computed.
+    expect(log).toContain('reported by agent-director')
+    expect(log).not.toContain('locally-computed')
+  })
+
+  // --- Message-shape coverage: plain 0.8.0 format -------------------------
+  // Installed AD 0.8.0's ErrJsonlMissing has no enumeration. The diagnostic
+  // must degrade to locally-computed candidates, label them honestly, and never
+  // throw (spawnForRoute still completes the amnesia fresh-spawn).
+  test('plain 0.8.0 ErrJsonlMissing message: degrades to honest locally-computed candidates, no throw', async () => {
+    captureStartupErrors()
+    const log = await withCapturedErr(async () => {
+      installAmnesia({
+        jsonlDescription: 'jsonl missing', // no <source> <path> (<err>) enumeration
+        getResult: { jsonl_path: '/data/proj/sess-2.jsonl', claude_session_id: 'sess-2', cwd: CWD },
+      })
+      const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+      const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, true)
+      // Never throws — the fresh-spawn still happens.
+      expect(result.action).toBe('fresh-after-amnesia')
+    })
+    // Honest provenance clause + locally-computed labels for both persisted
+    // column and config-dir fallback.
+    expect(log).toContain('agent-director gave no path detail')
+    expect(log).toContain('locally-computed(persisted-column) /data/proj/sess-2.jsonl')
+    expect(log).toContain('locally-computed(config-dir fallback)')
+  })
+
+  // --- Classification triad: never-created (quiet) ------------------------
+  // No archived messages since spawn → lossless. Quiet: no startup-error, no
+  // channel post; action still fresh-after-amnesia.
+  test('never-created: 0 archived messages since spawn → quiet (no startup-error, no channel post)', async () => {
+    const readLog = captureStartupErrors()
+    const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 0)
+    const { web, calls } = makeMockWeb()
+    installAmnesia({
+      getResult: {
+        jsonl_path: '/data/proj/sess-3.jsonl',
+        claude_session_id: 'sess-3',
+        cwd: CWD,
+        started_at: '2026-09-20T05:00:00Z',
+      },
+    })
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } }, message_archive_db: dbPath })
+    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, web as never, true)
+
+    expect(result.action).toBe('fresh-after-amnesia')
+    expect(calls).toHaveLength(0) // no channel post
+    expect(readLog()).not.toContain('jsonl-transcript-lost-on-resume') // quiet
+  })
+
+  // --- Classification triad: lost (loud) ----------------------------------
+  // Archived messages > 0 since spawn → real context destroyed. Loud:
+  // recordStartupError('jsonl-transcript-lost-on-resume') + channel post.
+  test('lost: archived messages since spawn > 0 → startup-error recorded + channel post', async () => {
+    const readLog = captureStartupErrors()
+    const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 4)
+    const { web, calls } = makeMockWeb()
+    installAmnesia({
+      getResult: {
+        jsonl_path: '/data/proj/sess-4.jsonl',
+        claude_session_id: 'sess-4',
+        cwd: CWD,
+        started_at: '2026-09-20T05:00:00Z',
+      },
+    })
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } }, message_archive_db: dbPath })
+    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, web as never, true)
+
+    expect(result.action).toBe('fresh-after-amnesia')
+    // Operator-visible: startup-error entry embedding the archived count.
+    const log = readLog()
+    expect(log).toContain('jsonl-transcript-lost-on-resume')
+    expect(log).toContain('4 message(s)')
+    // And a channel post to the affected channel.
+    expect(calls).toHaveLength(1)
+    expect((calls[0][0] as { channel: string }).channel).toBe(CH)
+  })
+
+  // --- Classification triad: unknown (row fetch fails) --------------------
+  // The diagnostic get() rejects → cannot classify. Must not throw; the amnesia
+  // fresh-spawn still completes and is counted.
+  test('unknown: diagnostic row fetch fails → no throw, still fresh-after-amnesia', async () => {
+    captureStartupErrors()
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    // First get() (collision recovery) returns ended; second get() (diagnostic)
+    // rejects. Drive this by flipping the stub's get after the first call.
+    const stub = installStub({
+      spawnCalls,
+      deleteCalls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+      ],
+      resumeError: errJsonlMissing(),
+    })
+    let getCalls = 0
+    stub.get = async (params) => {
+      getCalls++
+      if (getCalls >= 2) throw errGeneric('get', 'ErrSpawnGone')
+      return cannedGetResult({ claude_instance_id: params.claude_instance_id, state: 'ended' })
+    }
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, true)
+
+    expect(result.action).toBe('fresh-after-amnesia')
+    expect(deleteCalls).toHaveLength(1) // delete+fresh policy unchanged
+    expect(spawnCalls).toHaveLength(2)
+    expect(getCalls).toBeGreaterThanOrEqual(2)
+  })
+
+  // --- ErrNoSessionId sibling still 'spawned' (not amnesia) ---------------
+  // Guard: only ErrJsonlMissing routes to fresh-after-amnesia. The ErrNoSessionId
+  // sibling in the same branch keeps the plain 'spawned' action.
+  test('ErrNoSessionId sibling keeps action=spawned (only ErrJsonlMissing is amnesia)', async () => {
+    captureStartupErrors()
+    installStub({
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+      ],
+      getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
+      resumeError: errNoSessionId(),
+    })
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, true)
+    expect(result.action).toBe('spawned')
   })
 })

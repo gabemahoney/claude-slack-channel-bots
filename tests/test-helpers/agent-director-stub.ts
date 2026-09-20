@@ -201,9 +201,17 @@ export function errNoSessionId(): ErrNoSessionId {
   return new ErrNoSessionId('resume', 'ErrNoSessionId', 'no session id available')
 }
 
-/** Build an ErrJsonlMissing (resume / SR-1.3 fall-through). */
-export function errJsonlMissing(): ErrJsonlMissing {
-  return new ErrJsonlMissing('resume', 'ErrJsonlMissing', 'jsonl missing')
+/**
+ * Build an ErrJsonlMissing (resume / SR-1.3 fall-through).
+ *
+ * The optional `description` maps to `errDescription`, the human-readable
+ * detail string AD attaches to the error envelope. b.wrb's diagnostic parses
+ * this for the rich `<source> <path> (<stat error>)` enumeration; pass a plain
+ * string (the installed 0.8.0 shape) to exercise the locally-computed
+ * degradation path.
+ */
+export function errJsonlMissing(description: string = 'jsonl missing'): ErrJsonlMissing {
+  return new ErrJsonlMissing('resume', 'ErrJsonlMissing', description)
 }
 
 /** Build an ErrSpawnNotResumable (resume / SR-1.4 collision-recovery). */
