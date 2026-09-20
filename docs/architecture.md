@@ -82,7 +82,7 @@ CSCB consumes four AD verbs:
 1. `list()` → spawns currently in `check_permission`.
 2. For each spawn, `get()` returns the plural `permission_requests` projection.
 3. Non-conforming response (`permission_requests` is `null` or `undefined`): log + skip processing for that spawn this tick. The spawn's existing live entries are excluded from the closure sweep below (no state mutation — SR-2.1).
-4. For each row in `permission_requests`, compute the composite key. If not in `livePermissions`: post one `chat.postMessage` per row (no coalescing — SR-2.2) and insert one map entry. If already present: no-op (duplicate-tick safe). An empty projection produces no posting activity but does not exclude the spawn's live entries from closure reconciliation.
+4. For each row in `permission_requests`, compute the composite key. If not in `livePermissions`: post one `chat.postMessage` per row (no coalescing — SR-2.2) and insert one map entry. If already present: no-op (duplicate-tick safe). An empty projection produces no posting activity but does not exclude the spawn's live entries from closure reconciliation. An empty projection also feeds the wedge detector (below).
 5. **Set-diff closure reconciliation (SR-2.4):** `tokens_in_livePermissions − tokens_seen_this_tick = newly_closed_tokens` (with non-conforming spawns' entries protected per step 3). For each newly-closed token, call `getPermission(request_token)`. On success, render the verdict (below) via one `chat.update` against `entry.messageTs`, then drop the entry. On `ErrPermissionRequestNotFound`: render generic deny, drop, do not retry. On transient error: leave the entry alive — the next tick retries.
 
 #### Verdict rendering (SR-5)
@@ -110,6 +110,14 @@ The closure `chat.update` produces four visually-distinct surfaces driven by `de
 On a successful decide *and* a live entry present, the handler renders one `chat.update` against just that row's `messageTs` (SR-4.5) carrying text byte-identical to the poller's SR-2.4 verdict surface — `*Permission* — Allowed` for allow, `*Permission* — Denied by operator` for deny — then calls `markHandled`. Matching the verdict text exactly means there is no visible flicker when the next tick's reconciliation lands on the same message. A stale click (no entry in `livePermissions`) still fires the decide call with the decoded token — AD is the source of truth and returns idempotent results — but produces no `chat.update` from the click path; the next tick's verdict rendering handles the message.
 
 The Slack user id is intentionally NOT surfaced in the rendered text. An earlier draft of this design rendered "Allowed by <user>" / "Denied by <user>" as immediate operator feedback, but the SR-2.4 reconciler overwrites the message one tick later with the user-less verdict surface, producing visible flicker for the operator who clicked. The simpler, flicker-free design renders the verdict text on both the click path and the reconciliation path.
+
+#### Wedge detector (b.fae F4)
+
+A spawn can wedge permanently in `check_permission` with an **empty** `permission_requests` array: the underlying incident is a permission decision that AD recorded but could not deliver (the relay hook was killed before AD's poll deadline), leaving Claude Code blocked on a native TUI prompt with no open AD row and no hook that will ever fire again to advance state. To the poller this is a valid conforming response with zero rows, so before b.fae it was a silent no-op every tick — no log, no Slack message, no trail event ("the bot appears dead").
+
+The detector counts consecutive ticks a spawn is observed in `check_permission` with an empty projection. The trip threshold is derived from the poll interval — `wedgeTripTicks(intervalMs) = max(5, ceil(90000 / intervalMs))`, roughly 90 s of wall-clock — because a genuine wedge takes minutes to develop while a normal decided-then-closing spawn passes through the empty state only briefly. The counter is reset **only on a positive observation** that the spawn is not wedged — open rows present, its state changed, or it's confirmed gone via `ErrSpawnNotFound`. A spawn skipped in a tick because of a transient `get` error or a non-conforming response does **not** have its counter reset, so a single flaky AD connection can't silently defer a genuine wedge alarm.
+
+On trip it logs, emits the `cscb.poller.wedge_detected` trail event, and posts a **one-shot** top-level channel warning. Warning delivery is **fail-safe**: the `warningFired` latch is set **only after a successful `chat.postMessage`**. If the post fails, the trail event still records the attempt (`ok:false`) and the poller retries the post on later ticks — throttled to one attempt per `wedgeWarnRetryTicks(intervalMs)` (~30 s of wall-clock, `WEDGE_WARN_RETRY_WALL_CLOCK_MS`) so a Slack outage can't storm the API at the poll interval — until one succeeds, after which the latch sets and the episode posts nothing further. The warning tells the operator to inspect the native prompt with `agent-director read-pane --claude-instance-id <id>` then kill and respawn the session; it explicitly does **not** offer `send-keys`, which AD's relay guard (`pkg/api/sendkeys.go`) hard-rejects while `relay_mode=on && state=check_permission`. The detector re-arms per spawn the moment it leaves the wedged condition (an open row appears, or the spawn disappears from the tick), so a later genuine wedge warns again. State is in-memory (`wedgeStates` map) and resets on daemon restart.
 
 #### Action ID encoding (SR-3)
 
@@ -142,6 +150,14 @@ Three pre-Epic-4 mechanisms have been retired:
 - The single-prompt coalescing of multiple concurrent `tool_use` blocks is gone. N parallel tool_uses → N Slack prompts.
 
 AskUserQuestion is denied at the agent-director template (SR-3.1's `deny: ['AskUserQuestion']`) — the tool is unavailable to every CSCB-spawned bot and the prior `/ask` HTTP route + hook script have been removed.
+
+The template also carries a narrow `allow` list (b.fae) pre-authorizing bot reads of their own persistent-memory directories. The rules are **derived per config** by `deriveMemoryReadAllowRules(routingConfig)` rather than hardcoded. For each route the effective config dir is `route.claude_config_dir ?? routingConfig.claude_config_dir ?? ~/.claude` (via `os.homedir()`) — mirroring the spawn-time `CLAUDE_CONFIG_DIR` resolution in `session-manager.ts` `buildSpawnParams` exactly. The distinct dirs are de-duplicated and sorted, and one rule is emitted per dir:
+
+```
+Read(//<abs-config-dir>/projects/*/memory/**)
+```
+
+So a deployment routing to `~/.claude-infhub` and `~/.claude` yields those two rules, but a single-config or default-only deployment yields just one. Memory-note reads always require confirmation in Claude Code; without this rule they round-trip to a human as a native TUI permission prompt (the prompt class that wedged the relay in b.fae). **The scope is deliberately limited to `projects/*/memory/**` and must not be widened to the config-dir root** — that root holds live credentials (`settings.json` `ANTHROPIC_API_KEY`, `.claude.json` OAuth/token content), so a root-level allow would silently pre-authorize reads of billing credentials. The `//` prefix is Claude Code's absolute-path-from-filesystem-root anchor for Read rules.
 
 ## Session Lifecycle
 
@@ -453,6 +469,17 @@ Fields:
 ```json
 {"ts":"2026-06-04T20:40:02.456Z","event":"cscb.chat_update.attempted","claude_instance_id":"cscb_demo_C0B1ZJJLJ9M","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","channel":"C0B1ZJJLJ9M","message_ts":"1780600244.439969","text":"*Permission* — Allowed","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"*Permission* — Allowed"}}],"verdict_tag":"operator_allow","triggered_by":"poller","ok":true}
 ```
+
+#### `cscb.poller.wedge_detected` (b.fae F4)
+
+Emitted from `postWedgeWarning` in `src/permission-poller.ts` when the wedge detector trips — a spawn seen in `check_permission` with an empty `permission_requests` array for `wedgeTripTicks` consecutive ticks (~90 s). Exactly one **successful** (`ok=true`) event per wedge episode: the `warningFired` latch (set only after a successful post) suppresses further posts until the detector re-arms. A failed post emits an `ok=false` event without latching and the poller retries on a later tick (throttled ~30 s), so an episode with Slack trouble can log several `ok=false` events before the one `ok=true`. The envelope shape mirrors `cscb.chat_post.attempted`: success is trail-only; failure lands in BOTH the trail (`ok=false`) AND `server.log` (`b.emk` convention).
+
+Fields:
+- `ts`, `event="cscb.poller.wedge_detected"`, `claude_instance_id`, `channel`.
+- `text` — the full one-shot warning message posted to the channel (read-pane + kill/respawn remediation; send-keys explicitly not offered).
+- `ok` — `true` on success, `false` on failure.
+- On success: `slack_ts` — the Slack `ts` of the posted warning.
+- On failure: `error` — the Slack platform error class string.
 
 #### `cscb.block_action.received` (SR-V-2.9)
 

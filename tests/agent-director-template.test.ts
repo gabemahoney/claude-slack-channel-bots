@@ -17,8 +17,11 @@
 
 import { describe, test, expect } from 'bun:test'
 
+import * as os from 'node:os'
+
 import {
   buildTemplateParams,
+  deriveMemoryReadAllowRules,
   installSlackChannelBotTemplate,
 } from '../src/agent-director-template.ts'
 import {
@@ -52,6 +55,83 @@ describe('buildTemplateParams (SR-3.1)', () => {
       '/abs/mcp.json',
     ])
     expect(params.extra_env).toBeUndefined()
+  })
+
+  // b.fae F5 (code-review follow-up) — the allow array is DERIVED from the
+  // distinct effective Claude config dirs across all routes (per-route ??
+  // top-level ?? Claude's default `~/.claude`), one memory-scoped Read rule
+  // per dir, sorted + deduped. NEVER the config-dir root (holds live creds).
+  test('allow: default — no config dirs set → exactly the ~/.claude rule from os.homedir() (b.fae F5)', () => {
+    const cfg = makeRoutingConfig({ mcp_config_path: '/abs/mcp.json', system_prompt_mode: 'none' })
+    const params = buildTemplateParams(cfg)
+    // Built from os.homedir(), NOT a hardcoded /home/horde.
+    const expected = `Read(//${os.homedir().replace(/^\/+/, '')}/.claude/projects/*/memory/**)`
+    expect(params.allow).toEqual([expected])
+    // deny surface is unchanged by F5.
+    expect(params.deny).toEqual(['AskUserQuestion'])
+  })
+
+  test('allow: mixed routes (per-route infhub dir + a route with no dir) → both rules, sorted + deduped (b.fae F5)', () => {
+    const cfg = makeRoutingConfig({
+      mcp_config_path: '/abs/mcp.json',
+      system_prompt_mode: 'none',
+      routes: {
+        // Per-route override → infhub memory dir.
+        C_INFHUB: { cwd: '/tmp/a', claude_config_dir: '/home/horde/.claude-infhub' },
+        // No per-route + no top-level → Claude's default ~/.claude.
+        C_DEFAULT: { cwd: '/tmp/b' },
+        // A second route sharing the same infhub dir must NOT add a 3rd rule.
+        C_INFHUB2: { cwd: '/tmp/c', claude_config_dir: '/home/horde/.claude-infhub' },
+      },
+    })
+    const params = buildTemplateParams(cfg)
+    const defaultRule = `Read(//${os.homedir().replace(/^\/+/, '')}/.claude/projects/*/memory/**)`
+    const infhubRule = 'Read(//home/horde/.claude-infhub/projects/*/memory/**)'
+    // Sort is over the DIR paths, not the emitted rule strings: as dirs,
+    // '/home/horde/.claude' < '/home/horde/.claude-infhub' (shorter prefix
+    // first), so the default rule precedes the infhub rule.
+    expect(params.allow).toEqual([defaultRule, infhubRule])
+    // Deduped: three routes, two distinct dirs → two rules.
+    expect(params.allow?.length).toBe(2)
+  })
+
+  test('no allow rule covers a config-dir root (credentials guard, b.fae F5)', () => {
+    const cfg = makeRoutingConfig({
+      mcp_config_path: '/abs/mcp.json',
+      system_prompt_mode: 'none',
+      routes: {
+        C_INFHUB: { cwd: '/tmp/a', claude_config_dir: '/home/horde/.claude-infhub' },
+        C_DEFAULT: { cwd: '/tmp/b' },
+      },
+    })
+    const params = buildTemplateParams(cfg)
+    const allow = params.allow ?? []
+    // The rejected-in-triage broad glob and any bare-root variant must be absent.
+    expect(allow).not.toContain('Read(//home/horde/.claude-infhub/**)')
+    expect(allow).not.toContain('Read(//home/horde/.claude/**)')
+    // Belt-and-suspenders: every rule must reach into projects/*/memory, so no
+    // rule can resolve to the config-dir root, settings.json, or .claude.json.
+    expect(allow.length).toBeGreaterThan(0)
+    for (const rule of allow) {
+      expect(rule.endsWith('/projects/*/memory/**)')).toBe(true)
+    }
+  })
+
+  test('deriveMemoryReadAllowRules: top-level dir applies to routes without a per-route override (b.fae F5)', () => {
+    const cfg = makeRoutingConfig({
+      claude_config_dir: '/opt/shared-config',
+      routes: {
+        C_A: { cwd: '/tmp/a' },
+        C_B: { cwd: '/tmp/b', claude_config_dir: '/home/horde/.claude-infhub' },
+      },
+    })
+    // C_A → top-level /opt/shared-config; C_B → per-route infhub. Two rules.
+    expect(deriveMemoryReadAllowRules(cfg)).toEqual(
+      [
+        'Read(//opt/shared-config/projects/*/memory/**)',
+        'Read(//home/horde/.claude-infhub/projects/*/memory/**)',
+      ].sort(),
+    )
   })
 
   test('appends --append-system-prompt-file when readable', () => {
