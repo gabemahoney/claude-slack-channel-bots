@@ -124,6 +124,15 @@ Before calling `scheduleRestart`, the poller queries two guards from `restart.ts
 
 When neither guard fires and the session is dead, the poller calls `scheduleRestart(channelId, cwd)` — the same function used by the reactive `onsessionclosed` path.
 
+## Avoiding Duplicated Effort with agent-director
+
+agent-director owns spawn liveness, process management, and resume semantics. Before building CSCB-side logic that reimplements or works around any of those, figure out which case you're in:
+
+- **agent-director already does it.** Use its verb (or its typed errors — see `src/agent-director-errors.ts`) instead of building a parallel implementation. Accidental duplication drifts out of sync with agent-director's actual behavior and doubles the maintenance surface.
+- **Genuine capability gap on agent-director's side.** Build the *minimal* workaround CSCB needs, and flag it for removal: note the agent-director plan (or file one) that closes the gap, and reference it in the code comment so the workaround dies when the fix lands.
+
+The precedent to follow is the b.4dk/b.m4r/b.93m/b.ecw chain: agent-director's `find-missing` had a degraded-mode guard that refuses to answer liveness queries right after a reboot, so `src/session-manager.ts` grew a direct `tmux has-session` probe. That was a deliberate, justified hotfix — but it's tracked duplication, expected to shrink once agent-director's own fix (plan b.93m in their repo) lands. Do the same: workaround now, cited exit path, no permanent fork of responsibilities.
+
 ## Async Patterns
 
 - Use `async/await` throughout — no raw Promises except where explicitly holding connections open (e.g., SSE keep-alive streams)
