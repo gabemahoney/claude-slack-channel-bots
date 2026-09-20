@@ -18,6 +18,7 @@ import {
   setOutageFlag,
 } from '../src/outage-state.ts'
 import { _buildStatRouteImpl } from '../src/server.ts'
+import { _resetBackoffState } from '../src/backoff.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -34,6 +35,7 @@ type DepsOpts = {
   isSessionAliveResult?: boolean     // default: false (session is dead)
   isRestartPendingResult?: boolean   // simulates: timer scheduled, not yet fired
   isActiveLaunchingResult?: boolean  // simulates: launchSession actively in progress
+  isAtCapResult?: boolean            // default: false; set true to simulate capped channel
   statRouteResult?: boolean          // default: true (route cwd is reachable)
   statRouteHangs?: boolean           // if true, statRoute never resolves
   isShuttingDownResult?: boolean     // default: false
@@ -62,6 +64,9 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
     isRestartPendingOrActive(_channelId) {
       return (opts.isRestartPendingResult ?? false) || (opts.isActiveLaunchingResult ?? false)
     },
+    isAtCap(_channelId) {
+      return opts.isAtCapResult ?? false
+    },
     statRoute(_cwd) {
       if (opts.statRouteHangs) return new Promise<boolean>(() => {})
       return Promise.resolve(opts.statRouteResult ?? true)
@@ -85,6 +90,7 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
 beforeEach(() => {
   _resetHealthCheckState()
   _resetOutageState()
+  _resetBackoffState()
   // Wire outage-state with no-op Slack emit so setOutageFlag / clearOutageFlag
   // can mutate flags without side effects in tests that don't care about Slack.
   initOutageState({
@@ -319,5 +325,117 @@ describe('cwd-unreachable flag management + tick-in-flight guard', () => {
 
     const result = await resultPromise
     expect(result).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// isAtCap tick-guard (SR-25.3/25.4) — Task C subtask 7r
+//
+// The health-check tick must skip capped channels (isAtCap=true) and not call
+// scheduleRestart for them. Other channels in the same tick are unaffected.
+// A channel with isAtCap=false continues to behave as before this feature.
+// ---------------------------------------------------------------------------
+
+describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
+  // -------------------------------------------------------------------------
+  // Cap-guard: capped channel is skipped (no scheduleRestart, no isSessionAlive)
+  // -------------------------------------------------------------------------
+
+  test('SR-25.3: capped channel is SKIPPED — scheduleRestart not called, isSessionAlive not called', async () => {
+    // SR-25.3/25.4: once a channel is at cap, the health-check tick must not
+    // re-schedule restarts. The tick logs a message and continues past the channel.
+    const deps = makeDeps({
+      isAtCapResult: true,
+      isSessionAliveResult: false,  // would trigger restart if not capped
+    })
+    initHealthCheck(deps)
+
+    startHealthCheck(FAST_INTERVAL_S)
+    await Bun.sleep(WAIT_MS)
+
+    // scheduleRestart must not have been called — capped channel is skipped
+    expect(deps.scheduleRestartCalls).toHaveLength(0)
+    // isSessionAlive must not have been called — skip fires before the probe
+    expect(deps.isSessionAliveCalls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Cap-guard: un-capped channel proceeds normally (isAtCap=false baseline)
+  // -------------------------------------------------------------------------
+
+  test('SR-25.3: non-capped channel proceeds — dead session triggers scheduleRestart', async () => {
+    const deps = makeDeps({
+      isAtCapResult: false,
+      isSessionAliveResult: false,
+    })
+    initHealthCheck(deps)
+
+    startHealthCheck(FAST_INTERVAL_S)
+    await Bun.sleep(WAIT_MS)
+
+    expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
+    expect(deps.scheduleRestartCalls[0].channelId).toBe('C_TEST1')
+  })
+
+  // -------------------------------------------------------------------------
+  // Cap-guard: mixed channels — capped channel skipped, live channel processed
+  // -------------------------------------------------------------------------
+
+  test('SR-25.4: mixed routes — capped channel skipped while uncapped dead channel gets scheduleRestart', async () => {
+    // C_CAPPED is at cap (isAtCap=true) → must be skipped
+    // C_DEAD is not at cap (isAtCap=false) and dead → scheduleRestart must be called
+    const cappedChannels = new Set(['C_CAPPED'])
+
+    const scheduleRestartCalls: Array<{ channelId: string; cwd: string }> = []
+    const isSessionAliveCalls: string[] = []
+
+    const deps: HealthCheckDeps & {
+      scheduleRestartCalls: typeof scheduleRestartCalls
+      isSessionAliveCalls: typeof isSessionAliveCalls
+    } = {
+      scheduleRestartCalls,
+      isSessionAliveCalls,
+
+      async isSessionAlive(channelId) {
+        isSessionAliveCalls.push(channelId)
+        return false  // both channels are dead
+      },
+      isRestartPendingOrActive(_channelId) {
+        return false
+      },
+      isAtCap(channelId) {
+        // SR-25.3/25.4: capped channels are skipped by the tick
+        return cappedChannels.has(channelId)
+      },
+      statRoute(_cwd) {
+        return Promise.resolve(true)
+      },
+      scheduleRestart(channelId, cwd) {
+        scheduleRestartCalls.push({ channelId, cwd })
+      },
+      isShuttingDown() { return false },
+      getRoutes() {
+        return {
+          C_CAPPED: '/cwd/capped',
+          C_DEAD: '/cwd/dead',
+        }
+      },
+    }
+
+    initHealthCheck(deps)
+    startHealthCheck(FAST_INTERVAL_S)
+    await Bun.sleep(WAIT_MS)
+
+    // C_DEAD: scheduleRestart called (not capped, dead)
+    expect(scheduleRestartCalls.some(c => c.channelId === 'C_DEAD')).toBe(true)
+
+    // C_CAPPED: scheduleRestart NOT called (skipped due to cap)
+    expect(scheduleRestartCalls.some(c => c.channelId === 'C_CAPPED')).toBe(false)
+
+    // C_CAPPED: isSessionAlive NOT called (skip fires before the probe)
+    expect(isSessionAliveCalls.some(ch => ch === 'C_CAPPED')).toBe(false)
+
+    // C_DEAD: isSessionAlive WAS called (not skipped)
+    expect(isSessionAliveCalls.some(ch => ch === 'C_DEAD')).toBe(true)
   })
 })

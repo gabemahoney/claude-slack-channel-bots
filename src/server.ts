@@ -46,6 +46,7 @@ import {
   flushSpawnFailureQueue,
   instanceIdFor,
   launchSession,
+  postSpawnFailureToChannel,
   reconcileInstanceIds,
   reconcileOrphans,
   reconnectMcp,
@@ -55,7 +56,7 @@ import {
 } from './session-manager.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { ErrSpawnNotFound } from 'agent-director'
-import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from './agent-director-errors.ts'
+import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable, ErrSpawnCapReached } from './agent-director-errors.ts'
 import { getClient, closeClient } from './agent-director-client.ts'
 import {
   emitBlockActionReceived,
@@ -70,8 +71,10 @@ import {
   scheduleRestart,
   cancelAllRestartTimers,
   isRestartPendingOrActive,
+  RESTART_FAILURE_CAP,
 } from './restart.ts'
 import { initHealthCheck, startHealthCheck, stopHealthCheck } from './health-check.ts'
+import { isAtCap as backoffIsAtCap } from './backoff.ts'
 import { loadTokens, isDryRun } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
 import { trackAck, consumeAck } from './ack-tracker.ts'
@@ -1270,7 +1273,20 @@ export async function main(): Promise<void> {
       return session?.connected === true
     },
     reconnectSession: async (channelId) => {
-      await reconnectMcp(channelId, isDryRun() ? undefined : web, routingConfig ?? undefined)
+      // Widened return type (SR-25.1 single counting site): surface the
+      // ReconnectOutcome to restart.ts so it can call recordSuccess on the
+      // success path. Map main's ReconnectOutcome onto the restart union —
+      // 'ok' is the only success signal restart.ts acts on; 'dead-session'
+      // and 'failed' are non-success (no recordSuccess, no recordFailure).
+      // 'dead-session' maps to 'escalate-dead', which is currently a no-op in
+      // restart.ts: nothing re-enters scheduleRestart on it, so recovery waits
+      // for a future health tick or a server restart. Not counting here keeps
+      // failures attributed to the launchSession site, which owns the single
+      // counting site.
+      const result = await reconnectMcp(channelId, isDryRun() ? undefined : web, routingConfig ?? undefined)
+      if (result === 'ok') return 'success'
+      if (result === 'dead-session') return 'escalate-dead'
+      return 'transient'
     },
     killSession: async (channelId) => {
       try {
@@ -1293,6 +1309,16 @@ export async function main(): Promise<void> {
     },
     getRestartDelay: () => routingConfig?.session_restart_delay ?? 60,
     isShuttingDown: () => shuttingDown,
+    onCapReached: (channelId) => {
+      // Post a synthetic spawn-failure message to the channel indicating the
+      // consecutive-failure cap has been reached (SR-25.3). ErrSpawnCapReached
+      // is a CSCB-synthetic subclass (see agent-director-errors.ts) so
+      // remediationHint can surface a specific hint via instanceof (SR-0.2).
+      const err = new ErrSpawnCapReached(
+        `${RESTART_FAILURE_CAP} consecutive session-launch failures — automatic restarts suspended`,
+      )
+      postSpawnFailureToChannel(channelId, err, isDryRun() ? undefined : web, false)
+    },
   })
 
   // SR-1.6: orphan reconciliation BEFORE per-route reconcile. Spawns whose
@@ -1373,6 +1399,7 @@ export async function main(): Promise<void> {
   initHealthCheck({
     isSessionAlive: isSessionAliveAdapter,
     isRestartPendingOrActive,
+    isAtCap: (channelId) => backoffIsAtCap(channelId, RESTART_FAILURE_CAP),
     statRoute: _buildStatRouteImpl(),
     scheduleRestart,
     isShuttingDown: () => shuttingDown,

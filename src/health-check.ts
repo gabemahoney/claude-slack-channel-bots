@@ -17,6 +17,17 @@ import { setOutageFlag, clearOutageFlag } from './outage-state.ts'
 export interface HealthCheckDeps {
   isSessionAlive(channelId: string): Promise<boolean>
   isRestartPendingOrActive(channelId: string): boolean
+  /**
+   * Returns true when channelId has reached the consecutive-failure cap.
+   * Capped channels are skipped on every tick (SR-25.3/25.4) — the tick
+   * must not schedule more restarts once a cap has been signalled.
+   * Inbound user messages do NOT re-arm recovery for a capped route: a
+   * capped-dead route has no registered session, so inbound messages are
+   * dropped before reaching scheduleRestart (see src/server.ts:631-645).
+   * Recovery for such a route comes from a server restart, which clears the
+   * in-process backoff/cap state on boot.
+   */
+  isAtCap(channelId: string): boolean
   statRoute(cwd: string): Promise<boolean>
   scheduleRestart(channelId: string, cwd: string): void
   isShuttingDown(): boolean
@@ -72,6 +83,17 @@ export function startHealthCheck(intervalSeconds: number): void {
       for (const [channelId, cwd] of Object.entries(routes)) {
         try {
           if (deps.isRestartPendingOrActive(channelId)) continue
+
+          // SR-25.3/25.4: skip capped channels — the tick must not re-schedule
+          // restarts for channels that have reached the consecutive-failure cap.
+          // The cap is not clearable from the inbound message path: a capped-dead
+          // route has no registered session, so inbound messages are dropped
+          // (src/server.ts:631-645) and never reach scheduleRestart. The in-process
+          // cap/backoff state clears only on a server restart.
+          if (deps.isAtCap(channelId)) {
+            console.error(`[slack] health-check: channel=${channelId} is at cap — skipping tick (SR-25.3/25.4)`)
+            continue
+          }
 
           if (await deps.statRoute(cwd)) {
             clearOutageFlag(channelId, 'cwd-unreachable')

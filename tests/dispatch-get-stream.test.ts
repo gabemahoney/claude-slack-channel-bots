@@ -81,6 +81,7 @@ function makeRestartDeps(): RestartDeps {
     async launchSession() { return true },
     getRestartDelay: () => NEVER_FIRE_DELAY_S,
     isShuttingDown: () => false,
+    onCapReached: (_channelId) => { /* no-op stub */ },
   }
 }
 
