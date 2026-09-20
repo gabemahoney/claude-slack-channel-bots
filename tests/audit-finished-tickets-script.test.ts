@@ -143,22 +143,37 @@ function makeFixture(opts: {
 
   // Scratch git repo with a main branch and at least one commit.
   git(repo, ['init', '-q'])
-  // Disable this throwaway repo's inherited managed git hooks (the machine's
-  // pre-commit identity hook rejects any author on the first attempt) and pin
-  // a repo-local identity, so fixture commits succeed deterministically.
-  const noHooks = join(repo, '.githooks-empty')
-  mkdirSync(noHooks, { recursive: true })
-  git(repo, ['config', 'core.hooksPath', noHooks])
+  // Pin a repo-local identity so fixture commits resolve to a sanctioned
+  // account (repo-local `identity.account` wins first in the resolution order;
+  // see ~/.claude/skills/github-config/SKILL.md) — NOT a hook bypass, the
+  // machine's pre-commit identity hook still runs and passes. The neutral
+  // placeholder email keeps a real address out of a checked-in fixture; the
+  // hook self-corrects it on the first commit (see the retry-once below).
   git(repo, ['config', 'identity.account', 'work'])
   git(repo, ['config', 'user.name', 'Fixture'])
   git(repo, ['config', 'user.email', 'fixture@example.com'])
   git(repo, ['checkout', '-q', '-b', 'main'])
   writeFileSync(join(repo, 'README'), 'fixture\n')
   git(repo, ['add', 'README'])
-  git(repo, ['commit', '-q', '-m', 'initial commit'])
+  // Retry-once: on identity-enforcing hosts the pre-commit hook sees the
+  // placeholder user.email as a config value (not an env/CLI override), so per
+  // github-config SKILL.md outcome #2 it rewrites the repo's user.email to the
+  // resolved identity and blocks exactly once ("Re-run the commit; it will
+  // pass."). The identical retry then succeeds. On hosts without enforcement
+  // the first commit succeeds and the catch is dead code. Do not simplify away.
+  try {
+    git(repo, ['commit', '-q', '-m', 'initial commit'])
+  } catch {
+    git(repo, ['commit', '-q', '-m', 'initial commit'])
+  }
   for (const c of opts.commits ?? []) {
     const msg = c.body ? `${c.subject}\n\n${c.body}` : c.subject
-    git(repo, ['commit', '-q', '--allow-empty', '-m', msg])
+    // Same retry-once as the initial commit above (see note there).
+    try {
+      git(repo, ['commit', '-q', '--allow-empty', '-m', msg])
+    } catch {
+      git(repo, ['commit', '-q', '--allow-empty', '-m', msg])
+    }
   }
 
   return { proj, repo, script }
