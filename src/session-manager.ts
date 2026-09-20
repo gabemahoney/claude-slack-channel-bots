@@ -851,7 +851,8 @@ async function tryDelete(
  * (preserves session history) when resume_enabled, with the established
  * fallbacks (ErrTmuxSessionCreate → orphan-kill + respawn; ErrNoSessionId /
  * ErrJsonlMissing → delete + fresh; ErrSpawnNotResumable → kill + delete +
- * fresh). This is the `ended`/`missing` state handling, extracted so the
+ * fresh; ErrSpawnNotFound → fresh, no delete since the row is already gone).
+ * This is the `ended`/`missing` state handling, extracted so the
  * b.3ce dead-session fallback in the `waiting`/`working` branches reuses the
  * exact same decision logic instead of inventing its own.
  */
@@ -971,6 +972,33 @@ async function resumeOrFreshSpawn(
         }
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         if (isStartup) recordStartupError('spawn-failed', `fresh spawn failed for channel=${channelId}: ${e.errName}`, e)
+        postSpawnFailureToChannel(channelId, e, web, isStartup)
+        return { channelId, action: 'failed' }
+      }
+    }
+    if (err instanceof ErrSpawnNotFound) {
+      // Row vanished between the dead-session verdict and resume (operator
+      // delete, expire, race) — fresh-spawn directly, no delete: the row is
+      // already gone and a delete of a missing row would throw and turn
+      // recovery into action: 'failed'. Mirrors the caller-level retry below.
+      console.error(`[slack] spawnForRoute: ErrSpawnNotFound on resume for channel=${channelId} — fresh-spawn`)
+      try {
+        await withSpawnDetection(channelId, route.cwd, (client) => client.spawn(params))
+        console.error(`[slack] spawnForRoute: fresh-spawned (after ErrSpawnNotFound on resume) for channel=${channelId}`)
+        await approvePreSessionDialogs(channelId, web, isStartup, normalizedName)
+        return { channelId, action: 'spawned' }
+      } catch (err2) {
+        if (
+          err2 instanceof ErrSystemInstallDisappeared ||
+          err2 instanceof ErrTmuxNotAvailable ||
+          err2 instanceof ErrCwdNotFound ||
+          err2 instanceof ErrCwdNotADirectory
+        ) {
+          return { channelId, action: 'failed' }
+        }
+        const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
+        console.error(`[slack] spawnForRoute: fresh spawn after ErrSpawnNotFound on resume failed for channel=${channelId}: ${e.errName}`)
+        if (isStartup) recordStartupError('spawn-failed', `fresh spawn after ErrSpawnNotFound on resume failed for channel=${channelId}: ${e.errName}`, e)
         postSpawnFailureToChannel(channelId, e, web, isStartup)
         return { channelId, action: 'failed' }
       }

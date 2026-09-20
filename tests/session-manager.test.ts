@@ -217,6 +217,18 @@ describe('spawnForRoute: SR-1.1 fresh spawn', () => {
 // ---------------------------------------------------------------------------
 
 describe('spawnForRoute: SR-1.4 collision-then-act', () => {
+  /**
+   * Redirect startup-errors.log into a temp dir for this test and return a
+   * helper that reads back recorded entries. Restores the previous
+   * SLACK_STATE_DIR via the file-level afterEach.
+   */
+  function captureStartupErrors(): () => string {
+    const dir = mkdtempSync(join(tmpdir(), 'cscb-2oy-'))
+    process.env['SLACK_STATE_DIR'] = dir
+    const logPath = join(dir, 'startup-errors.log')
+    return () => (existsSync(logPath) ? readFileSync(logPath, 'utf-8') : '')
+  }
+
   test('ended state + resume_enabled → resume()', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
@@ -303,6 +315,72 @@ describe('spawnForRoute: SR-1.4 collision-then-act', () => {
       expect(result.action).toBe('no-op')
       resetClientForTests()
     }
+  })
+
+  // b.2oy — resume rejects with ErrSpawnNotFound (row vanished between the
+  // dead-session verdict and resume: operator delete, expire, race). Recovery
+  // must fresh-spawn directly with the original params — NO kill, NO delete,
+  // no channel-facing failure post — and report 'spawned'. Pre-fix this fell
+  // into the generic resume-catch, which posted a Slack "spawn failure" and
+  // returned action: 'failed'.
+  test('b.2oy: ErrSpawnNotFound on resume → fresh spawn (no kill, no delete, no channel post)', async () => {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const killCalls: import('agent-director').KillParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      spawnCalls,
+      killCalls,
+      deleteCalls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      ],
+      resumeError: errSpawnNotFound(),
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+    })
+    const { web, calls } = makeMockWeb()
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, web as never)
+    expect(result).toEqual({ channelId: 'C', action: 'spawned' })
+    // initial collision spawn + the fresh spawn after ErrSpawnNotFound
+    expect(spawnCalls).toHaveLength(2)
+    // fresh spawn carries the original params (same channel labels / id)
+    expect(spawnCalls[1].claude_instance_id).toBe('cscb_C')
+    expect(spawnCalls[1].label).toEqual(['service=cscb', 'channel=C'])
+    // row was already gone — no kill and no delete of a missing row
+    expect(killCalls).toHaveLength(0)
+    expect(deleteCalls).toHaveLength(0)
+    // no channel-facing spawn-failure post
+    expect(calls).toHaveLength(0)
+  })
+
+  // b.2oy — ErrSpawnNotFound recovery still surfaces genuine spawn failures.
+  // Resume throws ErrSpawnNotFound, then the fresh spawn fails with a generic
+  // error → 'failed' and postSpawnFailureToChannel fires.
+  test('b.2oy: ErrSpawnNotFound on resume + fresh spawn fails → failed + channel post', async () => {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const readLog = captureStartupErrors()
+    installStub({
+      spawnCalls,
+      deleteCalls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedErr<import('agent-director').SpawnResult>(errGeneric('spawn', 'ErrSpawnBroken')),
+      ],
+      resumeError: errSpawnNotFound(),
+      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+    })
+    const { web, calls } = makeMockWeb()
+    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, web as never)
+    expect(result.action).toBe('failed')
+    expect(spawnCalls).toHaveLength(2)
+    expect(deleteCalls).toHaveLength(0)
+    // generic spawn failure is surfaced to the channel
+    expect(calls.length).toBeGreaterThanOrEqual(1)
+    // startup-error side effect is part of the tested contract
+    expect(readLog()).toContain('[spawn-failed]')
   })
 
   test('ErrSpawnNotFound after collision → single retry-spawn', async () => {
