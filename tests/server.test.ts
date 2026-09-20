@@ -31,7 +31,9 @@ import {
   resetClientForTests,
 } from '../src/agent-director-client.ts'
 import { makeStubClient } from './test-helpers/agent-director-stub.ts'
-import { _buildIsSessionAliveAdapter } from '../src/server.ts'
+import { _buildIsSessionAliveAdapter, _buildReconnectSessionAdapter } from '../src/server.ts'
+import type { WebClient } from '@slack/web-api'
+import type { SendKeysParams, StatusParams } from 'agent-director'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -706,5 +708,103 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(emissions[0].text).toMatch(/tmux unavailable/)
     // ONSET_TEMPLATES['tmux-unavailable'] ignores the detail arg — nothing extra
     expect(emissions[0].text).not.toContain('undefined')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// _buildReconnectSessionAdapter (b.9a7 — working-state defer gate)
+//
+// The adapter probes AD state via withOutageDetection().status() before typing
+// `/mcp reconnect`. If the row is `working` it returns 'transient' WITHOUT
+// attempting the reconnect (hazard 2 / b.rmy: don't type into a session
+// mid-turn). Any other live state, or a status-probe error, falls through to
+// the reconnectMcp send-keys attempt. reconnectMcp is a direct module import,
+// but it drives its send-keys through the SAME withOutageDetection client the
+// status probe uses, so the shared stub's `sendKeysCalls` is the observable
+// seam for "was a reconnect attempted", and `sendKeysResult`/`sendKeysError`
+// drive the ok→'success' / dead-session→'escalate-dead' mapping.
+// ---------------------------------------------------------------------------
+
+describe('_buildReconnectSessionAdapter', () => {
+  /**
+   * Build a stub client wired into BOTH outage-state (which withOutageDetection
+   * calls via getClient) and setClientForTests, plus a reconnect adapter. The
+   * status probe and reconnectMcp's send-keys both flow through this one client.
+   */
+  function makeHarness(opts: {
+    statusState?: string
+    statusThrows?: boolean
+    sendKeysThrows?: Error
+  }): {
+    adapter: (channelId: string) => Promise<'success' | 'escalate-dead' | 'transient'>
+    statusCalls: StatusParams[]
+    sendKeysCalls: SendKeysParams[]
+  } {
+    const statusCalls: StatusParams[] = []
+    const sendKeysCalls: SendKeysParams[] = []
+    const stub = makeStubClient({
+      statusCalls,
+      statusFn: () =>
+        opts.statusThrows
+          ? new Error('AD status probe failed')
+          : { state: opts.statusState ?? 'waiting' },
+      sendKeysCalls,
+      sendKeysError: opts.sendKeysThrows,
+      sendKeysResult: opts.sendKeysThrows ? undefined : {},
+    })
+    _resetOutageState()
+    initOutageState({
+      postToChannel: () => {},
+      getClient: () => stub as unknown as Client,
+    })
+    setClientForTests(stub as unknown as Client)
+    const fakeConfig = { routes: { C1: { normalizedName: 'test-channel' } } }
+    return {
+      adapter: _buildReconnectSessionAdapter(() => fakeConfig as any, {} as unknown as WebClient),
+      statusCalls,
+      sendKeysCalls,
+    }
+  }
+
+  afterEach(() => {
+    resetClientForTests()
+    _resetOutageState()
+  })
+
+  test("(i) AD state 'working' → returns 'transient' and does NOT attempt the send-keys reconnect", async () => {
+    const { adapter, statusCalls, sendKeysCalls } = makeHarness({ statusState: 'working' })
+
+    const result = await adapter('C1')
+
+    expect(result).toBe('transient')
+    // The probe ran...
+    expect(statusCalls).toHaveLength(1)
+    // ...but the working-state defer short-circuited before reconnectMcp — no
+    // `/mcp reconnect` was typed into the pane.
+    expect(sendKeysCalls).toHaveLength(0)
+  })
+
+  test("(ii) non-working live state ('waiting') → reconnect IS attempted, maps ok → 'success'", async () => {
+    const { adapter, statusCalls, sendKeysCalls } = makeHarness({ statusState: 'waiting' })
+
+    const result = await adapter('C1')
+
+    // Not deferred: the send-keys reconnect ran and succeeded (reconnectMcp 'ok').
+    expect(result).toBe('success')
+    expect(statusCalls).toHaveLength(1)
+    expect(sendKeysCalls).toHaveLength(1)
+    expect(sendKeysCalls[0].text).toContain('/mcp reconnect')
+  })
+
+  test('(iii) status-probe error → falls through to the reconnect attempt (no false transient)', async () => {
+    const { adapter, statusCalls, sendKeysCalls } = makeHarness({ statusThrows: true })
+
+    const result = await adapter('C1')
+
+    // The probe threw, but the adapter must NOT manufacture a false defer — it
+    // falls through to reconnectMcp, which here succeeds → 'success'.
+    expect(result).toBe('success')
+    expect(statusCalls).toHaveLength(1)
+    expect(sendKeysCalls).toHaveLength(1)
   })
 })

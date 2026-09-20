@@ -744,7 +744,7 @@ async function tmuxFallbackVerdict(
 ): Promise<ReconnectOutcome> {
   if (await _hasTmuxSession(sessionName)) {
     console.error(
-      `[slack] waitForWaitingAndReconnect: timed out for channel=${channelId} after ${_waitForWaitingTimeoutMs}ms — ${reason}, tmux session alive, health-check will retry`,
+      `[slack] waitForWaitingAndReconnect: timed out for channel=${channelId} after ${_waitForWaitingTimeoutMs}ms — ${reason}, tmux session alive, health-check will reconnect it (b.9a7): during an AD outage the adapter reports alive=false and the tick restarts it; once AD recovers with the row live, the tick sees alive && !connected -> scheduleRestart -> reconnect`,
     )
     return 'ok'
   }
@@ -757,8 +757,9 @@ async function tmuxFallbackVerdict(
 /**
  * Poll `status({claude_instance_id})` until the spawn transitions to
  * `waiting`, then call reconnectMcp. Transitions to live transient states
- * (ask_user, check_permission, pending) return 'ok' — health-check picks it
- * up.
+ * (ask_user, check_permission, pending) return 'ok'; recovery is then the
+ * health-check tick's job — post-b.9a7 the tick observes the row as
+ * alive && !connected and routes it through scheduleRestart -> reconnect.
  *
  * b.ecw — which object each terminal branch keys on. AD probes the claude
  * PROCESS; CSCB's `_hasTmuxSession` probes the TMUX SESSION. A lingering tmux
@@ -860,7 +861,7 @@ export async function waitForWaitingAndReconnect(
       return 'dead-session'
     }
 
-    console.error(`[slack] waitForWaitingAndReconnect: channel=${channelId} transitioned to state=${state} — aborting (health-check will handle)`)
+    console.error(`[slack] waitForWaitingAndReconnect: channel=${channelId} transitioned to state=${state} — aborting; health-check reconnects it (tick sees alive && !connected -> scheduleRestart -> reconnect, b.9a7)`)
     return 'ok'
   }
 
@@ -905,7 +906,7 @@ export async function waitForWaitingAndReconnect(
     return 'dead-session'
   }
   console.error(
-    `[slack] reconnect: gave up waiting for channel=${channelId} after ${_waitForWaitingTimeoutMs}ms — claude process state=${timeoutState} (alive), health-check will retry`,
+    `[slack] reconnect: gave up waiting for channel=${channelId} after ${_waitForWaitingTimeoutMs}ms — claude process state=${timeoutState} (alive), health-check will reconnect (tick sees alive && !connected -> scheduleRestart -> reconnect, b.9a7)`,
   )
   return 'ok'
 }
