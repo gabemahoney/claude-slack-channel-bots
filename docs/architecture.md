@@ -178,7 +178,7 @@ Called from `main()` in `server.ts`. The order is:
 5. **Per-route reconcile** — `startupSessionManager(routingConfig, { concurrency: 3 })` iterates each configured route concurrently and calls `spawnForRoute` (SR-1.4 collision-then-act dispatcher):
    - Attempt `client.spawn(SR-1.1 params)` — `template: 'slack-channel-bot'`, `relay_mode: 'on'`, `label: ['service=cscb', 'channel=<id>']`, `claude_instance_id: cscb_<normalizedName>_<channelId>` (falls back to `cscb_<channelId>` when name resolution failed), `tmux_session_name: slack_bot_<normalizedName>_<channelId>` (same fallback), optional `extra_env.CLAUDE_CONFIG_DIR`.
    - On `ErrInstanceIdCollision`, call `client.get({claude_instance_id})` and branch on state per the [SR-11 substitution table](#sr-11-substitution-table):
-     - `ended` / `missing` + `resume_enabled` → `client.resume(...)`; `ErrNoSessionId` / `ErrJsonlMissing` → `client.delete(...)` + fresh `client.spawn(...)`.
+     - `ended` / `missing` + `resume_enabled` → `client.resume(...)`; `ErrNoSessionId` / `ErrJsonlMissing` → `client.delete(...)` + fresh `client.spawn(...)`; `ErrSpawnNotFound` (row vanished between the dead-session verdict and resume — operator delete, expire, race) → fresh `client.spawn(...)` directly with no delete (the row is already gone), action `spawned`.
      - `ended` / `missing` + `resume_enabled=false` → `client.kill(...)` + `client.delete(...)` + fresh `client.spawn(...)`.
      - `waiting` → `client.sendKeys({ text: '/mcp reconnect slack-channel-router' })`.
      - `working` → poll `client.status(...)` until `waiting`, then sendKeys.
