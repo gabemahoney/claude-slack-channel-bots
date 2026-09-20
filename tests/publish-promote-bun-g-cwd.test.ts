@@ -178,14 +178,35 @@ function initRepo(): string {
   const git = (...args: string[]) =>
     execFileSync('git', ['-C', dir, ...args], { stdio: 'pipe' })
   git('init', '-q')
-  git('config', 'user.email', 'test@example.com')
   git('config', 'user.name', 'Test')
   git('config', 'commit.gpgsign', 'false')
+  // Host-specific: hosts with git identity enforcement (a global pre-commit
+  // hook) refuse `git commit` in a no-remote repo because it resolves to
+  // neither allow-listed identity. Declaring identity.account is the sanctioned
+  // route (repo-local declaration wins first in the resolution order; see
+  // ~/.claude/skills/github-config/SKILL.md), NOT a hook bypass — the hook
+  // still runs and passes. A neutral placeholder email is used so no real
+  // person's address is baked into a checked-in fixture; the hook self-corrects
+  // it (see the retry below). Do not "simplify" either line away or the commit
+  // is refused and beforeAll throws on such hosts.
+  git('config', 'identity.account', 'work')
+  git('config', 'user.email', 'fixture@example.com')
   writeFileSync(join(dir, 'package.json'), '{"name":"x","version":"1.0.0"}\n')
   writeFileSync(join(dir, 'bun.lock'), 'LOCK v1\n')
   writeFileSync(join(dir, 'README.md'), 'clean\n')
   git('add', '-A')
-  git('commit', '-q', '-m', 'init')
+  // Retry-once: on identity-enforcing hosts the pre-commit hook sees the
+  // placeholder user.email mismatch a config value, not an env/CLI override,
+  // so per github-config SKILL.md outcome #2 it writes the resolved email into
+  // the repo config and blocks exactly once ("Re-run the commit; it will
+  // pass."). The identical retry then succeeds. On hosts without enforcement
+  // the first commit succeeds and the retry never runs. Do not simplify this
+  // away.
+  try {
+    git('commit', '-q', '-m', 'init')
+  } catch {
+    git('commit', '-q', '-m', 'init')
+  }
   return dir
 }
 
@@ -241,7 +262,10 @@ describe('b.bpp: SR-7.5 post-verify snapshot reverts promote-induced pkg/lock di
     tmpRepo = initRepo()
   })
   afterAll(() => {
-    rmSync(tmpRepo, { recursive: true, force: true })
+    // Guard against undefined: if beforeAll's initRepo() ever throws, tmpRepo
+    // stays undefined and an unguarded rmSync(undefined, …) would throw a second,
+    // misleading cascade failure that masks the real setup error.
+    if (tmpRepo) rmSync(tmpRepo, { recursive: true, force: true })
   })
 
   test('promote-induced package.json + bun.lock dirt is reverted; exit 0', () => {
