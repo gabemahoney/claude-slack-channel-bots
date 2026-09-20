@@ -34,10 +34,10 @@ import {
   ErrTmuxSendKeys,
   ErrTmuxSessionCreate,
 } from 'agent-director'
-import type { ListRow, SpawnParams, FindMissingResult } from 'agent-director'
+import type { ListRow, SpawnParams, FindMissingResult, GetResult } from 'agent-director'
 import type { WebClient } from '@slack/web-api'
 
-import { checkCozempicAvailable } from './cozempic.ts'
+import { checkCozempicAvailable, resolveJsonlPath } from './cozempic.ts'
 import { type RoutingConfig, MCP_SERVER_NAME, normalizeChannelName } from './config.ts'
 import { getClient } from './agent-director-client.ts'
 import { withOutageDetection, withSpawnDetection } from './outage-state.ts'
@@ -49,6 +49,12 @@ import {
 } from './agent-director-errors.ts'
 import { recordStartupError } from './startup-errors.ts'
 import { isDryRun } from './tokens.ts'
+import {
+  resolveEffectiveConfigDir,
+  makeDefaultArchiveCount,
+  rfc3339ToEpochSeconds,
+} from './jsonl-persistence-check.ts'
+import { statSync } from 'node:fs'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -908,7 +914,7 @@ export async function waitForWaitingAndReconnect(
 
 export interface SpawnRouteResult {
   channelId: string
-  action: 'spawned' | 'resumed' | 'reconnected' | 'no-op' | 'failed'
+  action: 'spawned' | 'resumed' | 'reconnected' | 'no-op' | 'failed' | 'fresh-after-amnesia'
 }
 
 /** Build SpawnParams for a route (SR-1.1). Per-route claude_config_dir wins. */
@@ -1038,6 +1044,193 @@ async function tryDelete(
   }
 }
 
+// ---------------------------------------------------------------------------
+// ErrJsonlMissing diagnostic (bug b.wrb)
+// ---------------------------------------------------------------------------
+
+/** One transcript candidate resume tried (or that we recomputed locally). */
+interface JsonlCandidate {
+  /** Provenance as reported by AD ('persisted' | 'fallback'), or 'locally-computed'
+   *  when we reconstructed it ourselves because AD's message lacked detail. */
+  source: string
+  path: string
+  /** The stat error AD reported, or our own local stat result label. */
+  note: string
+}
+
+/**
+ * Best-effort parse of an ErrJsonlMissing description into the candidate list
+ * AD enumerates as `<source> <path> (<stat error>)`, joined by "; ".
+ *
+ * Returns [] when the description does not carry the enumerated detail — which
+ * is the case for the installed agent-director 0.8.0 (whose ErrJsonlMissing
+ * message predates AD bug b.1ba). Callers MUST treat [] as "AD gave no path
+ * detail" and degrade to locally-computed candidates, never as "no paths".
+ *
+ * Strictly non-throwing and version-agnostic: it keys off the literal `persisted`
+ * / `fallback` source tokens, not any version string.
+ */
+function parseJsonlMissingCandidates(description: string): JsonlCandidate[] {
+  if (!description) return []
+  const out: JsonlCandidate[] = []
+  // AD renders each attempt as: `<source> <path> (<stat error>)`.
+  // Anchor on the known source tokens so unrelated prose is ignored.
+  const re = /(persisted|fallback)\s+(\S+)\s+\(([^)]*)\)/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(description)) !== null) {
+    out.push({ source: m[1], path: m[2], note: m[3] })
+  }
+  return out
+}
+
+/** Local stat label: what WE see at a path right now (never claims AD tried it). */
+function localStatNote(path: string): string {
+  try {
+    const st = statSync(path)
+    if (st.isFile() && st.size > 0) return `locally present, ${st.size} bytes`
+    if (st.isFile()) return 'locally present but empty'
+    return 'locally present but not a regular file'
+  } catch (err) {
+    const code = (err as { code?: string })?.code
+    return code ? `locally absent (${code})` : 'locally absent'
+  }
+}
+
+/**
+ * b.wrb: make an ErrJsonlMissing resume failure LEGIBLE without changing the
+ * delete+fresh recovery policy. Fetches the doomed AD row (before delete),
+ * logs which transcript path(s) were tried and their provenance, and classifies
+ * the loss as never-created (expected, lossless) vs lost (real context
+ * destroyed → operator-visible).
+ *
+ * MUST be called BEFORE tryDelete so the row's jsonl_path / session id / cwd /
+ * started_at are still available. Never throws.
+ *
+ * @returns 'lost' when the row had provable prior activity but no transcript
+ *          survives (loud), 'never-created' when idle-since-spawn (quiet), or
+ *          'unknown' when we could not gather enough evidence to decide.
+ */
+async function diagnoseJsonlMissing(
+  channelId: string,
+  routingConfig: RoutingConfig,
+  normalizedName: string | undefined,
+  err: ErrJsonlMissing,
+  web: WebClient | undefined,
+  isStartup: boolean,
+): Promise<'lost' | 'never-created' | 'unknown'> {
+  // --- 1. What paths did AD try, and from where? -------------------------
+  // err.errDescription is AD's detail string. In the future rich format (AD
+  // b.1ba) it enumerates `<source> <path> (<err>)`; in installed 0.8.0 it does
+  // not. Parse defensively — [] means "no AD detail", not "no paths".
+  const adCandidates = parseJsonlMissingCandidates(err.errDescription ?? '')
+
+  // --- 2. Fetch the row we are about to delete (best-effort). -------------
+  const claudeInstanceId = instanceIdFor(channelId, normalizedName)
+  let row: GetResult | undefined
+  try {
+    row = await withOutageDetection(channelId, undefined, (client) =>
+      client.get({ claude_instance_id: claudeInstanceId }),
+    )
+  } catch (getErr) {
+    // Row already gone / AD unreachable — cannot enrich. Log what AD told us.
+    const adDetail = adCandidates.length
+      ? adCandidates.map((c) => `${c.source} ${c.path} (${c.note})`).join('; ')
+      : err.errDescription || '(no path detail from agent-director)'
+    console.error(
+      `[slack] ErrJsonlMissing diagnostic: channel=${channelId} — could not fetch AD row ` +
+        `(${String(getErr)}); AD reported: ${adDetail}`,
+    )
+    return 'unknown'
+  }
+
+  // --- 3. Assemble the candidate list to log. ----------------------------
+  const effectiveConfigDir = resolveEffectiveConfigDir(routingConfig, channelId)
+  const candidates: JsonlCandidate[] = [...adCandidates]
+
+  if (adCandidates.length === 0) {
+    // 0.8.0 path: AD gave no enumerated detail. Reconstruct what WE can, clearly
+    // labelled as locally computed — never claim it is what AD tried.
+    if (row.jsonl_path) {
+      candidates.push({
+        source: 'locally-computed(persisted-column)',
+        path: row.jsonl_path,
+        note: localStatNote(row.jsonl_path),
+      })
+    }
+    if (row.claude_session_id) {
+      const fallback = resolveJsonlPath(row.cwd, row.claude_session_id, effectiveConfigDir)
+      if (fallback !== row.jsonl_path) {
+        candidates.push({
+          source: 'locally-computed(config-dir fallback)',
+          path: fallback,
+          note: localStatNote(fallback),
+        })
+      }
+    }
+  }
+
+  const candidateStr =
+    candidates.length > 0
+      ? candidates.map((c) => `${c.source} ${c.path} (${c.note})`).join('; ')
+      : '(no transcript path could be determined)'
+  const detailProvenance =
+    adCandidates.length > 0
+      ? 'paths+sources reported by agent-director'
+      : 'agent-director gave no path detail (0.8.0); paths below are locally computed'
+
+  // --- 4. Classify never-created vs lost via message-archive evidence. ----
+  // Reuse b.zak's archive-count helper (message_archive_db, read-only, absent
+  // file → null == no evidence). started_at bounds "since spawn".
+  const startedAtEpoch = row.started_at ? rfc3339ToEpochSeconds(row.started_at) : null
+  const archiveCount = makeDefaultArchiveCount(routingConfig)
+  const archivedSinceSpawn =
+    startedAtEpoch === null ? null : archiveCount(channelId, startedAtEpoch)
+
+  if (archivedSinceSpawn !== null && archivedSinceSpawn > 0) {
+    // LOST: conversation provably happened since spawn, yet no transcript
+    // survives. Real context destroyed — must be operator-visible.
+    const detail =
+      `channel=${channelId} instance=${claudeInstanceId}: resume threw ErrJsonlMissing and the row will be ` +
+      `deleted + fresh-spawned, but the message archive holds ${archivedSinceSpawn} message(s) since spawn ` +
+      `(started_at=${row.started_at}). Conversation history was LOST. Transcript candidates tried ` +
+      `(${detailProvenance}): ${candidateStr}.`
+    console.error(`[slack] ErrJsonlMissing diagnostic: ${detail}`)
+    // Operator-visible signal — reuse the existing startup-errors mechanism.
+    if (isStartup) recordStartupError('jsonl-transcript-lost-on-resume', detail, err)
+    // And a channel post so it is not buried in logs.
+    if (web !== undefined) {
+      web.chat
+        .postMessage({
+          channel: channelId,
+          text:
+            `⚠️ CSCB: on restart my conversation transcript could not be found, but the message archive shows ` +
+            `${archivedSinceSpawn} message(s) since I started — my memory of this channel has been lost and I ` +
+            `was started fresh. An operator should investigate transcript storage. Paths tried: ${candidateStr}`,
+        })
+        .catch((postErr: unknown) => {
+          console.error(
+            `[slack] ErrJsonlMissing diagnostic: failed to post lost-transcript notice to channel=${channelId}:`,
+            postErr,
+          )
+        })
+    }
+    return 'lost'
+  }
+
+  // NEVER-CREATED: no archived activity since spawn (or archive unavailable).
+  // Claude writes the .jsonl lazily on first message; an idle-since-spawn
+  // channel simply never had one. Expected and lossless — quiet log, no error,
+  // no channel post, counted as an ordinary fresh-spawn.
+  console.error(
+    `[slack] ErrJsonlMissing diagnostic: channel=${channelId} instance=${claudeInstanceId} — transcript never ` +
+      `created (no archived activity since spawn` +
+      `${startedAtEpoch === null ? ', started_at unparseable/absent' : ''}` +
+      `${archivedSinceSpawn === null ? ', archive unavailable' : ''}). Nothing to lose; resume will fresh-spawn. ` +
+      `Transcript candidates tried (${detailProvenance}): ${candidateStr}.`,
+  )
+  return 'never-created'
+}
+
 /**
  * Recover a collided spawn whose live session cannot be reached: resume-first
  * (preserves session history) when resume_enabled, with the established
@@ -1139,11 +1332,33 @@ async function resumeOrFreshSpawn(
     }
     if (err instanceof ErrNoSessionId || err instanceof ErrJsonlMissing) {
       console.error(`[slack] spawnForRoute: ${err.errName} on resume for channel=${channelId} — delete+fresh`)
+      // b.wrb: diagnose the missing transcript BEFORE deleting the row (its
+      // jsonl_path / session id / started_at are needed). Logging/classification
+      // only — the delete+fresh POLICY below is unchanged. The 'lost' case is
+      // made operator-visible inside diagnoseJsonlMissing itself.
+      if (err instanceof ErrJsonlMissing) {
+        await diagnoseJsonlMissing(
+          channelId,
+          routingConfig,
+          normalizedName,
+          err,
+          web,
+          isStartup,
+        )
+      }
       if (!(await tryDelete(channelId, normalizedName, web, isStartup))) return { channelId, action: 'failed' }
       try {
         await withSpawnDetection(channelId, route.cwd, (client) => client.spawn(params))
         console.error(`[slack] spawnForRoute: fresh-spawned (after delete) for channel=${channelId}`)
         await approvePreSessionDialogs(channelId, web, isStartup, normalizedName)
+        // A fresh-spawn that replaced a resume because the transcript was gone
+        // is amnesia, not a clean spawn — surface it as its own action so the
+        // startup summary does not count it as an ordinary "ok". 'never-created'
+        // and 'unknown' are lossless/inconclusive; only 'lost' was made loud
+        // above, but all three arrived here via ErrJsonlMissing amnesia.
+        if (err instanceof ErrJsonlMissing) {
+          return { channelId, action: 'fresh-after-amnesia' }
+        }
         return { channelId, action: 'spawned' }
       } catch (err2) {
         if (
@@ -1708,8 +1923,18 @@ export async function reconcileInstanceIds(
 // ---------------------------------------------------------------------------
 
 export interface StartupSessionManagerResult {
+  /** Any non-failed action (kept for callers that only care about liveness). */
   succeeded: number
   failed: number
+  /** b.wrb: honest per-outcome breakdown of the succeeded routes. */
+  resumed: number
+  /** Clean fresh spawns (no prior row / no resume attempted). */
+  freshSpawned: number
+  /** Fresh spawns that REPLACED a resume because the transcript was missing
+   *  (ErrJsonlMissing amnesia) — separated so they are never hidden in "ok". */
+  freshAfterAmnesia: number
+  reconnected: number
+  noop: number
   perChannel: Array<{ channelId: string; action: SpawnRouteResult['action'] }>
 }
 
@@ -1738,14 +1963,47 @@ export async function startupSessionManager(
   const perChannel: Array<{ channelId: string; action: SpawnRouteResult['action'] }> = []
   let succeeded = 0
   let failed = 0
+  let resumed = 0
+  let freshSpawned = 0
+  let freshAfterAmnesia = 0
+  let reconnected = 0
+  let noop = 0
   let nextIdx = 0
+
+  function tally(action: SpawnRouteResult['action']): void {
+    switch (action) {
+      case 'failed':
+        failed++
+        break
+      case 'resumed':
+        resumed++
+        succeeded++
+        break
+      case 'fresh-after-amnesia':
+        freshAfterAmnesia++
+        succeeded++
+        break
+      case 'reconnected':
+        reconnected++
+        succeeded++
+        break
+      case 'no-op':
+        noop++
+        succeeded++
+        break
+      case 'spawned':
+      default:
+        freshSpawned++
+        succeeded++
+        break
+    }
+  }
 
   async function processRoute(channelId: string, route: { cwd: string }): Promise<void> {
     try {
       const result = await spawnForRoute(channelId, route, routingConfig, web)
       perChannel.push({ channelId, action: result.action })
-      if (result.action === 'failed') failed++
-      else succeeded++
+      tally(result.action)
     } catch (err) {
       console.error(`[slack] startupSessionManager: unexpected error for channel=${channelId}:`, err)
       recordStartupError(
@@ -1771,9 +2029,33 @@ export async function startupSessionManager(
     Array.from({ length: Math.min(concurrency, routeEntries.length || 1) }, () => worker()),
   )
 
-  console.error(`[slack] startupSessionManager: complete — ${succeeded} ok, ${failed} failed`)
+  // b.wrb: honest breakdown. A fresh-spawn that replaced a resume because the
+  // transcript was missing (fresh-after-amnesia) is reported separately and
+  // never folded into a generic "ok".
+  console.error(
+    `[slack] startupSessionManager: complete — ${resumed} resumed, ${freshSpawned} fresh-spawned, ` +
+      `${freshAfterAmnesia} fresh-after-amnesia, ${reconnected} reconnected, ${noop} no-op, ${failed} failed`,
+  )
+  if (freshAfterAmnesia > 0) {
+    // Loud, grep-friendly signal that some channels lost their resume target.
+    // Per-channel "lost vs never-created" detail was already emitted (and, for
+    // 'lost', recorded to startup-errors) by diagnoseJsonlMissing.
+    console.error(
+      `[slack] startupSessionManager: ${freshAfterAmnesia} channel(s) were fresh-spawned after ErrJsonlMissing ` +
+        `(transcript could not be resumed) — see per-channel "ErrJsonlMissing diagnostic" lines above.`,
+    )
+  }
 
-  return { succeeded, failed, perChannel }
+  return {
+    succeeded,
+    failed,
+    resumed,
+    freshSpawned,
+    freshAfterAmnesia,
+    reconnected,
+    noop,
+    perChannel,
+  }
 }
 
 // ---------------------------------------------------------------------------

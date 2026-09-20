@@ -93,7 +93,7 @@ const ERR_KEY_LOST = 'jsonl-transcript-lost'
  * undefined when neither is set (the homedir default), so callers can pass it
  * straight to resolveJsonlPath (which defaults to homedir on undefined).
  */
-function resolveEffectiveConfigDir(
+export function resolveEffectiveConfigDir(
   config: RoutingConfig,
   channelId: string,
 ): string | undefined {
@@ -295,7 +295,7 @@ function defaultGetRow(channelId: string, claudeInstanceId: string): Promise<Get
  * The archive stores `timestamp` as REAL epoch seconds (parseFloat of the
  * Slack ts); `started_at` is RFC3339, converted to epoch seconds by the caller.
  */
-function makeDefaultArchiveCount(
+export function makeDefaultArchiveCount(
   config: RoutingConfig,
 ): (channelId: string, sinceEpochSeconds: number) => number | null {
   return (channelId: string, sinceEpochSeconds: number): number | null => {
@@ -333,7 +333,7 @@ async function defaultPostFn(web: WebClient, channelId: string, text: string): P
 }
 
 /** Parse an RFC3339 timestamp to epoch seconds; null on unparseable input. */
-function rfc3339ToEpochSeconds(value: string): number | null {
+export function rfc3339ToEpochSeconds(value: string): number | null {
   if (!value) return null
   const ms = Date.parse(value)
   return Number.isNaN(ms) ? null : ms / 1000
