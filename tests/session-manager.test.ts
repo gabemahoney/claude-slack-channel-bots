@@ -2764,7 +2764,14 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   // and PASSES post-fix. (Verified by inspecting HEAD:src/session-manager.ts,
   // whose ErrJsonlMissing branch returns { action: 'spawned' } and whose result
   // shape is { succeeded, failed, perChannel } only.)
-  test('REGRESSION: ErrJsonlMissing fresh-spawn is counted as fresh-after-amnesia, not "ok"', async () => {
+  // b.fwu: this config sets NO message_archive_db, so makeDefaultArchiveCount
+  // yields null and the diagnosis is INCONCLUSIVE (case c-config: no archive is
+  // configured, so there is no evidence source to consult). It must land in the
+  // dedicated freshAfterInconclusiveAmnesia bucket — never folded into the
+  // known-cause freshAfterAmnesia. Pre-fix (no 'inconclusive' classification,
+  // no separate counter, no 'fresh-after-inconclusive-amnesia' action) this
+  // FAILS; post-fix it PASSES.
+  test('REGRESSION: ErrJsonlMissing fresh-spawn with no archive configured is counted as fresh-after-inconclusive-amnesia, not fresh-after-amnesia', async () => {
     captureStartupErrors()
     installAmnesia({
       getResult: { jsonl_path: '/data/proj/sess-1.jsonl', claude_session_id: 'sess-1', cwd: CWD },
@@ -2772,13 +2779,16 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
-    expect(result.freshAfterAmnesia).toBe(1)
+    expect(result.freshAfterInconclusiveAmnesia).toBe(1)
+    expect(result.freshAfterAmnesia).toBe(0)
     expect(result.freshSpawned).toBe(0)
     expect(result.resumed).toBe(0)
     expect(result.failed).toBe(0)
     // Still counted toward liveness, but distinctly bucketed.
     expect(result.succeeded).toBe(1)
-    expect(result.perChannel).toEqual([{ channelId: CH, action: 'fresh-after-amnesia' }])
+    expect(result.perChannel).toEqual([
+      { channelId: CH, action: 'fresh-after-inconclusive-amnesia' },
+    ])
   })
 
   // --- Honest counters tallied separately ---------------------------------
@@ -2816,7 +2826,11 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
 
     expect(result.freshSpawned).toBe(1) // C1
     expect(result.resumed).toBe(1) // C2
-    expect(result.freshAfterAmnesia).toBe(1) // C3
+    // C3: ErrJsonlMissing with no message_archive_db configured → the diagnosis
+    // is inconclusive (c-config), so it lands in the dedicated inconclusive
+    // bucket, not freshAfterAmnesia.
+    expect(result.freshAfterInconclusiveAmnesia).toBe(1) // C3
+    expect(result.freshAfterAmnesia).toBe(0)
     expect(result.failed).toBe(1) // C4
     expect(result.succeeded).toBe(3)
     // C2's collision recovery does one get(); C3's collision recovery plus its
@@ -2824,14 +2838,20 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(getIdx).toBe(3)
 
     // AC 3: the honest summary line reports every bucket separately (never
-    // folding fresh-after-amnesia into a generic "ok"), and — because
-    // freshAfterAmnesia > 0 — the loud grep-friendly follow-up line fires.
+    // folding amnesia into a generic "ok"), splitting diagnosed
+    // (fresh-after-amnesia) from undiagnosable (fresh-after-inconclusive-amnesia).
     expect(errLog).toContain(
       'startupSessionManager: complete — 1 resumed, 1 fresh-spawned, ' +
-        '1 fresh-after-amnesia, 0 reconnected, 0 no-op, 1 failed',
+        '0 fresh-after-amnesia, 1 fresh-after-inconclusive-amnesia, ' +
+        '0 reconnected, 0 no-op, 1 failed',
     )
+    // Because freshAfterInconclusiveAmnesia > 0, its loud grep-friendly
+    // follow-up line fires (the freshAfterAmnesia line does not — count is 0).
     expect(errLog).toContain(
-      '1 channel(s) were fresh-spawned after ErrJsonlMissing',
+      '1 channel(s) were fresh-spawned after ErrJsonlMissing WITHOUT a conclusive diagnosis',
+    )
+    expect(errLog).not.toContain(
+      '1 channel(s) were fresh-spawned after ErrJsonlMissing (transcript could not be resumed)',
     )
   })
 
@@ -2872,8 +2892,9 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       })
       const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
       const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, true)
-      // Never throws — the fresh-spawn still happens.
-      expect(result.action).toBe('fresh-after-amnesia')
+      // Never throws — the fresh-spawn still happens. No message_archive_db is
+      // configured here, so the diagnosis is inconclusive (c-config).
+      expect(result.action).toBe('fresh-after-inconclusive-amnesia')
     })
     // Honest provenance clause + locally-computed labels for both persisted
     // column and config-dir fallback.
@@ -2900,9 +2921,14 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } }, message_archive_db: dbPath })
     const result = await spawnForRoute(CH, { cwd: CWD }, cfg, web as never, true)
 
+    // b.fwu: evidence-based never-created is the DIAGNOSED-lossless case — it
+    // stays quiet and is bucketed as the ordinary fresh-after-amnesia action,
+    // NOT the undiagnosable fresh-after-inconclusive-amnesia.
     expect(result.action).toBe('fresh-after-amnesia')
-    expect(calls).toHaveLength(0) // no channel post
-    expect(readLog()).not.toContain('jsonl-transcript-lost-on-resume') // quiet
+    expect(calls).toHaveLength(0) // no channel post at all
+    const log = readLog()
+    expect(log).not.toContain('jsonl-transcript-lost-on-resume') // quiet
+    expect(log).not.toContain('jsonl-diagnosis-inconclusive') // not inconclusive
   })
 
   // --- Classification triad: lost (loud) ----------------------------------
@@ -2933,10 +2959,12 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect((calls[0][0] as { channel: string }).channel).toBe(CH)
   })
 
-  // --- Classification triad: unknown (row fetch fails) --------------------
-  // The diagnostic get() rejects → cannot classify. Must not throw; the amnesia
-  // fresh-spawn still completes and is counted.
-  test('unknown: diagnostic row fetch fails → no throw, still fresh-after-amnesia', async () => {
+  // --- Classification triad: inconclusive (row fetch fails) ---------------
+  // b.fwu case (a): the diagnostic get() rejects → the row cannot be consulted,
+  // so we cannot classify loss vs never-created. Must not throw; the amnesia
+  // fresh-spawn still completes, now bucketed as the dedicated
+  // 'fresh-after-inconclusive-amnesia' action.
+  test('inconclusive (a): diagnostic row fetch fails → no throw, fresh-after-inconclusive-amnesia', async () => {
     captureStartupErrors()
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
@@ -2960,10 +2988,208 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
     const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, true)
 
-    expect(result.action).toBe('fresh-after-amnesia')
+    expect(result.action).toBe('fresh-after-inconclusive-amnesia')
     expect(deleteCalls).toHaveLength(1) // delete+fresh policy unchanged
     expect(spawnCalls).toHaveLength(2)
     expect(getCalls).toBeGreaterThanOrEqual(2)
+  })
+
+  // ==========================================================================
+  // b.fwu requirement 6: for EACH of the three inconclusive conditions —
+  // (a) row-fetch failure, (b) unparseable/absent started_at, (c) archive
+  // unavailable — assert BOTH the startup counter (freshAfterInconclusiveAmnesia
+  // increments, freshAfterAmnesia does not) AND the startup-error record
+  // (jsonl-diagnosis-inconclusive with a condition-specific detail).
+  // ==========================================================================
+
+  // (a) row-fetch failure, driven through startupSessionManager so the counter
+  // is observable. The diagnostic get() (second get) rejects; the collision
+  // recovery get() (first) succeeds so the amnesia path is reached at all.
+  test('inconclusive (a) via startup: row fetch fails → counter + jsonl-diagnosis-inconclusive record', async () => {
+    const readLog = captureStartupErrors()
+    const stub = installStub({
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+      ],
+      resumeError: errJsonlMissing(),
+    })
+    let getCalls = 0
+    stub.get = async (params) => {
+      getCalls++
+      if (getCalls >= 2) throw errGeneric('get', 'ErrSpawnGone')
+      return cannedGetResult({ claude_instance_id: params.claude_instance_id, state: 'ended' })
+    }
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+    const result = await startupSessionManager(cfg, { concurrency: 1 })
+
+    expect(result.freshAfterInconclusiveAmnesia).toBe(1)
+    expect(result.freshAfterAmnesia).toBe(0)
+    const log = readLog()
+    expect(log).toContain('jsonl-diagnosis-inconclusive')
+    // Detail names WHICH condition: the row could not be fetched.
+    expect(log).toContain('could not fetch the agent-director row')
+  })
+
+  // (b) unparseable/absent started_at — the archive is even configured (a real
+  // db), proving the short-circuit is on started_at, not on archive absence.
+  test('inconclusive (b) via startup: unparseable started_at → counter + jsonl-diagnosis-inconclusive record', async () => {
+    const readLog = captureStartupErrors()
+    const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 3)
+    installAmnesia({
+      getResult: {
+        jsonl_path: '/data/proj/sess-b.jsonl',
+        claude_session_id: 'sess-b',
+        cwd: CWD,
+        started_at: 'not-a-timestamp',
+      },
+    })
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } }, message_archive_db: dbPath })
+    const result = await startupSessionManager(cfg, { concurrency: 1 })
+
+    expect(result.freshAfterInconclusiveAmnesia).toBe(1)
+    expect(result.freshAfterAmnesia).toBe(0)
+    const log = readLog()
+    expect(log).toContain('jsonl-diagnosis-inconclusive')
+    // Detail names WHICH condition: started_at could not be parsed. Because it
+    // is unparseable, the archive must NOT have been consulted (no lost record).
+    expect(log).toContain("started_at is absent or unparseable")
+    expect(log).not.toContain('jsonl-transcript-lost-on-resume')
+  })
+
+  // (c-config) archive unavailable because none is configured. Distinguished
+  // from (c-other) by the actionable "no message archive is configured" hint.
+  test('inconclusive (c-config) via startup: no message_archive_db → counter + jsonl-diagnosis-inconclusive record', async () => {
+    const readLog = captureStartupErrors()
+    installAmnesia({
+      getResult: { jsonl_path: '/data/proj/sess-c1.jsonl', claude_session_id: 'sess-c1', cwd: CWD },
+    })
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } }) // no message_archive_db
+    const result = await startupSessionManager(cfg, { concurrency: 1 })
+
+    expect(result.freshAfterInconclusiveAmnesia).toBe(1)
+    expect(result.freshAfterAmnesia).toBe(0)
+    const log = readLog()
+    expect(log).toContain('jsonl-diagnosis-inconclusive')
+    expect(log).toContain('no message archive is configured')
+  })
+
+  // (c-other) archive IS configured but the file is missing / unreadable.
+  // Distinguished from (c-config) by naming the configured path in the detail.
+  test('inconclusive (c-other) via startup: configured archive file missing → counter + jsonl-diagnosis-inconclusive record', async () => {
+    const readLog = captureStartupErrors()
+    const missingDb = join(tmpdir(), `cscb-wrb-missing-${Date.now()}.db`)
+    installAmnesia({
+      getResult: {
+        jsonl_path: '/data/proj/sess-c2.jsonl',
+        claude_session_id: 'sess-c2',
+        cwd: CWD,
+        started_at: '2026-09-20T05:00:00Z',
+      },
+    })
+    const cfg = makeRoutingConfig({
+      routes: { [CH]: { cwd: CWD } },
+      message_archive_db: missingDb,
+    })
+    const result = await startupSessionManager(cfg, { concurrency: 1 })
+
+    expect(result.freshAfterInconclusiveAmnesia).toBe(1)
+    expect(result.freshAfterAmnesia).toBe(0)
+    const log = readLog()
+    expect(log).toContain('jsonl-diagnosis-inconclusive')
+    // c-other wording names the configured (but unusable) archive path, and is
+    // distinct from the c-config "no message archive is configured" hint.
+    expect(log).toContain(`the message archive (${missingDb})`)
+    expect(log).not.toContain('no message archive is configured')
+  })
+
+  // --- Conclusive amnesia through startup: freshAfterAmnesia counter ---------
+  // b.fwu review gap: no test drove freshAfterAmnesia > 0 through
+  // startupSessionManager — the diagnosed 'fresh-after-amnesia' switch case and
+  // its loud follow-up line ("transcript could not be resumed") were asserted
+  // only in the negative. These two cover the two conclusive flavors.
+
+  // (lost) archive has post-spawn messages → real context destroyed. Diagnosis
+  // is CONCLUSIVE, so it lands in freshAfterAmnesia (not the inconclusive
+  // bucket), and the loud diagnosed follow-up line fires.
+  test('conclusive lost via startup: post-spawn archived messages → freshAfterAmnesia counter + diagnosed follow-up line', async () => {
+    captureStartupErrors()
+    const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 4)
+    installAmnesia({
+      getResult: {
+        jsonl_path: '/data/proj/sess-lost.jsonl',
+        claude_session_id: 'sess-lost',
+        cwd: CWD,
+        started_at: '2026-09-20T05:00:00Z',
+      },
+    })
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } }, message_archive_db: dbPath })
+    let result!: Awaited<ReturnType<typeof startupSessionManager>>
+    const errLog = await withCapturedErr(async () => {
+      result = await startupSessionManager(cfg, { concurrency: 1 })
+    })
+
+    expect(result.freshAfterAmnesia).toBe(1)
+    expect(result.freshAfterInconclusiveAmnesia).toBe(0)
+    expect(result.succeeded).toBe(1)
+    // Summary line reports the conclusive bucket, not the inconclusive one.
+    expect(errLog).toContain(
+      'startupSessionManager: complete — 0 resumed, 0 fresh-spawned, ' +
+        '1 fresh-after-amnesia, 0 fresh-after-inconclusive-amnesia, ' +
+        '0 reconnected, 0 no-op, 0 failed',
+    )
+    // The diagnosed follow-up line fires; the inconclusive one does not.
+    expect(errLog).toContain(
+      '1 channel(s) were fresh-spawned after ErrJsonlMissing (transcript could not be resumed)',
+    )
+    expect(errLog).not.toContain(
+      'fresh-spawned after ErrJsonlMissing WITHOUT a conclusive diagnosis',
+    )
+  })
+
+  // (never-created) 0 post-spawn messages → lossless but still CONCLUSIVE, so it
+  // is bucketed as freshAfterAmnesia (quiet: the diagnosed follow-up line still
+  // fires because freshAfterAmnesia > 0, but no per-channel 'lost' record).
+  test('conclusive never-created via startup: 0 post-spawn messages → freshAfterAmnesia counter, not inconclusive', async () => {
+    captureStartupErrors()
+    const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 0)
+    installAmnesia({
+      getResult: {
+        jsonl_path: '/data/proj/sess-nc.jsonl',
+        claude_session_id: 'sess-nc',
+        cwd: CWD,
+        started_at: '2026-09-20T05:00:00Z',
+      },
+    })
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } }, message_archive_db: dbPath })
+    const result = await startupSessionManager(cfg, { concurrency: 1 })
+
+    expect(result.freshAfterAmnesia).toBe(1)
+    expect(result.freshAfterInconclusiveAmnesia).toBe(0)
+    expect(result.succeeded).toBe(1)
+  })
+
+  // Channel-post wording for an inconclusive case must be UNCERTAINTY-shaped,
+  // never the 'lost' "destroyed"/"memory has been lost" wording — a false
+  // "your history was destroyed" is its own harm.
+  test('inconclusive channel post is worded as uncertainty, not the lost "destroyed" wording', async () => {
+    captureStartupErrors()
+    const { web, calls } = makeMockWeb()
+    installAmnesia({
+      getResult: { jsonl_path: '/data/proj/sess-u.jsonl', claude_session_id: 'sess-u', cwd: CWD },
+    })
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } }) // c-config → inconclusive
+    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, web as never, true)
+
+    expect(result.action).toBe('fresh-after-inconclusive-amnesia')
+    expect(calls).toHaveLength(1)
+    const posted = calls[0][0] as { channel: string; text: string }
+    expect(posted.channel).toBe(CH)
+    // Uncertainty wording present.
+    expect(posted.text).toContain('could not determine whether my prior')
+    // 'lost'-branch wording absent.
+    expect(posted.text).not.toContain('my memory of this channel has been lost')
+    expect(posted.text).not.toContain('message archive shows')
   })
 
   // --- ErrNoSessionId sibling still 'spawned' (not amnesia) ---------------

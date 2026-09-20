@@ -916,7 +916,14 @@ export async function waitForWaitingAndReconnect(
 
 export interface SpawnRouteResult {
   channelId: string
-  action: 'spawned' | 'resumed' | 'reconnected' | 'no-op' | 'failed' | 'fresh-after-amnesia'
+  action:
+    | 'spawned'
+    | 'resumed'
+    | 'reconnected'
+    | 'no-op'
+    | 'failed'
+    | 'fresh-after-amnesia'
+    | 'fresh-after-inconclusive-amnesia'
 }
 
 /** Build SpawnParams for a route (SR-1.1). Per-route claude_config_dir wins. */
@@ -1109,8 +1116,11 @@ function localStatNote(path: string): string {
  * started_at are still available. Never throws.
  *
  * @returns 'lost' when the row had provable prior activity but no transcript
- *          survives (loud), 'never-created' when idle-since-spawn (quiet), or
- *          'unknown' when we could not gather enough evidence to decide.
+ *          survives (loud), 'never-created' when the archive was consulted and
+ *          proved idle-since-spawn (quiet, evidence-based lossless), or
+ *          'inconclusive' when we could not gather enough evidence to decide
+ *          either way (loud-but-uncertain — the diagnosis machinery itself is
+ *          degraded, which correlates with the storage faults that cause loss).
  */
 async function diagnoseJsonlMissing(
   channelId: string,
@@ -1119,7 +1129,7 @@ async function diagnoseJsonlMissing(
   err: ErrJsonlMissing,
   web: WebClient | undefined,
   isStartup: boolean,
-): Promise<'lost' | 'never-created' | 'unknown'> {
+): Promise<'lost' | 'never-created' | 'inconclusive'> {
   // --- 1. What paths did AD try, and from where? -------------------------
   // err.errDescription is AD's detail string. In the future rich format (AD
   // b.1ba) it enumerates `<source> <path> (<err>)`; in installed 0.8.0 it does
@@ -1134,15 +1144,21 @@ async function diagnoseJsonlMissing(
       client.get({ claude_instance_id: claudeInstanceId }),
     )
   } catch (getErr) {
-    // Row already gone / AD unreachable — cannot enrich. Log what AD told us.
+    // (a) Row already gone / AD unreachable — cannot enrich or classify.
+    // Inconclusive: we could not consult the row at all, so we do NOT know
+    // whether history was lost. Report it as uncertainty, not reassurance.
     const adDetail = adCandidates.length
       ? adCandidates.map((c) => `${c.source} ${c.path} (${c.note})`).join('; ')
       : err.errDescription || '(no path detail from agent-director)'
-    console.error(
-      `[slack] ErrJsonlMissing diagnostic: channel=${channelId} — could not fetch AD row ` +
-        `(${String(getErr)}); AD reported: ${adDetail}`,
+    reportInconclusiveDiagnosis(
+      channelId,
+      claudeInstanceId,
+      `could not fetch the agent-director row (${String(getErr)}); AD reported: ${adDetail}`,
+      web,
+      isStartup,
+      err,
     )
-    return 'unknown'
+    return 'inconclusive'
   }
 
   // --- 3. Assemble the candidate list to log. ----------------------------
@@ -1219,18 +1235,91 @@ async function diagnoseJsonlMissing(
     return 'lost'
   }
 
-  // NEVER-CREATED: no archived activity since spawn (or archive unavailable).
-  // Claude writes the .jsonl lazily on first message; an idle-since-spawn
-  // channel simply never had one. Expected and lossless — quiet log, no error,
-  // no channel post, counted as an ordinary fresh-spawn.
-  console.error(
-    `[slack] ErrJsonlMissing diagnostic: channel=${channelId} instance=${claudeInstanceId} — transcript never ` +
-      `created (no archived activity since spawn` +
-      `${startedAtEpoch === null ? ', started_at unparseable/absent' : ''}` +
-      `${archivedSinceSpawn === null ? ', archive unavailable' : ''}). Nothing to lose; resume will fresh-spawn. ` +
-      `Transcript candidates tried (${detailProvenance}): ${candidateStr}.`,
+  // Below archivedSinceSpawn is 0 or null. Only 0 (archive consulted, no
+  // activity since spawn) is evidence-based never-created. null means we never
+  // got a usable count — that is INCONCLUSIVE, not reassurance.
+  if (archivedSinceSpawn === 0) {
+    // NEVER-CREATED (evidence-based): the archive was consulted and proved zero
+    // archived activity since spawn. Claude writes the .jsonl lazily on first
+    // message; an idle-since-spawn channel simply never had one. Expected and
+    // lossless — quiet log, no error, no channel post, counted as an ordinary
+    // fresh-spawn.
+    console.error(
+      `[slack] ErrJsonlMissing diagnostic: channel=${channelId} instance=${claudeInstanceId} — transcript never ` +
+        `created (archive consulted: 0 archived messages since spawn). Nothing to lose; resume will fresh-spawn. ` +
+        `Transcript candidates tried (${detailProvenance}): ${candidateStr}.`,
+    )
+    return 'never-created'
+  }
+
+  // INCONCLUSIVE: we could not gather enough evidence to decide loss vs
+  // never-created. Determine WHY — the operator needs the actionable cause.
+  //   (b) started_at absent/unparseable → could not bound "since spawn".
+  //   (c-config) no message_archive_db configured → diagnosis is structurally
+  //              impossible; actionable "turn on the archive" hint.
+  //   (c-other) archive configured but file-missing / unreadable / query threw.
+  let reason: string
+  if (startedAtEpoch === null) {
+    reason =
+      `the row's started_at is absent or unparseable (started_at=${row.started_at ?? '(none)'}), ` +
+      `so "since spawn" could not be bounded and the archive was not consulted`
+  } else if (!routingConfig.message_archive_db) {
+    reason =
+      `no message archive is configured (message_archive_db unset), so there is no evidence source to ` +
+      `consult — enable the message archive to make transcript-loss diagnosis possible`
+  } else {
+    reason =
+      `the message archive (${routingConfig.message_archive_db}) could not be consulted (missing file, ` +
+      `unreadable, or the count query failed) — see prior archive-count error line`
+  }
+  reportInconclusiveDiagnosis(
+    channelId,
+    claudeInstanceId,
+    `${reason}. Transcript candidates tried (${detailProvenance}): ${candidateStr}`,
+    web,
+    isStartup,
+    err,
   )
-  return 'never-created'
+  return 'inconclusive'
+}
+
+/**
+ * b.fwu: emit the operator-visible signal for an INCONCLUSIVE ErrJsonlMissing
+ * diagnosis — one where we could not determine whether prior history was lost.
+ * Follows the 'lost' branch's pattern (recordStartupError guarded by isStartup
+ * + a channel post), but worded as UNCERTAINTY, not loss: a false "your history
+ * was destroyed" is its own harm. Never throws.
+ */
+function reportInconclusiveDiagnosis(
+  channelId: string,
+  claudeInstanceId: string,
+  reason: string,
+  web: WebClient | undefined,
+  isStartup: boolean,
+  err: ErrJsonlMissing,
+): void {
+  const detail =
+    `channel=${channelId} instance=${claudeInstanceId}: resume threw ErrJsonlMissing and the row will be ` +
+    `deleted + fresh-spawned, but diagnosis was INCONCLUSIVE — could not determine whether conversation ` +
+    `history was lost because ${reason}.`
+  console.error(`[slack] ErrJsonlMissing diagnostic: ${detail}`)
+  if (isStartup) recordStartupError('jsonl-diagnosis-inconclusive', detail, err)
+  if (web !== undefined) {
+    web.chat
+      .postMessage({
+        channel: channelId,
+        text:
+          `⚠️ CSCB: on restart this channel was restarted fresh; I could not determine whether my prior ` +
+          `conversation history was preserved (diagnosis inconclusive: ${reason}). An operator should ` +
+          `investigate.`,
+      })
+      .catch((postErr: unknown) => {
+        console.error(
+          `[slack] ErrJsonlMissing diagnostic: failed to post inconclusive-diagnosis notice to channel=${channelId}:`,
+          postErr,
+        )
+      })
+  }
 }
 
 /**
@@ -1338,8 +1427,9 @@ async function resumeOrFreshSpawn(
       // jsonl_path / session id / started_at are needed). Logging/classification
       // only — the delete+fresh POLICY below is unchanged. The 'lost' case is
       // made operator-visible inside diagnoseJsonlMissing itself.
+      let jsonlDiagnosis: 'lost' | 'never-created' | 'inconclusive' | undefined
       if (err instanceof ErrJsonlMissing) {
-        await diagnoseJsonlMissing(
+        jsonlDiagnosis = await diagnoseJsonlMissing(
           channelId,
           routingConfig,
           normalizedName,
@@ -1355,11 +1445,21 @@ async function resumeOrFreshSpawn(
         await approvePreSessionDialogs(channelId, web, isStartup, normalizedName)
         // A fresh-spawn that replaced a resume because the transcript was gone
         // is amnesia, not a clean spawn — surface it as its own action so the
-        // startup summary does not count it as an ordinary "ok". 'never-created'
-        // and 'unknown' are lossless/inconclusive; only 'lost' was made loud
-        // above, but all three arrived here via ErrJsonlMissing amnesia.
+        // startup summary does not count it as an ordinary "ok". b.fwu: split
+        // the amnesia into two actions by diagnosis. 'lost' and 'never-created'
+        // are DIAGNOSED amnesia (we know whether history was destroyed —
+        // 'lost' was already made loud above, 'never-created' is evidence-based
+        // lossless). 'inconclusive' is UNDIAGNOSABLE amnesia: we could not tell
+        // whether we destroyed anything, which is itself operator-worthy and
+        // must not be lumped with the known-cause cases.
         if (err instanceof ErrJsonlMissing) {
-          return { channelId, action: 'fresh-after-amnesia' }
+          return {
+            channelId,
+            action:
+              jsonlDiagnosis === 'inconclusive'
+                ? 'fresh-after-inconclusive-amnesia'
+                : 'fresh-after-amnesia',
+          }
         }
         return { channelId, action: 'spawned' }
       } catch (err2) {
@@ -1933,8 +2033,15 @@ export interface StartupSessionManagerResult {
   /** Clean fresh spawns (no prior row / no resume attempted). */
   freshSpawned: number
   /** Fresh spawns that REPLACED a resume because the transcript was missing
-   *  (ErrJsonlMissing amnesia) — separated so they are never hidden in "ok". */
+   *  (ErrJsonlMissing amnesia) and diagnosis was CONCLUSIVE ('lost' or
+   *  evidence-based 'never-created') — separated so they are never hidden in
+   *  "ok". */
   freshAfterAmnesia: number
+  /** b.fwu: fresh spawns that REPLACED a resume after ErrJsonlMissing amnesia
+   *  where diagnosis was INCONCLUSIVE — we could not determine whether prior
+   *  history was destroyed. Kept apart from freshAfterAmnesia so the operator
+   *  can distinguish known-cause amnesia from undiagnosable amnesia. */
+  freshAfterInconclusiveAmnesia: number
   reconnected: number
   noop: number
   perChannel: Array<{ channelId: string; action: SpawnRouteResult['action'] }>
@@ -1968,6 +2075,7 @@ export async function startupSessionManager(
   let resumed = 0
   let freshSpawned = 0
   let freshAfterAmnesia = 0
+  let freshAfterInconclusiveAmnesia = 0
   let reconnected = 0
   let noop = 0
   let nextIdx = 0
@@ -1983,6 +2091,10 @@ export async function startupSessionManager(
         break
       case 'fresh-after-amnesia':
         freshAfterAmnesia++
+        succeeded++
+        break
+      case 'fresh-after-inconclusive-amnesia':
+        freshAfterInconclusiveAmnesia++
         succeeded++
         break
       case 'reconnected':
@@ -2031,12 +2143,15 @@ export async function startupSessionManager(
     Array.from({ length: Math.min(concurrency, routeEntries.length || 1) }, () => worker()),
   )
 
-  // b.wrb: honest breakdown. A fresh-spawn that replaced a resume because the
-  // transcript was missing (fresh-after-amnesia) is reported separately and
-  // never folded into a generic "ok".
+  // b.wrb/b.fwu: honest breakdown. A fresh-spawn that replaced a resume because
+  // the transcript was missing is reported separately and never folded into a
+  // generic "ok". b.fwu splits that amnesia into DIAGNOSED (fresh-after-amnesia:
+  // we know whether history was lost) vs UNDIAGNOSABLE
+  // (fresh-after-inconclusive-amnesia: we could not tell).
   console.error(
     `[slack] startupSessionManager: complete — ${resumed} resumed, ${freshSpawned} fresh-spawned, ` +
-      `${freshAfterAmnesia} fresh-after-amnesia, ${reconnected} reconnected, ${noop} no-op, ${failed} failed`,
+      `${freshAfterAmnesia} fresh-after-amnesia, ${freshAfterInconclusiveAmnesia} fresh-after-inconclusive-amnesia, ` +
+      `${reconnected} reconnected, ${noop} no-op, ${failed} failed`,
   )
   if (freshAfterAmnesia > 0) {
     // Loud, grep-friendly signal that some channels lost their resume target.
@@ -2047,6 +2162,19 @@ export async function startupSessionManager(
         `(transcript could not be resumed) — see per-channel "ErrJsonlMissing diagnostic" lines above.`,
     )
   }
+  if (freshAfterInconclusiveAmnesia > 0) {
+    // b.fwu: a separate, louder signal — these channels were fresh-spawned but
+    // the diagnosis machinery could not tell whether history was destroyed. That
+    // degraded-diagnosis condition correlates with the storage faults that cause
+    // real loss, so it warrants its own attention. Each was recorded to
+    // startup-errors as 'jsonl-diagnosis-inconclusive'.
+    console.error(
+      `[slack] startupSessionManager: ${freshAfterInconclusiveAmnesia} channel(s) were fresh-spawned after ` +
+        `ErrJsonlMissing WITHOUT a conclusive diagnosis — could NOT determine whether conversation history was ` +
+        `lost. See per-channel "ErrJsonlMissing diagnostic ... INCONCLUSIVE" lines and the ` +
+        `'jsonl-diagnosis-inconclusive' startup errors above.`,
+    )
+  }
 
   return {
     succeeded,
@@ -2054,6 +2182,7 @@ export async function startupSessionManager(
     resumed,
     freshSpawned,
     freshAfterAmnesia,
+    freshAfterInconclusiveAmnesia,
     reconnected,
     noop,
     perChannel,
