@@ -156,10 +156,98 @@ export interface PollerDeps {
 }
 
 // ---------------------------------------------------------------------------
+// Wedge-detector tuning (b.fae F4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Wall-clock a spawn must sit in check_permission with ZERO open
+ * `permission_requests` rows before we declare it wedged (b.fae F4).
+ *
+ * Sizing rationale: the poll interval defaults to 1 s
+ * (DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS) but is operator-configurable in
+ * [200 ms, 1 h]. A raw tick count (the ticket's "K=30") would therefore mean
+ * 6 s at a 200 ms interval or 30 min at a 1 min interval — not a stable
+ * wall-clock. So we derive the tick threshold K from the interval to target a
+ * FIXED wall-clock window, `WEDGE_TRIP_WALL_CLOCK_MS`.
+ *
+ * The window (90 s) is chosen to straddle the two regimes the investigation
+ * measured:
+ *   - The LEGITIMATE transient — the sub-second/few-second race where `decide`
+ *     has closed the last open row and the next hook has not yet fired to
+ *     advance state — is at most a few seconds, well under 90 s, so a healthy
+ *     spawn never trips.
+ *   - The real wedge takes MINUTES to develop (the incident's lost decision
+ *     landed 680 s after the request), so 90 s still fires long before an
+ *     operator would otherwise notice the bot is silently dead, while staying
+ *     safely clear of the transient.
+ * The ticket's K=30 (~30 s at the 1 s default) also clears the transient; 90 s
+ * is chosen as a more conservative margin above it that still alarms within a
+ * couple of minutes.
+ */
+export const WEDGE_TRIP_WALL_CLOCK_MS = 90_000
+
+/**
+ * Convert the poll interval into the consecutive-tick threshold K that
+ * approximates `WEDGE_TRIP_WALL_CLOCK_MS`. Floored at 5 ticks so a
+ * pathologically large interval can never make K so small the transient trips
+ * it (K=1 would fire on a single tick that happens to catch the race).
+ */
+export function wedgeTripTicks(intervalMs: number): number {
+  return Math.max(5, Math.ceil(WEDGE_TRIP_WALL_CLOCK_MS / intervalMs))
+}
+
+/**
+ * Per-spawn detector state for the empty-open-rows wedge. A spawn appears here
+ * only while it is observed in check_permission with an empty
+ * `permission_requests` array. It is removed (counter AND fired flag reset)
+ * the moment it leaves that condition — it exits check_permission, an open row
+ * appears, or the spawn disappears — so a later genuine wedge alarms again.
+ */
+interface WedgeState {
+  /** Consecutive ticks observed empty-in-check_permission. */
+  emptyTicks: number
+  /** One-shot latch: true only once a channel warning has SUCCESSFULLY posted
+   * for this episode, suppressing per-tick spam until the spawn recovers (b.vfx
+   * dedupe shape: in-memory first-occurrence, reset on recovery / daemon
+   * restart). b.fae F3: set only after a successful chat.postMessage, so a
+   * transient Slack failure retries on a later tick instead of permanently
+   * swallowing the episode's one warning. */
+  warningFired: boolean
+  /**
+   * b.fae F3 — throttle for warning-post RETRIES while the latch is unset (the
+   * post keeps failing). Once the tick threshold is crossed we attempt a post;
+   * on failure `warningFired` stays false so we retry, but attempting every
+   * tick would hammer Slack (intervals go as low as 200 ms). This records the
+   * `emptyTicks` value at the last attempt so we back off to at most one retry
+   * per `WEDGE_WARN_RETRY_TICKS`-worth of ticks. The `ok:false` trail event is
+   * still emitted on each ACTUAL attempt — we suppress attempts, not the
+   * diagnostic record of the attempts we make.
+   */
+  lastWarnAttemptTicks: number
+}
+
+/**
+ * b.fae F3 — minimum wall-clock (ms) between warning-post retries while the
+ * latch is unset. Converted to a tick count against the live interval, same
+ * pattern as {@link wedgeTripTicks}. 30 s keeps a Slack outage from producing
+ * a per-tick storm of failing posts while still recovering promptly once Slack
+ * returns.
+ */
+export const WEDGE_WARN_RETRY_WALL_CLOCK_MS = 30_000
+
+/** Tick count between warning-post retries; floored at 1 so a huge interval
+ * always retries on the very next empty tick. */
+export function wedgeWarnRetryTicks(intervalMs: number): number {
+  return Math.max(1, Math.ceil(WEDGE_WARN_RETRY_WALL_CLOCK_MS / intervalMs))
+}
+
+// ---------------------------------------------------------------------------
 // Module-scoped live state
 // ---------------------------------------------------------------------------
 
 const livePermissions = new Map<string, LivePermission>()
+/** claude_instance_id → wedge-detector state (b.fae F4). */
+const wedgeStates = new Map<string, WedgeState>()
 let pollerHandle: ReturnType<typeof setInterval> | null = null
 let tickInFlight = false
 let skippedTicks = 0
@@ -197,6 +285,7 @@ export function _resetPollerState(): void {
     else clearInterval(pollerHandle)
   }
   livePermissions.clear()
+  wedgeStates.clear()
   pollerHandle = null
   tickInFlight = false
   skippedTicks = 0
@@ -284,6 +373,129 @@ function emitRowDecision(
 }
 
 /**
+ * b.fae F4 — one-shot channel warning for a spawn wedged in check_permission
+ * with zero open rows. Posts a single top-level channel message (no thread_ts)
+ * describing the wedge and the HONEST remediation. `send-keys` is NOT offered:
+ * AD's relay guard (pkg/api/sendkeys.go) hard-rejects send-keys whenever
+ * relay_mode=on && state=check_permission, with no open-row exemption — so the
+ * only correct recovery is read-pane + kill/respawn.
+ */
+async function postWedgeWarning(
+  deps: PollerDeps,
+  claudeInstanceId: string,
+  channelId: string,
+): Promise<boolean> {
+  const text =
+    '⚠️ This bot appears blocked on a native Claude Code permission prompt that ' +
+    "never reached Slack — it will not respond until it's cleared. To recover: run " +
+    '`agent-director read-pane --claude-instance-id ' +
+    claudeInstanceId +
+    '` to see the native prompt, then kill and respawn the session ' +
+    '(`agent-director kill` / tmux-kill + respawn). Do NOT use send-keys — it is ' +
+    'rejected in this state.'
+  const emit = deps.emitTrail ?? defaultEmitTrail
+  try {
+    const response = await deps.web.chat.postMessage({ channel: channelId, text })
+    const slackTs = (response as { ts?: string }).ts
+    emit({
+      event: 'cscb.poller.wedge_detected',
+      claude_instance_id: claudeInstanceId,
+      channel: channelId,
+      text,
+      ok: true,
+      slack_ts: slackTs,
+    })
+    return true
+  } catch (err) {
+    // b.emk convention: failures land in BOTH server.log and the trail JSONL.
+    logViaDeps(deps, `[slack] permission-poller: wedge warning postMessage failed for ${claudeInstanceId}:`, err)
+    emit({
+      event: 'cscb.poller.wedge_detected',
+      claude_instance_id: claudeInstanceId,
+      channel: channelId,
+      text,
+      ok: false,
+      error: classifySlackError(err),
+    })
+    return false
+  }
+}
+
+/**
+ * b.fae F4 — advance the wedge detector for one spawn observed this tick in
+ * check_permission with an EMPTY `permission_requests` array. Increments the
+ * per-spawn consecutive-empty-tick counter; when it crosses the K threshold
+ * (`wedgeTripTicks`) for the first time this episode, logs, emits a trail
+ * event, and posts the one-shot channel warning. The `warningFired` latch
+ * suppresses per-tick spam thereafter (the operator-hostile behavior b.vfx
+ * documents) — but b.fae F3: it latches ONLY after a successful post, so a
+ * transient chat.postMessage failure retries on a later tick instead of
+ * permanently swallowing the episode's one warning. Retries are throttled to
+ * one per {@link wedgeWarnRetryTicks} so a Slack outage cannot storm the API
+ * at a 200 ms interval. The detector is re-armed by `reconcileWedgeStates`
+ * dropping the spawn's state the moment it leaves the wedged condition.
+ */
+async function observeWedgeCandidate(
+  deps: PollerDeps,
+  claudeInstanceId: string,
+  channelId: string,
+): Promise<void> {
+  const k = wedgeTripTicks(deps.intervalMs)
+  let state = wedgeStates.get(claudeInstanceId)
+  if (!state) {
+    state = { emptyTicks: 0, warningFired: false, lastWarnAttemptTicks: 0 }
+    wedgeStates.set(claudeInstanceId, state)
+  }
+  state.emptyTicks++
+  if (state.emptyTicks < k || state.warningFired) return
+
+  // Threshold crossed and not yet successfully warned. Throttle retries: only
+  // (re)attempt if this is the first attempt (lastWarnAttemptTicks === 0) or
+  // enough ticks have elapsed since the last failed attempt.
+  const retryEvery = wedgeWarnRetryTicks(deps.intervalMs)
+  if (
+    state.lastWarnAttemptTicks !== 0 &&
+    state.emptyTicks - state.lastWarnAttemptTicks < retryEvery
+  ) {
+    return
+  }
+  state.lastWarnAttemptTicks = state.emptyTicks
+  logViaDeps(
+    deps,
+    `[slack] permission-poller: spawn ${claudeInstanceId} wedged in check_permission with zero open rows for ${state.emptyTicks} ticks (~${Math.round((state.emptyTicks * deps.intervalMs) / 1000)}s) — posting one-shot warning`,
+  )
+  const posted = await postWedgeWarning(deps, claudeInstanceId, channelId)
+  // b.fae F3: latch only on success; a failed post leaves warningFired false so
+  // a subsequent tick retries and exactly one message lands on recovery.
+  if (posted) state.warningFired = true
+}
+
+/**
+ * b.fae F4 — re-arm the detector for any tracked spawn POSITIVELY observed
+ * non-wedged this tick. A spawn leaves the wedged condition when it exits
+ * check_permission, an open row appears, or it disappears entirely; in every
+ * such case its instance id is absent from `observedEmpty`, so we drop its
+ * state (counter AND fired flag) and a later genuine wedge alarms afresh.
+ *
+ * b.fae F4 follow-up: a spawn merely SKIPPED this tick due to a transient `get`
+ * error or a non-conforming response (`skippedThisTick`) is NOT a positive
+ * observation — resetting on it would let a single flaky AD connection zero the
+ * counter and defer detection indefinitely. Such spawns are exempted (mirrors
+ * the closed-row sweep's `nonConformingInstanceIds` exemption): their state is
+ * preserved so the empty-tick count accumulates across transient read gaps.
+ */
+function reconcileWedgeStates(
+  observedEmpty: Set<string>,
+  skippedThisTick: Set<string>,
+): void {
+  for (const instanceId of [...wedgeStates.keys()]) {
+    if (observedEmpty.has(instanceId)) continue
+    if (skippedThisTick.has(instanceId)) continue
+    wedgeStates.delete(instanceId)
+  }
+}
+
+/**
  * Map an unknown Slack error to a stable error-class string per SR-V-2.4.
  * Slack platform errors expose `data.error` (e.g. `channel_not_found`); other
  * errors collapse to short class labels.
@@ -331,6 +543,19 @@ async function runTick(deps: PollerDeps): Promise<void> {
 
     const seenComposite = new Set<string>()
     const nonConformingInstanceIds = new Set<string>()
+    // b.fae F4: spawns observed this tick in check_permission with an empty
+    // (conforming) permission_requests array. Any tracked wedge state NOT in
+    // this set at tick-end is re-armed (the spawn left the wedged condition)…
+    const wedgeObservedEmpty = new Set<string>()
+    // …UNLESS the spawn was merely SKIPPED this tick due to a transient `get`
+    // error or a non-conforming (null/undefined) open-rows response. b.fae F4
+    // follow-up: a single flaky AD connection must not zero the wedge counter
+    // and defer detection indefinitely. This is the analogue of the closed-row
+    // sweep exempting `nonConformingInstanceIds`: we only reset wedge state for
+    // spawns POSITIVELY observed non-wedged (non-empty rows, or confirmed gone
+    // via ErrSpawnNotFound), never for spawns we simply could not read this
+    // tick. Spawns in this set keep their prior emptyTicks/warningFired.
+    const wedgeSkippedThisTick = new Set<string>()
     for (const row of rows) {
       const rowChannelId = row.labels['channel']
       if (!rowChannelId) {
@@ -344,7 +569,12 @@ async function runTick(deps: PollerDeps): Promise<void> {
           client.get({ claude_instance_id: row.claude_instance_id })
         )) as unknown as GetResultWithPermissionRequests
       } catch (err) {
+        // ErrSpawnNotFound is a POSITIVE observation the spawn is gone — it left
+        // check_permission, so let reconcileWedgeStates re-arm it (do NOT
+        // exempt). Every other error is a transient read failure: exempt the
+        // spawn from re-arming so its counter survives the flaky tick.
         if (err instanceof ErrSpawnNotFound) continue
+        wedgeSkippedThisTick.add(row.claude_instance_id)
         if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
           // Outage flag raised; skip per-event log.
           continue
@@ -357,9 +587,22 @@ async function runTick(deps: PollerDeps): Promise<void> {
       if (got.permission_requests === null || got.permission_requests === undefined) {
         logViaDeps(deps, `[slack] permission-poller: non-conforming open-rows response for ${row.claude_instance_id} — skipping`)
         nonConformingInstanceIds.add(row.claude_instance_id)
+        // b.fae F4 follow-up: a non-conforming response is a read we could not
+        // trust, not a positive non-wedged observation — exempt from re-arming.
+        wedgeSkippedThisTick.add(row.claude_instance_id)
         // SR-V-2.3: request_token omitted (no row was readable) per SR-V-1.1.
         emitRowDecision(deps, 'non_conforming_skipped', row.claude_instance_id, undefined)
         continue
+      }
+
+      // b.fae F4: an EMPTY (but conforming) array is a spawn sitting in
+      // check_permission with zero open rows — the silent-wedge signature.
+      // Feed it to the detector; a non-empty array means the spawn is NOT
+      // wedged, so it is intentionally excluded from wedgeObservedEmpty and
+      // will be re-armed by reconcileWedgeStates below.
+      if (got.permission_requests.length === 0) {
+        wedgeObservedEmpty.add(row.claude_instance_id)
+        await observeWedgeCandidate(deps, row.claude_instance_id, rowChannelId)
       }
 
       for (const perm of got.permission_requests) {
@@ -373,6 +616,11 @@ async function runTick(deps: PollerDeps): Promise<void> {
         await postPermissionPrompt(deps, row, perm)
       }
     }
+
+    // b.fae F4: re-arm the wedge detector for spawns no longer wedged (left
+    // check_permission, gained an open row, or disappeared), but NOT for spawns
+    // merely skipped by a transient read error this tick.
+    reconcileWedgeStates(wedgeObservedEmpty, wedgeSkippedThisTick)
 
     // SR-2.4 newly-closed reconciliation. Collect first, then reconcile —
     // avoids mutating the map while iterating it.

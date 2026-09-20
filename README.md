@@ -492,6 +492,10 @@ The Slack app must have **interactivity enabled** with **Socket Mode** as the de
 
 The `AskUserQuestion` tool is denied for every CSCB-spawned bot via the agent-director template (`deny: ['AskUserQuestion']`). Bots respond to operator questions via the Slack `reply` MCP tool instead. There is no `ask-relay.sh` hook and no `/ask` HTTP route.
 
+### Memory-directory reads
+
+The template also pre-allows each bot to read its own persistent-memory directory, so those reads don't surface a permission prompt to a human. One `Read(//<config-dir>/projects/*/memory/**)` rule is derived per distinct Claude config directory in your routing config (a route's `claude_config_dir`, the top-level `claude_config_dir`, or the `~/.claude` default). The rule is scoped to `projects/*/memory/**` only — never the config-dir root, which holds live credentials — so it never pre-authorizes credential reads.
+
 ---
 
 ## Slack Reply Guard (Stop hook)
@@ -573,6 +577,9 @@ Messages to channels not listed in `access.json → channels` and not present in
 
 **Permission relay not working**
 Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json`.
+
+**Bot appears dead / posts a "blocked on a native permission prompt" warning**
+The bot is wedged in `check_permission` on a native Claude Code TUI prompt that never reached Slack (a permission decision AD recorded but could not deliver). The bot stops responding, and after ~90 s the poller posts a one-shot channel warning. Recover by inspecting the native prompt with `agent-director read-pane --claude-instance-id <id>`, then killing and respawning the session (`agent-director kill <id>` or tmux-kill, then let the server restart it or `claude-slack-channel-bots stop && claude-slack-channel-bots start`). Do **not** use `send-keys` — agent-director hard-rejects it while the spawn is in this relayed permission state. The warning fires once per wedge episode; the detector re-arms if the bot later wedges again.
 
 **Session not restarting after crash**
 Auto-restart backs off exponentially on repeated launch failures — the delay doubles from `session_restart_delay` (default 60s) on each consecutive failure, up to a 15-minute ceiling. After 5 consecutive failures the route hits a cap: a `SpawnCapReached` message is posted to the channel and automatic restarts stop. A capped route has no registered session, so sending a message in the channel does **not** restart it — the inbound message is dropped. To retry a capped route, restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`; the failure counter is in-process and cleared on restart, giving each route a fresh attempt. To disable auto-restart entirely, set `session_restart_delay` to `0` in `config.json`.

@@ -46,6 +46,7 @@ import {
   markHandled,
   startPermissionPoller,
   stopPermissionPoller,
+  wedgeTripTicks,
 } from '../src/permission-poller.ts'
 import { _resetTrailFdForTests, type TrailEventBase } from '../src/permission-trail.ts'
 import { parsePermissionActionId } from '../src/permission-action-id.ts'
@@ -2037,5 +2038,315 @@ describe('b.en2 Epic 6 — withOutageDetection wrapper integration', () => {
     // No live permission entry, no Slack messages.
     expect(getLivePermission(INSTANCE_C, TOKEN_A)).toBeUndefined()
     expect(chat.calls).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.fae F4 — silent-wedge detector (empty permission_requests in
+// check_permission for K consecutive ticks → one-shot channel warning +
+// cscb.poller.wedge_detected trail event + log; re-arms on recovery).
+// ---------------------------------------------------------------------------
+
+describe('b.fae F4 — wedge detector', () => {
+  const WEDGE_INTERVAL_MS = 1000
+  // K at the 1s test interval: max(5, ceil(90000/1000)) = 90.
+  const K = wedgeTripTicks(WEDGE_INTERVAL_MS)
+
+  /**
+   * Build a poller wired to a mutable open-rows projection. Flip `empty` to
+   * toggle between a wedged spawn (zero open rows) and a healthy one (one open
+   * row). `driveTicks(n)` invokes the interval callback n times, awaiting the
+   * microtask queue after each so the async tick body settles.
+   */
+  function makeWedgeScenario(): {
+    ivl: ReturnType<typeof makeInterval>
+    chat: ReturnType<typeof makeChatStub>
+    trail: ReturnType<typeof makeTrailCapture>
+    logCalls: unknown[][]
+    setEmpty: (v: boolean) => void
+    driveTicks: (n: number) => Promise<void>
+  } {
+    const ivl = makeInterval()
+    const chat = makeChatStub()
+    const trail = makeTrailCapture()
+    const logCalls: unknown[][] = []
+    let empty = true
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: empty ? [] : [cannedPermissionRequest({ request_token: TOKEN_A })],
+      }),
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> =>
+        cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null }),
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: WEDGE_INTERVAL_MS,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+      emitTrail: trail.emit,
+      log: (...args) => { logCalls.push(args) },
+    })
+    return {
+      ivl,
+      chat,
+      trail,
+      logCalls,
+      setEmpty: (v) => { empty = v },
+      driveTicks: async (n) => {
+        for (let i = 0; i < n; i++) {
+          ivl.pending[0].cb()
+          await new Promise((r) => setTimeout(r, 0))
+        }
+      },
+    }
+  }
+
+  const wedgeWarnings = (chat: ReturnType<typeof makeChatStub>) =>
+    chat.calls.filter((c) => c.kind === 'postMessage' && String(c.text).includes('blocked on a native'))
+  const wedgeTrail = (trail: ReturnType<typeof makeTrailCapture>) =>
+    trail.events.filter((e) => e.event === 'cscb.poller.wedge_detected')
+
+  test('1. trips after K consecutive empty ticks: channel warning + trail event + log', async () => {
+    const s = makeWedgeScenario()
+
+    // K-1 empty ticks: not yet tripped.
+    await s.driveTicks(K - 1)
+    expect(wedgeWarnings(s.chat)).toHaveLength(0)
+    expect(wedgeTrail(s.trail)).toHaveLength(0)
+
+    // Kth empty tick: trips.
+    await s.driveTicks(1)
+    const warnings = wedgeWarnings(s.chat)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0].channel).toBe(CHANNEL_CH)
+
+    const events = wedgeTrail(s.trail)
+    expect(events).toHaveLength(1)
+    expect(events[0]['claude_instance_id']).toBe(INSTANCE_C)
+    expect(events[0]['channel']).toBe(CHANNEL_CH)
+    expect(events[0]['ok']).toBe(true)
+
+    // Log written on trip.
+    const tripLogs = s.logCalls.filter((a) => String(a[0]).includes('wedged in check_permission'))
+    expect(tripLogs.length).toBeGreaterThan(0)
+  })
+
+  test('2. does NOT trip on a brief transient (< K empties then non-empty resets the counter)', async () => {
+    const s = makeWedgeScenario()
+
+    // A few empty ticks, short of K.
+    await s.driveTicks(K - 2)
+    expect(wedgeWarnings(s.chat)).toHaveLength(0)
+
+    // Recovery tick: an open row appears → re-arm, counter reset to zero.
+    s.setEmpty(false)
+    await s.driveTicks(1)
+    expect(wedgeWarnings(s.chat)).toHaveLength(0)
+
+    // Back to empty: counter starts from zero, so K-1 more empties still don't trip.
+    s.setEmpty(true)
+    await s.driveTicks(K - 1)
+    expect(wedgeWarnings(s.chat)).toHaveLength(0)
+    expect(wedgeTrail(s.trail)).toHaveLength(0)
+
+    // One more empty tick reaches K post-reset → now it trips.
+    await s.driveTicks(1)
+    expect(wedgeWarnings(s.chat)).toHaveLength(1)
+  })
+
+  test('3. fires ONCE per episode across many post-K ticks', async () => {
+    const s = makeWedgeScenario()
+
+    // Well past K — one-shot latch must suppress re-posting every tick.
+    await s.driveTicks(K + 40)
+
+    expect(wedgeWarnings(s.chat)).toHaveLength(1)
+    expect(wedgeTrail(s.trail)).toHaveLength(1)
+  })
+
+  test('4. re-arms after recovery: second wedge fires a second warning', async () => {
+    const s = makeWedgeScenario()
+
+    // First episode: trip.
+    await s.driveTicks(K)
+    expect(wedgeWarnings(s.chat)).toHaveLength(1)
+
+    // Recover (open row appears) → detector state dropped.
+    s.setEmpty(false)
+    await s.driveTicks(1)
+
+    // Second wedge episode: K more empty ticks → second warning.
+    s.setEmpty(true)
+    await s.driveTicks(K)
+    expect(wedgeWarnings(s.chat)).toHaveLength(2)
+    expect(wedgeTrail(s.trail)).toHaveLength(2)
+  })
+
+  test('5. warning text mentions read-pane and does NOT recommend send-keys as a remedy', async () => {
+    const s = makeWedgeScenario()
+    await s.driveTicks(K)
+
+    const warnings = wedgeWarnings(s.chat)
+    expect(warnings).toHaveLength(1)
+    const text = String(warnings[0].text)
+    expect(text).toContain('read-pane')
+    // send-keys, if mentioned at all, must be an explicit DON'T — never a remedy.
+    expect(text).toContain('Do NOT use send-keys')
+    expect(text).not.toContain('use send-keys to')
+  })
+
+  // b.fae F3 — warning-post FAILURE path. The latch (`warningFired`) sets ONLY
+  // on a successful chat.postMessage; a failed post keeps it unset and retries
+  // on a later tick, throttled to one attempt per WEDGE_WARN_RETRY_WALL_CLOCK_MS.
+  // Each ACTUAL failed attempt still emits a `cscb.poller.wedge_detected`
+  // ok:false trail event; on eventual success exactly one channel message lands
+  // and no further posts occur.
+  test('6. post failure does not latch; retries throttled to the 30s window; success lands exactly one message (b.fae F3)', async () => {
+    const ivl = makeInterval()
+    const trail = makeTrailCapture()
+    const logCalls: unknown[][] = []
+    // Controllable post outcome: fail until flipped to succeed.
+    let postFails = true
+    const calls: ChatCall[] = []
+    const web = {
+      chat: {
+        async postMessage(args: unknown): Promise<{ ts?: string }> {
+          const a = args as { channel: string; text: string; blocks?: unknown }
+          calls.push({ kind: 'postMessage', channel: a.channel, text: a.text, blocks: a.blocks })
+          if (postFails) throw new Error('slack down')
+          return { ts: 'ok-ts' }
+        },
+        async update(): Promise<unknown> { return {} },
+      },
+    }
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => cannedGetResultPlural({
+        claude_instance_id: INSTANCE_C,
+        state: 'check_permission',
+        permission_requests: [],
+      }),
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> =>
+        cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null }),
+    })
+    startPermissionPoller({
+      getClient,
+      web: web as never,
+      intervalMs: WEDGE_INTERVAL_MS,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+      emitTrail: trail.emit,
+      log: (...args) => { logCalls.push(args) },
+    })
+    const drive = async (n: number) => {
+      for (let i = 0; i < n; i++) { ivl.pending[0].cb(); await new Promise((r) => setTimeout(r, 0)) }
+    }
+    const posts = () => calls.filter((c) => c.kind === 'postMessage')
+    const failEvents = () => trail.events.filter((e) => e.event === 'cscb.poller.wedge_detected' && e['ok'] === false)
+    const okEvents = () => trail.events.filter((e) => e.event === 'cscb.poller.wedge_detected' && e['ok'] === true)
+    const retryEvery = 30 // ceil(30000/1000) at the 1s test interval.
+
+    // Reach K → first attempt fires, fails, latch stays unset, ok:false trail.
+    await drive(K)
+    expect(posts()).toHaveLength(1)
+    expect(failEvents()).toHaveLength(1)
+    expect(okEvents()).toHaveLength(0)
+
+    // Within the retry window (< retryEvery more ticks) no NEW attempt is made.
+    await drive(retryEvery - 1)
+    expect(posts()).toHaveLength(1)
+    expect(failEvents()).toHaveLength(1)
+
+    // One more tick crosses the retry window → a second (still-failing) attempt.
+    await drive(1)
+    expect(posts()).toHaveLength(2)
+    expect(failEvents()).toHaveLength(2)
+
+    // Slack recovers; the next retry-window boundary posts successfully → latch
+    // sets, exactly one message lands total, one ok:true trail event, and no
+    // further posts thereafter no matter how many more empty ticks elapse.
+    postFails = false
+    await drive(retryEvery)
+    expect(posts()).toHaveLength(3) // two failed + one success
+    expect(okEvents()).toHaveLength(1)
+    const landed = posts().filter((c) => String(c.text).includes('blocked on a native'))
+    expect(landed).toHaveLength(3) // all three were real attempts; success is the 3rd
+    // Latched: no more attempts across many further ticks.
+    await drive(K + retryEvery)
+    expect(posts()).toHaveLength(3)
+    expect(okEvents()).toHaveLength(1)
+  })
+
+  // b.fae F4 — K derivation from the poll interval and the 5-tick floor.
+  test.each([
+    [1000, 90],
+    [200, 450],
+    [60000, 5],
+  ])('7. wedgeTripTicks(%i ms) === %i (derivation + 5-tick floor, b.fae F4)', (intervalMs, expected) => {
+    expect(wedgeTripTicks(intervalMs)).toBe(expected)
+  })
+
+  // b.fae F4 follow-up — a transient `get` error tick does NOT reset the wedge
+  // counter (it is exempt from re-arming), so the counter accumulates across the
+  // gap and trips at K TOTAL empty observations. An ErrSpawnNotFound tick, by
+  // contrast, is a positive "spawn is gone" observation and DOES reset.
+  test('8. transient get-error does not reset the counter; ErrSpawnNotFound does (b.fae F4 follow-up)', async () => {
+    const ivl = makeInterval()
+    const chat = makeChatStub()
+    const trail = makeTrailCapture()
+    // get() behavior is switchable per tick: 'empty' | 'transient' | 'notfound'.
+    let mode: 'empty' | 'transient' | 'notfound' = 'empty'
+    const getClient = () => ({
+      list: async () => ({ spawns: [checkPermRow()] }),
+      get: async () => {
+        if (mode === 'transient') throw errGeneric('get', 'ErrTransientGet', 'transient read failure')
+        if (mode === 'notfound') throw errSpawnNotFound()
+        return cannedGetResultPlural({
+          claude_instance_id: INSTANCE_C,
+          state: 'check_permission',
+          permission_requests: [],
+        })
+      },
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> =>
+        cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null }),
+    })
+    startPermissionPoller({
+      getClient,
+      web: chat.web as never,
+      intervalMs: WEDGE_INTERVAL_MS,
+      setInterval: ivl.setInterval,
+      clearInterval: ivl.clearInterval,
+      emitTrail: trail.emit,
+      log: () => {},
+    })
+    const drive = async (n: number) => {
+      for (let i = 0; i < n; i++) { ivl.pending[0].cb(); await new Promise((r) => setTimeout(r, 0)) }
+    }
+
+    // K-1 empty observations, then ONE transient-error tick, then 1 empty.
+    // The error tick must NOT reset, so total empties = K → trips.
+    await drive(K - 1)
+    expect(wedgeWarnings(chat)).toHaveLength(0)
+    mode = 'transient'
+    await drive(1) // read gap: counter preserved, no new empty observation.
+    expect(wedgeWarnings(chat)).toHaveLength(0)
+    mode = 'empty'
+    await drive(1) // Kth empty observation overall → trip.
+    expect(wedgeWarnings(chat)).toHaveLength(1)
+    expect(wedgeTrail(trail)).toHaveLength(1)
+
+    // Now recover via ErrSpawnNotFound → positive "gone" observation resets the
+    // detector. Coming back empty must require a FRESH K empties before re-trip.
+    mode = 'notfound'
+    await drive(1)
+    mode = 'empty'
+    await drive(K - 1)
+    expect(wedgeWarnings(chat)).toHaveLength(1) // still just the first trip.
+    await drive(1)
+    expect(wedgeWarnings(chat)).toHaveLength(2) // fresh episode trips at fresh K.
   })
 })
