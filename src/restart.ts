@@ -21,6 +21,21 @@ import {
 /** Consecutive-failure cap before onCapReached fires and restarts stop. */
 export const RESTART_FAILURE_CAP = 5
 
+/**
+ * Delay ceiling (seconds) for a human-triggered restart. An explicit inbound
+ * message is a far stronger signal than a periodic health tick, so we clamp the
+ * computed backoff delay down to this small constant instead of making a human
+ * wait out the full exponential backoff (up to 900s). We clamp DOWN only —
+ * never up — so a base delay smaller than this is left untouched.
+ *
+ * Crucially this only shortens the wait; it does NOT reset the failure counter
+ * and does NOT bypass the re-entrancy guard. Combined with
+ * isRestartPendingOrActive at the call site, a chatty channel gets at most one
+ * in-flight launch attempt at a time and each failed attempt still counts
+ * toward normal backoff/cap accounting (b.kvq).
+ */
+export const HUMAN_TRIGGER_DELAY_CEILING = 5
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -74,7 +89,12 @@ export function initRestart(d: RestartDeps): void {
 // scheduleRestart
 // ---------------------------------------------------------------------------
 
-export function scheduleRestart(channelId: string, cwd: string, sessionId?: string): void {
+export function scheduleRestart(
+  channelId: string,
+  cwd: string,
+  sessionId?: string,
+  opts?: { humanTrigger?: boolean },
+): void {
   if (!deps) {
     console.error('[slack] scheduleRestart: deps not initialized — skipping')
     return
@@ -89,7 +109,16 @@ export function scheduleRestart(channelId: string, cwd: string, sessionId?: stri
   // Compute exponential backoff delay from the pre-failure count (SR-25.2).
   // nextBackoffDelay reads the CURRENT count (before this attempt's failure is
   // recorded) so the first failure uses base*2^0 = base, the second base*2^1, etc.
-  const delay = nextBackoffDelay(channelId, baseDelay)
+  let delay = nextBackoffDelay(channelId, baseDelay)
+
+  // b.kvq: an explicit human message clamps the wait DOWN to a small ceiling so
+  // a person typing in the channel isn't told to wait out a 900s backoff. This
+  // does not touch the failure counter — each attempt still counts toward
+  // backoff/cap accounting — and the re-entrancy guard at the call site keeps a
+  // chatty channel to one in-flight launch at a time.
+  if (opts?.humanTrigger) {
+    delay = Math.min(delay, HUMAN_TRIGGER_DELAY_CEILING)
+  }
 
   // Cancel any existing timer for this channel
   const existing = pendingRestartTimers.get(channelId)
