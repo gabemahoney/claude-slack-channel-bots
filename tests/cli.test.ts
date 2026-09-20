@@ -48,6 +48,13 @@ interface Overrides {
   /** Override the resolved state dir (daemonize openSync()s <stateDir>/server.log for real). */
   resolveStateDir?: () => string
   loadConfig?: () => ReturnType<typeof makeRoutingConfig>
+  /**
+   * b.qwo: when provided, installs an initClient dep whose behavior mirrors the
+   * production wiring (runStartupGate → throw on failure). Omit to leave
+   * initClient undefined (the "stub singleton already installed" path, which
+   * callers skip). A function that throws simulates AD-unreachable at init.
+   */
+  initClient?: () => Promise<void>
   directorStatus?: (channelId: string) => Promise<{ state: string } | null>
   directorPause?: (channelId: string) => Promise<void>
   directorKill?: (channelId: string) => Promise<void>
@@ -66,6 +73,10 @@ interface Bundle {
   serverSignals: string[]
   /** Named side-effect events in call order — used to pin server-stop-vs-teardown ordering. */
   events: string[]
+  /** b.qwo: one entry per initClient invocation (the call's 0-based index); its
+   * length is the number of times the startup gate ran. Asserted in the
+   * initClient-ordering test to pin "gate runs exactly once, before teardown". */
+  initClientCalls: number[]
   /** Whether deps.startServer() was invoked (in-place server run). */
   readonly startServerCalled: boolean
 }
@@ -78,6 +89,7 @@ function makeDeps(o: Overrides = {}): Bundle {
   const statusCalls: string[] = []
   const serverSignals: string[] = []
   const events: string[] = []
+  const initClientCalls: number[] = []
   let startServerCalled = false
   const existing = new Set(o.existingPaths ?? [CONFIG_JSON])
   const deps: CliDeps = {
@@ -103,6 +115,19 @@ function makeDeps(o: Overrides = {}): Bundle {
     startServer: async () => { startServerCalled = true },
     exit: (code) => { exitCodes.push(code); throw new ExitError(code) },
     loadConfig: o.loadConfig ?? (() => makeRoutingConfig()),
+    // b.qwo: only install initClient when a test opts in; otherwise leave it
+    // undefined so createCli exercises the "stub already installed" skip path.
+    ...(o.initClient
+      ? {
+          initClient: async () => {
+            // Record this call's 0-based index (so the array is [0], [0,1], …);
+            // length == number of gate invocations.
+            initClientCalls.push(initClientCalls.length)
+            events.push('initClient')
+            return o.initClient!()
+          },
+        }
+      : {}),
     directorStatus: async (channelId) => {
       statusCalls.push(channelId)
       if (o.directorStatus) return o.directorStatus(channelId)
@@ -121,6 +146,7 @@ function makeDeps(o: Overrides = {}): Bundle {
   }
   return {
     deps, exitCodes, spawnCalls, pauseCalls, killCalls, statusCalls, serverSignals, events,
+    initClientCalls,
     get startServerCalled() { return startServerCalled },
   }
 }
@@ -304,15 +330,21 @@ describe('start — daemonize session-leader guard (b.acn)', () => {
 // ---------------------------------------------------------------------------
 
 describe('clean_restart', () => {
-  test('skips channels with no spawn row', async () => {
-    const { deps, statusCalls, pauseCalls, killCalls } = makeDeps({
+  test('genuinely-absent row (null) skips quietly and clean_restart still starts', async () => {
+    const { deps, exitCodes, statusCalls, pauseCalls, killCalls, spawnCalls } = makeDeps({
       loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
-      directorStatus: async () => null, // ErrSpawnNotFound branch
+      directorStatus: async () => null, // ErrSpawnNotFound branch — genuinely absent row
     })
     await createCli(deps).clean_restart()
     expect(statusCalls).toEqual(['C'])
     expect(pauseCalls).toEqual([])
     expect(killCalls).toEqual([])
+    // Absent-row path is not an error: no exit(1), teardown is a legit no-op,
+    // and the restart still proceeds to start (spawnSync(..., 'start')). This
+    // pins the semantic distinction the bare catch erased: absent-row (null) →
+    // skip + proceed; AD error (throw) → loud abort (see b.qwo suite below).
+    expect(exitCodes).not.toContain(1)
+    expect(spawnCalls.some((c) => c.args.includes('start'))).toBe(true)
   })
 
   test('skips channels already in terminal state', async () => {
@@ -466,6 +498,139 @@ describe('clean_restart teardown-via-closure regression (b.4dk)', () => {
     await createCli(deps).clean_restart()
     expect(pauseCalls).toEqual(['C']) // same pause/poll/kill teardown as before the extraction
     expect(killCalls).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.qwo — AD-unreachable teardown must fail LOUDLY, never a silent no-op
+//
+// Root cause (b.qps / incident-2026-09-18): getClient() threw in the short-lived
+// CLI process (no server startup gate), and a bare `catch { return null }` in
+// resolveCscbInstanceId + a swallow in teardownBots collapsed that into a
+// per-channel "no spawn row — skipping". Every channel was skipped, teardown was
+// a silent no-op, and clean_restart happily proceeded to `start`.
+//
+// The fix: directorStatus/precheck errors propagate; teardownBots throws an
+// aggregate on any rejected settlement; clean_restart and `stop --stop-bots`
+// exit(1) on teardown failure and NEVER proceed to start. These tests model
+// AD-unreachable as a directorStatus() throw (the precheck's only AD call in the
+// injected surface) — the exact failure the bare catch used to swallow.
+// ---------------------------------------------------------------------------
+
+describe('b.qwo — teardown fails loudly when agent-director is unreachable', () => {
+  // REGRESSION GUARD. Pre-fix teardownBots wrapped the whole per-channel body in
+  // a try/catch that logged and returned; an AD-unreachable throw was swallowed
+  // and clean_restart proceeded to start(). Post-fix the throw propagates, the
+  // aggregate re-throw fires, and clean_restart exits(1) BEFORE starting.
+  test('clean_restart aborts (exit 1, no start) when directorStatus throws (AD unreachable)', async () => {
+    const { deps, exitCodes, pauseCalls, killCalls, spawnCalls } = makeDeps({
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+      directorStatus: async () => { throw new Error('AD connection refused') },
+    })
+    await expect(createCli(deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    // Loud failure: exit(1), and the server was NEVER started on top of bots we
+    // could not reach (the b.qps silent-no-op-then-start bug). clean_restart
+    // starts the new server by spawnSync(..., 'start'); that must not have run.
+    expect(exitCodes).toContain(1)
+    expect(spawnCalls.some((c) => c.args.includes('start'))).toBe(false)
+    // No pause/kill happened because the precheck itself could not reach AD —
+    // and critically it was NOT misreported as "no spawn row — skipping".
+    expect(pauseCalls).toEqual([])
+    expect(killCalls).toEqual([])
+  })
+
+  // REGRESSION GUARD. `stop --stop-bots` shares teardownBots. Pre-fix the outer
+  // try/catch logged "bot teardown error" and let the stop report success. A
+  // stale PID (exit 0) would otherwise be the exit code; post-fix the loud
+  // teardown failure exits(1) instead.
+  test('stop --stop-bots exits 1 when directorStatus throws (AD unreachable)', async () => {
+    const { deps, exitCodes } = makeDeps({
+      existsAll: true,
+      pidFileContent: '4242',
+      isProcessRunning: () => false, // stale PID → server-stop block would exit(0)
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+      directorStatus: async () => { throw new Error('AD connection refused') },
+    })
+    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    // Loud failure from the teardown, not the clean stale-PID exit(0).
+    expect(exitCodes).toContain(1)
+  })
+
+  // Kill-never-delete (acceptance criterion "rows are paused/killed, never
+  // deleted"). Real guard over src/cli.ts, not the injected stub: the teardown
+  // path must never call a delete/destroy verb on the AD client. Extends the
+  // case-22-style static audit — grep the CLI teardown surface and fail on any
+  // delete verb. (The runtime pause→kill-escalation this used to duplicate is
+  // already covered by 'stopBots: pause timeout escalates to kill' ~:416.)
+  test('src/cli.ts teardown surface calls no delete/destroy verb (kill-never-delete, static audit)', async () => {
+    const { readFileSync } = await import('node:fs')
+    const src = readFileSync(resolve(import.meta.dir, '..', 'src', 'cli.ts'), 'utf-8')
+    // Ban any AD delete verb reachable from teardown: directorDelete, a bare
+    // deps.delete(...), or a director*.delete(...)/destroy(...) call. Comment /
+    // JSDoc lines are excluded so prose like "never deletes" does not trip it.
+    const banned = /\b(directorDelete\b|deps\.delete\s*\(|director\w*\.(delete|destroy)\s*\(|\.deleteSpawn\s*\()/
+    const offenders = src
+      .split('\n')
+      .map((line, i) => ({ lineNo: i + 1, line }))
+      .filter(({ line }) => !/^\s*(\*|\/\/)/.test(line))
+      .filter(({ line }) => banned.test(line))
+    expect(offenders.map((o) => `cli.ts:${o.lineNo}: ${o.line.trim()}`)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.qwo — initClient gate: AD singleton must be installed before teardown, and
+// a gate failure is a loud exit(1), never a silently-skipped teardown.
+// ---------------------------------------------------------------------------
+
+describe('b.qwo — initClient startup gate', () => {
+  test('clean_restart calls initClient before any director verb', async () => {
+    let n = 0
+    const { deps, events, initClientCalls } = makeDeps({
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+      initClient: async () => { /* gate ok */ },
+      // Live route (waiting → then terminal) so a real pause:C lands in `events`,
+      // giving the ordering assertion a second event to order against — a
+      // terminal-only status would emit no director verb and make the check
+      // vacuous. Mirrors the b.4dk SIGTERM-ordering pattern (~:445).
+      directorStatus: async () => {
+        n++
+        return n === 1 ? { state: 'waiting' } : { state: 'ended' } // precheck → post-pause terminal
+      },
+    })
+    await createCli(deps).clean_restart()
+    // initClient ran exactly once, and it precedes the first director verb.
+    expect(initClientCalls).toEqual([0])
+    const initIdx = events.indexOf('initClient')
+    const firstPause = events.findIndex((e) => e.startsWith('pause:'))
+    expect(initIdx).toBeGreaterThanOrEqual(0)
+    expect(firstPause).toBeGreaterThan(initIdx) // pause happened, and after init
+  })
+
+  test('clean_restart exits 1 (no start) when initClient throws', async () => {
+    const { deps, exitCodes, spawnCalls, statusCalls } = makeDeps({
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+      initClient: async () => { throw new Error('startup gate failed') },
+      directorStatus: async () => ({ state: 'waiting' }),
+    })
+    await expect(createCli(deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    expect(exitCodes).toContain(1)
+    expect(spawnCalls.some((c) => c.args.includes('start'))).toBe(false)
+    expect(statusCalls).toEqual([]) // never reached teardown precheck
+  })
+
+  test('stop --stop-bots exits 1 when initClient throws', async () => {
+    const { deps, exitCodes, statusCalls } = makeDeps({
+      existsAll: true,
+      pidFileContent: '4242',
+      isProcessRunning: () => false,
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+      initClient: async () => { throw new Error('startup gate failed') },
+      directorStatus: async () => ({ state: 'waiting' }),
+    })
+    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect(exitCodes).toContain(1)
+    expect(statusCalls).toEqual([]) // teardown never began
   })
 })
 

@@ -350,7 +350,9 @@ Plain `stop` leaves the managed bots running — they are meant to survive a ser
 claude-slack-channel-bots stop --stop-bots
 ```
 
-This mirrors `clean_restart`'s order: the server is stopped **first**, then the bot teardown runs for each route — pause the bot, poll until it exits (or up to `exit_timeout` seconds), then force-kill on timeout. Stopping the server first prevents its `onsessionclosed`/`scheduleRestart` handler from respawning a just-exited bot mid-teardown (which would delete its `ended` row and history). Use it when you want a clean, flushed shutdown of the bots (for example before a host reboot) so they can resume their conversation history on the next start.
+This mirrors `clean_restart`'s order: the server is stopped **first**, then the bot teardown runs for each route — pause the bot, poll until it exits (or up to `exit_timeout` seconds), then force-kill on timeout. Teardown kills but never deletes each row, preserving its `claude_session_id` so the bots can resume their conversation history on the next start. Stopping the server first prevents its `onsessionclosed`/`scheduleRestart` handler from respawning a just-exited bot mid-teardown (which would delete its `ended` row and history). Use it when you want a clean, flushed shutdown of the bots (for example before a host reboot).
+
+If agent-director is unreachable, the teardown **fails loudly** — the command prints the error and exits non-zero rather than silently reporting a clean stop. (A missing config is best-effort: teardown is skipped but the server stop still succeeds, since the server is already down.)
 
 ### `claude-slack-channel-bots clean_restart`
 
@@ -360,12 +362,15 @@ Gracefully exits all managed Claude Code sessions, then stops and starts the ser
 claude-slack-channel-bots clean_restart
 ```
 
-For each configured route, calls `client.pause({claude_instance_id})` via agent-director and polls `client.status(...)` until the spawn transitions to `ended` / `missing` (or `client.list(...)` returns no row). If the spawn does not exit within `exit_timeout` seconds (default 120s), the spawn is force-killed via `client.kill(...)`. All routes are processed in parallel. Individual session errors are logged and do not abort the restart. After the server restarts, the SR-1.4 collision-then-act dispatcher decides resume-vs-fresh per route — agent-director owns Claude session-id state, not CSCB.
+For each configured route, calls `client.pause({claude_instance_id})` via agent-director and polls `client.status(...)` until the spawn transitions to `ended` / `missing` (or `client.list(...)` returns no row). If the spawn does not exit within `exit_timeout` seconds (default 120s), the spawn is force-killed via `client.kill(...)`. Teardown kills but never deletes each row, preserving its `claude_session_id` so bots resume their conversation history on the next start. All routes are processed in parallel. After the server restarts, the SR-1.4 collision-then-act dispatcher decides resume-vs-fresh per route — agent-director owns Claude session-id state, not CSCB.
+
+Per-route pause/kill errors on a row that is present are logged and do not abort the restart.
 
 Behavior by case:
 
 - **No configured routes:** skips the shutdown phase and proceeds directly to stop/start.
 - **Server already stopped:** `stop` reports `server is not running`; `start` then brings up a fresh server.
+- **agent-director unreachable:** teardown fails loudly and the restart is aborted (non-zero exit); no new server is started. The `no spawn row` message appears only when a route genuinely has no spawn, never when the client failed to reach agent-director.
 
 ### PID file
 
@@ -574,6 +579,9 @@ After 3 consecutive launch failures for a route, auto-restart is suspended until
 
 **Session stuck during clean_restart**
 If a session does not exit within `exit_timeout` seconds (default 120s), `clean_restart` force-kills the spawn via `agent-director kill` and proceeds. To manually recover, run `agent-director list --label service=cscb` to find lingering spawns and `agent-director kill <claude_instance_id>` to clear them, then `claude-slack-channel-bots stop && claude-slack-channel-bots start`.
+
+**`clean_restart` or `stop --stop-bots` exits non-zero with an agent-director teardown error**
+This is intentional: when agent-director is unreachable, the teardown cannot run, so the command fails loudly rather than silently no-op'ing and (for `clean_restart`) restarting on top of bots it never touched. Confirm agent-director is installed and responsive with `agent-director version`, then re-run the command. Teardown kills but never deletes rows on any failure path, so it is always safe to retry once agent-director is reachable.
 
 **Bots come back with no memory of the prior conversation after a reboot**
 With `resume_enabled: true`, a bot whose host rebooted (or pod resumed) should return with its conversation history. If it comes back amnesiac, confirm the system-installed `agent-director` is **≥ 0.8.0** (`agent-director version`) — reboot recovery relies on capabilities added in that release. Note that `bun run install-check` does **not** confirm this: its client floor is `0.7.0`, lower than the reboot-recovery requirement, so install-check passes on a `0.7.x` binary that still yields amnesiac bots. Verify the resume requirement directly with `agent-director version`. Note: legacy sessions created before upgrading to 0.8.0 may lose history exactly once on their first post-upgrade recovery, then resume cleanly thereafter.

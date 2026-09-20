@@ -20,6 +20,7 @@ import { isDryRun } from './tokens.ts'
 import { ErrSpawnNotFound } from 'agent-director'
 import { getClient } from './agent-director-client.ts'
 import { instanceIdFor } from './session-manager.ts'
+import { runStartupGate } from './agent-director-startup.ts'
 
 // ---------------------------------------------------------------------------
 // Injectable dependency interface
@@ -48,6 +49,17 @@ export interface CliDeps {
   exit: (code: number) => never
   /** Load the routing configuration. */
   loadConfig: () => RoutingConfig
+  /**
+   * b.qwo: initialize the agent-director Client singleton before any per-channel
+   * teardown work. clean_restart / `stop --stop-bots` run in a short-lived CLI
+   * process that never runs the server startup gate, so getClient() would throw
+   * (the b.qps root cause). Production wires this to the non-exiting
+   * runStartupGate variant; on failure the caller exits loudly (AD-unreachable
+   * is never a silent skip). Optional so tests that install a stub singleton via
+   * setClientForTests can omit it — when absent, callers skip init and use the
+   * already-installed stub.
+   */
+  initClient?: () => Promise<void>
   /** Query the agent-director state for a channel. Returns null when the row is absent. */
   directorStatus: (channelId: string) => Promise<{ state: string } | null>
   /** Politely shut down the spawn for a channel via client.pause. */
@@ -120,57 +132,82 @@ export function createCli(deps: CliDeps): CliHandlers {
    * that residual case is recovered later via the findMissing→resume path.
    */
   async function teardownBots(routes: RoutingConfig['routes'], exit_timeout: number): Promise<void> {
-    await Promise.allSettled(Object.entries(routes).map(async ([channelId]) => {
+    // b.qwo: the precheck's directorStatus() reaches agent-director. If AD is
+    // unreachable (the b.qps/incident-2026-09-18 root cause: getClient() throws
+    // in the short-lived CLI process, or the AD binary is down), that error MUST
+    // NOT be swallowed as a per-channel "no spawn row — skipping" no-op. We let
+    // the precheck error propagate to Promise.allSettled as a rejection, then
+    // throw a loud aggregate error after the loop so callers exit non-zero and
+    // never proceed to `start`. Only pause/poll/kill escalations (which act on a
+    // row that is genuinely present) stay per-channel handled below.
+    const results = await Promise.allSettled(Object.entries(routes).map(async ([channelId]) => {
+      // Precheck: any row? If not, nothing to do.
+      // NOTE (b.qwo): errors here (AD unreachable / uninitialized client)
+      // intentionally propagate — they become allSettled rejections handled
+      // by the post-loop loud-failure check. "no spawn row" is reported ONLY
+      // when directorStatus resolves to null (row genuinely absent).
+      const precheck = await deps.directorStatus(channelId)
+      if (precheck === null) {
+        console.error(`[slack] teardownBots: no spawn row for channel=${channelId} — skipping`)
+        return
+      }
+      const state = precheck.state
+      if (state === 'ended' || state === 'missing') {
+        console.error(`[slack] teardownBots: channel=${channelId} already terminal (state=${state}) — skipping`)
+        return
+      }
+
+      // pause and poll for terminal transition
       try {
-        // Precheck: any row? If not, nothing to do.
-        const precheck = await deps.directorStatus(channelId)
-        if (precheck === null) {
-          console.error(`[slack] teardownBots: no spawn row for channel=${channelId} — skipping`)
-          return
-        }
-        const state = precheck.state
-        if (state === 'ended' || state === 'missing') {
-          console.error(`[slack] teardownBots: channel=${channelId} already terminal (state=${state}) — skipping`)
-          return
-        }
-
-        // pause and poll for terminal transition
-        try {
-          await deps.directorPause(channelId)
-        } catch (err) {
-          console.error(`[slack] teardownBots: pause failed for channel=${channelId} — escalating to kill:`, err)
-          try { await deps.directorKill(channelId) } catch { /* ignore */ }
-          return
-        }
-
-        const timeoutMs = exit_timeout * 1000
-        const startTime = Date.now()
-        let delay = 100
-        const maxDelay = 2_000
-
-        while (Date.now() - startTime < timeoutMs) {
-          await new Promise<void>((r) => setTimeout(r, delay))
-          delay = Math.min(delay * 2, maxDelay)
-          const pollResult = await deps.directorStatus(channelId)
-          if (pollResult === null || pollResult.state === 'ended' || pollResult.state === 'missing') {
-            const elapsed = Date.now() - startTime
-            console.error(`[slack] teardownBots: channel=${channelId} exited cleanly in ${elapsed}ms`)
-            return
-          }
-        }
-
-        // Timeout — force kill via agent-director
-        const elapsed = Date.now() - startTime
-        try {
-          await deps.directorKill(channelId)
-          console.error(`[slack] teardownBots: channel=${channelId} force-killed after ${elapsed}ms`)
-        } catch (err) {
-          console.error(`[slack] teardownBots: kill failed for channel=${channelId}:`, err)
-        }
+        await deps.directorPause(channelId)
       } catch (err) {
-        console.error(`[slack] teardownBots: error processing channel=${channelId}:`, err)
+        console.error(`[slack] teardownBots: pause failed for channel=${channelId} — escalating to kill:`, err)
+        try { await deps.directorKill(channelId) } catch { /* ignore */ }
+        return
+      }
+
+      const timeoutMs = exit_timeout * 1000
+      const startTime = Date.now()
+      let delay = 100
+      const maxDelay = 2_000
+
+      while (Date.now() - startTime < timeoutMs) {
+        await new Promise<void>((r) => setTimeout(r, delay))
+        delay = Math.min(delay * 2, maxDelay)
+        const pollResult = await deps.directorStatus(channelId)
+        if (pollResult === null || pollResult.state === 'ended' || pollResult.state === 'missing') {
+          const elapsed = Date.now() - startTime
+          console.error(`[slack] teardownBots: channel=${channelId} exited cleanly in ${elapsed}ms`)
+          return
+        }
+      }
+
+      // Timeout — force kill via agent-director
+      const elapsed = Date.now() - startTime
+      try {
+        await deps.directorKill(channelId)
+        console.error(`[slack] teardownBots: channel=${channelId} force-killed after ${elapsed}ms`)
+      } catch (err) {
+        console.error(`[slack] teardownBots: kill failed for channel=${channelId}:`, err)
       }
     }))
+
+    // b.qwo: loud AD-unreachable failure. A rejected settlement here is an
+    // agent-director error — either from the connectivity/precheck at the top
+    // of a channel's teardown, or from a directorStatus poll-loop call (~:177)
+    // — never a normal terminal-row skip, which resolves. Surface every one and
+    // throw so the teardown is never a silent no-op and the caller aborts
+    // before starting a new server.
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected')
+    if (rejected.length > 0) {
+      for (const r of rejected) {
+        console.error('[slack] teardownBots: agent-director error during teardown:', r.reason)
+      }
+      throw new Error(
+        `teardownBots: agent-director error — teardown incomplete for ${rejected.length} channel(s); ` +
+          `other channels may already have been paused or killed; rows are never deleted, safe to retry`,
+      )
+    }
   }
 
   async function start(): Promise<void> {
@@ -262,12 +299,38 @@ export function createCli(deps: CliDeps): CliHandlers {
 
     // Phase 2: gracefully exit managed bots (only for --stop-bots).
     if (opts?.stopBots) {
+      // Phase 2.4 (b.qwo): initialize the AD Client singleton before teardown.
+      // Like clean_restart, `stop --stop-bots` runs in a short-lived CLI process
+      // that never runs the server startup gate; without init getClient() throws
+      // and teardown becomes a silent no-op (the b.qps root cause).
+      if (deps.initClient) {
+        try {
+          await deps.initClient()
+        } catch (err) {
+          console.error('[slack] stop --stop-bots: agent-director initialization failed:', err)
+          deps.exit(1)
+        }
+      }
+
+      // Config load is best-effort: a config problem logs and skips teardown
+      // without failing the stop (the server is already down; b.4dk behavior).
+      let config: RoutingConfig | null = null
       try {
-        const config = deps.loadConfig()
-        console.error('[slack] stop --stop-bots: gracefully exiting managed bots')
-        await teardownBots(config.routes, config.exit_timeout)
+        config = deps.loadConfig()
       } catch (err) {
-        console.error('[slack] stop --stop-bots: bot teardown error:', err)
+        console.error('[slack] stop --stop-bots: could not load config — skipping bot teardown:', err)
+      }
+
+      // b.qwo: a teardown failure (AD unreachable) is a LOUD failure — exit
+      // non-zero rather than swallowing it and reporting a clean stop.
+      if (config !== null) {
+        console.error('[slack] stop --stop-bots: gracefully exiting managed bots')
+        try {
+          await teardownBots(config.routes, config.exit_timeout)
+        } catch (err) {
+          console.error('[slack] stop --stop-bots: bot teardown failed:', err)
+          deps.exit(1)
+        }
       }
     }
 
@@ -366,9 +429,32 @@ export function createCli(deps: CliDeps): CliHandlers {
       console.error(`[slack] clean_restart: stop returned non-zero exit code: ${stopResult.status}`)
     }
 
+    // Phase 2.5 (b.qwo): initialize the AD Client singleton before per-channel
+    // work. This CLI process does NOT run the server startup gate, so without
+    // explicit init getClient() throws (the b.qps root cause). We use the
+    // non-exiting runStartupGate variant so a gate failure surfaces here as a
+    // distinct loud non-zero exit rather than a silently skipped teardown.
+    if (deps.initClient) {
+      try {
+        await deps.initClient()
+      } catch (err) {
+        console.error('[slack] clean_restart: agent-director initialization failed:', err)
+        deps.exit(1)
+      }
+    }
+
     // Phases 3-4: SR-11 Event 12 — per-route pause/poll/kill teardown via
     // agent-director (shared with `stop --stop-bots`).
-    await teardownBots(routes, exit_timeout)
+    //
+    // b.qwo: teardownBots throws if AD is unreachable during the precheck. A
+    // failed teardown must abort the restart — never proceed to `start` on top
+    // of bots we could not reach.
+    try {
+      await teardownBots(routes, exit_timeout)
+    } catch (err) {
+      console.error('[slack] clean_restart: bot teardown failed — aborting restart:', err)
+      deps.exit(1)
+    }
 
     // Phases 5-6: Start new server and exit
     console.error('[slack] clean_restart: starting server')
@@ -407,19 +493,21 @@ if (import.meta.main) {
 
   // Resolve a channel's actual claude_instance_id by querying agent-director's
   // label index. Survives the b.1m9 naming change (cscb_<name>_<id>) without
-  // requiring the CLI to know the route's normalizedName. Returns null when
-  // no cscb row exists for the channel; falls back to bare-ID on a list-level
-  // error so legacy behavior is preserved.
+  // requiring the CLI to know the route's normalizedName.
+  //
+  // b.qwo: returns null ONLY when no cscb row exists for the channel (empty
+  // list). All other errors (AD connection refused, uninitialized client,
+  // binary unreachable, etc.) PROPAGATE. The previous bare `catch { return
+  // null }` was the b.qps / incident-2026-09-18 root cause: it collapsed an
+  // AD-unreachable throw into a "no row" null, so the teardown skipped every
+  // channel and silently no-op'd. AD-unreachable must fail loudly, and "no
+  // spawn row" must mean the row is genuinely absent.
   async function resolveCscbInstanceId(channelId: string): Promise<string | null> {
-    try {
-      const r = await getClient().list({ label: ['service=cscb', `channel=${channelId}`] })
-      if (r.spawns.length === 0) return null
-      // Prefer the new-naming row if both old and new exist mid-migration.
-      const newStyle = r.spawns.find((s) => s.claude_instance_id !== `cscb_${channelId}`)
-      return (newStyle ?? r.spawns[0]).claude_instance_id
-    } catch {
-      return null
-    }
+    const r = await getClient().list({ label: ['service=cscb', `channel=${channelId}`] })
+    if (r.spawns.length === 0) return null
+    // Prefer the new-naming row if both old and new exist mid-migration.
+    const newStyle = r.spawns.find((s) => s.claude_instance_id !== `cscb_${channelId}`)
+    return (newStyle ?? r.spawns[0]).claude_instance_id
   }
 
   const realDeps: CliDeps = {
@@ -434,6 +522,18 @@ if (import.meta.main) {
     startServer: async () => { const { main } = await import('./server.ts'); return main() },
     exit: (code) => process.exit(code),
     loadConfig: () => configLoadConfig(),
+    // b.qwo: install the AD Client singleton via the non-exiting startup gate
+    // before teardown. runStartupGate performs Client.create() + setClient() and
+    // returns a typed outcome; on failure we throw so the caller (clean_restart /
+    // stop --stop-bots) exits loudly rather than silently skipping teardown.
+    initClient: async () => {
+      const outcome = await runStartupGate()
+      if (!outcome.ok) {
+        throw new Error(
+          `agent-director startup gate failed (${outcome.classLabel}): ${outcome.message}`,
+        )
+      }
+    },
     directorStatus: async (channelId) => {
       // Resolve the actual claude_instance_id by label (cscb_<name>_<id> after b.1m9,
       // or cscb_<id> on pre-rename installs). Falls back to bare-ID lookup if
