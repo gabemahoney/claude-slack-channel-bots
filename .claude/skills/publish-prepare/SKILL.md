@@ -48,6 +48,9 @@ The LLM driving /publish prepare MUST NOT execute any bash command outside of `b
 | 12   | SR-2.1 | local `main` is behind or diverged from origin/main | operator: `git pull --ff-only` (behind) or resolve manually (diverged); LLM must NOT push/pull/reset |
 | 13   | SR-2.2 / SR-2.3 | `bun install --frozen-lockfile`, `bun test`, `bun run typecheck`, or "no *.test.ts files" failed | operator: fix on `main`, commit, rerun /publish prepare |
 | 14   | SR-2.4 | not authenticated to npm, OR next version already on npm | operator: `npm login`, or pull/larger bump |
+| 15   | SR-2.5 | host's agent-director missing/broken, OR version out of package.json range | operator: upgrade agent-director to match the range, or edit the range in package.json |
+| 16   | SR-2.6 | stranded finished work: a finished ticket's fix is neither on `main` nor explicitly closed, OR an unmerged branch references a finished ticket (audit exit 1) | operator: land the fix or explicitly close the ticket (no-repro/superseded/abandoned, with a pointer); merge or delete the branch; then rerun /publish prepare |
+| 17   | SR-2.6 | the finished-work audit could not run — it could not locate the hives / a git repo / a `main` ref from this checkout (audit exit 2 or other). NOT stranded work; a setup failure. Release still blocked (fail closed). | operator: rerun /publish prepare from the canonical checkout that sits beside the Bugs/Plans hives (the main working clone), not a throwaway/`/tmp` clone |
 | 20   | SR-3.1 | `npm version <bump>` failed | working tree rolled back; operator investigates npm error |
 | 21   | SR-4.1 | `bun pm pack` failed or tarball internal version mismatch | working tree rolled back; operator investigates pack output |
 | 22   | SR-4.2 | scratch install failed or installed version mismatch | working tree rolled back; operator inspects bun install / tarball layout |

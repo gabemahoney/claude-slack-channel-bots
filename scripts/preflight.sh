@@ -2,7 +2,7 @@
 #
 # /publish Phase 1 — local preflight.
 #
-# Gates SR-2.1 through SR-2.4 plus the SR-10.1 location check and the SR-1.2
+# Gates SR-2.1 through SR-2.6 plus the SR-10.1 location check and the SR-1.2
 # argument check. Exits 0 on full pass; exits with a stable non-zero code on
 # the first failed gate after writing a verbatim operator-facing diagnostic
 # (preserving the SR-X.Y identifier) to stderr.
@@ -22,6 +22,15 @@
 #                OR 'bun pm whoami' did not succeed (SR-2.4b)
 #   15  SR-2.5  host's agent-director binary missing/broken, OR its version
 #                does not satisfy package.json's declared range
+#   16  SR-2.6  stranded finished work: a finished bee's fix is neither on main
+#                nor explicitly closed, OR an unmerged branch references a
+#                finished ticket (scripts/audit-finished-tickets.sh exit 1)
+#   17  SR-2.6  the finished-work audit could not run — it could not locate the
+#                hives / a git repo / a 'main' ref from this checkout (audit
+#                exit 2 or any other unexpected code). NOT stranded work; a
+#                setup failure. FAIL CLOSED: the gate is required, so the
+#                release is still blocked. Recovery: rerun from the canonical
+#                checkout beside the hives.
 
 set -euo pipefail
 
@@ -160,5 +169,33 @@ if [ -n "${AD_RANGE}" ]; then
     exit 15
   fi
 fi
+
+# SR-2.6 — no stranded finished work. A bee must not sit in `finished` while its
+# fix is neither on main nor explicitly closed (out-of-repo / no-repro /
+# superseded), and no unmerged branch may reference a finished ticket. Shipping
+# with stranded work silently strands fixes on dead branches (see bug b.qps /
+# guardrail b.jaa). The audit is READ-ONLY.
+AUDIT_EXIT=0
+bash "${REPO_ROOT}/scripts/audit-finished-tickets.sh" "${REPO_ROOT}" || AUDIT_EXIT=$?
+case "${AUDIT_EXIT}" in
+  0)
+    : # clean — no stranded work
+    ;;
+  1)
+    # Genuine stranded finished work found. FAIL CLOSED.
+    echo "SR-2.6 (preflight): scripts/audit-finished-tickets.sh reported stranded finished work — one or more bees are 'finished' while their fix is neither on main nor explicitly closed, or an unmerged branch references a finished ticket (see the audit report above). Releasing now would ship with work silently stranded on dead branches. Operator recovery: for each flagged ticket, either land its fix on main, or explicitly close it (no-repro / superseded / abandoned, with a pointer to where the work actually lives); for each flagged branch, merge or delete it. Re-close the tickets as appropriate, then rerun '/publish ${BUMP_KIND}'. This gate is READ-ONLY and never mutates tickets or git." >&2
+    exit 16
+    ;;
+  *)
+    # Exit 2 (or any other unexpected code): the audit could NOT run — it could
+    # not locate the hives / a git repo / a 'main' ref from this checkout. This
+    # is a setup/configuration failure, NOT stranded work, so it does NOT get
+    # the SR-2.6 stranded-work recovery (which would be wrong). FAIL CLOSED — the
+    # audit is a required gate and must never be silently skipped, so we still
+    # block the release. Distinct exit code 17 keeps the recovery unambiguous.
+    echo "SR-2.6 (preflight): scripts/audit-finished-tickets.sh could not run (exit ${AUDIT_EXIT}) — it could not locate the Bugs/Plans hives, a git repo, or a 'main' ref from this checkout (see the audit's own diagnostic above). This is NOT a report of stranded work; the required stranded-finished-work gate simply could not be evaluated, so the release is BLOCKED. This typically means /publish was run from a throwaway/detached checkout (e.g. a /tmp clone) that does not sit beside the hives. Operator recovery: rerun '/publish ${BUMP_KIND}' from the canonical claude-slack-channel-bots checkout that lives beside the Bugs/Plans hives (the main working clone), where the audit can reconcile finished tickets against main. This gate is READ-ONLY and never mutates tickets or git." >&2
+    exit 17
+    ;;
+esac
 
 echo "Phase 1 (local preflight) passed. Next version will be: ${NEXT_VERSION}"

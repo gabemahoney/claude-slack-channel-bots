@@ -30,6 +30,13 @@
 #   12  SR-2.1  preflight: local main behind/diverged from origin/main
 #   13  SR-2.2/2.3  preflight: install/test/typecheck failed
 #   14  SR-2.4  preflight: npm not authenticated, or next version already on npm
+#   15  SR-2.5  preflight: host agent-director missing/broken or version out of range
+#   16  SR-2.6  preflight: stranded finished work (finished ticket not on main and
+#                not explicitly closed, or unmerged branch references a finished ticket)
+#   17  SR-2.6  preflight: the finished-work audit could not run (could not locate the
+#                hives / a git repo / a 'main' ref from this checkout) — a setup
+#                failure, NOT stranded work. FAIL CLOSED: release still blocked.
+#                Recovery: rerun from the canonical checkout beside the hives.
 #   20  SR-3.1  npm version bump failed
 #   21  SR-4.1  bun pm pack failed or tarball internal version mismatch
 #   22  SR-4.2  scratch install failed (from smoke-check.sh)

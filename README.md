@@ -650,14 +650,15 @@ The bump kind is **required** — there is no default. The skill exits with a us
 
 ### Preflight gates
 
-Before any side-effecting step runs, `/publish` enforces six fail-fast gates. Any failure aborts before the version is bumped, the tarball is packed, or anything is committed:
+Before any side-effecting step runs, `/publish` enforces seven fail-fast gates. Any failure aborts before the version is bumped, the tarball is packed, or anything is committed:
 
 1. **Clean working tree on `main` in sync with origin/main.** No uncommitted changes; HEAD branch is `main`; `main` is exactly equal to `origin/main` after `git fetch origin`.
 2. **Tests exist and pass.** At least one `*.test.ts` file under `tests/` and `bun test` exits zero.
 3. **Typecheck passes.** `bun run typecheck` exits zero.
 4. **npm authenticated.** `npm whoami` exits zero (run `npm login` first if not).
 5. **Next version not already published.** `npm view claude-slack-channel-bots@<next-version> version` must report nothing.
-6. **`/ci` integration suite passes.** The full Docker-based integration test suite is run via the `/ci` skill and must report PASS. **`/ci` is mandatory and has no opt-out flag** — release without an unbroken integration run is not possible through this skill.
+6. **No stranded finished work.** `scripts/audit-finished-tickets.sh` must exit zero. It flags any `finished` ticket whose fix is neither on `main` nor explicitly closed (ops-only / no-repro / superseded), any unmerged branch tied to a finished ticket, and any unmerged branch that references no known ticket at all (e.g. `origin/no-channels`). A release cannot ship while a fix is silently stranded on a dead branch. The gate is read-only — it never mutates tickets or git. This gate runs in Phase 1 preflight, **before** the `/ci` gate below, so a stranded-work failure aborts the release before the Docker suite ever runs. The gate splits its failure by the audit's exit code: audit exit 1 (stranded work) → preflight exit 16; audit exit 2 (setup failure — the Bugs/Plans hives, a git repo, or a `main` ref were not locatable from this checkout, e.g. a throwaway `/tmp` clone) → preflight exit 17, whose fix is to rerun `/publish` from the canonical checkout that sits beside the hives. **Note: this gate is known-red today** — it exits non-zero by design against pre-existing hygiene debt (tickets `b.qps`, `b.1qs`, `b.a4d`, `b.jfk`, `b.e3f`; branches `feature/b.e3f`, `feature/b.oaj`, `fix/b.k54-trust-dialog`, `origin/no-channels`, all tracked separately), so it will block releases until that debt is cleared or explicitly closed. A red result on first run is not a regression in the gate.
+7. **`/ci` integration suite passes.** The full Docker-based integration test suite is run via the `/ci` skill and must report PASS. **`/ci` is mandatory and has no opt-out flag** — release without an unbroken integration run is not possible through this skill.
 
 ### What happens during a release
 
