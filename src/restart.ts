@@ -171,11 +171,18 @@ export function scheduleRestart(
         }
         // Non-success/non-void branches ('escalate-dead', 'transient', or undefined):
         // do NOT recordFailure here. SR-25.1 / single counting site: counting
-        // lives only at the launchSession boolean below. 'escalate-dead' is
-        // currently a no-op — nothing re-enters scheduleRestart on that outcome,
-        // so restart.ts simply returns and recovery waits for a future health
-        // tick or a server restart. Not counting here keeps the failure count
-        // tied to actual launch attempts rather than a non-launch reconnect site.
+        // lives only at the launchSession boolean below. restart.ts does not
+        // re-enter scheduleRestart on any of these outcomes — it simply returns.
+        // Post-b.9a7 that is safe: the periodic health-check tick is now the
+        // retry driver. On the next tick the channel is re-observed; if it is
+        // still alive && !connected (or has since gone dead), the tick calls
+        // scheduleRestart again, so a failed/deferred reconnect is retried
+        // without any re-entry here. ('transient' also covers the b.9a7 hazard-2
+        // `working` defer: the tick retries once the turn settles.) For the
+        // dead-tmux 'escalate-dead' case the external
+        // ~/startup/find-missing-loop.sh may additionally reconcile the row to
+        // `missing`, after which a tick relaunches. Not counting here keeps the
+        // failure count tied to actual launch attempts, not this reconnect site.
         return
       }
 

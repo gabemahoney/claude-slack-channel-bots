@@ -1032,6 +1032,70 @@ export function _buildStatRouteImpl(deps?: {
 }
 
 // ---------------------------------------------------------------------------
+// _buildReconnectSessionAdapter
+// ---------------------------------------------------------------------------
+
+/**
+ * _buildReconnectSessionAdapter — test-only factory for the restart module's
+ * reconnectSession dependency. Production code wires this via main()'s
+ * initRestart call; tests call it directly to exercise the b.9a7 working→
+ * 'transient' state gate without importing the private closure inside main().
+ *
+ * b.9a7 HAZARD 2 (turn corruption, b.rmy invariant) — state gate:
+ * reconnectMcp types `/mcp reconnect` into the tmux pane. Before b.9a7 only
+ * rare event paths reached this; now the health-check tick can drive it
+ * periodically for any live state. A session mid-long-turn (`working`) is
+ * exactly the case most likely to look disconnected while healthy, and typing
+ * into its pane mid-turn risks corrupting the turn. So DEFER `working`: probe
+ * AD state and, if working, return 'transient' — a no-op that restart.ts does
+ * NOT count and does NOT re-enter scheduleRestart on, leaving the next tick free
+ * to retry once the turn settles to an idle-like state (waiting/ask_user/
+ * check_permission). This does not regress the b.rmy invariant: we never declare
+ * `working` dead, only decline to poke it. On any status error we fall through
+ * to the reconnect attempt (today's behavior) rather than manufacture a false
+ * defer.
+ *
+ * @internal
+ */
+export function _buildReconnectSessionAdapter(
+  getRoutingConfig: () => RoutingConfig | null | undefined,
+  web: WebClient,
+): (channelId: string) => Promise<'success' | 'escalate-dead' | 'transient'> {
+  return async (channelId: string) => {
+    const routingConfig = getRoutingConfig()
+    try {
+      const claude_instance_id = instanceIdFor(channelId, routingConfig?.routes[channelId]?.normalizedName)
+      const st = await withOutageDetection(channelId, undefined, (client) =>
+        client.status({ claude_instance_id }),
+      )
+      if (st.state === 'working') {
+        console.error(`[slack] reconnectSession: channel=${channelId} is working — deferring /mcp reconnect to a later tick (b.9a7/b.rmy)`)
+        return 'transient'
+      }
+    } catch {
+      // Ignore — proceed to reconnect attempt below (reconnectMcp handles its
+      // own status/send-keys errors and outage flagging).
+    }
+    // Widened return type (SR-25.1 single counting site): surface the
+    // ReconnectOutcome to restart.ts so it can call recordSuccess on the
+    // success path. Map main's ReconnectOutcome onto the restart union —
+    // 'ok' is the only success signal restart.ts acts on; 'dead-session'
+    // and 'failed' are non-success (no recordSuccess, no recordFailure).
+    // 'dead-session' maps to 'escalate-dead' (b.9a7-amended): restart.ts does
+    // not re-enter scheduleRestart on it, but the NEXT health-check tick will
+    // — it sees the row still alive && !connected (or dead), and reschedules.
+    // For the dead-tmux escalate-dead case, the external
+    // ~/startup/find-missing-loop.sh may also reconcile the row to `missing`
+    // first, after which a tick restarts it. Not counting here keeps failures
+    // attributed to the launchSession site, which owns the single counting site.
+    const result = await reconnectMcp(channelId, isDryRun() ? undefined : web, routingConfig ?? undefined)
+    if (result === 'ok') return 'success'
+    if (result === 'dead-session') return 'escalate-dead'
+    return 'transient'
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 //
 // HTTP routing strategy (roots-based session identity):
@@ -1344,22 +1408,7 @@ export async function main(): Promise<void> {
       const session = getSessionByChannel(channelId)
       return session?.connected === true
     },
-    reconnectSession: async (channelId) => {
-      // Widened return type (SR-25.1 single counting site): surface the
-      // ReconnectOutcome to restart.ts so it can call recordSuccess on the
-      // success path. Map main's ReconnectOutcome onto the restart union —
-      // 'ok' is the only success signal restart.ts acts on; 'dead-session'
-      // and 'failed' are non-success (no recordSuccess, no recordFailure).
-      // 'dead-session' maps to 'escalate-dead', which is currently a no-op in
-      // restart.ts: nothing re-enters scheduleRestart on it, so recovery waits
-      // for a future health tick or a server restart. Not counting here keeps
-      // failures attributed to the launchSession site, which owns the single
-      // counting site.
-      const result = await reconnectMcp(channelId, isDryRun() ? undefined : web, routingConfig ?? undefined)
-      if (result === 'ok') return 'success'
-      if (result === 'dead-session') return 'escalate-dead'
-      return 'transient'
-    },
+    reconnectSession: _buildReconnectSessionAdapter(() => routingConfig, web),
     killSession: async (channelId) => {
       try {
         const normalizedName = routingConfig?.routes[channelId]?.normalizedName
@@ -1470,6 +1519,13 @@ export async function main(): Promise<void> {
   // Initialize and start the health-check poller.
   initHealthCheck({
     isSessionAlive: isSessionAliveAdapter,
+    // b.9a7: same connectedness adapter wired into initRestart above
+    // (registry entry with connected === true). Lets the tick notice
+    // alive-but-disconnected rows and route them to scheduleRestart.
+    isSessionConnected: (channelId) => {
+      const session = getSessionByChannel(channelId)
+      return session?.connected === true
+    },
     isRestartPendingOrActive,
     isAtCap: (channelId) => backoffIsAtCap(channelId, RESTART_FAILURE_CAP),
     statRoute: _buildStatRouteImpl(),

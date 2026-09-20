@@ -74,7 +74,7 @@ When a managed session's MCP connection closes, `onsessionclosed` calls `schedul
 
 ### Failure Limiting
 
-Consecutive relaunch failures are tracked per channel by `src/backoff.ts` — a pure, import-free module with no timers or I/O (see SR-25). The module exposes a simple counter API consumed one-way by restart/health-check/server wiring. `restart.ts` counts at a single site: the `launchSession` boolean outcome (SR-25.1). A successful launch — or a successful MCP reconnect on the alive-but-disconnected path — calls `recordSuccess`; the failing `launchSession` branch calls `recordFailure`. The reconnect path never calls `recordFailure`: an `'escalate-dead'` reconnect is a no-op — nothing re-enters `scheduleRestart` on that outcome (recovery waits for a future health tick or a server restart) — so counting stays tied to actual launch attempts rather than a non-launch reconnect site.
+Consecutive relaunch failures are tracked per channel by `src/backoff.ts` — a pure, import-free module with no timers or I/O (see SR-25). The module exposes a simple counter API consumed one-way by restart/health-check/server wiring. `restart.ts` counts at a single site: the `launchSession` boolean outcome (SR-25.1). A successful launch — or a successful MCP reconnect on the alive-but-disconnected path — calls `recordSuccess`; the failing `launchSession` branch calls `recordFailure`. The reconnect path never calls `recordFailure`: an `'escalate-dead'` or `'transient'` reconnect does not re-enter `scheduleRestart` — restart.ts simply returns — so counting stays tied to actual launch attempts rather than a non-launch reconnect site. That is not a dead end (b.9a7): the periodic health-check tick is the retry driver, re-observing the channel each interval and calling `scheduleRestart` again while it is still alive-but-disconnected or once it goes dead, so a failed or deferred reconnect is retried on a bounded cadence.
 
 #### Exponential backoff
 
@@ -139,12 +139,13 @@ All restart activity is logged to stderr with the `[slack]` prefix:
 | `[slack] Session relaunch failed for channel=<id>` | Relaunch failed; failure counter incremented |
 | `[slack] Cap reached for channel=<id> — notifying and stopping restarts` | 5th consecutive failure; `SpawnCapReached` posted, no more timers scheduled |
 | `[slack] health-check: channel=<id> is at cap — skipping tick (SR-25.3/25.4)` | Poller skipped a capped channel on this tick |
+| `[slack] reconnectSession: channel=<id> is working — deferring /mcp reconnect to a later tick (b.9a7/b.rmy)` | A tick-driven reconnect declined to poke a mid-long-turn (`working`) session; the next tick retries once the turn settles |
 | `[slack] Skipping restart — server is shutting down (channel=<id>)` | Timer fired during shutdown; abort |
 | `[slack] Cancelled restart timer for channel=<id>` | Pending timer cleared on graceful shutdown |
 
 ## Health-Check Poller
 
-`health-check.ts` runs a `setInterval` loop that checks every configured route on a fixed cadence and schedules restarts for sessions that are dead and not already being recovered.
+`health-check.ts` runs a `setInterval` loop that checks every configured route on a fixed cadence and schedules recovery for sessions that are dead — and, as of b.9a7, for sessions that are alive (AD live state) but MCP-disconnected — when they are not already being recovered. Both cases route through `scheduleRestart`, which then reconnects or relaunches per case. The alive-but-disconnected case requires `!connected` on two consecutive ticks before firing, to avoid poking a freshly-launched session that has not yet registered its MCP connection.
 
 ### Configuration
 
@@ -173,7 +174,13 @@ Before calling `scheduleRestart`, the poller queries two guards:
 - `isRestartPendingOrActive(channelId)` from `restart.ts` — returns `true` if a restart timer is queued or a launch is in flight; skip to avoid double-launching.
 - `isAtCap(channelId, RESTART_FAILURE_CAP)` from `backoff.ts`, injected as `HealthCheckDeps.isAtCap` — returns `true` if the channel has reached the consecutive-failure cap; skip the tick for this channel. A capped channel recovers only via a server restart (see SR-25). The tick guard only stops the *poller* from re-scheduling. The `scheduleRestart` path is itself cap-exempt, but neither message trigger revives a capped-dead route: the streamless trigger (`server.ts:784`) reaches `scheduleRestart` only for a session that is registered yet missing its `_GET_stream` (which a capped-dead route does not have), and the b.kvq inbound drop-branch trigger (`server.ts:707`) checks `backoffIsAtCap` itself and declines to fire at the cap, replying that an operator must restart the server. Both drop-branch guards key on the owning channel — for a `default_route` channel that is the direct route owning the shared cwd, not the inbound channel.
 
-When neither guard fires and the session is dead, the poller calls `scheduleRestart(channelId, cwd)` — the same function used by the reactive `onsessionclosed` path.
+When neither guard fires, the poller checks liveness and connectedness via `isSessionAlive(channelId)` and `isSessionConnected(channelId)` (the latter added in b.9a7, wrapping the same registry-`connected` adapter restart.ts uses):
+
+- **Dead** (`!alive`) → `scheduleRestart(channelId, cwd)` immediately — the same function used by the reactive `onsessionclosed` path.
+- **Alive but disconnected** (`alive && !connected`) → increment a per-channel consecutive-disconnected streak; `scheduleRestart` fires only once the streak reaches two consecutive ticks (the freshly-launched false-positive guard). restart.ts then reconnects the row, deferring a `working` row (`reconnectSession` returns `'transient'` on `working`) so a mid-long-turn session is not poked (b.rmy invariant preserved).
+- **Alive and connected** → healthy; reset the streak.
+
+The capped-channel skip above covers the alive-but-disconnected path too: a capped channel gets no tick-driven reconnect, deliberately, so the b.kvq operator contract ("will NOT recover on its own") is not quietly contradicted.
 
 ## Avoiding Duplicated Effort with agent-director
 

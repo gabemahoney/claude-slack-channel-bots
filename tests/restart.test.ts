@@ -11,6 +11,7 @@ import {
   cancelAllRestartTimers,
   _resetRestartState,
   isRestartPendingOrActive,
+  RESTART_FAILURE_CAP,
   type RestartDeps,
 } from '../src/restart.ts'
 import {
@@ -652,6 +653,65 @@ describe('backoff integration (SR-29.3)', () => {
   //     backoff. A second scheduleRestart for the same channel cancels the
   //     first timer (cancel-and-replace semantic).
   // -------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // (6) b.9a7 — reconnect defer contract. A tick-driven reconnect that returns
+  //     'transient' (e.g. the server.ts adapter deferring a `working` session,
+  //     hazard 2 / b.rmy) or that fails must not consume the b.7u6 cap and must
+  //     leave the channel free for a later tick to retry: no launchSession, no
+  //     killSession, no recordFailure, no onCapReached, and no pending timer
+  //     re-armed from restart.ts (the tick is the retry driver, not re-entry).
+  // -------------------------------------------------------------------------
+
+  test('(6a) b.9a7: alive + reconnect="transient" (working-state defer) does not relaunch or re-arm', async () => {
+    // Unique to this case (the "transient leaves the counter unchanged" behavior
+    // is already pinned by 4c): the working-state defer takes NO recovery action
+    // and restart.ts does NOT re-enter scheduleRestart — the tick is the retry
+    // driver. This asserts the observable no-op side of the defer contract.
+    const CHANNEL = 'C_9A7_DEFER'
+    const deps = makeDeps({ isSessionAliveResult: true })
+    deps.reconnectSession = async (channelId) => {
+      deps.reconnectSessionCalls.push(channelId)
+      return 'transient'
+    }
+    initRestart(deps)
+
+    scheduleRestart(CHANNEL, '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    // Reconnect was attempted, but the defer path leaves the turn undisturbed:
+    // no kill, no relaunch.
+    expect(deps.reconnectSessionCalls).toEqual([CHANNEL])
+    expect(deps.killSessionCalls).toHaveLength(0)
+    expect(deps.launchSessionCalls).toHaveLength(0)
+    // restart.ts does NOT re-enter scheduleRestart — no pending timer remains;
+    // the next health-check tick is the retry driver.
+    expect(isRestartPendingOrActive(CHANNEL)).toBe(false)
+  })
+
+  test('(6b) b.9a7: repeated reconnect failures never consume the cap (single counting site)', async () => {
+    const CHANNEL = 'C_9A7_RETRY'
+    const deps = makeDeps({ isSessionAliveResult: true })
+    // Every reconnect attempt fails (throws → undefined result). Simulate the
+    // tick re-driving scheduleRestart many times over.
+    deps.reconnectSession = async (channelId) => {
+      deps.reconnectSessionCalls.push(channelId)
+      throw new Error('sendKeys failed')
+    }
+    initRestart(deps)
+
+    for (let i = 0; i < RESTART_FAILURE_CAP + 3; i++) {
+      scheduleRestart(CHANNEL, '/cwd/test')
+      await Bun.sleep(WAIT_MS)
+    }
+
+    // Reconnect was attempted every time, but the reconnect path never counts a
+    // failure, so the cap is never reached despite far more than CAP attempts.
+    expect(deps.reconnectSessionCalls.length).toBe(RESTART_FAILURE_CAP + 3)
+    expect(getFailureCount(CHANNEL)).toBe(0)
+    expect(isAtCap(CHANNEL, RESTART_FAILURE_CAP)).toBe(false)
+    expect(deps.onCapReachedCalls).toHaveLength(0)
+  })
 
   test('(5) SR-25.4 no-stacking: second scheduleRestart cancels first pending timer (cancel-and-replace)', async () => {
     const deps = makeDeps({ restartDelay: SLOW_DELAY_S, launchSessionResult: false })
