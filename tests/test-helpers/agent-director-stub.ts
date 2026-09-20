@@ -460,6 +460,14 @@ export interface StubClientOptions {
   statusError?: Error
   statusQueue?: CannedResponse<StatusResult>[]
   statusCalls?: StatusParams[]
+  /**
+   * Dynamic status seam (b.m4r). When supplied, takes precedence over
+   * `statusResult`/`statusQueue`/`statusError` and computes the result from the
+   * current call params — lets a test model an AD row whose state depends on
+   * whether an earlier verb (e.g. the up-front `findMissing` reconcile sweep)
+   * has run. Returning an `Error` rejects; returning a `StatusResult` resolves.
+   */
+  statusFn?: (params: StatusParams) => StatusResult | Error
 
   // get()
   getResult?: GetResult
@@ -529,10 +537,11 @@ export interface StubClientOptions {
   getPermissionCalls?: GetPermissionParams[]
 
   /**
-   * Ordered verb-name log. When supplied, only the two instrumented verbs —
-   * `findMissing` and `resume` — push their name before returning, letting a
-   * test assert their relative ordering (b.4dk: findMissing must precede
-   * resume). Other verbs are not instrumented.
+   * Ordered verb-name log. When supplied, the instrumented verbs — `findMissing`,
+   * `status`, and `resume` — push their name before returning, letting a test
+   * assert their relative ordering (b.4dk: findMissing must precede resume;
+   * b.m4r: the up-front findMissing sweep must precede the first status poll).
+   * Other verbs are not instrumented.
    */
   callLog?: string[]
 }
@@ -612,7 +621,13 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
       })
     },
     async status(params: StatusParams): Promise<StatusResult> {
+      opts.callLog?.push('status')
       opts.statusCalls?.push(params)
+      if (opts.statusFn) {
+        const r = opts.statusFn(params)
+        if (r instanceof Error) throw r
+        return r
+      }
       return nextResponse('status', opts.statusQueue, opts.statusResult, opts.statusError, { state: 'waiting' })
     },
     async get(params: GetParams): Promise<GetResult> {

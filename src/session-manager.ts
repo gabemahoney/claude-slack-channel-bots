@@ -34,7 +34,7 @@ import {
   ErrTmuxSendKeys,
   ErrTmuxSessionCreate,
 } from 'agent-director'
-import type { ListRow, SpawnParams } from 'agent-director'
+import type { ListRow, SpawnParams, FindMissingResult } from 'agent-director'
 import type { WebClient } from '@slack/web-api'
 
 import { checkCozempicAvailable } from './cozempic.ts'
@@ -621,6 +621,102 @@ export function _resetWaitForWaitingTimeoutMs(): void {
   _waitForWaitingTimeoutMs = WAIT_FOR_WAITING_TIMEOUT_MS
 }
 
+// ---------------------------------------------------------------------------
+// reconcileMissingSweep — shared, load-shedding findMissing sweep
+// ---------------------------------------------------------------------------
+
+/**
+ * TTL for the findMissing memo window (b.m4r). AD's `findMissing({})` is a
+ * whole-store, per-row evidence-based sweep; it is idempotent, so two sweeps
+ * fired within a few seconds of each other return the same verdicts. On a
+ * fleet restart, startupSessionManager (concurrency=3) resolves collisions
+ * across N channels near-simultaneously, and every `working`-row collision —
+ * plus each dead-path `reconcileMissingFirst` — would otherwise fire its own
+ * whole-store sweep (N sweeps, up to 3 concurrent). Single-flight collapses
+ * concurrent callers onto one in-flight promise; the TTL then lets callers
+ * arriving just after it resolves reuse that result instead of re-sweeping.
+ *
+ * 10s is chosen to comfortably cover one startup reconcile wave (the whole
+ * concurrency=3 wave over the fleet completes well inside this window) while
+ * staying short enough that the health-checker's later per-channel calls
+ * (spaced on the order of a minute) always fall outside the window and get a
+ * fresh sweep — recovery behavior is unchanged, only redundant load is shed.
+ */
+const FIND_MISSING_MEMO_TTL_MS = 10 * 1000
+
+let _findMissingMemoTtlMs = FIND_MISSING_MEMO_TTL_MS
+
+/** In-flight single-flight promise, shared by concurrent callers. */
+let _findMissingInFlight: Promise<FindMissingResult> | null = null
+/** Last successful sweep result and the time it resolved (for TTL reuse). */
+let _findMissingLast: { result: FindMissingResult; at: number } | null = null
+
+/**
+ * Test-only seam (mirrors `_setWaitForWaitingTimeoutMs`): override the memo TTL.
+ */
+export function _setFindMissingMemoTtlMs(ms: number): void {
+  _findMissingMemoTtlMs = ms
+}
+
+/**
+ * Test-only seam: clear all memo state (in-flight promise, cached result) and
+ * restore the default TTL. Tests that count findMissing calls must call this in
+ * their setup/teardown to stay deterministic.
+ */
+export function _resetFindMissingMemo(): void {
+  _findMissingInFlight = null
+  _findMissingLast = null
+  _findMissingMemoTtlMs = FIND_MISSING_MEMO_TTL_MS
+}
+
+/**
+ * Run AD's per-row, evidence-based `findMissing({})` sweep once, shedding
+ * redundant load (b.m4r). The sweep is idempotent, so this is purely a
+ * load-shedding optimization over calling `client.findMissing({})` directly:
+ *
+ * - Single-flight: concurrent callers share one in-flight sweep promise.
+ * - Short-TTL memo: a caller arriving within `_findMissingMemoTtlMs` of the
+ *   last successful sweep reuses that result instead of re-sweeping.
+ *
+ * Failures are NOT memoized — on error the next caller retries. Error handling
+ * mirrors the previous inline call sites: log once and let the caller proceed
+ * with today's behavior (fall through to the poll loop / attempt resume anyway).
+ *
+ * @param channelId only used for log context — the sweep itself is whole-store.
+ * @param logPrefix distinguishes the two call sites in the log line.
+ */
+async function reconcileMissingSweep(channelId: string, logPrefix: string): Promise<void> {
+  // Memo hit: a recent successful sweep is still within the TTL. Reuse it.
+  if (_findMissingLast && Date.now() - _findMissingLast.at < _findMissingMemoTtlMs) {
+    return
+  }
+
+  // Single-flight: an in-flight sweep exists — await it rather than starting one.
+  if (!_findMissingInFlight) {
+    _findMissingInFlight = withOutageDetection(channelId, undefined, (client) => client.findMissing({}))
+  }
+  const inFlight = _findMissingInFlight
+
+  try {
+    const r = await inFlight
+    // Only the caller that started this sweep records the result/log (others
+    // await the same promise but must not double-log or re-stamp the memo).
+    if (_findMissingInFlight === inFlight) {
+      _findMissingLast = { result: r, at: Date.now() }
+      _findMissingInFlight = null
+      console.error(`[slack] ${logPrefix}: findMissing sweep for channel=${channelId} — count=${r.count} ids=[${r.ids.join(',')}] unverified=${r.unverified} unverified_ids=[${r.unverified_ids.join(',')}]`)
+    }
+  } catch (err) {
+    // Do NOT memoize failures — clear the in-flight slot so the next caller
+    // retries. Log and let the caller proceed with today's behavior.
+    if (_findMissingInFlight === inFlight) {
+      _findMissingInFlight = null
+    }
+    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('findMissing', 'UnknownError', String(err))
+    console.error(`[slack] ${logPrefix}: findMissing sweep failed for channel=${channelId}: ${e.errName} — proceeding`)
+  }
+}
+
 /**
  * Poll `status({claude_instance_id})` until the spawn transitions to
  * `waiting`, then call reconnectMcp. Transitions to live transient states
@@ -643,6 +739,22 @@ export async function waitForWaitingAndReconnect(
   const sessionName = tmuxSessionNameFor(channelId, routingConfig.routes[channelId]?.normalizedName)
   const pollIntervalMs = routingConfig.agent_director_poll_interval_ms
   const deadline = Date.now() + _waitForWaitingTimeoutMs
+
+  // b.m4r: a bot killed mid-turn never fires SessionEnd, so its AD row freezes
+  // at `working`. Without a reconcile, the poll below spins on `status` for the
+  // full 10-minute window before the timeout tmux probe finally decides — the
+  // channel stays down that whole time. Run AD's per-row, evidence-based
+  // findMissing sweep ONCE up front (agent-director plan b.93m, t1.93m.hp:
+  // degraded-mode guard removed, shipped ≥ 0.8.0). A genuinely-dead row
+  // reconciles to `missing`, so the FIRST status poll below hits the
+  // ended/missing tmux-confirm branch and returns 'dead-session' in seconds; a
+  // genuinely-alive long-turn row is untouched by the evidence-based sweep and
+  // keeps today's polling behavior (b.rmy long-turn guard preserved). Prefer
+  // AD's findMissing verb over a CSCB-side tmux reconcile per
+  // docs/engineering-guide.md ("Avoiding Duplicated Effort"), mirroring
+  // resumeOrFreshSpawn's reconcileMissingFirst branch. On any findMissing
+  // error, log and fall through to the existing poll loop (today's behavior).
+  await reconcileMissingSweep(channelId, 'waitForWaitingAndReconnect')
 
   while (Date.now() < deadline) {
     let state: string
@@ -905,13 +1017,7 @@ async function resumeOrFreshSpawn(
   // (today's) fallback. Prefer AD's findMissing verb over CSCB-side tmux
   // probing per docs/engineering-guide.md ("Avoiding Duplicated Effort").
   if (opts?.reconcileMissingFirst) {
-    try {
-      const r = await withOutageDetection(channelId, undefined, (client) => client.findMissing({}))
-      console.error(`[slack] spawnForRoute: findMissing before resume for channel=${channelId} — count=${r.count} ids=[${r.ids.join(',')}] unverified=${r.unverified} unverified_ids=[${r.unverified_ids.join(',')}]`)
-    } catch (err) {
-      const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('findMissing', 'UnknownError', String(err))
-      console.error(`[slack] spawnForRoute: findMissing before resume failed for channel=${channelId}: ${e.errName} — attempting resume anyway`)
-    }
+    await reconcileMissingSweep(channelId, 'spawnForRoute: before resume')
   }
 
   // resume_enabled: attempt resume
