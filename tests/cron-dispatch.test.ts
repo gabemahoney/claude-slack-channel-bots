@@ -125,7 +125,7 @@ function token(detail: string, key: string): string | undefined {
  * dispatcher, the log path, and a `lines()` reader. `cronTablePath` defaults to
  * a file inside a fresh temp dir so relative prompt paths resolve there.
  */
-function makeHarness(opts: { cronTablePath?: string; port?: number } = {}): {
+function makeHarness(opts: { cronTablePath?: string; port?: number; deliverTimeoutMs?: number } = {}): {
   fire: (s: CronSchedule) => Promise<void>
   logPath: string
   lines: () => LogLine[]
@@ -135,7 +135,13 @@ function makeHarness(opts: { cronTablePath?: string; port?: number } = {}): {
   const logPath = join(logDir, 'cron.log')
   const cronTablePath = opts.cronTablePath ?? join(makeTempDir('cscb-crontab-test-'), 'crontab')
   const cronLog = createCronLog(logPath)
-  const dispatcher = createCronDispatcher({ port: opts.port ?? PORT, cronLog, cronTablePath })
+  const dispatcher = createCronDispatcher({
+    port: opts.port ?? PORT,
+    cronLog,
+    cronTablePath,
+    // Optional per-request deadline; omitted → factory default (production 3 s).
+    ...(opts.deliverTimeoutMs !== undefined ? { deliverTimeoutMs: opts.deliverTimeoutMs } : {}),
+  })
   return { fire: dispatcher.fire, logPath, lines: () => readLog(logPath), cronTablePath }
 }
 
@@ -540,4 +546,156 @@ describe('fresh-read', () => {
     expect(requests[0]!.body.message).toBe('first content')
     expect(requests[1]!.body.message).toBe('second content')
   })
+})
+
+// ---------------------------------------------------------------------------
+// 10. Deliver deadline — accepting-but-silent peer (b.rvo)
+// ---------------------------------------------------------------------------
+//
+// A peer that ACCEPTS the TCP connection but never responds would hang deliver()
+// forever without the AbortSignal.timeout fix — no outcome line, no summary
+// line, violating the every-fire-is-logged contract. These tests stand up a
+// dedicated Bun.serve whose handler returns a Promise that never settles, hand
+// its real bound port to the factory, and drive fire() with a short
+// deliverTimeoutMs (100 ms) so the deadline trips fast. The stalled server is
+// force-closed (`stop(true)`) in afterEach so an active hung connection cannot
+// wedge teardown.
+//
+// Anti-hang budget: deliverTimeoutMs=100 ms; per-target loop is sequential so
+// worst case is targets × 100 ms; each test carries a Bun test-timeout third
+// arg (2000 ms) that is ~20× the single-target deadline yet far under the
+// suite's default 5 s patience. WITHOUT the fix the never-settling handler means
+// fetch never rejects, fire() never returns, and the 2000 ms test timeout fires
+// → the test FAILS FAST (it does not hang the suite and it does not pass).
+
+describe('deliver deadline (accepting-but-silent peer)', () => {
+  /** Servers whose handler never settles — force-closed after each test. */
+  let silentServers: ReturnType<typeof Bun.serve>[]
+
+  beforeEach(() => {
+    silentServers = []
+  })
+
+  afterEach(() => {
+    for (const s of silentServers) {
+      // stop(true) force-closes active (hung) connections so teardown cannot
+      // block on the never-settling handler.
+      try {
+        s.stop(true)
+      } catch {
+        /* best-effort */
+      }
+    }
+  })
+
+  /**
+   * Start a server on an ephemeral port whose handler accepts the request and
+   * returns a Promise that never resolves. The request is captured so a hung
+   * connection is provable, but no Response is ever produced.
+   */
+  function startSilentServer(): number {
+    const server = Bun.serve({
+      port: 0,
+      fetch(): Promise<Response> {
+        // Never settles: the connection stays open, no response is ever sent.
+        return new Promise<Response>(() => {})
+      },
+    })
+    silentServers.push(server)
+    return server.port as number
+  }
+
+  test(
+    'wedged peer → fire completes, one http-error with TimeoutError detail, plus summary',
+    async () => {
+      const silentPort = startSilentServer()
+
+      const dir = makeTempDir('cscb-prompt-test-')
+      const promptPath = join(dir, 'p.md')
+      writeFileSync(promptPath, 'ping')
+
+      // Short per-request deadline so the wedged peer trips fast (production is
+      // 3 s). If fire() ever returns here, the deadline worked.
+      const h = makeHarness({ port: silentPort, deliverTimeoutMs: 100 })
+
+      // This await is the anti-hang assertion: without the fix it never resolves
+      // and the 2000 ms test timeout below fails the test fast.
+      await h.fire(explicitSchedule(promptPath, ['C_WEDGED']))
+
+      const lines = h.lines()
+
+      // Exactly one outcome for the wedged target, classed http-error.
+      const wedged = lines.filter((l) => l.channel === 'C_WEDGED')
+      expect(wedged).toHaveLength(1)
+      expect(wedged[0]!.outcome).toBe('http-error')
+      // TimeoutError detail: errno token is the DOMException name (not legacy 23).
+      // That token is the behavioral contract; the trailing free text is Bun's
+      // runtime-internal timeout prose, so assert only that it is non-empty
+      // rather than pinning the exact wording.
+      expect(token(wedged[0]!.detail, 'errno')).toBe('TimeoutError')
+      expect(wedged[0]!.detail.replace(/\S*errno=\S*/, '').trim().length).toBeGreaterThan(0)
+
+      // Summary line is produced: delivered=0 failed=1.
+      const summaries = lines.filter((l) => l.outcome === 'summary')
+      expect(summaries).toHaveLength(1)
+      expect(token(summaries[0]!.detail, 'delivered')).toBe('0')
+      expect(token(summaries[0]!.detail, 'failed')).toBe('1')
+    },
+    2000,
+  )
+
+  test(
+    'mixed fire (healthy + wedged) → healthy delivered, wedged http-error, summary counts both',
+    async () => {
+      const silentPort = startSilentServer()
+
+      const dir = makeTempDir('cscb-prompt-test-')
+      const promptPath = join(dir, 'multi.md')
+      writeFileSync(promptPath, 'multi body')
+
+      // A dispatcher targets exactly one port, so to exercise one healthy + one
+      // wedged target in a SINGLE fire we need one server that answers 200 for
+      // the healthy channel and hangs (never settles) for the wedged channel.
+      const mixedServer = Bun.serve({
+        port: 0,
+        async fetch(req: Request): Promise<Response> {
+          const raw = await req.text()
+          let channel = ''
+          try {
+            channel = (JSON.parse(raw) as { channel?: unknown }).channel as string
+          } catch {
+            /* leave channel empty */
+          }
+          if (channel === 'C_WEDGED') {
+            // Never settles for the wedged channel.
+            return new Promise<Response>(() => {})
+          }
+          return new Response(JSON.stringify({ status: 200 }), { status: 200 })
+        },
+      })
+      silentServers.push(mixedServer)
+      const mixedPort = mixedServer.port as number
+
+      const h = makeHarness({ port: mixedPort, deliverTimeoutMs: 100 })
+
+      // Healthy target first, wedged second — proves the sequential loop
+      // continues past a healthy delivery to attempt (and time out) the wedged
+      // one, and that the wedged hang does not swallow the earlier outcome.
+      await h.fire(explicitSchedule(promptPath, ['C_OK', 'C_WEDGED']))
+
+      const lines = h.lines()
+      expect(lines.find((l) => l.channel === 'C_OK')!.outcome).toBe('delivered')
+
+      const wedged = lines.filter((l) => l.channel === 'C_WEDGED')
+      expect(wedged).toHaveLength(1)
+      expect(wedged[0]!.outcome).toBe('http-error')
+      expect(token(wedged[0]!.detail, 'errno')).toBe('TimeoutError')
+
+      const summaries = lines.filter((l) => l.outcome === 'summary')
+      expect(summaries).toHaveLength(1)
+      expect(token(summaries[0]!.detail, 'delivered')).toBe('1')
+      expect(token(summaries[0]!.detail, 'failed')).toBe('1')
+    },
+    2000,
+  )
 })
