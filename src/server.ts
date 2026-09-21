@@ -105,6 +105,7 @@ import {
 } from './registry.ts'
 import { runAgentDirectorStartupGate } from './agent-director-startup.ts'
 import { installSlackChannelBotTemplate } from './agent-director-template.ts'
+import { ensureCrontableExists } from './cron-bootstrap.ts'
 import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy, withOutageDetection } from './outage-state.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
@@ -1220,6 +1221,18 @@ export async function main(): Promise<void> {
         archiveDb = undefined
         archiveResolver = undefined
       }
+    }
+
+    // Ensure the crontable exists (D-Q1: the server guarantees it). This is the
+    // server's only write to the crontable — exclusive-create, never rewrite.
+    // cron_table_path is already resolved/tilde-expanded by config.ts.
+    const cronBootstrap = ensureCrontableExists(routingConfig.cron_table_path)
+    if (cronBootstrap.outcome === 'created') {
+      console.error(`[slack] Created new crontable: ${routingConfig.cron_table_path}`)
+    } else if (cronBootstrap.outcome === 'failed') {
+      console.error(
+        `[slack] Warning: failed to create crontable at ${routingConfig.cron_table_path}: ${cronBootstrap.cause}`,
+      )
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
