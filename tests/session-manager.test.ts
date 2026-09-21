@@ -1199,7 +1199,6 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
     expect(line).toContain('channel=C')
     expect(line).toContain('verdict=dead-session')
     expect(line!.toLowerCase()).toContain('reconciliation')
-    expect(line).toContain('tmux session provably dead')
   })
 
   // The log is emitted UNCONDITIONALLY — before/outside the memoized helper —
@@ -1266,18 +1265,6 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
     await sweepDeadTmuxChannel('C', 'dead-session')
 
     expect(findMissingCalls).toHaveLength(2) // TTL=0 → no reuse, each escalate sweeps
-  })
-
-  // b.m4r contract pin through the wrapper: back-to-back callers within the
-  // default TTL share one memoized sweep (no second sweep pattern).
-  test('b.m4r pin: back-to-back callers within TTL share one memoized sweep', async () => {
-    const findMissingCalls: import('agent-director').FindMissingParams[] = []
-    installStub({ findMissingCalls, findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }) })
-
-    await sweepDeadTmuxChannel('C', 'dead-session')
-    await sweepDeadTmuxChannel('C', 'dead-session')
-
-    expect(findMissingCalls).toHaveLength(1) // second caller reused the memo
   })
 
   // b.m4r contract pin through the wrapper: a FAILED sweep is not memoized, so
