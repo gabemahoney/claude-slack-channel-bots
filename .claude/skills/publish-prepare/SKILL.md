@@ -64,6 +64,6 @@ The LLM's response on any non-zero exit is the same: relay the script's stderr v
 ## File pointers
 
 - `scripts/publish-prepare.sh` — bump + pack + smoke + commit + tag + manifest write
-- `scripts/preflight.sh` — invoked first by `publish-prepare.sh` (SR-2.1–SR-2.4)
+- `scripts/preflight.sh` — invoked first by `publish-prepare.sh` (SR-2.1–SR-2.6)
 - `scripts/smoke-check.sh` — SR-4.2 / SR-4.3 (invoked by `publish-prepare.sh`)
 - `.publish-state.json` — handoff manifest at repo root, consumed by `/publish promote`
