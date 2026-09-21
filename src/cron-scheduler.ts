@@ -4,18 +4,31 @@
  *
  * `createCronScheduler(deps)` returns a handle whose single self-re-arming
  * timer is the ONLY code path that dispatches cron schedules (decision 8). It
- * loads the crontable exactly once at start(), matches the in-memory schedules
- * against the current wall-clock minute in server-local time, and dispatches
+ * loads the crontable at start() and re-loads it at the top of any tick whose
+ * (mtimeMs, size) stat differs from the last successful load, matches the
+ * in-memory schedules against the current wall-clock minute in server-local
+ * time, and dispatches
  * every match for a minute to the dispatcher one schedule at a time, in
  * crontable line order — plain cron: N same-minute lines produce N separate
  * fire()s. There are NO per-job timers, ever — a single minute-aligned
  * setTimeout chain re-arms itself after each pass.
  *
  * Why a self-re-arming setTimeout chain and NOT setInterval: ticks must be
- * serialized (a pass never overlaps the next) so that E3's future crontable
- * hot-reload — which lands at the marked no-op insertion point at the top of
- * the tick body — mutates the in-memory table between whole passes, never
- * mid-pass. setInterval cannot guarantee that.
+ * serialized (a pass never overlaps the next) so that the crontable hot-reload
+ * at the top of the tick body mutates the in-memory table between whole passes,
+ * never mid-pass. setInterval cannot guarantee that.
+ *
+ * Hot-reload (E3): the crontable file — not the in-memory copy — is the runtime
+ * source of truth. Freshness is a per-tick (mtimeMs, size) stat compared for
+ * INEQUALITY (not ordering — a backwards touch still reloads) against the last
+ * SUCCESSFUL load. There is deliberately NO fs.watch/watcher/dirty flag: a swap
+ * can only take effect at a tick anyway, and single-file watches drop the
+ * atomic-save rename that is the mandated write pattern. A reload re-parses,
+ * re-compiles and swaps the array; it NEVER dispatches and NEVER re-arms
+ * timers. A missing file drops to ZERO schedules immediately (never keep stale
+ * schedules behind a deleted crontable, D-Q1) and the following pass re-creates
+ * it via the bootstrap. Errors are latched so a persistent condition warns once,
+ * not once a minute.
  *
  * At-most-once is a LOGGED ASSERTION, not the mechanism (decision 8): the
  * minute-aligned single-pass loop already makes a double-fire structurally
@@ -43,7 +56,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, statSync, type Stats } from 'node:fs'
 
 import { Cron } from 'croner'
 
@@ -93,7 +106,7 @@ export interface CronSchedulerDeps {
   dispatcher: CronDispatcher
   /** The cron-log writer handle (Task 1). */
   cronLog: CronLog
-  /** Path to the crontable file (read once at start; bootstrapped if absent). */
+  /** Path to the crontable file (bootstrapped if absent; re-read on change). */
   cronTablePath: string
   /** Optional clock override (defaults to real now()/setTimeout/clearTimeout). */
   clock?: SchedulerClock
@@ -132,9 +145,10 @@ export interface CronScheduler {
 // ---------------------------------------------------------------------------
 
 /**
- * A loaded schedule and its compiled croner pattern. The pattern is built ONCE
- * at start() (never per tick) and is only ever queried, never started — no
- * callback is supplied, so it schedules nothing on its own.
+ * A loaded schedule and its compiled croner pattern. The pattern is built once
+ * per load (at start() and at each detected crontable change — never per tick)
+ * and is only ever queried, never started — no callback is supplied, so it
+ * schedules nothing on its own.
  */
 interface CompiledSchedule {
   schedule: CronSchedule
@@ -152,8 +166,25 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
   const { dispatcher, cronLog, cronTablePath } = deps
   const clock = deps.clock ?? REAL_CLOCK
 
-  // In-memory table, loaded once at start(), in crontable line order.
+  // In-memory table, loaded at start() and re-loaded by the tick's reload step,
+  // in crontable line order.
   let compiled: CompiledSchedule[] = []
+
+  // (mtimeMs, size) of the last SUCCESSFUL load — the reload freshness gate.
+  // null means "nothing loaded yet", so the next reachable file always loads.
+  // A failed stat/read never updates it, so the stat stays stale and the next
+  // successful read reloads (this is what picks up a chmod recovery).
+  let lastLoadStat: { mtimeMs: number; size: number } | null = null
+
+  // Latch: a non-ENOENT stat/read failure (EACCES, EIO, …) warns on first
+  // appearance only, and clears on the next successful load.
+  let readErrorLatched = false
+
+  // Latch: the crontable is currently missing. Set on the pass that detects the
+  // deletion (which also drops to zero schedules); the NEXT pass attempts the
+  // bootstrap re-create. While set, neither the vanish WARN nor a repeated
+  // bootstrap failure is logged again. Cleared by the next successful load.
+  let vanished = false
 
   // At-most-once bookkeeping: compiled-schedule INSTANCE → epoch minute it last
   // fired in. In-memory only, pruned every tick. A LOGGED ASSERTION (decision
@@ -175,6 +206,87 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
   // start() sets this so a second start() (or a start() after stop()) is a
   // loud no-op rather than a silently dead second arm.
   let started = false
+
+  // -------------------------------------------------------------------------
+  // Shared load path — used by start() AND by the tick's reload step
+  // -------------------------------------------------------------------------
+
+  /** A stat attempt: the Stats on success, or the errno/message on failure. */
+  type StatProbe =
+    | { ok: true; stat: Stats }
+    | { ok: false; missing: boolean; cause: string }
+
+  /** Stat the crontable. `missing` distinguishes ENOENT from every other error. */
+  function probeStat(): StatProbe {
+    try {
+      return { ok: true, stat: statSync(cronTablePath) }
+    } catch (err) {
+      return { ok: false, missing: isEnoent(err), cause: describe(err) }
+    }
+  }
+
+  function isEnoent(err: unknown): boolean {
+    return (err as NodeJS.ErrnoException | null)?.code === 'ENOENT'
+  }
+
+  function describe(err: unknown): string {
+    return err instanceof Error ? err.message : String(err)
+  }
+
+  /**
+   * Read + parse + compile + swap, using `stat` (the stat that gated this load)
+   * as the recorded freshness marker. The ONLY place parse errors are logged
+   * and the ONLY place `compiled` is replaced with loaded content.
+   *
+   * The stat is recorded on every SUCCESSFUL read — including a read whose
+   * content has parse errors, so those errors are not re-emitted on unchanged
+   * ticks — and NEVER on a failed read (which also leaves `compiled` untouched,
+   * so a mid-run read failure keeps the current schedules firing).
+   *
+   * It deliberately does NOT log the "crontable reloaded" INFO: that line
+   * belongs to the tick-reload caller only, so start() never emits it.
+   */
+  function loadAndSwap(stat: Stats): { ok: true; count: number } | { ok: false; missing: boolean; cause: string } {
+    let text: string
+    try {
+      text = readFileSync(cronTablePath, 'utf-8')
+    } catch (err) {
+      return { ok: false, missing: isEnoent(err), cause: describe(err) }
+    }
+    lastLoadStat = { mtimeMs: stat.mtimeMs, size: stat.size }
+
+    const { schedules, errors } = parseCrontable(text)
+
+    // Each parse error → one outcome record (identity '-', channel '-') with
+    // line=<n> and the reason; rawLine goes in free text (operator-authored,
+    // not secret). Emitted once per load, hence once per detected change.
+    for (const e of errors) {
+      cronLog.outcome({
+        timestamp: clock.now().toISOString(),
+        identity: NO_FIELD,
+        channel: NO_FIELD,
+        outcome: 'parse-error',
+        detail: { line: e.lineNumber, text: `${e.reason} rawLine=${e.rawLine}` },
+      })
+    }
+
+    // Compile each good schedule's pattern once. parseCrontable already
+    // validated the expression via croner, so construction here does not
+    // throw; guard anyway so one bad line cannot abort the load.
+    const next: CompiledSchedule[] = []
+    for (const schedule of schedules) {
+      try {
+        next.push({ schedule, cron: new Cron(schedule.expression) })
+      } catch (err) {
+        console.error(
+          `[slack] cron-scheduler: skipping schedule with uncompilable expression ` +
+            `"${schedule.expression}": ${describe(err)}`,
+        )
+      }
+    }
+    compiled = next
+    return { ok: true, count: compiled.length }
+  }
 
   // -------------------------------------------------------------------------
   // start()
@@ -208,47 +320,18 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
         // Continue — the read below will surface as zero schedules.
       }
 
-      // (2) Read + parse EXACTLY ONCE. A read failure logs loudly and proceeds
-      // with zero schedules (the tick then does nothing every minute).
-      let text = ''
-      try {
-        text = readFileSync(cronTablePath, 'utf-8')
-      } catch (err) {
-        const cause = err instanceof Error ? err.message : String(err)
+      // (2) Initial load through the SHARED load path (the same helper the
+      // tick's reload step uses, so parse-error logging and the schedule swap
+      // are single-sited). A stat or read failure logs loudly and proceeds with
+      // zero schedules (the tick then does nothing until the file becomes
+      // readable, at which point the stale recorded stat makes it reload).
+      // start() emits no reload INFO — that line is the tick caller's alone.
+      const probe = probeStat()
+      const loaded = probe.ok ? loadAndSwap(probe.stat) : probe
+      if (!loaded.ok) {
         console.error(
-          `[slack] cron-scheduler: failed to read crontable at ${cronTablePath}: ${cause}`,
+          `[slack] cron-scheduler: failed to read crontable at ${cronTablePath}: ${loaded.cause}`,
         )
-      }
-
-      const { schedules, errors } = parseCrontable(text)
-
-      // Each parse error → one outcome record (identity '-', channel '-') with
-      // line=<n> and the reason; rawLine goes in free text (operator-authored,
-      // not secret).
-      for (const e of errors) {
-        cronLog.outcome({
-          timestamp: clock.now().toISOString(),
-          identity: NO_FIELD,
-          channel: NO_FIELD,
-          outcome: 'parse-error',
-          detail: { line: e.lineNumber, text: `${e.reason} rawLine=${e.rawLine}` },
-        })
-      }
-
-      // Compile each good schedule's pattern once. parseCrontable already
-      // validated the expression via croner, so construction here does not
-      // throw; guard anyway so one bad line cannot abort the load.
-      compiled = []
-      for (const schedule of schedules) {
-        try {
-          compiled.push({ schedule, cron: new Cron(schedule.expression) })
-        } catch (err) {
-          const cause = err instanceof Error ? err.message : String(err)
-          console.error(
-            `[slack] cron-scheduler: skipping schedule with uncompilable expression ` +
-              `"${schedule.expression}": ${cause}`,
-          )
-        }
       }
 
       // (3) Exactly ONE started marker (PD-4 outage-window marker).
@@ -301,13 +384,122 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
   }
 
   // -------------------------------------------------------------------------
+  // Hot-reload — tick step (1)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Re-load the crontable if its (mtimeMs, size) differs IN ANY WAY from the
+   * last successful load. An unchanged file does nothing and logs nothing.
+   *
+   * A mid-write read needs no special handling: the parser is line-tolerant, so
+   * healthy lines survive, and the completed write is a further stat change the
+   * next tick picks up.
+   *
+   * Note the at-most-once map is deliberately NOT touched here — it is tick
+   * state keyed on schedule instances, not schedule state, and it is an
+   * assertion rather than the double-fire protection (see the module header).
+   */
+  function reloadIfChanged(): void {
+    // Missing since a previous pass: this is the pass that tries to bring the
+    // file back (detect+zero happened on the pass that saw it disappear).
+    if (vanished) {
+      recreateAndLoad()
+      return
+    }
+
+    const probe = probeStat()
+    if (!probe.ok) {
+      noteLoadFailure(probe)
+      return
+    }
+    if (
+      lastLoadStat !== null &&
+      lastLoadStat.mtimeMs === probe.stat.mtimeMs &&
+      lastLoadStat.size === probe.stat.size
+    ) {
+      return
+    }
+
+    const loaded = loadAndSwap(probe.stat)
+    if (!loaded.ok) {
+      noteLoadFailure(loaded)
+      return
+    }
+    readErrorLatched = false
+    cronLog.info(clock.now().toISOString(), `crontable reloaded, ${loaded.count} schedules`)
+  }
+
+  /**
+   * Map a failed stat/read onto its latched log line. ENOENT is the deletion
+   * case (D-Q1: drop to zero rather than keep stale schedules behind a missing
+   * file); every other errno keeps the current schedules and warns once.
+   */
+  function noteLoadFailure(failure: { missing: boolean; cause: string }): void {
+    if (failure.missing) {
+      // Detected the deletion: zero schedules IMMEDIATELY (nothing stale ever
+      // fires post-delete), forget the recorded stat, warn once. The bootstrap
+      // re-create happens on the NEXT pass.
+      compiled = []
+      lastLoadStat = null
+      vanished = true
+      cronLog.warn(
+        clock.now().toISOString(),
+        `crontable vanished at ${cronTablePath} — 0 schedules until it is restored`,
+      )
+      return
+    }
+    if (readErrorLatched) return
+    readErrorLatched = true
+    cronLog.warn(
+      clock.now().toISOString(),
+      `crontable unreadable at ${cronTablePath}, keeping ${compiled.length} loaded schedules: ${failure.cause}`,
+    )
+  }
+
+  /**
+   * The pass after a vanish: re-create the crontable via the bootstrap, then
+   * load it. 'created' → log the re-creation (wording distinct from start()'s
+   * first-install line) and load the empty template (zero schedules).
+   * 'already-exists' → something else restored the file first; no create log,
+   * and its content loads intact. 'failed' (e.g. the config directory is gone)
+   * → silent, because the vanish WARN already latched this condition and a
+   * persistent failure must not log once a minute.
+   */
+  function recreateAndLoad(): void {
+    const bootstrap = ensureCrontableExists(cronTablePath)
+    if (bootstrap.outcome === 'failed') return
+    if (bootstrap.outcome === 'created') {
+      cronLog.info(clock.now().toISOString(), `crontable re-created at ${cronTablePath} after deletion`)
+    }
+
+    const probe = probeStat()
+    if (!probe.ok) {
+      // Still gone (or now unreadable) — stay vanished and stay quiet; the
+      // latch is what suppresses the per-tick repeat.
+      if (!probe.missing) noteLoadFailure(probe)
+      return
+    }
+    const loaded = loadAndSwap(probe.stat)
+    if (!loaded.ok) {
+      if (!loaded.missing) noteLoadFailure(loaded)
+      return
+    }
+    vanished = false
+    readErrorLatched = false
+    cronLog.info(clock.now().toISOString(), `crontable reloaded, ${loaded.count} schedules`)
+  }
+
+  // -------------------------------------------------------------------------
   // tick() — one dispatch pass
   // -------------------------------------------------------------------------
 
   async function tick(): Promise<void> {
     try {
-      // (1) E3 insertion point — crontable hot-reload lands HERE in E3. It MUST
-      // remain a no-op in this Epic (the table loads once at start()).
+      // (1) Crontable hot-reload — BEFORE the monotonic-minute guard and before
+      // matching, in the same serialized pass, so a swap happens between whole
+      // passes and the guard below still owns double-fire protection across a
+      // reload. Never dispatches, never re-arms timers.
+      reloadIfChanged()
 
       // (2) Stamp the current wall-clock minute (epoch minute). Skip the whole
       // pass if it is not strictly after the last-ticked minute (MONOTONIC

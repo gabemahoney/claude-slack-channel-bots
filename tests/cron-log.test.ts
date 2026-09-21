@@ -22,6 +22,7 @@ import {
   formatOutcomeLine,
   formatSummaryLine,
   formatInfoLine,
+  formatWarnLine,
   type CronOutcome,
   type CronLogRecord,
   type CronLogDetail,
@@ -293,6 +294,87 @@ describe('formatInfoLine', () => {
     log.info(TS, 'scheduler started, 0 schedules loaded')
     const f = fields(readLines()[0])
     expect(f[3]).toBe('info')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Warn line
+// ---------------------------------------------------------------------------
+
+describe('formatWarnLine', () => {
+  test('renders in the five-field layout with warn in the outcome position', () => {
+    const line = formatWarnLine(TS, 'crontable vanished, keeping last known schedules')
+    const f = fields(line)
+    expect(f[0]).toBe(TS)
+    expect(f[1]).toBe('-')
+    expect(f[2]).toBe('-')
+    expect(f[3]).toBe('warn')
+    expect(f.slice(4).join(' ')).toBe('crontable vanished, keeping last known schedules')
+  })
+
+  test('supplied identity/channel occupy their positional fields', () => {
+    const f = fields(formatWarnLine(TS, 'stat failed', 'daily-standup', 'C0123'))
+    expect(f[1]).toBe('daily-standup')
+    expect(f[2]).toBe('C0123')
+    expect(f[3]).toBe('warn')
+  })
+
+  test('whitespace in identity/channel collapses so warn keeps field position', () => {
+    const f = fields(formatWarnLine(TS, 'stat failed', 'my schedule', 'C 9'))
+    expect(f[1]).toBe('my_schedule')
+    expect(f[2]).toBe('C_9')
+    expect(f[3]).toBe('warn')
+  })
+
+  test('newlines in the text are escaped so the record stays one line', () => {
+    const line = formatWarnLine(TS, 'first\r\nsecond')
+    expect(line).toContain('\\r\\n')
+    expect(line).not.toContain('\n')
+  })
+
+  test('grep warn matches warn lines exactly — no other line kind contains it', () => {
+    const others = [
+      ...ALL_OUTCOMES.map((outcome) => formatOutcomeLine(makeRecord({ outcome }))),
+      formatSummaryLine(TS, 'daily-standup', 1, 0),
+      formatInfoLine(TS, 'scheduler started, 4 schedules loaded'),
+    ]
+    for (const line of others) expect(line).not.toContain('warn')
+    expect(formatWarnLine(TS, 'vanished')).toContain('warn')
+  })
+})
+
+describe('warn() through the writer handle', () => {
+  test('appends a warn line alongside the other kinds without truncating them', () => {
+    const log = createCronLog(logPath)
+    log.outcome(makeRecord())
+    log.warn(TS, 'crontable vanished', 'daily-standup', 'C0123')
+
+    const lines = readLines()
+    expect(lines).toHaveLength(2)
+    const f = fields(lines[1])
+    expect(f[1]).toBe('daily-standup')
+    expect(f[2]).toBe('C0123')
+    expect(f[3]).toBe('warn')
+    expect(f.slice(4).join(' ')).toBe('crontable vanished')
+  })
+
+  test('omitted identity/channel are written as the "-" sentinel', () => {
+    const log = createCronLog(logPath)
+    log.warn(TS, 'stat failed')
+    const f = fields(readLines()[0])
+    expect(f[1]).toBe('-')
+    expect(f[2]).toBe('-')
+    expect(f[3]).toBe('warn')
+  })
+
+  test('a failed warn append falls back to one [slack] cron-log console.error', () => {
+    const { badPath } = makeFileParentObstruction('warnfail')
+    const log = createCronLog(badPath)
+    expect(() => log.warn(TS, 'vanished', 'boom')).not.toThrow()
+    expect(errorCalls).toHaveLength(1)
+    expect(errorCalls[0]).toContain('[slack] cron-log')
+    expect(errorCalls[0]).toContain('identity=boom')
+    expect(errorCalls[0]).toContain('outcome=warn')
   })
 })
 

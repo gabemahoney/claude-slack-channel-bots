@@ -8,6 +8,14 @@
  * scheduling semantics; the fake `setTimeout`/`clearTimeout` are used only to
  * assert single minute-aligned arming and stop() cancellation.
  *
+ * Hot-reload (E3) and this file: the tick's step (1) is a real reload gated on
+ * the crontable's (mtimeMs, size). Every test here writes the crontable ONCE,
+ * before start(), and never rewrites it mid-test, so that gate always compares
+ * equal and the reload step is a silent no-op — these tests stay about pure
+ * dispatch semantics. Reload behavior itself (change detection, deletion,
+ * unreadable files, the `crontable reloaded` INFO) is covered in
+ * tests/cron-scheduler-reload.test.ts and is deliberately NOT duplicated here.
+ *
  * TZ hazard (docs/testing-guide.md, ticket Context): matching is server-local
  * time. Every cron expression here is built from the injected Date's OWN local
  * fields (minute/hour/day/month) or is `* * * * *`; no wall-clock minute is ever
@@ -150,7 +158,12 @@ afterEach(() => {
   rmSync(tempDir, { recursive: true, force: true })
 })
 
-/** Write a crontable file: template header + the given data lines. */
+/**
+ * Write a crontable file: template header + the given data lines. Call this
+ * BEFORE start() only — a mid-test rewrite changes the file's (mtimeMs, size)
+ * and makes the next tick reload, which is reload coverage and belongs in
+ * tests/cron-scheduler-reload.test.ts, not here.
+ */
 function writeCrontable(...dataLines: string[]): void {
   writeFileSync(cronTablePath, CRONTABLE_TEMPLATE_HEADER + dataLines.join('\n') + '\n')
 }
@@ -233,18 +246,30 @@ describe('cron-scheduler — start()', () => {
     expect(readLog().some((l) => l.includes('scheduler started, 1 schedules loaded'))).toBe(true)
   })
 
-  test('nothing dispatches before start()', async () => {
+  test('start() is what gates dispatch: no timer is armed before it (the tick() seam itself is ungated)', async () => {
     const start = new Date('2026-06-15T10:30:00')
     writeCrontable(line(everyMinute, '/p/a.md', 'C1'))
     const clock = makeClock(start)
     const dispatcher = makeDispatcher()
     const scheduler = build(clock, dispatcher)
 
-    // Calling tick() before start() → no compiled schedules → nothing fires.
-    await scheduler.tick()
-    expect(dispatcher.fireCalls).toHaveLength(0)
-    // And no timer was armed (arm() only runs inside start()).
+    // The real pre-start() guarantee: arm() runs ONLY inside start(), so the
+    // production dispatch path — the timer chain — does not exist yet and
+    // nothing can fire on its own, no matter what the crontable says.
     expect(clock.pending()).toHaveLength(0)
+    expect(dispatcher.fireCalls).toHaveLength(0)
+
+    // The direct tick() seam is deliberately NOT gated on started: post-E3 its
+    // reload step loads the table itself (lastLoadStat is null → first stat
+    // always loads), so a hand-called tick() on a never-started scheduler does
+    // dispatch. Pinned here so the ungated seam is a stated decision rather
+    // than an accident; production never calls tick() outside the chain.
+    await scheduler.tick()
+    expect(dispatcher.fireCalls.map((s) => s.promptPath)).toEqual(['/p/a.md'])
+
+    // start() is what arms the one minute-aligned timer.
+    scheduler.start()
+    expect(clock.live()).toHaveLength(1)
   })
 
   test('start() arms exactly one minute-aligned timer (no per-job timers)', () => {
@@ -322,6 +347,9 @@ describe('cron-scheduler — tick() matching', () => {
 
     expect(dispatcher.fireCalls).toHaveLength(0)
     // A no-match minute logs NOTHING (the log is unchanged since start()).
+    // The tick's reload step is silent here by design, not by luck: the file
+    // has not been touched since start()'s load, so its (mtimeMs, size) still
+    // matches and reloadIfChanged() returns without reading or logging.
     expect(readLog().length).toBe(logAfterStart)
   })
 
@@ -419,6 +447,7 @@ describe('cron-scheduler — at-most-once', () => {
       outcome: (record) => records.push({ kind: 'outcome', record }),
       summary: () => records.push({ kind: 'summary' }),
       info: (_ts, text, identity, channel) => records.push({ kind: 'info', text, identity, channel }),
+      warn: (_ts, text, identity, channel) => records.push({ kind: 'warn', text, identity, channel }),
     }
     const clock = makeClock(start)
     const dispatcher = makeDispatcher()
@@ -570,7 +599,9 @@ describe('cron-scheduler — monotonic guard and no catch-up', () => {
     // The skipped minutes 31..34 logged nothing about themselves: the log grew
     // only by nothing here (no-match logs nothing, and a match's dispatch is
     // logged by the dispatcher, which is stubbed → scheduler itself appends no
-    // per-minute lines for the empty skipped minutes).
+    // per-minute lines for the empty skipped minutes). The reload step adds no
+    // line either: the crontable is untouched since start(), so its stat is
+    // unchanged and reloadIfChanged() is a silent no-op.
     const logAfter = readLog().length
     expect(logAfter).toBe(logBefore)
   })

@@ -586,7 +586,8 @@ The `outcome` field of each line is one of these classes:
 
 - **No retry.** A failed fire is logged and dropped — never queued or re-sent. A channel with no live session fails every fire until its session is running again; the server does not queue the missed prompts.
 - **Missed fires are skipped, not caught up.** While the server is down, no scheduled prompts fire, and they are not replayed on restart. The `scheduler started, N schedules loaded` line in the cron log marks when scheduling resumed, bounding the outage window.
-- **Edits take effect after a server restart.** The crontable is read and parsed once, at scheduler start. Editing the file — by hand or by a bot appending a line — does nothing until the server restarts and reloads the table.
+- **Edits take effect within a minute — no restart.** The scheduler checks the crontable fresh on every tick, so an edit by hand or a line appended by a bot starts (or stops) firing within about a minute. The server is never restarted for a schedule change.
+- **Deleting the crontable stops all schedules.** Nothing fires from that moment, a WARN appears in the cron log, and the server re-creates the file empty (with its header) within about a minute. Add lines back and they schedule on the next check.
 - **Server-local time.** Cron expressions are evaluated in the server's local timezone.
 - **Channel-less lines are deferred.** A line with no channel is currently matched but logged `fanout-deferred` and not delivered. Give a line an explicit channel to have it fire.
 - **`bind` must include loopback.** The scheduler delivers via `127.0.0.1`, so a `bind` set to a single non-loopback interface makes every fire fail with `http-error`. Use the default `127.0.0.1` or `0.0.0.0`.
@@ -599,7 +600,7 @@ Every managed session carries the resolved crontable path in the `CSCB_CRONTABLE
 echo $CSCB_CRONTABLE_PATH
 ```
 
-The crontable is the single source of truth for schedules. When adding a schedule, **append** a new line — never rewrite, reorder, or delete other lines. An appended line takes effect after the next server restart (the table is read once at scheduler start).
+The crontable is the single source of truth for schedules. When adding a schedule, **append** a new line — never rewrite, reorder, or delete other lines. An appended line starts firing within about a minute; no server restart is needed.
 
 ---
 

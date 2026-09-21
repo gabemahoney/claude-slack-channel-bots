@@ -228,12 +228,34 @@ export function formatInfoLine(
   return joinFields(fields, sanitizeText(text))
 }
 
+/**
+ * Format a warning line. Shares the five-field layout with `warn` in the
+ * outcome position — a LINE KIND, not an outcome class, so it is deliberately
+ * absent from `CronOutcome`, and the token is distinct from every outcome
+ * class so `grep warn` matches exactly warn lines. `identity` and `channel`
+ * default to `-` since warn lines are not fire-scoped.
+ */
+export function formatWarnLine(
+  timestamp: string,
+  text: string,
+  identity: string = ABSENT,
+  channel: string = ABSENT,
+): string {
+  const fields = [
+    sanitizeToken(timestamp),
+    sanitizeToken(identity),
+    sanitizeToken(channel),
+    'warn',
+  ]
+  return joinFields(fields, sanitizeText(text))
+}
+
 // ---------------------------------------------------------------------------
 // I/O half — writer handle
 // ---------------------------------------------------------------------------
 
 /**
- * Writer handle returned by `createCronLog`. All three append methods funnel
+ * Writer handle returned by `createCronLog`. All four append methods funnel
  * through one internal append function (the E5 pruning choke point) — they
  * differ only in which pure formatter builds the line.
  */
@@ -244,6 +266,8 @@ export interface CronLog {
   summary(timestamp: string, identity: string, delivered: number, failed: number): void
   /** Append an informational line (scheduler-started seam). */
   info(timestamp: string, text: string, identity?: string, channel?: string): void
+  /** Append a warning line. */
+  warn(timestamp: string, text: string, identity?: string, channel?: string): void
 }
 
 /**
@@ -300,6 +324,9 @@ export function createCronLog(path: string): CronLog {
     },
     info(timestamp: string, text: string, identity: string = ABSENT, channel: string = ABSENT): void {
       append(formatInfoLine(timestamp, text, identity, channel), identity, 'info')
+    },
+    warn(timestamp: string, text: string, identity: string = ABSENT, channel: string = ABSENT): void {
+      append(formatWarnLine(timestamp, text, identity, channel), identity, 'warn')
     },
   }
 }
