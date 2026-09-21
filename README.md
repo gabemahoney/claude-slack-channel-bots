@@ -6,15 +6,23 @@ A single HTTP MCP server that holds one Slack Socket Mode connection and routes 
 
 ## Quick Start
 
+**[Bun](https://bun.sh) is required** — it is CSCB's runtime and the interpreter its install and start scripts run under. Install bun before you install CSCB. `npm install -g claude-slack-channel-bots` on a box without bun fails during postinstall (the postinstall script is a bun script).
+
 1. **Install globally via bun:**
 
    ```sh
    bun install -g claude-slack-channel-bots
    ```
 
-   The postinstall script creates skeleton config files in `~/.claude/channels/slack/`.
+2. **Trust the package so postinstall runs:**
 
-2. **Run the setup skill:**
+   ```sh
+   bun pm -g trust claude-slack-channel-bots
+   ```
+
+   Bun blocks the lifecycle scripts of untrusted packages, so the postinstall does not run on the plain `install` above — you must trust the package for it to fire. The `-g` flag targets the global install; without it `bun pm trust` looks for a `package.json` in the current directory and errors with `No package.json was found`. (Run `bun pm -g untrusted` to confirm it is listed first.) The postinstall then creates skeleton config files in `~/.claude/channels/slack/`. Skip this step and a later `start` fails with `missing prerequisite: config.json`.
+
+3. **Run the setup skill:**
 
    The package includes a Claude Code skill at `skills/setup-slack-channel-bots/` that walks you through the entire configuration. Copy or symlink it into `~/.claude/skills/`, then run:
 
@@ -24,7 +32,7 @@ A single HTTP MCP server that holds one Slack Socket Mode connection and routes 
 
    It handles Slack app creation, tokens, routing, access control, hooks, and validation — and skips anything already configured.
 
-3. **Start the server:**
+4. **Start the server:**
 
    ```sh
    claude-slack-channel-bots start
