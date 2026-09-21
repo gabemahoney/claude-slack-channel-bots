@@ -14,6 +14,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'path'
 import type { CliDeps, CliHandlers } from '../src/cli.ts'
+import { ErrCallTimeout, ErrSpawnNotFound } from '../src/agent-director-errors.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 
 process.env['SLACK_BOT_TOKEN'] = 'xoxb-test-placeholder'
@@ -380,6 +381,45 @@ describe('clean_restart', () => {
     await createCli(deps).clean_restart()
     expect(killCalls).toEqual(['C'])
   })
+
+  // b.dnt: AD dies between the precheck and the pause. The precheck resolves
+  // live, pause throws (escalation fires), and the escalation KILL also throws a
+  // non-ErrSpawnNotFound error (AD dead mid-teardown). Pre-fix, the escalation's
+  // `catch { /* ignore */ }` (git HEAD:src/cli.ts ~:165) swallowed EVERY kill
+  // error, so this channel resolved and clean_restart proceeded to start (no
+  // exit 1) — the residual quiet-failure path this bug closes. Post-fix the
+  // non-benign kill error rethrows into the allSettled aggregate → loud throw →
+  // clean_restart exit(1), no start. Assert on behavior: kill attempted, and the
+  // command aborts loudly.
+  test('b.dnt: escalation kill failing (non-ErrSpawnNotFound) rejects loudly (AD died mid-teardown)', async () => {
+    const { deps, exitCodes, killCalls, spawnCalls } = makeDeps({
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+      directorStatus: async () => ({ state: 'waiting' }), // precheck live
+      directorPause: async () => { throw new Error('AD connection refused') }, // AD died → escalate
+      directorKill: async () => { throw new ErrCallTimeout('kill', 35000, 30000) }, // non-benign kill error
+    })
+    await expect(createCli(deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    expect(killCalls).toEqual(['C']) // kill WAS attempted
+    expect(exitCodes).toContain(1) // loud aggregate throw → exit 1
+    expect(spawnCalls.some((c) => c.args.includes('start'))).toBe(false) // never started
+  })
+
+  // b.dnt: same escalation setup, but the kill throws the benign already-gone
+  // ErrSpawnNotFound race (row genuinely gone between pause and kill). That stays
+  // swallowed per-channel — the channel resolves, no aggregate rejection, no
+  // exit(1), and clean_restart proceeds to start.
+  test('b.dnt: escalation kill failing with ErrSpawnNotFound stays quiet (benign already-gone race)', async () => {
+    const { deps, exitCodes, killCalls, spawnCalls } = makeDeps({
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+      directorStatus: async () => ({ state: 'waiting' }), // precheck live
+      directorPause: async () => { throw new Error('pause failed') }, // escalate
+      directorKill: async () => { throw new ErrSpawnNotFound('kill', 'ErrSpawnNotFound', 'row gone') },
+    })
+    await createCli(deps).clean_restart() // resolves — no rejection
+    expect(killCalls).toEqual(['C']) // kill WAS attempted
+    expect(exitCodes).not.toContain(1) // benign — no loud failure
+    expect(spawnCalls.some((c) => c.args.includes('start'))).toBe(true) // restart proceeds
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -432,6 +472,45 @@ describe('stop --stop-bots (b.4dk)', () => {
     expect(pauseCalls).toEqual(['C'])
     expect(killCalls).toEqual(['C']) // exit_timeout=0 → immediate kill escalation
     expect(exitCodes).toContain(0)
+  })
+
+  // b.dnt: timeout-path kill failure. Precheck live, pause SUCCEEDS, the poll
+  // never reaches terminal (exit_timeout=0 → immediate timeout), then the
+  // force-kill throws a non-ErrSpawnNotFound error (AD died mid-teardown).
+  // Pre-fix the timeout kill's `catch { logged }` (git HEAD:src/cli.ts ~:200)
+  // swallowed it and the channel resolved. Post-fix it rethrows into the
+  // aggregate → loud throw → exit(1) (not the stale-PID exit(0)). Assert kill
+  // attempted and the command exits non-zero.
+  test('stopBots: timeout-path kill failing (non-ErrSpawnNotFound) rejects loudly (b.dnt)', async () => {
+    const { deps, pauseCalls, killCalls, exitCodes } = makeStopDeps({
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } }, exit_timeout: 0 }),
+      directorStatus: async () => ({ state: 'waiting' }), // never reaches terminal → force-kill
+      directorPause: async () => { /* pause succeeds */ },
+      directorKill: async () => { throw new ErrCallTimeout('kill', 35000, 30000) },
+    })
+    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect(pauseCalls).toEqual(['C']) // pause succeeded first
+    expect(killCalls).toEqual(['C']) // timeout-path kill attempted
+    expect(exitCodes).toContain(1) // loud teardown failure, not the stale-PID exit(0)
+  })
+
+  // b.dnt: same timeout-path setup, but the force-kill throws the benign
+  // already-gone ErrSpawnNotFound race (row genuinely gone between pause and
+  // kill). That stays swallowed per-channel — the channel resolves, no aggregate
+  // rejection, no loud exit(1), and the server stop proceeds normally to the
+  // stale-PID exit(0).
+  test('stopBots: timeout-path kill failing with ErrSpawnNotFound stays quiet, server still stops (b.dnt)', async () => {
+    const { deps, pauseCalls, killCalls, exitCodes } = makeStopDeps({
+      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } }, exit_timeout: 0 }),
+      directorStatus: async () => ({ state: 'waiting' }), // never reaches terminal → force-kill
+      directorPause: async () => { /* pause succeeds */ },
+      directorKill: async () => { throw new ErrSpawnNotFound('kill', 'ErrSpawnNotFound', 'row gone') },
+    })
+    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect(pauseCalls).toEqual(['C']) // pause succeeded first
+    expect(killCalls).toEqual(['C']) // timeout-path kill attempted
+    expect(exitCodes).not.toContain(1) // benign — no loud teardown failure
+    expect(exitCodes).toContain(0) // server stop still reached (stale PID → exit 0)
   })
 
   test('stopBots: teardown error does NOT block server stop', async () => {

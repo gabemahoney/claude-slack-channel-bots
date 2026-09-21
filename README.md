@@ -367,7 +367,7 @@ claude-slack-channel-bots clean_restart
 
 For each configured route, calls `client.pause({claude_instance_id})` via agent-director and polls `client.status(...)` until the spawn transitions to `ended` / `missing` (or `client.list(...)` returns no row). If the spawn does not exit within `exit_timeout` seconds (default 120s), the spawn is force-killed via `client.kill(...)`. Teardown kills but never deletes each row, preserving its `claude_session_id` so bots resume their conversation history on the next start. All routes are processed in parallel. After the server restarts, the SR-1.4 collision-then-act dispatcher decides resume-vs-fresh per route — agent-director owns Claude session-id state, not CSCB.
 
-Per-route pause/kill errors on a row that is present are logged and do not abort the restart.
+A benign kill outcome — the row already being gone — is tolerated per-route and does not abort the restart. Any other per-route teardown failure, including a pause failure that escalates to a kill which then fails to reach agent-director, is fatal: it fails loudly and aborts the restart (non-zero exit).
 
 Behavior by case:
 

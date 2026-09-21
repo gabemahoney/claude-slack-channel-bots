@@ -17,7 +17,7 @@ import { isProcessRunning } from './pid.ts'
 import { loadConfig as configLoadConfig, type RoutingConfig } from './config.ts'
 import { initLogging } from './logging.ts'
 import { isDryRun } from './tokens.ts'
-import { ErrSpawnNotFound } from 'agent-director'
+import { ErrSpawnNotFound } from './agent-director-errors.ts'
 import { getClient } from './agent-director-client.ts'
 import { instanceIdFor } from './session-manager.ts'
 import { runStartupGate } from './agent-director-startup.ts'
@@ -64,7 +64,12 @@ export interface CliDeps {
   directorStatus: (channelId: string) => Promise<{ state: string } | null>
   /** Politely shut down the spawn for a channel via client.pause. */
   directorPause: (channelId: string) => Promise<void>
-  /** Hard-terminate the spawn for a channel via client.kill. */
+  /**
+   * Hard-terminate the spawn for a channel via client.kill. May throw
+   * ErrSpawnNotFound for an already-gone row; the real deps absorb it and
+   * teardownBots also tolerates it at the call sites — the double-layer
+   * leniency is intentional (b.dnt).
+   */
   directorKill: (channelId: string) => Promise<void>
 }
 
@@ -138,8 +143,9 @@ export function createCli(deps: CliDeps): CliHandlers {
     // NOT be swallowed as a per-channel "no spawn row — skipping" no-op. We let
     // the precheck error propagate to Promise.allSettled as a rejection, then
     // throw a loud aggregate error after the loop so callers exit non-zero and
-    // never proceed to `start`. Only pause/poll/kill escalations (which act on a
-    // row that is genuinely present) stay per-channel handled below.
+    // never proceed to `start`. b.dnt: escalation/timeout kill failures on a
+    // present row also reject into the aggregate now — only the benign
+    // ErrSpawnNotFound already-gone race stays per-channel handled below.
     const results = await Promise.allSettled(Object.entries(routes).map(async ([channelId]) => {
       // Precheck: any row? If not, nothing to do.
       // NOTE (b.qwo): errors here (AD unreachable / uninitialized client)
@@ -162,7 +168,16 @@ export function createCli(deps: CliDeps): CliHandlers {
         await deps.directorPause(channelId)
       } catch (err) {
         console.error(`[slack] teardownBots: pause failed for channel=${channelId} — escalating to kill:`, err)
-        try { await deps.directorKill(channelId) } catch { /* ignore */ }
+        // b.dnt: the kill's outcome decides this channel's fate. A benign
+        // ErrSpawnNotFound (row genuinely already gone) resolves quietly;
+        // any other kill error (e.g. AD died mid-teardown) rethrows so it
+        // rejects into the Promise.allSettled aggregate below. SR-0.2:
+        // branch via the typed class, never on error strings.
+        try {
+          await deps.directorKill(channelId)
+        } catch (killErr) {
+          if (!(killErr instanceof ErrSpawnNotFound)) throw killErr
+        }
         return
       }
 
@@ -189,15 +204,21 @@ export function createCli(deps: CliDeps): CliHandlers {
         console.error(`[slack] teardownBots: channel=${channelId} force-killed after ${elapsed}ms`)
       } catch (err) {
         console.error(`[slack] teardownBots: kill failed for channel=${channelId}:`, err)
+        // b.dnt: same rule as the escalation path — a throwing kill here means
+        // AD is dead mid-teardown, not a benign already-gone row. Rethrow so it
+        // rejects into the aggregate; swallow only the benign ErrSpawnNotFound.
+        if (!(err instanceof ErrSpawnNotFound)) throw err
       }
     }))
 
     // b.qwo: loud AD-unreachable failure. A rejected settlement here is an
-    // agent-director error — either from the connectivity/precheck at the top
-    // of a channel's teardown, or from a directorStatus poll-loop call (~:177)
-    // — never a normal terminal-row skip, which resolves. Surface every one and
-    // throw so the teardown is never a silent no-op and the caller aborts
-    // before starting a new server.
+    // agent-director error — from the connectivity/precheck at the top of a
+    // channel's teardown, from a directorStatus poll-loop call, or
+    // (b.dnt) from an escalation/timeout kill that failed with anything other
+    // than the benign ErrSpawnNotFound already-gone race — never a normal
+    // terminal-row skip, which resolves. Surface every one and throw so the
+    // teardown is never a silent no-op and the caller aborts before starting a
+    // new server.
     const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected')
     if (rejected.length > 0) {
       for (const r of rejected) {
