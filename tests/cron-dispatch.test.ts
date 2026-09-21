@@ -127,6 +127,7 @@ function token(detail: string, key: string): string | undefined {
  */
 function makeHarness(opts: { cronTablePath?: string; port?: number; deliverTimeoutMs?: number } = {}): {
   fire: (s: CronSchedule) => Promise<void>
+  fireGroup: (s: CronSchedule[]) => Promise<void>
   logPath: string
   lines: () => LogLine[]
   cronTablePath: string
@@ -142,7 +143,13 @@ function makeHarness(opts: { cronTablePath?: string; port?: number; deliverTimeo
     // Optional per-request deadline; omitted → factory default (production 3 s).
     ...(opts.deliverTimeoutMs !== undefined ? { deliverTimeoutMs: opts.deliverTimeoutMs } : {}),
   })
-  return { fire: dispatcher.fire, logPath, lines: () => readLog(logPath), cronTablePath }
+  return {
+    fire: dispatcher.fire,
+    fireGroup: dispatcher.fireGroup,
+    logPath,
+    lines: () => readLog(logPath),
+    cronTablePath,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -698,4 +705,440 @@ describe('deliver deadline (accepting-but-silent peer)', () => {
     },
     2000,
   )
+})
+
+// ---------------------------------------------------------------------------
+// 11. fireGroup — same-channel concatenation (gate answer 3, t2.he5.eu.4q)
+// ---------------------------------------------------------------------------
+//
+// When N schedules match the same minute for the same target channel, ONE
+// /interject POST is delivered whose body is the N prompts concatenated in
+// crontable line (input) order, separated by exactly "\n\n". The grouped sender
+// names every contributor (head full identity + '+<basename>' per tail). Each
+// contributing (schedule, channel) pair gets its own outcome line carrying the
+// SHARED status, with grouped=N in the free text only when N >= 2. Each schedule
+// still gets exactly one summary line counting ITS own targets.
+
+describe('fireGroup same-channel concatenation', () => {
+  test('3 schedules → ONE POST, exact ordered body, combined sender, 3 grouped outcomes + 3 summaries', async () => {
+    const dir = makeTempDir('cscb-prompt-test-')
+    const p1 = join(dir, 'p1.md')
+    const p2 = join(dir, 'p2.md')
+    const p3 = join(dir, 'p3.md')
+    writeFileSync(p1, 'PROMPT-ONE')
+    writeFileSync(p2, 'PROMPT-TWO')
+    writeFileSync(p3, 'PROMPT-THREE')
+
+    const CHANNEL = 'C_GROUP'
+    const h = makeHarness()
+    await h.fireGroup([
+      explicitSchedule(p1, [CHANNEL], 'cscb-cron:alpha'),
+      explicitSchedule(p2, [CHANNEL], 'cscb-cron:beta'),
+      explicitSchedule(p3, [CHANNEL], 'cscb-cron:gamma'),
+    ])
+
+    // Exactly ONE POST for the shared channel (grouping reduced 3 fires to 1).
+    expect(requests).toHaveLength(1)
+    const req = requests[0]!
+    expect(req.body.channel).toBe(CHANNEL)
+
+    // Exact ordered body: p1 \n\n p2 \n\n p3. An accidental reordering (or a
+    // different separator) must fail loudly here.
+    expect(req.body.message).toBe('PROMPT-ONE\n\nPROMPT-TWO\n\nPROMPT-THREE')
+
+    // Combined sender: head full identity + '+<basename>' per subsequent
+    // contributor (shared cscb-cron: prefix stripped from the tail).
+    expect(req.body.sender).toBe('cscb-cron:alpha+beta+gamma')
+
+    const lines = h.lines()
+
+    // Each contributing (schedule, channel) pair gets its OWN outcome line, all
+    // sharing the delivered status, all carrying grouped=3.
+    const outcomes = lines.filter((l) => l.channel === CHANNEL && l.outcome === 'delivered')
+    expect(outcomes).toHaveLength(3)
+    const outcomeIdentities = outcomes.map((l) => l.identity).sort()
+    expect(outcomeIdentities).toEqual(['cscb-cron:alpha', 'cscb-cron:beta', 'cscb-cron:gamma'])
+    for (const l of outcomes) {
+      expect(token(l.detail, 'grouped')).toBe('3')
+    }
+
+    // One summary per contributing schedule, each counting its own 1 target.
+    const summaries = lines.filter((l) => l.outcome === 'summary')
+    expect(summaries).toHaveLength(3)
+    const summaryIdentities = summaries.map((l) => l.identity).sort()
+    expect(summaryIdentities).toEqual(['cscb-cron:alpha', 'cscb-cron:beta', 'cscb-cron:gamma'])
+    for (const s of summaries) {
+      expect(token(s.detail, 'delivered')).toBe('1')
+      expect(token(s.detail, 'failed')).toBe('0')
+    }
+  })
+
+  test('grouped outcome status is shared across contributors (503 → all no-session, grouped=3)', async () => {
+    const dir = makeTempDir('cscb-prompt-test-')
+    const p1 = join(dir, 'a.md')
+    const p2 = join(dir, 'b.md')
+    const p3 = join(dir, 'c.md')
+    writeFileSync(p1, 'A')
+    writeFileSync(p2, 'B')
+    writeFileSync(p3, 'C')
+
+    const CHANNEL = 'C_503'
+    responseByChannel.set(CHANNEL, 503)
+
+    const h = makeHarness()
+    await h.fireGroup([
+      explicitSchedule(p1, [CHANNEL], 'cscb-cron:a'),
+      explicitSchedule(p2, [CHANNEL], 'cscb-cron:b'),
+      explicitSchedule(p3, [CHANNEL], 'cscb-cron:c'),
+    ])
+
+    // Still ONE POST even on failure (no retry, no per-contributor re-send).
+    expect(requests).toHaveLength(1)
+
+    const lines = h.lines()
+    const outcomes = lines.filter((l) => l.channel === CHANNEL)
+    expect(outcomes).toHaveLength(3)
+    for (const l of outcomes) {
+      expect(l.outcome).toBe('no-session')
+      expect(token(l.detail, 'grouped')).toBe('3')
+    }
+
+    // Each schedule's own summary counts its single target as failed.
+    const summaries = lines.filter((l) => l.outcome === 'summary')
+    expect(summaries).toHaveLength(3)
+    for (const s of summaries) {
+      expect(token(s.detail, 'delivered')).toBe('0')
+      expect(token(s.detail, 'failed')).toBe('1')
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 12. fireGroup — mixed-channel grouping (different channels never concatenate)
+// ---------------------------------------------------------------------------
+
+describe('fireGroup mixed-channel grouping', () => {
+  test('one multi-channel schedule + single-channel siblings → per-channel bodies, never cross-channel concatenation', async () => {
+    const dir = makeTempDir('cscb-prompt-test-')
+    const pShared = join(dir, 'shared.md')
+    const pOnly1 = join(dir, 'only1.md')
+    const pOnly2 = join(dir, 'only2.md')
+    writeFileSync(pShared, 'SHARED')
+    writeFileSync(pOnly1, 'ONLY-C1')
+    writeFileSync(pOnly2, 'ONLY-C2')
+
+    // s1 targets BOTH C1 and C2; s2 targets only C1; s3 targets only C2.
+    // C1 group (input order): s1, s2 → "SHARED\n\nONLY-C1"
+    // C2 group (input order): s1, s3 → "SHARED\n\nONLY-C2"
+    const h = makeHarness()
+    await h.fireGroup([
+      explicitSchedule(pShared, ['C1', 'C2'], 'cscb-cron:shared'),
+      explicitSchedule(pOnly1, ['C1'], 'cscb-cron:one'),
+      explicitSchedule(pOnly2, ['C2'], 'cscb-cron:two'),
+    ])
+
+    // One POST per DISTINCT channel — never a single cross-channel concatenation.
+    expect(requests).toHaveLength(2)
+
+    const c1 = requests.find((r) => r.body.channel === 'C1')!
+    const c2 = requests.find((r) => r.body.channel === 'C2')!
+    expect(c1).toBeDefined()
+    expect(c2).toBeDefined()
+
+    // Per-channel bodies concatenated in input order; no other channel's prompt
+    // ever leaks in.
+    expect(c1.body.message).toBe('SHARED\n\nONLY-C1')
+    expect(c1.body.sender).toBe('cscb-cron:shared+one')
+    expect(c2.body.message).toBe('SHARED\n\nONLY-C2')
+    expect(c2.body.sender).toBe('cscb-cron:shared+two')
+
+    const lines = h.lines()
+
+    // Grouped outcome lines: C1 has {shared, one}, C2 has {shared, two}, each
+    // grouped=2.
+    const c1Outcomes = lines.filter((l) => l.channel === 'C1' && l.outcome === 'delivered')
+    expect(c1Outcomes.map((l) => l.identity).sort()).toEqual(['cscb-cron:one', 'cscb-cron:shared'])
+    for (const l of c1Outcomes) expect(token(l.detail, 'grouped')).toBe('2')
+
+    const c2Outcomes = lines.filter((l) => l.channel === 'C2' && l.outcome === 'delivered')
+    expect(c2Outcomes.map((l) => l.identity).sort()).toEqual(['cscb-cron:shared', 'cscb-cron:two'])
+    for (const l of c2Outcomes) expect(token(l.detail, 'grouped')).toBe('2')
+
+    // Summaries: shared delivered=2 (both channels), one/two delivered=1 each.
+    const summaries = lines.filter((l) => l.outcome === 'summary')
+    expect(summaries).toHaveLength(3)
+    const shared = summaries.find((s) => s.identity === 'cscb-cron:shared')!
+    expect(token(shared.detail, 'delivered')).toBe('2')
+    expect(token(shared.detail, 'failed')).toBe('0')
+    const one = summaries.find((s) => s.identity === 'cscb-cron:one')!
+    expect(token(one.detail, 'delivered')).toBe('1')
+    const two = summaries.find((s) => s.identity === 'cscb-cron:two')!
+    expect(token(two.detail, 'delivered')).toBe('1')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 13. fireGroup — oversize group falls back to individual delivery
+// ---------------------------------------------------------------------------
+
+describe('fireGroup oversize-group fallback', () => {
+  const CAP = 32768
+
+  test('concatenated body over cap → one info split line, then individual deliveries in order', async () => {
+    const dir = makeTempDir('cscb-prompt-test-')
+    const CHANNEL = 'C_OVER'
+    const IDENTITY_A = 'cscb-cron:big-a'
+    const IDENTITY_B = 'cscb-cron:big-b'
+
+    // Two prompts each comfortably UNDER the cap on their own, but whose
+    // concatenation (+ "\n\n" + combined sender envelope) exceeds it. Sizing
+    // each at ~20000 ASCII bytes guarantees the individual envelopes are under
+    // 32768 while the grouped body is well over.
+    const contentA = 'a'.repeat(20000)
+    const contentB = 'b'.repeat(20000)
+    const pA = join(dir, 'a.md')
+    const pB = join(dir, 'b.md')
+    writeFileSync(pA, contentA)
+    writeFileSync(pB, contentB)
+
+    const h = makeHarness()
+    await h.fireGroup([
+      explicitSchedule(pA, [CHANNEL], IDENTITY_A),
+      explicitSchedule(pB, [CHANNEL], IDENTITY_B),
+    ])
+
+    // Fallback: each contributor delivered INDIVIDUALLY (2 separate POSTs), in
+    // input order, each carrying only its own content (no concatenation).
+    expect(requests).toHaveLength(2)
+    expect(requests[0]!.body.channel).toBe(CHANNEL)
+    expect(requests[0]!.body.message).toBe(contentA)
+    expect(requests[0]!.body.sender).toBe(IDENTITY_A)
+    expect(requests[1]!.body.message).toBe(contentB)
+    expect(requests[1]!.body.sender).toBe(IDENTITY_B)
+
+    // Each individual body is under the cap.
+    for (const r of requests) {
+      expect(new TextEncoder().encode(r.raw).byteLength).toBeLessThanOrEqual(CAP)
+    }
+
+    const lines = h.lines()
+
+    // Exactly one info line records the split, naming the channel and group size.
+    const info = lines.filter((l) => l.outcome === 'info')
+    expect(info).toHaveLength(1)
+    expect(info[0]!.channel).toBe(CHANNEL)
+    expect(info[0]!.detail).toContain('2')
+
+    // Individual deliveries: two delivered outcomes, and because each was a
+    // single-contributor POST there is NO grouped= token.
+    const delivered = lines.filter((l) => l.channel === CHANNEL && l.outcome === 'delivered')
+    expect(delivered).toHaveLength(2)
+    for (const l of delivered) {
+      expect(token(l.detail, 'grouped')).toBeUndefined()
+    }
+
+    // One summary per schedule, each delivered=1 failed=0.
+    const summaries = lines.filter((l) => l.outcome === 'summary')
+    expect(summaries).toHaveLength(2)
+    for (const s of summaries) {
+      expect(token(s.detail, 'delivered')).toBe('1')
+      expect(token(s.detail, 'failed')).toBe('0')
+    }
+  })
+
+  test('oversize group where one contributor is itself over cap → that one logs prompt-oversize, sibling still delivers', async () => {
+    const dir = makeTempDir('cscb-prompt-test-')
+    const CHANNEL = 'C_MIX'
+    const IDENTITY_BIG = 'cscb-cron:huge'
+    const IDENTITY_OK = 'cscb-cron:tiny'
+
+    // One prompt individually OVER the cap, one small. The group is oversize, so
+    // fallback runs; the huge one fails its own cap check (prompt-oversize, no
+    // POST), the small one delivers.
+    const overhead = new TextEncoder().encode(
+      JSON.stringify({ channel: CHANNEL, message: '', sender: IDENTITY_BIG }),
+    ).byteLength
+    const contentBig = 'a'.repeat(CAP + 1 - overhead)
+    const contentOk = 'small'
+    const pBig = join(dir, 'huge.md')
+    const pOk = join(dir, 'tiny.md')
+    writeFileSync(pBig, contentBig)
+    writeFileSync(pOk, contentOk)
+
+    const h = makeHarness()
+    await h.fireGroup([
+      explicitSchedule(pBig, [CHANNEL], IDENTITY_BIG),
+      explicitSchedule(pOk, [CHANNEL], IDENTITY_OK),
+    ])
+
+    // Only the small sibling actually POSTs; the oversize one never does.
+    expect(requests).toHaveLength(1)
+    expect(requests[0]!.body.sender).toBe(IDENTITY_OK)
+    expect(requests[0]!.body.message).toBe(contentOk)
+
+    const lines = h.lines()
+
+    // Split info line present.
+    expect(lines.filter((l) => l.outcome === 'info')).toHaveLength(1)
+
+    // The oversize contributor logs prompt-oversize naming its promptPath.
+    const oversize = lines.filter((l) => l.outcome === 'prompt-oversize')
+    expect(oversize).toHaveLength(1)
+    expect(oversize[0]!.identity).toBe(IDENTITY_BIG)
+    expect(oversize[0]!.channel).toBe(CHANNEL)
+    expect(token(oversize[0]!.detail, 'prompt')).toBe(pBig)
+
+    // The sibling delivers.
+    const delivered = lines.filter((l) => l.channel === CHANNEL && l.outcome === 'delivered')
+    expect(delivered).toHaveLength(1)
+    expect(delivered[0]!.identity).toBe(IDENTITY_OK)
+
+    // Summaries: huge 0/1, tiny 1/0.
+    const summaries = lines.filter((l) => l.outcome === 'summary')
+    expect(summaries).toHaveLength(2)
+    const big = summaries.find((s) => s.identity === IDENTITY_BIG)!
+    expect(token(big.detail, 'delivered')).toBe('0')
+    expect(token(big.detail, 'failed')).toBe('1')
+    const ok = summaries.find((s) => s.identity === IDENTITY_OK)!
+    expect(token(ok.detail, 'delivered')).toBe('1')
+    expect(token(ok.detail, 'failed')).toBe('0')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 14. fireGroup — a prompt-missing schedule is excluded; siblings still deliver
+// ---------------------------------------------------------------------------
+
+describe('fireGroup with a prompt-missing sibling', () => {
+  test('missing prompt excluded from concatenation, siblings still concatenated/delivered, missing summarized 0/N', async () => {
+    const dir = makeTempDir('cscb-prompt-test-')
+    const CHANNEL = 'C_SIB'
+    const pPresent1 = join(dir, 'present1.md')
+    const pPresent2 = join(dir, 'present2.md')
+    const pGone = join(dir, 'gone.md')
+    writeFileSync(pPresent1, 'PRESENT-ONE')
+    writeFileSync(pPresent2, 'PRESENT-TWO')
+    // pGone deliberately never created.
+
+    // Order: present1, MISSING, present2 — the missing one sits BETWEEN the two
+    // present siblings, so a correct exclusion must still join present1\n\npresent2
+    // (the gap must not leave a blank slot or reorder).
+    const h = makeHarness()
+    await h.fireGroup([
+      explicitSchedule(pPresent1, [CHANNEL], 'cscb-cron:one'),
+      explicitSchedule(pGone, [CHANNEL], 'cscb-cron:gone'),
+      explicitSchedule(pPresent2, [CHANNEL], 'cscb-cron:two'),
+    ])
+
+    // One grouped POST for the two present siblings only.
+    expect(requests).toHaveLength(1)
+    expect(requests[0]!.body.channel).toBe(CHANNEL)
+    // The missing schedule is excluded — no empty separator slot, order preserved.
+    expect(requests[0]!.body.message).toBe('PRESENT-ONE\n\nPRESENT-TWO')
+    expect(requests[0]!.body.sender).toBe('cscb-cron:one+two')
+
+    const lines = h.lines()
+
+    // The missing schedule logs prompt-missing with no channel and is summarized
+    // 0/N (N=1 target here).
+    const missing = lines.filter((l) => l.outcome === 'prompt-missing')
+    expect(missing).toHaveLength(1)
+    expect(missing[0]!.identity).toBe('cscb-cron:gone')
+    expect(missing[0]!.channel).toBe('-')
+    expect(token(missing[0]!.detail, 'prompt')).toBe(pGone)
+
+    const goneSummary = lines.find((l) => l.outcome === 'summary' && l.identity === 'cscb-cron:gone')!
+    expect(token(goneSummary.detail, 'delivered')).toBe('0')
+    expect(token(goneSummary.detail, 'failed')).toBe('1')
+
+    // The two present siblings share the grouped delivery (grouped=2) and each
+    // summarizes 1/0.
+    const delivered = lines.filter((l) => l.channel === CHANNEL && l.outcome === 'delivered')
+    expect(delivered).toHaveLength(2)
+    for (const l of delivered) expect(token(l.detail, 'grouped')).toBe('2')
+
+    const oneSummary = lines.find((l) => l.outcome === 'summary' && l.identity === 'cscb-cron:one')!
+    expect(token(oneSummary.detail, 'delivered')).toBe('1')
+    const twoSummary = lines.find((l) => l.outcome === 'summary' && l.identity === 'cscb-cron:two')!
+    expect(token(twoSummary.detail, 'delivered')).toBe('1')
+  })
+
+  test('all-bots schedule inside a group keeps its own fanout-deferred handling; explicit sibling still delivers', async () => {
+    const dir = makeTempDir('cscb-prompt-test-')
+    const CHANNEL = 'C_AB'
+    const pExplicit = join(dir, 'explicit.md')
+    writeFileSync(pExplicit, 'EXPLICIT')
+
+    const h = makeHarness()
+    await h.fireGroup([
+      allBotsSchedule('/nonexistent/never-read.md', 'cscb-cron:allbots'),
+      explicitSchedule(pExplicit, [CHANNEL], 'cscb-cron:explicit'),
+    ])
+
+    // The explicit sibling delivers; the all-bots one POSTs nothing.
+    expect(requests).toHaveLength(1)
+    expect(requests[0]!.body.channel).toBe(CHANNEL)
+    expect(requests[0]!.body.message).toBe('EXPLICIT')
+
+    const lines = h.lines()
+
+    // All-bots keeps its fanout-deferred line + 0/0 summary, no prompt read.
+    const deferred = lines.filter((l) => l.outcome === 'fanout-deferred')
+    expect(deferred).toHaveLength(1)
+    expect(deferred[0]!.identity).toBe('cscb-cron:allbots')
+    expect(lines.some((l) => l.outcome.startsWith('prompt-'))).toBe(false)
+
+    const abSummary = lines.find((l) => l.outcome === 'summary' && l.identity === 'cscb-cron:allbots')!
+    expect(token(abSummary.detail, 'delivered')).toBe('0')
+    expect(token(abSummary.detail, 'failed')).toBe('0')
+
+    // The explicit sibling delivered — and since it was the SOLE contributor to
+    // its channel, no grouped= token.
+    const delivered = lines.filter((l) => l.channel === CHANNEL && l.outcome === 'delivered')
+    expect(delivered).toHaveLength(1)
+    expect(token(delivered[0]!.detail, 'grouped')).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 15. fire() single-schedule path is byte-identical (no grouped= token)
+// ---------------------------------------------------------------------------
+
+describe('single-schedule fire() unchanged by grouping', () => {
+  test('fire(s) and fireGroup([s]) both omit grouped= and produce identical outcome/summary shape', async () => {
+    const dir = makeTempDir('cscb-prompt-test-')
+    const promptPath = join(dir, 'solo.md')
+    writeFileSync(promptPath, 'SOLO')
+
+    const CHANNEL = 'C_SOLO'
+    const h = makeHarness()
+
+    // fire(s) — the single-schedule public entry.
+    await h.fire(explicitSchedule(promptPath, [CHANNEL], 'cscb-cron:solo'))
+    // fireGroup([s]) — the same shape, explicitly.
+    await h.fireGroup([explicitSchedule(promptPath, [CHANNEL], 'cscb-cron:solo')])
+
+    // Two POSTs, both single-contributor bodies (message === file content, plain
+    // identity sender, no combined naming).
+    expect(requests).toHaveLength(2)
+    for (const r of requests) {
+      expect(r.body.message).toBe('SOLO')
+      expect(r.body.sender).toBe('cscb-cron:solo')
+    }
+
+    const lines = h.lines()
+    const delivered = lines.filter((l) => l.channel === CHANNEL && l.outcome === 'delivered')
+    expect(delivered).toHaveLength(2)
+    // Neither path emits grouped= for a single schedule.
+    for (const l of delivered) {
+      expect(token(l.detail, 'grouped')).toBeUndefined()
+    }
+
+    const summaries = lines.filter((l) => l.outcome === 'summary')
+    expect(summaries).toHaveLength(2)
+    for (const s of summaries) {
+      expect(token(s.detail, 'delivered')).toBe('1')
+      expect(token(s.detail, 'failed')).toBe('0')
+    }
+  })
 })

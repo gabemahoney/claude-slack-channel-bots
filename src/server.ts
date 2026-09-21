@@ -105,7 +105,9 @@ import {
 } from './registry.ts'
 import { runAgentDirectorStartupGate } from './agent-director-startup.ts'
 import { installSlackChannelBotTemplate } from './agent-director-template.ts'
-import { ensureCrontableExists } from './cron-bootstrap.ts'
+import { createCronLog } from './cron-log.ts'
+import { createCronDispatcher } from './cron-dispatch.ts'
+import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
 import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy, withOutageDetection } from './outage-state.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
@@ -931,12 +933,17 @@ let routingConfig: RoutingConfig | null = null
 
 let shuttingDown = false
 let httpServer: ReturnType<typeof Bun.serve> | null = null
+let cronScheduler: CronScheduler | null = null
 
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
   stopPermissionPoller()
   stopHealthCheck()
+  if (cronScheduler) {
+    cronScheduler.stop()
+    cronScheduler = null
+  }
   cancelAllRestartTimers()
   stopAllKeepAliveTimers()
 
@@ -1189,8 +1196,9 @@ export async function main(): Promise<void> {
 
   // Check for an existing server BEFORE any side-effectful startup work —
   // before writePidFile (which would clobber the live server's PID file),
-  // and before the template overwrite, crontable bootstrap, and Socket Mode
-  // connect below. A duplicate start must fail fast without mutating shared state.
+  // and before the template overwrite and Socket Mode connect below (crontable
+  // bootstrap now happens later, inside the scheduler started after Bun.serve).
+  // A duplicate start must fail fast without mutating shared state.
   checkPidConflict(PID_FILE)
 
   // The agent-director store owns session-id state; CSCB's own sessions.json
@@ -1225,17 +1233,9 @@ export async function main(): Promise<void> {
       }
     }
 
-    // Ensure the crontable exists (D-Q1: the server guarantees it). This is the
-    // server's only write to the crontable — exclusive-create, never rewrite.
-    // cron_table_path is already resolved/tilde-expanded by config.ts.
-    const cronBootstrap = ensureCrontableExists(routingConfig.cron_table_path)
-    if (cronBootstrap.outcome === 'created') {
-      console.error(`[slack] Created new crontable: ${routingConfig.cron_table_path}`)
-    } else if (cronBootstrap.outcome === 'failed') {
-      console.error(
-        `[slack] Warning: failed to create crontable at ${routingConfig.cron_table_path}: ${cronBootstrap.cause}`,
-      )
-    }
+    // NOTE: crontable bootstrap (ensureCrontableExists) is NO LONGER called
+    // here. Per PM review it moved into cron-scheduler.start() — the scheduler
+    // is now the ONLY caller of ensure-exists, wired after Bun.serve() below.
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     if (msg.includes('cannot read routing config')) {
@@ -1477,6 +1477,40 @@ export async function main(): Promise<void> {
   console.error('Then launch Claude from a project directory with:')
   console.error(`  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:${MCP_SERVER_NAME}`)
   console.error('')
+
+  // Cron scheduler — the once-per-minute dispatch tick (b.he5 E2). It is its
+  // own /interject client, so it MUST start only AFTER Bun.serve() is listening
+  // (unlike startPermissionPoller, which starts before Bun.serve — do not copy
+  // that placement). Guarded on routingConfig: the env-var fallback path
+  // constructs and starts NOTHING cron-related. Uses the ACTUAL bound port
+  // (httpServer.port) so port-0 configs still reach the right listener. Any
+  // construction/start failure is non-fatal — the server keeps serving without
+  // a scheduler. scheduler.start() also owns the crontable bootstrap (the sole
+  // ensure-exists caller) and is failure-isolated internally.
+  if (routingConfig) {
+    try {
+      const cronLog = createCronLog(routingConfig.cron_log_path)
+      // Prefer the ACTUAL bound port (covers port-0 configs); fall back to the
+      // requested port only if Bun leaves it undefined (never expected once the
+      // server is listening).
+      const boundPort = httpServer.port ?? mcpPort
+      const dispatcher = createCronDispatcher({
+        port: boundPort,
+        cronLog,
+        cronTablePath: routingConfig.cron_table_path,
+      })
+      cronScheduler = createCronScheduler({
+        dispatcher,
+        cronLog,
+        cronTablePath: routingConfig.cron_table_path,
+      })
+      cronScheduler.start()
+    } catch (err) {
+      const cause = err instanceof Error ? err.message : String(err)
+      console.error(`[slack] Warning: cron scheduler failed to start — ${cause}`)
+      cronScheduler = null
+    }
+  }
 
   // Shared adapter: probes agent-director for the spawn's current state per
   // SR-11 Event 6a. Any AGENT_DIRECTOR_LIVE_STATES value → alive; terminal

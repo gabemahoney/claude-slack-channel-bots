@@ -1,22 +1,36 @@
 /**
- * cron-dispatch.ts — Fire/delivery path for one matched cron schedule
- * (Task 2 on b.he5; decisions 1/7, D-Q4, D-Q5 on b.grx).
+ * cron-dispatch.ts — Fire/delivery path for matched cron schedules
+ * (Task 2 on b.he5; decisions 1/7, D-Q4, D-Q5 on b.grx; group delivery is the
+ * owner's gate-answer-3 optimization on t2.he5.eu.4q).
  *
  * `createCronDispatcher({ port, cronLog, cronTablePath })` returns a handle
- * whose single method `fire(schedule)` delivers ONE already-parsed
- * `CronSchedule` and records every outcome via the injected cron-log handle.
- * The dispatcher is INERT: it imports nothing from server.ts, starts no
- * listener, holds no timer, reads no crontable, and never fires on its own —
- * Task 3's tick loop is the only intended caller. Delivery is a localhost HTTP
- * POST to the server's own `/interject` endpoint AS-IS (decision 7), which
- * gives us the 32KB cap and 503 semantics for free.
+ * with two delivery methods:
+ *   fire(schedule)       — deliver ONE already-parsed CronSchedule.
+ *   fireGroup(schedules) — deliver a set of schedules that matched the SAME
+ *                          minute; when several target the same channel their
+ *                          prompts are concatenated into ONE /interject POST
+ *                          (owner: "Cat in the order they are listed in the
+ *                          crontable"). fire(s) is exactly fireGroup([s]).
+ * Both record every outcome via the injected cron-log handle. The dispatcher is
+ * INERT: it imports nothing from server.ts, starts no listener, holds no timer,
+ * reads no crontable, and never fires on its own — Task 3's tick loop is the
+ * only intended caller. Delivery is a localhost HTTP POST to the server's own
+ * `/interject` endpoint AS-IS (decision 7), which gives us the 32KB cap and 503
+ * semantics for free.
  *
- * fire() has a fixed internal shape (PM review — this is E4's seam):
- *   resolve-targets → (all-bots marker → fanout-deferred branch) → per-target
- *   loop that is AGNOSTIC to where the targets came from.
- * E4 (all-bots fan-out) must later change ONLY the resolve step plus one
- * constructor dependency; the loop below never special-cases all-bots and
- * never fuses resolution into itself. Do not collapse these stages.
+ * Delivery has a fixed internal shape (PM review — this is E4's seam):
+ *   per-schedule resolve-targets → (all-bots marker → fanout-deferred branch) +
+ *   fresh prompt read → per-CHANNEL delivery that is AGNOSTIC to where the
+ *   targets came from. E4 (all-bots fan-out) must later change ONLY the resolve
+ *   step plus one constructor dependency; the delivery path below never
+ *   special-cases all-bots and never fuses resolution into itself. Do not
+ *   collapse these stages.
+ *
+ * Grouping REDUCES worst-case POSTs per tick: one POST per DISTINCT target
+ * channel instead of one per (schedule, channel) pair. The multi-target stall
+ * invariant (`targets × DEFAULT_DELIVER_TIMEOUT_MS` well under the 60 s tick)
+ * therefore only improves under grouping; DEFAULT_DELIVER_TIMEOUT_MS is
+ * unchanged. Task 3 awaits fireGroup once per tick.
  *
  * Summary convention (pinned — apply everywhere): `failed` counts targets
  * whose intended delivery did not happen. A no-match minute logs nothing at
@@ -110,10 +124,23 @@ export interface CronDispatcherDeps {
   deliverTimeoutMs?: number
 }
 
-/** The dispatcher handle. Minimal surface: one async delivery method. */
+/** The dispatcher handle. Two async delivery methods; neither ever throws. */
 export interface CronDispatcher {
-  /** Deliver one matched schedule, recording every outcome. Never throws. */
+  /**
+   * Deliver one matched schedule, recording every outcome. Exactly
+   * `fireGroup([schedule])` — kept as its own name for the single-schedule
+   * callers and existing tests. Never throws.
+   */
   fire(schedule: CronSchedule): Promise<void>
+  /**
+   * Deliver a group of schedules that matched the SAME minute. Schedules
+   * targeting the same channel have their (freshly read) prompts concatenated
+   * into ONE /interject POST in input (crontable line) order; schedules for
+   * different channels stay separate deliveries. Each contributing (schedule,
+   * channel) pair gets its own outcome line and each schedule gets exactly one
+   * summary line counting ITS own targets. Never throws.
+   */
+  fireGroup(schedules: CronSchedule[]): Promise<void>
 }
 
 // ---------------------------------------------------------------------------
@@ -253,92 +280,265 @@ export function createCronDispatcher(deps: CronDispatcherDeps): CronDispatcher {
     }
   }
 
-  async function fire(schedule: CronSchedule): Promise<void> {
+  /**
+   * Serialize ONE /interject body. sender = schedule identity (D-Q4): without
+   * it /interject defaults senderLabel to 'interject' and a cron fire is
+   * indistinguishable from peer-bot traffic. This is the single place a body is
+   * built, so "the measured string IS the sent string" holds by construction.
+   */
+  function buildBody(channel: string, message: string, sender: string): string {
+    return JSON.stringify({ channel, message, sender })
+  }
+
+  /** UTF-8 byte length of the exact serialized body (the cap predicate input). */
+  function bodyBytes(body: string): number {
+    return new TextEncoder().encode(body).byteLength
+  }
+
+  /**
+   * Build the sender for a grouped (concatenated) POST. Naming only the first
+   * contributor's identity would misattribute the other prompts' content to the
+   * reading agent, so the grouped sender lists EVERY contributor in group
+   * order: the first schedule's full identity (`cscb-cron:<basename1>`) followed
+   * by `+<basename>` for each subsequent contributor — the shared `cscb-cron:`
+   * namespace prefix stripped from the tail entries but retained on the head, so
+   * the whole label keeps the cscb-cron: property that distinguishes cron fires
+   * from humans/peers while staying truthful about all contributors. The prefix
+   * is derived from the head identity (everything through its first ':') rather
+   * than hardcoded, so it tracks crontable.ts's IDENTITY_PREFIX. Only ever
+   * called with 2+ contributors (the single-contributor path uses the plain
+   * identity unchanged).
+   */
+  function groupSender(contributors: Contributor[]): string {
+    const head = contributors[0]!.identity
+    const colon = head.indexOf(':')
+    const prefix = colon === -1 ? '' : head.slice(0, colon + 1)
+    const tail = contributors
+      .slice(1)
+      .map((c) => (prefix !== '' && c.identity.startsWith(prefix) ? c.identity.slice(prefix.length) : c.identity))
+    return tail.length === 0 ? head : `${head}+${tail.join('+')}`
+  }
+
+  /**
+   * A schedule that passed its per-fire pre-checks (all-bots deferral and
+   * prompt read already resolved) and therefore contributes real prompt content
+   * to one or more channels. `delivered`/`failed` accumulate across this
+   * schedule's OWN channels so it can emit exactly one summary at the end.
+   */
+  interface Contributor {
+    schedule: CronSchedule
+    identity: string
+    resolvedPath: string
+    content: string
+    delivered: number
+    failed: number
+  }
+
+  /**
+   * Deliver one measured body to a single channel and write the SAME resulting
+   * outcome line for each contributing schedule (grouped POST → shared status →
+   * one attributable line per contributor). Increments each contributor's own
+   * delivered/failed counter.
+   *
+   * `grouped=<n>` is added to the detail free text ONLY when n >= 2, i.e. when
+   * it actually carries information (this POST was a concatenation). A single-
+   * contributor delivery (the fire([s]) path) omits it entirely so its log
+   * lines stay byte-identical to Task 2's original fire().
+   */
+  async function deliverToChannel(
+    timestamp: string,
+    channel: string,
+    body: string,
+    contributors: Contributor[],
+  ): Promise<void> {
+    const { outcome, detail } = await deliver(body)
+    const groupedNote = contributors.length >= 2 ? `grouped=${contributors.length}` : undefined
+    for (const c of contributors) {
+      if (outcome === 'delivered') c.delivered++
+      else c.failed++
+      const text =
+        groupedNote === undefined
+          ? detail.text
+          : detail.text === undefined
+            ? groupedNote
+            : `${detail.text} ${groupedNote}`
+      cronLog.outcome({
+        timestamp,
+        identity: c.identity,
+        channel,
+        outcome,
+        detail: {
+          promptPath: c.resolvedPath,
+          ...detail,
+          text,
+        },
+      })
+    }
+  }
+
+  /**
+   * Deliver ONE schedule's prompt to one channel individually (no
+   * concatenation), applying its own cap check. Used both by the single-
+   * contributor channel path and by the oversize-group fallback. An
+   * individually-oversize body logs prompt-oversize naming its promptPath,
+   * exactly as the original fire() did, and increments `failed`.
+   */
+  async function deliverOne(
+    timestamp: string,
+    channel: string,
+    contributor: Contributor,
+  ): Promise<void> {
+    const body = buildBody(channel, contributor.content, contributor.identity)
+    const byteLength = bodyBytes(body)
+    if (byteLength > INTERJECT_BODY_CAP_BYTES) {
+      contributor.failed++
+      cronLog.outcome({
+        timestamp,
+        identity: contributor.identity,
+        channel,
+        outcome: 'prompt-oversize',
+        detail: {
+          promptPath: contributor.resolvedPath,
+          text: `size=${byteLength} cap=${INTERJECT_BODY_CAP_BYTES}`,
+        },
+      })
+      return
+    }
+    await deliverToChannel(timestamp, channel, body, [contributor])
+  }
+
+  /**
+   * Deliver a group of schedules that matched the SAME minute. fire() is
+   * exactly `fireGroup([schedule])`; the single-schedule shape falls out of the
+   * general path (one contributor per channel → one POST per target → identical
+   * outcome + summary lines, plus the harmless `grouped=1` note).
+   */
+  async function fireGroup(schedules: CronSchedule[]): Promise<void> {
     const timestamp = new Date().toISOString()
-    const { identity } = schedule
 
-    // --- resolve-targets --------------------------------------------------
-    // All-bots marker: no read, no POST. Fan-out is not yet enabled (E4), so
-    // the target set is undefined; log one fanout-deferred line + a 0/0
-    // summary (see the pinned-convention note in the module header) and stop.
-    if (schedule.channels.kind === 'all-bots') {
-      cronLog.outcome({
-        timestamp,
-        identity,
-        channel: NO_CHANNEL,
-        outcome: 'fanout-deferred',
-        detail: { text: 'all-bots fan-out not yet enabled' },
-      })
-      cronLog.summary(timestamp, identity, 0, 0)
-      return
-    }
+    // --- per-schedule resolve + fresh read (E4 seam preserved) ------------
+    // All-bots and prompt pre-check failures are handled here, per schedule,
+    // exactly as the original fire() did — such a schedule contributes to no
+    // channel and its summary is emitted immediately.
+    const contributors: Contributor[] = []
+    // Distinct target channels in first-seen (input/line) order, each mapping
+    // to its ordered contributor list.
+    const channelOrder: string[] = []
+    const byChannel = new Map<string, Contributor[]>()
 
-    const targets = resolveTargets(schedule)
+    for (const schedule of schedules) {
+      const { identity } = schedule
 
-    // --- fire-time path resolution + fresh prompt read --------------------
-    const resolvedPath = resolvePromptPath(schedule.promptPath, cronTablePath)
-    const read = readPromptFresh(resolvedPath)
-    if (!read.ok) {
-      // Missing/unreadable → one pre-fan-out outcome line (no channel) then a
-      // summary counting every intended target as failed; no POST.
-      cronLog.outcome({
-        timestamp,
-        identity,
-        channel: NO_CHANNEL,
-        outcome: read.outcome,
-        detail: { promptPath: resolvedPath, errno: read.errno },
-      })
-      cronLog.summary(timestamp, identity, 0, targets.length)
-      return
-    }
-
-    const content = read.content
-
-    // --- per-target loop (agnostic to target origin) ----------------------
-    // Sequential; EVERY target is attempted even after an earlier failure.
-    let delivered = 0
-    let failed = 0
-    for (const channel of targets) {
-      // Build the exact serialized body. sender = schedule identity (D-Q4):
-      // without it /interject defaults senderLabel to 'interject' and a cron
-      // fire is indistinguishable from peer-bot traffic.
-      const body = JSON.stringify({ channel, message: content, sender: identity })
-
-      // Oversize predicate on the EXACT serialized string, byte-identical to
-      // the /interject handler's own check (see INTERJECT_BODY_CAP_BYTES).
-      // Over the cap → log + continue; never truncate, never POST oversize.
-      const byteLength = new TextEncoder().encode(body).byteLength
-      if (byteLength > INTERJECT_BODY_CAP_BYTES) {
-        failed++
+      // All-bots marker: no read, no POST. Fan-out is not yet enabled (E4), so
+      // the target set is undefined; log one fanout-deferred line + a 0/0
+      // summary (pinned-convention note in the module header) and move on.
+      if (schedule.channels.kind === 'all-bots') {
         cronLog.outcome({
           timestamp,
           identity,
-          channel,
-          outcome: 'prompt-oversize',
-          detail: {
-            promptPath: resolvedPath,
-            text: `size=${byteLength} cap=${INTERJECT_BODY_CAP_BYTES}`,
-          },
+          channel: NO_CHANNEL,
+          outcome: 'fanout-deferred',
+          detail: { text: 'all-bots fan-out not yet enabled' },
         })
+        cronLog.summary(timestamp, identity, 0, 0)
         continue
       }
 
-      // Under the cap → POST the measured string (measured == sent).
-      const { outcome, detail } = await deliver(body)
-      if (outcome === 'delivered') delivered++
-      else failed++
-      cronLog.outcome({
-        timestamp,
+      const targets = resolveTargets(schedule)
+      const resolvedPath = resolvePromptPath(schedule.promptPath, cronTablePath)
+      const read = readPromptFresh(resolvedPath)
+      if (!read.ok) {
+        // Missing/unreadable → one pre-fan-out outcome line (no channel) then a
+        // summary counting every intended target as failed; no POST. This
+        // schedule is excluded from every channel's concatenation; siblings
+        // still deliver.
+        cronLog.outcome({
+          timestamp,
+          identity,
+          channel: NO_CHANNEL,
+          outcome: read.outcome,
+          detail: { promptPath: resolvedPath, errno: read.errno },
+        })
+        cronLog.summary(timestamp, identity, 0, targets.length)
+        continue
+      }
+
+      const contributor: Contributor = {
+        schedule,
         identity,
-        channel,
-        outcome,
-        detail: { promptPath: resolvedPath, ...detail },
-      })
+        resolvedPath,
+        content: read.content,
+        delivered: 0,
+        failed: 0,
+      }
+      contributors.push(contributor)
+      for (const channel of targets) {
+        let list = byChannel.get(channel)
+        if (list === undefined) {
+          list = []
+          byChannel.set(channel, list)
+          channelOrder.push(channel)
+        }
+        list.push(contributor)
+      }
     }
 
-    // Exactly one summary per fire.
-    cronLog.summary(timestamp, identity, delivered, failed)
+    // --- per-channel delivery (sequential; every channel attempted) -------
+    for (const channel of channelOrder) {
+      const group = byChannel.get(channel)!
+
+      if (group.length === 1) {
+        // Single contributor: the concatenated body IS that one prompt, so the
+        // general path and the individual path coincide — take the individual
+        // path so fire([s]) reproduces the original per-target logging exactly.
+        await deliverOne(timestamp, channel, group[0]!)
+        continue
+      }
+
+      // Concatenate the contributing prompts in input (crontable line) order.
+      // Separator is one blank line ("\n\n"): a markdown-natural paragraph
+      // break. Prompt files routinely end WITHOUT a trailing newline, so an
+      // explicit blank line keeps two prompts from fusing into one paragraph.
+      // No framing header is added — prompt authors own their own content.
+      const message = group.map((c) => c.content).join('\n\n')
+      // Grouped sender names every contributor (see groupSender) so no prompt's
+      // content is misattributed to the head schedule alone.
+      const body = buildBody(channel, message, groupSender(group))
+      const byteLength = bodyBytes(body)
+
+      if (byteLength > INTERJECT_BODY_CAP_BYTES) {
+        // Concatenation is an OPTIMIZATION only. An oversize group must not be
+        // dropped with one opaque line: fall back to delivering each
+        // contributing schedule to this channel individually, in line order,
+        // each subject to its own cap check. One info line records the split so
+        // the operator can see the group was broken up.
+        cronLog.info(
+          timestamp,
+          `grouped body oversize (size=${byteLength} cap=${INTERJECT_BODY_CAP_BYTES}) — ` +
+            `delivering ${group.length} schedules individually`,
+          NO_CHANNEL,
+          channel,
+        )
+        for (const contributor of group) {
+          await deliverOne(timestamp, channel, contributor)
+        }
+        continue
+      }
+
+      // Under the cap → one grouped POST for this channel (measured == sent).
+      await deliverToChannel(timestamp, channel, body, group)
+    }
+
+    // --- one summary per contributing schedule ----------------------------
+    // (All-bots and prompt-failure schedules already summarized above.)
+    for (const c of contributors) {
+      cronLog.summary(timestamp, c.identity, c.delivered, c.failed)
+    }
   }
 
-  return { fire }
+  async function fire(schedule: CronSchedule): Promise<void> {
+    await fireGroup([schedule])
+  }
+
+  return { fire, fireGroup }
 }

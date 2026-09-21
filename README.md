@@ -189,7 +189,7 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | `routes` | object | required | Map of Slack channel ID → route entry. Each entry requires a `cwd` field: the working directory for that session. Used to identify sessions via `roots/list` after MCP handshake. `~` is expanded. Each `cwd` must be unique across all routes. May also include an optional `claude_config_dir` string (see below). |
 | `default_route` | string | — | CWD path to use when a message arrives on a channel with no explicit entry in `routes`. Must match an existing route `cwd`. Channels that are in `routes` but whose session is not yet registered have their messages dropped — they do not fall back to `default_route`. |
 | `default_dm_session` | string | — | CWD path of the session that handles direct messages. Must match an existing route `cwd`. |
-| `bind` | string | `"127.0.0.1"` | Interface the HTTP server binds to. Use `"0.0.0.0"` to expose on all interfaces. |
+| `bind` | string | `"127.0.0.1"` | Interface the HTTP server binds to. Use `"0.0.0.0"` to expose on all interfaces. The in-process cron scheduler delivers via `127.0.0.1`, so `bind` must include loopback (the default, or `0.0.0.0`) for scheduled fires to work. |
 | `port` | number | `3100` | Port the HTTP server listens on. |
 | `session_restart_delay` | number | `60` | Seconds to wait before auto-restarting a dead session. Set to `0` to disable auto-restart. Must be non-negative. |
 | `health_check_interval` | number | `120` | Seconds between periodic liveness polls. Set to `0` to disable. Must be non-negative. |
@@ -472,6 +472,49 @@ On success, returns HTTP 200:
   -H "Content-Type: application/json" \
   -d '{"channel": "C1234567890", "message": "Weekly reminder: update the changelog before standup.", "sender": "cron"}'
 ```
+
+---
+
+## Scheduled Prompts (cscb_cron)
+
+The server fires scheduled prompts into bot channels once per minute, reading them from a crontable. Each fire is delivered as an `/interject` message into the target channel, exactly as if a script had POSTed it.
+
+### The crontable
+
+Schedules live in the crontable file at `cron_table_path` (default `<config dir>/crontab`, where `<config dir>` is the directory of your loaded `config.json`; override it with the `cron_table_path` key in `config.json`). The server creates the file on first boot if it is absent, with a self-documenting comment header describing the line format. That header is the format reference for now — read the top of the created file to see how to write a schedule; do not hand-edit the format from memory.
+
+```sh
+cat "$(dirname <path-to-config.json>)/crontab"
+```
+
+### How fires appear
+
+A scheduled fire arrives in the channel as an `/interject` message whose `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. When several schedules fire in the same minute for the same channel, their prompts are concatenated into a single message and the sender lists every contributor (for example `cscb-cron:standup+grooming`).
+
+### The cron log
+
+Every fire outcome is recorded in the cron log at `cron_log_path` (default `<config dir>/cron.log`; override with the `cron_log_path` key). Each attempt writes one line per target channel plus a per-fire summary line carrying `delivered=N failed=M` counts. The log is plain text, so `grep no-session cron.log` yields readable lines.
+
+The `outcome` field of each line is one of these classes:
+
+| Outcome | What happened | What to do |
+|---|---|---|
+| `delivered` | The prompt reached the target channel's session. | Nothing — success. |
+| `no-session` | The channel is routed but no live session is connected, so the message was dropped. | Bring the session up. Failed fires are **never** retried or queued (see below). |
+| `unknown-channel` | The target channel is not in `config.json → routes`. | Fix the channel ID in the crontable, or add the route. |
+| `prompt-missing` | The prompt file did not exist at fire time. | Create the file or correct its path in the crontable. |
+| `prompt-unreadable` | The prompt file existed but could not be read (see the `errno`). | Fix file permissions or the path. |
+| `prompt-oversize` | The prompt exceeds the 32KB `/interject` cap and was skipped, never truncated. | Shorten the prompt file. |
+| `parse-error` | The crontable line could not be parsed. | Fix the line — see the crontable header for the format. |
+| `http-error` | The localhost POST hit an unexpected HTTP status or a network failure. | Check that the server is listening on loopback (see the `bind` note below) and inspect the `errno`/`status` in the line. |
+| `fanout-deferred` | A channel-less (all-bots) line was matched but not delivered. | None — all-bots fan-out is not yet enabled; give the line an explicit channel to deliver it today. |
+
+### Delivery semantics
+
+- **No retry.** A failed fire is logged and dropped — never queued or re-sent. A channel with no live session fails every fire until its session is running again; the server does not queue the missed prompts.
+- **Missed fires are skipped, not caught up.** While the server is down, no scheduled prompts fire, and they are not replayed on restart. The `scheduler started, N schedules loaded` line in the cron log marks when scheduling resumed, bounding the outage window.
+- **Channel-less lines are deferred.** A line with no channel is currently matched but logged `fanout-deferred` and not delivered. Give a line an explicit channel to have it fire.
+- **`bind` must include loopback.** The scheduler delivers via `127.0.0.1`, so a `bind` set to a single non-loopback interface makes every fire fail with `http-error`. Use the default `127.0.0.1` or `0.0.0.0`.
 
 ---
 
