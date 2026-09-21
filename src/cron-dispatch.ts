@@ -52,6 +52,36 @@ import type { CronLog, CronLogDetail, CronOutcome } from './cron-log.ts'
  */
 const INTERJECT_BODY_CAP_BYTES = 32768
 
+/**
+ * Per-request deadline (ms) for the /interject POST in deliver(), applied as
+ * `AbortSignal.timeout(...)`. This bounds ONE pathological case the other
+ * outcome branches cannot catch: a peer that ACCEPTS the TCP connection but
+ * never responds (wedged event loop). A closed port already rejects instantly
+ * with connection-refused → http-error; only accepting-but-silent hangs fetch
+ * forever, so without this deadline that fire writes neither an outcome line
+ * nor a summary line, breaking the module's every-fire-is-logged contract. On
+ * expiry the abort throws a TimeoutError, caught below and mapped to http-error
+ * (no new outcome class) — verified against Bun's AbortSignal.timeout.
+ *
+ * Value = 3000 ms. These are localhost POSTs to the machine's own /interject;
+ * healthy responses are sub-millisecond, so 3 s is ~3000× the real latency —
+ * it never trips a merely-slow-but-alive peer, only a true hang.
+ *
+ * MULTI-TARGET INVARIANT (Task 3, t2.he5.eu.4q, must preserve): Task 3 awaits
+ * fire() serially from a once-per-minute (60 s) tick, and fire() POSTs to EVERY
+ * target sequentially even after failures. The worst case is thus every target
+ * wedged: total stall = targets × DEFAULT_DELIVER_TIMEOUT_MS. This must stay
+ * comfortably under the 60 s tick so a wedged peer cannot overlap ticks:
+ *   3 s × 15 targets = 45 s  < 60 s   (generous fan-out, all wedged)
+ * 3 s therefore leaves headroom up to ~19 fully-wedged targets before the
+ * budget approaches the tick period. This is a PER-REQUEST deadline only — it
+ * does NOT bound a fan-out wide enough to blow the tick on its own; if a future
+ * target set can exceed ~19 wedged peers, Task 3 (which owns the tick) must add
+ * a cross-target budget. Do not silently raise this constant to "fix" that: the
+ * arithmetic above is the invariant Task 3's author must not break.
+ */
+const DEFAULT_DELIVER_TIMEOUT_MS = 3000
+
 /** Sentinel for a log field with no channel (pre-per-target failures). */
 const NO_CHANNEL = '-'
 
@@ -70,6 +100,14 @@ export interface CronDispatcherDeps {
    * file's directory (see `resolvePromptPath`), so the dispatcher needs it.
    */
   cronTablePath: string
+  /**
+   * Optional override for the per-request /interject deadline (ms). Defaults to
+   * DEFAULT_DELIVER_TIMEOUT_MS. Exists ONLY so a test can exercise the
+   * accepting-but-silent hang path with a short timeout instead of waiting the
+   * production 3 s. Not a config-file key and not an env var by design — the
+   * production value is pinned as a constant and this seam is test-only.
+   */
+  deliverTimeoutMs?: number
 }
 
 /** The dispatcher handle. Minimal surface: one async delivery method. */
@@ -160,6 +198,7 @@ function outcomeForStatus(status: number): CronOutcome {
  */
 export function createCronDispatcher(deps: CronDispatcherDeps): CronDispatcher {
   const { port, cronLog, cronTablePath } = deps
+  const deliverTimeoutMs = deps.deliverTimeoutMs ?? DEFAULT_DELIVER_TIMEOUT_MS
   const interjectUrl = `http://127.0.0.1:${port}/interject`
 
   /**
@@ -175,8 +214,9 @@ export function createCronDispatcher(deps: CronDispatcherDeps): CronDispatcher {
   /**
    * POST one measured body to /interject and map the result to an outcome +
    * log detail. The MEASURED string IS the POSTed string (measured == sent),
-   * so a 413 cannot occur. A network/fetch failure maps to `http-error` with
-   * the error cause/errno in the detail text.
+   * so a 413 cannot occur. A network/fetch failure — including a deadline abort
+   * (see DEFAULT_DELIVER_TIMEOUT_MS) — maps to `http-error` with the error
+   * cause/errno in the detail text.
    */
   async function deliver(body: string): Promise<{ outcome: CronOutcome; detail: CronLogDetail }> {
     try {
@@ -184,12 +224,30 @@ export function createCronDispatcher(deps: CronDispatcherDeps): CronDispatcher {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body,
+        // Bound an accepting-but-silent peer: on expiry fetch rejects with a
+        // TimeoutError, handled in the catch below as http-error.
+        signal: AbortSignal.timeout(deliverTimeoutMs),
       })
       const outcome = outcomeForStatus(res.status)
+      // We branch on status alone and never read the body; cancel it so the
+      // connection/stream is released rather than left dangling.
+      await res.body?.cancel().catch(() => {
+        /* body already consumed/closed — nothing to release */
+      })
       const detail: CronLogDetail = { status: res.status }
       return { outcome, detail }
     } catch (err) {
-      const errno = err instanceof Error && 'code' in err ? String(err.code) : undefined
+      // A deadline abort throws a DOMException named 'TimeoutError' whose
+      // legacy numeric `code` (23) is opaque in an errno field; prefer the
+      // name so the log line reads `errno=TimeoutError`, mirroring the readable
+      // `errno=ConnectionRefused` a dead port produces. Other fetch failures
+      // keep their `code` (e.g. ConnectionRefused).
+      const errno =
+        err instanceof DOMException && err.name === 'TimeoutError'
+          ? err.name
+          : err instanceof Error && 'code' in err
+            ? String(err.code)
+            : undefined
       const cause = err instanceof Error ? err.message : String(err)
       return { outcome: 'http-error', detail: { errno, text: cause } }
     }
