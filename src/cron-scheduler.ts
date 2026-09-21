@@ -5,10 +5,11 @@
  * `createCronScheduler(deps)` returns a handle whose single self-re-arming
  * timer is the ONLY code path that dispatches cron schedules (decision 8). It
  * loads the crontable exactly once at start(), matches the in-memory schedules
- * against the current wall-clock minute in server-local time, and hands every
- * non-duplicate match for a minute to the dispatcher's group entry point in one
- * call. There are NO per-job timers, ever — a single minute-aligned setTimeout
- * chain re-arms itself after each pass.
+ * against the current wall-clock minute in server-local time, and dispatches
+ * every match for a minute to the dispatcher one schedule at a time, in
+ * crontable line order — plain cron: N same-minute lines produce N separate
+ * fire()s. There are NO per-job timers, ever — a single minute-aligned
+ * setTimeout chain re-arms itself after each pass.
  *
  * Why a self-re-arming setTimeout chain and NOT setInterval: ticks must be
  * serialized (a pass never overlaps the next) so that E3's future crontable
@@ -18,8 +19,12 @@
  *
  * At-most-once is a LOGGED ASSERTION, not the mechanism (decision 8): the
  * minute-aligned single-pass loop already makes a double-fire structurally
- * impossible; the Map<raw line, epoch minute> exists only to catch a scheduler
- * BUG and shout about it. A would-be duplicate is skipped and logged loudly.
+ * impossible; the Map<schedule instance, epoch minute> exists only to catch a
+ * scheduler BUG (the SAME loaded schedule fired twice in one pass) and shout
+ * about it. It is keyed on the compiled-schedule INSTANCE, not raw line text,
+ * so two identical operator lines are two distinct schedules that EACH fire —
+ * plain cron semantics (PD-6). A would-be re-fire of one instance in the same
+ * minute is skipped and logged loudly.
  *
  * Pinned behaviors (do not "fix"):
  *   - Monotonic guard: a pass whose observed minute <= the last-ticked minute
@@ -84,7 +89,7 @@ const REAL_CLOCK: SchedulerClock = {
 
 /** Constructor dependencies for the scheduler. */
 export interface CronSchedulerDeps {
-  /** The dispatcher (Task 2) — its group entry point is the only fire path. */
+  /** The dispatcher (Task 2) — its fire() is the only fire path. */
   dispatcher: CronDispatcher
   /** The cron-log writer handle (Task 1). */
   cronLog: CronLog
@@ -150,10 +155,13 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
   // In-memory table, loaded once at start(), in crontable line order.
   let compiled: CompiledSchedule[] = []
 
-  // At-most-once bookkeeping: raw line text → epoch minute it last fired in.
-  // In-memory only, pruned every tick. A LOGGED ASSERTION (decision 8), not the
-  // dispatch mechanism.
-  const firedAtMinute = new Map<string, number>()
+  // At-most-once bookkeeping: compiled-schedule INSTANCE → epoch minute it last
+  // fired in. In-memory only, pruned every tick. A LOGGED ASSERTION (decision
+  // 8), not the dispatch mechanism. Keyed on the instance (identity), NOT raw
+  // line text, so two identical operator lines are two distinct schedules that
+  // each fire (PD-6) — only the SAME loaded schedule reappearing twice in one
+  // minute is the bug this catches.
+  const firedAtMinute = new Map<CompiledSchedule, number>()
 
   // The single pending timer, and the last minute a pass actually processed
   // (the monotonic guard's high-water mark). -Infinity so the first observed
@@ -311,52 +319,59 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
       lastTickedMinute = observedMinute
 
       // (3) Match every in-memory schedule against that minute in server-local
-      // time, in parse (= crontable line) order so downstream ordering is line
-      // order. An occurrence exists within [minuteStart, minuteStart+60s) iff
-      // the next run at-or-after minuteStart falls before the next minute top.
+      // time, in parse (= crontable line) order so dispatch is line order. An
+      // occurrence exists within [minuteStart, minuteStart+60s) iff the next
+      // run at-or-after minuteStart falls before the next minute top. Each
+      // match is dispatched immediately, one fire() per schedule (plain cron:
+      // N same-minute lines → N separate fires, in line order).
       const windowStart = new Date(minuteStart - 1)
       const windowEndMs = minuteStart + MINUTE_MS
-      const matches: CronSchedule[] = []
-      for (const { schedule, cron } of compiled) {
+      for (const entry of compiled) {
+        const { schedule, cron } = entry
         const occurrence = cron.nextRun(windowStart)
         if (occurrence !== null && occurrence.getTime() < windowEndMs) {
-          // (4) At-most-once assertion, keyed on raw line text + this minute.
-          const already = firedAtMinute.get(schedule.rawLine)
+          // (4) At-most-once assertion, keyed on the compiled-schedule INSTANCE
+          // + this minute. Two identical operator lines are two distinct
+          // `entry` instances, so both fire (PD-6); only the SAME instance
+          // reappearing this minute trips the guard.
+          const already = firedAtMinute.get(entry)
           if (already === observedMinute) {
             // Structurally impossible via the once-per-minute loop; reaching
-            // here is a SCHEDULER BUG, not operator error. Shout and skip. This
+            // here means one loaded schedule fired twice in a single pass — a
+            // SCHEDULER BUG, not operator error (a duplicated line is a
+            // different instance and cannot reach here). Shout and skip. This
             // is an info LINE KIND, not an outcome class — a bug signal must not
             // pollute the 'http-error' network-failure triage view
             // (`grep http-error cron.log`).
             cronLog.info(
               new Date(nowMs).toISOString(),
-              `SCHEDULER BUG: at-most-once violation — line already fired this ` +
-                `minute (minute=${observedMinute}); skipping re-fire. rawLine=${schedule.rawLine}`,
+              `SCHEDULER BUG: at-most-once violation — schedule already fired ` +
+                `this minute (minute=${observedMinute}); skipping re-fire. ` +
+                `rawLine=${schedule.rawLine}`,
               schedule.identity,
               NO_FIELD,
             )
             continue
           }
-          firedAtMinute.set(schedule.rawLine, observedMinute)
-          matches.push(schedule)
-        }
-      }
+          firedAtMinute.set(entry, observedMinute)
 
-      // Hand ALL non-duplicate matches, in line order, to the dispatcher's
-      // group entry point in ONE call. The dispatcher never throws; wrap anyway
-      // (belt-and-braces) so a pass can never kill the timer chain. A minute
-      // with no matches does NOTHING and logs NOTHING.
-      if (matches.length > 0) {
-        try {
-          await dispatcher.fireGroup(matches)
-        } catch (err) {
-          console.error('[slack] cron-scheduler: fireGroup threw (isolated):', err)
+          // Dispatch this one schedule. The dispatcher never throws; wrap
+          // anyway (belt-and-braces, per-schedule isolation) so one bad
+          // schedule can never kill the pass or the timer chain, and siblings
+          // still fire.
+          try {
+            await dispatcher.fire(schedule)
+          } catch (err) {
+            console.error('[slack] cron-scheduler: fire threw (isolated):', err)
+          }
         }
       }
+      // A minute with no matches does NOTHING and logs NOTHING (above loop was
+      // empty of dispatches).
 
       // (5) Prune map entries older than the current minute.
-      for (const [rawLine, minute] of firedAtMinute) {
-        if (minute < observedMinute) firedAtMinute.delete(rawLine)
+      for (const [entry, minute] of firedAtMinute) {
+        if (minute < observedMinute) firedAtMinute.delete(entry)
       }
     } catch (err) {
       // A tick never throws — one loud line, timer chain survives.

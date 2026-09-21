@@ -94,25 +94,20 @@ function makeClock(start: Date): ManualClock {
 }
 
 // ---------------------------------------------------------------------------
-// Recording dispatcher stub — captures fireGroup / fire calls; no HTTP
+// Recording dispatcher stub — captures per-schedule fire() calls; no HTTP.
+// The scheduler dispatches one fire() per matched schedule in crontable line
+// order (plain cron, b.qby revert — there is no fireGroup); fireCalls preserves
+// that dispatch order for order-sensitive assertions.
 // ---------------------------------------------------------------------------
 
 interface RecordingDispatcher extends CronDispatcher {
-  groupCalls: CronSchedule[][]
   fireCalls: CronSchedule[]
 }
 
 function makeDispatcher(): RecordingDispatcher {
-  const groupCalls: CronSchedule[][] = []
   const fireCalls: CronSchedule[] = []
   return {
-    groupCalls,
     fireCalls,
-    async fireGroup(schedules: CronSchedule[]): Promise<void> {
-      // Snapshot the array — the scheduler builds a fresh one each pass, but
-      // copy defensively so later mutation can never rewrite history.
-      groupCalls.push([...schedules])
-    },
     async fire(schedule: CronSchedule): Promise<void> {
       fireCalls.push(schedule)
     },
@@ -247,7 +242,7 @@ describe('cron-scheduler — start()', () => {
 
     // Calling tick() before start() → no compiled schedules → nothing fires.
     await scheduler.tick()
-    expect(dispatcher.groupCalls).toHaveLength(0)
+    expect(dispatcher.fireCalls).toHaveLength(0)
     // And no timer was armed (arm() only runs inside start()).
     expect(clock.pending()).toHaveLength(0)
   })
@@ -307,8 +302,8 @@ describe('cron-scheduler — tick() matching', () => {
 
     await scheduler.tick()
 
-    expect(dispatcher.groupCalls).toHaveLength(1)
-    const fired = dispatcher.groupCalls[0]!.map((s) => s.promptPath)
+    // One fire() per matched schedule — a and c matched, b did not.
+    const fired = dispatcher.fireCalls.map((s) => s.promptPath)
     expect(fired).toEqual(['/p/a.md', '/p/c.md'])
   })
 
@@ -325,15 +320,16 @@ describe('cron-scheduler — tick() matching', () => {
     const logAfterStart = readLog().length
     await scheduler.tick()
 
-    expect(dispatcher.groupCalls).toHaveLength(0)
+    expect(dispatcher.fireCalls).toHaveLength(0)
     // A no-match minute logs NOTHING (the log is unchanged since start()).
     expect(readLog().length).toBe(logAfterStart)
   })
 
-  test('ORDERING: 3+ same-minute matches reach fireGroup in crontable line order', async () => {
+  test('ORDERING: N same-minute matches → N separate fire() calls in crontable line order', async () => {
     const start = new Date('2026-06-15T10:30:00')
     // Four schedules ALL matching this minute, deliberately NOT in path-alpha
     // order, so an accidental sort would reorder and fail this assertion loudly.
+    // Plain cron (b.qby): each match is its own fire(), never grouped.
     writeCrontable(
       line(everyMinute, '/p/zeta.md', 'C1'),
       line(matchAt(start), '/p/alpha.md', 'C2'),
@@ -347,13 +343,40 @@ describe('cron-scheduler — tick() matching', () => {
 
     await scheduler.tick()
 
-    expect(dispatcher.groupCalls).toHaveLength(1)
-    // EXACT crontable line order — not sorted, not reversed.
-    expect(dispatcher.groupCalls[0]!.map((s) => s.promptPath)).toEqual([
+    // Four SEPARATE fire() calls — not one grouped call — in EXACT crontable
+    // line order (not sorted, not reversed).
+    expect(dispatcher.fireCalls).toHaveLength(4)
+    expect(dispatcher.fireCalls.map((s) => s.promptPath)).toEqual([
       '/p/zeta.md',
       '/p/alpha.md',
       '/p/mike.md',
       '/p/bravo.md',
+    ])
+  })
+
+  test('SAME CHANNEL, same minute: N lines → N separate fire() calls (no concatenation)', async () => {
+    const start = new Date('2026-06-15T10:30:00')
+    // Three distinct lines all targeting ONE channel this minute. Under the
+    // reverted concatenation feature these would have been fused into a single
+    // grouped dispatch; plain cron keeps them as three independent fire()s in
+    // line order. This is the scheduler-level anti-regression guard.
+    writeCrontable(
+      line(everyMinute, '/p/one.md', 'C_SHARED'),
+      line(everyMinute, '/p/two.md', 'C_SHARED'),
+      line(everyMinute, '/p/three.md', 'C_SHARED'),
+    )
+    const clock = makeClock(start)
+    const dispatcher = makeDispatcher()
+    const scheduler = build(clock, dispatcher)
+    scheduler.start()
+
+    await scheduler.tick()
+
+    expect(dispatcher.fireCalls).toHaveLength(3)
+    expect(dispatcher.fireCalls.map((s) => s.promptPath)).toEqual([
+      '/p/one.md',
+      '/p/two.md',
+      '/p/three.md',
     ])
   })
 })
@@ -363,7 +386,7 @@ describe('cron-scheduler — tick() matching', () => {
 // ===========================================================================
 
 describe('cron-scheduler — at-most-once', () => {
-  test('two ticks in the same minute fire each line once; duplicate logs a SCHEDULER BUG info line', async () => {
+  test('a single instance fires at most once per minute: two ticks in one minute fire the line once', async () => {
     const start = new Date('2026-06-15T10:30:00')
     writeCrontable(line(everyMinute, '/p/a.md', 'C1'))
     const clock = makeClock(start)
@@ -372,22 +395,21 @@ describe('cron-scheduler — at-most-once', () => {
     scheduler.start()
 
     // A second tick at the SAME minute is stopped by the monotonic guard before
-    // it can even reach the at-most-once map, so a plain re-tick fires nothing
-    // more. That is the observable at-most-once property from the tick seam; the
-    // map itself is exercised directly by the duplicate-line test below.
+    // it can reach the at-most-once map, so a plain re-tick fires nothing more.
+    // That is the observable at-most-once property for a single instance.
     await scheduler.tick()
     await scheduler.tick()
 
-    // Line fired exactly once across the two same-minute ticks.
-    expect(dispatcher.groupCalls).toHaveLength(1)
-    expect(dispatcher.groupCalls[0]!.map((s) => s.promptPath)).toEqual(['/p/a.md'])
+    // The instance fired exactly once across the two same-minute ticks.
+    expect(dispatcher.fireCalls.map((s) => s.promptPath)).toEqual(['/p/a.md'])
   })
 
-  test('at-most-once map suppresses a duplicate raw line within one minute and logs the SCHEDULER BUG signal', async () => {
-    // Two IDENTICAL crontable lines both match this minute. They parse into two
-    // schedules sharing ONE rawLine key, so within a single pass the second is
-    // the duplicate the at-most-once map is built to catch — reaching the bug
-    // branch that the monotonic guard alone cannot exercise.
+  test('PD-6: two IDENTICAL crontable lines are two instances that EACH fire, and log NO SCHEDULER BUG', async () => {
+    // Two byte-identical crontable lines both match this minute. Post-revert the
+    // at-most-once map is keyed on the compiled-schedule INSTANCE, not raw line
+    // text, so these are two distinct instances that BOTH fire (plain cron,
+    // PD-6). The old raw-line-key dedupe (one fire + a perpetual SCHEDULER BUG
+    // line) is exactly the behavior this revert removed.
     const start = new Date('2026-06-15T10:30:00')
     const dupLine = line(everyMinute, '/p/a.md', 'C1')
     writeCrontable(dupLine, dupLine)
@@ -405,51 +427,46 @@ describe('cron-scheduler — at-most-once', () => {
 
     await scheduler.tick()
 
-    // The duplicate raw line was skipped: exactly ONE copy reached fireGroup.
-    expect(dispatcher.groupCalls).toHaveLength(1)
-    expect(dispatcher.groupCalls[0]!.map((s) => s.promptPath)).toEqual(['/p/a.md'])
+    // BOTH duplicate instances fired — two separate fire() calls for /p/a.md.
+    expect(dispatcher.fireCalls.map((s) => s.promptPath)).toEqual(['/p/a.md', '/p/a.md'])
 
-    // The suppressed duplicate produced the loud bug-signal INFO line. Assert on
-    // fields/prefix, not prose: it is an info LINE KIND (not an outcome class),
-    // carries the schedule identity, and channel '-'.
-    const bug = records.find((r) => r.kind === 'info' && r.text?.startsWith('SCHEDULER BUG: at-most-once violation'))
-    expect(bug).toBeDefined()
-    expect(bug!.identity).toBe('cscb-cron:a')
-    expect(bug!.channel).toBe('-')
+    // The operator's legitimate duplicate line must NOT be mislabelled a bug: no
+    // SCHEDULER BUG info line is logged for this case.
+    const bug = records.find(
+      (r) => r.kind === 'info' && r.text?.startsWith('SCHEDULER BUG: at-most-once violation'),
+    )
+    expect(bug).toBeUndefined()
   })
 })
 
 // ===========================================================================
-// Dispatcher failure isolation — a rejecting fireGroup must not break the tick
+// Dispatcher failure isolation — a rejecting fire() must not break the tick
 // ===========================================================================
 
 describe('cron-scheduler — dispatcher error isolation', () => {
-  test('fireGroup REJECTS → tick() resolves, minute is recorded (no same-minute re-dispatch), next minute still fires', async () => {
+  test('fire() REJECTS → tick() resolves, minute is recorded (no same-minute re-dispatch), next minute still fires', async () => {
     const start = new Date('2026-06-15T10:30:00')
     writeCrontable(line(everyMinute, '/p/a.md', 'C1'))
     const clock = makeClock(start)
 
-    // A dispatcher whose fireGroup rejects on every call, while still recording
-    // the attempt so we can count dispatch attempts across minutes.
-    const attempts: CronSchedule[][] = []
+    // A dispatcher whose fire() rejects on every call, while still recording the
+    // attempt so we can count dispatch attempts across minutes.
+    const attempts: CronSchedule[] = []
     const rejectingDispatcher: CronDispatcher = {
-      async fireGroup(schedules: CronSchedule[]): Promise<void> {
-        attempts.push([...schedules])
+      async fire(schedule: CronSchedule): Promise<void> {
+        attempts.push(schedule)
         throw new Error('dispatcher boom')
-      },
-      async fire(): Promise<void> {
-        throw new Error('unused')
       },
     }
     const scheduler = build(clock, rejectingDispatcher)
     scheduler.start()
 
-    // tick() must resolve, never reject, even though fireGroup threw.
+    // tick() must resolve, never reject, even though fire() threw.
     await expect(scheduler.tick()).resolves.toBeUndefined()
     expect(attempts).toHaveLength(1)
 
     // Same minute again: the at-most-once map already recorded this minute for
-    // the line, and the monotonic guard skips the whole pass → no re-dispatch.
+    // the instance, and the monotonic guard skips the whole pass → no re-dispatch.
     await expect(scheduler.tick()).resolves.toBeUndefined()
     expect(attempts).toHaveLength(1)
 
@@ -458,7 +475,35 @@ describe('cron-scheduler — dispatcher error isolation', () => {
     clock.advanceMinutes(1)
     await expect(scheduler.tick()).resolves.toBeUndefined()
     expect(attempts).toHaveLength(2)
-    expect(attempts[1]!.map((s) => s.promptPath)).toEqual(['/p/a.md'])
+    expect(attempts[1]!.promptPath).toBe('/p/a.md')
+  })
+
+  test('per-schedule isolation: one throwing fire() does not stop later same-minute schedules', async () => {
+    const start = new Date('2026-06-15T10:30:00')
+    // Three lines all match this minute; the MIDDLE one's fire() throws. The
+    // first and third must still be dispatched (per-schedule try/catch).
+    writeCrontable(
+      line(everyMinute, '/p/first.md', 'C1'),
+      line(everyMinute, '/p/boom.md', 'C2'),
+      line(everyMinute, '/p/third.md', 'C3'),
+    )
+    const clock = makeClock(start)
+
+    const attempts: string[] = []
+    const flakyDispatcher: CronDispatcher = {
+      async fire(schedule: CronSchedule): Promise<void> {
+        attempts.push(schedule.promptPath)
+        if (schedule.promptPath === '/p/boom.md') throw new Error('dispatcher boom')
+      },
+    }
+    const scheduler = build(clock, flakyDispatcher)
+    scheduler.start()
+
+    await expect(scheduler.tick()).resolves.toBeUndefined()
+
+    // All three were attempted in line order — the middle throw did not abort the
+    // pass or skip the third schedule.
+    expect(attempts).toEqual(['/p/first.md', '/p/boom.md', '/p/third.md'])
   })
 })
 
@@ -478,11 +523,11 @@ describe('cron-scheduler — monotonic guard and no catch-up', () => {
     scheduler.start()
 
     await scheduler.tick() // minute M fires
-    expect(dispatcher.groupCalls).toHaveLength(1)
+    expect(dispatcher.fireCalls).toHaveLength(1)
 
     clock.set(mMinusOne) // backwards clock jump
     await scheduler.tick() // whole pass skipped by the monotonic guard
-    expect(dispatcher.groupCalls).toHaveLength(1) // still just the one
+    expect(dispatcher.fireCalls).toHaveLength(1) // still just the one
   })
 
   test('fires again once the clock passes M', async () => {
@@ -499,7 +544,7 @@ describe('cron-scheduler — monotonic guard and no catch-up', () => {
     clock.set(new Date(m.getTime() + 60_000))
     await scheduler.tick() // M+1: passes the guard, fires again
 
-    expect(dispatcher.groupCalls).toHaveLength(2)
+    expect(dispatcher.fireCalls).toHaveLength(2)
   })
 
   test('NO catch-up: advancing several minutes between ticks fires nothing for skipped minutes and logs nothing about them', async () => {
@@ -511,18 +556,17 @@ describe('cron-scheduler — monotonic guard and no catch-up', () => {
     scheduler.start()
 
     await scheduler.tick() // minute 30 fires once
-    expect(dispatcher.groupCalls).toHaveLength(1)
+    expect(dispatcher.fireCalls).toHaveLength(1)
 
     const logBefore = readLog().length
     // Jump forward FIVE minutes without ticking the intervening ones.
     clock.advanceMinutes(5)
     await scheduler.tick() // minute 35 fires ONCE — no catch-up for 31..34
 
-    // Exactly one more dispatch (for minute 35), not five.
-    expect(dispatcher.groupCalls).toHaveLength(2)
-    // Each dispatch carried exactly the one matching schedule (single fire, not
-    // a batched catch-up of skipped minutes).
-    expect(dispatcher.groupCalls[1]!.map((s) => s.promptPath)).toEqual(['/p/a.md'])
+    // Exactly one more dispatch (for minute 35), not five — two fire()s total
+    // across both ticked minutes, not a batched catch-up of skipped minutes.
+    expect(dispatcher.fireCalls).toHaveLength(2)
+    expect(dispatcher.fireCalls.map((s) => s.promptPath)).toEqual(['/p/a.md', '/p/a.md'])
     // The skipped minutes 31..34 logged nothing about themselves: the log grew
     // only by nothing here (no-match logs nothing, and a match's dispatch is
     // logged by the dispatcher, which is stubbed → scheduler itself appends no
@@ -555,9 +599,9 @@ describe('cron-scheduler — delayed tick past a minute boundary', () => {
 
     await scheduler.tick()
 
-    expect(dispatcher.groupCalls).toHaveLength(1)
+    expect(dispatcher.fireCalls).toHaveLength(1)
     // Only the observed-minute schedule; the next-minute one is not swept in.
-    expect(dispatcher.groupCalls[0]!.map((s) => s.promptPath)).toEqual(['/p/now.md'])
+    expect(dispatcher.fireCalls.map((s) => s.promptPath)).toEqual(['/p/now.md'])
   })
 })
 
@@ -614,8 +658,8 @@ describe('cron-scheduler — production timer chain', () => {
     await Promise.resolve()
 
     // Exactly one dispatch happened for the fired minute.
-    expect(dispatcher.groupCalls).toHaveLength(1)
-    expect(dispatcher.groupCalls[0]!.map((s) => s.promptPath)).toEqual(['/p/a.md'])
+    expect(dispatcher.fireCalls).toHaveLength(1)
+    expect(dispatcher.fireCalls.map((s) => s.promptPath)).toEqual(['/p/a.md'])
 
     // The chain re-armed exactly ONE new timer, minute-aligned to the next
     // minute top (fired at :00, so a full 60s away).
@@ -645,7 +689,7 @@ describe('cron-scheduler — production timer chain', () => {
     await Promise.resolve()
 
     // The pass still dispatched (it was already in flight)...
-    expect(dispatcher.groupCalls).toHaveLength(1)
+    expect(dispatcher.fireCalls).toHaveLength(1)
     // ...but the chain did NOT re-arm: fireDueTimer cleared the fired timer and
     // the stopped guard suppressed a new one, so no timer is live.
     expect(clock.live()).toHaveLength(0)
