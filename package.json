@@ -33,6 +33,7 @@
     "@slack/socket-mode": "^2.0.0",
     "@slack/web-api": "^7.0.0",
     "agent-director": "^0.8.0",
+    "croner": "^10.0.1",
     "semver": "^7.6.0"
   },
   "devDependencies": {
