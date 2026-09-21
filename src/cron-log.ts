@@ -66,7 +66,7 @@ export type CronOutcome =
   | 'parse-error'
   /** Belt-and-braces class for an unexpected HTTP status (503→no-session and 404→unknown-channel are handled separately) or a network failure on the localhost POST. */
   | 'http-error'
-  /** All-bots fan-out not yet enabled — fire skipped (retired emission). */
+  /** All-bots fire skipped while fan-out remains deferred to E4 — emitted by the cron dispatcher. */
   | 'fanout-deferred'
 
 /**
