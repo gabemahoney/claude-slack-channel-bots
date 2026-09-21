@@ -8,7 +8,19 @@
 # bug's fix lived only on an unmerged branch for months while main kept the
 # bug). This script is the cheap enforcement half of the guardrail.
 #
-# For every `finished` bee in the Bugs and Plans hives it flags:
+# For every `finished` bee in the Bugs, Plans, AND Ideas (top-level) hives it
+# flags:
+#
+# DECISION (b.dw7): idea-hive top-level bees ARE held to the same standard as
+# Bugs and Plans. An idea can legitimately be "finished" by being absorbed into
+# an Epic/plan that landed — but that is exactly what the branch-(b) closure
+# vocabulary already expresses ("fully satisfied by <plan>", "superseded by
+# <id>", with a pointer). Absorption is therefore not a reason to exempt the
+# hive; it is only a reason the closure note is easy to write. Exempting Ideas/
+# would make the b.qps failure mode (finished, nothing on main, no stated
+# reason) permanently invisible in the one location where it actually occurred
+# seven times. Scope is a stated decision, not an accident of which paths got
+# hard-coded.
 #
 #   * STRANDED TICKET — a finished ticket whose work is NOT reachable from main
 #     (no genuine, non-disclaiming commit references its id, and its title does
@@ -34,7 +46,7 @@
 #
 # Usage:  scripts/audit-finished-tickets.sh [REPO_ROOT]
 #   REPO_ROOT   git repo whose `main` and branches are inspected.
-#               Defaults to the main checkout that owns the Bugs/Plans hives
+#               Defaults to the main checkout that owns the Bugs/Plans/Ideas hives
 #               (derived from this script's own location). Pass a path to
 #               audit a different clone/worktree read-only.
 #
@@ -83,11 +95,17 @@ PROJECT_DIR="$(cd "${REPO_OF_SCRIPT}/.." && pwd)"
 
 BUGS_HIVE="${PROJECT_DIR}/Bugs"
 PLANS_HIVE="${PROJECT_DIR}/Ideas/Plans"
+# Ideas top-level bees (b.dw7): the Ideas hive root itself, holding bee tickets
+# at Ideas/<id>/. Distinct from PLANS_HIVE (Ideas/Plans/), which the Plans pass
+# already covers; the Ideas pass skips that subdirectory so nothing is
+# double-reported.
+IDEAS_HIVE="${PROJECT_DIR}/Ideas"
 
-if [ ! -d "${BUGS_HIVE}" ] || [ ! -d "${PLANS_HIVE}" ]; then
+if [ ! -d "${BUGS_HIVE}" ] || [ ! -d "${PLANS_HIVE}" ] || [ ! -d "${IDEAS_HIVE}" ]; then
   echo "audit-finished-tickets: could not locate hives. Expected:" >&2
   echo "  Bugs  hive at ${BUGS_HIVE}" >&2
   echo "  Plans hive at ${PLANS_HIVE}" >&2
+  echo "  Ideas hive at ${IDEAS_HIVE}" >&2
   echo "Derived project dir '${PROJECT_DIR}' from script location '${SCRIPT_DIR}'." >&2
   echo "This script must live in scripts/ of a repo checked out beside the hives." >&2
   exit 2
@@ -299,7 +317,10 @@ has_docs_only_marker() {
 #   (a) out-of-repo resolution — a ~/ path (startup/.claude/.agent-director)
 #       CONNECTED to fix/resolution language (same line or same closure
 #       section; see out_of_repo_fix_connected), or
-#   (b) an explicit no-repro / superseded / abandoned closure note, or
+#   (b) an explicit no-repro / not-reproducible / cannot-reproduce / wont-fix /
+#       "closed as superseded|abandoned" / "superseded by" / "fully satisfied by"
+#       / "already satisfied" closure note (the b.fta satisfied-by-other-work
+#       vocabulary; see the pattern at branch (b) below), or
 #   (c) an explicit documents-only, outside-the-repo-tree closure marker
 #       (`## +closed:docs-only`; see has_docs_only_marker) — for tickets whose
 #       product is markdown/docs living outside any git repo.
@@ -359,12 +380,20 @@ has_closure_marker() {
 # ---------------------------------------------------------------------------
 STRANDED_TICKETS=()
 
+# audit_hive <hive> <hive_label> [skip_subdir]
+# Optional third arg names a subdirectory basename to skip (b.dw7): the Ideas
+# pass passes "Plans" so Ideas/Plans/ is not re-audited by both the Plans pass
+# and the Ideas pass. Not relied upon by accident — Ideas/Plans/Plans.md does
+# not exist so audit_hive would skip it anyway — but the skip is explicit so
+# scope is a stated decision.
 audit_hive() {
-  local hive="$1" hive_label="$2"
+  local hive="$1" hive_label="$2" skip_subdir="${3:-}"
   local d id status base file
   for d in "${hive}"/*/; do
     [ -d "${d}" ] || continue
     id="$(basename "${d}")"
+    # Explicit no-double-report guard (b.dw7): skip the named subdir hive.
+    [ -n "${skip_subdir}" ] && [ "${id}" = "${skip_subdir}" ] && continue
     file="${d}${id}.md"
     [ -f "${file}" ] || continue
 
@@ -397,6 +426,9 @@ audit_hive() {
 
 audit_hive "${BUGS_HIVE}"  "Bugs"
 audit_hive "${PLANS_HIVE}" "Plans"
+# b.dw7: Ideas top-level bees, skipping the Plans/ subdirectory already covered
+# by the Plans pass above.
+audit_hive "${IDEAS_HIVE}" "Ideas" "Plans"
 
 # ---------------------------------------------------------------------------
 # Pass 2 — stranded branches.
@@ -404,11 +436,18 @@ audit_hive "${PLANS_HIVE}" "Plans"
 # Build a lookup of every finished ticket's base component.
 declare -A FINISHED_BASES=()
 declare -A ID_STATUS=()
+# collect_statuses <hive> [skip_subdir]
+# Optional skip_subdir (b.dw7): same no-double-count guard as audit_hive. The
+# Ideas pass passes "Plans" so Ideas/Plans/ statuses are collected once (by the
+# Plans call), not twice. Explicit rather than relying on Ideas/Plans/Plans.md
+# being absent. Ideas/index.md is a file, not a dir, so the [ -d ] check already
+# skips it.
 collect_statuses() {
-  local hive="$1" d id status id_key
+  local hive="$1" skip_subdir="${2:-}" d id status id_key
   for d in "${hive}"/*/; do
     [ -d "${d}" ] || continue
     id="$(basename "${d}")"
+    [ -n "${skip_subdir}" ] && [ "${id}" = "${skip_subdir}" ] && continue
     [ -f "${d}${id}.md" ] || continue
     status="$(frontmatter_field "${d}${id}.md" status)"
     # Key ID_STATUS by the lowercased id so the branch-side lookup — which uses
@@ -422,6 +461,10 @@ collect_statuses() {
 }
 collect_statuses "${BUGS_HIVE}"
 collect_statuses "${PLANS_HIVE}"
+# b.dw7: Ideas top-level tickets so a branch referencing a finished Ideas ticket
+# is reconciled (previously tstatus="" ⇒ silently skipped). Skip Plans/ (already
+# collected by the Plans call).
+collect_statuses "${IDEAS_HIVE}" "Plans"
 
 STRANDED_BRANCHES=()
 
@@ -479,6 +522,7 @@ echo "=== Finished-ticket reconciliation audit ==="
 echo "Repo under audit : ${REPO_ROOT}"
 echo "Bugs hive        : ${BUGS_HIVE}"
 echo "Plans hive       : ${PLANS_HIVE}"
+echo "Ideas hive       : ${IDEAS_HIVE}"
 echo
 
 FOUND=0
