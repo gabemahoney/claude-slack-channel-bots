@@ -54,6 +54,13 @@ const SCRIPT_SRC = fileURLToPath(
   new URL('../scripts/audit-finished-tickets.sh', import.meta.url),
 )
 
+/**
+ * Absolute path to this worktree's repo root (the checkout that holds the
+ * post-fix script in its working tree and the PRE-fix script at git HEAD). Used
+ * only by the regression-proof test to recover the committed pre-fix source.
+ */
+const WORKTREE_ROOT = fileURLToPath(new URL('..', import.meta.url))
+
 const cleanups: Array<() => void> = []
 afterEach(() => {
   while (cleanups.length) cleanups.pop()!()
@@ -183,6 +190,29 @@ interface RunResult {
   status: number | null
   stdout: string
   stderr: string
+}
+
+/**
+ * A ticket body mirroring the b.tso defect-2 shape: a ~/ path quoted ONLY in an
+ * unrelated anchor-table evidence row (describing where the server keeps state),
+ * with fix/resolution language present ELSEWHERE in the body but never connected
+ * to the path — no same-line pairing and no closure section around the path.
+ * The pre-fix heuristic laundered this as an out-of-repo closure; the tightened
+ * one must not. Used by both the fixture-run test and the direct regression
+ * proof so they exercise byte-identical input.
+ */
+function incidentalPathBody(): string {
+  return (
+    '# anchor refresh over the b.4vj docs\n\n' +
+    '## Anchor table\n\n' +
+    '| doc anchor | code anchor | note |\n' +
+    '| --- | --- | --- |\n' +
+    '| PRD `:53` | `src/server.ts:148` | the state directory `~/.claude/channels/slack/` |\n\n' +
+    '## Notes\n\n' +
+    'This resolved the wording; the resolution is a proposed fix to the prose.\n' +
+    'No out-of-repo product was touched — the ~/ path above is only evidence of\n' +
+    'where the running server keeps its state, quoted from the PRD.\n'
+  )
 }
 
 /** Run the (copied) audit script against the fixture repo. */
@@ -412,6 +442,332 @@ describe('audit-finished-tickets.sh — landed vs stranded finished tickets', ()
     const r = runAudit(fx)
     expect(r.stdout).toContain('b.dsc')
     expect(r.status).not.toBe(0)
+  })
+})
+
+describe('audit-finished-tickets.sh — documents-only closure marker (b.zjm defect 1)', () => {
+  // AC 1: a documents-only ticket whose product lives outside any git repo,
+  // carrying the explicit `## +closed:docs-only` marker, has no main commit but
+  // is a legitimate closure — NOT stranded.
+  test('finished ticket with `## +closed:docs-only` marker and no main commit → not flagged', () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.doc',
+          hive: 'Bugs',
+          status: 'finished',
+          body:
+            '# wording pass over the b.4vj PRD/SRD\n\n' +
+            'Refreshed the Apiary ticket markdown under `Ideas/b.4vj/…`. The\n' +
+            'project root is not a git repo, so no commit on main can land this.\n\n' +
+            '## +closed:docs-only\n\n' +
+            'Product is documents outside any git repository.\n',
+        },
+      ],
+      // no commit references b.doc
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).not.toContain('b.doc')
+    expect(r.status).toBe(0)
+  })
+
+  // AC 2: the docs-only marker is STILL disqualified by has_anti_marker — a body
+  // that claims documents-only AND "pending merge"/"fixed on branch b.x" is
+  // stranded work, not a closure. The body also QUOTES a ~/ path in the marker
+  // section's prose: this additionally proves the (a)-section exclusion, since the
+  // anti-marker forces has_closure_marker to bail before EITHER the (c) docs-only
+  // branch or an (a) out-of-repo branch could fire — neither the marker heading
+  // nor the quoted path may launder it.
+  test.each([
+    ['pending merge', 'The fix is pending merge/release.'],
+    ['fixed on branch b.x', 'Also fixed on branch b.zzz.'],
+  ])(
+    '`## +closed:docs-only` + quoted ~/ path + anti-marker (%s) → still flagged',
+    (_label, antiLine) => {
+      const fx = makeFixture({
+        tickets: [
+          {
+            id: 'b.dam',
+            hive: 'Bugs',
+            status: 'finished',
+            body:
+              '# documents-only closure\n\n' +
+              '## +closed:docs-only\n\n' +
+              'Product is documents outside any git repository; state lives in\n' +
+              '`~/.claude/channels/slack/`, quoted only as evidence.\n' +
+              `${antiLine}\n`,
+          },
+        ],
+      })
+      const r = runAudit(fx)
+      expect(r.stdout).toContain('b.dam')
+      expect(r.status).not.toBe(0)
+    },
+  )
+
+  // AC 4: the docs-only class must pass EVEN for the b.tso incidental-path shape.
+  // A body that quotes a ~/ path in an unrelated evidence row with fix-ish
+  // language elsewhere (incidentalPathBody — the exact shape the tightened
+  // out-of-repo heuristic now REJECTS as an (a)-closure) is nonetheless a
+  // legitimate closure when it also carries the explicit `## +closed:docs-only`
+  // marker. This proves the docs-only marker is evaluated FIRST and that the
+  // marker heading does not itself open an (a)-section around the quoted path —
+  // the ticket passes for the right reason (the marker), not incidentally.
+  test('`## +closed:docs-only` marker + b.tso incidental-path body → not flagged (docs-only class)', () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.tso',
+          hive: 'Bugs',
+          status: 'finished',
+          body: incidentalPathBody() + '\n## +closed:docs-only\n\nProduct is documents outside any git repository.\n',
+        },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).not.toContain('b.tso')
+    expect(r.status).toBe(0)
+  })
+
+  // The marker must be the explicit heading, not loose prose. A body that only
+  // says "documents only" / "docs-only" in ordinary text does NOT match, so a
+  // genuinely stranded docs ticket without the deliberate heading stays flagged.
+  test('loose "docs-only" prose (no `## +closed:docs-only` heading) → still flagged', () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.los',
+          hive: 'Bugs',
+          status: 'finished',
+          body:
+            '# a docs-only change\n\n' +
+            'This was documents only; a docs-only wording pass, nothing more.\n',
+        },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).toContain('b.los')
+    expect(r.stdout).toContain('no commit on main lands it')
+    expect(r.status).not.toBe(0)
+  })
+})
+
+describe('audit-finished-tickets.sh — tightened out-of-repo heuristic (b.zjm defect 2)', () => {
+  // AC 5 / regression for defect 2: a finished ticket that merely QUOTES a ~/
+  // path in an unrelated evidence line (an anchor-table row, mirroring b.tso),
+  // with fix-ish language elsewhere in the body but no genuine connected
+  // closure, IS stranded. The pre-fix script paired any ~/ path anywhere with
+  // fix language anywhere and laundered this as an out-of-repo closure; the
+  // tightened heuristic requires the two to be connected (same line or same
+  // closure section), so it is now correctly flagged.
+  //
+  // Regression property verified out-of-band: this exact fixture body run
+  // through the pre-fix script (git show HEAD:scripts/audit-finished-tickets.sh)
+  // exits 0 / NOT flagged, and through the post-fix script exits 1 / flagged.
+  // See the "PRE-FIX REGRESSION PROOF" test below which asserts both directly.
+  test('~/ path in an unrelated anchor-table row + fix language elsewhere, no connected closure → flagged', () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.inc',
+          hive: 'Bugs',
+          status: 'finished',
+          body: incidentalPathBody(),
+        },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).toContain('b.inc')
+    expect(r.stdout).toContain('no commit on main lands it')
+    expect(r.status).not.toBe(0)
+  })
+
+  // Positive case for the tightened branch (a), isolating the SAME-LINE rule (i):
+  // when the ~/ path and the fix language are connected on the same line the
+  // out-of-repo closure is recognized and the ticket is NOT flagged. The heading
+  // is deliberately NEUTRAL ("# background notes") so it opens no closure section
+  // — if rule (i) regressed, the section rule (ii) could not silently rescue this
+  // ticket, and it would flag. This isolates rule (i) rather than duplicating the
+  // b.ccc test (whose `# out of repo fix` heading opens a section via rule ii).
+  test('~/ path + fix language on the SAME line (neutral heading) → recognized closure, not flagged', () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.sam',
+          hive: 'Bugs',
+          status: 'finished',
+          body:
+            '# background notes\n\n' +
+            '**Fix (2026-09-19):** `~/startup/start-all.sh` now resolved outside this repo.\n',
+        },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).not.toContain('b.sam')
+    expect(r.status).toBe(0)
+  })
+
+  // Positive case, section variant isolating the SECTION rule (ii): the ~/ path
+  // lives inside a recognized closure/fix SECTION (its `## Fix` heading names the
+  // fix), which is the shape of the genuine out-of-repo closures
+  // (b.mk7/b.mp5/b.s3x/b.xx7). The path line itself carries NO resolution
+  // vocabulary ("Lives in … outside any repo."), so it cannot trip the same-line
+  // rule (i) — only the surrounding section can excuse it. This isolates rule (ii)
+  // rather than passing incidentally via rule (i).
+  test('~/ path inside a `## Fix` closure section (path line has no fix words) → recognized closure, not flagged', () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.sec',
+          hive: 'Bugs',
+          status: 'finished',
+          body:
+            '# some out of repo work\n\n' +
+            'Background prose with no path here.\n\n' +
+            '## Fix\n\n' +
+            'Lives in `~/.agent-director/config`, outside any repo.\n',
+        },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).not.toContain('b.sec')
+    expect(r.status).toBe(0)
+  })
+
+  // Guard for the code-fence handling in out_of_repo_fix_connected: a fenced
+  // `# heading` sample must NOT open a closure section around a bare ~/ path.
+  // Here the only ~/ path sits in an unrelated evidence row and the sole
+  // "heading" that could open a fix section is inside a ``` code fence, so no
+  // genuine connection exists → the ticket stays flagged.
+  test('fenced `# Fix` sample does not open a closure section around an incidental ~/ path → flagged', () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.fen',
+          hive: 'Bugs',
+          status: 'finished',
+          body:
+            '# investigation notes\n\n' +
+            '| anchor | file | note |\n' +
+            '| --- | --- | --- |\n' +
+            '| PRD `:53` | `src/server.ts:148` | state dir `~/.claude/channels/slack/` |\n\n' +
+            'Example of the heading style we use in closures:\n\n' +
+            '```md\n' +
+            '## Fix\n' +
+            'resolution goes here\n' +
+            '```\n\n' +
+            'No genuine closure was written for this ticket.\n',
+        },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).toContain('b.fen')
+    expect(r.status).not.toBe(0)
+  })
+
+  // Word-boundary guard for the round-2 section-keyword change: section-opening
+  // keywords must match as WHOLE words on non-alnum boundaries, so a heading
+  // whose text merely CONTAINS "fix"/"resolv" as a substring — "Prefix routing",
+  // "Unfixed items", "Resolver notes" — must NOT open a closure section. Here the
+  // only ~/ path sits under such a heading, with fix-ish language present
+  // ELSEWHERE (an unconnected line), and no same-line pairing. Neither rule (i)
+  // nor rule (ii) may excuse it → still flagged.
+  test.each([
+    '## Prefix routing',
+    '## Unfixed items',
+    '## Resolver notes',
+  ])(
+    'substring-only heading %s does not open a closure section around a ~/ path → flagged',
+    (heading) => {
+      const fx = makeFixture({
+        tickets: [
+          {
+            id: 'b.wbd',
+            hive: 'Bugs',
+            status: 'finished',
+            body:
+              '# investigation notes\n\n' +
+              'A genuine fix was proposed but never connected to any path.\n\n' +
+              `${heading}\n\n` +
+              'State lives in `~/.claude/channels/slack/`, quoted here as evidence.\n',
+          },
+        ],
+      })
+      const r = runAudit(fx)
+      expect(r.stdout).toContain('b.wbd')
+      expect(r.stdout).toContain('no commit on main lands it')
+      expect(r.status).not.toBe(0)
+    },
+  )
+
+  // PRE-FIX REGRESSION PROOF. Directly demonstrates the AC-5 property: the SAME
+  // incidental-path body is laundered (exit 0, not flagged) by the PRE-FIX
+  // script and correctly flagged (exit non-zero) by the POST-FIX script. The
+  // pre-fix script is recovered from an IMMUTABLE pinned commit (5522f1b, the
+  // mainline commit immediately before this fix, permanently in repo history),
+  // so this asserts the behavioral change rather than merely asserting the
+  // post-fix behavior. Pinning to a fixed SHA (rather than HEAD) keeps the proof
+  // valid after the fix is committed — HEAD would then point at the post-fix
+  // script and vacuously break the comparison. The two sanity `not.toContain`
+  // assertions below guard against a vacuous proof: they confirm the recovered
+  // source truly is the OLD form. If the pinned commit is unreachable (shallow /
+  // partial clone), git show fails and the test fails loudly — never a silent pass.
+  test('the tightened heuristic CHANGES the verdict: pre-fix launders, post-fix flags [regression proof]', () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.inc',
+          hive: 'Bugs',
+          status: 'finished',
+          title: 'anchor refresh',
+          body: incidentalPathBody(),
+        },
+      ],
+    })
+
+    // Recover the genuine PRE-fix script from the immutable pinned commit
+    // (5522f1b) rather than HEAD: once this fix is committed HEAD would carry the
+    // post-fix script, so HEAD-relative recovery is a time bomb. Drop it beside
+    // the post-fix copy inside the SAME fixture project so both resolve identical
+    // hive paths and audit the same scratch git history.
+    const realPreFix = spawnSync(
+      'git',
+      ['show', '5522f1b:scripts/audit-finished-tickets.sh'],
+      { cwd: WORKTREE_ROOT, encoding: 'utf8' },
+    )
+    // Fail loudly if the pinned commit is unreachable (e.g. shallow / partial
+    // clone) — do NOT silently pass.
+    expect(
+      realPreFix.status,
+      'could not recover pre-fix script from pinned commit 5522f1b (shallow clone?)',
+    ).toBe(0)
+    // Sanity: the recovered pre-fix source must be the OLD form (no docs-only
+    // marker, uses the two independent greps), else the proof is vacuous. Against
+    // the pinned SHA these hold forever regardless of HEAD.
+    expect(realPreFix.stdout).not.toContain('out_of_repo_fix_connected')
+    expect(realPreFix.stdout).not.toContain('+closed:docs-only')
+
+    const preFixScript = join(fx.repo, 'scripts', 'audit-prefix.sh')
+    writeFileSync(preFixScript, realPreFix.stdout)
+
+    // The incidental-path body was written onto the fixture ticket by
+    // makeFixture (body: incidentalPathBody()), so both scripts audit the same
+    // ticket markdown — no hand-rolled frontmatter duplicating makeFixture.
+
+    // Pre-fix: the two-independent-greps heuristic launders the incidental path
+    // → b.inc NOT flagged, exit 0 (clean).
+    const pre = spawnSync('bash', [preFixScript, fx.repo], {
+      encoding: 'utf8',
+      env: { ...process.env },
+    })
+    expect(pre.stdout).not.toContain('b.inc')
+    expect(pre.status).toBe(0)
+
+    // Post-fix (the working-tree script the fixture copied in): connected
+    // heuristic rejects the incidental path → b.inc flagged, exit non-zero.
+    const post = runAudit(fx)
+    expect(post.stdout).toContain('b.inc')
+    expect(post.status).not.toBe(0)
   })
 })
 

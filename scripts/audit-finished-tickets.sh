@@ -13,10 +13,14 @@
 #   * STRANDED TICKET — a finished ticket whose work is NOT reachable from main
 #     (no genuine, non-disclaiming commit references its id, and its title does
 #     not match a main commit subject) AND whose body carries no recognized
-#     closure marker (out-of-repo fix naming a ~/ path + fix language, or an
-#     explicit no-repro / superseded / abandoned note). A body that says the
-#     fix is "pending merge/release" or "fixed on branch X" is treated as an
-#     ANTI-marker — that is exactly the invalid finished state this guards.
+#     closure marker: an out-of-repo fix naming a ~/ path CONNECTED to fix
+#     language (same line or same closure section), an explicit no-repro /
+#     superseded / abandoned note, or the explicit documents-only
+#     `## +closed:docs-only` marker (product lives outside any git repo, so no
+#     main commit is possible). A body that says the fix is "pending
+#     merge/release" or "fixed on branch X" is treated as an ANTI-marker — that
+#     is exactly the invalid finished state this guards, and it disqualifies
+#     every closure marker above.
 #
 #   * STRANDED BRANCH — any local/remote branch whose name references a
 #     `finished` ticket id but whose head is NOT an ancestor of main; plus any
@@ -37,13 +41,26 @@
 #
 # ============================ CALIBRATION NOTE ============================
 # On today's repo this script EXITS NON-ZERO BY DESIGN, and that is NOT a bug
-# in this script. Stranded finished tickets are clean (none). The remaining
-# debt is one class of finding: a stranded remote branch whose resolution
-# requires a push and is therefore reserved for the repo owner — currently
-# `origin/no-channels`, tracked on ticket b.gkz and pending the owner's
-# decision. A non-zero exit is the correct, expected result until b.gkz lands.
-# Do NOT re-list findings here; the script's own output is the inventory, and
-# the tracking ticket is the source of truth for what is expected vs. new.
+# in this script. Read its output by finding CLASS, not by ticket id:
+#
+#   * Stranded finished tickets. A finished ticket is expected to be excused by
+#     exactly one of: a genuine main commit (id-referencing or title-matching),
+#     an out-of-repo fix whose ~/ path is connected to its resolution claim, an
+#     explicit no-repro/superseded/abandoned note, or the documents-only
+#     `## +closed:docs-only` marker for work whose product lives outside any git
+#     repo. A finished ticket matching none of these is a real finding. Note the
+#     documents-only class exists because the project root itself is not a git
+#     repo — Apiary ticket markdown there can be legitimately finished with no
+#     main commit possible.
+#
+#   * Stranded branches. The remaining expected debt is one branch whose
+#     resolution requires a push and is therefore reserved for the repo owner —
+#     tracked on ticket b.gkz. A non-zero exit is the correct, expected result
+#     until b.gkz lands.
+#
+# Do NOT re-list findings here (naming the tracking ticket b.gkz for the
+# push-class is the standing exception): the script's own output is the
+# inventory, and the tracking ticket is the source of truth for expected vs new.
 # =========================================================================
 
 set -euo pipefail
@@ -192,20 +209,118 @@ has_anti_marker() {
   grep -qiE 'pending[ -]?(merge|release)|fixed on branch|on branch b\.' "$1"
 }
 
+# out_of_repo_fix_connected <file>
+# True when the body genuinely claims an out-of-repo resolution: a ~/ path
+# (startup/.claude/.agent-director) that is ACTUALLY CONNECTED to fix/resolution
+# language, not merely co-present with it somewhere else in the body.
+#
+# "Connected" means either:
+#   (i)  the ~/ path and a resolution word appear on the SAME line
+#        (e.g. "**Fix (2026-09-19):** `~/startup/start-all.sh` now …"), or
+#   (ii) the ~/ path appears inside a recognized closure/fix SECTION — a
+#        heading (##/###/…) whose text names a fix/closure/resolution.
+#
+# Why this is stricter than the old form: the previous check matched a ~/ path
+# ANYWHERE against fix language ANYWHERE, so a ticket that merely quoted a ~/
+# path in an unrelated evidence table (e.g. b.tso's anchor row naming the state
+# directory `~/.claude/channels/slack/`) laundered itself as an out-of-repo
+# closure. Requiring the two to be on the same line or in the same section
+# closes that hole while still recognizing the genuine out-of-repo closures
+# (b.mk7, b.mp5, b.s3x, b.xx7), whose ~/ path sits in their fix/closure section.
+#
+# Implemented in a single awk pass so section state is tracked correctly:
+# headings toggle in/out of a closure section, and ``` code fences are ignored
+# so a `# Heading` sample inside a fenced block cannot reset the section state.
+out_of_repo_fix_connected() {
+  tr '[:upper:]' '[:lower:]' < "$1" | awk '
+    BEGIN {
+      path = "~/(\\.claude|startup|\\.agent-director)";
+      res  = "(\\*\\*fix|fixed in|fixed \\(|fix direction|proposed fix|resolved|resolution|doc fix|purely a doc|closure note|closed as)";
+      insec = 0; fence = 0;
+    }
+    /^```/ { fence = !fence; next }
+    {
+      if (!fence && /^#+ /) {
+        # A heading opens an out-of-repo fix/closure section only when it names
+        # real closure vocabulary as WHOLE WORDS — not as an incidental
+        # substring. awk ERE has no \b, so anchor on non-alnum boundaries
+        # (^/$ or a non-[a-z0-9] char) on both sides. This prevents "prefix",
+        # "suffix", "unfixed", "resolver" from opening a section, and — the AC 4
+        # fix — prevents the `## +closed:docs-only` heading (whose text contains
+        # "closed") from being treated as an (a)-style closure section: it is
+        # matched explicitly and excluded so a ~/ path quoted in its prose can no
+        # longer launder itself as an out-of-repo fix. Genuine headings like
+        # `## Fix`, `## Proposed fix`, `## Resolution`, `# out of repo fix` still
+        # open a section.
+        if ($0 ~ /\+closed:docs-only/) {
+          insec = 0;
+        } else {
+          insec = (/(^|[^a-z0-9])(fix(ed|es)?|closure|closed|resolution|resolved?)([^a-z0-9]|$)/) ? 1 : 0;
+        }
+      }
+      haspath = ($0 ~ path);
+      if (haspath && $0 ~ res) { found = 1 }   # (i) same line
+      if (haspath && insec)    { found = 1 }   # (ii) inside a closure section
+    }
+    END { exit found ? 0 : 1 }
+  '
+}
+
+# DOCS-ONLY out-of-repo closure marker (defect-1 class).
+#
+# A deliberate, greppable heading that a documents-only ticket carries when its
+# product lives OUTSIDE any git repository (e.g. Apiary ticket markdown under
+# Ideas/b.4vj/… at the non-repo project root), so no commit on main can ever
+# land it. This is the escape hatch for the "no main commit ⇒ stranded" default,
+# for a class the in-repo model genuinely cannot represent.
+#
+# The marker is a heading line of the exact form (case-insensitive):
+#     ## +closed:docs-only
+# It is a purpose-built heading for this class. (Note: it does NOT reuse the
+# pre-existing branch-(b) alternative `## +closed`, whose ERE `+` quantifies the
+# preceding SPACE — that pattern matches `## closed` / `##  closed`, never a
+# literal `+closed` heading, so it never recognized this marker. Branch (b) is
+# pre-existing and left untouched; this heading is matched only by
+# has_docs_only_marker via the anchored DOCS_ONLY_MARKER pattern below.)
+# It is deliberately
+# hard to trip by accident — it is a section heading, not loose prose, and the
+# `+closed:docs-only` token does not occur in ordinary writing. Loose phrases
+# like "documents only" or "docs-only" in body text do NOT match; only the
+# explicit heading does.
+DOCS_ONLY_MARKER='^#+[[:space:]]+\+closed:docs-only\b'
+has_docs_only_marker() {
+  grep -qiE "${DOCS_ONLY_MARKER}" "$1"
+}
+
 # has_closure_marker <file>
 # A recognized, legitimate reason a finished ticket has no main commit:
 #   (a) out-of-repo resolution — a ~/ path (startup/.claude/.agent-director)
-#       paired with fix/resolution/doc-fix language, or
-#   (b) an explicit no-repro / superseded / abandoned closure note.
-# Anti-markers disqualify both — "superseded AND FIXED on branch, pending
-# release" is stranded work, not a closure.
+#       CONNECTED to fix/resolution language (same line or same closure
+#       section; see out_of_repo_fix_connected), or
+#   (b) an explicit no-repro / superseded / abandoned closure note, or
+#   (c) an explicit documents-only, outside-the-repo-tree closure marker
+#       (`## +closed:docs-only`; see has_docs_only_marker) — for tickets whose
+#       product is markdown/docs living outside any git repo.
+# Anti-markers disqualify ALL of them — a body that says "documents-only" AND
+# "fixed on branch b.x, pending merge" is stranded work, not a closure.
 has_closure_marker() {
   local f="$1"
   has_anti_marker "$f" && return 1
 
-  # (a) out-of-repo fix
-  if grep -qE '~/(\.claude|startup|\.agent-director)' "$f" \
-     && grep -qiE '\*\*fix|fixed in|fix direction|proposed fix|resolved|resolution|doc fix|purely a doc' "$f"; then
+  # (c) documents-only, outside-the-repo-tree closure. Evaluated FIRST so a
+  # ticket carrying the explicit `## +closed:docs-only` marker passes for the
+  # right reason (the marker), never incidentally via branch (a): the docs-only
+  # heading contains the substring "closed" and its prose may quote a ~/ path,
+  # so were (a) evaluated first such a ticket would pass via the very
+  # incidental-substring path AC 4 orders eliminated. out_of_repo_fix_connected
+  # additionally excludes this heading from opening a section, so (a) no longer
+  # fires on it at all — this ordering makes the marker the reason it passes.
+  if has_docs_only_marker "$f"; then
+    return 0
+  fi
+
+  # (a) out-of-repo fix — path and resolution claim must be connected.
+  if out_of_repo_fix_connected "$f"; then
     return 0
   fi
 
