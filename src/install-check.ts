@@ -3,8 +3,8 @@
  *
  * Source of truth for "is agent-director system-installed at a version
  * meeting AD's declared floor?" — consumed by:
- *   - The `bun run install-check` script (Epic 2).
- *   - The install-cscb skill (Epic 3).
+ *   - The `bun run install-check` script (scripts/install-check.ts; Epic 2).
+ *   - The install-cscb skill (skills/install-cscb; Epic 3).
  *
  * The startup gate (Epic 1, agent-director-startup.ts) does NOT call this
  * module — AD's own `Client.create()` enforces the same floor against the

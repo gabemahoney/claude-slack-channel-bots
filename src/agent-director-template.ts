@@ -199,7 +199,8 @@ export function buildTemplateParams(
     overwrite: true,
     // `extra_env` is omitted: no installation-wide env-var source in today's
     // config schema. Per-route CLAUDE_CONFIG_DIR is supplied at spawn time
-    // via SpawnParams.extra_env (SR-1.1) in Epic 2.
+    // via SpawnParams.extra_env (SR-1.1; see buildSpawnParams in
+    // session-manager.ts, landed in Epic 2).
   }
 }
 

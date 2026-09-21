@@ -1187,12 +1187,14 @@ export async function main(): Promise<void> {
   // user. Any failure records to startup-errors.log and exits non-zero.
   await runAgentDirectorStartupGate()
 
-  // Check for existing server BEFORE rotating sessions.json.
-  // If we rotate first, a failed start (e.g., server already running) destroys sessions.json.
+  // Check for an existing server BEFORE any side-effectful startup work —
+  // before writePidFile (which would clobber the live server's PID file),
+  // and before the template overwrite, crontable bootstrap, and Socket Mode
+  // connect below. A duplicate start must fail fast without mutating shared state.
   checkPidConflict(PID_FILE)
 
-  // The agent-director store owns session-id state now; CSCB no longer
-  // maintains its own sessions.json registry (SR-7.1 deletion in Epic 2).
+  // The agent-director store owns session-id state; CSCB's own sessions.json
+  // registry was deleted (SR-7.1, Epic 2).
 
   let mcpHost: string
   let mcpPort: number
@@ -1636,9 +1638,9 @@ export async function main(): Promise<void> {
   })
 
   if (routingConfig) {
-    // INVARIANT: Health check starts only after startupSessionManager() returns
-    // and sessions.json is written. Promise.allSettled ensures all launches have
-    // settled before this point. Do not move this call earlier in the startup sequence.
+    // INVARIANT: Health check starts only after startupSessionManager() returns.
+    // Promise.allSettled ensures all launches have settled before this point.
+    // Do not move this call earlier in the startup sequence.
     startHealthCheck(routingConfig.health_check_interval)
   }
 }

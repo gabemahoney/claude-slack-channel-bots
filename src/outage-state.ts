@@ -193,9 +193,9 @@ export function clearOutageFlag(channelId: string, cls: OutageClass): void {
 
 /**
  * resetAllToHealthy — silently wipes every channel's flag set and bad-stretch
- * history to a clean slate. No `postToChannel` calls. Used at boot time
- * after `socket.start()` as a defensive boundary for pre-auth observations
- * (boot-time call is added by Epic 2).
+ * history to a clean slate. No `postToChannel` calls. Called at boot by
+ * server.ts immediately after `socket.start()` as a defensive boundary for
+ * pre-auth observations (added in Epic 2).
  */
 export function resetAllToHealthy(channelIds: string[]): void {
   for (const channelId of channelIds) {
