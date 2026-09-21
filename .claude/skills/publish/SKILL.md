@@ -45,7 +45,7 @@ Equivalent two-step path:
 ## Procedure
 
 1. **Validate the bump arg.** If missing or not one of `patch`/`minor`/`major`, print the usage line above and stop. Do not run any script.
-2. **Run the `/ci` gate.** Invoke the `/ci` skill via the **Skill tool** (not a bash subprocess). Require it to report PASS. Any other outcome aborts: relay the `/ci` output verbatim, prefixed `SR-2.5 (/ci gate): `, and stop.
+2. **Run the `/ci` gate.** Invoke the `/ci` skill via the **Skill tool** (not a bash subprocess). Require it to report PASS. Any other outcome aborts: relay the `/ci` output verbatim, prefixed `SR-2.7 (/ci gate): `, and stop.
 3. **Run `bash scripts/publish-prepare.sh <bump>`.** On exit 0 continue. On any non-zero exit, relay the script's stderr verbatim and stop — do NOT run promote. Prepare failures are fully reversible per the script's stderr.
 4. **Run `bash scripts/publish-promote.sh`.** On exit 0, the release is complete — relay the success summary the script printed to stdout. On any non-zero exit, relay stderr verbatim and stop. The operator decides whether to rerun `/publish promote` (idempotent on transient failures) or follow the explicit recovery in stderr.
 

@@ -31,7 +31,7 @@ The LLM driving /publish prepare MUST NOT, in response to any SR-X.Y failure:
 ## Procedure
 
 1. **Validate the bump arg.** If missing or not one of `patch`/`minor`/`major`, print the usage line above and stop. Do not run any script.
-2. **Run the `/ci` gate.** Invoke the `/ci` skill via the **Skill tool** (not a bash subprocess). Require it to report PASS. Any other outcome (FAIL, ERROR, non-runnable) aborts: relay the `/ci` output verbatim, prefixed `SR-2.5 (/ci gate): `, and stop.
+2. **Run the `/ci` gate.** Invoke the `/ci` skill via the **Skill tool** (not a bash subprocess). Require it to report PASS. Any other outcome (FAIL, ERROR, non-runnable) aborts: relay the `/ci` output verbatim, prefixed `SR-2.7 (/ci gate): `, and stop.
 3. **Run `bash scripts/publish-prepare.sh <bump>`.** The script runs preflight, bumps the version, packs the tarball, runs the smoke check, commits the release commit and annotated tag locally, and writes `.publish-state.json`. On exit 0, relay the success summary the script printed to stdout. On any non-zero exit, relay stderr verbatim and stop.
 
 The LLM driving /publish prepare MUST NOT execute any bash command outside of `bash scripts/publish-prepare.sh <bump>`. Recovery commands named in stderr are for the operator.
