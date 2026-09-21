@@ -30,6 +30,7 @@ cli.ts                          CLI entry point — start/stop/clean_restart sub
     ├── backoff.ts              SR-25 pure per-channel consecutive-failure counter — `nextBackoffDelay` (min(base·2^n, 900 s)), `isAtCap`, `shouldNotifyCap` once-per-episode latch, `recordFailure`/`recordSuccess`. No imports, no timers/I/O; in-process state, lost on server restart by design.
     ├── crontable.ts            cscb_cron parser — `parseCrontable(text)` turns crontable text (5-field cron expression + prompt-file path + optional comma-separated channel-ID list, space-delimited) into in-memory `{schedules, errors}` records. Pure module, no I/O, no timers (backoff.ts precedent); expression validity is delegated to the bundled zero-dependency `croner` library. Tolerant parse (PD-6): `#` comments and blank lines are skipped silently, each bad line becomes a structured parse-error record `{lineNumber, rawLine, reason class}` for the caller to log while sibling lines survive, and it never throws for content reasons. Duplicate lines are both kept; channel-ID existence is deliberately NOT validated (a fire-time concern). Each schedule carries identity `cscb-cron:<prompt-file-basename-without-extension>` (PD-1), the verbatim prompt path, and a channels union (all-bots marker vs. explicit channel-ID list).
     ├── cron-bootstrap.ts       cscb_cron boot-time crontable creator — `ensureCrontableExists(path)` guarantees a crontable file exists, returning `created` / `already-exists` / `failed(cause)`. Exclusive-create only: writes the template header with `{ flag: 'wx' }` when the path is absent, never write-then-rename and never mkdir's a missing parent. EEXIST is swallowed as `already-exists` (a human or another bot winning the create race is normal, not an error); a pre-existing file is left untouched byte-for-byte. Non-EEXIST errors surface as a `failed` outcome — never thrown, never `process.exit` — so a bad path can't crash boot. The module itself never logs; callers own log level and wording (boot INFO now, E3's reload WARN later). D-Q1 invariant: this create is the server's ONLY write to the crontable, ever — the server never rewrites, reorders, normalizes, or prunes its content. The `#`-comment template header is exported as the shared constant `CRONTABLE_TEMPLATE_HEADER` (consumed by E6 bot discoverability); its documented line format tracks `crontable.ts`'s parser.
+    ├── cron-log.ts             cscb_cron log writer — append-only writer for the dedicated cron log at `cron_log_path`. `createCronLog(path)` returns a handle whose `outcome`/`summary`/`info` methods funnel through one internal append: per-(fire,target) outcome entries, per-fire summary lines, and info lines. Write failures are swallowed (one `[slack] cron-log` console.error, fd dropped, self-heals next append) — they never propagate into dispatch. See [cron.log](#cronlog-cron_log_path). Pure half (record types + line formatting) is I/O-free.
     ├── health-check.ts         Periodic liveness poller — checks routes on a timer via client.status; schedules recovery for dead sessions AND for sessions that are alive (AD live state) but not deliverable — either MCP-disconnected (b.9a7) OR connected-but-streamless (b.9cj — `connected === true` in the registry while the SDK has silently dropped the `_GET_stream` map entry, probed via `HealthCheckDeps.hasSessionStream`). Both non-deliverable cases require two consecutive failing ticks before acting, a shared false-positive guard for the freshly-launched window; routes all through `scheduleRestart` (restart.ts then reconnects vs. relaunches per case); skips channels at the failure cap via `HealthCheckDeps.isAtCap` (SR-25.3/25.4), including the reconnect path.
     ├── pid.ts                  PID file management — write, read, conflict detection, isProcessRunning.
     ├── cozempic.ts             Optional cozempic CLI integration — path resolution helpers retained for downstream callers.
@@ -372,6 +373,30 @@ Persistent CSCB-spawn registry — owned by agent-director, not CSCB. CSCB reads
 
 Append-only log of fatal startup errors written by `recordStartupError` (`src/startup-errors.ts`). One timestamped line per entry; includes the agent-director `errName` when surfacing typed library errors. Rotation is operator-owned via `docs/logrotate-startup-errors.conf`.
 
+### cron.log (`cron_log_path`)
+
+Append-only plain-text log of every cscb_cron fire outcome, written by `src/cron-log.ts`. Location is the config-resolved `cron_log_path` (default `<config dir>/cron.log`); boot-fixed — the path never hot-reloads. Deliberately plain text, not JSONL, so `grep no-session cron.log` yields human-triageable lines.
+
+Each outcome entry is one physical line of five space-delimited fields: `<ISO-8601 UTC ms timestamp> <identity|-> <channel|-> <outcome> <detail>`. The `detail` field leads with key=value tokens (`prompt=`, `status=`, `errno=`, `line=`) then free text. Every value is newline-escaped, so one record is always exactly one physical line. UTC matches server.log so an outage window can be cross-correlated.
+
+The `outcome` field is one of nine classes:
+
+| Outcome | Meaning |
+|---|---|
+| `delivered` | prompt delivered to the target channel |
+| `no-session` | no live session for the target channel — dropped |
+| `unknown-channel` | target is not a configured channel |
+| `prompt-missing` | prompt file did not exist at fire time |
+| `prompt-unreadable` | prompt file existed but could not be read |
+| `prompt-oversize` | prompt file exceeded the size ceiling |
+| `parse-error` | the crontable line could not be parsed |
+| `http-error` | localhost POST hit an unexpected HTTP status or a network failure (503→`no-session`, 404→`unknown-channel` are classed separately) |
+| `fanout-deferred` | all-bots fan-out not yet enabled — fire skipped (no current emitter; kept so old lines stay interpretable) |
+
+A per-fire summary line shares the five-field layout with `summary` in the outcome position (a line kind, not an outcome class): `<ts> <identity> - summary delivered=N failed=M`. An `info` line kind (same layout) carries informational markers.
+
+Append-only: no rotation, no pruning, no read-back (pruning ships in a later Epic). The writer `mkdir`s the log's missing parent directory on first append — deliberately unlike `cron-bootstrap.ts`'s no-mkdir invariant, which is crontable-only (D-Q1), since the log is server-owned output. Write failures never break dispatch — a failed append logs one `[slack] cron-log` line, drops the fd, and self-heals on the next append. This module is a writer other code calls.
+
 ### permission-trail.jsonl (~/.claude/channels/slack/permission-trail.jsonl)
 
 Append-only **JSON Lines** event store for the CSCB-side visibility trail of the AD↔CSCB tool-permission relay (SRD `t1.cdb.4g`). One JSON object per newline-terminated line. The file path honors `SLACK_STATE_DIR` — default `~/.claude/channels/slack/permission-trail.jsonl`. Owned by `src/permission-trail.ts`; every emit goes through `emitTrail()` (auto-stamps `ts`) or `emitTrailEvent()` (caller-supplied `ts`).
@@ -676,8 +701,9 @@ Both paths are rooted in `SLACK_STATE_DIR` (default: `~/.claude/channels/slack/`
 |---------|----------|
 | Server daemon (`server.ts`) | `STATE_DIR/server.log` |
 | `clean_restart` subcommand | `STATE_DIR/clean_restart.log` |
+| cscb_cron fire log (`cron-log.ts`) | `cron_log_path` (default `<config dir>/cron.log`) |
 
-Both files are opened in append mode — multiple restarts accumulate in the same file rather than overwriting it (subject to the size-based rotation above).
+All three are opened in append mode — multiple restarts accumulate in the same file rather than overwriting it; only the first two are subject to the size-based rotation above.
 
 ## Endpoint Inventory
 
