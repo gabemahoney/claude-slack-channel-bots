@@ -395,7 +395,7 @@ The `outcome` field is one of nine classes:
 | `prompt-oversize` | prompt file exceeded the size ceiling |
 | `parse-error` | the crontable line could not be parsed |
 | `http-error` | localhost POST hit an unexpected HTTP status or a network failure (503→`no-session`, 404→`unknown-channel` are classed separately) |
-| `fanout-deferred` | all-bots fan-out not yet enabled — fire skipped (no current emitter; kept so old lines stay interpretable) |
+| `fanout-deferred` | all-bots fire skipped — emitted by the cron dispatcher while fan-out remains deferred to E4; kept so old lines stay interpretable |
 
 A per-fire summary line shares the five-field layout with `summary` in the outcome position (a line kind, not an outcome class): `<ts> <identity> - summary delivered=N failed=M`. An `info` line kind (same layout) carries informational markers.
 
