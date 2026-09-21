@@ -353,7 +353,7 @@ Check that agent-director is installed and the `slack-channel-bot` template
 is registered:
 
 ```bash
-agent-director --version
+agent-director version
 ```
 
 The `slack-channel-bot` template is registered automatically at CSCB startup
