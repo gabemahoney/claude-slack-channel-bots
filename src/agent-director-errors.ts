@@ -19,6 +19,7 @@
  *   - ErrSpawnNotFound          (get / status / decide on missing row)
  *   - ErrNoSessionId            (resume / SR-1.3 fallthrough)
  *   - ErrJsonlMissing           (resume / SR-1.3 fallthrough)
+ *   - ErrJsonlNeverWritten      (resume / AD 0.10.0 — session never wrote a transcript, so nothing can be lost)
  *   - ErrSpawnNotResumable      (resume / SR-1.3 collision-recovery)
  *   - ErrAlreadyDecided         (decide / SR-2.2 treated-as-success)
  *   - ErrNoOpenPermissionRequest (decide / poller race)
@@ -73,6 +74,7 @@ export {
   ErrSpawnNotFound,
   ErrNoSessionId,
   ErrJsonlMissing,
+  ErrJsonlNeverWritten,
   ErrSpawnNotResumable,
   ErrAlreadyDecided,
   ErrNoOpenPermissionRequest,

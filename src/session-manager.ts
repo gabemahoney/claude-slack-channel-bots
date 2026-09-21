@@ -28,6 +28,7 @@ import {
   AgentDirectorError,
   ErrInstanceIdCollision,
   ErrJsonlMissing,
+  ErrJsonlNeverWritten,
   ErrNoSessionId,
   ErrSpawnNotFound,
   ErrSpawnNotResumable,
@@ -1378,7 +1379,7 @@ function reportInconclusiveDiagnosis(
  * Recover a collided spawn whose live session cannot be reached: resume-first
  * (preserves session history) when resume_enabled, with the established
  * fallbacks (ErrTmuxSessionCreate → orphan-kill + respawn; ErrNoSessionId /
- * ErrJsonlMissing → delete + fresh; ErrSpawnNotResumable → kill + delete +
+ * ErrJsonlMissing / ErrJsonlNeverWritten → delete + fresh; ErrSpawnNotResumable → kill + delete +
  * fresh; ErrSpawnNotFound → fresh, no delete since the row is already gone).
  * This is the `ended`/`missing` state handling, extracted so the
  * b.3ce dead-session fallback in the `waiting`/`working` branches reuses the
@@ -1473,8 +1474,15 @@ async function resumeOrFreshSpawn(
         return { channelId, action: 'failed' }
       }
     }
-    if (err instanceof ErrNoSessionId || err instanceof ErrJsonlMissing) {
+    if (err instanceof ErrNoSessionId || err instanceof ErrJsonlMissing || err instanceof ErrJsonlNeverWritten) {
       console.error(`[slack] spawnForRoute: ${err.errName} on resume for channel=${channelId} — delete+fresh`)
+      // b.jgf: AD 0.10.0 split the old "no transcript" condition in two.
+      // ErrJsonlNeverWritten asserts the session never wrote a transcript at
+      // all, so a fresh spawn is lossless BY DEFINITION — it gets no diagnosis
+      // ceremony, no amnesia action and no channel post, just the delete+fresh
+      // below and a successful action so restart.ts stops retrying. Only
+      // ErrJsonlMissing (a transcript path was recorded but is not there now)
+      // carries the ambiguity that the b.wrb/b.fwu machinery exists to resolve.
       // b.wrb: diagnose the missing transcript BEFORE deleting the row (its
       // jsonl_path / session id / started_at are needed). Logging/classification
       // only — the delete+fresh POLICY below is unchanged. The 'lost' case is
@@ -1503,7 +1511,10 @@ async function resumeOrFreshSpawn(
         // 'lost' was already made loud above, 'never-created' is evidence-based
         // lossless). 'inconclusive' is UNDIAGNOSABLE amnesia: we could not tell
         // whether we destroyed anything, which is itself operator-worthy and
-        // must not be lumped with the known-cause cases.
+        // must not be lumped with the known-cause cases. ErrNoSessionId and
+        // b.jgf's ErrJsonlNeverWritten fall through to plain 'spawned': no
+        // history existed to lose, so counting them as amnesia would overstate
+        // the damage in the startup summary.
         if (err instanceof ErrJsonlMissing) {
           return {
             channelId,
@@ -1603,7 +1614,7 @@ async function resumeOrFreshSpawn(
  * 2. Attempt `client.spawn(...)`. On success → done.
  * 3. `ErrInstanceIdCollision` → `client.get(...)` then branch on state:
  *    - ended/missing + resume_enabled → resume; on ErrNoSessionId/
- *      ErrJsonlMissing → delete + fresh spawn.
+ *      ErrJsonlMissing/ErrJsonlNeverWritten → delete + fresh spawn.
  *    - ended/missing + !resume_enabled → kill + delete + fresh spawn.
  *    - waiting → reconnectMcp; 'dead-session' → resume/fresh-spawn (b.3ce).
  *    - working → waitForWaitingAndReconnect; 'dead-session' → resume/fresh-spawn (b.3ce).
