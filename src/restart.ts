@@ -45,6 +45,14 @@ export interface RestartDeps {
   /** Check if the session already has a live MCP connection in the registry. */
   isSessionConnected(channelId: string): boolean
   /**
+   * Check if the session's standalone GET SSE stream (`_GET_stream`) is present
+   * in its transport. A session can be `connected === true` in the registry
+   * while the SDK has silently deleted the stream map entry — in that state
+   * messages cannot reach the bot, so it must NOT count as "already reconnected"
+   * (b.9cj). Returns false when there is no session at all.
+   */
+  hasSessionStream(channelId: string): boolean
+  /**
    * Attempt to reconnect the MCP session. Returns a discriminated result so
    * restart.ts can call recordSuccess on the 'success' path.
    *
@@ -151,8 +159,12 @@ export function scheduleRestart(
 
       if (alive) {
         // If the session already re-established its MCP connection (e.g. Claude
-        // Code refreshed the SSE stream on its own), skip the reconnect.
-        if (deps.isSessionConnected(channelId)) {
+        // Code refreshed the SSE stream on its own), skip the reconnect. A
+        // session is only truly healed when it is connected AND its standalone
+        // GET SSE stream is present: a connected-but-streamless session (b.9cj)
+        // cannot receive messages, so it must proceed to recovery rather than be
+        // waved through as "already reconnected".
+        if (deps.isSessionConnected(channelId) && deps.hasSessionStream(channelId)) {
           console.error(`[slack] Session already reconnected — skipping restart for channel=${channelId}`)
           return
         }

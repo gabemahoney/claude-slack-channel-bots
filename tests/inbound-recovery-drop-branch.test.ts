@@ -80,6 +80,7 @@ function makeRestartDeps(opts: DepsOpts = {}): RestartDeps & {
     launchSessionCalls,
     async isSessionAlive() { return false },
     isSessionConnected() { return false },
+    hasSessionStream() { return true },
     async reconnectSession() { /* not reached — session is dead */ },
     async killSession() { /* no-op */ },
     async launchSession(channelId, cwd, sessionId) {

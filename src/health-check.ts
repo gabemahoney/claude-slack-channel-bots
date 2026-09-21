@@ -25,6 +25,15 @@ export interface HealthCheckDeps {
    * Wraps the existing adapter at src/server.ts:1343-1346.
    */
   isSessionConnected(channelId: string): boolean
+  /**
+   * Returns true when channelId's session has its standalone GET SSE stream
+   * (`_GET_stream`) present in the transport. A session can be
+   * `isSessionConnected === true` while the SDK has silently dropped the stream
+   * map entry (b.9cj); such a connected-but-streamless row cannot receive
+   * messages and must be routed to recovery, so the tick treats it exactly like
+   * the alive-but-disconnected case. Returns false when there is no session.
+   */
+  hasSessionStream(channelId: string): boolean
   isRestartPendingOrActive(channelId: string): boolean
   /**
    * Returns true when channelId has reached the consecutive-failure cap.
@@ -172,11 +181,17 @@ export function startHealthCheck(intervalSeconds: number): void {
             // meaningless once the row is not alive, so drop it.
             disconnectedStreak.delete(channelId)
             deps.scheduleRestart(channelId, cwd)
-          } else if (!deps.isSessionConnected(channelId)) {
-            // Alive but MCP-disconnected. HAZARD 1: require two CONSECUTIVE
-            // ticks before acting, so a freshly-launched session that has not
-            // yet registered its connection is not poked mid-boot (see
-            // disconnectedStreak doc comment).
+          } else if (!deps.isSessionConnected(channelId) || !deps.hasSessionStream(channelId)) {
+            // Alive but not deliverable: either MCP-disconnected (b.9a7) OR
+            // connected-but-streamless — the SDK silently dropped the
+            // `_GET_stream` map entry so messages cannot reach the bot (b.9cj).
+            // Both land here and share the SAME two-consecutive-tick guard:
+            // HAZARD 1 — a session between registerSession and its stream
+            // re-opening is legitimately streamless for a moment and must not be
+            // poked mid-boot. Require two CONSECUTIVE ticks before acting (see
+            // disconnectedStreak doc comment). scheduleRestart then does the
+            // right thing per case — reconnect a disconnected row, or recover a
+            // streamless one (restart.ts:155 no longer waves the latter through).
             const streak = (disconnectedStreak.get(channelId) ?? 0) + 1
             if (streak >= 2) {
               disconnectedStreak.delete(channelId)
@@ -185,8 +200,9 @@ export function startHealthCheck(intervalSeconds: number): void {
               disconnectedStreak.set(channelId, streak)
             }
           } else {
-            // Alive AND connected — healthy. Reset any pending streak so a
-            // transient one-tick blip never accumulates toward the threshold.
+            // Alive, connected, AND stream present — healthy. Reset any pending
+            // streak so a transient one-tick blip never accumulates toward the
+            // threshold.
             disconnectedStreak.delete(channelId)
           }
         } catch (err) {

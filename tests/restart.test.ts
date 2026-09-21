@@ -54,6 +54,7 @@ const WAIT_MS = 50         // wait after scheduling; long enough for FAST_DELAY_
 type DepsOpts = {
   isSessionAliveResult?: boolean  // default: false (session is dead)
   isSessionConnectedResult?: boolean  // default: false (not yet reconnected)
+  hasSessionStreamResult?: boolean  // default: true (stream present — prior semantics)
   launchSessionResult?: boolean   // default: true (launch succeeds)
   launchSession?: (channelId: string, cwd: string, sessionId?: string) => Promise<boolean>  // override entire launchSession
   restartDelay?: number           // default: FAST_DELAY_S
@@ -86,6 +87,9 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     },
     isSessionConnected(_channelId) {
       return opts.isSessionConnectedResult ?? false
+    },
+    hasSessionStream(_channelId) {
+      return opts.hasSessionStreamResult ?? true
     },
     async reconnectSession(channelId) {
       reconnectSessionCalls.push(channelId)
@@ -176,6 +180,47 @@ describe('scheduleRestart', () => {
     scheduleRestart('C_TEST1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
+    expect(deps.launchSessionCalls).toHaveLength(0)
+  })
+
+  // b.9cj: the "already reconnected" early return is only taken when the session
+  // is connected AND its standalone GET stream is present. A connected-but-
+  // streamless session (the exact state scheduleRestart is invoked for) must NOT
+  // be waved through — it proceeds to recovery.
+  test('b.9cj: alive + connected + stream present — skips reconnect (already-healed guard holds)', async () => {
+    const deps = makeDeps({
+      isSessionAliveResult: true,
+      isSessionConnectedResult: true,
+      hasSessionStreamResult: true,
+    })
+    initRestart(deps)
+
+    scheduleRestart('C_TEST1', '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    // Genuinely healed: the guard returns before any recovery action.
+    expect(deps.reconnectSessionCalls).toHaveLength(0)
+    expect(deps.launchSessionCalls).toHaveLength(0)
+    expect(deps.killSessionCalls).toHaveLength(0)
+  })
+
+  test('b.9cj REGRESSION: alive + connected but STREAMLESS — recovery proceeds (no already-reconnected short-circuit)', async () => {
+    // Pre-fix, restart.ts skipped whenever isSessionConnected was true, so this
+    // connected-but-streamless session took the "already reconnected" early
+    // return and never recovered. Post-fix the guard also requires the stream,
+    // so recovery proceeds: alive → reconnectSession is called.
+    const deps = makeDeps({
+      isSessionAliveResult: true,
+      isSessionConnectedResult: true,
+      hasSessionStreamResult: false,
+    })
+    initRestart(deps)
+
+    scheduleRestart('C_TEST1', '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    // The alive branch ran reconnectSession — the guard did NOT short-circuit.
+    expect(deps.reconnectSessionCalls).toEqual(['C_TEST1'])
     expect(deps.launchSessionCalls).toHaveLength(0)
   })
 
@@ -358,6 +403,7 @@ describe('isRestartPendingOrActive', () => {
     const deps: RestartDeps = {
       isSessionAlive: (_channelId) => alivePromise,  // never resolves until we say so
       isSessionConnected: () => false,
+      hasSessionStream: () => true,
       reconnectSession: async () => {},
       killSession: async () => {},
       launchSession: async () => true,
@@ -832,6 +878,7 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
       launchSessionCalls,
       async isSessionAlive() { return alive },
       isSessionConnected() { return false },
+      hasSessionStream() { return true },
       reconnectSession,
       async killSession(channelId) { killSessionCalls.push(channelId) },
       async launchSession(channelId) { launchSessionCalls.push(channelId); return true },
