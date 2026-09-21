@@ -36,14 +36,14 @@
 # Exit: 0 when clean, non-zero (1) when unexplained stranded work is found.
 #
 # ============================ CALIBRATION NOTE ============================
-# On TODAY'S repo this script EXITS NON-ZERO BY DESIGN. It flags pre-existing
-# hygiene debt that is tracked separately and is NOT a bug in this script:
-#   stranded tickets: b.qps b.1qs b.a4d b.jfk b.e3f
-#   stranded branches: feature/b.e3f feature/b.oaj fix/b.k54-trust-dialog
-#                      origin/no-channels
-# A non-zero exit here is the correct, expected result until that debt is
-# resolved or the tickets are explicitly re-closed. Do NOT mistake it for a
-# broken script.
+# On today's repo this script EXITS NON-ZERO BY DESIGN, and that is NOT a bug
+# in this script. Stranded finished tickets are clean (none). The remaining
+# debt is one class of finding: a stranded remote branch whose resolution
+# requires a push and is therefore reserved for the repo owner — currently
+# `origin/no-channels`, tracked on ticket b.gkz and pending the owner's
+# decision. A non-zero exit is the correct, expected result until b.gkz lands.
+# Do NOT re-list findings here; the script's own output is the inventory, and
+# the tracking ticket is the source of truth for what is expected vs. new.
 # =========================================================================
 
 set -euo pipefail
