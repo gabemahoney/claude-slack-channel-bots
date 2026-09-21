@@ -130,25 +130,25 @@ fallthrough.
    inspection (`ls -la <binary_path>`) and removal of the bad entry,
    then re-installation via the AD install command. Re-run Step 1.
 
-3. **`probe-timeout`** — `agent-director --version` did not return within
+3. **`probe-timeout`** — `agent-director version` did not return within
    the probe window. Likely the binary is hanging on startup
    (corrupted, mismatched architecture, missing shared library).
-   Recommend a manual `<binary_path> --version` invocation to confirm,
+   Recommend a manual `<binary_path> version` invocation to confirm,
    then reinstall via the AD install command. Re-run Step 1.
 
-4. **`probe-nonzero-exit`** — `agent-director --version` exited with a
+4. **`probe-nonzero-exit`** — `agent-director version` exited with a
    non-zero code. The stderr block surfaces `exitCode` and any
    `diagnostic` from AD. Show the user the values and recommend a
-   manual reproduction (`<binary_path> --version`), then reinstall.
+   manual reproduction (`<binary_path> version`), then reinstall.
    Re-run Step 1.
 
-5. **`probe-killed-by-signal`** — `agent-director --version` was killed
+5. **`probe-killed-by-signal`** — `agent-director version` was killed
    by a signal (SIGSEGV, SIGBUS, etc.). The stderr block surfaces
    `signal`. The binary is likely corrupted or built for a different
    architecture. Recommend a full reinstall via the AD install command.
    Re-run Step 1.
 
-6. **`unparseable-version`** — `agent-director --version` returned but
+6. **`unparseable-version`** — `agent-director version` returned but
    the output could not be parsed as semver. The stderr's `diagnostic`
    field carries the raw output. Likely the installed binary is from
    a pre-release line that uses non-semver tags (e.g. `v0.6.3-dev`
