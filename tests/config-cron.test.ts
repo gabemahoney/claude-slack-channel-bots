@@ -126,6 +126,10 @@ describe('cron config keys — cron_log_max_bytes rejection', () => {
 // Defaults track the actual loaded config dir (through loadConfig)
 // ---------------------------------------------------------------------------
 
+// E6 (cron dispatch / buildSpawnParams) relies on this resolved-path coverage:
+// absent cron_table_path → default <config dir>/crontab (below), and present with
+// leading tilde → expanded absolute path (see 'tilde expansion' block). No E6 gap-fill
+// needed — both halves are proven here.
 describe('cron config keys — defaults track loaded config dir', () => {
   test('absent path keys default under the directory of the loaded config', () => {
     const { dir, configPath } = writeConfig(makeInput())

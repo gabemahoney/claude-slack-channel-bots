@@ -54,6 +54,8 @@ describe('buildTemplateParams (SR-3.1)', () => {
       '--mcp-config',
       '/abs/mcp.json',
     ])
+    // CSCB_CRONTABLE_PATH is spawn-time-only env (buildSpawnParams' extra_env),
+    // never template env — the template omits env entirely by design.
     expect(params.extra_env).toBeUndefined()
   })
 

@@ -204,8 +204,8 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | `resume_enabled` | boolean | `true` | When `true` (default), a bot whose session died — including after a host reboot or pod resume — comes back with its prior conversation history intact instead of starting fresh. When `false`, the session manager always performs a fresh launch instead of resuming, both on startup and on runtime auto-restart, even when a stored session exists. Set `false` as a workaround if your Claude Code version crashes with "sandbox required but unavailable" on resume (a known regression in v2.1.120). Requires a system-installed `agent-director` ≥ 0.8.0 for reboot recovery to actually restore history. |
 | `agent_director_poll_interval_ms` | number | `1000` | Poll interval (ms) for the agent-director permission relay tick. Must be a positive integer in `[200, 3_600_000]`. Replaces the pre-rename `claude_director_poll_interval_ms` — the old name is rejected at startup. Unknown top-level config fields are also rejected to surface stale configs after the rename. |
 | `stop_hook_bootstrap` | boolean | `true` | Controls whether the server installs the CSCB-managed Slack Reply Guard Stop hook into `<claude_config_dir>/settings.json` at boot (see [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook)). Set to `false` to disable installation for every route and to actively remove any previously-installed managed entry. Per-route `routes[id].stop_hook_bootstrap` overrides this top-level value. Non-boolean values are rejected by config validation at startup. |
-| `cron_table_path` | string | `<config dir>/crontab` | Path to the crontable for the built-in cron scheduler (`cscb_cron`). Defaults to `crontab` in the directory of the loaded `config.json`. A pointer only — the scheduler that reads it ships in a later release. `~` is expanded like other path keys. Must be a non-empty string when set. Changing it requires a server restart. |
-| `cron_log_path` | string | `<config dir>/cron.log` | Path to the `cscb_cron` log file. Defaults to `cron.log` in the directory of the loaded `config.json`. A pointer only — the scheduler that writes it ships in a later release. `~` is expanded like other path keys. Must be a non-empty string when set. Changing it requires a server restart. |
+| `cron_table_path` | string | `<config dir>/crontab` | Path to the crontable for the built-in cron scheduler (`cscb_cron`). Defaults to `crontab` in the directory of the loaded `config.json`. `~` is expanded like other path keys. The resolved path is exported into every managed session as `CSCB_CRONTABLE_PATH` so bots can find the crontable and self-schedule (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)). Must be a non-empty string when set. Changing it requires a server restart. |
+| `cron_log_path` | string | `<config dir>/cron.log` | Path to the `cscb_cron` log file. Defaults to `cron.log` in the directory of the loaded `config.json`. `~` is expanded like other path keys. Must be a non-empty string when set. Changing it requires a server restart. |
 | `cron_log_max_bytes` | number | — | Size cap in bytes for the cron log. Must be a positive integer when set. Cron-log pruning is disabled when absent. Changing it requires a server restart. |
 
 #### Per-route `claude_config_dir` override
@@ -466,6 +466,8 @@ On success, returns HTTP 200:
 
 ### Example: crontab reminder
 
+For recurring prompts, prefer the built-in scheduler (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)) — it needs no host cron and delivers straight into a bot channel. The host-crontab example below is an alternative when you already run `cron`:
+
 ```sh
 # crontab -e
 0 9 * * 1 curl -s -X POST http://localhost:3100/interject \
@@ -481,15 +483,78 @@ The server fires scheduled prompts into bot channels once per minute, reading th
 
 ### The crontable
 
-Schedules live in the crontable file at `cron_table_path` (default `<config dir>/crontab`, where `<config dir>` is the directory of your loaded `config.json`; override it with the `cron_table_path` key in `config.json`). The server creates the file on first boot if it is absent, with a self-documenting comment header describing the line format. That header is the format reference for now — read the top of the created file to see how to write a schedule; do not hand-edit the format from memory. With the default config location the crontable is at `~/.claude/channels/slack/crontab`:
+Schedules live in the crontable file at `cron_table_path` (default `<config dir>/crontab`, where `<config dir>` is the directory of your loaded `config.json`; override it with the `cron_table_path` key in `config.json`). The server creates the file on first boot if it is absent, with a self-documenting comment header describing the line format. See [Crontable format](#crontable-format) below for the full reference. With the default config location the crontable is at `~/.claude/channels/slack/crontab`:
 
 ```sh
 cat ~/.claude/channels/slack/crontab
 ```
 
+### Crontable format
+
+On first boot the server auto-creates the crontable with this self-documenting header:
+
+```
+# CSCB crontable — scheduled prompts for the Slack channel bots.
+#
+# One schedule per line. Fields are positional and whitespace-delimited:
+#
+#   <min> <hour> <dom> <mon> <dow> <prompt-path> [<channel-id>[,<channel-id>...]]
+#
+#   tokens 1-5 : a standard 5-field cron expression (minute hour day-of-month
+#                month day-of-week).
+#   token 6    : path to the prompt file to run. It must contain NO spaces — a
+#                line with more than 7 whitespace-delimited tokens is a parse
+#                error (a path with spaces is unrepresentable). The prompt
+#                file's content is capped at 32KB (enforced when the job fires).
+#   token 7    : OPTIONAL comma-separated list of Slack channel IDs to target.
+#                Omit it entirely to target ALL bots — that omission IS the
+#                all-bots form. There is NO all-bots wildcard: a literal '*' in
+#                the channel position is a parse error, not "all channels".
+#
+# Lines beginning with '#' and blank lines are ignored. A malformed line is
+# skipped on its own; sibling lines still schedule.
+#
+# Example (every day at 09:00, run grooming-tick.md, target two channels):
+#   0 9 * * * /home/horde/prompts/grooming-tick.md C0123ABC,C0456DEF
+#
+# Example (every hour on the hour, run standup.md, target all bots):
+#   0 * * * * /home/horde/prompts/standup.md
+```
+
+Each schedule is one line of **exactly 5 cron fields**, then the prompt-file path, then an optional comma-separated channel list:
+
+```
+0 9 * * 1 /home/horde/prompts/weekly-report.md C0123ABC,C0456DEF
+```
+
+Rules:
+
+- **Exactly 5 cron fields** (minute hour day-of-month month day-of-week). Croner's 6-field (seconds-precision) and `@macro` forms are **not** supported.
+- **Omit the channel list to target ALL bots** — the omission itself is the all-bots form.
+- **No `*` wildcard in the channel position.** A literal `*` where a channel ID belongs is a parse error, not "all channels".
+- **Prompt paths cannot contain spaces.** A path with spaces is unrepresentable; the extra tokens make the line a parse error and it is skipped.
+- **`#` comments and blank lines are allowed** and ignored.
+- **A bad line is skipped and logged** (as `parse-error` in the cron log), never fatal — sibling lines still schedule.
+
+Because the count is positional, a **6-field line silently mis-parses instead of erroring.** For example:
+
+```
+0 0 1 1 1 1 ~/prompts/p.md
+```
+
+Here the 6th field (`1`) is taken as the prompt path and the real path (`~/prompts/p.md`) is taken as the channel list. No error is raised — every slot is filled with something syntactically acceptable — so the schedule fires on a nonsense cadence against a nonsense path. Keep expressions to exactly 5 fields.
+
+### Path resolution
+
+The prompt-file path resolves as follows:
+
+- A leading `~` expands to the home directory.
+- A **relative** path resolves against the **crontable's own directory** — not `$HOME`. This is a deliberate divergence from system cron's convention, so you can keep a `prompts/` directory alongside the crontable and reference it as `prompts/standup.md`.
+- An **absolute** path is used as-is.
+
 ### How fires appear
 
-A scheduled fire arrives in the channel as an `/interject` message whose `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. When several schedules fire in the same minute for the same channel, their prompts are concatenated into a single message and the sender lists every contributor (for example `cscb-cron:standup+grooming`). If the combined message would exceed the 32KB cap, the prompts are delivered as separate messages instead, and an info line in `cron.log` records the split.
+A scheduled fire arrives in the channel as an `/interject` message whose `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. Each schedule delivers its own message independently, so when several schedules match the same minute for the same channel each one arrives as its own `/interject` message.
 
 ### The cron log
 
@@ -513,8 +578,20 @@ The `outcome` field of each line is one of these classes:
 
 - **No retry.** A failed fire is logged and dropped — never queued or re-sent. A channel with no live session fails every fire until its session is running again; the server does not queue the missed prompts.
 - **Missed fires are skipped, not caught up.** While the server is down, no scheduled prompts fire, and they are not replayed on restart. The `scheduler started, N schedules loaded` line in the cron log marks when scheduling resumed, bounding the outage window.
+- **Edits take effect after a server restart.** The crontable is read and parsed once, at scheduler start. Editing the file — by hand or by a bot appending a line — does nothing until the server restarts and reloads the table.
+- **Server-local time.** Cron expressions are evaluated in the server's local timezone.
 - **Channel-less lines are deferred.** A line with no channel is currently matched but logged `fanout-deferred` and not delivered. Give a line an explicit channel to have it fire.
 - **`bind` must include loopback.** The scheduler delivers via `127.0.0.1`, so a `bind` set to a single non-loopback interface makes every fire fail with `http-error`. Use the default `127.0.0.1` or `0.0.0.0`.
+
+### Bot self-scheduling
+
+Every managed session carries the resolved crontable path in the `CSCB_CRONTABLE_PATH` environment variable, so a bot can schedule its own prompts without being told where the crontable lives. Discover it from inside a session:
+
+```sh
+echo $CSCB_CRONTABLE_PATH
+```
+
+The crontable is the single source of truth for schedules. When adding a schedule, **append** a new line — never rewrite, reorder, or delete other lines. An appended line takes effect after the next server restart (the table is read once at scheduler start).
 
 ---
 

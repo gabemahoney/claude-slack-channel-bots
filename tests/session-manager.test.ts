@@ -171,7 +171,19 @@ function preSetAllFlags(channelId: string): void {
 // ---------------------------------------------------------------------------
 // SR-1.1 — fresh spawn shape
 // ---------------------------------------------------------------------------
-
+//
+// extra_env always carries CSCB_CRONTABLE_PATH — the resolved, absolute
+// cron_table_path from the RoutingConfig — for every route, whether or not a
+// (per-route or top-level) claude_config_dir is present. buildSpawnParams
+// copies the field verbatim; it never recomputes or re-resolves the path, so a
+// distinctive absolute override on the config must appear untouched in
+// extra_env (see the pass-through test below).
+//
+// There is deliberately no "cron_table_path missing" case here: cron_table_path
+// is a required field on the resolved RoutingConfig type, and the env-var
+// fallback server mode has no RoutingConfig at all — server.ts guards every
+// spawn on `if (routingConfig)`, so buildSpawnParams is never reached without
+// one. A missing-field case is therefore unrepresentable, not merely untested.
 describe('spawnForRoute: SR-1.1 fresh spawn', () => {
   test('emits SpawnParams with the SR-1.1 shape', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
@@ -192,7 +204,7 @@ describe('spawnForRoute: SR-1.1 fresh spawn', () => {
     expect(params.tmux_session_name).toBe('slack_bot_C012345')
     expect(params.relay_mode).toBe('on')
     expect(params.label).toEqual(['service=cscb', 'channel=C012345'])
-    expect(params.extra_env).toEqual({ CLAUDE_CONFIG_DIR: '/home/u/.claude-corp', CLAUDE_MANAGED_CHANNEL: 'C012345' })
+    expect(params.extra_env).toEqual({ CLAUDE_CONFIG_DIR: '/home/u/.claude-corp', CLAUDE_MANAGED_CHANNEL: 'C012345', CSCB_CRONTABLE_PATH: '/tmp/test-crontab' })
     expect(params.claude_args).toBeUndefined()
   })
 
@@ -206,7 +218,7 @@ describe('spawnForRoute: SR-1.1 fresh spawn', () => {
       claude_config_dir: '/top-level',
     })
     await spawnForRoute('C', { cwd: '/repo' }, cfg)
-    expect(spawnCalls[0].extra_env).toEqual({ CLAUDE_CONFIG_DIR: '/per-route', CLAUDE_MANAGED_CHANNEL: 'C' })
+    expect(spawnCalls[0].extra_env).toEqual({ CLAUDE_CONFIG_DIR: '/per-route', CLAUDE_MANAGED_CHANNEL: 'C', CSCB_CRONTABLE_PATH: '/tmp/test-crontab' })
   })
 
   test('omits extra_env when no claude_config_dir', async () => {
@@ -214,7 +226,29 @@ describe('spawnForRoute: SR-1.1 fresh spawn', () => {
     installStub({ spawnCalls })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
     await spawnForRoute('C', { cwd: '/x' }, cfg)
-    expect(spawnCalls[0].extra_env).toEqual({ CLAUDE_MANAGED_CHANNEL: 'C' })
+    expect(spawnCalls[0].extra_env).toEqual({ CLAUDE_MANAGED_CHANNEL: 'C', CSCB_CRONTABLE_PATH: '/tmp/test-crontab' })
+  })
+
+  test('extra_env passes the already-resolved cron_table_path through untouched (no recomputation)', async () => {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    const cfg = makeRoutingConfig({
+      routes: { C: { cwd: '/x' } },
+      cron_table_path: '/srv/resolved/absolute/crontable.md',
+    })
+    await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(spawnCalls[0].extra_env).toEqual({ CLAUDE_MANAGED_CHANNEL: 'C', CSCB_CRONTABLE_PATH: '/srv/resolved/absolute/crontable.md' })
+  })
+
+  test('extra_env carries the crontable path alongside a per-route claude_config_dir', async () => {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    const cfg = makeRoutingConfig({
+      routes: { C: { cwd: '/x', claude_config_dir: '/per-route' } },
+      cron_table_path: '/srv/resolved/absolute/crontable.md',
+    })
+    await spawnForRoute('C', { cwd: '/x' }, cfg)
+    expect(spawnCalls[0].extra_env).toEqual({ CLAUDE_CONFIG_DIR: '/per-route', CLAUDE_MANAGED_CHANNEL: 'C', CSCB_CRONTABLE_PATH: '/srv/resolved/absolute/crontable.md' })
   })
 })
 

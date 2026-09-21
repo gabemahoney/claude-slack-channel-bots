@@ -970,7 +970,14 @@ export interface SpawnRouteResult {
     | 'fresh-after-inconclusive-amnesia'
 }
 
-/** Build SpawnParams for a route (SR-1.1). Per-route claude_config_dir wins. */
+/**
+ * Build SpawnParams for a route (SR-1.1). Per-route claude_config_dir wins.
+ *
+ * extra_env unconditionally carries CSCB_CRONTABLE_PATH (the resolved,
+ * tilde-expanded, absolute cron_table_path from the config) so bots can
+ * locate the self-documenting crontable from the env var alone — no config
+ * file lookup needed (D-Q2, b.grx decision 3).
+ */
 function buildSpawnParams(
   channelId: string,
   route: { cwd: string },
@@ -990,6 +997,7 @@ function buildSpawnParams(
   params.extra_env = {
     ...(effectiveConfigDir ? { CLAUDE_CONFIG_DIR: effectiveConfigDir } : {}),
     CLAUDE_MANAGED_CHANNEL: channelId,
+    CSCB_CRONTABLE_PATH: routingConfig.cron_table_path,
   }
   return params
 }
