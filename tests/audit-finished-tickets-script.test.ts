@@ -237,6 +237,50 @@ function runAuditNoArg(fx: Fixture): RunResult {
   return { status: r.status, stdout: r.stdout, stderr: r.stderr }
 }
 
+/**
+ * Shared scaffolding for the two "pre-fix vs post-fix verdict flip" regression
+ * proofs (b.fta's ERE-lesson pin and b.zjm's connected-heuristic pin). Recovers
+ * the genuine PRE-fix script from an IMMUTABLE pinned SHA (never HEAD — once a
+ * fix commits, HEAD carries the post-fix script and vacuously breaks the
+ * comparison) and drops it beside the post-fix copy inside the SAME fixture
+ * project (`fx.repo/scripts/<name>`) so both scripts resolve identical hive
+ * paths and audit the same scratch git history.
+ *
+ * Fails loudly if the pinned commit is unreachable (shallow / partial clone) —
+ * never a silent pass. The `sanity` guards assert the recovered source truly is
+ * the OLD form (contains the pre-fix tokens, lacks the post-fix ones), so the
+ * proof cannot go vacuous. Against the pinned SHA these hold forever regardless
+ * of HEAD.
+ *
+ * Returns the absolute path to the written pre-fix script; the caller invokes it
+ * with `bash <path> <fx.repo>` and asserts the pre-fix verdict.
+ */
+function recoverPreFixScript(
+  fx: Fixture,
+  sha: string,
+  name: string,
+  sanity: { contains: string[]; lacks: string[] },
+): string {
+  const realPreFix = spawnSync(
+    'git',
+    ['show', `${sha}:scripts/audit-finished-tickets.sh`],
+    { cwd: WORKTREE_ROOT, encoding: 'utf8' },
+  )
+  expect(
+    realPreFix.status,
+    `could not recover pre-fix script from pinned commit ${sha} (shallow clone?)`,
+  ).toBe(0)
+  for (const needle of sanity.contains) {
+    expect(realPreFix.stdout).toContain(needle)
+  }
+  for (const needle of sanity.lacks) {
+    expect(realPreFix.stdout).not.toContain(needle)
+  }
+  const preFixScript = join(fx.repo, 'scripts', name)
+  writeFileSync(preFixScript, realPreFix.stdout)
+  return preFixScript
+}
+
 describe('audit-finished-tickets.sh — landed vs stranded finished tickets', () => {
   test('finished ticket with a main commit mentioning its id → clean, exit 0', () => {
     const fx = makeFixture({
@@ -552,6 +596,239 @@ describe('audit-finished-tickets.sh — documents-only closure marker (b.zjm def
   })
 })
 
+describe('audit-finished-tickets.sh — branch (b) closure vocabulary (b.fta)', () => {
+  // AC (b.fta): a bare, reasonless `## Closed` heading must NOT by itself
+  // satisfy branch (b). This is the load-bearing behavior change: the pre-fix
+  // ERE `## +closed` alternative quantified the preceding SPACE, so it matched
+  // ANY `## Closed …` heading (unanchored, case-insensitively) — silently
+  // covering for the missing reason vocabulary. With that alternative removed, a
+  // closure now requires a STATED reason. The fixture body has no ~/ path and no
+  // `## +closed:docs-only` marker, so it can only pass via branch (b); since it
+  // does not, and no commit lands it, it is flagged as stranded.
+  test('bare reasonless `## Closed` heading does NOT satisfy branch (b) → flagged', () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.bcl',
+          hive: 'Bugs',
+          status: 'finished',
+          body:
+            '# fixture ticket b.bcl\n\n' +
+            '## Closed 2026-09-20 — no separate work required\n',
+        },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).toContain('b.bcl')
+    expect(r.stdout).toContain('no commit on main lands it')
+    expect(r.status).not.toBe(0)
+  })
+
+  // AC (b.fta): each widened alternative — modeled on the real phrasing of the
+  // three legitimately-closed tickets b.49f/b.vfx/b.3kr — DOES satisfy branch
+  // (b), so a reasoned closure with no main commit is NOT flagged. Includes a
+  // case-insensitivity case (`## CLOSED … superseded by`) proving grep -i covers
+  // the uppercase heading, and the b.49f `## Closed … fully satisfied by` and
+  // b.3kr `already satisfied` shapes.
+  test.each([
+    [
+      'fully satisfied by (b.49f shape)',
+      '## Closed 2026-09-20 — fully satisfied by b.q53, no separate work required',
+    ],
+    [
+      'superseded by, uppercase heading (b.vfx shape)',
+      '## CLOSED 2026-09-20 — superseded by b.en2, verified against every acceptance criterion',
+    ],
+    [
+      'already satisfied (b.3kr shape)',
+      '## Closed 2026-09-20 — already satisfied, no work required',
+    ],
+  ])(
+    'widened branch (b) alternative %s → recognized closure, not flagged',
+    (_label, heading) => {
+      const fx = makeFixture({
+        tickets: [
+          {
+            id: 'b.wid',
+            hive: 'Bugs',
+            status: 'finished',
+            body: `# fixture ticket b.wid\n\n${heading}\n`,
+          },
+        ],
+      })
+      const r = runAudit(fx)
+      expect(r.stdout).not.toContain('b.wid')
+      expect(r.status).toBe(0)
+    },
+  )
+
+  // AC (b.fta): word-boundedness. The widened alternatives are anchored on
+  // non-alnum boundaries via the `(^|[^a-z0-9])…([^a-z0-9]|$)` idiom, so an
+  // incidental substring embedding must NOT match. "unsuperseded by" contains
+  // "superseded by" but is preceded by an alnum char ("n"), so the leading
+  // boundary fails and no closure is recognized → the ticket stays flagged.
+  test('incidental substring "unsuperseded by" does NOT match branch (b) → flagged', () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.wbb',
+          hive: 'Bugs',
+          status: 'finished',
+          body:
+            '# fixture ticket b.wbb\n\n' +
+            'This ticket was unsuperseded by anything and remains real work.\n',
+        },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).toContain('b.wbb')
+    expect(r.stdout).toContain('no commit on main lands it')
+    expect(r.status).not.toBe(0)
+  })
+
+  // AC (b.fta) — the b.qps anti-marker invariant. Each widened alternative, when
+  // the body ALSO carries an anti-marker (`pending merge` / `fixed on branch
+  // b.x`), must STILL be flagged: has_anti_marker is checked FIRST in
+  // has_closure_marker and disqualifies everything. Widening the closure
+  // vocabulary must not weaken this. One case per widened alternative — enough
+  // to show each newly-recognized reason is still disqualified by an anti-marker
+  // (the ticket AC). The anti-marker SHAPE is alternated across the three cases
+  // so both shapes still appear here; anti-marker-shape precedence itself is
+  // already covered exhaustively by the b.dam (~line 481) and b.eee (~line 296)
+  // test.each blocks, so a full 3×2 cross product would be redundant.
+  test.each([
+    ['fully satisfied by', 'The fix is pending merge/release.'],
+    ['superseded by', 'Also fixed on branch b.zzz.'],
+    ['already satisfied', 'The fix is pending merge/release.'],
+  ])(
+    'widened alternative "%s" + anti-marker (%s) → still flagged (b.qps invariant)',
+    (reason, antiLine) => {
+      const fx = makeFixture({
+        tickets: [
+          {
+            id: 'b.qai',
+            hive: 'Bugs',
+            status: 'finished',
+            body:
+              '# fixture ticket b.qai\n\n' +
+              `## Closed 2026-09-20 — ${reason} b.other, verified.\n` +
+              `${antiLine}\n`,
+          },
+        ],
+      })
+      const r = runAudit(fx)
+      expect(r.stdout).toContain('b.qai')
+      // has_anti_marker wins → the "never reached main" reason, not a closure.
+      expect(r.stdout).toContain('never reached main')
+      expect(r.status).not.toBe(0)
+    },
+  )
+
+  // AC (b.fta): a bare `## +closed` LITERAL heading must NOT satisfy branch (b)
+  // in the post-fix script either — the alternative was REMOVED, not fixed. The
+  // only intentional docs-only closure route is `## +closed:docs-only` via
+  // branch (c). A bare `## +closed` (no `:docs-only` suffix, no reason
+  // vocabulary, no ~/ path) is not a closure → the ticket is flagged.
+  test('bare `## +closed` literal heading (no :docs-only) does NOT satisfy branch (b) → flagged', () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.plc',
+          hive: 'Bugs',
+          status: 'finished',
+          body: '# fixture ticket b.plc\n\n## +closed\n\nsome trailing prose.\n',
+        },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).toContain('b.plc')
+    expect(r.stdout).toContain('no commit on main lands it')
+    expect(r.status).not.toBe(0)
+  })
+
+  // AC (b.fta) — ERE-lesson regression pin. Directly demonstrates the verdict
+  // FLIP for a bare, reasonless `## Closed` heading, recovering the genuine
+  // PRE-FIX script from the IMMUTABLE pinned commit a9173fa (the mainline commit
+  // immediately before this fix, permanently in repo history) — NOT HEAD, which
+  // would carry the post-fix script once this lands and vacuously break the
+  // comparison. Pre-fix: the ERE `## +closed` quantifier bug matches any
+  // `## Closed …` heading, so the ticket is laundered as closed (exit 0, not
+  // flagged). Post-fix: that alternative is removed, a reasonless heading is no
+  // longer a closure, so the ticket is flagged (exit non-zero). This pins the
+  // lesson so nobody "restores" `## +closed` as a regression. If the pinned
+  // commit is unreachable (shallow / partial clone) the recovery fails loudly.
+  test('the removed `## +closed` quantifier bug CHANGES the verdict: pre-fix launders a bare `## Closed` yet FLAGS a literal `## +closed`, post-fix flags both [regression proof]', () => {
+    // Two fixture tickets in the SAME project so both scripts audit one history:
+    //   b.ere — a bare, reasonless `## Closed` heading. This is what the ERE
+    //           `## +closed` alternative silently laundered pre-fix: the `+`
+    //           quantified the SPACE, so `## +closed` matched "## " followed by
+    //           one-or-more spaces then "closed", i.e. ANY `## Closed …` heading.
+    //   b.plt — a LITERAL `## +closed` heading body. This is the ERE lesson the
+    //           ticket AC names: a literal `## +closed` is NOT matched by the old
+    //           pattern (a literal "+" is a quantifier there, never a "+"), so
+    //           the pre-fix script must FLAG b.plt — proving the old pattern
+    //           never matched the literal. Post-fix the alternative is gone
+    //           entirely, so a literal `## +closed` (no `:docs-only`) is likewise
+    //           flagged.
+    const bareClosedBody =
+      '# fixture ticket b.ere\n\n' +
+      '## Closed 2026-09-20 — no separate work required\n'
+    const literalPlusBody =
+      '# fixture ticket b.plt\n\n## +closed\n\nsome trailing prose.\n'
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.ere',
+          hive: 'Bugs',
+          status: 'finished',
+          title: 'reasonless closed heading',
+          body: bareClosedBody,
+        },
+        {
+          id: 'b.plt',
+          hive: 'Bugs',
+          status: 'finished',
+          title: 'literal plus-closed heading',
+          body: literalPlusBody,
+        },
+      ],
+    })
+
+    // Recover the genuine PRE-fix script from the immutable pinned commit
+    // a9173fa (the mainline commit immediately before this fix). Sanity: its
+    // branch (b) still carries the buggy `## +closed` alternative and lacks the
+    // widened reason vocabulary, else the proof is vacuous.
+    const preFixScript = recoverPreFixScript(fx, 'a9173fa', 'audit-prefix-ere.sh', {
+      contains: ['## +closed'],
+      lacks: ['fully satisfied by', 'already satisfied'],
+    })
+
+    // Pre-fix run. The `## +closed` quantifier bug matches the bare `## Closed`
+    // heading → b.ere laundered as closed (NOT flagged). But a LITERAL `## +closed`
+    // heading is NOT matched by that same pattern (the "+" is a quantifier, not a
+    // literal plus) → b.plt is NOT laundered and IS flagged. Because b.plt strands,
+    // the pre-fix run exits non-zero overall — so the meaningful assertion is
+    // per-ticket: b.ere absent (laundered) yet b.plt present (flagged).
+    const pre = spawnSync('bash', [preFixScript, fx.repo], {
+      encoding: 'utf8',
+      env: { ...process.env },
+    })
+    expect(pre.stdout).not.toContain('b.ere')
+    expect(pre.stdout).toContain('b.plt')
+    // Sentinel: if the pre-fix pattern is ever misread as matching the literal
+    // (proof gone vacuous), b.plt would be laundered and this fails.
+    expect(pre.status).not.toBe(0)
+
+    // Post-fix (the working-tree script the fixture copied in): the alternative
+    // is removed → neither a reasonless `## Closed` nor a literal `## +closed`
+    // (no `:docs-only`) is a closure → BOTH flagged, exit non-zero.
+    const post = runAudit(fx)
+    expect(post.stdout).toContain('b.ere')
+    expect(post.stdout).toContain('b.plt')
+    expect(post.status).not.toBe(0)
+  })
+})
+
 describe('audit-finished-tickets.sh — tightened out-of-repo heuristic (b.zjm defect 2)', () => {
   // AC 5 / regression for defect 2: a finished ticket that merely QUOTES a ~/
   // path in an unrelated evidence line (an anchor-table row, mirroring b.tso),
@@ -726,29 +1003,13 @@ describe('audit-finished-tickets.sh — tightened out-of-repo heuristic (b.zjm d
     })
 
     // Recover the genuine PRE-fix script from the immutable pinned commit
-    // (5522f1b) rather than HEAD: once this fix is committed HEAD would carry the
-    // post-fix script, so HEAD-relative recovery is a time bomb. Drop it beside
-    // the post-fix copy inside the SAME fixture project so both resolve identical
-    // hive paths and audit the same scratch git history.
-    const realPreFix = spawnSync(
-      'git',
-      ['show', '5522f1b:scripts/audit-finished-tickets.sh'],
-      { cwd: WORKTREE_ROOT, encoding: 'utf8' },
-    )
-    // Fail loudly if the pinned commit is unreachable (e.g. shallow / partial
-    // clone) — do NOT silently pass.
-    expect(
-      realPreFix.status,
-      'could not recover pre-fix script from pinned commit 5522f1b (shallow clone?)',
-    ).toBe(0)
-    // Sanity: the recovered pre-fix source must be the OLD form (no docs-only
-    // marker, uses the two independent greps), else the proof is vacuous. Against
-    // the pinned SHA these hold forever regardless of HEAD.
-    expect(realPreFix.stdout).not.toContain('out_of_repo_fix_connected')
-    expect(realPreFix.stdout).not.toContain('+closed:docs-only')
-
-    const preFixScript = join(fx.repo, 'scripts', 'audit-prefix.sh')
-    writeFileSync(preFixScript, realPreFix.stdout)
+    // (5522f1b) rather than HEAD (see recoverPreFixScript). Sanity: the recovered
+    // source must be the OLD form (no docs-only marker, no connected-heuristic
+    // helper — uses the two independent greps), else the proof is vacuous.
+    const preFixScript = recoverPreFixScript(fx, '5522f1b', 'audit-prefix.sh', {
+      contains: [],
+      lacks: ['out_of_repo_fix_connected', '+closed:docs-only'],
+    })
 
     // The incidental-path body was written onto the fixture ticket by
     // makeFixture (body: incidentalPathBody()), so both scripts audit the same

@@ -15,7 +15,8 @@
 #     not match a main commit subject) AND whose body carries no recognized
 #     closure marker: an out-of-repo fix naming a ~/ path CONNECTED to fix
 #     language (same line or same closure section), an explicit no-repro /
-#     superseded / abandoned note, or the explicit documents-only
+#     superseded / abandoned / satisfied-by-other-work note ("superseded by",
+#     "fully satisfied by", "already satisfied"), or the explicit documents-only
 #     `## +closed:docs-only` marker (product lives outside any git repo, so no
 #     main commit is possible). A body that says the fix is "pending
 #     merge/release" or "fixed on branch X" is treated as an ANTI-marker — that
@@ -46,7 +47,8 @@
 #   * Stranded finished tickets. A finished ticket is expected to be excused by
 #     exactly one of: a genuine main commit (id-referencing or title-matching),
 #     an out-of-repo fix whose ~/ path is connected to its resolution claim, an
-#     explicit no-repro/superseded/abandoned note, or the documents-only
+#     explicit no-repro/superseded/abandoned/satisfied-by-other-work note
+#     ("superseded by", "fully satisfied by", "already satisfied"), or the documents-only
 #     `## +closed:docs-only` marker for work whose product lives outside any git
 #     repo. A finished ticket matching none of these is a real finding. Note the
 #     documents-only class exists because the project root itself is not a git
@@ -324,8 +326,28 @@ has_closure_marker() {
     return 0
   fi
 
-  # (b) no-repro / superseded / abandoned closure
-  if grep -qiE 'no[ -]?repro|not[ -]?reproducible|cannot reproduce|wont[ -]?fix|closed as (superseded|abandoned)|## +closed' "$f"; then
+  # (b) explicit closure note — no-repro / superseded / abandoned / satisfied.
+  #
+  # The closure vocabulary is deliberately widened to the phrasing actually used
+  # by legitimately-closed tickets (b.49f "fully satisfied by", b.vfx
+  # "superseded by", b.3kr "already satisfied"), each as a WORD-BOUNDED
+  # alternative. awk/ERE have no \b, so — matching the idiom used by
+  # out_of_repo_fix_connected above — boundaries are anchored on non-alnum
+  # (^/$ or a non-[a-z0-9] char). grep -i makes the [a-z0-9] class cover the
+  # uppercase forms too, so "## CLOSED … superseded by" still matches.
+  #
+  # The former `## +closed` alternative is REMOVED. Its ERE `+` quantified the
+  # preceding SPACE, so it never matched a literal `## +closed` heading — it
+  # matched any `## Closed …` heading (case-insensitively, unanchored, even
+  # mid-prose), which is exactly the accidental match that silently covered for
+  # the missing reason-vocabulary above. Its apparent intent (an explicit
+  # closed-heading marker) is now served two ways that are both intentional:
+  # the deliberate anchored `## +closed:docs-only` marker (branch (c),
+  # has_docs_only_marker) for docs-only work, and these word-bounded
+  # reason-vocabulary alternatives for reasoned closures. A bare, reasonless
+  # `## Closed` heading must NOT satisfy branch (b) — a closure needs a stated
+  # reason, and each alternative below carries one.
+  if grep -qiE '(^|[^a-z0-9])(no[ -]?repro|not[ -]?reproducible|cannot reproduce|wont[ -]?fix|closed as (superseded|abandoned)|superseded by|fully satisfied by|already satisfied)([^a-z0-9]|$)' "$f"; then
     return 0
   fi
 
@@ -487,7 +509,8 @@ echo
 
 if [ "${FOUND}" -ne 0 ]; then
   echo "RESULT: stranded work found. Resolve it (land the fix, or explicitly"
-  echo "close the ticket as no-repro/superseded/abandoned with a pointer, or"
+  echo "close the ticket as no-repro/superseded/abandoned/satisfied-by-other-work"
+  echo "with a pointer, or"
   echo "delete the merged/dead branch) before releasing."
   exit 1
 fi
