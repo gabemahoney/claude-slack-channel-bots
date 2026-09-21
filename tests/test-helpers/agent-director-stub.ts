@@ -33,6 +33,7 @@ import {
   ErrCallTimeout,
   ErrInstanceIdCollision,
   ErrJsonlMissing,
+  ErrJsonlNeverWritten,
   ErrNoOpenPermissionRequest,
   ErrNoSessionId,
   ErrPauseTimeout,
@@ -212,6 +213,19 @@ export function errNoSessionId(): ErrNoSessionId {
  */
 export function errJsonlMissing(description: string = 'jsonl missing'): ErrJsonlMissing {
   return new ErrJsonlMissing('resume', 'ErrJsonlMissing', description)
+}
+
+/**
+ * Build an ErrJsonlNeverWritten (resume / AD 0.10.0). Distinct from
+ * ErrJsonlMissing: the session never wrote a transcript at all, so there is
+ * provably no history to lose and the recovery is lossless (b.jgf).
+ */
+export function errJsonlNeverWritten(): ErrJsonlNeverWritten {
+  return new ErrJsonlNeverWritten(
+    'resume',
+    'ErrJsonlNeverWritten',
+    'spawn cscb_general_C session aaca1537 has produced no transcript',
+  )
 }
 
 /** Build an ErrSpawnNotResumable (resume / SR-1.4 collision-recovery). */

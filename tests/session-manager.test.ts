@@ -31,6 +31,7 @@ import {
   approvePreSessionDialogs,
   spawnForRoute,
   startupSessionManager,
+  launchSession,
   instanceIdFor,
   tmuxSessionNameFor,
   AGENT_DIRECTOR_LIVE_STATES,
@@ -67,6 +68,7 @@ import {
   errInstanceIdCollision,
   errNoSessionId,
   errJsonlMissing,
+  errJsonlNeverWritten,
   errSpawnNotFound,
   errSpawnNotResumable,
   errGeneric,
@@ -3369,5 +3371,111 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
     const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, true)
     expect(result.action).toBe('spawned')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.jgf — ErrJsonlNeverWritten: lossless delete + fresh spawn
+//
+// AD 0.10.0 split the old "resume can't find a transcript" condition into
+// ErrJsonlMissing (a transcript path was recorded but is gone now — ambiguous,
+// keeps the b.wrb diagnosis ceremony) and ErrJsonlNeverWritten (the session
+// never wrote one — provably nothing to lose). Pre-fix the new name matched no
+// branch in the resume ladder, so it hit the generic tail: action 'failed', a
+// spawn-failure post, and restart.ts retrying the same impossible resume with
+// a doubling backoff forever.
+// ---------------------------------------------------------------------------
+
+describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => {
+  const CH = 'C_JGF'
+  const CWD = '/repo/jgf'
+
+  beforeEach(() => {
+    // startupSessionManager writes startup-errors.log; keep it out of the repo.
+    process.env['SLACK_STATE_DIR'] = mkdtempSync(join(tmpdir(), 'cscb-jgf-'))
+  })
+
+  /**
+   * Drive the wedge: colliding spawn resolves to an `ended` row, resume rejects
+   * with ErrJsonlNeverWritten, then delete + fresh spawn succeeds.
+   */
+  function installNeverWritten(opts?: {
+    spawnCalls?: import('agent-director').SpawnParams[]
+    deleteCalls?: import('agent-director').DeleteParams[]
+    getCalls?: import('agent-director').GetParams[]
+  }) {
+    return installStub({
+      ...opts,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+      ],
+      resumeError: errJsonlNeverWritten(),
+      getResult: cannedGetResult({
+        claude_instance_id: `cscb_${CH}`,
+        state: 'ended',
+        jsonl_path: '/data/proj/sess-jgf.jsonl',
+        claude_session_id: 'sess-jgf',
+        cwd: CWD,
+      }),
+    })
+  }
+
+  // --- Regression requirement (designated) --------------------------------
+  // Pre-fix this same test FAILS on every assertion that matters: the resume
+  // rejection fell through to the generic tail, so action was 'failed', the
+  // row was never deleted, no fresh spawn was issued (spawnCalls === 1) and
+  // postSpawnFailureToChannel posted into the channel. Verified against
+  // main:src/session-manager.ts, whose branch condition is
+  // `err instanceof ErrNoSessionId || err instanceof ErrJsonlMissing`.
+  test('REGRESSION: resume ErrJsonlNeverWritten → delete + fresh spawn, action=spawned, no channel post, no diagnosis get', async () => {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const getCalls: import('agent-director').GetParams[] = []
+    installNeverWritten({ spawnCalls, deleteCalls, getCalls })
+    const { web, calls } = makeMockWeb()
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+
+    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, web as never, true)
+
+    // AC-2/AC-3: plain success action — not 'failed', and not borrowed from the
+    // amnesia vocabulary, because nothing was lost.
+    expect(result).toEqual({ channelId: CH, action: 'spawned' })
+    // Row deleted, then re-spawned with the original params.
+    expect(deleteCalls).toHaveLength(1)
+    expect(deleteCalls[0].claude_instance_id).toEqual([`cscb_${CH}`])
+    expect(spawnCalls).toHaveLength(2)
+    expect(spawnCalls[1].claude_instance_id).toBe(`cscb_${CH}`)
+    // AC-4: no spawn-failure post to the channel.
+    expect(calls).toHaveLength(0)
+    // AC-3: only the collision-recovery get ran. diagnoseJsonlMissing fetches
+    // the row a second time, so a single get proves the diagnosis was skipped.
+    expect(getCalls).toHaveLength(1)
+  })
+
+  // AC-5 (no retry): restart.ts reschedules with doubling backoff whenever its
+  // launchSession adapter returns false. The wedge was that loop, so assert at
+  // the adapter boundary rather than replicating restart.ts's timer.
+  test('launchSession adapter returns true → restart.ts records success, schedules no retry', async () => {
+    installNeverWritten()
+    const { web } = makeMockWeb()
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+
+    expect(await launchSession(CH, CWD, cfg, web as never)).toBe(true)
+  })
+
+  // AC-3: the startup summary must stay honest — a never-written transcript is
+  // an ordinary fresh spawn, not amnesia and not an undiagnosable one.
+  test('startup counters: bucketed as freshSpawned, not amnesia and not failed', async () => {
+    installNeverWritten()
+    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+
+    const result = await startupSessionManager(cfg, { concurrency: 1 })
+
+    expect(result.freshSpawned).toBe(1)
+    expect(result.freshAfterAmnesia).toBe(0)
+    expect(result.freshAfterInconclusiveAmnesia).toBe(0)
+    expect(result.failed).toBe(0)
+    expect(result.perChannel).toEqual([{ channelId: CH, action: 'spawned' }])
   })
 })
