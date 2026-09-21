@@ -51,6 +51,10 @@ type DepsOpts = {
   // depending on how many times the free-running timer fired. When the queue
   // for a channel is exhausted, the LAST scripted value repeats.
   connectedSequence?: Record<string, boolean[]>
+  hasSessionStreamResult?: boolean   // default: true (stream present — prior semantics; b.9cj)
+  // b.9cj: per-channel scripted stream-presence, consumed one-per-hasSessionStream
+  // call like connectedSequence. When the queue is exhausted the LAST value repeats.
+  streamSequence?: Record<string, boolean[]>
   statRouteResult?: boolean          // default: true (route cwd is reachable)
   statRouteHangs?: boolean           // if true, statRoute never resolves
   isShuttingDownResult?: boolean     // default: false
@@ -62,16 +66,23 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
   scheduleRestartCalls: Array<{ channelId: string; cwd: string }>
   isSessionAliveCalls: string[]
   isSessionConnectedCalls: string[]
+  hasSessionStreamCalls: string[]
   // For each scheduleRestart fire, how many times isSessionConnected had been
   // called for that channel at fire time. Lets a test assert a reconnect was
   // scheduled on the Nth disconnected observation (streak semantics).
   scheduleRestartAtConnectedCount: number[]
+  // b.9cj: same idea keyed on hasSessionStream call count — lets a streamless
+  // test assert the fire landed on the Nth stream observation (streak debounce).
+  scheduleRestartAtStreamCount: number[]
 } {
   const scheduleRestartCalls: Array<{ channelId: string; cwd: string }> = []
   const isSessionAliveCalls: string[] = []
   const isSessionConnectedCalls: string[] = []
+  const hasSessionStreamCalls: string[] = []
   const scheduleRestartAtConnectedCount: number[] = []
+  const scheduleRestartAtStreamCount: number[] = []
   const connectedCallCount = new Map<string, number>()
+  const streamCallCount = new Map<string, number>()
   let pendingCallCount = 0
   let atCapCallCount = 0
 
@@ -79,7 +90,9 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
     scheduleRestartCalls,
     isSessionAliveCalls,
     isSessionConnectedCalls,
+    hasSessionStreamCalls,
     scheduleRestartAtConnectedCount,
+    scheduleRestartAtStreamCount,
 
     async isSessionAlive(channelId) {
       isSessionAliveCalls.push(channelId)
@@ -98,6 +111,16 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
         return seq[Math.min(n - 1, seq.length - 1)]
       }
       return opts.isSessionConnectedResult ?? true
+    },
+    hasSessionStream(channelId) {
+      hasSessionStreamCalls.push(channelId)
+      const n = (streamCallCount.get(channelId) ?? 0) + 1
+      streamCallCount.set(channelId, n)
+      const seq = opts.streamSequence?.[channelId]
+      if (seq && seq.length > 0) {
+        return seq[Math.min(n - 1, seq.length - 1)]
+      }
+      return opts.hasSessionStreamResult ?? true
     },
     isRestartPendingOrActive(_channelId) {
       const seq = opts.pendingSequence
@@ -122,6 +145,7 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
     scheduleRestart(channelId, cwd) {
       scheduleRestartCalls.push({ channelId, cwd })
       scheduleRestartAtConnectedCount.push(connectedCallCount.get(channelId) ?? 0)
+      scheduleRestartAtStreamCount.push(streamCallCount.get(channelId) ?? 0)
     },
     isShuttingDown() {
       return opts.isShuttingDownResult ?? false
@@ -452,6 +476,9 @@ describe('isAtCap tick-guard (SR-25.3/25.4)', () => {
       isSessionConnected(_channelId) {
         return true
       },
+      hasSessionStream(_channelId) {
+        return true
+      },
       isRestartPendingOrActive(_channelId) {
         return false
       },
@@ -730,5 +757,93 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     // Two fresh post-cap observations were required — the pre-cap streak of 1
     // was cleared by the cap skip rather than carried across.
     expect(deps.scheduleRestartAtConnectedCount[0]).toBe(3)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.9cj — connected-but-streamless tick recovery
+//
+// Before b.9cj the alive-tick's unhealthy condition was `!isSessionConnected`
+// alone. A session that was alive AND connected but whose standalone GET SSE
+// stream had been silently dropped (`hasSessionStream === false`) landed in the
+// healthy `else` and was never recovered. The fix widens the unhealthy
+// condition to `!isSessionConnected || !hasSessionStream`, composing with the
+// EXISTING two-consecutive-tick disconnectedStreak debounce (no new streak
+// map). These tests pin: (a) a streamless session fires on the 2nd consecutive
+// streamless tick, not the 1st; (b) a stream-present session is healthy and
+// resets the streak.
+// ---------------------------------------------------------------------------
+
+describe('b.9cj connected-but-streamless tick recovery', () => {
+  test('REGRESSION: alive + connected but STREAMLESS → scheduleRestart fires on the 2nd consecutive tick, not the 1st', async () => {
+    // Pre-fix, a connected session was "healthy" regardless of stream presence,
+    // so scheduleRestart was NEVER called here. Post-fix it fires — and only on
+    // the SECOND streamless observation (shares the b.9a7 debounce for the
+    // freshly-launched, stream-not-yet-open window).
+    const deps = makeDeps({
+      isSessionAliveResult: true,
+      isSessionConnectedResult: true,   // connected …
+      hasSessionStreamResult: false,    // … but streamless
+    })
+    initHealthCheck(deps)
+
+    startHealthCheck(FAST_INTERVAL_S)
+    await Bun.sleep(WAIT_MS)
+
+    expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
+    expect(deps.scheduleRestartCalls[0].channelId).toBe('C_TEST1')
+    expect(deps.scheduleRestartCalls[0].cwd).toBe('/cwd/test')
+    // First fire landed on the 2nd streamless observation, never the 1st.
+    expect(deps.scheduleRestartAtStreamCount[0]).toBe(2)
+  })
+
+  test('alive + connected + stream present → healthy: no scheduleRestart and streak resets', async () => {
+    // A fully healthy session (alive, connected, stream present) is never
+    // scheduled. Prove it also RESETS the streak: a lone streamless blip
+    // followed by a stream-present tick never reaches two consecutive.
+    const deps = makeDeps({
+      isSessionAliveResult: true,
+      isSessionConnectedResult: true,
+      // false (streak→1), true (reset), false (fresh streak→1), true (reset) …
+      streamSequence: { C_TEST1: [false, true, false, true] },
+    })
+    initHealthCheck(deps)
+
+    startHealthCheck(FAST_INTERVAL_S)
+    await Bun.sleep(WAIT_MS)
+
+    // No two CONSECUTIVE streamless observations ever occurred — the healthy
+    // (stream-present) branch cleared the streak each time.
+    expect(deps.scheduleRestartCalls).toHaveLength(0)
+    // Anti-vacuity: the scripted sequence was actually observed.
+    expect(deps.hasSessionStreamCalls.length).toBeGreaterThanOrEqual(4)
+  })
+
+  test('DISCONNECTED (connected===false) short-circuits the OR: hasSessionStream is never consulted, recovery still fires on every 2nd tick', async () => {
+    // The unhealthy condition is `!isSessionConnected || !hasSessionStream`
+    // (health-check.ts:184). When connected===false the FIRST operand is already
+    // true, so JS short-circuits and hasSessionStream is NEVER called for this
+    // channel — the disconnected path (b.9a7) and the streamless path (b.9cj)
+    // share the same debounced branch and streak map. hasSessionStreamResult is
+    // set false here only to prove it is irrelevant when disconnected.
+    const deps = makeDeps({
+      isSessionAliveResult: true,
+      isSessionConnectedResult: false,   // disconnected — first operand short-circuits
+      hasSessionStreamResult: false,     // would also route here, but is never reached
+    })
+    initHealthCheck(deps)
+
+    startHealthCheck(FAST_INTERVAL_S)
+    await Bun.sleep(WAIT_MS)
+
+    // The disconnected session was recovered.
+    expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
+    // Proof of short-circuit: the stream probe was never consulted for C_TEST1.
+    expect(deps.hasSessionStreamCalls).toHaveLength(0)
+    // Every fire lands at an even CONNECTED-observation count (2, 4, 6…): the
+    // shared streak is consumed on fire and must re-accumulate two observations.
+    for (const n of deps.scheduleRestartAtConnectedCount) {
+      expect(n % 2).toBe(0)
+    }
   })
 })

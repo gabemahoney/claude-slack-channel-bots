@@ -778,13 +778,61 @@ async function handleMessage(event: unknown): Promise<void> {
         `connected=${targetSession.connected} text="${text.slice(0, 80)}"`
       )
       if (!hasGetStream) {
+        // b.9cj: the registry says connected but the SDK has silently dropped
+        // the standalone GET SSE stream, so notification() would evaporate with
+        // no throw and no return value. Do NOT send it — the message provably
+        // cannot reach the bot. Trigger recovery (which now actually fires:
+        // restart.ts no longer waves a connected-but-streamless session through
+        // as "already reconnected"), and give the sender the same honest
+        // "not delivered" reply a disconnected session gets on the b.kvq path.
         console.error(
           `[slack] DROP: no _GET_stream for cwd="${targetSession.cwd}" channel=${channelId} ` +
-          `mcpSessionId=${mcpSessionId} — message will not reach the bot; scheduling restart`
+          `mcpSessionId=${mcpSessionId} — message will not reach the bot; triggering recovery`
         )
-        scheduleRestart(channelId, targetSession.cwd)
-        // Continue with the .notification() call anyway, so behavior in this PR is
-        // strictly observe + restart-on-miss; not yet a behavior change for the normal path.
+
+        // Recovery is keyed to the OWNING channel of the session, not the
+        // inbound channel. targetSession may have been resolved via
+        // default_route (getSessionByCwd) or the DM default_dm_session path, in
+        // which case channelId is not the owner. instanceIdFor, tmux naming,
+        // backoff, and the pending/cap guards are all keyed by the owning
+        // channelId, so scheduling under the inbound channel could spawn a
+        // duplicate instance on a shared cwd and miss the owner's in-flight
+        // restart/cap state. The reply below stays on the inbound channelId.
+        const ownerChannelId = targetSession.channelId
+        const alreadyRestarting = isRestartPendingOrActive(ownerChannelId)
+        const autoRestartDisabled = (routingConfig?.session_restart_delay ?? 60) === 0
+        const capped = backoffIsAtCap(ownerChannelId, RESTART_FAILURE_CAP)
+
+        let replyText: string
+        if (alreadyRestarting) {
+          // A restart is already pending/active — do not stack a second launch.
+          replyText =
+            'Your message was not delivered. The session is restarting — please retry in a moment.'
+        } else if (autoRestartDisabled) {
+          // getRestartDelay()===0: auto-restart is off. scheduleRestart would
+          // early-return, so do not pretend recovery is underway.
+          replyText =
+            'Your message was not delivered and was not saved. Auto-restart is disabled for this channel, ' +
+            'so it will NOT recover on its own — an operator must restart the server.'
+        } else if (capped) {
+          // At the consecutive-failure cap: firing another launch would only
+          // burn a spawn attempt against a route that cannot come up. Bound the
+          // human trigger here rather than spawn-looping, and say so plainly.
+          replyText =
+            'Your message was not delivered and was not saved. This channel has hit its restart-failure limit ' +
+            'and will NOT recover on its own — an operator must restart the server.'
+        } else {
+          // Live session, streamless, under cap, auto-restart enabled: trigger a
+          // fast human-clamped recovery. This message is still lost.
+          scheduleRestart(ownerChannelId, targetSession.cwd, undefined, { humanTrigger: true })
+          replyText =
+            'Your message was not delivered. The session is restarting — please retry in a moment.'
+        }
+
+        try {
+          await web.chat.postMessage({ channel: channelId, text: replyText })
+        } catch { /* non-critical */ }
+        return
       }
       targetSession.server.notification({
         method: 'notifications/claude/channel',
@@ -1421,6 +1469,17 @@ export async function main(): Promise<void> {
   // back to "dead" defensively — health-check will retry.
   const isSessionAliveAdapter = _buildIsSessionAliveAdapter(() => routingConfig)
 
+  // b.9cj: shared stream-presence probe. A session can be `connected === true`
+  // in the registry while the SDK has silently deleted its `_GET_stream` map
+  // entry, in which state messages cannot reach the bot. Both the restart guard
+  // and the health-check tick consult this alongside isSessionConnected so a
+  // connected-but-streamless session is treated as unhealthy, not "healed".
+  // Factored here so the two dep objects below stay in exact agreement.
+  const hasSessionStreamAdapter = (channelId: string): boolean => {
+    const session = getSessionByChannel(channelId)
+    return session ? hasGetStreamKey(session.transport) : false
+  }
+
   // Initialize restart module with library-backed adapters
   initRestart({
     isSessionAlive: isSessionAliveAdapter,
@@ -1428,6 +1487,7 @@ export async function main(): Promise<void> {
       const session = getSessionByChannel(channelId)
       return session?.connected === true
     },
+    hasSessionStream: hasSessionStreamAdapter,
     reconnectSession: _buildReconnectSessionAdapter(() => routingConfig, web),
     killSession: async (channelId) => {
       try {
@@ -1546,6 +1606,9 @@ export async function main(): Promise<void> {
       const session = getSessionByChannel(channelId)
       return session?.connected === true
     },
+    // b.9cj: same stream-presence probe wired into initRestart above, so the
+    // tick can notice connected-but-streamless rows and route them to recovery.
+    hasSessionStream: hasSessionStreamAdapter,
     isRestartPendingOrActive,
     isAtCap: (channelId) => backoffIsAtCap(channelId, RESTART_FAILURE_CAP),
     statRoute: _buildStatRouteImpl(),

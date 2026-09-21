@@ -1,26 +1,35 @@
 /**
- * dispatch-get-stream.test.ts — Tests for the b.sjy instrumentation patch.
+ * dispatch-get-stream.test.ts — Tests for the b.sjy instrumentation patch and
+ * the b.9cj streamless-deliver rewrite of handleMessage.
  *
- * Verifies the dispatch-site logic added in handleMessage (server.ts ~line 664):
- *   - When _GET_stream is absent from transport._streamMapping, scheduleRestart
- *     is called with (channelId, cwd).
- *   - When _GET_stream IS present, scheduleRestart is NOT called from this path.
+ * Verifies the dispatch-site logic in handleMessage (server.ts:780-836):
+ *   - When _GET_stream is absent from transport._streamMapping, the branch does
+ *     NOT call notification() (the SDK's send() would evaporate silently).
+ *     Instead it selects a three-state reply and, only in the recover case,
+ *     calls scheduleRestart keyed to the session's OWNING channel with
+ *     { humanTrigger: true }, then replies to the INBOUND channel and returns.
+ *   - When _GET_stream IS present, notification() fires and nothing else.
  *
  * handleMessage cannot be imported directly (server.ts has module-scope side
  * effects: Slack client init, token load, etc.). We follow the same pattern as
  * dm-routing.test.ts — replicate only the relevant sub-logic in a
  * simulateDispatch helper and test it in isolation.
  *
- * scheduleRestart is observable via initRestart (injectable deps) +
- * isRestartPendingOrActive from restart.ts, which returns true when a timer is
- * pending. We use a large restart delay so the timer never fires during the
- * test, then check the pending state synchronously.
+ * REPLICATION GAP (honestly stated): simulateDispatch re-implements the
+ * server.ts branch; it cannot catch the *call* to hasGetStreamKey being deleted
+ * from server.ts, nor the reply strings drifting in server.ts. To narrow the
+ * string gap, the reply constants below are asserted against by name; if a
+ * source string changes, update the constant here in the same change. The
+ * scheduleRestart / isRestartPendingOrActive / isAtCap composition is the REAL
+ * restart.ts + backoff.ts machinery (not stubbed), so the three-state guard
+ * (already-restarting / auto-restart-disabled / capped / recover) is genuinely
+ * exercised.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { _resetRegistry } from '../src/registry.ts'
+import { _resetRegistry, registerSession, getSessionByChannel } from '../src/registry.ts'
 import { hasGetStreamKey } from '../src/lib.ts'
 import {
   initRestart,
@@ -28,8 +37,10 @@ import {
   isRestartPendingOrActive,
   cancelAllRestartTimers,
   _resetRestartState,
+  RESTART_FAILURE_CAP,
   type RestartDeps,
 } from '../src/restart.ts'
+import { isAtCap, recordFailure, _resetBackoffState } from '../src/backoff.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -76,6 +87,7 @@ function makeRestartDeps(): RestartDeps {
   return {
     async isSessionAlive() { return false },
     isSessionConnected() { return false },
+    hasSessionStream() { return true },
     async reconnectSession() {},
     async killSession() {},
     async launchSession() { return true },
@@ -85,44 +97,104 @@ function makeRestartDeps(): RestartDeps {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Reply-string constants — kept in lock-step with src/server.ts:807-829.
+// These mirror the source three-state reply text. Asserting toBe(<CONSTANT>)
+// is only as honest as this replication; if a source string changes it must be
+// changed here too (see REPLICATION GAP in the file header).
+// ---------------------------------------------------------------------------
+
+/** server.ts alreadyRestarting AND recover branches share this string. */
+const RESTARTING_REPLY =
+  'Your message was not delivered. The session is restarting — please retry in a moment.'
+
+/** server.ts autoRestartDisabled branch. */
+const AUTO_DISABLED_REPLY =
+  'Your message was not delivered and was not saved. Auto-restart is disabled for this channel, ' +
+  'so it will NOT recover on its own — an operator must restart the server.'
+
+/** server.ts capped branch. */
+const CAPPED_REPLY =
+  'Your message was not delivered and was not saved. This channel has hit its restart-failure limit ' +
+  'and will NOT recover on its own — an operator must restart the server.'
+
+type ReplyVariant = 'restarting' | 'auto-disabled' | 'capped'
+
 /**
- * Simulate the dispatch-site logic added by the b.sjy patch (server.ts ~664).
+ * Simulate the streamless dispatch branch in handleMessage (server.ts:780-836).
  *
- * Logic mirrors exactly:
- *   const transport = targetSession.transport as any
- *   if (!hasGetStreamKey(transport)) {
- *     scheduleRestart(channelId, targetSession.cwd)
- *   }
- *   targetSession.server.notification({ method: 'notifications/claude/channel', ... })
+ * Mirrors the b.9cj rewrite faithfully, keeping the two channel identities the
+ * source distinguishes:
+ *   - ownerChannelId = targetSession.channelId — everything recovery-keyed
+ *     (isRestartPendingOrActive, backoffIsAtCap, scheduleRestart) uses THIS.
+ *   - inboundChannelId — the channel the message arrived on; the reply posts
+ *     HERE. When a session is resolved via default_route/DM these differ, and
+ *     mis-keying recovery to the inbound channel is the bug this guards.
  *
- * simulateDispatch now delegates to the real hasGetStreamKey imported from
- * lib.ts, so if the predicate's semantics change in lib.ts these tests will
- * catch it.
+ * Three-state reply (server.ts order): alreadyRestarting → RESTARTING_REPLY (no
+ * new launch); autoRestartDisabled (session_restart_delay === 0) →
+ * AUTO_DISABLED_REPLY; capped → CAPPED_REPLY; else → scheduleRestart(owner, cwd,
+ * undefined, { humanTrigger: true }) then RESTARTING_REPLY. scheduleRestart is
+ * called ONLY in the else branch. notification() is NEVER called on this branch.
  *
- * RESIDUAL GAP: deleting the *call* to hasGetStreamKey from server.ts would
- * NOT be caught by these unit tests. That gap is intrinsic to the project's
- * "can't import server.ts" constraint; it belongs in Phase 1 manual
- * verification per the acceptance criteria in the b.sjy bee.
- *
- * Returns whether notification() was called (always true in the patch — the
- * .notification() call is unconditional).
+ * Uses the REAL isRestartPendingOrActive / isAtCap / scheduleRestart, so the
+ * guard is genuinely exercised over restart.ts + backoff.ts state.
  */
-function simulateDispatch(
-  channelId: string,
+function simulateStreamlessDispatch(
+  ownerChannelId: string,
+  inboundChannelId: string,
   cwd: string,
   transport: any,
   server: any,
-  scheduleRestartFn: (channelId: string, cwd: string) => void,
-): { notificationCalled: boolean } {
-  if (!hasGetStreamKey(transport)) {
-    scheduleRestartFn(channelId, cwd)
+  sessionRestartDelay: number,
+  postMessage: (channelId: string, text: string) => void,
+): { notificationCalled: boolean; variant: ReplyVariant; scheduled: boolean } {
+  // This helper only models the streamless branch; caller guarantees no stream.
+  if (hasGetStreamKey(transport)) {
+    throw new Error('simulateStreamlessDispatch called with a stream-present transport')
   }
 
+  const alreadyRestarting = isRestartPendingOrActive(ownerChannelId)
+  const autoRestartDisabled = (sessionRestartDelay ?? 60) === 0
+  const capped = isAtCap(ownerChannelId, RESTART_FAILURE_CAP)
+
+  let variant: ReplyVariant
+  let scheduled = false
+  let replyText: string
+  if (alreadyRestarting) {
+    variant = 'restarting'
+    replyText = RESTARTING_REPLY
+  } else if (autoRestartDisabled) {
+    variant = 'auto-disabled'
+    replyText = AUTO_DISABLED_REPLY
+  } else if (capped) {
+    variant = 'capped'
+    replyText = CAPPED_REPLY
+  } else {
+    scheduleRestart(ownerChannelId, cwd, undefined, { humanTrigger: true })
+    scheduled = true
+    variant = 'restarting'
+    replyText = RESTARTING_REPLY
+  }
+
+  // Reply posts to the INBOUND channel, not the owner.
+  postMessage(inboundChannelId, replyText)
+  return { notificationCalled: false, variant, scheduled }
+}
+
+/** Stream-PRESENT branch: notification() fires, nothing else. */
+function simulateStreamDispatch(
+  channelId: string,
+  transport: any,
+  server: any,
+): { notificationCalled: boolean } {
+  if (!hasGetStreamKey(transport)) {
+    throw new Error('simulateStreamDispatch called with a streamless transport')
+  }
   server.notification({
     method: 'notifications/claude/channel',
     params: { content: 'hello', meta: { chat_id: channelId } },
   })
-
   return { notificationCalled: true }
 }
 
@@ -133,110 +205,184 @@ function simulateDispatch(
 beforeEach(() => {
   _resetRegistry()
   _resetRestartState()
+  _resetBackoffState()
   initRestart(makeRestartDeps())
 })
 
 afterEach(() => {
   cancelAllRestartTimers()
   _resetRestartState()
+  _resetBackoffState()
 })
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('dispatch-site _GET_stream check (b.sjy)', () => {
-  // -------------------------------------------------------------------------
-  // Test 1 — no _GET_stream → scheduleRestart IS called
-  // -------------------------------------------------------------------------
+describe('dispatch-site _GET_stream branch (b.sjy + b.9cj)', () => {
+  // Distinct owner vs inbound channels so mis-keying recovery to the inbound
+  // channel (the bug the owner-keying guards) is caught: the session is owned
+  // by OWNER but the message arrives on INBOUND (e.g. via default_route / DM).
+  const OWNER = 'C_OWNER'
+  const INBOUND = 'C_INBOUND'
+  const CWD = '/tmp/streamless-session'
 
-  test('scheduleRestart is called when transport has no _GET_stream entry', () => {
-    const channelId = 'C_DROP_TEST'
-    const cwd = '/tmp/drop-session'
+  // -------------------------------------------------------------------------
+  // Streamless, recover case: no notification, real scheduleRestart keyed to
+  // the OWNER channel (not inbound), reply RESTARTING_REPLY to the INBOUND
+  // channel. Pre-fix this branch called notification() (silently dropped by the
+  // SDK) and never replied to the sender.
+  // -------------------------------------------------------------------------
+  test('b.9cj streamless recover: no notification(); real scheduleRestart keyed to OWNER; reply to INBOUND', () => {
     const transport = makeTransport(false) // _GET_stream absent
     const { server, notifications } = makeServer()
+    const replies: Array<{ channelId: string; text: string }> = []
 
-    const { notificationCalled } = simulateDispatch(
-      channelId,
-      cwd,
-      transport,
-      server,
-      scheduleRestart,
+    const result = simulateStreamlessDispatch(
+      OWNER, INBOUND, CWD, transport, server, 60,
+      (ch, text) => { replies.push({ channelId: ch, text }) },
     )
 
-    // The patch schedules a restart when _GET_stream is absent.
-    // isRestartPendingOrActive returns true iff scheduleRestart placed a timer
-    // (which it does when delay > 0 and failures < max).
-    expect(isRestartPendingOrActive(channelId)).toBe(true)
+    // notification() is NOT called on the streamless branch.
+    expect(result.notificationCalled).toBe(false)
+    expect(notifications).toHaveLength(0)
 
-    // .notification() is still called even on the drop path (observe + restart,
-    // not a behavior change to the normal path).
-    expect(notificationCalled).toBe(true)
-    expect(notifications).toHaveLength(1)
-    expect(notifications[0].method).toBe('notifications/claude/channel')
+    // Real scheduleRestart placed a pending timer under the OWNER channel …
+    expect(result.scheduled).toBe(true)
+    expect(isRestartPendingOrActive(OWNER)).toBe(true)
+    // … and NOT under the inbound channel (mis-keying regression).
+    expect(isRestartPendingOrActive(INBOUND)).toBe(false)
+
+    // Reply posted to the INBOUND channel with the honest "restarting" text.
+    expect(result.variant).toBe('restarting')
+    expect(replies).toEqual([{ channelId: INBOUND, text: RESTARTING_REPLY }])
   })
 
   // -------------------------------------------------------------------------
-  // Test 2 — _GET_stream present → scheduleRestart NOT called
+  // Streamless, already-restarting: a restart is pending on the OWNER channel,
+  // so no second launch is stacked; still replies "restarting" to INBOUND.
   // -------------------------------------------------------------------------
+  test('b.9cj streamless already-restarting: no new launch, RESTARTING reply', () => {
+    const transport = makeTransport(false)
+    const { server } = makeServer()
+    const replies: Array<{ channelId: string; text: string }> = []
 
-  test('scheduleRestart is NOT called when transport has _GET_stream entry', () => {
-    const channelId = 'C_OK_TEST'
-    const cwd = '/tmp/ok-session'
+    // Prime a pending restart on the OWNER channel.
+    scheduleRestart(OWNER, CWD)
+    expect(isRestartPendingOrActive(OWNER)).toBe(true)
+
+    const result = simulateStreamlessDispatch(
+      OWNER, INBOUND, CWD, transport, server, 60,
+      (ch, text) => { replies.push({ channelId: ch, text }) },
+    )
+
+    // No second scheduleRestart fired from the branch.
+    expect(result.scheduled).toBe(false)
+    expect(result.variant).toBe('restarting')
+    expect(replies).toEqual([{ channelId: INBOUND, text: RESTARTING_REPLY }])
+  })
+
+  // -------------------------------------------------------------------------
+  // Streamless, auto-restart disabled (session_restart_delay === 0): no
+  // scheduleRestart, AUTO_DISABLED reply to INBOUND.
+  // -------------------------------------------------------------------------
+  test('b.9cj streamless auto-restart-disabled: no scheduleRestart, AUTO_DISABLED reply', () => {
+    const transport = makeTransport(false)
+    const { server } = makeServer()
+    const replies: Array<{ channelId: string; text: string }> = []
+
+    const result = simulateStreamlessDispatch(
+      OWNER, INBOUND, CWD, transport, server, 0, // delay 0 → disabled
+      (ch, text) => { replies.push({ channelId: ch, text }) },
+    )
+
+    expect(result.scheduled).toBe(false)
+    expect(isRestartPendingOrActive(OWNER)).toBe(false)
+    expect(result.variant).toBe('auto-disabled')
+    expect(replies).toEqual([{ channelId: INBOUND, text: AUTO_DISABLED_REPLY }])
+  })
+
+  // -------------------------------------------------------------------------
+  // Streamless, at the restart-failure cap: no scheduleRestart, CAPPED reply.
+  // Drives the real backoff state to the cap via recordFailure.
+  // -------------------------------------------------------------------------
+  test('b.9cj streamless capped: no scheduleRestart, CAPPED reply', () => {
+    const transport = makeTransport(false)
+    const { server } = makeServer()
+    const replies: Array<{ channelId: string; text: string }> = []
+
+    // Push the OWNER channel to the failure cap in real backoff state.
+    for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(OWNER)
+    expect(isAtCap(OWNER, RESTART_FAILURE_CAP)).toBe(true)
+
+    const result = simulateStreamlessDispatch(
+      OWNER, INBOUND, CWD, transport, server, 60,
+      (ch, text) => { replies.push({ channelId: ch, text }) },
+    )
+
+    expect(result.scheduled).toBe(false)
+    expect(result.variant).toBe('capped')
+    expect(replies).toEqual([{ channelId: INBOUND, text: CAPPED_REPLY }])
+  })
+
+  // -------------------------------------------------------------------------
+  // Stream-PRESENT branch: notification() fires; no reply, no restart.
+  // -------------------------------------------------------------------------
+  test('b.9cj stream-present: notification() fires, no reply and no restart', () => {
     const transport = makeTransport(true) // _GET_stream present
     const { server, notifications } = makeServer()
 
-    simulateDispatch(channelId, cwd, transport, server, scheduleRestart)
+    const result = simulateStreamDispatch(OWNER, transport, server)
 
-    // No restart should be scheduled on the healthy path.
-    expect(isRestartPendingOrActive(channelId)).toBe(false)
-
-    // Notification still fires.
+    expect(result.notificationCalled).toBe(true)
     expect(notifications).toHaveLength(1)
+    // Nothing recovery-side happened.
+    expect(isRestartPendingOrActive(OWNER)).toBe(false)
   })
+})
 
-  // -------------------------------------------------------------------------
-  // Test 3 — correct channelId and cwd are passed to scheduleRestart
-  // -------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// b.9cj — the connected-but-streamless state, constructed exactly as the SDK
+// produces it, driving the REAL hasSessionStreamAdapter composition.
+//
+// Reproduction (ticket step 1-2): register a session normally so
+// connected === true, then delete the '_GET_stream' entry from the transport's
+// _streamMapping WITHOUT closing the transport and WITHOUT a DELETE — connected
+// stays true. hasSessionStreamAdapter (getSessionByChannel → hasGetStreamKey,
+// false when no session) is the src/server.ts probe wired into both dep
+// objects; this replicates its two lines over the real registry so the seam is
+// exercised end-to-end, not stubbed.
+// ---------------------------------------------------------------------------
 
-  test('scheduleRestart receives the correct channelId and cwd when _GET_stream is absent', () => {
-    const channelId = 'C_SPECIFIC'
-    const cwd = '/tmp/specific-session'
-    const transport = makeTransport(false)
+describe('b.9cj hasSessionStreamAdapter over the real registry', () => {
+  // The exact two-line adapter from src/server.ts main().
+  const hasSessionStreamAdapter = (channelId: string): boolean => {
+    const session = getSessionByChannel(channelId)
+    return session ? hasGetStreamKey(session.transport) : false
+  }
+
+  test('connected stays true but the adapter reports streamless after the SDK drops _GET_stream', () => {
+    const channelId = 'C_STREAMLESS'
+    const transport = makeTransport(true) // registered WITH a _GET_stream entry
     const { server } = makeServer()
 
-    // Use a recording wrapper instead of the real scheduleRestart so we can
-    // assert the exact arguments without relying on restart internals.
-    const calls: Array<{ channelId: string; cwd: string }> = []
-    simulateDispatch(channelId, cwd, transport, server, (ch, c) => {
-      calls.push({ channelId: ch, cwd: c })
-    })
+    const entry = registerSession('/tmp/streamless-session', channelId, transport as any, server as any)
 
-    expect(calls).toHaveLength(1)
-    expect(calls[0].channelId).toBe(channelId)
-    expect(calls[0].cwd).toBe(cwd)
+    // Freshly registered: connected and stream present.
+    expect(entry.connected).toBe(true)
+    expect(hasSessionStreamAdapter(channelId)).toBe(true)
+
+    // The SDK drops the standalone GET stream WITHOUT closing the transport and
+    // WITHOUT a DELETE — connected must remain true (the steady state the bug
+    // describes).
+    ;(transport._streamMapping as Map<string, unknown>).delete('_GET_stream')
+
+    expect(entry.connected).toBe(true)                 // unchanged — still "connected"
+    expect(hasSessionStreamAdapter(channelId)).toBe(false)  // but no longer deliverable
   })
 
-  // -------------------------------------------------------------------------
-  // Test 4 — drop path does NOT skip the .notification() call
-  // -------------------------------------------------------------------------
-
-  test('notification() is still called even when _GET_stream is absent (drop + restart, not drop + skip)', () => {
-    const channelId = 'C_DROP_NOTIFY'
-    const cwd = '/tmp/drop-notify-session'
-    const transport = makeTransport(false)
-    const { server, notifications } = makeServer()
-    const calls: Array<{ channelId: string; cwd: string }> = []
-
-    simulateDispatch(channelId, cwd, transport, server, (ch, c) => {
-      calls.push({ channelId: ch, cwd: c })
-    })
-
-    // scheduleRestart was triggered
-    expect(calls).toHaveLength(1)
-    // notification() was still called (not short-circuited)
-    expect(notifications).toHaveLength(1)
-    expect(notifications[0].method).toBe('notifications/claude/channel')
+  test('adapter returns false when there is no session at all', () => {
+    expect(hasSessionStreamAdapter('C_NO_SESSION')).toBe(false)
   })
 })
 

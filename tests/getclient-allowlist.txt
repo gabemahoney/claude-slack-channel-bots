@@ -20,7 +20,7 @@ src/agent-director-client.ts:64  # error-message string literal naming getClient
 src/outage-state.ts:61  # JSDoc for OutageStateDeps.getClient() — type-surface reference, not a call
 src/outage-state.ts:62  # OutageStateDeps interface property declaration — type-surface, not a call
 src/outage-state.ts:237  # wrapper's deps.getClient() — sanctioned single entry point
-src/server.ts:964  # isSessionAliveAdapter tick-path bare getClient() — sanctioned tick-path exception (b.kvq drop-branch rewrite shifted 891→935→963; t2.tkk.e4.s4 sweepDeadTmuxChannel insertion shifted 963→964)
+src/server.ts:1012  # isSessionAliveAdapter tick-path bare getClient() — sanctioned tick-path exception (b.kvq drop-branch rewrite shifted 891→935→963; t2.tkk.e4.s4 sweepDeadTmuxChannel insertion shifted 963→964; b.9cj hasSessionStreamAdapter + streamless deliver-branch rewrite shifted 964→976→1012)
 src/agent-director-template.ts:49  # production-deps factory wiring: getClient: () => getClient()
 src/agent-director-template.ts:219  # startup-fatal makeTemplate install: const client = d.getClient()
 src/session-manager.ts:1787  # const client = getClient() in reconcileOrphans (orphans have no routed-channel attribution) — b.9a7 comment reword shifted 1743→1744; t2.tkk.e4.s4 sweepDeadTmuxChannel insertion shifted 1744→1780; JSDoc expansion shifted 1780→1787
