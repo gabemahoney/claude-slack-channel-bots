@@ -17,7 +17,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect, afterEach } from 'bun:test'
 import { homedir, tmpdir } from 'node:os'
 import { mkdtempSync, existsSync, chmodSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -35,7 +35,7 @@ import { instanceIdFor } from '../src/session-manager.ts'
 import { ErrSpawnNotFound } from '../src/agent-director-errors.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 import type { RoutingConfig } from '../src/config.ts'
-import { openArchiveDatabase } from '../src/message-archive.ts'
+import { buildTempArchiveDb, type ArchiveRow } from './test-helpers/archive-db.ts'
 
 // ---------------------------------------------------------------------------
 // Realistic multi-mount mountinfo fixture
@@ -471,24 +471,14 @@ describe('runJsonlPersistenceSafeguard — Layer 1 loud path', () => {
 
 const SPAWN_EPOCH = Date.parse(makeRow().started_at) / 1000 // 2026-09-20T05:00:00Z
 
+// Cleanup handles for temp archive dirs built during this suite (drained in afterEach).
+const archiveCleanups: Array<() => void> = []
+
 /** Builds a temp archive DB with the given (timestamp, channel) rows; returns its path. */
-function makeArchiveDb(rows: Array<{ ts: number; channel?: string }>): string {
-  const dir = mkdtempSync(join(tmpdir(), 'jsonl-archive-test-'))
-  const dbPath = join(dir, 'archive.db')
-  const db = openArchiveDatabase(dbPath)
-  const insert = db.query(
-    'INSERT INTO messages (id, channel_id, channel_name, timestamp, sender_id, sender_name, message_text, thread_ts) ' +
-      'VALUES (?, ?, ?, ?, ?, ?, ?, NULL)',
-  )
-  let i = 0
-  for (const { ts, channel } of rows) {
-    insert.run(`${channel ?? CH}:${ts}:${i++}`, channel ?? CH, '#chan', ts, 'U1', 'user', 'hi')
-  }
-  // openArchiveDatabase uses WAL; checkpoint so a later read-only open sees the
-  // rows in the main DB file (read-only openers cannot replay an unflushed WAL).
-  db.exec('PRAGMA wal_checkpoint(TRUNCATE);')
-  db.close()
-  return dbPath
+function makeArchiveDb(rows: ArchiveRow[]): string {
+  const built = buildTempArchiveDb(rows, CH)
+  archiveCleanups.push(built.cleanup)
+  return built.dbPath
 }
 
 /** Config whose message_archive_db points at dbPath (undefined → unconfigured). */
@@ -501,6 +491,10 @@ function archiveConfig(dbPath: string | undefined): RoutingConfig {
 }
 
 describe('makeDefaultArchiveCount (real temp sqlite, via default archiveCountSince)', () => {
+  afterEach(() => {
+    while (archiveCleanups.length > 0) archiveCleanups.pop()!()
+  })
+
   test('unconfigured message_archive_db → null → quiet (no loud lost signal)', async () => {
     const c = await runLayer2({ statFn: () => false, archiveCountSince: undefined }, archiveConfig(undefined))
     expect(c.errors).toEqual([])
