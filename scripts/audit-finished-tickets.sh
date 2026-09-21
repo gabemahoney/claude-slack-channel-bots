@@ -53,8 +53,10 @@
 # Exit: 0 when clean, non-zero (1) when unexplained stranded work is found.
 #
 # ============================ CALIBRATION NOTE ============================
-# On today's repo this script EXITS NON-ZERO BY DESIGN, and that is NOT a bug
-# in this script. Read its output by finding CLASS, not by ticket id:
+# On today's repo this script EXITS 0 with zero findings. There is no known
+# expected debt left in either class, so a non-zero exit is a NEW, real finding
+# to investigate — not a pre-existing condition to wave past. Read any output
+# by finding CLASS, not by ticket id:
 #
 #   * Stranded finished tickets. A finished ticket is expected to be excused by
 #     exactly one of: a genuine main commit (id-referencing or title-matching),
@@ -67,14 +69,16 @@
 #     repo — Apiary ticket markdown there can be legitimately finished with no
 #     main commit possible.
 #
-#   * Stranded branches. The remaining expected debt is one branch whose
-#     resolution requires a push and is therefore reserved for the repo owner —
-#     tracked on ticket b.gkz. A non-zero exit is the correct, expected result
-#     until b.gkz lands.
+#   * Stranded branches. There is no expected stranded-branch debt anymore. The
+#     last one (`origin/no-channels`) was retired under b.gkz: its commits were
+#     published as tag `archive/no-channels` and the branch was then deleted. A
+#     stranded-branch finding now means genuinely new stranded work — unmerged
+#     commits that either belong on main or need an archive tag plus deletion.
 #
-# Do NOT re-list findings here (naming the tracking ticket b.gkz for the
-# push-class is the standing exception): the script's own output is the
-# inventory, and the tracking ticket is the source of truth for expected vs new.
+# Do NOT re-list findings here: the script's own output is the inventory, and
+# the tracking ticket for any finding is the source of truth for expected vs
+# new. (b.gkz is named above only as the historical resolution of the last
+# known finding, not as a standing exception to this rule.)
 # =========================================================================
 
 set -euo pipefail

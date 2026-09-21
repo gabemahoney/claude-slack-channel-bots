@@ -79,11 +79,6 @@ reinstalls (see Phase 2 — promote already does the registry reinstall for you)
 On any non-zero exit, the scripts print an `SR-X.Y` diagnostic with an
 `Operator recovery:` block. Follow that block verbatim; do not work around it.
 
-> Note: the SR-2.6 finished-work audit gate is known-red today by design
-> (stranded remote branch `origin/no-channels`, tracked on `b.gkz`). That is
-> expected, not a gate defect — see the [Release process](../README.md#release-process)
-> section of the README.
-
 ---
 
 ## Phase 2 — Remove the `file:` install and install from the registry
