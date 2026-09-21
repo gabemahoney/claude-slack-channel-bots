@@ -28,6 +28,11 @@ import {
   type OutageClass,
 } from '../src/outage-state.ts'
 import { makeStubClient } from './test-helpers/agent-director-stub.ts'
+import {
+  auditGetClientAllowlist,
+  enclosingScope,
+  scanFile,
+} from './getclient-allowlist-audit.ts'
 
 // ---------------------------------------------------------------------------
 // Harness helpers
@@ -416,56 +421,50 @@ describe('cases 20-21: flap cycles and never-set no-op', () => {
 // ---------------------------------------------------------------------------
 
 describe('static audits', () => {
-  test('22. every getClient() match in src/ is in tests/getclient-allowlist.txt', async () => {
-    const { readFileSync } = await import('node:fs')
-    const { execSync } = await import('node:child_process')
+  test('22. every getClient() site in src/ is content-anchored in tests/getclient-allowlist.txt', async () => {
+    const { readFileSync, readdirSync, statSync } = await import('node:fs')
+    const { join } = await import('node:path')
 
-    // Parse the allowlist: one `path:line  # reason` entry per non-comment line.
-    const allowlistRaw = readFileSync('tests/getclient-allowlist.txt', 'utf-8')
-    const allowed = new Set<string>()
-    for (const line of allowlistRaw.split('\n')) {
-      const trimmed = line.trim()
-      if (!trimmed || trimmed.startsWith('#')) continue
-      const m = trimmed.match(/^([^:#\s]+:\d+)/)
-      if (m) allowed.add(m[1])
-    }
-
-    // grep -nE '\bgetClient\(\)' src/ -r --include='*.ts' — capture path:line for every match.
-    let grepOut = ''
-    try {
-      grepOut = execSync(
-        `grep -rnE '\\bgetClient\\(\\)' src/ --include='*.ts'`,
-        { encoding: 'utf-8' },
-      )
-    } catch (err) {
-      // grep exits 1 if no match — treat as empty.
-      grepOut = ((err as { stdout?: Buffer }).stdout?.toString()) ?? ''
-    }
-
-    const violations: string[] = []
-    for (const line of grepOut.split('\n')) {
-      if (!line) continue
-      // grep format: src/path.ts:NN:content
-      const m = line.match(/^([^:]+):(\d+):(.*)$/)
-      if (!m) continue
-      const [, path, lineNo, content] = m
-      // Filter out comment / JSDoc lines: lines whose content begins with
-      // optional whitespace then `*` or `//`.
-      if (/^\s*(\*|\/\/)/.test(content)) continue
-      const key = `${path}:${lineNo}`
-      if (!allowed.has(key)) {
-        violations.push(`${key}  # content: ${content.trim()}`)
+    // Enumerate src/**/*.ts and build a path → content Map for the pure core.
+    // Anchoring is by (path, enclosing-scope, normalized-content), so this
+    // audit survives comment/JSDoc insertion above a site (b.qbn); it fails
+    // only when a NEW site appears or a site MOVES to a different function.
+    function walk(dir: string): string[] {
+      const out: string[] = []
+      for (const entry of readdirSync(dir)) {
+        const full = join(dir, entry)
+        if (statSync(full).isDirectory()) out.push(...walk(full))
+        else if (full.endsWith('.ts')) out.push(full)
       }
+      return out
+    }
+    const sources = new Map<string, string>()
+    for (const abs of walk('src')) {
+      // Normalize to forward-slashed repo-relative path (matches allowlist).
+      sources.set(abs.split('\\').join('/'), readFileSync(abs, 'utf-8'))
     }
 
+    const allowlistText = readFileSync('tests/getclient-allowlist.txt', 'utf-8')
+    const { violations, staleEntries } = auditGetClientAllowlist(sources, allowlistText)
+
+    const problems: string[] = []
     if (violations.length > 0) {
-      throw new Error(
-        `unsanctioned getClient() call(s) found in src/ not in tests/getclient-allowlist.txt:\n` +
-          violations.join('\n') +
-          `\n\nIf this is a legitimate sanctioned site, add it to tests/getclient-allowlist.txt.\n` +
-          `Otherwise migrate it to withOutageDetection / withSpawnDetection from src/outage-state.ts.`,
+      problems.push(
+        `unsanctioned getClient() site(s) found in src/ not content-anchored in tests/getclient-allowlist.txt:\n` +
+          violations.map((v) => `  ${v}`).join('\n') +
+          `\n\nIf a site is a legitimate sanctioned exception, copy the anchor above into\n` +
+          `tests/getclient-allowlist.txt (path | scope | content). Otherwise migrate it to\n` +
+          `withOutageDetection / withSpawnDetection from src/outage-state.ts.`,
       )
     }
+    if (staleEntries.length > 0) {
+      problems.push(
+        `stale allowlist entr${staleEntries.length === 1 ? 'y' : 'ies'} in ` +
+          `tests/getclient-allowlist.txt matching no getClient() site (the site moved or was removed):\n` +
+          staleEntries.map((e) => `  ${e}`).join('\n'),
+      )
+    }
+    if (problems.length > 0) throw new Error(problems.join('\n\n'))
   })
 
   test('23 Part A. exactly one resetAllToHealthy(...) call site in src/ outside src/outage-state.ts', async () => {
@@ -556,5 +555,164 @@ describe('static audits', () => {
     expect(allClear.text).toContain('/bin/ad')
     expect(allClear.text).toContain('/route/cwd')
     expect(getOutageFlags('C1').size).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.qbn — getClient() allowlist content-anchoring meta-tests
+//
+// These exercise the PURE audit core (tests/getclient-allowlist-audit.ts) with
+// SYNTHETIC sources, proving both directions of the guard independent of the
+// real src/ tree: comment insertion is inert (AC-1), a new site fails (AC-2),
+// a relocated site fails (AC-3), plus counts, the four non-call kinds, and
+// stale-entry detection.
+// ---------------------------------------------------------------------------
+
+describe('getClient() allowlist content-anchoring (b.qbn)', () => {
+  // A tiny synthetic module with one sanctioned site inside `reconcileOrphans`,
+  // and the allowlist entry that anchors it. Reused across cases.
+  const baseSource = [
+    `export async function reconcileOrphans(`,
+    `  routingConfig: RoutingConfig,`,
+    `): Promise<void> {`,
+    `  const client = getClient()`,
+    `  return client.list()`,
+    `}`,
+  ].join('\n')
+  const baseAllowlist =
+    `# header comment\n` +
+    `src/fake.ts | reconcileOrphans | const client = getClient()  # sanctioned`
+
+  test('AC-1: inserting comment/JSDoc lines above an allowed site → no violations, no stale entries', () => {
+    const withComments = [
+      `export async function reconcileOrphans(`,
+      `  routingConfig: RoutingConfig,`,
+      `): Promise<void> {`,
+      `  // freshly inserted line comment`,
+      `  /**`,
+      `   * freshly inserted JSDoc block`,
+      `   */`,
+      `  const client = getClient()`,
+      `  return client.list()`,
+      `}`,
+    ].join('\n')
+    const res = auditGetClientAllowlist(
+      new Map([['src/fake.ts', withComments]]),
+      baseAllowlist,
+    )
+    expect(res.violations).toEqual([])
+    expect(res.staleEntries).toEqual([])
+  })
+
+  test('AC-2: a brand-new getClient() call not covered by an entry → violation names path + scope + content', () => {
+    const withNewSite = baseSource.replace(
+      `  return client.list()`,
+      `  return client.list()\n}\n\nexport async function brandNewFn(): Promise<void> {\n  const c2 = getClient()\n  return c2.list()`,
+    )
+    const res = auditGetClientAllowlist(
+      new Map([['src/fake.ts', withNewSite]]),
+      baseAllowlist,
+    )
+    expect(res.violations).toHaveLength(1)
+    expect(res.violations[0]).toContain('src/fake.ts')
+    expect(res.violations[0]).toContain('brandNewFn')
+    expect(res.violations[0]).toContain('const c2 = getClient()')
+    expect(res.staleEntries).toEqual([])
+  })
+
+  test('AC-3: relocating an allowed call into a DIFFERENT function → violation AND stale entry', () => {
+    const relocated = [
+      `export async function reconcileOrphans(`,
+      `  routingConfig: RoutingConfig,`,
+      `): Promise<void> {`,
+      `  return`,
+      `}`,
+      ``,
+      `export async function somewhereElse(): Promise<void> {`,
+      `  const client = getClient()`,
+      `  return client.list()`,
+      `}`,
+    ].join('\n')
+    const res = auditGetClientAllowlist(
+      new Map([['src/fake.ts', relocated]]),
+      baseAllowlist,
+    )
+    // The hit's scope is now `somewhereElse` — no matching entry → violation.
+    expect(res.violations).toHaveLength(1)
+    expect(res.violations[0]).toContain('somewhereElse')
+    // The `reconcileOrphans` entry now matches nothing → stale.
+    expect(res.staleEntries).toHaveLength(1)
+    expect(res.staleEntries[0]).toContain('reconcileOrphans')
+  })
+
+  test('duplicate identical call in the same function → violation (counts are enforced)', () => {
+    const dup = [
+      `export async function reconcileOrphans(`,
+      `  routingConfig: RoutingConfig,`,
+      `): Promise<void> {`,
+      `  const client = getClient()`,
+      `  const client = getClient()`,
+      `  return client.list()`,
+      `}`,
+    ].join('\n')
+    const res = auditGetClientAllowlist(new Map([['src/fake.ts', dup]]), baseAllowlist)
+    // One entry consumes one hit; the second identical hit is unmatched.
+    expect(res.violations).toHaveLength(1)
+    expect(res.violations[0]).toContain('const client = getClient()')
+    expect(res.staleEntries).toEqual([])
+  })
+
+  test('stale-entry detection: deleting the only allowed site → stale entry named', () => {
+    const noSite = [
+      `export async function reconcileOrphans(`,
+      `): Promise<void> {`,
+      `  return`,
+      `}`,
+    ].join('\n')
+    const res = auditGetClientAllowlist(new Map([['src/fake.ts', noSite]]), baseAllowlist)
+    expect(res.violations).toEqual([])
+    expect(res.staleEntries).toHaveLength(1)
+    expect(res.staleEntries[0]).toContain('reconcileOrphans')
+  })
+
+  test('the four non-call kinds anchor to the honest scope', () => {
+    // definition line + string literal both live inside getClient's own body;
+    // single-line JSDoc + interface property both belong to OutageStateDeps.
+    const src = [
+      `export function getClient(): Client {`,
+      `  if (singleton === null) {`,
+      `    throw new Error(`,
+      `      'getClient() called before the startup gate installed a Client',`,
+      `    )`,
+      `  }`,
+      `  return singleton`,
+      `}`,
+      ``,
+      `export interface OutageStateDeps {`,
+      `  /** Return the singleton AD Client. Same semantics as getClient() here. */`,
+      `  getClient(): Client`,
+      `}`,
+    ].join('\n')
+    const lines = src.split('\n')
+    // definition line (index 0) → own name, opens a scope.
+    expect(enclosingScope(lines, 0)).toBe('getClient')
+    // string literal inside the throw (index 3) → still getClient's body.
+    expect(enclosingScope(lines, 3)).toBe('getClient')
+    // single-line JSDoc (index 10) → the enclosing interface, not a call.
+    expect(enclosingScope(lines, 10)).toBe('OutageStateDeps')
+    // interface property (index 11) → the enclosing interface, not its own name.
+    expect(enclosingScope(lines, 11)).toBe('OutageStateDeps')
+
+    // And scanFile's comment filter keeps the single-line JSDoc + the interface
+    // property (neither begins with `*` or `//`), but the string-literal line
+    // and definition line are also real hits → 4 hits total here.
+    const hits = scanFile('src/fake.ts', src)
+    expect(hits).toHaveLength(4)
+    expect(hits.map((h) => h.scope).sort()).toEqual([
+      'OutageStateDeps',
+      'OutageStateDeps',
+      'getClient',
+      'getClient',
+    ])
   })
 })
