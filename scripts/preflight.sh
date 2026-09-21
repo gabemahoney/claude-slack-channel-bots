@@ -183,7 +183,7 @@ case "${AUDIT_EXIT}" in
     ;;
   1)
     # Genuine stranded finished work found. FAIL CLOSED.
-    echo "SR-2.6 (preflight): scripts/audit-finished-tickets.sh reported stranded finished work — one or more bees are 'finished' while their fix is neither on main nor explicitly closed, or an unmerged branch references a finished ticket (see the audit report above). Releasing now would ship with work silently stranded on dead branches. Operator recovery: for each flagged ticket, either land its fix on main, or explicitly close it (no-repro / superseded / abandoned, with a pointer to where the work actually lives); for each flagged branch, merge or delete it. Re-close the tickets as appropriate, then rerun '/publish ${BUMP_KIND}'. This gate is READ-ONLY and never mutates tickets or git." >&2
+    echo "SR-2.6 (preflight): scripts/audit-finished-tickets.sh reported stranded finished work — one or more bees are 'finished' while their fix is neither on main nor explicitly closed, or an unmerged branch references a finished ticket (see the audit report above). Releasing now would ship with work silently stranded on dead branches. Operator recovery: for each flagged ticket, either land its fix on main, or explicitly close it (no-repro / superseded / abandoned / satisfied-by-other-work, with a pointer to where the work actually lives); for each flagged branch, merge or delete it. Re-close the tickets as appropriate, then rerun '/publish ${BUMP_KIND}'. This gate is READ-ONLY and never mutates tickets or git." >&2
     exit 16
     ;;
   *)
@@ -193,7 +193,7 @@ case "${AUDIT_EXIT}" in
     # the SR-2.6 stranded-work recovery (which would be wrong). FAIL CLOSED — the
     # audit is a required gate and must never be silently skipped, so we still
     # block the release. Distinct exit code 17 keeps the recovery unambiguous.
-    echo "SR-2.6 (preflight): scripts/audit-finished-tickets.sh could not run (exit ${AUDIT_EXIT}) — it could not locate the Bugs/Plans hives, a git repo, or a 'main' ref from this checkout (see the audit's own diagnostic above). This is NOT a report of stranded work; the required stranded-finished-work gate simply could not be evaluated, so the release is BLOCKED. This typically means /publish was run from a throwaway/detached checkout (e.g. a /tmp clone) that does not sit beside the hives. Operator recovery: rerun '/publish ${BUMP_KIND}' from the canonical claude-slack-channel-bots checkout that lives beside the Bugs/Plans hives (the main working clone), where the audit can reconcile finished tickets against main. This gate is READ-ONLY and never mutates tickets or git." >&2
+    echo "SR-2.6 (preflight): scripts/audit-finished-tickets.sh could not run (exit ${AUDIT_EXIT}) — it could not locate the Bugs/Plans/Ideas hives, a git repo, or a 'main' ref from this checkout (see the audit's own diagnostic above). This is NOT a report of stranded work; the required stranded-finished-work gate simply could not be evaluated, so the release is BLOCKED. This typically means /publish was run from a throwaway/detached checkout (e.g. a /tmp clone) that does not sit beside the hives. Operator recovery: rerun '/publish ${BUMP_KIND}' from the canonical claude-slack-channel-bots checkout that lives beside the Bugs/Plans/Ideas hives (the main working clone), where the audit can reconcile finished tickets against main. This gate is READ-ONLY and never mutates tickets or git." >&2
     exit 17
     ;;
 esac

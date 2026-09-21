@@ -84,8 +84,11 @@ function git(repo: string, args: string[]): string {
 }
 
 interface Ticket {
+  // 'Ideas' places the ticket at the Ideas hive ROOT (Ideas/<id>/), the
+  // top-level bee location the b.dw7 third pass audits — distinct from 'Plans'
+  // (Ideas/Plans/<id>/), which the Plans pass already covered.
   id: string
-  hive: 'Bugs' | 'Plans'
+  hive: 'Bugs' | 'Plans' | 'Ideas'
   status: string
   title?: string
   body?: string
@@ -126,10 +129,16 @@ function makeFixture(opts: {
   mkdirSync(join(proj, 'Bugs'), { recursive: true })
   mkdirSync(join(proj, 'Ideas', 'Plans'), { recursive: true })
 
-  // Hives beside the repo, as the script expects (<project>/{Bugs,Ideas/Plans}).
+  // Hives beside the repo, as the script expects
+  // (<project>/{Bugs,Ideas,Ideas/Plans}). 'Ideas' is the hive ROOT (top-level
+  // bees at Ideas/<id>/); 'Plans' is the Ideas/Plans/ subdir.
   for (const t of opts.tickets) {
     const hiveRoot =
-      t.hive === 'Bugs' ? join(proj, 'Bugs') : join(proj, 'Ideas', 'Plans')
+      t.hive === 'Bugs'
+        ? join(proj, 'Bugs')
+        : t.hive === 'Ideas'
+          ? join(proj, 'Ideas')
+          : join(proj, 'Ideas', 'Plans')
     const dir = join(hiveRoot, t.id)
     mkdirSync(dir, { recursive: true })
     const title = t.title ?? `fixture ticket ${t.id}`
@@ -1032,6 +1041,135 @@ describe('audit-finished-tickets.sh — tightened out-of-repo heuristic (b.zjm d
   })
 })
 
+describe('audit-finished-tickets.sh — Ideas/ top-level bee pass (b.dw7)', () => {
+  // AC (b.dw7): a finished bee at Ideas/<id>/ with NO commit on main naming it
+  // and NO closure marker is stranded work the gate previously never looked at.
+  // The third pass now audits Ideas/ top-level bees, so it is flagged under the
+  // [Ideas] label and drives a non-zero exit. This is the core coverage-gap fix.
+  test('finished Ideas/ top-level bee, no commit + no closure marker → flagged under [Ideas], exit non-zero', () => {
+    const fx = makeFixture({
+      tickets: [{ id: 'b.idb', hive: 'Ideas', status: 'finished' }],
+      // no commit references b.idb
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).toContain('[Ideas] b.idb')
+    expect(r.stdout).toContain('no commit on main lands it')
+    expect(r.status).not.toBe(0)
+  })
+
+  // AC (b.dw7) — regression proof. The SAME fixture run through the genuine
+  // PRE-FIX script (recovered from the IMMUTABLE pinned commit 555e33f, the
+  // mainline commit immediately before this fix — never HEAD, which carries the
+  // post-fix script once this lands and vacuously breaks the comparison) does
+  // NOT flag the Ideas/ bee: the pre-fix script scans only Bugs/ and Ideas/Plans/,
+  // so an Ideas top-level bee is invisible → exit 0 clean. This proves the new
+  // test fails against the old script. Sanity: the recovered source lacks the
+  // IDEAS_HIVE pass, else the proof is vacuous.
+  test('the added Ideas pass CHANGES the verdict: pre-fix (555e33f) never audits Ideas/ so does NOT flag, post-fix flags [regression proof]', () => {
+    const fx = makeFixture({
+      tickets: [{ id: 'b.idb', hive: 'Ideas', status: 'finished' }],
+    })
+
+    const preFixScript = recoverPreFixScript(fx, '555e33f', 'audit-prefix-ideas.sh', {
+      contains: ['PLANS_HIVE'],
+      lacks: ['IDEAS_HIVE'],
+    })
+
+    // Pre-fix: Ideas/ top-level is never scanned → b.idb invisible, exit 0 clean.
+    const pre = spawnSync('bash', [preFixScript, fx.repo], {
+      encoding: 'utf8',
+      env: { ...process.env },
+    })
+    expect(pre.stdout).not.toContain('b.idb')
+    expect(pre.status).toBe(0)
+
+    // Post-fix (the working-tree script the fixture copied in): the Ideas pass
+    // flags the stranded bee → exit non-zero.
+    const post = runAudit(fx)
+    expect(post.stdout).toContain('[Ideas] b.idb')
+    expect(post.status).not.toBe(0)
+  })
+
+  // AC (b.dw7): no double-reporting. A finished, stranded ticket in Ideas/Plans/
+  // must be audited EXACTLY once — by the Plans pass, labeled [Plans], never
+  // [Ideas]. The Ideas pass passes skip_subdir="Plans", so Ideas/Plans/ is not
+  // re-audited. Assert the id appears exactly once in the whole output.
+  test('Ideas/Plans/ ticket audited exactly once, labeled [Plans], never [Ideas]', () => {
+    const fx = makeFixture({
+      tickets: [{ id: 'b.pln', hive: 'Plans', status: 'finished' }],
+      // no commit references b.pln → stranded, so it appears in the output
+    })
+    const r = runAudit(fx)
+    const occurrences = r.stdout.split('b.pln').length - 1
+    expect(occurrences).toBe(1)
+    expect(r.stdout).toContain('[Plans] b.pln')
+    expect(r.stdout).not.toContain('[Ideas] b.pln')
+    expect(r.status).not.toBe(0)
+  })
+
+  // AC (b.dw7): the b.qps anti-marker invariant applies to the new Ideas pass.
+  // A finished Ideas bee whose body carries a closure-vocabulary phrase
+  // ("superseded by b.zzz") AND an anti-marker ("fixed on branch b.zzz, pending
+  // merge") is STILL flagged — has_anti_marker is checked FIRST in
+  // has_closure_marker and disqualifies the closure, yielding the "never reached
+  // main" reason. Widening coverage to Ideas/ must not weaken this.
+  test('finished Ideas bee with closure vocabulary + anti-marker → still flagged, "never reached main" reason', () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.iam',
+          hive: 'Ideas',
+          status: 'finished',
+          body:
+            '# fixture ideas bee b.iam\n\n' +
+            '## Closed 2026-09-20 — superseded by b.zzz.\n' +
+            'Fixed on branch b.zzz, pending merge/release.\n',
+        },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).toContain('[Ideas] b.iam')
+    expect(r.stdout).toContain('never reached main')
+    expect(r.status).not.toBe(0)
+  })
+
+  // AC (b.dw7): a finished Ideas bee WITH a legitimate closure marker (a reasoned
+  // branch-(b) closure, no anti-marker) is NOT flagged — the Ideas pass reuses
+  // the same has_closure_marker recognition as the Bugs/Plans passes, so a
+  // genuinely-excused idea passes.
+  test('finished Ideas bee with a legitimate closure marker → not flagged', () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.icl',
+          hive: 'Ideas',
+          status: 'finished',
+          body:
+            '# fixture ideas bee b.icl\n\n' +
+            '## Closed 2026-09-20 — fully satisfied by b.zzz (merged in abc1234), no separate work required.\n',
+        },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).not.toContain('b.icl')
+    expect(r.status).toBe(0)
+  })
+
+  // AC (b.dw7, honesty): the summary output names the Ideas hive PATH, so a
+  // clean claim provably covers every scanned location (no silent over-claim
+  // that finished work is clean while a whole hive went unscanned).
+  test('summary output names the Ideas hive path', () => {
+    const fx = makeFixture({
+      tickets: [{ id: 'b.aaa', hive: 'Bugs', status: 'finished' }],
+      commits: [{ subject: 'fix(core): land b.aaa properly' }],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).toContain('Ideas hive')
+    expect(r.stdout).toContain(join(fx.proj, 'Ideas'))
+    expect(r.status).toBe(0)
+  })
+})
+
 describe('audit-finished-tickets.sh — stranded branches', () => {
   test('branch referencing a finished ticket, head NOT ancestor of main → flagged; merged → not flagged', () => {
     // Two finished tickets; b.brn gets an unmerged branch, b.mrg gets a merged one.
@@ -1099,6 +1237,39 @@ describe('audit-finished-tickets.sh — stranded branches', () => {
     const r = runAudit(fx)
     expect(r.stdout).toContain('FEATURE/B.XYZQ')
     expect(r.stdout).toContain('references finished ticket b.xyzq')
+    expect(r.status).not.toBe(0)
+  })
+
+  // b.dw7 pass-2 coverage: collect_statuses now also scans Ideas/ top-level
+  // (collect_statuses "${IDEAS_HIVE}" "Plans"), so a branch naming a FINISHED
+  // Ideas-root bee resolves to ID_STATUS[...]="finished" and is reconciled as a
+  // stranded branch. Before the fix its tstatus was empty ⇒ the branch was
+  // silently skipped. The bee carries a legitimate closure marker so the TICKET
+  // (Ideas) pass stays clean and only the BRANCH pass drives the flag.
+  test('unmerged branch for a finished Ideas-root bee (with closure marker) → flagged as stranded branch', () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.idr',
+          hive: 'Ideas',
+          status: 'finished',
+          body:
+            '# fixture ideas bee b.idr\n\n' +
+            '## Closed 2026-09-20 — fully satisfied by b.zzz (merged in abc1234), no separate work required.\n',
+        },
+      ],
+    })
+    const firstSha = git(fx.repo, ['rev-list', '--max-parents=0', 'main']).trim()
+    git(fx.repo, ['checkout', '-q', '-b', 'feature/b.idr', firstSha])
+    git(fx.repo, ['commit', '-q', '--allow-empty', '-m', 'wip b.idr on branch'])
+    git(fx.repo, ['checkout', '-q', 'main'])
+
+    const r = runAudit(fx)
+    // The TICKET pass stays clean (legitimate closure marker), so the id is
+    // NOT flagged under [Ideas]; only the branch pass reports it.
+    expect(r.stdout).not.toContain('[Ideas] b.idr')
+    expect(r.stdout).toContain('feature/b.idr')
+    expect(r.stdout).toContain('references finished ticket b.idr')
     expect(r.status).not.toBe(0)
   })
 
