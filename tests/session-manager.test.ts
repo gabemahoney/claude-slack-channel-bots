@@ -77,7 +77,7 @@ import {
   type StubClient,
 } from './test-helpers/agent-director-stub.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
-import { openArchiveDatabase } from '../src/message-archive.ts'
+import { messagesSince } from './test-helpers/archive-db.ts'
 import {
   initOutageState,
   getOutageFlags,
@@ -2816,6 +2816,13 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   const CH = 'C_WRB'
   const CWD = '/repo/wrb'
 
+  // Cleanup handles for temp archive dirs built during this suite (drained in afterEach).
+  const archiveCleanups: Array<() => void> = []
+
+  afterEach(() => {
+    while (archiveCleanups.length > 0) archiveCleanups.pop()!()
+  })
+
   /**
    * Redirect startup-errors.log into a temp dir and return a reader. The
    * 'lost' classification records to startup-errors ONLY when isStartup=true,
@@ -2843,20 +2850,9 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
 
   /** Build a temp archive DB holding `count` post-spawn messages for CH. */
   function makeArchiveWithMessagesSince(startedAt: string, count: number): string {
-    const dir = mkdtempSync(join(tmpdir(), 'cscb-wrb-archive-'))
-    const dbPath = join(dir, 'archive.db')
-    const db = openArchiveDatabase(dbPath)
-    const boundary = Date.parse(startedAt) / 1000
-    const insert = db.query(
-      'INSERT INTO messages (id, channel_id, channel_name, timestamp, sender_id, sender_name, message_text, thread_ts) ' +
-        'VALUES (?, ?, ?, ?, ?, ?, ?, NULL)',
-    )
-    for (let i = 0; i < count; i++) {
-      insert.run(`${CH}:${boundary + 1 + i}:${i}`, CH, '#chan', boundary + 1 + i, 'U1', 'user', 'hi')
-    }
-    db.exec('PRAGMA wal_checkpoint(TRUNCATE);')
-    db.close()
-    return dbPath
+    const built = messagesSince(startedAt, CH, count)
+    archiveCleanups.push(built.cleanup)
+    return built.dbPath
   }
 
   /**
