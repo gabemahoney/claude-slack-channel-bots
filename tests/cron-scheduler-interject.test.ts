@@ -257,9 +257,10 @@ describe('tick → /interject end-to-end (real scheduler + dispatcher + cron-log
     const { scheduler } = makeWiring({ cronTablePath, now: FIXED_NOW })
     scheduler.start()
 
-    // Edit the PROMPT FILE (not the crontable — crontable hot-reload is E3
-    // scope) AFTER the scheduler has loaded the table. The dispatcher reads the
-    // prompt fresh at fire time, so the edited content must win.
+    // Edit the PROMPT FILE (not the crontable — crontable hot-reload is its own
+    // step at the top of the tick, covered in tests/cron-scheduler-reload.test.ts)
+    // AFTER the scheduler has loaded the table. The dispatcher reads the prompt
+    // fresh at fire time, so the edited content must win.
     const editedBody = 'EDITED content after start(), before tick()'
     writeFileSync(promptPath, editedBody)
 

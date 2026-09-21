@@ -22,7 +22,16 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'fs'
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -461,6 +470,42 @@ describe('cron-scheduler reload — crontable deleted mid-run', () => {
     // The restored content loaded and fired.
     expect(dispatcher.paths()).toEqual(['/p/a.md', '/p/restored.md'])
     expect(reloadLines().map((l) => l.detail)).toEqual(['crontable reloaded, 1 schedules'])
+  })
+
+  test('a PERSISTENT re-create failure (parent directory gone) stays silent: still ONE warn, no re-create, nothing fires', async () => {
+    const clock = makeClock(START)
+    // Keep the crontable in its own subdirectory so that directory can be
+    // removed without taking the cron log down with it.
+    const tableDir = join(tempDir, 'cfg')
+    mkdirSync(tableDir)
+    cronTablePath = join(tableDir, 'crontable')
+    const { dispatcher, scheduler } = startWith(clock, line(everyMinute, '/p/a.md'))
+
+    await scheduler.tick()
+    expect(dispatcher.paths()).toEqual(['/p/a.md'])
+
+    rmSync(cronTablePath)
+    clock.advanceMinutes(1)
+    await scheduler.tick() // detects the vanish
+    expect(kindOf('warn')).toHaveLength(1)
+
+    // Now remove the directory as well: the bootstrap never mkdir's a missing
+    // parent, so every later re-create attempt fails with ENOENT and the file
+    // can never come back on its own.
+    rmSync(tableDir, { recursive: true, force: true })
+
+    for (const _ of [1, 2, 3]) {
+      clock.advanceMinutes(1)
+      await scheduler.tick()
+    }
+
+    // The vanish latch holds across a failure that repeats every minute: no
+    // second warn, no re-created INFO, no reload line, and zero fires behind a
+    // crontable that is still missing.
+    expect(kindOf('warn')).toHaveLength(1)
+    expect(kindOf('info').filter((l) => l.detail.includes('re-created'))).toHaveLength(0)
+    expect(reloadLines()).toHaveLength(0)
+    expect(dispatcher.paths()).toEqual(['/p/a.md'])
   })
 })
 
