@@ -18,6 +18,8 @@ export function makeRoutingConfig(overrides?: Partial<RoutingConfig>): RoutingCo
     exit_timeout: 120,
     stop_timeout: 30,
     mcp_config_path: '/tmp/test-mcp.json',
+    cron_table_path: '/tmp/test-crontab',
+    cron_log_path: '/tmp/test-cron.log',
     cozempic_prescription: 'standard',
     system_prompt_mode: 'append',
     resume_enabled: true,

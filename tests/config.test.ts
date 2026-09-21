@@ -262,6 +262,8 @@ function makeValidConfig(overrides: Partial<RoutingConfig> = {}): RoutingConfig 
     exit_timeout: 120,
     stop_timeout: 30,
     mcp_config_path: `${homedir()}/.claude/slack-mcp.json`,
+    cron_table_path: `${homedir()}/.claude/channels/slack/crontab`,
+    cron_log_path: `${homedir()}/.claude/channels/slack/cron.log`,
     cozempic_prescription: 'standard',
     system_prompt_mode: 'append',
     resume_enabled: true,

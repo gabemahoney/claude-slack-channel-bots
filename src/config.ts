@@ -10,11 +10,19 @@
 
 import { readFileSync } from 'fs'
 import { homedir } from 'os'
-import { resolve } from 'path'
+import { dirname, resolve } from 'path'
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+/**
+ * Default path to config.json. Also the source of the fallback config
+ * directory used by default resolution when no loaded-config path is known
+ * (direct pure-function callers): the expanded dirname of this path
+ * (`~/.claude/channels/slack`).
+ */
+const DEFAULT_CONFIG_PATH = '~/.claude/channels/slack/config.json'
 
 export const MCP_SERVER_NAME = 'slack-channel-router'
 export const ALLOWED_PRESCRIPTIONS = ['gentle', 'standard', 'aggressive']
@@ -54,6 +62,9 @@ const KNOWN_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
   'resume_enabled',
   'agent_director_poll_interval_ms',
   'stop_hook_bootstrap',
+  'cron_table_path',
+  'cron_log_path',
+  'cron_log_max_bytes',
 ])
 
 /** The canonical set of per-route keys allowed inside a routes[<channel>] entry. */
@@ -158,6 +169,25 @@ export interface RoutingConfigInput {
    * is rejected explicitly at startup per SR-4.1.
    */
   agent_director_poll_interval_ms?: number
+  /**
+   * Path to the cscb_cron crontable file (b.he5 PD-5). Optional: when omitted,
+   * defaults to `<config dir>/crontab`, where `<config dir>` is the directory
+   * of the config file actually loaded. `~` is expanded and the path resolved
+   * to absolute. Config carries only this pointer, never schedules.
+   */
+  cron_table_path?: string
+  /**
+   * Path to the cscb_cron log file (b.he5 PD-5). Optional: when omitted,
+   * defaults to `<config dir>/cron.log`. `~` is expanded and the path resolved
+   * to absolute.
+   */
+  cron_log_path?: string
+  /**
+   * Maximum size in bytes of the cron log before pruning (b.he5 PD-5). Optional
+   * with NO default: absent means pruning is disabled. When set, must be a
+   * positive integer (finite, integer, >= 1) — no upper bound.
+   */
+  cron_log_max_bytes?: number
 }
 
 /** Validated, fully-resolved routing configuration with all defaults applied. */
@@ -189,6 +219,21 @@ export interface RoutingConfig {
   stop_hook_bootstrap: boolean
   /** Poll interval (ms) for the SR-2.1 permission-relay tick. */
   agent_director_poll_interval_ms: number
+  /**
+   * Absolute path to the cscb_cron crontable file (b.he5 PD-5). Always present:
+   * defaults to `<config dir>/crontab` when omitted from input.
+   */
+  cron_table_path: string
+  /**
+   * Absolute path to the cscb_cron log file (b.he5 PD-5). Always present:
+   * defaults to `<config dir>/cron.log` when omitted from input.
+   */
+  cron_log_path: string
+  /**
+   * Maximum size in bytes of the cron log before pruning (b.he5 PD-5). Optional
+   * with no default: undefined means pruning is disabled.
+   */
+  cron_log_max_bytes?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -196,10 +241,28 @@ export interface RoutingConfig {
 // ---------------------------------------------------------------------------
 
 /**
+ * Resolve the directory used to derive config-dir-relative defaults
+ * (`cron_table_path`, `cron_log_path`). When `configDir` is provided (the
+ * directory of the config file actually loaded — including non-default paths),
+ * it is used verbatim. Direct pure-function callers with no path context pass
+ * nothing and fall back to the expanded dirname of DEFAULT_CONFIG_PATH
+ * (`~/.claude/channels/slack`).
+ */
+function resolveConfigDir(configDir?: string): string {
+  if (configDir !== undefined) return configDir
+  return dirname(resolve(expandTilde(DEFAULT_CONFIG_PATH)))
+}
+
+/**
  * Returns a new config object with all optional fields filled in with defaults.
  * Does not mutate the input.
+ *
+ * @param configDir  Directory of the loaded config file, used to derive the
+ *   config-dir-relative cron path defaults. Omit for direct pure-function
+ *   callers with no path context (falls back to dirname of DEFAULT_CONFIG_PATH).
  */
-export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
+export function applyDefaults(input: RoutingConfigInput, configDir?: string): RoutingConfig {
+  const dir = resolveConfigDir(configDir)
   return {
     routes: input.routes,
     default_route: input.default_route,
@@ -220,6 +283,9 @@ export function applyDefaults(input: RoutingConfigInput): RoutingConfig {
     stop_hook_bootstrap: input.stop_hook_bootstrap ?? true,
     agent_director_poll_interval_ms:
       input.agent_director_poll_interval_ms ?? DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS,
+    cron_table_path: input.cron_table_path ?? resolve(dir, 'crontab'),
+    cron_log_path: input.cron_log_path ?? resolve(dir, 'cron.log'),
+    cron_log_max_bytes: input.cron_log_max_bytes,
   }
 }
 
@@ -366,6 +432,36 @@ export function validateConfig(config: RoutingConfig): void {
       `Routing config validation error: agent_director_poll_interval_ms must be a positive integer in [${MIN_AGENT_DIRECTOR_POLL_INTERVAL_MS}, ${MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS}]; got ${JSON.stringify(pollMs)}.`,
     )
   }
+
+  // cron_table_path must be a non-empty (post-trim) string (b.he5 PD-5).
+  if (typeof config.cron_table_path !== 'string' || config.cron_table_path.trim() === '') {
+    throw new Error(
+      'Routing config validation error: cron_table_path must be a non-empty string.',
+    )
+  }
+
+  // cron_log_path must be a non-empty (post-trim) string (b.he5 PD-5).
+  if (typeof config.cron_log_path !== 'string' || config.cron_log_path.trim() === '') {
+    throw new Error(
+      'Routing config validation error: cron_log_path must be a non-empty string.',
+    )
+  }
+
+  // cron_log_max_bytes, when set, must be a positive integer (finite, integer,
+  // >= 1) — no upper bound (b.he5 PD-5). Absent disables pruning.
+  if (config.cron_log_max_bytes !== undefined) {
+    const maxBytes = config.cron_log_max_bytes
+    if (
+      typeof maxBytes !== 'number' ||
+      !Number.isFinite(maxBytes) ||
+      !Number.isInteger(maxBytes) ||
+      maxBytes < 1
+    ) {
+      throw new Error(
+        `Routing config validation error: cron_log_max_bytes must be a positive integer (>= 1) when set; got ${JSON.stringify(maxBytes)}.`,
+      )
+    }
+  }
 }
 
 /**
@@ -416,8 +512,8 @@ function rejectUnknownFields(parsed: Record<string, unknown>): void {
  * Applies defaults, expands tildes on all CWD paths, then validates.
  * Returns a fully resolved RoutingConfig or throws on invalid input.
  */
-export function resolveConfig(input: RoutingConfigInput): RoutingConfig {
-  const withDefaults = applyDefaults(input)
+export function resolveConfig(input: RoutingConfigInput, configDir?: string): RoutingConfig {
+  const withDefaults = applyDefaults(input, configDir)
 
   // Expand tildes on every route's cwd and claude_config_dir; preserve other fields verbatim.
   // Empty/whitespace claude_config_dir is preserved unchanged so validateConfig can reject it.
@@ -459,6 +555,17 @@ export function resolveConfig(input: RoutingConfigInput): RoutingConfig {
           ? withDefaults.claude_config_dir
           : resolve(expandTilde(withDefaults.claude_config_dir)))
       : undefined,
+    // Expand tildes on the cron paths; preserve empty/whitespace verbatim so
+    // validateConfig can reject them (claude_config_dir convention). Defaults
+    // applied by applyDefaults are already absolute and pass through unchanged.
+    cron_table_path:
+      typeof withDefaults.cron_table_path === 'string' && withDefaults.cron_table_path.trim() !== ''
+        ? resolve(expandTilde(withDefaults.cron_table_path))
+        : withDefaults.cron_table_path,
+    cron_log_path:
+      typeof withDefaults.cron_log_path === 'string' && withDefaults.cron_log_path.trim() !== ''
+        ? resolve(expandTilde(withDefaults.cron_log_path))
+        : withDefaults.cron_log_path,
   }
 
   validateConfig(config)
@@ -468,8 +575,6 @@ export function resolveConfig(input: RoutingConfigInput): RoutingConfig {
 // ---------------------------------------------------------------------------
 // I/O wrapper
 // ---------------------------------------------------------------------------
-
-const DEFAULT_CONFIG_PATH = '~/.claude/channels/slack/config.json'
 
 /**
  * Reads routing configuration from disk, parses it, and returns a validated
@@ -514,7 +619,7 @@ export function loadConfig(path?: string): RoutingConfig {
 
   try {
     rejectUnknownFields(parsed as Record<string, unknown>)
-    return resolveConfig(input)
+    return resolveConfig(input, dirname(configPath))
   } catch (err) {
     const cause = err instanceof Error ? err.message : String(err)
     throw new Error(`loadConfig: invalid routing config in "${configPath}": ${cause}`)
