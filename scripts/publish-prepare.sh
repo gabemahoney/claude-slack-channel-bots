@@ -29,7 +29,9 @@
 #   11  SR-2.1  preflight: git fetch origin failed
 #   12  SR-2.1  preflight: local main behind/diverged from origin/main
 #   13  SR-2.2/2.3  preflight: install/test/typecheck failed
-#   14  SR-2.4  preflight: npm not authenticated, or next version already on npm
+#   14  SR-2.4  preflight: npm not authenticated, OR next version already on npm,
+#                OR npm registry is non-canonical (SR-2.4a),
+#                OR 'bun pm whoami' did not succeed (SR-2.4b)
 #   15  SR-2.5  preflight: host agent-director missing/broken or version out of range
 #   16  SR-2.6  preflight: stranded finished work (finished ticket not on main and
 #                not explicitly closed, or unmerged branch references a finished ticket)
