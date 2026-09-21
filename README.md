@@ -481,15 +481,15 @@ The server fires scheduled prompts into bot channels once per minute, reading th
 
 ### The crontable
 
-Schedules live in the crontable file at `cron_table_path` (default `<config dir>/crontab`, where `<config dir>` is the directory of your loaded `config.json`; override it with the `cron_table_path` key in `config.json`). The server creates the file on first boot if it is absent, with a self-documenting comment header describing the line format. That header is the format reference for now — read the top of the created file to see how to write a schedule; do not hand-edit the format from memory.
+Schedules live in the crontable file at `cron_table_path` (default `<config dir>/crontab`, where `<config dir>` is the directory of your loaded `config.json`; override it with the `cron_table_path` key in `config.json`). The server creates the file on first boot if it is absent, with a self-documenting comment header describing the line format. That header is the format reference for now — read the top of the created file to see how to write a schedule; do not hand-edit the format from memory. With the default config location the crontable is at `~/.claude/channels/slack/crontab`:
 
 ```sh
-cat "$(dirname <path-to-config.json>)/crontab"
+cat ~/.claude/channels/slack/crontab
 ```
 
 ### How fires appear
 
-A scheduled fire arrives in the channel as an `/interject` message whose `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. When several schedules fire in the same minute for the same channel, their prompts are concatenated into a single message and the sender lists every contributor (for example `cscb-cron:standup+grooming`).
+A scheduled fire arrives in the channel as an `/interject` message whose `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. When several schedules fire in the same minute for the same channel, their prompts are concatenated into a single message and the sender lists every contributor (for example `cscb-cron:standup+grooming`). If the combined message would exceed the 32KB cap, the prompts are delivered as separate messages instead, and an info line in `cron.log` records the split.
 
 ### The cron log
 

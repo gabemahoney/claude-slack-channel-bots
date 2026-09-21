@@ -923,11 +923,13 @@ describe('fireGroup oversize-group fallback', () => {
 
     const lines = h.lines()
 
-    // Exactly one info line records the split, naming the channel and group size.
+    // Exactly one info line records the split, naming the channel and the exact
+    // group size the source emits (`delivering <n> schedules individually`) —
+    // not a bare `2`, which any status/byte digit would satisfy.
     const info = lines.filter((l) => l.outcome === 'info')
     expect(info).toHaveLength(1)
     expect(info[0]!.channel).toBe(CHANNEL)
-    expect(info[0]!.detail).toContain('2')
+    expect(info[0]!.detail).toContain('delivering 2 schedules individually')
 
     // Individual deliveries: two delivered outcomes, and because each was a
     // single-contributor POST there is NO grouped= token.
@@ -1140,5 +1142,49 @@ describe('single-schedule fire() unchanged by grouping', () => {
       expect(token(s.detail, 'delivered')).toBe('1')
       expect(token(s.detail, 'failed')).toBe('0')
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 16. resolveTargets dedupe — a duplicate channel in one line's explicit list
+// (operator typo `C1,C1`) targets that channel at most ONCE.
+// ---------------------------------------------------------------------------
+
+describe('duplicate channel in one schedule', () => {
+  test('explicit list `C1,C1` → exactly ONE POST, plain (non-grouped) sender, one outcome, summary 1/0', async () => {
+    const dir = makeTempDir('cscb-prompt-test-')
+    const CHANNEL = 'C_DUP'
+    const promptBody = 'dedupe me'
+    const promptPath = join(dir, 'dup.md')
+    writeFileSync(promptPath, promptBody)
+
+    const h = makeHarness()
+    // Same channel listed twice on one line. Without dedupe the schedule would
+    // be its own second contributor to CHANNEL: two POSTs, or one grouped POST
+    // with a self-doubled sender (`cscb-cron:dup+dup`).
+    await h.fire(explicitSchedule(promptPath, [CHANNEL, CHANNEL], 'cscb-cron:dup'))
+
+    // Exactly ONE POST, carrying the plain single-schedule sender (no `+dup`
+    // self-doubling) and the prompt content once (no self-concatenation).
+    expect(requests).toHaveLength(1)
+    expect(requests[0]!.body.channel).toBe(CHANNEL)
+    expect(requests[0]!.body.message).toBe(promptBody)
+    expect(requests[0]!.body.sender).toBe('cscb-cron:dup')
+
+    const lines = h.lines()
+
+    // Exactly one delivered outcome line for the channel, with NO grouped=
+    // token (single contributor after dedupe).
+    const delivered = lines.filter((l) => l.channel === CHANNEL && l.outcome === 'delivered')
+    expect(delivered).toHaveLength(1)
+    expect(delivered[0]!.identity).toBe('cscb-cron:dup')
+    expect(token(delivered[0]!.detail, 'grouped')).toBeUndefined()
+
+    // One summary, delivered=1 failed=0 (one target, not two).
+    const summaries = lines.filter((l) => l.outcome === 'summary')
+    expect(summaries).toHaveLength(1)
+    expect(summaries[0]!.identity).toBe('cscb-cron:dup')
+    expect(token(summaries[0]!.detail, 'delivered')).toBe('1')
+    expect(token(summaries[0]!.detail, 'failed')).toBe('0')
   })
 })

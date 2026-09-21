@@ -50,6 +50,13 @@ interface ManualClock extends SchedulerClock {
   pending(): FakeTimer[]
   /** Timers still live (armed and not cleared). */
   live(): FakeTimer[]
+  /**
+   * Fire the single currently-live timer's captured callback exactly as the
+   * production runtime would when the delay elapses. Asserts there is exactly
+   * one live timer first, so a test that expected the chain to re-arm (or to
+   * have stopped) fails loudly here rather than silently firing the wrong one.
+   */
+  fireDueTimer(): void
 }
 
 function makeClock(start: Date): ManualClock {
@@ -73,6 +80,16 @@ function makeClock(start: Date): ManualClock {
     },
     pending: () => timers,
     live: () => timers.filter((x) => !x.cleared),
+    fireDueTimer() {
+      const armed = timers.filter((x) => !x.cleared)
+      if (armed.length !== 1) {
+        throw new Error(`fireDueTimer expected exactly one live timer, found ${armed.length}`)
+      }
+      // The production arm() drops its handle before running the pass; mirror
+      // that by marking this timer cleared so it is not counted as a re-arm.
+      armed[0]!.cleared = true
+      armed[0]!.cb()
+    },
   }
 }
 
@@ -403,6 +420,49 @@ describe('cron-scheduler — at-most-once', () => {
 })
 
 // ===========================================================================
+// Dispatcher failure isolation — a rejecting fireGroup must not break the tick
+// ===========================================================================
+
+describe('cron-scheduler — dispatcher error isolation', () => {
+  test('fireGroup REJECTS → tick() resolves, minute is recorded (no same-minute re-dispatch), next minute still fires', async () => {
+    const start = new Date('2026-06-15T10:30:00')
+    writeCrontable(line(everyMinute, '/p/a.md', 'C1'))
+    const clock = makeClock(start)
+
+    // A dispatcher whose fireGroup rejects on every call, while still recording
+    // the attempt so we can count dispatch attempts across minutes.
+    const attempts: CronSchedule[][] = []
+    const rejectingDispatcher: CronDispatcher = {
+      async fireGroup(schedules: CronSchedule[]): Promise<void> {
+        attempts.push([...schedules])
+        throw new Error('dispatcher boom')
+      },
+      async fire(): Promise<void> {
+        throw new Error('unused')
+      },
+    }
+    const scheduler = build(clock, rejectingDispatcher)
+    scheduler.start()
+
+    // tick() must resolve, never reject, even though fireGroup threw.
+    await expect(scheduler.tick()).resolves.toBeUndefined()
+    expect(attempts).toHaveLength(1)
+
+    // Same minute again: the at-most-once map already recorded this minute for
+    // the line, and the monotonic guard skips the whole pass → no re-dispatch.
+    await expect(scheduler.tick()).resolves.toBeUndefined()
+    expect(attempts).toHaveLength(1)
+
+    // Advance one minute: the tick fires again despite the prior rejection (the
+    // failure did not poison the chain or the bookkeeping).
+    clock.advanceMinutes(1)
+    await expect(scheduler.tick()).resolves.toBeUndefined()
+    expect(attempts).toHaveLength(2)
+    expect(attempts[1]!.map((s) => s.promptPath)).toEqual(['/p/a.md'])
+  })
+})
+
+// ===========================================================================
 // Monotonic guard + no catch-up
 // ===========================================================================
 
@@ -521,6 +581,73 @@ describe('cron-scheduler — stop()', () => {
 
     // Idempotent: a second stop() does not throw and clears nothing new.
     expect(() => scheduler.stop()).not.toThrow()
+    expect(clock.live()).toHaveLength(0)
+  })
+})
+
+// ===========================================================================
+// Production timer chain — the armed callback is what fires in production; the
+// direct tick() seam above never exercises arm()'s re-arm/stop interaction.
+// These drive the CAPTURED timer callback (never real time) to prove the chain
+// dispatches once per fire and re-arms exactly one minute-aligned timer.
+// ===========================================================================
+
+describe('cron-scheduler — production timer chain', () => {
+  test('firing the armed timer dispatches once and re-arms exactly one minute-aligned timer', async () => {
+    const start = new Date('2026-06-15T10:30:15.250') // 15.25s into the minute
+    writeCrontable(line(everyMinute, '/p/a.md', 'C1'))
+    const clock = makeClock(start)
+    const dispatcher = makeDispatcher()
+    const scheduler = build(clock, dispatcher)
+    scheduler.start()
+
+    // start() armed one timer at the top of the next minute (44.75s away).
+    expect(clock.live()).toHaveLength(1)
+    expect(clock.live()[0]!.ms).toBe(60_000 - 15_250)
+
+    // Advance the clock to the top of that minute (where production would fire
+    // it), then invoke the captured callback exactly as the runtime would.
+    clock.set(new Date('2026-06-15T10:31:00'))
+    clock.fireDueTimer()
+    // The pass re-arms on a microtask after tick() settles; let it run.
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // Exactly one dispatch happened for the fired minute.
+    expect(dispatcher.groupCalls).toHaveLength(1)
+    expect(dispatcher.groupCalls[0]!.map((s) => s.promptPath)).toEqual(['/p/a.md'])
+
+    // The chain re-armed exactly ONE new timer, minute-aligned to the next
+    // minute top (fired at :00, so a full 60s away).
+    const live = clock.live()
+    expect(live).toHaveLength(1)
+    expect(live[0]!.ms).toBe(60_000)
+  })
+
+  test('stop() during an in-flight pass prevents re-arm (no live timer after the pass completes)', async () => {
+    const start = new Date('2026-06-15T10:30:15.250')
+    writeCrontable(line(everyMinute, '/p/a.md', 'C1'))
+    const clock = makeClock(start)
+    const dispatcher = makeDispatcher()
+    const scheduler = build(clock, dispatcher)
+    scheduler.start()
+
+    expect(clock.live()).toHaveLength(1)
+
+    // Fire the armed callback (starts the pass), then stop() synchronously —
+    // before the async tick() settles and its finally() re-arms. arm()'s
+    // finally() reads `stopped` AFTER the pass, so it must skip the re-arm.
+    clock.set(new Date('2026-06-15T10:31:00'))
+    clock.fireDueTimer()
+    scheduler.stop()
+    // Let the in-flight tick() settle and its finally() run.
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // The pass still dispatched (it was already in flight)...
+    expect(dispatcher.groupCalls).toHaveLength(1)
+    // ...but the chain did NOT re-arm: fireDueTimer cleared the fired timer and
+    // the stopped guard suppressed a new one, so no timer is live.
     expect(clock.live()).toHaveLength(0)
   })
 })

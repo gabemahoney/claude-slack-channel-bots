@@ -94,11 +94,26 @@ export interface CronSchedulerDeps {
   clock?: SchedulerClock
 }
 
-/** The scheduler handle. */
+/**
+ * The scheduler handle. SINGLE-USE: a handle runs at most one start()→stop()
+ * lifecycle. stop() does not re-open it — start() never resets `stopped`, so a
+ * stop() then start() would arm at most one tick and then die silently. To
+ * restart, construct a NEW scheduler. Calling start() twice, or start() after
+ * stop(), is a loud no-op (a `[slack] cron-scheduler` console.error), never a
+ * silent one. The current server wiring starts once and stops once at shutdown,
+ * so this is documented, not designed around.
+ */
 export interface CronScheduler {
-  /** Bootstrap + load + arm the tick. Failure-isolated: never throws. */
+  /**
+   * Bootstrap + load + arm the tick. Failure-isolated: never throws. May be
+   * called at most ONCE per handle (see the single-use note above); a second
+   * call, or a call after stop(), is a logged no-op.
+   */
   start(): void
-  /** Cancel the pending tick. Idempotent (stopHealthCheck convention). */
+  /**
+   * Cancel the pending tick. Idempotent (stopHealthCheck convention). Does NOT
+   * re-open the handle for a later start() — the scheduler is single-use.
+   */
   stop(): void
   /**
    * Run exactly one tick pass now (async). A directly callable seam for tests;
@@ -146,14 +161,31 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
   let timer: ReturnType<typeof setTimeout> | null = null
   let lastTickedMinute = Number.NEGATIVE_INFINITY
 
-  // stop() sets this so a pass in flight does not re-arm after we cancel.
+  // stop() sets this to true so a pass in flight does not re-arm after we
+  // cancel. Once true it is never cleared — the handle is single-use.
   let stopped = false
+  // start() sets this so a second start() (or a start() after stop()) is a
+  // loud no-op rather than a silently dead second arm.
+  let started = false
 
   // -------------------------------------------------------------------------
   // start()
   // -------------------------------------------------------------------------
 
   function start(): void {
+    // The handle is SINGLE-USE (see the CronScheduler interface docs): start()
+    // does not reset `stopped`, so a stop()→start() sequence would arm at most
+    // one tick and then die silently. Reject re-entry loudly instead; to
+    // restart, construct a fresh scheduler.
+    if (started) {
+      console.error('[slack] cron-scheduler: start() called more than once — ignoring (handle is single-use; construct a new scheduler to restart)')
+      return
+    }
+    if (stopped) {
+      console.error('[slack] cron-scheduler: start() called after stop() — ignoring (handle is single-use; construct a new scheduler to restart)')
+      return
+    }
+    started = true
     try {
       // (1) Bootstrap FIRST — this start() is the ONLY caller of ensure-exists
       // (server wiring removed its own call per PM review). A missing crontable
@@ -254,7 +286,7 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
       timer = null
       void tick().finally(() => {
         // Only re-arm if we have not been stopped during the pass. stop() sets
-        // a flag by nulling `stopped`; check via the sentinel below.
+        // `stopped = true`; check it here so a stop() mid-pass ends the chain.
         if (!stopped) arm()
       })
     }, delay)

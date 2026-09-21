@@ -233,9 +233,18 @@ export function createCronDispatcher(deps: CronDispatcherDeps): CronDispatcher {
    * an all-bots schedule this is where fan-out expansion will slot in; today
    * only explicit lists produce targets (all-bots is handled by its own
    * deferral branch in fire(), never reaching the loop).
+   *
+   * Duplicate channel IDs within one schedule's explicit list (e.g. `C1,C1`,
+   * an operator typo) are deduped here, preserving first-seen order. Without
+   * this, the group path would treat the schedule as its own second contributor
+   * to that channel — concatenating the prompt with itself and stamping a
+   * self-doubled sender (`cscb-cron:a+a`). One line can target a channel at most
+   * once.
    */
   function resolveTargets(schedule: CronSchedule): string[] {
-    return schedule.channels.kind === 'explicit' ? schedule.channels.channelIds : []
+    return schedule.channels.kind === 'explicit'
+      ? [...new Set(schedule.channels.channelIds)]
+      : []
   }
 
   /**
@@ -410,8 +419,9 @@ export function createCronDispatcher(deps: CronDispatcherDeps): CronDispatcher {
   /**
    * Deliver a group of schedules that matched the SAME minute. fire() is
    * exactly `fireGroup([schedule])`; the single-schedule shape falls out of the
-   * general path (one contributor per channel → one POST per target → identical
-   * outcome + summary lines, plus the harmless `grouped=1` note).
+   * general path (one contributor per channel → one POST per target → outcome +
+   * summary lines byte-identical to Task 2's original fire(): a single
+   * contributor omits the `grouped=` token entirely — it is added only for 2+).
    */
   async function fireGroup(schedules: CronSchedule[]): Promise<void> {
     const timestamp = new Date().toISOString()

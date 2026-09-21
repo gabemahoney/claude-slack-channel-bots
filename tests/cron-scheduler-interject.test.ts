@@ -6,7 +6,7 @@
  * state, afterAll stop). No mocks of the product modules; no real sleeping.
  *
  * The clock is fully injected. The scheduler arms its next pass via
- * clock.setTimeout, but this test's fake clock CAPTURES that handler and never
+ * clock.setTimeout, but this test's fake clock DISCARDS that handler and never
  * auto-fires it — every pass is driven through the direct `tick()` seam with an
  * injected now() inside a `* * * * *` minute. `* * * * *` matches every minute,
  * so the test is TZ-agnostic (no local-time coupling).
@@ -114,18 +114,18 @@ function token(detail: string, key: string): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// Fake clock — CAPTURES the armed handler, never auto-fires it. now() is a
+// Fake clock — DISCARDS the armed handler, never auto-fires it. now() is a
 // controllable time inside a `* * * * *` minute so the direct tick() matches.
 // ---------------------------------------------------------------------------
 
 /** A fixed instant inside a minute — any minute matches `* * * * *`. */
 const FIXED_NOW = new Date('2026-01-15T10:30:30.000Z')
 
-function makeCapturingClock(nowDate: Date): SchedulerClock {
+function makeNonFiringClock(nowDate: Date): SchedulerClock {
   return {
     now: () => nowDate,
-    // Capture-only: return an opaque handle and never invoke the handler, so
-    // the only pass that runs is the one this test drives via tick().
+    // Discard the armed handler: return an opaque handle and never invoke it,
+    // so the only pass that runs is the one this test drives via tick().
     setTimeout: () => 0 as unknown as ReturnType<typeof setTimeout>,
     clearTimeout: () => {},
   }
@@ -147,7 +147,7 @@ function makeWiring(opts: {
     dispatcher,
     cronLog,
     cronTablePath: opts.cronTablePath,
-    clock: makeCapturingClock(opts.now),
+    clock: makeNonFiringClock(opts.now),
   })
   return { scheduler, logPath, lines: () => readLog(logPath) }
 }

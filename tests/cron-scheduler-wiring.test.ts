@@ -42,6 +42,37 @@ describe('server.ts wires the cron scheduler', () => {
     expect(startIdx).toBeGreaterThan(serveIdx)
   })
 
+  test('constructs the cron scheduler+log INSIDE the `if (routingConfig)` guard block (env-var fallback path builds nothing cron-related)', () => {
+    // AC (subtask t3.he5.eu.4q.ti): on the env-var fallback path (no routing
+    // config) nothing cron-related is constructed or started. Enforced by
+    // requiring the createCronLog/createCronScheduler/start() calls to live
+    // inside the routingConfig guard block, so dropping the guard fails here.
+    const schedIdx = SERVER_SRC.indexOf('createCronScheduler(')
+    const logIdx = SERVER_SRC.indexOf('createCronLog(')
+    const startIdx = SERVER_SRC.indexOf('cronScheduler.start(')
+    expect(schedIdx).toBeGreaterThan(-1)
+    expect(logIdx).toBeGreaterThan(-1)
+    expect(startIdx).toBeGreaterThan(-1)
+
+    // The enclosing guard is the LAST `if (routingConfig) {` before the cron
+    // construction; its try/catch closes at the first `catch (err)` after it.
+    // Bounding the region by content (never line numbers) keeps this robust to
+    // edits elsewhere in main() — the same indexOf technique the shutdown-region
+    // and Bun.serve-ordering tests use.
+    const guardIdx = SERVER_SRC.lastIndexOf('if (routingConfig) {', schedIdx)
+    expect(guardIdx).toBeGreaterThan(-1)
+    const guardEnd = SERVER_SRC.indexOf('catch (err)', guardIdx)
+    expect(guardEnd).toBeGreaterThan(guardIdx)
+
+    // All three cron wiring calls must fall strictly within [guard, catch): if
+    // the guard were removed the lastIndexOf would land on a DIFFERENT, earlier
+    // `if (routingConfig)` and one of these bounds would fail.
+    for (const idx of [logIdx, schedIdx, startIdx]) {
+      expect(idx).toBeGreaterThan(guardIdx)
+      expect(idx).toBeLessThan(guardEnd)
+    }
+  })
+
   test('stops the scheduler inside the shutdown() function body', () => {
     // Bound the shutdown function body by content: from its declaration to the
     // first process.on() signal-wiring line that follows it. Anchoring on
