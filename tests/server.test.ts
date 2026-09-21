@@ -30,10 +30,15 @@ import {
   setClientForTests,
   resetClientForTests,
 } from '../src/agent-director-client.ts'
-import { makeStubClient } from './test-helpers/agent-director-stub.ts'
+import { makeStubClient, errTmuxSendKeys } from './test-helpers/agent-director-stub.ts'
 import { _buildIsSessionAliveAdapter, _buildReconnectSessionAdapter } from '../src/server.ts'
+import {
+  _resetFindMissingMemo,
+  _setTmuxServerEnsurer,
+  _resetTmuxServerEnsurer,
+} from '../src/session-manager.ts'
 import type { WebClient } from '@slack/web-api'
-import type { SendKeysParams, StatusParams } from 'agent-director'
+import type { FindMissingParams, SendKeysParams, StatusParams } from 'agent-director'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -739,9 +744,11 @@ describe('_buildReconnectSessionAdapter', () => {
     adapter: (channelId: string) => Promise<'success' | 'escalate-dead' | 'transient'>
     statusCalls: StatusParams[]
     sendKeysCalls: SendKeysParams[]
+    findMissingCalls: FindMissingParams[]
   } {
     const statusCalls: StatusParams[] = []
     const sendKeysCalls: SendKeysParams[] = []
+    const findMissingCalls: FindMissingParams[] = []
     const stub = makeStubClient({
       statusCalls,
       statusFn: () =>
@@ -751,6 +758,10 @@ describe('_buildReconnectSessionAdapter', () => {
       sendKeysCalls,
       sendKeysError: opts.sendKeysThrows,
       sendKeysResult: opts.sendKeysThrows ? undefined : {},
+      // The escalate-dead sweep (reconcileMissingSweep → client.findMissing({}))
+      // flows through this SAME stub client. `findMissingCalls` is the observable
+      // seam for "was the memoized sweep triggered".
+      findMissingCalls,
     })
     _resetOutageState()
     initOutageState({
@@ -758,21 +769,35 @@ describe('_buildReconnectSessionAdapter', () => {
       getClient: () => stub as unknown as Client,
     })
     setClientForTests(stub as unknown as Client)
+    // Seam: reconnectMcp's ErrTmuxSendKeys self-heal calls _ensureTmuxServer
+    // between the two send-keys attempts. Stub it so the dead-session path
+    // (double ErrTmuxSendKeys) never touches a live tmux server.
+    _setTmuxServerEnsurer(async () => {})
     const fakeConfig = { routes: { C1: { normalizedName: 'test-channel' } } }
     return {
       adapter: _buildReconnectSessionAdapter(() => fakeConfig as any, {} as unknown as WebClient),
       statusCalls,
       sendKeysCalls,
+      findMissingCalls,
     }
   }
+
+  beforeEach(() => {
+    // The escalate-dead sweep is memoized (b.m4r, 10s TTL). Clear the memo so a
+    // sweep from another test can't satisfy this test's findMissing assertion —
+    // the TTL setter alone does not clear an already-populated memo entry.
+    _resetFindMissingMemo()
+  })
 
   afterEach(() => {
     resetClientForTests()
     _resetOutageState()
+    _resetTmuxServerEnsurer()
+    _resetFindMissingMemo()
   })
 
   test("(i) AD state 'working' → returns 'transient' and does NOT attempt the send-keys reconnect", async () => {
-    const { adapter, statusCalls, sendKeysCalls } = makeHarness({ statusState: 'working' })
+    const { adapter, statusCalls, sendKeysCalls, findMissingCalls } = makeHarness({ statusState: 'working' })
 
     const result = await adapter('C1')
 
@@ -782,10 +807,12 @@ describe('_buildReconnectSessionAdapter', () => {
     // ...but the working-state defer short-circuited before reconnectMcp — no
     // `/mcp reconnect` was typed into the pane.
     expect(sendKeysCalls).toHaveLength(0)
+    // b.9a7: the transient path never escalates, so no sweep fires.
+    expect(findMissingCalls).toHaveLength(0)
   })
 
   test("(ii) non-working live state ('waiting') → reconnect IS attempted, maps ok → 'success'", async () => {
-    const { adapter, statusCalls, sendKeysCalls } = makeHarness({ statusState: 'waiting' })
+    const { adapter, statusCalls, sendKeysCalls, findMissingCalls } = makeHarness({ statusState: 'waiting' })
 
     const result = await adapter('C1')
 
@@ -794,10 +821,12 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(statusCalls).toHaveLength(1)
     expect(sendKeysCalls).toHaveLength(1)
     expect(sendKeysCalls[0].text).toContain('/mcp reconnect')
+    // b.9a7: the success path never escalates, so no sweep fires.
+    expect(findMissingCalls).toHaveLength(0)
   })
 
   test('(iii) status-probe error → falls through to the reconnect attempt (no false transient)', async () => {
-    const { adapter, statusCalls, sendKeysCalls } = makeHarness({ statusThrows: true })
+    const { adapter, statusCalls, sendKeysCalls, findMissingCalls } = makeHarness({ statusThrows: true })
 
     const result = await adapter('C1')
 
@@ -806,5 +835,30 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(result).toBe('success')
     expect(statusCalls).toHaveLength(1)
     expect(sendKeysCalls).toHaveLength(1)
+    // Fell through to a successful reconnect, not escalate-dead — no sweep.
+    expect(findMissingCalls).toHaveLength(0)
+  })
+
+  test("(iv) reconnectMcp 'dead-session' → 'escalate-dead', firing exactly one memoized findMissing sweep (b.sv7 / Epic t1.tkk.e4)", async () => {
+    // Persistent ErrTmuxSendKeys: the first send-keys AND the self-heal retry
+    // both fail, so reconnectMcp returns 'dead-session' (b.3ce). The status
+    // probe is 'waiting' (not 'working'), so the adapter does NOT defer — it
+    // falls through to reconnectMcp and the dead-session escalate branch.
+    const { adapter, statusCalls, sendKeysCalls, findMissingCalls } = makeHarness({
+      statusState: 'waiting',
+      sendKeysThrows: errTmuxSendKeys(),
+    })
+
+    const result = await adapter('C1')
+
+    // Mapping is byte-for-byte unchanged per b.9a7: dead-session → 'escalate-dead'.
+    expect(result).toBe('escalate-dead')
+    expect(statusCalls).toHaveLength(1)
+    // Two send-keys attempts (original + one self-heal retry) both threw.
+    expect(sendKeysCalls).toHaveLength(2)
+    // The escalate-dead branch fires sweepDeadTmuxChannel → the memoized
+    // reconcileMissingSweep → exactly ONE client.findMissing({}). No direct new
+    // findMissing call site; the memoized helper is the only sweep mechanism.
+    expect(findMissingCalls).toHaveLength(1)
   })
 })

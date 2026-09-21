@@ -649,10 +649,17 @@ export function _resetWaitForWaitingTimeoutMs(): void {
  * arriving just after it resolves reuse that result instead of re-sweeping.
  *
  * 10s is chosen to comfortably cover one startup reconcile wave (the whole
- * concurrency=3 wave over the fleet completes well inside this window) while
- * staying short enough that the health-checker's later per-channel calls
- * (spaced on the order of a minute) always fall outside the window and get a
- * fresh sweep — recovery behavior is unchanged, only redundant load is shed.
+ * concurrency=3 wave over the fleet completes well inside this window) and to
+ * collapse a same-tick escalate-dead burst: when N channels escalate together
+ * (b.nk5 fleet shape — /tmp wiped, every channel dead-tmux at once), those
+ * `sweepDeadTmuxChannel` callers deliberately land INSIDE the window and share
+ * the single in-flight/memoized sweep — one findMissing reconciles the whole
+ * store for all of them. Across ticks the 10s TTL is far shorter than the
+ * ~120s health-check cadence, so the following tick's escalate-dead sweeps
+ * always fall outside the window and re-sweep: a memoized-stale answer costs at
+ * most ONE extra tick. Recovery behavior is unchanged, only redundant load is
+ * shed (see the `_buildReconnectSessionAdapter` call-site note in src/server.ts
+ * and docs/architecture.md's b.m4r sweep note).
  */
 const FIND_MISSING_MEMO_TTL_MS = 10 * 1000
 
@@ -727,6 +734,42 @@ async function reconcileMissingSweep(channelId: string, logPrefix: string): Prom
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('findMissing', 'UnknownError', String(err))
     console.error(`[slack] ${logPrefix}: findMissing sweep failed for channel=${channelId}: ${e.errName} — proceeding`)
   }
+}
+
+/**
+ * b.sv7 / Epic t1.tkk.e4: the escalate-dead → internal-sweep entry point, and
+ * the single reusable place for it (b.4vj will add a second retry driver that
+ * hits dead-tmux and must share this exact logic — do NOT inline the sweep at
+ * another call site).
+ *
+ * When the tick/restart path decides a channel's tmux session is provably dead
+ * while its AD row still looks alive ('dead-session' → 'escalate-dead'), CSCB
+ * recovers itself instead of silently waiting on the external
+ * `~/startup/find-missing-loop.sh`: emit an operator-visible log line, then run
+ * the existing memoized `reconcileMissingSweep` (b.m4r). The sweep reconciles
+ * the frozen `working` row to `missing`, so the NEXT health-check tick observes
+ * `alive === false` and takes the normal kill+relaunch branch. The external
+ * loop remains belt-and-braces; removing it is a separate operator decision.
+ *
+ * The log line is emitted UNCONDITIONALLY here — before/outside the memoized
+ * helper — because a memo hit returns silently and a sweep failure logs only
+ * the generic failure line; an operator must see that recovery was triggered on
+ * every escalate-dead verdict. `reconcileMissingSweep` stays module-private; this
+ * wrapper is the only export.
+ *
+ * Never throws: `reconcileMissingSweep` already logs and swallows its own
+ * failures (and does not memoize them, so the next tick retries), so the caller
+ * can await this and return its verdict unchanged regardless of sweep outcome.
+ *
+ * @param channelId the dead-tmux channel to reconcile (log context; the sweep
+ *   itself is whole-store, so one in-flight sweep serves the fleet — b.nk5).
+ * @param verdict the verdict/context fragment for the log line (e.g. 'dead-session').
+ */
+export async function sweepDeadTmuxChannel(channelId: string, verdict: string): Promise<void> {
+  console.error(
+    `[slack] escalate-dead: channel=${channelId} verdict=${verdict} — tmux session provably dead, triggering internal findMissing reconciliation (next tick relaunches; ~/startup/find-missing-loop.sh is belt-and-braces)`,
+  )
+  await reconcileMissingSweep(channelId, 'escalate-dead')
 }
 
 /**

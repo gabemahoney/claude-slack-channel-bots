@@ -179,10 +179,15 @@ export function scheduleRestart(
         // scheduleRestart again, so a failed/deferred reconnect is retried
         // without any re-entry here. ('transient' also covers the b.9a7 hazard-2
         // `working` defer: the tick retries once the turn settles.) For the
-        // dead-tmux 'escalate-dead' case the external
-        // ~/startup/find-missing-loop.sh may additionally reconcile the row to
-        // `missing`, after which a tick relaunches. Not counting here keeps the
-        // failure count tied to actual launch attempts, not this reconnect site.
+        // dead-tmux 'escalate-dead' case CSCB now recovers itself (b.sv7 / Epic
+        // t1.tkk.e4): the reconnectSession adapter fires the internal memoized
+        // findMissing sweep before returning 'escalate-dead', so the frozen
+        // `working` row reconciles to `missing` and the NEXT tick observes
+        // alive === false and falls through to the kill+relaunch branch below.
+        // The external ~/startup/find-missing-loop.sh is belt-and-braces only —
+        // recovery no longer depends on it, and removing it is a separate
+        // operator decision. Not counting here keeps the failure count tied to
+        // actual launch attempts, not this reconnect site.
         return
       }
 

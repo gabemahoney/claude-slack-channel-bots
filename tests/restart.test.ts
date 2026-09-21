@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import {
   initRestart,
   scheduleRestart,
@@ -19,6 +19,25 @@ import {
   getFailureCount,
   isAtCap,
 } from '../src/backoff.ts'
+import { _buildReconnectSessionAdapter } from '../src/server.ts'
+import {
+  _resetFindMissingMemo,
+  _setTmuxServerEnsurer,
+  _resetTmuxServerEnsurer,
+} from '../src/session-manager.ts'
+import {
+  setClientForTests,
+  resetClientForTests,
+} from '../src/agent-director-client.ts'
+import {
+  _resetOutageState,
+  initOutageState,
+} from '../src/outage-state.ts'
+import { makeStubClient } from './test-helpers/agent-director-stub.ts'
+import { errTmuxSendKeys } from './test-helpers/agent-director-stub.ts'
+import type { Client } from 'agent-director'
+import type { WebClient } from '@slack/web-api'
+import type { FindMissingParams } from 'agent-director'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -544,11 +563,17 @@ describe('backoff integration (SR-29.3)', () => {
   //
   //     Single-counting-site pin: the reconnect path never calls recordFailure.
   //     On main, a non-success reconnect outcome ('escalate-dead' or 'transient')
-  //     does NOT re-enter scheduleRestart — 'escalate-dead' is currently a no-op;
-  //     recovery waits for a future health tick or a server restart. The one and
-  //     only place a failure is counted is the launchSession boolean on the
-  //     dead-session relaunch path. Recording a failure at the reconnect site too
-  //     would be a spurious second count of the same episode.
+  //     does NOT re-enter scheduleRestart. For 'escalate-dead' (dead-tmux) the
+  //     adapter upstream fires CSCB's internal reconcileMissingSweep so the frozen
+  //     `working` row reconciles to `missing` and the NEXT health tick takes the
+  //     kill+relaunch branch (Epic t1.tkk.e4 / b.sv7) — recovery is internal, not
+  //     deferred to the external ~/startup/find-missing-loop.sh (belt-and-braces
+  //     only). Whether or not that sweep fires, the reconnect verdict path still
+  //     records neither success nor failure: the one and only place a failure is
+  //     counted is the launchSession boolean on the dead-session relaunch path.
+  //     Recording a failure at the reconnect site too would be a spurious second
+  //     count of the same episode, and escalate-dead ticks must not accumulate
+  //     toward the b.7u6 5-spawn cap.
   //
   //     These tests pin the negative: a non-success reconnect leaves the counter
   //     untouched. To distinguish "left unchanged" from "erroneously reset to 0
@@ -576,13 +601,16 @@ describe('backoff integration (SR-29.3)', () => {
     expect(getFailureCount(CHANNEL)).toBe(0)
   })
 
-  test('(4b) reconnect result=escalate-dead leaves counter unchanged at reconnect site (single-counting-site pin)', async () => {
+  test('(4b) reconnect result=escalate-dead leaves counter unchanged at reconnect site (single-counting-site pin; no cap accumulation)', async () => {
     // Single-counting-site pin: the reconnect path does NOT call recordFailure.
-    // On main, 'escalate-dead' is a no-op — it does NOT re-enter scheduleRestart;
-    // recovery waits for a future health tick or a server restart. The lone place
-    // failures are counted is the launchSession boolean on the relaunch path.
-    // This test also proves the reconnect path does not erroneously RESET the
-    // counter: it pre-seeds one failure and asserts the count remains 1.
+    // 'escalate-dead' does NOT re-enter scheduleRestart; internal recovery flows
+    // through the adapter's reconcileMissingSweep so the next health tick relaunches
+    // (Epic t1.tkk.e4 / b.sv7). The lone place failures are counted is the
+    // launchSession boolean on the relaunch path. This test also proves the
+    // reconnect path does not erroneously RESET the counter: it pre-seeds one
+    // failure and asserts the count remains 1 — so escalate-dead ticks never
+    // accumulate toward the b.7u6 5-spawn cap (a pre-seeded failure stays put,
+    // and repeated escalate-dead ticks would leave it there rather than climbing).
     const CHANNEL = 'C_RECONNECT_ESCALATE'
 
     // Pre-seed a failure so "unchanged" is distinguishable from "reset to 0"
@@ -600,8 +628,12 @@ describe('backoff integration (SR-29.3)', () => {
     scheduleRestart(CHANNEL, '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
-    // Counter UNCHANGED at the reconnect site — neither incremented nor reset
+    // Counter UNCHANGED at the reconnect site — neither incremented nor reset.
+    // No cap accumulation (b.7u6): the escalate-dead tick did not climb the
+    // failure count toward the 5-spawn cap, and onCapReached never fired.
     expect(getFailureCount(CHANNEL)).toBe(1)
+    expect(isAtCap(CHANNEL, RESTART_FAILURE_CAP)).toBe(false)
+    expect(escapingDeps.onCapReachedCalls).toHaveLength(0)
   })
 
   test('(4c) reconnect result=transient leaves counter unchanged at reconnect site', async () => {
@@ -727,5 +759,131 @@ describe('backoff integration (SR-29.3)', () => {
     // Only one pending timer exists (cancel-and-replace): counter has not changed
     // because no timer has fired yet
     expect(getFailureCount('C_NOSTACK')).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Escalate-dead internal recovery (Epic t1.tkk.e4 / b.sv7) — two-tick relaunch
+//
+// The fake-deps tests above inject a fake `reconnectSession` that returns
+// 'escalate-dead' directly, so they never touch the real adapter or the
+// session-manager sweep wrapper. This block instead composes the REAL
+// `_buildReconnectSessionAdapter` as the injected `deps.reconnectSession`, wired
+// to a single stub AD client via setClientForTests + initOutageState. That is
+// the seam Epic AC 2 demands: a dead-tmux verdict driven through the stub's
+// send-keys failures ('dead-session' → 'escalate-dead') must fire CSCB's OWN
+// memoized reconcileMissingSweep (observed as exactly one findMissing call — the
+// external ~/startup/find-missing-loop.sh is absent by construction, never
+// referenced here). Then, once that sweep has (in production) reconciled the
+// frozen `working` row to `missing`, a SUBSEQUENT tick with the session reported
+// dead takes the normal kill+relaunch branch.
+//
+// Seams only — the tmux-server ensurer is stubbed to a no-op so reconnectMcp's
+// self-heal retry never shells out to a real tmux server; no live tmux/fleet is
+// ever touched. The findMissing memo is reset per test so the call count is
+// deterministic (the TTL setter alone does not clear the memo).
+// ---------------------------------------------------------------------------
+
+describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
+  /**
+   * Build restart deps whose `reconnectSession` is the REAL adapter, plus a
+   * mutable `alive` flag so a test can flip liveness between simulated ticks.
+   * The stub client is shared by the adapter's status probe and reconnectMcp's
+   * send-keys (both flow through withOutageDetection's getClient), and its
+   * findMissing capture is the observable seam for "the sweep ran".
+   */
+  function makeRealAdapterDeps(): {
+    deps: RestartDeps & {
+      killSessionCalls: string[]
+      launchSessionCalls: string[]
+    }
+    findMissingCalls: FindMissingParams[]
+    setAlive: (v: boolean) => void
+  } {
+    let alive = true
+    const killSessionCalls: string[] = []
+    const launchSessionCalls: string[] = []
+    const findMissingCalls: FindMissingParams[] = []
+
+    // Non-working status → adapter falls through to reconnectMcp; persistent
+    // ErrTmuxSendKeys on send-keys (ensurer stubbed no-op) → 'dead-session'
+    // → adapter maps to 'escalate-dead' and fires the internal sweep.
+    const stub = makeStubClient({
+      statusFn: () => ({ state: 'waiting' }),
+      sendKeysError: errTmuxSendKeys(),
+      findMissingCalls,
+    })
+    _resetOutageState()
+    initOutageState({
+      postToChannel: () => {},
+      getClient: () => stub as unknown as Client,
+    })
+    setClientForTests(stub as unknown as Client)
+    _setTmuxServerEnsurer(async () => {})
+
+    const fakeConfig = { routes: { C_DEADTMUX: { normalizedName: 'dead-tmux' } } }
+    const reconnectSession = _buildReconnectSessionAdapter(
+      () => fakeConfig as never,
+      {} as unknown as WebClient,
+    )
+
+    const deps: RestartDeps & { killSessionCalls: string[]; launchSessionCalls: string[] } = {
+      killSessionCalls,
+      launchSessionCalls,
+      async isSessionAlive() { return alive },
+      isSessionConnected() { return false },
+      reconnectSession,
+      async killSession(channelId) { killSessionCalls.push(channelId) },
+      async launchSession(channelId) { launchSessionCalls.push(channelId); return true },
+      getRestartDelay: () => FAST_DELAY_S,
+      isShuttingDown: () => false,
+      onCapReached: () => {},
+    }
+    return { deps, findMissingCalls, setAlive: (v: boolean) => { alive = v } }
+  }
+
+  beforeEach(() => {
+    _resetFindMissingMemo()
+  })
+
+  afterEach(() => {
+    resetClientForTests()
+    _resetOutageState()
+    _resetTmuxServerEnsurer()
+    _resetFindMissingMemo()
+  })
+
+  test('tick 1: alive+dead-tmux verdict fires exactly one internal findMissing sweep (no kill/relaunch); tick 2: session dead → kill+relaunch', async () => {
+    const CHANNEL = 'C_DEADTMUX'
+    const { deps, findMissingCalls, setAlive } = makeRealAdapterDeps()
+    initRestart(deps)
+
+    // --- Tick 1: row still looks alive; the real adapter runs reconnectMcp,
+    // which returns 'dead-session' → 'escalate-dead', firing the internal sweep.
+    setAlive(true)
+    scheduleRestart(CHANNEL, '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    // The existing memoized sweep ran exactly once — this is CSCB's own recovery,
+    // not the external loop (absent by construction). The escalate-dead verdict
+    // takes NO relaunch action on this tick.
+    expect(findMissingCalls).toHaveLength(1)
+    expect(deps.killSessionCalls).toHaveLength(0)
+    expect(deps.launchSessionCalls).toHaveLength(0)
+    // Single counting site: escalate-dead never records a failure.
+    expect(getFailureCount(CHANNEL)).toBe(0)
+    expect(isAtCap(CHANNEL, RESTART_FAILURE_CAP)).toBe(false)
+
+    // --- Tick 2: the sweep has (in production) reconciled the row to `missing`,
+    // so the next tick observes the session dead. The normal kill+relaunch
+    // branch runs. Reset the memo so this tick's semantics don't depend on the
+    // prior sweep's TTL — we are simulating a LATER tick past the memo window.
+    _resetFindMissingMemo()
+    setAlive(false)
+    scheduleRestart(CHANNEL, '/cwd/test')
+    await Bun.sleep(WAIT_MS)
+
+    expect(deps.killSessionCalls).toEqual([CHANNEL])
+    expect(deps.launchSessionCalls).toEqual([CHANNEL])
   })
 })

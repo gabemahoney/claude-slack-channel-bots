@@ -44,6 +44,7 @@ import {
   _resetWaitForWaitingTimeoutMs,
   _setFindMissingMemoTtlMs,
   _resetFindMissingMemo,
+  sweepDeadTmuxChannel,
   _setTmuxSessionKiller,
   _resetTmuxSessionKiller,
   _setTmuxServerEnsurer,
@@ -1146,6 +1147,149 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
     await waitForWaitingAndReconnect('C', cfg)
 
     expect(findMissingCalls).toHaveLength(2) // failure not cached → both callers hit AD
+  })
+})
+
+// ---------------------------------------------------------------------------
+// t1.tkk.e4 / b.sv7 — sweepDeadTmuxChannel: the exported escalate-dead wrapper
+//
+// The wrapper bundles an UNCONDITIONAL operator log line (emitted before/outside
+// the memoized helper — memo hits return silently, so the log must not live
+// inside reconcileMissingSweep) plus a call into the still-private memoized
+// reconcileMissingSweep (b.m4r). Exercised here through its exported surface.
+//
+// Coverage:
+//   - Log content: the operator line names the channel id, the dead-tmux
+//     verdict, and that reconciliation was triggered — emitted UNCONDITIONALLY,
+//     including on a memo hit (Epic AC 3, I1).
+//   - b.nk5 fleet shape: several distinct channel ids escalate concurrently in
+//     one tick window → exactly ONE client.findMissing sweep (in-flight sharing),
+//     all callers resolve; a caller past the TTL re-sweeps.
+//   - b.m4r contract pins through the wrapper: one memoized TTL-guarded
+//     in-flight-shared sweep; failures NOT memoized; never a second sweep pattern.
+// ---------------------------------------------------------------------------
+
+describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
+  // Capture console.error to assert on the operator-visible log line. The
+  // wrapper (and reconcileMissingSweep) log via console.error; we restore it in
+  // afterEach so no capture leaks into later tests.
+  let errLog: string[]
+  let realError: typeof console.error
+
+  beforeEach(() => {
+    errLog = []
+    realError = console.error
+    console.error = (...args: unknown[]) => { errLog.push(args.map(String).join(' ')) }
+  })
+
+  afterEach(() => {
+    console.error = realError
+  })
+
+  // The escalate-dead operator line names the channel, the dead-tmux verdict,
+  // and that reconciliation was triggered — the recovery-no-longer-silently-
+  // blocked signal an operator must see on every escalate-dead verdict.
+  test('log: operator line names channel id, dead-tmux verdict, reconciliation triggered', async () => {
+    installStub({ findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }) })
+
+    await sweepDeadTmuxChannel('C', 'dead-session')
+
+    const line = errLog.find((l) => l.includes('escalate-dead: channel=C'))
+    expect(line).toBeDefined()
+    expect(line).toContain('channel=C')
+    expect(line).toContain('verdict=dead-session')
+    expect(line!.toLowerCase()).toContain('reconciliation')
+    expect(line).toContain('tmux session provably dead')
+  })
+
+  // The log is emitted UNCONDITIONALLY — before/outside the memoized helper —
+  // so a memo HIT (which returns silently from reconcileMissingSweep, firing no
+  // findMissing) still produces the operator line. This is the I1 contract: the
+  // log lives in the wrapper, not the memoized sweep.
+  test('log: emitted even on a memo hit (unconditional), no second findMissing', async () => {
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    installStub({ findMissingCalls, findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }) })
+
+    // First escalate primes the memo (one real sweep).
+    await sweepDeadTmuxChannel('C', 'dead-session')
+    expect(findMissingCalls).toHaveLength(1)
+
+    errLog.length = 0 // isolate the memo-hit call's emissions
+    // Second escalate within the (default, non-zero) TTL: memo hit → no sweep,
+    // but the wrapper's operator line must still fire.
+    await sweepDeadTmuxChannel('D', 'dead-session')
+
+    expect(findMissingCalls).toHaveLength(1) // memo hit → NO second sweep
+    const line = errLog.find((l) => l.includes('escalate-dead: channel=D'))
+    expect(line).toBeDefined()
+    expect(line).toContain('verdict=dead-session')
+    expect(line!.toLowerCase()).toContain('reconciliation')
+  })
+
+  // b.nk5 post-reboot fleet shape: every channel's tmux session is dead, so the
+  // health-check tick escalates them all in one window. The sweep is whole-store
+  // and single-flight, so N concurrent wrapper calls must collapse to exactly
+  // ONE client.findMissing({}) — the fleet is served by one in-flight-shared
+  // sweep, not N. All callers resolve (the wrapper never throws).
+  test('b.nk5: N channels escalating concurrently in one tick share ONE findMissing', async () => {
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    installStub({ findMissingCalls, findMissingResult: cannedFindMissing({ count: 3, ids: ['cscb_A', 'cscb_B', 'cscb_C'] }) })
+
+    // Start all wrappers WITHOUT awaiting between them: the first synchronously
+    // stakes the in-flight slot before any await resolves, so the rest reuse it.
+    const settled = await Promise.allSettled([
+      sweepDeadTmuxChannel('A', 'dead-session'),
+      sweepDeadTmuxChannel('B', 'dead-session'),
+      sweepDeadTmuxChannel('C', 'dead-session'),
+      sweepDeadTmuxChannel('D', 'dead-session'),
+    ])
+
+    // All callers resolve (single in-flight-shared sweep, wrapper never throws).
+    expect(settled.every((s) => s.status === 'fulfilled')).toBe(true)
+    // Exactly one real sweep for the whole fleet (in-flight sharing).
+    expect(findMissingCalls).toHaveLength(1)
+    expect(findMissingCalls[0]).toEqual({})
+    // Every escalating channel got its own unconditional operator line.
+    for (const c of ['A', 'B', 'C', 'D']) {
+      expect(errLog.some((l) => l.includes(`escalate-dead: channel=${c}`))).toBe(true)
+    }
+  })
+
+  // Past the TTL, a later escalate re-sweeps — the memo is a short-TTL cache, not
+  // a latch. TTL=0 defeats reuse so the second wrapper call issues a fresh sweep.
+  test('b.nk5/b.m4r: a caller past the TTL re-sweeps', async () => {
+    _setFindMissingMemoTtlMs(0)
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    installStub({ findMissingCalls, findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }) })
+
+    await sweepDeadTmuxChannel('C', 'dead-session')
+    await sweepDeadTmuxChannel('C', 'dead-session')
+
+    expect(findMissingCalls).toHaveLength(2) // TTL=0 → no reuse, each escalate sweeps
+  })
+
+  // b.m4r contract pin through the wrapper: back-to-back callers within the
+  // default TTL share one memoized sweep (no second sweep pattern).
+  test('b.m4r pin: back-to-back callers within TTL share one memoized sweep', async () => {
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    installStub({ findMissingCalls, findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }) })
+
+    await sweepDeadTmuxChannel('C', 'dead-session')
+    await sweepDeadTmuxChannel('C', 'dead-session')
+
+    expect(findMissingCalls).toHaveLength(1) // second caller reused the memo
+  })
+
+  // b.m4r contract pin through the wrapper: a FAILED sweep is not memoized, so
+  // the next escalate retries. The wrapper still never throws on the failure.
+  test('b.m4r pin: a failed sweep is not memoized → next escalate retries, wrapper never throws', async () => {
+    const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    installStub({ findMissingCalls, findMissingError: errGeneric('find-missing', 'ErrProbeFailed') })
+
+    await sweepDeadTmuxChannel('C', 'dead-session') // must not throw
+    await sweepDeadTmuxChannel('C', 'dead-session') // must not throw
+
+    expect(findMissingCalls).toHaveLength(2) // failure not cached → both hit AD
   })
 })
 

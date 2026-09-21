@@ -53,6 +53,7 @@ import {
   refreshRouteNameFromEvent,
   resolveChannelNames,
   startupSessionManager,
+  sweepDeadTmuxChannel,
 } from './session-manager.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { ErrSpawnNotFound } from 'agent-director'
@@ -1084,13 +1085,32 @@ export function _buildReconnectSessionAdapter(
     // 'dead-session' maps to 'escalate-dead' (b.9a7-amended): restart.ts does
     // not re-enter scheduleRestart on it, but the NEXT health-check tick will
     // — it sees the row still alive && !connected (or dead), and reschedules.
-    // For the dead-tmux escalate-dead case, the external
-    // ~/startup/find-missing-loop.sh may also reconcile the row to `missing`
-    // first, after which a tick restarts it. Not counting here keeps failures
-    // attributed to the launchSession site, which owns the single counting site.
+    // For the dead-tmux escalate-dead case (b.sv7 / Epic t1.tkk.e4), CSCB
+    // recovers ITSELF: we fire the internal sweep wrapper here so the frozen
+    // `working` row reconciles to `missing`, and the next tick sees
+    // alive === false and takes the normal kill+relaunch branch. The external
+    // ~/startup/find-missing-loop.sh is belt-and-braces only (it may also
+    // reconcile the row, but recovery no longer silently depends on it —
+    // removing it is a separate operator decision). Not counting here keeps
+    // failures attributed to the launchSession site, which owns the single
+    // counting site (SR-25.1).
     const result = await reconnectMcp(channelId, isDryRun() ? undefined : web, routingConfig ?? undefined)
     if (result === 'ok') return 'success'
-    if (result === 'dead-session') return 'escalate-dead'
+    if (result === 'dead-session') {
+      // b.sv7: trigger the internal memoized findMissing sweep (b.m4r) before
+      // returning the verdict. The 'escalate-dead' return value is unchanged
+      // regardless of sweep outcome (the wrapper never throws).
+      //
+      // Memo-TTL vs. tick-cadence: reconcileMissingSweep's 10s memo TTL is
+      // harmless at the ~120s health-check tick cadence — a memoized-stale
+      // answer costs at most ONE extra tick, because the following tick's
+      // escalate-dead sweeps again well past the TTL. And the fleet-wide
+      // post-reboot case (b.nk5 — /tmp wiped, ALL channels dead-tmux at once)
+      // is served correctly by the single in-flight-shared sweep: one
+      // findMissing reconciles the whole store for every escalating channel.
+      await sweepDeadTmuxChannel(channelId, result)
+      return 'escalate-dead'
+    }
     return 'transient'
   }
 }
