@@ -530,7 +530,7 @@ Each schedule is one line of **exactly 5 cron fields**, then the prompt-file pat
 Rules:
 
 - **Exactly 5 cron fields** (minute hour day-of-month month day-of-week). Croner's 6-field (seconds-precision) and `@macro` forms are **not** supported.
-- **Omit the channel list to target ALL bots** — the omission itself is the all-bots form.
+- **Omit the channel list to target ALL bots** — the omission itself is the all-bots form. (All-bots delivery is currently deferred — see [Delivery semantics](#delivery-semantics).)
 - **No `*` wildcard in the channel position.** A literal `*` where a channel ID belongs is a parse error, not "all channels".
 - **Prompt paths cannot contain spaces.** A path with spaces is unrepresentable; the extra tokens make the line a parse error and it is skipped.
 - **`#` comments and blank lines are allowed** and ignored.

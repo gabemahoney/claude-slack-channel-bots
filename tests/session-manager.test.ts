@@ -221,7 +221,7 @@ describe('spawnForRoute: SR-1.1 fresh spawn', () => {
     expect(spawnCalls[0].extra_env).toEqual({ CLAUDE_CONFIG_DIR: '/per-route', CLAUDE_MANAGED_CHANNEL: 'C', CSCB_CRONTABLE_PATH: '/tmp/test-crontab' })
   })
 
-  test('omits extra_env when no claude_config_dir', async () => {
+  test('extra_env carries only channel + crontable path when no claude_config_dir', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     installStub({ spawnCalls })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
