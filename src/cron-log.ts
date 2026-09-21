@@ -44,9 +44,10 @@ import { dirname } from 'node:path'
  * The nine cron-fire outcome classes (PD-3 failure taxonomy). Each renders as
  * a single token in the outcome field so `grep <class>` is exact.
  *
- * `fanout-deferred` (E2's "all-bots fan-out not yet enabled" skip) is currently
- * emitted by no caller — E4 retired its emission — but it STAYS in the union so
- * old log lines remain interpretable. Do not omit it.
+ * `fanout-deferred` (the "all-bots fan-out not yet enabled" skip) is emitted by
+ * the cron dispatcher for all-bots schedules while fan-out remains deferred to
+ * E4. It STAYS in the union even after that so old log lines remain
+ * interpretable. Do not omit it.
  */
 export type CronOutcome =
   /** Prompt delivered to the target channel successfully. */
