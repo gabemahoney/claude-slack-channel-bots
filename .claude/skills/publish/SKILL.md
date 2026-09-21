@@ -101,7 +101,7 @@ The LLM's response on any non-zero exit is the same: relay the script's stderr v
 
 - `scripts/publish-prepare.sh` — reversible half (preflight + bump + pack + smoke + commit + tag + manifest)
 - `scripts/publish-promote.sh` — irreversible half (push commit + publish + push tag + poll + sanitize + reinstall + verify)
-- `scripts/preflight.sh` — invoked by `publish-prepare.sh` (SR-2.1–SR-2.4)
+- `scripts/preflight.sh` — invoked by `publish-prepare.sh` (SR-2.1–SR-2.6)
 - `scripts/smoke-check.sh` — invoked by `publish-prepare.sh` (SR-4.2 / SR-4.3)
 - `scripts/sanitize-global.sh` — invoked by `publish-promote.sh` (SR-7.1 / SR-7.2; sunsets when bun ≥ 1.3.14 is universal)
 - `.publish-state.json` — handoff manifest, written by prepare and consumed/deleted by promote
