@@ -59,6 +59,8 @@ The LLM driving /publish prepare MUST NOT execute any bash command outside of `b
 | 31   | SR-5.1 | `git tag` failed | commit IS on local `main`, NOT pushed; operator: `git reset --hard HEAD~1` then rerun /publish prepare |
 | 90   | SR-8.1 | `.publish-state.json` write failed | commit + tag + tarball exist locally; operator: roll back per stderr prose, then rerun /publish prepare |
 
+Backstop: `publish-prepare.sh` (and the `preflight.sh` / `smoke-check.sh` it invokes) also carries an EXIT trap that prints `SR-99.0 (uncaught)` when the script dies at an **unguarded** site — a `set -e` failure with no SR wrapper. It keeps the failing command's exit code rather than inventing one, and it never fires for the guarded exits in the table above, since every deliberate exit raises a one-way guard flag first. SR-99.0 and a per-step SR-X.Y diagnostic therefore never appear together. Recovery owner is the operator: relay the trap output verbatim so the unguarded site can be wrapped, and do not rerun.
+
 The LLM's response on any non-zero exit is the same: relay the script's stderr verbatim, identify the recovery owner from the table above, and stop. The LLM is never the recovery owner.
 
 ## File pointers

@@ -24,6 +24,10 @@
 
 set -euo pipefail
 
+# This trap deliberately lacks the SR_GUARDED_EXIT guard the other release
+# scripts carry (b.vqy): every deliberate exit here is `exit 0` (sanitize is
+# best-effort by contract), so the rc-ne-0 test alone already excludes them
+# and the trap can only fire on a genuinely unguarded failure.
 # shellcheck disable=SC2154
 trap 'rc=$?; if [ $rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 

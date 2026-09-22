@@ -259,6 +259,23 @@ The bump kind is **required** — there is no default. The skill exits with `SR-
 
 The SR-5.1 → SR-5.4 ordering is load-bearing: the tag is pushed only after `npm publish` succeeds, so the git remote and npm never disagree about whether `v<version>` exists.
 
+### Diagnostic contract in the release scripts
+
+Every non-zero exit from a release script must carry an `SR-X.Y` diagnostic on stderr naming the failing step and the operator's recovery action. The driving LLM relays that stderr verbatim and stops, so the stderr is the whole artifact the human gets — it must be unambiguous.
+
+Two mechanisms enforce this in `publish-prepare.sh`, `publish-promote.sh`, `preflight.sh`, `smoke-check.sh`, and `install-local.sh`; new code in those scripts must honor both:
+
+- **Guarded exits.** Print the `SR-X.Y` line, then exit via `sr_exit <code>` rather than a bare `exit <code>`. `sr_exit` raises a one-way `SR_GUARDED_EXIT` flag before exiting, which tells the backstop this failure is already described.
+- **The SR-99.0 backstop.** Each script installs an EXIT trap that prints `SR-99.0 (uncaught)` when it exits non-zero *with the flag unset* — i.e. a `set -e` death at a site nobody wrapped. It preserves the failing command's exit code and reports the command text, so the unguarded site can be found and wrapped.
+
+Consequences worth knowing before editing these scripts:
+
+- Do not use an exit-code allowlist instead of the flag. An allowlist silently rots the moment a new SR code is added; the flag needs no bookkeeping.
+- `sr_exit` must run in the script's own shell. Inside a subshell or command substitution the flag would be set in the child only, and the backstop would fire anyway. A helper that must fail from a subshell should `return 1` and let its call site do `|| sr_exit <code>`.
+- A correct run therefore produces exactly one SR block. Seeing `SR-99.0` alongside a per-step `SR-X.Y` means the guard was bypassed, not that two things failed.
+
+`scripts/sanitize-global.sh` is exempt: all of its deliberate exits are 0 (it is belt-and-suspenders by design), so it has nothing to guard. `scripts/install-local.sh` is a developer helper outside the release path, so its one guarded failure prints an `[install-local]` diagnostic rather than an `SR-X.Y` one — but it still routes that exit through `sr_exit`, for the same reason.
+
 ### Recovery actions by failure mode
 
 Every failure path in `/publish` emits a diagnostic identifying the failing SR sub-step and the operator's recovery action — the operator should not need to read the skill source. Common modes:
@@ -283,6 +300,7 @@ Every failure path in `/publish` emits a diagnostic identifying the failing SR s
 | Registry not visible within 60s | `SR-6.1 (registry verification)` | Propagation lag only; the release succeeded. Re-confirm with `npm view claude-slack-channel-bots@<version> version`, then proceed manually with `bun install -g` and `clean_restart`. |
 | Post-publish install failure | `SR-7.3 (post-publish install)` | Dev box has no global install. Re-run `bun install -g claude-slack-channel-bots@<version>` manually until it succeeds, then `clean_restart`. |
 | Post-publish verification failure (wrong location, wrong version, bin not on PATH) | `SR-7.4 (post-publish verification)` | The release is published; only the local install is wrong. `bun remove -g claude-slack-channel-bots && bun install -g claude-slack-channel-bots@<version>`, then `clean_restart`. |
+| A release script died at a site with no SR wrapper (backstop) | `SR-99.0 (uncaught)` | State of the release is indeterminate. Relay the trap output verbatim — it names the script and the failing command — and do not rerun `/publish` until a human has assessed. Wrap the identified site with a real SR-X.Y diagnostic before the next release. |
 
 ### Post-publish
 

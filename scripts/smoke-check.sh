@@ -22,8 +22,23 @@
 
 set -euo pipefail
 
+# SR-99.0 is a backstop for UNGUARDED failures only. Every deliberate exit below
+# goes through sr_exit(), which raises this flag first, so the trap stays silent
+# for an exit that already printed its own SR-X.Y diagnostic. An unguarded
+# failure (a set -e death at a site with no wrapper) leaves the flag at 0 and
+# still gets SR-99.0. This is deliberately not an exit-code allowlist: a new SR
+# code needs no bookkeeping here, only that its site calls sr_exit. sr_exit must
+# be called from the script's own shell — inside a subshell or a command
+# substitution the flag would be set in the subshell only and the backstop would
+# fire anyway.
+SR_GUARDED_EXIT=0
+sr_exit() {
+  SR_GUARDED_EXIT=1
+  exit "$1"
+}
+
 # shellcheck disable=SC2154
-trap 'rc=$?; if [ $rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+trap 'rc=$?; if [ $rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
 TARBALL_ABS="${TARBALL_ABS:?TARBALL_ABS must be set}"
 NEXT_VERSION="${NEXT_VERSION:?NEXT_VERSION must be set}"
@@ -39,34 +54,34 @@ cleanup() {
 # run cleanup (remove the scratch BUN_INSTALL prefix), then fire the SR-99.0
 # backstop on non-zero exit. Replaces the top-of-script SR-99-only trap.
 # shellcheck disable=SC2154
-trap '_rc=$?; _cmd="${BASH_COMMAND}"; cleanup; if [ $_rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $_rc at command: $_cmd. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+trap '_rc=$?; _cmd="${BASH_COMMAND}"; cleanup; if [ $_rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $_rc at command: $_cmd. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
 SCRATCH_DIR="$(mktemp -d)"
 
 if ! BUN_INSTALL="${SCRATCH_DIR}" bun install -g "${TARBALL_ABS}" > /dev/null 2>&1; then
   echo "SR-4.2 (scratch install): 'bun install -g ${TARBALL_ABS}' into scratch BUN_INSTALL did not succeed. Working tree has been rolled back. Rerun the failing command manually to inspect the bun output, then rerun '/publish ${BUMP_KIND}'." >&2
-  exit 22
+  sr_exit 22
 fi
 
 INSTALLED_PKG="${SCRATCH_DIR}/install/global/node_modules/claude-slack-channel-bots/package.json"
 if [ ! -f "${INSTALLED_PKG}" ]; then
   echo "SR-4.2 (scratch install): installed package.json not found at ${INSTALLED_PKG}. Working tree has been rolled back. The tarball layout may be malformed — inspect the tarball with 'tar -tzf ${TARBALL_ABS}', then rerun '/publish ${BUMP_KIND}'." >&2
-  exit 22
+  sr_exit 22
 fi
 
 if ! INSTALLED_VERSION="$(jq -r .version "${INSTALLED_PKG}")"; then
   echo "SR-4.2 (scratch install): 'jq -r .version ${INSTALLED_PKG}' failed — the installed package.json is malformed JSON or jq is broken. Working tree has been rolled back. Inspect the tarball with 'tar -tzf ${TARBALL_ABS}' and the extracted manifest, then rerun '/publish ${BUMP_KIND}'." >&2
-  exit 22
+  sr_exit 22
 fi
 if [ "${INSTALLED_VERSION}" != "${NEXT_VERSION}" ]; then
   echo "SR-4.2 (scratch install): installed version '${INSTALLED_VERSION}' != bumped ${NEXT_VERSION}. Working tree has been rolled back. This indicates a tarball/install inconsistency — investigate, then rerun '/publish ${BUMP_KIND}'." >&2
-  exit 22
+  sr_exit 22
 fi
 
 INSTALLED_BIN="${SCRATCH_DIR}/bin/claude-slack-channel-bots"
 if [ ! -x "${INSTALLED_BIN}" ]; then
   echo "SR-4.3 (smoke check): installed bin not found or not executable at ${INSTALLED_BIN}. Working tree has been rolled back. Inspect package.json's 'bin' field and the tarball contents, then rerun '/publish ${BUMP_KIND}'." >&2
-  exit 23
+  sr_exit 23
 fi
 
 SMOKE_EXIT=0
@@ -74,10 +89,10 @@ SMOKE_STDERR="$("${INSTALLED_BIN}" 2>&1 >/dev/null)" || SMOKE_EXIT=$?
 
 if [ "${SMOKE_EXIT}" = "0" ]; then
   echo "SR-4.3 (smoke check): bin exited zero with no arguments (expected non-zero). Working tree has been rolled back. The CLI's no-args behavior has changed — update src/cli.ts to exit non-zero on missing arguments (the smoke check assumes this contract; see the SRD), then rerun '/publish ${BUMP_KIND}'." >&2
-  exit 23
+  sr_exit 23
 fi
 
 if ! grep -q "Usage:" <<< "${SMOKE_STDERR}"; then
   echo "SR-4.3 (smoke check): bin stderr did not contain 'Usage:' (the smoke contract). Working tree has been rolled back. Update src/cli.ts to emit a 'Usage:' line on no-args (or update this skill to match the new CLI contract — see the SRD), then rerun '/publish ${BUMP_KIND}'." >&2
-  exit 23
+  sr_exit 23
 fi

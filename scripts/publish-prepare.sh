@@ -49,8 +49,23 @@
 
 set -euo pipefail
 
+# SR-99.0 is a backstop for UNGUARDED failures only. Every deliberate exit below
+# goes through sr_exit(), which raises this flag first, so the trap stays silent
+# for an exit that already printed its own SR-X.Y diagnostic. An unguarded
+# failure (a set -e death at a site with no wrapper) leaves the flag at 0 and
+# still gets SR-99.0. This is deliberately not an exit-code allowlist: a new SR
+# code needs no bookkeeping here, only that its site calls sr_exit. sr_exit must
+# be called from the script's own shell — inside a subshell or a command
+# substitution the flag would be set in the subshell only and the backstop would
+# fire anyway.
+SR_GUARDED_EXIT=0
+sr_exit() {
+  SR_GUARDED_EXIT=1
+  exit "$1"
+}
+
 # shellcheck disable=SC2154
-trap 'rc=$?; if [ $rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+trap 'rc=$?; if [ $rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -59,7 +74,7 @@ case "${BUMP_KIND}" in
   patch|minor|major) ;;
   *)
     echo "SR-1.2 (argument): missing or invalid bump kind '${BUMP_KIND}'. Rerun: /publish prepare <patch|minor|major>" >&2
-    exit 2
+    sr_exit 2
     ;;
 esac
 
@@ -67,7 +82,7 @@ esac
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 if [ -z "${REPO_ROOT}" ]; then
   echo "SR-10.1 (location): not inside a git working tree. Rerun '/publish prepare ${BUMP_KIND}' from any directory inside a clone or worktree of claude-slack-channel-bots." >&2
-  exit 3
+  sr_exit 3
 fi
 cd "${REPO_ROOT}"
 
@@ -86,7 +101,7 @@ cleanup() {
 # SR-99.0 backstop if the script is exiting non-zero. Replaces the top-of-script
 # SR-99-only trap so the backstop coverage persists past this point.
 # shellcheck disable=SC2154
-trap '_rc=$?; _cmd="${BASH_COMMAND}"; cleanup; if [ $_rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $_rc at command: $_cmd. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+trap '_rc=$?; _cmd="${BASH_COMMAND}"; cleanup; if [ $_rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $_rc at command: $_cmd. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
 rollback_working_tree() {
   # SR-3.2: restore package.json and bun.lock to HEAD. If git checkout itself
@@ -104,7 +119,7 @@ rollback_working_tree() {
 PREFLIGHT_EXIT=0
 bash "${SCRIPT_DIR}/preflight.sh" "${BUMP_KIND}" || PREFLIGHT_EXIT=$?
 if [ "${PREFLIGHT_EXIT}" != "0" ]; then
-  exit "${PREFLIGHT_EXIT}"
+  sr_exit "${PREFLIGHT_EXIT}"
 fi
 
 FROM_VERSION="$(node -p "require('./package.json').version")"
@@ -119,7 +134,7 @@ esac
 if ! npm version "${BUMP_KIND}" --no-git-tag-version > /dev/null; then
   echo "SR-3.1 (bump): 'npm version ${BUMP_KIND} --no-git-tag-version' did not apply. Working tree has been rolled back (package.json + bun.lock restored). Investigate the npm error above, then rerun '/publish prepare ${BUMP_KIND}'." >&2
   rollback_working_tree
-  exit 20
+  sr_exit 20
 fi
 
 # SR-4.1 — pack tarball + verify internal version
@@ -128,25 +143,25 @@ rm -f claude-slack-channel-bots-*.tgz || true
 if ! bun pm pack > /dev/null; then
   echo "SR-4.1 (pack): 'bun pm pack' did not produce a tarball. Working tree has been rolled back. Investigate the bun error above, then rerun '/publish prepare ${BUMP_KIND}'." >&2
   rollback_working_tree
-  exit 21
+  sr_exit 21
 fi
 
 TARBALL="claude-slack-channel-bots-${NEXT_VERSION}.tgz"
 if [ ! -f "${TARBALL}" ]; then
   echo "SR-4.1 (pack): expected tarball '${TARBALL}' not found in CWD after 'bun pm pack'. Working tree has been rolled back. Inspect the CWD for stray *.tgz files, resolve the cause, then rerun '/publish prepare ${BUMP_KIND}'." >&2
   rollback_working_tree
-  exit 21
+  sr_exit 21
 fi
 
 if ! TARBALL_VERSION="$(tar -xzOf "${TARBALL}" package/package.json | jq -r .version)"; then
   echo "SR-4.1 (pack): could not read package/package.json from ${TARBALL} (tar or jq failed). Working tree has been rolled back. The tarball is malformed or jq could not parse the embedded package.json. Operator recovery: inspect 'tar -tzf ${TARBALL}' to confirm the layout and 'tar -xzOf ${TARBALL} package/package.json' to view the embedded manifest, then rerun '/publish prepare ${BUMP_KIND}'." >&2
   rollback_working_tree
-  exit 21
+  sr_exit 21
 fi
 if [ "${TARBALL_VERSION}" != "${NEXT_VERSION}" ]; then
   echo "SR-4.1 (pack): tarball internal version '${TARBALL_VERSION}' != bumped ${NEXT_VERSION}. Working tree has been rolled back. This indicates a packing bug — investigate 'bun pm pack' output and package.json contents, then rerun '/publish prepare ${BUMP_KIND}'." >&2
   rollback_working_tree
-  exit 21
+  sr_exit 21
 fi
 
 # SR-4.2 / SR-4.3 — delegate to smoke-check.sh. On failure, roll back the
@@ -159,32 +174,32 @@ TARBALL_ABS="${TARBALL_ABS}" NEXT_VERSION="${NEXT_VERSION}" BUMP_KIND="${BUMP_KI
 
 if [ "${SMOKE_EXIT}" != "0" ]; then
   rollback_working_tree
-  exit "${SMOKE_EXIT}"
+  sr_exit "${SMOKE_EXIT}"
 fi
 
 # SR-5.1 — release commit + annotated tag (no push yet)
 if ! git add package.json bun.lock; then
   echo "SR-5.1 (release commit): 'git add package.json bun.lock' did not succeed. Working tree has been rolled back. Inspect git status, then rerun '/publish prepare ${BUMP_KIND}'." >&2
   rollback_working_tree
-  exit 30
+  sr_exit 30
 fi
 
 if ! git commit -m "Release v${NEXT_VERSION}" > /dev/null; then
   echo "SR-5.1 (release commit): 'git commit -m \"Release v${NEXT_VERSION}\"' did not succeed. Working tree has been rolled back (nothing is committed). Inspect git status (a pre-commit hook may have failed), then rerun '/publish prepare ${BUMP_KIND}'." >&2
   rollback_working_tree
-  exit 30
+  sr_exit 30
 fi
 
 TAG_NAME="v${NEXT_VERSION}"
 if ! git tag -a "${TAG_NAME}" -m "Release v${NEXT_VERSION}"; then
   echo "SR-5.1 (release tag): 'git tag -a ${TAG_NAME}' did not succeed. State: the release commit IS on the local main branch but has NOT been pushed; no tarball is preserved on disk (cleanup removed it); no manifest was written. Operator recovery (the LLM driving /publish prepare MUST NOT execute these commands itself): have the operator run 'git reset --hard HEAD~1' to revert the local release commit, then rerun '/publish prepare ${BUMP_KIND}'." >&2
-  exit 31
+  sr_exit 31
 fi
 
 COMMIT_SHA="$(git rev-parse HEAD)"
 if ! TARBALL_SHA1="$(sha1sum "${TARBALL_ABS}" | awk '{print $1}')" || [ -z "${TARBALL_SHA1}" ]; then
   echo "SR-8.1 (manifest write): could not compute sha1 of ${TARBALL_ABS} (sha1sum or awk failed, or produced no output). State: the release commit + annotated tag are on the local main branch; the tarball is on disk at ${TARBALL_ABS}; nothing has been pushed; .publish-state.json was NOT written. Operator recovery (the LLM driving /publish prepare MUST NOT execute these commands itself): have the operator inspect the tarball ('ls -l ${TARBALL_ABS}' and 'file ${TARBALL_ABS}') and confirm sha1sum is functional, then roll back with 'git reset --hard origin/main && git tag -d ${TAG_NAME} && rm -f ${TARBALL_ABS}' and rerun '/publish prepare ${BUMP_KIND}'." >&2
-  exit 90
+  sr_exit 90
 fi
 PREPARED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
@@ -213,7 +228,7 @@ if ! jq -n \
     prepared_at: $prepared_at
   }' > .publish-state.json; then
   echo "SR-8.1 (manifest write): could not write .publish-state.json. State: the release commit + tag are on the local main branch; the tarball is on disk at ${TARBALL_ABS}; nothing has been pushed. Operator recovery (the LLM driving /publish prepare MUST NOT execute these commands itself): have the operator investigate the jq / filesystem error, then either (a) write .publish-state.json by hand using the fields the script intended to write, or (b) roll back with 'git reset --hard origin/main && git tag -d ${TAG_NAME} && rm -f ${TARBALL_ABS}' and rerun '/publish prepare ${BUMP_KIND}'." >&2
-  exit 90
+  sr_exit 90
 fi
 
 # Successful prepare — preserve the tarball for publish-promote.sh.
