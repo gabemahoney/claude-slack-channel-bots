@@ -47,7 +47,7 @@ Equivalent two-step path:
 1. **Validate the bump arg.** If missing or not one of `patch`/`minor`/`major`, print the usage line above and stop. Do not run any script.
 2. **Run the `/ci` gate.** Invoke the `/ci` skill via the **Skill tool** (not a bash subprocess). Require it to report PASS. Any other outcome aborts: relay the `/ci` output verbatim, prefixed `SR-2.7 (/ci gate): `, and stop.
 3. **Run `bash scripts/publish-prepare.sh <bump>`.** On exit 0 continue. On any non-zero exit, relay the script's stderr verbatim and stop — do NOT run promote. Prepare failures are fully reversible per the script's stderr.
-4. **Run `bash scripts/publish-promote.sh`.** On exit 0, the release is complete — relay the success summary the script printed to stdout. On any non-zero exit, relay stderr verbatim and stop. The operator decides whether to rerun `/publish promote` (idempotent on transient failures) or follow the explicit recovery in stderr.
+4. **Run `bash scripts/publish-promote.sh` with the Bash tool's maximum timeout (`timeout: 600000`, i.e. 600s).** The default 120s tool timeout is shorter than the SR-6.1 registry poll alone (a 10-minute window). On exit 0, the release is complete — relay the success summary the script printed to stdout. On any non-zero exit, relay stderr verbatim and stop. The operator decides whether to rerun `/publish promote` (idempotent on transient failures) or follow the explicit recovery in stderr.
 
 The LLM driving /publish MUST NOT execute any bash command outside of `bash scripts/publish-prepare.sh <bump>` and `bash scripts/publish-promote.sh`. Recovery commands named in stderr are for the operator.
 
@@ -85,9 +85,11 @@ Promote-phase exit codes (script: `scripts/publish-promote.sh`):
 | 50   | SR-5.2 | `git push origin main` failed | commit + tag local only; manifest preserved; operator resolves and reruns /publish promote (idempotent), OR rolls back per stderr |
 | 51   | SR-5.3 | `npm publish` failed, OR version exists on npm with mismatched dist.shasum | commit IS on origin/main; manifest preserved; operator fixes and reruns /publish promote, OR follows content-drift recovery in stderr |
 | 52   | SR-5.4 | `git push origin <tag>` failed | npm has release; only tag missing; operator pushes tag manually + deletes manifest. Do NOT rerun /publish promote unless tag still confirmed missing. |
-| 60   | SR-6.1 | registry did not surface new version within 60s | release succeeded; propagation lag; operator confirms + reinstalls manually + deletes manifest. Do NOT rerun /publish promote. |
+| 60   | SR-6.1 | registry did not surface new version within 10 minutes | release succeeded; propagation lag; operator confirms + reinstalls manually + deletes manifest. Do NOT rerun /publish promote. |
 | 71   | SR-7.3 | post-publish `bun install -g` failed | release IS published; manifest preserved; operator reruns install manually + deletes manifest. Do NOT rerun /publish promote. |
 | 72   | SR-7.4 | post-publish verification failed | release IS published; manifest preserved; operator follows stderr recovery. Do NOT rerun /publish promote. |
+
+A Bash *tool* timeout during promote (raw timeout, no SR-X.Y block) is almost always the SR-6.1 poll overrunning even the 600s maximum. Treat it as exit 60 with the stderr missing: push, publish, and tag already succeeded, and the manifest is preserved. Operator recovery is exit 60's — confirm with `npm view claude-slack-channel-bots@<version> version`, run `bun install -g` + `clean_restart` manually, then delete the manifest. Do NOT rerun /publish promote blindly.
 
 Any script — backstop:
 

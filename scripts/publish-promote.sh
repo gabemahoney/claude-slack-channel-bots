@@ -22,7 +22,7 @@
 #   50  SR-5.2  git push origin main failed
 #   51  SR-5.3  npm publish failed (or version exists with mismatched content)
 #   52  SR-5.4  git push tag failed
-#   60  SR-6.1  registry did not surface new version within 60s
+#   60  SR-6.1  registry did not surface new version within 10 minutes
 #   70  SR-7.1  sanitize-global.sh failed
 #   71  SR-7.3  post-publish bun install -g failed
 #   72  SR-7.4  post-publish verification failed
@@ -231,9 +231,25 @@ else
   fi
 fi
 
-# SR-6.1 — poll npm registry until v${NEXT_VERSION} is visible (5s cadence, up to 12 attempts = 60s)
+# SR-6.1 — poll npm registry until v${NEXT_VERSION} is visible.
+#
+# Window: 10 minutes (120 attempts at a 5-second cadence = 600s).
+#
+# Why 10 minutes and not 5: the only measured propagation lag we have is 210s
+# (the 0.10.0 release, 2026-09-21), and npm's own publish output warns that a
+# new version's visibility "may take a few minutes". A 5-minute window would
+# leave only ~90s of margin over a single thin observation. 10 minutes gives
+# roughly 3× margin over that measurement, and the only thing a longer window
+# costs is wall-clock time during a release that is already in progress —
+# whereas the alternative (timing out into exit 60) costs a full manual Phase 7.
+SR61_POLL_ATTEMPTS=120
+SR61_POLL_INTERVAL=5
+SR61_PROGRESS_EVERY=6   # one progress line every 6 attempts ≈ every 30s
+
+echo "SR-6.1 (registry verification): polling npm for claude-slack-channel-bots@${NEXT_VERSION}. npm propagation commonly takes several minutes; the polling window is 10 minutes (${SR61_POLL_ATTEMPTS} attempts at ${SR61_POLL_INTERVAL}s)."
+
 VERIFIED=0
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+for ATTEMPT in $(seq 1 "${SR61_POLL_ATTEMPTS}"); do
   # `|| true` is load-bearing: when npm registry hasn't yet propagated v${NEXT_VERSION},
   # `npm view` exits non-zero (E404), and under set -e + pipefail the bare pipeline-
   # assignment kills the script with no SR-X.Y diagnostic. The empty-result case
@@ -243,11 +259,14 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
     VERIFIED=1
     break
   fi
-  sleep 5
+  if [ $(( ATTEMPT % SR61_PROGRESS_EVERY )) -eq 0 ]; then
+    echo "SR-6.1 (registry verification): still waiting for claude-slack-channel-bots@${NEXT_VERSION} to appear on the registry (attempt ${ATTEMPT}/${SR61_POLL_ATTEMPTS}, ~$(( ATTEMPT * SR61_POLL_INTERVAL ))s elapsed)…"
+  fi
+  sleep "${SR61_POLL_INTERVAL}"
 done
 
 if [ "${VERIFIED}" != "1" ]; then
-  echo "SR-6.1 (registry verification): claude-slack-channel-bots@${NEXT_VERSION} was not visible within the 60-second polling window. The release succeeded (commit, publish, and tag all pushed) — this is a propagation-verification failure only, not a release failure. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute the install or restart itself): have the operator re-confirm with 'npm view claude-slack-channel-bots@${NEXT_VERSION} version'; once visible, have the operator run 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually and then 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
+  echo "SR-6.1 (registry verification): claude-slack-channel-bots@${NEXT_VERSION} was not visible within the 10-minute polling window. The release succeeded (commit, publish, and tag all pushed) — this is a propagation-verification failure only, not a release failure. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute the install or restart itself): have the operator re-confirm with 'npm view claude-slack-channel-bots@${NEXT_VERSION} version'; once visible, have the operator run 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually and then 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
   sr_exit 60
 fi
 
