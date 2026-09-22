@@ -25,10 +25,11 @@
 #   * STRANDED TICKET — a finished ticket whose work is NOT reachable from main
 #     (no genuine, non-disclaiming commit references its id, and its title does
 #     not match a main commit subject) AND whose body carries no recognized
-#     closure marker: an out-of-repo fix naming a ~/ path CONNECTED to fix
-#     language (same line or same closure section), an explicit no-repro /
-#     superseded / abandoned / satisfied-by-other-work note ("superseded by",
-#     "fully satisfied by", "already satisfied"), or the explicit documents-only
+#     closure marker: the explicit out-of-repo marker `## +closed:out-of-repo
+#     <path>` naming the artifact changed outside this repo, an explicit
+#     no-repro / won't-fix / not-a-bug / superseded / abandoned /
+#     satisfied-by-other-work note ("superseded by", "fully satisfied by",
+#     "already satisfied"), or the explicit documents-only
 #     `## +closed:docs-only` marker (product lives outside any git repo, so no
 #     main commit is possible). A body that says the fix is "pending
 #     merge/release" or "fixed on branch X" is treated as an ANTI-marker — that
@@ -60,9 +61,10 @@
 #
 #   * Stranded finished tickets. A finished ticket is expected to be excused by
 #     exactly one of: a genuine main commit (id-referencing or title-matching),
-#     an out-of-repo fix whose ~/ path is connected to its resolution claim, an
-#     explicit no-repro/superseded/abandoned/satisfied-by-other-work note
-#     ("superseded by", "fully satisfied by", "already satisfied"), or the documents-only
+#     the explicit `## +closed:out-of-repo <path>` marker for a fix that landed
+#     outside this repo, an explicit
+#     no-repro/won't-fix/not-a-bug/superseded/abandoned/satisfied-by-other-work
+#     note ("superseded by", "fully satisfied by", "already satisfied"), or the documents-only
 #     `## +closed:docs-only` marker for work whose product lives outside any git
 #     repo. A finished ticket matching none of these is a real finding. Note the
 #     documents-only class exists because the project root itself is not a git
@@ -233,61 +235,64 @@ has_anti_marker() {
   grep -qiE 'pending[ -]?(merge|release)|fixed on branch|on branch b\.' "$1"
 }
 
-# out_of_repo_fix_connected <file>
-# True when the body genuinely claims an out-of-repo resolution: a ~/ path
-# (startup/.claude/.agent-director) that is ACTUALLY CONNECTED to fix/resolution
-# language, not merely co-present with it somewhere else in the body.
+# OUT-OF-REPO closure marker (b.jpw defect 2, AC-3).
 #
-# "Connected" means either:
-#   (i)  the ~/ path and a resolution word appear on the SAME line
-#        (e.g. "**Fix (2026-09-19):** `~/startup/start-all.sh` now …"), or
-#   (ii) the ~/ path appears inside a recognized closure/fix SECTION — a
-#        heading (##/###/…) whose text names a fix/closure/resolution.
+# A deliberate, greppable heading that a ticket carries when its fix landed in a
+# file OUTSIDE this repository (e.g. `~/startup/start-all.sh`, the bots' append
+# system prompt at `~/.claude/channels/slack/system-prompt.md`), so no commit on
+# main can ever land it. The heading NAMES the out-of-repo artifact:
 #
-# Why this is stricter than the old form: the previous check matched a ~/ path
-# ANYWHERE against fix language ANYWHERE, so a ticket that merely quoted a ~/
-# path in an unrelated evidence table (e.g. b.tso's anchor row naming the state
-# directory `~/.claude/channels/slack/`) laundered itself as an out-of-repo
-# closure. Requiring the two to be on the same line or in the same section
-# closes that hole while still recognizing the genuine out-of-repo closures
-# (b.mk7, b.mp5, b.s3x, b.xx7), whose ~/ path sits in their fix/closure section.
+#     ## +closed:out-of-repo ~/startup/start-all.sh
 #
-# Implemented in a single awk pass so section state is tracked correctly:
-# headings toggle in/out of a closure section, and ``` code fences are ignored
-# so a `# Heading` sample inside a fenced block cannot reset the section state.
-out_of_repo_fix_connected() {
-  tr '[:upper:]' '[:lower:]' < "$1" | awk '
-    BEGIN {
-      path = "~/(\\.claude|startup|\\.agent-director)";
-      res  = "(\\*\\*fix|fixed in|fixed \\(|fix direction|proposed fix|resolved|resolution|doc fix|purely a doc|closure note|closed as)";
-      insec = 0; fence = 0;
-    }
-    /^```/ { fence = !fence; next }
-    {
-      if (!fence && /^#+ /) {
-        # A heading opens an out-of-repo fix/closure section only when it names
-        # real closure vocabulary as WHOLE WORDS — not as an incidental
-        # substring. awk ERE has no \b, so anchor on non-alnum boundaries
-        # (^/$ or a non-[a-z0-9] char) on both sides. This prevents "prefix",
-        # "suffix", "unfixed", "resolver" from opening a section, and — the AC 4
-        # fix — prevents the `## +closed:docs-only` heading (whose text contains
-        # "closed") from being treated as an (a)-style closure section: it is
-        # matched explicitly and excluded so a ~/ path quoted in its prose can no
-        # longer launder itself as an out-of-repo fix. Genuine headings like
-        # `## Fix`, `## Proposed fix`, `## Resolution`, `# out of repo fix` still
-        # open a section.
-        if ($0 ~ /\+closed:docs-only/) {
-          insec = 0;
-        } else {
-          insec = (/(^|[^a-z0-9])(fix(ed|es)?|closure|closed|resolution|resolved?)([^a-z0-9]|$)/) ? 1 : 0;
-        }
-      }
-      haspath = ($0 ~ path);
-      if (haspath && $0 ~ res) { found = 1 }   # (i) same line
-      if (haspath && insec)    { found = 1 }   # (ii) inside a closure section
-    }
-    END { exit found ? 0 : 1 }
-  '
+# WHY A MARKER AND NOT THE OLD INFERENCE. Branch (a) used to *infer* an
+# out-of-repo closure from prose: a ~/ path "connected to" fix/resolution
+# language (same line, or inside a heading whose text named a fix). Two rounds
+# of tightening (same-line, then same-section, then excluding the docs-only
+# heading) each closed one accidental match and left the shape intact — an
+# inference over natural language, which fails in BOTH directions:
+#
+#   * False positive, the one that matters. b.mqd's body says the out-of-repo
+#     mitigation "lives outside this repo in `~/.claude/channels/slack/
+#     system-prompt.md` … flagged but NOT actioned here". The sentence states
+#     the work was declined; the heuristic read "~/ path + fix language" and
+#     returned success. A gate that reads a refusal as a closure is not a gate.
+#     No amount of further tightening fixes this, because the prose that says
+#     "we did it" and the prose that says "we declined to do it" are lexically
+#     the same modulo a negation the matcher cannot see.
+#   * Ongoing fragility. Every ticket that merely *quotes* a ~/ path near the
+#     word "fix" is a latent accidental pass (b.tso already was one).
+#
+# So branch (a) becomes a DECLARATION, exactly mirroring the design decision
+# already recorded for `## +closed:docs-only` below (see the DOCS_ONLY_MARKER
+# comment): an anchored, purpose-built heading beat loose phrasing there for the
+# same reason it does here — the token does not occur in ordinary writing, it
+# cannot be produced by accident, and it records that a human decided the ticket
+# is closed rather than that a regex found two words near each other. Prose
+# alone no longer passes a ticket; the author must state the claim.
+#
+# The heading must be followed by a non-space operand — the marker is required
+# to NAME the artifact, so the evidence is specific ("which file?") and reviewable
+# rather than a bare "trust me". The operand is intentionally NOT validated as a
+# `~/` path: a legitimate out-of-repo product may live at an absolute path or in
+# another repo, and the audit has no business enumerating those shapes.
+#
+# AC-4: the operand is NEVER stat-ed, hashed, or otherwise probed on disk. This
+# audit is a release gate that must give the same verdict on any machine; a check
+# against the current box's $HOME would pass or fail for reasons having nothing
+# to do with the ticket. The marker is self-contained evidence — a signed
+# statement by the closer, auditable by reading the ticket — not a filesystem
+# measurement.
+#
+# Design intent, line-based matching: the marker is a plain line-oriented grep,
+# so a marker line quoted inside a ``` code fence WOULD match. That is accepted
+# deliberately — it mirrors the pre-existing DOCS_ONLY_MARKER's identical
+# line-based behavior (out of scope to change here), and the `+closed:out-of-repo`
+# token cannot occur by accident except in a ticket that documents this syntax.
+# Anyone quoting the syntax in a ticket body should use inline backticks, which
+# are not line-anchored headings and therefore do not match.
+OUT_OF_REPO_MARKER='^#+[[:space:]]+\+closed:out-of-repo[[:space:]]+[^[:space:]]'
+has_out_of_repo_marker() {
+  grep -qiE "${OUT_OF_REPO_MARKER}" "$1"
 }
 
 # DOCS-ONLY out-of-repo closure marker (defect-1 class).
@@ -316,15 +321,71 @@ has_docs_only_marker() {
   grep -qiE "${DOCS_ONLY_MARKER}" "$1"
 }
 
+# CLOSURE_REASON_PATTERN — branch (b) reason vocabulary.
+#
+# Each alternative is a REASON a finished ticket legitimately has no main commit.
+# All of them share one word-boundary frame: `(^|[^a-z0-9]) … ([^a-z0-9]|$)`.
+# ERE has no \b, so boundaries are anchored on non-alnum characters; grep -i
+# makes [a-z0-9] cover the uppercase forms, so `## CLOSED WON'T-FIX` matches.
+#
+# WON'T-FIX SPELLINGS (b.jpw defect 1, AC-1). This alternative used to read
+# `wont[ -]?fix` — the one spelling a human almost never writes. b.mqd's own
+# owner ruling is headed `## CLOSED WON'T-FIX` and was unmatchable; b.jam was
+# flagged as stranded work purely because of its wording, and the operator's
+# workaround was to append a second heading spelled `wont-fix` to appease the
+# regex. A gate whose accepted vocabulary excludes the common spelling of a
+# phrase it claims to accept teaches operators to add boilerplate instead of
+# reading the finding. `won('|’)?t[ -]?fix` now covers `wont fix`, `wont-fix`,
+# `won't fix`, `won't-fix`, `WON'T-FIX` and the typographic `won’t fix` (U+2019).
+# The apostrophe is itself a non-alnum character, but it sits INSIDE the
+# alternative, never at an edge, so the surrounding boundary frame is unaffected:
+# the left boundary is still tested before `w` and the right boundary after `x`.
+# An alternation `('|’)` is used rather than a bracket class so the multi-byte
+# U+2019 is matched as one unit regardless of the ambient locale.
+#
+# NOT-A-BUG / BY DESIGN / WORKS AS INTENDED (b.jpw AC-2 — ADDED, decision
+# recorded here). These are recognized closure reasons because they are
+# semantically distinct from the two neighbours already in the list:
+#   * no-repro   = the reported behaviour could not be OBSERVED.
+#   * won't-fix  = the behaviour was observed and a fix was DECLINED.
+#   * not-a-bug / by design / works as intended = the behaviour was observed and
+#     is CORRECT. Nothing was declined and nothing failed to reproduce.
+# Forcing that third verdict to be spelled as one of the first two would make the
+# closure note lie about what was decided. The real instance is b.jam (closed
+# 2026-09-22): its closure was worded `CLOSED NOT-A-BUG`, the gate refused the
+# wording, and the ticket read as stranded work. The hyphenated `not-a-bug` form
+# is accepted alongside the spaced one (`not[ -]a[ -]bug`) because that is
+# literally how b.jam was written.
+#
+# SCOPE LIMIT (non-goal, carried from the header): this widens the SPELLINGS of
+# phrases on the list and adds three named reasons. It does not loosen the list
+# into unanchored prose. The removed `## +closed` alternative — whose ERE `+`
+# quantified a space and so silently matched any `## Closed …` heading anywhere
+# in a body — is the failure this list exists to avoid; a bare, reasonless
+# `## Closed` heading still does NOT satisfy branch (b).
+#
+# Branch (b) is deliberately PROSE-LEVEL vocabulary, not an anchored marker: it
+# matches these phrases wherever they appear in the body, the same way the
+# long-standing `superseded by` / `already satisfied` alternatives do. A
+# sentence like "I won't fix the typo in passing" therefore DOES match. That is
+# accepted, with eyes open: branch (b)'s job is to recognize a stated reason in a
+# human-written closure note, and it has never been the load-bearing guard
+# against a wrongly-finished ticket — the anti-marker check (which disqualifies
+# every branch) and the requirement of a main commit are. Tickets whose closure
+# must be unambiguous carry an anchored marker instead: `## +closed:docs-only`
+# (branch (c)) or `## +closed:out-of-repo <path>` (branch (a)). The same caveat
+# applies to `by design`, which is the most prose-like of the three additions.
+CLOSURE_REASON_PATTERN="(^|[^a-z0-9])(no[ -]?repro|not[ -]?reproducible|cannot reproduce|won('|’)?t[ -]?fix|not[ -]a[ -]bug|by design|works as intended|closed as (superseded|abandoned)|superseded by|fully satisfied by|already satisfied)([^a-z0-9]|\$)"
+
 # has_closure_marker <file>
 # A recognized, legitimate reason a finished ticket has no main commit:
-#   (a) out-of-repo resolution — a ~/ path (startup/.claude/.agent-director)
-#       CONNECTED to fix/resolution language (same line or same closure
-#       section; see out_of_repo_fix_connected), or
-#   (b) an explicit no-repro / not-reproducible / cannot-reproduce / wont-fix /
-#       "closed as superseded|abandoned" / "superseded by" / "fully satisfied by"
-#       / "already satisfied" closure note (the b.fta satisfied-by-other-work
-#       vocabulary; see the pattern at branch (b) below), or
+#   (a) an explicit out-of-repo closure marker naming the artifact that was
+#       changed (`## +closed:out-of-repo ~/startup/start-all.sh`; see
+#       has_out_of_repo_marker) — for fixes that landed outside this repo, or
+#   (b) an explicit no-repro / not-reproducible / cannot-reproduce / won't-fix /
+#       not-a-bug / by-design / works-as-intended / "closed as
+#       superseded|abandoned" / "superseded by" / "fully satisfied by" /
+#       "already satisfied" closure note (see CLOSURE_REASON_PATTERN), or
 #   (c) an explicit documents-only, outside-the-repo-tree closure marker
 #       (`## +closed:docs-only`; see has_docs_only_marker) — for tickets whose
 #       product is markdown/docs living outside any git repo.
@@ -336,18 +397,16 @@ has_closure_marker() {
 
   # (c) documents-only, outside-the-repo-tree closure. Evaluated FIRST so a
   # ticket carrying the explicit `## +closed:docs-only` marker passes for the
-  # right reason (the marker), never incidentally via branch (a): the docs-only
-  # heading contains the substring "closed" and its prose may quote a ~/ path,
-  # so were (a) evaluated first such a ticket would pass via the very
-  # incidental-substring path AC 4 orders eliminated. out_of_repo_fix_connected
-  # additionally excludes this heading from opening a section, so (a) no longer
-  # fires on it at all — this ordering makes the marker the reason it passes.
+  # right reason (the marker). Branches (a) and (c) are now both anchored
+  # markers on distinct, non-overlapping tokens, so this ordering is no longer
+  # load-bearing the way it was against the old prose heuristic — it is kept so
+  # each marker remains the stated reason its own class passes.
   if has_docs_only_marker "$f"; then
     return 0
   fi
 
-  # (a) out-of-repo fix — path and resolution claim must be connected.
-  if out_of_repo_fix_connected "$f"; then
+  # (a) out-of-repo fix — an explicit marker naming the artifact changed.
+  if has_out_of_repo_marker "$f"; then
     return 0
   fi
 
@@ -356,8 +415,7 @@ has_closure_marker() {
   # The closure vocabulary is deliberately widened to the phrasing actually used
   # by legitimately-closed tickets (b.49f "fully satisfied by", b.vfx
   # "superseded by", b.3kr "already satisfied"), each as a WORD-BOUNDED
-  # alternative. awk/ERE have no \b, so — matching the idiom used by
-  # out_of_repo_fix_connected above — boundaries are anchored on non-alnum
+  # alternative. awk/ERE have no \b, so boundaries are anchored on non-alnum
   # (^/$ or a non-[a-z0-9] char). grep -i makes the [a-z0-9] class cover the
   # uppercase forms too, so "## CLOSED … superseded by" still matches.
   #
@@ -371,8 +429,8 @@ has_closure_marker() {
   # has_docs_only_marker) for docs-only work, and these word-bounded
   # reason-vocabulary alternatives for reasoned closures. A bare, reasonless
   # `## Closed` heading must NOT satisfy branch (b) — a closure needs a stated
-  # reason, and each alternative below carries one.
-  if grep -qiE '(^|[^a-z0-9])(no[ -]?repro|not[ -]?reproducible|cannot reproduce|wont[ -]?fix|closed as (superseded|abandoned)|superseded by|fully satisfied by|already satisfied)([^a-z0-9]|$)' "$f"; then
+  # reason, and each alternative carries one. See CLOSURE_REASON_PATTERN.
+  if grep -qiE "${CLOSURE_REASON_PATTERN}" "$f"; then
     return 0
   fi
 
@@ -557,8 +615,10 @@ echo
 
 if [ "${FOUND}" -ne 0 ]; then
   echo "RESULT: stranded work found. Resolve it (land the fix, or explicitly"
-  echo "close the ticket as no-repro/superseded/abandoned/satisfied-by-other-work"
-  echo "with a pointer, or"
+  echo "close the ticket as no-repro / won't-fix / not-a-bug / by design /"
+  echo "works as intended / superseded / abandoned / satisfied-by-other-work,"
+  echo "with a pointer, or add an anchored closure marker heading"
+  echo "'## +closed:docs-only' or '## +closed:out-of-repo <path>', or"
   echo "delete the merged/dead branch) before releasing."
   exit 1
 fi

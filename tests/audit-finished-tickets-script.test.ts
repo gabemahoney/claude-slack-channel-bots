@@ -312,7 +312,7 @@ describe('audit-finished-tickets.sh — landed vs stranded finished tickets', ()
     expect(r.status).not.toBe(0)
   })
 
-  test('finished ticket with an out-of-repo closure marker (~/startup + fix language) → not flagged', () => {
+  test('finished ticket with the `## +closed:out-of-repo <path>` marker → not flagged', () => {
     const fx = makeFixture({
       tickets: [
         {
@@ -321,7 +321,8 @@ describe('audit-finished-tickets.sh — landed vs stranded finished tickets', ()
           status: 'finished',
           body:
             '# out of repo fix\n\n' +
-            '**Fix**: resolved in `~/startup/start-all.sh` outside this repo.\n',
+            '## +closed:out-of-repo ~/startup/start-all.sh\n\n' +
+            'The fix landed outside this repo, so no commit on main can carry it.\n',
         },
       ],
     })
@@ -346,7 +347,7 @@ describe('audit-finished-tickets.sh — landed vs stranded finished tickets', ()
     expect(r.status).toBe(0)
   })
 
-  test("body says 'pending merge/release' → flagged even with an out-of-repo path + fix language present", () => {
+  test("body says 'pending merge/release' → flagged even with a valid out-of-repo marker present", () => {
     const fx = makeFixture({
       tickets: [
         {
@@ -356,7 +357,7 @@ describe('audit-finished-tickets.sh — landed vs stranded finished tickets', ()
           body:
             '# stranded\n\n' +
             // Include an otherwise-valid closure marker to prove the anti-marker wins.
-            '**Fix**: resolved in `~/startup/start-all.sh`.\n' +
+            '## +closed:out-of-repo ~/startup/start-all.sh\n\n' +
             'Also fixed on branch b.zzz; pending merge/release.\n',
         },
       ],
@@ -838,20 +839,174 @@ describe('audit-finished-tickets.sh — branch (b) closure vocabulary (b.fta)', 
   })
 })
 
-describe('audit-finished-tickets.sh — tightened out-of-repo heuristic (b.zjm defect 2)', () => {
-  // AC 5 / regression for defect 2: a finished ticket that merely QUOTES a ~/
-  // path in an unrelated evidence line (an anchor-table row, mirroring b.tso),
-  // with fix-ish language elsewhere in the body but no genuine connected
-  // closure, IS stranded. The pre-fix script paired any ~/ path anywhere with
-  // fix language anywhere and laundered this as an out-of-repo closure; the
-  // tightened heuristic requires the two to be connected (same line or same
-  // closure section), so it is now correctly flagged.
+describe("audit-finished-tickets.sh — branch (b) won't-fix spellings & added reasons (b.jpw AC-1/AC-2)", () => {
+  /** Body carrying only the given closure phrase — nothing else can excuse it. */
+  function reasonBody(id: string, heading: string): string {
+    return `# fixture ticket ${id}\n\n${heading}\n`
+  }
+
+  // AC-1. The old alternative spelled the phrase `wont[ -]?fix` — the one
+  // spelling a human almost never writes — so b.mqd's own `## CLOSED WON'T-FIX`
+  // owner ruling was unmatchable and the ticket read as stranded work. All six
+  // spellings the AC enumerates must now be recognized: the ASCII apostrophe,
+  // the typographic U+2019, hyphenated and spaced, upper and lower case. These
+  // are the fails-before/passes-after cases (see the regression proof below).
+  test.each([
+    ['wont fix', '## Closed 2026-09-20 — wont fix, declined by the owner'],
+    ['wont-fix', '## Closed 2026-09-20 — wont-fix, declined by the owner'],
+    ["won't fix", "## Closed 2026-09-20 — won't fix, declined by the owner"],
+    ["won't-fix", "## Closed 2026-09-20 — won't-fix, declined by the owner"],
+    ["WON'T-FIX (b.mqd shape)", "## CLOSED WON'T-FIX — owner ruling 2026-09-21"],
+    ['won’t fix (U+2019)', '## Closed 2026-09-20 — won’t fix, declined by the owner'],
+  ])("won't-fix spelling %s → recognized closure, not flagged", (_label, heading) => {
+    const fx = makeFixture({
+      tickets: [
+        { id: 'b.wnf', hive: 'Bugs', status: 'finished', body: reasonBody('b.wnf', heading) },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).not.toContain('b.wnf')
+    expect(r.status).toBe(0)
+  })
+
+  // AC-2. Three reasons ADDED to the vocabulary, each a verdict the existing
+  // alternatives cannot express: no-repro means the behavior could not be
+  // observed, won't-fix means it was observed and a fix declined, and these mean
+  // it was observed and is CORRECT. b.jam was closed `CLOSED NOT-A-BUG`, the
+  // gate refused the wording, and the operator appended boilerplate to appease
+  // the regex — so the hyphenated form is accepted alongside the spaced one.
+  test.each([
+    ['not a bug', '## Closed 2026-09-22 — not a bug, the behavior is correct'],
+    ['not-a-bug (b.jam shape)', '## CLOSED NOT-A-BUG — 2026-09-22, behavior is correct'],
+    ['by design', '## Closed 2026-09-22 — by design, see the SRD'],
+    ['works as intended', '## Closed 2026-09-22 — works as intended'],
+  ])('added reason "%s" → recognized closure, not flagged', (_label, heading) => {
+    const fx = makeFixture({
+      tickets: [
+        { id: 'b.nab', hive: 'Bugs', status: 'finished', body: reasonBody('b.nab', heading) },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).not.toContain('b.nab')
+    expect(r.status).toBe(0)
+  })
+
+  // AC-1's non-closure clause, asserting the DESIGN INTENT rather than a
+  // hoped-for cleverness: branch (b) is deliberately PROSE-LEVEL vocabulary, not
+  // an anchored marker, exactly like the long-standing `superseded by` and
+  // `already satisfied` alternatives. So an incidental sentence — "I won't fix
+  // the typo in passing" — DOES satisfy branch (b) and the ticket is NOT
+  // flagged. That is accepted with eyes open (see the CLOSURE_REASON_PATTERN
+  // comment block): branch (b) recognizes a stated reason in a human-written
+  // closure note and has never been the load-bearing guard against a wrongly
+  // finished ticket — the anti-marker check and the main-commit requirement are.
+  // Tickets whose closure must be unambiguous carry an anchored marker instead.
+  // If this ever becomes intolerable the fix is a new anchored marker, not a
+  // regex that tries to read negation; this test is the record of the choice.
+  test("incidental prose \"I won't fix the typo in passing\" DOES satisfy branch (b) → not flagged (documented design intent: branch (b) is prose-level)", () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.inp',
+          hive: 'Bugs',
+          status: 'finished',
+          body:
+            '# fixture ticket b.inp\n\n' +
+            'Rewrote the poller loop. I won\'t fix the typo in passing — separate change.\n',
+        },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).not.toContain('b.inp')
+    expect(r.status).toBe(0)
+  })
+
+  // Word-boundedness of the widened alternative. The apostrophe sits INSIDE the
+  // alternative, never at an edge, so the `(^|[^a-z0-9])…([^a-z0-9]|$)` frame is
+  // unchanged: "Wontfixing" fails the trailing boundary ("i" is alnum) and
+  // "unwont-fix" fails the leading one. Widening SPELLINGS must not loosen the
+  // list — a reasonless `## Closed` heading is covered by the b.bcl test above.
+  test.each([
+    ['Wontfixing this later, once the release is out.', 'trailing boundary'],
+    ['This was unwont-fixed and remains real work.', 'leading boundary'],
+  ])('substring-only %s does NOT match (%s) → flagged', (line) => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.wbf',
+          hive: 'Bugs',
+          status: 'finished',
+          body: `# fixture ticket b.wbf\n\n${line}\n`,
+        },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).toContain('b.wbf')
+    expect(r.stdout).toContain('no commit on main lands it')
+    expect(r.status).not.toBe(0)
+  })
+
+  // AC-1 REGRESSION PROOF — the verdict flip. b.mqd's real closure heading
+  // `## CLOSED WON'T-FIX` run through the genuine PRE-FIX script (recovered from
+  // the IMMUTABLE pinned commit 9310965, the mainline commit that last touched
+  // the script before this fix — never HEAD, which carries the post-fix script
+  // once this lands and vacuously breaks the comparison) is FLAGGED as stranded:
+  // `wont[ -]?fix` cannot match an apostrophe. Post-fix it is a recognized
+  // closure and the run is clean. The ticket body carries NO ~/ path and no
+  // marker, so the pre-fix script has no branch-(a) escape hatch either — which
+  // is precisely b.mqd's situation once branch (a) stops reading prose. Sanity
+  // assertions guard against a vacuous proof; if the pinned commit is
+  // unreachable (shallow clone) the recovery fails loudly.
+  test("the widened won't-fix spelling CHANGES the verdict: pre-fix (9310965) flags `## CLOSED WON'T-FIX`, post-fix accepts it [regression proof]", () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.mqw',
+          hive: 'Bugs',
+          status: 'finished',
+          title: 'owner ruling stands',
+          body: "# fixture ticket b.mqw\n\n## CLOSED WON'T-FIX — owner ruling 2026-09-21\n",
+        },
+      ],
+    })
+
+    const preFixScript = recoverPreFixScript(fx, '9310965', 'audit-prefix-wontfix.sh', {
+      contains: ['wont[ -]?fix', 'out_of_repo_fix_connected'],
+      lacks: ['CLOSURE_REASON_PATTERN', '+closed:out-of-repo'],
+    })
+
+    // Pre-fix: the apostrophe form is unmatchable → a correctly-closed ticket
+    // reads as stranded work and the gate fails closed on a clean repo.
+    const pre = spawnSync('bash', [preFixScript, fx.repo], {
+      encoding: 'utf8',
+      env: { ...process.env },
+    })
+    expect(pre.stdout).toContain('b.mqw')
+    expect(pre.stdout).toContain('no commit on main lands it')
+    expect(pre.status).not.toBe(0)
+
+    // Post-fix (the working-tree script the fixture copied in): recognized.
+    const post = runAudit(fx)
+    expect(post.stdout).not.toContain('b.mqw')
+    expect(post.status).toBe(0)
+  })
+})
+
+describe('audit-finished-tickets.sh — out-of-repo closure MARKER (b.jpw AC-3; replaces the b.zjm prose heuristic)', () => {
+  // b.jpw AC-3 converted branch (a) from an INFERENCE over prose into a
+  // DECLARATION: only the anchored heading `## +closed:out-of-repo <path>`
+  // excuses a finished ticket that has no main commit. A ~/ path near fix
+  // language no longer passes anything, however tightly "connected" — b.mqd's
+  // body said the out-of-repo change was "flagged but not actioned" and the old
+  // heuristic read that refusal as a closure. The positive marker case lives in
+  // the first describe (b.ccc).
   //
-  // Regression property verified out-of-band: this exact fixture body run
-  // through the pre-fix script (git show HEAD:scripts/audit-finished-tickets.sh)
-  // exits 0 / NOT flagged, and through the post-fix script exits 1 / flagged.
-  // See the "PRE-FIX REGRESSION PROOF" test below which asserts both directly.
-  test('~/ path in an unrelated anchor-table row + fix language elsewhere, no connected closure → flagged', () => {
+  // Still-flagged case carried over from b.zjm: a body that merely QUOTES a ~/
+  // path in an unrelated evidence row (the b.tso anchor-table shape) with
+  // fix-ish language elsewhere. It was laundered by the ORIGINAL two-greps
+  // heuristic; the "PRE-FIX REGRESSION PROOF" test below asserts that verdict
+  // flip directly against the pinned pre-b.zjm script.
+  test('~/ path in an unrelated anchor-table row + fix language elsewhere, no marker → flagged', () => {
     const fx = makeFixture({
       tickets: [
         {
@@ -868,64 +1023,109 @@ describe('audit-finished-tickets.sh — tightened out-of-repo heuristic (b.zjm d
     expect(r.status).not.toBe(0)
   })
 
-  // Positive case for the tightened branch (a), isolating the SAME-LINE rule (i):
-  // when the ~/ path and the fix language are connected on the same line the
-  // out-of-repo closure is recognized and the ticket is NOT flagged. The heading
-  // is deliberately NEUTRAL ("# background notes") so it opens no closure section
-  // — if rule (i) regressed, the section rule (ii) could not silently rescue this
-  // ticket, and it would flag. This isolates rule (i) rather than duplicating the
-  // b.ccc test (whose `# out of repo fix` heading opens a section via rule ii).
-  test('~/ path + fix language on the SAME line (neutral heading) → recognized closure, not flagged', () => {
+  // b.jpw AC-3, the load-bearing behavior change. Every prose shape the b.zjm
+  // "connected" heuristic ACCEPTED is now a finding: the same-line pairing
+  // ("**Fix:** `~/startup/…` now resolved"), the ~/ path inside a `## Fix`
+  // closure section, and — the instance that motivated the ticket — b.mqd's
+  // sentence naming a ~/ artifact the author explicitly DECLINED to change.
+  // None of them declare a closure; only `## +closed:out-of-repo <path>` does.
+  // Each body deliberately carries NO reason vocabulary, so branch (b) cannot
+  // rescue it and the verdict isolates branch (a).
+  test.each([
+    [
+      'same-line ~/ path + fix language (old rule i)',
+      '# background notes\n\n' +
+        '**Fix (2026-09-19):** `~/startup/start-all.sh` now resolved outside this repo.\n',
+    ],
+    [
+      '~/ path inside a `## Fix` section (old rule ii)',
+      '# some out of repo work\n\n' +
+        'Background prose with no path here.\n\n' +
+        '## Fix\n\n' +
+        'Lives in `~/.agent-director/config`, outside any repo.\n',
+    ],
+    [
+      'b.mqd shape — ~/ artifact named but explicitly NOT actioned',
+      '# owner ruling\n\n' +
+        '## Fix direction\n\n' +
+        'The zero-complexity mitigation lives outside this repo in\n' +
+        '`~/.claude/channels/slack/system-prompt.md` and is the owner call,\n' +
+        'flagged but not actioned here.\n',
+    ],
+  ])(
+    'old prose inference %s is no longer a closure → flagged',
+    (_label, body) => {
+      const fx = makeFixture({
+        tickets: [{ id: 'b.prz', hive: 'Bugs', status: 'finished', body }],
+      })
+      const r = runAudit(fx)
+      expect(r.stdout).toContain('b.prz')
+      expect(r.stdout).toContain('no commit on main lands it')
+      expect(r.status).not.toBe(0)
+    },
+  )
+
+  // The marker must NAME the artifact: `[[:space:]]+[^[:space:]]` after the
+  // token requires a non-space operand. A bare `## +closed:out-of-repo` is a
+  // reasonless "trust me" with nothing to review, so it does NOT excuse the
+  // ticket — the same standard the reason vocabulary holds for `## Closed`.
+  test('bare `## +closed:out-of-repo` with no path does NOT satisfy branch (a) → flagged', () => {
     const fx = makeFixture({
       tickets: [
         {
-          id: 'b.sam',
+          id: 'b.bom',
           hive: 'Bugs',
           status: 'finished',
           body:
-            '# background notes\n\n' +
-            '**Fix (2026-09-19):** `~/startup/start-all.sh` now resolved outside this repo.\n',
+            '# fixture ticket b.bom\n\n' +
+            '## +closed:out-of-repo\n\n' +
+            'Trailing prose that names no artifact.\n',
         },
       ],
     })
     const r = runAudit(fx)
-    expect(r.stdout).not.toContain('b.sam')
-    expect(r.status).toBe(0)
+    expect(r.stdout).toContain('b.bom')
+    expect(r.stdout).toContain('no commit on main lands it')
+    expect(r.status).not.toBe(0)
   })
 
-  // Positive case, section variant isolating the SECTION rule (ii): the ~/ path
-  // lives inside a recognized closure/fix SECTION (its `## Fix` heading names the
-  // fix), which is the shape of the genuine out-of-repo closures
-  // (b.mk7/b.mp5/b.s3x/b.xx7). The path line itself carries NO resolution
-  // vocabulary ("Lives in … outside any repo."), so it cannot trip the same-line
-  // rule (i) — only the surrounding section can excuse it. This isolates rule (ii)
-  // rather than passing incidentally via rule (i).
-  test('~/ path inside a `## Fix` closure section (path line has no fix words) → recognized closure, not flagged', () => {
+  // The marker is ANCHORED to a heading, mirroring `## +closed:docs-only`: the
+  // same token quoted inside ordinary prose is not a declaration and must not
+  // launder a ticket, or the marker would be as accidental as the prose it
+  // replaced.
+  test('`+closed:out-of-repo` quoted in prose (not a heading) → still flagged', () => {
     const fx = makeFixture({
       tickets: [
         {
-          id: 'b.sec',
+          id: 'b.qim',
           hive: 'Bugs',
           status: 'finished',
           body:
-            '# some out of repo work\n\n' +
-            'Background prose with no path here.\n\n' +
-            '## Fix\n\n' +
-            'Lives in `~/.agent-director/config`, outside any repo.\n',
+            '# fixture ticket b.qim\n\n' +
+            'We considered writing `+closed:out-of-repo ~/startup/start-all.sh`\n' +
+            'as a heading, but never did.\n',
         },
       ],
     })
     const r = runAudit(fx)
-    expect(r.stdout).not.toContain('b.sec')
-    expect(r.status).toBe(0)
+    expect(r.stdout).toContain('b.qim')
+    expect(r.stdout).toContain('no commit on main lands it')
+    expect(r.status).not.toBe(0)
   })
 
-  // Guard for the code-fence handling in out_of_repo_fix_connected: a fenced
-  // `# heading` sample must NOT open a closure section around a bare ~/ path.
-  // Here the only ~/ path sits in an unrelated evidence row and the sole
-  // "heading" that could open a fix section is inside a ``` code fence, so no
-  // genuine connection exists → the ticket stays flagged.
-  test('fenced `# Fix` sample does not open a closure section around an incidental ~/ path → flagged', () => {
+  // DESIGN INTENT, pinned — not an endorsement. The marker grep is LINE-based,
+  // so a marker line sitting inside a fenced code block DOES match and DOES
+  // excuse the ticket. That is accepted with eyes open, exactly as the
+  // pre-existing `## +closed:docs-only` marker behaves: `+closed:out-of-repo`
+  // is a coined token that cannot occur by accident, and the documented way to
+  // QUOTE it without declaring a closure is inline backticks (see the
+  // "quoted in prose" test above), which do not match the anchored pattern.
+  // This test records the choice so a future reader knows the fenced case was
+  // considered and deliberately left matching; it does NOT endorse a fenced
+  // block as the way to close a ticket — the way to close one is a real
+  // heading. If the line-based grep is ever replaced with a fence-aware
+  // reader, this test is the record of what changes and why.
+  test('marker line inside a fenced code block DOES satisfy branch (a) → not flagged (documented design intent, mirrors `+closed:docs-only`; NOT an endorsement of fenced markers)', () => {
     const fx = makeFixture({
       tickets: [
         {
@@ -933,58 +1133,43 @@ describe('audit-finished-tickets.sh — tightened out-of-repo heuristic (b.zjm d
           hive: 'Bugs',
           status: 'finished',
           body:
-            '# investigation notes\n\n' +
-            '| anchor | file | note |\n' +
-            '| --- | --- | --- |\n' +
-            '| PRD `:53` | `src/server.ts:148` | state dir `~/.claude/channels/slack/` |\n\n' +
-            'Example of the heading style we use in closures:\n\n' +
-            '```md\n' +
-            '## Fix\n' +
-            'resolution goes here\n' +
-            '```\n\n' +
-            'No genuine closure was written for this ticket.\n',
+            '# fixture ticket b.fen\n\n' +
+            'Example of the marker syntax:\n\n' +
+            '```markdown\n' +
+            '## +closed:out-of-repo ~/startup/start-all.sh\n' +
+            '```\n',
         },
       ],
     })
     const r = runAudit(fx)
-    expect(r.stdout).toContain('b.fen')
-    expect(r.status).not.toBe(0)
+    expect(r.stdout).not.toContain('b.fen')
+    expect(r.status).toBe(0)
   })
 
-  // Word-boundary guard for the round-2 section-keyword change: section-opening
-  // keywords must match as WHOLE words on non-alnum boundaries, so a heading
-  // whose text merely CONTAINS "fix"/"resolv" as a substring — "Prefix routing",
-  // "Unfixed items", "Resolver notes" — must NOT open a closure section. Here the
-  // only ~/ path sits under such a heading, with fix-ish language present
-  // ELSEWHERE (an unconnected line), and no same-line pairing. Neither rule (i)
-  // nor rule (ii) may excuse it → still flagged.
-  test.each([
-    '## Prefix routing',
-    '## Unfixed items',
-    '## Resolver notes',
-  ])(
-    'substring-only heading %s does not open a closure section around a ~/ path → flagged',
-    (heading) => {
-      const fx = makeFixture({
-        tickets: [
-          {
-            id: 'b.wbd',
-            hive: 'Bugs',
-            status: 'finished',
-            body:
-              '# investigation notes\n\n' +
-              'A genuine fix was proposed but never connected to any path.\n\n' +
-              `${heading}\n\n` +
-              'State lives in `~/.claude/channels/slack/`, quoted here as evidence.\n',
-          },
-        ],
-      })
-      const r = runAudit(fx)
-      expect(r.stdout).toContain('b.wbd')
-      expect(r.stdout).toContain('no commit on main lands it')
-      expect(r.status).not.toBe(0)
-    },
-  )
+  // The operand is NOT validated as a `~/` path — the pattern requires only a
+  // non-space token after the marker. Out-of-repo artifacts routinely live at
+  // absolute system paths (a systemd unit, /etc config), so an absolute
+  // non-home operand is a recognized closure. Pins the documented decision that
+  // branch (a) checks that an artifact was NAMED, not where it lives; reviewers
+  // judge the operand, the script does not.
+  test('`## +closed:out-of-repo /etc/...` (absolute non-home operand) → recognized closure, not flagged', () => {
+    const fx = makeFixture({
+      tickets: [
+        {
+          id: 'b.abs',
+          hive: 'Bugs',
+          status: 'finished',
+          body:
+            '# fixture ticket b.abs\n\n' +
+            '## +closed:out-of-repo /etc/systemd/system/foo.service\n\n' +
+            'The unit file lives on the host, outside any repo.\n',
+        },
+      ],
+    })
+    const r = runAudit(fx)
+    expect(r.stdout).not.toContain('b.abs')
+    expect(r.status).toBe(0)
+  })
 
   // PRE-FIX REGRESSION PROOF. Directly demonstrates the AC-5 property: the SAME
   // incidental-path body is laundered (exit 0, not flagged) by the PRE-FIX
