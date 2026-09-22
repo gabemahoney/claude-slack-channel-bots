@@ -25,7 +25,10 @@
 #   60  SR-6.1  registry did not surface new version within 10 minutes
 #   70  SR-7.1  sanitize-global.sh failed
 #   71  SR-7.3  post-publish bun install -g failed
-#   72  SR-7.4  post-publish verification failed
+#   72  SR-7.4  post-publish verification failed (includes an install in another
+#               bun prefix shadowing this one on PATH — see SR-7.0, which warns
+#               about the same condition before the install, and SR-7.4b, which
+#               warns about a blocked postinstall; neither of those exits)
 
 set -euo pipefail
 
@@ -276,10 +279,170 @@ if ! bash "${SCRIPT_DIR}/sanitize-global.sh"; then
   sr_exit 70
 fi
 
+# ---------------------------------------------------------------------------
+# Phase 7 prefix resolution + shadowing-install helpers (b.r6x)
+# ---------------------------------------------------------------------------
+#
+# BUN_PREFIX is bun's global prefix. `${BUN_INSTALL:-$HOME/.bun}` is the CORRECT
+# expansion (verified with bun 1.4.0: with BUN_INSTALL unset, ~/.bun is bun's
+# default global prefix) — do not "fix" it. What b.r6x is about is that an
+# install can also exist in some OTHER prefix (e.g. a stale ~/.cache/.bun farm
+# left by an install run with BUN_INSTALL pointed there), and that stale copy can
+# win on PATH via a shim in ~/.local/bin. Phase 7 used to be blind to that: it
+# installed correctly here, then failed SR-7.4 with a diagnostic blaming this
+# prefix's layout instead of naming the shadowing install.
+#
+# Every helper below is a pure function over its arguments plus BUN_PREFIX /
+# GLOBAL_DIR, and both of those derive from the environment (BUN_INSTALL, HOME)
+# while resolution itself goes through PATH. A test can therefore drive all of
+# this against fake prefixes under a mktemp -d with no real install in sight.
+BUN_PREFIX="${BUN_INSTALL:-$HOME/.bun}"
+GLOBAL_DIR="${BUN_PREFIX}/install/global"
+
+# Where does `claude-slack-channel-bots` resolve from on PATH right now?
+# Prints "<path-on-PATH>\t<readlink -f target>", or nothing when the command is
+# not on PATH at all. Never exits: it is meant to be called inside $( ), where an
+# sr_exit would set the guard flag in a subshell only (see the SR-99.0 note).
+cscb_resolve_on_path() {
+  local on_path target
+  on_path="$(command -v claude-slack-channel-bots 2>/dev/null || true)"
+  [ -n "${on_path}" ] || return 0
+  target="$(readlink -f "${on_path}" 2>/dev/null || true)"
+  printf '%s\t%s' "${on_path}" "${target}"
+}
+
+# 0 (true) when ${resolved} is NOT under "${prefix}/". An empty/unresolvable
+# path counts as outside — an unresolvable bin is never a healthy install here.
+cscb_is_outside_prefix() {
+  local resolved="$1" prefix="$2"
+  [ -n "${resolved}" ] || return 0
+  case "${resolved}" in
+    "${prefix}"/*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+# Render the symlink chain starting at $1 as "a -> b -> c", one hop per link, so
+# the diagnostic shows the shim that is actually doing the shadowing rather than
+# only `readlink -f`'s final answer. Hop-capped to survive a symlink cycle.
+cscb_symlink_chain() {
+  local p="$1" chain="$1" next hops=0
+  while [ -L "${p}" ] && [ "${hops}" -lt 16 ]; do
+    next="$(readlink "${p}" 2>/dev/null || true)"
+    [ -n "${next}" ] || break
+    case "${next}" in
+      /*) ;;
+      *) next="$(dirname "${p}")/${next}" ;;
+    esac
+    chain="${chain} -> ${next}"
+    p="${next}"
+    hops=$(( hops + 1 ))
+  done
+  printf '%s' "${chain}"
+}
+
+# Best-effort: the bun prefix owning a single path, recognizing both shapes a
+# shadowing install takes — the install tree (<prefix>/install/global/...) and
+# the prefix's own bin symlink (<prefix>/bin/claude-slack-channel-bots). Prints
+# nothing for anything else (e.g. a farm symlink pointing straight into a repo).
+cscb_bun_prefix_of() {
+  case "$1" in
+    */install/global/*) printf '%s' "${1%%/install/global/*}" ;;
+    */bin/claude-slack-channel-bots) printf '%s' "$(dirname "$(dirname "$1")")" ;;
+  esac
+}
+
+# Walk the symlink chain from $1 and print the first bun prefix found that is NOT
+# the canonical ${BUN_PREFIX} — i.e. the stale prefix to clean up. Prints nothing
+# when the chain never passes through another prefix.
+#
+# The `-d <candidate>/install/global` test is load-bearing, not belt-and-braces:
+# a plain PATH shim such as ~/.local/bin/claude-slack-channel-bots matches the
+# <prefix>/bin/<pkg> shape by accident, and calling ~/.local a bun prefix would
+# make the report tell the operator to delete the very shim that AC-4 says must
+# be repointed instead. Only a directory that really holds an install/global
+# tree counts.
+cscb_shadow_prefix() {
+  local start="$1" chain hop candidate raw canonical
+  chain="$(cscb_symlink_chain "${start}")"
+  # Compare normalized paths, not spellings: a hop can reach the canonical
+  # prefix through a symlinked directory or an unnormalized relative target, and
+  # a literal string test would call that a second prefix and tell the operator
+  # to delete the tree we just installed.
+  canonical="$(readlink -f "${BUN_PREFIX}" 2>/dev/null || true)"
+  canonical="${canonical:-${BUN_PREFIX}}"
+  # The chain is " -> "-separated; no path in it can contain that separator.
+  local IFS=$'\n'
+  for hop in $(printf '%s' "${chain}" | sed 's/ -> /\n/g'); do
+    raw="$(cscb_bun_prefix_of "${hop}")"
+    # Fall back to the raw spelling when readlink -f cannot resolve it, so an
+    # unresolvable path is still reported rather than silently dropped.
+    candidate="$(readlink -f "${raw}" 2>/dev/null || true)"
+    candidate="${candidate:-${raw}}"
+    if [ -n "${candidate}" ] && [ "${candidate}" != "${canonical}" ] && [ -d "${candidate}/install/global" ]; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+}
+
+# The shared shadowing-install report: names the resolved path, the shim chain,
+# the expected prefix, and the exact manual remediation. Used by BOTH the
+# SR-7.0 pre-install warning and the SR-7.4 exit-72 diagnostic so the two can
+# never drift. Deliberately reports instead of deleting: promote does not own
+# other prefixes on the host, and a wrong `rm -rf` there is unrecoverable.
+cscb_shadow_report() {
+  local on_path="$1" resolved="$2" stale
+  stale="$(cscb_shadow_prefix "${on_path}")"
+  printf 'On PATH:           %s\n' "${on_path}"
+  printf 'Symlink chain:     %s\n' "$(cscb_symlink_chain "${on_path}")"
+  printf 'Resolves to:       %s\n' "${resolved:-<unresolvable>}"
+  printf 'Expected under:    %s/\n' "${GLOBAL_DIR}"
+  printf '\n'
+  if [ -n "${stale}" ]; then
+    printf 'A second bun global prefix at %s is shadowing the canonical one. Manual remediation (the LLM driving /publish promote MUST NOT execute these commands itself):\n' "${stale}"
+    printf '    rm -rf %s/install/global\n' "${stale}"
+    # Never emit an `rm -f` for the PATH shim itself — the ln -sfn below repoints
+    # it, and deleting it can make the command unresolvable (AC-4).
+    if [ "${stale}/bin/claude-slack-channel-bots" != "${on_path}" ]; then
+      printf '    rm -f  %s/bin/claude-slack-channel-bots\n' "${stale}"
+    fi
+  else
+    printf 'The resolved path is outside the canonical prefix but does not look like another bun global prefix (a symlink farm pointing into a repo checkout does this). Manual remediation (the LLM driving /publish promote MUST NOT execute these commands itself) — remove whatever owns the path above, then:\n'
+  fi
+  printf '    ln -sfn %s/bin/claude-slack-channel-bots %s\n' "${BUN_PREFIX}" "${on_path}"
+  printf '    bun pm -g trust claude-slack-channel-bots\n'
+  printf '    command -v claude-slack-channel-bots   # must now resolve under %s/\n' "${GLOBAL_DIR}"
+  printf '\n'
+  printf 'Two constraints on that cleanup: (1) NEVER touch any install/cache directory under a bun prefix — that is bun'"'"'s shared package download cache, used by every package on the box, not part of this install; (2) REPOINT the PATH shim with ln -sfn, do not delete it — %s/bin is commonly not on the interactive PATH, so deleting the shim makes the command unresolvable in a normal shell.\n' "${BUN_PREFIX}"
+}
+
+# SR-7.0 — pre-install shadowing check (b.r6x AC-1).
+# Runs BEFORE the remove/install below, so the state it reports is the state that
+# existed when promote started rather than a post-install mixture. It only warns
+# here: aborting before the install would leave the host with the stale copy AND
+# no new install, which is strictly worse. If the shadow still wins after the
+# install, SR-7.4 below fails with the same report.
+SR70_PATH_INFO="$(cscb_resolve_on_path)"
+SR70_ON_PATH="${SR70_PATH_INFO%%$'\t'*}"
+SR70_RESOLVED="${SR70_PATH_INFO#*$'\t'}"
+if [ -z "${SR70_PATH_INFO}" ]; then
+  SR70_ON_PATH=""
+  SR70_RESOLVED=""
+fi
+if [ -n "${SR70_ON_PATH}" ] && cscb_is_outside_prefix "${SR70_RESOLVED}" "${GLOBAL_DIR}"; then
+  {
+    echo ""
+    echo "SR-7.0 (pre-install shadow check): WARNING — 'claude-slack-channel-bots' currently resolves from OUTSIDE the prefix promote is about to install into. The new install will land correctly, but this stale copy will keep winning on PATH until it is removed, and SR-7.4 below will fail the release because of it."
+    cscb_shadow_report "${SR70_ON_PATH}" "${SR70_RESOLVED}"
+  } >&2
+fi
+
 # SR-7.2 — remove any existing global install (tolerate non-zero exit; nothing may be installed).
 # Then defensively rm the leftover node_modules entry to clean up dangling files or symlinks the
 # remove step may not have cleared (e.g. a prior `install-local.sh` symlink farm).
-GLOBAL_DIR="${BUN_INSTALL:-$HOME/.bun}/install/global"
+# Scope note (b.r6x): this cleanup is deliberately confined to ${GLOBAL_DIR}. A
+# shadowing install in another prefix is REPORTED (SR-7.0 / SR-7.4), never
+# deleted here — see cscb_shadow_report.
 (cd "$HOME" && bun remove -g claude-slack-channel-bots) > /dev/null 2>&1 || true
 rm -rf "${GLOBAL_DIR}/node_modules/claude-slack-channel-bots" || true
 
@@ -303,7 +466,15 @@ fi
 case "${RESOLVED_BIN}" in
   "${GLOBAL_DIR}"/*) ;;
   *)
-    echo "SR-7.4 (post-publish verification): resolved bin '${RESOLVED_BIN}' is not under '${GLOBAL_DIR}/' — a worktree-pointing symlink farm would resolve outside this prefix and fail this check. State: the release IS published. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'bun remove -g claude-slack-channel-bots' followed by 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' to replace the symlink farm with a real-copy install, then 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
+    # b.r6x AC-6: this used to blame "the global install layout" and send the
+    # operator to re-run remove/install in THIS prefix — which cannot help when
+    # the winner on PATH lives in a different prefix entirely. Name what was
+    # actually found, what was expected, and the shim in between.
+    {
+      echo "SR-7.4 (post-publish verification): the 'claude-slack-channel-bots' on PATH does not come from the prefix this release installed into. The install itself is fine — something else is shadowing it on PATH."
+      cscb_shadow_report "${INSTALLED_BIN_PATH}" "${RESOLVED_BIN}"
+      echo "State: the release IS published (v${NEXT_VERSION} is on npm + tag is on origin) and installed at ${GLOBAL_DIR}/node_modules/claude-slack-channel-bots; only PATH resolution is wrong. ${MANIFEST} is preserved. After the remediation above resolves the command under ${GLOBAL_DIR}/, have the operator run 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote — rerunning reinstalls the same correct copy and changes nothing about the shadowing path."
+    } >&2
     sr_exit 72
     ;;
 esac
@@ -321,6 +492,54 @@ fi
 if [ "${INSTALLED_VERSION}" != "${NEXT_VERSION}" ]; then
   echo "SR-7.4 (post-publish verification): installed version '${INSTALLED_VERSION}' != published ${NEXT_VERSION}. State: the release IS published but the local install resolved to a stale version. ${MANIFEST} is preserved. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'bun remove -g claude-slack-channel-bots' followed by 'bun install -g claude-slack-channel-bots@${NEXT_VERSION}' manually until the installed version matches, then 'claude-slack-channel-bots clean_restart', then delete ${MANIFEST}. Do NOT rerun /publish promote." >&2
   sr_exit 72
+fi
+
+# SR-7.4b — postinstall trust gap (b.r6x AC-7).
+#
+# Bun blocks a package's postinstall unless the global manifest lists it in
+# trustedDependencies. A FRESH global prefix has no such entry, so the install
+# above succeeds while src/postinstall.ts never runs — and the failure only
+# surfaces much later, as `start` dying with "missing prerequisite: config.json".
+# So: trust the package if the manifest does not already, then verify the
+# artifacts postinstall is responsible for actually exist.
+#
+# Non-fatal by design, like SR-7.5: the release is published, tagged and verified
+# by this point, and the artifacts are scaffolded skeletons an operator can
+# create in one command. Failing the release here would tell the operator the
+# release broke when it did not. Paths honor SLACK_STATE_DIR (the same override
+# src/postinstall.ts reads), so this block is drivable against a temp state dir.
+SR74B_STATE_DIR="${SLACK_STATE_DIR:-${HOME}/.claude/channels/slack}"
+SR74B_MCP_CONFIG="${HOME}/.claude/slack-mcp.json"
+SR74B_GLOBAL_PKG="${GLOBAL_DIR}/package.json"
+
+SR74B_TRUSTED=0
+if [ -f "${SR74B_GLOBAL_PKG}" ]; then
+  if jq -e '(.trustedDependencies // []) | index("claude-slack-channel-bots")' "${SR74B_GLOBAL_PKG}" > /dev/null 2>&1; then
+    SR74B_TRUSTED=1
+  fi
+fi
+
+if [ "${SR74B_TRUSTED}" != "1" ]; then
+  echo "SR-7.4b (postinstall trust): ${SR74B_GLOBAL_PKG} does not list claude-slack-channel-bots in trustedDependencies, so bun blocked its postinstall. Running 'bun pm -g trust claude-slack-channel-bots' to execute it."
+  # $HOME subshell for the same reason every other `bun -g` site has one (b.bpp):
+  # bun must not resolve the repo's package.json during a global operation.
+  (cd "$HOME" && bun pm -g trust claude-slack-channel-bots) || \
+    echo "SR-7.4b (postinstall trust): 'bun pm -g trust claude-slack-channel-bots' did not succeed. Continuing — the artifact check below reports whether that actually left anything missing." >&2
+fi
+
+SR74B_MISSING=()
+for sr74b_artifact in "${SR74B_STATE_DIR}/config.json" "${SR74B_STATE_DIR}/access.json" "${SR74B_MCP_CONFIG}"; do
+  if [ ! -f "${sr74b_artifact}" ]; then
+    SR74B_MISSING+=("${sr74b_artifact}")
+  fi
+done
+
+if [ "${#SR74B_MISSING[@]}" -gt 0 ]; then
+  {
+    echo "SR-7.4b (postinstall trust): WARNING — these files the postinstall scaffolds are still missing after the install:"
+    printf '  %s\n' "${SR74B_MISSING[@]}"
+    echo "Without them 'claude-slack-channel-bots start' fails with 'missing prerequisite: config.json'. The release IS fully delivered (v${NEXT_VERSION} is on npm + tag on origin + verified locally), so this is NOT a release failure and the script does not exit non-zero here. Operator recovery (the LLM driving /publish promote MUST NOT execute these commands itself): have the operator run 'bun pm -g trust claude-slack-channel-bots' and confirm it prints a '✓ [postinstall]' line, then re-check the paths above. Note that trust SWALLOWS the postinstall's own stdout — the paths existing on disk is the observable proof, not the script's log."
+  } >&2
 fi
 
 # SR-7.5 — belt-and-suspenders: post-verify working-tree snapshot.

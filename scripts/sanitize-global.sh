@@ -47,6 +47,27 @@ if [ -n "${BUN_VERSION}" ]; then
   fi
 fi
 
+# SCOPE (b.r6x, deliberate): this script sanitizes the CANONICAL prefix only —
+# `${BUN_INSTALL:-$HOME/.bun}/install/global` — and does not look for, or touch,
+# an install living in any other bun prefix, even one that is shadowing this one
+# on PATH. Three reasons:
+#   1. Purpose. The only job here is to de-poison the manifest that the very next
+#      step (publish-promote.sh SR-7.3 `bun install -g`) is about to install
+#      into. Promote never installs into any other prefix, so no other prefix's
+#      manifest can affect that install.
+#   2. Blast radius. This script is best-effort and exits 0 unconditionally, so
+#      nothing downstream can react to a mistake it makes. A script with that
+#      contract must not mutate state outside the one directory it owns —
+#      silently rewriting a manifest in some unrelated prefix would be exactly
+#      the sort of unrecoverable side effect the always-exit-0 contract makes
+#      invisible.
+#   3. Division of labour. Detecting a shadowing install in another prefix is
+#      publish-promote.sh's SR-7.0 / SR-7.4 job, and it REPORTS rather than
+#      mutates — it names the shadowing path, the PATH shim, and the exact manual
+#      remediation, and leaves the deletion to a human.
+# The expansion below is correct as written (with BUN_INSTALL unset, ~/.bun is
+# bun's default global prefix): b.r6x's defect was the missing shadow check, not
+# a miscomputed prefix. Do not "fix" it.
 GLOBAL_DIR="${BUN_INSTALL:-$HOME/.bun}/install/global"
 GLOBAL_PKG="${GLOBAL_DIR}/package.json"
 
