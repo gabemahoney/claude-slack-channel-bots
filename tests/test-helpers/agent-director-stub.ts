@@ -37,6 +37,7 @@ import {
   ErrNoOpenPermissionRequest,
   ErrNoSessionId,
   ErrPauseTimeout,
+  ErrRelayFallenBack,
   ErrRelayModeOff,
   ErrSpawnNotFound,
   ErrSpawnNotInteractive,
@@ -280,6 +281,20 @@ export function errNoOpenPermissionRequest(): ErrNoOpenPermissionRequest {
 /** Build an ErrRelayModeOff (spawn / SR-1.2 abort). */
 export function errRelayModeOff(): ErrRelayModeOff {
   return new ErrRelayModeOff('spawn', 'ErrRelayModeOff', 'relay_mode is off')
+}
+
+/**
+ * Build an ErrRelayFallenBack (decide / AD 0.10.0). Distinct from
+ * ErrRelayModeOff: relay was on, but this request's relay window elapsed, so
+ * Claude already fell back to asking at its own tmux pane and AD refuses to
+ * record a verdict nothing would read. The spawn stays alive (b.qi1).
+ */
+export function errRelayFallenBack(): ErrRelayFallenBack {
+  return new ErrRelayFallenBack(
+    'decide',
+    'ErrRelayFallenBack',
+    'relay window elapsed; the prompt fell back to the tmux pane',
+  )
 }
 
 /** Build an ErrPauseTimeout (pause budget exceeded). */

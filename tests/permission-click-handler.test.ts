@@ -16,6 +16,8 @@
  *   - Happy path with chat.update throwing → markHandled NOT called.
  *   - ErrAlreadyDecided → silent swallow. No chat.update, no markHandled
  *     mutation (SR-4.4).
+ *   - ErrRelayFallenBack → log + buttonless "answer at the tmux pane"
+ *     repaint + no markHandled + no retry (b.qi1).
  *   - ErrInvalidFlags / ErrAmbiguousRequest → log + no retry + no
  *     chat.update (SR-4.4).
  *   - Unknown decide error → log + no chat.update (SR-4.4).
@@ -47,6 +49,7 @@ import {
   errAlreadyDecided,
   errAmbiguousRequest,
   errInvalidFlags,
+  errRelayFallenBack,
 } from './test-helpers/agent-director-stub.ts'
 import {
   _resetOutageState,
@@ -107,7 +110,7 @@ const TOKEN_A = '11111111-1111-4111-8111-111111111111'
 const TOKEN_B = '22222222-2222-4222-8222-222222222222'
 const TOKEN_C = '33333333-3333-4333-8333-333333333333'
 
-interface ChatCall { kind: 'postMessage' | 'update'; channel: string; ts?: string; text?: string }
+interface ChatCall { kind: 'postMessage' | 'update'; channel: string; ts?: string; text?: string; blocks?: unknown[] }
 
 function makeChatStub(opts?: { updateError?: Error }): {
   web: { chat: { postMessage: (args: unknown) => Promise<{ ts: string }>; update: (args: unknown) => Promise<unknown> } }
@@ -125,8 +128,8 @@ function makeChatStub(opts?: { updateError?: Error }): {
           return { ts: `POSTED.TS.${postCounter}` }
         },
         async update(args: unknown): Promise<unknown> {
-          const a = args as { channel: string; ts: string; text: string }
-          calls.push({ kind: 'update', channel: a.channel, ts: a.ts, text: a.text })
+          const a = args as { channel: string; ts: string; text: string; blocks?: unknown[] }
+          calls.push({ kind: 'update', channel: a.channel, ts: a.ts, text: a.text, blocks: a.blocks })
           if (opts?.updateError) throw opts.updateError
           return {}
         },
@@ -657,6 +660,101 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
     expect(logs).toHaveLength(1)
     expect(seed.chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
     expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.qi1 — ErrRelayFallenBack (AD 0.10.0) surfaced, session untouched
+// ---------------------------------------------------------------------------
+
+describe('handlePermissionClick — ErrRelayFallenBack (b.qi1)', () => {
+  const RELAY_FALLEN_BACK_TEXT =
+    '*Permission* — relay window elapsed; answer this prompt at the session\'s tmux pane'
+
+  test('repaints the prompt buttonless, emits the relay-fallen-back trail pair, and leaves the entry unhandled', async () => {
+    const seed = await seedLiveEntry({
+      instanceId: INSTANCE_C,
+      channelId: CHANNEL_CH,
+      requestToken: TOKEN_A,
+    })
+    const messageTs = getLivePermission(INSTANCE_C, TOKEN_A)!.messageTs
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub({ throwOn: errRelayFallenBack() })
+    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    const logs: unknown[][] = []
+
+    const result = await handlePermissionClick(
+      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
+      {
+        web: seed.chat.web as never,
+        emitTrail: trail.emit,
+        log: (...args: unknown[]) => logs.push(args),
+      } satisfies ClickHandlerDepsShape as never,
+      { channel: CHANNEL_CH },
+    )
+
+    expect(result).toBe(true)
+    // Exactly one decide attempt — the window is closed, so re-deciding would
+    // fail identically. No retry.
+    expect(decide.calls).toHaveLength(1)
+
+    // The operator's click is surfaced, not swallowed: one chat.update over
+    // the original prompt message, carrying the pane-redirect text and no
+    // actions block (the buttons are now inert).
+    const updates = seed.chat.calls.filter((c) => c.kind === 'update')
+    expect(updates).toHaveLength(1)
+    expect(updates[0].channel).toBe(CHANNEL_CH)
+    expect(updates[0].ts).toBe(messageTs)
+    expect(updates[0].text).toBe(RELAY_FALLEN_BACK_TEXT)
+    const blocks = updates[0].blocks as Array<{ type: string }>
+    expect(blocks.find((b) => b.type === 'actions')).toBeUndefined()
+
+    // The decide attempt is classified, not bucketed into 'other'.
+    const decided = trail.events.find((e) => e.event === 'cscb.ad_decide.attempted')
+    expect(decided!['result_class']).toBe('ErrRelayFallenBack')
+    expect('raw_error_message' in decided!).toBe(false)
+
+    // The repaint is recorded under its own non-verdict tag.
+    const closure = trail.events.find((e) => e.event === 'cscb.chat_update.attempted')
+    expect(closure).toBeDefined()
+    expect(closure!['verdict_tag']).toBe('click_handler_relay_fallen_back')
+    expect(closure!['triggered_by']).toBe('click_handler')
+    expect(closure!['ok']).toBe(true)
+    expect(closure!.message_ts).toBe(messageTs)
+    expect(closure!.request_token).toBe(TOKEN_A)
+
+    // markHandled is deliberately NOT called: this is not a verdict, so the
+    // AD row stays open and a later poller closure may render over it.
+    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(false)
+
+    // Loud, not silent: the operator-facing repaint is accompanied by a log.
+    expect(logs).toHaveLength(1)
+    expect(String(logs[0].join(' '))).toContain('ErrRelayFallenBack')
+  })
+
+  test('stale click (no live entry) → decide fires once, no chat.update, returns true', async () => {
+    const chat = makeChatStub()
+    const trail = makeTrailCapture()
+    const decide = makeDecideStub({ throwOn: errRelayFallenBack() })
+    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+
+    const result = await handlePermissionClick(
+      encodePermissionActionId('deny', INSTANCE_C, TOKEN_C),
+      {
+        web: chat.web as never,
+        emitTrail: trail.emit,
+        log: () => { /* swallow */ },
+      } satisfies ClickHandlerDepsShape as never,
+      { channel: CHANNEL_CH },
+    )
+
+    expect(result).toBe(true)
+    expect(decide.calls).toHaveLength(1)
+    // Nothing to repaint — there is no Slack message this handler owns.
+    expect(chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
+    expect(trail.events.find((e) => e.event === 'cscb.chat_update.attempted')).toBeUndefined()
+    const decided = trail.events.find((e) => e.event === 'cscb.ad_decide.attempted')
+    expect(decided!['result_class']).toBe('ErrRelayFallenBack')
   })
 })
 

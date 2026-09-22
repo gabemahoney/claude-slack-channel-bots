@@ -13,13 +13,25 @@
  * Slack rendering. `ErrAlreadyDecided` is the canonical race sentinel and
  * is swallowed silently for the same reason.
  *
+ * `ErrRelayFallenBack` (AD 0.10.0) is the other end of that race: the
+ * request's relay window elapsed, Claude fell back to its own tmux pane, and
+ * AD refuses the verdict. The session is healthy, so the handler neither
+ * retries nor touches the session — it repaints the prompt message to say the
+ * answer must now be given at the pane (b.qi1).
+ *
  * SPDX-License-Identifier: MIT
  */
 
-import { AgentDirectorError, ErrAlreadyDecided, ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from 'agent-director'
 import type { WebClient } from '@slack/web-api'
 
 import { decideWithToken } from './agent-director-client.ts'
+import {
+  AgentDirectorError,
+  ErrAlreadyDecided,
+  ErrRelayFallenBack,
+  ErrSystemInstallDisappeared,
+  ErrTmuxNotAvailable,
+} from './agent-director-errors.ts'
 import { withOutageDetection } from './outage-state.ts'
 import { parsePermissionActionId, type PermissionDecision } from './permission-action-id.ts'
 import { getLivePermission, markHandled } from './permission-poller.ts'
@@ -55,6 +67,7 @@ function logDeps(deps: ClickDeps, ...args: unknown[]): void {
  */
 function classifyAdDecideError(err: unknown): AdDecideResponseClass {
   if (err instanceof ErrAlreadyDecided) return 'ErrAlreadyDecided'
+  if (err instanceof ErrRelayFallenBack) return 'ErrRelayFallenBack'
   if (err instanceof AgentDirectorError && err.errName === 'ErrInvalidFlags') return 'ErrInvalidFlags'
   if (err instanceof AgentDirectorError && err.errName === 'ErrAmbiguousRequest') return 'ErrAmbiguousRequest'
   return 'other'
@@ -89,6 +102,67 @@ function buildDecisionBlocks(decision: PermissionDecision): unknown[] {
       text: { type: 'mrkdwn', text },
     },
   ]
+}
+
+/**
+ * b.qi1 — message body for a click AD refused with `ErrRelayFallenBack`. The
+ * request's relay window elapsed before the click landed, so Claude already
+ * fell back to asking at its own tmux pane and AD will not record a verdict
+ * nothing would read. The session is alive and unharmed; only THIS prompt is
+ * no longer answerable from Slack, so the rendering strips the now-inert
+ * buttons and says where the answer has to be given instead.
+ */
+const RELAY_FALLEN_BACK_TEXT =
+  '*Permission* — relay window elapsed; answer this prompt at the session\'s tmux pane'
+
+function buildRelayFallenBackBlocks(): unknown[] {
+  return [
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: RELAY_FALLEN_BACK_TEXT },
+    },
+  ]
+}
+
+/**
+ * Render a terminal state over a live prompt's Slack message and emit the
+ * SR-V-2.5 `cscb.chat_update.attempted` event. Returns true when Slack
+ * accepted the update.
+ */
+async function renderPromptUpdate(
+  deps: ClickDeps,
+  emit: (partial: Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown }) => void,
+  entry: { claudeInstanceId: string; requestToken: string; channelId: string; messageTs: string },
+  text: string,
+  blocks: unknown[],
+  verdictTag: ClosureVerdictTag,
+): Promise<boolean> {
+  const envelope = {
+    event: 'cscb.chat_update.attempted',
+    claude_instance_id: entry.claudeInstanceId,
+    request_token: entry.requestToken,
+    channel: entry.channelId,
+    message_ts: entry.messageTs,
+    text,
+    blocks,
+    verdict_tag: verdictTag,
+    triggered_by: 'click_handler' as const,
+  }
+  try {
+    await deps.web.chat.update({
+      channel: entry.channelId,
+      ts: entry.messageTs,
+      text,
+      blocks: blocks as never,
+    })
+    emit({ ...envelope, ok: true })
+    return true
+  } catch (err) {
+    // b.emk: failures land in BOTH server.log and the trail JSONL.
+    logDeps(deps, `[slack] permission-click: decision chat.update failed for ${entry.claudeInstanceId}:`, err)
+    emit({ ...envelope, ok: false, error: classifySlackError(err) })
+    return false
+  }
 }
 
 /**
@@ -208,6 +282,36 @@ export async function handlePermissionClick(
     // SR-4.4: ErrAlreadyDecided is silently swallowed — the next poller tick
     // reconciles the operator-visible Slack rendering via SR-2.4 / SR-5.
     if (err instanceof ErrAlreadyDecided) return true
+    // b.qi1: the relay window for this request elapsed before the click landed.
+    // AD refuses the verdict because Claude has already fallen back to asking
+    // at its own tmux pane. Nothing is broken and nothing is retryable here —
+    // re-deciding would fail identically, and killing or respawning the session
+    // would destroy a healthy session over one un-relayed prompt. The only
+    // useful action is to tell the operator loudly that their click did NOT
+    // land and where the prompt now lives.
+    if (err instanceof ErrRelayFallenBack) {
+      logDeps(
+        deps,
+        `[slack] permission-click: ErrRelayFallenBack from decide for ${claudeInstanceId} ` +
+          `(request_token=${requestToken}) — relay window elapsed; the prompt must be ` +
+          `answered at the session's tmux pane`,
+      )
+      const staleEntry = getLivePermission(claudeInstanceId, requestToken)
+      if (staleEntry) {
+        // Deliberately no markHandled(): this is not a verdict. The request row
+        // stays open on AD's side, so a later poller closure (timeout /
+        // find_missing / a pane answer) must still be free to render over it.
+        await renderPromptUpdate(
+          deps,
+          emit,
+          staleEntry,
+          RELAY_FALLEN_BACK_TEXT,
+          buildRelayFallenBackBlocks(),
+          'click_handler_relay_fallen_back',
+        )
+      }
+      return true
+    }
     if (err instanceof AgentDirectorError && err.errName === 'ErrInvalidFlags') {
       logDeps(deps, `[slack] permission-click: ErrInvalidFlags from decide for ${claudeInstanceId} (request_token=${requestToken})`)
       return true
@@ -237,31 +341,8 @@ export async function handlePermissionClick(
   const verdictTag: ClosureVerdictTag = decision === 'allow'
     ? 'click_handler_allow'
     : 'click_handler_deny'
-  const envelope = {
-    event: 'cscb.chat_update.attempted',
-    claude_instance_id: claudeInstanceId,
-    request_token: requestToken,
-    channel: entry.channelId,
-    message_ts: entry.messageTs,
-    text,
-    blocks,
-    verdict_tag: verdictTag,
-    triggered_by: 'click_handler' as const,
-  }
-  try {
-    await deps.web.chat.update({
-      channel: entry.channelId,
-      ts: entry.messageTs,
-      text,
-      blocks: blocks as never,
-    })
-    markHandled(claudeInstanceId, requestToken)
-    emit({ ...envelope, ok: true })
-  } catch (err) {
-    // b.emk: failures land in BOTH server.log and the trail JSONL.
-    logDeps(deps, `[slack] permission-click: decision chat.update failed for ${claudeInstanceId}:`, err)
-    emit({ ...envelope, ok: false, error: classifySlackError(err) })
-  }
+  const ok = await renderPromptUpdate(deps, emit, entry, text, blocks, verdictTag)
+  if (ok) markHandled(claudeInstanceId, requestToken)
   return true
 }
 
