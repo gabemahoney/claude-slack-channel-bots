@@ -91,8 +91,21 @@ The manual equivalent is documented here so you understand what promote does and
 can reproduce it if promote's post-publish install step (SR-7.3) fails and tells
 you to reinstall by hand.
 
+> **Which global prefix.** The canonical bun global prefix is
+> `${BUN_INSTALL:-$HOME/.bun}/install/global` — with `BUN_INSTALL` unset that is
+> `~/.bun/install/global`, and every path below uses it. A prefix somewhere else
+> (this box once carried a `~/.cache/.bun` farm from an install run with
+> `BUN_INSTALL` pointed there) is a **stale shadowing install**: it can still win
+> `command -v` via a shim such as `~/.local/bin/claude-slack-channel-bots`, which
+> makes a perfectly good new install look broken. `/publish promote` detects that
+> at SR-7.0 / SR-7.4 and prints the remediation; remove the stale
+> `<prefix>/install/global` tree and repoint the shim with `ln -sfn`. Never
+> delete the shim outright (`~/.bun/bin` is often not on the interactive PATH),
+> and never touch any `install/cache` directory — that is bun's shared package
+> download cache for the whole box.
+
 1. **Sanitize + drop the `file:` entry from the global manifest.** The global
-   manifest at `~/.cache/.bun/install/global/package.json` currently pins the
+   manifest at `~/.bun/install/global/package.json` pins the
    `file:` path and lists `claude-slack-channel-bots` in `trustedDependencies`.
    `scripts/sanitize-global.sh` removes the stale `claude-slack-channel-bots`
    dependency entry (and any bun-1.3.13 empty-string poison key):
@@ -109,10 +122,24 @@ you to reinstall by hand.
 
 3. **Trust the package so postinstall runs.** Bun blocks lifecycle scripts of
    untrusted packages, so the postinstall config scaffolding does not run until
-   the package is trusted. On this box `trustedDependencies` already lists
-   `claude-slack-channel-bots` in the global manifest, which is what satisfies
-   the trust gate for a global install here. If a fresh install reports the
-   package as untrusted:
+   the package is trusted. A **fresh** global prefix has no `trustedDependencies`
+   entry at all, so this step is required there; a prefix that has carried the
+   package before usually already lists it.
+
+   Snapshot the three files the postinstall scaffolds **before** trusting, so you
+   can prove afterwards whether it created them and whether it left existing ones
+   untouched:
+
+   ```sh
+   stat -c '%n %s %Y' ~/.claude/channels/slack/config.json \
+                      ~/.claude/channels/slack/access.json \
+                      ~/.claude/slack-mcp.json 2>&1 | tee /tmp/cscb-postinstall-before
+   sha256sum ~/.claude/channels/slack/config.json \
+             ~/.claude/channels/slack/access.json \
+             ~/.claude/slack-mcp.json 2>&1 | tee -a /tmp/cscb-postinstall-before
+   ```
+
+   Then trust:
 
    ```sh
    bun pm -g untrusted        # confirm claude-slack-channel-bots is listed
@@ -121,11 +148,41 @@ you to reinstall by hand.
 
    The `-g` flag targets the global install; run from an arbitrary directory the
    non-`-g` form errors with `No package.json was found`. `bun pm -g trust` adds
-   the package to `trustedDependencies` in the global
-   manifest and runs the blocked postinstall, which scaffolds
+   the package to `trustedDependencies` in the global manifest and runs the
+   blocked postinstall, which scaffolds
    `~/.claude/channels/slack/{config.json,access.json}` and
    `~/.claude/slack-mcp.json`. Without this step, a later `start` fails with the
    cryptic `missing prerequisite: config.json`.
+
+   Re-run the same two commands into a second file and diff:
+
+   ```sh
+   stat -c '%n %s %Y' ~/.claude/channels/slack/config.json \
+                      ~/.claude/channels/slack/access.json \
+                      ~/.claude/slack-mcp.json 2>&1 | tee /tmp/cscb-postinstall-after
+   sha256sum ~/.claude/channels/slack/config.json \
+             ~/.claude/channels/slack/access.json \
+             ~/.claude/slack-mcp.json 2>&1 | tee -a /tmp/cscb-postinstall-after
+   diff /tmp/cscb-postinstall-before /tmp/cscb-postinstall-after
+   ```
+
+   How to read the result:
+
+   | Before → after | Meaning |
+   |---|---|
+   | File absent → present | The postinstall ran and scaffolded it. Expected on a fresh prefix. |
+   | Hash and mtime unchanged | The postinstall ran and correctly left existing config alone — this is the idempotency proof. |
+   | Hash or mtime changed | The postinstall **overwrote** live config. Stop and investigate before `start`. |
+   | Still absent afterwards | The postinstall did not run (trust did not take). Re-run the trust command; a later `start` will fail with `missing prerequisite: config.json`. |
+
+   Do not try to judge any of this from the command's output. `bun pm -g trust`
+   **swallows the postinstall's stdout** — it prints only a `✓ [postinstall]`
+   summary line, so the script's own `skipped:` / `created:` lines are never
+   visible. The files on disk are the only observable evidence.
+
+   `/publish promote` performs this same trust-and-verify automatically at
+   SR-7.4b, warning (non-fatally) if any of the three files is still missing
+   after the install.
 
 ---
 
@@ -137,7 +194,7 @@ Run all three checks. The install is only "real" if every one passes.
    be real files, not symlinks back into the working tree:
 
    ```sh
-   find ~/.cache/.bun/install/global/node_modules/claude-slack-channel-bots -type l
+   find ~/.bun/install/global/node_modules/claude-slack-channel-bots -type l
    ```
 
    Expected output: **nothing**. Any line printed is a symlink — the install is
@@ -150,20 +207,27 @@ Run all three checks. The install is only "real" if every one passes.
    `package.json`:
 
    ```sh
-   grep '"version"' ~/.cache/.bun/install/global/node_modules/claude-slack-channel-bots/package.json
+   grep '"version"' ~/.bun/install/global/node_modules/claude-slack-channel-bots/package.json
    ```
 
-   Expected: the `<version>` that `/publish prepare` reported. Confirm the binary
-   itself resolves from PATH:
+   Expected: the `<version>` that `/publish prepare` reported. Then confirm the
+   binary on PATH is *that* install and not another copy shadowing it — follow
+   the symlinks all the way down, because a shim can point anywhere:
 
    ```sh
    command -v claude-slack-channel-bots
+   readlink -f "$(command -v claude-slack-channel-bots)"
    ```
+
+   Expected: the resolved path is under `~/.bun/install/global/`. Anything else
+   (another bun prefix, or a path inside the repo checkout) means a stale install
+   is winning on PATH — see the global-prefix note in Phase 2. This is the same
+   check `/publish promote` makes at SR-7.4, where a mismatch is exit 72.
 
 3. **Cron files are present on disk** (the whole point of the release):
 
    ```sh
-   ls ~/.cache/.bun/install/global/node_modules/claude-slack-channel-bots/src/ \
+   ls ~/.bun/install/global/node_modules/claude-slack-channel-bots/src/ \
      | grep -E 'cron-bootstrap|cron-dispatch|cron-log|cron-scheduler|crontable'
    ```
 
@@ -230,7 +294,7 @@ not touch the running daemon).
    `No package.json was found` when run from an arbitrary directory.)
 
    You can confirm the global manifest is back to the `file:` shape by checking
-   that `~/.cache/.bun/install/global/package.json` pins
+   that `~/.bun/install/global/package.json` pins
    `"claude-slack-channel-bots": "file:/home/horde/projects/claude-slack-channel-bots-project/claude-slack-channel-bots-main"`
    and still carries `"trustedDependencies": ["claude-slack-channel-bots"]`.
 
@@ -238,7 +302,7 @@ not touch the running daemon).
 
    ```sh
    command -v claude-slack-channel-bots
-   find ~/.cache/.bun/install/global/node_modules/claude-slack-channel-bots/src -type l | head
+   find ~/.bun/install/global/node_modules/claude-slack-channel-bots/src -type l | head
    ```
 
    Under the `file:` install the second command prints symlinks (that is the
