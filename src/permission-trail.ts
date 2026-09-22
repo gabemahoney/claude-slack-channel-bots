@@ -82,9 +82,14 @@ export type CanonicalRowDecisionAction = (typeof ROW_DECISION_ACTIONS)[number]
 export type RowDecisionAction = CanonicalRowDecisionAction | (string & {})
 
 /**
- * The 8 canonical verdict tags carried on `cscb.chat_update.attempted` events
- * (SR-V-2.5). 6 are emitted by the poller's `renderClosureUpdate`; 2 are
- * emitted by the click handler's verdict-render path. Open to extension.
+ * The canonical verdict tags carried on `cscb.chat_update.attempted` events
+ * (SR-V-2.5). 6 are emitted by the poller's `renderClosureUpdate`; the
+ * `click_handler_*` tags are emitted by the click handler's verdict-render
+ * path. Open to extension.
+ *
+ * `click_handler_relay_fallen_back` is not a verdict — it records that AD
+ * refused the click because the request's relay window had already elapsed
+ * (b.qi1); the real answer is given at the tmux pane.
  */
 export const CLOSURE_VERDICT_TAGS = [
   'operator_allow',
@@ -95,6 +100,7 @@ export const CLOSURE_VERDICT_TAGS = [
   'not_found',
   'click_handler_allow',
   'click_handler_deny',
+  'click_handler_relay_fallen_back',
 ] as const
 
 export type CanonicalClosureVerdictTag = (typeof CLOSURE_VERDICT_TAGS)[number]
@@ -127,7 +133,7 @@ export type ClickDecision = 'allow' | 'deny'
 
 /**
  * Classification of an agent-director `decide` response on the CSCB call
- * side (SR-V-2.7). The four named error classes match the AD error
+ * side (SR-V-2.7). The named error classes match the AD error
  * identifiers in `src/agent-director-errors.ts`. `"other"` is the catch-all
  * for any other thrown value; the emit additionally carries a
  * `raw_error_message` string in that case. Open extension allowed.
@@ -137,6 +143,7 @@ export const AD_DECIDE_RESPONSE_CLASSES = [
   'ErrAlreadyDecided',
   'ErrInvalidFlags',
   'ErrAmbiguousRequest',
+  'ErrRelayFallenBack',
   'other',
 ] as const
 

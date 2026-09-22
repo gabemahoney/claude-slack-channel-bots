@@ -24,6 +24,10 @@
  *   - ErrAlreadyDecided         (decide / SR-2.2 treated-as-success)
  *   - ErrNoOpenPermissionRequest (decide / poller race)
  *   - ErrRelayModeOff           (spawn / SR-1.2 abort)
+ *   - ErrRelayFallenBack       (decide / AD 0.10.0 — the request's relay window
+ *                               elapsed, so Claude already fell back to asking at
+ *                               the tmux pane; AD refuses to record a verdict that
+ *                               nothing would read. The spawn stays alive.)
  *   - ErrRelayModeInvalid       (spawn / SR-1.2 abort)
  *   - ErrTemplateMalformed      (makeTemplate / SR-3.2 fatal)
  *   - ErrTemplateExists         (makeTemplate; only relevant pre-overwrite)
@@ -79,6 +83,7 @@ export {
   ErrAlreadyDecided,
   ErrNoOpenPermissionRequest,
   ErrRelayModeOff,
+  ErrRelayFallenBack,
   ErrRelayModeInvalid,
   ErrTemplateMalformed,
   ErrTemplateExists,
