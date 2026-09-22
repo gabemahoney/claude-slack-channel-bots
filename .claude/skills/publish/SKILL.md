@@ -93,7 +93,9 @@ Any script — backstop:
 
 | Code | SR | Failure | Recovery owner |
 |------|----|---------|----------------|
-| 99   | SR-99.0 (uncaught) | script terminated with no per-step SR-X.Y diagnostic. State indeterminate; report and pause. | operator: report the SR-99.0 trap output verbatim so the unguarded site can be wrapped; do NOT rerun /publish |
+| any (inherited from the failing command) | SR-99.0 (uncaught) | script died at an **unguarded** site — a `set -e` failure with no SR wrapper — so no per-step SR-X.Y diagnostic was printed. State indeterminate; report and pause. | operator: report the SR-99.0 trap output verbatim so the unguarded site can be wrapped; do NOT rerun /publish |
+
+SR-99.0 is a backstop, not an exit code of its own: the EXIT trap keeps whatever code the failing command produced and only fires when the exit did *not* come from a guarded SR path. Each script raises a one-way flag (`sr_exit`) immediately before every deliberate `exit`, so a guarded failure prints exactly one SR-X.Y block. **SR-99.0 and a per-step SR-X.Y diagnostic never appear together** — if you see SR-99.0, the site genuinely had no wrapper.
 
 The LLM's response on any non-zero exit is the same: relay the script's stderr verbatim, identify the recovery owner from the table above, and stop. The LLM is never the recovery owner.
 

@@ -13,15 +13,27 @@
 # `bun install -g .` run.
 set -euo pipefail
 
+# SR-99.0 is a backstop for UNGUARDED failures only. The one deliberate non-zero
+# exit below goes through sr_exit(), which raises this flag first, so the trap
+# stays silent for an exit that already printed its own diagnostic. An unguarded
+# failure (a set -e death at a site with no wrapper) leaves the flag at 0 and
+# still gets SR-99.0. This is deliberately not an exit-code allowlist: a new
+# guarded exit needs no bookkeeping here, only that its site calls sr_exit.
+SR_GUARDED_EXIT=0
+sr_exit() {
+  SR_GUARDED_EXIT=1
+  exit "$1"
+}
+
 # shellcheck disable=SC2154
-trap 'rc=$?; if [ $rc -ne 0 ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
+trap 'rc=$?; if [ $rc -ne 0 ] && [ "${SR_GUARDED_EXIT:-0}" != "1" ]; then echo "SR-99.0 (uncaught): scripts/$(basename "${BASH_SOURCE[0]}") exited with code $rc at command: ${BASH_COMMAND}. The b.1wi contract requires an SR-X.Y diagnostic for every non-zero exit; that diagnostic is missing because the failing command was not wrapped. Operator recovery: report this trap output verbatim — it identifies the unguarded site so the next /publish run can add the missing wrapper. State of the release is indeterminate; do NOT rerun /publish until the operator has assessed." >&2; fi' EXIT
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
 if ! pkg_name=$(bun -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync("package.json","utf8")).name)'); then
   echo "[install-local] failed to read package name from package.json via 'bun -e'. Cannot proceed with the global install. Inspect package.json and the bun installation, then rerun 'scripts/install-local.sh'." >&2
-  exit 1
+  sr_exit 1
 fi
 
 global_dir=${BUN_INSTALL_GLOBAL:-${BUN_INSTALL:-$HOME/.bun}/install/global}
