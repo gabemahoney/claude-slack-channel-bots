@@ -1110,10 +1110,24 @@ async function tryDelete(
 // ErrJsonlMissing diagnostic (bug b.wrb)
 // ---------------------------------------------------------------------------
 
+/** The source tokens agent-director stamps on each candidate it stat'd
+ *  (AD's `jsonlAttempt.source`): the persisted jsonl_path column, the
+ *  CLAUDE_CONFIG_DIR-aware recomputed fallback, and archived session_history
+ *  entries. Kept as the literal token set AD emits — never a version check. */
+type AdJsonlCandidateSource = 'persisted' | 'fallback' | 'history'
+
+/** Single source of truth for the tokens the candidate parser anchors on. */
+const AD_JSONL_CANDIDATE_SOURCES: readonly AdJsonlCandidateSource[] = [
+  'persisted',
+  'fallback',
+  'history',
+]
+
 /** One transcript candidate resume tried (or that we recomputed locally). */
 interface JsonlCandidate {
-  /** Provenance as reported by AD ('persisted' | 'fallback'), or 'locally-computed'
-   *  when we reconstructed it ourselves because AD's message lacked detail. */
+  /** Provenance as reported by AD (see AdJsonlCandidateSource), or a
+   *  'locally-computed(…)' label when we reconstructed it ourselves because
+   *  AD's message lacked detail. */
   source: string
   path: string
   /** The stat error AD reported, or our own local stat result label. */
@@ -1124,20 +1138,24 @@ interface JsonlCandidate {
  * Best-effort parse of an ErrJsonlMissing description into the candidate list
  * AD enumerates as `<source> <path> (<stat error>)`, joined by "; ".
  *
- * Returns [] when the description does not carry the enumerated detail — which
- * is the case for the installed agent-director 0.8.0 (whose ErrJsonlMissing
- * message predates AD bug b.1ba). Callers MUST treat [] as "AD gave no path
- * detail" and degrade to locally-computed candidates, never as "no paths".
+ * Returns [] when the description does not carry the enumerated detail — the
+ * case for any AD whose ErrJsonlMissing message predates the per-candidate
+ * enumeration delivered by AD bug b.1ba. Callers MUST treat [] as "AD gave no
+ * path detail" and degrade to locally-computed candidates, never as "no paths".
  *
- * Strictly non-throwing and version-agnostic: it keys off the literal `persisted`
- * / `fallback` source tokens, not any version string.
+ * Strictly non-throwing and version-agnostic: it keys off the literal
+ * `persisted` / `fallback` / `history` source tokens, not any version string.
+ * An AD that emits only a subset of those tokens simply yields fewer matches.
  */
 function parseJsonlMissingCandidates(description: string): JsonlCandidate[] {
   if (!description) return []
   const out: JsonlCandidate[] = []
   // AD renders each attempt as: `<source> <path> (<stat error>)`.
   // Anchor on the known source tokens so unrelated prose is ignored.
-  const re = /(persisted|fallback)\s+(\S+)\s+\(([^)]*)\)/g
+  const re = new RegExp(
+    `(${AD_JSONL_CANDIDATE_SOURCES.join('|')})\\s+(\\S+)\\s+\\(([^)]*)\\)`,
+    'g',
+  )
   let m: RegExpExecArray | null
   while ((m = re.exec(description)) !== null) {
     out.push({ source: m[1], path: m[2], note: m[3] })
@@ -1184,8 +1202,8 @@ async function diagnoseJsonlMissing(
   isStartup: boolean,
 ): Promise<'lost' | 'never-created' | 'inconclusive'> {
   // --- 1. What paths did AD try, and from where? -------------------------
-  // err.errDescription is AD's detail string. In the future rich format (AD
-  // b.1ba) it enumerates `<source> <path> (<err>)`; in installed 0.8.0 it does
+  // err.errDescription is AD's detail string. The rich format (AD b.1ba,
+  // shipped in v0.10.0) enumerates `<source> <path> (<err>)`; pre-b.1ba ADs do
   // not. Parse defensively — [] means "no AD detail", not "no paths".
   const adCandidates = parseJsonlMissingCandidates(err.errDescription ?? '')
 
@@ -1219,8 +1237,9 @@ async function diagnoseJsonlMissing(
   const candidates: JsonlCandidate[] = [...adCandidates]
 
   if (adCandidates.length === 0) {
-    // 0.8.0 path: AD gave no enumerated detail. Reconstruct what WE can, clearly
-    // labelled as locally computed — never claim it is what AD tried.
+    // pre-b.1ba / shape-mismatch path: AD gave no enumerated detail.
+    // Reconstruct what WE can, clearly labelled as locally computed — never
+    // claim it is what AD tried.
     if (row.jsonl_path) {
       candidates.push({
         source: 'locally-computed(persisted-column)',
@@ -1247,7 +1266,7 @@ async function diagnoseJsonlMissing(
   const detailProvenance =
     adCandidates.length > 0
       ? 'paths+sources reported by agent-director'
-      : 'agent-director gave no path detail (0.8.0); paths below are locally computed'
+      : 'agent-director gave no path detail (pre-b.1ba message shape); paths below are locally computed'
 
   // --- 4. Classify never-created vs lost via message-archive evidence. ----
   // Reuse b.zak's archive-count helper (message_archive_db, read-only, absent
