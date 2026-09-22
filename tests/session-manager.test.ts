@@ -3018,15 +3018,20 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     )
   })
 
-  // --- Message-shape coverage: rich future format -------------------------
-  // AD b.1ba rich enumeration `<source> <path> (<err>)` — the diagnostic must
-  // extract each path AND its source verbatim.
-  test('rich ErrJsonlMissing message: extracts both persisted and fallback paths with sources', async () => {
-    captureStartupErrors()
-    const desc =
-      'no transcript found: persisted /data/proj/sess-1.jsonl (no such file or directory); ' +
-      'fallback /home/u/.claude/projects/-repo-wrb/sess-1.jsonl (no such file or directory)'
-    const log = await withCapturedErr(async () => {
+  // --- Message-shape coverage: all three AD source tokens (b.hcq) ---------
+  // AD v0.10.0's formatJsonlAttempts stamps three source tokens — persisted,
+  // fallback and history. Pre-fix the parser anchored on persisted|fallback
+  // only, so every `history` candidate (the archived-session evidence that
+  // distinguishes "lost" from "never written") was silently dropped.
+
+  /** Render one AD attempt the way formatJsonlAttempts does. */
+  function adAttempt(source: string, path: string): string {
+    return `${source} ${path} (no such file or directory)`
+  }
+
+  /** Drive the amnesia diagnostic with `desc` and return the captured log. */
+  async function logForDescription(desc: string): Promise<string> {
+    return withCapturedErr(async () => {
       installAmnesia({
         jsonlDescription: desc,
         getResult: { jsonl_path: '/data/proj/sess-1.jsonl', claude_session_id: 'sess-1', cwd: CWD },
@@ -3034,19 +3039,56 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
       await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, true)
     })
-    // Both AD-reported paths, with AD's source tokens, surface in the diagnostic.
-    expect(log).toContain('persisted /data/proj/sess-1.jsonl')
-    expect(log).toContain('fallback /home/u/.claude/projects/-repo-wrb/sess-1.jsonl')
-    // Provenance is honestly attributed to AD, not locally computed.
-    expect(log).toContain('reported by agent-director')
+  }
+
+  test('REGRESSION: all three AD source tokens are parsed, in the order AD reported them', async () => {
+    captureStartupErrors()
+    const attempts = [
+      adAttempt('persisted', '/data/proj/sess-1.jsonl'),
+      adAttempt('fallback', '/home/u/.claude/projects/-repo-wrb/sess-1.jsonl'),
+      adAttempt('history', '/home/u/.claude/projects/-old-repo/sess-0.jsonl'),
+    ]
+    const log = await logForDescription(`no transcript found: ${attempts.join('; ')}`)
+    // Exactly the three AD candidates, joined in AD's order — nothing dropped,
+    // nothing reordered, no locally-computed padding.
+    expect(log).toContain(
+      `Transcript candidates tried (paths+sources reported by agent-director): ${attempts.join('; ')}.`,
+    )
     expect(log).not.toContain('locally-computed')
   })
 
-  // --- Message-shape coverage: plain 0.8.0 format -------------------------
-  // Installed AD 0.8.0's ErrJsonlMissing has no enumeration. The diagnostic
-  // must degrade to locally-computed candidates, label them honestly, and never
-  // throw (spawnForRoute still completes the amnesia fresh-spawn).
-  test('plain 0.8.0 ErrJsonlMissing message: degrades to honest locally-computed candidates, no throw', async () => {
+  test('history-only description yields exactly that one candidate', async () => {
+    captureStartupErrors()
+    const attempt = adAttempt('history', '/home/u/.claude/projects/-old-repo/sess-0.jsonl')
+    const log = await logForDescription(`no transcript found: ${attempt}`)
+    expect(log).toContain(
+      `Transcript candidates tried (paths+sources reported by agent-director): ${attempt}.`,
+    )
+    // A single AD candidate still counts as AD detail: no local reconstruction.
+    expect(log).not.toContain('locally-computed')
+    expect(log).not.toContain('agent-director gave no path detail')
+  })
+
+  test.each([
+    ['history: /p/sess.jsonl - missing', 'source token not followed by a path + parens'],
+    ['archived /p/sess.jsonl (no such file or directory)', 'unknown source token'],
+    ['history(/p/sess.jsonl)', 'no whitespace-separated path'],
+  ])('malformed description (%s) parses to no AD candidates without throwing', async (desc) => {
+    captureStartupErrors()
+    const log = await logForDescription(desc)
+    // Non-throwing: the diagnostic still ran and degraded honestly to locally
+    // computed candidates rather than claiming AD reported none.
+    expect(log).toContain('agent-director gave no path detail')
+    expect(log).toContain('locally-computed(persisted-column) /data/proj/sess-1.jsonl')
+    expect(log).not.toContain('paths+sources reported by agent-director')
+  })
+
+  // --- Message-shape coverage: plain non-enumerated format ----------------
+  // A pre-b.1ba AD's ErrJsonlMissing carries no per-candidate enumeration. The
+  // diagnostic must degrade to locally-computed candidates, label them
+  // honestly, and never throw (spawnForRoute still completes the amnesia
+  // fresh-spawn).
+  test('plain non-enumerated ErrJsonlMissing message: degrades to honest locally-computed candidates, no throw', async () => {
     captureStartupErrors()
     const log = await withCapturedErr(async () => {
       installAmnesia({
