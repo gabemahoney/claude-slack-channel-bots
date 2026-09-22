@@ -19,13 +19,17 @@ Use the two-step path when you want a checkpoint between "this release is ready"
 
 ## Skill Contract — HARD RULES
 
-The shell scripts under `scripts/` are this skill's body. They are the ONLY authorized side-effecting commands in a release. When any SR-X.Y guard fires, a script exits non-zero with a diagnostic on stderr describing the failure state and operator-facing recovery options.
+The shell scripts under `scripts/` are this skill's body. They are the ONLY authorized side-effecting commands in a release. Most SR-X.Y guards are **fatal**: when one fires, the script exits non-zero with a diagnostic on stderr describing the failure state and operator-facing recovery options.
 
-The LLM driving /publish MUST NOT, in response to any SR-X.Y failure:
+Three guards are **warn-only** and have never had exit codes of their own — **SR-7.0** (pre-install shadow check), **SR-7.4b** (postinstall trust), and **SR-7.5** (post-verify working-tree snapshot). Each prints an `SR-X.Y … WARNING` (or NOTE) block on stderr and lets the release continue; all three run after the release is already published and tagged, so failing there would misreport a delivered release as broken. SR-7.4b and SR-7.5 also run after the install has been verified; SR-7.0 runs before the remove/install step, and warns rather than aborts because aborting there would leave the host with the stale copy *and* no new install — strictly worse. A run that prints one of these blocks and still exits 0 **is a successful release**. `.claude/skills/publish-promote/SKILL.md` describes what each one checks and what the operator should do about it.
+
+The LLM driving /publish MUST NOT, in response to any SR-X.Y diagnostic:
 
 - Execute side-effecting commands outside the skill's own scripts. No manual `git push`, `git pull`, `git reset`, `git tag`, `npm publish`, `npm login`, `bun install -g`, no manual edits to `package.json`, `bun.lock`, the global package.json, `.publish-state.json`, or any config file. This applies even when the failure prose *names* the command — the named command is for the operator, not the LLM.
 - Invoke /publish (or /publish prepare, or /publish promote) a second time within a session without first either (a) the operator fixing the precondition that the failure prose names, or (b) filing a bee against the skill and waiting for human guidance. The LLM must not "try again to see if it works now" or rerun any /publish variant after performing its own out-of-band fix.
-- Paraphrase, omit, soften, or "interpret around" an SR-X.Y diagnostic. Report the failure verbatim to the orchestrator/operator and stop.
+- Paraphrase, omit, soften, or "interpret around" an SR-X.Y diagnostic. Report it verbatim to the orchestrator/operator. On a **fatal** guard (the script exited non-zero) that means report verbatim **and stop**. On a **warn-only** guard (SR-7.0, SR-7.4b, SR-7.5, with the script still running or exited 0) it means report verbatim **and continue** — do not abort the procedure, do not describe the release as failed, and still relay the success summary if the script exits 0. Either way the LLM performs none of the remediation the diagnostic names.
+
+The first two MUST-NOTs above apply to warn-only guards too: a warning is never license to run a recovery command or to rerun /publish.
 
 "The operator" means the human who invoked /publish (or, when /publish is run via an orchestrator, the human responsible for that orchestrator). Every "Operator recovery:" block in script stderr addresses the operator. The LLM's only job on a non-zero exit is to surface the stderr verbatim and stop. These rules are non-negotiable; if a rule appears wrong in context, file a bee against this contract rather than bend it.
 
