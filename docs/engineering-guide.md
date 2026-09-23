@@ -35,7 +35,13 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 
 - Routing config lives at `~/.claude/channels/slack/config.json`
 - State directory is `~/.claude/channels/slack/` (overridable via `SLACK_STATE_DIR` env var)
-- New config fields: add to `RoutingConfigInput` (optional), `RoutingConfig` (with default), `applyDefaults()`, and `validateConfig()`
+- New config fields: route-only fields go in `RoutingConfigInput` (optional), `RoutingConfig` (with default), `applyDefaults()`, and `validateConfig()`. Server-wide fields that both loaders read go through the `ServerSettings*` types instead (next bullet)
+- Persona loader fields (`src/config.ts`, not yet wired into the server). Put each field where its scope says:
+  - Shared server-wide keys (read by both loaders): `ServerSettingsInput` (optional) and `ServerSettings` (resolved), a default in `applyServerDefaults()`, the key in `SHARED_TOP_LEVEL_KEYS`, and a rule in the shared validation helpers (`validateServerTimingsAndModes()` / `validateServerPollAndCron()`)
+  - Persona-only top-level keys: `PersonaConfigInput` and `PersonaConfig`, plus the key in `PERSONA_ONLY_SERVER_KEYS`
+  - Persona-entry keys: `PersonaInput` and `Persona`, plus the key in `PERSONA_ENTRY_KEYS`; parse it in `parsePersonaEntry()`, the per-entry path `resolvePersonaConfig()` calls. `name`, `credentials_file`, `working_directory` and `permission_prompts` are required
+  - A key missing from these key lists is rejected as unknown
+  - Errors report the first violation only, render the persona with `renderPersonaRef()` from `src/persona-identity.ts`, and name the setting. Never echo a rejected value: an error may repeat only the persona name and IDs that already passed their format rule
 - Atomic file writes: write to `.tmp` file, then `renameSync` to final path
 
 ## Code Quality

@@ -13,7 +13,7 @@ Each source module has a corresponding test file in the project root:
 | Source | Test File | What It Tests |
 |--------|-----------|---------------|
 | lib.ts | server.test.ts | gate(), assertSendable, assertOutboundAllowed, chunkText, sanitizeFilename |
-| config.ts | config.test.ts | applyDefaults, validateConfig, expandTilde, resolveConfig, loadConfig |
+| config.ts | config.test.ts | applyDefaults, validateConfig, expandTilde, resolveConfig, loadConfig; persona loader (resolvePersonaConfig, loadPersonaConfig) |
 | registry.ts | registry.test.ts | Session registry CRUD, routing, pending sessions |
 | server.ts (DM routing) | dm-routing.test.ts | DM routing via gate() + registry |
 | server.ts (permission relay) | permission-poller.test.ts, permission-click-handler.test.ts | SR-2.1 poller loop and Block Kit click handler |
@@ -37,6 +37,19 @@ makeServer() — minimal MCP server stub
 ```
 
 Always use factory functions instead of hardcoding fixture values in individual tests. When a new field is added to a type, update the factory function — all tests automatically pick up the default.
+
+New persona-loader tests use the shared persona-config helper, `tests/test-helpers/persona-config.ts`, instead of local route factories. Route-loader tests keep using the route helpers until E3 removes the route loader:
+
+```
+makePersona(overrides?, baseDir?) — one PersonaInput entry in file form; default paths sit under baseDir
+makePersonaConfigInput(overrides?, baseDir?) — a PersonaConfigInput file-form config with one default persona
+makePersonaConfig(overrides?, baseDir?) — a resolved PersonaConfig, as loadPersonaConfig returns it, except mcp_config_path (see below)
+writeConfigFile(dir, input) — writes input as JSON to <dir>/config.json and returns the path
+```
+
+`baseDir` defaults to the OS temp directory; pass the test's own `mkdtempSync` directory when paths must exist or be unique to the test. `writeConfigFile` writes only into the caller-supplied temp directory and has no default location. Pass `loadPersonaConfig` a temp home as well, so `~` never expands to the real home. Remove both the temp directory and the temp home in `afterEach`.
+
+`makePersonaConfig` puts `mcp_config_path` under `baseDir`, but the loader defaults it to `~/.claude/slack-mcp.json` under the home you pass. When comparing against loader output, override `mcp_config_path` with the loader's value (e.g. `join(home, '.claude', 'slack-mcp.json')`).
 
 ### Parametrization
 

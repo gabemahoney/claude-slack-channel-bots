@@ -10,8 +10,10 @@
  *
  * Pure module (b.av2 SR-13.1): no module-scope side effects, no file-system
  * or environment access, and nothing reads the home directory at import.
- * Only the `config_dir` derivations consult a home directory, which callers
- * may inject; the OS home is read at call time only when none is given.
+ * Only tilde expansion (`expandTilde`, the one tilde rule, which `config.ts`
+ * delegates to) and the `config_dir` derivations consult a home directory,
+ * which callers may inject; the OS home is read at call time only when none
+ * is given.
  * Must not import `config.ts` (the persona config loader imports this
  * module), the server, the session manager or the agent-director client.
  *
@@ -71,14 +73,22 @@ function sha256Hex(input: string): string {
   return createHash('sha256').update(input, 'utf8').digest('hex')
 }
 
+// ---------------------------------------------------------------------------
+// Tilde expansion (the one tilde rule; `config.ts` delegates here)
+// ---------------------------------------------------------------------------
+
 /**
- * Same tilde rule as `expandTilde` in `config.ts` (exactly `~`, or a leading
- * `~/`; any other `~` form is left unchanged), but with the home directory
- * injected rather than read.
+ * Replace a leading `~` in a path with a home directory. Only exactly `~` or
+ * a leading `~/` is expanded; any other `~` form (`~user`, a `~` later in the
+ * path) is returned unchanged, as is a path without one.
+ *
+ * @param path  The path to expand.
+ * @param home  Home directory to substitute. When omitted, the OS home is read
+ *   at call time, and only if the path needs it.
  */
-function expandTildeWithHome(path: string, home: string): string {
-  if (path === '~') return home
-  if (path.startsWith('~/')) return home + path.slice(1)
+export function expandTilde(path: string, home?: string): string {
+  if (path === '~') return home ?? homedir()
+  if (path.startsWith('~/')) return (home ?? homedir()) + path.slice(1)
   return path
 }
 
@@ -153,7 +163,7 @@ export function personaTmuxSessionName(key: string): string {
  */
 export function resolveClaudeConfigDir(configDir?: string, home: string = homedir()): string {
   if (!configDir) return resolve(home, DEFAULT_CLAUDE_CONFIG_SUBDIR)
-  return resolve(expandTildeWithHome(configDir, home))
+  return resolve(expandTilde(configDir, home))
 }
 
 /**

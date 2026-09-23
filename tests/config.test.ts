@@ -1,5 +1,5 @@
-import { describe, test, expect } from 'bun:test'
-import { writeFileSync, mkdtempSync } from 'fs'
+import { describe, test, expect, afterEach, beforeEach } from 'bun:test'
+import { writeFileSync, mkdtempSync, existsSync, readFileSync, readdirSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { homedir } from 'os'
@@ -10,10 +10,21 @@ import {
   normalizeChannelName,
   resolveConfig,
   loadConfig,
+  loadPersonaConfig,
+  prePersonaConversionMessage,
   type RouteEntry,
   type RoutingConfigInput,
   type RoutingConfig,
+  type PersonaConfigInput,
+  type PersonaInput,
 } from '../src/config.ts'
+import { personaKey } from '../src/persona-identity.ts'
+import {
+  makePersona,
+  makePersonaConfig,
+  makePersonaConfigInput,
+  writeConfigFile,
+} from './test-helpers/persona-config.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1293,5 +1304,429 @@ describe('normalizeChannelName (b.1m9)', () => {
       expect(out.startsWith('_')).toBe(false)
       expect(out.endsWith('_')).toBe(false)
     }
+  })
+})
+
+// ===========================================================================
+// Persona configuration loader (b.av2 SR-1.1–1.3, 1.5 per-entry, 1.6, 1.7)
+//
+// Every case writes its file into its own mkdtempSync directory and loads it
+// with an injected mkdtempSync home (b.av2 SR-13.2); both are removed after
+// each case. The loader lives in src/config.ts, so no child-process import
+// purity test is added here (b.av2 SR-13.1).
+// ===========================================================================
+
+/**
+ * Non-token-shaped stand-in for a secret or a rejected value; must never reach
+ * an error. Unhyphenated so a JSON parser quotes it whole (Bun stops an
+ * identifier at `-`), keeping the malformed-JSON leak check meaningful.
+ */
+const PLACEHOLDER = 'placeholder_not_a_secret'
+
+describe('loadPersonaConfig (b.av2 SR-1)', () => {
+  let dir: string
+  let home: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'persona-config-'))
+    home = mkdtempSync(join(tmpdir(), 'persona-home-'))
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  const load = (input: unknown) => loadPersonaConfig(writeConfigFile(dir, input), home)
+
+  /** Load `input`, expecting rejection; returns the message after checking it leaks no placeholder. */
+  function loadError(input: unknown): string {
+    let message: string | undefined
+    try {
+      load(input)
+    } catch (err) {
+      message = (err as Error).message
+    }
+    if (message === undefined) throw new Error('expected loadPersonaConfig to reject the configuration')
+    expect(message).not.toContain(PLACEHOLDER)
+    return message
+  }
+
+  /** The b.av2 SR-2.2 persona reference: JSON-quoted name with its key. */
+  function expectNamesPersona(message: string, name: string): void {
+    expect(message).toContain(`${JSON.stringify(name)} (key=${personaKey(name)})`)
+  }
+
+  const withPersonas = (...personas: PersonaInput[]) => makePersonaConfigInput({ personas })
+
+  describe('valid load', () => {
+    test('two personas sharing a channel, one also in a second channel, resolve with keys and defaults', () => {
+      const config = load(withPersonas(
+        makePersona({
+          name: 'Ops Bot',
+          channels: [{ id: 'C0TEST001', delivery: 'all' }, { id: 'G0TEST002', delivery: 'all' }],
+          dm: undefined,
+        }),
+        makePersona({ name: 'review_bot' }),
+      ))
+      expect(config.personas.map((p) => [p.index, p.name, p.key])).toEqual([
+        [0, 'Ops Bot', personaKey('Ops Bot')],
+        [1, 'review_bot', personaKey('review_bot')],
+      ])
+      expect(config.personas[0].channels.map((c) => c.id)).toEqual(['C0TEST001', 'G0TEST002'])
+      expect(config.personas[1].channels.map((c) => c.id)).toEqual(['C0TEST001'])
+      for (const persona of config.personas) {
+        expect(persona.dm).toEqual({ enabled: false })
+        expect('contact' in persona.dm).toBe(false)
+        expect('claude_config_dir' in persona).toBe(false)
+        expect(persona.stop_hook_bootstrap).toBe(true)
+      }
+    })
+
+    test('the default input resolves to the makePersonaConfig shape', () => {
+      const config = load(makePersonaConfigInput({}, dir))
+      expect(config).toEqual(makePersonaConfig({ mcp_config_path: join(home, '.claude', 'slack-mcp.json') }, dir))
+    })
+
+    test('a mentions channel loads', () => {
+      const config = load(withPersonas(makePersona({ channels: [{ id: 'C0TEST001', delivery: 'mentions' }] })))
+      expect(config.personas[0].channels).toEqual([{ id: 'C0TEST001', delivery: 'mentions' }])
+    })
+
+    test('a ~ config path is expanded under the injected home', () => {
+      writeConfigFile(home, makePersonaConfigInput())
+      expect(loadPersonaConfig('~/config.json', home).cron_table_path).toBe(join(home, 'crontab'))
+    })
+  })
+
+  describe('empty and zero-channel shapes', () => {
+    test('an empty personas array loads (AC 54 config leg)', () => {
+      expect(load({ personas: [] }).personas).toEqual([])
+    })
+
+    test('a zero-channel DM-only persona loads, channels defaulting to empty (AC 40/41 config leg)', () => {
+      const persona = makePersona({
+        channels: undefined,
+        dm: { enabled: true, contact: 'U0TEST001' },
+        permission_prompts: 'dm',
+      })
+      const [resolved] = load(withPersonas(persona)).personas
+      expect(resolved.channels).toEqual([])
+      expect(resolved.dm).toEqual({ enabled: true, contact: 'U0TEST001' })
+      expect(resolved.permission_prompts).toBe('dm')
+    })
+
+    test.each([
+      ['missing', 'personas', {}],
+      ['an object', 'personas', { personas: {} }],
+      ['a string', 'personas', { personas: 'none' }],
+      ['holding a null entry', 'personas[0]', { personas: [null] }],
+    ])('personas %s is rejected, naming %s', (_label, named, input) => {
+      expect(loadError(input)).toContain(named)
+    })
+  })
+
+  describe('claude_config_dir and stop_hook_bootstrap inheritance (SR-1.2, SR-10.2; AC 48 config leg)', () => {
+    test.each([
+      ['neither set: absent and true', {}, {}, undefined, true],
+      ['top-level only: inherited', { claude_config_dir: '~/cfg-top', stop_hook_bootstrap: false }, {}, 'cfg-top', false],
+      [
+        'per-persona wins over top-level',
+        { claude_config_dir: '~/cfg-top', stop_hook_bootstrap: false },
+        { claude_config_dir: '~/cfg-own', stop_hook_bootstrap: true },
+        'cfg-own',
+        true,
+      ],
+    ])('%s', (_label, top, own, expectedDir, expectedStopHook) => {
+      const [persona] = load({ ...makePersonaConfigInput(top), personas: [makePersona(own)] }).personas
+      expect(persona.claude_config_dir).toBe(expectedDir === undefined ? undefined : join(home, expectedDir))
+      expect(persona.stop_hook_bootstrap).toBe(expectedStopHook)
+    })
+  })
+
+  describe('persona path rules (SR-1.2)', () => {
+    test.each([
+      ['credentials_file', '~/creds/ops.json'],
+      ['working_directory', '~'],
+      ['claude_config_dir', '~/cfg'],
+    ] as const)('%s accepts %s, expanded under the injected home', (setting, value) => {
+      const [persona] = load(withPersonas(makePersona({ [setting]: value }))).personas
+      expect(persona[setting]).toBe(value === '~' ? home : join(home, value.slice(2)))
+    })
+
+    test('absolute paths that do not exist load: existence is not a load-time check', () => {
+      const paths = {
+        credentials_file: join(dir, 'missing', 'credentials.json'),
+        working_directory: join(dir, 'missing', 'work'),
+        claude_config_dir: join(dir, 'missing', 'claude'),
+      }
+      const [persona] = load(withPersonas(makePersona(paths))).personas
+      expect(persona).toMatchObject(paths)
+      for (const path of Object.values(paths)) expect(existsSync(path)).toBe(false)
+    })
+
+    test.each([
+      ['credentials_file', 'relative/credentials.json'],
+      ['working_directory', '~other/work'],
+      ['claude_config_dir', './claude'],
+    ])('%s rejects %s, naming the persona and the key', (setting, value) => {
+      const message = loadError(withPersonas(makePersona({ name: 'Ops Bot', [setting]: value })))
+      expectNamesPersona(message, 'Ops Bot')
+      expect(message).toContain(setting)
+      expect(message).not.toContain(value)
+    })
+  })
+
+  describe('unknown keys (SR-1.1, SR-1.2; AC 20 config leg)', () => {
+    const persona = (overrides: Record<string, unknown>) =>
+      withPersonas(makePersona({ name: 'Ops Bot', ...overrides } as Partial<PersonaInput>))
+
+    test.each([
+      ['top-level', { ...makePersonaConfigInput(), extra_setting: 1 }, 'extra_setting', false],
+      ['persona entry', persona({ nickname: 'ops' }), 'nickname', true],
+      ['persona entry bot_token', persona({ bot_token: PLACEHOLDER }), 'bot_token', true],
+      ['persona entry route-era cwd (SR-10.2)', persona({ cwd: '/tmp/somewhere' }), 'cwd', true],
+      ['dm object', persona({ dm: { enabled: false, relay: true } }), 'relay', true],
+      ['channel entry', persona({ channels: [{ id: 'C0TEST001', delivery: 'all', label: 'ops' }] }), 'label', true],
+    ])('an unknown key in the %s is rejected, naming it', (_label, input, key, inPersona) => {
+      const message = loadError(input)
+      expect(message).toContain(JSON.stringify(key))
+      if (inPersona) expectNamesPersona(message, 'Ops Bot')
+    })
+  })
+
+  describe('dm and channel shapes, channel and contact formats (SR-1.2, SR-1.3, SR-1.5)', () => {
+    test.each([
+      ['a non-object dm', { dm: true }, 'dm'],
+      ['a non-array channels', { channels: PLACEHOLDER }, 'channels'],
+      ['a non-object channel entry', { channels: [null] }, 'channels[0]'],
+      ['a channel ID not matching ^[CG][A-Z0-9]+$', { channels: [{ id: 'D0TEST001', delivery: 'all' }] }, 'channels[0].id'],
+      ['a missing channel id', { channels: [{ delivery: 'all' }] }, 'channels[0].id'],
+      ['a missing delivery', { channels: [{ id: 'C0TEST001' }] }, 'channels[0].delivery'],
+      ['an unsupported delivery', { channels: [{ id: 'C0TEST001', delivery: PLACEHOLDER }] }, 'channels[0].delivery'],
+      ['a dm.contact not matching ^[UW][A-Z0-9]+$', { dm: { enabled: true, contact: 'B0TEST001' } }, 'dm.contact'],
+      [
+        'the same channel listed twice',
+        { channels: [{ id: 'C0TEST001', delivery: 'all' }, { id: 'C0TEST001', delivery: 'mentions' }] },
+        'C0TEST001',
+      ],
+    ])('%s is rejected, naming the persona and the key or channel', (_label, overrides, named) => {
+      const message = loadError(withPersonas(makePersona({ name: 'Ops Bot', ...overrides } as Partial<PersonaInput>)))
+      expectNamesPersona(message, 'Ops Bot')
+      expect(message).toContain(named)
+    })
+  })
+
+  describe('type and range errors (SR-1.5)', () => {
+    test.each([
+      ['an empty name', { name: '' }, 'name'],
+      ['a whitespace-only name', { name: '   ' }, 'name'],
+      ['a non-string name', { name: 42 }, 'name'],
+    ])('%s is rejected, naming personas[i] and the setting', (_label, overrides, setting) => {
+      const message = loadError(withPersonas(makePersona(overrides as Partial<PersonaInput>)))
+      expect(message).toContain(`personas[0]: ${setting}`)
+    })
+
+    test.each([
+      ['a missing credentials_file', { credentials_file: undefined }, 'credentials_file'],
+      ['a missing working_directory', { working_directory: undefined }, 'working_directory'],
+      ['a non-boolean dm.enabled', { dm: { enabled: 'yes' } }, 'dm.enabled'],
+      ['a non-boolean stop_hook_bootstrap', { stop_hook_bootstrap: 'false' }, 'stop_hook_bootstrap'],
+      ['an empty claude_config_dir', { claude_config_dir: '' }, 'claude_config_dir'],
+      ['a permission_prompts that is neither dm nor a channel ID', { permission_prompts: PLACEHOLDER }, 'permission_prompts'],
+    ])('%s is rejected, naming the persona and the setting', (_label, overrides, setting) => {
+      const message = loadError(withPersonas(makePersona({ name: 'Ops Bot', ...overrides } as Partial<PersonaInput>)))
+      expectNamesPersona(message, 'Ops Bot')
+      expect(message).toContain(setting)
+    })
+  })
+
+  describe('per-entry load-time rejections (SR-1.5)', () => {
+    // Rows: label, personas, the persona the error must name, the settings (or
+    // channel) it must name. Task 3 extends this table with cross-persona rows.
+    test.each([
+      ['AC 33: missing permission_prompts', [makePersona({ name: 'Ops Bot', permission_prompts: undefined })], 'Ops Bot', ['permission_prompts']],
+      [
+        'AC 30: permission_prompts dm without dm.contact',
+        [makePersona({ name: 'Say "hi" Bot', dm: { enabled: true }, permission_prompts: 'dm' })],
+        'Say "hi" Bot',
+        ['permission_prompts', 'dm.contact'],
+      ],
+      [
+        'AC 32: destination channel not in the persona channels',
+        [makePersona({ name: 'Ops Bot', permission_prompts: 'C0TEST999' })],
+        'Ops Bot',
+        ['permission_prompts', 'C0TEST999'],
+      ],
+      [
+        'AC 42: zero channels with dm.enabled false',
+        [makePersona({ name: 'ops_bot', channels: [], dm: { enabled: false } })],
+        'ops_bot',
+        ['dm.enabled'],
+      ],
+      [
+        'AC 42: zero channels with dm absent',
+        [makePersona({ name: 'Ops Bot', channels: undefined, dm: undefined })],
+        'Ops Bot',
+        ['dm.enabled'],
+      ],
+      [
+        'AC 43: dm destination with dm.enabled false',
+        [makePersona({ name: 'Ops Bot', dm: { enabled: false, contact: 'U0TEST001' }, permission_prompts: 'dm' })],
+        'Ops Bot',
+        ['permission_prompts', 'dm.enabled'],
+      ],
+      [
+        'AC 30 + AC 43: dm destination with neither dm.enabled nor dm.contact',
+        [makePersona({ name: 'Ops Bot', permission_prompts: 'dm' })],
+        'Ops Bot',
+        ['permission_prompts', 'dm.contact', 'dm.enabled'],
+      ],
+    ])('%s', (_label, personas, offender, settings) => {
+      const message = loadError(withPersonas(...personas))
+      expectNamesPersona(message, offender)
+      for (const setting of settings) expect(message).toContain(setting)
+    })
+
+    test('only the first violation is reported: two invalid personas name the first only', () => {
+      const message = loadError(withPersonas(
+        makePersona({ name: 'first_bot', permission_prompts: undefined }),
+        makePersona({ name: 'second_bot', channels: [] }),
+      ))
+      expectNamesPersona(message, 'first_bot')
+      expect(message).not.toContain('second_bot')
+    })
+  })
+
+  describe('server-wide settings (SR-1.6)', () => {
+    // Defaults when absent are pinned by 'the default input resolves to the
+    // makePersonaConfig shape' above.
+    test('every server-wide key accepts a valid non-default value, ~ paths expanded under the injected home', () => {
+      const values = {
+        bind: '0.0.0.0',
+        port: 8080,
+        session_restart_delay: 5,
+        health_check_interval: 30,
+        exit_timeout: 10,
+        stop_timeout: 5,
+        mcp_config_path: '~/mcp.json',
+        append_system_prompt_file: '~/prompt.md',
+        cozempic_prescription: 'aggressive',
+        system_prompt_mode: 'none',
+        message_archive_db: '~/archive.db',
+        claude_config_dir: '~/cfg',
+        resume_enabled: false,
+        agent_director_poll_interval_ms: 250,
+        stop_hook_bootstrap: false,
+        cron_table_path: '~/cron/crontab',
+        cron_log_path: '~/cron/cron.log',
+        cron_log_max_bytes: 1024,
+        ack_reaction: 'eyes',
+        reply_chunk_limit: 12000,
+        reply_chunk_mode: 'length',
+      } satisfies Omit<Required<PersonaConfigInput>, 'personas'>
+      const underHome = (path: string) => join(home, path.slice(2))
+      expect(load(makePersonaConfigInput(values))).toMatchObject({
+        ...values,
+        mcp_config_path: underHome(values.mcp_config_path),
+        append_system_prompt_file: underHome(values.append_system_prompt_file),
+        message_archive_db: underHome(values.message_archive_db),
+        claude_config_dir: underHome(values.claude_config_dir),
+        cron_table_path: underHome(values.cron_table_path),
+        cron_log_path: underHome(values.cron_log_path),
+      })
+    })
+
+    test.each([
+      ['cozempic_prescription', PLACEHOLDER, 'cozempic_prescription'],
+      ['system_prompt_mode', PLACEHOLDER, 'system_prompt_mode'],
+      ['stop_hook_bootstrap', PLACEHOLDER, 'stop_hook_bootstrap'],
+      ['mcp_config_path', 42, 'mcp_config_path'],
+      ['claude_config_dir', '   ', 'claude_config_dir'],
+      ['session_restart_delay', -1, 'session_restart_delay'],
+      ['agent_director_poll_interval_ms', 50, 'agent_director_poll_interval_ms'],
+      ['cron_log_max_bytes', 0, 'cron_log_max_bytes'],
+      ['claude_director_poll_interval_ms', 1000, 'agent_director_poll_interval_ms'],
+      ['ack_reaction', '', 'ack_reaction'],
+      ['reply_chunk_limit', 0, 'reply_chunk_limit'],
+      ['reply_chunk_limit', -5, 'reply_chunk_limit'],
+      ['reply_chunk_limit', 2.5, 'reply_chunk_limit'],
+      ['reply_chunk_mode', PLACEHOLDER, 'reply_chunk_mode'],
+    ])('%s = %p is rejected, naming %s', (key, value, named) => {
+      expect(loadError({ ...makePersonaConfigInput(), [key]: value })).toContain(named)
+    })
+  })
+
+  describe('pre-persona rejection (SR-1.7 loader part; AC 45)', () => {
+    /** Load `input`, returning the error plus proof that the file and directory are untouched. */
+    function rejectUntouched(input: unknown): string {
+      const path = writeConfigFile(dir, input)
+      const bytes = readFileSync(path)
+      const listing = readdirSync(dir)
+      let message: string | undefined
+      try {
+        loadPersonaConfig(path, home)
+      } catch (err) {
+        message = (err as Error).message
+      }
+      expect(readFileSync(path).equals(bytes)).toBe(true)
+      expect(readdirSync(dir)).toEqual(listing)
+      if (message === undefined) throw new Error('expected loadPersonaConfig to reject the configuration')
+      return message
+    }
+
+    test.each([
+      ['routes as a populated object', 'routes', { C0TEST001: { cwd: '/tmp/ops' } }],
+      ['routes as an empty object', 'routes', {}],
+      ['routes as an array', 'routes', []],
+      ['routes as a non-object', 'routes', 'none'],
+      ['routes as null', 'routes', null],
+      ['default_route', 'default_route', '/tmp/ops'],
+      ['default_dm_session', 'default_dm_session', '/tmp/ops'],
+    ])('%s is rejected with the conversion message; the file is unchanged', (_label, key, value) => {
+      const message = rejectUntouched({ ...makePersonaConfigInput(), [key]: value })
+      expect(message).toContain(prePersonaConversionMessage(key))
+      expect(message).toContain(JSON.stringify(key))
+      expect(message).toContain('must be converted to personas')
+    })
+
+    test.each([
+      ['a missing personas', { routes: {} }],
+      ['an unknown top-level key', { ...makePersonaConfigInput(), default_route: '/tmp/ops', extra_setting: 1 }],
+      ['an invalid persona', { personas: [makePersona({ permission_prompts: undefined })], default_dm_session: '/tmp/ops' }],
+    ])('the conversion message wins over %s', (_label, input) => {
+      const message = rejectUntouched(input)
+      expect(message).toContain('must be converted to personas')
+      expect(message).not.toContain('extra_setting')
+      expect(message).not.toContain('permission_prompts')
+    })
+  })
+
+  describe('loader I/O errors', () => {
+    test.each([
+      ['a missing file', (d: string) => join(d, 'absent.json'), 'cannot read'],
+      [
+        'malformed JSON',
+        (d: string) => {
+          const path = join(d, 'config.json')
+          writeFileSync(path, `{ "personas": [ ${PLACEHOLDER}`, 'utf-8')
+          return path
+        },
+        'malformed JSON',
+      ],
+      ['a JSON array', (d: string) => writeConfigFile(d, []), 'must be a JSON object'],
+    ])('%s is rejected, naming the file path', (_label, setup, fragment) => {
+      const path = setup(dir)
+      let message = ''
+      try {
+        loadPersonaConfig(path, home)
+      } catch (err) {
+        message = (err as Error).message
+      }
+      expect(message).toContain(fragment)
+      expect(message).toContain(path)
+      expect(message).not.toContain(PLACEHOLDER)
+      expect(message).not.toContain('JSON Parse error')
+    })
   })
 })

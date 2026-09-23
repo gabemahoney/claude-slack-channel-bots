@@ -1,16 +1,34 @@
 /**
- * config.ts — Routing configuration loader and validator for the Slack Channel Router.
+ * config.ts — Configuration loaders and validators for the Slack Channel Router.
  *
- * Pure functions (applyDefaults, validateConfig, expandTilde, resolveConfig) are
- * side-effect-free and importable by tests without performing any I/O.
- * The single I/O wrapper (loadConfig) reads the JSON file and delegates to resolveConfig.
+ * Two loaders live side by side until E3 of b.ob2 switches the server over:
+ *
+ * - The route loader (`loadConfig` / `resolveConfig`) reads today's
+ *   route-keyed shape (`routes`, `default_route`, `default_dm_session`). The
+ *   running server and CLI use it.
+ * - The persona loader (`loadPersonaConfig` / `resolvePersonaConfig`) reads the
+ *   persona shape of b.av2 SR-1: a `personas` array plus the server-wide
+ *   settings. It rejects the pre-persona shape before any other check
+ *   (b.av2 SR-1.7) and never writes or converts the file. Nothing in the
+ *   server calls it yet; E3 wires it in and deletes the route loader.
+ *
+ * Both loaders share the server-wide defaults, path resolution and
+ * validation rules; only their error prefixes differ, and persona-loader
+ * errors never echo a rejected value (b.av2 SR-10.3).
+ *
+ * Pure functions (applyDefaults, validateConfig, expandTilde, resolveConfig,
+ * resolvePersonaConfig) are side-effect-free and importable by tests without
+ * performing any I/O (b.av2 SR-13.1). The I/O wrappers (loadConfig,
+ * loadPersonaConfig) read the JSON file once and delegate to them.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { readFileSync } from 'fs'
 import { homedir } from 'os'
-import { dirname, resolve } from 'path'
+import { dirname, isAbsolute, resolve } from 'path'
+
+import { expandTilde as expandTildeWith, personaKey, renderPersonaRef } from './persona-identity.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -38,15 +56,17 @@ export const MIN_AGENT_DIRECTOR_POLL_INTERVAL_MS = 200
 export const MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS = 3_600_000
 
 /**
- * The canonical set of top-level keys allowed in config.json. Anything else
- * is rejected at startup per SR-4.2; the rename of
- * claude_director_poll_interval_ms → agent_director_poll_interval_ms (SR-4.1)
- * relies on this rejection to surface stale operator configs loudly.
+ * The top-level keys of the pre-persona (route-keyed) shape that the persona
+ * loader rejects before any other check (b.av2 SR-1.7), in the order they are
+ * looked for.
  */
-const KNOWN_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
-  'routes',
-  'default_route',
-  'default_dm_session',
+export const PRE_PERSONA_KEYS = ['routes', 'default_route', 'default_dm_session'] as const
+
+/**
+ * Server-wide top-level keys shared by the route shape and the persona shape
+ * (b.av2 SR-1.6): every current top-level key except the pre-persona ones.
+ */
+const SHARED_TOP_LEVEL_KEYS = [
   'bind',
   'port',
   'session_restart_delay',
@@ -65,7 +85,21 @@ const KNOWN_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
   'cron_table_path',
   'cron_log_path',
   'cron_log_max_bytes',
+] as const
+
+/**
+ * The canonical set of top-level keys allowed in config.json. Anything else
+ * is rejected at startup per SR-4.2; the rename of
+ * claude_director_poll_interval_ms → agent_director_poll_interval_ms (SR-4.1)
+ * relies on this rejection to surface stale operator configs loudly.
+ */
+const KNOWN_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
+  ...PRE_PERSONA_KEYS,
+  ...SHARED_TOP_LEVEL_KEYS,
 ])
+
+/** Top-level key the route loader answers with a rename message (SR-4.1); the persona loader too. */
+const RENAMED_POLL_INTERVAL_KEY = 'claude_director_poll_interval_ms'
 
 /** The canonical set of per-route keys allowed inside a routes[<channel>] entry. */
 const KNOWN_ROUTE_KEYS: ReadonlySet<string> = new Set([
@@ -73,6 +107,81 @@ const KNOWN_ROUTE_KEYS: ReadonlySet<string> = new Set([
   'claude_config_dir',
   'stop_hook_bootstrap',
 ])
+
+// ---------------------------------------------------------------------------
+// Persona schema constants (b.av2 SR-1.1 to SR-1.3, SR-1.6)
+// ---------------------------------------------------------------------------
+
+/** Default `reply_chunk_limit` (b.av2 SR-1.6): today's reply-tool default. */
+export const DEFAULT_REPLY_CHUNK_LIMIT = 4000
+
+/** Allowed `reply_chunk_mode` values (b.av2 SR-1.6). */
+export const REPLY_CHUNK_MODES = ['length', 'newline'] as const
+
+/** Default `reply_chunk_mode` (b.av2 SR-1.6): today's reply-tool default. */
+export const DEFAULT_REPLY_CHUNK_MODE: ReplyChunkMode = 'newline'
+
+/** Top-level keys that only the persona shape accepts (b.av2 SR-1.6). */
+const PERSONA_ONLY_SERVER_KEYS = ['ack_reaction', 'reply_chunk_limit', 'reply_chunk_mode'] as const
+
+/**
+ * Every top-level key the persona shape accepts (b.av2 SR-1.1, SR-1.6):
+ * `personas`, the shared server-wide keys and the three persona-only ones.
+ */
+export const PERSONA_TOP_LEVEL_KEYS: readonly string[] = [
+  'personas',
+  ...SHARED_TOP_LEVEL_KEYS,
+  ...PERSONA_ONLY_SERVER_KEYS,
+]
+
+/** Keys allowed in a persona entry (b.av2 SR-1.2). */
+export const PERSONA_ENTRY_KEYS: readonly (keyof PersonaInput)[] = [
+  'name',
+  'credentials_file',
+  'working_directory',
+  'channels',
+  'dm',
+  'permission_prompts',
+  'claude_config_dir',
+  'stop_hook_bootstrap',
+]
+
+/** Keys allowed in a persona's `dm` object (b.av2 SR-1.2). */
+export const PERSONA_DM_KEYS: readonly (keyof PersonaDmInput)[] = ['enabled', 'contact']
+
+/** Keys allowed in a channel entry (b.av2 SR-1.3); both are required. */
+export const CHANNEL_ENTRY_KEYS: readonly (keyof ChannelEntryInput)[] = ['id', 'delivery']
+
+/** Allowed channel `delivery` values (b.av2 SR-1.3). */
+export const DELIVERY_MODES = ['all', 'mentions'] as const
+
+/** The `permission_prompts` value that sends prompts and notices by DM to `dm.contact`. */
+export const DM_DESTINATION = 'dm'
+
+/** Channel IDs in channel entries and `permission_prompts` (b.av2 SR-1.3, SR-1.5). */
+export const CHANNEL_ID_RE = /^[CG][A-Z0-9]+$/
+
+/** `dm.contact` Slack user IDs (b.av2 SR-1.2, SR-1.5). */
+export const DM_CONTACT_RE = /^[UW][A-Z0-9]+$/
+
+/** Prefix of every error the persona loader's validation raises. */
+const PERSONA_ERROR_PREFIX = 'Persona config validation error: '
+
+/** Prefix of every error the route loader's validation raises. */
+const ROUTING_ERROR_PREFIX = 'Routing config validation error: '
+
+/**
+ * The b.av2 SR-1.7 conversion message for a pre-persona key found in a
+ * configuration: names the key and says the configuration must be rewritten
+ * as personas, and that nothing is converted automatically.
+ */
+export function prePersonaConversionMessage(key: string): string {
+  return (
+    `${JSON.stringify(key)} belongs to the pre-persona configuration shape, which is no longer accepted. ` +
+    'The configuration must be converted to personas: rewrite it by hand as a "personas" array. ' +
+    'Nothing is converted automatically and the file has not been changed.'
+  )
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -124,12 +233,19 @@ export function normalizeChannelName(name: string): string {
 }
 
 /** Raw shape of config.json as parsed from disk. All optional fields may be absent. */
-export interface RoutingConfigInput {
+export interface RoutingConfigInput extends ServerSettingsInput {
   routes: Record<string, RouteEntry>
   /** CWD path to use when a message arrives on a channel with no explicit entry in routes. */
   default_route?: string
   /** CWD path of the session that handles direct messages. */
   default_dm_session?: string
+}
+
+/**
+ * Server-wide settings as parsed from disk, shared by the route shape and the
+ * persona shape (b.av2 SR-1.6). All fields may be absent.
+ */
+export interface ServerSettingsInput {
   bind?: string
   port?: number
   session_restart_delay?: number
@@ -191,10 +307,17 @@ export interface RoutingConfigInput {
 }
 
 /** Validated, fully-resolved routing configuration with all defaults applied. */
-export interface RoutingConfig {
+export interface RoutingConfig extends ServerSettings {
   routes: Record<string, RouteEntry>
   default_route?: string
   default_dm_session?: string
+}
+
+/**
+ * Validated, fully-resolved server-wide settings with all defaults applied,
+ * shared by the route shape and the persona shape (b.av2 SR-1.6).
+ */
+export interface ServerSettings {
   bind: string
   port: number
   session_restart_delay: number
@@ -237,6 +360,109 @@ export interface RoutingConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Persona configuration types (b.av2 SR-1.1 to SR-1.3, SR-1.6)
+// ---------------------------------------------------------------------------
+
+/** Channel `delivery`: `all` delivers every message, `mentions` only those that mention the persona. */
+export type DeliveryMode = (typeof DELIVERY_MODES)[number]
+
+/** How a long reply is split into chunks (b.av2 SR-1.6). */
+export type ReplyChunkMode = (typeof REPLY_CHUNK_MODES)[number]
+
+/** A channel entry as written in the file (b.av2 SR-1.3). Both keys are required. */
+export interface ChannelEntryInput {
+  /** Slack channel ID matching `CHANNEL_ID_RE`. */
+  id: string
+  delivery: DeliveryMode
+}
+
+/** A persona's `dm` object as written in the file (b.av2 SR-1.2). */
+export interface PersonaDmInput {
+  /** The DMs switch. Defaults to false. */
+  enabled?: boolean
+  /** Slack user ID (`DM_CONTACT_RE`) that receives prompts and notices when `permission_prompts` is `dm`. */
+  contact?: string
+}
+
+/** A persona entry as written in the file (b.av2 SR-1.2). */
+export interface PersonaInput {
+  /** Persona identity: a non-empty string with no format rule. */
+  name: string
+  /** Path to the persona's credentials file: absolute, `~` or `~/…`. */
+  credentials_file: string
+  /** The instance's working directory: absolute, `~` or `~/…`. */
+  working_directory: string
+  /** Channels the persona is in. Defaults to none. */
+  channels?: ChannelEntryInput[]
+  dm?: PersonaDmInput
+  /** Destination of prompts and notices: `dm` or one of the persona's channel IDs. Required. */
+  permission_prompts: string
+  /** Per-persona Claude config dir: absolute, `~` or `~/…`. Defaults to the top-level value. */
+  claude_config_dir?: string
+  /** Per-persona Stop-hook bootstrap flag. Defaults to the top-level value. */
+  stop_hook_bootstrap?: boolean
+}
+
+/** The persona configuration file as parsed from disk (b.av2 SR-1.1, SR-1.6). */
+export interface PersonaConfigInput extends ServerSettingsInput {
+  /** Required; may be empty. */
+  personas: PersonaInput[]
+  /** Emoji name of the acknowledgement reaction. Absent means no acknowledgement. */
+  ack_reaction?: string
+  /** Largest reply chunk, in characters. Positive integer; defaults to 4000. */
+  reply_chunk_limit?: number
+  /** How replies are split. Defaults to `newline`. */
+  reply_chunk_mode?: ReplyChunkMode
+}
+
+/** A resolved channel entry (b.av2 SR-1.3). */
+export interface ChannelEntry {
+  id: string
+  delivery: DeliveryMode
+}
+
+/** A resolved `dm` object (b.av2 SR-1.2). */
+export interface PersonaDm {
+  enabled: boolean
+  contact?: string
+}
+
+/** A resolved persona with defaults applied and settings inherited (b.av2 SR-1.2, SR-10.2). */
+export interface Persona {
+  /** Position of the entry in the file's `personas` array, for `personas[i]` in diagnostics. */
+  index: number
+  name: string
+  /** Persona key derived from `name` (b.av2 SR-2.1). */
+  key: string
+  /** Absolute, tilde-expanded path. Not checked for existence at load time. */
+  credentials_file: string
+  /** Absolute, tilde-expanded path. Not checked for existence at load time. */
+  working_directory: string
+  /** Empty when the file lists none. */
+  channels: ChannelEntry[]
+  dm: PersonaDm
+  /** `dm` or one of `channels`' IDs. */
+  permission_prompts: string
+  /**
+   * Effective Claude config dir: the per-persona value, else the top-level
+   * value, else absent (Claude's own default applies). Absolute.
+   */
+  claude_config_dir?: string
+  /** Effective Stop-hook bootstrap flag: the per-persona value, else the top-level value. */
+  stop_hook_bootstrap: boolean
+}
+
+/** Validated, fully-resolved persona configuration (b.av2 SR-1.1, SR-1.6). */
+export interface PersonaConfig extends ServerSettings {
+  /** In file order. */
+  personas: Persona[]
+  /** Absent means no acknowledgement reaction. */
+  ack_reaction?: string
+  reply_chunk_limit: number
+  reply_chunk_mode: ReplyChunkMode
+}
+
+// ---------------------------------------------------------------------------
 // Pure functions
 // ---------------------------------------------------------------------------
 
@@ -262,11 +488,22 @@ function resolveConfigDir(configDir?: string): string {
  *   callers with no path context (falls back to dirname of DEFAULT_CONFIG_PATH).
  */
 export function applyDefaults(input: RoutingConfigInput, configDir?: string): RoutingConfig {
-  const dir = resolveConfigDir(configDir)
   return {
     routes: input.routes,
     default_route: input.default_route,
     default_dm_session: input.default_dm_session,
+    ...applyServerDefaults(input, resolveConfigDir(configDir)),
+  }
+}
+
+/**
+ * Fill in the defaults of the server-wide settings shared by both shapes
+ * (b.av2 SR-1.6). Paths are returned as given (defaults unexpanded, except
+ * the cron paths, which are absolute under `configDir`); `resolveServerPaths`
+ * expands them. Does not mutate the input.
+ */
+function applyServerDefaults(input: ServerSettingsInput, configDir: string): ServerSettings {
+  return {
     bind: input.bind ?? '127.0.0.1',
     port: input.port ?? 3100,
     session_restart_delay: input.session_restart_delay ?? 60,
@@ -283,21 +520,203 @@ export function applyDefaults(input: RoutingConfigInput, configDir?: string): Ro
     stop_hook_bootstrap: input.stop_hook_bootstrap ?? true,
     agent_director_poll_interval_ms:
       input.agent_director_poll_interval_ms ?? DEFAULT_AGENT_DIRECTOR_POLL_INTERVAL_MS,
-    cron_table_path: input.cron_table_path ?? resolve(dir, 'crontab'),
-    cron_log_path: input.cron_log_path ?? resolve(dir, 'cron.log'),
+    cron_table_path: input.cron_table_path ?? resolve(configDir, 'crontab'),
+    cron_log_path: input.cron_log_path ?? resolve(configDir, 'cron.log'),
     cron_log_max_bytes: input.cron_log_max_bytes,
   }
 }
 
 /**
  * Replaces a leading ~ in a path string with the current user's home directory.
- * Paths without a leading ~ are returned unchanged.
+ * Paths without a leading ~ are returned unchanged. Delegates to the one tilde
+ * rule in `persona-identity.ts` (imported here as `expandTildeWith`, which
+ * also takes an injected home directory).
  */
 export function expandTilde(path: string): string {
-  if (path === '~') return homedir()
-  if (path.startsWith('~/')) return homedir() + path.slice(1)
-  return path
+  return expandTildeWith(path)
 }
+
+// ---------------------------------------------------------------------------
+// Shared server-wide rules (both loaders)
+// ---------------------------------------------------------------------------
+
+/**
+ * How a validation rule words its error. The route loader echoes rejected
+ * values (existing tests pin its text byte for byte); the persona loader never
+ * does, so a token pasted into any setting cannot reach an error (b.av2 SR-10.3).
+ */
+interface RuleStyle {
+  prefix: string
+  echoValues: boolean
+}
+
+const ROUTING_RULE_STYLE: RuleStyle = { prefix: ROUTING_ERROR_PREFIX, echoValues: true }
+const PERSONA_RULE_STYLE: RuleStyle = { prefix: PERSONA_ERROR_PREFIX, echoValues: false }
+
+function ruleError(style: RuleStyle, message: string): Error {
+  return new Error(`${style.prefix}${message}`)
+}
+
+/** `; got <JSON value>` when the style echoes values, otherwise nothing. */
+function gotSuffix(style: RuleStyle, value: unknown): string {
+  return style.echoValues ? `; got ${JSON.stringify(value)}` : ''
+}
+
+function checkNonNegative(value: number, key: string, style: RuleStyle): void {
+  if (value < 0) throw ruleError(style, `${key} must be a non-negative number.`)
+}
+
+function checkAllowedValue(value: unknown, key: string, allowed: readonly string[], style: RuleStyle): void {
+  if (allowed.includes(value as string)) return
+  const shown = style.echoValues ? ` "${value}"` : ''
+  throw ruleError(style, `${key}${shown} is invalid. Allowed values are: ${allowed.join(', ')}.`)
+}
+
+/** A string that is non-empty after trimming. */
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() !== ''
+}
+
+/** Absent, or a string that is non-empty after trimming. */
+function checkOptionalNonEmptyString(value: unknown, key: string, style: RuleStyle): void {
+  if (value !== undefined && !isNonEmptyString(value)) {
+    throw ruleError(style, `${key} must be a non-empty string when set.`)
+  }
+}
+
+function checkNonEmptyString(value: unknown, key: string, style: RuleStyle): void {
+  if (!isNonEmptyString(value)) throw ruleError(style, `${key} must be a non-empty string.`)
+}
+
+function checkBoolean(value: unknown, key: string, style: RuleStyle): void {
+  if (typeof value !== 'boolean') {
+    throw ruleError(style, `${key} must be a boolean${gotSuffix(style, value)}.`)
+  }
+}
+
+function isPositiveInteger(value: unknown): boolean {
+  return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= 1
+}
+
+/** Absent, or a positive integer (finite, integer, >= 1) with no upper bound. */
+function checkOptionalPositiveInteger(value: unknown, key: string, style: RuleStyle): void {
+  if (value === undefined || isPositiveInteger(value)) return
+  throw ruleError(style, `${key} must be a positive integer (>= 1) when set${gotSuffix(style, value)}.`)
+}
+
+/**
+ * The server-wide rules that come first in both loaders: the non-negative
+ * timings and the two enumerated modes.
+ */
+function validateServerTimingsAndModes(config: ServerSettings, style: RuleStyle): void {
+  checkNonNegative(config.session_restart_delay, 'session_restart_delay', style)
+  checkNonNegative(config.health_check_interval, 'health_check_interval', style)
+  checkNonNegative(config.exit_timeout, 'exit_timeout', style)
+  checkNonNegative(config.stop_timeout, 'stop_timeout', style)
+  checkAllowedValue(config.cozempic_prescription, 'cozempic_prescription', ALLOWED_PRESCRIPTIONS, style)
+  checkAllowedValue(config.system_prompt_mode, 'system_prompt_mode', ALLOWED_SYSTEM_PROMPT_MODES, style)
+}
+
+/**
+ * The server-wide rules that come last in both loaders: the SR-4.1 poll
+ * interval range [200, 3_600_000] and the b.he5 PD-5 cron settings (absent
+ * `cron_log_max_bytes` disables pruning).
+ */
+function validateServerPollAndCron(config: ServerSettings, style: RuleStyle): void {
+  const pollMs = config.agent_director_poll_interval_ms
+  if (
+    !isPositiveInteger(pollMs) ||
+    pollMs < MIN_AGENT_DIRECTOR_POLL_INTERVAL_MS ||
+    pollMs > MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS
+  ) {
+    throw ruleError(
+      style,
+      `agent_director_poll_interval_ms must be a positive integer in [${MIN_AGENT_DIRECTOR_POLL_INTERVAL_MS}, ${MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS}]${gotSuffix(style, pollMs)}.`,
+    )
+  }
+  checkNonEmptyString(config.cron_table_path, 'cron_table_path', style)
+  checkNonEmptyString(config.cron_log_path, 'cron_log_path', style)
+  checkOptionalPositiveInteger(config.cron_log_max_bytes, 'cron_log_max_bytes', style)
+}
+
+/**
+ * Today's resolution of the server-wide path settings: `~` expanded and the
+ * result made absolute with `path.resolve`. Empty or whitespace
+ * `claude_config_dir` and cron paths are kept verbatim so validation rejects
+ * them. Defaults from `applyServerDefaults` resolve the same way.
+ *
+ * @param home  Home directory for `~`; the OS home, read only when needed, if omitted.
+ */
+function resolveServerPaths(
+  settings: ServerSettings,
+  home?: string,
+): Pick<
+  ServerSettings,
+  | 'mcp_config_path'
+  | 'append_system_prompt_file'
+  | 'message_archive_db'
+  | 'claude_config_dir'
+  | 'cron_table_path'
+  | 'cron_log_path'
+> {
+  const expand = (path: string): string => resolve(expandTildeWith(path, home))
+  const expandUnlessBlank = (path: string): string => (path.trim() === '' ? path : expand(path))
+  return {
+    mcp_config_path: expand(settings.mcp_config_path),
+    append_system_prompt_file:
+      settings.append_system_prompt_file !== undefined ? expand(settings.append_system_prompt_file) : undefined,
+    message_archive_db:
+      settings.message_archive_db !== undefined ? expand(settings.message_archive_db) : undefined,
+    claude_config_dir:
+      settings.claude_config_dir !== undefined ? expandUnlessBlank(settings.claude_config_dir) : undefined,
+    cron_table_path:
+      typeof settings.cron_table_path === 'string'
+        ? expandUnlessBlank(settings.cron_table_path)
+        : settings.cron_table_path,
+    cron_log_path:
+      typeof settings.cron_log_path === 'string'
+        ? expandUnlessBlank(settings.cron_log_path)
+        : settings.cron_log_path,
+  }
+}
+
+/**
+ * Reject top-level keys outside `known` (SR-4.2), naming the keys only. The
+ * pre-rename `claude_director_poll_interval_ms` gets a targeted message naming
+ * its new name (SR-4.1).
+ *
+ * Operates on the raw parsed object so we can see fields that would otherwise
+ * be dropped by structural casting.
+ */
+function rejectUnknownTopLevelKeys(
+  parsed: Record<string, unknown>,
+  known: ReadonlySet<string>,
+  style: RuleStyle,
+): void {
+  const unknown: string[] = []
+  for (const key of Object.keys(parsed)) {
+    if (known.has(key)) continue
+    if (key === RENAMED_POLL_INTERVAL_KEY) {
+      throw ruleError(
+        style,
+        `${RENAMED_POLL_INTERVAL_KEY} has been renamed to agent_director_poll_interval_ms (SR-4.1). Rename the field in config.json — the old name is not accepted as an alias.`,
+      )
+    }
+    unknown.push(key)
+  }
+  if (unknown.length > 0) {
+    throw ruleError(style, `unknown top-level field(s) in config.json: ${quoteKeys(unknown)}.`)
+  }
+}
+
+/** Key names JSON-quoted and comma-separated, for unknown-key errors. */
+function quoteKeys(keys: readonly string[]): string {
+  return keys.map((k) => JSON.stringify(k)).join(', ')
+}
+
+// ---------------------------------------------------------------------------
+// Route loader
+// ---------------------------------------------------------------------------
 
 /**
  * Validates the cross-references and invariants of a routing config.
@@ -305,6 +724,8 @@ export function expandTilde(path: string): string {
  * Does not mutate the input.
  */
 export function validateConfig(config: RoutingConfig): void {
+  const style = ROUTING_RULE_STYLE
+
   // At least one route must be defined
   const cwds = Object.values(config.routes).map((r) => r.cwd)
   if (cwds.length === 0) {
@@ -331,47 +752,7 @@ export function validateConfig(config: RoutingConfig): void {
     }
   }
 
-  // session_restart_delay must not be negative
-  if (config.session_restart_delay < 0) {
-    throw new Error(
-      'Routing config validation error: session_restart_delay must be a non-negative number.',
-    )
-  }
-
-  // health_check_interval must not be negative
-  if (config.health_check_interval < 0) {
-    throw new Error(
-      'Routing config validation error: health_check_interval must be a non-negative number.',
-    )
-  }
-
-  // exit_timeout must not be negative
-  if (config.exit_timeout < 0) {
-    throw new Error(
-      'Routing config validation error: exit_timeout must be a non-negative number.',
-    )
-  }
-
-  // stop_timeout must not be negative
-  if (config.stop_timeout < 0) {
-    throw new Error(
-      'Routing config validation error: stop_timeout must be a non-negative number.',
-    )
-  }
-
-  // cozempic_prescription must be one of the allowed values
-  if (!ALLOWED_PRESCRIPTIONS.includes(config.cozempic_prescription)) {
-    throw new Error(
-      `Routing config validation error: cozempic_prescription "${config.cozempic_prescription}" is invalid. Allowed values are: ${ALLOWED_PRESCRIPTIONS.join(', ')}.`,
-    )
-  }
-
-  // system_prompt_mode must be one of the allowed values
-  if (!ALLOWED_SYSTEM_PROMPT_MODES.includes(config.system_prompt_mode)) {
-    throw new Error(
-      `Routing config validation error: system_prompt_mode "${config.system_prompt_mode}" is invalid. Allowed values are: ${ALLOWED_SYSTEM_PROMPT_MODES.join(', ')}.`,
-    )
-  }
+  validateServerTimingsAndModes(config, style)
 
   // default_dm_session must reference an existing route CWD
   if (config.default_dm_session !== undefined) {
@@ -383,31 +764,15 @@ export function validateConfig(config: RoutingConfig): void {
   }
 
   // Top-level claude_config_dir, when set, must be a non-empty (post-trim) string
-  if (config.claude_config_dir !== undefined) {
-    if (typeof config.claude_config_dir !== 'string' || config.claude_config_dir.trim() === '') {
-      throw new Error(
-        'Routing config validation error: claude_config_dir must be a non-empty string when set.',
-      )
-    }
-  }
+  checkOptionalNonEmptyString(config.claude_config_dir, 'claude_config_dir', style)
 
   // Per-route claude_config_dir, when set, must also be a non-empty (post-trim) string
   for (const [channelId, route] of Object.entries(config.routes)) {
-    if (route.claude_config_dir !== undefined) {
-      if (typeof route.claude_config_dir !== 'string' || route.claude_config_dir.trim() === '') {
-        throw new Error(
-          `Routing config validation error: routes["${channelId}"].claude_config_dir must be a non-empty string when set.`,
-        )
-      }
-    }
+    checkOptionalNonEmptyString(route.claude_config_dir, `routes["${channelId}"].claude_config_dir`, style)
   }
 
   // Top-level stop_hook_bootstrap must be a boolean (SR-4.1–SR-4.5).
-  if (typeof config.stop_hook_bootstrap !== 'boolean') {
-    throw new Error(
-      `Routing config validation error: stop_hook_bootstrap must be a boolean; got ${JSON.stringify(config.stop_hook_bootstrap)}.`,
-    )
-  }
+  checkBoolean(config.stop_hook_bootstrap, 'stop_hook_bootstrap', style)
 
   // Per-route stop_hook_bootstrap, when set, must also be a boolean.
   for (const [channelId, route] of Object.entries(config.routes)) {
@@ -418,50 +783,7 @@ export function validateConfig(config: RoutingConfig): void {
     }
   }
 
-  // SR-4.1: agent_director_poll_interval_ms must be a positive integer in
-  // the closed range [200, 3_600_000].
-  const pollMs = config.agent_director_poll_interval_ms
-  if (
-    typeof pollMs !== 'number' ||
-    !Number.isFinite(pollMs) ||
-    !Number.isInteger(pollMs) ||
-    pollMs < MIN_AGENT_DIRECTOR_POLL_INTERVAL_MS ||
-    pollMs > MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS
-  ) {
-    throw new Error(
-      `Routing config validation error: agent_director_poll_interval_ms must be a positive integer in [${MIN_AGENT_DIRECTOR_POLL_INTERVAL_MS}, ${MAX_AGENT_DIRECTOR_POLL_INTERVAL_MS}]; got ${JSON.stringify(pollMs)}.`,
-    )
-  }
-
-  // cron_table_path must be a non-empty (post-trim) string (b.he5 PD-5).
-  if (typeof config.cron_table_path !== 'string' || config.cron_table_path.trim() === '') {
-    throw new Error(
-      'Routing config validation error: cron_table_path must be a non-empty string.',
-    )
-  }
-
-  // cron_log_path must be a non-empty (post-trim) string (b.he5 PD-5).
-  if (typeof config.cron_log_path !== 'string' || config.cron_log_path.trim() === '') {
-    throw new Error(
-      'Routing config validation error: cron_log_path must be a non-empty string.',
-    )
-  }
-
-  // cron_log_max_bytes, when set, must be a positive integer (finite, integer,
-  // >= 1) — no upper bound (b.he5 PD-5). Absent disables pruning.
-  if (config.cron_log_max_bytes !== undefined) {
-    const maxBytes = config.cron_log_max_bytes
-    if (
-      typeof maxBytes !== 'number' ||
-      !Number.isFinite(maxBytes) ||
-      !Number.isInteger(maxBytes) ||
-      maxBytes < 1
-    ) {
-      throw new Error(
-        `Routing config validation error: cron_log_max_bytes must be a positive integer (>= 1) when set; got ${JSON.stringify(maxBytes)}.`,
-      )
-    }
-  }
+  validateServerPollAndCron(config, style)
 }
 
 /**
@@ -474,21 +796,7 @@ export function validateConfig(config: RoutingConfig): void {
  * be dropped by RoutingConfigInput's structural casting.
  */
 function rejectUnknownFields(parsed: Record<string, unknown>): void {
-  const unknown: string[] = []
-  for (const key of Object.keys(parsed)) {
-    if (KNOWN_TOP_LEVEL_KEYS.has(key)) continue
-    if (key === 'claude_director_poll_interval_ms') {
-      throw new Error(
-        `Routing config validation error: claude_director_poll_interval_ms has been renamed to agent_director_poll_interval_ms (SR-4.1). Rename the field in config.json — the old name is not accepted as an alias.`,
-      )
-    }
-    unknown.push(key)
-  }
-  if (unknown.length > 0) {
-    throw new Error(
-      `Routing config validation error: unknown top-level field(s) in config.json: ${unknown.map((k) => JSON.stringify(k)).join(', ')}.`,
-    )
-  }
+  rejectUnknownTopLevelKeys(parsed, KNOWN_TOP_LEVEL_KEYS, ROUTING_RULE_STYLE)
 
   // Per-route unknown-field check
   const routes = parsed['routes']
@@ -501,7 +809,7 @@ function rejectUnknownFields(parsed: Record<string, unknown>): void {
       }
       if (routeUnknown.length > 0) {
         throw new Error(
-          `Routing config validation error: unknown field(s) in routes["${channelId}"]: ${routeUnknown.map((k) => JSON.stringify(k)).join(', ')}.`,
+          `Routing config validation error: unknown field(s) in routes["${channelId}"]: ${quoteKeys(routeUnknown)}.`,
         )
       }
     }
@@ -543,29 +851,7 @@ export function resolveConfig(input: RoutingConfigInput, configDir?: string): Ro
     default_dm_session: withDefaults.default_dm_session !== undefined
       ? resolve(expandTilde(withDefaults.default_dm_session))
       : undefined,
-    mcp_config_path: resolve(expandTilde(withDefaults.mcp_config_path)),
-    append_system_prompt_file: withDefaults.append_system_prompt_file !== undefined
-      ? resolve(expandTilde(withDefaults.append_system_prompt_file))
-      : undefined,
-    message_archive_db: withDefaults.message_archive_db !== undefined
-      ? resolve(expandTilde(withDefaults.message_archive_db))
-      : undefined,
-    claude_config_dir: withDefaults.claude_config_dir !== undefined
-      ? (withDefaults.claude_config_dir.trim() === ''
-          ? withDefaults.claude_config_dir
-          : resolve(expandTilde(withDefaults.claude_config_dir)))
-      : undefined,
-    // Expand tildes on the cron paths; preserve empty/whitespace verbatim so
-    // validateConfig can reject them (claude_config_dir convention). Defaults
-    // applied by applyDefaults are already absolute and pass through unchanged.
-    cron_table_path:
-      typeof withDefaults.cron_table_path === 'string' && withDefaults.cron_table_path.trim() !== ''
-        ? resolve(expandTilde(withDefaults.cron_table_path))
-        : withDefaults.cron_table_path,
-    cron_log_path:
-      typeof withDefaults.cron_log_path === 'string' && withDefaults.cron_log_path.trim() !== ''
-        ? resolve(expandTilde(withDefaults.cron_log_path))
-        : withDefaults.cron_log_path,
+    ...resolveServerPaths(withDefaults),
   }
 
   validateConfig(config)
@@ -573,7 +859,356 @@ export function resolveConfig(input: RoutingConfigInput, configDir?: string): Ro
 }
 
 // ---------------------------------------------------------------------------
-// I/O wrapper
+// Persona loader: server-wide settings (b.av2 SR-1.6, SR-10.2)
+// ---------------------------------------------------------------------------
+
+/** Lookup form of PERSONA_TOP_LEVEL_KEYS. */
+const PERSONA_TOP_LEVEL_KEY_SET: ReadonlySet<string> = new Set(PERSONA_TOP_LEVEL_KEYS)
+
+/**
+ * Top-level path settings that today's resolution expands without a type
+ * check (a non-string there would crash rather than be rejected), so the
+ * persona loader checks their type first.
+ */
+const UNCHECKED_TOP_LEVEL_PATH_KEYS = [
+  'mcp_config_path',
+  'append_system_prompt_file',
+  'message_archive_db',
+  'claude_config_dir',
+] as const
+
+/** The resolved persona configuration without its personas. */
+type PersonaServerSettings = Omit<PersonaConfig, 'personas'>
+
+/**
+ * Default, resolve and validate the server-wide settings of a persona-shape
+ * object with today's rules (b.av2 SR-1.6): top-level paths keep today's
+ * resolution (not the persona path rule), with `~` expanded under `home`,
+ * and the cron path defaults sit under `configDir`. Adds the persona-only
+ * `ack_reaction`, `reply_chunk_limit` and `reply_chunk_mode`. Errors name the
+ * key and the rule, never the rejected value.
+ */
+function resolvePersonaServerSettings(
+  parsed: Record<string, unknown>,
+  configDir: string,
+  home: string,
+): PersonaServerSettings {
+  for (const key of UNCHECKED_TOP_LEVEL_PATH_KEYS) {
+    const value = parsed[key]
+    if (value !== undefined && typeof value !== 'string') {
+      throw ruleError(PERSONA_RULE_STYLE, `${key} must be a string when set.`)
+    }
+  }
+  const input = parsed as Partial<PersonaConfigInput>
+  const withDefaults = applyServerDefaults(input, configDir)
+  const settings: PersonaServerSettings = {
+    ...withDefaults,
+    ...resolveServerPaths(withDefaults, home),
+    ack_reaction: input.ack_reaction,
+    reply_chunk_limit: input.reply_chunk_limit ?? DEFAULT_REPLY_CHUNK_LIMIT,
+    reply_chunk_mode: input.reply_chunk_mode ?? DEFAULT_REPLY_CHUNK_MODE,
+  }
+  validatePersonaServerSettings(settings)
+  return settings
+}
+
+/**
+ * Today's server-wide rules in today's order, then the persona-only keys.
+ * The route-only rules (at least one route, duplicate route CWD, the
+ * `default_route` / `default_dm_session` references) have no counterpart here.
+ */
+function validatePersonaServerSettings(settings: PersonaServerSettings): void {
+  const style = PERSONA_RULE_STYLE
+  validateServerTimingsAndModes(settings, style)
+  checkOptionalNonEmptyString(settings.claude_config_dir, 'claude_config_dir', style)
+  checkBoolean(settings.stop_hook_bootstrap, 'stop_hook_bootstrap', style)
+  validateServerPollAndCron(settings, style)
+  checkOptionalNonEmptyString(settings.ack_reaction, 'ack_reaction', style)
+  checkOptionalPositiveInteger(settings.reply_chunk_limit, 'reply_chunk_limit', style)
+  checkAllowedValue(settings.reply_chunk_mode, 'reply_chunk_mode', REPLY_CHUNK_MODES, style)
+}
+
+// ---------------------------------------------------------------------------
+// Persona loader: persona and channel entries (b.av2 SR-1.2, SR-1.3, SR-1.5)
+// ---------------------------------------------------------------------------
+
+/** Top-level values a persona inherits when its entry omits them (b.av2 SR-1.2, SR-10.2). */
+interface InheritedPersonaSettings {
+  claude_config_dir?: string
+  stop_hook_bootstrap: boolean
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** JSON type name of a value, for shape errors that must not echo the value itself. */
+function jsonTypeName(value: unknown): string {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'array'
+  return typeof value
+}
+
+/**
+ * Error style for one persona entry. Every message starts with `personas[i]`
+ * and, when the name is valid, the persona reference of b.av2 SR-2.2
+ * (JSON-quoted name with its key), and never echoes a rejected value.
+ */
+function personaEntryStyle(entry: Record<string, unknown>, index: number): RuleStyle {
+  const name = entry['name']
+  const ref = isNonEmptyString(name) ? ` ${renderPersonaRef(name)}` : ''
+  return { prefix: `${PERSONA_ERROR_PREFIX}personas[${index}]${ref}: `, echoValues: false }
+}
+
+function rejectUnknownEntryKeys(
+  obj: Record<string, unknown>,
+  allowed: readonly string[],
+  where: string,
+  style: RuleStyle,
+): void {
+  const unknown = Object.keys(obj).filter((key) => !allowed.includes(key))
+  if (unknown.length > 0) throw ruleError(style, `unknown field(s) in ${where}: ${quoteKeys(unknown)}.`)
+}
+
+/**
+ * Stage 1 of an entry: the shapes of the `dm` object and the `channels`
+ * array and its entries, and unknown keys at every level (key names only).
+ */
+function checkPersonaEntryShape(entry: Record<string, unknown>, style: RuleStyle): void {
+  rejectUnknownEntryKeys(entry, PERSONA_ENTRY_KEYS, 'the persona entry', style)
+  const dm = entry['dm']
+  if (dm !== undefined) {
+    if (!isJsonObject(dm)) throw ruleError(style, `dm must be a JSON object, got ${jsonTypeName(dm)}.`)
+    rejectUnknownEntryKeys(dm, PERSONA_DM_KEYS, 'dm', style)
+  }
+  const channels = entry['channels']
+  if (channels === undefined) return
+  if (!Array.isArray(channels)) {
+    throw ruleError(style, `channels must be an array, got ${jsonTypeName(channels)}.`)
+  }
+  channels.forEach((channel: unknown, j) => {
+    if (!isJsonObject(channel)) {
+      throw ruleError(style, `channels[${j}] must be a JSON object, got ${jsonTypeName(channel)}.`)
+    }
+    rejectUnknownEntryKeys(channel, CHANNEL_ENTRY_KEYS, `channels[${j}]`, style)
+  })
+}
+
+/**
+ * The persona path rule (b.av2 SR-1.2): a string that is absolute, exactly
+ * `~`, or starts with `~/`. Returns it tilde-expanded under `home` and made
+ * absolute. No file-system access.
+ */
+function parsePersonaPath(value: unknown, setting: string, home: string, style: RuleStyle): string {
+  if (typeof value !== 'string' || !(isAbsolute(value) || value === '~' || value.startsWith('~/'))) {
+    throw ruleError(style, `${setting} must be an absolute path, "~" or a path starting with "~/".`)
+  }
+  return resolve(expandTildeWith(value, home))
+}
+
+function requirePersonaPath(entry: Record<string, unknown>, setting: string, home: string, style: RuleStyle): string {
+  if (entry[setting] === undefined) throw ruleError(style, `${setting} is required.`)
+  return parsePersonaPath(entry[setting], setting, home, style)
+}
+
+/** Channel entries (b.av2 SR-1.3): shapes already checked in stage 1. */
+function parseChannels(channels: Record<string, unknown>[], style: RuleStyle): ChannelEntry[] {
+  const firstIndexById = new Map<string, number>()
+  return channels.map((channel, j) => {
+    const { id, delivery } = channel
+    if (id === undefined) throw ruleError(style, `channels[${j}].id is required.`)
+    if (typeof id !== 'string' || !CHANNEL_ID_RE.test(id)) {
+      throw ruleError(style, `channels[${j}].id must be a Slack channel ID matching ${CHANNEL_ID_RE.source}.`)
+    }
+    if (delivery === undefined) throw ruleError(style, `channels[${j}].delivery is required.`)
+    checkAllowedValue(delivery, `channels[${j}].delivery`, DELIVERY_MODES, style)
+    const first = firstIndexById.get(id)
+    if (first !== undefined) {
+      throw ruleError(style, `channel ${id} is listed more than once (channels[${first}] and channels[${j}]).`)
+    }
+    firstIndexById.set(id, j)
+    return { id, delivery: delivery as DeliveryMode }
+  })
+}
+
+/** The `dm` object (b.av2 SR-1.2): shape already checked in stage 1. */
+function parseDm(dm: Record<string, unknown> | undefined, style: RuleStyle): PersonaDm {
+  const enabled = dm?.['enabled']
+  const contact = dm?.['contact']
+  if (enabled !== undefined) checkBoolean(enabled, 'dm.enabled', style)
+  if (contact === undefined) return { enabled: enabled === true }
+  if (typeof contact !== 'string' || !DM_CONTACT_RE.test(contact)) {
+    throw ruleError(style, `dm.contact must be a Slack user ID matching ${DM_CONTACT_RE.source}.`)
+  }
+  return { enabled: enabled === true, contact }
+}
+
+function parsePermissionPrompts(value: unknown, style: RuleStyle): string {
+  if (value === undefined) {
+    throw ruleError(style, `permission_prompts is required: set it to "${DM_DESTINATION}" or one of the persona's channel IDs.`)
+  }
+  if (value === DM_DESTINATION || (typeof value === 'string' && CHANNEL_ID_RE.test(value))) return value
+  throw ruleError(style, `permission_prompts must be "${DM_DESTINATION}" or a Slack channel ID matching ${CHANNEL_ID_RE.source}.`)
+}
+
+/**
+ * Stage 3 of an entry: the cross-setting rules of b.av2 SR-1.5. Zero channels
+ * with DMs off comes first: every destination would otherwise fail one of the
+ * later rules, so AC 42 could never be reported. Then a channel destination
+ * not among `channels`, then a `dm` destination without `dm.contact` or with
+ * `dm.enabled` not true (both named when both are wrong). Values named here
+ * (channel IDs) have already passed their format rule.
+ */
+function checkPersonaCrossSettings(persona: Persona, style: RuleStyle): void {
+  const { permission_prompts: destination, channels, dm } = persona
+  if (channels.length === 0 && !dm.enabled) {
+    throw ruleError(
+      style,
+      'the persona has no channels and dm.enabled is not true, so it can receive no messages. Add a channel or set dm.enabled to true.',
+    )
+  }
+  if (destination !== DM_DESTINATION && !channels.some((channel) => channel.id === destination)) {
+    throw ruleError(style, `permission_prompts names channel ${destination}, which is not in the persona's channels.`)
+  }
+  if (destination === DM_DESTINATION) {
+    const problems: string[] = []
+    if (dm.contact === undefined) problems.push('dm.contact is not set')
+    if (!dm.enabled) problems.push('dm.enabled is not true')
+    if (problems.length > 0) {
+      throw ruleError(style, `permission_prompts is "${DM_DESTINATION}" but ${problems.join(' and ')}.`)
+    }
+  }
+}
+
+/**
+ * Parse, default and validate one persona entry (b.av2 SR-1.2, SR-1.3 and
+ * the per-entry rules of SR-1.5), throwing on the first violation.
+ *
+ * Check order, so "first violation" is reproducible:
+ *   0. the entry is a JSON object;
+ *   1. shape and unknown keys: persona entry, `dm`, `channels` and each
+ *      channel entry (stage 1);
+ *   2. types and formats, in this order: `name`, `credentials_file`,
+ *      `working_directory`, `claude_config_dir`, `stop_hook_bootstrap`,
+ *      `channels` (in array order: `id`, `delivery`, duplicate ID), `dm.enabled`,
+ *      `dm.contact`, `permission_prompts` (required);
+ *   3. cross-setting rules (see `checkPersonaCrossSettings`): zero channels
+ *      with `dm.enabled` not true, then a destination channel not among
+ *      `channels`, then a `dm` destination without `dm.contact` / with
+ *      `dm.enabled` not true.
+ *
+ * Errors name `personas[i]` and, once the name is valid, the persona
+ * reference, plus the setting's key path; they never echo a rejected value.
+ * Pure: no file-system access, and the OS home is never read (`home` is given).
+ */
+function parsePersonaEntry(
+  raw: unknown,
+  index: number,
+  inherited: InheritedPersonaSettings,
+  home: string,
+): Persona {
+  if (!isJsonObject(raw)) {
+    throw ruleError(PERSONA_RULE_STYLE, `personas[${index}] must be a JSON object, got ${jsonTypeName(raw)}.`)
+  }
+  const style = personaEntryStyle(raw, index)
+  checkPersonaEntryShape(raw, style)
+
+  const name = raw['name']
+  if (name === undefined) throw ruleError(style, 'name is required.')
+  if (!isNonEmptyString(name)) throw ruleError(style, 'name must be a non-empty string.')
+  const credentials_file = requirePersonaPath(raw, 'credentials_file', home, style)
+  const working_directory = requirePersonaPath(raw, 'working_directory', home, style)
+  const ownConfigDir = raw['claude_config_dir']
+  const claude_config_dir =
+    ownConfigDir !== undefined
+      ? parsePersonaPath(ownConfigDir, 'claude_config_dir', home, style)
+      : inherited.claude_config_dir
+  const ownStopHook = raw['stop_hook_bootstrap']
+  if (ownStopHook !== undefined) checkBoolean(ownStopHook, 'stop_hook_bootstrap', style)
+  const channels = parseChannels((raw['channels'] as Record<string, unknown>[] | undefined) ?? [], style)
+  const dm = parseDm(raw['dm'] as Record<string, unknown> | undefined, style)
+  const permission_prompts = parsePermissionPrompts(raw['permission_prompts'], style)
+
+  const persona: Persona = {
+    index,
+    name,
+    key: personaKey(name),
+    credentials_file,
+    working_directory,
+    channels,
+    dm,
+    permission_prompts,
+    ...(claude_config_dir !== undefined ? { claude_config_dir } : {}),
+    stop_hook_bootstrap: (ownStopHook as boolean | undefined) ?? inherited.stop_hook_bootstrap,
+  }
+  checkPersonaCrossSettings(persona, style)
+  return persona
+}
+
+// ---------------------------------------------------------------------------
+// Persona loader: entry point (b.av2 SR-1.1, SR-1.7)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve an already-parsed persona configuration: apply defaults, expand
+ * paths and validate, throwing on the first violation. Pure: it reads no file
+ * and writes nothing, so the reload path can validate pending content with it.
+ *
+ * Check order:
+ *   1. the value is a JSON object;
+ *   2. b.av2 SR-1.7: `routes` (any value), `default_route` or
+ *      `default_dm_session` present → the conversion message, before any
+ *      other check;
+ *   3. unknown top-level keys (key names only; the SR-4.1 rename message);
+ *   4. `personas` present and an array (it may be empty);
+ *   5. server-wide settings defaulted and validated (b.av2 SR-1.6);
+ *   6. each persona entry in array order (see `parsePersonaEntry`),
+ *      inheriting the resolved top-level `claude_config_dir` and
+ *      `stop_hook_bootstrap`.
+ *
+ * The cross-persona rules (b.av2 SR-1.5) are not implemented yet: nothing
+ * currently rejects duplicate names or keys, or shared working directories or
+ * credentials files. Task t2.ob2.uf.pq adds them after step 6.
+ *
+ * @param raw        The parsed JSON value of the configuration file.
+ * @param configDir  Directory of the configuration file; the cron path defaults sit under it.
+ * @param home       Home directory for every `~` (persona and top-level paths and the
+ *   `mcp_config_path` default). Defaults to the OS home, read at call time only.
+ */
+export function resolvePersonaConfig(raw: unknown, configDir: string, home: string = homedir()): PersonaConfig {
+  const style = PERSONA_RULE_STYLE
+  if (!isJsonObject(raw)) {
+    throw ruleError(style, `the configuration must be a JSON object, got ${jsonTypeName(raw)}.`)
+  }
+  for (const key of PRE_PERSONA_KEYS) {
+    if (Object.hasOwn(raw, key)) throw ruleError(style, prePersonaConversionMessage(key))
+  }
+  rejectUnknownTopLevelKeys(raw, PERSONA_TOP_LEVEL_KEY_SET, style)
+
+  const entries = raw['personas']
+  if (entries === undefined) {
+    throw ruleError(style, 'personas is required: an array of persona entries, which may be empty.')
+  }
+  if (!Array.isArray(entries)) {
+    throw ruleError(style, `personas must be an array, got ${jsonTypeName(entries)}.`)
+  }
+
+  const settings = resolvePersonaServerSettings(raw, configDir, home)
+  const inherited: InheritedPersonaSettings = {
+    claude_config_dir: settings.claude_config_dir,
+    stop_hook_bootstrap: settings.stop_hook_bootstrap,
+  }
+  const personas = entries.map((entry: unknown, index) => parsePersonaEntry(entry, index, inherited, home))
+
+  // The cross-persona rules (b.av2 SR-1.5: duplicate name or key, working
+  // directory, credentials file) are not implemented yet; Task t2.ob2.uf.pq
+  // adds them at this point, over the parsed personas.
+
+  return { ...settings, personas }
+}
+
+// ---------------------------------------------------------------------------
+// I/O wrappers
 // ---------------------------------------------------------------------------
 
 /**
@@ -623,5 +1258,44 @@ export function loadConfig(path?: string): RoutingConfig {
   } catch (err) {
     const cause = err instanceof Error ? err.message : String(err)
     throw new Error(`loadConfig: invalid routing config in "${configPath}": ${cause}`)
+  }
+}
+
+/**
+ * Reads a persona configuration file once, parses it and returns the
+ * validated PersonaConfig (see `resolvePersonaConfig`). Read, parse and
+ * validation failures are rethrown naming the path.
+ *
+ * Read-only (b.av2 SR-1.7, AC 45): the file is opened for reading only and
+ * nothing is ever written, renamed, created or converted. A malformed-JSON
+ * error omits the parser's detail, which can quote file content such as a
+ * pasted token (b.av2 SR-10.3). Not called by the server until E3.
+ *
+ * @param path  Path to the configuration file; `~` is expanded under `home`.
+ * @param home  Home directory for every `~`; defaults to the OS home, read at call time only.
+ */
+export function loadPersonaConfig(path: string, home?: string): PersonaConfig {
+  const configPath = resolve(expandTildeWith(path, home))
+
+  let text: string
+  try {
+    text = readFileSync(configPath, 'utf-8')
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err)
+    throw new Error(`loadPersonaConfig: cannot read persona config at "${configPath}": ${cause}`)
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new Error(`loadPersonaConfig: malformed JSON in "${configPath}".`)
+  }
+
+  try {
+    return resolvePersonaConfig(parsed, dirname(configPath), home)
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err)
+    throw new Error(`loadPersonaConfig: invalid persona config in "${configPath}": ${cause}`)
   }
 }

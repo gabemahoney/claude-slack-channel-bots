@@ -9,8 +9,8 @@ The Slack Channel Router is a two-way bridge between Slack and Claude Code sessi
 ```
 cli.ts                          CLI entry point — start/stop/clean_restart subcommands. `stop --stop-bots` and clean_restart share a `teardownBots` closure that uses agent-director pause/status/kill verbs (SR-11 Event 12).
 └── server.ts                   Main entry point — HTTP server, Socket Mode, message routing. Embeds the SR-5.1 startup gate, SR-3.2 template install, SR-1.6 orphan reconcile, SR-2.1 poller. `isHttpVerbose()` (b.3k6) gates the per-request `/mcp` access line behind `CSCB_HTTP_VERBOSE` (truthy: 1/true/yes/on) — off by default, checked per request.
-    ├── config.ts               Routing configuration — load, validate, defaults, tilde expansion. SR-4.1 agent_director_poll_interval_ms field. SR-4.2 unknown-field rejection.
-    ├── persona-identity.ts     b.av2 SR-2.1 / SR-2.2 persona key rule and every identifier derived from the key. Key rule: a name of 1–40 chars drawn only from `a-z0-9_` is its own key; any other name is lower-cased, each run of other characters becomes one `_`, leading/trailing `_` are trimmed, the stem is truncated to 40 chars, and `_` plus the first 8 hex digits of the SHA-256 of the original name is appended (an empty stem leaves the 8 hex digits alone; max key length 49). Derived from the key: instance ID `cscb_<key>` (keeps the `cscb_` anchor `permission-action-id.ts`'s regex relies on), tmux session name `slack_bot_<key>`, labels `service=cscb` / `persona=<key>` / `config_dir=<12 hex of SHA-256 of the effective claude_config_dir>` (the dir is resolved lexically — tilde-expanded, made absolute, no symlink or existence check — and no configured dir means `~/.claude`), and spawn-environment values `CSCB_PERSONA` and `CLAUDE_MANAGED_CHANNEL` (both the key), `CSCB_CRONTABLE_PATH`, and `CLAUDE_CONFIG_DIR` only when a dir is configured. Persona references in logs and errors render as the JSON-quoted name with the key beside it, e.g. `"Ops Bot" (key=ops_bot_5e2526f3)`. Pure (b.av2 SR-13.1): the module does no I/O and runs nothing at import; the home directory can be passed in, and is looked up from the OS only at call time when not given; must not import `config.ts`. No callers in the server yet; E3 wires it into spawns, so the route-keyed descriptions elsewhere in this doc still describe runtime behaviour.
+    ├── config.ts               Routing configuration — load, validate, defaults, tilde expansion. SR-4.1 agent_director_poll_interval_ms field. SR-4.2 unknown-field rejection. Also holds the persona config loader (b.av2 SR-1), not yet called by the server; see "Persona config (loader only, not yet wired)" under Configuration.
+    ├── persona-identity.ts     b.av2 SR-2.1 / SR-2.2 persona key rule and every identifier derived from the key. Key rule: a name of 1–40 chars drawn only from `a-z0-9_` is its own key; any other name is lower-cased, each run of other characters becomes one `_`, leading/trailing `_` are trimmed, the stem is truncated to 40 chars, and `_` plus the first 8 hex digits of the SHA-256 of the original name is appended (an empty stem leaves the 8 hex digits alone; max key length 49). Derived from the key: instance ID `cscb_<key>` (keeps the `cscb_` anchor `permission-action-id.ts`'s regex relies on), tmux session name `slack_bot_<key>`, labels `service=cscb` / `persona=<key>` / `config_dir=<12 hex of SHA-256 of the effective claude_config_dir>` (the dir is resolved lexically — tilde-expanded, made absolute, no symlink or existence check — and no configured dir means `~/.claude`), and spawn-environment values `CSCB_PERSONA` and `CLAUDE_MANAGED_CHANNEL` (both the key), `CSCB_CRONTABLE_PATH`, and `CLAUDE_CONFIG_DIR` only when a dir is configured. Persona references in logs and errors render as the JSON-quoted name with the key beside it, e.g. `"Ops Bot" (key=ops_bot_5e2526f3)`. Pure (b.av2 SR-13.1): the module does no I/O and runs nothing at import; the home directory can be passed in, and is looked up from the OS only at call time when not given; must not import `config.ts`. Also holds the one tilde rule (`expandTilde(path, home?)`: only exactly `~` or a leading `~/` expands). Its only importer in `src/` is `config.ts`: both loaders use the tilde rule, and the persona loader (not called by the server yet) uses the key and the persona reference. E3 wires the derived identifiers into spawns, so the route-keyed descriptions elsewhere in this doc still describe runtime behaviour.
     ├── registry.ts             Session registry — pending/registered sessions, MCP Server factory, transport routing. No session-id discovery (AD owns it).
     ├── lib.ts                  Pure utilities — gate, access control, chunking, sanitization.
     ├── logging.ts              Log file setup — overrides console.error/console.log with timestamped writeSync to a log file. Size-based rotation on every write (b.brv): rotates server.log/clean_restart.log at CSCB_LOG_MAX_BYTES (default 10 MiB), keeps CSCB_LOG_KEEP generations (default 5; 0 = truncate).
@@ -430,6 +430,53 @@ Key fields:
 - `cron_log_max_bytes` — optional positive integer (>= 1); no default. Registered in `KNOWN_TOP_LEVEL_KEYS`; `validateConfig` rejects any value that is not a positive integer when set. When absent, log pruning is disabled — this bullet states the contract only; the prune mechanics ship in a later Epic.
 
 The path keys are pointers only: schedules never live in `config.json` — the crontable file is the single source of truth.
+
+### Persona config (loader only, not yet wired)
+
+The persona loader in `src/config.ts` (`resolvePersonaConfig`, `loadPersonaConfig`) accepts the persona shape of b.av2 SR-1. **The running server doesn't read this shape yet.** It still loads the route-keyed `config.json` above through `loadConfig`, and E3 switches it over. Everything else in this doc that talks about routes still describes runtime behaviour.
+
+**Entry points and purity (b.av2 SR-13.1).** `resolvePersonaConfig(raw, configDir, home)` parses, defaults and validates an already-parsed value and does no I/O. `loadPersonaConfig(path, home?)` reads the file once and delegates to it; it never writes, renames or converts the file. Nothing runs at import. Both loaders share the server-wide defaults, path resolution and validation helpers.
+
+**Top level.** A required `personas` array, which may be empty, plus the server-wide settings. Every current top-level key except `routes`, `default_route` and `default_dm_session` keeps its meaning, default and validation from the `config.json` section above, including path resolution for the top-level path keys. Unknown top-level keys are rejected by name, and the renamed poll-interval key gets the same rename message as today. Three keys are new to this shape. They are validated only; E9 wires them.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `ack_reaction` | non-empty string | absent | Emoji name of the acknowledgement reaction. Absent means no acknowledgement. |
+| `reply_chunk_limit` | positive integer | `4000` | Largest reply chunk, in characters. |
+| `reply_chunk_mode` | `length` or `newline` | `newline` | How a long reply is split. |
+
+**Persona entry.** Each element of `personas` is an object with these keys:
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `name` | non-empty string, required | — | Persona identity. No format rule; the persona key is derived from it by `src/persona-identity.ts`. |
+| `credentials_file` | path, required | — | The persona's credentials file. |
+| `working_directory` | path, required | — | The instance's working directory. |
+| `channels` | array of channel entries | none | Channels the persona is in. The same channel ID may not appear twice in one persona. |
+| `dm.enabled` | boolean | `false` | The DMs switch. |
+| `dm.contact` | Slack user ID | absent | The user who receives prompts and notices when `permission_prompts` is `dm`. |
+| `permission_prompts` | `dm` or a channel ID, required | — | Where permission prompts and notices go. |
+| `claude_config_dir` | path | top-level `claude_config_dir` | Claude config dir for the persona. Absent at both levels means Claude's own default. |
+| `stop_hook_bootstrap` | boolean | top-level `stop_hook_bootstrap` | Per-persona Stop-hook bootstrap flag. |
+
+**Channel entry.** Both keys are required: `id`, a Slack channel ID matching `^[CG][A-Z0-9]+$`, and `delivery`, either `all` (every message) or `mentions` (only messages that mention the persona). `dm.contact` must match `^[UW][A-Z0-9]+$`, and a channel ID in `permission_prompts` uses the channel ID format.
+
+**Path rule.** Persona paths (`credentials_file`, `working_directory`, per-persona `claude_config_dir`) must be absolute, exactly `~`, or start with `~/`. The tilde is expanded under the home directory passed in (the OS home when not given) and the result is made absolute. Relative paths are rejected.
+
+**Unknown keys.** An unknown key in a persona entry, its `dm` object or a channel entry is rejected, naming the persona and the key. A token-like key such as `bot_token` is rejected the same way: credentials live only in the credentials file.
+
+**Per-entry rejections.** On top of the type and format rules above, a persona entry is rejected when:
+
+- `permission_prompts` is missing
+- it has zero channels and DMs off (`dm.enabled` not `true`), so it can receive no messages
+- `permission_prompts` names a channel the persona isn't in
+- `permission_prompts` is `dm` but `dm.contact` is missing or DMs are off (both are named when both are wrong)
+
+**Pre-persona rejection (b.av2 SR-1.7).** If the top level has `routes` (in any shape), `default_route` or `default_dm_session`, the loader stops with the conversion message before any other check. The message names the key and says the configuration must be rewritten by hand as personas. The file is never written and nothing is auto-converted.
+
+**Check order and errors.** The loader checks, in order: the value is an object, the pre-persona keys, unknown top-level keys, `personas` is present and an array, the server-wide settings, then each persona entry in array order. It reports the first violation only. Entry errors name the entry's position and, once `name` is valid, the persona as its JSON-quoted name with its key (the `src/persona-identity.ts` renderer), plus the setting. Errors don't echo rejected values: they may repeat only the persona name and IDs that already passed their format rule (e.g. a `permission_prompts` channel ID that isn't in the persona's channels, or a duplicated channel ID). A malformed-JSON error omits the parser's detail, which could quote file content.
+
+**Not checked at load time.** The loader doesn't read the credentials file and doesn't check that any directory or file exists. Those are bring-up checks (E2, E3, E5).
 
 ### agent-director state.db (~/.agent-director/state.db)
 

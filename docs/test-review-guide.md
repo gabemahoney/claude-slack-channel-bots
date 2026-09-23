@@ -23,11 +23,12 @@ When reviewing tests, check for:
 - [ ] Module-scoped state is reset in `beforeEach`
 - [ ] No shared mutable state leaking between tests
 - [ ] Test servers bind to port 0 (no port conflicts)
+- [ ] Tests that write configuration or other state files do so only in a `mkdtempSync` directory removed in `afterEach`, pass every path (and any home directory) explicitly, and never read or write `~/.claude/channels/slack` or `~/.agent-director` or start a server against the real home
 
 ### Patterns
 - [ ] Factory functions used for fixtures (not inline object literals)
 - [ ] External dependencies stubbed (WebClient, tmux, etc.)
-- [ ] No real network calls or file I/O in unit tests
+- [ ] No real network calls; file I/O only inside a `mkdtempSync` directory (see Isolation)
 - [ ] No `sleep` or timing-dependent assertions longer than 100ms
 - [ ] Capture arrays used to verify side effects (API calls, messages sent)
 
