@@ -46,7 +46,7 @@ cli.ts                          CLI entry point — start/stop/clean_restart sub
     └── message-archive.ts      Optional SQLite archive of every inbound Slack message.
 
 stop-hooks/
-└── slack-reply-guard.sh       Claude Code Stop hook — blocks a turn (exit 2) when the most recent real user message carries the `<channel source="slack…"` tag prefix and no subsequent assistant `tool_use` targets `mcp__slack-channel-router__reply`; fail-open on any error. Bootstrapped into settings.json by `src/stop-hook-bootstrap.ts`.
+└── slack-reply-guard.sh       Claude Code Stop hook — one-time, declinable reminder (exit 2) when the user messages that started the turn include a real (non-injected) Slack message and no later assistant `tool_use` targets `mcp__slack-channel-router__reply`; fail-open on any error. See [Slack Reply Guard](#slack-reply-guard-stop-hook). Bootstrapped into settings.json by `src/stop-hook-bootstrap.ts`.
 ```
 
 The deleted files from the pre-Epic-2 architecture (`src/tmux.ts`, `src/peer-pid.ts`, `src/sessions.ts`, `hooks/permission-relay.sh`, `hooks/ask-relay.sh`) are absent: agent-director owns the tmux integration and Claude session-id state, the SR-2.1 poller replaces the hook-based long-poll relay, and AskUserQuestion is denied at the template level (SR-3.1). The `src/trail-cli.ts` and `src/trail-query.ts` CLI query wrappers (removed in `b.8tm`) are also absent — the trail file itself is the surface; see [Trail file location and query recipes](#trail-file-location-and-query-recipes--sr-v-5--sr-v-6).
@@ -55,7 +55,7 @@ The deleted files from the pre-Epic-2 architecture (`src/tmux.ts`, `src/peer-pid
 
 ### Inbound (Slack → Claude Code)
 
-1. Slack message arrives via Socket Mode (`message` or `app_mention` event)
+1. Slack message arrives via Socket Mode (`message` or `app_mention` event). Both socket handlers call `handleMessage` and nothing deduplicates them, so a channel @mention (which Slack sends as both events) is dispatched to the bot twice with the same `ts`.
 2. `gate()` checks access control (bot messages, subtypes, DM policy, allowlist)
 3. If `ackReaction` is configured, the ack emoji is applied to the message and `trackAck(channelId, messageTs)` records the pending ack for later removal
 4. Message is routed to the correct session via `getSessionByChannel()` or `getSessionByCwd()`. If the channel is configured (has a `routes` entry, or resolves via `default_route`) but its session is not registered, the message is dropped — it is never delivered to Claude or replayed — and the server posts a per-case reply back to the channel (b.kvq). If a restart is already pending/active it says the session is restarting; if under the failure cap and auto-restart is enabled it calls `scheduleRestart(..., { humanTrigger: true })` (fast human-clamped recovery) and says the session is starting; if at the cap or auto-restart is disabled (`session_restart_delay: 0`) it says the channel will not self-recover and an operator must restart the server. `default_route` does not apply for configured channels; it is only consulted for channels with no entry in `routes` at all.
@@ -67,6 +67,19 @@ The deleted files from the pre-Epic-2 architecture (`src/tmux.ts`, `src/peer-pid
 2. Tool handler checks `assertOutboundAllowed()` — session can only send to channels it has received messages from
 3. Tool calls the Slack Web API (`web.chat.postMessage`, `web.reactions.add`, etc.)
 4. After the first chunk posts, if `message_id` was provided and `consumeAck(channelId, messageTs)` finds a tracked entry, the ack reaction is removed via `reactions.remove`
+
+### Slack Reply Guard (Stop hook)
+
+`stop-hooks/slack-reply-guard.sh` runs in every bot session whose config dir the bootstrap patched (startup step 4a-ter). It reads the transcript once with a single `jq` pass and fails open (exit 0) on any error, missing input, or missing `jq`.
+
+1. **Retry pass-through.** `stop_hook_active=true` exits 0 immediately, so the reminder fires at most once per turn.
+2. **Trigger run.** A real user entry has `type=="user"`, is not `isSidechain` or `isCompactSummary`, and has at least one text block. The run is every real user entry after the nearest non-sidechain assistant entry preceding the latest real user entry. Claude Code can write queued channel messages as consecutive user entries, so the run can hold several. Tool-result-only entries, sidechain entries, and compaction summaries neither join nor end the run.
+3. **Envelope.** Only an opening `<channel …>` tag at the very start of an entry's text (after optional whitespace) is an envelope; a tag later in the text is quoted body and is ignored. The envelope is Slack iff its `source` starts with `slack`. Attributes are read by name.
+4. **Injected check.** A Slack envelope is injected if `user` starts with `cscb-cron:` or `ts` is present and does not match `^[0-9]+\.[0-9]{6}$`. Slack event timestamps always have six fractional digits; `/interject` stamps `String(Date.now() / 1000)`, which has at most three. The `/interject` `user` is a caller-supplied label, so `ts` shape is the identifying signal. An envelope with no `ts` counts as real Slack. No real Slack envelope in the run → exit 0.
+5. **Reply check.** An assistant `tool_use` named `mcp__slack-channel-router__reply` anywhere after the earliest real Slack entry in the run → exit 0. Because the whole run is checked, an injected message queued right after a human's Slack message does not hide it.
+6. **Reminder.** Otherwise exit 2 with a declinable reminder on stderr naming the provenance from the `chat_id` of the last real Slack envelope in the run: an ID starting with `D` gets the direct-message wording (`conversation <chat_id>`), any other Slack-shaped ID gets the channel wording (`channel <chat_id>`), and a missing or non-`^[A-Z0-9]+$` `chat_id` gets the channel wording without the parenthetical. README.md shows the direct-message and channel texts.
+
+The envelope is rendered by the Claude Code harness from the MCP notification's `meta`, so the tag name and the `chat_id`/`user`/`ts` attribute names are a harness-owned contract. The injected check also couples the guard to two CSCB-side formats: the `cscb-cron:` sender prefix (`src/crontable.ts`) and the `/interject` `ts` form (`src/server.ts`). Changing `/interject` to emit a six-decimal `ts` would make every non-cron `/interject` turn trigger the reminder.
 
 ### Permission Relay (SR-2)
 
@@ -398,7 +411,7 @@ Key fields:
 - `routes` — `Record<channelId, { cwd: string }>` — the channel-to-directory mapping
 - `bind` — HTTP server bind address (default: 127.0.0.1)
 - `port` — HTTP server port (default: 3100)
-- `default_route` — CWD for channels without explicit routes
+- `default_route` — CWD for channels without explicit routes. `gate()` only admits such a channel if it has an `access.json` `channels` entry (`routeChannels` is built from `routes` keys alone), so an unlisted channel is dropped before routing
 - `default_dm_session` — CWD for handling direct messages
 - `session_restart_delay` — seconds before auto-restarting dead sessions (default: 60, 0 = disabled)
 - `health_check_interval` — seconds between health-check polls (default: 120, 0 = disabled)
@@ -795,7 +808,7 @@ Injects a message directly into an active Claude session without going through S
 
 - Looks up the channel in `routingConfig.routes`; 404 if absent
 - Calls `getSessionByChannel()` to resolve the active session; 503 if none or not connected
-- Sends `notifications/claude/channel` with `content: message` and `meta: { chat_id, message_id, user, ts }` (timestamps derived from `Date.now()`)
+- Sends `notifications/claude/channel` with `content: message` and `meta: { chat_id, message_id, user, ts }` — `user` is the `sender` label; `message_id` and `ts` are both `String(Date.now() / 1000)`, which has at most three fractional digits. The Slack Reply Guard relies on that shape to tell injected messages from Slack ones (see [Slack Reply Guard](#slack-reply-guard-stop-hook)).
 - Does not call `gate()`, the Slack API, or mutate `deliveredChannels`
 
 ## Security Model

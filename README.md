@@ -195,7 +195,7 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `routes` | object | required | Map of Slack channel ID → route entry. Each entry requires a `cwd` field: the working directory for that session. Used to identify sessions via `roots/list` after MCP handshake. `~` is expanded. Each `cwd` must be unique across all routes. May also include an optional `claude_config_dir` string (see below). |
-| `default_route` | string | — | CWD path to use when a message arrives on a channel with no explicit entry in `routes`. Must match an existing route `cwd`. Channels that are in `routes` but whose session is not yet registered have their messages dropped — they do not fall back to `default_route`. |
+| `default_route` | string | — | CWD path to use when a message arrives on a channel with no explicit entry in `routes`. Must match an existing route `cwd`. The channel also needs a `channels` entry in `access.json`, or its messages are dropped. Channels that are in `routes` but whose session is not yet registered have their messages dropped — they do not fall back to `default_route`. |
 | `default_dm_session` | string | — | CWD path of the session that handles direct messages. Must match an existing route `cwd`. |
 | `bind` | string | `"127.0.0.1"` | Interface the HTTP server binds to. Use `"0.0.0.0"` to expose on all interfaces. The in-process cron scheduler delivers via `127.0.0.1`, so `bind` must include loopback (the default, or `0.0.0.0`) for scheduled fires to work. |
 | `port` | number | `3100` | Port the HTTP server listens on. |
@@ -265,7 +265,7 @@ A per-route opt-out only *fully* disables the guard for that bot when the route 
 
 `access.json` is read from `~/.claude/channels/slack/access.json` by default (same directory as `config.json`). A skeleton file with defaults is created by postinstall. The file is written with `0600` permissions.
 
-Channels in `config.json` are automatically allowed — you do not need to list them here. The `channels` map is only needed for per-channel overrides like requiring @mentions or restricting which users can trigger the bot.
+Channels with a `routes` entry in `config.json` are automatically allowed — you do not need to list them here. Add a `channels` entry for per-channel overrides like requiring @mentions or restricting which users can trigger the bot, or to let a channel with no `routes` entry reach `default_route` (an empty `{}` entry is enough).
 
 The `slack-channel-access` skill manages pairings and allowlist entries at runtime.
 
@@ -294,7 +294,7 @@ The `slack-channel-access` skill manages pairings and allowlist entries at runti
 |---|---|---|---|
 | `dmPolicy` | `"pairing"` \| `"allowlist"` \| `"disabled"` | `"pairing"` | Controls who can DM the bot. `pairing`: unknown users receive a one-time code and are added to `allowFrom` after verification. `allowlist`: only users in `allowFrom` are accepted. `disabled`: all DMs are dropped. |
 | `allowFrom` | string[] | `[]` | Slack user IDs allowed to DM the bot unconditionally (regardless of `dmPolicy`). |
-| `channels` | object | `{}` | Optional per-channel overrides. Channels in `config.json` are allowed automatically — only add entries here to customize behavior (e.g. require @mention or restrict users). Each entry is a `ChannelPolicy`. |
+| `channels` | object | `{}` | Per-channel policies. Channels with a `routes` entry in `config.json` are allowed automatically. Add an entry to customize behavior (e.g. require @mention or restrict users), or to admit a channel with no `routes` entry so it reaches `default_route`. Each entry is a `ChannelPolicy`. |
 | `channels[id].requireMention` | boolean | `false` | When `true`, messages in that channel are only delivered if the bot is `@mentioned`. |
 | `channels[id].allowFrom` | string[] | `[]` | When non-empty, restricts delivery to the listed Slack user IDs for that channel. |
 | `pending` | object | `{}` | Managed by the server. Stores in-flight pairing codes indexed by code string. Do not edit manually. |
@@ -437,7 +437,7 @@ Each MCP endpoint exposes the following tools to the connected Claude Code sessi
 
 ## Interject
 
-POST to `/interject` to inject a message into an active Claude session from localhost. Only requests from `127.0.0.1` or `::1` are accepted — external callers are rejected with 403.
+POST to `/interject` to inject a message into an active Claude session from localhost. Only requests from `127.0.0.1` or `::1` are accepted — external callers are rejected with 403. The bot sees it as described in [Messages a bot receives](#messages-a-bot-receives); the Slack Reply Guard does not remind it to reply.
 
 ### Request
 
@@ -562,7 +562,7 @@ The prompt-file path resolves as follows:
 
 ### How fires appear
 
-A scheduled fire arrives in the channel as an `/interject` message whose `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. Each schedule delivers its own message independently, so when several schedules match the same minute for the same channel each one arrives as its own `/interject` message.
+A scheduled fire arrives in the channel as an `/interject` message whose `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. The [Slack Reply Guard](#slack-reply-guard-stop-hook) never reminds a bot to reply to a scheduled prompt. Each schedule delivers its own message independently, so when several schedules match the same minute for the same channel each one arrives as its own `/interject` message.
 
 ### The cron log
 
@@ -632,7 +632,35 @@ The template also pre-allows each bot to read its own persistent-memory director
 
 ## Slack Reply Guard (Stop hook)
 
-CSCB ships a Claude Code Stop hook that enforces a simple rule for every bot session it manages: **when the most recent real user message on the turn came from Slack, the assistant must call the `mcp__slack-channel-router__reply` tool before ending the turn**. If it does not, the Stop hook exits `2`, and Claude Code shows the assistant the reminder `Slack user is waiting for a reply. You must respond by calling the mcp__slack-channel-router__reply tool before ending your turn.` and re-runs it once. The retry sets `stop_hook_active=true`, which short-circuits the guard, so exactly one forced retry occurs per turn — never an infinite block loop.
+CSCB ships a Claude Code Stop hook that gives every bot session it manages a **one-time, declinable reminder** to answer in Slack. When the messages that started the turn include a real Slack message and the bot ends its turn without calling the `mcp__slack-channel-router__reply` tool, the hook exits `2` and Claude Code shows the bot one of these reminders:
+
+| Message came from | Reminder |
+|---|---|
+| A direct message | `This turn started from a Slack direct message (conversation <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
+| A channel | `This turn started from a Slack channel message (channel <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
+
+The bot then continues once. It can reply, or end the turn without replying. That continuation carries `stop_hook_active=true`, which the guard always lets through, so the reminder appears at most once per turn and never loops.
+
+Injected messages — cscb_cron scheduled prompts and `/interject` messages — never trigger the reminder, because no Slack conversation is waiting on them. An injected message that arrives right after a human's Slack message does not cancel the reminder for the human's message.
+
+### Messages a bot receives
+
+Every message reaches a bot as its text wrapped in a `<channel source="slack-channel-router" …>` tag. This table covers every source and whether the guard reminds the bot to reply to it.
+
+| Source | How it gets to the bot | Tag attributes | Reminder? |
+|---|---|---|---|
+| Direct message | Goes only to the bot whose `cwd` is `default_dm_session`. Dropped if that is unset or the bot is down. `dmPolicy` and `allowFrom` in `access.json` control who can DM. | `chat_id="D…"`, `user` = the sender's Slack display name (falling back to real name, then Slack username, then user ID), `message_id` and `ts` = the Slack timestamp (for example `1789936743.069939`). Also `thread_ts` for a thread reply, and `attachment_count` and `attachments` when files are attached. | Yes, direct-message wording |
+| Channel message that @mentions the bot | Goes to the channel's bot: its `routes` entry, or `default_route` for a channel with no `routes` entry that is listed under `channels` in `access.json` (unlisted, it is dropped). The bot's @mention is removed from the text. | Same as a direct message, with the channel ID in `chat_id` | Yes, channel wording |
+| Channel message, when the bot receives everything | By default a bot receives every message in its channel. Setting `requireMention: true` for the channel in `access.json` limits it to @mentions, and `channels[id].allowFrom` limits who it hears. | Same as the @mention row | Yes, channel wording |
+| cscb_cron scheduled prompt | The server's scheduler posts it to `/interject` for the target channel. | `chat_id` = the target channel, `user="cscb-cron:<prompt-file-basename>"`, `message_id` and `ts` = the server clock in seconds, with at most three decimal places | No |
+| `/interject` message | A localhost script POSTs it (see [Interject](#interject)). | `chat_id` = the request's `channel`, `user` = the request's `sender` (default `interject`), `message_id` and `ts` in the same form as a scheduled prompt | No |
+
+Points to handle in a bot's prompt:
+
+- **Nothing marks an @mention.** The mention is removed from the text and no attribute records it, so a bot in a receive-everything channel cannot tell an @mention from any other message.
+- **A channel @mention currently arrives twice.** Slack sends both a `message` event and an `app_mention` event for it, and the server delivers both. The two copies have the same `message_id`. Answer it once.
+- **`/interject` sender labels are free-form.** Any localhost caller can set any `user` value, including one that starts with `cscb-cron:`. To tell an injected message from a Slack message, check `ts`: Slack timestamps always have six decimal places, and injected ones have at most three. The guard relies on this check too.
+- **Bots on the same server never see each other's Slack posts.** They all post as one Slack app, and the server drops that app's own messages.
 
 ### What the server writes, and where
 
@@ -670,7 +698,7 @@ Routes with no effective `claude_config_dir` — neither per-route nor top-level
 
 ### v1 limitations — opt these bots out
 
-The v1 guard only recognises a reply via `mcp__slack-channel-router__reply`. Bots whose only Slack surface is `edit_message` or `react` will end their turn without producing a matching `tool_use`, and the guard will block them and force one useless retry every turn. **Opt these bots out** by setting `stop_hook_bootstrap: false` on the route (see the field reference below), and give the route a dedicated `claude_config_dir` — see [Shared-dir aggregation](#shared-dir-aggregation).
+The v1 guard only recognises a reply via `mcp__slack-channel-router__reply`. Bots whose only Slack surface is `edit_message` or `react` end their turn without producing a matching `tool_use`, so the guard reminds them after every Slack message and costs them one extra, useless continuation each time. **Opt these bots out** by setting `stop_hook_bootstrap: false` on the route (see the field reference below), and give the route a dedicated `claude_config_dir` — see [Shared-dir aggregation](#shared-dir-aggregation).
 
 ### Opting out
 
@@ -678,15 +706,15 @@ The `stop_hook_bootstrap` boolean lives on the top level of `config.json` and on
 
 ### Tag drift — fail-open, verify after upgrades
 
-The guard's Slack-origination predicate is a substring match on the prefix `<channel source="slack` in the transcript entry Claude Code writes for every Slack-delivered turn. CSCB only sends `{content, meta}` over MCP; the `<channel source="…">` wrapper is rendered by the **Claude Code harness itself** when it serialises the MCP tool result into the transcript, and the `source` attribute is the MCP server name (e.g. `slack-channel-router`). That tag is therefore an **external, harness-owned contract** — a future Claude Code release can rename it or restructure the wrapper without touching CSCB, and the guard's predicate would silently stop matching. Because the contract sits outside CSCB, the guard is designed to fail open on drift, and a post-upgrade verification recipe (below) exists so operators catch a silent-dark guard the next time the harness changes the tag.
+The guard reads the `<channel …>` tag at the very start of each message that started the turn, treats it as a Slack message when its `source` starts with `slack`, and uses its `chat_id`, `user`, and `ts` attributes. A tag quoted later in a message's text is ignored. CSCB only sends `{content, meta}` over MCP; the `<channel source="…">` wrapper is rendered by the **Claude Code harness itself** when it serialises the MCP tool result into the transcript, and the `source` attribute is the MCP server name (e.g. `slack-channel-router`). That tag is therefore an **external, harness-owned contract** — a future Claude Code release can rename it or restructure the wrapper without touching CSCB, and the guard would silently stop matching. Because the contract sits outside CSCB, the guard is designed to fail open on drift, and a post-upgrade verification recipe (below) exists so operators catch a silent-dark guard the next time the harness changes the tag.
 
 The guard is **fail-open by design**: any error, missing transcript, missing `jq`, or absence of the tag results in `exit 0` (turn allowed). This means a future rename of the `<channel>` tag will silently disable the guard rather than break the bot. After every CSCB or Claude Code upgrade, verify the guard end-to-end:
 
 1. Send the bot a Slack message that requires a reply.
 2. Confirm the reply lands in Slack.
-3. In the bot's transcript file (`<claude_config_dir>/projects/<slug>/*.jsonl` — guard-covered bots always run with a dedicated `claude_config_dir`, since the bootstrap refuses the operator's personal `~/.claude`), grep for `<channel source="slack` on the triggering message and for a subsequent assistant entry containing `"name":"mcp__slack-channel-router__reply"` in a `tool_use` block.
+3. In the bot's transcript file (`<claude_config_dir>/projects/<slug>/*.jsonl` — guard-covered bots always run with a dedicated `claude_config_dir`, since the bootstrap refuses the operator's personal `~/.claude`), grep for `<channel source="slack` at the start of the triggering message's text, confirm that tag still carries `chat_id`, `user`, and `ts` attributes, and look for a subsequent assistant entry containing `"name":"mcp__slack-channel-router__reply"` in a `tool_use` block.
 
-If the tag prefix no longer appears, the guard is dark — file an issue.
+If the tag or any of those attributes no longer appears, the guard is dark or misclassifying messages — file an issue.
 
 ---
 
