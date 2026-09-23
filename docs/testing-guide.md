@@ -17,6 +17,7 @@ Each source module has a corresponding test file in the project root:
 | registry.ts | registry.test.ts | Session registry CRUD, routing, pending sessions |
 | server.ts (DM routing) | dm-routing.test.ts | DM routing via gate() + registry |
 | server.ts (permission relay) | permission-poller.test.ts, permission-click-handler.test.ts | SR-2.1 poller loop and Block Kit click handler |
+| persona-identity.ts | persona-identity.test.ts | persona key rule, derived identifiers, persona-name rendering |
 
 New features that add significant logic should get their own test file (e.g., `session-manager.test.ts`).
 
