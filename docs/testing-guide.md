@@ -13,7 +13,7 @@ Each source module has a corresponding test file in the project root:
 | Source | Test File | What It Tests |
 |--------|-----------|---------------|
 | lib.ts | server.test.ts | gate(), assertSendable, assertOutboundAllowed, chunkText, sanitizeFilename |
-| config.ts | config.test.ts | applyDefaults, validateConfig, expandTilde, resolveConfig, loadConfig; persona loader (resolvePersonaConfig, loadPersonaConfig) |
+| config.ts | config.test.ts | applyDefaults, validateConfig, expandTilde, resolveConfig, loadConfig; resolveRealPath (real path, lexical fallback, injected realpath); persona loader (resolvePersonaConfig, loadPersonaConfig), cross-persona rejections (duplicate name or key, shared working_directory or credentials_file), non-collision controls, SR-14 rejection table |
 | registry.ts | registry.test.ts | Session registry CRUD, routing, pending sessions |
 | server.ts (DM routing) | dm-routing.test.ts | DM routing via gate() + registry |
 | server.ts (permission relay) | permission-poller.test.ts, permission-click-handler.test.ts | SR-2.1 poller loop and Block Kit click handler |

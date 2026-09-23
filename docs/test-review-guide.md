@@ -10,6 +10,7 @@ When reviewing tests, check for:
 - [ ] Error paths tested (invalid input, API failures, missing data)
 - [ ] Edge cases from the PRD/SRD are covered
 - [ ] Concurrent/parallel scenarios tested where applicable
+- [ ] A rule that rejects duplicate paths is tested with a symlinked duplicate and a non-existent path (lexical fallback), both rooted inside the test's `mkdtempSync` directory, plus a non-collision control that loads
 
 ### Quality
 - [ ] Each test has a single clear assertion (or a small set of related assertions)

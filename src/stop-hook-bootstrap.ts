@@ -9,9 +9,9 @@
  *     enabled (route.stop_hook_bootstrap ?? routingConfig.stop_hook_bootstrap);
  *     remove (and prune emptied groups) only if none of the routes for that
  *     dir are enabled.
- *   - Refuse the operator's personal ~/.claude dir (compared via realpathSync
- *     with a lexical resolve() fallback for non-existent paths): skip, warn,
- *     recordStartupError.
+ *   - Refuse the operator's personal ~/.claude dir (compared via config.ts's
+ *     shared resolveRealPath: realpathSync with a lexical resolve() fallback
+ *     for non-existent paths): skip, warn, recordStartupError.
  *   - Skip routes with no effective dir; treat empty/whitespace-only dirs as
  *     absent (guards against resolve("") landing in cwd).
  *   - jq absent at boot: warn + recordStartupError, still install entries
@@ -35,15 +35,14 @@ import {
   readFileSync,
   writeFileSync,
   renameSync,
-  realpathSync,
   statSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
 
-import { type RoutingConfig } from './config.ts'
+import { type RoutingConfig, resolveRealPath } from './config.ts'
 import { recordStartupError } from './startup-errors.ts'
 
 // ---------------------------------------------------------------------------
@@ -333,26 +332,14 @@ export function removeManagedEntry(dir: string): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve a path lexically-then-physically for comparison. Uses realpathSync
- * when the path exists (follows symlinks); falls back to lexical resolve()
- * when the path does not exist so we can still refuse ~/.claude by name.
- */
-function safeResolve(p: string): string {
-  try {
-    return realpathSync(p)
-  } catch {
-    return resolve(p)
-  }
-}
-
-/**
- * True iff `dir` resolves to the operator's own ~/.claude directory. Uses
- * realpathSync (symlink-follow) with a lexical resolve() fallback for
- * non-existent paths.
+ * True iff `dir` resolves to the operator's own ~/.claude directory. Compares
+ * with the shared `resolveRealPath` (realpathSync, symlink-follow, with a
+ * lexical resolve() fallback for non-existent paths) so ~/.claude is still
+ * refused by name when it does not exist.
  */
 function isForbiddenHomeClaudeDir(dir: string): boolean {
-  const forbidden = safeResolve(join(homedir(), '.claude'))
-  const candidate = safeResolve(dir)
+  const forbidden = resolveRealPath(join(homedir(), '.claude'))
+  const candidate = resolveRealPath(dir)
   return candidate === forbidden
 }
 

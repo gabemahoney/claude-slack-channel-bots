@@ -1,7 +1,17 @@
 import { describe, test, expect, afterEach, beforeEach } from 'bun:test'
-import { writeFileSync, mkdtempSync, existsSync, readFileSync, readdirSync, rmSync } from 'fs'
+import {
+  writeFileSync,
+  mkdtempSync,
+  mkdirSync,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+} from 'fs'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { join, resolve } from 'path'
 import { homedir } from 'os'
 import {
   applyDefaults,
@@ -12,6 +22,8 @@ import {
   loadConfig,
   loadPersonaConfig,
   prePersonaConversionMessage,
+  resolvePersonaConfig,
+  resolveRealPath,
   type RouteEntry,
   type RoutingConfigInput,
   type RoutingConfig,
@@ -1308,20 +1320,89 @@ describe('normalizeChannelName (b.1m9)', () => {
 })
 
 // ===========================================================================
-// Persona configuration loader (b.av2 SR-1.1–1.3, 1.5 per-entry, 1.6, 1.7)
+// Persona configuration loader (b.av2 SR-1.1–1.3, 1.5, 1.6, 1.7) and its
+// real-path helper
 //
 // Every case writes its file into its own mkdtempSync directory and loads it
 // with an injected mkdtempSync home (b.av2 SR-13.2); both are removed after
-// each case. The loader lives in src/config.ts, so no child-process import
-// purity test is added here (b.av2 SR-13.1).
+// each case. Directories, placeholder credentials files and symlinks live in
+// that temp directory too. The loader lives in src/config.ts, so no
+// child-process import purity test is added here (b.av2 SR-13.1).
 // ===========================================================================
 
 /**
- * Non-token-shaped stand-in for a secret or a rejected value; must never reach
- * an error. Unhyphenated so a JSON parser quotes it whole (Bun stops an
- * identifier at `-`), keeping the malformed-JSON leak check meaningful.
+ * Non-token-shaped stand-in for a secret, a rejected value or the content of a
+ * credentials file; must never reach an error. Unhyphenated so a JSON parser
+ * quotes it whole (Bun stops an identifier at `-`), keeping the malformed-JSON
+ * leak check meaningful.
  */
 const PLACEHOLDER = 'placeholder_not_a_secret'
+
+describe('resolveRealPath (b.av2 SR-1.5)', () => {
+  let tmp: string
+  /** The temp root's own real path: the temp root may itself sit behind a symlink. */
+  let real: string
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'real-path-'))
+    real = realpathSync(tmp)
+    mkdirSync(join(tmp, 'dir'))
+    mkdirSync(join(tmp, 'other'))
+    writeFileSync(join(tmp, 'dir', 'file.json'), PLACEHOLDER)
+    symlinkSync(join(tmp, 'dir'), join(tmp, 'dir-link'))
+    symlinkSync(join(tmp, 'dir', 'file.json'), join(tmp, 'file-link.json'))
+    symlinkSync(join(tmp, 'absent'), join(tmp, 'dangling'))
+  })
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true })
+  })
+
+  /** `rel` appended to the temp root as text, so `.`, `..` and trailing `/` survive. */
+  const at = (rel: string) => `${tmp}/${rel}`
+  const listing = () => readdirSync(tmp, { recursive: true }).sort()
+
+  test.each([
+    ['an existing directory', 'dir', 'real', 'dir'],
+    ['an existing file', 'dir/file.json', 'real', 'dir/file.json'],
+    ['a symlink to the directory', 'dir-link', 'real', 'dir'],
+    ['a symlink to the file', 'file-link.json', 'real', 'dir/file.json'],
+    ['a path through a symlinked parent directory', 'dir-link/file.json', 'real', 'dir/file.json'],
+    ['a non-existent path', 'missing/x', 'lexical', 'missing/x'],
+    ['a non-existent path with a trailing slash', 'missing/x/', 'lexical', 'missing/x'],
+    ['a non-existent path with a . segment', 'missing/./x', 'lexical', 'missing/x'],
+    ['a non-existent path with a .. segment', 'missing/y/../x', 'lexical', 'missing/x'],
+    ['a dangling symlink, without throwing', 'dangling', 'lexical', 'dangling'],
+  ] as const)('%s (%s) resolves to its %s form and writes nothing', (_label, input, form, expected) => {
+    const before = listing()
+    expect(resolveRealPath(at(input))).toBe(resolve(form === 'real' ? real : tmp, expected))
+    expect(listing()).toEqual(before)
+  })
+
+  test.each([
+    ['two different non-existent paths', 'missing/x', 'missing/y'],
+    ['a symlink to one directory and an unrelated existing directory', 'dir-link', 'other'],
+  ])('%s resolve to different values', (_label, a, b) => {
+    expect(resolveRealPath(at(a))).not.toBe(resolveRealPath(at(b)))
+  })
+
+  test('an injected realpath that throws gives the lexical form, not the symlink target', () => {
+    const fails = () => {
+      throw new Error('simulated realpath failure')
+    }
+    expect(resolveRealPath(at('dir/../dir-link/'), fails)).toBe(join(tmp, 'dir-link'))
+  })
+
+  test('an injected realpath that returns a value is used as is', () => {
+    const calls: string[] = []
+    const injected = (path: string) => {
+      calls.push(path)
+      return join(tmp, 'injected')
+    }
+    expect(resolveRealPath(at('dir-link'), injected)).toBe(join(tmp, 'injected'))
+    expect(calls).toEqual([at('dir-link')])
+  })
+})
 
 describe('loadPersonaConfig (b.av2 SR-1)', () => {
   let dir: string
@@ -1541,60 +1622,411 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
-  describe('per-entry load-time rejections (SR-1.5)', () => {
-    // Rows: label, personas, the persona the error must name, the settings (or
-    // channel) it must name. Task 3 extends this table with cross-persona rows.
-    test.each([
-      ['AC 33: missing permission_prompts', [makePersona({ name: 'Ops Bot', permission_prompts: undefined })], 'Ops Bot', ['permission_prompts']],
-      [
-        'AC 30: permission_prompts dm without dm.contact',
-        [makePersona({ name: 'Say "hi" Bot', dm: { enabled: true }, permission_prompts: 'dm' })],
-        'Say "hi" Bot',
-        ['permission_prompts', 'dm.contact'],
-      ],
-      [
-        'AC 32: destination channel not in the persona channels',
-        [makePersona({ name: 'Ops Bot', permission_prompts: 'C0TEST999' })],
-        'Ops Bot',
-        ['permission_prompts', 'C0TEST999'],
-      ],
-      [
-        'AC 42: zero channels with dm.enabled false',
-        [makePersona({ name: 'ops_bot', channels: [], dm: { enabled: false } })],
-        'ops_bot',
-        ['dm.enabled'],
-      ],
-      [
-        'AC 42: zero channels with dm absent',
-        [makePersona({ name: 'Ops Bot', channels: undefined, dm: undefined })],
-        'Ops Bot',
-        ['dm.enabled'],
-      ],
-      [
-        'AC 43: dm destination with dm.enabled false',
-        [makePersona({ name: 'Ops Bot', dm: { enabled: false, contact: 'U0TEST001' }, permission_prompts: 'dm' })],
-        'Ops Bot',
-        ['permission_prompts', 'dm.enabled'],
-      ],
-      [
-        'AC 30 + AC 43: dm destination with neither dm.enabled nor dm.contact',
-        [makePersona({ name: 'Ops Bot', permission_prompts: 'dm' })],
-        'Ops Bot',
-        ['permission_prompts', 'dm.contact', 'dm.enabled'],
-      ],
-    ])('%s', (_label, personas, offender, settings) => {
+  describe('SR-14 rejection table and cross-persona rules (SR-1.5; AC 21, 30, 32, 33, 42, 43, 53)', () => {
+    /** A name needing normalisation whose key is longer than 40 characters, so a persona named by that key has another key. */
+    const LONG_NAME = 'Operations Review And Deployment Assistant Bot'
+    const LONG_KEY = personaKey(LONG_NAME)
+    /** An in-form name that is its own key and equals the derived key of 'Ops Bot'. */
+    const OPS_KEY = personaKey('Ops Bot')
+    /** Slack token prefixes; no error may contain one (`assertNoLeak` arrives in E2). */
+    const TOKEN_LIKE = /\bx(?:ox[a-z]|app)-/
+
+    const inDir = (rel: string) => join(dir, rel)
+    const makeDir = (rel: string) => {
+      mkdirSync(inDir(rel), { recursive: true })
+      return inDir(rel)
+    }
+    /** A real credentials file holding placeholder, non-token content, which no error may echo. */
+    const makeCredentials = (rel: string) => {
+      writeFileSync(inDir(rel), PLACEHOLDER)
+      return inDir(rel)
+    }
+    const makeLink = (target: string, rel: string) => {
+      symlinkSync(target, inDir(rel))
+      return inDir(rel)
+    }
+
+    /**
+     * Personas in array order, each with its own non-existent paths under the
+     * temp dir (`p<i>/work`, `p<i>/credentials.json`) unless overridden, so a
+     * case collides only where it says so.
+     */
+    const personasOf = (...entries: [string, Partial<PersonaInput>?][]) =>
+      entries.map(([name, overrides], i) =>
+        makePersona(
+          { name, working_directory: inDir(`p${i}/work`), credentials_file: inDir(`p${i}/credentials.json`), ...overrides },
+          dir,
+        ))
+
+    /** `personas[i]` plus the b.av2 SR-2.2 reference (JSON-quoted name with its key). */
+    const indexedRef = (index: number, name: string) =>
+      `personas[${index}] ${JSON.stringify(name)} (key=${personaKey(name)})`
+
+    interface RejectionRow {
+      ac: string
+      label: string
+      /** The offending personas by array position; the error names each and no other persona. */
+      offenders: [number, string][]
+      /** The offending settings or channel, shown in the title and named by the error. */
+      settings: string[]
+      /** Builds the personas (creating any files) and the further values the error must name. */
+      build: () => { personas: PersonaInput[]; named?: string[] }
+    }
+
+    const rejectionRows: RejectionRow[] = [
+      // Per-entry rows (Task 2)
+      {
+        ac: '33',
+        label: 'missing permission_prompts',
+        offenders: [[0, 'Ops Bot']],
+        settings: ['permission_prompts'],
+        build: () => ({ personas: [makePersona({ name: 'Ops Bot', permission_prompts: undefined })] }),
+      },
+      {
+        ac: '30',
+        label: 'permission_prompts dm without dm.contact',
+        offenders: [[0, 'Say "hi" Bot']],
+        settings: ['permission_prompts', 'dm.contact'],
+        build: () => ({
+          personas: [makePersona({ name: 'Say "hi" Bot', dm: { enabled: true }, permission_prompts: 'dm' })],
+        }),
+      },
+      {
+        ac: '32',
+        label: 'destination channel not in the persona channels',
+        offenders: [[0, 'Ops Bot']],
+        settings: ['permission_prompts', 'C0TEST999'],
+        build: () => ({ personas: [makePersona({ name: 'Ops Bot', permission_prompts: 'C0TEST999' })] }),
+      },
+      {
+        ac: '42',
+        label: 'zero channels with dm.enabled false',
+        offenders: [[0, 'ops_bot']],
+        settings: ['dm.enabled'],
+        build: () => ({ personas: [makePersona({ name: 'ops_bot', channels: [], dm: { enabled: false } })] }),
+      },
+      {
+        ac: '42',
+        label: 'zero channels with dm absent',
+        offenders: [[0, 'Ops Bot']],
+        settings: ['dm.enabled'],
+        build: () => ({ personas: [makePersona({ name: 'Ops Bot', channels: undefined, dm: undefined })] }),
+      },
+      {
+        ac: '43',
+        label: 'dm destination with dm.enabled false',
+        offenders: [[0, 'Ops Bot']],
+        settings: ['permission_prompts', 'dm.enabled'],
+        build: () => ({
+          personas: [makePersona({ name: 'Ops Bot', dm: { enabled: false, contact: 'U0TEST001' }, permission_prompts: 'dm' })],
+        }),
+      },
+      {
+        ac: '30 + 43',
+        label: 'dm destination with neither dm.enabled nor dm.contact',
+        offenders: [[0, 'Ops Bot']],
+        settings: ['permission_prompts', 'dm.contact', 'dm.enabled'],
+        build: () => ({ personas: [makePersona({ name: 'Ops Bot', permission_prompts: 'dm' })] }),
+      },
+      // Cross-persona rows: name and key
+      {
+        ac: '53',
+        label: 'the same name twice',
+        offenders: [[0, 'Ops Bot'], [1, 'Ops Bot']],
+        settings: ['name'],
+        build: () => ({ personas: personasOf(['Ops Bot'], ['Ops Bot']), named: [`name ${JSON.stringify('Ops Bot')}`] }),
+      },
+      {
+        ac: '53',
+        label: "an in-form name equal to another persona's derived key",
+        offenders: [[0, 'Ops Bot'], [1, OPS_KEY]],
+        settings: ['key'],
+        build: () => ({ personas: personasOf(['Ops Bot'], [OPS_KEY]), named: [`key ${OPS_KEY}`] }),
+      },
+      {
+        ac: '53',
+        label: "a later name equal to an earlier persona's long key (names and keys differ)",
+        offenders: [[0, LONG_NAME], [1, LONG_KEY]],
+        settings: ['name'],
+        build: () => ({ personas: personasOf([LONG_NAME], [LONG_KEY]), named: [`name ${JSON.stringify(LONG_KEY)}`] }),
+      },
+      {
+        ac: '53',
+        label: "a later persona's long key equal to an earlier name (names and keys differ)",
+        offenders: [[0, LONG_KEY], [1, LONG_NAME]],
+        settings: ['key'],
+        build: () => ({ personas: personasOf([LONG_KEY], [LONG_NAME]), named: [`key ${LONG_KEY}`] }),
+      },
+      {
+        ac: '53',
+        label: 'the same name on the second and third of three personas (the first distinct)',
+        offenders: [[1, 'review_bot'], [2, 'review_bot']],
+        settings: ['name'],
+        build: () => ({
+          personas: personasOf(['Ops Bot'], ['review_bot'], ['review_bot']),
+          named: [`name ${JSON.stringify('review_bot')}`],
+        }),
+      },
+      {
+        ac: '53',
+        label: 'the same key on the second and third of three personas (the first distinct)',
+        offenders: [[1, 'Ops Bot'], [2, OPS_KEY]],
+        settings: ['key'],
+        build: () => ({ personas: personasOf(['deploy_bot'], ['Ops Bot'], [OPS_KEY]), named: [`key ${OPS_KEY}`] }),
+      },
+      // Cross-persona rows: credentials_file
+      {
+        ac: '53',
+        label: 'the same literal path',
+        offenders: [[0, 'Ops Bot'], [1, 'review_bot']],
+        settings: ['credentials_file'],
+        build: () => {
+          const shared = inDir('shared/credentials.json')
+          return {
+            personas: personasOf(['Ops Bot', { credentials_file: shared }], ['review_bot', { credentials_file: shared }]),
+            named: [JSON.stringify(shared)],
+          }
+        },
+      },
+      {
+        ac: '53',
+        label: 'a ~/ form against its expansion under the injected home',
+        offenders: [[0, 'Ops Bot'], [1, 'review_bot']],
+        settings: ['credentials_file'],
+        build: () => {
+          const expanded = join(home, 'creds', 'ops.json')
+          return {
+            personas: personasOf(
+              ['Ops Bot', { credentials_file: '~/creds/ops.json' }],
+              ['review_bot', { credentials_file: expanded }],
+            ),
+            named: [JSON.stringify(expanded)],
+          }
+        },
+      },
+      {
+        ac: '53',
+        label: "a symlink to the other persona's existing file",
+        offenders: [[0, 'Ops Bot'], [1, 'review_bot']],
+        settings: ['credentials_file'],
+        build: () => {
+          const target = makeCredentials('ops-credentials.json')
+          const link = makeLink(target, 'review-credentials.json')
+          return {
+            personas: personasOf(['Ops Bot', { credentials_file: target }], ['review_bot', { credentials_file: link }]),
+            named: [target, link, realpathSync(target)].map((path) => JSON.stringify(path)),
+          }
+        },
+      },
+      {
+        ac: '53',
+        label: 'the second and the third of three personas (the first distinct)',
+        offenders: [[1, 'review_bot'], [2, 'deploy_bot']],
+        settings: ['credentials_file'],
+        build: () => {
+          const shared = inDir('shared/credentials.json')
+          return {
+            personas: personasOf(
+              ['Ops Bot'],
+              ['review_bot', { credentials_file: shared }],
+              ['deploy_bot', { credentials_file: shared }],
+            ),
+            named: [JSON.stringify(shared)],
+          }
+        },
+      },
+      // Cross-persona rows: working_directory
+      {
+        ac: '21',
+        label: 'the same literal path',
+        offenders: [[0, 'Ops Bot'], [1, 'review_bot']],
+        settings: ['working_directory'],
+        build: () => {
+          const shared = inDir('shared-work')
+          return {
+            personas: personasOf(['Ops Bot', { working_directory: shared }], ['review_bot', { working_directory: shared }]),
+            named: [JSON.stringify(shared)],
+          }
+        },
+      },
+      {
+        ac: '21',
+        label: 'a trailing-slash spelling of the same non-existent path',
+        offenders: [[0, 'Ops Bot'], [1, 'review_bot']],
+        settings: ['working_directory'],
+        build: () => {
+          const work = inDir('work')
+          return {
+            personas: personasOf(['Ops Bot', { working_directory: work }], ['review_bot', { working_directory: `${work}/` }]),
+            named: [JSON.stringify(work)],
+          }
+        },
+      },
+      {
+        ac: '21',
+        label: "a symlink to the other persona's existing directory, reached through a symlinked parent",
+        offenders: [[0, 'Ops Bot'], [1, 'review_bot']],
+        settings: ['working_directory'],
+        build: () => {
+          // Three distinct spellings: the configured path of each persona and the shared real path.
+          const target = makeDir('real/ops-work')
+          const viaParent = join(makeLink(inDir('real'), 'real-link'), 'ops-work')
+          const link = makeLink(target, 'review-work')
+          return {
+            personas: personasOf(['Ops Bot', { working_directory: viaParent }], ['review_bot', { working_directory: link }]),
+            named: [viaParent, link, realpathSync(target)].map((path) => JSON.stringify(path)),
+          }
+        },
+      },
+      {
+        ac: '21',
+        label: 'the first and the third of three personas',
+        offenders: [[0, 'Ops Bot'], [2, 'deploy_bot']],
+        settings: ['working_directory'],
+        build: () => {
+          const shared = inDir('shared-work')
+          return {
+            personas: personasOf(
+              ['Ops Bot', { working_directory: shared }],
+              ['review_bot'],
+              ['deploy_bot', { working_directory: shared }],
+            ),
+            named: [JSON.stringify(shared)],
+          }
+        },
+      },
+      {
+        ac: '21',
+        label: 'the second and the third of three personas (the first distinct)',
+        offenders: [[1, 'review_bot'], [2, 'deploy_bot']],
+        settings: ['working_directory'],
+        build: () => {
+          const shared = inDir('shared-work')
+          return {
+            personas: personasOf(
+              ['Ops Bot'],
+              ['review_bot', { working_directory: shared }],
+              ['deploy_bot', { working_directory: shared }],
+            ),
+            named: [JSON.stringify(shared)],
+          }
+        },
+      },
+    ]
+
+    test.each(
+      rejectionRows.map((row) => ({
+        ...row,
+        who: row.offenders.map(([, name]) => JSON.stringify(name)).join(' and '),
+        setting: row.settings.join(', '),
+      })),
+    )('AC $ac: $who, $setting: $label', ({ offenders, settings, build }) => {
+      const { personas, named = [] } = build()
       const message = loadError(withPersonas(...personas))
-      expectNamesPersona(message, offender)
-      for (const setting of settings) expect(message).toContain(setting)
+      for (const [index, name] of offenders) expect(message).toContain(indexedRef(index, name))
+      personas.forEach((_, i) => {
+        if (!offenders.some(([index]) => index === i)) expect(message).not.toContain(`personas[${i}]`)
+      })
+      for (const value of [...settings, ...named]) expect(message).toContain(value)
+      expect(message).not.toMatch(TOKEN_LIKE)
     })
 
-    test('only the first violation is reported: two invalid personas name the first only', () => {
-      const message = loadError(withPersonas(
-        makePersona({ name: 'first_bot', permission_prompts: undefined }),
-        makePersona({ name: 'second_bot', channels: [] }),
+    test.each([
+      [
+        'different existing working directories and credentials files',
+        () =>
+          personasOf(
+            ['Ops Bot', { working_directory: makeDir('ops-work'), credentials_file: makeCredentials('ops.json') }],
+            ['review_bot', { working_directory: makeDir('review-work'), credentials_file: makeCredentials('review.json') }],
+          ),
+      ],
+      [
+        "a symlink to a directory other than the other persona's",
+        () =>
+          personasOf(
+            ['Ops Bot', { working_directory: makeDir('ops-work') }],
+            ['review_bot', { working_directory: makeLink(makeDir('elsewhere'), 'review-work') }],
+          ),
+      ],
+      ['two distinct non-existent paths per setting', () => personasOf(['Ops Bot'], ['review_bot'])],
+      ['names normalising to the same stem with different keys', () => personasOf(['Ops Bot'], ['OPS BOT'])],
+      [
+        "one persona's working_directory equal to another's credentials_file",
+        () =>
+          personasOf(
+            ['Ops Bot', { working_directory: inDir('shared') }],
+            ['review_bot', { credentials_file: inDir('shared') }],
+          ),
+      ],
+    ])('non-collision control loads: %s', (_label, build) => {
+      const personas = build()
+      expect(load(withPersonas(...personas)).personas.map((p) => p.name)).toEqual(personas.map((p) => p.name))
+    })
+
+    test.each([
+      {
+        label: 'of two per-entry violations, the first persona',
+        build: () => [
+          makePersona({ name: 'first_bot', permission_prompts: undefined }),
+          makePersona({ name: 'second_bot', channels: [] }),
+        ],
+        reported: [[0, 'first_bot']] as [number, string][],
+        named: 'permission_prompts',
+        absent: ['second_bot'],
+      },
+      {
+        label: 'a later per-entry violation before an earlier duplicate name',
+        build: () => personasOf(['Ops Bot'], ['Ops Bot'], ['third_bot', { permission_prompts: undefined }]),
+        reported: [[2, 'third_bot']] as [number, string][],
+        named: 'permission_prompts',
+        absent: ['"Ops Bot"', 'duplicated'],
+      },
+      {
+        label: 'a later duplicate name before an earlier duplicate working_directory',
+        build: () =>
+          personasOf(
+            ['Ops Bot', { working_directory: inDir('shared-work') }],
+            ['review_bot', { working_directory: inDir('shared-work') }],
+            ['Ops Bot'],
+          ),
+        reported: [[0, 'Ops Bot'], [2, 'Ops Bot']] as [number, string][],
+        named: `name ${JSON.stringify('Ops Bot')}`,
+        absent: ['working_directory', 'personas[1]'],
+      },
+      {
+        label: 'a later duplicate working_directory before an earlier duplicate credentials_file',
+        build: () =>
+          personasOf(
+            ['Ops Bot', { credentials_file: inDir('shared.json') }],
+            ['review_bot', { credentials_file: inDir('shared.json') }],
+            ['deploy_bot', { working_directory: inDir('p0/work') }],
+          ),
+        reported: [[0, 'Ops Bot'], [2, 'deploy_bot']] as [number, string][],
+        named: 'working_directory',
+        absent: ['credentials_file', 'personas[1]'],
+      },
+    ])('only the first violation is reported: $label', ({ build, reported, named, absent }) => {
+      const message = loadError(withPersonas(...build()))
+      for (const [index, name] of reported) expect(message).toContain(indexedRef(index, name))
+      expect(message).toContain(named)
+      for (const fragment of absent) expect(message).not.toContain(fragment)
+    })
+
+    test('resolvePersonaConfig rejects a symlinked working_directory duplicate as the loader does', () => {
+      const target = makeDir('ops-work')
+      const input = withPersonas(...personasOf(
+        ['Ops Bot', { working_directory: target }],
+        ['review_bot', { working_directory: makeLink(target, 'review-work') }],
       ))
-      expectNamesPersona(message, 'first_bot')
-      expect(message).not.toContain('second_bot')
+      let pure = ''
+      try {
+        resolvePersonaConfig(input, dir, home)
+      } catch (err) {
+        pure = (err as Error).message
+      }
+      expect(pure).toContain(`${indexedRef(1, 'review_bot')}: working_directory`)
+      expect(pure).toContain(indexedRef(0, 'Ops Bot'))
+      expect(loadError(input)).toContain(pure)
     })
   })
 

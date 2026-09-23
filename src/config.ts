@@ -16,15 +16,17 @@
  * validation rules; only their error prefixes differ, and persona-loader
  * errors never echo a rejected value (b.av2 SR-10.3).
  *
- * Pure functions (applyDefaults, validateConfig, expandTilde, resolveConfig,
- * resolvePersonaConfig) are side-effect-free and importable by tests without
- * performing any I/O (b.av2 SR-13.1). The I/O wrappers (loadConfig,
+ * Pure functions (applyDefaults, validateConfig, expandTilde, resolveConfig)
+ * are side-effect-free and importable by tests without performing any I/O
+ * (b.av2 SR-13.1); importing this module touches no file. resolvePersonaConfig
+ * and resolveRealPath additionally resolve real paths (b.av2 SR-1.5) but never
+ * open, read, create or write a file. The I/O wrappers (loadConfig,
  * loadPersonaConfig) read the JSON file once and delegate to them.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { readFileSync } from 'fs'
+import { readFileSync, realpathSync } from 'fs'
 import { homedir } from 'os'
 import { dirname, isAbsolute, resolve } from 'path'
 
@@ -537,6 +539,33 @@ export function expandTilde(path: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Real-path comparison (b.av2 SR-1.5), shared with later bring-up checks
+// ---------------------------------------------------------------------------
+
+/**
+ * The comparison form of a configured path (b.av2 SR-1.5): its real path
+ * when `realpath` succeeds, otherwise its lexical `path.resolve`. Any realpath
+ * failure (missing path or ancestor, permission error, symlink loop) falls
+ * back to the lexical form, so this never throws for a string path. Two paths
+ * name the same file or directory when their comparison forms are `===`.
+ *
+ * Resolves only: it never opens, reads or creates anything and does not
+ * require the path to exist. The input must already be tilde-expanded; `~`
+ * is not expanded here.
+ *
+ * @param path      The path to compare, already tilde-expanded.
+ * @param realpath  Realpath function; defaults to `fs.realpathSync`, looked up
+ *   at call time. Tests inject one to simulate file-system behaviour.
+ */
+export function resolveRealPath(path: string, realpath: (path: string) => string = realpathSync): string {
+  try {
+    return realpath(path)
+  } catch {
+    return resolve(path)
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Shared server-wide rules (both loaders)
 // ---------------------------------------------------------------------------
 
@@ -954,8 +983,7 @@ function jsonTypeName(value: unknown): string {
  * and, when the name is valid, the persona reference of b.av2 SR-2.2
  * (JSON-quoted name with its key), and never echoes a rejected value.
  */
-function personaEntryStyle(entry: Record<string, unknown>, index: number): RuleStyle {
-  const name = entry['name']
+function personaEntryStyle(name: unknown, index: number): RuleStyle {
   const ref = isNonEmptyString(name) ? ` ${renderPersonaRef(name)}` : ''
   return { prefix: `${PERSONA_ERROR_PREFIX}personas[${index}]${ref}: `, echoValues: false }
 }
@@ -1110,7 +1138,7 @@ function parsePersonaEntry(
   if (!isJsonObject(raw)) {
     throw ruleError(PERSONA_RULE_STYLE, `personas[${index}] must be a JSON object, got ${jsonTypeName(raw)}.`)
   }
-  const style = personaEntryStyle(raw, index)
+  const style = personaEntryStyle(raw['name'], index)
   checkPersonaEntryShape(raw, style)
 
   const name = raw['name']
@@ -1146,13 +1174,123 @@ function parsePersonaEntry(
 }
 
 // ---------------------------------------------------------------------------
+// Persona loader: cross-persona rules (b.av2 SR-1.5)
+// ---------------------------------------------------------------------------
+
+/** `personas[i]` plus the persona reference, naming the other persona in a cross-persona error. */
+function renderIndexedPersonaRef(persona: Persona): string {
+  return `personas[${persona.index}] ${renderPersonaRef(persona.name, persona.key)}`
+}
+
+const UNIQUE_NAMES_HINT = 'Persona names and keys must be unique.'
+
+/**
+ * How `later`'s name or key collides with `earlier`'s, as the error text
+ * after the later persona's prefix, or undefined when they do not collide.
+ * Compared by exact string equality. Names are JSON-quoted; keys are bare
+ * (they are drawn from `a-z0-9_` only).
+ */
+function describeNameKeyCollision(earlier: Persona, later: Persona): string | undefined {
+  const other = renderIndexedPersonaRef(earlier)
+  if (later.name === earlier.name) {
+    return `name ${JSON.stringify(later.name)} is duplicated: ${other} has the same name. ${UNIQUE_NAMES_HINT}`
+  }
+  if (later.key === earlier.key) {
+    return `key ${later.key} is duplicated: ${other} has the same key. ${UNIQUE_NAMES_HINT}`
+  }
+  if (later.name === earlier.key) {
+    return `name ${JSON.stringify(later.name)} equals the key of ${other}. ${UNIQUE_NAMES_HINT}`
+  }
+  if (later.key === earlier.name) {
+    return `key ${later.key} equals the name of ${other}. ${UNIQUE_NAMES_HINT}`
+  }
+  return undefined
+}
+
+/**
+ * b.av2 SR-1.5, first row: no persona's name or key (SR-2.1) may equal
+ * another persona's name or key. A persona whose own name is its own key
+ * does not collide with itself.
+ *
+ * Order: personas are scanned in array order; the first one whose name or
+ * key equals an earlier persona's name or key is reported, against the
+ * earliest such persona. Within a pair, a shared name is reported first, then
+ * a shared key, then the later name equal to the earlier key, then the later
+ * key equal to the earlier name. No file-system access.
+ */
+function checkUniqueNamesAndKeys(personas: readonly Persona[]): void {
+  personas.forEach((later, j) => {
+    for (const earlier of personas.slice(0, j)) {
+      const collision = describeNameKeyCollision(earlier, later)
+      if (collision !== undefined) throw ruleError(personaEntryStyle(later.name, later.index), collision)
+    }
+  })
+}
+
+/** The per-persona paths that no two personas may share (b.av2 SR-1.5), in the order they are checked. */
+const UNIQUE_PERSONA_PATH_SETTINGS = ['working_directory', 'credentials_file'] as const
+
+type UniquePersonaPathSetting = (typeof UNIQUE_PERSONA_PATH_SETTINGS)[number]
+
+/**
+ * Reject the first persona whose `setting` has the same comparison form
+ * (`resolveRealPath`) as an earlier persona's, against the earliest such
+ * persona. Persona paths are stored tilde-expanded and `path.resolve`d
+ * (`parsePersonaPath`), so `~/x` against its absolute form, a trailing slash
+ * or `..` already yield the same string and get the short message. Only when
+ * the two stored paths differ, which only a symlink can cause, does the error
+ * show both and the shared real path. Paths are the one value these errors
+ * echo: they have already passed the persona path rule.
+ */
+function rejectSharedRealPath(personas: readonly Persona[], setting: UniquePersonaPathSetting): void {
+  const firstByRealPath = new Map<string, Persona>()
+  for (const persona of personas) {
+    const path = persona[setting]
+    const realPath = resolveRealPath(path)
+    const earlier = firstByRealPath.get(realPath)
+    if (earlier === undefined) {
+      firstByRealPath.set(realPath, persona)
+      continue
+    }
+    const other = renderIndexedPersonaRef(earlier)
+    const why =
+      earlier[setting] === path
+        ? `${setting} ${JSON.stringify(path)} is also the ${setting} of ${other}.`
+        : `${setting} ${JSON.stringify(path)} is also the ${setting} of ${other}: its ${setting} ` +
+          `${JSON.stringify(earlier[setting])} and this one both resolve to ${JSON.stringify(realPath)}.`
+    throw ruleError(personaEntryStyle(persona.name, persona.index), `${why} Each persona needs its own ${setting}.`)
+  }
+}
+
+/**
+ * The real-path collision step (b.av2 SR-1.5): no two personas may share a
+ * `working_directory`, then no two may share a `credentials_file`, each
+ * compared by real path with a lexical fallback (`resolveRealPath`), so a
+ * symlink to another persona's path, or `~/x` against its absolute form, is a
+ * duplicate. Per setting, personas are scanned in array order and the first
+ * collision is reported against the earliest persona sharing the path. One
+ * persona's working directory against another's credentials file, or a
+ * persona's own two paths, is not a collision.
+ *
+ * Resolves paths only: never requires them to exist and never opens, reads,
+ * creates or writes a file. Kept as its own step so a start from the record
+ * (E11) can treat these collisions differently without restructuring the
+ * loader.
+ */
+function checkRealPathCollisions(personas: readonly Persona[]): void {
+  for (const setting of UNIQUE_PERSONA_PATH_SETTINGS) rejectSharedRealPath(personas, setting)
+}
+
+// ---------------------------------------------------------------------------
 // Persona loader: entry point (b.av2 SR-1.1, SR-1.7)
 // ---------------------------------------------------------------------------
 
 /**
  * Resolve an already-parsed persona configuration: apply defaults, expand
- * paths and validate, throwing on the first violation. Pure: it reads no file
- * and writes nothing, so the reload path can validate pending content with it.
+ * paths and validate, throwing on the first violation. It resolves persona
+ * paths to real paths for the collision rules (step 8) but never opens, reads,
+ * creates or writes a file and never requires a path to exist, so the reload
+ * path can validate pending content with it.
  *
  * Check order:
  *   1. the value is a JSON object;
@@ -1164,11 +1302,16 @@ function parsePersonaEntry(
  *   5. server-wide settings defaulted and validated (b.av2 SR-1.6);
  *   6. each persona entry in array order (see `parsePersonaEntry`),
  *      inheriting the resolved top-level `claude_config_dir` and
- *      `stop_hook_bootstrap`.
+ *      `stop_hook_bootstrap`;
+ *   7. the cross-persona name/key rule (b.av2 SR-1.5, see
+ *      `checkUniqueNamesAndKeys`): no name or key equal to another persona's
+ *      name or key;
+ *   8. the real-path collision step (b.av2 SR-1.5, see
+ *      `checkRealPathCollisions`): no shared `working_directory`, then no
+ *      shared `credentials_file`, compared by `resolveRealPath`.
  *
- * The cross-persona rules (b.av2 SR-1.5) are not implemented yet: nothing
- * currently rejects duplicate names or keys, or shared working directories or
- * credentials files. Task t2.ob2.uf.pq adds them after step 6.
+ * Steps 7 and 8 run only after every entry has parsed, so a per-entry
+ * violation anywhere is reported before any cross-persona one.
  *
  * @param raw        The parsed JSON value of the configuration file.
  * @param configDir  Directory of the configuration file; the cron path defaults sit under it.
@@ -1200,9 +1343,10 @@ export function resolvePersonaConfig(raw: unknown, configDir: string, home: stri
   }
   const personas = entries.map((entry: unknown, index) => parsePersonaEntry(entry, index, inherited, home))
 
-  // The cross-persona rules (b.av2 SR-1.5: duplicate name or key, working
-  // directory, credentials file) are not implemented yet; Task t2.ob2.uf.pq
-  // adds them at this point, over the parsed personas.
+  // Cross-persona rules (b.av2 SR-1.5), only once every entry has parsed so
+  // per-entry violations are reported first.
+  checkUniqueNamesAndKeys(personas)
+  checkRealPathCollisions(personas)
 
   return { ...settings, personas }
 }

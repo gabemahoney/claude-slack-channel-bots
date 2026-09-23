@@ -41,7 +41,8 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
   - Persona-only top-level keys: `PersonaConfigInput` and `PersonaConfig`, plus the key in `PERSONA_ONLY_SERVER_KEYS`
   - Persona-entry keys: `PersonaInput` and `Persona`, plus the key in `PERSONA_ENTRY_KEYS`; parse it in `parsePersonaEntry()`, the per-entry path `resolvePersonaConfig()` calls. `name`, `credentials_file`, `working_directory` and `permission_prompts` are required
   - A key missing from these key lists is rejected as unknown
-  - Errors report the first violation only, render the persona with `renderPersonaRef()` from `src/persona-identity.ts`, and name the setting. Never echo a rejected value: an error may repeat only the persona name and IDs that already passed their format rule
+  - Errors report the first violation only, render the persona with `renderPersonaRef()` from `src/persona-identity.ts`, and name the setting. Never echo a rejected value: an error may repeat only the persona name, IDs and paths that already passed their format rule
+- New "same path" checks compare configured paths through `resolveRealPath()` in `src/config.ts`: the real path, or the lexical `path.resolve` form when realpath fails. Tilde-expand the path first; tests inject the realpath function. Import it; don't write a second realpath-with-fallback helper, so these checks agree. Two intentional exceptions stay as they are: the route-keyed duplicate-CWD rule in `validateConfig` (unchanged until E3) and the lexical `config_dir` label in `src/persona-identity.ts`
 - Atomic file writes: write to `.tmp` file, then `renameSync` to final path
 
 ## Code Quality
