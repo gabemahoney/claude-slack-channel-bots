@@ -1,6 +1,6 @@
 /**
  * interject.test.ts — The `/interject` handler (b.av2 SR-6.4, SR-9.1, SR-9.2,
- * SR-10.2, SR-13.1; AC 50's `/interject` leg).
+ * SR-10.2, SR-13.1; the `/interject` legs of AC 50 and AC 51).
  *
  * Drives the real `handleInterject` from src/interject.ts with injected
  * dependencies: a two-persona config from `makeMultiPersonaConfig`, stub
@@ -20,7 +20,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -448,15 +448,39 @@ describe('AC 50: /interject reaches only the named persona', () => {
 // ---------------------------------------------------------------------------
 
 describe('/interject notification meta (SR-9.2)', () => {
-  test('method and content unchanged; meta is exactly { user, ts } — no chat_id, message_id or via', async () => {
-    await interject({ persona: B_NAME, message: 'Hello from interject', sender: 'cscb-cron:tick' })
-    expect(b.calls).toEqual([
-      {
-        method: 'notifications/claude/channel',
-        params: { content: 'Hello from interject', meta: { user: 'cscb-cron:tick', ts: '1700000000.123' } },
-      },
-    ])
-    expect(Object.keys(b.calls[0]!.params.meta).sort()).toEqual(['ts', 'user'])
+  // b.av2 AC 51 (the /interject leg): the reply guard tells an injected prompt
+  // by the absence of via, so the injected meta must never carry via (nor the
+  // Slack-only chat_id / message_id), and a normal delivery logs no failure.
+  test('AC 51: 200; method and content unchanged; meta is exactly { user, ts } — no chat_id, message_id or via; only the normal delivery line is logged', async () => {
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {})
+    const consoleWarn = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const res = await interject({ persona: B_NAME, message: 'Hello from interject', sender: 'cscb-cron:tick' })
+      expect(res.status).toBe(200)
+      expect(await res.json()).toEqual({ ok: true, persona: B_NAME })
+      expect(b.calls).toEqual([
+        {
+          method: 'notifications/claude/channel',
+          params: { content: 'Hello from interject', meta: { user: 'cscb-cron:tick', ts: '1700000000.123' } },
+        },
+      ])
+      const meta = b.calls[0]!.params.meta
+      expect(Object.keys(meta).sort()).toEqual(['ts', 'user'])
+      for (const key of ['chat_id', 'message_id', 'via']) expect(meta).not.toHaveProperty(key)
+
+      // A rejected notification is logged asynchronously; let it surface first.
+      await Bun.sleep(0)
+      // Exactly the one delivery line, nothing else (no failure line).
+      expect(logs).toEqual([
+        `[slack] /interject: delivering to persona ${renderPersonaRef(B_NAME, B_KEY)} sender="cscb-cron:tick" message="Hello from interject"`,
+      ])
+      // Nothing bypasses the injected logger to report a problem either.
+      expect(consoleError).not.toHaveBeenCalled()
+      expect(consoleWarn).not.toHaveBeenCalled()
+    } finally {
+      consoleError.mockRestore()
+      consoleWarn.mockRestore()
+    }
   })
 
   test.each([
@@ -471,8 +495,9 @@ describe('/interject notification meta (SR-9.2)', () => {
     expect(Object.keys(b.calls[0]!.params.meta).sort()).toEqual(['ts', 'user'])
   })
 
-  // The b.wr5 reply guard treats a ts without six fractional digits as an
-  // injected prompt; ts is String(epoch ms / 1000), never a Slack-shaped ts.
+  // ts is String(epoch ms / 1000) — Unix seconds with at most three
+  // fractional digits, never a Slack-shaped ts (b.av2 SR-9.2). The reply guard
+  // tells an injected prompt by the absence of via (see the AC 51 test above).
   test.each([
     [1_700_000_000_123, '1700000000.123'],
     [1_700_000_000_120, '1700000000.12'],

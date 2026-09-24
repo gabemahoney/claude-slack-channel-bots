@@ -20,8 +20,9 @@
  *
  * The notification goes to the named persona's session only, as
  * `notifications/claude/channel` with meta `user` (the sender label) and `ts`
- * and nothing else: no `chat_id`, `message_id` or `via` (SR-9.2). `ts` keeps
- * the form the b.wr5 reply guard recognises injected messages by.
+ * and nothing else: no `chat_id`, `message_id` or `via` (SR-9.2). The reply
+ * guard tells injected messages from delivered Slack messages by the absence
+ * of `via`, not by `user` or `ts`.
  *
  * A request for a persona that is not up is refused with 503 and the body
  * `{ error: 'Persona is not up', persona: <name> }`, and one line is logged:
@@ -111,8 +112,7 @@ function isLocalAddress(address: string): boolean {
 
 /**
  * The `ts` meta value for an injected message: the string form of the epoch
- * milliseconds divided by 1000 (at most three fractional digits). The b.wr5
- * reply guard recognises injected messages by this shape; keep it.
+ * milliseconds divided by 1000 (at most three fractional digits).
  */
 function interjectTs(nowMs: number): string {
   return String(nowMs / 1000)
