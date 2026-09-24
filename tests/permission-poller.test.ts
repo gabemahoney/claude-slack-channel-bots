@@ -28,7 +28,17 @@
  *   - Slack failures (prompt post, wedge warning, closure update) are
  *     scripted on the stub: one token-safe log line with the platform
  *     reason, the error class in the trail, nothing leaks (b.av2 SR-10.3).
- *   - `dm` destination (until E7): logged once, no Slack call, no live entry.
+ *   - `dm` destination (b.av2 SR-7.1; AC 29, 34, 44): `conversations.open`
+ *     for `dm.contact` then `chat.postMessage` to the returned `D…`, both on
+ *     the persona's own client, with no identity override; the live entry and
+ *     the trail name the `D…`; one open serves every later prompt; a
+ *     channel-destination persona in the same tick makes no open; a failed
+ *     open is logged and trailed (ok:false, no channel) and nothing posts; a
+ *     refused destination (DMs off or no contact) is logged once per request
+ *     with no Slack call and no trail event.
+ *   - Closing updates after DMs are turned off or the destination changes
+ *     (AC 36, b.av2 SR-5.1): one `chat.update` on the recorded conversation
+ *     and ts, no post and no open; later prompts use the new destination.
  *   - Persona client unavailable: prompt logged once and retried; closure
  *     logged naming the persona (or its key once it is gone) and dropped;
  *     stuck-prompt warning unlatched and throttled.
@@ -89,6 +99,7 @@ import {
   type PollerDeps,
 } from '../src/permission-poller.ts'
 import { _resetTrailFdForTests } from '../src/permission-trail.ts'
+import { createPersonaDestinations } from '../src/persona-destination.ts'
 import { parsePermissionActionId } from '../src/permission-action-id.ts'
 import { personaKeyFromActionId } from './test-helpers/action-id-key.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
@@ -108,7 +119,7 @@ import {
   type CannedGetResult,
 } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
-import { makeStubSlack, type StubSlack } from './test-helpers/slack-stub.ts'
+import { asWebClient, makeStubSlack, openedDm, stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
 import { LEAK_SENTINEL, assertNoLeak } from './test-helpers/credentials.ts'
 import {
   makeManualInterval,
@@ -174,12 +185,13 @@ const NAME_B = 'Beta Relay'
 const KEY_B = personaKey(NAME_B)
 const INSTANCE_B = personaInstanceId(KEY_B)
 const B_DEST = 'C0BDEST001'
-// Persona D sends prompts by DM (logged only until E7).
+// Persona D sends prompts by DM to D_CONTACT; an unscripted open returns D_DM.
 const NAME_D = 'Delta Direct'
 const KEY_D = personaKey(NAME_D)
 const INSTANCE_D = personaInstanceId(KEY_D)
 const D_WORK = 'C0DWORK001'
 const D_CONTACT = 'U0DCONTACT1'
+const D_DM = stubOpenedDmId(D_CONTACT)
 
 const POST_TS = 'TS1'
 const POST_TS_2 = 'TS2'
@@ -261,6 +273,14 @@ const getPersona = (key: string): Persona | undefined => config.personas.find((p
 function unapply(key: string): void {
   config = { ...config, personas: config.personas.filter((p) => p.key !== key) }
 }
+
+/** Replace fields of applied persona `key` (a reload that changes it; the loader's rules don't apply here). */
+function reconfigure(key: string, patch: Partial<Persona>): void {
+  config = { ...config, personas: config.personas.map((p) => (p.key === key ? { ...p, ...patch } : p)) }
+}
+
+/** The Web API methods called on a stub's client, in call order. */
+const methods = (stub: StubSlack): string[] => stub.web.callLog.map((c) => c.method)
 
 /** Start the poller with the persona lookups and a manual interval. */
 function startPoller(
@@ -468,10 +488,7 @@ describe('poller tick — persona routing (b.av2 SR-7.1)', () => {
     expect(posts(stubA).map((c) => c.channel)).toEqual([A_DEST])
 
     // A's destination moves to its work channel in the supplied config.
-    config = {
-      ...config,
-      personas: config.personas.map((p) => (p.key === KEY_A ? { ...p, permission_prompts: A_WORK } : p)),
-    }
+    reconfigure(KEY_A, { permission_prompts: A_WORK })
     rows = [cannedPermissionRequest({ request_token: TOKEN_B, request_id: 2 })]
     await ivl.tick()
 
@@ -511,46 +528,6 @@ describe('poller tick — persona routing (b.av2 SR-7.1)', () => {
       expect(getOutageFlags(key).size).toBe(0)
     }
     expect(outageEmissions).toHaveLength(0)
-  })
-
-  test('`dm` destination (until E7): logged once per open request naming the persona; no Slack call, no live entry, no post trail across repeat ticks', async () => {
-    const logCalls: unknown[][] = []
-    const trail = makeTrailCapture()
-    const getPermissionCalls: GetPermissionParams[] = []
-    let rows = [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })]
-    const ivl = startPoller(() => ({
-      list: async () => ({ spawns: [checkPermRow(D)] }),
-      get: async () => getResult(rows, D),
-      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
-        getPermissionCalls.push(params)
-        return cannedGetPermissionResponse({ request_token: params.request_token })
-      },
-    }), { log: (...args) => { logCalls.push(args) }, emitTrail: trail.emit })
-
-    await ivl.tick()
-    await ivl.tick()
-    await ivl.tick()
-
-    const dmLines = logLines(logCalls, 'permission prompts by DM are not supported yet')
-    expect(dmLines).toHaveLength(1)
-    expect(String(dmLines[0][0])).toContain(renderPersonaRef(NAME_D, KEY_D))
-    expect(String(dmLines[0][0])).toContain(INSTANCE_D)
-    expect(String(dmLines[0][0])).toContain(TOKEN_A)
-    expect(slackCalls(stubA, stubB, stubD)).toBe(0)
-    expect(getLivePermission(INSTANCE_D, TOKEN_A)).toBeUndefined()
-    expect(rowDecisions(trail, 'post_attempted')).toHaveLength(0)
-    expect(chatPosts(trail)).toHaveLength(0)
-
-    // A new open request logs its own line; the gone one is never reconciled
-    // (it was never tracked).
-    rows = [cannedPermissionRequest({ request_token: TOKEN_B, request_id: 2 })]
-    await ivl.tick()
-    await ivl.tick()
-    const after = logLines(logCalls, 'permission prompts by DM are not supported yet')
-    expect(after).toHaveLength(2)
-    expect(String(after[1][0])).toContain(TOKEN_B)
-    expect(getPermissionCalls).toHaveLength(0)
-    expect(slackCalls(stubA, stubB, stubD)).toBe(0)
   })
 
   test('client unavailable: prompt not posted, logged once across ticks, no live entry or post trail; posts once when the client returns', async () => {
@@ -667,8 +644,9 @@ describe('poller tick — persona routing (b.av2 SR-7.1)', () => {
     expect(getLivePermission(INSTANCE_A, TOKEN_A)?.messageTs).toBe(POST_TS)
   })
 
-  test('a not-posted request keeps its one log line across ticks where its persona is not applied', async () => {
+  test('a not-posted request (client unavailable) keeps its one log line across ticks where its persona is not applied', async () => {
     const logCalls: unknown[][] = []
+    clients.setUnavailable(KEY_D)
     const ivl = startPoller(() => ({
       list: async () => ({ spawns: [checkPermRow(D)] }),
       get: async () => getResult([cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })], D),
@@ -679,7 +657,7 @@ describe('poller tick — persona routing (b.av2 SR-7.1)', () => {
     await ivl.tick()
     config = applied
     await ivl.tick()
-    expect(logLines(logCalls, 'permission prompts by DM are not supported yet')).toHaveLength(1)
+    expect(logLines(logCalls, `no Slack client for ${renderPersonaRef(NAME_D, KEY_D)}`)).toHaveLength(1)
     expect(slackCalls(stubA, stubB, stubD)).toBe(0)
   })
 
@@ -695,6 +673,224 @@ describe('poller tick — persona routing (b.av2 SR-7.1)', () => {
     await ivl.tick()
     expect(posts(stubA).map((c) => c.channel)).toEqual([A_DEST])
     expect(getLivePermission(INSTANCE_A, TOKEN_A)?.personaKey).toBe(KEY_A)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// `dm` destination (b.av2 SR-7.1; SR-5.1 exception)
+// ---------------------------------------------------------------------------
+
+describe('poller tick — `dm` destination (b.av2 SR-7.1, SR-5.1)', () => {
+  const A_CONTACT = 'U0ACONTACT1'
+  const TOKEN_C = '33333333-3333-4333-8333-333333333333'
+  const request = (request_token: string, request_id: number) => cannedPermissionRequest({ request_token, request_id })
+  const allowAll = async (params: GetPermissionParams): Promise<GetPermissionResult> =>
+    cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null })
+  const stubOf = (key: string): StubSlack => (key === KEY_A ? stubA : key === KEY_B ? stubB : stubD)
+  const otherStubs = (key: string): StubSlack[] => [stubA, stubB, stubD].filter((s) => s !== stubOf(key))
+
+  test.each<[string, string, (() => void) | undefined, string[], () => string]>([
+    ['channel destination (A): chat.postMessage only, to its channel', KEY_A, undefined, ['chat.postMessage'], () => A_DEST],
+    [
+      'AC 29: DM destination with DMs on (D): conversations.open for its contact, then chat.postMessage to the returned D…',
+      KEY_D, undefined, ['conversations.open', 'chat.postMessage'], () => D_DM,
+    ],
+    [
+      'AC 44: DM-only persona with zero channels (D), first prompt with no DM yet: the conversation is opened and the prompt delivered there',
+      KEY_D, () => reconfigure(KEY_D, { channels: [] }), ['conversations.open', 'chat.postMessage'], () => D_DM,
+    ],
+  ])('%s — on the persona\'s own client, in that exact order, with no identity override; the live entry and trail name that conversation', async (_label, key, setup, expectedMethods, expectedChannel) => {
+    setup?.()
+    const persona = getPersona(key)!
+    const stub = stubOf(key)
+    const instance = personaInstanceId(key)
+    scriptPostTs(stub, POST_TS)
+    const trail = makeTrailCapture()
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow(persona)] }),
+      get: async () => getResult([request(TOKEN_A, 1)], persona),
+    }), { emitTrail: trail.emit })
+    await ivl.tick()
+
+    // The exact ordered call log: no conversation-list, history or membership lookup.
+    expect(methods(stub)).toEqual(expectedMethods)
+    if (expectedMethods.includes('conversations.open')) expect(stub.calls.conversationsOpen).toEqual([{ users: D_CONTACT }])
+    for (const other of otherStubs(key)) expect(other.callLog).toEqual([])
+
+    const [post] = posts(stub) as unknown as Array<Record<string, unknown>>
+    expect(post['channel']).toBe(expectedChannel())
+    expect(Array.isArray(post['blocks'])).toBe(true)
+    for (const field of ['username', 'icon_url', 'icon_emoji', 'thread_ts']) expect(field in post).toBe(false)
+    const actions = (post['blocks'] as Array<Record<string, unknown>>).find((b) => b['type'] === 'actions') as
+      { elements: Array<{ action_id: string }> }
+    expect(actions.elements.map((el) => personaKeyFromActionId(el.action_id))).toEqual([key, key])
+
+    // The click handler and the closing update resolve in the conversation posted to.
+    expect(getLivePermission(instance, TOKEN_A)).toMatchObject({ personaKey: key, channelId: expectedChannel(), messageTs: POST_TS })
+    expect(chatPosts(trail).map((e) => [e.channel, e['ok'], e['slack_ts']])).toEqual([[expectedChannel(), true, POST_TS]])
+  })
+
+  test('one conversations.open serves every prompt of the persona: two requests in one tick and a third on a later tick all post to the opened D…', async () => {
+    const chosen = 'D0CHOSEN01'
+    stubD.script.open.push(openedDm(chosen))
+    let rows = [request(TOKEN_A, 1), request(TOKEN_B, 2)]
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow(D)] }),
+      get: async () => getResult(rows, D),
+    }))
+    await ivl.tick()
+    rows = [...rows, request(TOKEN_C, 3)]
+    await ivl.tick()
+
+    expect(methods(stubD)).toEqual(['conversations.open', 'chat.postMessage', 'chat.postMessage', 'chat.postMessage'])
+    expect(posts(stubD).map((c) => c.channel)).toEqual([chosen, chosen, chosen])
+    for (const token of [TOKEN_A, TOKEN_B, TOKEN_C]) expect(getLivePermission(INSTANCE_D, token)?.channelId).toBe(chosen)
+  })
+
+  test('an injected destination resolver is the one used: a DM it already opened (as the notifier would) is reused with no second open', async () => {
+    const destinations = createPersonaDestinations({ log: () => {} })
+    expect(await destinations.post(D, asWebClient(stubD.web), { text: 'a notice' })).toMatchObject({ outcome: 'posted', channelId: D_DM })
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow(D)] }),
+      get: async () => getResult([request(TOKEN_A, 1)], D),
+    }), { destinations })
+    await ivl.tick()
+    expect(methods(stubD)).toEqual(['conversations.open', 'chat.postMessage', 'chat.postMessage'])
+    expect(posts(stubD).map((c) => c.channel)).toEqual([D_DM, D_DM])
+  })
+
+  test('AC 34: two personas in one tick route by their own settings: A posts to its channel with no conversations.open, D opens and posts in its DM, each on its own client; B gets nothing', async () => {
+    scriptPostTs(stubA, POST_TS)
+    scriptPostTs(stubD, POST_TS_2)
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow(A), checkPermRow(D)] }),
+      get: async (p: { claude_instance_id: string }) =>
+        p.claude_instance_id === INSTANCE_A ? getResult([request(TOKEN_A, 1)], A) : getResult([request(TOKEN_B, 2)], D),
+    }))
+    await ivl.tick()
+
+    expect(methods(stubA)).toEqual(['chat.postMessage'])
+    expect(posts(stubA).map((c) => c.channel)).toEqual([A_DEST])
+    expect(methods(stubD)).toEqual(['conversations.open', 'chat.postMessage'])
+    expect(stubD.calls.conversationsOpen).toEqual([{ users: D_CONTACT }])
+    expect(posts(stubD).map((c) => c.channel)).toEqual([D_DM])
+    expect(stubB.callLog).toEqual([])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ personaKey: KEY_A, channelId: A_DEST, messageTs: POST_TS })
+    expect(getLivePermission(INSTANCE_D, TOKEN_B)).toMatchObject({ personaKey: KEY_D, channelId: D_DM, messageTs: POST_TS_2 })
+  })
+
+  test.each<[string, string, () => void, () => string, string[], string[], () => string]>([
+    [
+      'AC 36: a DM prompt, after DMs are turned off and the destination is a channel',
+      KEY_D, () => reconfigure(KEY_D, { dm: { enabled: false }, permission_prompts: D_WORK }),
+      () => D_DM, ['conversations.open', 'chat.postMessage'], ['chat.postMessage'], () => D_WORK,
+    ],
+    [
+      'a channel prompt, after the destination changes to dm',
+      KEY_A, () => reconfigure(KEY_A, { dm: { enabled: true, contact: A_CONTACT }, permission_prompts: 'dm' }),
+      () => A_DEST, ['chat.postMessage'], ['conversations.open', 'chat.postMessage'], () => stubOpenedDmId(A_CONTACT),
+    ],
+  ])('%s: the closing update is one chat.update on the recorded conversation and ts through the persona\'s client, with no post and no open; a later prompt uses the new destination', async (_label, key, change, postedIn, firstMethods, nextMethods, nextChannel) => {
+    const persona = getPersona(key)!
+    const stub = stubOf(key)
+    const instance = personaInstanceId(key)
+    scriptPostTs(stub, POST_TS)
+    let rows = [request(TOKEN_A, 1)]
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow(persona)] }),
+      get: async () => getResult(rows, persona),
+      getPermission: allowAll,
+    }))
+    await ivl.tick()
+    expect(methods(stub)).toEqual(firstMethods)
+    expect(getLivePermission(instance, TOKEN_A)?.channelId).toBe(postedIn())
+
+    change()
+    rows = []
+    await ivl.tick()
+    expect(methods(stub).slice(firstMethods.length)).toEqual(['chat.update'])
+    expect(updates(stub).map((c) => [c.channel, c.ts])).toEqual([[postedIn(), POST_TS]])
+    expect(getLivePermission(instance, TOKEN_A)).toBeUndefined()
+
+    rows = [request(TOKEN_B, 2)]
+    await ivl.tick()
+    expect(methods(stub).slice(firstMethods.length + 1)).toEqual(nextMethods)
+    expect(posts(stub).map((c) => c.channel)).toEqual([postedIn(), nextChannel()])
+    for (const other of otherStubs(key)) expect(other.callLog).toEqual([])
+  })
+
+  test.each<[string, SlackFailureRow, 'conversations.open' | 'chat.postMessage', string]>([
+    ['conversations.open fails (user_not_found)', { kind: 'platform', error: 'user_not_found' }, 'conversations.open', 'user_not_found'],
+    ['conversations.open fails (network)', { kind: 'network' }, 'conversations.open', 'network_error'],
+    ['chat.postMessage to the opened D… fails (is_archived)', { kind: 'platform', error: 'is_archived' }, 'chat.postMessage', 'is_archived'],
+  ])('%s: not posted, no live entry; one token-safe log line naming the failed step; one ok:false chat_post trail event with the error class, naming the D… only once it was opened', async (_label, outcome, step, errorClass) => {
+    if (step === 'conversations.open') stubD.script.open.push(outcome)
+    else stubD.script.post.push(outcome)
+    const trail = makeTrailCapture()
+    const logCalls: unknown[][] = []
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow(D)] }),
+      get: async () => getResult([request(TOKEN_A, 1)], D),
+    }), { emitTrail: trail.emit, log: (...args) => { logCalls.push(args) } })
+    await ivl.tick()
+
+    expect(methods(stubD)).toEqual(step === 'conversations.open' ? ['conversations.open'] : ['conversations.open', 'chat.postMessage'])
+    expect(getLivePermission(INSTANCE_D, TOKEN_A)).toBeUndefined()
+    expect(rowDecisions(trail, 'post_attempted')).toHaveLength(1)
+    const events = chatPosts(trail)
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ claude_instance_id: INSTANCE_D, request_token: TOKEN_A, ok: false, error: errorClass })
+    if (step === 'conversations.open') expect('channel' in events[0]).toBe(false)
+    else expect(events[0].channel).toBe(D_DM)
+    expectTokenSafeFailure(logCalls, trail, `${step} failed for ${INSTANCE_D}`, outcome)
+    expect(slackCalls(stubA, stubB)).toBe(0)
+  })
+
+  test.each<[string, Persona['dm'], string]>([
+    ['DMs off', { enabled: false, contact: D_CONTACT }, 'dm.enabled is not true'],
+    ['no contact', { enabled: true }, 'dm.contact is not set'],
+  ])('`dm` destination refused (%s; the loader rejects it): logged once per open request naming the persona and the setting; no Slack call, no live entry, no trail event; posts once the setting is fixed', async (_label, dm, setting) => {
+    reconfigure(KEY_D, { dm })
+    const logCalls: unknown[][] = []
+    const trail = makeTrailCapture()
+    const getPermissionCalls: GetPermissionParams[] = []
+    let rows = [request(TOKEN_A, 1)]
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow(D)] }),
+      get: async () => getResult(rows, D),
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
+        getPermissionCalls.push(params)
+        return allowAll(params)
+      },
+    }), { log: (...args) => { logCalls.push(args) }, emitTrail: trail.emit })
+    const refusals = () =>
+      logLines(logCalls, `${renderPersonaRef(NAME_D, KEY_D)} has permission_prompts set to "dm" but ${setting}`)
+
+    await ivl.tick()
+    await ivl.tick()
+    await ivl.tick()
+    expect(refusals()).toHaveLength(1)
+    expect(String(refusals()[0][0])).toContain(INSTANCE_D)
+    expect(String(refusals()[0][0])).toContain(TOKEN_A)
+    expect(slackCalls(stubA, stubB, stubD)).toBe(0)
+    expect(getLivePermission(INSTANCE_D, TOKEN_A)).toBeUndefined()
+    expect(trail.events).toEqual([])
+
+    // A new open request logs its own line; the gone one was never tracked, so never reconciled.
+    rows = [request(TOKEN_B, 2)]
+    await ivl.tick()
+    await ivl.tick()
+    expect(refusals()).toHaveLength(2)
+    expect(String(refusals()[1][0])).toContain(TOKEN_B)
+    expect(getPermissionCalls).toHaveLength(0)
+    expect(slackCalls(stubA, stubB, stubD)).toBe(0)
+
+    // Fixed: the still-open request posts in the DM on the next tick.
+    reconfigure(KEY_D, { dm: { enabled: true, contact: D_CONTACT } })
+    await ivl.tick()
+    expect(methods(stubD)).toEqual(['conversations.open', 'chat.postMessage'])
+    expect(getLivePermission(INSTANCE_D, TOKEN_B)?.channelId).toBe(D_DM)
+    expect(refusals()).toHaveLength(2)
   })
 })
 
@@ -2112,23 +2308,69 @@ describe('b.fae F4 — wedge detector', () => {
     expect(wedgeTrail(s.trail)).toHaveLength(1)
   })
 
-  test('9. `dm` destination (until E7): the warning is logged naming the persona, with no Slack call and no trail event; the episode latches', async () => {
+  test('9. `dm` destination: the warning opens the persona\'s DM and posts there through its client; the trail names the D…; the episode latches', async () => {
+    const s = makeWedgeScenario(D)
+    await s.driveTicks(K - 1)
+    expect(stubD.callLog).toEqual([])
+    await s.driveTicks(1)
+
+    expect(methods(stubD)).toEqual(['conversations.open', 'chat.postMessage'])
+    expect(stubD.calls.conversationsOpen).toEqual([{ users: D_CONTACT }])
+    const warnings = wedgeWarnings(stubD)
+    expect(warnings.map((c) => c.channel)).toEqual([D_DM])
+    expect(String(warnings[0].text).startsWith(`Persona ${renderPersonaRef(NAME_D, KEY_D)}: `)).toBe(true)
+    const events = wedgeTrail(s.trail)
+    expect(events.map((e) => [e['claude_instance_id'], e['channel'], e['ok']])).toEqual([[INSTANCE_D, D_DM, true]])
+
+    // Latched: nothing more across many further empty ticks.
+    await s.driveTicks(K + RETRY_EVERY)
+    expect(methods(stubD)).toHaveLength(2)
+    expect(wedgeTrail(s.trail)).toHaveLength(1)
+    expect(slackCalls(stubA, stubB)).toBe(0)
+  })
+
+  test.each<[SlackFailureRow, string]>([
+    [{ kind: 'platform', error: 'user_not_found' }, 'user_not_found'],
+    [{ kind: 'network' }, 'network_error'],
+  ])('9b. `dm` destination, conversations.open fails (%o) → no post, one token-safe log line naming the persona, one ok:false trail event with no channel; not latched, so the next retry window opens again and posts', async (outcome, errorClass) => {
+    stubD.script.open.push(outcome)
     const s = makeWedgeScenario(D)
     await s.driveTicks(K)
 
-    const dmLines = logLines(s.logCalls, 'stuck-prompt warning by DM is not supported yet')
-    expect(dmLines).toHaveLength(1)
-    const line = String(dmLines[0][0])
-    expect(line).toContain(renderPersonaRef(NAME_D, KEY_D))
-    expect(line).toContain(`Persona ${renderPersonaRef(NAME_D, KEY_D)}: `)
-    expect(line).toContain('read-pane')
+    expect(methods(stubD)).toEqual(['conversations.open'])
+    const failed = wedgeTrail(s.trail)
+    expect(failed).toHaveLength(1)
+    expect(failed[0]).toMatchObject({ claude_instance_id: INSTANCE_D, ok: false, error: errorClass })
+    expect('channel' in failed[0]).toBe(false)
+    expectTokenSafeFailure(s.logCalls, s.trail, 'wedge warning conversations.open failed', outcome)
+    expect(String(logLines(s.logCalls, 'wedge warning conversations.open failed')[0][0]))
+      .toContain(`for ${renderPersonaRef(NAME_D, KEY_D)} (${INSTANCE_D})`)
+
+    await s.driveTicks(RETRY_EVERY)
+    expect(methods(stubD)).toEqual(['conversations.open', 'conversations.open', 'chat.postMessage'])
+    expect(wedgeWarnings(stubD).map((c) => c.channel)).toEqual([D_DM])
+    expect(wedgeTrail(s.trail).map((e) => e['ok'])).toEqual([false, true])
+  })
+
+  test('9c. `dm` destination refused (DMs off; the loader rejects it): one refusal line per attempt naming the persona and the setting, no Slack call, no trail event and no latch; with DMs on again, a later retry posts the warning in the DM and latches', async () => {
+    reconfigure(KEY_D, { dm: { enabled: false, contact: D_CONTACT } })
+    const s = makeWedgeScenario(D)
+    const refusals = () =>
+      logLines(s.logCalls, `${renderPersonaRef(NAME_D, KEY_D)} has permission_prompts set to "dm" but dm.enabled is not true`)
+    await s.driveTicks(K)
+    expect(refusals()).toHaveLength(1)
+    await s.driveTicks(RETRY_EVERY)
+    expect(refusals()).toHaveLength(2)
     expect(slackCalls(stubA, stubB, stubD)).toBe(0)
     expect(wedgeTrail(s.trail)).toHaveLength(0)
 
-    // Latched: no further log lines across many more empty ticks.
+    reconfigure(KEY_D, { dm: { enabled: true, contact: D_CONTACT } })
+    await s.driveTicks(RETRY_EVERY)
+    expect(methods(stubD)).toEqual(['conversations.open', 'chat.postMessage'])
+    expect(wedgeWarnings(stubD).map((c) => c.channel)).toEqual([D_DM])
     await s.driveTicks(K + RETRY_EVERY)
-    expect(logLines(s.logCalls, 'stuck-prompt warning by DM is not supported yet')).toHaveLength(1)
-    expect(slackCalls(stubA, stubB, stubD)).toBe(0)
+    expect(methods(stubD)).toHaveLength(2)
+    expect(wedgeTrail(s.trail).map((e) => e['ok'])).toEqual([true])
   })
 
   test('10. client unavailable: no post and no latch; once the client returns, exactly one warning lands after the retry throttle', async () => {
@@ -2370,17 +2612,18 @@ describe('poller tick — a persona that is not up (b.av2 SR-6.4)', () => {
     expect(updates(stubA)).toHaveLength(1)
   })
 
-  test('a request not posted (`dm` destination) keeps its one log line across ticks where its persona is not up', async () => {
+  test('a request not posted (client unavailable) keeps its one log line across ticks where its persona is not up', async () => {
     const s = makeNotUpScenario()
     s.listed.clear()
     s.listed.add(D)
     s.open.set(INSTANCE_D, [requestA()])
+    clients.setUnavailable(KEY_D)
     await s.drive(1)
     s.down(KEY_D)
     await s.drive(2)
     s.up(KEY_D)
     await s.drive(2)
-    expect(logLines(s.logCalls, 'permission prompts by DM are not supported yet')).toHaveLength(1)
+    expect(logLines(s.logCalls, `no Slack client for ${renderPersonaRef(NAME_D, KEY_D)}`)).toHaveLength(1)
     expect(slackCalls(stubA, stubB, stubD)).toBe(0)
   })
 

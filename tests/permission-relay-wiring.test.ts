@@ -10,7 +10,9 @@
  *
  * - it builds the router, as the connection manager's `onEvent`, with
  *   `clientFor` and `getPersona: getAppliedPersona`;
- * - it starts the poller with `clientFor` and `getPersona: getAppliedPersona`;
+ * - it starts the poller with `clientFor` and `getPersona: getAppliedPersona`,
+ *   and with the one destination resolver the persona notifier also gets, so
+ *   a persona's DM is opened once for both;
  * - it derives no persona key from an action ID.
  *
  * Why a static audit: main() cannot run in a unit test (the agent-director
@@ -22,7 +24,7 @@
 
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
-import { indicesOf, objectProperties, onlyCallArguments, stripComments } from './test-helpers/source-audit.ts'
+import { callsOf, indicesOf, objectProperties, onlyCallArguments, stripComments } from './test-helpers/source-audit.ts'
 
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(readFileSync('src/server.ts', 'utf-8'))
@@ -48,5 +50,14 @@ describe('server.ts wires the permission poller by persona (b.av2 SR-7.1)', () =
     const props = objectProperties(onlyCallArguments(SERVER_CODE, 'startPermissionPoller'))
     expect(props.get('clientFor')).toBe('clientFor')
     expect(props.get('getPersona')).toBe('getAppliedPersona')
+  })
+
+  test('the poller gets the one createPersonaDestinations resolver, the same one the persona notifier gets', () => {
+    const decls = [...SERVER_CODE.matchAll(/\bconst\s+(\w+)\s*=\s*createPersonaDestinations\s*\(/g)].map((m) => m[1])
+    expect(decls).toHaveLength(1)
+    expect(callsOf(SERVER_CODE, 'createPersonaDestinations')).toHaveLength(1)
+    const resolver = decls[0]!
+    expect(objectProperties(onlyCallArguments(SERVER_CODE, 'startPermissionPoller')).get('destinations')).toBe(resolver)
+    expect(objectProperties(onlyCallArguments(SERVER_CODE, 'createPersonaNotifier')).get('destinations')).toBe(resolver)
   })
 })

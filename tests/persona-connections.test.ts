@@ -93,6 +93,7 @@ import {
   createUnhandledRejectionHandler,
   describeSlackCallFailure,
   describeThrownValue,
+  isSafeIdentifier,
   slackPlatformReason,
 } from '../src/persona-connection-errors.ts'
 import {
@@ -2785,6 +2786,50 @@ describe('slackPlatformReason (SR-10.3)', () => {
         result = slackPlatformReason(value)
       }).not.toThrow()
       expect(result).toBeUndefined()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// isSafeIdentifier (SR-10.3): the short-identifier check, exported for callers
+// ---------------------------------------------------------------------------
+
+describe('isSafeIdentifier (SR-10.3)', () => {
+  test.each<[string, string]>([
+    ['a Slack error code', 'missing_scope'],
+    ['a library code', 'slack_webapi_platform_error'],
+    ['a single letter', 'a'],
+    ['a leading underscore', '_private'],
+    ['a leading dollar sign', '$ref'],
+    ['mixed case and digits', 'ECONNREFUSED2'],
+    ['64 characters', `a${'b'.repeat(63)}`],
+  ])('%s is safe', (_label, value) => {
+    expect(isSafeIdentifier(value)).toBe(true)
+  })
+
+  test.each<[string, unknown]>([
+    ['a fake token (a token always has a hyphen)', fakeToken(BOT_TOKEN_PREFIX, 'code')],
+    ['a bare hyphen', '-'],
+    ['spaces', 'not in channel'],
+    ['a newline', 'missing_scope\nsecond'],
+    ['a trailing newline', 'missing_scope\n'],
+    ['a dot', 'conversations.open'],
+    ['65 characters', `a${'b'.repeat(64)}`],
+    ['an empty string', ''],
+    ['a leading digit', '1abc'],
+    ['undefined', undefined],
+    ['null', null],
+    ['a number', 42],
+    ['an object', { toString: () => 'missing_scope' }],
+    ['a String object', new String('missing_scope')],
+  ])('%s is not safe', (_label, value) => {
+    expect(isSafeIdentifier(value)).toBe(false)
+  })
+
+  test('it is the same check as the code in describeThrownValue', () => {
+    for (const code of ['missing_scope', fakeToken(BOT_TOKEN_PREFIX, 'code'), `a${'b'.repeat(64)}`, '1abc']) {
+      const described = describeThrownValue(Object.assign(new Error('x'), { code }))
+      expect(described.includes(` code=${code}`)).toBe(isSafeIdentifier(code))
     }
   })
 })

@@ -43,6 +43,19 @@
  *     client gets decide but no update and no markHandled.
  *   - Trail `channel` fields keep holding Slack channel IDs.
  *
+ * DM prompt pins (b.av2 SR-7.1 DM part, SR-5.1 exception; AC 29, AC 36):
+ *   - A third persona, D, has DMs on, a `dm.contact` and
+ *     `permission_prompts: 'dm'`. Its prompt is seeded through a poller tick,
+ *     which opens the DM on D's stub and records the opened `D…` ID as the
+ *     entry's conversation.
+ *   - A click on D's DM prompt is decided once and makes exactly one
+ *     `chat.update` on that `D…` conversation and ts, through D's client only.
+ *   - With D's applied persona then switched to DMs off and a channel
+ *     destination, the click still makes that one update in the DM and
+ *     nothing else: no post, no `conversations.open` (an update is not a post).
+ *   - A's channel prompt and D's DM prompt, clicked in one run, each update
+ *     through their own client.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -72,11 +85,12 @@ import {
   errRelayFallenBack,
 } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
-import { makeStubSlack, type StubSlack } from './test-helpers/slack-stub.ts'
+import { makeStubSlack, openedDm, type StubSlack } from './test-helpers/slack-stub.ts'
 import { LEAK_SENTINEL, assertNoLeak } from './test-helpers/credentials.ts'
 import {
   makePersonaClients,
   makeTrailCapture,
+  posts,
   slackCalls,
   startManualPoller,
   updates as updatesOn,
@@ -122,6 +136,14 @@ const PERSONA_B_NAME = 'Build Bot'
 const CHANNEL_A = 'C0OPSREVIEW'
 /** Persona B's destination channel. */
 const CHANNEL_B = 'C0BUILDBOT'
+/** Persona D's name: DMs on, prompts to its DM with its contact. */
+const PERSONA_D_NAME = 'Inbox Bot'
+/** Persona D's one channel; its prompt destination once DMs are turned off. */
+const CHANNEL_D = 'C0INBOXBOT'
+/** Persona D's `dm.contact`. */
+const CONTACT_D = 'U0OPERATOR1'
+/** The DM conversation `conversations.open` returns for D's contact. */
+const DM_D = 'D0INBOXDM1'
 const TOKEN_A = '11111111-1111-4111-8111-111111111111'
 const TOKEN_B = '22222222-2222-4222-8222-222222222222'
 const TOKEN_C = '33333333-3333-4333-8333-333333333333'
@@ -130,6 +152,8 @@ const UNKNOWN_KEY = 'no_such_persona'
 
 const ALLOWED_TEXT = '*Permission* — Allowed'
 const DENIED_TEXT = '*Permission* — Denied by operator'
+const RELAY_FALLEN_BACK_TEXT =
+  '*Permission* — relay window elapsed; answer this prompt at the session\'s tmux pane'
 
 // ---------------------------------------------------------------------------
 // Two-persona harness
@@ -139,15 +163,21 @@ interface Harness {
   dir: string
   personaA: Persona
   personaB: Persona
+  /** DMs on, `dm.contact` set, prompts to its DM (`permission_prompts: 'dm'`). */
+  personaD: Persona
   instanceA: string
   instanceB: string
+  instanceD: string
   stubA: StubSlack
   stubB: StubSlack
+  stubD: StubSlack
   /** Each persona's own stub client; `setUnavailable` makes one unavailable, `calls` records every key asked for. */
   clients: PersonaClients
   /** Every key `getPersona` was asked for, in order. */
   getPersonaCalls: string[]
   getPersona: (key: string) => Persona | undefined
+  /** Replace the applied persona with this key, as a reload would (read by `getPersona` from then on). */
+  applyPersona: (persona: Persona) => void
 }
 
 let h: Harness
@@ -158,27 +188,39 @@ function makeHarness(): Harness {
     [
       { name: PERSONA_A_NAME, channels: [{ id: CHANNEL_A, delivery: 'all' }] },
       { name: PERSONA_B_NAME, channels: [{ id: CHANNEL_B, delivery: 'all' }] },
+      {
+        name: PERSONA_D_NAME,
+        channels: [{ id: CHANNEL_D, delivery: 'all' }],
+        dm: { enabled: true, contact: CONTACT_D },
+        permission_prompts: 'dm',
+      },
     ],
     dir,
   )
-  const [personaA, personaB] = config.personas as [Persona, Persona]
+  const [personaA, personaB, personaD] = config.personas as [Persona, Persona, Persona]
   // Scripted Slack failures carry the sentinel wherever a real error can hold secrets.
   const stubA = makeStubSlack({ leakMarker: LEAK_SENTINEL })
   const stubB = makeStubSlack({ leakMarker: LEAK_SENTINEL })
-  const clients = makePersonaClients((key) => (key === personaA.key ? stubA : key === personaB.key ? stubB : undefined))
+  const stubD = makeStubSlack({ leakMarker: LEAK_SENTINEL })
+  const stubs = new Map([[personaA.key, stubA], [personaB.key, stubB], [personaD.key, stubD]])
+  const clients = makePersonaClients((key) => stubs.get(key))
   const byKey = new Map(config.personas.map((p) => [p.key, p]))
   const getPersonaCalls: string[] = []
   return {
     dir,
     personaA,
     personaB,
+    personaD,
     instanceA: personaInstanceId(personaA.key),
     instanceB: personaInstanceId(personaB.key),
+    instanceD: personaInstanceId(personaD.key),
     stubA,
     stubB,
+    stubD,
     clients,
     getPersonaCalls,
     getPersona: (key) => { getPersonaCalls.push(key); return byKey.get(key) },
+    applyPersona: (persona) => { byKey.set(persona.key, persona) },
   }
 }
 
@@ -213,24 +255,27 @@ afterEach(() => {
 })
 
 /**
- * Run one poller tick over a single `check_permission` spawn of `persona`,
- * as a spawn of that persona writes it, whose open rows are `requests`. The
- * poller posts each prompt through the persona's client (the harness stub) to
- * its destination channel and records the live entries.
+ * Run one poller tick over one `check_permission` spawn per `[persona,
+ * requests]` pair, as a spawn of that persona writes it, whose open rows are
+ * `requests`. The poller posts each prompt through the persona's client (the
+ * harness stub) to its destination (its channel, or its DM, opened first) and
+ * records the live entries.
  */
 async function runSeedTick(
-  persona: Persona,
-  requests: ReturnType<typeof cannedPermissionRequest>[],
+  spawns: Array<[Persona, ReturnType<typeof cannedPermissionRequest>[]]>,
 ): Promise<ManualInterval[]> {
   const getClient = () => ({
     list: async () => ({
-      spawns: [cannedListRow({ state: 'check_permission' }, persona, h.dir)],
+      spawns: spawns.map(([persona]) => cannedListRow({ state: 'check_permission' }, persona, h.dir)),
     }),
-    get: async () => cannedGetResultPlural(
-      { state: 'check_permission', permission_requests: requests },
-      persona,
-      h.dir,
-    ),
+    get: async ({ claude_instance_id }: { claude_instance_id: string }) => {
+      const [persona, requests] = spawns.find(([p]) => personaInstanceId(p.key) === claude_instance_id)!
+      return cannedGetResultPlural(
+        { state: 'check_permission', permission_requests: requests },
+        persona,
+        h.dir,
+      )
+    },
   })
   initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
   const ivl = startManualPoller({ getClient: getClient as never, clientFor: h.clients.clientFor, getPersona: h.getPersona })
@@ -249,12 +294,12 @@ async function seedLiveEntry(opts: {
   requestToken: string
   requestId?: number
 }): Promise<{ pending: ManualInterval[] }> {
-  const pending = await runSeedTick(opts.persona ?? h.personaA, [
+  const pending = await runSeedTick([[opts.persona ?? h.personaA, [
     cannedPermissionRequest({
       request_token: opts.requestToken,
       request_id: opts.requestId ?? 1,
     }),
-  ])
+  ]]])
   return { pending }
 }
 
@@ -267,7 +312,7 @@ async function seedTwoSiblings(opts: {
   tokenA: string
   tokenB: string
 }): Promise<{ pending: ManualInterval[] }> {
-  const pending = await runSeedTick(h.personaA, [
+  const pending = await runSeedTick([[h.personaA, [
     cannedPermissionRequest({
       request_token: opts.tokenA,
       request_id: 1,
@@ -280,7 +325,7 @@ async function seedTwoSiblings(opts: {
       tool_name: 'Edit',
       tool_input: JSON.stringify({ file_path: '/etc/hosts' }),
     }),
-  ])
+  ]]])
   return { pending }
 }
 
@@ -507,6 +552,117 @@ describe('handlePermissionClick — happy path', () => {
 })
 
 // ---------------------------------------------------------------------------
+// A prompt in a persona's DM — AC 29, AC 36 (b.av2 SR-7.1 DM part, SR-5.1 exception)
+// ---------------------------------------------------------------------------
+
+/**
+ * Seed persona D's prompt for `requestToken` through a poller tick (alone, or
+ * beside other spawns): the poller opens D's DM with its contact on D's stub,
+ * which answers `DM_D`, and posts the prompt there. Returns D's live entry
+ * and how many calls D's stub had logged by then.
+ */
+async function seedDmPrompt(
+  requestToken: string,
+  others: Array<[Persona, ReturnType<typeof cannedPermissionRequest>[]]> = [],
+): Promise<{ entry: NonNullable<ReturnType<typeof getLivePermission>>; seedCalls: number }> {
+  h.stubD.script.open.push(openedDm(DM_D))
+  await runSeedTick([...others, [h.personaD, [cannedPermissionRequest({ request_token: requestToken })]]])
+  // Precondition: the prompt lives in the opened DM, posted through D's client.
+  expect(h.stubD.callLog.map((c) => c.method)).toEqual(['conversations.open', 'chat.postMessage'])
+  expect(h.stubD.calls.conversationsOpen).toEqual([{ users: CONTACT_D }])
+  expect(posts(h.stubD).map((p) => p.channel)).toEqual([DM_D])
+  const entry = getLivePermission(h.instanceD, requestToken)!
+  expect(entry.personaKey).toBe(h.personaD.key)
+  expect(entry.channelId).toBe(DM_D)
+  return { entry, seedCalls: h.stubD.callLog.length }
+}
+
+/** D as applied after DMs were turned off: the switch off and prompts to its channel. */
+const withDmsOff = (persona: Persona): Persona => ({
+  ...persona,
+  dm: { enabled: false, contact: CONTACT_D },
+  permission_prompts: CHANNEL_D,
+})
+
+describe('handlePermissionClick — a prompt in a persona\'s DM (AC 29, AC 36)', () => {
+  test.each([
+    { label: 'AC 29: DMs on', dmsOff: false },
+    { label: 'AC 36: DMs turned off after the prompt was posted', dmsOff: true },
+  ] as const)('$label → an allow click is decided once; exactly one chat.update on the DM conversation and ts through D\'s own client; no post, no conversations.open, no call on another client', async ({ dmsOff }) => {
+    const { entry, seedCalls } = await seedDmPrompt(TOKEN_A)
+    if (dmsOff) h.applyPersona(withDmsOff(h.personaD))
+    const decide = makeDecideStub()
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    const trail = makeTrailCapture()
+    const logs: unknown[][] = []
+
+    const result = await handlePermissionClick(
+      encodePermissionActionId('allow', h.instanceD, TOKEN_A),
+      clickDeps({ receivingPersonaKey: h.personaD.key, emitTrail: trail.emit, log: (...args) => { logs.push(args) } }),
+      { channel: DM_D, messageTs: entry.messageTs, user: CONTACT_D },
+    )
+
+    expect(result).toBe(true)
+    expect(decide.calls).toEqual([
+      { claude_instance_id: h.instanceD, decision: 'allow', request_token: TOKEN_A } as DecideParams & { request_token: string },
+    ])
+    // D's client made exactly one call after the seed: the update, in the DM, at the prompt's ts.
+    const clickCalls = h.stubD.callLog.slice(seedCalls)
+    expect(clickCalls.map((c) => c.method)).toEqual(['chat.update'])
+    const update = clickCalls[0]!.args as { channel: string; ts: string; text: string }
+    expect(update.channel).toBe(entry.channelId)
+    expect(update.channel).toBe(DM_D)
+    expect(update.ts).toBe(entry.messageTs)
+    expect(update.text).toBe(ALLOWED_TEXT)
+    expect(h.clients.calls.at(-1)).toBe(h.personaD.key)
+    // No other client saw anything.
+    expect(h.stubA.callLog).toEqual([])
+    expect(h.stubB.callLog).toEqual([])
+    // The trail names the DM conversation, and the click posted nothing.
+    const closure = trail.events.filter((e) => e.event === 'cscb.chat_update.attempted')
+    expect(closure).toHaveLength(1)
+    expect(closure[0]!.channel).toBe(DM_D)
+    expect(closure[0]!['verdict_tag']).toBe('click_handler_allow')
+    expect(closure[0]!['ok']).toBe(true)
+    expect(trail.events.find((e) => e.event === 'cscb.chat_post.attempted')).toBeUndefined()
+    expect(getLivePermission(h.instanceD, TOKEN_A)?.handled).toBe(true)
+    // Nothing logged: a DMs-off refusal would add a line.
+    expect(logs).toEqual([])
+  })
+
+  test('two personas: A\'s channel prompt and D\'s DM prompt, each clicked on its own connection → each update through its own client, in its own conversation', async () => {
+    const { entry: entryD, seedCalls } = await seedDmPrompt(TOKEN_B, [
+      [h.personaA, [cannedPermissionRequest({ request_token: TOKEN_A })]],
+    ])
+    const entryA = getLivePermission(h.instanceA, TOKEN_A)!
+    expect(entryA.channelId).toBe(CHANNEL_A)
+    const seedCallsA = h.stubA.callLog.length
+    const decide = makeDecideStub()
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+
+    await handlePermissionClick(
+      encodePermissionActionId('deny', h.instanceD, TOKEN_B),
+      clickDeps({ receivingPersonaKey: h.personaD.key }),
+    )
+    await handlePermissionClick(
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ receivingPersonaKey: h.personaA.key }),
+    )
+
+    expect(decide.calls.map((c) => c.claude_instance_id)).toEqual([h.instanceD, h.instanceA])
+    expect(h.stubD.callLog.slice(seedCalls).map((c) => ({ method: c.method, args: c.args }))).toEqual([
+      { method: 'chat.update', args: expect.objectContaining({ channel: DM_D, ts: entryD.messageTs, text: DENIED_TEXT }) },
+    ])
+    expect(h.stubA.callLog.slice(seedCallsA).map((c) => ({ method: c.method, args: c.args }))).toEqual([
+      { method: 'chat.update', args: expect.objectContaining({ channel: CHANNEL_A, ts: entryA.messageTs, text: ALLOWED_TEXT }) },
+    ])
+    expect(h.stubB.callLog).toEqual([])
+    expect(getLivePermission(h.instanceD, TOKEN_B)?.handled).toBe(true)
+    expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // SR-4.1 / SR-7.2 — decide-wire invariant
 // ---------------------------------------------------------------------------
 
@@ -676,9 +832,6 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
 // ---------------------------------------------------------------------------
 
 describe('handlePermissionClick — ErrRelayFallenBack (b.qi1)', () => {
-  const RELAY_FALLEN_BACK_TEXT =
-    '*Permission* — relay window elapsed; answer this prompt at the session\'s tmux pane'
-
   test('repaints the prompt buttonless through A\'s client, emits the relay-fallen-back trail pair, and leaves the entry unhandled', async () => {
     await seedLiveEntry({ requestToken: TOKEN_A })
     const messageTs = getLivePermission(h.instanceA, TOKEN_A)!.messageTs

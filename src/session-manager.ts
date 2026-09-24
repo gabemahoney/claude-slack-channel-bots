@@ -99,6 +99,7 @@ import { firstNoticeLine, notifySafely, type PersonaNoticeOptions, type PersonaN
 import type { PersonaBringUpFailure } from './persona-start.ts'
 import type { PersonaBringUpController, PersonaBringUpOutcome } from './persona-bringup-controller.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
+import { describeDestinationFailureCause } from './persona-destination.ts'
 import { RESTART_FAILURE_CAP } from './restart.ts'
 import { isDryRun } from './tokens.ts'
 // Import cycle with jsonl-persistence-check.ts: use these imports only inside functions, never at module top level.
@@ -296,13 +297,15 @@ export function notifySpawnFailure(key: string, error: AgentDirectorError, isSta
     `  Error: \`${error.errName}\` — ${error.errDescription.slice(0, 300)}\n` +
     `  Remediation: ${remediationHint(error)}`
   sendPersonaNotice(key, text, {
-    onPostFailure: (err) => {
+    onPostFailure: (failure) => {
+      // Token-safe cause: a Slack rejection's message can carry secrets, so
+      // only the describer's type/code/frames reach stderr and the log file.
+      // A failed DM open names the step and its code.
+      const cause = describeDestinationFailureCause(failure)
       if (isStartup) {
-        // Token-safe cause: a Slack rejection's message can carry secrets, so
-        // only the describer's type/code/frames reach stderr and the log file.
-        recordStartupError('spawn-failure-post', `failed to post spawn failure for ${ref}`, describeThrownValue(err))
+        recordStartupError('spawn-failure-post', `failed to post spawn failure for ${ref}`, cause)
       } else {
-        console.error(`[slack] spawn-failure-post: failed to post spawn failure for ${ref}: ${describeThrownValue(err)}`)
+        console.error(`[slack] spawn-failure-post: failed to post spawn failure for ${ref}: ${cause}`)
       }
     },
   })

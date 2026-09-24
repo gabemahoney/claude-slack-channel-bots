@@ -16,6 +16,8 @@
  *   run and up→flush listener, `connections = <manager>`, `clientFor` and
  *   `identityFor` over the connection view, the routing's identity, client and
  *   archive seams, and the archive writer's per-persona resolver source.
+ * - The one destination resolver (SR-7.1): built at module scope and shared
+ *   by the persona notifier and the permission poller.
  * - The bring-up controller (SR-6.1, SR-6.4): the start's bring-up, told
  *   every connection status, stored for shutdown and cancelled there before
  *   the connections stop.
@@ -331,6 +333,13 @@ describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, 
     // would be in its temporal dead zone when the manager is built).
     expect(listeners[1]).toMatch(/^\((\w+), (\w+)\) => bringUps\?\.onConnectionStatus\(\1, \2\)$/)
     expect(listeners[1]).not.toContain(constOf('createPersonaBringUpController'))
+  })
+
+  test('the notifier and the permission poller share one destination resolver: createPersonaDestinations built once, at module scope, and passed as `destinations` to both (b.av2 SR-7.1)', () => {
+    const resolver = constOf('createPersonaDestinations')
+    expect(insideMain(onlyCallOf('createPersonaDestinations'))).toBe(false)
+    expect(onlyCallProps('createPersonaNotifier').get('destinations')).toBe(resolver)
+    expect(onlyCallProps('startPermissionPoller').get('destinations')).toBe(resolver)
   })
 
   test('main() points the lookups at the manager: `connections = <manager>` once, inside main(), before the bring-up', () => {

@@ -49,6 +49,7 @@ import type { Persona, PersonaConfig } from '../src/config.ts'
 import { buildTempArchiveDb, type ArchiveRow } from './test-helpers/archive-db.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
+import { stubOpenedDmId } from './test-helpers/slack-stub.ts'
 import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
 
 // ---------------------------------------------------------------------------
@@ -706,6 +707,66 @@ describe('runJsonlPersistenceSafeguard — real per-persona notifier', () => {
     expect(aPosts[0]!.text).toContain(fallback)
     expect(h.posts(b.key)).toEqual([])
     // Posted, not dropped, dry-run or failed: the notifier logged nothing.
+    expect(h.logs).toEqual([])
+  })
+
+  test("non-persistent-storage warning: a dm persona gets it once in its DM with its contact, on its own client, with the channel persona's text; nothing on the persona off the tmpfs root", async () => {
+    const contact = 'U0DELTADM'
+    // A (channel) and D (dm) share the tmpfs root /tmp/claude; B is on ext4.
+    const config = makeMultiPersonaConfig(
+      [
+        { name: 'Alpha Bot', claude_config_dir: '/tmp/claude' },
+        { name: 'Delta Bot', channels: [], dm: { enabled: true, contact }, permission_prompts: 'dm', claude_config_dir: '/tmp/claude' },
+        { name: 'Beta Bot', claude_config_dir: '/home/user/.claude' },
+      ],
+      makeTempDir(),
+    )
+    const [a, d, b] = config.personas as [Persona, Persona, Persona]
+    const h = makeNotifierHarness(config)
+    // Collect the notifier's pending deliveries: a DM post settles only after its conversations.open.
+    const pending: Promise<void>[] = []
+    const errors: string[] = []
+    await runJsonlPersistenceSafeguard(config, (key, text, options) => {
+      const p = h.notifier.notify(key, text, options)
+      pending.push(p)
+      return p
+    }, {
+      readMountinfo: fixture(REALISTIC_MOUNTINFO),
+      statFn: () => true,
+      getRow: async () => {
+        throw new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'x')
+      },
+      archiveCountSince: () => null,
+      recordStartupError: (key) => {
+        errors.push(key)
+      },
+      home,
+    })
+    await Promise.all(pending)
+
+    expect(errors).toEqual(['jsonl-non-persistent'])
+    // D: one open with its contact, then one post to the returned D… conversation, both on D's client.
+    const dStub = h.stub(d.key)
+    expect(dStub.web.callLog.map((c) => c.method)).toEqual(['conversations.open', 'chat.postMessage'])
+    expect(dStub.calls.conversationsOpen).toEqual([{ users: contact }])
+    const dPosts = h.posts(d.key)
+    expect(dPosts).toHaveLength(1)
+    expect(Object.keys(dPosts[0]!).sort()).toEqual(['channel', 'text'])
+    expect(dPosts[0]!.channel).toBe(stubOpenedDmId(contact))
+    const refD = renderPersonaRef(d.name, d.key)
+    expect(dPosts[0]!.text).toContain(refD)
+    expect(dPosts[0]!.text).toContain('/tmp/claude/projects')
+    expect(dPosts[0]!.text).toMatch(/non-persistent filesystem/)
+    // A (channel destination) is unchanged: one post to its channel, no open.
+    expect(h.stub(a.key).web.callLog.map((c) => c.method)).toEqual(['chat.postMessage'])
+    const aPosts = h.posts(a.key)
+    expect(aPosts).toEqual([{ channel: a.permission_prompts, text: expect.any(String) }])
+    // Same notice text for either destination, apart from the persona reference.
+    const refA = renderPersonaRef(a.name, a.key)
+    expect(dPosts[0]!.text.replace(refD, '<ref>')).toBe(aPosts[0]!.text.replace(refA, '<ref>'))
+    expect(dPosts[0]!.text).not.toContain(refA)
+    // B is off the flagged root: nothing on its client.
+    expect(h.stub(b.key).callLog).toEqual([])
     expect(h.logs).toEqual([])
   })
 })

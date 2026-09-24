@@ -216,12 +216,10 @@ Two personas share the channel `C0555555555`. `planner` receives every message i
 | `credentials_file` | yes | Path to the persona's [credentials file](#credentials-files). Absolute, `~` or `~/…`. |
 | `working_directory` | yes | Working directory of the persona's Claude instance. Absolute, `~` or `~/…`. |
 | `channels` | yes, unless `dm.enabled` is `true` | The channels the persona is in. Each entry is `{ "id": "<channel ID>", "delivery": "all" \| "mentions" }`: `all` delivers every message in the channel, `mentions` only messages that @mention the persona or use `@here` / `@channel`. Invite the persona's Slack app to each channel. |
-| `permission_prompts` | yes | The persona's **destination**: where its permission prompts and server notices are posted. One of the persona's own channel IDs, or `"dm"`. |
+| `permission_prompts` | yes | The persona's **destination**: where its permission prompts and server notices are posted. One of the persona's own channel IDs, or `"dm"` for a DM from the persona's app to its `dm.contact`. |
 | `claude_config_dir` | no | Claude config directory for this persona. Defaults to the top-level `claude_config_dir`. See [Per-persona `claude_config_dir` override](#per-persona-claude_config_dir-override). |
 | `stop_hook_bootstrap` | no | Slack Reply Guard switch for this persona. Defaults to the top-level `stop_hook_bootstrap`. See [Per-persona `stop_hook_bootstrap` override](#per-persona-stop_hook_bootstrap-override). |
 | `dm` | no | Direct-message settings: `{ "enabled": <boolean>, "contact": "<user ID>" }`. `enabled` defaults to `false`. `contact` is a Slack user ID such as `U0123456789` (starting with `U` or `W`), the person a `"dm"` destination addresses. See [Direct messages](#direct-messages-dmenabled). |
-
-A `"dm"` destination is accepted, but in this version its prompts and notices are only written to `server.log`, not sent to Slack.
 
 The rules that most often trip a first config:
 
@@ -271,7 +269,9 @@ A DM-only persona:
 }
 ```
 
-Starting a DM with a user needs the `im:write` bot scope, which the shipped `slack-app-manifest.yml` grants. An app created from an earlier manifest lacks it: `reply` to a user ID fails with `missing_scope` until the scope is added and the app is re-installed. Receiving DMs and answering in them work without it. The `debug-slack-channel-bots` skill (see [Troubleshooting](#troubleshooting)) has the steps under "A persona can't open a DM".
+Starting a DM with a user (a `reply` to a user ID, or a persona whose `permission_prompts` is `"dm"`) needs the `im:write` bot scope, which the shipped `slack-app-manifest.yml` grants. A `"dm"` destination always opens its DM through Slack before it first posts there, even when the DM already exists. For an app created from an earlier manifest, a `"dm"` persona's prompts and notices are not posted, and a `reply` to a user ID fails with `missing_scope`, until the scope is added and the app is re-installed.
+
+Receiving DMs and replying in an existing DM (a `D…` ID) work without the scope. The `debug-slack-channel-bots` skill (see [Troubleshooting](#troubleshooting)) has the steps under "A persona can't open a DM".
 
 #### Credentials files
 
@@ -774,8 +774,8 @@ Flow:
 
 1. agent-director moves the spawn into `check_permission` state when Claude requests a tool permission.
 2. CSCB's poller (`src/permission-poller.ts`) runs `client.list({ state: ['check_permission'], label: ['service=cscb'] })` at the `agent_director_poll_interval_ms` cadence (default 1000 ms).
-3. For each new spawn, `client.get(...)` returns the open permission request (tool name, tool input and an opaque `request_token`). CSCB identifies the persona that owns the spawn from its `persona` label and posts the Block Kit prompt to the persona's destination (its `permission_prompts` channel) as that persona.
-4. The operator clicks Allow / Deny in Slack. CSCB resolves the click through the same persona: it calls `client.decide({ claude_instance_id, decision, request_token })` and, as that persona, updates the message to "*Permission* — Allowed" or "*Permission* — Denied by operator".
+3. For each new spawn, `client.get(...)` returns the open permission request (tool name, tool input and an opaque `request_token`). CSCB identifies the persona that owns the spawn from its `persona` label and posts the Block Kit prompt to the persona's destination as that persona: its `permission_prompts` channel, or, for `"dm"`, a DM from the persona's app to its `dm.contact`. The server opens that DM if none exists yet, so a DM-only persona's first prompt is delivered too. Each persona follows its own setting.
+4. The operator clicks Allow / Deny in Slack, in the channel or the DM; the buttons work the same in both. CSCB resolves the click through the same persona: it calls `client.decide({ claude_instance_id, decision, request_token })` and, as that persona, updates the message to "*Permission* — Allowed" or "*Permission* — Denied by operator".
 5. If a tracked prompt closes for any reason other than a Slack click, the next poller tick replaces the buttons with the verdict: "⏱ *Permission* — Timed out", "🪦 *Permission* — Session ended", "*Permission* — Allowed", "*Permission* — Denied by operator", or "*Permission* — Denied (closed)" when the reason is unknown.
 
 While a persona is not up (broken or retrying), its instance keeps running but its permission prompts are not posted and its already-posted prompts are left as they are. They appear, or get their verdict, on the first poll after the persona comes up.
@@ -925,10 +925,10 @@ Add the channel to a persona's `channels` and restart the server.
 Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json`.
 
 **Bot appears dead / posts a "blocked on a native Claude Code permission prompt" warning**
-The bot is wedged in `check_permission` on a native Claude Code TUI prompt that never reached Slack (a permission decision AD recorded but could not deliver). The bot stops responding, and after ~90 s the poller posts a one-shot warning naming the persona to the persona's destination. Recover by inspecting the native prompt with `agent-director read-pane --claude-instance-id <id>`, then killing and respawning the session (`agent-director kill <id>` or tmux-kill, then let the server restart it or `claude-slack-channel-bots stop && claude-slack-channel-bots start`). Do **not** use `send-keys` — agent-director hard-rejects it while the spawn is in this relayed permission state. The warning fires once per wedge episode; the detector re-arms if the bot later wedges again.
+The bot is wedged in `check_permission` on a native Claude Code TUI prompt that never reached Slack (a permission decision AD recorded but could not deliver). The bot stops responding, and after ~90 s the poller posts a one-shot warning naming the persona to the persona's destination (a channel or a DM with its contact). Recover by inspecting the native prompt with `agent-director read-pane --claude-instance-id <id>`, then killing and respawning the session (`agent-director kill <id>` or tmux-kill, then let the server restart it or `claude-slack-channel-bots stop && claude-slack-channel-bots start`). Do **not** use `send-keys` — agent-director hard-rejects it while the spawn is in this relayed permission state. The warning fires once per wedge episode; the detector re-arms if the bot later wedges again.
 
 **Session not restarting after crash**
-Auto-restart backs off exponentially on repeated launch failures — the delay doubles from `session_restart_delay` (default 60s) on each consecutive failure, up to a 15-minute ceiling. After 5 consecutive failures the persona hits a cap: a `SpawnCapReached` notice naming the persona is posted to the persona's destination (its `permission_prompts`) and automatic restarts stop.
+Auto-restart backs off exponentially on repeated launch failures — the delay doubles from `session_restart_delay` (default 60s) on each consecutive failure, up to a 15-minute ceiling. After 5 consecutive failures the persona hits a cap: a `SpawnCapReached` notice naming the persona is posted to the persona's destination (a channel or a DM with its contact, per its `permission_prompts`) and automatic restarts stop.
 
 A message delivered to a persona whose session is dead but not yet capped triggers a fast recovery: the restart is scheduled immediately (the backoff delay is clamped down to 5 seconds for an explicit human trigger, never raised), and the sender is told the session is starting and to retry in a moment. The dropped message itself is **not** delivered or replayed — recovery only starts the session; you must resend after it comes up. This human trigger still counts each failed launch toward the backoff/cap, and a restart already pending or active is not stacked.
 

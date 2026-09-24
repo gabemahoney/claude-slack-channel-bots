@@ -73,6 +73,11 @@ export function describeThrownValue(value: unknown): string {
   }
 }
 
+/** True when `value` is a short identifier (the `code` check), so safe to log. Never throws. */
+export function isSafeIdentifier(value: unknown): value is string {
+  return typeof value === 'string' && SAFE_IDENTIFIER_RE.test(value)
+}
+
 /**
  * The Slack platform reason of a rejected Web API call (`err.data.error`, e.g.
  * `not_in_channel`), only when it passes the same short-identifier check as

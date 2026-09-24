@@ -83,6 +83,7 @@ import {
   sweepDeadTmuxChannel,
 } from './session-manager.ts'
 import { createPersonaNotifier } from './persona-notifier.ts'
+import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaRouting, hasSessionStream } from './persona-routing.ts'
 import { createPersonaConnectionManager, type PersonaConnectionManager } from './persona-connections.ts'
 import { createUnhandledRejectionHandler, describeThrownValue } from './persona-connection-errors.ts'
@@ -664,6 +665,14 @@ function getAppliedPersona(key: string): Persona | undefined {
 // ---------------------------------------------------------------------------
 
 /**
+ * The one destination resolver (b.av2 SR-7.1): resolves each persona's
+ * destination and caches its DM conversation per persona and contact. Shared
+ * by the notifier and the permission poller, so they open a persona's DM
+ * once. Side-effect-free to build: an empty cache, no timer, no Slack call.
+ */
+const personaDestinations = createPersonaDestinations({ log: (line) => console.error(line) })
+
+/**
  * The one per-persona notifier. Outage state, the session manager and the
  * JSONL safeguard send every persona notice through it (installed in main()).
  * A notice raised while its persona has no client is held, and flushed when
@@ -672,6 +681,7 @@ function getAppliedPersona(key: string): Persona | undefined {
 const personaNotifier = createPersonaNotifier({
   getPersona: getAppliedPersona,
   clientFor,
+  destinations: personaDestinations,
   isDryRun,
   log: (line) => console.error(line),
 })
@@ -1127,6 +1137,7 @@ export async function main(): Promise<void> {
     startPermissionPoller({
       getClient,
       clientFor,
+      destinations: personaDestinations,
       getPersona: getAppliedPersona,
       // b.av2 SR-6.4: a not-up persona's rows are skipped, its prompts and
       // wedge state held until it is up.

@@ -34,7 +34,8 @@ import {
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { makeStubClient } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
-import type { StubSlack } from './test-helpers/slack-stub.ts'
+import { formatPersonaNotice } from '../src/persona-notifier.ts'
+import { stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
 import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
 import {
   auditGetClientAllowlist,
@@ -580,6 +581,72 @@ describe('persona-keyed notices', () => {
 
       // No drop, dry-run or failure path was taken.
       expect(lines).toEqual([])
+    })
+
+    test('A with a dm destination: onset and all-clear each post once to A\'s DM with its contact, opened once on A\'s client; same text as a channel destination; nothing on B', async () => {
+      const contact = 'U0ALPHADM'
+      const config = makeMultiPersonaConfig(
+        [
+          {
+            name: 'Alpha Ops',
+            channels: [{ id: 'C0ALPHA01', delivery: 'all' }],
+            dm: { enabled: true, contact },
+            permission_prompts: 'dm',
+          },
+          { name: 'Bravo Ops', channels: [{ id: 'C0BRAVO01', delivery: 'all' }], permission_prompts: 'C0BRAVO01' },
+        ],
+        dir,
+      )
+      const [a, b] = config.personas
+      const h = makeNotifierHarness(config)
+      // The bodies outage-state raised, and the notifier's pending deliveries
+      // (a DM post settles only after its conversations.open).
+      const bodies: string[] = []
+      const pending: Promise<void>[] = []
+      _resetOutageState()
+      initOutageState({
+        notify: (key, text) => {
+          bodies.push(text)
+          pending.push(h.notifier.notify(key, text))
+        },
+        getClient: () => makeStubClient() as unknown as Client,
+      })
+      const stubA = h.stub(a.key)
+      const dmId = stubOpenedDmId(contact)
+      const refA = renderPersonaRef(a.name, a.key)
+
+      setOutageFlag(a.key, 'ad-unreachable', '/bin/ad')
+      // A repeated raise is deduped: nothing more is posted.
+      setOutageFlag(a.key, 'ad-unreachable', '/bin/ad')
+      await Promise.all(pending)
+      expect(stubA.web.callLog.map((c) => c.method)).toEqual(['conversations.open', 'chat.postMessage'])
+      expect(stubA.calls.conversationsOpen).toEqual([{ users: contact }])
+      expect(stubA.calls.postMessage).toHaveLength(1)
+      const onset = stubA.calls.postMessage[0] as { channel: string; text: string }
+      // Exactly channel + text, to the opened D… conversation (never the contact's user ID).
+      expect(Object.keys(onset).sort()).toEqual(['channel', 'text'])
+      expect(onset.channel).toBe(dmId)
+      // The same text a channel destination gets: the notifier's persona reference + the raised body.
+      expect(onset.text).toBe(formatPersonaNotice(a, bodies[0]!))
+      expect(onset.text).toContain(refA)
+      expect(onset.text).toMatch(/agent-director unreachable/)
+
+      clearOutageFlag(a.key, 'ad-unreachable')
+      await Promise.all(pending)
+      // The cached DM is reused: no second open.
+      expect(stubA.web.callLog.map((c) => c.method)).toEqual(['conversations.open', 'chat.postMessage', 'chat.postMessage'])
+      expect(stubA.calls.postMessage).toHaveLength(2)
+      const allClear = stubA.calls.postMessage[1] as { channel: string; text: string }
+      expect(Object.keys(allClear).sort()).toEqual(['channel', 'text'])
+      expect(allClear.channel).toBe(dmId)
+      expect(allClear.text).toBe(formatPersonaNotice(a, bodies[1]!))
+      expect(allClear.text).toContain(refA)
+      expect(allClear.text).toMatch(/All clear/)
+      expect(bodies).toHaveLength(2)
+
+      // Nothing on B's client, and no drop, dry-run, refusal or failure line.
+      expect(h.stub(b.key).callLog).toEqual([])
+      expect(h.logs).toEqual([])
     })
   })
 })

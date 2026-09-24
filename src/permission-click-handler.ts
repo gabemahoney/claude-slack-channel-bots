@@ -27,6 +27,13 @@
  * one whose instance ID is not `cscb_<receiving key>` is logged and neither
  * decided nor updated (fail closed).
  *
+ * A prompt posted in a DM is handled the same way: the recorded conversation
+ * is its `D…` ID, and the persona comes from the receiving connection, never
+ * from a channel lookup. Nothing here reads the persona's current destination
+ * or DMs switch, so a DM prompt stays answerable after DMs were turned off
+ * (b.av2 SR-5.1: an update is not a post). The click path never posts and
+ * never calls `conversations.open`.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -44,6 +51,7 @@ import type { Persona } from './config.ts'
 import { withOutageDetection } from './outage-state.ts'
 import { parsePermissionActionId, type PermissionDecision } from './permission-action-id.ts'
 import { describeSlackCallFailure } from './persona-connection-errors.ts'
+import { classifySlackError } from './persona-destination.ts'
 import { personaInstanceId, renderPersonaRef } from './persona-identity.ts'
 import { getLivePermission, markHandled } from './permission-poller.ts'
 import { emitTrail as defaultEmitTrail } from './permission-trail.ts'
@@ -93,22 +101,6 @@ function classifyAdDecideError(err: unknown): AdDecideResponseClass {
   if (err instanceof AgentDirectorError && err.errName === 'ErrInvalidFlags') return 'ErrInvalidFlags'
   if (err instanceof AgentDirectorError && err.errName === 'ErrAmbiguousRequest') return 'ErrAmbiguousRequest'
   return 'other'
-}
-
-/** SR-V-2.5 Slack error class string (mirrors permission-poller.ts). */
-function classifySlackError(err: unknown): string {
-  if (err !== null && typeof err === 'object') {
-    const data = (err as { data?: unknown }).data
-    if (data !== null && typeof data === 'object') {
-      const e = (data as { error?: unknown }).error
-      if (typeof e === 'string' && e.length > 0) return e
-    }
-  }
-  if (err instanceof Error) {
-    if (err.name === 'AbortError') return 'aborted'
-    return 'network_error'
-  }
-  return 'unknown_error'
 }
 
 // Match the poller's SR-2.4 terminal verdict text exactly so the click-handler

@@ -62,6 +62,8 @@ import type { DeleteParams, FindMissingParams, KillParams, SendKeysParams, Spawn
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
+import { stubOpenedDmId, type StubWebMethod } from './test-helpers/slack-stub.ts'
+import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import type { Persona, PersonaConfig } from '../src/config.ts'
 
 // ---------------------------------------------------------------------------
@@ -1379,50 +1381,86 @@ describe('restart cap notice goes to the persona destination (b.av2 SR-7.2)', ()
    * post to "the channel" (its first) is distinguishable from a post to the
    * destination.
    */
-  function setupCapNotice(): { a: Persona; b: Persona; h: NotifierHarness } {
+  function setupCapNotice(alphaDestination: Pick<Persona, 'dm' | 'permission_prompts'> = {
+    dm: { enabled: false },
+    permission_prompts: 'C0ALPHAPR',
+  }): { a: Persona; b: Persona; h: NotifierHarness; bodies: string[] } {
     const config = makeMultiPersonaConfig([
       {
         name: 'Alpha Bot',
         channels: [{ id: 'C0ALPHA01', delivery: 'all' }, { id: 'C0ALPHAPR', delivery: 'all' }],
-        permission_prompts: 'C0ALPHAPR',
+        ...alphaDestination,
       },
       { name: 'beta_bot' },
     ], dir)
     const [a, b] = config.personas as [Persona, Persona]
     const h = makeNotifierHarness(config)
-    setSessionNotifier(h.notifier.notify)
-    return { a, b, h }
+    // The notice bodies the session manager raised, in order.
+    const bodies: string[] = []
+    setSessionNotifier((key, text, options) => {
+      bodies.push(text)
+      return h.notifier.notify(key, text, options)
+    })
+    return { a, b, h, bodies }
   }
+
+  const DM_CONTACT = 'U0ALPHADM'
 
   /** Let the fire-and-forget cap notice post settle. */
   async function settleNotices(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 0))
   }
 
-  test('cap for persona A posts exactly one notice on A\'s client to A\'s permission_prompts channel, naming A; nothing on B', async () => {
-    const { a, b, h } = setupCapNotice()
+  test.each([
+    {
+      label: 'A\'s permission_prompts channel',
+      destination: { dm: { enabled: false }, permission_prompts: 'C0ALPHAPR' },
+      channel: 'C0ALPHAPR',
+      methods: ['chat.postMessage'],
+    },
+    {
+      // b.av2 SR-7.2 DM destination: the DM with A's contact, opened on A's
+      // client, posted to the returned D… conversation (never the user ID).
+      label: 'A\'s DM with its contact',
+      destination: { dm: { enabled: true, contact: DM_CONTACT }, permission_prompts: 'dm' },
+      channel: stubOpenedDmId(DM_CONTACT),
+      methods: ['conversations.open', 'chat.postMessage'],
+    },
+  ] as Array<{ label: string; destination: Pick<Persona, 'dm' | 'permission_prompts'>; channel: string; methods: StubWebMethod[] }>)(
+    'cap for persona A posts exactly one notice on A\'s client to $label, naming A; nothing on B',
+    async ({ destination, channel, methods }) => {
+      const { a, b, h, bodies } = setupCapNotice(destination)
 
-    const deps = makeDeps({
-      restartDelay: CAP_BASE_DELAY_S,
-      launchSessionResult: false,
-      onCapReached: notifyRestartCapReached,
-    })
-    initRestart(deps)
+      const deps = makeDeps({
+        restartDelay: CAP_BASE_DELAY_S,
+        launchSessionResult: false,
+        onCapReached: notifyRestartCapReached,
+      })
+      initRestart(deps)
 
-    await driveFailures(a.key, a.working_directory, RESTART_FAILURE_CAP)
+      await driveFailures(a.key, a.working_directory, RESTART_FAILURE_CAP)
+      await settleNotices()
 
-    expect(deps.onCapReachedCalls).toEqual([a.key])
-    const posts = h.posts(a.key)
-    expect(posts).toEqual([{ channel: 'C0ALPHAPR', text: expect.any(String) }])
-    expect(h.posts(b.key)).toHaveLength(0)
-    expect(h.logs).toEqual([])
+      expect(deps.onCapReachedCalls).toEqual([a.key])
+      const posts = h.posts(a.key)
+      expect(posts).toEqual([{ channel, text: expect.any(String) }])
+      expect(h.stub(a.key).web.callLog.map((c) => c.method)).toEqual(methods)
+      if (destination.permission_prompts === 'dm') {
+        expect(h.stub(a.key).calls.conversationsOpen).toEqual([{ users: DM_CONTACT }])
+      }
+      expect(h.stub(b.key).callLog).toEqual([])
+      expect(h.logs).toEqual([])
 
-    const text = posts[0]!.text
-    expect(text.startsWith(`Persona ${renderPersonaRef(a.name, a.key)}: `)).toBe(true)
-    expect(text).toContain('`SpawnCapReached`')
-    expect(text).not.toMatch(/this channel/i)
-    for (const id of ['C0ALPHA01', 'C0ALPHAPR']) expect(text).not.toContain(id)
-  })
+      // The same text for either destination: the persona reference + the raised body.
+      expect(bodies).toHaveLength(1)
+      const text = posts[0]!.text
+      expect(text).toBe(formatPersonaNotice(a, bodies[0]!))
+      expect(text.startsWith(`Persona ${renderPersonaRef(a.name, a.key)}: `)).toBe(true)
+      expect(text).toContain('`SpawnCapReached`')
+      expect(text).not.toMatch(/this channel/i)
+      for (const id of ['C0ALPHA01', 'C0ALPHAPR', channel, DM_CONTACT]) expect(text).not.toContain(id)
+    },
+  )
 
   test('a further failed re-attempt after the cap was reached and notified does not notify again (PM N7)', async () => {
     const { a, b, h } = setupCapNotice()

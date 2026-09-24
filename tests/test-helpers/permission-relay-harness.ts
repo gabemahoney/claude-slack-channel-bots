@@ -97,8 +97,8 @@ export function startManualPoller(
 // Per-persona client lookup
 // ---------------------------------------------------------------------------
 
-/** The chat surface the poller and the click handler use on a persona's client. */
-export type RelaySlackClient = Pick<WebClient, 'chat'>
+/** The Slack surface the poller and the click handler use on a persona's client: chat and DM opens. */
+export type RelaySlackClient = Pick<WebClient, 'chat' | 'conversations'>
 
 export interface PersonaClients {
   /** The injected lookup: the key's stub Web client, or undefined when unknown or marked unavailable. */

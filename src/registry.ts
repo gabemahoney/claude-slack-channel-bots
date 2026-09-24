@@ -39,6 +39,7 @@ import { DM_CONTACT_RE, MCP_SERVER_NAME, resolveRealPath, type Persona } from '.
 import { chunkText, sanitizeFilename } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, slackPlatformReason } from './persona-connection-errors.ts'
+import { DM_OPEN_SCOPE, MISSING_SCOPE_ERROR } from './persona-destination.ts'
 import { isDryRun } from './tokens.ts'
 // Peer-PID + sessions.json registry have been deleted (SR-7.1). The
 // agent-director library owns session state.
@@ -605,12 +606,6 @@ const TOOL_TARGET: Readonly<Record<string, { arg: string; action: PersonaTargetA
   fetch_messages: { arg: 'channel', action: 'act' },
   download_attachment: { arg: 'chat_id', action: 'act' },
 }
-
-/** The bot scope `conversations.open` needs to open a DM with a user. */
-const DM_OPEN_SCOPE = 'im:write'
-
-/** Slack's platform error for a call the app's scopes do not cover. */
-const MISSING_SCOPE_ERROR = 'missing_scope'
 
 /** Reply chunk size when the access config sets none. */
 const DEFAULT_CHUNK_LIMIT = 4000

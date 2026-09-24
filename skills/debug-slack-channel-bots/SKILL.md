@@ -58,7 +58,8 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
 5. **No class line, but the persona still isn't served?** See
    [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running)
    and [Other lines you may see](#other-lines-you-may-see).
-6. **A `reply` to a user ID fails with `missing_scope`?** See
+6. **A `reply` to a user ID, or a `"dm"` destination's prompts or notices,
+   fail with `missing_scope`?** See
    [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite).
 
 ---
@@ -488,10 +489,26 @@ and is `broken`.
   `Tool "reply" failed for persona <ref>: could not open a DM with "<user>" (missing_scope). The persona's Slack app lacks the im:write scope; add it and re-install the app.`
   `server.log` has a matching `[slack] Tool "reply" failed for persona <ref>: could not open a DM with "<user>" …`
   line. Nothing is posted.
-- **Cause:** opening a DM with a user needs the `im:write` bot scope. The
+- **Same cause, prompts and notices:** a persona whose `permission_prompts`
+  is `"dm"` opens its DM with `dm.contact` the same way, so its permission
+  prompts, stuck-prompt warnings and server notices fail too. Nothing is
+  posted, and `server.log` has these lines, each ending in
+  `(reason=missing_scope): …`:
+  - `[slack] permission-poller: conversations.open failed for <instance> …`
+    for a prompt. Each poller tick (about once a second by default) tries
+    again, so the line repeats for as long as the prompt stays open;
+  - `[slack] permission-poller: wedge warning conversations.open failed for <ref> (<instance>) …`
+    for a stuck-prompt warning, repeated about every 30 seconds while the
+    spawn stays stuck;
+  - `[slack] persona-notifier: failed to post notice for <ref>: could not open its DM destination (conversations.open) …`
+    for a server notice, once per notice (it is not posted again).
+- **Cause:** starting a DM with a user (a `reply` to a user ID, or a persona
+  whose `permission_prompts` is `"dm"`) needs the `im:write` bot scope. The
   persona's Slack app was created, or last installed, from a manifest without
-  it. Receiving DMs and replying in an existing DM (a `D…` ID) use other
-  scopes, so they keep working.
+  it. A `"dm"` destination always opens its DM through `conversations.open`
+  before it first posts there, even when the DM already exists, so an
+  existing DM does not help. Receiving DMs and a `reply` into an existing DM
+  (a `D…` ID) use other scopes, so they keep working.
 - **Per app:** each persona is its own Slack app, so the fix is for that
   persona's app only. Other personas are unaffected; apply the fix to each app
   that shows the error.
@@ -503,8 +520,9 @@ and is `broken`.
      name and bot display name to the shipped defaults.
   2. Re-install the app to the workspace (Slack prompts for it after a scope
      change).
-  3. Try the `reply` to the user ID again. No server restart is needed while
-     the bot token is unchanged.
+  3. Try the `reply` to the user ID again; a pending permission prompt is
+     posted by DM on the poller's next tick. No server restart is needed
+     while the bot token is unchanged.
 - **The bot token after the re-install:** Slack adds the new scope to the
   app's existing grant, and the shipped manifest has token rotation off, so
   the Bot User OAuth Token normally stays the same. The operator checks this
@@ -526,6 +544,7 @@ and is `broken`.
 | `[slack] persona "<name>" (key=<key>): up after its bring-up retry (directory\|Slack) — launching` | A retrying persona came up and is launched from its retry. Normal recovery. |
 | `[slack] Session connected: persona "<name>" (key=<key>) cwd="<path>"` | The persona's instance registered: it's being served. |
 | `[slack] Session connected with CWD "<path>" — no matching persona` | A Claude session connected from a directory that is no persona's `working_directory` (compared by real path). It is not registered: the server disconnects it. Start it from the persona's directory, or fix `working_directory`. |
+| `[slack] persona-destination: <ref> has permission_prompts set to "dm" but dm.enabled is not true — no DM opened and nothing posted` (or `… dm.contact is not set …`; for a prompt the line starts `[slack] permission-poller: <ref>` and ends `— prompt for <instance> (request_token=…) not posted and no DM opened`) | The persona's prompt or notice had a `"dm"` destination without DMs on or a contact, which the loader rejects, so it should not happen. Nothing is sent. Report it as a bug, with the persona's lines. |
 | `[slack] Fatal: configuration error — …` | The server refused `config.json` and exited. See [Configuration rejections](#configuration-rejections). |
 | `… launch after its bring-up retry failed: …`, `… working-directory retry failed: …`, `… handling its change from up to <outcome> failed: …`, `persona … not brought up: Slack bring-up threw: …`, `persona <step> failed: personas[<i>] …`, `unhandled rejection (process keeps running): …` | An internal error. The server keeps running. Report it as a bug, with the persona's lines around it. |
 
@@ -647,18 +666,3 @@ Read the row's state with the persona's server-log lines:
 `tmux has-session -t slack_bot_<key>` confirms whether the instance's tmux
 session exists.
 
----
-
-## Interim behaviours
-
-### Prompts and notices by DM are logged, not posted
-
-A persona whose `permission_prompts` is `"dm"` loads, but this version doesn't
-send prompts or notices by DM. Each one is logged instead:
-
-- `[slack] permission-poller: "<name>" (key=<key>) has permission_prompts set to DM, and permission prompts by DM are not supported yet — prompt for <instance> (…) logged instead of posted`
-- the same wording for the stuck-prompt warning;
-- `[slack] persona-notifier: "<name>" (key=<key>) has permission_prompts set to DM, and server notices by DM are not supported yet — notice logged instead of posted: <text>`
-
-To get prompts in Slack now, set `permission_prompts` to one of the persona's
-channels and restart the server.

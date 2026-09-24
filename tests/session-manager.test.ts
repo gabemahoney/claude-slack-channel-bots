@@ -38,7 +38,9 @@
  *     relay_mode='on'.
  *   - Persona notices (b.av2 SR-7.2): spawn failure (generic, dialog-approval
  *     timeout, self-heal failure, restart cap), lost and inconclusive history,
- *     held-until-validated notices and the `spawn-failure-post` startup error,
+ *     held-until-validated notices (channel and `dm` destinations) and the
+ *     `spawn-failure-post` startup error and restart-path stderr line, whose
+ *     cause names a failed DM open's step and code,
  *     through the real per-persona notifier installed with
  *     `setSessionNotifier`.
  *
@@ -103,7 +105,14 @@ import {
 import { UNATTRIBUTABLE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
 import { resolveJsonlPath } from '../src/cozempic.ts'
 import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
-import { makeDeferredConnect, type DeferredConnect, type StubSlackOptions, type WebApiOutcome } from './test-helpers/slack-stub.ts'
+import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import {
+  makeDeferredConnect,
+  openedDm,
+  type DeferredConnect,
+  type StubSlackOptions,
+  type WebApiOutcome,
+} from './test-helpers/slack-stub.ts'
 import type { PersonaConnectionManager } from '../src/persona-connections.ts'
 import type { PersonaBringUpStep } from '../src/persona-start.ts'
 import {
@@ -361,6 +370,31 @@ function makeNoticeConfig(overrides: Partial<Omit<PersonaConfig, 'personas'>> = 
     fixtureDir,
     overrides,
   )
+}
+
+/** The notice persona's `dm.contact` in the DM-destination config (a user ID, never posted to). */
+const NOTICE_CONTACT = 'U0OPER001'
+/** The DM conversation `conversations.open` returns for NOTICE_CONTACT (scripted with `openedDm`). */
+const NOTICE_DM = 'D0NOTEDM1'
+
+/**
+ * `makeNoticeConfig` with the notice persona's destination switched to `dm`
+ * (DMs on, contact NOTICE_CONTACT); the second persona keeps its channel
+ * destination OTHER_DEST.
+ */
+function makeDmNoticeConfig(): PersonaConfig {
+  const cfg = makeNoticeConfig()
+  const personas = cfg.personas.map((p) =>
+    p.key === NOTICE_KEY
+      ? { ...p, permission_prompts: 'dm', dm: { enabled: true, contact: NOTICE_CONTACT } }
+      : p,
+  )
+  return { ...cfg, personas }
+}
+
+/** The Web API methods called on `key`'s validated client (its stub `web`), in call order. */
+function webMethods(h: NotifierHarness, key: string): string[] {
+  return h.stub(key).web.callLog.map((c) => c.method)
 }
 
 /**
@@ -5765,6 +5799,73 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     expect(h.posts(NOTICE_KEY)).toHaveLength(1)
   })
 
+  // --- dm destination (b.av2 SR-7.1 DM part, SR-7.2 DM destination) --------
+
+  test('held (mixed destinations): notices raised before validation make no Slack call, even on a flush; once validated each persona\'s held notices flush to its own destination on its own client, once each, with one DM open', async () => {
+    captureStartupErrors()
+    installGenericSpawnFailure()
+    const cfg = makeDmNoticeConfig()
+    const h = installNoticeNotifier(cfg, { validated: false })
+    h.stub(NOTICE_KEY).script.open.push(openedDm(NOTICE_DM))
+
+    // Raised by the session manager in this order: the dm persona's spawn failure and restart cap, then the channel persona's cap.
+    const result = await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)
+    notifyRestartCapReached(NOTICE_KEY)
+    notifyRestartCapReached(OTHER_KEY)
+    await settleNotices()
+    expect(result.action).toBe('failed')
+    // Held: no open and no post, on any client of either persona.
+    expect(h.stub(NOTICE_KEY).callLog).toEqual([])
+    expect(h.stub(OTHER_KEY).callLog).toEqual([])
+
+    // A flush while the clients are still unvalidated keeps holding them (the DM is never opened before validation).
+    await Promise.all([h.notifier.flush(NOTICE_KEY), h.notifier.flush(OTHER_KEY)])
+    await settleNotices()
+    expect(h.stub(NOTICE_KEY).callLog).toEqual([])
+    expect(h.stub(OTHER_KEY).callLog).toEqual([])
+
+    h.validate(NOTICE_KEY)
+    h.validate(OTHER_KEY)
+    await Promise.all([h.notifier.flush(NOTICE_KEY), h.notifier.flush(OTHER_KEY)])
+    await settleNotices()
+
+    // The dm persona: one open with its contact, then its two notices in the DM, on its client only.
+    expect(webMethods(h, NOTICE_KEY)).toEqual(['conversations.open', 'chat.postMessage', 'chat.postMessage'])
+    expect(h.stub(NOTICE_KEY).callLog).toHaveLength(3)
+    expect(h.stub(NOTICE_KEY).calls.conversationsOpen).toEqual([{ users: NOTICE_CONTACT }])
+    const dmPosts = h.posts(NOTICE_KEY)
+    expect(dmPosts.map((p) => p.channel)).toEqual([NOTICE_DM, NOTICE_DM])
+    expect(dmPosts[0]!.text).toContain('Error: `ErrSpawnBroken`')
+    expect(dmPosts[1]!.text).toContain('Error: `SpawnCapReached`')
+    // Posted to the returned D… conversation, never to the contact's user ID; top-level, no identity override.
+    for (const post of dmPosts) {
+      expect(Object.keys(post).sort()).toEqual(['channel', 'text'])
+      expect(post.text.startsWith(`Persona ${renderPersonaRef(NOTICE_NAME, NOTICE_KEY)}: `)).toBe(true)
+      expect(post.text).not.toContain(NOTICE_CONTACT)
+    }
+
+    // The channel persona: unchanged, one post to its channel, no open, on its client only.
+    expect(webMethods(h, OTHER_KEY)).toEqual(['chat.postMessage'])
+    expect(h.stub(OTHER_KEY).callLog).toHaveLength(1)
+    const [otherPost] = h.posts(OTHER_KEY)
+    expect(otherPost!.channel).toBe(OTHER_DEST)
+    expect(Object.keys(otherPost!).sort()).toEqual(['channel', 'text'])
+    expect(otherPost!.text.startsWith(`Persona ${renderPersonaRef(OTHER_NAME, OTHER_KEY)}: `)).toBe(true)
+    expect(otherPost!.text).toContain('Error: `SpawnCapReached`')
+    expect(otherPost!.text).not.toContain(NOTICE_NAME)
+
+    // No cross-persona call: nothing of either persona's reached the other's client.
+    expect(h.totalPosts()).toBe(3)
+    expect(h.stub(OTHER_KEY).calls.conversationsOpen).toHaveLength(0)
+    expect(dmPosts.every((p) => !p.text.includes(OTHER_NAME))).toBe(true)
+
+    // A second flush of either persona posts nothing more.
+    await Promise.all([h.notifier.flush(NOTICE_KEY), h.notifier.flush(OTHER_KEY)])
+    await settleNotices()
+    expect(h.stub(NOTICE_KEY).callLog).toHaveLength(3)
+    expect(h.stub(OTHER_KEY).callLog).toHaveLength(1)
+  })
+
   test('restart cap: notifyRestartCapReached posts one SpawnCapReached notice to the persona destination', async () => {
     const cfg = makeNoticeConfig()
     const h = installNoticeNotifier(cfg)
@@ -5879,6 +5980,95 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     expect(errLog).toContain(`[slack] spawn-failure-post: failed to post spawn failure for persona=${NOTICE_KEY}`)
     assertNoLeak({ errLog, logs: h.logs }, 'launchSession spawn-failure-post')
   })
+
+  // The cause names what failed. Known thrown values (message carrying the
+  // sentinel) make the expected cause exact: a failed post keeps the cause it
+  // had before DM destinations (`describeThrownValue` of the rejection, SR-11
+  // byte-for-byte); a failed DM open names the step and its code.
+  const postErr = Object.assign(new Error(`An API error occurred: not_in_channel ${LEAK_SENTINEL}`), {
+    code: 'slack_webapi_platform_error',
+    data: { ok: false, error: 'not_in_channel' },
+  })
+  const openErr = Object.assign(new Error(`An API error occurred: missing_scope ${LEAK_SENTINEL}`), {
+    code: 'slack_webapi_platform_error',
+    data: { ok: false, error: 'missing_scope' },
+  })
+  const CAUSES: [string, () => PersonaConfig, (h: NotifierHarness) => void, string[], () => string][] = [
+    [
+      'channel destination, post rejected',
+      makeNoticeConfig,
+      (h) => h.stub(NOTICE_KEY).script.post.push({ kind: 'reject', value: postErr }),
+      ['chat.postMessage'],
+      () => describeThrownValue(postErr),
+    ],
+    [
+      'dm destination, open rejected (missing_scope)',
+      makeDmNoticeConfig,
+      (h) => h.stub(NOTICE_KEY).script.open.push({ kind: 'reject', value: openErr }),
+      ['conversations.open'],
+      () => `conversations.open code=missing_scope: ${describeThrownValue(openErr)}`,
+    ],
+    [
+      'dm destination, open returned no conversation ID',
+      makeDmNoticeConfig,
+      (h) => h.stub(NOTICE_KEY).script.open.push({ kind: 'ok', result: { channel: undefined } }),
+      ['conversations.open'],
+      () => 'conversations.open code=no_conversation_id',
+    ],
+    [
+      'dm destination, post to the opened DM rejected',
+      makeDmNoticeConfig,
+      (h) => h.stub(NOTICE_KEY).script.post.push({ kind: 'reject', value: postErr }),
+      ['conversations.open', 'chat.postMessage'],
+      () => describeThrownValue(postErr),
+    ],
+  ]
+
+  test.each(CAUSES)(
+    'spawn-failure-post cause (%s): the startup record is exactly "<message> — <cause>"',
+    async (_label, makeCfg, script, methods, cause) => {
+      const readLog = captureStartupErrors()
+      installGenericSpawnFailure()
+      const cfg = makeCfg()
+      const h = installNoticeNotifier(cfg, { leakMarker: LEAK_SENTINEL })
+      script(h)
+
+      const errLog = await withCapturedErr(async () => {
+        await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)
+        await settleNotices()
+      })
+
+      expect(webMethods(h, NOTICE_KEY)).toEqual(methods)
+      const entries = readLog().split('\n').filter((line) => line.includes('] [spawn-failure-post] '))
+      expect(entries).toHaveLength(1)
+      expect(entries[0]!.replace(/^\[[^\]]+\] /, '')).toBe(
+        `[spawn-failure-post] failed to post spawn failure for persona=${NOTICE_KEY} — ${cause()}`,
+      )
+      assertNoLeak({ startupErrorsLog: readLog(), errLog, logs: h.logs }, `spawn-failure-post cause ${_label}`)
+    },
+  )
+
+  test.each(CAUSES)(
+    'spawn-failure-post cause (%s): the restart-path (launchSession) stderr line is exactly "<message>: <cause>" and nothing is recorded',
+    async (_label, makeCfg, script, methods, cause) => {
+      const readLog = captureStartupErrors()
+      installGenericSpawnFailure()
+      const cfg = makeCfg()
+      const h = installNoticeNotifier(cfg, { leakMarker: LEAK_SENTINEL })
+      script(h)
+
+      const errLog = await withCapturedErr(async () => {
+        expect(await launchSession(NOTICE_KEY, cfg)).toBe(false)
+        await settleNotices()
+      })
+
+      expect(webMethods(h, NOTICE_KEY)).toEqual(methods)
+      expect(readLog()).toBe('')
+      const lines = errLog.split('\n').filter((line) => line.startsWith('[slack] spawn-failure-post: '))
+      expect(lines).toEqual([`[slack] spawn-failure-post: failed to post spawn failure for persona=${NOTICE_KEY}: ${cause()}`])
+      assertNoLeak({ errLog, logs: h.logs }, `launchSession spawn-failure-post cause ${_label}`)
+    },
+  )
 
   // --- The setSessionNotifier seam ----------------------------------------
 
