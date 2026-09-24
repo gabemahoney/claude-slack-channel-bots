@@ -10,7 +10,17 @@
  * legs, the 5 s → 300 s backoff schedule and `retryAfter`) and the SR-10.3
  * `persona-slack-unreachable` / `persona-credentials-refused` episode lines,
  * every row driven through the shared Slack stub with sentinel-bearing
- * errors. Later E2 Tasks extend this file with the supervised-connection cases.
+ * errors. E2 Task 3 adds the supervised connection manager: SR-3.1 (validate,
+ * connect, identity, event tagging), SR-3.3 (client options, reopen rules, the
+ * 10 s start() bound, late settlement, isolation, the unhandledRejection
+ * handler), SR-3.4 (dry run), SR-10.3 (`persona-connection-lost` /
+ * `persona-connection-restored`), SR-13.1 and the AC 5 walk-through (each
+ * clause a case named "AC 5: …"), plus the connection legs of AC 20, AC 23/24
+ * and AC 47. Time is a fake clock throughout; nothing sleeps.
+ *
+ * Unhandled rejections: `bun test` fails the running test on any unhandled
+ * rejection (the process listener never sees it), so every manager case also
+ * proves that nothing it did left a rejection unhandled.
  *
  * Permission cases use the checks' injected file-system seams, so they pass
  * as root (docker CI). The real-permission variants are skipped under root,
@@ -30,6 +40,7 @@ import { createHash } from 'node:crypto'
 import {
   chmodSync,
   constants as fsConstants,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -44,7 +55,17 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
-import { checkPersonaCredentials, type CredentialsFs } from '../src/persona-credentials.ts'
+import { checkPersonaCredentials, type CredentialsFs, type PersonaSlackTokens } from '../src/persona-credentials.ts'
+import {
+  createPersonaConnectionManager,
+  dryRunPersonaIdentity,
+  type PersonaConnectionManager,
+  type PersonaConnectionStatus,
+  type PersonaEventHandler,
+  type PersonaSocketEventName,
+  type PersonaSocketEventPayload,
+} from '../src/persona-connections.ts'
+import { createUnhandledRejectionHandler } from '../src/persona-connection-errors.ts'
 import {
   checkPersonaLocalBringUp,
   checkPersonaWorkingDirectory,
@@ -53,6 +74,8 @@ import {
   type WorkingDirectoryFs,
 } from '../src/persona-bringup.ts'
 import {
+  PERSONA_CONNECTION_LOST,
+  PERSONA_CONNECTION_RESTORED,
   PERSONA_CREDENTIALS_INVALID,
   PERSONA_CREDENTIALS_MISSING,
   PERSONA_CREDENTIALS_REFUSED,
@@ -86,7 +109,22 @@ import {
   writeCredentialsFile,
   type CredentialsOverrides,
 } from './test-helpers/credentials.ts'
-import { makeStubSlack, type ConnectOutcome, type WebApiOutcome } from './test-helpers/slack-stub.ts'
+import {
+  makeAppMention,
+  makeChannelMessage,
+  makeDeferredConnect,
+  makeStubSlack,
+  makeStubSlackFactory,
+  mentionText,
+  type ConnectOutcome,
+  type SettledConnectOutcome,
+  type StubClientKind,
+  type StubSlack,
+  type StubSlackFactory,
+  type WebApiOutcome,
+} from './test-helpers/slack-stub.ts'
+import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { makeStubClient, type StubClientOptions } from './test-helpers/agent-director-stub.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -706,8 +744,10 @@ describe('no writes', () => {
 // ---------------------------------------------------------------------------
 
 describe('diagnostic lines', () => {
-  test('the label set is exactly the seven credentials, Slack-validation and directory classes', () => {
+  test('the label set is exactly the nine credentials, Slack-validation, connection and directory classes', () => {
     expect([...PERSONA_DIAGNOSTIC_CLASSES].sort()).toEqual([
+      'persona-connection-lost',
+      'persona-connection-restored',
       'persona-credentials-invalid',
       'persona-credentials-missing',
       'persona-credentials-refused',
@@ -1326,5 +1366,1128 @@ describe('Slack episode lines', () => {
     expect(b.lines.map(classOf)).toEqual([R])
     expect([a.tracker.open, b.tracker.open]).toEqual([null, R])
     expect(b.lines[0]).toContain('personas[1]')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Connection manager harness (E2 Task 3; E5 extends these sections)
+// ---------------------------------------------------------------------------
+
+/** A persona the manager runs, with the tokens the credentials reader returned (none in dry run). */
+interface ManagedPersona extends BringUpPersona {
+  tokens?: PersonaSlackTokens
+}
+
+/** One event as the handler received it. */
+interface ForwardedEvent {
+  key: string
+  eventName: PersonaSocketEventName
+  payload: PersonaSocketEventPayload
+}
+
+/** Two personas A and B under one manager, with a stub Slack, a fake clock and captured output. */
+interface Harness {
+  manager: PersonaConnectionManager
+  clock: FakeClock
+  slack: StubSlackFactory
+  a: ManagedPersona
+  b: ManagedPersona
+  lines: string[]
+  events: ForwardedEvent[]
+  statuses: [string, PersonaConnectionStatus][]
+  /**
+   * An agent-director recorder beside the manager, as E3's wiring will hold
+   * one. The manager has no agent-director dependency (decisions.md), so its
+   * count stays zero unless that changes; the SR-13.1 source check pins the
+   * missing import.
+   */
+  agentDirector: { callCount(): number }
+}
+
+interface HarnessOptions {
+  dryRun?: boolean
+  /** Names of A and B (indices 0 and 1). Default Alpha and Beta. */
+  names?: [string, string]
+  /** Called after each event is recorded. */
+  onEvent?: PersonaEventHandler
+}
+
+/** Harnesses built in the running test; stopped and leak-checked after it. */
+const harnesses: Harness[] = []
+
+afterEach(async () => {
+  for (const h of harnesses.splice(0)) {
+    await h.manager.stopAll()
+    // Every status report, log line and forwarded event of the test, stop included.
+    assertNoLeak({ lines: h.lines, statuses: h.statuses, events: h.events }, 'connection harness')
+  }
+})
+
+/** The distinct tokens written to `persona`'s credentials file. */
+function fileTokensOf(persona: BringUpPersona): { botToken: string; appToken: string } {
+  return { botToken: fakeToken(BOT_TOKEN_PREFIX, `${persona.key}-bot`), appToken: fakeToken(APP_TOKEN_PREFIX, `${persona.key}-app`) }
+}
+
+/** Write `persona`'s credentials file and read it back through the Task 1 reader (AC 47: tokens come from the file). */
+function readTokens(persona: BringUpPersona): PersonaSlackTokens {
+  const { botToken, appToken } = fileTokensOf(persona)
+  writeCreds(persona, { bot_token: botToken, app_token: appToken })
+  const result = checkPersonaCredentials(persona, { others: [] })
+  if (!result.ok) throw new Error(`expected readable credentials, got ${result.class}`)
+  return result.tokens
+}
+
+/** An agent-director stub whose every verb records into a list; `callCount` sums them. */
+function makeAgentDirectorRecorder(): { callCount(): number } {
+  const calls = {
+    versionCalls: [], makeTemplateCalls: [], spawnCalls: [], statusCalls: [], getCalls: [], sendKeysCalls: [],
+    readPaneCalls: [], killCalls: [], decideCalls: [], resumeCalls: [], findMissingCalls: [], deleteCalls: [],
+    listCalls: [], pauseCalls: [], getPermissionCalls: [], callLog: [],
+  } satisfies StubClientOptions
+  makeStubClient(calls)
+  return { callCount: () => Object.values(calls).reduce((sum, list: unknown[]) => sum + list.length, 0) }
+}
+
+/**
+ * Build a manager over personas A and B. Outside dry run each persona's
+ * credentials file is written and read, and its stub (leak marker on) is
+ * registered with the factory.
+ */
+function makeHarness(opts: HarnessOptions = {}): Harness {
+  const dryRun = opts.dryRun ?? false
+  const clock = createFakeClock()
+  const slack = makeStubSlackFactory()
+  const lines: string[] = []
+  const events: ForwardedEvent[] = []
+  const statuses: [string, PersonaConnectionStatus][] = []
+  const [a, b] = (opts.names ?? ['Alpha', 'Beta']).map((name, index): ManagedPersona => {
+    const persona = makePersona(name, { index })
+    if (dryRun) return persona
+    const tokens = readTokens(persona)
+    slack.addPersona(persona.key, tokens, { leakMarker: LEAK_SENTINEL })
+    return { ...persona, tokens }
+  }) as [ManagedPersona, ManagedPersona]
+  const manager = createPersonaConnectionManager({
+    dryRun,
+    factory: slack.factory,
+    clock,
+    log: line => void lines.push(line),
+    onStatus: (key, status) => void statuses.push([key, status]),
+    onEvent: (key, eventName, payload) => {
+      events.push({ key, eventName, payload })
+      return opts.onEvent?.(key, eventName, payload)
+    },
+  })
+  const h: Harness = { manager, clock, slack, a, b, lines, events, statuses, agentDirector: makeAgentDirectorRecorder() }
+  harnesses.push(h)
+  return h
+}
+
+/** Bring A and B up and check both are up. */
+async function bringUpBoth(h: Harness): Promise<void> {
+  for (const p of [h.a, h.b]) expect(await h.manager.bringUp(p, p.tokens)).toMatchObject({ state: 'up' })
+}
+
+/** The persona's stub: `socket` is its latest socket client, `sockets` every one built. */
+function stubOf(h: Harness, p: ManagedPersona): StubSlack {
+  return h.slack.persona(p.key)
+}
+
+/** `start()` calls over all of the persona's socket clients. */
+function startsOf(h: Harness, p: ManagedPersona): number {
+  return stubOf(h, p).sockets.reduce((sum, socket) => sum + socket.startCalls, 0)
+}
+
+/** How many of the persona's socket clients are connected. */
+function liveSocketsOf(h: Harness, p: ManagedPersona): number {
+  return stubOf(h, p).sockets.filter(socket => socket.connected).length
+}
+
+/** The persona's reported states, in order. */
+function statesOf(h: Harness, p: ManagedPersona): string[] {
+  return h.statuses.filter(([key]) => key === p.key).map(([, status]) => status.state)
+}
+
+/** Requested delays of the pending timers, earliest first. */
+function pendingDelays(h: Harness): number[] {
+  return h.clock.pending().map(timer => timer.delayMs)
+}
+
+let deliverySeq = 0
+
+/** Deliver a uniquely-texted message on the persona's latest socket; it must reach the handler exactly once, tagged with that persona. */
+async function expectDelivers(h: Harness, p: ManagedPersona): Promise<void> {
+  const text = `delivery ${++deliverySeq} on ${p.key}`
+  await stubOf(h, p).socket.deliver(makeChannelMessage({ text }))
+  expect(h.events.filter(e => e.payload.event?.text === text).map(e => e.key)).toEqual([p.key])
+}
+
+/**
+ * A `@slack/web-api`-shaped error with `code`, carrying the sentinel in its
+ * message, its `original` (message and Authorization header), its response
+ * headers and `data`, never in `data.error` (set to `slackError` when given).
+ */
+function sentinelSlackError(code: string, slackError?: string): Error {
+  const original = Object.assign(new Error(`socket hang up ${LEAK_SENTINEL}`), {
+    code: 'ECONNRESET',
+    config: { headers: { Authorization: `Bearer ${fakeToken(BOT_TOKEN_PREFIX, 'original')}` } },
+  })
+  const data: Record<string, unknown> = { ok: false, provided: LEAK_SENTINEL }
+  if (slackError !== undefined) data.error = slackError
+  return Object.assign(new Error(`A request error occurred: ${LEAK_SENTINEL}`), {
+    code,
+    original,
+    headers: { 'x-slack-req-id': LEAK_SENTINEL, authorization: `Bearer ${fakeToken(APP_TOKEN_PREFIX, 'header')}` },
+    data,
+  })
+}
+
+const HOUR_MS = 3_600_000
+
+// ---------------------------------------------------------------------------
+// Bring-up and identity (SR-3.1)
+// ---------------------------------------------------------------------------
+
+describe('connection manager: bring-up and identity (SR-3.1)', () => {
+  test('a persona is up once auth.test on its own validation client returned both IDs, before its socket is built and started', async () => {
+    const h = makeHarness()
+
+    await bringUpBoth(h)
+
+    for (const p of [h.a, h.b]) {
+      const stub = stubOf(h, p)
+      const identity = { botUserId: stub.identity.botUserId, botId: stub.identity.botId }
+      expect(h.manager.status(p.key)).toEqual({ state: 'up', identity })
+      expect(h.manager.identity(p.key)).toEqual(identity)
+      expect(h.slack.buildsOf(p.key).map(build => build.kind)).toEqual(['validation', 'web', 'socket'])
+      expect(stub.calls.authTest).toHaveLength(1)
+      expect(stub.socket.startCalls).toBe(1)
+      expect(h.manager.webClient(p.key)).toBeDefined()
+      expect(statesOf(h, p)).toEqual(['connecting', 'up'])
+    }
+    expect(h.manager.identity(h.a.key)).not.toEqual(h.manager.identity(h.b.key))
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  test.each([
+    ['the bot user ID', { user_id: undefined }],
+    ['the bot ID', { bot_id: undefined }],
+  ])('an auth.test answer without %s leaves the persona retrying with no socket; the retry re-runs auth.test', async (_label, result) => {
+    const h = makeHarness()
+    stubOf(h, h.a).script.authTest.push({ kind: 'ok', result })
+
+    const status = await h.manager.bringUp(h.a, h.a.tokens)
+
+    expect(status).toMatchObject({
+      state: 'retrying',
+      phase: 'bring-up',
+      retryInMs: 5_000,
+      outcome: { kind: 'slack-unreachable', check: 'auth.test', reason: 'no-identity' },
+    })
+    expect(h.slack.buildsOf(h.a.key, 'socket')).toEqual([])
+    expect(h.manager.identity(h.a.key)).toBeUndefined()
+    expect(h.manager.webClient(h.a.key)).toBeUndefined()
+    await h.clock.advance(5_000)
+    expect(stubOf(h, h.a).calls.authTest).toHaveLength(2)
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+  })
+
+  test('a refused auth.test leaves the persona credentials-broken: no socket built or started, never retried', async () => {
+    const h = makeHarness()
+    stubOf(h, h.a).script.authTest.push({ kind: 'platform', error: 'invalid_auth' })
+
+    const status = await h.manager.bringUp(h.a, h.a.tokens)
+    await h.clock.advance(24 * HOUR_MS)
+
+    expect(status).toMatchObject({
+      state: 'broken',
+      phase: 'bring-up',
+      outcome: { kind: 'credentials-refused', check: 'auth.test', key: 'bot_token', slackError: 'invalid_auth' },
+    })
+    expect(h.slack.buildsOf(h.a.key).map(build => build.kind)).toEqual(['validation'])
+    expect(stubOf(h, h.a).calls.authTest).toHaveLength(1)
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(h.lines.map(classOf)).toEqual([PERSONA_CREDENTIALS_REFUSED])
+  })
+
+  test('bring-up outside dry run without credentials rejects with a TypeError and builds nothing', async () => {
+    const h = makeHarness()
+
+    const thrown = await h.manager.bringUp(h.a).catch((err: unknown) => err)
+
+    assertNoLeak(thrown)
+    expect(thrown).toBeInstanceOf(TypeError)
+    expect(h.slack.builds).toEqual([])
+    expect(h.manager.status(h.a.key)).toBeUndefined()
+  })
+
+  test('bringing up a persona already managed returns its status and builds nothing more', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const builds = h.slack.builds.length
+
+    expect(await h.manager.bringUp(h.a, h.a.tokens)).toEqual(h.manager.status(h.a.key)!)
+    expect(h.slack.builds).toHaveLength(builds)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Client options (SR-3.3, AC 20 connection leg) and tokens (AC 47)
+// ---------------------------------------------------------------------------
+
+describe('connection manager: client options (SR-3.3, AC 20 connection leg) and tokens from the file (AC 47)', () => {
+  const NO_RETRY = { retryConfig: { retries: 0 }, timeout: 10_000, rejectRateLimitedCalls: true, attachOriginalToWebAPIRequestError: false }
+
+  // The long-lived client keeps the library's retry policy: no retryConfig, no rejectRateLimitedCalls.
+  // Rows: kind, its exact options, and how many are built across A's bring-up and reopen and B's bring-up.
+  test.each<[StubClientKind, Record<string, unknown>, number]>([
+    ['socket', { autoReconnectEnabled: false, clientOptions: NO_RETRY }, 3],
+    ['validation', NO_RETRY, 2],
+    ['web', { timeout: 30_000, attachOriginalToWebAPIRequestError: false }, 2],
+  ])('every %s client, a reopen’s included, is built with exactly the SR-3.3 options', async (kind, expected, count) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    stubOf(h, h.a).socket.drop()
+    await h.clock.flush()
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+
+    const builds = h.slack.builds.filter(build => build.kind === kind)
+
+    // A's bring-up socket and its reopen socket.
+    expect(h.slack.buildsOf(h.a.key, 'socket')).toHaveLength(2)
+    expect(builds).toHaveLength(count)
+    for (const build of builds) {
+      const options: Record<string, unknown> = { ...build.options }
+      delete options.appToken
+      expect(options).toStrictEqual(expected)
+    }
+  })
+
+  test('AC 47: every client receives the credentials file’s tokens, never the environment’s', async () => {
+    const envTokens = [fakeToken(BOT_TOKEN_PREFIX, 'env-connection'), fakeToken(APP_TOKEN_PREFIX, 'env-connection')] as const
+    const saved = ENV_KEYS.map(key => process.env[key])
+    setEnvTokens(envTokens)
+    try {
+      const h = makeHarness()
+      await bringUpBoth(h)
+
+      expect(h.slack.builds).toHaveLength(6)
+      for (const build of h.slack.builds) {
+        const file = fileTokensOf(build.persona === h.a.key ? h.a : h.b)
+        const [fromFile, fromEnv] = build.kind === 'socket' ? [file.appToken, envTokens[1]] : [file.botToken, envTokens[0]]
+        expect(build.hasToken(fromFile)).toBe(true)
+        expect(build.hasToken(fromEnv)).toBe(false)
+      }
+    } finally {
+      setEnvTokens(saved)
+    }
+    expect(envTokensEqual(saved)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// No module-scope effects (SR-13.1)
+// ---------------------------------------------------------------------------
+
+const CONNECTION_MODULES = ['persona-connections.ts', 'persona-slack-clients.ts', 'persona-connection-errors.ts']
+
+describe('connection manager: no module-scope effects (SR-13.1)', () => {
+  test('creating a manager builds no client, schedules no timer and reports nothing until a persona is brought up', () => {
+    const h = makeHarness()
+
+    expect(h.slack.builds).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(h.statuses).toEqual([])
+  })
+
+  test.each(CONNECTION_MODULES)('importing %s afresh adds no unhandledRejection listener', async module => {
+    const before = process.listenerCount('unhandledRejection')
+
+    await import(`../src/${module}?fresh=${crypto.randomUUID()}`)
+
+    expect(process.listenerCount('unhandledRejection')).toBe(before)
+  })
+
+  test('the connection modules read no environment variable, import no file-system module and import nothing from agent-director', () => {
+    // Static, bare side-effect, dynamic and require forms of a module reference naming agent-director.
+    const agentDirectorImport = /(?:from\s*|import\s*\(?\s*|require\s*\()['"][^'"]*agent-director/
+    for (const form of [
+      `import { x } from './agent-director-client.ts'`,
+      `import type { X } from "./agent-director.ts"`,
+      `import './agent-director.ts'`,
+      `await import('./agent-director-client.ts')`,
+      `require("./agent-director")`,
+    ]) {
+      expect(form).toMatch(agentDirectorImport)
+    }
+    for (const module of CONNECTION_MODULES) {
+      const source = readFileSync(join(import.meta.dir, '..', 'src', module), 'utf-8')
+      expect(source).not.toMatch(/process\.env|Bun\.env|import\.meta\.env/)
+      expect(source).not.toMatch(/from ['"](?:node:)?fs(?:\/promises)?['"]/)
+      expect(source).not.toMatch(agentDirectorImport)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Event tagging and isolation (SR-3.1)
+// ---------------------------------------------------------------------------
+
+describe('connection manager: event tagging and isolation (SR-3.1)', () => {
+  test('message, app_mention and interactive events reach the handler tagged with their own persona, payload unchanged, never acked by the manager', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const sent: [string, PersonaSocketEventName, Record<string, unknown>][] = []
+
+    for (const p of [h.a, h.b]) {
+      const stub = stubOf(h, p)
+      const message = makeChannelMessage({ text: `message for ${p.key}` })
+      const mention = makeAppMention({ text: `${mentionText(stub.identity.botUserId)} hello` })
+      const click = { type: 'block_actions', actions: [{ action_id: `click-${p.key}` }] }
+      await stub.socket.deliver(message)
+      await stub.socket.deliver(mention)
+      await stub.socket.deliverInteractive(click)
+      sent.push([p.key, 'message', message], [p.key, 'app_mention', mention], [p.key, 'interactive', click])
+    }
+
+    expect(h.events.map(e => [e.key, e.eventName])).toEqual(sent.map(([key, name]) => [key, name]))
+    h.events.forEach((e, i) => {
+      expect(e.eventName === 'interactive' ? e.payload.body : e.payload.event).toBe(sent[i]![2])
+      expect(typeof e.payload.ack).toBe('function')
+    })
+    for (const p of [h.a, h.b]) expect(stubOf(h, p).socket.acks).toEqual([])
+  })
+
+  test('a handler that throws for A is logged without leaking and stops neither A’s later events nor B’s', async () => {
+    const failing = personaKey('Alpha')
+    const h = makeHarness({
+      onEvent: key => {
+        if (key === failing) throw new Error(`handler ${LEAK_SENTINEL}`)
+      },
+    })
+    await bringUpBoth(h)
+
+    await expectDelivers(h, h.a)
+    await expectDelivers(h, h.b)
+    await expectDelivers(h, h.a)
+
+    assertNoLeak(h.lines)
+    expect(h.lines).toHaveLength(2)
+    for (const line of h.lines) {
+      expect(line).toContain(renderPersonaRef(h.a.name, h.a.key))
+      expect(line).toContain('personas[0]')
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC 5: the isolation walk-through (sprint demo)
+// ---------------------------------------------------------------------------
+
+describe('AC 5: per-persona isolation walk-through (fake clock)', () => {
+  test('AC 5: A drops and reopens at once while B keeps delivering; after the reopen A has one live socket and each event reaches A exactly once', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    await expectDelivers(h, h.a)
+
+    stubOf(h, h.a).socket.drop()
+
+    // The reopen began on the drop itself: a fresh socket client whose start() ran, no timer waited on.
+    expect(stubOf(h, h.a).sockets).toHaveLength(2)
+    expect(stubOf(h, h.a).socket.startCalls).toBe(1)
+    expect(h.clock.firedCount()).toBe(0)
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'lost' })
+    await expectDelivers(h, h.b)
+    await h.clock.flush()
+
+    expect(h.clock.now()).toBe(0)
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+    expect(liveSocketsOf(h, h.a)).toBe(1)
+    for (let i = 0; i < 3; i++) await expectDelivers(h, h.a)
+    await expectDelivers(h, h.b)
+    expect(statesOf(h, h.a)).toEqual(['connecting', 'up', 'lost', 'up'])
+    expect(statesOf(h, h.b)).toEqual(['connecting', 'up'])
+  })
+
+  test('AC 5: the reopen is socket-only: no auth.test, no new long-lived Web API client, same client and identity', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const web = h.manager.webClient(h.a.key)
+    const identity = h.manager.identity(h.a.key)
+
+    stubOf(h, h.a).socket.drop()
+    await h.clock.flush()
+
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+    expect(stubOf(h, h.a).calls.authTest).toHaveLength(1)
+    expect(h.slack.buildsOf(h.a.key).map(build => build.kind)).toEqual(['validation', 'web', 'socket', 'socket'])
+    expect(web).toBeDefined()
+    expect(h.manager.webClient(h.a.key)).toBe(web!)
+    expect(h.manager.identity(h.a.key)).toEqual(identity!)
+  })
+
+  test('AC 5: a rejected reopen for A leaves the process running and B delivering; retries wait 5 s, then 10 s, and a later success restores A', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    stubOf(h, h.a).script.connect.push({ kind: 'network' }, { kind: 'http', status: 503 })
+
+    expect(() => stubOf(h, h.a).socket.drop()).not.toThrow()
+    await h.clock.flush()
+
+    expect(h.manager.status(h.a.key)).toMatchObject({
+      state: 'retrying',
+      phase: 'reopen',
+      retryInMs: 5_000,
+      nextAttemptAt: 5_000,
+      outcome: { kind: 'slack-unreachable', check: 'socket-mode' },
+    })
+    expect(pendingDelays(h)).toEqual([5_000])
+    await expectDelivers(h, h.b)
+
+    await h.clock.advance(4_999)
+    expect(startsOf(h, h.a)).toBe(2)
+    await h.clock.advance(1)
+    expect(startsOf(h, h.a)).toBe(3)
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'retrying', retryInMs: 10_000, outcome: { reason: 'http-status', status: 503 } })
+    await expectDelivers(h, h.b)
+
+    await h.clock.advance(10_000)
+    expect(startsOf(h, h.a)).toBe(4)
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+    expect(liveSocketsOf(h, h.a)).toBe(1)
+    await expectDelivers(h, h.a)
+    await expectDelivers(h, h.b)
+  })
+
+  // Rows: label, how start() hangs, and when apps.connections.open answers (0: at once). A slow open
+  // does not eat into the WebSocket phase's 10 s: the bound restarts at authenticated/connecting.
+  test.each<[string, SettledConnectOutcome, number]>([
+    ['the WebSocket phase never reaches hello', { kind: 'never' }, 0],
+    ['apps.connections.open never answers', { kind: 'open-never-answers' }, 0],
+    ['apps.connections.open answers after 9 s, then the WebSocket phase never reaches hello', { kind: 'never' }, 9_000],
+  ])('AC 5: a reopen whose start() never settles (%s) is abandoned 10 s into its WebSocket phase on the fake clock, counts as Slack-unreachable and is retried on the backoff while B keeps delivering', async (_label, hang, openAnswersAfterMs) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const slowOpen = makeDeferredConnect()
+    stubOf(h, h.a).script.connect.push(openAnswersAfterMs > 0 ? slowOpen.outcome : hang)
+    stubOf(h, h.a).socket.drop()
+    const hung = stubOf(h, h.a).socket
+    if (openAnswersAfterMs > 0) {
+      await h.clock.advance(openAnswersAfterMs)
+      expect(hung.lifecycle).toEqual([])
+      slowOpen.settle(hang)
+      await h.clock.flush()
+      expect(hung.lifecycle).toEqual(['authenticated', 'connecting'])
+    }
+
+    await h.clock.advance(9_999)
+    expect(hung.disconnectCalls).toBe(0)
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'lost' })
+    await expectDelivers(h, h.b)
+
+    await h.clock.advance(1)
+    expect(hung.disconnectCalls).toBe(1)
+    expect(h.manager.status(h.a.key)).toMatchObject({
+      state: 'retrying',
+      phase: 'reopen',
+      retryInMs: 5_000,
+      outcome: { kind: 'slack-unreachable', check: 'socket-mode', reason: 'timeout' },
+    })
+    expect(pendingDelays(h)).toEqual([5_000])
+    await expectDelivers(h, h.b)
+
+    await h.clock.advance(5_000)
+    expect(stubOf(h, h.a).sockets).toHaveLength(3)
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+    expect(liveSocketsOf(h, h.a)).toBe(1)
+    await expectDelivers(h, h.a)
+    await expectDelivers(h, h.b)
+  })
+
+  test('AC 5: no agent-director call is made for A across a drop, a rejected reopen, an abandoned reopen and a refused reopen', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    stubOf(h, h.a).script.connect.push({ kind: 'network' }, { kind: 'never' }, { kind: 'platform', error: 'invalid_auth' })
+
+    stubOf(h, h.a).socket.drop()
+    // Rejected at 0 s, the retry at 5 s hangs and is abandoned at 15 s, the retry at 25 s is refused.
+    await h.clock.advance(25_000)
+
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'broken', phase: 'reopen' })
+    expect(h.agentDirector.callCount()).toBe(0)
+    await expectDelivers(h, h.b)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Reopen rules (SR-3.3)
+// ---------------------------------------------------------------------------
+
+describe('connection manager: reopen rules (SR-3.3)', () => {
+  // Rows: label, arrangement after both are up, and whether A's socket emits `disconnected` on the stop.
+  test.each<[string, (h: Harness) => void, boolean]>([
+    ['while A is up', () => {}, true],
+    [
+      'while A waits to retry a rejected reopen',
+      h => {
+        stubOf(h, h.a).script.connect.push({ kind: 'network' })
+        stubOf(h, h.a).socket.drop()
+      },
+      false,
+    ],
+    [
+      'while A’s reopen start() is in flight',
+      h => {
+        stubOf(h, h.a).script.connect.push({ kind: 'never' })
+        stubOf(h, h.a).socket.drop()
+      },
+      true,
+    ],
+    [
+      // The stub's disconnect() does not settle this start(): only the stop's own cancel ends the attempt.
+      'while A’s reopen start() waits on an apps.connections.open that never answers',
+      h => {
+        stubOf(h, h.a).script.connect.push({ kind: 'open-never-answers' })
+        stubOf(h, h.a).socket.drop()
+      },
+      true,
+    ],
+  ])('the manager’s own stop %s cancels every timer and schedules no reopen; B is untouched', async (_label, arrange, emitsDisconnected) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    arrange(h)
+    await h.clock.flush()
+    const starts = startsOf(h, h.a)
+
+    await h.manager.stop(h.a.key)
+    await h.manager.stop(h.a.key)
+
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(stubOf(h, h.a).socket.lifecycle.includes('disconnected')).toBe(emitsDisconnected)
+    await h.clock.advance(HOUR_MS)
+    expect(startsOf(h, h.a)).toBe(starts)
+    expect(liveSocketsOf(h, h.a)).toBe(0)
+    expect(h.manager.status(h.a.key)).toBeUndefined()
+    expect(h.manager.webClient(h.a.key)).toBeUndefined()
+    expect(statesOf(h, h.a).at(-1)).toBe('stopped')
+    expect(h.manager.status(h.b.key)).toMatchObject({ state: 'up' })
+    await expectDelivers(h, h.b)
+  })
+
+  test('stopping A during a bring-up hung on an apps.connections.open that never answers cancels the attempt itself: bring-up resolves stopped, no timer is left; B is untouched', async () => {
+    const h = makeHarness()
+    stubOf(h, h.a).script.connect.push({ kind: 'open-never-answers' })
+    let resolvedA: PersonaConnectionStatus | undefined
+    const bringUpA = h.manager.bringUp(h.a, h.a.tokens).then(status => (resolvedA = status))
+    expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
+    await h.clock.flush()
+    expect(stubOf(h, h.a).socket.startCalls).toBe(1)
+    expect(resolvedA).toBeUndefined()
+
+    await h.manager.stop(h.a.key)
+    await h.clock.flush()
+
+    // Settled by the stop, with no time passing; the 10 s bound is cancelled with it.
+    expect(resolvedA).toEqual({ state: 'stopped' })
+    expect(await bringUpA).toEqual({ state: 'stopped' })
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(stubOf(h, h.a).socket.disconnectCalls).toBe(1)
+    await h.clock.advance(HOUR_MS)
+    expect(startsOf(h, h.a)).toBe(1)
+    expect(h.manager.status(h.a.key)).toBeUndefined()
+    expect(statesOf(h, h.a)).toEqual(['connecting', 'stopped'])
+    expect(h.manager.status(h.b.key)).toMatchObject({ state: 'up' })
+    await expectDelivers(h, h.b)
+  })
+
+  test('stopAll stops both personas and is idempotent', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+
+    await h.manager.stopAll()
+    await h.manager.stopAll()
+    await h.clock.advance(HOUR_MS)
+
+    for (const p of [h.a, h.b]) {
+      expect(h.manager.status(p.key)).toBeUndefined()
+      expect(liveSocketsOf(h, p)).toBe(0)
+      expect(startsOf(h, p)).toBe(1)
+    }
+  })
+
+  test.each(['closed-before-hello', 'websocket-error'] as const)('a reopen start() whose WebSocket phase fails (%s) emits disconnected but schedules no extra reopen: start() calls follow the backoff exactly', async kind => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a)
+    a.script.connect.push({ kind }, { kind }, { kind })
+
+    a.socket.drop()
+
+    // [virtual time, start() calls so far (the first is the bring-up)]: fails at 0, 5 and 15 s; up at 35 s.
+    for (const [at, starts] of [[0, 2], [4_999, 2], [5_000, 3], [14_999, 3], [15_000, 4], [34_999, 4], [35_000, 5]] as const) {
+      await h.clock.advanceTo(at)
+      expect(startsOf(h, h.a)).toBe(starts)
+      expect(h.clock.pendingCount()).toBeLessThanOrEqual(1)
+    }
+    expect(a.sockets.slice(1, 4).map(socket => socket.lifecycle.includes('disconnected'))).toEqual([true, true, true])
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+  })
+
+  test('a drop before A was ever up (during its bring-up start()) schedules no reopen; the bring-up retry follows the backoff and re-runs auth.test', async () => {
+    const h = makeHarness()
+    stubOf(h, h.a).script.connect.push({ kind: 'never' })
+    const bringUpA = h.manager.bringUp(h.a, h.a.tokens)
+    await h.clock.flush()
+
+    stubOf(h, h.a).socket.drop()
+
+    expect(await bringUpA).toMatchObject({ state: 'retrying', phase: 'bring-up', retryInMs: 5_000, outcome: { reason: 'socket-closed' } })
+    expect(startsOf(h, h.a)).toBe(1)
+    expect(pendingDelays(h)).toEqual([5_000])
+    await h.clock.advance(4_999)
+    expect(startsOf(h, h.a)).toBe(1)
+    await h.clock.advance(1)
+    expect(stubOf(h, h.a).calls.authTest).toHaveLength(2)
+    expect(h.slack.buildsOf(h.a.key).map(build => build.kind)).toEqual(['validation', 'web', 'socket', 'validation', 'socket'])
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+    expect(statesOf(h, h.a)).not.toContain('lost')
+  })
+
+  test('a reopen socket that closes between hello and start() resolving is Slack-unreachable: no live socket, no second reopen, retried after 5 s', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a)
+    a.socket.drop()
+    const reopen = a.socket
+    // Slack closes the reopen socket inside its `connected` emit, before start() resolves.
+    reopen.once('connected', () => reopen.drop())
+
+    await h.clock.flush()
+
+    expect(reopen.lifecycle).toEqual(['authenticated', 'connecting', 'connected', 'close', 'disconnected'])
+    expect(h.manager.status(h.a.key)).toMatchObject({
+      state: 'retrying',
+      phase: 'reopen',
+      retryInMs: 5_000,
+      outcome: { kind: 'slack-unreachable', check: 'socket-mode', reason: 'socket-closed' },
+    })
+    expect(pendingDelays(h)).toEqual([5_000])
+    expect(startsOf(h, h.a)).toBe(2)
+    expect(liveSocketsOf(h, h.a)).toBe(0)
+    await expectDelivers(h, h.b)
+
+    await h.clock.advance(4_999)
+    expect(startsOf(h, h.a)).toBe(2)
+    await h.clock.advance(1)
+    expect(startsOf(h, h.a)).toBe(3)
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+    expect(liveSocketsOf(h, h.a)).toBe(1)
+    await expectDelivers(h, h.a)
+    expect(statesOf(h, h.a)).toEqual(['connecting', 'up', 'lost', 'retrying', 'up'])
+  })
+
+  test('a credentials error on reopen leaves A disconnected and credentials-broken: no further start() however far the clock runs, B unaffected, no agent-director call', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    stubOf(h, h.a).script.connect.push({ kind: 'platform', error: 'invalid_auth' })
+
+    stubOf(h, h.a).socket.drop()
+    await h.clock.flush()
+
+    expect(h.manager.status(h.a.key)).toMatchObject({
+      state: 'broken',
+      phase: 'reopen',
+      outcome: { kind: 'credentials-refused', check: 'socket-mode', key: 'app_token', slackError: 'invalid_auth' },
+    })
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.clock.advance(24 * HOUR_MS)
+    expect(startsOf(h, h.a)).toBe(2)
+    expect(liveSocketsOf(h, h.a)).toBe(0)
+    expect(h.manager.status(h.b.key)).toMatchObject({ state: 'up' })
+    await expectDelivers(h, h.b)
+    expect(h.agentDirector.callCount()).toBe(0)
+  })
+
+  test('after a successful reopen a later drop reopens at once again, and its first failure waits 5 s (the backoff was reset)', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a)
+    a.script.connect.push({ kind: 'network' }, { kind: 'network' })
+    a.socket.drop()
+    await h.clock.advance(5_000)
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'retrying', retryInMs: 10_000 })
+    await h.clock.advance(10_000)
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+    const starts = startsOf(h, h.a)
+    a.script.connect.push({ kind: 'network' })
+
+    a.socket.drop()
+
+    expect(startsOf(h, h.a)).toBe(starts + 1)
+    await h.clock.flush()
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'retrying', retryInMs: 5_000 })
+  })
+
+  test.each([
+    ['longer than the backoff step waits retryAfter', 30, 30_000],
+    ['shorter than the backoff step waits the step', 3, 5_000],
+  ])('a rate-limited reopen failure with a retryAfter %s', async (_label, retryAfter, waitMs) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    stubOf(h, h.a).script.connect.push({ kind: 'rate-limited', retryAfter })
+
+    stubOf(h, h.a).socket.drop()
+    await h.clock.flush()
+
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'retrying', retryInMs: waitMs, outcome: { reason: 'rate-limited', retryAfter } })
+    expect(pendingDelays(h)).toEqual([waitMs])
+    expect(waitMs).toBeGreaterThanOrEqual(retryAfter * 1000)
+    await h.clock.advance(waitMs - 1)
+    expect(startsOf(h, h.a)).toBe(2)
+    await h.clock.advance(1)
+    expect(startsOf(h, h.a)).toBe(3)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Late settlement of an abandoned start() (SR-3.1, SR-3.3)
+// ---------------------------------------------------------------------------
+
+describe('connection manager: late settlement of an abandoned start()', () => {
+  test.each<['bring-up' | 'reopen', string, SettledConnectOutcome]>([
+    ['bring-up', 'resolves', { kind: 'ok' }],
+    ['bring-up', 'rejects', { kind: 'network' }],
+    ['reopen', 'resolves', { kind: 'ok' }],
+    ['reopen', 'rejects', { kind: 'network' }],
+  ])('an abandoned %s start() that %s after the 10 s bound does not mark A up, forwards nothing and adds no attempt; B keeps delivering', async (phase, _settles, late) => {
+    const h = makeHarness()
+    const a = stubOf(h, h.a)
+    const deferred = makeDeferredConnect()
+    let bringUpA: Promise<PersonaConnectionStatus> | undefined
+    if (phase === 'bring-up') {
+      a.script.connect.push(deferred.outcome)
+      bringUpA = h.manager.bringUp(h.a, h.a.tokens)
+      expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
+    } else {
+      await bringUpBoth(h)
+      a.script.connect.push(deferred.outcome)
+      a.socket.drop()
+    }
+    await h.clock.flush()
+    const abandoned = a.socket
+    await h.clock.advance(10_000)
+    if (bringUpA !== undefined) await bringUpA
+    expect(abandoned.disconnectCalls).toBe(1)
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'retrying', phase, outcome: { reason: 'timeout' } })
+    await expectDelivers(h, h.b)
+    const starts = startsOf(h, h.a)
+    const reported = h.statuses.length
+    // Should the late socket open, deliver on it while it is connected: nothing may reach the handler.
+    const lateText = 'from the abandoned socket'
+    const lateDeliveries: Promise<void>[] = []
+    abandoned.on('connected', () => void lateDeliveries.push(abandoned.deliver(makeChannelMessage({ text: lateText }))))
+
+    deferred.settle(late)
+    await h.clock.flush()
+    await Promise.all(lateDeliveries)
+
+    expect(lateDeliveries).toHaveLength(late.kind === 'ok' ? 1 : 0)
+    expect(h.events.filter(e => e.payload.event?.text === lateText)).toEqual([])
+    expect(abandoned.disconnectCalls).toBe(late.kind === 'ok' ? 2 : 1)
+    expect(liveSocketsOf(h, h.a)).toBe(0)
+    expect(h.statuses).toHaveLength(reported)
+    expect(startsOf(h, h.a)).toBe(starts)
+    expect(pendingDelays(h)).toEqual([5_000])
+    await expectDelivers(h, h.b)
+
+    await h.clock.advance(5_000)
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+    expect(liveSocketsOf(h, h.a)).toBe(1)
+    await expectDelivers(h, h.a)
+    const recovered = startsOf(h, h.a)
+    await h.clock.advance(HOUR_MS)
+    expect(startsOf(h, h.a)).toBe(recovered)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Bring-up connection legs of AC 23/24
+// ---------------------------------------------------------------------------
+
+describe('connection manager: bring-up connection legs of AC 23/24', () => {
+  // Rows: label, A's connect outcome, when apps.connections.open answers (0: at once), when the
+  // manager abandons it (0: it fails at once), and the outcome's reason. The 10 s bound restarts
+  // when the WebSocket phase begins, so a slow open is abandoned 10 s after it answered.
+  test.each<[string, SettledConnectOutcome, number, number, string]>([
+    ['the socket closes before hello', { kind: 'closed-before-hello' }, 0, 0, 'socket-closed'],
+    ['start() never settles: apps.connections.open never answers', { kind: 'open-never-answers' }, 0, 10_000, 'timeout'],
+    ['start() never settles: the WebSocket never reaches hello', { kind: 'never' }, 0, 10_000, 'timeout'],
+    ['start() never settles: apps.connections.open answers after 9 s, then the WebSocket never reaches hello', { kind: 'never' }, 9_000, 19_000, 'timeout'],
+  ])('%s: A is Slack-unreachable and retrying, never credentials-broken, while B comes up and delivers', async (_label, connect, openAnswersAfterMs, abandonAtMs, reason) => {
+    const h = makeHarness()
+    const slowOpen = makeDeferredConnect()
+    stubOf(h, h.a).script.connect.push(openAnswersAfterMs > 0 ? slowOpen.outcome : connect)
+    let resolvedA: PersonaConnectionStatus | undefined
+    const bringUpA = h.manager.bringUp(h.a, h.a.tokens).then(status => (resolvedA = status))
+
+    expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
+    await expectDelivers(h, h.b)
+    // Never up yet: the long-lived Web API client is not handed out.
+    expect(h.manager.webClient(h.a.key)).toBeUndefined()
+    if (openAnswersAfterMs > 0) {
+      await h.clock.advance(openAnswersAfterMs)
+      slowOpen.settle(connect)
+      await h.clock.flush()
+      expect(stubOf(h, h.a).socket.lifecycle).toEqual(['authenticated', 'connecting'])
+    }
+    if (abandonAtMs > 0) {
+      await h.clock.advanceTo(abandonAtMs - 1)
+      expect(resolvedA).toBeUndefined()
+      expect(stubOf(h, h.a).socket.disconnectCalls).toBe(0)
+      expect(h.manager.status(h.a.key)).toEqual({ state: 'connecting' })
+      expect(h.manager.webClient(h.a.key)).toBeUndefined()
+      await expectDelivers(h, h.b)
+      await h.clock.advance(1)
+    }
+
+    expect(await bringUpA).toMatchObject({
+      state: 'retrying',
+      phase: 'bring-up',
+      retryInMs: 5_000,
+      outcome: { kind: 'slack-unreachable', check: 'socket-mode', key: 'app_token', reason },
+    })
+    expect(h.clock.now()).toBe(abandonAtMs)
+    expect(stubOf(h, h.a).socket.disconnectCalls).toBe(abandonAtMs > 0 ? 1 : 0)
+    expect(statesOf(h, h.a)).not.toContain('broken')
+    expect(h.manager.webClient(h.a.key)).toBeUndefined()
+    await expectDelivers(h, h.b)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// No cross-persona coupling (SR-3.3)
+// ---------------------------------------------------------------------------
+
+describe('connection manager: no cross-persona coupling (SR-3.3)', () => {
+  test('while A’s reopen start() hangs after two failures, B drops, fails once and reopens on its own 5 s step; A’s failure count never lengthens B’s wait', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const [a, b] = [stubOf(h, h.a), stubOf(h, h.b)]
+    a.script.connect.push({ kind: 'network' }, { kind: 'network' }, { kind: 'never' })
+    a.socket.drop()
+    // A fails at 0 and 5 s; its third attempt, at 15 s, hangs.
+    await h.clock.advance(15_000)
+    expect(startsOf(h, h.a)).toBe(4)
+    b.script.connect.push({ kind: 'network' })
+
+    b.socket.drop()
+    await h.clock.flush()
+
+    expect(h.manager.status(h.b.key)).toMatchObject({ state: 'retrying', phase: 'reopen', retryInMs: 5_000 })
+    await h.clock.advance(5_000)
+    expect(h.manager.status(h.b.key)).toMatchObject({ state: 'up' })
+    expect(a.socket.disconnectCalls).toBe(0)
+    await expectDelivers(h, h.b)
+    // 25 s: A's hung start() is abandoned; its next wait is its own third step.
+    await h.clock.advance(5_000)
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'retrying', retryInMs: 20_000, outcome: { reason: 'timeout' } })
+    expect(h.manager.status(h.b.key)).toMatchObject({ state: 'up' })
+    await expectDelivers(h, h.b)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Log classes (SR-10.3)
+// ---------------------------------------------------------------------------
+
+describe('connection manager: log classes (SR-10.3)', () => {
+  const LOST = PERSONA_CONNECTION_LOST
+  const RESTORED = PERSONA_CONNECTION_RESTORED
+  const U = PERSONA_SLACK_UNREACHABLE
+
+  // Rows: label, what happens to A after the harness is built, and the classes of the lines logged.
+  test.each<[string, (h: Harness) => Promise<void>, string[]]>([
+    [
+      'a reopen outage with three failed attempts, one abandoned: one lost line, then one restored line',
+      async h => {
+        await bringUpBoth(h)
+        stubOf(h, h.a).script.connect.push({ kind: 'network' }, { kind: 'http', status: 503 }, { kind: 'never' })
+        stubOf(h, h.a).socket.drop()
+        // Fails at 0 and 5 s, hangs at 15 s, abandoned at 25 s, up at 45 s.
+        await h.clock.advance(45_000)
+        expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+      },
+      [LOST, RESTORED],
+    ],
+    [
+      'a refused reopen: one lost line, then one refused line and no restored line',
+      async h => {
+        await bringUpBoth(h)
+        stubOf(h, h.a).script.connect.push({ kind: 'network' }, { kind: 'platform', error: 'invalid_auth' })
+        stubOf(h, h.a).socket.drop()
+        await h.clock.advance(5_000)
+        expect(h.manager.status(h.a.key)).toMatchObject({ state: 'broken' })
+      },
+      [LOST, PERSONA_CREDENTIALS_REFUSED],
+    ],
+    [
+      'a bring-up outage with two failed attempts: one unreachable line, then one cleared line',
+      async h => {
+        stubOf(h, h.a).script.authTest.push({ kind: 'dns' }, { kind: 'dns' })
+        expect(await h.manager.bringUp(h.a, h.a.tokens)).toMatchObject({ state: 'retrying' })
+        expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
+        // Fails at 0 and 5 s, up at 15 s.
+        await h.clock.advance(15_000)
+        expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+      },
+      [U, U],
+    ],
+  ])('%s', async (_label, run, classes) => {
+    const name = 'Night "Ops"\nDesk'
+    const h = makeHarness({ names: [name, 'Beta'] })
+
+    await run(h)
+
+    assertNoLeak(h.lines)
+    expect(h.lines.map(classOf)).toEqual(classes)
+    for (const line of h.lines) {
+      expect(line).not.toMatch(/[\r\n]/)
+      expect(line).toContain(renderPersonaRef(name, h.a.key))
+      expect(line).toContain('personas[0]')
+      expect(line).toContain(`path=${JSON.stringify(h.a.credentials_file)}`)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Dry run (SR-3.4)
+// ---------------------------------------------------------------------------
+
+describe('connection manager: dry run (SR-3.4)', () => {
+  test('reads no credentials file, builds no client, makes no Slack call, and brings every persona up with a distinct placeholder identity derived from its key', async () => {
+    // No credentials file is written: each persona points at a missing path.
+    const h = makeHarness({ dryRun: true })
+
+    for (const p of [h.a, h.b]) {
+      expect(existsSync(p.credentials_file)).toBe(false)
+      expect(await h.manager.bringUp(p)).toEqual({ state: 'up', identity: dryRunPersonaIdentity(p.key) })
+      expect(h.manager.identity(p.key)).toEqual(dryRunPersonaIdentity(p.key))
+      expect(h.manager.webClient(p.key)).toBeUndefined()
+      expect(existsSync(p.credentials_file)).toBe(false)
+    }
+
+    expect(h.slack.builds).toEqual([])
+    expect(h.lines).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
+    // Derived from the key alone: a second manager gives the same identity.
+    const other = makeHarness({ dryRun: true })
+    expect(await other.manager.bringUp(h.a)).toEqual({ state: 'up', identity: dryRunPersonaIdentity(h.a.key) })
+    // Distinct keys, even near-identical ones, never share either placeholder ID.
+    const identities = [h.a.key, h.b.key, 'alpha', 'alpha_1', 'alpha1', 'alph'].map(dryRunPersonaIdentity)
+    expect(new Set(identities.map(identity => identity.botUserId)).size).toBe(identities.length)
+    expect(new Set(identities.map(identity => identity.botId)).size).toBe(identities.length)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// unhandledRejection handler (SR-3.3)
+// ---------------------------------------------------------------------------
+
+describe('unhandledRejection handler (SR-3.3)', () => {
+  // Rows: label, the rejection reason, and pieces the line must carry. Called
+  // directly; never installed on the real process.
+  test.each<[string, unknown, string[]]>([
+    ['an Error with the sentinel in its message', new Error(`boom ${LEAK_SENTINEL}`), ['Error', 'at ']],
+    [
+      'a Slack-shaped error with the sentinel in its message, headers, data and original',
+      sentinelSlackError('slack_webapi_request_error'),
+      ['Error', 'code=slack_webapi_request_error'],
+    ],
+    [
+      'an Error whose message spans several lines, the sentinel on a later, frame-shaped line',
+      new TypeError(`first line\n    at ${LEAK_SENTINEL} (frame-shaped:1:1)\n${fakeToken(BOT_TOKEN_PREFIX, 'third-line')}`),
+      ['TypeError'],
+    ],
+    ['undefined', undefined, ['undefined']],
+    ['null', null, ['null']],
+    ['a sentinel-bearing string', `boom ${LEAK_SENTINEL}`, ['string']],
+    ['a plain object holding a token', { token: fakeToken(APP_TOKEN_PREFIX, 'object') }, ['object']],
+  ])('%s: logs one token-free [slack] line, returns normally and never exits', (_label, reason, pieces) => {
+    const { lines, log } = capture()
+    const exit = spyOn(process, 'exit').mockImplementation(() => undefined as never)
+    let returned: unknown
+    let outputCalls: number
+    try {
+      const handler = createUnhandledRejectionHandler(log)
+      ;({ value: returned, outputCalls } = withSilencedOutput(() => handler(reason, Promise.resolve())))
+      expect(exit).not.toHaveBeenCalled()
+    } finally {
+      exit.mockRestore()
+    }
+
+    assertNoLeak({ lines }, 'unhandled rejection')
+    if (reason !== undefined && reason !== null) expect(() => assertNoLeak(reason)).toThrow()
+    expect(returned).toBeUndefined()
+    expect(outputCalls).toBe(0)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith('[slack] ')
+    for (const piece of pieces) expect(lines[0]).toContain(piece)
+  })
+
+  test('a logger that throws does not make the handler throw', () => {
+    const handler = createUnhandledRejectionHandler(() => {
+      throw new Error('logger down')
+    })
+
+    expect(() => handler(new Error('rejected'))).not.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Rejected Web API calls (AC 20)
+// ---------------------------------------------------------------------------
+
+describe('rejected Web API calls (AC 20)', () => {
+  // Rows: label, leg, the scripted rejection, the state A is left in. Rows
+  // with `reject` carry the sentinel in message, original, headers and data;
+  // the http rows carry it through the stub's leak marker.
+  test.each<[string, Leg, Scripted, 'retrying' | 'broken']>([
+    ['a request error', 'auth.test', { kind: 'reject', value: sentinelSlackError('slack_webapi_request_error') }, 'retrying'],
+    ['a refusing platform error', 'auth.test', { kind: 'reject', value: sentinelSlackError('slack_webapi_platform_error', 'invalid_auth') }, 'broken'],
+    ['an HTTP 503', 'auth.test', { kind: 'http', status: 503 }, 'retrying'],
+    ['a request error', 'socket-mode', { kind: 'reject', value: sentinelSlackError('slack_webapi_request_error') }, 'retrying'],
+    ['a refusing platform error', 'socket-mode', { kind: 'reject', value: sentinelSlackError('slack_webapi_platform_error', 'invalid_auth') }, 'broken'],
+    ['an HTTP 503', 'socket-mode', { kind: 'http', status: 503 }, 'retrying'],
+  ])('(i) %s rejecting the manager’s own %s call leaves no sentinel in the outcome, status or log line', async (_label, leg, scripted, state) => {
+    const h = makeHarness()
+    const stub = stubOf(h, h.a)
+    if (leg === 'auth.test') stub.script.authTest.push(scripted as WebApiOutcome)
+    else stub.script.connect.push(scripted as ConnectOutcome)
+
+    const status = await h.manager.bringUp(h.a, h.a.tokens)
+
+    assertNoLeak({ status, statuses: h.statuses, lines: h.lines }, `rejected ${leg}`)
+    if (scripted.kind === 'reject') expect(() => assertNoLeak(scripted.value)).toThrow()
+    expect(status).toMatchObject({ state, phase: 'bring-up', outcome: { check: leg } })
+    expect(h.lines).toHaveLength(1)
+  })
+
+  test('(ii) a rejected call on A’s long-lived Web API client, from the manager’s query, surfaces without original and leaks nothing', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const stub = stubOf(h, h.a)
+    stub.script.post.push({ kind: 'network' }, { kind: 'network' })
+    const web = h.manager.webClient(h.a.key)
+    if (web === undefined) throw new Error('expected A’s long-lived Web API client')
+
+    const thrown = await web.chat.postMessage({ channel: 'C0STUB0001', text: 'hello' }).catch((err: unknown) => err)
+    // Control: the same failure on a client built without the SR-3.3 option carries the Authorization header in original.
+    const control = await stub.web.chat.postMessage({ channel: 'C0STUB0001', text: 'hello' }).catch((err: unknown) => err)
+
+    expect(thrown).toMatchObject({ code: 'slack_webapi_request_error' })
+    expect(thrown).not.toHaveProperty('original')
+    assertNoLeak(thrown, 'long-lived client rejection')
+    expect(control).toHaveProperty('original')
+    expect(() => assertNoLeak(control)).toThrow()
   })
 })

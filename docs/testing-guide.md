@@ -20,6 +20,7 @@ Each source module has a corresponding test file in the project root:
 | persona-identity.ts | persona-identity.test.ts | persona key rule, derived identifiers, persona-name rendering |
 | persona-credentials.ts, persona-bringup.ts, persona-diagnostics.ts | persona-connections.test.ts | checkPersonaCredentials (valid, missing, unreadable and each invalid shape), checkPersonaWorkingDirectory (missing, not a directory, unreadable, unsearchable), checkPersonaLocalBringUp (both causes reported), real-path collisions with another applied persona, no environment token read, no file written, diagnostic class labels and line format (causes escaped to one line), success values that never print a token |
 | persona-slack-validation.ts, persona-retry-schedule.ts, persona-slack-episodes.ts | persona-connections.test.ts | classifySlackValidationError on each leg an outcome applies to (`auth.test`, `socket-mode` or both) and botIdentityFromAuthTest on the `auth.test` leg: up, Slack-unreachable (with reason) or credentials-refused for every scripted Slack outcome; createPersonaRetrySchedule (5 s doubling to 300 s, no cap, reset, per-persona isolation, `retryAfter` honoured); createSlackEpisodeTracker (one start line and one cleared line per episode, class changes, per-persona isolation) |
+| persona-connections.ts, persona-slack-clients.ts, persona-connection-errors.ts | persona-connections.test.ts | createPersonaConnectionManager: bring-up and identity, exact client options per client kind, tokens from the file, no module-scope effects, event tagging, the AC 5 isolation walk-through, reopen rules, late settlement of an abandoned `start()`, AC 23/24 connection legs, no cross-persona coupling, log classes, dry run; createUnhandledRejectionHandler; rejected Web API calls leak nothing |
 | backoff.ts | backoff.test.ts | Per-channel failure counts, nextBackoffDelay, doublingBackoffDelay (doubling per prior attempt, clamped to the ceiling), isAtCap, shouldNotifyCap, per-channel isolation |
 
 New features that add significant logic should get their own test file (e.g., `session-manager.test.ts`).
@@ -115,7 +116,9 @@ The socket stub behaves like `SocketModeClient` with auto-reconnect off:
 | `network`, `dns`, `timeout`, `http`, `rate-limited` | Slack unreachable: a request error, an HTTP error with a status, or a rate-limited error with `retryAfter` in seconds. |
 | `no-url` | Connect only: `apps.connections.open` answered without a URL. `start()` rejects with a plain error on the connect leg, with no lifecycle event. |
 | `closed-before-hello`, `websocket-error` | Connect only: the WebSocket closes before `hello`. `start()` rejects with no value after `close` and `disconnected`; `websocket-error` emits `error` first. |
-| `never` | The call never settles. A pending `start()` ends only on `drop()` or `disconnect()`. |
+| `never` | Connect: `apps.connections.open` answers, `authenticated` and `connecting` are emitted, and the WebSocket phase never reaches `hello`; `start()` ends only on `drop()` or `disconnect()`. Web API calls: the call never settles. |
+| `open-never-answers` | Connect only: `apps.connections.open` never answers. `start()` stays pending for good with no lifecycle event; `disconnect()` does not end it. |
+| `deferred` | Connect only: built with `makeDeferredConnect()`. `start()` waits at the connect leg until the test calls `settle(outcome?)` (default `ok`), then proceeds as that outcome. Settling after the manager abandoned the `start()` drives a late settlement. |
 | `reject` | The call rejects with the given value exactly as given (a plain error, a string, `undefined` and so on). |
 
 Set `leakMarker` to `LEAK_SENTINEL` and every error the stub builds carries the marker wherever a real error can hold secrets: the message, the wrapped `original` error and its headers, HTTP headers and body, fields of `data`, and the error the socket's `error` event carries. `data.error` stays exactly as scripted, so classification still sees the real Slack error code.
@@ -126,15 +129,60 @@ Not every failure carries the marker. A rejection with no value carries nothing:
 
 **Reference example.** The `Slack validation classification (both legs, sentinel-bearing errors)` describe block in `tests/persona-connections.test.ts` is a table test. Each row scripts one outcome and runs it against a fresh sentinel-bearing stub on each leg it applies to: `auth.test`, `socket-mode` or both. It checks the class, the reason fields and `assertNoLeak` on everything captured.
 
+### Fake Clock
+
+Persona suites that need virtual time use the shared helper `tests/test-helpers/fake-clock.ts`, not hand-rolled single-shot timer fakes. The connection manager takes its clock and timers by injection, so tests pass it a clock from `createFakeClock` rather than using Bun's global fake timers. The helper also flushes pending promise continuations after each timer it fires and lets a test list the pending timers, which is what driving the backoff, the 10 s bound on a `start()` that never settles and reopen retry timers without sleeping needs.
+
+`createFakeClock({ start?, flushTurns? })` builds one independent clock. Its `now`, `setTimeout` and `clearTimeout` satisfy the connection manager's `PersonaConnectionClock`, so a test passes the clock with no cast. Virtual time moves only when the test moves it.
+
+| Member | What it gives a test |
+|--------|----------------------|
+| `now()` | The current virtual time in ms (default start 0). |
+| `advance(ms)`, `advanceTo(time)` | Move virtual time forward, firing every due timer in due-time order, including timers that callbacks schedule during the move. Resolves with the number fired. |
+| `runNext()` | Jump to the earliest pending timer and fire every timer due then. |
+| `flush()` | Let pending promise continuations run without moving time. The clock does the same before, between and after firings, so a stub's settled promise chain finishes before the next timer fires. |
+| `pending()`, `pendingCount()`, `firedCount()` | Introspection: each pending timer's requested `delayMs`, `dueAt` and `scheduledAt`, earliest first; the pending count; callbacks fired so far. |
+
+A zero, negative or overlong delay fires after 1 ms, as in Bun, but `pending()` still reports the requested `delayMs`. Assert on the requested delay to check what the code asked for.
+
 ### Backoff and Retry Tests
 
 Backoff, retry and timeout tests never wait in real time.
 
 - **Pure schedules are called, not timed.** `createPersonaRetrySchedule` holds no timer and reads no clock: it returns the next wait. Tests drive it by calling `nextDelayMs` and asserting on the returned sequence, as the `backoff schedule` describe block does.
-- **Timers and clocks are injected.** Code that schedules a wait, or abandons a call that never settles, takes its clock and timers as parameters. Tests pass fakes and advance them; they never sleep past a real delay.
+- **Timers and clocks are injected.** Code that schedules a wait, or abandons a call that never settles, takes its clock and timers as parameters. Tests pass the shared fake clock (see Fake Clock) and advance it; they never sleep past a real delay.
 - **Never-settling cases.** A `never` outcome stays pending for good, so the test ends it through the stub (`drop()`, `disconnect()`) or through the injected clock, never by waiting for it.
 - **`retryAfter` rows.** Script `retryAfter` values above and below the current step, and assert that the wait is never shorter than `retryAfter`. The outcome carries `retryAfter` in seconds and the schedule returns milliseconds, so convert before comparing. The `retryAfter` describe block is the reference.
 - **Leak checks still apply.** Every captured log line and error passes through `assertNoLeak`.
+
+### Connection Manager Tests
+
+Connection manager tests build `createPersonaConnectionManager` from injected fakes only: the `factory` from `makeStubSlackFactory()` (in `tests/test-helpers/slack-stub.ts`) and the `clock` from `createFakeClock()`, which supplies both the clock and the timers. Always pass both: an omitted `factory` falls back to `PRODUCTION_SLACK_CLIENT_FACTORY` (real Slack clients) and an omitted `clock` to `SYSTEM_PERSONA_CONNECTION_CLOCK` (real timers). A test never builds a real Slack client.
+
+| `makeStubSlackFactory()` member | What it gives a test |
+|--------|----------------------|
+| `factory` | The `PersonaSlackClientFactory` to pass to the manager, uncast. It routes each build to the persona whose token it received: the app token for a socket client, the bot token for the validation and long-lived Web API clients. |
+| `addPersona(key, tokens, opts?)` | Registers a persona with its own `makeStubSlack(opts)` stub. No identity, script queue, capture or socket is shared with another persona. |
+| `persona(key)` | That persona's stub. `socket` is its latest socket client and `sockets` every one built, abandoned ones included. |
+| `builds`, `buildsOf(key, kind?)` | Every client built, in build order, each with its `kind` (`socket`, `validation` or `web`), `persona` and `options` exactly as received. |
+| `hasToken(expected)` | On each build record: whether the client got exactly that token. The token itself is not enumerable, so a failing assertion never prints it. |
+
+Rules:
+
+- **Check client options through the build records.** Assert on `options` in `builds` or `buildsOf`, per client kind. A socket build's options hold the app token, so drop that field before comparing. Check tokens with `hasToken`, never by reading or printing the token.
+- **Use the file-level harness.** `makeHarness()` in `tests/persona-connections.test.ts` builds personas A and B, their credentials files and stubs (leak marker on), the manager, the fake clock and the captured lines, statuses and events. Its `afterEach` stops every harness manager with `stopAll()` and runs `assertNoLeak` over everything captured. A new connection test uses it rather than building a second harness.
+- **Isolation tests check both personas.** Whenever one persona fails, drops, is rejected or hangs, the test also delivers on the healthy persona (`expectDelivers`) and checks its events still arrive, tagged with that persona. Asserting only on the failing persona does not show isolation.
+
+**Reference example.** The `AC 5: per-persona isolation walk-through (fake clock)` describe block in `tests/persona-connections.test.ts` is the model. Each case is named "AC 5: …". A's socket drops and reopens at once while B keeps delivering. A rejected reopen waits 5 s, then 10 s, and B keeps delivering throughout. A reopen whose `start()` never settles is abandoned at 10 s on the fake clock and retried. The case `AC 5: no agent-director call is made for A across a drop, a rejected reopen, an abandoned reopen and a refused reopen` counts calls on an agent-director recorder built with `makeStubClient` and asserts zero.
+
+### Process-Level Listeners
+
+`bun test` runs every file in one process, so a listener added to `process` is process-global state, with the same hazard as `mock.module` (see Module Mocks). A leaked `unhandledRejection` listener would change how every later file handles a stray rejection.
+
+- **Call the handler, don't install it.** Tests call the exported `createUnhandledRejectionHandler(log)` result directly with each rejection reason. The `unhandledRejection handler (SR-3.3)` describe block is the reference. `bun test` already fails on an unhandled rejection, so no test needs a handler of its own.
+- **Remove what you add.** A test that must register a process-level listener removes it in `afterEach`. No test leaves one installed. A spy on `process.exit` is restored in `finally`.
+- **Check import side effects by count.** To show a module installs no listener at import, compare `process.listenerCount('unhandledRejection')` before and after a fresh import, as the `connection manager: no module-scope effects (SR-13.1)` describe block does.
+- **Leak checks still apply.** Every log line the handler produced passes through `assertNoLeak`.
 
 ### Parametrization
 

@@ -12,6 +12,12 @@
  *   `chat.postMessage` (`script`), falling back to success when exhausted;
  * - a record of the options every client was built with (`options`).
  *
+ * `makeStubSlackFactory()` adapts per-persona stubs to the connection
+ * manager's injected `PersonaSlackClientFactory`: one factory serves every
+ * persona, routing each build to the persona whose token it received (the app
+ * token for a socket client, the bot token for a Web API client), and records
+ * every client it built with its kind, persona, options and token.
+ *
  * Failure shapes follow the installed libraries, `@slack/web-api` 7.15.0 and
  * `@slack/socket-mode` 2.0.6, whose `ErrorCode` values the stub uses directly:
  * - platform error: `code` `slack_webapi_platform_error`, message
@@ -20,7 +26,9 @@
  * - request error (network, DNS, timeout): `code` `slack_webapi_request_error`,
  *   message `A request error occurred: <original message>`, and `original` (an
  *   axios-style error with `code`, `config.headers`) unless the client was
- *   built with `attachOriginalToWebAPIRequestError: false`;
+ *   built with `attachOriginalToWebAPIRequestError: false` (in a Web API
+ *   client's options, or in a socket client's `clientOptions` for its connect
+ *   leg), as `@slack/web-api` 7.15.0 does;
  * - HTTP error: `code` `slack_webapi_http_error`, `statusCode`,
  *   `statusMessage`, `headers`, `body`;
  * - rate-limited error: `code` `slack_webapi_rate_limited_error`,
@@ -31,6 +39,11 @@
  *
  * Socket lifecycle, as `SocketModeClient` behaves with
  * `autoReconnectEnabled: false`:
+ * - The connect leg (`apps.connections.open`) answers first. With
+ *   `open-never-answers` it never answers: `start()` stays pending and no
+ *   lifecycle event is emitted, whatever happens later. With `deferred` it
+ *   answers when the test settles the outcome (`makeDeferredConnect`), and
+ *   `start()` then proceeds with the outcome the test settled it with.
  * - A Web API failure on the connect leg (request, DNS, timeout, HTTP,
  *   rate-limited, platform error, no URL, `reject`) rejects `start()` with that
  *   error and emits no lifecycle event.
@@ -40,10 +53,13 @@
  *   `closed-before-hello` emits `close` and `disconnected` and `start()`
  *   rejects with no value; `websocket-error` emits `error` first, then the
  *   same; `never` leaves `start()` pending until `drop()` or `disconnect()`.
- * - `drop()` (Slack closing the connection) emits `close` and `disconnected`.
- *   `disconnect()` (the client's own close, i.e. CSCB closing the socket) is
- *   counted in `disconnectCalls` and emits `disconnecting`, `close` (if a
- *   WebSocket phase ever began) and `disconnected`.
+ * - `drop()` is Slack closing the connection: it emits `close` and
+ *   `disconnected`. `disconnect()` is the client's own close (CSCB closing the
+ *   socket, never Slack): it is counted in `disconnectCalls` and emits
+ *   `disconnecting`, `close` (if a WebSocket phase ever began) and
+ *   `disconnected`. A `start()` still waiting on its connect leg stays
+ *   pending through `disconnect()`, and a later answer (a settled `deferred`)
+ *   still opens the WebSocket, as `@slack/socket-mode` 2.0.6 does.
  * - `start()` can be called again after a drop; `startCalls` counts calls.
  *
  * Leak marker: with `leakMarker` set (normally `LEAK_SENTINEL`), every
@@ -51,7 +67,10 @@
  * the message, the `original` (message and an `Authorization` header built
  * with `fakeToken`), HTTP headers and body, the `error` event's error, and
  * fields of `data` other than `data.error`, which stays exactly as scripted.
- * `closed-before-hello` rejects with no value, so it carries nothing.
+ * `closed-before-hello` rejects with no value, so it carries nothing. A
+ * request error from a client built with `attachOriginalToWebAPIRequestError:
+ * false` carries nothing either: without `original` the library keeps only
+ * the axios message, which never holds the request's headers.
  *
  * Isolation (b.av2 SR-13.2): no module-scope state, no network, no
  * filesystem, no environment access, no timers. No token literal: tokens are
@@ -65,6 +84,7 @@ import { ErrorCode as WebApiErrorCode } from '@slack/web-api'
 import type { AppsConnectionsOpenResponse, WebClient, WebClientOptions } from '@slack/web-api'
 import { ErrorCode as SocketModeErrorCode } from '@slack/socket-mode'
 import type { SocketModeOptions } from '@slack/socket-mode'
+import type { PersonaSlackClientFactory } from '../../src/persona-slack-clients.ts'
 import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, fakeToken } from './credentials.ts'
 
 // ---------------------------------------------------------------------------
@@ -107,8 +127,8 @@ export type WebApiOutcome =
   /** The call rejects with `value` exactly as given (a plain `Error`, a string, `undefined` …). */
   | { kind: 'reject'; value: unknown }
 
-/** One scripted socket `start()` result. */
-export type ConnectOutcome =
+/** A socket `start()` result the test can settle a `deferred` outcome with: every kind but `deferred`. */
+export type SettledConnectOutcome =
   /** `hello` arrives: `connected` is emitted and `start()` resolves. */
   | { kind: 'ok' }
   /** Web API failures of the `apps.connections.open` leg: `start()` rejects with the error. */
@@ -119,8 +139,71 @@ export type ConnectOutcome =
   | { kind: 'websocket-error' }
   /** WebSocket closed before `hello`: `close`, `disconnected`; `start()` rejects with no value. */
   | { kind: 'closed-before-hello' }
-  /** The WebSocket phase never reaches `hello`; `start()` stays pending until a drop or disconnect. */
+  /**
+   * `apps.connections.open` answers but the WebSocket phase never reaches
+   * `hello`: `authenticated` and `connecting` are emitted, then `start()` stays
+   * pending until a drop or disconnect.
+   */
   | { kind: 'never' }
+  /**
+   * `apps.connections.open` never answers: `start()` stays pending for good and
+   * no lifecycle event is emitted. `disconnect()` does not end it, and
+   * `drop()` throws (no WebSocket was begun).
+   */
+  | { kind: 'open-never-answers' }
+
+/**
+ * A `start()` whose `apps.connections.open` leg answers only when the test
+ * settles it. Build with `makeDeferredConnect`; the `answer` is internal.
+ */
+export interface DeferredConnectOutcome {
+  kind: 'deferred'
+  readonly answer: Promise<SettledConnectOutcome>
+}
+
+/** One scripted socket `start()` result. */
+export type ConnectOutcome = SettledConnectOutcome | DeferredConnectOutcome
+
+/** A deferred connect outcome and its settle control. */
+export interface DeferredConnect {
+  /** Script this (`script.connect.push(d.outcome)`); every `start()` that takes it waits for `settle`. */
+  readonly outcome: DeferredConnectOutcome
+  /** Whether `settle` was called. */
+  readonly settled: boolean
+  /**
+   * Answer the connect leg: each waiting `start()` then proceeds as if
+   * `outcome` (default `ok`) had been scripted, lifecycle events included.
+   * Throws if already settled.
+   */
+  settle(outcome?: SettledConnectOutcome): void
+}
+
+/**
+ * A connect outcome that holds `start()` at its `apps.connections.open` leg,
+ * with no lifecycle event, until the test calls `settle`. Settling after the
+ * manager abandoned the `start()` makes it resolve or reject late.
+ */
+export function makeDeferredConnect(): DeferredConnect {
+  let answer: (outcome: SettledConnectOutcome) => void = () => {}
+  let settled = false
+  const outcome: DeferredConnectOutcome = {
+    kind: 'deferred',
+    answer: new Promise<SettledConnectOutcome>((resolve) => {
+      answer = resolve
+    }),
+  }
+  return {
+    outcome,
+    get settled() {
+      return settled
+    },
+    settle(settledWith = { kind: 'ok' }) {
+      if (settled) throw new Error('slack-stub: a deferred connect outcome settles once')
+      settled = true
+      answer(settledWith)
+    },
+  }
+}
 
 /** Per-call outcome queues. Consumed front to back; an empty queue means success. */
 export interface StubSlackScript {
@@ -211,6 +294,11 @@ export interface StubSocketClient {
   removeAllListeners(event?: string): this
   listenerCount(event: string): number
   start(): Promise<AppsConnectionsOpenResponse>
+  /**
+   * The client's own close (CSCB closing the socket), never Slack's: counted
+   * in `disconnectCalls`; emits `disconnecting`, `close` (if a WebSocket phase
+   * ever began) and `disconnected`. Use `drop()` for Slack closing it.
+   */
   disconnect(): Promise<void>
 
   /** True between `connected` and the next `close`. */
@@ -328,22 +416,25 @@ function axiosError(message: string, code: string, ctx: CallContext): Error {
   return err
 }
 
-function requestError(outcome: 'network' | 'dns' | 'timeout', ctx: CallContext): Error {
-  let original: Error
-  if (outcome === 'network') {
-    original = axiosError('connect ECONNREFUSED 192.0.2.1:443', 'ECONNREFUSED', ctx)
-  } else if (outcome === 'dns') {
-    original = axiosError('getaddrinfo ENOTFOUND slack.com', 'ENOTFOUND', ctx)
-  } else if (ctx.timeoutMs !== undefined && ctx.timeoutMs > 0) {
-    original = axiosError(`timeout of ${ctx.timeoutMs}ms exceeded`, 'ECONNABORTED', ctx)
-  } else {
-    original = axiosError('connect ETIMEDOUT 192.0.2.1:443', 'ETIMEDOUT', ctx)
+/** The axios error behind a request error of kind `outcome`. */
+function requestFailure(outcome: 'network' | 'dns' | 'timeout', ctx: CallContext): Error {
+  if (outcome === 'network') return axiosError('connect ECONNREFUSED 192.0.2.1:443', 'ECONNREFUSED', ctx)
+  if (outcome === 'dns') return axiosError('getaddrinfo ENOTFOUND slack.com', 'ENOTFOUND', ctx)
+  if (ctx.timeoutMs !== undefined && ctx.timeoutMs > 0) {
+    return axiosError(`timeout of ${ctx.timeoutMs}ms exceeded`, 'ECONNABORTED', ctx)
   }
-  return codedError(
-    `A request error occurred: ${original.message}`,
-    WebApiErrorCode.RequestError,
-    ctx.attachOriginal ? { original } : {},
-  )
+  return axiosError('connect ETIMEDOUT 192.0.2.1:443', 'ETIMEDOUT', ctx)
+}
+
+function requestError(outcome: 'network' | 'dns' | 'timeout', ctx: CallContext): Error {
+  if (!ctx.attachOriginal) {
+    // `attachOriginalToWebAPIRequestError: false`: the library keeps only the
+    // axios message, which never holds the request's headers, so no marker.
+    const { message } = requestFailure(outcome, { ...ctx, marker: undefined })
+    return codedError(`A request error occurred: ${message}`, WebApiErrorCode.RequestError)
+  }
+  const original = requestFailure(outcome, ctx)
+  return codedError(`A request error occurred: ${original.message}`, WebApiErrorCode.RequestError, { original })
 }
 
 function httpError(status: number, marker: string | undefined): Error {
@@ -637,9 +728,11 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
 
       async start() {
         startCalls++
-        const outcome = script.connect.shift() ?? { kind: 'ok' }
+        const scripted: ConnectOutcome = script.connect.shift() ?? { kind: 'ok' }
         // The apps.connections.open leg: a failure here rejects start() with no event.
         await Promise.resolve()
+        const outcome = scripted.kind === 'deferred' ? await scripted.answer : scripted
+        if (outcome.kind === 'open-never-answers') return new Promise<AppsConnectionsOpenResponse>(() => {})
         if (outcome.kind === 'reject') throw outcome.value
         if (outcome.kind === 'no-url') {
           throw new Error(`apps.connections.open did not return a URL! (response: ${marker ?? '[object Object]'})`)
@@ -770,6 +863,144 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
       if (latest === undefined) throw new Error('slack-stub: no socket client built yet; call createSocketClient first')
       return latest
     },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// makeStubSlackFactory: the connection manager's client factory
+// ---------------------------------------------------------------------------
+
+/** Which client a factory call built: Socket Mode, short-lived validation Web API, or long-lived Web API. */
+export type StubClientKind = 'socket' | 'validation' | 'web'
+
+/** A persona's two tokens, as the credentials fixture holds them (`PersonaSlackTokens` fits). */
+export interface StubPersonaTokens {
+  readonly botToken: string
+  readonly appToken: string
+}
+
+interface StubClientBuildCommon {
+  /** Key of the persona that registered the token, or `undefined` if none did (the build then threw). */
+  readonly persona: string | undefined
+  /**
+   * The token the client received (the app token for a socket client). Not
+   * enumerable, so printing a record or comparing records never shows it.
+   */
+  readonly token: string
+  /** Whether the client received exactly `expected`; assert on this so a failure prints no token. */
+  hasToken(expected: string): boolean
+}
+
+/**
+ * One client the factory built, in build order. `options` is the object the
+ * factory received, unchanged: a socket build's options hold the app token as
+ * `appToken`, so compare them without it (`const { appToken, ...rest } = …`).
+ */
+export type StubClientBuild =
+  | (StubClientBuildCommon & { readonly kind: 'socket'; readonly options: SocketModeOptions })
+  | (StubClientBuildCommon & { readonly kind: 'validation'; readonly options: WebClientOptions })
+  | (StubClientBuildCommon & { readonly kind: 'web'; readonly options: WebClientOptions })
+
+export interface StubSlackFactory {
+  /** Pass to `createPersonaConnectionManager({ factory })`; no cast needed. */
+  readonly factory: PersonaSlackClientFactory
+  /**
+   * Register persona `key` with its tokens and give it its own stub
+   * (`makeStubSlack(opts)`): its own identity, script queues, captures and
+   * socket clients, shared with no other persona. Throws if the key or
+   * either token is already registered.
+   */
+  addPersona(key: string, tokens: StubPersonaTokens, opts?: StubSlackOptions): StubSlack
+  /**
+   * Persona `key`'s stub. `socket` is its latest (live) socket client,
+   * `sockets` every one built, abandoned ones included. Throws if unknown.
+   */
+  persona(key: string): StubSlack
+  /** Every client built, all personas, in build order. */
+  readonly builds: readonly StubClientBuild[]
+  /** The clients built for persona `key`, optionally of one kind, in build order. */
+  buildsOf<K extends StubClientKind>(key: string, kind: K): Extract<StubClientBuild, { kind: K }>[]
+  buildsOf(key: string): StubClientBuild[]
+}
+
+/**
+ * A `PersonaSlackClientFactory` over per-persona stubs. Each build is routed
+ * by the token it received: `createSocketClient` by `options.appToken`,
+ * `createValidationClient` and `createWebClient` by the bot token (an app
+ * token passed as a bot token matches no persona). The build goes to that
+ * persona's stub with the options unchanged, so the stub honours them
+ * (`attachOriginalToWebAPIRequestError: false` drops `original`), and is
+ * recorded in `builds`. A token no persona registered is recorded with
+ * `persona: undefined` and the build throws an error naming no token.
+ *
+ * Every socket client the manager builds for a persona comes from that
+ * persona's stub, so its `script.connect` queue applies across them all.
+ */
+export function makeStubSlackFactory(): StubSlackFactory {
+  const stubs = new Map<string, StubSlack>()
+  const byBotToken = new Map<string, string>()
+  const byAppToken = new Map<string, string>()
+  const builds: StubClientBuild[] = []
+
+  /**
+   * Record one build and hand it to the persona the token routes to (the app
+   * token for a socket client, the bot token otherwise); throw if none.
+   */
+  function build<T>(
+    kind: StubClientKind,
+    token: string,
+    options: SocketModeOptions | WebClientOptions,
+    make: (stub: StubSlack) => T,
+  ): T {
+    const persona = (kind === 'socket' ? byAppToken : byBotToken).get(token)
+    const entry = { kind, persona, options, hasToken: (expected: string) => expected === token }
+    Object.defineProperty(entry, 'token', { value: token, enumerable: false })
+    // `kind` and `options` always arrive paired by the factory methods below.
+    builds.push(entry as StubClientBuild)
+    const stub = persona === undefined ? undefined : stubs.get(persona)
+    if (stub === undefined) {
+      throw new Error(`slack-stub factory: no persona registered this ${kind === 'socket' ? 'app' : 'bot'} token`)
+    }
+    return make(stub)
+  }
+
+  const factory: PersonaSlackClientFactory = {
+    createSocketClient: (options) => build('socket', options.appToken, options, (stub) => stub.createSocketClient(options)),
+    createValidationClient: (botToken, options) =>
+      build('validation', botToken, options, (stub) => stub.createWebClient(botToken, options)),
+    createWebClient: (botToken, options) =>
+      // `WebClient` is a class with private members, so no plain object can
+      // satisfy it structurally. The stub implements the methods persona code
+      // calls; this is the one cast, so test files pass `factory` uncast.
+      build('web', botToken, options, (stub) => stub.createWebClient(botToken, options) as unknown as WebClient),
+  }
+
+  function buildsOf<K extends StubClientKind>(key: string, kind: K): Extract<StubClientBuild, { kind: K }>[]
+  function buildsOf(key: string): StubClientBuild[]
+  function buildsOf(key: string, kind?: StubClientKind): StubClientBuild[] {
+    return builds.filter((entry) => entry.persona === key && (kind === undefined || entry.kind === kind))
+  }
+
+  return {
+    factory,
+    addPersona(key, tokens, opts = {}) {
+      if (stubs.has(key)) throw new Error(`slack-stub factory: persona ${JSON.stringify(key)} is already registered`)
+      if (byBotToken.has(tokens.botToken) || byAppToken.has(tokens.appToken)) {
+        throw new Error(`slack-stub factory: persona ${JSON.stringify(key)} reuses a token another persona registered`)
+      }
+      const stub = makeStubSlack(opts)
+      stubs.set(key, stub)
+      byBotToken.set(tokens.botToken, key)
+      byAppToken.set(tokens.appToken, key)
+      return stub
+    },
+    persona(key) {
+      const stub = stubs.get(key)
+      if (stub === undefined) throw new Error(`slack-stub factory: no persona ${JSON.stringify(key)} registered`)
+      return stub
+    },
+    builds,
+    buildsOf,
   }
 }
 

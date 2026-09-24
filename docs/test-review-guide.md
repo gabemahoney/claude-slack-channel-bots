@@ -24,6 +24,7 @@ When reviewing tests, check for:
 - [ ] Module-scoped state is reset in `beforeEach`
 - [ ] No shared mutable state leaking between tests
 - [ ] Test servers bind to port 0 (no port conflicts)
+- [ ] No test leaves a process-level listener (such as `unhandledRejection`) installed: the handler is called directly, or any listener a test registers is removed in `afterEach`
 - [ ] Tests that write configuration or other state files do so only in a `mkdtempSync` directory removed in `afterEach`, pass every path (and any home directory) explicitly, and never read or write `~/.claude/channels/slack` or `~/.agent-director` or start a server against the real home
 
 ### Patterns
@@ -36,6 +37,9 @@ When reviewing tests, check for:
 - [ ] Slack failure cases use the stub's scripted outcomes with `leakMarker` set to `LEAK_SENTINEL`, and assert on the classification, not on the error text
 - [ ] Backoff, retry and timeout tests never wait in real time: pure schedules are called directly, timers and clocks are injected fakes, and a never-settling call is ended through the stub or the injected clock
 - [ ] `retryAfter` cases assert the wait is never shorter than `retryAfter`, converting seconds to milliseconds
+- [ ] Persona suites drive virtual time with `createFakeClock` from `tests/test-helpers/fake-clock.ts`; a hand-rolled fake timer or clock is a defect
+- [ ] Connection tests build the manager with the `factory` from `makeStubSlackFactory` and the fake clock, and check client options through the factory's build records; a test that builds a real Slack client, or omits `factory` or `clock` so the production default applies, is a defect
+- [ ] An isolation test that makes one persona fail, drop or hang also checks that the healthy persona keeps delivering its events; one that asserts only on the failing persona is a defect
 
 ### Credentials and Leak Checks
 - [ ] Every test that handles tokens or a credentials file runs `assertNoLeak` over all its captured log lines, errors and results, failure paths included; a missing call is a defect

@@ -732,6 +732,9 @@ If a Claude Code session connects but immediately disconnects, the session's act
 **Bot not receiving messages in a new channel**
 After inviting the bot to a channel, Slack may not deliver messages until the bot is @mentioned for the first time. This is a Slack Socket Mode behavior — the first @mention activates event delivery for that channel. After that, all messages flow normally regardless of `requireMention` settings.
 
+**File attachment fails after a long wait**
+Each attempt of a Slack request is limited to 30 s, and that includes uploading a file attached with `reply`. An upload that takes longer than 30 s fails on every attempt, so the tool returns an error only after about 30 minutes, once the standard retries are spent. This is not a hang: send smaller files, or split a large attachment into several smaller ones.
+
 **Channel not in access.json**
 Messages to channels not listed in `access.json → channels` and not present in `config.json → routes` are silently dropped. Use the `claude-slack-channels-config` skill or edit `access.json` directly to add the channel ID with a `ChannelPolicy` entry.
 

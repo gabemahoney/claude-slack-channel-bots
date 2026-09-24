@@ -19,7 +19,7 @@
  * These lines never go to `startup-errors.log`, and no log file is added.
  *
  * The label set grows as later work lands (E2 Task 2 added credentials-refused
- * and Slack-unreachable; E2 Task 3: connection lost/restored; later Epics theirs).
+ * and Slack-unreachable, E2 Task 3 connection lost/restored; later Epics theirs).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -52,6 +52,16 @@ export const PERSONA_CREDENTIALS_REFUSED = 'persona-credentials-refused'
  */
 export const PERSONA_SLACK_UNREACHABLE = 'persona-slack-unreachable'
 
+/**
+ * A persona's Socket Mode connection that was up closed without the server
+ * closing it; the server reopens it (b.av2 SR-3.3). Logged once per outage,
+ * when the connection drops, not on each reopen attempt.
+ */
+export const PERSONA_CONNECTION_LOST = 'persona-connection-lost'
+
+/** A lost persona connection is open again. Logged once, when the reopen succeeds. */
+export const PERSONA_CONNECTION_RESTORED = 'persona-connection-restored'
+
 /** The working directory does not exist. */
 export const PERSONA_DIRECTORY_MISSING = 'persona-directory-missing'
 
@@ -65,6 +75,8 @@ export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_CREDENTIALS_INVALID,
   PERSONA_CREDENTIALS_REFUSED,
   PERSONA_SLACK_UNREACHABLE,
+  PERSONA_CONNECTION_LOST,
+  PERSONA_CONNECTION_RESTORED,
   PERSONA_DIRECTORY_MISSING,
   PERSONA_DIRECTORY_UNUSABLE,
 ] as const

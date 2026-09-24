@@ -31,6 +31,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 - Non-critical failures (reaction add, message update) use empty catch blocks with `/* non-critical */` or `/* ignore */`
 - Critical failures (token loading, routing config) exit the process with a clear message
 - Persona diagnostic lines (b.av2 SR-10.3) go through `src/persona-diagnostics.ts`. Add a new class to its closed label set, build the line with `formatPersonaDiagnostic()` or `personaCheckFailure()`, and emit it only through an injected logger, never with a direct `console` call in a pure module. The cause is one line, names a bad token by its key and the rule it breaks, never by its value, and never quotes file contents
+- On persona connection paths, log a thrown or rejected value only through `describeThrownValue()` in `src/persona-connection-errors.ts`, never the error object or its message: a Slack library error's message, request and headers can hold a token
 
 ## Configuration
 
@@ -60,6 +61,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 - Localhost-only endpoints: check `server.requestIP(req)` for `127.0.0.1`, `::1`, and `::ffff:127.*`
 - Sensitive files (`access.json`): `chmod 0o600`
 - No secrets in config files that don't need them (config.json); never hardcode tokens or keys in source — load from environment or config
+- Build every persona Slack client through the connection manager's injected `PersonaSlackClientFactory` with the option builders in `src/persona-slack-clients.ts`; never construct a `WebClient` or `SocketModeClient` for a persona elsewhere, and never add a client that attaches the original request to its errors
 - Gate all inbound Slack messages through the `gate()` function before processing
 - Validate all external input at system boundaries (HTTP endpoints, Slack payloads, config files) before acting on it
 - Error responses to external callers must not expose stack traces, internal paths, or sensitive data — log detail to stderr, return a generic message
@@ -209,6 +211,8 @@ The precedent to follow is the b.4dk/b.m4r/b.93m/b.ecw chain, which shows how to
 - SSE keep-alive pattern: hold the response open with a `Promise` that resolves on `req.signal` abort; stream events by writing to `res` directly; clean up on abort via `req.signal.addEventListener('abort', ...)`
 - Always clean up on abort: `req.signal.addEventListener('abort', ...)` for held HTTP connections
 - Use `settled` flag pattern to prevent double-resolution in race conditions
+- Bound any Slack `start()` or call that may never settle with a timer on the injected clock (as `src/persona-connections.ts` does). On expiry, abandon it, and disconnect or catch whatever it settles to later
+- Per-persona work keeps its state in that persona's own entry: no lock, queue, promise chain or timer is shared between personas
 
 ## Review Prioritization
 
