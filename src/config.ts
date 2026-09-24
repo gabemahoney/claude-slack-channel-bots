@@ -443,10 +443,29 @@ export function expandTilde(path: string): string {
  *   at call time. Tests inject one to simulate file-system behaviour.
  */
 export function resolveRealPath(path: string, realpath: (path: string) => string = realpathSync): string {
+  return tryResolveRealPath(path, realpath) ?? resolve(path)
+}
+
+/**
+ * The real path of `path`, or undefined when realpath fails (a missing path
+ * or ancestor, a permission error, a symlink loop): `resolveRealPath` without
+ * its lexical fallback, for a check that must know the path could not be
+ * resolved (b.av2 SR-6.4: a directory-broken persona's rows are not compared
+ * by `cwd`). Never throws for a string path; the input must already be
+ * tilde-expanded.
+ *
+ * @param path      The path to resolve, already tilde-expanded.
+ * @param realpath  Realpath function; defaults to `fs.realpathSync`, looked up
+ *   at call time.
+ */
+export function tryResolveRealPath(
+  path: string,
+  realpath: (path: string) => string = realpathSync,
+): string | undefined {
   try {
     return realpath(path)
   } catch {
-    return resolve(path)
+    return undefined
   }
 }
 

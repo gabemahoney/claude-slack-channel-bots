@@ -13,7 +13,9 @@
  *        (a body that still carries only the old `channel` field gets the
  *        `persona` error)
  *   404  no applied persona has that name or key (or no persona config)
- *   503  the persona has no registered, connected session
+ *   503  the persona is not up (b.av2 SR-6.4; checked before the session
+ *        lookup, so a still-registered session of a not-up persona gets
+ *        nothing), or it has no registered, connected session
  *   200  `{ ok: true, persona: <name> }` after one notification is sent
  *
  * The notification goes to the named persona's session only, as
@@ -21,10 +23,15 @@
  * and nothing else: no `chat_id`, `message_id` or `via` (SR-9.2). `ts` keeps
  * the form the b.wr5 reply guard recognises injected messages by.
  *
+ * A request for a persona that is not up is refused with 503 and the body
+ * `{ error: 'Persona is not up', persona: <name> }`, and one line is logged:
+ *
+ *   [slack] /interject: refused for persona "<name>" (key=<key>) — the persona is not up; nothing delivered
+ *
  * Side-effect free (b.av2 SR-13.1): importing this module reads no file,
  * environment variable or config, binds nothing and logs nothing. The
- * persona config, the session lookup, the clock and the logger are injected
- * per call. It never imports server.ts.
+ * persona config, the up check, the session lookup, the clock and the logger
+ * are injected per call. It never imports server.ts.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -72,6 +79,11 @@ export interface InterjectDeps {
    * unknown (404).
    */
   getPersonaConfig: () => { personas: readonly InterjectPersona[] } | null
+  /**
+   * Whether the persona with this key is up (b.av2 SR-6.4); production passes
+   * `createPersonaUpPredicate`. Asked before the session lookup.
+   */
+  isPersonaUp: (key: string) => boolean
   /** The registry lookup by persona key (`getSessionByPersona` in production). */
   getSessionByPersona: (key: string) => InterjectSession | undefined
   /** Clock in epoch milliseconds for the `ts` meta value. Defaults to `Date.now`. */
@@ -151,18 +163,26 @@ export async function handleInterject(
   const persona = resolvePersonaTarget(deps.getPersonaConfig(), target)
   if (!persona) return jsonResponse(404, { error: 'Persona not found in the applied config' })
 
+  const log = deps.log ?? ((line: string) => console.error(line))
+  const ref = renderPersonaRef(persona.name, persona.key)
+
+  // b.av2 SR-6.4: a persona that is not up is refused before the session
+  // lookup, even when its instance's session is still registered.
+  if (!deps.isPersonaUp(persona.key)) {
+    log(`[slack] /interject: refused for persona ${ref} — the persona is not up; nothing delivered`)
+    return jsonResponse(503, { error: 'Persona is not up', persona: persona.name })
+  }
+
   const session = deps.getSessionByPersona(persona.key)
   if (!session || !session.connected) {
     return jsonResponse(503, { error: 'No active session for this persona' })
   }
 
-  const log = deps.log ?? ((line: string) => console.error(line))
   const senderLabel = typeof sender === 'string' && sender ? sender : DEFAULT_INTERJECT_SENDER
   const meta: Record<string, string> = {
     user: senderLabel,
     ts: interjectTs((deps.now ?? Date.now)()),
   }
-  const ref = renderPersonaRef(persona.name, persona.key)
 
   log(
     `[slack] /interject: delivering to persona ${ref} sender="${senderLabel}" ` +

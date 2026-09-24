@@ -1,11 +1,14 @@
 /**
- * interject.test.ts — The `/interject` handler (b.av2 SR-9.1, SR-9.2, SR-10.2,
- * SR-13.1; AC 50's `/interject` leg).
+ * interject.test.ts — The `/interject` handler (b.av2 SR-6.4, SR-9.1, SR-9.2,
+ * SR-10.2, SR-13.1; AC 50's `/interject` leg).
  *
  * Drives the real `handleInterject` from src/interject.ts with injected
  * dependencies: a two-persona config from `makeMultiPersonaConfig`, stub
- * sessions keyed by persona key that capture `notification` calls, a fixed
- * clock and a capturing logger. Most cases call the handler directly; the
+ * sessions keyed by persona key that capture `notification` calls, a
+ * hand-written `isPersonaUp` stand-in over a set of not-up keys (every persona
+ * up by default; the handler sees only the boolean, and the production
+ * predicate is pinned by tests/server-startup-wiring.test.ts), a fixed clock
+ * and a capturing logger. Most cases call the handler directly; the
  * body-size cap and the loopback check also run over a real HTTP request to a
  * port-0 `Bun.serve` bound to 127.0.0.1 in this process, the way server.ts
  * hands the request over (`server.requestIP(req)?.address`).
@@ -75,6 +78,11 @@ let sessions: Map<string, InterjectSession>
 let a: StubSession
 let b: StubSession
 let logs: string[]
+/** Keys of the personas that are not up; every other persona is up. */
+let notUp: Set<string>
+/** Keys passed to `isPersonaUp` / `getSessionByPersona`, in call order. */
+let upChecks: string[]
+let sessionLookups: string[]
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'cscb-interject-'))
@@ -86,6 +94,9 @@ beforeEach(() => {
     [B_KEY, b.session],
   ])
   logs = []
+  notUp = new Set()
+  upChecks = []
+  sessionLookups = []
 })
 
 afterEach(() => {
@@ -95,7 +106,14 @@ afterEach(() => {
 function deps(): InterjectDeps {
   return {
     getPersonaConfig: () => config,
-    getSessionByPersona: (key) => sessions.get(key),
+    isPersonaUp: (key) => {
+      upChecks.push(key)
+      return !notUp.has(key)
+    },
+    getSessionByPersona: (key) => {
+      sessionLookups.push(key)
+      return sessions.get(key)
+    },
     now: () => NOW_MS,
     log: (line) => logs.push(line),
   }
@@ -261,6 +279,101 @@ describe('/interject status table (SR-9.1)', () => {
     expect(await res.json()).toEqual({ error: 'No active session for this persona' })
     expectNoDelivery()
     expect(stub?.calls ?? []).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SR-6.4 — a persona that is not up gets 503 (checked before the session lookup)
+// ---------------------------------------------------------------------------
+
+describe('/interject refuses a persona that is not up (SR-6.4)', () => {
+  const NOT_UP_BODY = { error: 'Persona is not up', persona: A_NAME }
+  const NOT_UP_LOG = `[slack] /interject: refused for persona ${renderPersonaRef(A_NAME, A_KEY)} — the persona is not up; nothing delivered`
+
+  // Persona A's key is the hashed form, so a handler that asked the up check
+  // with the name instead of the key would find A "up" and fail these cases.
+  test.each([
+    ['by name', A_NAME],
+    ['by key', A_KEY],
+  ] as const)(
+    'a not-up persona addressed %s, with a registered and connected session → 503 naming it as not up; no session notified, no session lookup, and the log line carries no message text',
+    async (_label, persona) => {
+      notUp.add(A_KEY)
+      expect(sessions.get(A_KEY)?.connected).toBe(true)
+      const res = await interject({ persona, message: 'secret-body-text' })
+      expect(res.status).toBe(503)
+      expect(await res.json()).toEqual(NOT_UP_BODY)
+      expectNoDelivery()
+      expect(upChecks).toEqual([A_KEY])
+      expect(sessionLookups).toEqual([])
+      expect(logs).toEqual([NOT_UP_LOG])
+    },
+  )
+
+  test('a not-up persona with no session → 503 "Persona is not up" (the up check comes first)', async () => {
+    notUp.add(A_KEY)
+    sessions.delete(A_KEY)
+    const res = await interject({ persona: A_KEY, message: 'hi' })
+    expect(res.status).toBe(503)
+    expect(await res.json()).toEqual(NOT_UP_BODY)
+    expect(sessionLookups).toEqual([])
+  })
+
+  test('an up persona beside a not-up one → 200 with its name; only its session gets the message, meta exactly { user, ts }', async () => {
+    notUp.add(A_KEY)
+    const res = await interject({ persona: B_NAME, message: 'for B', sender: 'ops-script' })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ ok: true, persona: B_NAME })
+    expect(a.calls).toHaveLength(0)
+    expect(b.calls).toEqual([
+      {
+        method: 'notifications/claude/channel',
+        params: { content: 'for B', meta: { user: 'ops-script', ts: '1700000000.123' } },
+      },
+    ])
+  })
+
+  test('a persona that comes up with a connected session → 200 after being refused while not up', async () => {
+    notUp.add(A_KEY)
+    const refused = await interject({ persona: A_NAME, message: 'too early' })
+    expect(refused.status).toBe(503)
+    expect(a.calls).toHaveLength(0)
+
+    notUp.delete(A_KEY)
+    const res = await interject({ persona: A_NAME, message: 'now up' })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ ok: true, persona: A_NAME })
+    expect(a.calls).toHaveLength(1)
+    expect(a.calls[0]!.params.content).toBe('now up')
+    expect(b.calls).toHaveLength(0)
+  })
+
+  test('a persona absent from the config → 404 (never 503) even when no persona is up; the up check is not asked', async () => {
+    notUp.add(A_KEY)
+    notUp.add(B_KEY)
+    const res = await interject({ persona: 'nobody', message: 'hi' })
+    expect(res.status).toBe(404)
+    expect(await res.json()).toEqual({ error: 'Persona not found in the applied config' })
+    expect(upChecks).toEqual([])
+    expectNoDelivery()
+  })
+
+  test.each([
+    ['a missing persona field (400)', { message: 'hi' }, 400],
+    ['a missing message field (400)', { persona: A_NAME }, 400],
+  ] as const)('%s for a not-up persona keeps its status; the up check is not asked', async (_label, body, status) => {
+    notUp.add(A_KEY)
+    const res = await interject(body)
+    expect(res.status).toBe(status)
+    expect(upChecks).toEqual([])
+    expectNoDelivery()
+  })
+
+  test('a non-loopback caller naming a not-up persona → 403, not 503', async () => {
+    notUp.add(A_KEY)
+    const res = await interject({ persona: A_NAME, message: 'hi' }, { remote: '10.0.0.5' })
+    expect(res.status).toBe(403)
+    expect(upChecks).toEqual([])
   })
 })
 

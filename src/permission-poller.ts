@@ -41,6 +41,16 @@
  * composite key means a "new" token simply appears as an unseen entry and
  * the old token naturally falls out of the seen-set on the next tick.
  *
+ * A persona that is not up (b.av2 SR-6.4, the injected `isPersonaUp`) keeps
+ * its instance, but the poller leaves it alone: its rows get no `get`, no
+ * prompt and no wedge-detector tick, and its tracked prompts and wedge state
+ * are held as they are (not treated as closed, not re-armed) until it is up,
+ * when the next tick reconciles them normally. The skip emits no trail event;
+ * it is logged once when it starts and once when it ends:
+ *
+ *   [slack] permission-poller: persona "<name>" (key=<key>) is not up — skipping its rows and holding its tracked prompts until it is up
+ *   [slack] permission-poller: persona "<name>" (key=<key>) is up again — polling its rows again
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -171,6 +181,11 @@ export interface PollerDeps {
    * swapped persona set is seen at once.
    */
   getPersona: (key: string) => Persona | undefined
+  /**
+   * Whether the persona with this key is up (b.av2 SR-6.4); production passes
+   * `createPersonaUpPredicate`. An applied persona that is not up is skipped.
+   */
+  isPersonaUp: (key: string) => boolean
   /** Poll interval in ms; from config.agent_director_poll_interval_ms. */
   intervalMs: number
   /** Hook to record runtime errors. Defaults to console.error. */
@@ -237,6 +252,8 @@ export function wedgeTripTicks(intervalMs: number): number {
  * appears, or the spawn disappears — so a later genuine wedge alarms again.
  */
 interface WedgeState {
+  /** Key of the spawn's persona, so its state is held while the persona is not up. */
+  personaKey: string
   /** Consecutive ticks observed empty-in-check_permission. */
   emptyTicks: number
   /** One-shot latch: true only once the warning has SUCCESSFULLY posted (or,
@@ -289,6 +306,8 @@ const livePermissions = new Map<string, LivePermission>()
 const unpostedPrompts = new Map<string, UnpostedReason>()
 /** claude_instance_id → wedge-detector state (b.fae F4). */
 const wedgeStates = new Map<string, WedgeState>()
+/** Keys of the personas in a not-up skip episode, for its start and end lines (b.av2 SR-6.4). */
+const notUpSkipping = new Set<string>()
 let pollerHandle: ReturnType<typeof setInterval> | null = null
 let tickInFlight = false
 let skippedTicks = 0
@@ -328,6 +347,7 @@ export function _resetPollerState(): void {
   livePermissions.clear()
   unpostedPrompts.clear()
   wedgeStates.clear()
+  notUpSkipping.clear()
   pollerHandle = null
   tickInFlight = false
   skippedTicks = 0
@@ -528,7 +548,7 @@ async function observeWedgeCandidate(
   const k = wedgeTripTicks(deps.intervalMs)
   let state = wedgeStates.get(claudeInstanceId)
   if (!state) {
-    state = { emptyTicks: 0, warningFired: false, lastWarnAttemptTicks: 0 }
+    state = { personaKey: persona.key, emptyTicks: 0, warningFired: false, lastWarnAttemptTicks: 0 }
     wedgeStates.set(claudeInstanceId, state)
   }
   state.emptyTicks++
@@ -568,14 +588,18 @@ async function observeWedgeCandidate(
  * counter and defer detection indefinitely. Such spawns are exempted (mirrors
  * the closed-row sweep's `nonConformingInstanceIds` exemption): their state is
  * preserved so the empty-tick count accumulates across transient read gaps.
+ * The state of a spawn whose persona is not up (`isHeld`, b.av2 SR-6.4) is
+ * preserved the same way, listed this tick or not.
  */
 function reconcileWedgeStates(
   observedEmpty: Set<string>,
   skippedThisTick: Set<string>,
+  isHeld: (personaKey: string) => boolean,
 ): void {
-  for (const instanceId of [...wedgeStates.keys()]) {
+  for (const [instanceId, state] of [...wedgeStates]) {
     if (observedEmpty.has(instanceId)) continue
     if (skippedThisTick.has(instanceId)) continue
+    if (isHeld(state.personaKey)) continue
     wedgeStates.delete(instanceId)
   }
 }
@@ -653,6 +677,15 @@ async function runTick(deps: PollerDeps): Promise<void> {
       }
       if (resolved.kind === 'no_label') continue
       const persona = resolved.persona
+      if (!deps.isPersonaUp(persona.key)) {
+        // b.av2 SR-6.4: no get, no prompt, no wedge tick for a persona that is
+        // not up; its requests stay open, so hold its live entries and wedge
+        // state exactly as for a spawn that could not be read this tick.
+        noteNotUpSkip(deps, persona)
+        nonConformingInstanceIds.add(row.claude_instance_id)
+        wedgeSkippedThisTick.add(row.claude_instance_id)
+        continue
+      }
 
       let got: GetResultWithPermissionRequests
       try {
@@ -710,7 +743,10 @@ async function runTick(deps: PollerDeps): Promise<void> {
     // b.fae F4: re-arm the wedge detector for spawns no longer wedged (left
     // check_permission, gained an open row, or disappeared), but NOT for spawns
     // merely skipped by a transient read error this tick.
-    reconcileWedgeStates(wedgeObservedEmpty, wedgeSkippedThisTick)
+    // b.av2 SR-6.4: a not-up persona's wedge state and tracked prompts are
+    // held even when its spawn was not listed this tick.
+    const isHeld = (personaKey: string) => isHeldForNotUpPersona(deps, personaKey)
+    reconcileWedgeStates(wedgeObservedEmpty, wedgeSkippedThisTick, isHeld)
     forgetUnobservedUnposted(seenComposite, wedgeSkippedThisTick)
 
     // SR-2.4 newly-closed reconciliation. Collect first, then reconcile —
@@ -719,8 +755,10 @@ async function runTick(deps: PollerDeps): Promise<void> {
     for (const [key, entry] of livePermissions) {
       if (seenComposite.has(key)) continue
       if (nonConformingInstanceIds.has(entry.claudeInstanceId)) continue
+      if (isHeld(entry.personaKey)) continue
       closedEntries.push(entry)
     }
+    endNotUpSkips(deps)
 
     for (const entry of closedEntries) {
       let info: GetPermissionResult
@@ -757,6 +795,48 @@ async function runTick(deps: PollerDeps): Promise<void> {
     }
   } finally {
     tickInFlight = false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Not-up personas (b.av2 SR-6.4)
+// ---------------------------------------------------------------------------
+
+/** Open the persona's not-up skip episode, logging its start line once. */
+function noteNotUpSkip(deps: PollerDeps, persona: Pick<Persona, 'name' | 'key'>): void {
+  if (notUpSkipping.has(persona.key)) return
+  notUpSkipping.add(persona.key)
+  logViaDeps(
+    deps,
+    `[slack] permission-poller: persona ${renderPersonaRef(persona.name, persona.key)} is not up — ` +
+      'skipping its rows and holding its tracked prompts until it is up',
+  )
+}
+
+/**
+ * Whether state kept for `personaKey` (a tracked prompt, a wedge state) is
+ * held this tick: the persona is applied and not up. The skip episode is
+ * opened when it is. A persona no longer applied is not held (E3's handling).
+ */
+function isHeldForNotUpPersona(deps: PollerDeps, personaKey: string): boolean {
+  const persona = deps.getPersona(personaKey)
+  if (!persona || deps.isPersonaUp(personaKey)) return false
+  noteNotUpSkip(deps, persona)
+  return true
+}
+
+/** Close the skip episode of every persona that is up again (or no longer applied), logging its end line once. */
+function endNotUpSkips(deps: PollerDeps): void {
+  for (const key of [...notUpSkipping]) {
+    const persona = deps.getPersona(key)
+    if (persona && !deps.isPersonaUp(key)) continue
+    notUpSkipping.delete(key)
+    logViaDeps(
+      deps,
+      persona
+        ? `[slack] permission-poller: persona ${renderPersonaRef(persona.name, persona.key)} is up again — polling its rows again`
+        : `[slack] permission-poller: persona=${key} is no longer applied — no longer skipping its rows`,
+    )
   }
 }
 

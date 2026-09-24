@@ -1,11 +1,15 @@
 /**
- * registry.test.ts — Persona-keyed MCP session registry and persona-scoped
- * Slack tools (b.av2 SR-6.3, SR-5.1, SR-5.2 wiring, SR-12 instructions part).
+ * registry.test.ts — Persona-keyed MCP session registry, not-up session
+ * admission and drop, and persona-scoped Slack tools (b.av2 SR-6.3, SR-6.4,
+ * SR-5.1, SR-5.2 wiring, SR-12 instructions part).
  *
  * Tools are driven through the real MCP server (`createSessionServer`) with an
  * in-memory MCP client. Each persona has its own `makeStubSlack` client, so a
  * case can show which persona's client a call landed on. Every path is under
  * the test's own `mkdtempSync` directory; no token literal appears here.
+ * The not-up block (b.av2 SR-6.3, SR-6.4) brings personas up through the real
+ * bring-up controller on the real connection manager (stub Slack, fake clock)
+ * and drives the real admission decision, up predicate and session drop.
  * The global `fetch` is stubbed for every test (it throws unless a test sets
  * `h.fetchHandler`), so no test reaches the network, and every tool result
  * and log line is leak-checked in `afterEach`.
@@ -24,6 +28,17 @@ import type { Persona } from '../src/config.ts'
 import { assertSendable } from '../src/lib.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import {
+  createNotUpSessionDropper,
+  createPersonaBringUpController,
+  describePersonaNotUp,
+  type PersonaBringUpController,
+} from '../src/persona-bringup-controller.ts'
+import { createPersonaUpPredicate } from '../src/persona-start.ts'
+import {
+  closePendingSession,
+  decideSessionAdmission,
+  dropPersonaSession,
+  type SessionAdmission,
   registerSession,
   unregisterSession,
   unregisterByMcpSessionId,
@@ -44,7 +59,8 @@ import {
 } from '../src/registry.ts'
 import { trackAck, consumeAck, _resetAckTracker } from '../src/ack-tracker.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
-import { makeStubSlack, type StubSlack } from './test-helpers/slack-stub.ts'
+import { makeStubSlack, type StubSlack, type StubSlackOptions } from './test-helpers/slack-stub.ts'
+import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import {
   BOT_TOKEN_PREFIX,
   LEAK_SENTINEL,
@@ -58,9 +74,26 @@ import {
 // Fixtures
 // ---------------------------------------------------------------------------
 
-/** Minimal stub for WebStandardStreamableHTTPServerTransport. */
-function makeTransport(sessionId?: string): any {
-  return { sessionId, handleRequest: () => {}, close: async () => {} }
+/**
+ * Minimal stub for WebStandardStreamableHTTPServerTransport. `closeCalls`
+ * counts `close()`; `onClose` runs inside it, to observe the registry then.
+ */
+function makeTransport(sessionId?: string, onClose?: () => void): any {
+  const transport = {
+    sessionId,
+    closeCalls: 0,
+    handleRequest: () => {},
+    close: async () => {
+      transport.closeCalls++
+      onClose?.()
+    },
+  }
+  return transport
+}
+
+/** What an HTTP request carrying MCP session ID `id` is routed to. */
+function routed(id: string) {
+  return resolveTransportForRequest(new Request('http://localhost/mcp', { headers: { 'mcp-session-id': id } }))
 }
 
 /** Minimal stub for MCP Server. */
@@ -390,6 +423,36 @@ describe('pending sessions', () => {
     expect(getAllPendingSessions()).toEqual([])
   })
 
+  test.each<[string, boolean]>([
+    ['resolves', false],
+    ['rejects (the failure is ignored)', true],
+  ])("closePendingSession removes the pending entry, then stops the keep-alive, then closes the transport, whose close %s; the other pending session and a persona's registered session are untouched", async (_label, closeRejects) => {
+    const steps: string[] = []
+    const transport = {
+      close: async () => {
+        steps.push('close')
+        if (closeRejects) throw new Error('close failed')
+      },
+    }
+    createPendingSession('pid-closed', transport as any, makeServer())
+    const other = createPendingSession('pid-other', makeTransport(), makeServer())
+    const registeredA = registerSession(h.alpha.working_directory, h.alpha.key, makeTransport('mcp-alpha'), makeServer())
+
+    await closePendingSession('pid-closed', transport, {
+      removePending: (id) => {
+        steps.push(`removePending ${id}`)
+        removePendingSession(id)
+      },
+      stopKeepAlive: (t) => void steps.push(t === transport ? 'stopKeepAlive' : 'stopKeepAlive (another transport)'),
+    })
+
+    expect(steps).toEqual(['removePending pid-closed', 'stopKeepAlive', 'close'])
+    expect(getPendingSession('pid-closed')).toBeUndefined()
+    expect(getPendingSession('pid-other')).toBe(other)
+    expect(getSessionByPersona(h.alpha.key)).toBe(registeredA)
+    expect(registeredA.connected).toBe(true)
+  })
+
   test('stub-less promotion creates a fresh entry under the persona key and removes the pending entry', () => {
     const transport = makeTransport()
     const server = makeServer()
@@ -496,6 +559,276 @@ describe('matchPersonaByRootsPath', () => {
 
     expect(matched).toBeUndefined()
     expect(logs).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Not-up personas: admission and session drop (b.av2 SR-6.3, SR-6.4)
+//
+// The admission decision and the drop run through their real imports. The
+// refusal of a registration is checked here with a stubbed up query and cause;
+// the other cases use the server's composition: the real bring-up controller on
+// the real connection manager (stub Slack, fake clock), `createPersonaUpPredicate`
+// over both as the up query (its truth table is in
+// tests/persona-relaunch-gate.test.ts), `describePersonaNotUp` of the controller's state for
+// the refusal line, and `createNotUpSessionDropper` over `dropPersonaSession` as
+// the controller's `onLeftUp`. Each not-up cause through the real start pass, and
+// a running persona's reopen (refused, in flight, retrying or succeeding), are in
+// tests/persona-connections.test.ts (`bring-up outcomes (E5)`). What
+// handleInitialized does with a refusal is `closePendingSession` (tested in
+// `pending sessions` above); server.ts's call of it is pinned in
+// tests/server-startup-wiring.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('not-up personas: MCP session admission and drop (b.av2 SR-6.3, SR-6.4)', () => {
+  interface Started {
+    c: ConnectionHarness
+    alpha: Persona
+    beta: Persona
+    controller: PersonaBringUpController
+    /** Keys the controller launched after a retry. */
+    launches: string[]
+    /** `decideSessionAdmission` as handleInitialized calls it. */
+    admit: (rootsPath: string) => SessionAdmission
+  }
+
+  interface StartOptions {
+    dryRun?: boolean
+    stubOptions?: Readonly<Record<string, StubSlackOptions>>
+    /** Breaks Alpha Bot after its files are written and before any bring-up. */
+    breakAlpha?: (alpha: Persona) => void
+  }
+
+  let started: Started[] = []
+
+  afterEach(async () => {
+    for (const s of started) s.controller.cancelAll()
+    await Promise.all(started.map((s) => s.c.manager.stopAll()))
+    for (const s of started) {
+      expect(s.c.clock.pendingCount()).toBe(0)
+      assertNoLeak({ managerLines: s.c.lines }, 'registry.test not-up harness')
+    }
+    started = []
+  })
+
+  /** Alpha Bot and Beta Bot brought up (steps 1–3) through the server's wiring; see the block comment. */
+  async function start(opts: StartOptions = {}): Promise<Started> {
+    const c = makeConnectionHarness([{ name: 'Alpha Bot' }, { name: 'Beta Bot' }], join(h.dir, 'bring-up'), {
+      files: true,
+      dryRun: opts.dryRun,
+      stubOptions: opts.stubOptions,
+    })
+    const [alpha, beta] = c.personas as [Persona, Persona]
+    opts.breakAlpha?.(alpha)
+    const log = (line: string) => void h.lines.push(line)
+    const launches: string[] = []
+    const controller = createPersonaBringUpController({
+      connections: c.manager,
+      dryRun: opts.dryRun ?? false,
+      log,
+      clock: c.clock,
+      launch: async (persona) => void launches.push(persona.key),
+      onLeftUp: createNotUpSessionDropper({ drop: dropPersonaSession, log }),
+    })
+    c.onStatus = (key, status) => controller.onConnectionStatus(key, status)
+    const isPersonaUp = createPersonaUpPredicate(c.manager, controller)
+    const admit = (rootsPath: string) =>
+      decideSessionAdmission(rootsPath, c.personas, {
+        isPersonaUp,
+        describeNotUp: (key) => describePersonaNotUp(controller.state(key)),
+        log,
+      })
+    const s: Started = { c, alpha, beta, controller, launches, admit }
+    started.push(s)
+    for (const persona of c.personas) await controller.bringUp(persona, c.personas)
+    return s
+  }
+
+  /** A pending session with a stub entry, as initPendingSession creates it. */
+  function pendingFor(id: string) {
+    const stub = makePendingStub()
+    const transport = makeTransport(id)
+    const pending = createPendingSession(id, transport, makeServer(), stub)
+    return { pending, stub, transport }
+  }
+
+  /** handleInitialized's admitted branch: promote the pending session and map its MCP session ID. */
+  function promote(p: Persona, pendingId: string): SessionEntry {
+    const entry = registerSession(realpathSync(p.working_directory), p.key, pendingId)
+    registerMcpSessionId(pendingId, p.key)
+    return entry
+  }
+
+  /** A registered session for `p` under MCP session ID `id`. */
+  function registered(p: Persona, id: string, onClose?: () => void): SessionEntry {
+    const entry = registerSession(p.working_directory, p.key, makeTransport(id, onClose), makeServer())
+    registerMcpSessionId(id, p.key)
+    return entry
+  }
+
+  function refusedLine(p: Persona, why: string): string {
+    return `[slack] Session refused: persona ${renderPersonaRef(p.name, p.key)} is not up (${why}) — not registered; its instance is kept and may register once the persona is up`
+  }
+
+  const rmDir = (a: Persona) => rmSync(a.working_directory, { recursive: true, force: true })
+
+  test("a not-up persona's session is refused with exactly one line naming it and its cause; its older registered session is kept and the pending one is neither promoted nor mapped; an up persona is admitted with no line", () => {
+    const existing = registered(h.alpha, 'mcp-alpha-old')
+    const { pending, stub, transport } = pendingFor('mcp-alpha-new')
+    const lines: string[] = []
+    const decide = (p: Persona) =>
+      decideSessionAdmission(p.working_directory, [h.alpha, h.beta], {
+        isPersonaUp: (key) => key === h.beta.key,
+        describeNotUp: (key) => `broken: the cause for ${key}`,
+        log: (line) => void lines.push(line),
+      })
+
+    expect(decide(h.alpha)).toEqual({ kind: 'not-up', persona: h.alpha })
+    expect(lines).toEqual([refusedLine(h.alpha, `broken: the cause for ${h.alpha.key}`)])
+    // The decision acts on nothing: the older session stays registered and
+    // routed, and the refused one is neither promoted nor mapped.
+    expect(getSessionByPersona(h.alpha.key)).toBe(existing)
+    expect(existing.connected).toBe(true)
+    expect(existing.transport).not.toBe(transport)
+    expect((existing.transport as any).closeCalls).toBe(0)
+    expect(routed('mcp-alpha-old')).toBe(existing)
+    expect(routed('mcp-alpha-new')).toBe(pending)
+    expect(stub.personaKey).toBe('')
+
+    expect(decide(h.beta)).toEqual({ kind: 'admitted', persona: h.beta })
+    expect(lines).toHaveLength(1)
+    assertNoLeak({ lines })
+  })
+
+  test('a persona still serving on its connection whose bring-up outcome is unknown to the controller (cancelled) is refused', async () => {
+    const s = await start()
+    s.controller.cancel(s.alpha.key)
+    expect(s.c.manager.status(s.alpha.key)?.state).toBe('up')
+    const linesBefore = h.lines.length
+
+    expect(s.admit(s.alpha.working_directory)).toEqual({ kind: 'not-up', persona: s.alpha })
+    expect(h.lines.slice(linesBefore)).toEqual([refusedLine(s.alpha, 'its bring-up has not run')])
+    expect(s.admit(s.beta.working_directory)).toEqual({ kind: 'admitted', persona: s.beta })
+  })
+
+  test('directory-broken: a roots path under the missing working directory cannot be resolved; it maps to that persona only, is refused and nothing throws', async () => {
+    const s = await start({ breakAlpha: rmDir })
+    const wd = s.alpha.working_directory
+
+    for (const rootsPath of [wd, `${wd}/`, join(wd, 'gone', '..')]) {
+      let admission: SessionAdmission | undefined
+      expect(() => {
+        admission = s.admit(rootsPath)
+      }).not.toThrow()
+      expect(admission).toEqual({ kind: 'not-up', persona: s.alpha })
+    }
+    expect(getSessionByPersona(s.alpha.key)).toBeUndefined()
+    expect(getSessionByPersona(s.beta.key)).toBeUndefined()
+  })
+
+  test('a healthy persona beside a not-up one is admitted, promoted in place and replaced by a newer session exactly as before', async () => {
+    const s = await start({ breakAlpha: (a) => rmSync(a.credentials_file) })
+    const first = pendingFor('mcp-beta-1')
+    expect(s.admit(s.beta.working_directory)).toEqual({ kind: 'admitted', persona: s.beta })
+    expect(promote(s.beta, 'mcp-beta-1')).toBe(first.stub)
+
+    const second = pendingFor('mcp-beta-2')
+    expect(s.admit(s.beta.working_directory)).toEqual({ kind: 'admitted', persona: s.beta })
+    expect(promote(s.beta, 'mcp-beta-2')).toBe(second.stub)
+
+    expect(getSessionByPersona(s.beta.key)).toBe(second.stub)
+    expect(first.stub.connected).toBe(false)
+    expect(unregisterByMcpSessionId('mcp-beta-1')).toBeUndefined()
+    expect(routed('mcp-beta-2')).toBe(second.stub)
+    expect(getSessionByPersona(s.alpha.key)).toBeUndefined()
+  })
+
+  // The directory-broken counterpart (with the surviving row reused) is in
+  // tests/persona-connections.test.ts's surviving-instance cases.
+  test('a persona refused while Slack is unreachable comes up on its own retry timer once Slack answers, and its next registration is admitted, with no restart', async () => {
+    const s = await start({ stubOptions: { 'Alpha Bot': { authTest: [{ kind: 'network' }] } } })
+    expect(s.admit(s.alpha.working_directory).kind).toBe('not-up')
+
+    await s.c.clock.advance(5_000)
+
+    expect(s.controller.state(s.alpha.key)?.outcome).toBe('up')
+    expect(s.launches).toEqual([s.alpha.key])
+    const { stub } = pendingFor('mcp-alpha')
+    expect(s.admit(s.alpha.working_directory)).toEqual({ kind: 'admitted', persona: s.alpha })
+    expect(promote(s.alpha, 'mcp-alpha')).toBe(stub)
+    expect(routed('mcp-alpha')).toBe(stub)
+  })
+
+  test('dry run: an up persona is admitted and a directory-broken one is refused', async () => {
+    const s = await start({ dryRun: true, breakAlpha: rmDir })
+
+    expect(s.admit(s.alpha.working_directory)).toEqual({ kind: 'not-up', persona: s.alpha })
+    expect(s.admit(s.beta.working_directory)).toEqual({ kind: 'admitted', persona: s.beta })
+  })
+
+  // -------------------------------------------------------------------------
+  // dropPersonaSession and the controller's leaving-up notification
+  // -------------------------------------------------------------------------
+
+  test("dropPersonaSession removes A's entry and every MCP session ID mapped to A before closing A's transport, so the close finds nothing to restart; B is untouched", async () => {
+    const atClose: unknown[] = []
+    registered(h.alpha, 'mcp-alpha-old')
+    const a = registered(h.alpha, 'mcp-alpha', () => {
+      // What onsessionclosed and the SSE abort would see at this moment.
+      atClose.push(getSessionByPersona(h.alpha.key), routed('mcp-alpha'), a.connected, unregisterByMcpSessionId('mcp-alpha'))
+    })
+    const b = registered(h.beta, 'mcp-beta')
+
+    expect(await dropPersonaSession(h.alpha.key)).toBe(true)
+
+    expect(atClose).toEqual([undefined, undefined, false, undefined])
+    expect((a.transport as any).closeCalls).toBe(1)
+    expect(getSessionByPersona(h.alpha.key)).toBeUndefined()
+    expect(routed('mcp-alpha-old')).toBeUndefined()
+    expect(getSessionByPersona(h.beta.key)).toBe(b)
+    expect(b.connected).toBe(true)
+    expect((b.transport as any).closeCalls).toBe(0)
+    expect(routed('mcp-beta')).toBe(b)
+  })
+
+  test('dropPersonaSession for a persona with no registered session does nothing and resolves false', async () => {
+    const b = registered(h.beta, 'mcp-beta')
+
+    expect(await dropPersonaSession(h.alpha.key)).toBe(false)
+
+    expect(getSessionByPersona(h.beta.key)).toBe(b)
+    expect(b.connected).toBe(true)
+    expect((b.transport as any).closeCalls).toBe(0)
+    expect(routed('mcp-beta')).toBe(b)
+  })
+
+  test("after A's session is dropped, a new session from A's working directory is refused while A is not up and admitted once the up query reports A up", async () => {
+    registered(h.alpha, 'mcp-alpha')
+    await dropPersonaSession(h.alpha.key)
+    let up = false
+    const decide = () => decideSessionAdmission(h.alpha.working_directory, [h.alpha, h.beta], { isPersonaUp: () => up })
+
+    expect(decide()).toEqual({ kind: 'not-up', persona: h.alpha })
+    // Without describeNotUp or log: the line has no cause and goes to console.error.
+    expect(h.lines.filter((l) => l.startsWith('[slack] Session refused'))).toEqual([
+      `[slack] Session refused: persona ${renderPersonaRef(h.alpha.name, h.alpha.key)} is not up — not registered; its instance is kept and may register once the persona is up`,
+    ])
+    up = true
+    expect(decide()).toEqual({ kind: 'admitted', persona: h.alpha })
+  })
+
+  test('a persona that stops being up with no registered session drops nothing and logs no drop line', async () => {
+    const s = await start()
+    const b = registered(s.beta, 'mcp-beta')
+    s.c.stub(s.alpha).script.connect.push({ kind: 'platform', error: 'token_revoked' })
+
+    s.c.stub(s.alpha).socket.drop()
+    await s.c.clock.flush()
+
+    expect(s.controller.state(s.alpha.key)?.outcome).toBe('broken')
+    expect(h.lines.filter((l) => l.includes('MCP session dropped'))).toEqual([])
+    expect(getSessionByPersona(s.beta.key)).toBe(b)
+    expect((b.transport as any).closeCalls).toBe(0)
   })
 })
 

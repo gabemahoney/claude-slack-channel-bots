@@ -50,6 +50,11 @@
  *   that persona's held notices, and no other persona's (SR-7.2).
  * - `composePersonaStatusListeners`: several status listeners as the
  *   manager's one (the up-flush listener and the bring-up controller's).
+ * - `createPersonaUpPredicate`: whether a persona is up (serving, and its
+ *   bring-up outcome is `up`); the one check behind the relaunch gate (which
+ *   decides through the same check over its single status read) and every
+ *   not-up refusal (MCP session admission, the permission poller's skip,
+ *   `/interject`'s 503). Logs nothing.
  * - `createPersonaRelaunchGate`: whether a persona may be relaunched (health
  *   check work list, restart, restart launch): only while it is serving and,
  *   given the bring-up controller, up.
@@ -297,6 +302,38 @@ export interface PersonaUpQuery {
 }
 
 /**
+ * Build the "is this persona up" predicate (b.av2 SR-6.4): true while the
+ * persona's connection is serving (`isPersonaClientServing`: `up`, `lost`, or
+ * `retrying` a reopen; every brought-up persona is `up` in dry run) and its
+ * bring-up outcome is `up`; false otherwise, including for a persona the
+ * manager or the controller does not know. The single source for every
+ * refusal of a persona that is not up: the relaunch gate, MCP session
+ * admission (`decideSessionAdmission`), the permission poller's skip and
+ * `/interject`'s 503. Logs nothing.
+ */
+export function createPersonaUpPredicate(
+  connections: Pick<PersonaConnectionManager, 'status'>,
+  outcomes: PersonaUpQuery,
+): (key: string) => boolean {
+  return (key) => isPersonaUpGiven(key, connections.status(key), outcomes)
+}
+
+/**
+ * The up check itself, over a status already read: serving and, when
+ * `outcomes` is given, bring-up outcome `up`. `createPersonaUpPredicate` and
+ * `createPersonaRelaunchGate` both decide through it, so the two cannot
+ * drift; the gate reads the status once and reuses it to word its line.
+ * The outcome is asked only when the connection is serving.
+ */
+function isPersonaUpGiven(
+  key: string,
+  status: PersonaConnectionStatus | undefined,
+  outcomes: PersonaUpQuery | undefined,
+): boolean {
+  return isPersonaClientServing(status) && (outcomes === undefined || outcomes.isUp(key))
+}
+
+/**
  * Build the relaunch gate: `canRelaunch(key)` is true while the persona's
  * connection is serving (`isPersonaClientServing`: `up`, `lost`, or
  * `retrying` a reopen; every brought-up persona is `up` in dry run) and, when
@@ -330,16 +367,17 @@ export function createPersonaRelaunchGate(
 ): (key: string) => boolean {
   const lastLogged = new Map<string, string>()
   return (key) => {
+    // The up predicate's check, over the one status read; the status is
+    // reused below only to word the refusal line.
     const status = connections.status(key)
-    const serving = isPersonaClientServing(status)
-    if (serving && (outcomes === undefined || outcomes.isUp(key))) {
+    if (isPersonaUpGiven(key, status, outcomes)) {
       lastLogged.delete(key)
       return true
     }
     // Serving, but the bring-up outcome is not `up` (unknown to the
     // controller, cancelled, broken or retrying there): the connection is
     // fine, so the line names the bring-up instead.
-    const reason = serving
+    const reason = isPersonaClientServing(status)
       ? 'its bring-up has not succeeded'
       : `its Slack connection is ${describeNotServing(status)}`
     if (lastLogged.get(key) !== reason) {

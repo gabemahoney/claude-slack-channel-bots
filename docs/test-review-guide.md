@@ -11,6 +11,8 @@ When reviewing tests, check for:
 - [ ] Edge cases from the PRD/SRD are covered
 - [ ] Concurrent/parallel scenarios tested where applicable
 - [ ] A rule that rejects duplicate paths is tested with a symlinked duplicate and a non-existent path (lexical fallback), both rooted inside the test's `mkdtempSync` directory, plus a non-collision control that loads
+- [ ] Every path that serves a persona's instance (MCP registration, the permission poller, `/interject`, and any new endpoint, tool or poller) has a test for a persona that is not up, and an up persona beside it still served. Cross-module and integration tests build the up check with the real `createPersonaUpPredicate`; a handler unit test (such as `/interject` or the cron dispatch over it) may inject a stand-in predicate only when a source audit of `server.ts` (as in `server-startup-wiring.test.ts`) pins the production predicate to that path; a new serving path with no not-up case is a defect
+- [ ] A persona whose working directory can't be resolved keeps its agent-director row: sweep and launch tests cover a missing directory and a dangling symlink, assert no kill or delete, and assert the row is reused once the directory exists; they also cover a row whose `cwd` is an existing directory elsewhere, which is still swept or replaced
 
 ### Quality
 - [ ] Each test has a single clear assertion (or a small set of related assertions)

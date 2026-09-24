@@ -573,7 +573,7 @@ On success, returns HTTP 200:
 | 404 | No persona in the applied configuration has that name or key. |
 | 405 | Must use POST method. |
 | 413 | Request body exceeds 32KB. |
-| 503 | The persona has no live connected session. |
+| 503 | The persona is configured but not up (broken or retrying), even if its instance is running, or it has no live connected session. Nothing is delivered. The persona's lines in the server log give the cause. |
 
 ### Example: crontab reminder
 
@@ -690,7 +690,7 @@ The `outcome` field of each line is one of these classes:
 | Outcome | What happened | What to do |
 |---|---|---|
 | `delivered` | The prompt reached the target persona's session. | Nothing — success. |
-| `no-session` | The persona exists but has no live connected session, so the message was dropped. | Bring the session up. Failed fires are **never** retried or queued (see below). |
+| `no-session` | The persona exists but is not up (broken or retrying) or has no live connected session, so the message was dropped. | Check the persona's lines in the server log for the cause. A retrying persona comes up on its own; otherwise bring the session up. Failed fires are **never** retried or queued (see below). |
 | `unknown-persona` | No persona in the applied configuration has that name or key. | Correct the target in the crontable. |
 | `prompt-missing` | The prompt file did not exist at fire time. | Create the file or correct its path in the crontable. |
 | `prompt-unreadable` | The prompt file existed but could not be read (see the `errno`). | Fix file permissions or the path. |
@@ -701,7 +701,7 @@ The `outcome` field of each line is one of these classes:
 
 ### Delivery semantics
 
-- **No retry.** A failed fire is logged and dropped — never queued or re-sent. A persona with no live session fails every fire until its session is running again; the server does not queue the missed prompts.
+- **No retry.** A failed fire is logged and dropped — never queued or re-sent. A persona that is not up, or has no live session, fails every fire until it is up and its session is running again; the server does not queue the missed prompts.
 - **Missed fires are skipped, not caught up.** While the server is down, no scheduled prompts fire, and they are not replayed on restart. The `scheduler started, N schedules loaded` line in the cron log marks when scheduling resumed, bounding the outage window.
 - **Edits take effect within a minute — no restart.** The scheduler checks the crontable fresh on every tick, so an edit by hand or a line appended by a bot starts (or stops) firing within about a minute. The server is never restarted for a schedule change.
 - **Deleting the crontable stops all schedules.** Nothing fires from that moment, a WARN appears in the cron log, and the server re-creates the file empty (with its header) within about two minutes — detection and re-creation happen on separate once-a-minute passes, so the re-create lands up to two tick boundaries after the deletion. Add lines back and they schedule on the next check.
@@ -738,6 +738,8 @@ Flow:
 3. For each new spawn, `client.get(...)` returns the open permission request (tool name, tool input and an opaque `request_token`). CSCB identifies the persona that owns the spawn from its `persona` label and posts the Block Kit prompt to the persona's destination (its `permission_prompts` channel) as that persona.
 4. The operator clicks Allow / Deny in Slack. CSCB resolves the click through the same persona: it calls `client.decide({ claude_instance_id, decision, request_token })` and, as that persona, updates the message to "*Permission* — Allowed" or "*Permission* — Denied by operator".
 5. If a tracked prompt closes for any reason other than a Slack click, the next poller tick replaces the buttons with the verdict: "⏱ *Permission* — Timed out", "🪦 *Permission* — Session ended", "*Permission* — Allowed", "*Permission* — Denied by operator", or "*Permission* — Denied (closed)" when the reason is unknown.
+
+While a persona is not up (broken or retrying), its instance keeps running but its permission prompts are not posted and its already-posted prompts are left as they are. They appear, or get their verdict, on the first poll after the persona comes up.
 
 ### Slack app prerequisites
 

@@ -61,6 +61,12 @@
  *   - buildPermissionBlocks emits the UUIDv4-anchored action_id shape.
  *   - Wedge detector (b.fae F4 / SR-7.2): one persona-named warning to the
  *     persona's destination through its client.
+ *   - A persona that is not up (b.av2 SR-6.4), through the production up
+ *     predicate: its rows get no `get`, post, update, live entry, wedge tick
+ *     or trail event while an up persona's row posts in the same tick; a
+ *     skipped request posts once after it comes up; its tracked prompt and
+ *     wedge count are held (not closed, dropped, re-posted or re-armed) and
+ *     reconciled once it is up; the skip is logged once per episode.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -86,6 +92,8 @@ import { _resetTrailFdForTests } from '../src/permission-trail.ts'
 import { parsePermissionActionId } from '../src/permission-action-id.ts'
 import { personaKeyFromActionId } from './test-helpers/action-id-key.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
+import { createPersonaUpPredicate } from '../src/persona-start.ts'
+import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
 import {
   cannedGetPermissionResponse,
   cannedGetResult,
@@ -1395,6 +1403,7 @@ describe('poller lifecycle', () => {
       getClient,
       clientFor: clients.clientFor,
       getPersona,
+      isPersonaUp: () => true,
       intervalMs: 1000,
       setInterval: ivl.setInterval,
       clearInterval: ivl.clearInterval,
@@ -2146,5 +2155,272 @@ describe('b.fae F4 — wedge detector', () => {
     expect(posts(stubA)).toHaveLength(1)
     expect(noClient()).toHaveLength(1)
     expect(slackCalls(stubB, stubD)).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A persona that is not up (b.av2 SR-6.4, SR-7.2)
+// ---------------------------------------------------------------------------
+
+describe('poller tick — a persona that is not up (b.av2 SR-6.4)', () => {
+  const K = wedgeTripTicks(1000)
+  const UP: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0BOTUSER1', botId: 'B0BOTID001' } } as PersonaConnectionStatus
+
+  /**
+   * The not-up states the production predicate (`createPersonaUpPredicate`)
+   * sees: a connection status, or none, and the bring-up outcome.
+   */
+  const NOT_UP: Array<[string, PersonaConnectionStatus | undefined, boolean]> = [
+    ['broken: Slack refused its token', { state: 'broken', phase: 'bring-up' } as PersonaConnectionStatus, false],
+    ['retrying: Slack unreachable at bring-up', { state: 'retrying', phase: 'bring-up' } as PersonaConnectionStatus, false],
+    ['broken or retrying on its working directory: no connection', undefined, false],
+    ['serving, but its bring-up outcome is not up', UP, false],
+  ]
+
+  /**
+   * A poller over personas A and B (listed) and D (not listed), all up to
+   * start with, each with a mutable set of open requests, and the production
+   * up predicate over a per-persona connection status and bring-up outcome.
+   * `down(key, variant?)` puts a persona in a `NOT_UP` state, `up(key)`
+   * brings it up.
+   */
+  function makeNotUpScenario() {
+    const statuses = new Map<string, PersonaConnectionStatus | undefined>([[KEY_A, UP], [KEY_B, UP], [KEY_D, UP]])
+    const outcomeUp = new Set<string>([KEY_A, KEY_B, KEY_D])
+    const isPersonaUp = createPersonaUpPredicate({ status: (key) => statuses.get(key) }, { isUp: (key) => outcomeUp.has(key) })
+    const open = new Map<string, PermissionRequestRow[]>()
+    const listed = new Set<Persona>([A, B])
+    const extraRows: ReturnType<typeof cannedListRow>[] = []
+    const getCalls: string[] = []
+    const getPermissionCalls: string[] = []
+    const logCalls: unknown[][] = []
+    const trail = makeTrailCapture()
+    const byInstance = (id: string) => config.personas.find((p) => personaInstanceId(p.key) === id)
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [...[...listed].map((p) => checkPermRow(p)), ...extraRows] }),
+      get: async ({ claude_instance_id }) => {
+        getCalls.push(claude_instance_id)
+        return getResult(open.get(claude_instance_id) ?? [], byInstance(claude_instance_id))
+      },
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
+        getPermissionCalls.push(params.request_token)
+        return cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null })
+      },
+    }), { isPersonaUp, emitTrail: trail.emit, log: (...args) => { logCalls.push(args) } })
+    return {
+      ivl,
+      open,
+      listed,
+      extraRows,
+      getCalls,
+      getPermissionCalls,
+      logCalls,
+      trail,
+      down(key: string, [, status, outcome]: [string, PersonaConnectionStatus | undefined, boolean] = NOT_UP[0]) {
+        statuses.set(key, status)
+        if (outcome) outcomeUp.add(key)
+        else outcomeUp.delete(key)
+      },
+      up(key: string) {
+        statuses.set(key, UP)
+        outcomeUp.add(key)
+      },
+      /** Fire `n` ticks, letting each settle. */
+      async drive(n: number) {
+        for (let i = 0; i < n; i++) {
+          ivl.fire()
+          await new Promise((r) => setTimeout(r, 0))
+        }
+      },
+    }
+  }
+
+  const requestA = () => cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })
+  const requestB = () => cannedPermissionRequest({ request_token: TOKEN_B, request_id: 2 })
+  const allUpdates = () => updates(stubA).length + updates(stubB).length + updates(stubD).length
+  const trailFor = (trail: TrailCapture, instanceId: string) =>
+    trail.events.filter((e) => e['claude_instance_id'] === instanceId)
+  const wedgeWarnings = () =>
+    [stubA, stubB, stubD].flatMap((s) => posts(s)).filter((c) => String(c.text).includes('blocked on a native'))
+  const skipStarts = (logCalls: unknown[][], persona: Persona) =>
+    logLines(logCalls, renderPersonaRef(persona.name, persona.key)).filter((l) => String(l[0]).includes('is not up'))
+  const skipEnds = (logCalls: unknown[][], persona: Persona) =>
+    logLines(logCalls, renderPersonaRef(persona.name, persona.key)).filter((l) => String(l[0]).includes('up again'))
+
+  test.each(NOT_UP)('%s: its row gets no get, no post, no update, no live entry and no trail event, while an up persona\'s row in the same tick posts through its own client', async (label, status, outcomeUp) => {
+    const s = makeNotUpScenario()
+    s.down(KEY_A, [label, status, outcomeUp])
+    s.open.set(INSTANCE_A, [requestA()])
+    s.open.set(INSTANCE_B, [requestB()])
+    scriptPostTs(stubB, POST_TS_2)
+    // E3's handling of a row with no persona label, and of one naming no applied persona, is unchanged.
+    s.extraRows.push(
+      cannedListRow({ claude_instance_id: 'cscb_unlabelled', state: 'check_permission', labels: { service: 'cscb' } }),
+      cannedListRow({ claude_instance_id: 'cscb_absent', state: 'check_permission', labels: { service: 'cscb', persona: 'absent' } }),
+    )
+    await s.ivl.tick()
+
+    expect(s.getCalls).toEqual([INSTANCE_B])
+    expect(posts(stubA)).toHaveLength(0)
+    expect(allUpdates()).toBe(0)
+    expect(slackCalls(stubA, stubD)).toBe(0)
+    expect(clients.calls).not.toContain(KEY_A)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    expect(trailFor(s.trail, INSTANCE_A)).toHaveLength(0)
+
+    // B: posted once on its own client to its destination, tracked, with its trail.
+    expect(posts(stubB).map((c) => c.channel)).toEqual([B_DEST])
+    expect(getLivePermission(INSTANCE_B, TOKEN_B)).toMatchObject({ personaKey: KEY_B, channelId: B_DEST, messageTs: POST_TS_2 })
+    expect(rowDecisions(s.trail, 'post_attempted').map((e) => e['claude_instance_id'])).toEqual([INSTANCE_B])
+    expect(chatPosts(s.trail)).toHaveLength(1)
+
+    expect(logLines(s.logCalls, 'cscb_unlabelled has no persona label')).toHaveLength(1)
+    expect(logLines(s.logCalls, 'cscb_absent names no applied persona')).toHaveLength(1)
+    expect(skipStarts(s.logCalls, A)).toHaveLength(1)
+    expect(logLines(s.logCalls, 'is not up')).toHaveLength(1)
+  })
+
+  test('a skipped open request posts exactly once, through its own client to its destination, on the first tick after the persona comes up', async () => {
+    const s = makeNotUpScenario()
+    s.listed.delete(B)
+    s.down(KEY_A)
+    s.open.set(INSTANCE_A, [requestA()])
+    scriptPostTs(stubA, POST_TS)
+    await s.drive(4)
+    expect(s.getCalls).toHaveLength(0)
+    expect(slackCalls(stubA, stubB, stubD)).toBe(0)
+
+    s.up(KEY_A)
+    await s.ivl.tick()
+    expect(posts(stubA).map((c) => c.channel)).toEqual([A_DEST])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)?.messageTs).toBe(POST_TS)
+
+    // The composite-key dedupe still holds: no second post.
+    await s.drive(2)
+    expect(posts(stubA)).toHaveLength(1)
+    expect(rowDecisions(s.trail, 'post_attempted')).toHaveLength(1)
+    expect(rowDecisions(s.trail, 'already_tracked')).toHaveLength(2)
+    expect(slackCalls(stubB, stubD)).toBe(0)
+  })
+
+  test('the stuck-prompt warning never fires for a not-up persona\'s empty spawn; once it is up, the detector needs K fresh empty ticks', async () => {
+    const s = makeNotUpScenario()
+    s.listed.delete(B)
+    s.down(KEY_A)
+    await s.drive(K + 1)
+    expect(s.getCalls).toHaveLength(0)
+    expect(wedgeWarnings()).toHaveLength(0)
+    expect(s.trail.events.filter((e) => e.event === 'cscb.poller.wedge_detected')).toHaveLength(0)
+    expect(logLines(s.logCalls, 'wedged in check_permission')).toHaveLength(0)
+
+    s.up(KEY_A)
+    await s.drive(K - 1)
+    expect(wedgeWarnings()).toHaveLength(0)
+    await s.drive(1)
+    expect(wedgeWarnings().map((c) => c.channel)).toEqual([A_DEST])
+  })
+
+  test('a wedge count reached before the persona went down is held, neither advanced nor reset, listed or not, and trips on the first empty tick after it is up', async () => {
+    const s = makeNotUpScenario()
+    s.listed.delete(B)
+    await s.drive(K - 1)
+    s.down(KEY_A)
+    await s.drive(3) // listed, not up
+    s.listed.delete(A)
+    await s.drive(3) // not listed, not up
+    expect(wedgeWarnings()).toHaveLength(0)
+
+    s.listed.add(A)
+    s.up(KEY_A)
+    await s.drive(1) // Kth empty observation overall
+    expect(wedgeWarnings().map((c) => c.channel)).toEqual([A_DEST])
+  })
+
+  test('a persona that goes down after its prompt posted: the prompt is not updated, dropped or re-posted while it is down, even after its row closes; once up, the next tick reconciles it through its own client', async () => {
+    const s = makeNotUpScenario()
+    s.open.set(INSTANCE_A, [requestA()])
+    scriptPostTs(stubA, POST_TS)
+    await s.ivl.tick()
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)?.messageTs).toBe(POST_TS)
+    const getsBefore = s.getCalls.filter((id) => id === INSTANCE_A).length
+
+    s.down(KEY_A)
+    await s.drive(2) // row still listed and open
+    s.listed.delete(A)
+    await s.drive(2) // row closed while A is down
+    expect(s.getCalls.filter((id) => id === INSTANCE_A)).toHaveLength(getsBefore)
+    expect(s.getPermissionCalls).toHaveLength(0)
+    expect(posts(stubA)).toHaveLength(1)
+    expect(allUpdates()).toBe(0)
+    expect(slackCalls(stubB, stubD)).toBe(0)
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ messageTs: POST_TS, channelId: A_DEST, handled: false })
+    expect(rowDecisions(s.trail, 'reconciled_closed')).toHaveLength(0)
+
+    s.up(KEY_A)
+    await s.ivl.tick()
+    expect(s.getPermissionCalls).toEqual([TOKEN_A])
+    expect(updates(stubA).map((c) => [c.channel, c.ts])).toEqual([[A_DEST, POST_TS]])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+    expect(rowDecisions(s.trail, 'reconciled_closed')).toHaveLength(1)
+    expect(posts(stubA)).toHaveLength(1)
+    expect(updates(stubB).length + updates(stubD).length).toBe(0)
+
+    await s.drive(2)
+    expect(s.getPermissionCalls).toHaveLength(1)
+    expect(updates(stubA)).toHaveLength(1)
+  })
+
+  test('a request not posted (`dm` destination) keeps its one log line across ticks where its persona is not up', async () => {
+    const s = makeNotUpScenario()
+    s.listed.clear()
+    s.listed.add(D)
+    s.open.set(INSTANCE_D, [requestA()])
+    await s.drive(1)
+    s.down(KEY_D)
+    await s.drive(2)
+    s.up(KEY_D)
+    await s.drive(2)
+    expect(logLines(s.logCalls, 'permission prompts by DM are not supported yet')).toHaveLength(1)
+    expect(slackCalls(stubA, stubB, stubD)).toBe(0)
+  })
+
+  test('the skip is logged once when it starts and once when it ends, naming the persona and key, not per tick, with no token', async () => {
+    const s = makeNotUpScenario()
+    s.open.set(INSTANCE_A, [requestA()])
+    s.down(KEY_A)
+    await s.drive(3)
+    expect(skipStarts(s.logCalls, A)).toHaveLength(1)
+    expect(skipEnds(s.logCalls, A)).toHaveLength(0)
+
+    s.up(KEY_A)
+    await s.drive(3)
+    expect(skipStarts(s.logCalls, A)).toHaveLength(1)
+    expect(skipEnds(s.logCalls, A)).toHaveLength(1)
+
+    // A second episode logs its own pair.
+    s.down(KEY_A)
+    await s.drive(3)
+    s.up(KEY_A)
+    await s.drive(3)
+    expect(skipStarts(s.logCalls, A)).toHaveLength(2)
+    expect(skipEnds(s.logCalls, A)).toHaveLength(2)
+
+    // B stayed up: nothing about it.
+    expect(logLines(s.logCalls, renderPersonaRef(NAME_B, KEY_B))).toHaveLength(0)
+    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'not-up skip lines')
+  })
+
+  test('a persona dropped from the applied set mid-episode ends its skip with one line naming its key; its row then gets E3\'s not-applied handling', async () => {
+    const s = makeNotUpScenario()
+    s.down(KEY_A)
+    await s.drive(2)
+    unapply(KEY_A)
+    await s.drive(3)
+    const ended = logLines(s.logCalls, `persona=${KEY_A} is no longer applied`)
+    expect(ended).toHaveLength(1)
+    expect(skipStarts(s.logCalls, A)).toHaveLength(1)
+    // E3's not-applied handling logs the row on each of the three ticks.
+    expect(logLines(s.logCalls, `${INSTANCE_A} names no applied persona`)).toHaveLength(3)
+    expect(s.getCalls.filter((id) => id === INSTANCE_A)).toHaveLength(0)
   })
 })

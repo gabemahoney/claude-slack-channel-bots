@@ -23,6 +23,10 @@
  *   bring-up controller and passed to the restart module (`canRestart`), the
  *   restart launch and the health-check work list; the restart delay read
  *   from the applied config; the permission poller not started in dry run.
+ * - Not-up personas (SR-6.3, SR-6.4): the one `isPersonaUp` predicate handed
+ *   to the permission poller, `/interject` and the MCP admission decision;
+ *   a refused session disconnected and never registered; the controller's
+ *   `onLeftUp` dropping the persona's registered session.
  * - SR-5.2: the file guard handed to the session tools protects every persona
  *   credentials file.
  *
@@ -416,6 +420,209 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
     expect(insideMain(applied[0]!.index!)).toBe(true)
     expect(applied[0]!.index!).toBeGreaterThan(onlyCallOf('loadStartPersonaConfig'))
     expect(onlyCallProps('initRestart').get('getRestartDelay')).toBe(`() => ${applied[0]![1]}.session_restart_delay`)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static audit: a persona that is not up is refused service (SR-6.3, SR-6.4)
+//
+// The admission decision, the drop and the up predicate are driven through
+// their real imports in tests/registry.test.ts; what only server.ts holds is
+// which call gets the predicate, the drop listener, and what handleInitialized
+// does with a refused session.
+// ---------------------------------------------------------------------------
+
+describe('server.ts refuses service to a persona that is not up (b.av2 SR-6.3, SR-6.4)', () => {
+  /** [start, end) of the body of `async function <name>(…)`. */
+  function asyncFunctionBody(name: string): [number, number] {
+    const decl = SERVER_CODE.search(new RegExp(`\\basync\\s+function\\s+${name}\\s*\\(`))
+    expect(decl).toBeGreaterThan(-1)
+    const [, paramsEnd] = balancedAfter(SERVER_CODE, decl, '(', ')')
+    return balancedAfter(SERVER_CODE, paramsEnd + 1, '{', '}')
+  }
+
+  test('isPersonaUp is built once, at module scope, from createPersonaUpPredicate over the connection view and the controller\'s isUp (false before main() builds it); server.ts has no up check of its own', () => {
+    expect(constOf('createPersonaUpPredicate')).toBe('isPersonaUp')
+    expect(insideMain(onlyCallOf('createPersonaUpPredicate'))).toBe(false)
+    const args = onlyCallArgs('createPersonaUpPredicate')
+    expect(args).toHaveLength(2)
+    expect(args[0]).toBe('connectionView')
+    const outcomes = objectProperties(args[1]!)
+    expect([...outcomes.keys()]).toEqual(['isUp'])
+    expect(outcomes.get('isUp')).toMatch(/^\((\w+)\) => bringUps\?\.isUp\(\1\) \?\? false$/)
+    // Never called directly, and no serving check copied in.
+    expect(callsOf('isPersonaUp')).toEqual([])
+    expect(indicesOf(/\bisPersonaClientServing\b/g, SERVER_CODE)).toEqual([])
+  })
+
+  test('the permission poller, /interject and the MCP admission decision each get isPersonaUp', () => {
+    expect(onlyCallProps('startPermissionPoller').get('isPersonaUp')).toBe('isPersonaUp')
+    const interject = onlyCallArgs('handleInterject')
+    expect(interject).toHaveLength(3)
+    expect(objectProperties(interject[2]!).get('isPersonaUp')).toBe('isPersonaUp')
+    expect(onlyCallProps('decideSessionAdmission').get('isPersonaUp')).toBe('isPersonaUp')
+  })
+
+  test('handleInitialized decides admission over the roots path and the loaded personas, with the controller\'s not-up description, and no longer matches personas itself', () => {
+    const [start, end] = asyncFunctionBody('handleInitialized')
+    const at = onlyCallOf('decideSessionAdmission')
+    expect(at > start && at < end).toBe(true)
+    expect(callsOf('matchPersonaByRootsPath')).toEqual([])
+
+    const args = onlyCallArgs('decideSessionAdmission')
+    expect(args).toHaveLength(3)
+    expect(args[0]).toBe('rootsPath')
+    expect(args[1]).toBe(`${loadedConfigName(SERVER_CODE)}?.personas ?? []`)
+    const props = objectProperties(args[2]!)
+    expect(props.get('describeNotUp')).toBe('describePersonaNotUpByKey')
+    expect(props.get('log')).toMatch(/^\((\w+)\) => console\.error\(\1\)$/)
+    const describe = SERVER_CODE.search(/\bfunction\s+describePersonaNotUpByKey\s*\(/)
+    expect(describe).toBeGreaterThan(-1)
+    const [, paramsEnd] = balancedAfter(SERVER_CODE, describe, '(', ')')
+    const body = SERVER_CODE.slice(...balancedAfter(SERVER_CODE, paramsEnd + 1, '{', '}')).trim()
+    expect(body).toMatch(/^return describePersonaNotUp\(bringUps\?\.state\((\w+)\)\)$/)
+  })
+
+  /** The top-level arguments of every `closePendingSession(…)` call in `code`, in order. */
+  function closeCallsIn(code: string): string[][] {
+    return indicesOf(/(?<![\w.$])closePendingSession\s*\(/g, code).map((at) => splitTopLevel(callArguments(code, at)))
+  }
+
+  /** A hand-rolled pending close: the pieces `closePendingSession` does, called directly. */
+  const HAND_ROLLED_CLOSE = /\bremovePendingSession\s*\(|\bstopSseKeepAlive\s*\(|\.close\s*\(/
+
+  test('pendingSessionCloseDeps is one module-scope object wiring exactly removePending: removePendingSession and stopKeepAlive: stopSseKeepAlive, and closePendingSession is the registry\'s', () => {
+    expect(SERVER_CODE).toMatch(/import\s*\{[^}]*\bclosePendingSession\b[^}]*\}\s*from\s*['"]\.\/registry\.ts['"]/)
+    expect(SERVER_CODE).not.toMatch(/\bfunction\s+closePendingSession\b|\b(?:const|let|var)\s+closePendingSession\b/)
+
+    const decls = indicesOf(/^const\s+pendingSessionCloseDeps\b[^=]*=\s*\{/gm, SERVER_CODE)
+    expect(decls).toHaveLength(1)
+    expect(indicesOf(/\b(?:const|let|var)\s+pendingSessionCloseDeps\b/g, SERVER_CODE)).toEqual(decls)
+    const props = objectProperties(SERVER_CODE.slice(SERVER_CODE.indexOf('=', decls[0]!)))
+    expect([...props.entries()]).toEqual([
+      ['removePending', 'removePendingSession'],
+      ['stopKeepAlive', 'stopSseKeepAlive'],
+    ])
+    expect(assignmentsTo('pendingSessionCloseDeps')).toEqual([])
+  })
+
+  test('a refused or unmatched session is closed through closePendingSession(pendingId, <pending>.transport, pendingSessionCloseDeps), awaited, and handleInitialized returns before it could be promoted or mapped', () => {
+    const [start, end] = asyncFunctionBody('handleInitialized')
+    const code = SERVER_CODE.slice(start, end)
+    const decl = code.match(/\bconst\s+(\w+)\s*=\s*decideSessionAdmission\s*\(/)
+    expect(decl).not.toBeNull()
+    const admission = decl![1]!
+    const guards = indicesOf(new RegExp(`\\bif\\s*\\(\\s*${admission}\\.kind\\s*!==\\s*'admitted'\\s*\\)\\s*\\{`, 'g'), code)
+    expect(guards).toHaveLength(1)
+    const [blockStart, blockEnd] = balancedAfter(code, guards[0]!, '{', '}')
+    const block = code.slice(blockStart, blockEnd)
+
+    const pending = block.match(/\bconst\s+(\w+)\s*=\s*getPendingSession\s*\(\s*pendingId\s*\)/)
+    expect(pending).not.toBeNull()
+    const p = pending![1]!
+    expect(block).toMatch(new RegExp(`\\bif\\s*\\(\\s*${p}\\s*\\)\\s*await\\s+closePendingSession\\s*\\(`))
+    expect(closeCallsIn(block)).toEqual([['pendingId', `${p}.transport`, 'pendingSessionCloseDeps']])
+    expect(block).not.toMatch(HAND_ROLLED_CLOSE)
+    expect(block.trim()).toMatch(/\breturn\s*;?$/)
+    // Nothing in the refusal registers the session.
+    expect(block).not.toMatch(/\bregisterSession\s*\(|\bregisterMcpSessionId\s*\(/)
+    // Only after the guard is the session promoted and mapped (the admitted persona).
+    for (const call of ['registerSession', 'registerMcpSessionId']) {
+      const at = indicesOf(new RegExp(`\\b${call}\\s*\\(`, 'g'), code)
+      expect(at).toHaveLength(1)
+      expect(at[0]!).toBeGreaterThan(blockEnd)
+    }
+    expect(code.slice(blockEnd)).toMatch(new RegExp(`\\bconst\\s*\\{\\s*persona\\s*\\}\\s*=\\s*${admission}\\b`))
+  })
+
+  /**
+   * The body of each of handleInitialized's other close branches, and the
+   * pending entry whose transport it must close.
+   */
+  const OTHER_CLOSE_BRANCHES: Array<[string, (code: string) => { block: string; entry: string }]> = [
+    [
+      'the SSE stream never opened',
+      (code) => {
+        const wait = code.match(/\bconst\s+(\w+)\s*=\s*await\s+waitForSseStream\s*\(\s*(\w+)\.transport\s*\)/)
+        expect(wait).not.toBeNull()
+        const guard = code.search(new RegExp(`\\bif\\s*\\(\\s*!\\s*${wait![1]}\\s*\\)\\s*\\{`))
+        expect(guard).toBeGreaterThan(-1)
+        return { block: code.slice(...balancedAfter(code, guard, '{', '}')), entry: wait![2]! }
+      },
+    ],
+    [
+      'roots/list failed',
+      (code) => {
+        const list = code.search(/\.listRoots\s*\(/)
+        expect(list).toBeGreaterThan(-1)
+        const tryAt = indicesOf(/\btry\s*\{/g, code).filter((at) => at < list).pop()!
+        const [, tryEnd] = balancedAfter(code, tryAt, '{', '}')
+        expect(list).toBeLessThan(tryEnd)
+        const rest = code.slice(tryEnd + 1)
+        expect(rest).toMatch(/^\s*catch\s*\([^)]*\)\s*\{/)
+        return pendingBranch(rest.slice(...balancedAfter(rest, rest.indexOf(')'), '{', '}')))
+      },
+    ],
+    [
+      'the client reported no roots',
+      (code) => {
+        const guard = code.search(/\bif\s*\(\s*!\s*\w+\.length\s*\)\s*\{/)
+        expect(guard).toBeGreaterThan(-1)
+        return pendingBranch(code.slice(...balancedAfter(code, guard, '{', '}')))
+      },
+    ],
+  ]
+
+  /** A branch that re-reads the pending entry (`const <p> = getPendingSession(pendingId)`) and closes it only when present. */
+  function pendingBranch(block: string): { block: string; entry: string } {
+    const pending = block.match(/\bconst\s+(\w+)\s*=\s*getPendingSession\s*\(\s*pendingId\s*\)/)
+    expect(pending).not.toBeNull()
+    expect(block).toMatch(new RegExp(`\\bif\\s*\\(\\s*${pending![1]}\\s*\\)\\s*await\\s+closePendingSession\\s*\\(`))
+    return { block, entry: pending![1]! }
+  }
+
+  test.each(OTHER_CLOSE_BRANCHES)('when %s, handleInitialized closes the pending session through closePendingSession with pendingSessionCloseDeps, awaited, and returns', (_label, branchOf) => {
+    const [start, end] = asyncFunctionBody('handleInitialized')
+    const { block, entry } = branchOf(SERVER_CODE.slice(start, end))
+    expect(closeCallsIn(block)).toEqual([['pendingId', `${entry}.transport`, 'pendingSessionCloseDeps']])
+    expect(block).toMatch(/\bawait\s+closePendingSession\s*\(/)
+    expect(block).not.toMatch(HAND_ROLLED_CLOSE)
+    expect(block.trim()).toMatch(/\breturn\s*;?$/)
+  })
+
+  test('handleInitialized has no other close path: exactly the four closePendingSession calls, and no direct pending remove, keep-alive stop or transport close', () => {
+    const [start, end] = asyncFunctionBody('handleInitialized')
+    const code = SERVER_CODE.slice(start, end)
+    const calls = closeCallsIn(code)
+    expect(calls).toHaveLength(OTHER_CLOSE_BRANCHES.length + 1)
+    for (const args of calls) {
+      expect(args).toHaveLength(3)
+      expect(args[0]).toBe('pendingId')
+      expect(args[2]).toBe('pendingSessionCloseDeps')
+    }
+    expect(code).not.toMatch(HAND_ROLLED_CLOSE)
+  })
+
+  test('the bring-up controller\'s onLeftUp drops the persona\'s MCP session through createNotUpSessionDropper over dropPersonaSessionAndKeepAlive, which stops the keep-alive and then calls dropPersonaSession', () => {
+    expect(onlyCallProps('createPersonaBringUpController').get('onLeftUp')).toStartWith('createNotUpSessionDropper(')
+    const dropper = onlyCallProps('createNotUpSessionDropper')
+    expect([...dropper.keys()].sort()).toEqual(['drop', 'log'])
+    expect(dropper.get('drop')).toBe('dropPersonaSessionAndKeepAlive')
+    expect(dropper.get('log')).toMatch(/^\((\w+)\) => console\.error\(\1\)$/)
+
+    const [start, end] = asyncFunctionBody('dropPersonaSessionAndKeepAlive')
+    const body = SERVER_CODE.slice(start, end)
+    const session = body.match(/\bconst\s+(\w+)\s*=\s*getSessionByPersona\s*\(\s*(\w+)\s*\)/)
+    expect(session).not.toBeNull()
+    const [, s, key] = session!
+    const stop = body.search(new RegExp(`\\bstopSseKeepAlive\\s*\\(\\s*${s}\\.transport\\s*\\)`))
+    const drop = body.search(new RegExp(`\\breturn\\s+dropPersonaSession\\s*\\(\\s*${key}\\s*\\)`))
+    expect(stop).toBeGreaterThan(-1)
+    expect(drop).toBeGreaterThan(stop)
+    // The one drop call in server.ts.
+    const drops = callsOf('dropPersonaSession')
+    expect(drops).toHaveLength(1)
+    expect(drops[0]! > start && drops[0]! < end).toBe(true)
   })
 })
 

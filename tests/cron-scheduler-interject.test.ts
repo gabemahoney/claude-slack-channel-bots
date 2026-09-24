@@ -84,6 +84,8 @@ let personaConfig: PersonaConfig | null = null
 const sessions = new Map<string, InterjectSession>()
 let a: StubSession
 let b: StubSession
+/** Persona keys that are not up; every other persona is up. */
+const notUp = new Set<string>()
 
 const interjectServer = Bun.serve({
   hostname: '127.0.0.1',
@@ -101,6 +103,7 @@ const interjectServer = Bun.serve({
     if (url.pathname !== '/interject') return new Response('Not Found', { status: 404 })
     return handleInterject(req, server.requestIP(req)?.address, {
       getPersonaConfig: () => personaConfig,
+      isPersonaUp: (key) => !notUp.has(key),
       getSessionByPersona: (key) => sessions.get(key),
       log: () => {},
     })
@@ -227,6 +230,7 @@ beforeEach(() => {
   sessions.clear()
   sessions.set(A_KEY, a.session)
   sessions.set(B_KEY, b.session)
+  notUp.clear()
 })
 
 afterEach(() => {
@@ -427,5 +431,28 @@ describe('AC 50: scheduled prompts reach only the targeted persona (real /interj
     expect(noSession).toHaveLength(1)
     expect(noSession[0]!.target).toBe(A_NAME)
     expect(token(noSession[0]!.detail, 'status')).toBe('503')
+  })
+  test('SR-6.4: a line naming a not-up persona that still has a connected session logs `no-session` (503); no session is notified', async () => {
+    notUp.add(A_KEY)
+    expect(sessions.get(A_KEY)?.connected).toBe(true)
+    const dir = makeTempDir('cscb-sched-notup-')
+    const cronTablePath = writeTable(dir, 'broken-tick.md', 'A is not up', A_NAME)
+
+    const { scheduler, lines } = makeWiring({ cronTablePath, now: FIXED_NOW })
+    scheduler.start()
+    await scheduler.tick()
+
+    expect(posts.map((p) => p.body.persona)).toEqual([A_KEY])
+    expect(a.calls).toHaveLength(0)
+    expect(b.calls).toHaveLength(0)
+    const log = lines()
+    const noSession = log.filter((l) => l.outcome === 'no-session')
+    expect(noSession).toHaveLength(1)
+    expect(noSession[0]!.target).toBe(A_NAME)
+    expect(token(noSession[0]!.detail, 'status')).toBe('503')
+    expect(log.filter((l) => l.outcome === 'delivered')).toHaveLength(0)
+    const summary = log.find((l) => l.outcome === 'summary')!
+    expect(token(summary.detail, 'delivered')).toBe('0')
+    expect(token(summary.detail, 'failed')).toBe('1')
   })
 })

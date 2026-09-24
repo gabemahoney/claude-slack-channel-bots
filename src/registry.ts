@@ -5,7 +5,10 @@
  * Session identity (b.av2 SR-6.3): an MCP session is identified by the working
  * directory its client reports through `roots/list`. That directory is
  * compared by real path (`resolveRealPath`) with the applied personas' working
- * directories and maps to exactly one persona (`matchPersonaByRootsPath`). The
+ * directories and maps to exactly one persona (`matchPersonaByRootsPath`). A
+ * session is admitted only while that persona is up (b.av2 SR-6.4,
+ * `decideSessionAdmission`, with the up check injected), and a persona that
+ * stops being up has its session dropped (`dropPersonaSession`). The
  * registry is keyed by persona key; a newer session for a persona replaces the
  * older one. A session sits in the pending map from its MCP init request until
  * its roots are matched, and its entry stub is promoted in place so the tool
@@ -143,6 +146,66 @@ export function matchPersonaByRootsPath(
 }
 
 // ---------------------------------------------------------------------------
+// Session admission (b.av2 SR-6.3, SR-6.4)
+// ---------------------------------------------------------------------------
+
+/** Options for `decideSessionAdmission`. */
+export interface SessionAdmissionOptions extends MatchPersonaOptions {
+  /**
+   * Whether the persona with this key is up (b.av2 SR-6.4). Production passes
+   * `createPersonaUpPredicate` over the connection manager and the bring-up
+   * controller.
+   */
+  isPersonaUp: (key: string) => boolean
+  /**
+   * The token-free outcome or cause of a persona that is not up, for the
+   * refusal line (production: `describePersonaNotUp` of the controller's
+   * state). The line omits it when absent.
+   */
+  describeNotUp?: (key: string) => string
+}
+
+/** What `decideSessionAdmission` decided for a session. */
+export type SessionAdmission =
+  /** The roots working directory maps to an up persona: register the session under it. */
+  | { kind: 'admitted'; persona: Persona }
+  /** No persona (or more than one) matches the roots working directory. */
+  | { kind: 'unmatched' }
+  /** The matched persona is not up: refuse the session and keep any session already registered for it. */
+  | { kind: 'not-up'; persona: Persona }
+
+/**
+ * Decide whether a session whose roots working directory is `rootsPath` may
+ * register (b.av2 SR-6.3, SR-6.4): match it to one persona by real path
+ * (`matchPersonaByRootsPath`), then admit it only when that persona is up.
+ * A persona that is not up (broken or retrying) keeps its instance, but the
+ * instance's session is refused until the persona is up; the refusal logs one
+ * line through `options.log`, with no token and no diagnostic class label:
+ *
+ *   [slack] Session refused: persona "<name>" (key=<key>) is not up (<outcome>: <cause>) — not registered; its instance is kept and may register once the persona is up
+ *
+ * A missing working directory still matches its own persona (the lexical
+ * fallback of `resolveRealPath`) and is refused here. Registers, removes and
+ * closes nothing: the caller acts on the result.
+ */
+export function decideSessionAdmission(
+  rootsPath: string,
+  personas: readonly Persona[],
+  options: SessionAdmissionOptions,
+): SessionAdmission {
+  const persona = matchPersonaByRootsPath(rootsPath, personas, options)
+  if (!persona) return { kind: 'unmatched' }
+  if (options.isPersonaUp(persona.key)) return { kind: 'admitted', persona }
+  const log = options.log ?? ((line: string) => console.error(line))
+  const why = options.describeNotUp ? ` (${options.describeNotUp(persona.key)})` : ''
+  log(
+    `[slack] Session refused: persona ${renderPersonaRef(persona.name, persona.key)} is not up${why} — ` +
+      'not registered; its instance is kept and may register once the persona is up',
+  )
+  return { kind: 'not-up', persona }
+}
+
+// ---------------------------------------------------------------------------
 // Public API — registry operations
 // ---------------------------------------------------------------------------
 
@@ -257,6 +320,37 @@ export function removePendingSession(pendingId: string): void {
   pendingSessionMap.delete(pendingId)
 }
 
+/** What `closePendingSession` acts through, injected (b.av2 SR-13.1). */
+export interface ClosePendingSessionDeps<T> {
+  /** Remove the pending entry (production: `removePendingSession`). */
+  removePending: (pendingId: string) => void
+  /** Stop the transport's SSE keep-alive (production: server.ts `stopSseKeepAlive`). */
+  stopKeepAlive: (transport: T) => void
+}
+
+/**
+ * Disconnect a pending session that will not be registered: remove its
+ * pending entry, stop its SSE keep-alive, then close its transport (a close
+ * failure is ignored). The one close path for a pending session in
+ * `handleInitialized`: a persona that is not up (b.av2 SR-6.4), a roots
+ * working directory that matches no persona, a roots/list failure or empty
+ * roots, and an SSE stream that never opened. Registers nothing and never
+ * touches a persona's registered session. Resolves once the close settles.
+ */
+export async function closePendingSession<T extends { close(): Promise<void> }>(
+  pendingId: string,
+  transport: T,
+  deps: ClosePendingSessionDeps<T>,
+): Promise<void> {
+  deps.removePending(pendingId)
+  deps.stopKeepAlive(transport)
+  try {
+    await transport.close()
+  } catch {
+    /* ignore */
+  }
+}
+
 /** Return all pending sessions (for graceful shutdown). */
 export function getAllPendingSessions(): PendingSessionEntry[] {
   return Array.from(pendingSessionMap.values())
@@ -312,6 +406,30 @@ export function unregisterSession(personaKey: string): void {
 
   registry.delete(personaKey)
   console.error(`[registry] Unregistered session for persona=${personaKey}`)
+}
+
+/**
+ * Drop the session registered for a persona (b.av2 SR-6.3: a session is
+ * registered only while its persona is up; the SR-6.5 teardown can reuse it):
+ * remove its registry entry and every MCP session ID mapped to the persona,
+ * mark the entry not connected, then close its transport. The mappings go
+ * first, so the close's `onsessionclosed` and the SSE abort find no session
+ * and restart nothing. Every other persona's session is untouched. Resolves
+ * whether a session was registered; a persona with none is a no-op. A failing
+ * close is ignored. Makes no agent-director call and logs nothing.
+ */
+export async function dropPersonaSession(personaKey: string): Promise<boolean> {
+  const entry = registry.get(personaKey)
+  if (!entry) return false
+  for (const [mcpId, key] of [...mcpSessionIdToPersonaKey]) {
+    if (key === personaKey) mcpSessionIdToPersonaKey.delete(mcpId)
+  }
+  registry.delete(personaKey)
+  entry.connected = false
+  try {
+    await entry.transport.close()
+  } catch { /* ignore */ }
+  return true
 }
 
 /** Look up the session registered for a persona key. */

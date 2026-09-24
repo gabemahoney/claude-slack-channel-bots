@@ -3,7 +3,8 @@
  * permission-relay suites (poller, click handler, trail file, capstone).
  *
  * - `startManualPoller(deps)` starts the poller on a manual interval: nothing
- *   runs until the test fires a tick (`tick(settleMs?)` or `fire()`).
+ *   runs until the test fires a tick (`tick(settleMs?)` or `fire()`). Every
+ *   persona is up unless the test passes its own `isPersonaUp`.
  * - `makePersonaClients(stubFor)` is the injected per-persona client lookup:
  *   each key gets its own `makeStubSlack` stub's Web client, and a test can
  *   mark a key's client unavailable (as production does before validation, in
@@ -75,15 +76,17 @@ export function makeManualInterval(): ManualIntervalControl {
 
 /**
  * Start the poller on a manual interval (1000 ms unless `deps.intervalMs`
- * says otherwise). Returns the interval control.
+ * says otherwise). Every persona is up unless `deps.isPersonaUp` says
+ * otherwise. Returns the interval control.
  */
 export function startManualPoller(
-  deps: Omit<PollerDeps, 'intervalMs' | 'setInterval' | 'clearInterval'> & Partial<PollerDeps>,
+  deps: Omit<PollerDeps, 'intervalMs' | 'setInterval' | 'clearInterval' | 'isPersonaUp'> & Partial<PollerDeps>,
 ): ManualIntervalControl {
   const ivl = makeManualInterval()
   startPermissionPoller({
     intervalMs: 1000,
     ...deps,
+    isPersonaUp: deps.isPersonaUp ?? (() => true),
     setInterval: ivl.setInterval,
     clearInterval: ivl.clearInterval,
   })

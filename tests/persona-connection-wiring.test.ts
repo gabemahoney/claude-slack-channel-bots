@@ -562,6 +562,8 @@ describe('Task 6 carry: a click is decided only through the persona whose connec
       getClient: (() => ad) as never,
       clientFor: h.clientFor,
       getPersona: (key) => h.getPersona(key),
+      // Both personas were brought up above.
+      isPersonaUp: () => true,
     })
     await poller.tick()
     const prompt = posts(h.stub(h.A))

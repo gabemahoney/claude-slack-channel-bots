@@ -31,7 +31,12 @@
  * The start sweep (`reconcileOrphans`, b.av2 SR-6.3) lists every
  * `service=cscb` spawn and kills+deletes any with no `persona` label, a
  * persona absent from the applied configuration, an instance ID other than
- * `cscb_<key>`, or a `cwd` other than its persona's working directory.
+ * `cscb_<key>`, or a `cwd` other than its persona's working directory. While a
+ * persona's working directory cannot be resolved to a real path, neither the
+ * sweep nor the collision ladder kills or deletes on `cwd` grounds a row
+ * whose `cwd` has no real path either (b.av2 SR-6.4): the sweep defers the
+ * check to the launch, and the ladder fails the launch instead. A row whose
+ * `cwd` resolves to an existing directory is still a `cwd` mismatch.
  *
  * At start, `startupSessionManager` brings each applied persona up through
  * the b.av2 SR-6.1 procedure (`persona-start.ts`, driven by the bring-up
@@ -66,6 +71,7 @@ import {
   type PersonaConfig,
   MCP_SERVER_NAME,
   resolveRealPath,
+  tryResolveRealPath,
 } from './config.ts'
 import {
   CONFIG_DIR_LABEL_PREFIX,
@@ -80,7 +86,7 @@ import {
   resolveClaudeConfigDir,
 } from './persona-identity.ts'
 import { getClient } from './agent-director-client.ts'
-import { withOutageDetection, withSpawnDetection } from './outage-state.ts'
+import { setOutageFlag, withOutageDetection, withSpawnDetection } from './outage-state.ts'
 import {
   ErrSystemInstallDisappeared,
   ErrTmuxNotAvailable,
@@ -104,6 +110,7 @@ import {
 } from './jsonl-persistence-check.ts'
 import { realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { resolve as resolvePath } from 'node:path'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -166,6 +173,23 @@ const CONFIG_DIR_LABEL_KEY = CONFIG_DIR_LABEL_PREFIX.slice(0, -1)
 export interface RowPersonaComparison {
   /** The row's `cwd` and the persona's working_directory have the same real path. */
   cwdMatches: boolean
+  /**
+   * The persona's working_directory resolved to a real path. When it did not
+   * (missing, not searchable, a dangling symlink), `cwdMatches` is only the
+   * lexical comparison.
+   */
+  workingDirectoryResolved: boolean
+  /**
+   * The `cwd` condition cannot be evaluated now (b.av2 SR-6.4): the persona's
+   * working_directory has no real path AND the row's `cwd` has none either
+   * (absent, missing, a dangling symlink's old target) or equals the
+   * configured working_directory lexically. The start sweep and the collision
+   * ladder never kill or delete such a row on `cwd` grounds. A row whose `cwd`
+   * resolves to an existing directory elsewhere is not deferred: it is a
+   * `cwd` mismatch even while the working directory is missing, so a persona
+   * never adopts a directory another persona may now own.
+   */
+  cwdCheckDeferred: boolean
   /** The row carries a `config_dir` label equal to `expectedConfigDirLabel`. */
   configDirMatches: boolean
   /** The row's `config_dir` label value; undefined when the label is absent. */
@@ -184,6 +208,13 @@ export interface RowPersonaComparison {
  *
  * - `cwdMatches`: `resolveRealPath` on both sides (a symlink to the working
  *   directory matches). A row with no `cwd` never matches.
+ * - `workingDirectoryResolved`: the persona's working directory has a real
+ *   path (`tryResolveRealPath`).
+ * - `cwdCheckDeferred`: the working directory has no real path and the row's
+ *   `cwd` has none either or equals the configured path lexically. Callers
+ *   skip the `cwd` condition for such a row rather than act on the lexical
+ *   comparison (b.av2 SR-6.4); a row whose `cwd` resolves to an existing
+ *   directory is compared as usual and so mismatches.
  * - `configDirMatches`: the row's `config_dir` label is present and equals
  *   `personaConfigDirLabelValue(persona.claude_config_dir, home, realpath)`,
  *   the value the spawn writes.
@@ -200,12 +231,19 @@ export function compareRowToPersona(
   home: string = homedir(),
   realpath: (path: string) => string = realpathSync,
 ): RowPersonaComparison {
-  const cwdMatches =
-    !!row.cwd && resolveRealPath(row.cwd, realpath) === resolveRealPath(persona.working_directory, realpath)
+  const workingDirectory = tryResolveRealPath(persona.working_directory, realpath)
+  const configuredLexical = resolvePath(persona.working_directory)
+  const rowCwdReal = row.cwd ? tryResolveRealPath(row.cwd, realpath) : undefined
+  const cwdMatches = !!row.cwd && (rowCwdReal ?? resolvePath(row.cwd)) === (workingDirectory ?? configuredLexical)
+  const cwdCheckDeferred =
+    workingDirectory === undefined &&
+    (rowCwdReal === undefined || resolvePath(row.cwd!) === configuredLexical)
   const configDirLabel = row.labels?.[CONFIG_DIR_LABEL_KEY]
   const expectedConfigDirLabel = personaConfigDirLabelValue(persona.claude_config_dir, home, realpath)
   return {
     cwdMatches,
+    workingDirectoryResolved: workingDirectory !== undefined,
+    cwdCheckDeferred,
     configDirMatches: configDirLabel !== undefined && configDirLabel === expectedConfigDirLabel,
     configDirLabel,
     expectedConfigDirLabel,
@@ -1884,7 +1922,11 @@ export function isLaunchInFlight(key: string): boolean {
  * 4. `ErrInstanceIdCollision` → `client.get(...)`, then:
  *    - the row's `cwd` differs from the persona's working_directory by real
  *      path (`compareRowToPersona`) → kill + delete + fresh spawn, whatever
- *      the state and resume_enabled (b.av2 SR-6.2). Otherwise branch on state:
+ *      the state and resume_enabled (b.av2 SR-6.2). When the working directory
+ *      cannot be resolved to a real path at that moment and the row's `cwd`
+ *      has none either (`cwdCheckDeferred`), the row is kept instead: no
+ *      kill, no delete, `cwd-unreachable` raised and `failed` returned
+ *      (b.av2 SR-6.4). Otherwise branch on state:
  *    - ended/missing + resume_enabled → resume; on ErrNoSessionId/
  *      ErrJsonlMissing/ErrJsonlNeverWritten → delete + fresh spawn.
  *    - ended/missing + !resume_enabled → kill + delete + fresh spawn.
@@ -2030,7 +2072,22 @@ async function runPersonaLadder(
   // b.av2 SR-6.2: a row in another directory (by real path) is never resumed,
   // reconnected or waited on, whatever its state and resume_enabled: kill,
   // delete and spawn fresh in the persona's working directory.
-  if (!compareRowToPersona(row, persona, spawnHomeDir()).cwdMatches) {
+  const comparison = compareRowToPersona(row, persona, spawnHomeDir())
+  if (!comparison.cwdMatches) {
+    if (comparison.cwdCheckDeferred) {
+      // b.av2 SR-6.4: neither the working directory nor the row's cwd has a
+      // real path right now, so the row cannot be shown to be in another
+      // directory. Keep it (its instance and history) and fail the launch as a
+      // spawn in a missing directory would: the cwd-unreachable notice, then
+      // restart recovery. A row whose cwd resolves to an existing directory is
+      // not deferred and is replaced below.
+      console.error(
+        `[slack] spawnForPersona: ${ref} working_directory=${persona.working_directory} cannot be resolved to a real path — ` +
+          `keeping its row (cwd=${row.cwd || '<none>'}, state=${state}); the launch fails and is retried by the restart path`,
+      )
+      setOutageFlag(key, 'cwd-unreachable', persona.working_directory)
+      return { key, action: 'failed' }
+    }
     console.error(
       `[slack] spawnForPersona: ${ref} row cwd=${row.cwd || '<none>'} differs from working_directory=${persona.working_directory} (state=${state}) — replacing the row: kill+delete+fresh`,
     )
@@ -2101,22 +2158,30 @@ export interface OrphanReconcileResult {
 }
 
 /**
- * Why the start sweep removes a row, or undefined when the row is kept
- * (b.av2 SR-6.3). A row is kept only when it has a `persona` label naming an
- * applied persona, its instance ID is that persona's `cscb_<key>`, and its
- * `cwd` matches the persona's working directory by real path.
+ * What the start sweep does with a row (b.av2 SR-6.3, SR-6.4): `sweep` it
+ * with a reason, `keep` it, or keep it with its `cwd` check `deferred` to the
+ * persona's launch. A row is kept only when it has a `persona` label naming
+ * an applied persona, its instance ID is that persona's `cscb_<key>`, and its
+ * `cwd` matches the persona's working directory by real path. When that
+ * working directory cannot be resolved to a real path (a directory-broken
+ * persona) and the row's `cwd` has no real path either or equals the
+ * configured path lexically (`cwdCheckDeferred`), the `cwd` condition cannot
+ * be evaluated and is deferred; the other three conditions still apply. A row
+ * whose `cwd` resolves to an existing directory is swept as `wrong cwd`.
  */
-function sweepReason(
+function sweepDecision(
   row: ListRow,
   persona: Persona | undefined,
   personaLabel: string | undefined,
   home: string,
-): string | undefined {
-  if (!personaLabel) return 'no persona label'
-  if (!persona) return 'absent persona'
-  if (row.claude_instance_id !== personaInstanceId(persona.key)) return 'wrong instance ID'
-  if (!compareRowToPersona(row, persona, home).cwdMatches) return 'wrong cwd'
-  return undefined
+): { action: 'sweep'; reason: string } | { action: 'keep' } | { action: 'deferred'; persona: Persona } {
+  if (!personaLabel) return { action: 'sweep', reason: 'no persona label' }
+  if (!persona) return { action: 'sweep', reason: 'absent persona' }
+  if (row.claude_instance_id !== personaInstanceId(persona.key)) return { action: 'sweep', reason: 'wrong instance ID' }
+  const comparison = compareRowToPersona(row, persona, home)
+  if (comparison.cwdCheckDeferred) return { action: 'deferred', persona }
+  if (!comparison.cwdMatches) return { action: 'sweep', reason: 'wrong cwd' }
+  return { action: 'keep' }
 }
 
 /**
@@ -2127,6 +2192,14 @@ function sweepReason(
  *   - has an instance ID other than `cscb_<key>` for its persona, or
  *   - has a `cwd` other than its persona's working directory, by real path
  *     (`compareRowToPersona`).
+ * When a persona's working directory cannot be resolved to a real path (a
+ * directory-broken persona, b.av2 SR-6.4), its rows whose `cwd` has no real
+ * path either (or equals the configured path lexically) are kept, and one
+ * line per persona says the check is deferred to its launch; a row whose
+ * `cwd` resolves to an existing directory is still swept as `wrong cwd`:
+ *
+ *   [slack] reconcileOrphans: persona "<name>" (key=<key>) working_directory="<path>" cannot be resolved to a real path — keeping its rows; the cwd check is deferred to its launch
+ *
  * A `channel` label left on a row by an older spawn plays no part. A failed
  * kill still attempts the delete; kill and delete failures record
  * `orphan-cleanup`, a list failure records `orphan-cleanup-list-failed` and
@@ -2162,11 +2235,25 @@ export async function reconcileOrphans(
   let killed = 0
   let failed = 0
 
+  const deferredLogged = new Set<string>()
+
   for (const row of rows) {
     const personaLabel = row.labels?.[PERSONA_LABEL_KEY]
     const persona = personaLabel ? personasByKey.get(personaLabel) : undefined
-    const reason = sweepReason(row, persona, personaLabel, home)
-    if (!reason) continue
+    const decision = sweepDecision(row, persona, personaLabel, home)
+    if (decision.action === 'keep') continue
+    if (decision.action === 'deferred') {
+      const deferred = decision.persona
+      if (!deferredLogged.has(deferred.key)) {
+        deferredLogged.add(deferred.key)
+        console.error(
+          `[slack] reconcileOrphans: persona ${personaRef(deferred)} working_directory="${deferred.working_directory}" ` +
+            'cannot be resolved to a real path — keeping its rows; the cwd check is deferred to its launch',
+        )
+      }
+      continue
+    }
+    const { reason } = decision
 
     found++
     // The persona reference when the persona exists, else the raw label value.

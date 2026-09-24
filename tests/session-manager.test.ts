@@ -142,6 +142,7 @@ import {
   holdSpawns,
   makeStubClient,
   type CannedGetResult,
+  type CannedResponse,
   type PersonaGetResultOverrides,
   type StubClient,
 } from './test-helpers/agent-director-stub.ts'
@@ -1984,6 +1985,65 @@ describe('resume_enabled: false fresh spawn self-heals ErrTmuxSessionCreate', ()
 })
 
 // ---------------------------------------------------------------------------
+// b.av2 SR-6.4 — a directory-broken persona's working directory
+// ---------------------------------------------------------------------------
+
+/**
+ * The ways a directory-broken persona's working directory cannot be resolved
+ * to a real path, each with the `cwd` its surviving row carries. A missing
+ * directory's row holds the configured path. A dangling symlink's row holds
+ * either the link or the link's old real target (what agent-director recorded
+ * when the spawn ran there): the second compares lexically unequal to the
+ * configured path.
+ */
+const UNRESOLVABLE_WORKDIRS = [
+  'a missing directory, row cwd the configured path',
+  'a dangling symlink, row cwd the link',
+  'a dangling symlink, row cwd its old real target',
+] as const
+type UnresolvableWorkdir = (typeof UNRESOLVABLE_WORKDIRS)[number]
+
+interface BrokenWorkdir {
+  /** The persona's configured working_directory; it has no real path yet. */
+  workingDirectory: string
+  /** The `cwd` of the row the persona's last spawn left behind. */
+  rowCwd: string
+  /** Create the missing directory (or the link's target) at the same path, so the working directory resolves. */
+  recreate: () => void
+}
+
+/** Build `variant` under this test's fixture dir (named `name`); nothing resolves until `recreate()`. */
+function brokenWorkdir(variant: UnresolvableWorkdir, name = 'broken'): BrokenWorkdir {
+  if (variant === 'a missing directory, row cwd the configured path') {
+    const dir = join(fixtureDir, `${name}-work`)
+    return { workingDirectory: dir, rowCwd: dir, recreate: () => void fixtureSubdir(`${name}-work`) }
+  }
+  const target = fixtureSubdir(`${name}-target`)
+  const realTarget = realpathSync(target)
+  const link = join(fixtureDir, `${name}-link`)
+  symlinkSync(target, link)
+  rmSync(target, { recursive: true })
+  return {
+    workingDirectory: link,
+    rowCwd: variant === 'a dangling symlink, row cwd the link' ? link : realTarget,
+    recreate: () => void fixtureSubdir(`${name}-target`),
+  }
+}
+
+/** The start sweep's line for a persona whose `cwd` check it defers. */
+function deferredSweepLine(name: string, key: string, workingDirectory: string): string {
+  return (
+    `reconcileOrphans: persona ${renderPersonaRef(name, key)} working_directory="${workingDirectory}" ` +
+    'cannot be resolved to a real path — keeping its rows; the cwd check is deferred to its launch'
+  )
+}
+
+/** Number of deferred-check lines in a captured log. */
+function countDeferredLines(errLog: string): number {
+  return errLog.split('\n').filter((line) => line.includes('the cwd check is deferred to its launch')).length
+}
+
+// ---------------------------------------------------------------------------
 // b.av2 SR-6.3 (formerly SR-1.6) — the start sweep
 // ---------------------------------------------------------------------------
 
@@ -2057,6 +2117,156 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong cwd) persona=${renderPersonaRef('gamma', 'gamma')} instanceId=cscb_gamma state=waiting cwd=${elsewhere} — killing and deleting`)
     expect(errLog).not.toContain('instanceId=cscb_alpha state=')
     expect(errLog).not.toContain('instanceId=cscb_beta ')
+    // Every working directory resolves, so nothing is deferred.
+    expect(countDeferredLines(errLog)).toBe(0)
+  })
+
+  // b.av2 SR-6.4: the sweep runs before any bring-up, so it cannot compare a
+  // directory-broken persona's rows by real path. It keeps them and defers the
+  // cwd check to the launch; the other three conditions still apply, to that
+  // persona and to every other row in the same sweep.
+  test.each([...UNRESOLVABLE_WORKDIRS])(
+    'working directory %s: its row is kept (neither found nor failed) with one deferred-check line; the other conditions still kill and delete',
+    async (variant) => {
+      const home = useSpawnHome()
+      const broken = brokenWorkdir(variant)
+      const cfg = makeMultiPersonaConfig(
+        [
+          { name: 'alpha', working_directory: fixtureSubdir('alpha-work') },
+          { name: 'delta', working_directory: broken.workingDirectory },
+          { name: 'gamma', working_directory: fixtureSubdir('gamma-work') },
+        ],
+        fixtureDir,
+      )
+      const alpha = personaOf(cfg, 'alpha')
+      const delta = personaOf(cfg, 'delta')
+      const gamma = personaOf(cfg, 'gamma')
+      const elsewhere = fixtureSubdir('elsewhere')
+      const killCalls: import('agent-director').KillParams[] = []
+      const deleteCalls: import('agent-director').DeleteParams[] = []
+      installStub({
+        killCalls,
+        deleteCalls,
+        listResult: {
+          spawns: [
+            // Kept, check deferred: the directory-broken persona's own row.
+            cannedListRow({ cwd: broken.rowCwd }, delta, home),
+            // Swept: the directory-broken persona's label, another instance ID.
+            cannedListRow({ claude_instance_id: 'cscb_delta_old', cwd: broken.rowCwd }, delta, home),
+            // Swept: an absent persona.
+            cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed' } }, alpha, home),
+            // Swept: no persona label.
+            cannedListRow({ claude_instance_id: 'cscb_legacy', labels: { service: 'cscb' } }, alpha, home),
+            // Kept: a correct row for a resolvable persona.
+            cannedListRow({}, alpha, home),
+            // Swept: a resolvable persona's row in another directory.
+            cannedListRow({ cwd: elsewhere }, gamma, home),
+          ],
+        },
+      })
+
+      let result!: Awaited<ReturnType<typeof reconcileOrphans>>
+      const errLog = await withCapturedErr(async () => {
+        result = await reconcileOrphans(cfg)
+      })
+
+      expect(result).toEqual({ found: 4, killed: 4, failed: 0 })
+      const swept = ['cscb_delta_old', 'cscb_departed', 'cscb_gamma', 'cscb_legacy']
+      expect(killCalls.map((k) => k.claude_instance_id).sort()).toEqual(swept)
+      expect(deleteCalls.map((d) => d.claude_instance_id).sort()).toEqual(swept.map((id) => [id]))
+      expect(errLog).toContain(deferredSweepLine('delta', 'delta', broken.workingDirectory))
+      expect(countDeferredLines(errLog)).toBe(1)
+      expect(errLog).toContain(
+        `reconcileOrphans: sweeping row (wrong instance ID) persona=${renderPersonaRef('delta', 'delta')} instanceId=cscb_delta_old state=waiting — killing and deleting`,
+      )
+      expect(errLog).toContain('reconcileOrphans: sweeping row (absent persona) persona=departed instanceId=cscb_departed')
+      expect(errLog).toContain('reconcileOrphans: sweeping row (no persona label) persona=<no persona label> instanceId=cscb_legacy')
+      expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong cwd) persona=${renderPersonaRef('gamma', 'gamma')} instanceId=cscb_gamma state=waiting cwd=${elsewhere}`)
+      expect(errLog).not.toContain('instanceId=cscb_delta state=')
+    },
+  )
+
+  test('two directory-broken personas: one deferred-check line each, and neither row is swept', async () => {
+    const home = useSpawnHome()
+    const first = brokenWorkdir('a missing directory, row cwd the configured path', 'first')
+    const second = brokenWorkdir('a dangling symlink, row cwd its old real target', 'second')
+    const cfg = makeMultiPersonaConfig(
+      [
+        { name: 'delta', working_directory: first.workingDirectory },
+        { name: 'epsilon', working_directory: second.workingDirectory },
+      ],
+      fixtureDir,
+    )
+    const killCalls: import('agent-director').KillParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      killCalls,
+      deleteCalls,
+      listResult: {
+        spawns: [
+          cannedListRow({ cwd: first.rowCwd }, personaOf(cfg, 'delta'), home),
+          cannedListRow({ cwd: second.rowCwd }, personaOf(cfg, 'epsilon'), home),
+        ],
+      },
+    })
+
+    let result!: Awaited<ReturnType<typeof reconcileOrphans>>
+    const errLog = await withCapturedErr(async () => {
+      result = await reconcileOrphans(cfg)
+    })
+
+    expect(result).toEqual({ found: 0, killed: 0, failed: 0 })
+    expect(killCalls).toHaveLength(0)
+    expect(deleteCalls).toHaveLength(0)
+    expect(errLog).toContain(deferredSweepLine('delta', 'delta', first.workingDirectory))
+    expect(errLog).toContain(deferredSweepLine('epsilon', 'epsilon', second.workingDirectory))
+    expect(countDeferredLines(errLog)).toBe(2)
+  })
+
+  // A directory-broken persona's row whose cwd resolves to an existing
+  // directory (here another persona's) is not deferred: it is swept as wrong
+  // cwd, so the persona can never adopt that instance. A row with no real
+  // path in the same sweep is still deferred.
+  test('a directory-broken persona whose row cwd is an existing directory elsewhere: swept as wrong cwd, no deferred line for it', async () => {
+    const home = useSpawnHome()
+    const alphaWork = fixtureSubdir('alpha-work')
+    const delta = brokenWorkdir('a missing directory, row cwd the configured path', 'delta')
+    const epsilon = brokenWorkdir('a dangling symlink, row cwd its old real target', 'epsilon')
+    const cfg = makeMultiPersonaConfig(
+      [
+        { name: 'alpha', working_directory: alphaWork },
+        { name: 'delta', working_directory: delta.workingDirectory },
+        { name: 'epsilon', working_directory: epsilon.workingDirectory },
+      ],
+      fixtureDir,
+    )
+    const killCalls: import('agent-director').KillParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      killCalls,
+      deleteCalls,
+      listResult: {
+        spawns: [
+          cannedListRow({}, personaOf(cfg, 'alpha'), home),
+          // Swept: delta's row sits in alpha's existing directory.
+          cannedListRow({ cwd: alphaWork }, personaOf(cfg, 'delta'), home),
+          // Kept, check deferred: epsilon's row cwd has no real path.
+          cannedListRow({ cwd: epsilon.rowCwd }, personaOf(cfg, 'epsilon'), home),
+        ],
+      },
+    })
+
+    let result!: Awaited<ReturnType<typeof reconcileOrphans>>
+    const errLog = await withCapturedErr(async () => {
+      result = await reconcileOrphans(cfg)
+    })
+
+    expect(result).toEqual({ found: 1, killed: 1, failed: 0 })
+    expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_delta'])
+    expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_delta']])
+    expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong cwd) persona=${renderPersonaRef('delta', 'delta')} instanceId=cscb_delta state=waiting cwd=${alphaWork}`)
+    expect(errLog).toContain(deferredSweepLine('epsilon', 'epsilon', epsilon.workingDirectory))
+    expect(countDeferredLines(errLog)).toBe(1)
   })
 
   test.each([
@@ -2095,6 +2305,200 @@ describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', ()
     expect(result.found).toBe(0)
     expect(result.killed).toBe(0)
     expect(readLog()).toContain('[orphan-cleanup-list-failed]')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-6.4 — the collision ladder keeps a row while the persona's
+// working directory cannot be resolved, and reuses it once the persona is up
+// ---------------------------------------------------------------------------
+
+describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6.4)', () => {
+  /** Persona `C` in `workingDirectory`, the seam home installed. */
+  function brokenConfig(workingDirectory: string): PersonaConfig {
+    useSpawnHome()
+    return makeStandInPersonaConfig({ C: { working_directory: workingDirectory } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
+  }
+
+  /** `n` colliding spawns, then one that succeeds (for a fresh spawn after kill + delete). */
+  function collisionsThenOk(n: number): CannedResponse<import('agent-director').SpawnResult>[] {
+    return [
+      ...Array.from({ length: n }, () => cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())),
+      cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+    ]
+  }
+
+  async function launch(cfg: PersonaConfig): Promise<{ result: Awaited<ReturnType<typeof spawnForPersona>>; errLog: string }> {
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+    return { result, errLog }
+  }
+
+  // A working directory that stops resolving between the persona's directory
+  // check and its launch, with a row `cwd` that has no real path either and
+  // differs lexically from the configured path (a lexically equal one never
+  // reaches the cwd guard). The guard runs before the ladder branches on
+  // state, so two states that would otherwise reuse the row are enough.
+  test.each(['ended', 'waiting'] as const)(
+    'a dangling symlink, row cwd its old real target, state=%s: no kill, delete, resume or reconnect; cwd-unreachable and failed (the spawn-failure path)',
+    async (state) => {
+      const { workingDirectory, rowCwd } = brokenWorkdir('a dangling symlink, row cwd its old real target')
+      const cfg = brokenConfig(workingDirectory)
+      const calls = newLadderCalls()
+      installStub({ ...calls, spawnQueue: collisionsThenOk(1), getResult: personaRow(cfg, 'C', { state, cwd: rowCwd }) })
+
+      const { result, errLog } = await launch(cfg)
+
+      expect(result).toEqual({ key: 'C', action: 'failed' })
+      expect(calls.killCalls).toHaveLength(0)
+      expect(calls.deleteCalls).toHaveLength(0)
+      expect(calls.spawnCalls).toHaveLength(1) // only the colliding spawn
+      expect(calls.resumeCalls).toHaveLength(0)
+      expect(calls.sendKeysCalls).toHaveLength(0)
+      expect(calls.findMissingCalls).toHaveLength(0)
+      // As a spawn in a missing directory fails: the cwd-unreachable onset
+      // naming the working directory, and no spawn-failure notice.
+      expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
+      expect(outageEmissions.filter((e) => e.key === 'C' && e.text.includes(workingDirectory))).toHaveLength(1)
+      expect(notices).toHaveLength(0)
+      expect(errLog).toContain(
+        `spawnForPersona: ${renderPersonaRef('C', 'C')} working_directory=${workingDirectory} cannot be resolved to a real path — ` +
+          `keeping its row (cwd=${rowCwd}, state=${state}); the launch fails and is retried by the restart path`,
+      )
+      expect(errLog).not.toContain('replacing the row')
+    },
+  )
+
+  // The common case: the row holds the configured path itself, which matches
+  // lexically, so the ladder reaches the row's own branch. Its resume fails
+  // on the missing directory as a spawn would, and the row is never removed.
+  test('a removed directory whose row cwd is the configured path: the resume fails with ErrCwdNotFound → cwd-unreachable and failed, no kill or delete', async () => {
+    const work = fixtureSubdir('work')
+    const cfg = brokenConfig(work)
+    rmSync(work, { recursive: true })
+    const calls = newLadderCalls()
+    installStub({
+      ...calls,
+      spawnQueue: collisionsThenOk(1),
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
+      resumeError: new ErrCwdNotFound('resume', 'ErrCwdNotFound', `cwd ${work} does not exist`),
+    })
+
+    const { result } = await launch(cfg)
+
+    expect(result).toEqual({ key: 'C', action: 'failed' })
+    expect(calls.resumeCalls.map((r) => r.claude_instance_id)).toEqual(['cscb_C'])
+    expect(calls.killCalls).toHaveLength(0)
+    expect(calls.deleteCalls).toHaveLength(0)
+    expect(calls.spawnCalls).toHaveLength(1)
+    expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
+    expect(notices).toHaveLength(0)
+  })
+
+  // A row whose cwd resolves to an existing directory elsewhere is not
+  // deferred even while the persona's own directory is missing: it may be
+  // another persona's instance, so it is replaced, never adopted. The fresh
+  // spawn then fails on the missing directory as any spawn there would.
+  test('a removed directory whose row cwd is another existing directory: killed, deleted and spawned fresh; the fresh spawn fails with ErrCwdNotFound → cwd-unreachable', async () => {
+    const work = fixtureSubdir('work')
+    const cfg = brokenConfig(work)
+    rmSync(work, { recursive: true })
+    const elsewhere = fixtureSubdir('elsewhere')
+    const calls = newLadderCalls()
+    installStub({
+      ...calls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedErr<import('agent-director').SpawnResult>(new ErrCwdNotFound('spawn', 'ErrCwdNotFound', `cwd ${work} does not exist`)),
+      ],
+      getResult: personaRow(cfg, 'C', { state: 'ended', cwd: elsewhere }),
+    })
+
+    const { result, errLog } = await launch(cfg)
+
+    expect(result).toEqual({ key: 'C', action: 'failed' })
+    expect(calls.killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_C'])
+    expect(calls.deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_C']])
+    expect(calls.resumeCalls).toHaveLength(0)
+    // The colliding spawn, then the fresh one in the persona's directory.
+    expect(calls.spawnCalls).toHaveLength(2)
+    expect(calls.spawnCalls[1].cwd).toBe(work)
+    expect(errLog).toContain(
+      `spawnForPersona: ${renderPersonaRef('C', 'C')} row cwd=${elsewhere} differs from working_directory=${work} (state=ended) — replacing the row: kill+delete+fresh`,
+    )
+    expect(errLog).not.toContain('cannot be resolved')
+    expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
+    expect(notices).toHaveLength(0)
+  })
+
+  // The persona's retry launch once its directory is usable goes through
+  // spawnForPersona (the bring-up controller's launch). Its row first survives
+  // the start sweep, then the ladder reuses it: the history is kept. The row
+  // holds the old real target, the one shape that compares lexically unequal
+  // (the other shapes are covered by the sweep table).
+  test.each([
+    ['waiting', 'reconnected'],
+    ['working', 'reconnected'],
+    ['ended', 'resumed'],
+    ['missing', 'resumed'],
+  ] as const)(
+    'a dangling symlink, row cwd its old real target, kept by the sweep, then created: a %s row is reused (%s) — no kill, delete or fresh spawn',
+    async (state, action) => {
+      const broken = brokenWorkdir('a dangling symlink, row cwd its old real target')
+      const cfg = brokenConfig(broken.workingDirectory)
+      const calls = newLadderCalls()
+      installStub({
+        ...calls,
+        listResult: { spawns: [cannedListRow({ cwd: broken.rowCwd, state }, personaOf(cfg, 'C'), ladderHome())] },
+        spawnQueue: collisionsThenOk(1),
+        getResult: personaRow(cfg, 'C', { state, cwd: broken.rowCwd }),
+        // A working row reaches waiting on the second poll.
+        statusQueue: state === 'working' ? [cannedOk<import('agent-director').StatusResult>({ state: 'working' })] : undefined,
+      })
+
+      let sweep!: Awaited<ReturnType<typeof reconcileOrphans>>
+      const sweepLog = await withCapturedErr(async () => {
+        sweep = await reconcileOrphans(cfg)
+      })
+      expect(sweep).toEqual({ found: 0, killed: 0, failed: 0 })
+      expect(sweepLog).toContain(deferredSweepLine('C', 'C', broken.workingDirectory))
+
+      broken.recreate()
+      const { result, errLog } = await launch(cfg)
+
+      expect(result).toEqual({ key: 'C', action })
+      expect(calls.killCalls).toHaveLength(0)
+      expect(calls.deleteCalls).toHaveLength(0)
+      expect(calls.spawnCalls).toHaveLength(1) // only the colliding spawn
+      expect(calls.resumeCalls.map((r) => r.claude_instance_id)).toEqual(action === 'resumed' ? ['cscb_C'] : [])
+      expect(calls.sendKeysCalls.map((s) => s.text)).toEqual(action === 'reconnected' ? [`/mcp reconnect ${MCP_SERVER_NAME}`] : [])
+      // The resume passed the config_dir check; neither guard fired.
+      expect(errLog).not.toContain('config_dir label')
+      expect(errLog).not.toContain('cannot be resolved')
+      expect(errLog).not.toContain('replacing the row')
+      expect(getOutageFlags('C').has('cwd-unreachable')).toBe(false)
+    },
+  )
+
+  test('a persona come up with an ended row carrying a stale config_dir label: the config_dir check still runs → delete + fresh spawn, no resume', async () => {
+    const broken = brokenWorkdir('a dangling symlink, row cwd its old real target')
+    const cfg = brokenConfig(broken.workingDirectory)
+    const stale = personaConfigDirLabelValue(fixtureSubdir('earlier-config'), ladderHome())
+    const row = personaRow(cfg, 'C', { state: 'ended', cwd: broken.rowCwd })
+    const calls = newLadderCalls()
+    installStub({ ...calls, spawnQueue: collisionsThenOk(1), getResult: { ...row, labels: { ...row.labels, config_dir: stale } } })
+
+    broken.recreate()
+    const { result, errLog } = await launch(cfg)
+
+    expect(result).toEqual({ key: 'C', action: 'spawned' })
+    expect(calls.resumeCalls).toHaveLength(0)
+    expect(calls.killCalls).toHaveLength(0)
+    expect(calls.deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_C']])
+    expect(calls.spawnCalls).toHaveLength(2)
+    expect(errLog).toContain(`spawnForPersona: ${renderPersonaRef('C', 'C')} config_dir label changed (was=${stale}`)
   })
 })
 

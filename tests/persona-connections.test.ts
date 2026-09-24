@@ -23,7 +23,16 @@
  * on a later reopen) and its per-persona retry timers (AC 66: the directory
  * backoff with held credentials, Slack retries launching on recovery, a
  * launch after a retry that fails, combined causes, independence, dry run,
- * cancellation). Time is a fake clock throughout;
+ * cancellation). E5 Task 2 adds the surviving-instance leg of AC 23, AC 24
+ * (SR-6.3, SR-6.4): for every not-up cause the persona's agent-director row
+ * survives the start sweep, the start pass and its retries, and its instance's
+ * MCP registration is refused through the real admission decision while the
+ * healthy persona's is accepted; a directory-broken persona that comes up
+ * reuses its row through the collision ladder and is then admitted; a running
+ * persona refused on reopen has its session dropped, while a reopen in
+ * progress keeps it; the controller's `onLeftUp` fires once per change out of
+ * `up` (never for a persona that was never up, a failing listener logged), and
+ * `describePersonaNotUp` gives the cause text. Time is a fake clock throughout;
  * nothing sleeps (the start-pass cases poll in 1 ms real-time steps only for
  * the real spawn path).
  *
@@ -151,6 +160,10 @@ import {
 } from './test-helpers/slack-stub.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
+  cannedGetResult,
+  cannedListRow,
+  errInstanceIdCollision,
+  errSpawnNotFound,
   installStubSpawnPath,
   makeStubCallLog,
   makeStubClient,
@@ -159,20 +172,44 @@ import {
   type StubSpawnPath,
 } from './test-helpers/agent-director-stub.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
-import type { Persona } from '../src/config.ts'
+import { resolveRealPath, type Persona } from '../src/config.ts'
 import {
+  createNotUpSessionDropper,
   createPersonaBringUpController,
+  describePersonaNotUp,
   type PersonaBringUpController,
+  type PersonaBringUpControllerDeps,
   type PersonaBringUpResultSummary,
+  type PersonaBringUpState,
 } from '../src/persona-bringup-controller.ts'
-import { composePersonaStatusListeners, createPersonaUpFlushListener } from '../src/persona-start.ts'
+import {
+  composePersonaStatusListeners,
+  createPersonaUpFlushListener,
+  createPersonaUpPredicate,
+} from '../src/persona-start.ts'
 import { createPersonaNotifier, type PersonaNotifier } from '../src/persona-notifier.ts'
 import {
+  reconcileOrphans,
   setSessionNotifier,
   spawnForPersona,
   startupSessionManager,
   type StartupSessionManagerResult,
 } from '../src/session-manager.ts'
+import {
+  _resetRegistry,
+  closePendingSession,
+  createPendingSession,
+  decideSessionAdmission,
+  dropPersonaSession,
+  getSessionByPersona,
+  registerMcpSessionId,
+  registerSession,
+  removePendingSession,
+  resolveTransportForRequest,
+  unregisterByMcpSessionId,
+  type SessionAdmission,
+  type SessionEntry,
+} from '../src/registry.ts'
 import { _resetOutageState, getOutageFlags, initOutageState } from '../src/outage-state.ts'
 import { getClient } from '../src/agent-director-client.ts'
 import { _resetBackoffState, getFailureCount } from '../src/backoff.ts'
@@ -2893,6 +2930,13 @@ interface BringUpFixtureOptions {
   launch?: (persona: Persona) => Promise<unknown>
   /** Runs once the manager's `bringUp` for a persona resolved, before the controller sees the result. */
   afterSlackBringUp?: (persona: Persona) => void
+  /**
+   * Wire the controller's `onLeftUp` as server.ts does: `createNotUpSessionDropper` over the
+   * real `dropPersonaSession`, logging to `h.lines`.
+   */
+  dropSessions?: boolean
+  /** The controller's `onLeftUp` itself (instead of `dropSessions`). */
+  onLeftUp?: PersonaBringUpControllerDeps['onLeftUp']
 }
 
 /**
@@ -2944,6 +2988,9 @@ function makeBringUpFixture(opts: BringUpFixtureOptions = {}): BringUpFixture {
       if (opts.launch) return opts.launch(persona)
       return opts.spawn ? spawnForPersona(persona, h.config!, false) : undefined
     },
+    ...(opts.dropSessions
+      ? { onLeftUp: createNotUpSessionDropper({ drop: dropPersonaSession, log: line => void h.lines.push(line) }) }
+      : { onLeftUp: opts.onLeftUp }),
   })
   h.onStatus = composePersonaStatusListeners(
     createPersonaUpFlushListener(notifier),
@@ -3050,6 +3097,7 @@ describe('bring-up outcomes (E5)', () => {
     console.error = (...args: unknown[]) => void consoleLines.push(args.map(String).join(' '))
     ad = installStubSpawnPath(join(dir, 'home'))
     _resetBackoffState()
+    _resetRegistry()
     sessionNotices = []
     outageNotices = []
     // Recorded, and routed through the running test's notifier so any post would reach a stub.
@@ -3079,6 +3127,7 @@ describe('bring-up outcomes (E5)', () => {
     setSessionNotifier(undefined)
     _resetOutageState()
     _resetBackoffState()
+    _resetRegistry()
     if (savedStateDir === undefined) delete process.env['SLACK_STATE_DIR']
     else process.env['SLACK_STATE_DIR'] = savedStateDir
   })
@@ -3101,67 +3150,234 @@ describe('bring-up outcomes (E5)', () => {
   // The start pass (AC 23, AC 24)
   // -------------------------------------------------------------------------
 
-  describe('the start pass: one broken persona per cause beside a healthy one (AC 23, AC 24)', () => {
-    /** Push `outcome` enough times that every retry in the test's hour of fake time fails too. */
-    const always = <T>(queue: T[], outcome: T) => { for (let i = 0; i < 60; i++) queue.push(outcome) }
-    const credentialsPath = (p: Persona) => p.credentials_file
-    const directoryPath = (p: Persona) => p.working_directory
+  /** Push `outcome` enough times that every retry in the test's hour of fake time fails too. */
+  const always = <T>(queue: T[], outcome: T) => { for (let i = 0; i < 60; i++) queue.push(outcome) }
+  const credentialsPath = (p: Persona) => p.credentials_file
+  const directoryPath = (p: Persona) => p.working_directory
 
-    // Rows: label, A's outcome, A's class, the path its line names, the arrangement, when the
-    // manager abandons A's first attempt (0: it ends at once), and whether A may get a Slack client.
-    test.each<[string, 'broken' | 'retrying', string, (p: Persona) => string, (f: BringUpFixture, a: Persona) => void, number, boolean]>([
-      ['credentials missing', 'broken', PERSONA_CREDENTIALS_MISSING, credentialsPath, (_f, a) => rmSync(a.credentials_file), 0, false],
-      [
-        'credentials unreadable',
-        'broken',
-        PERSONA_CREDENTIALS_UNREADABLE,
+  // One not-up cause per row, shared by the start-pass table and the surviving-instance table.
+  // Rows: label, A's outcome, A's class, the path its line names, the arrangement, when the
+  // manager abandons A's first attempt (0: it ends at once), and whether A may get a Slack client.
+  const NOT_UP_CAUSES: [string, 'broken' | 'retrying', string, (p: Persona) => string, (f: BringUpFixture, a: Persona) => void, number, boolean][] = [
+    ['credentials missing', 'broken', PERSONA_CREDENTIALS_MISSING, credentialsPath, (_f, a) => rmSync(a.credentials_file), 0, false],
+    [
+      'credentials unreadable',
+      'broken',
+      PERSONA_CREDENTIALS_UNREADABLE,
+      credentialsPath,
+      (f, a) => {
+        f.fsOverride.openFile = path => (path === a.credentials_file ? failsWith('EACCES')() : DEFAULT_CREDENTIALS_FS.openFile(path))
+      },
+      0,
+      false,
+    ],
+    [
+      'credentials locally invalid (a bot token with the wrong prefix)',
+      'broken',
+      PERSONA_CREDENTIALS_INVALID,
+      credentialsPath,
+      (_f, a) => void writeCredentialsFile(dir, relative(dir, a.credentials_file), { bot_token: fakeToken('xoxz-') }),
+      0,
+      false,
+    ],
+    [
+      'credentials refused by Slack (invalid_auth)',
+      'broken',
+      PERSONA_CREDENTIALS_REFUSED,
+      credentialsPath,
+      (f, a) => void f.h.stub(a).script.authTest.push({ kind: 'platform', error: 'invalid_auth' }),
+      0,
+      true,
+    ],
+    ['working directory missing', 'retrying', PERSONA_DIRECTORY_MISSING, directoryPath, (_f, a) => breakDirectory(a.working_directory, 'missing'), 0, false],
+    ['working directory unusable (a regular file)', 'retrying', PERSONA_DIRECTORY_UNUSABLE, directoryPath, (_f, a) => breakDirectory(a.working_directory, 'unusable'), 0, false],
+    ['Slack unreachable at auth.test', 'retrying', PERSONA_SLACK_UNREACHABLE, credentialsPath, (f, a) => always(f.h.stub(a).script.authTest, { kind: 'network' }), 0, true],
+    ['auth.test never answers (abandoned at the manager’s 10 s bound)', 'retrying', PERSONA_SLACK_UNREACHABLE, credentialsPath, (f, a) => always<WebApiOutcome>(f.h.stub(a).script.authTest, { kind: 'never' }), 10_000, true],
+    // The manager-level rows whose apps.connections.open answers at once: Slack-unreachable, never broken.
+    ...UNREACHABLE_CONNECT_LEGS.filter(([, , openAnswersAfterMs]) => openAnswersAfterMs === 0).map(
+      ([label, connect, , abandonAtMs]): [string, 'retrying', string, (p: Persona) => string, (f: BringUpFixture, a: Persona) => void, number, boolean] => [
+        label,
+        'retrying',
+        PERSONA_SLACK_UNREACHABLE,
         credentialsPath,
-        (f, a) => {
-          f.fsOverride.openFile = path => (path === a.credentials_file ? failsWith('EACCES')() : DEFAULT_CREDENTIALS_FS.openFile(path))
-        },
-        0,
-        false,
-      ],
-      [
-        'credentials locally invalid (a bot token with the wrong prefix)',
-        'broken',
-        PERSONA_CREDENTIALS_INVALID,
-        credentialsPath,
-        (_f, a) => void writeCredentialsFile(dir, relative(dir, a.credentials_file), { bot_token: fakeToken('xoxz-') }),
-        0,
-        false,
-      ],
-      [
-        'credentials refused by Slack (invalid_auth)',
-        'broken',
-        PERSONA_CREDENTIALS_REFUSED,
-        credentialsPath,
-        (f, a) => void f.h.stub(a).script.authTest.push({ kind: 'platform', error: 'invalid_auth' }),
-        0,
+        (f, a) => always<ConnectOutcome>(f.h.stub(a).script.connect, connect),
+        abandonAtMs,
         true,
       ],
-      ['working directory missing', 'retrying', PERSONA_DIRECTORY_MISSING, directoryPath, (_f, a) => breakDirectory(a.working_directory, 'missing'), 0, false],
-      ['working directory unusable (a regular file)', 'retrying', PERSONA_DIRECTORY_UNUSABLE, directoryPath, (_f, a) => breakDirectory(a.working_directory, 'unusable'), 0, false],
-      ['Slack unreachable at auth.test', 'retrying', PERSONA_SLACK_UNREACHABLE, credentialsPath, (f, a) => always(f.h.stub(a).script.authTest, { kind: 'network' }), 0, true],
-      ['auth.test never answers (abandoned at the manager’s 10 s bound)', 'retrying', PERSONA_SLACK_UNREACHABLE, credentialsPath, (f, a) => always<WebApiOutcome>(f.h.stub(a).script.authTest, { kind: 'never' }), 10_000, true],
-      // The manager-level rows whose apps.connections.open answers at once: Slack-unreachable, never broken.
-      ...UNREACHABLE_CONNECT_LEGS.filter(([, , openAnswersAfterMs]) => openAnswersAfterMs === 0).map(
-        ([label, connect, , abandonAtMs]): [string, 'retrying', string, (p: Persona) => string, (f: BringUpFixture, a: Persona) => void, number, boolean] => [
-          label,
-          'retrying',
-          PERSONA_SLACK_UNREACHABLE,
-          credentialsPath,
-          (f, a) => always<ConnectOutcome>(f.h.stub(a).script.connect, connect),
-          abandonAtMs,
-          true,
-        ],
-      ),
-    ])('AC 23, AC 24: %s — A ends %s; B is up, launched and serving; A is not launched; nothing is posted, now or after later retries', async (_label, outcome, cls, pathOf, arrange, abandonAtMs, slackBuilt) => {
+    ),
+  ]
+
+  // -------------------------------------------------------------------------
+  // A not-up persona's surviving instance (AC 23, AC 24; b.av2 SR-6.3, SR-6.4)
+  //
+  // The agent-director stub holds rows (`holdRows`), the start sweep and the start pass run as
+  // server.ts runs them, and each MCP registration goes through the real `decideSessionAdmission`
+  // with the production up check (`createPersonaUpPredicate` over the manager and the controller).
+  // `connectSession` stands in for server.ts's initialized handler, which cannot be imported: it
+  // promotes an admitted session, and disconnects a refused one through the real
+  // `closePendingSession`, as that handler does.
+  // -------------------------------------------------------------------------
+
+  /** A row of a persona absent from the config: the sweep's control, which it must remove. */
+  const ORPHAN_ID = 'cscb_gone'
+  /** The rows the agent-director stub holds, by instance ID (see holdRows). */
+  let rows: Map<string, { list: ReturnType<typeof cannedListRow>; get: ReturnType<typeof cannedGetResult> }>
+  let sessionSeq = 0
+
+  const idOf = (persona: Persona) => `cscb_${persona.key}`
+  const spawnHome = () => join(dir, 'home')
+
+  /**
+   * Make the test's agent-director stub hold `rows` (emptied here): a spawn of an instance that has
+   * a row collides, `get` returns the row, `list` lists every row and `delete` removes one. Every
+   * call is still recorded in `ad.calls`.
+   */
+  function holdRows(): void {
+    rows = new Map()
+    const { client } = ad
+    const spawn = client.spawn.bind(client)
+    const get = client.get.bind(client)
+    const list = client.list.bind(client)
+    const del = client.delete.bind(client)
+    client.spawn = async params => {
+      const result = await spawn(params)
+      if (rows.has(String(params.claude_instance_id))) throw errInstanceIdCollision()
+      return result
+    }
+    client.get = async params => {
+      await get(params)
+      const row = rows.get(params.claude_instance_id)
+      if (!row) throw errSpawnNotFound()
+      return row.get
+    }
+    client.list = async params => {
+      await list(params)
+      return { spawns: [...rows.values()].map(row => row.list) }
+    }
+    client.delete = async params => {
+      const result = await del(params)
+      for (const id of params.claude_instance_id) rows.delete(id)
+      return result
+    }
+  }
+
+  /** Give `persona` a surviving row, as its spawn wrote it unless `cwd` says otherwise, and add the orphan. */
+  function addSurvivingRow(persona: Persona, state: 'waiting' | 'ended', cwd = persona.working_directory): void {
+    rows.set(idOf(persona), {
+      list: cannedListRow({ state, cwd }, persona, spawnHome()),
+      get: cannedGetResult({ state, cwd }, persona, spawnHome()),
+    })
+    rows.set(ORPHAN_ID, { list: cannedListRow({ claude_instance_id: ORPHAN_ID }), get: cannedGetResult({ claude_instance_id: ORPHAN_ID }) })
+  }
+
+  /** The agent-director calls addressing instance `id`, counted by verb; verbs with none are left out. */
+  function adCallsFor(id: string): Record<string, number> {
+    const out: Record<string, number> = {}
+    for (const [verb, calls] of Object.entries(ad.calls)) {
+      const n = (calls as { claude_instance_id?: unknown }[]).filter(call => [call.claude_instance_id].flat().includes(id)).length
+      if (n > 0) out[verb.replace(/Calls$/, '')] = n
+    }
+    return out
+  }
+
+  /** The sweep's lines deferring a persona's `cwd` check. */
+  const deferredLines = () => consoleLines.filter(line => line.includes('the cwd check is deferred to its launch'))
+
+  /** Run the start sweep, then the start pass, as server.ts does. */
+  async function sweepAndStart(f: BringUpFixture): Promise<StartupSessionManagerResult> {
+    await reconcileOrphans(f.h.config!)
+    return startupSessionManager(f.h.config!, { bringUp: f.controller })
+  }
+
+  /**
+   * A transport that counts its closes. Closing one runs `unregisterByMcpSessionId`, as server.ts's
+   * `onsessionclosed` and SSE abort do, and records the persona key it found: server.ts restarts
+   * that persona, so an undefined entry means nothing would be restarted. `steps` records, in
+   * order, the pending-entry removal and keep-alive stop `closePendingSession` asked for, and each close.
+   */
+  interface FakeTransport {
+    sessionId: string
+    closes: number
+    unregisteredOnClose: (string | undefined)[]
+    steps: string[]
+    handleRequest(): void
+    close(): Promise<void>
+  }
+
+  /** One MCP session from `rootsPath`: its admission, its transport and, when admitted, its registered entry. */
+  interface FakeSession {
+    admission: SessionAdmission
+    transport: FakeTransport
+    entry: SessionEntry | undefined
+  }
+
+  /**
+   * Connect an MCP session whose roots working directory is `rootsPath` and admit or refuse it, as
+   * server.ts's initialized handler does: an admitted one is promoted and mapped; a refused one goes
+   * through the real `closePendingSession`, with the real pending-entry removal and a recording keep-alive stop.
+   */
+  async function connectSession(f: BringUpFixture, rootsPath: string): Promise<FakeSession> {
+    const id = `mcp-session-${++sessionSeq}`
+    const transport: FakeTransport = {
+      sessionId: id,
+      closes: 0,
+      unregisteredOnClose: [],
+      steps: [],
+      handleRequest: () => {},
+      close: async () => {
+        transport.closes++
+        transport.steps.push('close')
+        transport.unregisteredOnClose.push(unregisterByMcpSessionId(id))
+      },
+    }
+    createPendingSession(id, transport as never, {} as never)
+    const admission = decideSessionAdmission(rootsPath, f.h.config!.personas, {
+      isPersonaUp: createPersonaUpPredicate(f.h.manager, f.controller),
+      describeNotUp: key => describePersonaNotUp(f.controller.state(key)),
+      log: line => void f.h.lines.push(line),
+    })
+    if (admission.kind === 'admitted') {
+      registerSession(resolveRealPath(rootsPath), admission.persona.key, id)
+      registerMcpSessionId(id, admission.persona.key)
+      return { admission, transport, entry: getSessionByPersona(admission.persona.key) }
+    }
+    await closePendingSession(id, transport, {
+      removePending: pendingId => {
+        transport.steps.push(`removePending ${pendingId}`)
+        removePendingSession(pendingId)
+      },
+      stopKeepAlive: stopped => void transport.steps.push(stopped === transport ? 'stopKeepAlive' : 'stopKeepAlive (another transport)'),
+    })
+    return { admission, transport, entry: undefined }
+  }
+
+  /** What disconnecting a refused session did to its transport, in order. */
+  const refusedSteps = (session: FakeSession) => [`removePending ${session.transport.sessionId}`, 'stopKeepAlive', 'close']
+
+  /** The session an HTTP request carrying MCP session ID `id` is routed to, if any. */
+  const routedTo = (session: FakeSession) =>
+    resolveTransportForRequest(new Request('http://127.0.0.1/mcp', { headers: { 'mcp-session-id': session.transport.sessionId } }))
+
+  /** The session-refused lines naming `persona`. */
+  const refusalsOf = (f: BringUpFixture, persona: Persona) => linesOf(f, persona).filter(line => line.startsWith('[slack] Session refused: '))
+
+  describe('the start pass: one broken persona per cause beside a healthy one (AC 23, AC 24)', () => {
+    test.each(NOT_UP_CAUSES)('AC 23, AC 24: %s — A ends %s and keeps its surviving agent-director row through the sweep, the pass and its retries; B is up, launched and serving; A is not launched; A’s instance’s MCP registration is refused while B’s is admitted; nothing is posted, now or after later retries', async (_label, outcome, cls, pathOf, arrange, abandonAtMs, slackBuilt) => {
+      holdRows()
       const f = makeBringUpFixture({ spawn: true })
       const [a, b] = f.personas as [Persona, Persona]
       arrange(f, a)
+      addSurvivingRow(a, 'waiting')
       // A notice raised for A before the pass is held; it must never be posted.
       await f.notifier.notify(a.key, 'held notice for A')
+
+      // The start sweep removes its control row and nothing of A's; A's cwd check is deferred
+      // only when its working directory has no real path.
+      await reconcileOrphans(f.h.config!)
+      expect(adCallsFor(ORPHAN_ID)).toEqual({ kill: 1, delete: 1 })
+      expect([...rows.keys()]).toEqual([idOf(a)])
+      expect(deferredLines()).toEqual(existsSync(a.working_directory) ? [] : [expect.stringContaining(renderPersonaRef(a.name, a.key))])
+
       let result: StartupSessionManagerResult | undefined
       const pass = startupSessionManager(f.h.config!, { bringUp: f.controller }).then(r => (result = r))
 
@@ -3191,12 +3407,36 @@ describe('bring-up outcomes (E5)', () => {
       await expectServes(f, b)
       if (!slackBuilt) expect(f.h.slack.buildsOf(a.key)).toEqual([])
 
-      // Well past A's later retries: still not up, never launched, nothing posted.
+      // A's surviving instance registers and is refused (the pending entry removed, the keep-alive
+      // stopped, the transport closed; never promoted or routed); B's is admitted.
+      const fromA = await connectSession(f, a.working_directory)
+      const fromB = await connectSession(f, b.working_directory)
+      expect(fromA.admission).toEqual({ kind: 'not-up', persona: a })
+      expect(fromA.transport.steps).toEqual(refusedSteps(fromA))
+      expect(getSessionByPersona(a.key)).toBeUndefined()
+      expect(routedTo(fromA)).toBeUndefined()
+      expect(fromB.admission).toEqual({ kind: 'admitted', persona: b })
+      expect(fromB.entry).toMatchObject({ personaKey: b.key, connected: true, transport: fromB.transport })
+      expect(routedTo(fromB)).toBe(fromB.entry!)
+      expect(fromB.transport.steps).toEqual([])
+      const refusals = refusalsOf(f, a)
+      expect(refusals).toHaveLength(1)
+      expect(refusals[0]).toContain(`is not up (${outcome}: `)
+      expect(refusalsOf(f, b)).toEqual([])
+
+      // Well past A's later retries: still not up, never launched, nothing posted; its row is
+      // still there, untouched, and its instance is still refused.
       await f.h.clock.advance(HOUR_MS)
       expect(f.controller.state(a.key)?.outcome).toBe(outcome)
       expect(spawnedIds()).toEqual([`cscb_${b.key}`])
       expect(f.launches).toEqual([])
       if (!slackBuilt) expect(f.h.slack.buildsOf(a.key)).toEqual([])
+      const later = await connectSession(f, a.working_directory)
+      expect(later.admission.kind).toBe('not-up')
+      expect(getSessionByPersona(a.key)).toBeUndefined()
+      expect(getSessionByPersona(b.key)).toBe(fromB.entry!)
+      expect(adCallsFor(idOf(a))).toEqual({})
+      expect([...rows.keys()]).toEqual([idOf(a)])
       await expectServes(f, b)
       expect(slackCallsBesidesAuthTest(f)).toEqual([])
       expect(sessionNotices).toEqual([])
@@ -3208,7 +3448,7 @@ describe('bring-up outcomes (E5)', () => {
       expect(classLines[0]).toContain('personas[0]')
       expect(classLines[0]).toContain(JSON.stringify(pathOf(a)))
       expect(existsSync(startupErrorsLog())).toBe(false)
-      assertNoLeak(f.captured({ result, consoleLines }))
+      assertNoLeak(f.captured({ result, consoleLines, admissions: [fromA.admission, fromB.admission, later.admission] }))
     })
 
     test('AC 23, AC 24: the start pass returns while A is still retrying (its start() never settled), B’s launch did not wait for A, and A is launched from its own retry once Slack answers', async () => {
@@ -3316,6 +3556,257 @@ describe('bring-up outcomes (E5)', () => {
       expect(refused[0]).toContain(`path=${JSON.stringify(a.credentials_file)}`)
       expect(slackCallsBesidesAuthTest(f)).toEqual([])
       assertNoLeak(f.captured())
+    })
+  })
+
+  // The surviving instance after its persona recovers or stops being up (the helpers are above the
+  // start pass, whose per-cause table covers the row surviving and the instance being refused).
+  describe('a not-up persona’s surviving instance (AC 23, AC 24)', () => {
+    beforeEach(() => holdRows())
+
+    // Rows: the row's state, how the row spells A's directory, what the ladder does with it and
+    // the calls it makes for A's instance (the spawn is the one that collides with the row).
+    test.each<[string, 'waiting' | 'ended', 'configured' | 'old symlink target', 'reconnected' | 'resumed', Record<string, number>]>([
+      ['a waiting row is reconnected', 'waiting', 'configured', 'reconnected', { spawn: 1, get: 1, sendKeys: 1 }],
+      // The status read is the resumed instance's dialog check.
+      ['an ended row is resumed', 'ended', 'configured', 'resumed', { spawn: 1, get: 1, resume: 1, status: 1 }],
+      ['a waiting row recorded under the target of a working_directory symlink that now dangles is reconnected', 'waiting', 'old symlink target', 'reconnected', { spawn: 1, get: 1, sendKeys: 1 }],
+    ])('AC 23, AC 24: a directory-broken persona’s surviving row is kept, and once its directory exists it comes up with no confirmation and its launch reuses the row — %s, with no kill, delete or fresh spawn; its instance, refused while it retried, is then admitted', async (_label, state, spelling, action, reuseCalls) => {
+      let launched: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+      const f: BringUpFixture = makeBringUpFixture({
+        dropSessions: true,
+        // The controller's launch after the retry, through the real ladder (as server.ts's launch).
+        launch: async persona => (launched = await spawnForPersona(persona, f.h.config!, false)),
+      })
+      const [a, b] = f.personas as [Persona, Persona]
+      // The instance's own directory: the configured path, or the real directory a symlink pointed at.
+      const instanceDir = spelling === 'configured' ? a.working_directory : join(dir, 'moved', a.key)
+      rmSync(a.working_directory, { recursive: true, force: true })
+      if (spelling === 'old symlink target') symlinkSync(instanceDir, a.working_directory)
+      addSurvivingRow(a, state, instanceDir)
+
+      const result = await sweepAndStart(f)
+
+      expect(result.perPersona.find(p => p.key === a.key)).toMatchObject({ action: 'not-brought-up', outcome: 'retrying' })
+      expect(adCallsFor(idOf(a))).toEqual({})
+      expect(adCallsFor(ORPHAN_ID)).toEqual({ kill: 1, delete: 1 })
+      expect(deferredLines()).toEqual([expect.stringContaining(renderPersonaRef(a.name, a.key))])
+      // While A retries, a registration from its configured directory is refused.
+      const whileRetrying = await connectSession(f, a.working_directory)
+      expect(whileRetrying.admission).toEqual({ kind: 'not-up', persona: a })
+      expect(whileRetrying.transport.steps).toEqual(refusedSteps(whileRetrying))
+      expect(routedTo(whileRetrying)).toBeUndefined()
+
+      mkdirSync(instanceDir, { recursive: true })
+      await f.h.clock.advance(5_000)
+
+      expect(f.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+      expect(f.launches).toEqual([a.key])
+      await waitForReal(() => launched !== undefined)
+      expect(launched).toEqual({ key: a.key, action })
+      expect(adCallsFor(idOf(a))).toEqual(reuseCalls)
+      expect([...rows.keys()]).toEqual([idOf(a)])
+      expect(spawnedIds()).toEqual([idOf(b), idOf(a)])
+      expect(getOutageFlags(a.key).has('cwd-unreachable')).toBe(false)
+
+      // The instance registers again from its own directory, with no restart of anything.
+      const afterUp = await connectSession(f, instanceDir)
+      expect(afterUp.admission).toEqual({ kind: 'admitted', persona: a })
+      expect(afterUp.entry).toMatchObject({ personaKey: a.key, cwd: realpathSync(instanceDir), connected: true })
+      expect(routedTo(afterUp)).toBe(afterUp.entry!)
+      expect(refusalsOf(f, a)).toHaveLength(1)
+      expect(slackCallsBesidesAuthTest(f)).toEqual([])
+      expect(sessionNotices).toEqual([])
+      expect(outageNotices).toEqual([])
+      await expectServes(f, a)
+      await expectServes(f, b)
+      assertNoLeak(f.captured({ result, launched, consoleLines, admissions: [whileRetrying.admission, afterUp.admission] }))
+    })
+
+    test('AC 23, AC 24: a running persona whose reopen is refused (token_revoked) has its MCP session dropped — entry and session-ID mapping removed, transport closed with nothing left to restart — while B’s session is unchanged; no agent-director call, restart or post; its next registration is refused', async () => {
+      const f = makeBringUpFixture({ dropSessions: true })
+      const [a, b] = f.personas as [Persona, Persona]
+      await bringUpEach(f)
+      const fromA = await connectSession(f, a.working_directory)
+      const fromB = await connectSession(f, b.working_directory)
+      expect([fromA.admission.kind, fromB.admission.kind]).toEqual(['admitted', 'admitted'])
+      f.h.stub(a).script.connect.push({ kind: 'platform', error: 'token_revoked' })
+
+      f.h.stub(a).socket.drop()
+      // Lost and being reopened, A is still up and keeps its session.
+      expect(f.h.manager.status(a.key)).toEqual({ state: 'lost' })
+      expect(getSessionByPersona(a.key)).toBe(fromA.entry!)
+      await f.h.clock.flush()
+
+      expect(f.controller.state(a.key)?.outcome).toBe('broken')
+      expect(getSessionByPersona(a.key)).toBeUndefined()
+      expect(routedTo(fromA)).toBeUndefined()
+      expect(fromA.entry!.connected).toBe(false)
+      expect(fromA.transport.closes).toBe(1)
+      expect(fromA.transport.unregisteredOnClose).toEqual([undefined])
+      expect(getSessionByPersona(b.key)).toBe(fromB.entry!)
+      expect(fromB.entry!.connected).toBe(true)
+      expect(routedTo(fromB)).toBe(fromB.entry!)
+      expect(fromB.transport.closes).toBe(0)
+      expect(f.h.lines.filter(line => line.includes('MCP session dropped'))).toEqual([
+        `[slack] persona ${renderPersonaRef(a.name, a.key)}: MCP session dropped — the persona is not up ` +
+          `(broken: ${f.controller.state(a.key)!.causes.slack!.cause}); its instance and agent-director row are kept`,
+      ])
+      expect(ad.callCount()).toBe(0)
+      expect(getFailureCount(a.key)).toBe(0)
+
+      // Meanwhile its instance's next registration is refused, and B is unaffected throughout.
+      const again = await connectSession(f, a.working_directory)
+      expect(again.admission).toEqual({ kind: 'not-up', persona: a })
+      await f.h.clock.advance(HOUR_MS)
+      expect(f.controller.state(a.key)?.outcome).toBe('broken')
+      expect(getSessionByPersona(a.key)).toBeUndefined()
+      expect(getSessionByPersona(b.key)).toBe(fromB.entry!)
+      expect(f.h.lines.filter(line => line.includes('MCP session dropped'))).toHaveLength(1)
+      expect(ad.callCount()).toBe(0)
+      expect(slackCallsBesidesAuthTest(f)).toEqual([])
+      expect(sessionNotices).toEqual([])
+      await expectServes(f, b)
+      assertNoLeak(f.captured({ consoleLines, admissions: [fromA.admission, fromB.admission, again.admission] }))
+    })
+
+    test.each<[string, ConnectOutcome[], 'lost' | 'retrying' | 'up']>([
+      ['is still in flight (lost; its WebSocket never reaches hello)', [{ kind: 'never' }], 'lost'],
+      ['is still retrying (Slack unreachable)', [{ kind: 'network' }], 'retrying'],
+      ['succeeds', [], 'up'],
+    ])('AC 23, AC 24: a running persona whose reopen %s stays up and keeps its registered MCP session; nothing is dropped', async (_label, reopen, state) => {
+      const f = makeBringUpFixture({ dropSessions: true })
+      const [a, b] = f.personas as [Persona, Persona]
+      await bringUpEach(f)
+      const fromA = await connectSession(f, a.working_directory)
+      const fromB = await connectSession(f, b.working_directory)
+      f.h.stub(a).script.connect.push(...reopen)
+
+      f.h.stub(a).socket.drop()
+      await f.h.clock.flush()
+
+      expect(f.h.manager.status(a.key)).toMatchObject({ state })
+      expect(f.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+      for (const session of [fromA, fromB]) {
+        expect(getSessionByPersona(session.entry!.personaKey)).toBe(session.entry!)
+        expect(session.entry!.connected).toBe(true)
+        expect(routedTo(session)).toBe(session.entry!)
+        expect(session.transport.closes).toBe(0)
+      }
+      await f.h.clock.advance(HOUR_MS)
+      expect(f.h.manager.status(a.key)).toMatchObject({ state: 'up' })
+      expect(getSessionByPersona(a.key)).toBe(fromA.entry!)
+      expect(fromA.transport.closes).toBe(0)
+      expect(f.h.lines.filter(line => line.includes('MCP session dropped'))).toEqual([])
+      expect(ad.callCount()).toBe(0)
+      await expectServes(f, a)
+      await expectServes(f, b)
+      assertNoLeak(f.captured({ consoleLines }))
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Leaving up (b.av2 SR-6.3, SR-6.4): the controller's `onLeftUp` listener and
+  // the not-up description used by the refusal and drop lines
+  // -------------------------------------------------------------------------
+
+  describe('leaving up: onLeftUp and describePersonaNotUp', () => {
+    /** A recording `onLeftUp`: the key and state of each call, in order. */
+    function recordLeftUp() {
+      const calls: [string, PersonaBringUpState][] = []
+      return { calls, onLeftUp: (persona: Persona, state: PersonaBringUpState) => void calls.push([persona.key, state]) }
+    }
+
+    /** Bring A and B up, then refuse A's reopen (token_revoked): A goes from up to broken. */
+    async function upThenRefusedReopen(f: BringUpFixture): Promise<void> {
+      const [a] = f.personas as [Persona, Persona]
+      await bringUpEach(f)
+      expect(f.controller.state(a.key)?.outcome).toBe('up')
+      f.h.stub(a).script.connect.push({ kind: 'platform', error: 'token_revoked' })
+      f.h.stub(a).socket.drop()
+      await f.h.clock.flush()
+      expect(f.controller.state(a.key)?.outcome).toBe('broken')
+    }
+
+    test('a persona that is never up is never reported: A retrying (Slack unreachable), then broken (invalid_auth) at its retry, makes no onLeftUp call; neither does B, up throughout', async () => {
+      const { calls, onLeftUp } = recordLeftUp()
+      const f = makeBringUpFixture({
+        slack: { [OUTCOME_A]: { authTest: [{ kind: 'network' }, { kind: 'platform', error: 'invalid_auth' }] } },
+        onLeftUp,
+      })
+      const [a, b] = f.personas as [Persona, Persona]
+
+      await bringUpEach(f)
+      expect(f.controller.state(a.key)?.outcome).toBe('retrying')
+      await f.h.clock.advance(5_000)
+
+      expect(f.controller.state(a.key)?.outcome).toBe('broken')
+      expect(f.controller.state(b.key)?.outcome).toBe('up')
+      expect(calls).toEqual([])
+      assertNoLeak(f.captured({ calls }))
+    })
+
+    test('A up, then broken on a refused reopen: onLeftUp is called exactly once, with A and outcome broken and its Slack cause, however many status events follow; B is never reported', async () => {
+      const { calls, onLeftUp } = recordLeftUp()
+      const f = makeBringUpFixture({ onLeftUp })
+      const [a] = f.personas as [Persona, Persona]
+
+      await upThenRefusedReopen(f)
+      expect(calls).toEqual([
+        [a.key, { outcome: 'broken', causes: { slack: expect.objectContaining({ step: 'slack', class: PERSONA_CREDENTIALS_REFUSED }) } }],
+      ])
+
+      // More status events while A stays broken: its status delivered again, and an hour of fake time.
+      for (let i = 0; i < 3; i++) f.controller.onConnectionStatus(a.key, f.h.manager.status(a.key)!)
+      await f.h.clock.advance(HOUR_MS)
+
+      expect(f.controller.state(a.key)?.outcome).toBe('broken')
+      expect(calls.map(([key, state]) => [key, state.outcome])).toEqual([[a.key, 'broken']])
+      assertNoLeak(f.captured({ calls }))
+    })
+
+    const LISTENER_ERROR = new Error('the onLeftUp listener failed')
+    test.each<[string, () => unknown]>([
+      ['throws', () => { throw LISTENER_ERROR }],
+      ['rejects', async () => { throw LISTENER_ERROR }],
+    ])('an onLeftUp listener that %s is logged once, naming A and the change, and leaves no unhandled rejection; A stays broken and B still serves', async (_label, onLeftUp) => {
+      const f = makeBringUpFixture({ onLeftUp })
+      const [a, b] = f.personas as [Persona, Persona]
+
+      await upThenRefusedReopen(f)
+      await f.h.clock.flush()
+
+      expect(f.h.lines.filter(line => line.includes('handling its change from up to'))).toEqual([
+        `[slack] persona ${renderPersonaRef(a.name, a.key)}: handling its change from up to broken failed: ${describeThrownValue(LISTENER_ERROR)}`,
+      ])
+      expect(f.controller.state(a.key)?.outcome).toBe('broken')
+      await expectServes(f, b)
+      assertNoLeak(f.captured())
+    })
+
+    const failure = (step: 'credentials' | 'working-directory' | 'slack', cause: string) => ({ step, class: `class of ${step}`, cause })
+    test.each<[string, PersonaBringUpState | undefined, string]>([
+      ['no state (the controller never brought it up, or it was cancelled)', undefined, 'its bring-up has not run'],
+      ['no outcome yet (its first Slack attempt in flight)', { outcome: undefined, causes: {} }, 'its Slack connection is not serving'],
+      ['bring-up up (only its connection is not serving)', { outcome: 'up', causes: {} }, 'its Slack connection is not serving'],
+      ['broken with no cause', { outcome: 'broken', causes: {} }, 'broken'],
+      ['retrying with no cause', { outcome: 'retrying', causes: {} }, 'retrying'],
+      [
+        'broken with every cause: credentials first',
+        {
+          outcome: 'broken',
+          causes: { credentials: failure('credentials', 'file missing'), directory: failure('working-directory', 'dir missing'), slack: failure('slack', 'refused') },
+        },
+        'broken: file missing',
+      ],
+      [
+        'retrying with directory and Slack causes: directory first',
+        { outcome: 'retrying', causes: { directory: failure('working-directory', 'dir missing'), slack: failure('slack', 'unreachable') } },
+        'retrying: dir missing',
+      ],
+      ['retrying with a Slack cause only', { outcome: 'retrying', causes: { slack: failure('slack', 'unreachable') } }, 'retrying: unreachable'],
+    ])('describePersonaNotUp: %s', (_label, state, expected) => {
+      expect(describePersonaNotUp(state)).toBe(expected)
     })
   })
 

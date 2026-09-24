@@ -20,6 +20,12 @@
  *     out of every tick; once the manager's retry brings it up, the
  *     controller launches it from that retry and the next tick schedules it.
  *
+ * Also covers `createPersonaUpPredicate` (src/persona-start.ts), the "is this
+ * persona up" query the permission poller, `/interject` and the MCP admission
+ * decision get: its truth table over every connection status crossed with the
+ * bring-up outcome, and, row by row, the same answer as the gate over the same
+ * status and outcome, so the two cannot drift.
+ *
  * Also covers `composePersonaStatusListeners` (src/persona-start.ts): every
  * listener runs even when an earlier one throws or rejects, the result waits
  * for every listener to settle (even after one has failed), and it rejects
@@ -46,7 +52,7 @@ import { _resetHealthCheckState, buildPersonaWorkList, initHealthCheck, startHea
 import { _resetOutageState, getOutageFlags, initOutageState } from '../src/outage-state.ts'
 import { createPersonaBringUpController, type PersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import type { PersonaConnectionManager, PersonaConnectionStatus, PersonaStatusListener } from '../src/persona-connections.ts'
-import { composePersonaStatusListeners, createPersonaRelaunchGate } from '../src/persona-start.ts'
+import { composePersonaStatusListeners, createPersonaRelaunchGate, createPersonaUpPredicate } from '../src/persona-start.ts'
 import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
 import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 
@@ -198,6 +204,46 @@ describe('createPersonaRelaunchGate: true only while the persona\'s connection i
       bringUpLine('persona_a'),
     ])
     assertNoLeak({ lines })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The up predicate: its truth table, and the gate's answer on every row
+// ---------------------------------------------------------------------------
+
+describe('createPersonaUpPredicate: up while the connection is serving and the bring-up outcome is up, the same answer as the gate', () => {
+  // Every connection status, with whether it is serving (up, lost, or retrying a reopen).
+  const STATUSES: Array<[string, PersonaConnectionStatus | undefined, boolean]> = [
+    ['up', UP, true],
+    ['lost', { state: 'lost' }, true],
+    ['retrying a reopen', { state: 'retrying', phase: 'reopen', outcome: UNREACHABLE, retryInMs: 5_000, nextAttemptAt: 5_000 }, true],
+    ['retrying its bring-up', { state: 'retrying', phase: 'bring-up', outcome: UNREACHABLE, retryInMs: 5_000, nextAttemptAt: 5_000 }, false],
+    ['broken at bring-up', { state: 'broken', phase: 'bring-up', outcome: REFUSED }, false],
+    ['broken at a reopen', { state: 'broken', phase: 'reopen', outcome: REFUSED }, false],
+    ['connecting', CONNECTING, false],
+    ['stopped', { state: 'stopped' }, false],
+    ['unknown to the manager', undefined, false],
+  ]
+  const ROWS = STATUSES.flatMap(([label, status, serving]) =>
+    [true, false].map((outcomeUp) => [label, outcomeUp, serving && outcomeUp, status] as const),
+  )
+
+  test.each(ROWS)('connection %s, bring-up outcome up=%p → up: %p; the gate allows exactly when the predicate says up', (_label, outcomeUp, expected, status) => {
+    const statusReads: string[] = []
+    const outcomeAsks: string[] = []
+    const connections = { status: (key: string) => (statusReads.push(key), status) }
+    const outcomes = { isUp: (key: string) => (outcomeAsks.push(key), outcomeUp) }
+    const isPersonaUp = createPersonaUpPredicate(connections, outcomes)
+    const canRelaunch = createPersonaRelaunchGate(connections, () => {}, outcomes)
+
+    const up = isPersonaUp('persona_a')
+    expect(up).toBe(expected)
+    expect(statusReads).toEqual(['persona_a'])
+
+    statusReads.length = 0
+    expect(canRelaunch('persona_a')).toBe(up)
+    expect(statusReads).toEqual(['persona_a'])
+    expect(outcomeAsks.every((key) => key === 'persona_a')).toBe(true)
   })
 })
 

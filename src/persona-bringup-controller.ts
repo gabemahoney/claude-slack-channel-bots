@@ -47,6 +47,15 @@
  * after `lost` or after `retrying` a reopen launches nothing: the instance is
  * already running. At most one such launch per persona.
  *
+ * Leaving up (SR-6.3, SR-6.4): each time a persona's outcome changes from
+ * `up` to `broken` or `retrying` (today only a refused reopen of a running
+ * persona), the injected `onLeftUp` is told once. A lost connection being
+ * reopened (`lost`, `retrying` a reopen) stays `up`. Production wires
+ * `createNotUpSessionDropper`, which drops the persona's registered MCP
+ * session; its instance and agent-director row are kept.
+ * `describePersonaNotUp` renders a state's outcome and cause for the not-up
+ * refusal and drop lines.
+ *
  * Logging (SR-10.3): one `persona-start` line per persona when its bring-up
  * starts, before its outcome lines:
  *
@@ -80,7 +89,8 @@
  *
  * Pure module (b.av2 SR-13.1): nothing is created, read or scheduled at
  * import or at `createPersonaBringUpController`. The clock, logger, checks,
- * file-system seam, connection manager and launch are injected.
+ * file-system seam, connection manager, launch and leaving-up listener are
+ * injected.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -99,6 +109,7 @@ import {
   PERSONA_START,
   formatPersonaDiagnostic,
   type PersonaCheckFailure,
+  type PersonaDiagnosticLogger,
 } from './persona-diagnostics.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { createPersonaRetrySchedule, type PersonaRetrySchedule } from './persona-retry-schedule.ts'
@@ -148,6 +159,15 @@ export interface PersonaBringUpControllerDeps
    * inspected; a throw or rejection is logged.
    */
   launch: (persona: Persona) => Promise<unknown>
+  /**
+   * Told once each time a persona's outcome changes from `up` to `broken` or
+   * `retrying` (b.av2 SR-6.3, SR-6.4), with the persona and its new state.
+   * A persona that was never up is never reported; a lost connection being
+   * reopened stays `up` and is not reported. A throw or rejection is logged.
+   * Production drops the persona's registered MCP session
+   * (`createNotUpSessionDropper`).
+   */
+  onLeftUp?: (persona: Persona, state: PersonaBringUpState) => unknown
   /** Clock and timers for the directory re-checks; default the real clock. */
   clock?: PersonaConnectionClock
 }
@@ -209,6 +229,8 @@ interface BringUpEntry {
   lastStatus: PersonaConnectionStatus | undefined
   /** Set once a launch after a retry was started. */
   retryLaunched: boolean
+  /** Whether the outcome was `up` when last observed, for the up → not-up notification. */
+  wasUp: boolean
   cancelled: boolean
 }
 
@@ -314,6 +336,40 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     entry.slackStarted = true
     const result = await connectPersonaSlack(entry.persona, entry.tokens, { connections, log })
     if ('failure' in result) entry.slackError = result.failure
+    observeOutcome(entry)
+  }
+
+  // -------------------------------------------------------------------------
+  // Leaving up (b.av2 SR-6.3, SR-6.4)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Record whether the persona is up now; on a change from `up` to `broken`
+   * or `retrying`, tell `onLeftUp` once. Any other change out of `up` (the
+   * manager stopped the persona) only re-arms the record.
+   */
+  function observeOutcome(entry: BringUpEntry): void {
+    if (entry.cancelled) return
+    const outcome = outcomeOf(entry)
+    if (outcome === 'up') {
+      entry.wasUp = true
+      return
+    }
+    if (!entry.wasUp) return
+    entry.wasUp = false
+    if (outcome === 'broken' || outcome === 'retrying') notifyLeftUp(entry, outcome)
+  }
+
+  function notifyLeftUp(entry: BringUpEntry, outcome: PersonaBringUpOutcome): void {
+    const listener = deps.onLeftUp
+    if (listener === undefined) return
+    const failed = (err: unknown) =>
+      log(`[slack] persona ${ref(entry)}: handling its change from up to ${outcome} failed: ${describeThrownValue(err)}`)
+    try {
+      Promise.resolve(listener(entry.persona, { outcome, causes: causesOf(entry) })).catch(failed)
+    } catch (err) {
+      failed(err)
+    }
   }
 
   /** Launch after a retry, at most once per persona; a throw is logged, never posted. */
@@ -421,6 +477,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
       slackError: undefined,
       lastStatus: undefined,
       retryLaunched: false,
+      wasUp: false,
       cancelled: false,
     }
     entries.set(persona.key, entry)
@@ -444,6 +501,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     if (status.state === 'up' && previous?.state === 'retrying' && previous.phase === 'bring-up') {
       launchAfterRetry(entry, 'Slack')
     }
+    observeOutcome(entry)
   }
 
   function cancel(key: string): void {
@@ -469,5 +527,54 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     cancelAll: () => {
       for (const key of [...entries.keys()]) cancel(key)
     },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Not-up descriptions and the session drop (b.av2 SR-6.3, SR-6.4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Why a persona is not up, for a log line: its outcome and its first cause
+ * (credentials, then directory, then Slack), e.g. `broken: <cause>`. Uses the
+ * token-free cause text only, never a diagnostic class label. Pure.
+ */
+export function describePersonaNotUp(state: PersonaBringUpState | undefined): string {
+  if (state === undefined) return 'its bring-up has not run'
+  if (state.outcome === undefined || state.outcome === 'up') return 'its Slack connection is not serving'
+  const cause = state.causes.credentials ?? state.causes.directory ?? state.causes.slack
+  return cause === undefined ? state.outcome : `${state.outcome}: ${cause.cause}`
+}
+
+/** Dependencies of `createNotUpSessionDropper`. */
+export interface NotUpSessionDropperDeps {
+  /**
+   * Drop the MCP session registered for a persona key (`dropPersonaSession`
+   * in `registry.ts`); resolves whether one was registered.
+   */
+  drop: (key: string) => Promise<boolean>
+  log: PersonaDiagnosticLogger
+}
+
+/**
+ * Build the controller's `onLeftUp` listener: drop the MCP session registered
+ * for the persona that stopped being up (b.av2 SR-6.3: a session is
+ * registered only while its persona is up) and log one line when a session
+ * was dropped:
+ *
+ *   [slack] persona "<name>" (key=<key>): MCP session dropped — the persona is not up (<outcome>: <cause>); its instance and agent-director row are kept
+ *
+ * Makes no agent-director call, schedules no restart and posts nothing to
+ * Slack; the instance registers again once the persona is up.
+ */
+export function createNotUpSessionDropper(
+  deps: NotUpSessionDropperDeps,
+): (persona: Pick<Persona, 'name' | 'key'>, state: PersonaBringUpState) => Promise<void> {
+  return async (persona, state) => {
+    if (!(await deps.drop(persona.key))) return
+    deps.log(
+      `[slack] persona ${renderPersonaRef(persona.name, persona.key)}: MCP session dropped — ` +
+        `the persona is not up (${describePersonaNotUp(state)}); its instance and agent-director row are kept`,
+    )
   }
 }

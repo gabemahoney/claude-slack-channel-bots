@@ -24,8 +24,10 @@
  *
  * Multi-session routing: each Claude Code session connects to its own MCP Server
  * instance and is matched to a persona by the real path of its roots working
- * directory. Inbound Slack messages go through the receiving persona's
- * pipeline in `persona-routing.ts`: a persona hears only the channels it is
+ * directory; it registers only while that persona is up, and a persona that
+ * stops being up has its session dropped (b.av2 SR-6.3, SR-6.4). Inbound Slack
+ * messages go through the receiving persona's pipeline in
+ * `persona-routing.ts`: a persona hears only the channels it is
  * configured into (every message in a `delivery: all` channel, only its direct
  * mentions in a `delivery: mentions` one), and a delivered message reaches that
  * persona's session only. Outbound tool calls post as the session's persona,
@@ -88,8 +90,14 @@ import {
   createPersonaIdentityLookup,
   createPersonaRelaunchGate,
   createPersonaUpFlushListener,
+  createPersonaUpPredicate,
 } from './persona-start.ts'
-import { createPersonaBringUpController, type PersonaBringUpController } from './persona-bringup-controller.ts'
+import {
+  createNotUpSessionDropper,
+  createPersonaBringUpController,
+  describePersonaNotUp,
+  type PersonaBringUpController,
+} from './persona-bringup-controller.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { ErrSpawnNotFound } from 'agent-director'
 import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from './agent-director-errors.ts'
@@ -119,7 +127,8 @@ import {
   registerSession,
   unregisterByMcpSessionId,
   getSessionByPersona,
-  matchPersonaByRootsPath,
+  decideSessionAdmission,
+  dropPersonaSession,
   resolveTransportForRequest,
   registerMcpSessionId,
   createSessionServer,
@@ -128,6 +137,8 @@ import {
   getPendingSession,
   removePendingSession,
   getAllPendingSessions,
+  closePendingSession,
+  type ClosePendingSessionDeps,
   type SessionToolDeps,
   type SessionEntry,
 } from './registry.ts'
@@ -250,6 +261,19 @@ const clientFor = createPersonaClientLookup(connectionView, () => personaConfig)
 
 /** The persona's bot identity while it is serving; the placeholder identity in dry run. */
 const identityFor = createPersonaIdentityLookup(connectionView, () => personaConfig)
+
+/**
+ * Whether a persona is up (b.av2 SR-6.4): its connection is serving and its
+ * bring-up outcome is `up`. False for every persona before main() builds the
+ * controller. The one check behind MCP session admission, the permission
+ * poller's skip and `/interject`'s 503 (see `createPersonaUpPredicate`).
+ */
+const isPersonaUp = createPersonaUpPredicate(connectionView, { isUp: (key) => bringUps?.isUp(key) ?? false })
+
+/** A not-up persona's outcome and cause, for the refusal and session-drop lines. */
+function describePersonaNotUpByKey(key: string): string {
+  return describePersonaNotUp(bringUps?.state(key))
+}
 
 /** Installed once, in main(), before any persona connects. */
 let unhandledRejectionHandlerInstalled = false
@@ -394,6 +418,18 @@ function restartDisconnectedPersona(key: string, via: string): void {
   scheduleRestart(key, persona.working_directory)
 }
 
+/**
+ * Drop the session registered for persona `key` (`dropPersonaSession`: the
+ * registry entry and its MCP session IDs go before the transport closes, so
+ * neither `onsessionclosed` nor the SSE abort restarts anything) and stop its
+ * SSE keep-alive. Resolves whether a session was registered.
+ */
+async function dropPersonaSessionAndKeepAlive(key: string): Promise<boolean> {
+  const session = getSessionByPersona(key)
+  if (session) stopSseKeepAlive(session.transport)
+  return dropPersonaSession(key)
+}
+
 function initPendingSession(): { pendingId: string; transport: WebStandardStreamableHTTPServerTransport } {
   const pendingId = crypto.randomUUID()
 
@@ -465,8 +501,10 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
 //
 // Called after the MCP initialized notification. Calls roots/list on the
 // client and matches the first root's directory, by real path, to exactly one
-// applied persona (b.av2 SR-6.3). On match: promotes the pending session to
-// registered under the persona key. On no match or error: disconnects it.
+// applied persona (b.av2 SR-6.3), admitting it only while that persona is up
+// (SR-6.4, `decideSessionAdmission`). On admission: promotes the pending
+// session to registered under the persona key. On no match, a persona that is
+// not up, or an error: disconnects it.
 // ---------------------------------------------------------------------------
 
 /**
@@ -487,6 +525,16 @@ async function waitForSseStream(
   return false
 }
 
+/**
+ * How `handleInitialized` disconnects a pending session it will not register
+ * (`closePendingSession`): the pending map's remove and this module's SSE
+ * keep-alive stop.
+ */
+const pendingSessionCloseDeps: ClosePendingSessionDeps<WebStandardStreamableHTTPServerTransport> = {
+  removePending: removePendingSession,
+  stopKeepAlive: stopSseKeepAlive,
+}
+
 async function handleInitialized(
   pendingId: string,
   server: import('@modelcontextprotocol/sdk/server/index.js').Server,
@@ -503,8 +551,7 @@ async function handleInitialized(
   const sseReady = await waitForSseStream(pendingEntry.transport)
   if (!sseReady) {
     console.error(`[slack] Timed out waiting for SSE stream from session "${pendingId}" — disconnecting`)
-    removePendingSession(pendingId)
-    try { await pendingEntry.transport.close() } catch { /* ignore */ }
+    await closePendingSession(pendingId, pendingEntry.transport, pendingSessionCloseDeps)
     return
   }
 
@@ -516,20 +563,14 @@ async function handleInitialized(
   } catch (err) {
     console.error(`[slack] roots/list failed for pending session "${pendingId}":`, err)
     const pending = getPendingSession(pendingId)
-    if (pending) {
-      removePendingSession(pendingId)
-      try { await pending.transport.close() } catch { /* ignore */ }
-    }
+    if (pending) await closePendingSession(pendingId, pending.transport, pendingSessionCloseDeps)
     return
   }
 
   if (!roots.length) {
     console.error(`[slack] Pending session "${pendingId}" reported no roots — disconnecting`)
     const pending = getPendingSession(pendingId)
-    if (pending) {
-      removePendingSession(pendingId)
-      try { await pending.transport.close() } catch { /* ignore */ }
-    }
+    if (pending) await closePendingSession(pendingId, pending.transport, pendingSessionCloseDeps)
     return
   }
 
@@ -539,18 +580,25 @@ async function handleInitialized(
   const rootsPath = resolve(expandTilde(rawCwd))
   const realCwd = resolveRealPath(rootsPath)
 
-  const persona = matchPersonaByRootsPath(rootsPath, personaConfig?.personas ?? [])
+  // b.av2 SR-6.3 / SR-6.4: match by real path, then admit only an up persona.
+  // A refused session is disconnected like an unmatched one; the persona's
+  // registered session, if any, is left as it is.
+  const admission = decideSessionAdmission(rootsPath, personaConfig?.personas ?? [], {
+    isPersonaUp,
+    describeNotUp: describePersonaNotUpByKey,
+    log: (line) => console.error(line),
+  })
 
-  if (!persona) {
-    console.error(`[slack] Session connected with CWD "${realCwd}" — no matching persona`)
-    const pending = getPendingSession(pendingId)
-    if (pending) {
-      removePendingSession(pendingId)
-      try { await pending.transport.close() } catch { /* ignore */ }
+  if (admission.kind !== 'admitted') {
+    if (admission.kind === 'unmatched') {
+      console.error(`[slack] Session connected with CWD "${realCwd}" — no matching persona`)
     }
+    const pending = getPendingSession(pendingId)
+    if (pending) await closePendingSession(pendingId, pending.transport, pendingSessionCloseDeps)
     return
   }
 
+  const { persona } = admission
   const ref = renderPersonaRef(persona.name, persona.key)
   const existingSession = getSessionByPersona(persona.key)
 
@@ -1045,6 +1093,14 @@ export async function main(): Promise<void> {
     dryRun: isDryRun(),
     log: (line) => console.error(line),
     launch: (persona) => spawnForPersona(persona, appliedConfig, false),
+    // b.av2 SR-6.3: a session is registered only while its persona is up. A
+    // persona that stops being up (a refused reopen) has its session dropped;
+    // its instance and row are kept, nothing is restarted or posted, and the
+    // instance registers again once the persona is up.
+    onLeftUp: createNotUpSessionDropper({
+      drop: dropPersonaSessionAndKeepAlive,
+      log: (line) => console.error(line),
+    }),
   })
   bringUps = personaBringUps
 
@@ -1069,6 +1125,9 @@ export async function main(): Promise<void> {
       getClient,
       clientFor,
       getPersona: getAppliedPersona,
+      // b.av2 SR-6.4: a not-up persona's rows are skipped, its prompts and
+      // wedge state held until it is up.
+      isPersonaUp,
       intervalMs: personaConfig.agent_director_poll_interval_ms,
     })
   }
@@ -1102,6 +1161,7 @@ export async function main(): Promise<void> {
       if (url.pathname === '/interject') {
         return handleInterject(req, server.requestIP(req)?.address, {
           getPersonaConfig: () => personaConfig,
+          isPersonaUp,
           getSessionByPersona,
         })
       }
