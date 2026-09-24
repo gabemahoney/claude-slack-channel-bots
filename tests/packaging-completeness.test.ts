@@ -22,6 +22,22 @@
  *      without anyone noticing. Hermetic where possible; shells out to npm for
  *      the authoritative file list and skips cleanly if npm is unavailable.
  *
+ * b.av2 AC 27 guard (SR-12, SR-13.5): the shipped debugging skill
+ * `skills/debug-slack-channel-bots/SKILL.md` must be in the npm pack list
+ * (same probe and skip/error contract as guard 2), with a hermetic companion
+ * that needs no npm (the file exists with a `name` matching its directory and
+ * a `description`, and package.json `files` covers the skill's path with no
+ * `!` entry excluding it), and a class-coverage check: every label in
+ * PERSONA_DIAGNOSTIC_CLASSES (imported, side-effect free) names a `##`–`####`
+ * heading in the skill (the skill gives each class a `###` heading naming it),
+ * so a class added without a skill entry, or an entry cut down to a passing
+ * mention, fails here. Content audits of shipped text (forbidden terms, the
+ * SR-1.7 exception) are later Epics' work (E6/E14), not this file's.
+ *
+ * Both npm-backed tests share one memoised pack probe per file load. The npm
+ * child gets a throwaway cache and user config inside the probe's temp dir,
+ * so it never reads or writes the real HOME (b.av2 SR-13.2).
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -31,6 +47,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import semver from 'semver'
+import { PERSONA_DIAGNOSTIC_CLASSES } from '../src/persona-diagnostics.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 
@@ -104,21 +121,24 @@ type PackProbe =
  * we key strictly off stdout + exit status for the file list.
  */
 function npmPackProbe(): PackProbe {
-  // npm writes its cache, debug logs and update-notifier stamp under
-  // ~/.npm by default. Point every npm child at a throwaway cache so the test
-  // never touches the real npm cache.
-  const cacheDir = mkdtempSync(join(tmpdir(), 'cscb-npm-cache-'))
+  // npm writes its cache, debug logs and update-notifier stamp under ~/.npm
+  // and reads ~/.npmrc by default. Point every npm child at a throwaway dir
+  // for all of these so the test never touches the real HOME.
+  const probeDir = mkdtempSync(join(tmpdir(), 'cscb-npm-probe-'))
   try {
-    return npmPackProbeWithCache(cacheDir)
+    return npmPackProbeIn(probeDir)
   } finally {
-    rmSync(cacheDir, { recursive: true, force: true })
+    rmSync(probeDir, { recursive: true, force: true })
   }
 }
 
-function npmPackProbeWithCache(cacheDir: string): PackProbe {
+function npmPackProbeIn(probeDir: string): PackProbe {
   const env = {
     ...process.env,
-    npm_config_cache: cacheDir,
+    HOME: probeDir,
+    // Never created: npm treats a missing user config as empty.
+    npm_config_userconfig: join(probeDir, 'npmrc'),
+    npm_config_cache: join(probeDir, 'cache'),
     npm_config_update_notifier: 'false',
   }
   const probe = spawnSync('npm', ['--version'], { encoding: 'utf-8', env })
@@ -172,6 +192,14 @@ function npmPackProbeWithCache(cacheDir: string): PackProbe {
   return { kind: 'ok', files: files.map((f) => f.path) }
 }
 
+let sharedProbe: PackProbe | undefined
+
+/** One npm pack probe per file load, shared by every npm-backed test. */
+function packProbe(): PackProbe {
+  sharedProbe ??= npmPackProbe()
+  return sharedProbe
+}
+
 /** Every runtime src/*.ts file the repo would need to ship (tests excluded). */
 function runtimeSrcFiles(): string[] {
   return readdirSync(resolve(REPO_ROOT, 'src'))
@@ -181,7 +209,7 @@ function runtimeSrcFiles(): string[] {
 }
 
 describe('b.q9t: npm pack ships every runtime src file', () => {
-  const probe = npmPackProbe()
+  const probe = packProbe()
 
   // Skip ONLY when the npm toolchain is absent. With npm present, a pack or
   // parse failure is surfaced as a hard failure below — a skip must never hide
@@ -196,6 +224,109 @@ describe('b.q9t: npm pack ships every runtime src file', () => {
       const packedSet = new Set(probe.kind === 'ok' ? probe.files : [])
       const missing = runtimeSrcFiles().filter((rel) => !packedSet.has(rel))
       expect(missing).toEqual([])
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
+// 3. b.av2 AC 27 — the debugging skill ships
+// ---------------------------------------------------------------------------
+
+const SKILL_NAME = 'debug-slack-channel-bots'
+const SKILL_REL = `skills/${SKILL_NAME}/SKILL.md`
+
+/** The `key: value` lines of a leading `---` frontmatter block, or null. */
+function skillFrontmatter(text: string): Record<string, string> | null {
+  const m = /^---\n([\s\S]*?)\n---\n/.exec(text)
+  if (!m) return null
+  const fields: Record<string, string> = {}
+  for (const line of m[1].split('\n')) {
+    const kv = /^([A-Za-z][\w-]*):\s*(.*)$/.exec(line)
+    // An empty quoted value (`""`) counts as empty.
+    if (kv) fields[kv[1]] = kv[2].trim().replace(/^(['"])(.*)\1$/, '$2').trim()
+  }
+  return fields
+}
+
+/**
+ * True when `pattern` (a package.json `files` glob, `!` already stripped)
+ * matches `rel` or one of its ancestor directories. As in npm, an entry that
+ * names a directory (`skills`, `skills/`) covers everything under it.
+ */
+function filesEntryMatches(pattern: string, rel: string): boolean {
+  const glob = new Bun.Glob(pattern.replace(/^\.?\//, '').replace(/\/+$/, ''))
+  const parts = rel.split('/')
+  for (let n = parts.length; n > 0; n--) {
+    if (glob.match(parts.slice(0, n).join('/'))) return true
+  }
+  return false
+}
+
+/**
+ * True when package.json `files` would ship `rel`: some positive entry covers
+ * it and no `!` entry excludes it. Stricter than npm on ordering (any matching
+ * `!` entry excludes, wherever it sits), which is enough for a guard.
+ */
+function filesCover(files: string[], rel: string): boolean {
+  const excluded = files.some(
+    (f) => f.startsWith('!') && filesEntryMatches(f.slice(1), rel),
+  )
+  const included = files.some(
+    (f) => !f.startsWith('!') && filesEntryMatches(f, rel),
+  )
+  return included && !excluded
+}
+
+/** A string matched literally inside a RegExp. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+describe('b.av2 AC 27: the debugging skill ships in the package', () => {
+  const probe = packProbe()
+
+  // Same contract as guard 2: skip only when npm is absent; a pack or parse
+  // error is a hard failure.
+  test.skipIf(probe.kind === 'skip')(
+    `AC 27: the npm pack file list includes ${SKILL_REL}`,
+    () => {
+      if (probe.kind === 'error') throw new Error(probe.message)
+      expect(probe.kind === 'ok' ? probe.files : []).toContain(SKILL_REL)
+    },
+  )
+
+  // Hermetic companion: guards AC 27 where npm is unavailable.
+  test('AC 27 (hermetic): the skill file exists, is non-empty and has name and description frontmatter', () => {
+    const path = resolve(REPO_ROOT, SKILL_REL)
+    expect(existsSync(path)).toBe(true)
+    const text = readFileSync(path, 'utf-8')
+    expect(text.trim().length).toBeGreaterThan(0)
+    const fm = skillFrontmatter(text)
+    expect(fm).not.toBeNull()
+    expect(fm?.name).toBe(SKILL_NAME)
+    expect(fm?.description ?? '').not.toBe('')
+  })
+
+  test(`AC 27 (hermetic): package.json files covers ${SKILL_REL} and no ! entry excludes it`, () => {
+    expect(filesCover(readPkg().files ?? [], SKILL_REL)).toBe(true)
+  })
+})
+
+describe('b.av2 AC 27: the debugging skill covers every persona diagnostic class', () => {
+  // Labels come from the exported closed set, never a hand-copied list, so a
+  // class added later without a skill entry fails here (b.av2 SR-12).
+  test.each([...PERSONA_DIAGNOSTIC_CLASSES])(
+    'AC 27: the skill has a heading for class %s',
+    (label) => {
+      const text = readFileSync(resolve(REPO_ROOT, SKILL_REL), 'utf-8')
+      // A `##`–`####` heading naming the whole label (not a prefix or suffix of
+      // a longer hyphenated word): a passing mention in body text is not an
+      // entry for the class.
+      const re = new RegExp(
+        `^#{2,4} [^\\n]*(?<![\\w-])${escapeRegExp(label)}(?![\\w-])`,
+        'm',
+      )
+      expect(re.test(text)).toBe(true)
     },
   )
 })

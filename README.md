@@ -849,6 +849,24 @@ If the tag or any of those attributes no longer appears, the guard is dark or mi
 **Session connects but has no persona**
 If a Claude Code session connects but immediately disconnects, `server.log` shows `Session connected with CWD "<path>" — no matching persona`: the session's working directory is no persona's `working_directory`. It is compared with each persona's `working_directory` by real path (after tilde expansion, with symlinks resolved), so a symlinked path to the same directory also matches. If a second session connects from the same directory, it replaces the first. Two personas with the same working directory are rejected when the configuration loads.
 
+**A persona doesn't come up or doesn't answer**
+Symptoms: the persona is silent, `/interject` returns 503 for it, or its scheduled prompts log `no-session`. One broken persona never stops the server or delays the others, and nothing about it is posted to Slack. Look in `server.log` instead. Find the persona's key on its `persona-start` line, then read its lines. Each failure line names a class, the persona's `personas[i]` entry and the file or directory at fault:
+
+```sh
+grep persona-start ~/.claude/channels/slack/server.log | tail
+grep -E '\(key=<key>\)|persona=<key>\b' ~/.claude/channels/slack/server.log
+```
+
+| Class | Persona | What to do |
+|---|---|---|
+| `persona-credentials-*` | Stays down | Fix the credentials file, then restart the server |
+| `persona-slack-unreachable` | Retries on its own | Nothing; it comes up once Slack answers |
+| `persona-directory-*` | Retries on its own | Create or fix the working directory; the persona comes up with no restart |
+
+While a persona is down, its Claude instance keeps running and keeps its history, but the server doesn't serve it until the persona is up.
+
+The `debug-slack-channel-bots` skill has an entry for every persona log class, every `config.json` rejection and each recovery step. It ships in the package at `skills/debug-slack-channel-bots/SKILL.md` (`node_modules/claude-slack-channel-bots/skills/debug-slack-channel-bots/SKILL.md` after install). Copy it to `~/.claude/skills/debug-slack-channel-bots/SKILL.md`, then invoke `/debug-slack-channel-bots` from Claude Code.
+
 **Bot not receiving messages in a new channel**
 After inviting the bot to a channel, Slack may not deliver messages until the bot is @mentioned for the first time. This is a Slack Socket Mode behavior — the first @mention activates event delivery for that channel. After that, all messages flow normally.
 
