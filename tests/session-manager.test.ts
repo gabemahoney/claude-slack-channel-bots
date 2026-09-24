@@ -420,7 +420,7 @@ function preSetAllFlags(key: string): void {
 //
 // Spawns are keyed by persona: `cscb_<key>`, `slack_bot_<key>`, the labels
 // `service=cscb`, `persona=<key>`, `config_dir=<12 hex of the REAL effective
-// claude_config_dir>` and the interim `channel=<key>` (removed in E3 Task 6),
+// claude_config_dir>` and nothing else (no `channel` label since E3 Task 6),
 // and the env `CSCB_PERSONA` / `CLAUDE_MANAGED_CHANNEL` (the key),
 // `CSCB_CRONTABLE_PATH`, and `CLAUDE_CONFIG_DIR` only when a directory is
 // configured.
@@ -473,7 +473,9 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
     expect(params.claude_instance_id).toBe(`cscb_${key}`)
     expect(params.tmux_session_name).toBe(`slack_bot_${key}`)
     expect(params.relay_mode).toBe('on')
-    expect(params.label).toEqual(['service=cscb', `persona=${key}`, configDirLabelFor(configDir), `channel=${key}`])
+    expect(params.label).toEqual(['service=cscb', `persona=${key}`, configDirLabelFor(configDir)])
+    // The interim `channel=<key>` label is no longer written (E3 Task 6).
+    expect(params.label!.some((l) => l.startsWith('channel='))).toBe(false)
     expect(params.extra_env).toEqual({
       CLAUDE_CONFIG_DIR: configDir,
       CSCB_PERSONA: key,
@@ -499,7 +501,6 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
       'service=cscb',
       'persona=C',
       `config_dir=${personaConfigDirLabelValue(undefined, home)}`,
-      'channel=C',
     ])
     // Independent of the helper: the hash of the real <home>/.claude.
     expect(spawnCalls[0].label).toContain(`config_dir=${configDirLabelValue(join(realpathSync(home), '.claude'))}`)
@@ -712,7 +713,6 @@ describe('spawnForPersona: persona identity (SR-2.2)', () => {
       'service=cscb',
       'persona=C0AMDDZEHCY',
       configDirLabelFor(topLevel),
-      'channel=C0AMDDZEHCY',
     ])
     // The top-level claude_config_dir reaches the env of a stand-in with none of its own.
     expect(params.extra_env).toEqual({
@@ -865,7 +865,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     expect(spawnCalls).toHaveLength(2)
     // fresh spawn carries the original params (same persona labels / id)
     expect(spawnCalls[1].claude_instance_id).toBe('cscb_C')
-    expect(spawnCalls[1].label).toEqual(['service=cscb', 'persona=C', `config_dir=${personaConfigDirLabelValue(undefined, home)}`, 'channel=C'])
+    expect(spawnCalls[1].label).toEqual(['service=cscb', 'persona=C', `config_dir=${personaConfigDirLabelValue(undefined, home)}`])
     // row was already gone — no kill and no delete of a missing row
     expect(killCalls).toHaveLength(0)
     expect(deleteCalls).toHaveLength(0)
@@ -1286,7 +1286,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     expect(calls.killCalls).toHaveLength(dead ? 1 : 0)
     expect(calls.deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_C']])
     expect(calls.spawnCalls).toHaveLength(2)
-    expect(calls.spawnCalls[1].label).toContain(`config_dir=${expectedLabel}`)
+    expect(calls.spawnCalls[1].label).toEqual(['service=cscb', 'persona=C', `config_dir=${expectedLabel}`])
     expect(calls.spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configDir)
     // A fresh spawn, not amnesia: no transcript diagnosis, record or notice.
     const log = readLog()
@@ -1436,7 +1436,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_C']])
     expect(spawnCalls).toHaveLength(2)
     expect(spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(later)
-    expect(spawnCalls[1].label).toContain(configDirLabelFor(later))
+    expect(spawnCalls[1].label).toEqual(['service=cscb', 'persona=C', configDirLabelFor(later)])
     expect(spawnCalls[1].label).not.toContain(configDirLabelFor(earlier))
   })
 })
@@ -2096,9 +2096,9 @@ describe('startupSessionManager', () => {
     // Each spawn carries its own persona's working directory and persona label.
     const byId = new Map(spawnCalls.map((p) => [p.claude_instance_id, p]))
     expect(byId.get('cscb_alpha')!.cwd).toBe('/x/alpha')
-    expect(byId.get('cscb_alpha')!.label).toContain('persona=alpha')
+    expect(byId.get('cscb_alpha')!.label).toEqual(['service=cscb', 'persona=alpha', expect.stringMatching(/^config_dir=/)])
     expect(byId.get('cscb_beta')!.cwd).toBe('/x/beta')
-    expect(byId.get('cscb_beta')!.label).toContain('persona=beta')
+    expect(byId.get('cscb_beta')!.label).toEqual(['service=cscb', 'persona=beta', expect.stringMatching(/^config_dir=/)])
     // Result counts are per persona.
     expect(result.succeeded).toBe(2)
     expect(result.freshSpawned).toBe(2)

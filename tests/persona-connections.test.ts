@@ -65,7 +65,12 @@ import {
   type PersonaSocketEventName,
   type PersonaSocketEventPayload,
 } from '../src/persona-connections.ts'
-import { createUnhandledRejectionHandler, slackPlatformReason } from '../src/persona-connection-errors.ts'
+import {
+  createUnhandledRejectionHandler,
+  describeSlackCallFailure,
+  describeThrownValue,
+  slackPlatformReason,
+} from '../src/persona-connection-errors.ts'
 import {
   checkPersonaLocalBringUp,
   checkPersonaWorkingDirectory,
@@ -2500,6 +2505,44 @@ describe('slackPlatformReason (SR-10.3)', () => {
       }).not.toThrow()
       expect(result).toBeUndefined()
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// describeSlackCallFailure (SR-10.3): the token-safe tail of a failed-call line
+// ---------------------------------------------------------------------------
+
+describe('describeSlackCallFailure (SR-10.3)', () => {
+  test.each<[string, unknown, string | undefined]>([
+    ['a sentinel-bearing platform error', sentinelSlackError('slack_webapi_platform_error', 'not_in_channel'), 'not_in_channel'],
+    ['a sentinel-bearing request error (Authorization header in original)', sentinelSlackError('slack_webapi_request_error'), undefined],
+    ['a platform error whose reason is not an identifier', sentinelSlackError('slack_webapi_platform_error', fakeToken(BOT_TOKEN_PREFIX, 'reason')), undefined],
+    ['undefined', undefined, undefined],
+    ['a sentinel-bearing string', `boom ${LEAK_SENTINEL}`, undefined],
+  ])('%s: ` (reason=…)` only for a safe reason, then `: ` and the thrown-value description; nothing leaks', (_label, value, reason) => {
+    const tail = describeSlackCallFailure(value)
+
+    expect(tail).toBe(`${reason === undefined ? '' : ` (reason=${reason})`}: ${describeThrownValue(value)}`)
+    assertNoLeak({ tail }, 'failure tail')
+    if (typeof value === 'object' && value !== null) expect(() => assertNoLeak(value)).toThrow()
+  })
+
+  test('a value whose every read throws still yields a line, never throws', () => {
+    const hostile = new Proxy(new Error(`hostile ${LEAK_SENTINEL}`), {
+      get() {
+        throw new Error(`getter ${LEAK_SENTINEL}`)
+      },
+      getPrototypeOf() {
+        throw new Error(`proto ${LEAK_SENTINEL}`)
+      },
+    })
+
+    let tail = ''
+    expect(() => {
+      tail = describeSlackCallFailure(hostile)
+    }).not.toThrow()
+    expect(tail).toStartWith(': ')
+    assertNoLeak({ tail }, 'hostile failure tail')
   })
 })
 

@@ -8,19 +8,31 @@
  * requests on the same spawn each get their own Slack prompt without
  * colliding.
  *
+ * Rows are mapped to personas by their `persona` label (b.av2 SR-7.1). A
+ * persona's prompts go to its destination (`resolvePersonaDestination`, shared
+ * with the per-persona notifier) through that persona's own Web client
+ * (`clientFor`), never to a channel taken from the row. Outage state is keyed
+ * by the persona key. Until E7, a `dm` destination's prompts are logged only.
+ *
  * Behavior per tick:
  *   1. list({state:['check_permission'], label:['service=cscb']}).
- *   2. For each row, get({claude_instance_id}). When the plural projection
- *      is absent (undefined/null), log non-conformance and skip — do not
- *      mutate state for that row, and exclude that spawn's live entries
- *      from the newly-closed sweep this tick.
+ *   2. For each row, resolve the persona from its `persona` label; a row with
+ *      no label, or one naming no applied persona, is logged and skipped.
+ *      Then get({claude_instance_id}). When the plural projection is absent
+ *      (undefined/null), log non-conformance and skip — do not mutate state
+ *      for that row, and exclude that spawn's live entries from the
+ *      newly-closed sweep this tick.
  *   3. For each PermissionRequestRow in the plural projection, compute the
  *      composite key. If already tracked → skip (duplicate-tick no-op).
- *      Else post a fresh Block Kit prompt and register the live entry.
+ *      Else post a fresh Block Kit prompt to the persona's destination and
+ *      register the live entry. A `dm` destination, or a persona whose client
+ *      is unavailable, is logged once per open request and not tracked (a
+ *      later tick retries the unavailable client).
  *   4. Newly-closed reconciliation (SR-2.4): for each live entry whose
  *      composite key was NOT observed this tick (excluding non-conforming
  *      spawns), call `get-permission`, render the verdict-distinct
- *      chat.update against that row's messageTs, and drop the entry.
+ *      chat.update through the posting persona's client against that row's
+ *      channel and messageTs, and drop the entry.
  *      `ErrPermissionRequestNotFound` → render generic deny + drop + no
  *      retry. Other transient errors → leave entry alive, retry next tick.
  *      Unknown `decision_reason` → fail-closed generic deny (SR-5.2).
@@ -44,6 +56,7 @@ import type {
 } from 'agent-director'
 import type { WebClient } from '@slack/web-api'
 
+import type { Persona } from './config.ts'
 import {
   getPermission,
   isErrPermissionRequestNotFound,
@@ -54,6 +67,9 @@ import type {
 } from './agent-director-client.ts'
 import { withOutageDetection } from './outage-state.ts'
 import { encodePermissionActionId } from './permission-action-id.ts'
+import { describeSlackCallFailure } from './persona-connection-errors.ts'
+import { PERSONA_LABEL_KEY, renderPersonaRef } from './persona-identity.ts'
+import { formatPersonaNotice, resolvePersonaDestination } from './persona-notifier.ts'
 import { emitTrail as defaultEmitTrail } from './permission-trail.ts'
 import type {
   ClosureVerdictTag,
@@ -101,6 +117,9 @@ export interface LivePermission {
   claudeInstanceId: string
   /** Opaque per-request token. */
   requestToken: string
+  /** Key of the persona whose client posted the prompt; closing updates go through it. */
+  personaKey: string
+  /** Slack channel the prompt was posted to. */
   channelId: string
   messageTs: string
   /** Retained for logging only; never used for routing/keying/encoding. */
@@ -108,6 +127,9 @@ export interface LivePermission {
   /** Set to true by the click handler once its final chat.update succeeds. */
   handled: boolean
 }
+
+/** Why an open request's prompt was not posted: a `dm` destination, or no client. */
+type UnpostedReason = 'dm' | 'client-unavailable'
 
 /**
  * Deterministic composite key for the pending map. The null byte
@@ -118,10 +140,13 @@ export function makeCompositeKey(claudeInstanceId: string, requestToken: string)
   return `${claudeInstanceId}\x00${requestToken}`
 }
 
+/** The Slack surface the poller uses on a persona's client. */
+export type PollerSlackClient = Pick<WebClient, 'chat'>
+
 /**
  * Injection points for the poller. Production callers supply the real Bun
- * setInterval/clearInterval and a real WebClient + getClient(); tests pass
- * stubs.
+ * setInterval/clearInterval, getClient() and the per-persona client and
+ * persona lookups; tests pass stubs.
  */
 export interface PollerDeps {
   /** Returns the agent-director Client singleton. */
@@ -136,8 +161,16 @@ export interface PollerDeps {
      */
     getPermission?: (params: GetPermissionParams) => Promise<GetPermissionResult>
   }
-  /** Slack WebClient (or a stub satisfying the chat.* surface). */
-  web: Pick<WebClient, 'chat'>
+  /**
+   * The persona's chat-capable Slack client, or undefined when it is not
+   * available (not validated yet, dry run, unknown key).
+   */
+  clientFor: (key: string) => PollerSlackClient | undefined
+  /**
+   * The applied persona with this key, or undefined. Read on every tick, so a
+   * swapped persona set is seen at once.
+   */
+  getPersona: (key: string) => Persona | undefined
   /** Poll interval in ms; from config.agent_director_poll_interval_ms. */
   intervalMs: number
   /** Hook to record runtime errors. Defaults to console.error. */
@@ -206,12 +239,13 @@ export function wedgeTripTicks(intervalMs: number): number {
 interface WedgeState {
   /** Consecutive ticks observed empty-in-check_permission. */
   emptyTicks: number
-  /** One-shot latch: true only once a channel warning has SUCCESSFULLY posted
-   * for this episode, suppressing per-tick spam until the spawn recovers (b.vfx
-   * dedupe shape: in-memory first-occurrence, reset on recovery / daemon
-   * restart). b.fae F3: set only after a successful chat.postMessage, so a
-   * transient Slack failure retries on a later tick instead of permanently
-   * swallowing the episode's one warning. */
+  /** One-shot latch: true only once the warning has SUCCESSFULLY posted (or,
+   * for a `dm` destination until E7, been logged) for this episode,
+   * suppressing per-tick spam until the spawn recovers (b.vfx dedupe shape:
+   * in-memory first-occurrence, reset on recovery / daemon restart). b.fae
+   * F3: set only after a successful chat.postMessage, so a transient Slack
+   * failure retries on a later tick instead of permanently swallowing the
+   * episode's one warning. */
   warningFired: boolean
   /**
    * b.fae F3 — throttle for warning-post RETRIES while the latch is unset (the
@@ -246,6 +280,13 @@ export function wedgeWarnRetryTicks(intervalMs: number): number {
 // ---------------------------------------------------------------------------
 
 const livePermissions = new Map<string, LivePermission>()
+/**
+ * Composite key → why an open request was not posted (`dm` destination, or
+ * the persona's client unavailable). Keeps the not-posted log line to one per
+ * open request and reason; an entry is forgotten once the request is posted
+ * or no longer observed.
+ */
+const unpostedPrompts = new Map<string, UnpostedReason>()
 /** claude_instance_id → wedge-detector state (b.fae F4). */
 const wedgeStates = new Map<string, WedgeState>()
 let pollerHandle: ReturnType<typeof setInterval> | null = null
@@ -285,6 +326,7 @@ export function _resetPollerState(): void {
     else clearInterval(pollerHandle)
   }
   livePermissions.clear()
+  unpostedPrompts.clear()
   wedgeStates.clear()
   pollerHandle = null
   tickInFlight = false
@@ -373,29 +415,68 @@ function emitRowDecision(
 }
 
 /**
- * b.fae F4 — one-shot channel warning for a spawn wedged in check_permission
- * with zero open rows. Posts a single top-level channel message (no thread_ts)
- * describing the wedge and the HONEST remediation. `send-keys` is NOT offered:
- * AD's relay guard (pkg/api/sendkeys.go) hard-rejects send-keys whenever
- * relay_mode=on && state=check_permission, with no open-row exemption — so the
- * only correct recovery is read-pane + kill/respawn.
+ * b.fae F4 — one-shot warning for a spawn wedged in check_permission with
+ * zero open rows. The text names the persona (b.av2 SR-7.2) and gives the
+ * HONEST remediation. `send-keys` is NOT offered: AD's relay guard
+ * (pkg/api/sendkeys.go) hard-rejects send-keys whenever relay_mode=on &&
+ * state=check_permission, with no open-row exemption — so the only correct
+ * recovery is read-pane + kill/respawn.
+ */
+function buildWedgeWarningText(persona: Pick<Persona, 'name' | 'key'>, claudeInstanceId: string): string {
+  return formatPersonaNotice(
+    persona,
+    '⚠️ This persona appears blocked on a native Claude Code permission prompt that ' +
+      "never reached Slack — it will not respond until it's cleared. To recover: run " +
+      '`agent-director read-pane --claude-instance-id ' +
+      claudeInstanceId +
+      '` to see the native prompt, then kill and respawn the session ' +
+      '(`agent-director kill` / tmux-kill + respawn). Do NOT use send-keys — it is ' +
+      'rejected in this state.',
+  )
+}
+
+/**
+ * b.fae F4 / b.av2 SR-7.2 — deliver the one-shot wedge warning to the
+ * persona's destination. Returns true when the episode counts as warned (the
+ * latch may be set):
+ *   - channel destination: one top-level message (no thread_ts) through the
+ *     persona's client; true only when the post succeeds. A client that is
+ *     unavailable counts as a failed post (false), with no Slack call and no
+ *     trail event, so the retry throttle governs the next attempt;
+ *   - `dm` destination (until E7): the warning is logged, no Slack call is
+ *     made, and the episode counts as warned so it is not logged every tick.
+ * Every actual post emits `cscb.poller.wedge_detected` with `channel` equal to
+ * the destination channel.
  */
 async function postWedgeWarning(
   deps: PollerDeps,
   claudeInstanceId: string,
-  channelId: string,
+  persona: Persona,
 ): Promise<boolean> {
-  const text =
-    '⚠️ This bot appears blocked on a native Claude Code permission prompt that ' +
-    "never reached Slack — it will not respond until it's cleared. To recover: run " +
-    '`agent-director read-pane --claude-instance-id ' +
-    claudeInstanceId +
-    '` to see the native prompt, then kill and respawn the session ' +
-    '(`agent-director kill` / tmux-kill + respawn). Do NOT use send-keys — it is ' +
-    'rejected in this state.'
+  const ref = renderPersonaRef(persona.name, persona.key)
+  const text = buildWedgeWarningText(persona, claudeInstanceId)
+  const destination = resolvePersonaDestination(persona)
+  if (destination.kind === 'dm') {
+    logViaDeps(
+      deps,
+      `[slack] permission-poller: ${ref} has permission_prompts set to DM, and the stuck-prompt warning by DM ` +
+        `is not supported yet — warning for ${claudeInstanceId} logged instead of posted: ${text}`,
+    )
+    return true
+  }
+  const web = deps.clientFor(persona.key)
+  if (!web) {
+    logViaDeps(
+      deps,
+      `[slack] permission-poller: no Slack client for ${ref} — stuck-prompt warning for ${claudeInstanceId} ` +
+        'not posted; retrying on a later tick',
+    )
+    return false
+  }
+  const channelId = destination.channelId
   const emit = deps.emitTrail ?? defaultEmitTrail
   try {
-    const response = await deps.web.chat.postMessage({ channel: channelId, text })
+    const response = await web.chat.postMessage({ channel: channelId, text })
     const slackTs = (response as { ts?: string }).ts
     emit({
       event: 'cscb.poller.wedge_detected',
@@ -408,7 +489,11 @@ async function postWedgeWarning(
     return true
   } catch (err) {
     // b.emk convention: failures land in BOTH server.log and the trail JSONL.
-    logViaDeps(deps, `[slack] permission-poller: wedge warning postMessage failed for ${claudeInstanceId}:`, err)
+    logViaDeps(
+      deps,
+      `[slack] permission-poller: wedge warning postMessage failed for ${ref} (${claudeInstanceId})` +
+        describeSlackCallFailure(err),
+    )
     emit({
       event: 'cscb.poller.wedge_detected',
       claude_instance_id: claudeInstanceId,
@@ -425,8 +510,8 @@ async function postWedgeWarning(
  * b.fae F4 — advance the wedge detector for one spawn observed this tick in
  * check_permission with an EMPTY `permission_requests` array. Increments the
  * per-spawn consecutive-empty-tick counter; when it crosses the K threshold
- * (`wedgeTripTicks`) for the first time this episode, logs, emits a trail
- * event, and posts the one-shot channel warning. The `warningFired` latch
+ * (`wedgeTripTicks`) for the first time this episode, logs, and sends the
+ * one-shot warning to the persona's destination. The `warningFired` latch
  * suppresses per-tick spam thereafter (the operator-hostile behavior b.vfx
  * documents) — but b.fae F3: it latches ONLY after a successful post, so a
  * transient chat.postMessage failure retries on a later tick instead of
@@ -438,7 +523,7 @@ async function postWedgeWarning(
 async function observeWedgeCandidate(
   deps: PollerDeps,
   claudeInstanceId: string,
-  channelId: string,
+  persona: Persona,
 ): Promise<void> {
   const k = wedgeTripTicks(deps.intervalMs)
   let state = wedgeStates.get(claudeInstanceId)
@@ -462,12 +547,12 @@ async function observeWedgeCandidate(
   state.lastWarnAttemptTicks = state.emptyTicks
   logViaDeps(
     deps,
-    `[slack] permission-poller: spawn ${claudeInstanceId} wedged in check_permission with zero open rows for ${state.emptyTicks} ticks (~${Math.round((state.emptyTicks * deps.intervalMs) / 1000)}s) — posting one-shot warning`,
+    `[slack] permission-poller: spawn ${claudeInstanceId} for ${renderPersonaRef(persona.name, persona.key)} wedged in check_permission with zero open rows for ${state.emptyTicks} ticks (~${Math.round((state.emptyTicks * deps.intervalMs) / 1000)}s) — sending one-shot warning`,
   )
-  const posted = await postWedgeWarning(deps, claudeInstanceId, channelId)
+  const warned = await postWedgeWarning(deps, claudeInstanceId, persona)
   // b.fae F3: latch only on success; a failed post leaves warningFired false so
   // a subsequent tick retries and exactly one message lands on recovery.
-  if (posted) state.warningFired = true
+  if (warned) state.warningFired = true
 }
 
 /**
@@ -557,15 +642,21 @@ async function runTick(deps: PollerDeps): Promise<void> {
     // tick. Spawns in this set keep their prior emptyTicks/warningFired.
     const wedgeSkippedThisTick = new Set<string>()
     for (const row of rows) {
-      const rowChannelId = row.labels['channel']
-      if (!rowChannelId) {
-        logViaDeps(deps, `[slack] permission-poller: spawn ${row.claude_instance_id} has no channel label — skipping`)
+      const resolved = resolveRowPersona(deps, row)
+      if (resolved.kind === 'not_applied') {
+        // The spawn's requests may still be open in agent-director: exempt its
+        // live entries from the closing sweep and keep its wedge state, as for
+        // any other spawn not read this tick.
+        nonConformingInstanceIds.add(row.claude_instance_id)
+        wedgeSkippedThisTick.add(row.claude_instance_id)
         continue
       }
+      if (resolved.kind === 'no_label') continue
+      const persona = resolved.persona
 
       let got: GetResultWithPermissionRequests
       try {
-        got = (await withOutageDetection(rowChannelId, undefined, () =>
+        got = (await withOutageDetection(persona.key, undefined, () =>
           client.get({ claude_instance_id: row.claude_instance_id })
         )) as unknown as GetResultWithPermissionRequests
       } catch (err) {
@@ -602,7 +693,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
       // will be re-armed by reconcileWedgeStates below.
       if (got.permission_requests.length === 0) {
         wedgeObservedEmpty.add(row.claude_instance_id)
-        await observeWedgeCandidate(deps, row.claude_instance_id, rowChannelId)
+        await observeWedgeCandidate(deps, row.claude_instance_id, persona)
       }
 
       for (const perm of got.permission_requests) {
@@ -612,8 +703,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
           emitRowDecision(deps, 'already_tracked', row.claude_instance_id, perm.request_token)
           continue
         }
-        emitRowDecision(deps, 'post_attempted', row.claude_instance_id, perm.request_token)
-        await postPermissionPrompt(deps, row, perm)
+        await dispatchPermissionPrompt(deps, row, persona, perm, key)
       }
     }
 
@@ -621,6 +711,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
     // check_permission, gained an open row, or disappeared), but NOT for spawns
     // merely skipped by a transient read error this tick.
     reconcileWedgeStates(wedgeObservedEmpty, wedgeSkippedThisTick)
+    forgetUnobservedUnposted(seenComposite, wedgeSkippedThisTick)
 
     // SR-2.4 newly-closed reconciliation. Collect first, then reconcile —
     // avoids mutating the map while iterating it.
@@ -634,7 +725,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
     for (const entry of closedEntries) {
       let info: GetPermissionResult
       try {
-        info = await withOutageDetection(entry.channelId, undefined, () =>
+        info = await withOutageDetection(entry.personaKey, undefined, () =>
           getPermission(client, { request_token: entry.requestToken })
         )
       } catch (err) {
@@ -669,17 +760,108 @@ async function runTick(deps: PollerDeps): Promise<void> {
   }
 }
 
-async function postPermissionPrompt(
+/** Outcome of resolving a listed row's persona. */
+type RowPersona =
+  | { kind: 'persona'; persona: Persona }
+  | { kind: 'no_label' }
+  | { kind: 'not_applied' }
+
+/**
+ * Resolve a listed row's persona from its `persona` label (b.av2 SR-7.1). A row
+ * with no `persona` label (`no_label`), or one naming no applied persona
+ * (`not_applied`), is logged; the caller skips it. The `channel` label is
+ * never read.
+ */
+function resolveRowPersona(deps: PollerDeps, row: ListRow): RowPersona {
+  const key = row.labels[PERSONA_LABEL_KEY]
+  if (!key) {
+    logViaDeps(deps, `[slack] permission-poller: spawn ${row.claude_instance_id} has no persona label — skipping`)
+    return { kind: 'no_label' }
+  }
+  const persona = deps.getPersona(key)
+  if (!persona) {
+    logViaDeps(deps, `[slack] permission-poller: spawn ${row.claude_instance_id} names no applied persona (persona=${key}) — skipping`)
+    return { kind: 'not_applied' }
+  }
+  return { kind: 'persona', persona }
+}
+
+/**
+ * Log once per open request and reason why its prompt was not posted. A
+ * later tick with the same reason is silent; a changed reason logs again.
+ */
+function logUnpostedOnce(deps: PollerDeps, compositeKey: string, reason: UnpostedReason, line: string): void {
+  if (unpostedPrompts.get(compositeKey) === reason) return
+  unpostedPrompts.set(compositeKey, reason)
+  logViaDeps(deps, line)
+}
+
+/**
+ * Forget the not-posted record of every request no longer observed, except
+ * for spawns that could not be read this tick (their requests may still be
+ * open).
+ */
+function forgetUnobservedUnposted(seenComposite: Set<string>, skippedThisTick: Set<string>): void {
+  for (const compositeKey of [...unpostedPrompts.keys()]) {
+    if (seenComposite.has(compositeKey)) continue
+    const instanceId = compositeKey.slice(0, compositeKey.indexOf('\x00'))
+    if (skippedThisTick.has(instanceId)) continue
+    unpostedPrompts.delete(compositeKey)
+  }
+}
+
+/**
+ * Route one untracked open request to the persona's destination (b.av2
+ * SR-7.1). A `dm` destination (until E7) is logged once and not tracked, with
+ * no Slack call. A channel destination whose client is unavailable is logged
+ * once and not tracked, so a later tick retries it. Otherwise the
+ * `post_attempted` row decision is emitted and the prompt is posted through
+ * the persona's client to the destination channel.
+ */
+async function dispatchPermissionPrompt(
   deps: PollerDeps,
   row: ListRow,
+  persona: Persona,
   permission: PermissionRequestRow,
+  compositeKey: string,
 ): Promise<void> {
-  const channelId = row.labels['channel']
-  if (!channelId) {
-    logViaDeps(deps, `[slack] permission-poller: spawn ${row.claude_instance_id} has no channel label — skipping`)
+  const ref = renderPersonaRef(persona.name, persona.key)
+  const destination = resolvePersonaDestination(persona)
+  if (destination.kind === 'dm') {
+    logUnpostedOnce(
+      deps,
+      compositeKey,
+      'dm',
+      `[slack] permission-poller: ${ref} has permission_prompts set to DM, and permission prompts by DM are not ` +
+        `supported yet — prompt for ${row.claude_instance_id} (tool=${permission.tool_name}, ` +
+        `request_token=${permission.request_token}) logged instead of posted`,
+    )
     return
   }
+  const web = deps.clientFor(persona.key)
+  if (!web) {
+    logUnpostedOnce(
+      deps,
+      compositeKey,
+      'client-unavailable',
+      `[slack] permission-poller: no Slack client for ${ref} — prompt for ${row.claude_instance_id} ` +
+        `(request_token=${permission.request_token}) not posted; retrying on a later tick`,
+    )
+    return
+  }
+  unpostedPrompts.delete(compositeKey)
+  emitRowDecision(deps, 'post_attempted', row.claude_instance_id, permission.request_token)
+  await postPermissionPrompt(deps, web, row, persona, destination.channelId, permission)
+}
 
+async function postPermissionPrompt(
+  deps: PollerDeps,
+  web: PollerSlackClient,
+  row: ListRow,
+  persona: Persona,
+  channelId: string,
+  permission: PermissionRequestRow,
+): Promise<void> {
   // tool_input is a raw JSON string per the typed contract; parse for the
   // Block Kit builder, fall back to the raw string + warning on parse fail.
   let toolInput: Record<string, unknown>
@@ -703,7 +885,7 @@ async function postPermissionPrompt(
   const text = `🤖🛠️ permission request: ${permission.tool_name}`
   const emit = deps.emitTrail ?? defaultEmitTrail
   try {
-    const response = await deps.web.chat.postMessage({
+    const response = await web.chat.postMessage({
       channel: channelId,
       text,
       blocks: blocks as never,
@@ -728,6 +910,7 @@ async function postPermissionPrompt(
     livePermissions.set(makeCompositeKey(row.claude_instance_id, permission.request_token), {
       claudeInstanceId: row.claude_instance_id,
       requestToken: permission.request_token,
+      personaKey: persona.key,
       channelId,
       messageTs,
       requestId: permission.request_id,
@@ -737,7 +920,10 @@ async function postPermissionPrompt(
     // b.emk: failures land in BOTH server.log (real-time visibility) AND the
     // trail JSONL (after-the-fact debugging). Success paths stay trail-only,
     // preserving the SR-V-2.4 asymmetric-behavior fix.
-    logViaDeps(deps, `[slack] permission-poller: chat.postMessage failed for ${row.claude_instance_id}:`, err)
+    logViaDeps(
+      deps,
+      `[slack] permission-poller: chat.postMessage failed for ${row.claude_instance_id}${describeSlackCallFailure(err)}`,
+    )
     emit({
       event: 'cscb.chat_post.attempted',
       claude_instance_id: row.claude_instance_id,
@@ -826,14 +1012,29 @@ function buildVerdictRendering(tag: VerdictTag): { text: string; blocks: unknown
 
 /**
  * Issue exactly one `chat.update` carrying the verdict-distinct rendering
- * against this entry's messageTs. Sibling-independent by construction: the
- * call only ever names `entry.channelId` + `entry.messageTs` (SR-5.3).
+ * against this entry's messageTs, through the client of the persona that
+ * posted it: a prompt stays where it was posted. Sibling-independent by
+ * construction: the call only ever names `entry.channelId` +
+ * `entry.messageTs` (SR-5.3). When that persona's client is unavailable, one
+ * line is logged and no update is made (the caller still drops the entry:
+ * agent-director has already closed the request).
  */
 async function renderClosureUpdate(
   deps: PollerDeps,
   entry: LivePermission,
   tag: VerdictTag,
 ): Promise<void> {
+  const web = deps.clientFor(entry.personaKey)
+  if (!web) {
+    const persona = deps.getPersona(entry.personaKey)
+    const ref = persona ? renderPersonaRef(persona.name, persona.key) : `persona=${entry.personaKey}`
+    logViaDeps(
+      deps,
+      `[slack] permission-poller: no Slack client for ${ref} — closure update for ` +
+        `${entry.claudeInstanceId} token=${entry.requestToken} (verdict=${tag}) skipped`,
+    )
+    return
+  }
   const { text, blocks } = buildVerdictRendering(tag)
   const emit = deps.emitTrail ?? defaultEmitTrail
   const envelope = {
@@ -848,7 +1049,7 @@ async function renderClosureUpdate(
     triggered_by: 'poller' as const,
   }
   try {
-    await deps.web.chat.update({
+    await web.chat.update({
       channel: entry.channelId,
       ts: entry.messageTs,
       text,
@@ -857,7 +1058,11 @@ async function renderClosureUpdate(
     emit({ ...envelope, ok: true })
   } catch (err) {
     // b.emk: failures land in BOTH server.log and the trail JSONL.
-    logViaDeps(deps, `[slack] permission-poller: closure chat.update failed for ${entry.claudeInstanceId} token=${entry.requestToken} (verdict=${tag}):`, err)
+    logViaDeps(
+      deps,
+      `[slack] permission-poller: closure chat.update failed for ${entry.claudeInstanceId} token=${entry.requestToken} ` +
+        `(verdict=${tag})${describeSlackCallFailure(err)}`,
+    )
     emit({ ...envelope, ok: false, error: classifySlackError(err) })
   }
 }

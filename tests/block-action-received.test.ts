@@ -15,12 +15,16 @@ import { describe, test, expect } from 'bun:test'
 import { emitBlockActionReceived } from '../src/permission-click-handler.ts'
 import { encodePermissionActionId } from '../src/permission-action-id.ts'
 import type { TrailEventBase } from '../src/permission-trail.ts'
+import { personaInstanceId, personaKey } from '../src/persona-identity.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
-const INSTANCE_C = 'cscb_demo_C0B1ZJJLJ9M'
+/** Persona whose key differs from the inbound channel ID (b.av2 SR-2.2). */
+const PERSONA_NAME = 'Demo Relay Bot'
+const PERSONA_KEY = personaKey(PERSONA_NAME)
+const INSTANCE_C = personaInstanceId(PERSONA_KEY)
 const CHANNEL_CH = 'C0B1ZJJLJ9M'
 const MSG_TS = '1780600244.439969'
 const USER = 'U_OPERATOR'
@@ -85,6 +89,7 @@ describe('emitBlockActionReceived — decode failure', () => {
     expect(cap.events).toHaveLength(1)
     const e = cap.events[0]!
     expect(e['parse_failure_reason']).toBe('foreign_action_id')
+    expect(e.channel).toBe(CHANNEL_CH)
     expect(e['raw_action_id']).toBe('some_other_bot_action')
     expect('claude_instance_id' in e).toBe(false)
     expect('request_token' in e).toBe(false)
@@ -101,6 +106,7 @@ describe('emitBlockActionReceived — decode failure', () => {
     const cap = makeCapture()
     emitBlockActionReceived(`perm_deny_${INSTANCE_C}_42`, makeContext(), cap.emit)
     expect(cap.events[0]!['parse_failure_reason']).toBe('malformed_token')
+    expect(cap.events[0]!.channel).toBe(CHANNEL_CH)
   })
 })
 

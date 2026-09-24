@@ -9,6 +9,9 @@
  *   - Decoder yields null (not throw) on malformed inputs.
  *   - Regex anchors on outer UUIDv4 shape only — the token's bytes are
  *     opaque to CSCB.
+ *   - Persona instance ids (b.av2 SR-2.1 / SR-2.2): `cscb_<key>` for keys
+ *     from `personaKey` round-trips within Slack's 255-character action_id
+ *     limit, and `personaKeyFromActionId` recovers the key.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -18,7 +21,9 @@ import {
   encodePermissionActionId,
   parsePermissionActionId,
   PERMISSION_ACTION_ID_RE,
+  personaKeyFromActionId,
 } from '../src/permission-action-id.ts'
+import { personaInstanceId, personaKey } from '../src/persona-identity.ts'
 
 // ---------------------------------------------------------------------------
 // Shared fixtures — no inline magic strings (SR-8.1)
@@ -218,5 +223,64 @@ describe('PERMISSION_ACTION_ID_RE — invariant', () => {
     expect(PERMISSION_ACTION_ID_RE.source).toContain('cscb_')
     expect(PERMISSION_ACTION_ID_RE.source).toContain('[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
     expect(PERMISSION_ACTION_ID_RE.source.endsWith('$')).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Persona instance ids — cscb_<key> (b.av2 SR-2.1 / SR-2.2)
+// ---------------------------------------------------------------------------
+
+/** Slack's maximum length for a Block Kit element's `action_id`. */
+const SLACK_ACTION_ID_MAX_LENGTH = 255
+
+/**
+ * Sample persona names, each paired with the key shape it must produce. Keys
+ * come from `personaKey`, never hard-coded.
+ */
+const PERSONA_NAME_SAMPLES: Array<{ label: string; name: string }> = [
+  { label: 'plain a-z0-9_ name (its own key)', name: 'ops_bot_2' },
+  { label: 'name with spaces and capitals (hashed form)', name: 'Ops Review Bot' },
+  { label: 'name with no ASCII letters or digits (bare 8-hex key)', name: '!!!' },
+  { label: 'name long enough for the 40-char truncation plus hash', name: 'A Very Long Persona Name That Keeps Going On And On' },
+  { label: 'name that itself contains perm_allow_', name: 'perm_allow_ Relay Bot' },
+]
+
+describe('parsePermissionActionId — cscb_<persona key> round-trip', () => {
+  test.each(PERSONA_NAME_SAMPLES)('$label: allow and deny round-trip within the action_id limit', ({ name }) => {
+    const key = personaKey(name)
+    const instanceId = personaInstanceId(key)
+    expect(instanceId).toBe(`cscb_${key}`)
+    for (const decision of ['allow', 'deny'] as const) {
+      for (const token of SAMPLE_TOKENS) {
+        const actionId = encodePermissionActionId(decision, instanceId, token)
+        expect(actionId.length).toBeLessThanOrEqual(SLACK_ACTION_ID_MAX_LENGTH)
+        expect(parsePermissionActionId(actionId)).toEqual({
+          decision,
+          claudeInstanceId: instanceId,
+          requestToken: token,
+        })
+      }
+    }
+  })
+})
+
+describe('personaKeyFromActionId', () => {
+  test.each(PERSONA_NAME_SAMPLES)('$label: returns the key the action_id was built for', ({ name }) => {
+    const key = personaKey(name)
+    for (const decision of ['allow', 'deny'] as const) {
+      const actionId = encodePermissionActionId(decision, personaInstanceId(key), SAMPLE_TOKENS[3]!)
+      expect(personaKeyFromActionId(actionId)).toBe(key)
+    }
+  })
+
+  test.each<[string, string]>([
+    ['a foreign (non-perm_) action_id', 'some_other_bot_action'],
+    ['an empty action_id', ''],
+    ['an instance id without the cscb_ prefix', `perm_allow_other_ops_bot_${SAMPLE_TOKENS[0]}`],
+    ['a numeric (non-UUID) token', `perm_allow_cscb_${personaKey(PERSONA_NAME_SAMPLES[1]!.name)}_42`],
+    ['an unknown decision verb', `perm_maybe_cscb_${personaKey(PERSONA_NAME_SAMPLES[1]!.name)}_${SAMPLE_TOKENS[0]}`],
+    ['no instance id after cscb_', `perm_allow_cscb_${SAMPLE_TOKENS[0]}`],
+  ])('returns undefined for %s', (_label, actionId) => {
+    expect(personaKeyFromActionId(actionId)).toBeUndefined()
   })
 })

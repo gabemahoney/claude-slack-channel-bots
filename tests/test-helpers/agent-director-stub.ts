@@ -89,8 +89,13 @@ import type {
   GetPermissionResult,
 } from '../../src/agent-director-client.ts'
 import type { Persona } from '../../src/config.ts'
-import { personaInstanceId, personaTmuxSessionName } from '../../src/persona-identity.ts'
+import {
+  PERSONA_INSTANCE_ID_PREFIX,
+  personaInstanceId,
+  personaTmuxSessionName,
+} from '../../src/persona-identity.ts'
 import { personaConfigDirLabelValue } from '../../src/session-manager.ts'
+import { makePersona } from './persona-config.ts'
 
 // ---------------------------------------------------------------------------
 // Canned-result and canned-rejection factories
@@ -318,8 +323,8 @@ export type CannedRowPersona = Pick<Persona, 'key' | 'working_directory' | 'clau
 /**
  * The fields a spawn of `persona` writes (b.av2 SR-2.2): `cwd` = the working
  * directory, instance ID `cscb_<key>`, tmux session `slack_bot_<key>`, and the
- * labels `service=cscb`, `persona=<key>`, `config_dir=<value>` and the interim
- * `channel=<key>`. The `config_dir` value comes from the production helper
+ * labels `service=cscb`, `persona=<key>` and `config_dir=<value>` (no
+ * `channel` label). The `config_dir` value comes from the production helper
  * `personaConfigDirLabelValue` (real path, lexical fallback) against the
  * caller's `home`, never the OS home. No I/O beyond that helper's realpath;
  * nothing is created or written.
@@ -335,21 +340,61 @@ function personaRowDefaults(persona: CannedRowPersona, home: string): {
     cwd: persona.working_directory,
     claude_instance_id: personaInstanceId(persona.key),
     tmux_session_name: personaTmuxSessionName(persona.key),
-    labels: { service: 'cscb', persona: persona.key, config_dir: configDir, channel: persona.key },
+    labels: { service: 'cscb', persona: persona.key, config_dir: configDir },
   }
 }
 
 /**
- * Build a canned ListRow with sensible defaults. Override fields as needed.
+ * The `cwd` a row built without a persona argument defaults to: the working
+ * directory of the default persona fixture (`makePersona()` from
+ * `persona-config.ts`, i.e. `<tmpdir>/personas/test_bot/work`). Computed per
+ * call because `tmpdir()` follows `TMPDIR`; nothing creates the directory.
+ */
+export function defaultCannedRowCwd(): string {
+  return makePersona().working_directory
+}
+
+/**
+ * The persona key a row built without a persona argument stands for: its
+ * instance ID without the `cscb_` prefix (the ID itself when it lacks it).
+ */
+function defaultRowPersonaKey(claudeInstanceId: string): string {
+  return claudeInstanceId.startsWith(PERSONA_INSTANCE_ID_PREFIX)
+    ? claudeInstanceId.slice(PERSONA_INSTANCE_ID_PREFIX.length)
+    : claudeInstanceId
+}
+
+/**
+ * Defaults for a row built without a persona argument (b.av2 SR-13.4): labels
+ * exactly `service=cscb` and `persona=<key>` (no `config_dir`, no `channel`),
+ * tmux session `slack_bot_<key>`, and `cwd` `defaultCannedRowCwd()`.
+ */
+function defaultRowFields(claudeInstanceId: string): {
+  cwd: string
+  tmux_session_name: string
+  labels: Record<string, string>
+} {
+  const key = defaultRowPersonaKey(claudeInstanceId)
+  return {
+    cwd: defaultCannedRowCwd(),
+    tmux_session_name: personaTmuxSessionName(key),
+    labels: { service: 'cscb', persona: key },
+  }
+}
+
+/**
+ * Build a canned ListRow with persona defaults. Override fields as needed.
  *
- * Without `persona` the defaults are the legacy ones (`cwd` `/tmp/cwd`, tmux
- * `slack_bot_<claude_instance_id>`, labels `service=cscb`, `channel=C_TEST`)
- * and `claude_instance_id` is required. With `persona` the defaults are what
- * a spawn of that persona writes (see `personaRowDefaults`) and
- * `claude_instance_id` defaults to `cscb_<key>`; `home` (required) is the home
- * directory the `config_dir` label is computed against. Explicit overrides always win,
- * so a negative case can replace `cwd` or `labels` (e.g. drop `config_dir`).
- * E3 Task 6 makes the persona form the default.
+ * Without `persona`, `claude_instance_id` is required and the row stands for
+ * the persona whose key is that ID without its `cscb_` prefix: labels exactly
+ * `service=cscb` and `persona=<key>`, tmux `slack_bot_<key>`, and `cwd`
+ * `defaultCannedRowCwd()` (the default persona fixture's working directory).
+ * With `persona` the defaults are what a spawn of that persona writes (see
+ * `personaRowDefaults`), `claude_instance_id` defaults to `cscb_<key>`, and
+ * `home` (required) is the home directory the `config_dir` label is computed
+ * against. Explicit overrides always win, so a negative case can replace
+ * `cwd` or `labels` (e.g. drop `persona` or `config_dir`, or carry only an
+ * old `channel` label).
  */
 export function cannedListRow(overrides: Partial<ListRow> & { claude_instance_id: string }): ListRow
 export function cannedListRow(overrides: Partial<ListRow>, persona: CannedRowPersona, home: string): ListRow
@@ -370,10 +415,8 @@ export function cannedListRow(overrides: Partial<ListRow>, persona?: CannedRowPe
   return {
     parent_id: undefined,
     state: 'waiting',
-    cwd: '/tmp/cwd',
-    tmux_session_name: `slack_bot_${overrides.claude_instance_id}`,
     relay_mode: 'on',
-    labels: { service: 'cscb', channel: 'C_TEST' },
+    ...defaultRowFields(overrides.claude_instance_id as string),
     started_at: '2026-05-24T12:00:00Z',
     last_seen_at: '2026-05-24T12:00:00Z',
     ended_at: null,
@@ -431,15 +474,16 @@ export type CannedGetResult = GetResult & { permission_requests?: PermissionRequ
  * rows under the new plural-projection wire. For the negative-test cases
  * (poller skips when the plural field is absent), pass `null` or omit.
  *
- * Without `persona` the defaults are the legacy ones (`cwd` `/tmp/cwd`, tmux
- * `slack_bot_<claude_instance_id>`, labels `service=cscb`, `channel=C_TEST`)
- * and `claude_instance_id` is required. With `persona` the `cwd`, instance
- * ID, tmux name and labels default to what a spawn of that persona writes:
- * `cwd` = working directory, `cscb_<key>`, `slack_bot_<key>`, and
- * `service=cscb`, `persona=<key>`, `config_dir=<personaConfigDirLabelValue>`
- * and the interim `channel=<key>`; `home` (required) is the home directory the
- * `config_dir` label is computed against. Explicit overrides always win.
- * E3 Task 6 makes the persona form the default.
+ * The `cwd`, tmux name and label defaults match `cannedListRow`. Without
+ * `persona`, `claude_instance_id` is required and the row stands for the
+ * persona whose key is that ID without its `cscb_` prefix: labels exactly
+ * `service=cscb` and `persona=<key>`, tmux `slack_bot_<key>`, `cwd`
+ * `defaultCannedRowCwd()`. With `persona` they default to what a spawn of
+ * that persona writes: `cwd` = working directory, `cscb_<key>`,
+ * `slack_bot_<key>`, and `service=cscb`, `persona=<key>`,
+ * `config_dir=<personaConfigDirLabelValue>`; `home` (required) is the home
+ * directory the `config_dir` label is computed against. Explicit overrides
+ * always win. The stub client's default `get` row uses the no-persona form.
  */
 export function cannedGetResult(overrides: GetResultOverrides): CannedGetResult
 export function cannedGetResult(
@@ -471,13 +515,11 @@ export function cannedGetResult(
   return {
     parent_id: '',
     state: 'waiting',
-    cwd: '/tmp/cwd',
-    tmux_session_name: `slack_bot_${overrides.claude_instance_id}`,
     claude_args: [],
     relay_mode: 'on',
     jsonl_path: '',
     claude_session_id: '',
-    labels: { service: 'cscb', channel: 'C_TEST' },
+    ...defaultRowFields((overrides as GetResultOverrides).claude_instance_id),
     started_at: '2026-05-24T12:00:00Z',
     last_seen_at: '2026-05-24T12:00:00Z',
     ended_at: null,

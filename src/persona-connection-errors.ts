@@ -19,7 +19,8 @@
  *
  * `slackPlatformReason` reads one more field for callers that want it: the
  * Slack platform reason (`data.error`), under the same short-identifier check
- * as `code`.
+ * as `code`. `describeSlackCallFailure` joins the two into the tail of a
+ * failed-Slack-call log line.
  *
  * `createUnhandledRejectionHandler(log)` returns a listener for the process's
  * `unhandledRejection` event that logs one `[slack]` line built with the
@@ -80,6 +81,18 @@ export function describeThrownValue(value: unknown): string {
 export function slackPlatformReason(value: unknown): string | undefined {
   const reason = readProp(readProp(value, 'data'), 'error')
   return typeof reason === 'string' && SAFE_IDENTIFIER_RE.test(reason) ? reason : undefined
+}
+
+/**
+ * The token-safe tail of a failed-Slack-call log line: ` (reason=<reason>)`
+ * when {@link slackPlatformReason} finds one, then `: ` and
+ * {@link describeThrownValue}. For callers that would otherwise log the raw
+ * error, which can carry the original request, Authorization header
+ * included. Never throws.
+ */
+export function describeSlackCallFailure(value: unknown): string {
+  const reason = slackPlatformReason(value)
+  return `${reason ? ` (reason=${reason})` : ''}: ${describeThrownValue(value)}`
 }
 
 /** The constructor name of an `Error`, when it is a safe identifier; otherwise `Error`. */

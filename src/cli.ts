@@ -19,7 +19,7 @@ import { initLogging } from './logging.ts'
 import { isDryRun } from './tokens.ts'
 import { ErrSpawnNotFound } from './agent-director-errors.ts'
 import { getClient } from './agent-director-client.ts'
-import { personaInstanceId } from './persona-identity.ts'
+import { PERSONA_LABEL_PREFIX, SERVICE_LABEL, personaInstanceId } from './persona-identity.ts'
 import { runStartupGate } from './agent-director-startup.ts'
 
 // ---------------------------------------------------------------------------
@@ -487,6 +487,34 @@ export function createCli(deps: CliDeps): CliHandlers {
 }
 
 // ---------------------------------------------------------------------------
+// agent-director instance lookup
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a persona's actual claude_instance_id by querying agent-director's
+ * label index: the rows labelled `service=cscb` and `persona=<key>`. Spawns
+ * are named `cscb_<key>`; until the CLI moves to the persona set (E3 Task 10)
+ * the key is the channel ID of the route being torn down.
+ *
+ * When more than one row carries the label, the row named exactly
+ * `cscb_<key>` wins; otherwise the first row.
+ *
+ * b.qwo: returns null ONLY when no cscb row carries the persona label (empty
+ * list). All other errors (AD connection refused, uninitialized client,
+ * binary unreachable, etc.) PROPAGATE. The previous bare `catch { return
+ * null }` was the b.qps / incident-2026-09-18 root cause: it collapsed an
+ * AD-unreachable throw into a "no row" null, so the teardown skipped every
+ * channel and silently no-op'd. AD-unreachable must fail loudly, and "no
+ * spawn row" must mean the row is genuinely absent.
+ */
+export async function resolveCscbInstanceId(key: string): Promise<string | null> {
+  const r = await getClient().list({ label: [SERVICE_LABEL, `${PERSONA_LABEL_PREFIX}${key}`] })
+  if (r.spawns.length === 0) return null
+  const exact = r.spawns.find((s) => s.claude_instance_id === personaInstanceId(key))
+  return (exact ?? r.spawns[0]).claude_instance_id
+}
+
+// ---------------------------------------------------------------------------
 // Top-level entry point
 // ---------------------------------------------------------------------------
 
@@ -503,27 +531,6 @@ if (import.meta.main) {
     console.error('stop flags:')
     console.error('  --stop-bots    Gracefully exit all managed bots before stopping the server')
     process.exit(1)
-  }
-
-  // Resolve a channel's actual claude_instance_id by querying agent-director's
-  // label index (the interim `channel` label). Spawns are named `cscb_<key>`
-  // and, until the persona loader switch, the key is the channel ID.
-  //
-  // b.qwo: returns null ONLY when no cscb row exists for the channel (empty
-  // list). All other errors (AD connection refused, uninitialized client,
-  // binary unreachable, etc.) PROPAGATE. The previous bare `catch { return
-  // null }` was the b.qps / incident-2026-09-18 root cause: it collapsed an
-  // AD-unreachable throw into a "no row" null, so the teardown skipped every
-  // channel and silently no-op'd. AD-unreachable must fail loudly, and "no
-  // spawn row" must mean the row is genuinely absent.
-  async function resolveCscbInstanceId(channelId: string): Promise<string | null> {
-    const r = await getClient().list({ label: ['service=cscb', `channel=${channelId}`] })
-    if (r.spawns.length === 0) return null
-    // Prefer the row named exactly `cscb_<channel>` (the current naming) when
-    // more than one carries the label; any other row is a leftover from the
-    // retired channel-name naming. Fall back to the first row otherwise.
-    const current = r.spawns.find((s) => s.claude_instance_id === personaInstanceId(channelId))
-    return (current ?? r.spawns[0]).claude_instance_id
   }
 
   const realDeps: CliDeps = {
@@ -552,7 +559,7 @@ if (import.meta.main) {
     },
     directorStatus: async (channelId) => {
       // Resolve the actual claude_instance_id by label; null when no cscb row
-      // carries this channel's label.
+      // carries this key's persona label.
       const id = await resolveCscbInstanceId(channelId)
       if (id === null) return null
       try {

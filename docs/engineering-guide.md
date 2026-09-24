@@ -31,7 +31,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 - Non-critical failures (reaction add, message update) use empty catch blocks with `/* non-critical */` or `/* ignore */`
 - Critical failures (token loading, routing config) exit the process with a clear message
 - Persona diagnostic lines (b.av2 SR-10.3) go through `src/persona-diagnostics.ts`. Add a new class to its closed label set, build the line with `formatPersonaDiagnostic()` or `personaCheckFailure()`, and emit it only through an injected logger, never with a direct `console` call in a pure module. The cause is one line, names a bad token by its key and the rule it breaks, never by its value, and never quotes file contents
-- On persona connection paths, log a thrown or rejected value only through `describeThrownValue()` in `src/persona-connection-errors.ts`, never the error object or its message: a Slack library error's message, request and headers can hold a token
+- On persona connection paths, log a thrown or rejected value only through `describeThrownValue()` in `src/persona-connection-errors.ts`, never the error object or its message: a Slack library error's message, request and headers can hold a token. For a failed Slack Web API call, end the log line with `describeSlackCallFailure()` from the same module, which adds the Slack platform reason when it is a safe identifier
 
 ## Configuration
 

@@ -25,6 +25,12 @@
  * Held notices are per persona (b.av2 SR-3.3): flushing one persona never
  * touches another's queue.
  *
+ * Shared helpers: `resolvePersonaDestination` (where a persona's prompts and
+ * notices go) and `formatPersonaNotice` (a notice text carrying the persona
+ * reference) are pure and exported. The permission poller uses both for its
+ * prompts and its stuck-prompt warning, which need the post's outcome and so
+ * cannot go through `notify`. E7 extends the destination helper for DMs.
+ *
  * Pure module (b.av2 SR-13.1): no module-scope state, no I/O of its own, no
  * timers and nothing runs at import. All state lives in the instance the
  * factory returns; the Slack client, the persona lookup, the dry-run predicate
@@ -87,6 +93,14 @@ export interface PersonaNotifier {
   flush(key: string): Promise<void>
 }
 
+/**
+ * Where a persona's permission prompts and server notices go (b.av2 SR-7.1):
+ * a channel, with its ID, or `dm`.
+ */
+export type PersonaDestination =
+  | { kind: 'channel'; channelId: string }
+  | { kind: 'dm' }
+
 /** A notice held until its persona's client is validated. */
 interface HeldNotice {
   text: string
@@ -104,8 +118,19 @@ export function firstNoticeLine(text: string): string {
 }
 
 /**
+ * Resolve a persona's destination from its `permission_prompts` setting:
+ * `dm` for the DM destination, else the channel it names. Pure; shared by
+ * `notify` and the permission poller. E7 extends it for DMs.
+ */
+export function resolvePersonaDestination(persona: Pick<Persona, 'permission_prompts'>): PersonaDestination {
+  if (persona.permission_prompts === DM_DESTINATION) return { kind: 'dm' }
+  return { kind: 'channel', channelId: persona.permission_prompts }
+}
+
+/**
  * The posted text of a notice: the persona reference, rendered from the
- * persona's stored key, then the body.
+ * persona's stored key (never one derived again from the name), then the
+ * body. Pure; shared by `notify` and the permission poller.
  */
 export function formatPersonaNotice(persona: Pick<Persona, 'name' | 'key'>, text: string): string {
   return `Persona ${renderPersonaRef(persona.name, persona.key)}: ${text}`
@@ -141,9 +166,8 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
 
   // The Slack call is made before the first `await`, so calling `post` issues
   // the post synchronously; only the settling is awaited.
-  async function post(persona: Persona, client: WebClient, notice: HeldNotice): Promise<void> {
+  async function post(persona: Persona, channel: string, client: WebClient, notice: HeldNotice): Promise<void> {
     const ref = renderPersonaRef(persona.name, persona.key)
-    const channel = persona.permission_prompts
     try {
       await client.chat.postMessage({ channel, text: formatPersonaNotice(persona, notice.text) })
     } catch (err) {
@@ -169,7 +193,8 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
       deps.log(`[slack] dry-run: would post notice for ${ref}: ${firstNoticeLine(text)}`)
       return
     }
-    if (persona.permission_prompts === DM_DESTINATION) {
+    const destination = resolvePersonaDestination(persona)
+    if (destination.kind === 'dm') {
       deps.log(
         `[slack] persona-notifier: ${ref} has permission_prompts set to DM, and server notices by DM are not ` +
           `supported yet — notice logged instead of posted: ${text}`,
@@ -186,7 +211,7 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
       if (client) await flush(key)
       return
     }
-    await post(persona, client, { text, options })
+    await post(persona, destination.channelId, client, { text, options })
   }
 
   async function flush(key: string): Promise<void> {

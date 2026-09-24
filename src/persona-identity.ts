@@ -53,8 +53,11 @@ export const PERSONA_TMUX_SESSION_PREFIX = 'slack_bot_'
 /** Label marking an agent-director row as owned by this server. */
 export const SERVICE_LABEL = 'service=cscb'
 
+/** Label-map key of the label carrying the persona key (`persona`). */
+export const PERSONA_LABEL_KEY = 'persona'
+
 /** Prefix of the label carrying the persona key. */
-export const PERSONA_LABEL_PREFIX = 'persona='
+export const PERSONA_LABEL_PREFIX = `${PERSONA_LABEL_KEY}=`
 
 /** Prefix of the label carrying the hashed effective claude_config_dir. */
 export const CONFIG_DIR_LABEL_PREFIX = 'config_dir='

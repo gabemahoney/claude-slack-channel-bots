@@ -38,21 +38,32 @@
  *   - No `chat.update` ever targets a sibling's messageTs in response to a
  *     single-row event (SR-4.5 / SR-5.3 compounded)
  *
+ * The spawn row carries the persona label; the poller and the click handler
+ * reach Slack through that persona's own client, and every post and update
+ * lands on its destination channel (b.av2 SR-7.1). A second persona's client
+ * stays untouched.
+ *
  * SPDX-License-Identifier: MIT
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import type { Client, DecideParams, DecideResult, ListResult } from 'agent-director'
 
-import { handlePermissionClick } from '../src/permission-click-handler.ts'
+import { mkdtempSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+
+import type { Persona } from '../src/config.ts'
+import { handlePermissionClick, type ClickDeps } from '../src/permission-click-handler.ts'
 import { _resetOutageState, initOutageState } from '../src/outage-state.ts'
 import { encodePermissionActionId } from '../src/permission-action-id.ts'
+import { _resetTrailFdForTests } from '../src/permission-trail.ts'
 import {
   _resetPollerState,
   getLivePermission,
-  startPermissionPoller,
   stopPermissionPoller,
 } from '../src/permission-poller.ts'
+import { personaInstanceId, personaKey } from '../src/persona-identity.ts'
 import type { GetPermissionParams, GetPermissionResult } from '../src/agent-director-client.ts'
 import {
   cannedGetPermissionResponse,
@@ -60,13 +71,31 @@ import {
   cannedListRow,
   cannedPermissionRequest,
 } from './test-helpers/agent-director-stub.ts'
+import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeStubSlack, type StubSlack } from './test-helpers/slack-stub.ts'
+import {
+  makePersonaClients,
+  posts,
+  slackCalls,
+  startManualPoller,
+  updates,
+  type PersonaClients,
+} from './test-helpers/permission-relay-harness.ts'
 
 // ---------------------------------------------------------------------------
 // Pinned constants (no inline magic strings per SR-8.1)
 // ---------------------------------------------------------------------------
 
-const INSTANCE_C = 'cscb_C'
-const CHANNEL_CH = 'CH'
+// The owning persona: its key differs from its destination channel ID, and
+// its destination is not its first (work) channel.
+const NAME_A = 'Capstone Relay'
+const KEY_A = personaKey(NAME_A)
+const INSTANCE_C = personaInstanceId(KEY_A)
+const WORK_CH = 'C0CAPWORK1'
+const CHANNEL_CH = 'C0CAPDEST1'
+// A second persona whose client must stay untouched.
+const NAME_B = 'Capstone Bystander'
+const CHANNEL_B = 'C0CAPBYST1'
 const POST_TS_A = 'TS.row_A'
 const POST_TS_B = 'TS.row_B'
 
@@ -76,80 +105,57 @@ const TOK_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 
 
 // ---------------------------------------------------------------------------
-// Shared test plumbing — manual interval + chat-recording stub
+// Shared test plumbing — per-persona stubs and lookups
 // ---------------------------------------------------------------------------
 
-interface ManualInterval { cb: () => void; ms: number; cleared: boolean }
-function makeInterval(): {
-  setInterval: typeof globalThis.setInterval
-  clearInterval: typeof globalThis.clearInterval
-  pending: ManualInterval[]
-} {
-  const pending: ManualInterval[] = []
-  return {
-    setInterval: ((cb: () => void, ms: number) => {
-      const entry: ManualInterval = { cb, ms, cleared: false }
-      pending.push(entry)
-      return entry as unknown as ReturnType<typeof setInterval>
-    }) as unknown as typeof globalThis.setInterval,
-    clearInterval: ((handle: unknown) => {
-      const entry = handle as ManualInterval
-      entry.cleared = true
-    }) as unknown as typeof globalThis.clearInterval,
-    pending,
-  }
-}
+let tempDir: string
+let origStateDir: string | undefined
+let personas: Persona[]
+let stubA: StubSlack
+let stubB: StubSlack
+/** Each persona's own stub, handed out by key. */
+let clients: PersonaClients
 
-interface ChatCall {
-  kind: 'postMessage' | 'update'
-  channel: string
-  ts?: string
-  text?: string
-}
+const getPersona = (key: string): Persona | undefined => personas.find((p) => p.key === key)
 
-function makeChatStub(opts: { tsSequence: string[] }): {
-  web: {
-    chat: {
-      postMessage: (args: unknown) => Promise<{ ts: string }>
-      update: (args: unknown) => Promise<unknown>
-    }
-  }
-  calls: ChatCall[]
-} {
-  const calls: ChatCall[] = []
-  const seq = [...opts.tsSequence]
-  let fallback = 0
-  return {
-    web: {
-      chat: {
-        async postMessage(args: unknown): Promise<{ ts: string }> {
-          const a = args as { channel: string; text: string }
-          const ts = seq.shift() ?? `auto-${++fallback}`
-          calls.push({ kind: 'postMessage', channel: a.channel, text: a.text, ts })
-          return { ts }
-        },
-        async update(args: unknown): Promise<unknown> {
-          const a = args as { channel: string; ts: string; text: string }
-          calls.push({ kind: 'update', channel: a.channel, ts: a.ts, text: a.text })
-          return {}
-        },
-      },
-    },
-    calls,
-  }
-}
+/** Click deps for a click received on the owning persona's connection. */
+const clickDeps = (): ClickDeps => ({ receivingPersonaKey: KEY_A, clientFor: clients.clientFor, getPersona })
 
 beforeEach(() => {
   // Initialize outage-state so withOutageDetection does not throw during
   // poller ticks. The test body overrides via initOutageState with the full
   // sharedClient (which carries decide) before invoking handlePermissionClick.
   initOutageState({ getClient: () => ({} as unknown as Client), notify: () => {} })
+  tempDir = mkdtempSync(join(tmpdir(), 'relay-repro-'))
+  // The poller and click handler write the default trail under
+  // SLACK_STATE_DIR; keep it in this test's temp directory.
+  origStateDir = process.env['SLACK_STATE_DIR']
+  process.env['SLACK_STATE_DIR'] = tempDir
+  _resetTrailFdForTests()
+  personas = makeMultiPersonaConfig(
+    [
+      {
+        name: NAME_A,
+        channels: [{ id: WORK_CH, delivery: 'all' }, { id: CHANNEL_CH, delivery: 'mentions' }],
+        permission_prompts: CHANNEL_CH,
+      },
+      { name: NAME_B, channels: [{ id: CHANNEL_B, delivery: 'all' }] },
+    ],
+    tempDir,
+  ).personas
+  stubA = makeStubSlack()
+  stubB = makeStubSlack()
+  clients = makePersonaClients((key) => (key === KEY_A ? stubA : key === personas[1]!.key ? stubB : undefined))
 })
 
 afterEach(() => {
   stopPermissionPoller()
   _resetPollerState()
   _resetOutageState()
+  if (origStateDir === undefined) delete process.env['SLACK_STATE_DIR']
+  else process.env['SLACK_STATE_DIR'] = origStateDir
+  _resetTrailFdForTests()
+  rmSync(tempDir, { recursive: true, force: true })
 })
 
 // ---------------------------------------------------------------------------
@@ -158,8 +164,10 @@ afterEach(() => {
 
 describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
   test('two prompts → one allow + one deny click → next tick reconciles both via getPermission', async () => {
-    const ivl = makeInterval()
-    const chat = makeChatStub({ tsSequence: [POST_TS_A, POST_TS_B] })
+    stubA.script.post.push(
+      { kind: 'ok', result: { ts: POST_TS_A } },
+      { kind: 'ok', result: { ts: POST_TS_B } },
+    )
 
     // Tick-N projection presence is mutable: starts with both rows, then
     // empties for tick N+1 to drive the closure path.
@@ -169,13 +177,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     ]
 
     const listResult: ListResult = {
-      spawns: [
-        cannedListRow({
-          claude_instance_id: INSTANCE_C,
-          state: 'check_permission',
-          labels: { service: 'cscb', channel: CHANNEL_CH },
-        }),
-      ],
+      spawns: [cannedListRow({ state: 'check_permission' }, personas[0]!, tempDir)],
     }
 
     const decideCalls: DecideParams[] = []
@@ -222,25 +224,19 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     const getClient = () => sharedClient
 
     initOutageState({ getClient: getClient as unknown as () => Client, notify: () => {} })
-    startPermissionPoller({
-      getClient,
-      web: chat.web as never,
-      intervalMs: 1000,
-      setInterval: ivl.setInterval,
-      clearInterval: ivl.clearInterval,
-    })
+    const ivl = startManualPoller({ getClient, clientFor: clients.clientFor, getPersona })
 
     // -----------------------------------------------------------------
     // Tick N — two open rows produce two distinct prompts
     // -----------------------------------------------------------------
-    ivl.pending[0].cb()
-    await new Promise((r) => setTimeout(r, 10))
+    await ivl.tick()
 
-    const tickNPosts = chat.calls.filter((c) => c.kind === 'postMessage')
+    const tickNPosts = posts(stubA)
     expect(tickNPosts).toHaveLength(2)
+    // Every post lands on the owning persona's destination, on its own client.
     expect(tickNPosts.every((c) => c.channel === CHANNEL_CH)).toBe(true)
     // Two distinct ts values, matching the seeded sequence
-    const tickNTs = new Set(tickNPosts.map((c) => c.ts))
+    const tickNTs = new Set([getLivePermission(INSTANCE_C, TOK_A)?.messageTs, getLivePermission(INSTANCE_C, TOK_B)?.messageTs])
     expect(tickNTs).toEqual(new Set([POST_TS_A, POST_TS_B]))
 
     // Two pending-map entries, each on the composite key
@@ -258,9 +254,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     // -----------------------------------------------------------------
     initOutageState({ getClient: getClient as unknown as () => Client, notify: () => {} })
     const allowActionId = encodePermissionActionId('allow', INSTANCE_C, TOK_A)
-    const allowHandled = await handlePermissionClick(allowActionId, {
-      web: chat.web as never,
-    })
+    const allowHandled = await handlePermissionClick(allowActionId, clickDeps())
     expect(allowHandled).toBe(true)
 
     // Exactly one decide call so far: allow on TOK_A
@@ -271,7 +265,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
       request_token: TOK_A,
     } as DecideParams & { request_token: string })
     // Exactly one chat.update, on row_A's ts
-    const afterAllowUpdates = chat.calls.filter((c) => c.kind === 'update')
+    const afterAllowUpdates = updates(stubA)
     expect(afterAllowUpdates).toHaveLength(1)
     expect(afterAllowUpdates[0].ts).toBe(POST_TS_A)
     expect(afterAllowUpdates[0].text).toBe('*Permission* — Allowed')
@@ -283,9 +277,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     // Click row B as DENY
     // -----------------------------------------------------------------
     const denyActionId = encodePermissionActionId('deny', INSTANCE_C, TOK_B)
-    const denyHandled = await handlePermissionClick(denyActionId, {
-      web: chat.web as never,
-    })
+    const denyHandled = await handlePermissionClick(denyActionId, clickDeps())
     expect(denyHandled).toBe(true)
 
     // Two decide calls now: allow(TOK_A) followed by deny(TOK_B)
@@ -296,7 +288,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
       request_token: TOK_B,
     } as DecideParams & { request_token: string })
     // Two chat.updates: one per row's ts
-    const afterDenyUpdates = chat.calls.filter((c) => c.kind === 'update')
+    const afterDenyUpdates = updates(stubA)
     expect(afterDenyUpdates).toHaveLength(2)
     expect(afterDenyUpdates[1].ts).toBe(POST_TS_B)
     expect(afterDenyUpdates[1].text).toBe('*Permission* — Denied by operator')
@@ -308,21 +300,20 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     // Tick N+1 — both rows closed in AD; reconciliation runs
     // -----------------------------------------------------------------
     openRows = []
-    const postsBeforeTickNPlus1 = chat.calls.filter((c) => c.kind === 'postMessage').length
-    const updatesBeforeTickNPlus1 = chat.calls.filter((c) => c.kind === 'update').length
+    const postsBeforeTickNPlus1 = posts(stubA).length
+    const updatesBeforeTickNPlus1 = updates(stubA).length
 
-    ivl.pending[0].cb()
-    await new Promise((r) => setTimeout(r, 10))
+    await ivl.tick()
 
     // Zero new postMessage activity on the closure tick
-    expect(chat.calls.filter((c) => c.kind === 'postMessage').length).toBe(postsBeforeTickNPlus1)
+    expect(posts(stubA).length).toBe(postsBeforeTickNPlus1)
 
     // Exactly two getPermission calls, one per token (order-insensitive)
     expect(getPermissionCalls).toHaveLength(2)
     expect(new Set(getPermissionCalls.map((c) => c.request_token))).toEqual(new Set([TOK_A, TOK_B]))
 
     // Two new chat.update calls beyond what the clicks produced
-    const allUpdates = chat.calls.filter((c) => c.kind === 'update')
+    const allUpdates = updates(stubA)
     const tickNPlus1Updates = allUpdates.slice(updatesBeforeTickNPlus1)
     expect(tickNPlus1Updates).toHaveLength(2)
 
@@ -340,5 +331,12 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     // Both entries dropped — livePermissions is empty
     expect(getLivePermission(INSTANCE_C, TOK_A)).toBeUndefined()
     expect(getLivePermission(INSTANCE_C, TOK_B)).toBeUndefined()
+
+    // Every update (clicks and closures) went through the owning persona's
+    // client to its destination; nothing reached its work channel, and the
+    // second persona's client was never used.
+    expect(allUpdates.every((u) => u.channel === CHANNEL_CH)).toBe(true)
+    expect([...posts(stubA), ...allUpdates].some((c) => c.channel === WORK_CH)).toBe(false)
+    expect(slackCalls(stubB)).toBe(0)
   })
 })

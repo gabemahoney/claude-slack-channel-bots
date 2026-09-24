@@ -6,8 +6,8 @@
  * keyed by persona (b.av2 SR-2.2): instance ID `cscb_<key>`, tmux session
  * `slack_bot_<key>`, `relay_mode='on'`, and the labels `service=cscb`,
  * `persona=<key>` and `config_dir=<12 hex of the real effective
- * claude_config_dir>` (plus the interim `channel=<key>` label). Per-persona
- * reconciliation uses the SR-1.4 collision-then-act dispatch:
+ * claude_config_dir>`, and no other label. Per-persona reconciliation uses
+ * the SR-1.4 collision-then-act dispatch:
  *
  *   1. Try `client.spawn(...)` directly.
  *   2. On `ErrInstanceIdCollision`, call `client.get(...)`. A row whose `cwd`
@@ -61,6 +61,7 @@ import {
 } from './config.ts'
 import {
   CONFIG_DIR_LABEL_PREFIX,
+  PERSONA_LABEL_KEY,
   PERSONA_LABEL_PREFIX,
   SERVICE_LABEL,
   configDirLabelValue,
@@ -115,14 +116,6 @@ export const AGENT_DIRECTOR_LIVE_STATES: ReadonlySet<string> = new Set([
 const TEMPLATE_NAME = 'slack-channel-bot'
 
 /**
- * Interim label carrying the persona key under the old `channel` name. The
- * permission poller and the CLI's `stop --stop-bots` lookup still read it
- * (the start sweep reads the `persona` label); removed in E3 Task 6 once they
- * read the `persona` label.
- */
-const INTERIM_CHANNEL_LABEL_PREFIX = 'channel='
-
-/**
  * Persona reference for log lines and startup-error messages (b.av2 SR-2.2):
  * the name JSON-quoted with the key beside it.
  */
@@ -155,9 +148,6 @@ export function personaConfigDirLabelValue(
 ): string {
   return configDirLabelValue(resolveRealPath(resolveClaudeConfigDir(configDir, home), realpath), home)
 }
-
-/** Label-map key of the `persona=<key>` label (`persona`). */
-const PERSONA_LABEL_KEY = PERSONA_LABEL_PREFIX.slice(0, -1)
 
 /** Label-map key of the `config_dir=<hash>` label (`config_dir`). */
 const CONFIG_DIR_LABEL_KEY = CONFIG_DIR_LABEL_PREFIX.slice(0, -1)
@@ -1129,7 +1119,6 @@ function buildSpawnParams(persona: Persona, config: PersonaConfig): SpawnParams 
       SERVICE_LABEL,
       `${PERSONA_LABEL_PREFIX}${key}`,
       `${CONFIG_DIR_LABEL_PREFIX}${personaConfigDirLabelValue(persona.claude_config_dir, spawnHomeDir())}`,
-      `${INTERIM_CHANNEL_LABEL_PREFIX}${key}`,
     ],
     extra_env: personaSpawnEnv({
       key,
@@ -2128,9 +2117,10 @@ function sweepReason(
  *   - has an instance ID other than `cscb_<key>` for its persona, or
  *   - has a `cwd` other than its persona's working directory, by real path
  *     (`compareRowToPersona`).
- * The interim `channel` label plays no part. A failed kill still attempts the
- * delete; kill and delete failures record `orphan-cleanup`, a list failure
- * records `orphan-cleanup-list-failed` and does not block startup.
+ * A `channel` label left on a row by an older spawn plays no part. A failed
+ * kill still attempts the delete; kill and delete failures record
+ * `orphan-cleanup`, a list failure records `orphan-cleanup-list-failed` and
+ * does not block startup.
  */
 export async function reconcileOrphans(
   personaConfig: PersonaConfig,

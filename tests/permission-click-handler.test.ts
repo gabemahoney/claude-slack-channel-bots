@@ -1,6 +1,7 @@
 /**
  * permission-click-handler.test.ts — SR-2.2 / SR-4 click → decide path under
- * the request_token / plural-projection wire (Epic 2 rewrite).
+ * the request_token / plural-projection wire (Epic 2 rewrite), resolved by
+ * persona (b.av2 SR-7.1).
  *
  * Contract pins:
  *   - decide() is the ONLY AD call. No pre-decide get(); no `tokenStillOpen`
@@ -13,7 +14,8 @@
  *     (SR-4.2).
  *   - Happy path: decide → chat.update verdict text → markHandled
  *     ONLY after the chat.update lands (SR-5.4).
- *   - Happy path with chat.update throwing → markHandled NOT called.
+ *   - Happy path with chat.update failing (scripted on the stub) →
+ *     markHandled NOT called; one token-safe log line; nothing leaks.
  *   - ErrAlreadyDecided → silent swallow. No chat.update, no markHandled
  *     mutation (SR-4.4).
  *   - ErrRelayFallenBack → log + buttonless "answer at the tmux pane"
@@ -23,7 +25,23 @@
  *   - Unknown decide error → log + no chat.update (SR-4.4).
  *   - Sibling independence: clicking one of two siblings on the same spawn
  *     leaves the sibling's entry / messageTs untouched (SR-4.5).
- *   - Malformed action_id returns false (caller keeps looking).
+ *   - Malformed action_id returns false (caller keeps looking), before the
+ *     receiving persona is resolved.
+ *
+ * Persona pins (b.av2 SR-7.1, AC 28):
+ *   - Two personas, A and B, each with its own `makeStubSlack` Web stub and
+ *     a destination channel that differs from its key. Prompts are seeded
+ *     through a poller tick, so they post on A's stub to A's destination.
+ *   - A click on A's prompt resolves and updates through A's client only;
+ *     B's stub sees no call.
+ *   - Outage flags raised by decide land under the persona key, never the
+ *     channel ID.
+ *   - A click with no live entry and no payload channel, received for an
+ *     applied persona, is still decided.
+ *   - An unresolvable receiving persona is logged and bypassed; a click whose
+ *     instance is not `cscb_<receiving key>` fails closed; a persona with no
+ *     client gets decide but no update and no markHandled.
+ *   - Trail `channel` fields keep holding Slack channel IDs.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -33,15 +51,16 @@ import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { ErrSystemInstallDisappeared, type Client, type DecideParams, type DecideResult } from 'agent-director'
-import { handlePermissionClick } from '../src/permission-click-handler.ts'
-import { encodePermissionActionId } from '../src/permission-action-id.ts'
+import { handlePermissionClick, type ClickDeps } from '../src/permission-click-handler.ts'
+import { encodePermissionActionId, personaKeyFromActionId } from '../src/permission-action-id.ts'
 import {
   _resetPollerState,
   getLivePermission,
-  startPermissionPoller,
   stopPermissionPoller,
 } from '../src/permission-poller.ts'
-import { _resetTrailFdForTests, type TrailEventBase } from '../src/permission-trail.ts'
+import { _resetTrailFdForTests } from '../src/permission-trail.ts'
+import type { Persona } from '../src/config.ts'
+import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import {
   cannedGetResultPlural,
   cannedListRow,
@@ -51,6 +70,18 @@ import {
   errInvalidFlags,
   errRelayFallenBack,
 } from './test-helpers/agent-director-stub.ts'
+import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeStubSlack, type StubSlack } from './test-helpers/slack-stub.ts'
+import { LEAK_SENTINEL, assertNoLeak } from './test-helpers/credentials.ts'
+import {
+  makePersonaClients,
+  makeTrailCapture,
+  slackCalls,
+  startManualPoller,
+  updates as updatesOn,
+  type ManualInterval,
+  type PersonaClients,
+} from './test-helpers/permission-relay-harness.ts'
 import {
   _resetOutageState,
   getOutageFlags,
@@ -78,194 +109,178 @@ afterAll(() => {
   rmSync(trailTempDir, { recursive: true, force: true })
 })
 
+// ---------------------------------------------------------------------------
+// Shared fixtures — no inline magic strings (SR-8.1)
+// ---------------------------------------------------------------------------
+
+/** Persona A's name; its key (hashed form) differs from its destination channel. */
+const PERSONA_A_NAME = 'Ops Review Bot'
+/** Persona B's name. */
+const PERSONA_B_NAME = 'Build Bot'
+/** Persona A's destination (`permission_prompts`) channel. */
+const CHANNEL_A = 'C0OPSREVIEW'
+/** Persona B's destination channel. */
+const CHANNEL_B = 'C0BUILDBOT'
+const TOKEN_A = '11111111-1111-4111-8111-111111111111'
+const TOKEN_B = '22222222-2222-4222-8222-222222222222'
+const TOKEN_C = '33333333-3333-4333-8333-333333333333'
+/** A key naming no applied persona. */
+const UNKNOWN_KEY = 'no_such_persona'
+
+const ALLOWED_TEXT = '*Permission* — Allowed'
+const DENIED_TEXT = '*Permission* — Denied by operator'
+
+// ---------------------------------------------------------------------------
+// Two-persona harness
+// ---------------------------------------------------------------------------
+
+interface Harness {
+  dir: string
+  personaA: Persona
+  personaB: Persona
+  instanceA: string
+  instanceB: string
+  stubA: StubSlack
+  stubB: StubSlack
+  /** Each persona's own stub client; `setUnavailable` makes one unavailable, `calls` records every key asked for. */
+  clients: PersonaClients
+  /** Every key `getPersona` was asked for, in order. */
+  getPersonaCalls: string[]
+  getPersona: (key: string) => Persona | undefined
+}
+
+let h: Harness
+
+function makeHarness(): Harness {
+  const dir = mkdtempSync(join(tmpdir(), 'click-persona-'))
+  const config = makeMultiPersonaConfig(
+    [
+      { name: PERSONA_A_NAME, channels: [{ id: CHANNEL_A, delivery: 'all' }] },
+      { name: PERSONA_B_NAME, channels: [{ id: CHANNEL_B, delivery: 'all' }] },
+    ],
+    dir,
+  )
+  const [personaA, personaB] = config.personas as [Persona, Persona]
+  // Scripted Slack failures carry the sentinel wherever a real error can hold secrets.
+  const stubA = makeStubSlack({ leakMarker: LEAK_SENTINEL })
+  const stubB = makeStubSlack({ leakMarker: LEAK_SENTINEL })
+  const clients = makePersonaClients((key) => (key === personaA.key ? stubA : key === personaB.key ? stubB : undefined))
+  const byKey = new Map(config.personas.map((p) => [p.key, p]))
+  const getPersonaCalls: string[] = []
+  return {
+    dir,
+    personaA,
+    personaB,
+    instanceA: personaInstanceId(personaA.key),
+    instanceB: personaInstanceId(personaB.key),
+    stubA,
+    stubB,
+    clients,
+    getPersonaCalls,
+    getPersona: (key) => { getPersonaCalls.push(key); return byKey.get(key) },
+  }
+}
+
+/**
+ * Click-handler deps for persona A receiving the click, through the
+ * harness's `clientFor` / `getPersona`. Overrides win (an explicit
+ * `receivingPersonaKey: undefined` clears the receiving key).
+ */
+function clickDeps(overrides: Partial<ClickDeps> = {}): ClickDeps {
+  return {
+    receivingPersonaKey: h.personaA.key,
+    clientFor: h.clients.clientFor,
+    getPersona: h.getPersona,
+    ...overrides,
+  }
+}
+
 beforeEach(() => {
   _resetTrailFdForTests()
+  h = makeHarness()
   // Initialize outage-state so withOutageDetection (used in the poller) does
   // not throw during seedLiveEntry ticks. Per-test calls to initOutageState
   // below override this with the decide-stub for click-handler assertions.
   initOutageState({ getClient: () => ({} as unknown as Client), notify: () => {} })
 })
 
-// ---------------------------------------------------------------------------
-// Trail event capture (Epic 3 closure tests)
-// ---------------------------------------------------------------------------
+afterEach(() => {
+  stopPermissionPoller()
+  _resetPollerState()
+  _resetOutageState()
+  rmSync(h.dir, { recursive: true, force: true })
+})
 
-type CapturedTrailEvent = Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown }
-
-function makeTrailCapture(): {
-  emit: (partial: CapturedTrailEvent) => void
-  events: CapturedTrailEvent[]
-} {
-  const events: CapturedTrailEvent[] = []
-  return { events, emit: (p) => { events.push(p) } }
-}
-
-// ---------------------------------------------------------------------------
-// Shared fixtures — no inline magic strings (SR-8.1)
-// ---------------------------------------------------------------------------
-
-const INSTANCE_C = 'cscb_C'
-const CHANNEL_CH = 'CH'
-const TOKEN_A = '11111111-1111-4111-8111-111111111111'
-const TOKEN_B = '22222222-2222-4222-8222-222222222222'
-const TOKEN_C = '33333333-3333-4333-8333-333333333333'
-
-interface ChatCall { kind: 'postMessage' | 'update'; channel: string; ts?: string; text?: string; blocks?: unknown[] }
-
-function makeChatStub(opts?: { updateError?: Error }): {
-  web: { chat: { postMessage: (args: unknown) => Promise<{ ts: string }>; update: (args: unknown) => Promise<unknown> } }
-  calls: ChatCall[]
-} {
-  const calls: ChatCall[] = []
-  let postCounter = 0
-  return {
-    web: {
-      chat: {
-        async postMessage(args: unknown): Promise<{ ts: string }> {
-          const a = args as { channel: string; text: string }
-          postCounter++
-          calls.push({ kind: 'postMessage', channel: a.channel, text: a.text })
-          return { ts: `POSTED.TS.${postCounter}` }
-        },
-        async update(args: unknown): Promise<unknown> {
-          const a = args as { channel: string; ts: string; text: string; blocks?: unknown[] }
-          calls.push({ kind: 'update', channel: a.channel, ts: a.ts, text: a.text, blocks: a.blocks })
-          if (opts?.updateError) throw opts.updateError
-          return {}
-        },
-      },
-    },
-    calls,
-  }
-}
-
-interface ManualInterval { cb: () => void; ms: number; cleared: boolean }
-function makeIntervalStubs(): {
-  setInterval: typeof globalThis.setInterval
-  clearInterval: typeof globalThis.clearInterval
-  pending: ManualInterval[]
-} {
-  const pending: ManualInterval[] = []
-  return {
-    setInterval: ((cb: () => void, ms: number) => {
-      const entry: ManualInterval = { cb, ms, cleared: false }
-      pending.push(entry)
-      return entry as unknown as ReturnType<typeof setInterval>
-    }) as unknown as typeof globalThis.setInterval,
-    clearInterval: ((handle: unknown) => {
-      const entry = handle as ManualInterval
-      entry.cleared = true
-    }) as unknown as typeof globalThis.clearInterval,
-    pending,
-  }
+/**
+ * Run one poller tick over a single `check_permission` spawn of `persona`,
+ * as a spawn of that persona writes it, whose open rows are `requests`. The
+ * poller posts each prompt through the persona's client (the harness stub) to
+ * its destination channel and records the live entries.
+ */
+async function runSeedTick(
+  persona: Persona,
+  requests: ReturnType<typeof cannedPermissionRequest>[],
+): Promise<ManualInterval[]> {
+  const getClient = () => ({
+    list: async () => ({
+      spawns: [cannedListRow({ state: 'check_permission' }, persona, h.dir)],
+    }),
+    get: async () => cannedGetResultPlural(
+      { state: 'check_permission', permission_requests: requests },
+      persona,
+      h.dir,
+    ),
+  })
+  initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
+  const ivl = startManualPoller({ getClient: getClient as never, clientFor: h.clients.clientFor, getPersona: h.getPersona })
+  await ivl.tick()
+  return ivl.pending
 }
 
 /**
  * Seed a single live entry under the composite key
- * (instanceId, requestToken) by running one poller tick against a chat stub.
- * Returns the chat stub so the same `web` can be reused as the click
- * handler's `deps.web` — chat.update calls then accumulate on
- * `result.web.calls`.
+ * (cscb_<persona key>, requestToken) by running one poller tick. The prompt
+ * posts on the persona's stub; the click handler's updates then accumulate
+ * on the same stub's `calls.update`.
  */
 async function seedLiveEntry(opts: {
-  instanceId: string
-  channelId: string
+  persona?: Persona
   requestToken: string
   requestId?: number
-}): Promise<{ chat: ReturnType<typeof makeChatStub>; pending: ManualInterval[] }> {
-  const ivl = makeIntervalStubs()
-  const chat = makeChatStub()
-  const getClient = () => ({
-    list: async () => ({
-      spawns: [
-        cannedListRow({
-          claude_instance_id: opts.instanceId,
-          state: 'check_permission',
-          labels: { service: 'cscb', channel: opts.channelId },
-        }),
-      ],
+}): Promise<{ pending: ManualInterval[] }> {
+  const pending = await runSeedTick(opts.persona ?? h.personaA, [
+    cannedPermissionRequest({
+      request_token: opts.requestToken,
+      request_id: opts.requestId ?? 1,
     }),
-    get: async () => cannedGetResultPlural({
-      claude_instance_id: opts.instanceId,
-      state: 'check_permission',
-      permission_requests: [
-        cannedPermissionRequest({
-          request_token: opts.requestToken,
-          request_id: opts.requestId ?? 1,
-        }),
-      ],
-    }),
-  })
-  initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
-  startPermissionPoller({
-    getClient,
-    web: chat.web as never,
-    intervalMs: 1000,
-    setInterval: ivl.setInterval,
-    clearInterval: ivl.clearInterval,
-  })
-  ivl.pending[0].cb()
-  await new Promise((r) => setTimeout(r, 10))
-  return { chat, pending: ivl.pending }
+  ])
+  return { pending }
 }
 
 /**
- * Seed TWO live entries on the SAME spawn under different request_tokens.
- * Used to assert SR-4.5 sibling independence on click. Uses the canonical
- * two-row plural-projection fixture and pins both tokens to known constants
- * so the test can target a specific sibling.
+ * Seed TWO live entries on persona A's spawn under different request_tokens.
+ * Used to assert SR-4.5 sibling independence on click. Pins both tokens to
+ * known constants so the test can target a specific sibling.
  */
 async function seedTwoSiblings(opts: {
-  instanceId: string
-  channelId: string
   tokenA: string
   tokenB: string
-}): Promise<{ chat: ReturnType<typeof makeChatStub>; pending: ManualInterval[] }> {
-  const ivl = makeIntervalStubs()
-  const chat = makeChatStub()
-  // cannedTwoRowPluralProjection mints fresh random tokens; override the
-  // two PermissionRequestRow entries' request_tokens to the test constants
-  // by constructing the GetResult directly via cannedGetResultPlural.
-  const getClient = () => ({
-    list: async () => ({
-      spawns: [
-        cannedListRow({
-          claude_instance_id: opts.instanceId,
-          state: 'check_permission',
-          labels: { service: 'cscb', channel: opts.channelId },
-        }),
-      ],
+}): Promise<{ pending: ManualInterval[] }> {
+  const pending = await runSeedTick(h.personaA, [
+    cannedPermissionRequest({
+      request_token: opts.tokenA,
+      request_id: 1,
+      tool_name: 'Bash',
+      tool_input: JSON.stringify({ command: 'ls /tmp' }),
     }),
-    get: async () => cannedGetResultPlural({
-      claude_instance_id: opts.instanceId,
-      state: 'check_permission',
-      permission_requests: [
-        cannedPermissionRequest({
-          request_token: opts.tokenA,
-          request_id: 1,
-          tool_name: 'Bash',
-          tool_input: JSON.stringify({ command: 'ls /tmp' }),
-        }),
-        cannedPermissionRequest({
-          request_token: opts.tokenB,
-          request_id: 2,
-          tool_name: 'Edit',
-          tool_input: JSON.stringify({ file_path: '/etc/hosts' }),
-        }),
-      ],
+    cannedPermissionRequest({
+      request_token: opts.tokenB,
+      request_id: 2,
+      tool_name: 'Edit',
+      tool_input: JSON.stringify({ file_path: '/etc/hosts' }),
     }),
-  })
-  initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
-  startPermissionPoller({
-    getClient,
-    web: chat.web as never,
-    intervalMs: 1000,
-    setInterval: ivl.setInterval,
-    clearInterval: ivl.clearInterval,
-  })
-  ivl.pending[0].cb()
-  await new Promise((r) => setTimeout(r, 10))
-  return { chat, pending: ivl.pending }
+  ])
+  return { pending }
 }
 
 /**
@@ -290,171 +305,203 @@ function makeDecideStub(opts: { throwOn?: Error } = {}): {
   }
 }
 
-interface ClickHandlerDepsShape {
-  web: { chat: { update: (args: unknown) => Promise<unknown> } }
-  log?: (...args: unknown[]) => void
-  emitTrail?: (partial: CapturedTrailEvent) => void
-}
-
-afterEach(() => {
-  stopPermissionPoller()
-  _resetPollerState()
-  _resetOutageState()
-})
-
 // ---------------------------------------------------------------------------
-// Malformed action_id
+// Malformed action_id — parse first (SR-11)
 // ---------------------------------------------------------------------------
 
 describe('handlePermissionClick — non-matching action ids', () => {
   test('returns false on non-perm action id; no AD or chat call', async () => {
-    const chat = makeChatStub()
     const decide = makeDecideStub()
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    const logs: unknown[][] = []
     const handled = await handlePermissionClick(
       'some_other_action',
-      {
-        web: chat.web as never,
-      } satisfies ClickHandlerDepsShape as never,
+      clickDeps({ receivingPersonaKey: undefined, log: (...args) => { logs.push(args) } }),
     )
     expect(handled).toBe(false)
     expect(decide.calls).toHaveLength(0)
-    expect(chat.calls).toHaveLength(0)
+    expect(slackCalls(h.stubA)).toBe(0)
+    expect(slackCalls(h.stubB)).toBe(0)
+    // Parse first: no bypass log line, and the persona is never resolved.
+    expect(logs).toHaveLength(0)
+    expect(h.getPersonaCalls).toHaveLength(0)
+    expect(h.clients.calls).toHaveLength(0)
   })
 
   test('returns false on perm action id missing the cscb_ prefix; no AD or chat call', async () => {
-    const chat = makeChatStub()
     const decide = makeDecideStub()
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    const logs: unknown[][] = []
     const handled = await handlePermissionClick(
       `perm_allow_NOT_CSCB_PREFIX_${TOKEN_A}`,
-      {
-        web: chat.web as never,
-      } satisfies ClickHandlerDepsShape as never,
+      clickDeps({ receivingPersonaKey: undefined, log: (...args) => { logs.push(args) } }),
     )
     expect(handled).toBe(false)
     expect(decide.calls).toHaveLength(0)
-    expect(chat.calls).toHaveLength(0)
+    expect(slackCalls(h.stubA)).toBe(0)
+    expect(slackCalls(h.stubB)).toBe(0)
+    expect(logs).toHaveLength(0)
+    expect(h.getPersonaCalls).toHaveLength(0)
   })
 
   test('returns false on perm action id with non-UUID trailing segment', async () => {
-    const chat = makeChatStub()
     const decide = makeDecideStub()
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    const logs: unknown[][] = []
     const handled = await handlePermissionClick(
-      `perm_allow_${INSTANCE_C}_42`,
-      {
-        web: chat.web as never,
-      } satisfies ClickHandlerDepsShape as never,
+      `perm_allow_${h.instanceA}_42`,
+      clickDeps({ receivingPersonaKey: undefined, log: (...args) => { logs.push(args) } }),
     )
     expect(handled).toBe(false)
     expect(decide.calls).toHaveLength(0)
-    expect(chat.calls).toHaveLength(0)
+    expect(slackCalls(h.stubA)).toBe(0)
+    expect(slackCalls(h.stubB)).toBe(0)
+    // Parse first: a malformed perm_ id never reaches the bypass log line.
+    expect(logs).toHaveLength(0)
+    expect(h.getPersonaCalls).toHaveLength(0)
+  })
+
+  test('a malformed perm_ id is not handled even when a receiving persona is known', async () => {
+    const decide = makeDecideStub()
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    const handled = await handlePermissionClick(`perm_deny_${h.instanceA}_42`, clickDeps())
+    expect(handled).toBe(false)
+    expect(decide.calls).toHaveLength(0)
+    expect(slackCalls(h.stubA)).toBe(0)
   })
 })
 
 // ---------------------------------------------------------------------------
-// Happy path — decide → chat.update → markHandled
+// Happy path — decide → chat.update → markHandled (AC 28)
 // ---------------------------------------------------------------------------
 
 describe('handlePermissionClick — happy path', () => {
-  test('allow → decide(allow, request_token) → chat.update "Allowed" → markHandled', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
-    const entryBefore = getLivePermission(INSTANCE_C, TOKEN_A)
+  test('allow → decide(allow, request_token) → chat.update "Allowed" through A\'s client → markHandled', async () => {
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    const entryBefore = getLivePermission(h.instanceA, TOKEN_A)
     expect(entryBefore).toBeDefined()
     const messageTs = entryBefore!.messageTs
 
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const handled = await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-      } satisfies ClickHandlerDepsShape as never,
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps(),
     )
 
     expect(handled).toBe(true)
     expect(decide.calls).toHaveLength(1)
     expect(decide.calls[0]).toEqual({
-      claude_instance_id: INSTANCE_C,
+      claude_instance_id: h.instanceA,
       decision: 'allow',
       // SR-4.1 / SR-7.2: request_token is unconditionally on the wire.
       request_token: TOKEN_A,
     } as DecideParams & { request_token: string })
 
-    const updates = seed.chat.calls.filter((c) => c.kind === 'update')
+    const updates = updatesOn(h.stubA)
     expect(updates).toHaveLength(1)
-    expect(updates[0].channel).toBe(CHANNEL_CH)
-    expect(updates[0].ts).toBe(messageTs)
-    expect(updates[0].text).toBe('*Permission* — Allowed')
+    expect(updates[0]!.channel).toBe(CHANNEL_A)
+    expect(updates[0]!.ts).toBe(messageTs)
+    expect(updates[0]!.text).toBe(ALLOWED_TEXT)
+    // Nothing went through persona B's client.
+    expect(slackCalls(h.stubB)).toBe(0)
+    // The update was resolved through A's key.
+    expect(h.clients.calls.at(-1)).toBe(h.personaA.key)
 
-    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(true)
+    expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(true)
   })
 
-  test('deny → decide(deny, request_token) → chat.update "Denied by operator" → markHandled', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+  test('deny → decide(deny, request_token) → chat.update "Denied by operator" through A\'s client → markHandled', async () => {
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    const messageTs = getLivePermission(h.instanceA, TOKEN_A)!.messageTs
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
 
     await handlePermissionClick(
-      encodePermissionActionId('deny', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-      } satisfies ClickHandlerDepsShape as never,
+      encodePermissionActionId('deny', h.instanceA, TOKEN_A),
+      clickDeps(),
     )
 
     expect(decide.calls).toHaveLength(1)
-    expect(decide.calls[0].decision).toBe('deny')
+    expect(decide.calls[0]!.decision).toBe('deny')
     expect((decide.calls[0] as DecideParams & { request_token: string }).request_token).toBe(TOKEN_A)
 
-    const updates = seed.chat.calls.filter((c) => c.kind === 'update')
+    const updates = updatesOn(h.stubA)
     expect(updates).toHaveLength(1)
-    expect(updates[0].text).toBe('*Permission* — Denied by operator')
-    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(true)
+    expect(updates[0]!.channel).toBe(CHANNEL_A)
+    expect(updates[0]!.ts).toBe(messageTs)
+    expect(updates[0]!.text).toBe(DENIED_TEXT)
+    expect(slackCalls(h.stubB)).toBe(0)
+    expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(true)
   })
 
-  test('chat.update throws → markHandled NOT called; handled stays false', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
-    // Swap the seeded chat stub's update for one that throws by overriding
-    // its method directly (the click handler reuses seed.chat.web).
-    const chatForClick = makeChatStub({ updateError: new Error('Slack API down') })
+  test('B\'s prompt clicked on B → updates through B\'s client only', async () => {
+    await seedLiveEntry({ persona: h.personaB, requestToken: TOKEN_B })
+    const messageTs = getLivePermission(h.instanceB, TOKEN_B)!.messageTs
+    const updatesOnABefore = h.stubA.calls.update.length
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
 
+    await handlePermissionClick(
+      encodePermissionActionId('allow', h.instanceB, TOKEN_B),
+      clickDeps({ receivingPersonaKey: h.personaB.key }),
+    )
+
+    expect(decide.calls).toHaveLength(1)
+    expect(decide.calls[0]!.claude_instance_id).toBe(h.instanceB)
+    expect(h.stubB.calls.update).toHaveLength(1)
+    expect(h.stubB.calls.update[0]!.channel).toBe(CHANNEL_B)
+    expect(h.stubB.calls.update[0]!.ts).toBe(messageTs)
+    expect(h.stubA.calls.update.length).toBe(updatesOnABefore)
+    expect(slackCalls(h.stubA)).toBe(0)
+    expect(getLivePermission(h.instanceB, TOKEN_B)?.handled).toBe(true)
+  })
+
+  test.each<[{ kind: 'platform'; error: string } | { kind: 'network' }, string]>([
+    [{ kind: 'platform', error: 'message_not_found' }, 'message_not_found'],
+    [{ kind: 'network' }, 'network_error'],
+  ])('chat.update fails (%o) → markHandled NOT called; ok=false trail with the error class; one token-safe log line', async (outcome, errorClass) => {
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    h.stubA.script.update.push(outcome)
+    const decide = makeDecideStub()
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+
+    const trail = makeTrailCapture()
     const logs: unknown[][] = []
     const result = await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: chatForClick.web as never,
-        log: (...args: unknown[]) => logs.push(args),
-      } satisfies ClickHandlerDepsShape as never,
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ emitTrail: trail.emit, log: (...args: unknown[]) => logs.push(args) }),
     )
 
     expect(result).toBe(true)
     // decide still landed before chat.update was attempted.
     expect(decide.calls).toHaveLength(1)
-    // chat.update was attempted once and threw.
-    expect(chatForClick.calls.filter((c) => c.kind === 'update')).toHaveLength(1)
+    // chat.update was attempted once, through A's client, and failed.
+    expect(h.stubA.calls.update).toHaveLength(1)
+    expect(h.stubA.calls.update[0]!.channel).toBe(CHANNEL_A)
     // handled stays false — markHandled is only called on update success.
-    const entry = getLivePermission(INSTANCE_C, TOKEN_A)
+    const entry = getLivePermission(h.instanceA, TOKEN_A)
     expect(entry).toBeDefined()
     expect(entry?.handled).toBe(false)
-    // b.emk: failures land in BOTH server.log (via logDeps) and the trail
-    // JSONL (cscb.chat_update.attempted{ok=false}, asserted separately).
-    expect(logs.length).toBeGreaterThan(0)
-    // The original seeded stub did not see the update (it landed on the
-    // separately-stubbed chatForClick), so the poller's chat history is
-    // untouched.
-    expect(seed.chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
+    // b.emk: failures land in BOTH server.log (via logDeps) and the trail JSONL.
+    const closure = trail.events.find(e => e.event === 'cscb.chat_update.attempted')
+    expect(closure).toBeDefined()
+    expect(closure!['ok']).toBe(false)
+    expect(closure!['error']).toBe(errorClass)
+    expect(closure!['triggered_by']).toBe('click_handler')
+    // One line, token-safe (b.av2 SR-10.3): the platform reason, never the raw error.
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toHaveLength(1)
+    const line = String(logs[0]![0])
+    expect(line).toContain(`decision chat.update failed for ${h.instanceA}`)
+    if (outcome.kind === 'platform') expect(line).toContain(`(reason=${outcome.error}): Error code=slack_webapi_platform_error`)
+    else {
+      expect(line).not.toContain('(reason=')
+      expect(line).toContain(': Error code=slack_webapi_request_error')
+    }
+    assertNoLeak({ logs, trail: trail.events }, 'click update failure')
+    // Persona B's client saw nothing.
+    expect(slackCalls(h.stubB)).toBe(0)
   })
 })
 
@@ -464,18 +511,12 @@ describe('handlePermissionClick — happy path', () => {
 
 describe('handlePermissionClick — decide-wire invariant (SR-4.1 / SR-7.2)', () => {
   test('every decide call carries a non-empty request_token matching the action_id', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_A })
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-      } satisfies ClickHandlerDepsShape as never,
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps(),
     )
     expect(decide.calls).toHaveLength(1)
     const wire = decide.calls[0] as DecideParams & { request_token: string }
@@ -492,58 +533,48 @@ describe('handlePermissionClick — decide-wire invariant (SR-4.1 / SR-7.2)', ()
 describe('handlePermissionClick — stale click (SR-4.2)', () => {
   test('no live entry for (instance, token) → decide STILL fires with decoded token; NO chat.update', async () => {
     // Do NOT seed an entry. The poller-state is empty; the click is stale.
-    // Supply context.channel so ctxChannel resolves and decide still fires
-    // (production payloads always carry a channel).
-    const chat = makeChatStub()
+    // The receiving persona resolves, so decide still fires.
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const result = await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_C),
-      {
-        web: chat.web as never,
-        log: () => { /* swallow */ },
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH },
+      encodePermissionActionId('allow', h.instanceA, TOKEN_C),
+      clickDeps({ log: () => { /* swallow */ } }),
+      { channel: CHANNEL_A },
     )
 
     expect(result).toBe(true)
     // SR-4.2: decide STILL fires on stale clicks — AD is the source of truth.
     expect(decide.calls).toHaveLength(1)
     expect(decide.calls[0]).toEqual({
-      claude_instance_id: INSTANCE_C,
+      claude_instance_id: h.instanceA,
       decision: 'allow',
       request_token: TOKEN_C,
     } as DecideParams & { request_token: string })
     // No chat.update from the click handler — the poller's reconciliation
     // tick surfaces the closure.
-    expect(chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
+    expect(h.stubA.calls.update).toHaveLength(0)
+    expect(h.stubB.calls.update).toHaveLength(0)
   })
 
   test('seeded entry on a DIFFERENT token → that other entry untouched; clicked token still fires decide', async () => {
     // Seed token A live; click token C (not in map). This makes sure the
     // composite-key lookup miss is taken on the click's token, not on the
-    // claude_instance_id alone. Supply context.channel so ctxChannel resolves.
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+    // claude_instance_id alone.
+    await seedLiveEntry({ requestToken: TOKEN_A })
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
-      encodePermissionActionId('deny', INSTANCE_C, TOKEN_C),
-      {
-        web: seed.chat.web as never,
-        log: () => { /* swallow */ },
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH },
+      encodePermissionActionId('deny', h.instanceA, TOKEN_C),
+      clickDeps({ log: () => { /* swallow */ } }),
+      { channel: CHANNEL_A },
     )
     expect(decide.calls).toHaveLength(1)
     expect((decide.calls[0] as DecideParams & { request_token: string }).request_token).toBe(TOKEN_C)
     // The seeded sibling on TOKEN_A is untouched: no chat.update against
     // its messageTs, handled=false.
-    expect(seed.chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
-    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(false)
+    expect(h.stubA.calls.update).toHaveLength(0)
+    expect(h.stubB.calls.update).toHaveLength(0)
+    expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(false)
   })
 })
 
@@ -553,49 +584,36 @@ describe('handlePermissionClick — stale click (SR-4.2)', () => {
 
 describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
   test('ErrAlreadyDecided → silent swallow: no chat.update, no markHandled, returns true', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_A })
     const decide = makeDecideStub({ throwOn: errAlreadyDecided() })
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const logs: unknown[][] = []
 
     const result = await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        log: (...args: unknown[]) => logs.push(args),
-      } satisfies ClickHandlerDepsShape as never,
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ log: (...args: unknown[]) => logs.push(args) }),
     )
 
     expect(result).toBe(true)
     expect(decide.calls).toHaveLength(1)
     // SR-4.4: no chat.update from the click handler on ErrAlreadyDecided.
-    expect(seed.chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
+    expect(h.stubA.calls.update).toHaveLength(0)
+    expect(h.stubB.calls.update).toHaveLength(0)
     // markHandled was NOT called: the entry remains pristine.
-    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(false)
+    expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(false)
     // ErrAlreadyDecided is swallowed silently — no log fires.
     expect(logs).toHaveLength(0)
   })
 
   test('ErrInvalidFlags → logged once, no retry, no chat.update; returns true', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_A })
     const decide = makeDecideStub({ throwOn: errInvalidFlags() })
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const logs: unknown[][] = []
 
     const result = await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        log: (...args: unknown[]) => logs.push(args),
-      } satisfies ClickHandlerDepsShape as never,
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ log: (...args: unknown[]) => logs.push(args) }),
     )
 
     expect(result).toBe(true)
@@ -604,62 +622,51 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
     // exactly one log entry.
     expect(logs).toHaveLength(1)
     // The log message names the failing errName.
-    expect(String(logs[0].join(' '))).toContain('ErrInvalidFlags')
+    expect(String(logs[0]!.join(' '))).toContain('ErrInvalidFlags')
     // No chat.update from the click handler.
-    expect(seed.chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
+    expect(h.stubA.calls.update).toHaveLength(0)
+    expect(h.stubB.calls.update).toHaveLength(0)
     // No markHandled mutation.
-    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(false)
+    expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(false)
   })
 
   test('ErrAmbiguousRequest → logged once, no retry, no chat.update; returns true', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_A })
     const decide = makeDecideStub({ throwOn: errAmbiguousRequest() })
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const logs: unknown[][] = []
 
     const result = await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        log: (...args: unknown[]) => logs.push(args),
-      } satisfies ClickHandlerDepsShape as never,
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ log: (...args: unknown[]) => logs.push(args) }),
     )
 
     expect(result).toBe(true)
     expect(decide.calls).toHaveLength(1)
     expect(logs).toHaveLength(1)
-    expect(String(logs[0].join(' '))).toContain('ErrAmbiguousRequest')
-    expect(seed.chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
-    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(false)
+    expect(String(logs[0]!.join(' '))).toContain('ErrAmbiguousRequest')
+    expect(h.stubA.calls.update).toHaveLength(0)
+    expect(h.stubB.calls.update).toHaveLength(0)
+    expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(false)
   })
 
   test('unknown (non-AgentDirectorError) → logged, no chat.update, returns true', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_A })
     const decide = makeDecideStub({ throwOn: new Error('something exploded') })
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const logs: unknown[][] = []
 
     const result = await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        log: (...args: unknown[]) => logs.push(args),
-      } satisfies ClickHandlerDepsShape as never,
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ log: (...args: unknown[]) => logs.push(args) }),
     )
 
     expect(result).toBe(true)
     expect(decide.calls).toHaveLength(1)
     expect(logs).toHaveLength(1)
-    expect(seed.chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
-    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(false)
+    expect(h.stubA.calls.update).toHaveLength(0)
+    expect(h.stubB.calls.update).toHaveLength(0)
+    expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(false)
   })
 })
 
@@ -671,26 +678,21 @@ describe('handlePermissionClick — ErrRelayFallenBack (b.qi1)', () => {
   const RELAY_FALLEN_BACK_TEXT =
     '*Permission* — relay window elapsed; answer this prompt at the session\'s tmux pane'
 
-  test('repaints the prompt buttonless, emits the relay-fallen-back trail pair, and leaves the entry unhandled', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
-    const messageTs = getLivePermission(INSTANCE_C, TOKEN_A)!.messageTs
+  test('repaints the prompt buttonless through A\'s client, emits the relay-fallen-back trail pair, and leaves the entry unhandled', async () => {
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    const messageTs = getLivePermission(h.instanceA, TOKEN_A)!.messageTs
     const trail = makeTrailCapture()
     const decide = makeDecideStub({ throwOn: errRelayFallenBack() })
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const logs: unknown[][] = []
 
     const result = await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({
         emitTrail: trail.emit,
         log: (...args: unknown[]) => logs.push(args),
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH },
+      }),
+      { channel: CHANNEL_A },
     )
 
     expect(result).toBe(true)
@@ -701,13 +703,15 @@ describe('handlePermissionClick — ErrRelayFallenBack (b.qi1)', () => {
     // The operator's click is surfaced, not swallowed: one chat.update over
     // the original prompt message, carrying the pane-redirect text and no
     // actions block (the buttons are now inert).
-    const updates = seed.chat.calls.filter((c) => c.kind === 'update')
+    const updates = updatesOn(h.stubA)
     expect(updates).toHaveLength(1)
-    expect(updates[0].channel).toBe(CHANNEL_CH)
-    expect(updates[0].ts).toBe(messageTs)
-    expect(updates[0].text).toBe(RELAY_FALLEN_BACK_TEXT)
-    const blocks = updates[0].blocks as Array<{ type: string }>
+    expect(updates[0]!.channel).toBe(CHANNEL_A)
+    expect(updates[0]!.ts).toBe(messageTs)
+    expect(updates[0]!.text).toBe(RELAY_FALLEN_BACK_TEXT)
+    const blocks = updates[0]!.blocks as Array<{ type: string }>
     expect(blocks.find((b) => b.type === 'actions')).toBeUndefined()
+    // The repaint went through A's client only.
+    expect(slackCalls(h.stubB)).toBe(0)
 
     // The decide attempt is classified, not bucketed into 'other'.
     const decided = trail.events.find((e) => e.event === 'cscb.ad_decide.attempted')
@@ -722,36 +726,36 @@ describe('handlePermissionClick — ErrRelayFallenBack (b.qi1)', () => {
     expect(closure!['ok']).toBe(true)
     expect(closure!.message_ts).toBe(messageTs)
     expect(closure!.request_token).toBe(TOKEN_A)
+    expect(closure!.channel).toBe(CHANNEL_A)
 
     // markHandled is deliberately NOT called: this is not a verdict, so the
     // AD row stays open and a later poller closure may render over it.
-    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(false)
+    expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(false)
 
     // Loud, not silent: the operator-facing repaint is accompanied by a log.
     expect(logs).toHaveLength(1)
-    expect(String(logs[0].join(' '))).toContain('ErrRelayFallenBack')
+    expect(String(logs[0]!.join(' '))).toContain('ErrRelayFallenBack')
   })
 
   test('stale click (no live entry) → decide fires once, no chat.update, returns true', async () => {
-    const chat = makeChatStub()
     const trail = makeTrailCapture()
     const decide = makeDecideStub({ throwOn: errRelayFallenBack() })
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
 
     const result = await handlePermissionClick(
-      encodePermissionActionId('deny', INSTANCE_C, TOKEN_C),
-      {
-        web: chat.web as never,
+      encodePermissionActionId('deny', h.instanceA, TOKEN_C),
+      clickDeps({
         emitTrail: trail.emit,
         log: () => { /* swallow */ },
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH },
+      }),
+      { channel: CHANNEL_A },
     )
 
     expect(result).toBe(true)
     expect(decide.calls).toHaveLength(1)
     // Nothing to repaint — there is no Slack message this handler owns.
-    expect(chat.calls.filter((c) => c.kind === 'update')).toHaveLength(0)
+    expect(h.stubA.calls.update).toHaveLength(0)
+    expect(h.stubB.calls.update).toHaveLength(0)
     expect(trail.events.find((e) => e.event === 'cscb.chat_update.attempted')).toBeUndefined()
     const decided = trail.events.find((e) => e.event === 'cscb.ad_decide.attempted')
     expect(decided!['result_class']).toBe('ErrRelayFallenBack')
@@ -764,15 +768,10 @@ describe('handlePermissionClick — ErrRelayFallenBack (b.qi1)', () => {
 
 describe('handlePermissionClick — sibling independence (SR-4.5)', () => {
   test('two sibling rows seeded; clicking one updates only the clicked entry', async () => {
-    const seed = await seedTwoSiblings({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      tokenA: TOKEN_A,
-      tokenB: TOKEN_B,
-    })
+    await seedTwoSiblings({ tokenA: TOKEN_A, tokenB: TOKEN_B })
 
-    const entryABefore = getLivePermission(INSTANCE_C, TOKEN_A)
-    const entryBBefore = getLivePermission(INSTANCE_C, TOKEN_B)
+    const entryABefore = getLivePermission(h.instanceA, TOKEN_A)
+    const entryBBefore = getLivePermission(h.instanceA, TOKEN_B)
     expect(entryABefore).toBeDefined()
     expect(entryBBefore).toBeDefined()
     expect(entryABefore!.messageTs).not.toBe(entryBBefore!.messageTs)
@@ -783,10 +782,8 @@ describe('handlePermissionClick — sibling independence (SR-4.5)', () => {
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-      } satisfies ClickHandlerDepsShape as never,
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps(),
     )
 
     // Exactly one decide call, carrying A's token.
@@ -794,15 +791,15 @@ describe('handlePermissionClick — sibling independence (SR-4.5)', () => {
     expect((decide.calls[0] as DecideParams & { request_token: string }).request_token).toBe(TOKEN_A)
 
     // Exactly one chat.update — against A's messageTs only.
-    const updates = seed.chat.calls.filter((c) => c.kind === 'update')
+    const updates = updatesOn(h.stubA)
     expect(updates).toHaveLength(1)
-    expect(updates[0].ts).toBe(tsA)
+    expect(updates[0]!.ts).toBe(tsA)
     // No update targeted B's messageTs.
     expect(updates.find((u) => u.ts === tsB)).toBeUndefined()
 
     // A is markHandled; B is untouched.
-    expect(getLivePermission(INSTANCE_C, TOKEN_A)?.handled).toBe(true)
-    expect(getLivePermission(INSTANCE_C, TOKEN_B)?.handled).toBe(false)
+    expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(true)
+    expect(getLivePermission(h.instanceA, TOKEN_B)?.handled).toBe(false)
   })
 })
 
@@ -813,20 +810,27 @@ describe('handlePermissionClick — sibling independence (SR-4.5)', () => {
 
 describe('handlePermissionClick — helper sanity', () => {
   test('cannedGetResultPlural seed yields a getLivePermission entry under the composite key', async () => {
-    await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-      requestId: 17,
-    })
-    const entry = getLivePermission(INSTANCE_C, TOKEN_A)
+    await seedLiveEntry({ requestToken: TOKEN_A, requestId: 17 })
+    const entry = getLivePermission(h.instanceA, TOKEN_A)
     expect(entry).toBeDefined()
-    expect(entry?.claudeInstanceId).toBe(INSTANCE_C)
+    expect(entry?.claudeInstanceId).toBe(h.instanceA)
     expect(entry?.requestToken).toBe(TOKEN_A)
     expect(entry?.requestId).toBe(17)
     expect(entry?.handled).toBe(false)
   })
 
+  test('the seed posts through A\'s stub to A\'s destination channel; keys differ from channel IDs', async () => {
+    expect(h.personaA.key).not.toBe(CHANNEL_A)
+    expect(h.personaB.key).not.toBe(CHANNEL_B)
+    expect(h.instanceA).toBe(`cscb_${h.personaA.key}`)
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    const entry = getLivePermission(h.instanceA, TOKEN_A)!
+    expect(entry.personaKey).toBe(h.personaA.key)
+    expect(entry.channelId).toBe(CHANNEL_A)
+    expect(h.stubA.calls.postMessage).toHaveLength(1)
+    expect(h.stubA.calls.postMessage[0]!.channel).toBe(CHANNEL_A)
+    expect(slackCalls(h.stubB)).toBe(0)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -835,28 +839,23 @@ describe('handlePermissionClick — helper sanity', () => {
 
 describe('trail events — cscb.chat_update.attempted (click-handler-triggered)', () => {
   test('Allow click → ok=true, verdict_tag=click_handler_allow, triggered_by=click_handler', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
-    const entry = getLivePermission(INSTANCE_C, TOKEN_A)!
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    const entry = getLivePermission(h.instanceA, TOKEN_A)!
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        emitTrail: trail.emit,
-      } satisfies ClickHandlerDepsShape as never,
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ emitTrail: trail.emit }),
     )
     const closure = trail.events.find(e => e.event === 'cscb.chat_update.attempted')
     expect(closure).toBeDefined()
     expect(closure!['verdict_tag']).toBe('click_handler_allow')
     expect(closure!['triggered_by']).toBe('click_handler')
     expect(closure!['ok']).toBe(true)
-    expect(closure!.channel).toBe(CHANNEL_CH)
+    // `channel` keeps its meaning: the entry's Slack channel, never the persona key.
+    expect(closure!.channel).toBe(CHANNEL_A)
+    expect(closure!.channel).not.toBe(h.personaA.key)
     expect(closure!.message_ts).toBe(entry.messageTs)
     expect(typeof closure!['text']).toBe('string')
     expect(Array.isArray(closure!['blocks'])).toBe(true)
@@ -864,74 +863,33 @@ describe('trail events — cscb.chat_update.attempted (click-handler-triggered)'
   })
 
   test('Deny click → ok=true, verdict_tag=click_handler_deny', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_A })
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
-      encodePermissionActionId('deny', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        emitTrail: trail.emit,
-      } satisfies ClickHandlerDepsShape as never,
+      encodePermissionActionId('deny', h.instanceA, TOKEN_A),
+      clickDeps({ emitTrail: trail.emit }),
     )
     const closure = trail.events.find(e => e.event === 'cscb.chat_update.attempted')
     expect(closure!['verdict_tag']).toBe('click_handler_deny')
     expect(closure!['triggered_by']).toBe('click_handler')
     expect(closure!['ok']).toBe(true)
-  })
-
-  test('chat.update Slack platform error → ok=false, error=Slack platform error class', async () => {
-    await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
-    const platformError = Object.assign(new Error('platform error'), {
-      name: 'WebAPIPlatformError',
-      data: { ok: false, error: 'message_not_found' },
-    })
-    const chatForClick = makeChatStub({ updateError: platformError })
-    const trail = makeTrailCapture()
-    const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
-    await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: chatForClick.web as never,
-        emitTrail: trail.emit,
-      } satisfies ClickHandlerDepsShape as never,
-    )
-    const closure = trail.events.find(e => e.event === 'cscb.chat_update.attempted')
-    expect(closure).toBeDefined()
-    expect(closure!['ok']).toBe(false)
-    expect(closure!['error']).toBe('message_not_found')
-    expect(closure!['triggered_by']).toBe('click_handler')
+    expect(closure!.channel).toBe(CHANNEL_A)
   })
 
   test('request_token correlation: trail event request_token matches decoded action_id', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_C,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_C })
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_C),
-      {
-        web: seed.chat.web as never,
-        emitTrail: trail.emit,
-      } satisfies ClickHandlerDepsShape as never,
+      encodePermissionActionId('allow', h.instanceA, TOKEN_C),
+      clickDeps({ emitTrail: trail.emit }),
     )
     const closure = trail.events.find(e => e.event === 'cscb.chat_update.attempted')
     expect(closure!.request_token).toBe(TOKEN_C)
-    expect(closure!.claude_instance_id).toBe(INSTANCE_C)
+    expect(closure!.claude_instance_id).toBe(h.instanceA)
   })
 })
 
@@ -943,31 +901,26 @@ describe('trail events — cscb.click_handler.invoked', () => {
   const USER = 'U_OPERATOR'
 
   test('live_pending=true when a LivePermission entry exists at click time', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
-    const entry = getLivePermission(INSTANCE_C, TOKEN_A)!
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    const entry = getLivePermission(h.instanceA, TOKEN_A)!
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
-    const actionId = encodePermissionActionId('allow', INSTANCE_C, TOKEN_A)
+    const actionId = encodePermissionActionId('allow', h.instanceA, TOKEN_A)
     await handlePermissionClick(
       actionId,
-      {
-        web: seed.chat.web as never,
-        emitTrail: trail.emit,
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH, messageTs: entry.messageTs, user: USER },
+      clickDeps({ emitTrail: trail.emit }),
+      { channel: CHANNEL_A, messageTs: entry.messageTs, user: USER },
     )
     const invoked = trail.events.find(e => e.event === 'cscb.click_handler.invoked')
     expect(invoked).toBeDefined()
     expect(invoked!['live_pending']).toBe(true)
     expect(invoked!['decision']).toBe('allow')
-    expect(invoked!.claude_instance_id).toBe(INSTANCE_C)
+    expect(invoked!.claude_instance_id).toBe(h.instanceA)
     expect(invoked!.request_token).toBe(TOKEN_A)
-    expect(invoked!.channel).toBe(CHANNEL_CH)
+    // `channel` keeps its meaning: the payload's Slack channel, never the persona key.
+    expect(invoked!.channel).toBe(CHANNEL_A)
+    expect(invoked!.channel).not.toBe(h.personaA.key)
     expect(invoked!.message_ts).toBe(entry.messageTs)
     expect(invoked!['user']).toBe(USER)
     expect(invoked!['raw_action_id']).toBe(actionId)
@@ -978,35 +931,29 @@ describe('trail events — cscb.click_handler.invoked', () => {
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const trail = makeTrailCapture()
-    const chatForClick = makeChatStub()
-    const actionId = encodePermissionActionId('deny', INSTANCE_C, TOKEN_A)
+    const actionId = encodePermissionActionId('deny', h.instanceA, TOKEN_A)
     await handlePermissionClick(
       actionId,
-      {
-        web: chatForClick.web as never,
-        emitTrail: trail.emit,
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH, messageTs: '0000.0000', user: USER },
+      clickDeps({ emitTrail: trail.emit }),
+      { channel: CHANNEL_A, messageTs: '0000.0000', user: USER },
     )
     const invoked = trail.events.find(e => e.event === 'cscb.click_handler.invoked')
     expect(invoked).toBeDefined()
     expect(invoked!['live_pending']).toBe(false)
     expect(invoked!['decision']).toBe('deny')
-    expect(invoked!.claude_instance_id).toBe(INSTANCE_C)
+    expect(invoked!.claude_instance_id).toBe(h.instanceA)
     expect(invoked!.request_token).toBe(TOKEN_A)
+    expect(invoked!.channel).toBe(CHANNEL_A)
   })
 
   test('decode failure path does NOT emit cscb.click_handler.invoked', async () => {
     const decide = makeDecideStub()
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const trail = makeTrailCapture()
-    const chatForClick = makeChatStub()
     const handled = await handlePermissionClick(
       'foreign_bot_action',
-      {
-        web: chatForClick.web as never,
-        emitTrail: trail.emit,
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH, messageTs: '0.0', user: USER },
+      clickDeps({ emitTrail: trail.emit }),
+      { channel: CHANNEL_A, messageTs: '0.0', user: USER },
     )
     expect(handled).toBe(false)
     const invoked = trail.events.find(e => e.event === 'cscb.click_handler.invoked')
@@ -1016,21 +963,14 @@ describe('trail events — cscb.click_handler.invoked', () => {
   })
 
   test('emitted once per call (no duplicate emissions per click)', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_A })
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        emitTrail: trail.emit,
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ emitTrail: trail.emit }),
+      { channel: CHANNEL_A, messageTs: 'TS', user: USER },
     )
     const invoked = trail.events.filter(e => e.event === 'cscb.click_handler.invoked')
     expect(invoked).toHaveLength(1)
@@ -1045,47 +985,33 @@ describe('trail events — cscb.ad_decide.attempted', () => {
   const USER = 'U_OPERATOR'
 
   test('happy path → result_class="ok" with submitted decision', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_A })
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        emitTrail: trail.emit,
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ emitTrail: trail.emit }),
+      { channel: CHANNEL_A, messageTs: 'TS', user: USER },
     )
     const event = trail.events.find(e => e.event === 'cscb.ad_decide.attempted')
     expect(event).toBeDefined()
     expect(event!['result_class']).toBe('ok')
     expect(event!['decision']).toBe('allow')
-    expect(event!.claude_instance_id).toBe(INSTANCE_C)
+    expect(event!.claude_instance_id).toBe(h.instanceA)
     expect(event!.request_token).toBe(TOKEN_A)
     expect('raw_error_message' in event!).toBe(false)
   })
 
   test('happy path → submitted decision recorded for deny', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_A })
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
-      encodePermissionActionId('deny', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        emitTrail: trail.emit,
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+      encodePermissionActionId('deny', h.instanceA, TOKEN_A),
+      clickDeps({ emitTrail: trail.emit }),
+      { channel: CHANNEL_A, messageTs: 'TS', user: USER },
     )
     const event = trail.events.find(e => e.event === 'cscb.ad_decide.attempted')
     expect(event!['decision']).toBe('deny')
@@ -1093,21 +1019,14 @@ describe('trail events — cscb.ad_decide.attempted', () => {
   })
 
   test('ErrAlreadyDecided → result_class="ErrAlreadyDecided", no raw_error_message', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_A })
     const trail = makeTrailCapture()
     const decide = makeDecideStub({ throwOn: errAlreadyDecided() })
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        emitTrail: trail.emit,
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ emitTrail: trail.emit }),
+      { channel: CHANNEL_A, messageTs: 'TS', user: USER },
     )
     const event = trail.events.find(e => e.event === 'cscb.ad_decide.attempted')
     expect(event!['result_class']).toBe('ErrAlreadyDecided')
@@ -1115,22 +1034,14 @@ describe('trail events — cscb.ad_decide.attempted', () => {
   })
 
   test('ErrInvalidFlags → result_class="ErrInvalidFlags", no raw_error_message', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_A })
     const trail = makeTrailCapture()
     const decide = makeDecideStub({ throwOn: errInvalidFlags() })
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        emitTrail: trail.emit,
-        log: () => { /* swallow */ },
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ emitTrail: trail.emit, log: () => { /* swallow */ } }),
+      { channel: CHANNEL_A, messageTs: 'TS', user: USER },
     )
     const event = trail.events.find(e => e.event === 'cscb.ad_decide.attempted')
     expect(event!['result_class']).toBe('ErrInvalidFlags')
@@ -1138,22 +1049,14 @@ describe('trail events — cscb.ad_decide.attempted', () => {
   })
 
   test('ErrAmbiguousRequest → result_class="ErrAmbiguousRequest", no raw_error_message', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_A })
     const trail = makeTrailCapture()
     const decide = makeDecideStub({ throwOn: errAmbiguousRequest() })
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        emitTrail: trail.emit,
-        log: () => { /* swallow */ },
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ emitTrail: trail.emit, log: () => { /* swallow */ } }),
+      { channel: CHANNEL_A, messageTs: 'TS', user: USER },
     )
     const event = trail.events.find(e => e.event === 'cscb.ad_decide.attempted')
     expect(event!['result_class']).toBe('ErrAmbiguousRequest')
@@ -1161,22 +1064,14 @@ describe('trail events — cscb.ad_decide.attempted', () => {
   })
 
   test('generic Error → result_class="other" with raw_error_message', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_A })
     const trail = makeTrailCapture()
     const decide = makeDecideStub({ throwOn: new Error('network timeout') })
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        emitTrail: trail.emit,
-        log: () => { /* swallow */ },
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ emitTrail: trail.emit, log: () => { /* swallow */ } }),
+      { channel: CHANNEL_A, messageTs: 'TS', user: USER },
     )
     const event = trail.events.find(e => e.event === 'cscb.ad_decide.attempted')
     expect(event!['result_class']).toBe('other')
@@ -1184,21 +1079,14 @@ describe('trail events — cscb.ad_decide.attempted', () => {
   })
 
   test('request_token correlates with click_handler.invoked from Epic 4', async () => {
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_B,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_B })
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_B),
-      {
-        web: seed.chat.web as never,
-        emitTrail: trail.emit,
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH, messageTs: 'TS', user: USER },
+      encodePermissionActionId('allow', h.instanceA, TOKEN_B),
+      clickDeps({ emitTrail: trail.emit }),
+      { channel: CHANNEL_A, messageTs: 'TS', user: USER },
     )
     const invoked = trail.events.find(e => e.event === 'cscb.click_handler.invoked')
     const decided = trail.events.find(e => e.event === 'cscb.ad_decide.attempted')
@@ -1212,55 +1100,52 @@ describe('trail events — cscb.ad_decide.attempted', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Epic 5 — wrapper outage short-circuit + log-and-bypass
+// Epic 5 — wrapper outage short-circuit, keyed by persona (b.av2 SR-7.1)
 // ---------------------------------------------------------------------------
 
 describe('handlePermissionClick — wrapper outage short-circuit', () => {
-  test('ErrSystemInstallDisappeared → ad-unreachable flag raised; no per-event logDeps call; returns true', async () => {
+  test('ErrSystemInstallDisappeared → ad-unreachable flag raised under A\'s key; no per-event logDeps call; returns true', async () => {
     const BINARY = '/usr/local/bin/agent-director'
     const err = new ErrSystemInstallDisappeared('spawn', BINARY)
     const decide = makeDecideStub({ throwOn: err })
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    const notices: Array<{ key: string; text: string }> = []
+    initOutageState({
+      getClient: () => decide.client as unknown as Client,
+      notify: (key, text) => { notices.push({ key, text }) },
     })
-    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const logCalls: unknown[][] = []
     const handled = await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        log: (...args) => { logCalls.push(args) },
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH },
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ log: (...args) => { logCalls.push(args) } }),
+      { channel: CHANNEL_A },
     )
     expect(handled).toBe(true)
-    // The wrapper raised ad-unreachable with the binary path as detail.
-    expect(getOutageFlags(CHANNEL_CH).has('ad-unreachable')).toBe(true)
+    // The wrapper raised ad-unreachable under the persona key...
+    expect(getOutageFlags(h.personaA.key).has('ad-unreachable')).toBe(true)
+    // ...and nothing under the channel ID or the other persona.
+    expect(getOutageFlags(CHANNEL_A).size).toBe(0)
+    expect(getOutageFlags(h.personaB.key).size).toBe(0)
+    // The onset notice is addressed to A's key.
+    expect(notices.map((n) => n.key)).toEqual([h.personaA.key])
     // The per-event logDeps branch (ErrInvalidFlags / ErrAmbiguousRequest / generic log)
     // must NOT fire — the ad/tmux short-circuit returns before those branches.
     expect(logCalls).toHaveLength(0)
+    expect(h.stubA.calls.update).toHaveLength(0)
+    expect(slackCalls(h.stubB)).toBe(0)
   })
 
   test('carve-out trail entry carries result_class=ErrSystemInstallDisappeared + raw_error_message', async () => {
     const BINARY = '/usr/local/bin/agent-director'
     const err = new ErrSystemInstallDisappeared('spawn', BINARY)
     const decide = makeDecideStub({ throwOn: err })
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
-    })
+    await seedLiveEntry({ requestToken: TOKEN_A })
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const trail = makeTrailCapture()
     await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        emitTrail: trail.emit,
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH },
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ emitTrail: trail.emit }),
+      { channel: CHANNEL_A },
     )
     // Exactly one cscb.ad_decide.attempted entry should land — the carve-out
     // emits before the early return. result_class names the typed AD error
@@ -1268,61 +1153,179 @@ describe('handlePermissionClick — wrapper outage short-circuit', () => {
     // forensic context the loud Slack alert can't carry by itself.
     const adDecides = trail.events.filter(e => e['event'] === 'cscb.ad_decide.attempted')
     expect(adDecides).toHaveLength(1)
-    expect(adDecides[0]['result_class']).toBe('ErrSystemInstallDisappeared')
-    expect(adDecides[0]['raw_error_message']).toBe(err.message)
-    expect(adDecides[0]['claude_instance_id']).toBe(INSTANCE_C)
-    expect(adDecides[0]['request_token']).toBe(TOKEN_A)
+    expect(adDecides[0]!['result_class']).toBe('ErrSystemInstallDisappeared')
+    expect(adDecides[0]!['raw_error_message']).toBe(err.message)
+    expect(adDecides[0]!['claude_instance_id']).toBe(h.instanceA)
+    expect(adDecides[0]!['request_token']).toBe(TOKEN_A)
+    expect(getOutageFlags(h.personaA.key).has('ad-unreachable')).toBe(true)
+    expect(getOutageFlags(CHANNEL_A).size).toBe(0)
   })
 
-  test('carve-out trail entry for ErrTmuxNotAvailable: result_class=ErrTmuxNotAvailable + raw_error_message', async () => {
+  test('carve-out trail entry for ErrTmuxNotAvailable: result_class=ErrTmuxNotAvailable + raw_error_message; flag under A\'s key', async () => {
     const ErrTmuxCtor = (await import('agent-director')).ErrTmuxNotAvailable
     const err = new ErrTmuxCtor('spawn', 'ErrTmuxNotAvailable', 'tmux not found on PATH')
     const decide = makeDecideStub({ throwOn: err })
-    const seed = await seedLiveEntry({
-      instanceId: INSTANCE_C,
-      channelId: CHANNEL_CH,
-      requestToken: TOKEN_A,
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    const notices: Array<{ key: string; text: string }> = []
+    initOutageState({
+      getClient: () => decide.client as unknown as Client,
+      notify: (key, text) => { notices.push({ key, text }) },
     })
-    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const trail = makeTrailCapture()
     await handlePermissionClick(
-      encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      {
-        web: seed.chat.web as never,
-        emitTrail: trail.emit,
-      } satisfies ClickHandlerDepsShape as never,
-      { channel: CHANNEL_CH },
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ emitTrail: trail.emit }),
+      { channel: CHANNEL_A },
     )
     const adDecides = trail.events.filter(e => e['event'] === 'cscb.ad_decide.attempted')
     expect(adDecides).toHaveLength(1)
-    expect(adDecides[0]['result_class']).toBe('ErrTmuxNotAvailable')
-    expect(adDecides[0]['raw_error_message']).toBe(err.message)
-    expect(getOutageFlags(CHANNEL_CH).has('tmux-unavailable')).toBe(true)
+    expect(adDecides[0]!['result_class']).toBe('ErrTmuxNotAvailable')
+    expect(adDecides[0]!['raw_error_message']).toBe(err.message)
+    expect(getOutageFlags(h.personaA.key).has('tmux-unavailable')).toBe(true)
+    expect(getOutageFlags(CHANNEL_A).size).toBe(0)
+    expect(getOutageFlags(h.personaB.key).size).toBe(0)
+    expect(notices.map((n) => n.key)).toEqual([h.personaA.key])
   })
 })
 
-describe('handlePermissionClick — log-and-bypass (no resolvable ctxChannel)', () => {
-  test('no context.channel + no earlyEntry → 0 decide calls, no outage flag, diagnostic log emitted', async () => {
+// ---------------------------------------------------------------------------
+// Unresolvable receiving persona — log and bypass
+// ---------------------------------------------------------------------------
+
+describe('handlePermissionClick — log-and-bypass (unresolvable receiving persona)', () => {
+  const GHOST_INSTANCE = personaInstanceId('ghost_persona')
+
+  test.each([
+    { label: 'no receiving key', instance: 'A', receiving: () => undefined },
+    { label: 'an unknown receiving key', instance: 'A', receiving: () => UNKNOWN_KEY },
+    {
+      label: 'an instance id that maps to no applied persona',
+      instance: 'ghost',
+      receiving: (actionId: string) => personaKeyFromActionId(actionId),
+    },
+  ] as const)('$label → 0 decide calls, no Slack call, no outage flag, diagnostic log emitted', async ({ instance, receiving }) => {
+    // A live prompt exists on A, and the payload names A's channel: neither
+    // is enough to resolve the persona.
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    const callsA = slackCalls(h.stubA)
+    const clientForBefore = h.clients.calls.length
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const logLines: string[] = []
-    const ACTION_ID = encodePermissionActionId('allow', INSTANCE_C, TOKEN_A)
+    const instanceId = instance === 'A' ? h.instanceA : GHOST_INSTANCE
+    const ACTION_ID = encodePermissionActionId('allow', instanceId, TOKEN_A)
     const handled = await handlePermissionClick(
       ACTION_ID,
-      {
-        web: { chat: { update: async () => ({}) } } as never,
+      clickDeps({
+        receivingPersonaKey: receiving(ACTION_ID),
         log: (...args) => { logLines.push(args.map(String).join(' ')) },
-      } satisfies ClickHandlerDepsShape as never,
-      // no context.channel supplied; no live entry seeded → ctxChannel = undefined
-      {},
+      }),
+      { channel: CHANNEL_A },
     )
     expect(handled).toBe(true)
     expect(decide.calls).toHaveLength(0)
-    // No orphan outage flag under any channel, including '<unknown>'
-    expect(getOutageFlags(CHANNEL_CH).size).toBe(0)
-    // Diagnostic log must contain action_id and request_token
-    const log = logLines.join('\n')
-    expect(log).toContain(ACTION_ID)
-    expect(log).toContain(TOKEN_A)
+    // No Slack call through any persona's client.
+    expect(slackCalls(h.stubA)).toBe(callsA)
+    expect(slackCalls(h.stubB)).toBe(0)
+    expect(h.clients.calls.length).toBe(clientForBefore)
+    expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(false)
+    // No orphan outage flag under any key or channel, including '<unknown>'.
+    for (const key of [h.personaA.key, h.personaB.key, CHANNEL_A, CHANNEL_B, UNKNOWN_KEY, 'ghost_persona', '<unknown>', 'undefined']) {
+      expect(getOutageFlags(key).size).toBe(0)
+    }
+    // One diagnostic log line carrying the action_id and request_token.
+    expect(logLines).toHaveLength(1)
+    expect(logLines[0]).toContain(ACTION_ID)
+    expect(logLines[0]).toContain(TOKEN_A)
+  })
+})
+
+describe('handlePermissionClick — no channel anywhere, receiving persona known', () => {
+  test('no live entry and no payload channel, received for applied A → exactly one decide with the token, no update, no bypass log line', async () => {
+    const decide = makeDecideStub()
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    const logs: unknown[][] = []
+    const handled = await handlePermissionClick(
+      encodePermissionActionId('allow', h.instanceA, TOKEN_C),
+      clickDeps({ log: (...args) => { logs.push(args) } }),
+    )
+    expect(handled).toBe(true)
+    expect(decide.calls).toEqual([
+      { claude_instance_id: h.instanceA, decision: 'allow', request_token: TOKEN_C } as DecideParams & { request_token: string },
+    ])
+    expect(slackCalls(h.stubA, h.stubB)).toBe(0)
+    expect(logs).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Mismatch — a click for B's instance received as A's fails closed (ENG-4)
+// ---------------------------------------------------------------------------
+
+describe('handlePermissionClick — instance / receiving persona mismatch (fail closed)', () => {
+  test('click for cscb_<B key> delivered as A\'s → not decided, no chat.update, logged naming both keys', async () => {
+    await seedLiveEntry({ persona: h.personaB, requestToken: TOKEN_B })
+    const decide = makeDecideStub()
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    const trail = makeTrailCapture()
+    const logLines: string[] = []
+    const handled = await handlePermissionClick(
+      encodePermissionActionId('allow', h.instanceB, TOKEN_B),
+      clickDeps({
+        receivingPersonaKey: h.personaA.key,
+        emitTrail: trail.emit,
+        log: (...args) => { logLines.push(args.map(String).join(' ')) },
+      }),
+      { channel: CHANNEL_A },
+    )
+    expect(handled).toBe(true)
+    expect(decide.calls).toHaveLength(0)
+    expect(h.stubA.calls.update).toHaveLength(0)
+    expect(h.stubB.calls.update).toHaveLength(0)
+    expect(getLivePermission(h.instanceB, TOKEN_B)?.handled).toBe(false)
+    expect(trail.events.find((e) => e.event === 'cscb.ad_decide.attempted')).toBeUndefined()
+    expect(trail.events.find((e) => e.event === 'cscb.chat_update.attempted')).toBeUndefined()
+    for (const key of [h.personaA.key, h.personaB.key, CHANNEL_A, CHANNEL_B]) {
+      expect(getOutageFlags(key).size).toBe(0)
+    }
+    expect(logLines).toHaveLength(1)
+    expect(logLines[0]).toContain(h.personaA.key)
+    expect(logLines[0]).toContain(h.personaB.key)
+    expect(logLines[0]).toContain(renderPersonaRef(h.personaA.name, h.personaA.key))
+    expect(logLines[0]).toContain(TOKEN_B)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Client unavailable — decide, but no update and no markHandled
+// ---------------------------------------------------------------------------
+
+describe('handlePermissionClick — persona client unavailable', () => {
+  test.each(['allow', 'deny'] as const)('%s on A\'s live prompt with no client for A → decide once, no chat.update, no markHandled, one log line', async (decision) => {
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    h.clients.setUnavailable(h.personaA.key)
+    const decide = makeDecideStub()
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    const logLines: string[] = []
+    const handled = await handlePermissionClick(
+      encodePermissionActionId(decision, h.instanceA, TOKEN_A),
+      clickDeps({ log: (...args) => { logLines.push(args.map(String).join(' ')) } }),
+      { channel: CHANNEL_A },
+    )
+    expect(handled).toBe(true)
+    expect(decide.calls).toHaveLength(1)
+    expect(decide.calls[0]).toEqual({
+      claude_instance_id: h.instanceA,
+      decision,
+      request_token: TOKEN_A,
+    } as DecideParams & { request_token: string })
+    expect(h.clients.calls.at(-1)).toBe(h.personaA.key)
+    expect(h.stubA.calls.update).toHaveLength(0)
+    expect(h.stubB.calls.update).toHaveLength(0)
+    expect(slackCalls(h.stubB)).toBe(0)
+    expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(false)
+    expect(logLines).toHaveLength(1)
+    expect(logLines[0]).toContain(renderPersonaRef(h.personaA.name, h.personaA.key))
+    expect(logLines[0]).toContain(TOKEN_A)
   })
 })

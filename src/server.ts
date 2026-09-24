@@ -75,6 +75,7 @@ import {
   emitBlockActionReceived,
   handlePermissionClick,
 } from './permission-click-handler.ts'
+import { personaKeyFromActionId } from './permission-action-id.ts'
 import { trustBootstrap, trustPatchPersona } from './trust-bootstrap.ts'
 import { runJsonlPersistenceSafeguard } from './jsonl-persistence-check.ts'
 import { stopHookBootstrap } from './stop-hook-bootstrap.ts'
@@ -923,9 +924,16 @@ socket.on('interactive', async (evt) => {
       user: userId,
     })
 
+    // TRANSITIONAL — until E3 Task 9 there is one Socket Mode connection, so
+    // the receiving persona is taken from the action ID. Task 9 replaces it
+    // with the receiving connection's persona key.
     const handled = await handlePermissionClick(
       actionId,
-      { web },
+      {
+        receivingPersonaKey: personaKeyFromActionId(actionId),
+        clientFor,
+        getPersona: getAppliedPersona,
+      },
       { channel: channelId, messageTs, user: userId },
     )
     if (handled) {
@@ -1395,12 +1403,14 @@ export async function main(): Promise<void> {
     }
 
     // SR-2.1 permission poller — single-threaded interval loop monitors AD
-    // state for spawns in check_permission and posts Block Kit prompts.
-    if (routingConfig) {
+    // state for spawns in check_permission and posts Block Kit prompts to
+    // each persona's destination through its client (b.av2 SR-7.1).
+    if (personaConfig) {
       startPermissionPoller({
         getClient,
-        web,
-        intervalMs: routingConfig.agent_director_poll_interval_ms,
+        clientFor,
+        getPersona: getAppliedPersona,
+        intervalMs: personaConfig.agent_director_poll_interval_ms,
       })
     }
 

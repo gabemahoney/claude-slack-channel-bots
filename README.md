@@ -614,8 +614,8 @@ Flow:
 
 1. agent-director moves the spawn into `check_permission` state when Claude requests a tool permission.
 2. CSCB's poller (`src/permission-poller.ts`) runs `client.list({ state: ['check_permission'], label: ['service=cscb'] })` at the `agent_director_poll_interval_ms` cadence (default 1000 ms).
-3. For each new spawn, `client.get(...)` returns the open `permission_request` (tool name + tool input + integer `request_id`). CSCB `chat.postMessage`s the Block Kit prompt to the spawn's `channel` label.
-4. The operator clicks Allow / Deny in Slack. CSCB's interactive handler calls `client.decide({ claude_instance_id, decision })` and `chat.update`s the message to "Allowed/Denied by <user>".
+3. For each new spawn, `client.get(...)` returns the open `permission_request` (tool name + tool input + integer `request_id`). CSCB identifies the bot that owns the spawn from its `persona` label and posts the Block Kit prompt to that bot's channel as that bot.
+4. The operator clicks Allow / Deny in Slack. CSCB resolves the click through the same bot: it calls `client.decide({ claude_instance_id, decision, request_token })` and, as that bot, updates the message to "*Permission* — Allowed" or "*Permission* — Denied by operator".
 5. If a tracked prompt drops out of `check_permission` for any reason other than a Slack click (timeout, external `decide`, crash), the next poller tick replaces the buttons with "expired".
 
 ### Slack app prerequisites
@@ -743,7 +743,7 @@ Messages to channels not listed in `access.json → channels` and not present in
 **Permission relay not working**
 Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json`.
 
-**Bot appears dead / posts a "blocked on a native permission prompt" warning**
+**Bot appears dead / posts a "blocked on a native Claude Code permission prompt" warning**
 The bot is wedged in `check_permission` on a native Claude Code TUI prompt that never reached Slack (a permission decision AD recorded but could not deliver). The bot stops responding, and after ~90 s the poller posts a one-shot channel warning. Recover by inspecting the native prompt with `agent-director read-pane --claude-instance-id <id>`, then killing and respawning the session (`agent-director kill <id>` or tmux-kill, then let the server restart it or `claude-slack-channel-bots stop && claude-slack-channel-bots start`). Do **not** use `send-keys` — agent-director hard-rejects it while the spawn is in this relayed permission state. The warning fires once per wedge episode; the detector re-arms if the bot later wedges again.
 
 **Session not restarting after crash**

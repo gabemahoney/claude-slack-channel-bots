@@ -21,10 +21,12 @@ process.env['SLACK_BOT_TOKEN'] = 'xoxb-test-placeholder'
 process.env['SLACK_APP_TOKEN'] = 'xapp-test-placeholder'
 
 let createCli: (deps: CliDeps) => CliHandlers
+let resolveCscbInstanceId: (key: string) => Promise<string | null>
 
 beforeAll(async () => {
   const mod = await import('../src/cli.ts')
   createCli = mod.createCli
+  resolveCscbInstanceId = mod.resolveCscbInstanceId
 })
 
 class ExitError extends Error {
@@ -774,5 +776,111 @@ describe('unknown subcommand', () => {
     expect(output).not.toContain('CSCB_RECONCILE_INSTANCE_IDS')
     // Usage text should mention the valid subcommands
     expect(output).toContain('start')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// resolveCscbInstanceId — the teardown's persona-label lookup (b.av2 SR-2.2)
+//
+// Spawns carry only `service=cscb`, `persona=<key>` and `config_dir=…` (the
+// interim `channel=<key>` label is gone since E3 Task 6), so the CLI teardown
+// must find a bot's row by its persona label. Were it still to query `channel`,
+// it would find no row for any bot and the teardown would silently do nothing
+// (the b.qps / b.qwo incident class). The b.qwo pins stay: null ONLY for an
+// empty list; every agent-director error propagates. Under the route→persona
+// adapter the CLI passes channel IDs, which equal the persona keys.
+//
+// Isolation (b.av2 SR-13.2): a stub agent-director client installed through
+// setClientForTests — no real binary, no startup gate, no server start.
+// ---------------------------------------------------------------------------
+
+describe('resolveCscbInstanceId: persona-label lookup', () => {
+  type Stub = typeof import('./test-helpers/agent-director-stub.ts')
+  type AdClient = typeof import('../src/agent-director-client.ts')
+  let stub: Stub
+  let adClient: AdClient
+
+  beforeAll(async () => {
+    stub = await import('./test-helpers/agent-director-stub.ts')
+    adClient = await import('../src/agent-director-client.ts')
+  })
+
+  afterEach(() => {
+    adClient.resetClientForTests()
+  })
+
+  /** Install a stub client whose `list` answers with `listResult` / `listError`. */
+  function install(opts: Parameters<Stub['makeStubClient']>[0]): import('agent-director').ListParams[] {
+    const listCalls: import('agent-director').ListParams[] = []
+    const client = stub.makeStubClient({ ...opts, listCalls })
+    adClient.setClientForTests(client as unknown as Parameters<AdClient['setClientForTests']>[0])
+    return listCalls
+  }
+
+  test('one row for key k: a single list by exactly service=cscb and persona=k (no channel label) returns cscb_k', async () => {
+    const listCalls = install({ listResult: { spawns: [stub.cannedListRow({ claude_instance_id: 'cscb_k' })] } })
+
+    expect(await resolveCscbInstanceId('k')).toBe('cscb_k')
+
+    expect(listCalls).toHaveLength(1)
+    expect(listCalls[0]!.label).toEqual(['service=cscb', 'persona=k'])
+    expect(listCalls[0]!.label!.some((l) => l.startsWith('channel='))).toBe(false)
+  })
+
+  test('a channel-ID key (route→persona adapter) is looked up by persona=<channel ID>', async () => {
+    const listCalls = install({ listResult: { spawns: [stub.cannedListRow({ claude_instance_id: 'cscb_C0AMDDZEHCY' })] } })
+
+    expect(await resolveCscbInstanceId('C0AMDDZEHCY')).toBe('cscb_C0AMDDZEHCY')
+
+    expect(listCalls.map((c) => c.label)).toEqual([['service=cscb', 'persona=C0AMDDZEHCY']])
+  })
+
+  test('several rows carry the label: the row named exactly cscb_<key> wins over an earlier leftover', async () => {
+    install({
+      listResult: {
+        spawns: [
+          stub.cannedListRow({ claude_instance_id: 'cscb_general_k', labels: { service: 'cscb', persona: 'k' } }),
+          stub.cannedListRow({ claude_instance_id: 'cscb_k' }),
+        ],
+      },
+    })
+
+    expect(await resolveCscbInstanceId('k')).toBe('cscb_k')
+  })
+
+  test('several rows and none named cscb_<key>: the first row is returned', async () => {
+    install({
+      listResult: {
+        spawns: [
+          stub.cannedListRow({ claude_instance_id: 'cscb_general_k', labels: { service: 'cscb', persona: 'k' } }),
+          stub.cannedListRow({ claude_instance_id: 'cscb_other_k', labels: { service: 'cscb', persona: 'k' } }),
+        ],
+      },
+    })
+
+    expect(await resolveCscbInstanceId('k')).toBe('cscb_general_k')
+  })
+
+  test('empty list: null', async () => {
+    const listCalls = install({ listResult: { spawns: [] } })
+
+    expect(await resolveCscbInstanceId('k')).toBeNull()
+    expect(listCalls).toHaveLength(1)
+  })
+
+  test.each([
+    ['ErrCallTimeout', () => stub.errCallTimeout('list')],
+    ['a connection error', () => new Error('AD connection refused')],
+  ])('a list error (%s) propagates: the call rejects with that error and never returns null', async (_name, makeErr) => {
+    const err = makeErr()
+    install({ listError: err })
+
+    await expect(resolveCscbInstanceId('k')).rejects.toBe(err)
+  })
+
+  test('no client installed (the b.qps root cause: no startup gate ran): the call rejects, never null', async () => {
+    adClient.resetClientForTests()
+
+    await expect(resolveCscbInstanceId('k')).rejects.toThrow('getClient() called before the startup gate')
   })
 })

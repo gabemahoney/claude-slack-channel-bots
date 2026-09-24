@@ -6,8 +6,9 @@
  *
  *   perm_<allow|deny>_<claude_instance_id>_<request_token>
  *
- * `claude_instance_id` is `cscb_<channelId>` and can itself contain
- * underscores. The trailing `request_token` is an opaque per-request
+ * `claude_instance_id` is `cscb_<persona key>` (`personaInstanceId`, whose
+ * `PERSONA_INSTANCE_ID_PREFIX` is the regex's `cscb_` anchor) and can itself
+ * contain underscores. The trailing `request_token` is an opaque per-request
  * identifier minted by agent-director — CSCB MUST NOT parse or otherwise
  * interpret its bytes (the regex anchors on UUIDv4 outer shape only to
  * fix the middle capture group's rightmost boundary, not to validate the
@@ -15,6 +16,8 @@
  *
  * SPDX-License-Identifier: MIT
  */
+
+import { PERSONA_INSTANCE_ID_PREFIX } from './persona-identity.ts'
 
 export type PermissionDecision = 'allow' | 'deny'
 
@@ -67,4 +70,15 @@ export function parsePermissionActionId(actionId: string): ParsedPermissionActio
   const claudeInstanceId = match[2]
   const requestToken = match[3]
   return { decision, claudeInstanceId, requestToken }
+}
+
+/**
+ * The persona key a permission action ID was built for: its instance ID with
+ * `PERSONA_INSTANCE_ID_PREFIX` removed (the inverse of `personaInstanceId`).
+ * Undefined for a foreign or malformed action ID.
+ */
+export function personaKeyFromActionId(actionId: string): string | undefined {
+  const parsed = parsePermissionActionId(actionId)
+  if (parsed === null || !parsed.claudeInstanceId.startsWith(PERSONA_INSTANCE_ID_PREFIX)) return undefined
+  return parsed.claudeInstanceId.slice(PERSONA_INSTANCE_ID_PREFIX.length)
 }

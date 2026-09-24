@@ -7,6 +7,11 @@
  * file → `JSON.parse` intact, including SR-V-1.4 `action_id` reversibility
  * from the persisted `blocks` array.
  *
+ * Rows carry the persona label, and the poller and click handler reach Slack
+ * through the persona's own client (b.av2 SR-7.1). The persisted `channel`
+ * field keeps its meaning (b.av2 SR-11): the Slack channel of the prompt
+ * message, i.e. the persona's destination channel ID, never its key.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -15,18 +20,25 @@ import { mkdtempSync, readFileSync, rmSync, existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import type { Client } from 'agent-director'
+import type { Persona } from '../src/config.ts'
 import {
   _resetPollerState,
-  startPermissionPoller,
   stopPermissionPoller,
+  type PollerDeps,
 } from '../src/permission-poller.ts'
 import { _resetTrailFdForTests } from '../src/permission-trail.ts'
 import { _resetOutageState, initOutageState } from '../src/outage-state.ts'
-import { encodePermissionActionId, parsePermissionActionId } from '../src/permission-action-id.ts'
+import {
+  encodePermissionActionId,
+  parsePermissionActionId,
+  personaKeyFromActionId,
+} from '../src/permission-action-id.ts'
 import {
   emitBlockActionReceived,
   handlePermissionClick,
+  type ClickDeps,
 } from '../src/permission-click-handler.ts'
+import { personaInstanceId, personaKey } from '../src/persona-identity.ts'
 import type { DecideParams, DecideResult } from 'agent-director'
 import {
   cannedGetPermissionResponse,
@@ -34,14 +46,30 @@ import {
   cannedListRow,
   cannedPermissionRequest,
 } from './test-helpers/agent-director-stub.ts'
+import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeStubSlack, type StubSlack, type WebApiOutcome } from './test-helpers/slack-stub.ts'
+import { LEAK_SENTINEL, assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
+import {
+  makePersonaClients,
+  slackCalls,
+  startManualPoller,
+  type ManualIntervalControl,
+  type PersonaClients,
+} from './test-helpers/permission-relay-harness.ts'
 import type { GetPermissionParams, GetPermissionResult } from '../src/agent-director-client.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
-const INSTANCE_C = 'cscb_demo_C0B1ZJJLJ9M'
+// The prompting persona: its key differs from its destination channel ID.
+const NAME_A = 'Trail Demo'
+const KEY_A = personaKey(NAME_A)
+const INSTANCE_C = personaInstanceId(KEY_A)
 const CHANNEL_CH = 'C0B1ZJJLJ9M'
+// A second persona whose client must stay untouched.
+const NAME_B = 'Trail Bystander'
+const CHANNEL_B = 'C0BYSTAND01'
 const TOKEN_A = '6f3a1d2c-aaaa-4bbb-8ccc-dddddddddddd'
 const SLACK_RETURNED_TS = '1780600244.439969'
 
@@ -51,6 +79,11 @@ const SLACK_RETURNED_TS = '1780600244.439969'
 
 let tempDir: string
 let origStateDir: string | undefined
+let A: Persona
+let personas: Persona[]
+let stubA: StubSlack
+let stubB: StubSlack
+let clients: PersonaClients
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'poller-trail-file-test-'))
@@ -61,67 +94,55 @@ beforeEach(() => {
   // Tests that need a specific client (e.g. decide) override via initOutageState
   // inside the test body.
   initOutageState({ getClient: () => ({} as unknown as Client), notify: () => {} })
+  personas = makeMultiPersonaConfig(
+    [
+      { name: NAME_A, channels: [{ id: CHANNEL_CH, delivery: 'all' }] },
+      { name: NAME_B, channels: [{ id: CHANNEL_B, delivery: 'all' }] },
+    ],
+    tempDir,
+  ).personas
+  A = personas[0]!
+  // Scripted Slack failures carry the sentinel wherever a real error can hold secrets.
+  stubA = makeStubSlack({ leakMarker: LEAK_SENTINEL })
+  stubB = makeStubSlack({ leakMarker: LEAK_SENTINEL })
+  clients = makePersonaClients((key) => (key === A.key ? stubA : key === personas[1]!.key ? stubB : undefined))
 })
 
 afterEach(() => {
-  stopPermissionPoller()
-  _resetPollerState()
-  _resetOutageState()
-  if (origStateDir === undefined) delete process.env['SLACK_STATE_DIR']
-  else process.env['SLACK_STATE_DIR'] = origStateDir
-  _resetTrailFdForTests()
-  rmSync(tempDir, { recursive: true, force: true })
+  try {
+    // The bystander persona's client is never used.
+    expect(slackCalls(stubB)).toBe(0)
+  } finally {
+    stopPermissionPoller()
+    _resetPollerState()
+    _resetOutageState()
+    if (origStateDir === undefined) delete process.env['SLACK_STATE_DIR']
+    else process.env['SLACK_STATE_DIR'] = origStateDir
+    _resetTrailFdForTests()
+    rmSync(tempDir, { recursive: true, force: true })
+  }
 })
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-interface ManualInterval {
-  cb: () => void
-  ms: number
-}
+const getPersona = (key: string): Persona | undefined => personas.find((p) => p.key === key)
 
-function makeInterval(): {
-  setInterval: typeof globalThis.setInterval
-  clearInterval: typeof globalThis.clearInterval
-  pending: ManualInterval[]
-} {
-  const pending: ManualInterval[] = []
-  return {
-    setInterval: ((cb: () => void, ms: number) => {
-      const entry: ManualInterval = { cb, ms }
-      pending.push(entry)
-      return entry as unknown as ReturnType<typeof setInterval>
-    }) as unknown as typeof globalThis.setInterval,
-    clearInterval: (() => { /* no-op */ }) as unknown as typeof globalThis.clearInterval,
-    pending,
-  }
-}
+/** Click deps for a click received on persona A's connection. */
+const clickDeps = (): ClickDeps => ({ receivingPersonaKey: KEY_A, clientFor: clients.clientFor, getPersona })
 
-interface ChatStub {
-  web: {
-    chat: {
-      postMessage: (a: unknown) => Promise<{ ts?: string }>
-      update: (a: unknown) => Promise<unknown>
-    }
-  }
-}
-
-function makeChatStub(opts: { ts?: string; postMessageError?: Error } = {}): ChatStub {
-  return {
-    web: {
-      chat: {
-        async postMessage(_args: unknown): Promise<{ ts?: string }> {
-          if (opts.postMessageError) throw opts.postMessageError
-          return { ts: opts.ts ?? SLACK_RETURNED_TS }
-        },
-        async update(_args: unknown): Promise<unknown> {
-          return {}
-        },
-      },
-    },
-  }
+/**
+ * Start the poller with the persona lookups. A's first post has outcome
+ * `post` (default: success returning SLACK_RETURNED_TS).
+ */
+function startPoller(
+  getClient: PollerDeps['getClient'],
+  opts: Partial<PollerDeps> & { post?: WebApiOutcome } = {},
+): ManualIntervalControl {
+  const { post, ...rest } = opts
+  stubA.script.post.push(post ?? { kind: 'ok', result: { ts: SLACK_RETURNED_TS } })
+  return startManualPoller({ getClient, clientFor: clients.clientFor, getPersona, ...rest })
 }
 
 function trailFile(): string {
@@ -136,12 +157,8 @@ function readAllLines(): Array<Record<string, unknown>> {
     .map(l => JSON.parse(l) as Record<string, unknown>)
 }
 
-const checkPermRow = () =>
-  cannedListRow({
-    claude_instance_id: INSTANCE_C,
-    state: 'check_permission',
-    labels: { service: 'cscb', channel: CHANNEL_CH },
-  })
+/** Persona A's spawn in check_permission, as a spawn of A writes it. */
+const checkPermRow = () => cannedListRow({ state: 'check_permission' }, A, tempDir)
 
 // ---------------------------------------------------------------------------
 // Happy path
@@ -149,8 +166,6 @@ const checkPermRow = () =>
 
 describe('permission-poller — trail file end-to-end (Epic 2)', () => {
   test('success: row_decision{post_attempted} + chat_post.attempted{ok=true} persisted with matching ts', async () => {
-    const ivl = makeInterval()
-    const chat = makeChatStub({ ts: SLACK_RETURNED_TS })
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => cannedGetResultPlural({
@@ -160,16 +175,9 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
       }),
     })
     initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
-    startPermissionPoller({
-      getClient,
-      web: chat.web as never,
-      intervalMs: 1000,
-      setInterval: ivl.setInterval,
-      clearInterval: ivl.clearInterval,
-    })
+    const ivl = startPoller(getClient)
 
-    ivl.pending[0]!.cb()
-    await new Promise(r => setTimeout(r, 20))
+    await ivl.tick(20)
 
     const all = readAllLines()
     const matching = all.filter(e => e['request_token'] === TOKEN_A)
@@ -185,12 +193,14 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     expect(post).toBeDefined()
     expect(post!['ok']).toBe(true)
     expect(post!['slack_ts']).toBe(SLACK_RETURNED_TS)
+    // The persisted channel is A's destination channel ID, never its key.
     expect(post!['channel']).toBe(CHANNEL_CH)
+    expect(post!['channel']).not.toBe(KEY_A)
+    // Posted through A's own client, to its destination.
+    expect((stubA.calls.postMessage as Array<{ channel: string }>).map((c) => c.channel)).toEqual([CHANNEL_CH])
   })
 
   test('SR-V-1.4 decode round-trip: persisted blocks yield both Allow and Deny action_ids that decode back to (decision, instance, token)', async () => {
-    const ivl = makeInterval()
-    const chat = makeChatStub()
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => cannedGetResultPlural({
@@ -200,16 +210,9 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
       }),
     })
     initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
-    startPermissionPoller({
-      getClient,
-      web: chat.web as never,
-      intervalMs: 1000,
-      setInterval: ivl.setInterval,
-      clearInterval: ivl.clearInterval,
-    })
+    const ivl = startPoller(getClient)
 
-    ivl.pending[0]!.cb()
-    await new Promise(r => setTimeout(r, 20))
+    await ivl.tick(20)
 
     const post = readAllLines().find(
       e => e['event'] === 'cscb.chat_post.attempted' && e['request_token'] === TOKEN_A,
@@ -232,11 +235,12 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
       claudeInstanceId: INSTANCE_C,
       requestToken: TOKEN_A,
     })
+    // The persisted buttons name persona A's instance, `cscb_<key>`.
+    expect(INSTANCE_C).toBe(`cscb_${KEY_A}`)
+    for (const el of actions!.elements) expect(personaKeyFromActionId(el.action_id)).toBe(KEY_A)
   })
 
   test('closure persists on disk: row_decision{reconciled_closed} + chat_update.attempted{operator_allow} land with the original prompt ts (SRD §10 Q5)', async () => {
-    const ivl = makeInterval()
-    const chat = makeChatStub({ ts: SLACK_RETURNED_TS })
     let listProjection: ReturnType<typeof cannedPermissionRequest>[] = [
       cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 }),
     ]
@@ -251,21 +255,13 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         cannedGetPermissionResponse({ request_token: p.request_token, decision: 'allow', decision_reason: null }),
     })
     initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
-    startPermissionPoller({
-      getClient,
-      web: chat.web as never,
-      intervalMs: 1000,
-      setInterval: ivl.setInterval,
-      clearInterval: ivl.clearInterval,
-    })
+    const ivl = startPoller(getClient)
 
     // Tick 1: post
-    ivl.pending[0]!.cb()
-    await new Promise(r => setTimeout(r, 20))
+    await ivl.tick(20)
     // Tick 2: closure
     listProjection = []
-    ivl.pending[0]!.cb()
-    await new Promise(r => setTimeout(r, 20))
+    await ivl.tick(20)
 
     const matching = readAllLines().filter(e => e['request_token'] === TOKEN_A)
     const events = matching.map(e => e['event'])
@@ -290,15 +286,16 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     // SRD §10 Q5: closure renders on the same ts the original post returned.
     expect(closure['message_ts']).toBe(post['slack_ts'])
     expect(closure['channel']).toBe(CHANNEL_CH)
+    // The closure update went through A's own client, on the recorded channel and ts.
+    expect(stubA.calls.update as Array<{ channel: string; ts: string }>).toMatchObject([
+      { channel: CHANNEL_CH, ts: SLACK_RETURNED_TS },
+    ])
   })
 
-  test('failure: Slack platform error → chat_post.attempted{ok=false,error="channel_not_found"} persisted', async () => {
-    const ivl = makeInterval()
-    const platformError = Object.assign(new Error('platform error'), {
-      name: 'WebAPIPlatformError',
-      data: { ok: false, error: 'channel_not_found' },
-    })
-    const chat = makeChatStub({ postMessageError: platformError })
+  test.each<[WebApiOutcome, string]>([
+    [{ kind: 'platform', error: 'channel_not_found' }, 'channel_not_found'],
+    [{ kind: 'network' }, 'network_error'],
+  ])('failure: Slack %o → chat_post.attempted{ok=false,error=<class>} persisted; neither the file nor the log leaks', async (outcome, errorClass) => {
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => cannedGetResultPlural({
@@ -308,29 +305,26 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
       }),
     })
     initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
-    startPermissionPoller({
-      getClient,
-      web: chat.web as never,
-      intervalMs: 1000,
-      setInterval: ivl.setInterval,
-      clearInterval: ivl.clearInterval,
-      log: () => { /* swallow */ },
+    const logCalls: unknown[][] = []
+    const ivl = startPoller(getClient, {
+      post: outcome,
+      log: (...args) => { logCalls.push(args) },
     })
 
-    ivl.pending[0]!.cb()
-    await new Promise(r => setTimeout(r, 20))
+    await ivl.tick(20)
 
     const post = readAllLines().find(
       e => e['event'] === 'cscb.chat_post.attempted' && e['request_token'] === TOKEN_A,
     )
     expect(post).toBeDefined()
     expect(post!['ok']).toBe(false)
-    expect(post!['error']).toBe('channel_not_found')
+    expect(post!['error']).toBe(errorClass)
+    expect(post!['channel']).toBe(CHANNEL_CH)
+    expect(logCalls.filter((args) => String(args[0]).includes('chat.postMessage failed'))).toHaveLength(1)
+    assertNoLeak({ logCalls, trail: writtenFile(trailFile()) }, 'trail-file post failure')
   })
 
   test('inbound click persists block_action.received{success} + click_handler.invoked{live_pending=true} on disk', async () => {
-    const ivl = makeInterval()
-    const chat = makeChatStub({ ts: SLACK_RETURNED_TS })
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => cannedGetResultPlural({
@@ -340,17 +334,10 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
       }),
     })
     initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
-    startPermissionPoller({
-      getClient,
-      web: chat.web as never,
-      intervalMs: 1000,
-      setInterval: ivl.setInterval,
-      clearInterval: ivl.clearInterval,
-    })
+    const ivl = startPoller(getClient)
 
     // Tick 1: seed the live entry
-    ivl.pending[0]!.cb()
-    await new Promise(r => setTimeout(r, 20))
+    await ivl.tick(20)
 
     // Simulate the inbound Slack click: SR-V-2.9 then SR-V-2.6
     const USER = 'U_OPERATOR'
@@ -366,7 +353,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     initOutageState({ getClient: () => decideStub.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       actionId,
-      { web: chat.web as never },
+      clickDeps(),
       { channel: CHANNEL_CH, messageTs: SLACK_RETURNED_TS, user: USER },
     )
 
@@ -389,11 +376,21 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     const idxBlock = matching.indexOf(blockEvt!)
     const idxInvoked = matching.indexOf(invoked!)
     expect(idxBlock).toBeLessThan(idxInvoked)
+
+    // The click's update persisted with the destination channel and went
+    // through A's own client.
+    const clickUpdate = matching.find(
+      e => e['event'] === 'cscb.chat_update.attempted' && e['triggered_by'] === 'click_handler',
+    )
+    expect(clickUpdate).toBeDefined()
+    expect(clickUpdate!['channel']).toBe(CHANNEL_CH)
+    expect(clickUpdate!['message_ts']).toBe(SLACK_RETURNED_TS)
+    expect(stubA.calls.update as Array<{ channel: string; ts: string }>).toMatchObject([
+      { channel: CHANNEL_CH, ts: SLACK_RETURNED_TS },
+    ])
   })
 
   test('ad_decide.attempted{result_class="ok"} persists after click_handler.invoked for the same request_token', async () => {
-    const ivl = makeInterval()
-    const chat = makeChatStub({ ts: SLACK_RETURNED_TS })
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => cannedGetResultPlural({
@@ -403,15 +400,8 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
       }),
     })
     initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
-    startPermissionPoller({
-      getClient,
-      web: chat.web as never,
-      intervalMs: 1000,
-      setInterval: ivl.setInterval,
-      clearInterval: ivl.clearInterval,
-    })
-    ivl.pending[0]!.cb()
-    await new Promise(r => setTimeout(r, 20))
+    const ivl = startPoller(getClient)
+    await ivl.tick(20)
 
     const decideStub: { client: { decide: (p: DecideParams) => Promise<DecideResult> } } = {
       client: { decide: async (_p: DecideParams) => ({}) },
@@ -419,7 +409,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     initOutageState({ getClient: () => decideStub.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      { web: chat.web as never },
+      clickDeps(),
       { channel: CHANNEL_CH, messageTs: SLACK_RETURNED_TS, user: 'U_OPERATOR' },
     )
 
@@ -437,8 +427,6 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
   test('ad_decide.attempted{result_class="ErrAlreadyDecided"} persists when decide throws', async () => {
     // Inline import to keep the agent-director surface localized.
     const { ErrAlreadyDecided } = await import('agent-director')
-    const ivl = makeInterval()
-    const chat = makeChatStub({ ts: SLACK_RETURNED_TS })
     const getClient = () => ({
       list: async () => ({ spawns: [checkPermRow()] }),
       get: async () => cannedGetResultPlural({
@@ -448,15 +436,8 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
       }),
     })
     initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
-    startPermissionPoller({
-      getClient,
-      web: chat.web as never,
-      intervalMs: 1000,
-      setInterval: ivl.setInterval,
-      clearInterval: ivl.clearInterval,
-    })
-    ivl.pending[0]!.cb()
-    await new Promise(r => setTimeout(r, 20))
+    const ivl = startPoller(getClient)
+    await ivl.tick(20)
 
     const decideStub: { client: { decide: (p: DecideParams) => Promise<DecideResult> } } = {
       client: {
@@ -468,7 +449,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     initOutageState({ getClient: () => decideStub.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
-      { web: chat.web as never },
+      clickDeps(),
       { channel: CHANNEL_CH, messageTs: SLACK_RETURNED_TS, user: 'U_OPERATOR' },
     )
 
@@ -492,10 +473,9 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     const decideStub: { client: { decide: (p: DecideParams) => Promise<DecideResult> } } = {
       client: { decide: async (_p: DecideParams) => ({}) },
     }
-    const chat = makeChatStub()
     const handled = await handlePermissionClick(
       FORGED_ID,
-      { web: chat.web as never },
+      clickDeps(),
       { channel: CHANNEL_CH, messageTs: '9999.0', user: USER },
     )
     expect(handled).toBe(false)

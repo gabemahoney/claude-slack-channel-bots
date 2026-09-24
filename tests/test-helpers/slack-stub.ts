@@ -13,7 +13,7 @@
  *   handlers, deliver events in the `{ event, body, ack }` shape `server.ts`
  *   consumes, record acks, drop on demand and can be started again;
  * - per-call scripted outcomes for `auth.test`, socket `start()`,
- *   `chat.postMessage`, `filesUploadV2`, `conversations.history`,
+ *   `chat.postMessage`, `chat.update`, `filesUploadV2`, `conversations.history`,
  *   `conversations.replies` and `conversations.info` (`script`), falling back
  *   to success when exhausted;
  * - a record of the options every client was built with (`options`).
@@ -216,6 +216,8 @@ export interface StubSlackScript {
   authTest: WebApiOutcome[]
   connect: ConnectOutcome[]
   post: WebApiOutcome[]
+  /** `chat.update`. */
+  update: WebApiOutcome[]
   /** `filesUploadV2`. */
   upload: WebApiOutcome[]
   /** `conversations.history`; an `ok` `result` can set `messages`. */
@@ -233,6 +235,8 @@ export interface StubSlackOptions {
   connect?: readonly ConnectOutcome[]
   /** Initial `chat.postMessage` outcomes. */
   post?: readonly WebApiOutcome[]
+  /** Initial `chat.update` outcomes. */
+  update?: readonly WebApiOutcome[]
   /** Initial `filesUploadV2` outcomes. */
   upload?: readonly WebApiOutcome[]
   /** Initial `conversations.history` outcomes. */
@@ -571,6 +575,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
     authTest: [...(opts.authTest ?? [])],
     connect: [...(opts.connect ?? [])],
     post: [...(opts.post ?? [])],
+    update: [...(opts.update ?? [])],
     upload: [...(opts.upload ?? [])],
     history: [...(opts.history ?? [])],
     replies: [...(opts.replies ?? [])],
@@ -656,7 +661,10 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
         },
         update: (args) => {
           calls.update.push(args)
-          return Promise.resolve({ ok: true, channel: args.channel, ts: args.ts, text: textOf(args) })
+          const outcome = script.update.shift()
+          return runWebApiCall(outcome, ctx('chat.update'), () =>
+            mergeDroppingUndefined({ ok: true, channel: args.channel, ts: args.ts, text: textOf(args) }, okResult(outcome)),
+          )
         },
       },
       reactions: {

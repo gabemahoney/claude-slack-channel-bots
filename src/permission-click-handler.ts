@@ -19,6 +19,14 @@
  * retries nor touches the session — it repaints the prompt message to say the
  * answer must now be given at the pane (b.qi1).
  *
+ * Clicks resolve through the receiving persona (b.av2 SR-7.1): the persona
+ * whose connection received the click. Its key keys the outage state around
+ * `decide`, and the verdict update and the relay-fallen-back repaint go
+ * through its client, to the channel and `ts` recorded on the live entry. A
+ * click whose receiving persona cannot be resolved is logged and bypassed;
+ * one whose instance ID is not `cscb_<receiving key>` is logged and neither
+ * decided nor updated (fail closed).
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -32,8 +40,11 @@ import {
   ErrSystemInstallDisappeared,
   ErrTmuxNotAvailable,
 } from './agent-director-errors.ts'
+import type { Persona } from './config.ts'
 import { withOutageDetection } from './outage-state.ts'
 import { parsePermissionActionId, type PermissionDecision } from './permission-action-id.ts'
+import { describeSlackCallFailure } from './persona-connection-errors.ts'
+import { personaInstanceId, renderPersonaRef } from './persona-identity.ts'
 import { getLivePermission, markHandled } from './permission-poller.ts'
 import { emitTrail as defaultEmitTrail } from './permission-trail.ts'
 import type {
@@ -44,7 +55,18 @@ import type {
 } from './permission-trail.ts'
 
 export interface ClickDeps {
-  web: Pick<WebClient, 'chat'>
+  /**
+   * Key of the persona whose connection received the click; undefined when
+   * it is not known.
+   */
+  receivingPersonaKey?: string
+  /**
+   * The persona's chat-capable Slack client, or undefined when it is not
+   * available (not validated yet, dry run, unknown key).
+   */
+  clientFor: (key: string) => Pick<WebClient, 'chat'> | undefined
+  /** The applied persona with this key, or undefined. */
+  getPersona: (key: string) => Persona | undefined
   log?: (...args: unknown[]) => void
   /**
    * Trail emitter hook (SR-V). Defaults to `emitTrail` from
@@ -125,18 +147,32 @@ function buildRelayFallenBackBlocks(): unknown[] {
 }
 
 /**
- * Render a terminal state over a live prompt's Slack message and emit the
- * SR-V-2.5 `cscb.chat_update.attempted` event. Returns true when Slack
- * accepted the update.
+ * Render a terminal state over a live prompt's Slack message through the
+ * receiving persona's client and emit the SR-V-2.5
+ * `cscb.chat_update.attempted` event. Returns true when Slack accepted the
+ * update. When the persona's client is unavailable, logs one line and makes
+ * no update (decide has already happened; the next poller tick reconciles
+ * the rendering) and returns false.
  */
 async function renderPromptUpdate(
   deps: ClickDeps,
   emit: (partial: Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown }) => void,
+  persona: Persona,
   entry: { claudeInstanceId: string; requestToken: string; channelId: string; messageTs: string },
   text: string,
   blocks: unknown[],
   verdictTag: ClosureVerdictTag,
 ): Promise<boolean> {
+  const web = deps.clientFor(persona.key)
+  if (!web) {
+    logDeps(
+      deps,
+      `[slack] permission-click: no Slack client for ${renderPersonaRef(persona.name, persona.key)} — ` +
+        `update for ${entry.claudeInstanceId} (request_token=${entry.requestToken}, verdict=${verdictTag}) ` +
+        'skipped; the next poller tick reconciles the rendering',
+    )
+    return false
+  }
   const envelope = {
     event: 'cscb.chat_update.attempted',
     claude_instance_id: entry.claudeInstanceId,
@@ -149,7 +185,7 @@ async function renderPromptUpdate(
     triggered_by: 'click_handler' as const,
   }
   try {
-    await deps.web.chat.update({
+    await web.chat.update({
       channel: entry.channelId,
       ts: entry.messageTs,
       text,
@@ -159,7 +195,10 @@ async function renderPromptUpdate(
     return true
   } catch (err) {
     // b.emk: failures land in BOTH server.log and the trail JSONL.
-    logDeps(deps, `[slack] permission-click: decision chat.update failed for ${entry.claudeInstanceId}:`, err)
+    logDeps(
+      deps,
+      `[slack] permission-click: decision chat.update failed for ${entry.claudeInstanceId}${describeSlackCallFailure(err)}`,
+    )
     emit({ ...envelope, ok: false, error: classifySlackError(err) })
     return false
   }
@@ -185,6 +224,8 @@ export interface ClickInteractionContext {
  * Handle a permission Block Kit click. Returns true when the action_id was a
  * valid permission decision (the caller has already ack'd); false when the
  * action_id did not match the expected shape (caller should keep looking).
+ * Parsing comes first: an action_id that does not parse returns false before
+ * the receiving persona is resolved.
  */
 export async function handlePermissionClick(
   actionId: string,
@@ -213,17 +254,31 @@ export async function handlePermissionClick(
     live_pending: earlyEntry !== undefined,
   })
 
-  const ctxChannel = context.channel ?? earlyEntry?.channelId
-  if (!ctxChannel) {
+  const receivingKey = deps.receivingPersonaKey
+  const persona = receivingKey === undefined ? undefined : deps.getPersona(receivingKey)
+  if (!persona) {
     logDeps(
       deps,
-      `[slack] permission-click-handler: cannot resolve channelId ` +
-        `(context.channel=${context.channel ?? 'undefined'}, ` +
-        `earlyEntry.channelId=${earlyEntry?.channelId ?? 'undefined'}, ` +
+      `[slack] permission-click-handler: cannot resolve the receiving persona ` +
+        `(receiving key=${receivingKey ?? 'undefined'}, ` +
         `claude_instance_id=${claudeInstanceId}, ` +
         `action_id=${actionId}, ` +
         `request_token=${requestToken}) ` +
         `— logging and bypassing this click. This is a CSCB bug — investigate.`,
+    )
+    return true
+  }
+
+  // Fail closed: a button built for another persona's instance is never
+  // decided or updated through this persona. The request stays open and
+  // times out on agent-director's side.
+  const expectedInstanceId = personaInstanceId(persona.key)
+  if (claudeInstanceId !== expectedInstanceId) {
+    logDeps(
+      deps,
+      `[slack] permission-click-handler: click for ${claudeInstanceId} received for ` +
+        `${renderPersonaRef(persona.name, persona.key)} (instance ${expectedInstanceId}) — ` +
+        `not deciding (request_token=${requestToken})`,
     )
     return true
   }
@@ -239,7 +294,7 @@ export async function handlePermissionClick(
     decision,
   }
   try {
-    await withOutageDetection(ctxChannel, undefined, (client) =>
+    await withOutageDetection(persona.key, undefined, (client) =>
       decideWithToken(client, {
         claude_instance_id: claudeInstanceId,
         decision,
@@ -304,6 +359,7 @@ export async function handlePermissionClick(
         await renderPromptUpdate(
           deps,
           emit,
+          persona,
           staleEntry,
           RELAY_FALLEN_BACK_TEXT,
           buildRelayFallenBackBlocks(),
@@ -341,7 +397,7 @@ export async function handlePermissionClick(
   const verdictTag: ClosureVerdictTag = decision === 'allow'
     ? 'click_handler_allow'
     : 'click_handler_deny'
-  const ok = await renderPromptUpdate(deps, emit, entry, text, blocks, verdictTag)
+  const ok = await renderPromptUpdate(deps, emit, persona, entry, text, blocks, verdictTag)
   if (ok) markHandled(claudeInstanceId, requestToken)
   return true
 }
