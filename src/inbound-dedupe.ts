@@ -3,9 +3,12 @@
  *
  * A channel mention reaches a persona twice, as a `message` event and as an
  * `app_mention` event with the same ts, and Slack may redeliver an event (for
- * example after a Socket Mode reconnect). The store remembers each
- * (conversation, ts) key for `INBOUND_DEDUPE_RETENTION_MS` after its first
- * sighting, so the persona's pipeline handles each message once.
+ * example after a Socket Mode reconnect). The store remembers each key for
+ * `INBOUND_DEDUPE_RETENTION_MS` after its first sighting, so the persona's
+ * pipeline handles each message once. The key is (conversation, ts), or
+ * (conversation, ts, edit ts) for an event that carries an edit ts: an edit
+ * keeps the message's ts, so the edit ts is what tells it apart from the
+ * original and from other edits, and each distinct edit gets its own window.
  *
  * One store holds one persona's keys; it knows nothing about personas, Slack
  * or config, and the caller keeps one store per persona. It counts, limits and
@@ -29,7 +32,11 @@
 /** How long a key is remembered after its first sighting, in milliseconds (b.av2 SR-4.1: at least 10 minutes). */
 export const INBOUND_DEDUPE_RETENTION_MS = 10 * 60 * 1000
 
-/** Separator between the conversation ID and the ts in a stored key; neither Slack value contains it. */
+/**
+ * Separator between the parts of a stored key (conversation ID, ts, and the
+ * edit ts when there is one); no Slack ID or ts contains it, so a two-part key
+ * and a three-part key never collide.
+ */
 const KEY_SEPARATOR = '\u0000'
 
 // ---------------------------------------------------------------------------
@@ -48,10 +55,12 @@ export type DedupeOutcome = 'new' | 'duplicate' | 'unkeyable'
 /** One persona's dedupe store. Independent of every other store. */
 export interface InboundDedupeStore {
   /**
-   * Prune expired keys, then report whether (`conversationId`, `ts`) is new,
-   * recording it when it is. A duplicate does not extend the key's window.
+   * Prune expired keys, then report whether the key is new, recording it when
+   * it is. The key is (`conversationId`, `ts`, `editedTs`) when `editedTs` is a
+   * non-empty string, and (`conversationId`, `ts`) otherwise. A duplicate does
+   * not extend the key's window.
    */
-  record(conversationId: unknown, ts: unknown): DedupeOutcome
+  record(conversationId: unknown, ts: unknown, editedTs?: unknown): DedupeOutcome
   /** Number of keys currently retained (expired keys leave on the next `record`). */
   readonly size: number
 }
@@ -74,11 +83,12 @@ export function createInboundDedupeStore(now: () => number = Date.now): InboundD
   }
 
   return {
-    record(conversationId: unknown, ts: unknown): DedupeOutcome {
+    record(conversationId: unknown, ts: unknown, editedTs?: unknown): DedupeOutcome {
       if (!isNonEmptyString(conversationId) || !isNonEmptyString(ts)) return 'unkeyable'
       const at = now()
       prune(at)
-      const key = conversationId + KEY_SEPARATOR + ts
+      const baseKey = conversationId + KEY_SEPARATOR + ts
+      const key = isNonEmptyString(editedTs) ? baseKey + KEY_SEPARATOR + editedTs : baseKey
       if (firstSeen.has(key)) return 'duplicate'
       firstSeen.set(key, at)
       return 'new'

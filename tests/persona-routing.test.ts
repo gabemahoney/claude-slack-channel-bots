@@ -1,6 +1,7 @@
 /**
- * persona-routing.test.ts — Inbound channel delivery per persona (b.av2 SR-4.1
- * and SR-4.2, SR-10.1 gate removal, SR-10.3 `unclaimed-channel`).
+ * persona-routing.test.ts — Inbound delivery per persona (b.av2 SR-4.1,
+ * SR-4.2, SR-4.3 DMs, SR-10.1 gate removal, SR-10.3 `unclaimed-channel` and
+ * `persona-dm-dropped`).
  *
  * Replaces the old DM-routing and default-route fallback suites and the gate
  * and pairing cases of server.test.ts (b.av2 SR-13.5). Drives the real
@@ -32,8 +33,9 @@
  * them (subtypes, bot and webhook authors, bot-ID self-exclusion, broadcasts),
  * pins the E3 behaviour the rules keep, and covers the per-persona dedupe and
  * the one archive row (SR-4.1) and the author and `via` meta (SR-4.4). Every
- * harness has fresh dedupe stores reading this test's fake clock. E6 replaces
- * the interim DM drop.
+ * harness has fresh dedupe stores reading this test's fake clock. It also owns
+ * inbound DMs per persona (SR-4.3; AC 15, AC 35 and the delivery leg of AC
+ * 40/41) and the edited-event dedupe key (an edit that adds a mention).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -441,45 +443,190 @@ describe('AC 52: unclaimed-channel line', () => {
 })
 
 // ---------------------------------------------------------------------------
-// DMs (interim until E6)
+// DMs per persona (b.av2 SR-4.3, SR-10.3 `persona-dm-dropped`; AC 15, 35 and
+// the delivery leg of AC 40/41). A DM reaches only the persona whose
+// connection received it: each bot has its own DM conversation (`D…`) with a
+// person. Each case that feeds only DMs also checks that no
+// `unclaimed-channel` line is logged: a DM never reaches the channel steps.
+// (The AC 40/41 case also feeds a channel message, which does log one.)
 // ---------------------------------------------------------------------------
 
-describe('DMs are dropped with a persona-dm-dropped line (interim until E6)', () => {
+describe('DMs per persona (SR-4.3)', () => {
+  /** A's and B's DM conversations with the same person. */
+  const DA = 'D0DMALPHA1'
+  const DB = 'D0DMBETA01'
   const marker = 'ZEBRA4410DIRECT'
 
-  // Rule order (5i): the subtype and own-message rules run before the DM rule,
-  // so a DM that is P's own message, or a non-file_share subtype, is dropped
-  // for that reason and logs no persona-dm-dropped line.
-  test.each<[string, boolean, boolean, (pBot: string) => SlackEvent, 'dm' | 'own' | 'non-message']>([
-    ['DMs off, session live', false, true, () => makeDm({ text: `${marker} private note` }), 'dm'],
-    ['DMs on, session live', true, true, () => makeDm({ text: `${marker} private note` }), 'dm'],
-    ['DMs on, no session', true, false, () => makeDm({ text: `${marker} private note` }), 'dm'],
-    ['P\'s own DM, DMs on, session live', true, true, (pBot) => makeDm({ user: pBot, text: `${marker} private note` }), 'own'],
-    ['a message_changed DM, DMs on, session live', true, true, () => makeDm({ subtype: 'message_changed', text: `${marker} private note` }), 'non-message'],
-  ])('a DM is not delivered, gets no reply or restart, logs no message text, and logs the line its rule gives (%s)', async (_label, enabled, live, build, reason) => {
+  /**
+   * The shapes a DM is recognised in: the `message` Slack sends (`channel_type`
+   * `im`), and, defensively, an event with no `channel_type` whose conversation
+   * ID is a `D…` ID. Slack does not send `app_mention` for DMs; the second
+   * shape is built with `makeAppMention` only because that helper omits
+   * `channel_type`, so the routing must tell a DM from its `D…` ID alone.
+   */
+  const DM_SHAPES: Array<[string, (o: Record<string, unknown>) => SlackEvent]> = [
+    ['message.im', (o) => makeDm(o)],
+    ['defensive: no channel_type, a D… ID', (o) => makeAppMention(o)],
+  ]
+
+  /** The plain drop lines P logged whose reason is `reason`. */
+  const plainDrops = (h: Harness, name: string, reason: string) => {
+    const { persona } = h.p(name)
+    return lines(h, `persona ${renderPersonaRef(persona.name, persona.key)} dropped message`).filter((l) => l.endsWith(`: ${reason}`))
+  }
+
+  test.each(DM_SHAPES)('AC 15 (%s): A\'s DM on A\'s connection reaches only A, and B\'s DM only B, each once with via=dm, its own D… chat_id and the author\'s user_id', async (_shape, build) => {
+    const h = makeHarness([
+      { name: 'Alpha Bot', dm: { enabled: true } },
+      { name: 'Beta Bot', dm: { enabled: true } },
+    ])
+    const toA = build({ channel: DA, text: 'hi alpha' })
+    const toB = build({ channel: DB, text: 'hi beta' })
+
+    await h.receive(toA, ['Alpha Bot'])
+    await h.receive(toB, ['Beta Bot'])
+
+    const meta = (ev: SlackEvent) => ({
+      chat_id: ev.channel as string,
+      message_id: ev.ts as string,
+      user: 'stub-user',
+      user_id: ev.user as string,
+      ts: ev.ts as string,
+      via: 'dm',
+    })
+    expect(h.p('Alpha Bot').notifications.map((n) => ({ meta: n.params.meta, content: n.params.content }))).toEqual([{ meta: meta(toA), content: 'hi alpha' }])
+    expect(h.p('Beta Bot').notifications.map((n) => ({ meta: n.params.meta, content: n.params.content }))).toEqual([{ meta: meta(toB), content: 'hi beta' }])
+    expect(lines(h, 'persona-dm-dropped')).toEqual([])
+    expect(lines(h, 'unclaimed-channel')).toEqual([])
+    expect(lines(h, 'dropped message')).toEqual([])
+    assertNoLeak(captured(h))
+  })
+
+  test.each<[string, (o: Record<string, unknown>) => SlackEvent, boolean]>([
+    ['message.im, B\'s session live', DM_SHAPES[0]![1], true],
+    ['defensive: no channel_type, a D… ID, B\'s session live', DM_SHAPES[1]![1], true],
+    ['message.im, B has no session', DM_SHAPES[0]![1], false],
+  ])('AC 35 (%s): A (DMs on) gets its DM; B (DMs off) gets none, logs exactly one persona-dm-dropped line naming B, dm.enabled and the DM\'s conversation and ts, and makes no Slack call', async (_label, build, bLive) => {
     const h = makeHarness(
-      [{ name: 'Dm Bot', dm: { enabled } }],
-      { sessions: live ? ['Dm Bot'] : [] },
+      [
+        { name: 'Alpha Bot', dm: { enabled: true } },
+        { name: 'Beta Bot', dm: { enabled: false } },
+      ],
+      { ackReaction: 'eyes', sessions: bLive ? ['Alpha Bot', 'Beta Bot'] : ['Alpha Bot'] },
     )
-    const P = h.p('Dm Bot')
-    const ref = renderPersonaRef(P.persona.name, P.persona.key)
+    const B = h.p('Beta Bot').persona
+    const evB = build({ channel: DB, text: `${marker} for beta` })
 
-    await h.receive(build(P.stub.identity.botUserId))
+    await h.receive(build({ channel: DA, text: `${marker} for alpha` }), ['Alpha Bot'])
+    await h.receive(evB, ['Beta Bot'])
 
+    expect(deliveries(h, ['Alpha Bot', 'Beta Bot'])).toEqual({
+      'Alpha Bot': [{ chat_id: DA, via: 'dm' }],
+      'Beta Bot': [],
+    })
+    // A silent drop (no line) fails here.
     const dropped = lines(h, 'persona-dm-dropped')
-    if (reason === 'dm') {
-      expect(dropped).toHaveLength(1)
-      expect(dropped[0]).toContain(`personas[0] ${ref}`)
-      expect(lines(h, `persona ${ref} dropped message`)).toEqual([])
-    } else {
-      expect(dropped).toEqual([])
-      expect(lines(h, `persona ${ref} dropped message`).filter((l) => l.endsWith(`: ${reason}`))).toHaveLength(1)
-    }
+    expect(dropped).toHaveLength(1)
+    expect(dropped[0]).toContain(`personas[${B.index}] ${renderPersonaRef(B.name, B.key)}`)
+    expect(dropped[0]).toContain('dm.enabled')
+    expect(dropped[0]).toContain(DB)
+    expect(dropped[0]).toContain(`ts=${evB.ts as string}`)
+    expect(lines(h, 'dropped message')).toEqual([])
+    expect(lines(h, 'unclaimed-channel')).toEqual([])
+    expect(linesWithText(h, `${marker} for beta`)).toEqual([])
+    expect(slackCalls(h.p('Beta Bot').stub)).toBe(0)
+    expect(isRestartPendingOrActive(B.key)).toBe(false)
+    // Control: the delivered DM did get its ack reaction, so the zero above is not vacuous.
+    expect(h.p('Alpha Bot').stub.calls.reactionsAdd.length).toBe(1)
+    assertNoLeak(captured(h))
+  })
+
+  // SR-4.2 steps 1 and 2 run before the DMs switch, so these drop for their own
+  // reason even with DMs off, and never log persona-dm-dropped. (Their rules
+  // themselves are covered in tests/delivery-decision.test.ts.)
+  test.each<[string, (id: { botUserId: string; botId: string }) => SlackEvent, string]>([
+    ['a message_changed DM (an edit)', () => makeDm({ subtype: 'message_changed', text: `${marker} edited` }), 'non-message'],
+    ['a message_deleted DM (a deletion)', () => makeDm({ subtype: 'message_deleted', text: `${marker} deleted` }), 'non-message'],
+    ['P\'s own DM post (P\'s bot user)', (id) => makeDm({ user: id.botUserId, text: `${marker} own` }), 'own'],
+    ['P\'s own DM post (P\'s bot ID, no user)', (id) => makeWebhookPost({ channel: DA, channel_type: 'im', bot_id: id.botId, text: `${marker} own` }), 'own'],
+  ])('SR-4.2 steps 1-2 on a DM, DMs off: %s is dropped as its rule says, with no persona-dm-dropped line', async (_label, build, reason) => {
+    const h = makeHarness([{ name: 'Dm Bot', dm: { enabled: false } }], { ackReaction: 'eyes' })
+    const P = h.p('Dm Bot')
+
+    await h.receive(build(P.stub.identity))
+
+    expect(P.notifications).toHaveLength(0)
+    expect(plainDrops(h, 'Dm Bot', reason)).toHaveLength(1)
+    expect(lines(h, 'persona-dm-dropped')).toEqual([])
     expect(lines(h, 'unclaimed-channel')).toEqual([])
     expect(linesWithText(h, marker)).toEqual([])
-    expect(P.notifications).toHaveLength(0)
-    expect(posts(P.stub)).toEqual([]) // no pairing reply, no lost-message reply
-    expect(isRestartPendingOrActive(P.persona.key)).toBe(false)
+    expect(slackCalls(P.stub)).toBe(0)
+  })
+
+  test('SR-4.2 steps 1-2 on a DM: a bot-authored DM with an allowed subtype and no user is delivered, with its bot ID in the meta', async () => {
+    const h = makeHarness([{ name: 'Dm Bot', dm: { enabled: true } }])
+    const event = makeWebhookPost({ channel: DA, channel_type: 'im' })
+
+    await h.receive(event)
+
+    expect(lines(h, 'unclaimed-channel')).toEqual([])
+    expect(h.p('Dm Bot').notifications.map((n) => n.params.meta)).toEqual([{
+      chat_id: DA,
+      message_id: event.ts as string,
+      user: 'stub-webhook',
+      bot_id: event.bot_id as string,
+      ts: event.ts as string,
+      via: 'dm',
+    }])
+  })
+
+  test.each([
+    ['DMs on', true],
+    ['DMs off', false],
+  ])('a group DM (channel_type mpim) is never delivered (%s), logs no persona-dm-dropped or unclaimed-channel line and makes no Slack call', async (_label, enabled) => {
+    const h = makeHarness([{ name: 'Dm Bot', dm: { enabled } }], { ackReaction: 'eyes' })
+
+    await h.receive(makeDm({ channel_type: 'mpim', channel: 'G0GROUPDM1', text: `${marker} group` }))
+
+    expect(h.p('Dm Bot').notifications).toHaveLength(0)
+    expect(plainDrops(h, 'Dm Bot', 'group-dm')).toHaveLength(1)
+    expect(lines(h, 'persona-dm-dropped')).toEqual([])
+    expect(lines(h, 'unclaimed-channel')).toEqual([])
+    expect(slackCalls(h.p('Dm Bot').stub)).toBe(0)
+  })
+
+  test('AC 40 / AC 41 (delivery leg): a DM-only persona (no channels, DMs on) is delivered its DM with via=dm; a channel message on its connection is not delivered', async () => {
+    // A real AC 41 persona: permission_prompts dm requires a dm.contact.
+    const h = makeHarness([{ name: 'Dm Only', channels: [], dm: { enabled: true, contact: 'U0DMCONTACT' }, permission_prompts: 'dm' }])
+
+    await h.receive(makeDm({ channel: DA }))
+    await h.receive(makeChannelMessage({ channel: CX }))
+
+    expect(deliveries(h, ['Dm Only'])).toEqual({ 'Dm Only': [{ chat_id: DA, via: 'dm' }] })
+    expect(lines(h, 'persona-dm-dropped')).toEqual([])
+    expect(lines(h, 'unclaimed-channel')).toHaveLength(1)
+    expect(lines(h, 'unclaimed-channel')[0]).toContain(CX)
+    expect(h.allPosts()).toEqual([])
+  })
+
+  // Dedupe (SR-4.1) runs before the decision, so a DM is decided, and its
+  // drop logged, at most once per persona.
+  test.each<[string, (p: { dm: SlackEvent; twin: SlackEvent }) => SlackEvent[], boolean]>([
+    ['the same DM redelivered, DMs on', (p) => [p.dm, p.dm], true],
+    ['the same DM redelivered, DMs off', (p) => [p.dm, p.dm], false],
+    ['a DM mentioning P then the same DM with no channel_type (defensive shape), DMs on', (p) => [p.dm, p.twin], true],
+    ['a DM mentioning P then the same DM with no channel_type (defensive shape), DMs off', (p) => [p.dm, p.twin], false],
+  ])('dedupe on the DM path: %s gives one delivery or one persona-dm-dropped line', async (_label, order, enabled) => {
+    const h = makeHarness([{ name: 'Dm Bot', dm: { enabled } }])
+    const P = h.p('Dm Bot')
+    const dm = makeDm({ channel: DA, text: `${mentionText(P.stub.identity.botUserId)} hello` })
+    const twin = makeAppMention({ channel: DA, ts: dm.ts, text: dm.text, user: dm.user })
+
+    for (const event of order({ dm, twin })) await h.receive(event)
+
+    expect(deliveries(h, ['Dm Bot'])).toEqual({ 'Dm Bot': enabled ? [{ chat_id: DA, via: 'dm' }] : [] })
+    expect(lines(h, 'persona-dm-dropped')).toHaveLength(enabled ? 0 : 1)
+    expect(lines(h, 'unclaimed-channel')).toEqual([])
   })
 })
 
@@ -970,6 +1117,126 @@ describe('SR-4.1 per-persona dedupe through the pipeline', () => {
 
     expect(first.p('A').notifications).toHaveLength(1)
     expect(second.p('A').notifications).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Edited event dedupe (b.av2 SR-4.1, operator-approved key): an event with a
+// top-level `edited.ts` is deduped on (conversation, ts, edited.ts), so an
+// edit that adds P's mention reaches P even though P saw the original. The
+// unedited pair and redelivery cases stay in the describe above. Event shapes
+// follow the Slack Events API: the edited `app_mention` keeps the original
+// ts, with a later `event_ts` and a top-level `edited`; `message_changed` has
+// its own ts and nests the edited message under `message`.
+// ---------------------------------------------------------------------------
+
+describe('SR-4.1 edited event dedupe through the pipeline', () => {
+  /** A `all` alone, B `mentions`, in one channel. */
+  const CE = 'C0EDITED1'
+  const ORIGINAL_TS = '1700000600.000100'
+  const EDIT_TS = '1700000660.000100'
+  const CHANGED_TS = '1700000660.000200'
+  const editSpecs = (): PersonaSpec[] => [
+    { name: 'A', channels: [{ id: CE, delivery: 'all' }] },
+    { name: 'B', channels: [{ id: CE, delivery: 'mentions' }] },
+  ]
+
+  const original = () => makeChannelMessage({ channel: CE, ts: ORIGINAL_TS, text: 'please review the deploy' })
+
+  /**
+   * The `non-message` drop lines each persona logged. `message_changed` has no
+   * top-level author, so if it got past SR-4.2 step 1 it would still drop, as
+   * `no-author`; only this reason proves step 1 stopped it.
+   */
+  const nonMessageDrops = (h: Harness) => h.all.map((x) =>
+    lines(h, `persona ${renderPersonaRef(x.persona.name, x.persona.key)} dropped message`).filter((l) => l.endsWith(': non-message')).length)
+
+  /** The `app_mention` Slack sends when an edit adds a mention: the original's ts, a later event_ts, a top-level `edited`. */
+  const editedMention = (orig: SlackEvent, text: string, editTs = EDIT_TS) => makeAppMention({
+    channel: CE,
+    ts: orig.ts,
+    event_ts: CHANGED_TS,
+    user: orig.user,
+    edited: { user: orig.user, ts: editTs },
+    text,
+  })
+
+  /** The `message_changed` event for an edit to `text`: its own ts, no top-level user or text. */
+  const messageChanged = (orig: SlackEvent, text: string) => makeChannelMessage({
+    subtype: 'message_changed',
+    channel: CE,
+    ts: CHANGED_TS,
+    user: undefined,
+    text: undefined,
+    hidden: true,
+    message: { type: 'message', user: orig.user, text, ts: orig.ts, edited: { user: orig.user, ts: EDIT_TS } },
+    previous_message: { type: 'message', user: orig.user, text: orig.text, ts: orig.ts },
+  })
+
+  test('an edit that adds B\'s mention to a message B already saw reaches B once with via=mention and the original ts; A gets nothing more, and message_changed wakes neither', async () => {
+    const h = makeHarness(editSpecs())
+    const orig = original()
+    const bMention = `${mentionText(h.p('B').stub.identity.botUserId)} please review the deploy`
+
+    await receiveOnEach(h, orig)
+    expect(deliveries(h, ['A', 'B'])).toEqual({ A: [{ chat_id: CE, via: 'receive_all' }], B: [] })
+
+    await receiveOnEach(h, messageChanged(orig, bMention))
+    expect(nonMessageDrops(h)).toEqual([1, 1])
+    await h.receive(editedMention(orig, bMention), ['B'])
+    await receiveOnEach(h, messageChanged(orig, bMention))
+    // The redelivered message_changed is collapsed by dedupe before the decision.
+    expect(nonMessageDrops(h)).toEqual([1, 1])
+
+    expect(deliveries(h, ['A', 'B'])).toEqual({
+      A: [{ chat_id: CE, via: 'receive_all' }],
+      B: [{ chat_id: CE, via: 'mention' }],
+    })
+    expect(h.p('B').notifications[0]!.params.meta.message_id).toBe(ORIGINAL_TS)
+    expect(h.allPosts()).toEqual([])
+  })
+
+  test('a redelivery of the same edited app_mention collapses: one notification, one dispatch, one ack reaction; another edit is new; A keeps only the original', async () => {
+    const h = makeHarness(editSpecs(), { ackReaction: 'eyes' })
+    const B = h.p('B')
+    const orig = original()
+    const bMention = `${mentionText(B.stub.identity.botUserId)} please review the deploy`
+    const ref = renderPersonaRef(B.persona.name, B.persona.key)
+
+    await receiveOnEach(h, orig)
+    await h.receive(editedMention(orig, bMention), ['B'])
+    await h.receive(editedMention(orig, bMention), ['B'])
+
+    expect(deliveries(h, ['A', 'B'])).toEqual({
+      A: [{ chat_id: CE, via: 'receive_all' }],
+      B: [{ chat_id: CE, via: 'mention' }],
+    })
+    expect(B.notifications[0]!.params.meta.message_id).toBe(ORIGINAL_TS)
+    expect(lines(h, `Dispatching to persona ${ref}`)).toHaveLength(1)
+    expect(B.stub.calls.reactionsAdd).toEqual([{ channel: CE, timestamp: ORIGINAL_TS, name: 'eyes' }])
+
+    // A later edit carries a new edited.ts, so it is a new key.
+    await h.receive(editedMention(orig, `${bMention} today`, '1700000720.000100'), ['B'])
+    expect(deliveries(h, ['A', 'B'])).toEqual({
+      A: [{ chat_id: CE, via: 'receive_all' }],
+      B: [{ chat_id: CE, via: 'mention' }, { chat_id: CE, via: 'mention' }],
+    })
+  })
+
+  test.each<[string, (ids: { b: string }) => string]>([
+    ['<!here>', () => `${broadcastText('here')} please review the deploy`],
+    ['<!channel>', () => `${broadcastText('channel')} please review the deploy`],
+    ['B\'s mention', (ids) => `${mentionText(ids.b)} please review the deploy`],
+  ])('a message_changed edit that adds %s, fed on every connection, wakes nobody: no notification, reaction or post', async (_label, text) => {
+    const h = makeHarness(editSpecs(), { ackReaction: 'eyes' })
+    const orig = original()
+
+    await receiveOnEach(h, messageChanged(orig, text({ b: h.p('B').stub.identity.botUserId })))
+
+    expect(deliveries(h, ['A', 'B'])).toEqual({ A: [], B: [] })
+    expect(nonMessageDrops(h)).toEqual([1, 1])
+    expect(h.all.map((x) => x.stub.calls.reactionsAdd.length)).toEqual([0, 0])
+    expect(h.allPosts()).toEqual([])
   })
 })
 

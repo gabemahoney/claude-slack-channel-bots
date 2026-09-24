@@ -27,10 +27,11 @@
  * directory; it registers only while that persona is up, and a persona that
  * stops being up has its session dropped (b.av2 SR-6.3, SR-6.4). Inbound Slack
  * messages go through the receiving persona's pipeline in
- * `persona-routing.ts`: a persona hears only the channels it is
- * configured into (every message in a `delivery: all` channel, only its direct
- * mentions in a `delivery: mentions` one), and a delivered message reaches that
- * persona's session only. Outbound tool calls post as the session's persona,
+ * `persona-routing.ts`: a persona hears the channels it is configured into
+ * (every message in a `delivery: all` channel, only its direct mentions in a
+ * `delivery: mentions` one) and, with `dm.enabled` on, direct messages to its
+ * own app (SR-4.3); group DMs are never delivered. A delivered message reaches
+ * that persona's session only. Outbound tool calls post as the session's persona,
  * through its own client, and are scoped to that persona's configured channels.
  *
  * SPDX-License-Identifier: MIT

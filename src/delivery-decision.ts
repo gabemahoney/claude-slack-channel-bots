@@ -1,11 +1,11 @@
 /**
- * delivery-decision.ts — The one place channel delivery is decided (b.av2
- * SR-4.2, SR-4.3 interim DM drop, SR-4.4 `via`).
+ * delivery-decision.ts — The one place inbound delivery is decided (b.av2
+ * SR-4.2 channel rules, SR-4.3 direct messages, SR-4.4 `via`).
  *
  * `decideDelivery` takes a raw Slack `message` / `app_mention` event, the
- * receiving persona P (key, bot user ID, bot ID, channel entries) and a
- * read-only view of every applied persona's key and channel entries, and
- * returns either deliver (with how the message reached P, `via`) or drop
+ * receiving persona P (key, bot user ID, bot ID, channel entries, DMs switch)
+ * and a read-only view of every applied persona's key and channel entries,
+ * and returns either deliver (with how the message reached P, `via`) or drop
  * (with a machine-readable reason). Steps, in order:
  *
  * 1. Message shape: no subtype, or one of `file_share`, `bot_message`,
@@ -16,7 +16,12 @@
  *    `user` equal to P's bot user ID, or the event's `bot_id` equal to P's bot
  *    ID, is `own`. An author without `user` (webhooks, integrations) is
  *    identified by its bot ID and carries on.
- * 3. A DM (`channel_type` `im`) is `dm` (not delivered until E6).
+ * 3. Conversation kind (SR-4.3). A DM (`channel_type` `im`, or, as a
+ *    defensive fallback for an event with no `channel_type`, a conversation ID
+ *    starting with `D`) depends only on P's DMs switch: on,
+ *    it delivers with `via` `dm`, whatever the text mentions; off, it is
+ *    `dm-disabled`. A group DM (`channel_type` `mpim`) is `group-dm`, never
+ *    delivered. Neither reaches the channel steps below.
  * 4. A channel P is not configured into is `channel-not-configured`, with
  *    `unclaimed` set when no applied persona lists it.
  * 5. `delivery: all` delivers.
@@ -52,6 +57,12 @@ const DELIVERABLE_SUBTYPES: ReadonlySet<string> = new Set([
 /** `channel_type` of a direct message. */
 const DM_CHANNEL_TYPE = 'im'
 
+/** `channel_type` of a group DM (multi-person direct message). */
+const GROUP_DM_CHANNEL_TYPE = 'mpim'
+
+/** First character of a direct-message conversation ID. */
+const DM_CONVERSATION_PREFIX = 'D'
+
 /** `<!here>` or `<!channel>`, each with or without a `|label`. */
 const BROADCAST_PATTERN = /<!(?:here|channel)(?:\|[^>]*)?>/
 
@@ -61,7 +72,7 @@ const BROADCAST_PATTERN = /<!(?:here|channel)(?:\|[^>]*)?>/
 
 /**
  * How a delivered message reached the persona (b.av2 SR-4.4), first match
- * wins: `dm` (E6; no channel event returns it), `mention` (P's user mention),
+ * wins: `dm` (a direct message to P), `mention` (P's user mention),
  * `broadcast` (`<!here>` / `<!channel>`), `receive_all_shared` (`delivery:
  * all` for P and at least one other applied persona), `receive_all`.
  */
@@ -74,7 +85,9 @@ export type Via = 'dm' | 'mention' | 'broadcast' | 'receive_all_shared' | 'recei
  * - `no-author`: neither `user` nor `bot_id`, so self-exclusion cannot tell
  *   who wrote it.
  * - `own`: written by P (its bot user or its bot ID).
- * - `dm`: a direct message (interim drop until E6).
+ * - `dm-disabled`: a direct message to P while P's DMs switch (`dm.enabled`)
+ *   is off.
+ * - `group-dm`: a group DM; never delivered to any persona.
  * - `channel-not-configured`: P does not list the channel.
  * - `not-mentioned`: a `delivery: mentions` channel without P's mention or a
  *   broadcast.
@@ -83,7 +96,8 @@ export type DeliveryDropReason =
   | 'non-message'
   | 'no-author'
   | 'own'
-  | 'dm'
+  | 'dm-disabled'
+  | 'group-dm'
   | 'channel-not-configured'
   | 'not-mentioned'
 
@@ -117,6 +131,8 @@ export interface DeliveryPersona {
   botId: string | undefined
   /** P's channel entries. */
   channels: readonly ChannelEntry[]
+  /** P's DMs switch (`dm.enabled`). */
+  dmEnabled: boolean
 }
 
 /** One applied persona as `decideDelivery` sees it (P included). */
@@ -154,7 +170,14 @@ export function decideDelivery(
   if (user === undefined && botId === undefined) return { action: 'drop', reason: 'no-author' }
   if (isOwn(user, botId, persona)) return { action: 'drop', reason: 'own' }
 
-  if (ev['channel_type'] === DM_CHANNEL_TYPE) return { action: 'drop', reason: 'dm' }
+  switch (conversationKind(ev['channel_type'], channel)) {
+    case 'dm':
+      return persona.dmEnabled ? { action: 'deliver', via: 'dm' } : { action: 'drop', reason: 'dm-disabled' }
+    case 'group-dm':
+      return { action: 'drop', reason: 'group-dm' }
+    case 'channel':
+      break
+  }
 
   const entry = persona.channels.find((c) => c.id === channel)
   if (!entry) {
@@ -176,6 +199,19 @@ function isOwn(user: string | undefined, botId: string | undefined, persona: Del
   const ownUser = nonEmptyString(persona.botUserId)
   const ownBot = nonEmptyString(persona.botId)
   return (ownUser !== undefined && user === ownUser) || (ownBot !== undefined && botId === ownBot)
+}
+
+/**
+ * SR-4.3: what kind of conversation `channel` is. `channel_type` decides when
+ * the event has one. An event without it (such as an `app_mention`, which
+ * Slack does not send for DMs) is treated, defensively, as a DM when its
+ * conversation ID starts with `D`, and as a channel otherwise.
+ */
+function conversationKind(channelType: unknown, channel: string): 'dm' | 'group-dm' | 'channel' {
+  if (channelType === DM_CHANNEL_TYPE) return 'dm'
+  if (channelType === GROUP_DM_CHANNEL_TYPE) return 'group-dm'
+  if (channelType === undefined && channel.startsWith(DM_CONVERSATION_PREFIX)) return 'dm'
+  return 'channel'
 }
 
 /** The value when it is a non-empty string; otherwise undefined. */

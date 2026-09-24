@@ -1,7 +1,7 @@
 /**
- * delivery-decision.test.ts — The pure channel delivery decision (b.av2
- * SR-4.2 steps in order, SR-4.3 interim DM drop, SR-4.4 `via` precedence)
- * and `stripPersonaMention`.
+ * delivery-decision.test.ts — The pure inbound delivery decision (b.av2
+ * SR-4.2 steps in order, SR-4.3 direct messages and group DMs, SR-4.4 `via`
+ * precedence) and `stripPersonaMention`.
  *
  * Imports the module directly: no server, no `mock.module`, no I/O. Events
  * come from the Slack stub's event factories; P and the applied view are
@@ -50,14 +50,18 @@ const MENTIONS = 'C0MENTION1'
 const Q_ONLY = 'C0QONLY001'
 /** No applied persona lists this channel. */
 const NOBODY = 'C0NOBODY01'
+/** A direct-message conversation (IDs start `D`) and a group DM (`G`). */
+const DM = 'D0DIRECT01'
+const GROUP_DM = 'G0GROUPDM1'
 
 function persona(
   key: string,
   botUserId: string | undefined,
   botId: string | undefined,
   channels: readonly ChannelEntry[],
+  dmEnabled = true,
 ): DeliveryPersona {
-  return { key, botUserId, botId, channels }
+  return { key, botUserId, botId, channels, dmEnabled }
 }
 
 function view(p: DeliveryPersona): AppliedPersonaView {
@@ -133,7 +137,6 @@ describe('step 2: author and self-exclusion', () => {
   test.each<[string, Record<string, unknown>]>([
     ['no user and no bot ID', { user: undefined }],
     ['an empty user and an empty bot ID', { user: '', bot_id: '' }],
-    ['no author, in a DM channel', { user: undefined, channel_type: 'im' }],
     ['no author, mentioning P', { user: undefined, channel: MENTIONS, text: mentionText(P_USER) }],
   ])('%s is dropped as no-author', (_label, overrides) => {
     expect(decide(makeChannelMessage({ channel: ALL, ...overrides }))).toEqual(drop('no-author'))
@@ -147,7 +150,6 @@ describe('step 2: author and self-exclusion', () => {
     ['own post mentioning P in a mentions channel', makeChannelMessage({ channel: MENTIONS, user: P_USER, text: mentionText(P_USER) })],
     ['own post broadcasting in a mentions channel', makeChannelMessage({ channel: MENTIONS, user: P_USER, text: broadcastText('here') })],
     ['own post by bot ID with a labelled mention of P', makeWebhookPost({ channel: MENTIONS, bot_id: P_BOT, text: mentionText(P_USER, 'p') })],
-    ['own post in a DM', makeDm({ user: P_USER })],
     ['own post in a channel P is not in', makeChannelMessage({ channel: NOBODY, user: P_USER })],
   ])('%s is dropped as own', (_label, event) => {
     expect(decide(event)).toEqual(drop('own'))
@@ -177,16 +179,104 @@ describe('step 2: author and self-exclusion', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Step 3: DMs (interim drop)
+// Step 3: conversation kind (DMs and group DMs, SR-4.3)
 // ---------------------------------------------------------------------------
 
-describe('step 3: DMs', () => {
+describe('step 3: DMs and group DMs', () => {
+  const pOff = persona('p', P_USER, P_BOT, P.channels, false)
+  /** P with no channel entries: a DM does not depend on channel membership. */
+  const pNoChannels = persona('p', P_USER, P_BOT, [])
+  const pNoChannelsOff = persona('p', P_USER, P_BOT, [], false)
+  const mention = mentionText(P_USER)
+  const here = broadcastText('here')
+  // Slack does not send app_mention for DMs. The app_mention-shaped rows are
+  // defensive: an event with no channel_type and a D… ID is still a DM.
+
   test.each<[string, Record<string, unknown>]>([
-    ['a plain DM', makeDm()],
-    ['a DM mentioning P', makeDm({ text: `${mentionText(P_USER)} hi` })],
-    ['a DM in a channel ID P lists as all', makeDm({ channel: ALL })],
-  ])('%s is dropped as dm', (_label, event) => {
-    expect(decide(event)).toEqual(drop('dm'))
+    ['a plain DM', makeDm({ channel: DM })],
+    ['a DM with no text', makeDm({ channel: DM, text: undefined })],
+    ['a DM mentioning P', makeDm({ channel: DM, text: `${mention} hi` })],
+    ['a DM with <!here>', makeDm({ channel: DM, text: `${here} hi` })],
+    ['a DM with <!channel>', makeDm({ channel: DM, text: `${broadcastText('channel')} hi` })],
+    ["a DM with P's mention and <!here>", makeDm({ channel: DM, text: `${here} ${mention} hi` })],
+    ['a DM mentioning only another persona', makeDm({ channel: DM, text: `${mentionText(Q_USER)} hi` })],
+    ['an app_mention-shaped event with no channel_type and a D… ID', makeAppMention({ channel: DM, text: `${mention} hi` })],
+    ['a message with no channel_type and a D… ID', makeDm({ channel: DM, channel_type: undefined })],
+    ["another persona's DM to P", makeBotMessage({ channel: DM, channel_type: 'im', user: Q_USER, bot_id: Q_BOT })],
+    ['a webhook-style post in a DM', makeWebhookPost({ channel: DM, channel_type: 'im' })],
+    ['a file_share in a DM', makeDm({ channel: DM, subtype: 'file_share' })],
+    ['a thread_broadcast in a DM', makeDm({ channel: DM, subtype: 'thread_broadcast' })],
+    ['a DM whose ID P lists as all', makeDm({ channel: ALL })],
+    ['a DM whose ID P lists as mentions, without a mention', makeDm({ channel: MENTIONS })],
+    ['a DM whose ID only another persona lists', makeDm({ channel: Q_ONLY })],
+  ])('DMs on: %s is delivered with via dm', (_label, event) => {
+    expect(decide(event)).toEqual(deliver('dm'))
+  })
+
+  test.each<[string, Record<string, unknown>]>([
+    ['a plain DM', makeDm({ channel: DM })],
+    ["a DM with P's mention and <!here>", makeDm({ channel: DM, text: `${here} ${mention} hi` })],
+    ['an app_mention-shaped event with no channel_type and a D… ID', makeAppMention({ channel: DM, text: `${mention} hi` })],
+    ['a DM whose ID P lists as all', makeDm({ channel: ALL })],
+  ])('DMs off: %s is dropped as dm-disabled', (_label, event) => {
+    expect(decide(event, pOff, [view(pOff), view(Q)])).toEqual(drop('dm-disabled'))
+  })
+
+  test.each<[string, DeliveryPersona, DeliveryDecision]>([
+    ['DMs on', pNoChannels, deliver('dm')],
+    ['DMs off', pNoChannelsOff, drop('dm-disabled')],
+  ])('a zero-channel persona with %s: a DM nobody lists is decided by the switch alone', (_label, receiver, expected) => {
+    expect(decide(makeDm({ channel: DM }), receiver, [view(receiver)])).toEqual(expected)
+    expect(decide(makeAppMention({ channel: DM, text: `${mention} hi` }), receiver, [view(receiver)])).toEqual(expected)
+  })
+
+  test.each<[string, DeliveryPersona, Record<string, unknown>]>([
+    ['DMs on, plain', P, makeDm({ channel: GROUP_DM, channel_type: 'mpim' })],
+    ['DMs off, plain', pOff, makeDm({ channel: GROUP_DM, channel_type: 'mpim' })],
+    ["DMs on, P's mention and <!here>", P, makeDm({ channel: GROUP_DM, channel_type: 'mpim', text: `${here} ${mention} hi` })],
+    ['DMs on, a group DM whose ID P lists as all', P, makeDm({ channel: ALL, channel_type: 'mpim' })],
+    ['DMs on, a group DM with a D… ID', P, makeDm({ channel: DM, channel_type: 'mpim' })],
+    ['zero-channel persona, DMs on', pNoChannels, makeDm({ channel: GROUP_DM, channel_type: 'mpim' })],
+  ])('a group DM is dropped as group-dm: %s', (_label, receiver, event) => {
+    expect(decide(event, receiver, [view(receiver), view(Q)])).toEqual(drop('group-dm'))
+  })
+
+  test.each<[string, DeliveryPersona, Record<string, unknown>, DeliveryDecision]>([
+    ["P's own DM by user ID", P, makeDm({ channel: DM, user: P_USER }), drop('own')],
+    ["P's own DM by bot ID", P, makeDm({ channel: DM, user: undefined, bot_id: P_BOT }), drop('own')],
+    ["P's own app_mention-shaped event with no channel_type and a D… ID", P, makeAppMention({ channel: DM, user: P_USER, text: `${mention} hi` }), drop('own')],
+    ["P's own DM mentioning P, DMs off", pOff, makeDm({ channel: DM, user: P_USER, text: `${mention} hi` }), drop('own')],
+    ["P's own group DM", P, makeDm({ channel: GROUP_DM, channel_type: 'mpim', bot_id: P_BOT }), drop('own')],
+    ['a DM with no author', P, makeDm({ channel: DM, user: undefined }), drop('no-author')],
+    ['a DM with no author, DMs off', pOff, makeDm({ channel: DM, user: undefined }), drop('no-author')],
+    ['a message_changed in a DM', P, makeDm({ channel: DM, subtype: 'message_changed' }), drop('non-message')],
+    ['a message_deleted in a DM', P, makeDm({ channel: DM, subtype: 'message_deleted' }), drop('non-message')],
+    ['a message_changed in a DM, DMs off', pOff, makeDm({ channel: DM, subtype: 'message_changed' }), drop('non-message')],
+    ['a channel_join in a group DM', P, makeDm({ channel: GROUP_DM, channel_type: 'mpim', subtype: 'channel_join' }), drop('non-message')],
+  ])('steps 1 and 2 run before the DM decision: %s', (_label, receiver, event, expected) => {
+    expect(decide(event, receiver, [view(receiver), view(Q)])).toEqual(expected)
+  })
+
+  test.each<[string, Record<string, unknown>, DeliveryDecision]>([
+    ['channel_type channel, an ID nobody lists', makeChannelMessage({ channel: DM }), { action: 'drop', reason: 'channel-not-configured', unclaimed: true }],
+    ['channel_type group, an ID nobody lists', makeChannelMessage({ channel: DM, channel_type: 'group' }), { action: 'drop', reason: 'channel-not-configured', unclaimed: true }],
+    ['channel_type channel, an ID P lists as all', makeChannelMessage({ channel: 'D0LISTED01' }), deliver('receive_all')],
+    ['channel_type channel, an ID P lists as mentions, no mention', makeChannelMessage({ channel: 'D0LISTED02' }), drop('not-mentioned')],
+  ])('a D… ID with a non-im channel_type is decided as a channel: %s', (_label, event, expected) => {
+    const receiver = persona('p', P_USER, P_BOT, [
+      ...P.channels,
+      { id: 'D0LISTED01', delivery: 'all' },
+      { id: 'D0LISTED02', delivery: 'mentions' },
+    ])
+    expect(decide(event, receiver, [view(receiver), view(Q)])).toEqual(expected)
+  })
+
+  test.each<[string, Record<string, unknown>, DeliveryDecision]>([
+    ['a plain message in an all channel', makeChannelMessage({ channel: ALL }), deliver('receive_all')],
+    ['an app_mention of P in a mentions channel', makeAppMention({ channel: MENTIONS, text: `${mention} hi` }), deliver('mention')],
+    ['a channel nobody lists', makeChannelMessage({ channel: NOBODY }), { action: 'drop', reason: 'channel-not-configured', unclaimed: true }],
+  ])('the DMs switch off does not change a channel decision: %s', (_label, event, expected) => {
+    expect(decide(event, pOff, [view(pOff), view(Q)])).toEqual(expected)
   })
 })
 

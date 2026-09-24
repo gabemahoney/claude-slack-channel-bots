@@ -1,6 +1,7 @@
 /**
  * inbound-dedupe.test.ts — One persona's inbound dedupe store (b.av2 SR-4.1,
- * SR-4.2 no count or rate state, SR-13.1 injected clock).
+ * including the edited-event key, SR-4.2 no count or rate state, SR-13.1
+ * injected clock).
  *
  * Imports the module directly: no server, no `mock.module`, no I/O. Time
  * moves only through the shared fake clock's `now()`; nothing sleeps and no
@@ -17,6 +18,9 @@ import { createFakeClock } from './test-helpers/fake-clock.ts'
 const TEN_MINUTES_MS = 10 * 60 * 1000
 const CHANNEL = 'C0DEDUPE01'
 const TS = '1700000000.000100'
+/** Two edit ts values for the same message. */
+const EDIT = '1700000060.000100'
+const EDIT2 = '1700000120.000100'
 
 /** A store on a fresh fake clock starting at 0. */
 function makeStore() {
@@ -33,25 +37,75 @@ describe('inbound dedupe: new vs duplicate', () => {
     expect(store.size).toBe(1)
   })
 
-  test.each([
-    ['only the conversation differs', 'C0DEDUPE02', TS],
-    ['only the ts differs', CHANNEL, '1700000000.000200'],
-    ['a DM conversation with the same ts', 'D0DEDUPE01', TS],
-  ])('a key where %s is new', (_label, conversation, ts) => {
+  // Each row records (CHANNEL, TS, edit ts) first, then its own key with the
+  // same edit ts: the three-part rows prove every part of an edited key counts.
+  test.each<[string, string, string, string | undefined]>([
+    ['only the conversation differs', 'C0DEDUPE02', TS, undefined],
+    ['only the ts differs', CHANNEL, '1700000000.000200', undefined],
+    ['a DM conversation with the same ts', 'D0DEDUPE01', TS, undefined],
+    ['an edit with the same conversation and edit ts but a different ts', CHANNEL, '1700000000.000200', EDIT],
+    ['an edit with the same ts and edit ts but a different conversation', 'C0DEDUPE02', TS, EDIT],
+  ])('a key where %s is new', (_label, conversation, ts, editedTs) => {
     const { store } = makeStore()
-    expect(store.record(CHANNEL, TS)).toBe('new')
-    expect(store.record(conversation, ts)).toBe('new')
-    expect(store.record(conversation, ts)).toBe('duplicate')
+    expect(store.record(CHANNEL, TS, editedTs)).toBe('new')
+    expect(store.record(conversation, ts, editedTs)).toBe('new')
+    expect(store.record(conversation, ts, editedTs)).toBe('duplicate')
     expect(store.size).toBe(2)
   })
 
-  test('the split between conversation and ts is part of the key ("a:b"/"c" and "a"/"b:c" are distinct)', () => {
+  test('the split between the parts is part of the key: "a:b"/"c", "a"/"b:c", "ab"/"c", "a"/"bc" and "a"/"b"/"c" are distinct', () => {
     const { store } = makeStore()
     expect(store.record('a:b', 'c')).toBe('new')
     expect(store.record('a', 'b:c')).toBe('new')
     expect(store.record('ab', 'c')).toBe('new')
     expect(store.record('a', 'bc')).toBe('new')
-    expect(store.size).toBe(4)
+    expect(store.record('a', 'b', 'c')).toBe('new')
+    expect(store.record('a', 'b', 'c')).toBe('duplicate')
+    expect(store.size).toBe(5)
+  })
+})
+
+describe('inbound dedupe: edited event dedupe (conversation, ts, edit ts)', () => {
+  test('after (conversation, ts) is seen, an edit of it is new, its repeat a duplicate, another edit new, and an unedited repeat still a duplicate', () => {
+    const { store } = makeStore()
+    expect(store.record(CHANNEL, TS)).toBe('new')
+    expect(store.record(CHANNEL, TS, EDIT)).toBe('new')
+    expect(store.record(CHANNEL, TS, EDIT)).toBe('duplicate')
+    expect(store.record(CHANNEL, TS, EDIT2)).toBe('new')
+    expect(store.record(CHANNEL, TS)).toBe('duplicate')
+    expect(store.size).toBe(3)
+  })
+
+  test.each([
+    ['empty', ''],
+    ['undefined', undefined],
+    ['null', null],
+    ['a number', 1700000060.0001],
+    ['an object', { ts: EDIT }],
+  ])('an edit ts that is %s is keyed as unedited: a duplicate of the original', (_label, editedTs) => {
+    const { store } = makeStore()
+    expect(store.record(CHANNEL, TS)).toBe('new')
+    expect(store.record(CHANNEL, TS, editedTs)).toBe('duplicate')
+    expect(store.size).toBe(1)
+  })
+
+  test('an edited key has its own window from its first sighting', async () => {
+    const { clock, store } = makeStore()
+    store.record(CHANNEL, TS)
+    await clock.advanceTo(60_000)
+    expect(store.record(CHANNEL, TS, EDIT)).toBe('new')
+    await clock.advanceTo(60_000 + INBOUND_DEDUPE_RETENTION_MS - 1)
+    expect(store.record(CHANNEL, TS)).toBe('new') // the original's window has ended
+    expect(store.record(CHANNEL, TS, EDIT)).toBe('duplicate')
+    await clock.advanceTo(60_000 + INBOUND_DEDUPE_RETENTION_MS)
+    expect(store.record(CHANNEL, TS, EDIT)).toBe('new')
+  })
+
+  test('an edit ts does not make an event without a conversation or ts keyable', () => {
+    const { store } = makeStore()
+    expect(store.record(undefined, TS, EDIT)).toBe('unkeyable')
+    expect(store.record(CHANNEL, '', EDIT)).toBe('unkeyable')
+    expect(store.size).toBe(0)
   })
 })
 

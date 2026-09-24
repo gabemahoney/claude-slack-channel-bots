@@ -1394,9 +1394,9 @@ describe('tool list and instructions', () => {
     expect(instructions).toContain('Reply with the reply tool — pass chat_id back.')
   })
 
-  // b.av2 SR-12: the tag attributes, the channel via values and persona mentions.
+  // b.av2 SR-12: the tag attributes, the via values (channel and dm) and persona mentions.
   // Key tokens only, so harmless rewording does not break the case.
-  test('instructions name chat_id, user_id, bot_id and via, list the channel via values and say <@ID> reaches a user or persona', async () => {
+  test('instructions name chat_id, user_id, bot_id and via, list the channel and dm via values and say <@ID> reaches a user or persona', async () => {
     const { client } = await openPersonaSession(h.alpha)
 
     const instructions = client.getInstructions() ?? ''
@@ -1407,8 +1407,8 @@ describe('tool list and instructions', () => {
     for (const value of ['mention', 'broadcast', 'receive_all_shared', 'receive_all']) {
       expect(viaList).toMatch(new RegExp(`\\b${value} \\(`))
     }
-    // E6 adds dm as a via value and flips this expectation.
-    expect(viaList).not.toMatch(/\bdm\b/)
+    // E6: dm (a direct message to the persona) is a via value too.
+    expect(viaList).toMatch(/\bdm \(/)
     expect(instructions).toMatch(/<@ID>[^\n]*mentions a Slack user or another persona/)
   })
 

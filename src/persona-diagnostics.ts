@@ -20,7 +20,7 @@
  *
  * The label set grows as later work lands (E2 Task 2 added credentials-refused
  * and Slack-unreachable, E2 Task 3 connection lost/restored, E3 Task 7 the
- * unclaimed channel and the interim DM drop, E5 Task 1 the per-persona start
+ * unclaimed channel and the DM drop, E5 Task 1 the per-persona start
  * line; later Epics theirs).
  *
  * SPDX-License-Identifier: MIT
@@ -78,9 +78,9 @@ export const PERSONA_DIRECTORY_UNUSABLE = 'persona-directory-unusable'
 export const UNCLAIMED_CHANNEL = 'unclaimed-channel'
 
 /**
- * Interim: a direct message reached a persona and was dropped, because DMs are
- * not delivered yet whatever `dm.enabled` says. The cause names the
- * conversation. Replaced when DM delivery lands.
+ * A direct message reached a persona whose DMs switch (`dm.enabled`) is off,
+ * and was dropped (b.av2 SR-4.3). The cause names the conversation, the ts and
+ * `dm.enabled`, never the message text.
  */
 export const PERSONA_DM_DROPPED = 'persona-dm-dropped'
 

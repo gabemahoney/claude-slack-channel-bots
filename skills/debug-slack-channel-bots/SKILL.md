@@ -322,15 +322,30 @@ running, is kept but not served. Healthy personas are unaffected.
   persona lists in `channels`, so the message reached no one. Logged by each
   persona whose app received it.
 - **Fix:** Add the channel to the right persona's `channels` in `config.json`
-  and restart the server, or remove the app from the channel.
+  and restart the server, or remove the app from the channel. If the ID is a
+  group DM (someone @mentioned the persona in a multi-person DM), the line is
+  expected: do not add that ID to any persona's `channels`, because that would
+  deliver group-DM mentions to it.
 
-### `persona-dm-dropped` (interim)
+### `persona-dm-dropped`
 
 - **State:** the persona is `up`; this is about a message.
-- **Line:** `[slack] persona-dm-dropped: personas[<i>] "<name>" (key=<key>): direct message in conversation <id> dropped: DMs are not delivered yet, whatever dm.enabled says`
-- **Meaning:** Someone sent the persona a direct message. This version doesn't
-  deliver direct messages yet, whatever `dm.enabled` says.
-- **Fix:** None in this version. Use a channel the persona lists.
+- **Line:** `[slack] persona-dm-dropped: personas[<i>] "<name>" (key=<key>): direct message in conversation <id> ts=<ts> dropped: dm.enabled is off for this persona`
+- **Meaning:** Someone sent a direct message to the persona's Slack app while
+  that persona's `dm.enabled` is off, so the message was not delivered. The
+  line names the persona, the DM conversation, the message ts and
+  `dm.enabled`, never the message text.
+- **Fix:** Set `dm.enabled` to `true` for that persona in `config.json` and
+  restart the server. Leaving it off is valid when the persona should ignore
+  DMs; the line is then expected.
+- **Group DMs:** a group DM (a direct message with more than one person) is
+  not delivered and never logs `persona-dm-dropped`, whatever `dm.enabled`
+  says. This is by design, not a fault; turning `dm.enabled` on does not
+  change it. A group-DM message that Slack marks with `channel_type` `mpim`
+  logs the plain `[slack] persona "<name>" (key=<key>) dropped message from
+  channel=<id> …: group-dm` line. An @mention of the persona in a group DM
+  arrives without `channel_type`, so it logs `unclaimed-channel` instead (see
+  [`unclaimed-channel`](#unclaimed-channel)).
 
 ---
 

@@ -1,6 +1,6 @@
 /**
  * persona-routing.ts — Inbound Slack delivery per persona (b.av2 SR-4.1,
- * SR-4.2, SR-4.4, SR-10.3 `unclaimed-channel`).
+ * SR-4.2, SR-4.3, SR-4.4, SR-10.3 `unclaimed-channel` and `persona-dm-dropped`).
  *
  * Every `message` and `app_mention` event a persona's connection receives
  * feeds that persona's single pipeline:
@@ -12,23 +12,29 @@
  *    logged, naming the persona, and never stops another persona's run.
  * 2. Dedupe (b.av2 SR-4.1): P's own store (`src/inbound-dedupe.ts`), kept
  *    per persona key for the life of this routing instance (so it survives a
- *    reopen of P's connection), records the event's (channel, ts). A key P
- *    already saw within the retention window, such as the second of the
- *    `message` / `app_mention` pair or a Slack redelivery, stops here with no
- *    decision, dispatch, reaction, recovery, post or log line. An event
- *    without a channel or ts is not keyed and carries on.
+ *    reopen of P's connection), records the event's (channel, ts), or
+ *    (channel, ts, edited.ts) when the event carries a top-level `edited.ts`
+ *    (an edit that adds a mention arrives as an `app_mention` with the
+ *    original ts and an `edited` object). A key P already saw within the
+ *    retention window, such as the second of the `message` / `app_mention`
+ *    pair or a Slack redelivery, stops here with no decision, dispatch,
+ *    reaction, recovery, post or log line. An event without a channel or ts
+ *    is not keyed and carries on.
  * 3. Decision: one call to `decideDelivery` (`src/delivery-decision.ts`, the
- *    only module holding channel-delivery rules) with P's key, bot user ID,
- *    bot ID and channel entries and the applied personas. It returns deliver
- *    with `via`, or drop with a reason.
+ *    only module holding delivery rules) with P's key, bot user ID, bot ID,
+ *    channel entries and DMs switch (`dm.enabled`) and the applied personas.
+ *    It returns deliver with `via`, or drop with a reason. A DM is decided
+ *    only against the persona whose connection received it.
  * 4. Drop logging: a channel no applied persona lists logs one
  *    `unclaimed-channel` line naming the channel and P; a channel another
- *    applied persona lists logs nothing; a DM logs one interim
- *    `persona-dm-dropped` line; any other reason logs one plain line naming
- *    the author ID. No drop line carries message text.
+ *    applied persona lists logs nothing; a DM to P with its DMs switch off
+ *    logs one `persona-dm-dropped` line naming P and `dm.enabled`, and makes
+ *    no Slack call; any other reason logs one plain line naming the author
+ *    ID. No drop line carries message text.
  * 5. Dispatch: P's session is looked up by persona key; the ack reaction is
  *    added through P's client; the message goes as `notifications/claude/channel`
- *    to P's session only, with `chat_id` set to the source conversation. The
+ *    to P's session only, with `chat_id` set to the source conversation (the
+ *    channel, or the DM conversation). The
  *    meta `user` is the author's display name, or for an author without
  *    `user` (webhook, `bot_message`) the event's `username`, else its
  *    `bot_profile.name`, else its bot ID. The meta also carries the author's
@@ -39,8 +45,7 @@
  *    scheduled when the restart guards allow (b.kvq / b.9cj), and one reply
  *    saying so is posted in the source conversation through P's client.
  *
- * Deferred rules and where they are completed: DM delivery (E6, which replaces
- * the interim DM drop and its line); the lost-message notice to P's
+ * Deferred rules and where they are completed: the lost-message notice to P's
  * destination (E8, which replaces the source-conversation replies below); the
  * ack reaction's source and keying (E9; today it comes from `access.json`).
  *
@@ -251,7 +256,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     }
     try {
       const ev = event as Record<string, unknown>
-      if (dedupeStoreFor(key).record(ev['channel'], ev['ts']) === 'duplicate') return
+      if (dedupeStoreFor(key).record(ev['channel'], ev['ts'], editedTs(ev)) === 'duplicate') return
       await runPipeline(key, ev)
     } catch (err) {
       deps.log(`[slack] persona-routing: error handling event for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
@@ -268,7 +273,13 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     const identity = deps.getBotIdentity(key)
     const decision = decideDelivery(
       ev,
-      { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels },
+      {
+        key,
+        botUserId: identity?.botUserId,
+        botId: identity?.botId,
+        channels: persona.channels,
+        dmEnabled: persona.dm.enabled,
+      },
       config.personas,
     )
     if (decision.action === 'drop') {
@@ -292,13 +303,13 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           cause: `message in channel ${channel} not delivered: no applied persona lists this channel`,
         }))
         return
-      case 'dm':
+      case 'dm-disabled':
         deps.log(formatPersonaDiagnostic({
           class: PERSONA_DM_DROPPED,
           name: persona.name,
           key: persona.key,
           index: persona.index,
-          cause: `direct message in conversation ${channel} dropped: DMs are not delivered yet, whatever dm.enabled says`,
+          cause: `direct message in conversation ${channel}${describeTs(ev)} dropped: dm.enabled is off for this persona`,
         }))
         return
       default:
@@ -461,6 +472,22 @@ function botAuthorLabel(ev: Record<string, unknown>): string {
     if (typeof candidate === 'string' && candidate !== '') return candidate
   }
   return UNKNOWN_AUTHOR
+}
+
+/**
+ * The event's top-level `edited.ts`, or undefined when `edited` is absent or
+ * not an object. Only the top level is read: a `message_changed` event nests
+ * its edit under `message.edited` and keeps its own key.
+ */
+function editedTs(ev: Record<string, unknown>): unknown {
+  const edited = ev['edited']
+  return typeof edited === 'object' && edited !== null ? (edited as Record<string, unknown>)['ts'] : undefined
+}
+
+/** ` ts=<ts>` for a drop line when the event has a non-empty string ts; otherwise empty. */
+function describeTs(ev: Record<string, unknown>): string {
+  const ts = ev['ts']
+  return typeof ts === 'string' && ts !== '' ? ` ts=${ts}` : ''
 }
 
 /** The author ID for a drop line: `user=<U…>`, else `bot_id=<B…>`, else `user=(none)`. */

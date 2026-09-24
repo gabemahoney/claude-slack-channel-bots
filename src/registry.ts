@@ -649,7 +649,7 @@ const MCP_INSTRUCTIONS = [
   '',
   'Messages from Slack arrive as <channel source="slack" chat_id="C..." message_id="1234567890.123456" user="jeremy" user_id="U..." thread_ts="..." ts="..." via="mention">.',
   'user_id is the author\'s Slack user ID. When a bot or integration without a user posted the message, the tag carries bot_id instead of user_id.',
-  'via says how the message reached you: mention (you were @mentioned), broadcast (@here or @channel), ' +
+  'via says how the message reached you: dm (a direct message to you), mention (you were @mentioned), broadcast (@here or @channel), ' +
     'receive_all_shared (a channel where you and at least one other persona receive every message), ' +
     'receive_all (a channel where you alone receive every message).',
   '<@ID> in message text mentions a Slack user or another persona. Mention another persona the same way, with <@ID>, to address it.',
