@@ -42,7 +42,7 @@ import { expandTilde as expandTildeWith, personaKey, renderPersonaRef } from './
  * (direct pure-function callers): the expanded dirname of this path
  * (`~/.claude/channels/slack`).
  */
-const DEFAULT_CONFIG_PATH = '~/.claude/channels/slack/config.json'
+export const DEFAULT_CONFIG_PATH = '~/.claude/channels/slack/config.json'
 
 export const MCP_SERVER_NAME = 'slack-channel-router'
 export const ALLOWED_PRESCRIPTIONS = ['gentle', 'standard', 'aggressive']
@@ -539,6 +539,54 @@ export function resolveRealPath(path: string, realpath: (path: string) => string
   } catch {
     return resolve(path)
   }
+}
+
+// ---------------------------------------------------------------------------
+// Credentials files protected by the file guard (b.av2 SR-5.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * The persona credentials files that `assertSendable` must refuse (b.av2
+ * SR-5.2): every applied persona's `credentials_file`, plus every string
+ * `personas[i].credentials_file` named by the configuration file currently at
+ * `configPath`, tilde-expanded under `home` and made absolute.
+ *
+ * The current file is read tolerantly and not validated, so a file with an
+ * invalid edit still protects the paths it names. An unreadable file,
+ * unparseable JSON, or a file without a `personas` array contributes nothing;
+ * this never throws. The file's contents never appear in the result beyond
+ * the paths themselves. Callers compare the returned paths by
+ * `resolveRealPath`.
+ *
+ * @param appliedPersonas  The applied personas; their `credentials_file` is
+ *   already absolute and tilde-expanded.
+ * @param configPath       Path to the configuration file; `~` is expanded under `home`.
+ * @param home             Home directory for every `~`; defaults to the OS home,
+ *   read at call time and only when a path needs it.
+ */
+export function credentialsFilesToProtect(
+  appliedPersonas: readonly Persona[],
+  configPath: string,
+  home?: string,
+): string[] {
+  const paths = appliedPersonas.map((p) => p.credentials_file)
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(readFileSync(resolve(expandTildeWith(configPath, home)), 'utf-8'))
+  } catch {
+    return paths
+  }
+  const personas = typeof parsed === 'object' && parsed !== null
+    ? (parsed as Record<string, unknown>)['personas']
+    : undefined
+  if (!Array.isArray(personas)) return paths
+  for (const entry of personas) {
+    const file = typeof entry === 'object' && entry !== null
+      ? (entry as Record<string, unknown>)['credentials_file']
+      : undefined
+    if (typeof file === 'string' && file !== '') paths.push(resolve(expandTildeWith(file, home)))
+  }
+  return paths
 }
 
 // ---------------------------------------------------------------------------

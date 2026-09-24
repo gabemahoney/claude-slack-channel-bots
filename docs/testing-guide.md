@@ -12,9 +12,9 @@ Each source module has a corresponding test file in the project root:
 
 | Source | Test File | What It Tests |
 |--------|-----------|---------------|
-| lib.ts | server.test.ts | gate(), assertSendable, assertOutboundAllowed, chunkText, sanitizeFilename |
-| config.ts | config.test.ts | applyDefaults, validateConfig, expandTilde, resolveConfig, loadConfig; resolveRealPath (real path, lexical fallback, injected realpath); persona loader (resolvePersonaConfig, loadPersonaConfig), cross-persona rejections (duplicate name or key, shared working_directory or credentials_file), non-collision controls, SR-14 rejection table; every persona rejection passes `assertNoLeak` |
-| registry.ts | registry.test.ts | Session registry CRUD, routing, pending sessions |
+| lib.ts | server.test.ts | gate(), assertSendable (state-dir rule; also refuses each listed credentials file by real path, symlinks included), chunkText, sanitizeFilename |
+| config.ts | config.test.ts | applyDefaults, validateConfig, expandTilde, resolveConfig, loadConfig; resolveRealPath (real path, lexical fallback, injected realpath); persona loader (resolvePersonaConfig, loadPersonaConfig), cross-persona rejections (duplicate name or key, shared working_directory or credentials_file), non-collision controls, SR-14 rejection table; credentialsFilesToProtect (applied and current-file credentials paths, tolerant of an unreadable or unparseable file); every persona rejection passes `assertNoLeak` |
+| registry.ts | registry.test.ts | Persona-keyed session registry CRUD (newer session replaces older, stale-close guard), pending sessions and in-place promotion, matchPersonaByRootsPath (real-path roots cwd → exactly one persona), the posting-scope check checkPersonaTarget and the persona-scoped tools' refusals as tool errors |
 | server.ts (DM routing) | dm-routing.test.ts | DM routing via gate() + registry |
 | server.ts (permission relay) | permission-poller.test.ts, permission-click-handler.test.ts | SR-2.1 poller loop and Block Kit click handler |
 | persona-identity.ts | persona-identity.test.ts | persona key rule, derived identifiers, persona-name rendering |
@@ -108,11 +108,12 @@ New persona and connection suites fake Slack with the shared helper `tests/test-
 | Member | What it gives a test |
 |--------|----------------------|
 | `identity` | The bot user ID, bot ID and team ID a successful `auth.test` returns. The bot user ID and bot ID default to random values, distinct per stub; the team ID defaults to a fixed value. Override them through `botUserId`, `botId` and `teamId`. |
-| `script` | Outcome queues `authTest`, `connect` (socket `start()`) and `post` (`chat.postMessage`). Seed them through the options of the same names, or push onto them at any time. Each call takes the next outcome; an empty queue means success. |
-| `calls` | Capture arrays of call arguments: `authTest`, `postMessage`, `update`, `reactionsAdd`, `reactionsRemove`, `conversationsOpen`, `usersInfo`. Every Web API client of the stub shares them. |
-| `web` | A ready Web API client with default options, for direct calls. |
-| `createWebClient(token?, options?)` | Builds a Web API client as the real constructor would; recorded in `options.web`. |
+| `script` | Outcome queues `authTest`, `connect` (socket `start()`), `post` (`chat.postMessage`), `upload` (`filesUploadV2`), `history` (`conversations.history`), `replies` (`conversations.replies`) and `info` (`conversations.info`). Seed them through the options of the same names, or push onto them at any time. Each call takes the next outcome; an empty queue means success. |
+| `calls` | Capture arrays of call arguments: `authTest`, `postMessage`, `update`, `reactionsAdd`, `reactionsRemove`, `conversationsOpen`, `usersInfo`, `filesUploadV2`, `conversationsHistory`, `conversationsReplies`, `conversationsInfo`. Every Web API client of the stub shares them. |
+| `web` | A ready Web API client with default options, for direct calls. Its bot token is the `token` option; the default is a sentinel-bearing fake token with a random suffix, distinct per stub. |
+| `createWebClient(token?, options?)` | Builds a Web API client as the real constructor would; recorded in `options.web`. Without `token` it uses a fixed sentinel-bearing fake token, the same for every stub. |
 | `createSocketClient(options?)` | Builds a socket client; recorded in `options.socket` and `sockets`. Throws on an empty app token, as the real constructor does. |
+| `token`, `hasToken(expected)` | Every Web API client carries the bot token it was built with as `token`, like `WebClient.token`. It is not enumerable, so printing or comparing a client never shows it; assert with `hasToken(expected)`, which prints no token on failure. |
 | `options` | The options every client was built with, in build order (`web`, `socket`). |
 | `sockets`, `socket` | Every socket client built, and the latest one (`socket` throws if none was built). |
 
@@ -128,7 +129,7 @@ The socket stub behaves like `SocketModeClient` with auto-reconnect off:
 
 | Kind | Result |
 |------|--------|
-| `ok` | Success. On `auth.test` and `post`, an optional `result` is merged over the default response; a key set to `undefined` is removed. |
+| `ok` | Success. On `auth.test`, `post`, `upload`, `history`, `replies` and `info`, an optional `result` is merged over the default response; a key set to `undefined` is removed. |
 | `platform` | A named Slack error (an `ok: false` answer) with that `error`, and an optional `retryAfter` in the response metadata. |
 | `network`, `dns`, `timeout`, `http`, `rate-limited` | Slack unreachable: a request error, an HTTP error with a status, or a rate-limited error with `retryAfter` in seconds. |
 | `no-url` | Connect only: `apps.connections.open` answered without a URL. `start()` rejects with a plain error on the connect leg, with no lifecycle event. |

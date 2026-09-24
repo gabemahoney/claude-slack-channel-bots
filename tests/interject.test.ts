@@ -33,7 +33,8 @@ interface MockSession {
 
 let routingConfig: { routes: Record<string, { cwd: string }> } | null = null
 
-// sessions keyed by channel — mirrors getSessionByChannel lookup
+// sessions keyed by channel — mirrors the getSessionByPersona(channel) lookup
+// (a stand-in persona's key is its channel ID)
 const sessions = new Map<string, MockSession>()
 
 // Capture array for notification() calls — reset in beforeEach via .length = 0

@@ -10,8 +10,12 @@
  * Fix: Added `!routingConfig.routes[channelId]` guard so default_route only
  * applies to channels that have NO route entry at all.
  *
- * Fixed condition (server.ts ~line 560):
+ * Fixed condition (server.ts handleMessage):
  *   if (!targetSession && routingConfig?.default_route && !routingConfig.routes[channelId])
+ *
+ * The registry is keyed by persona key. Under the route->persona adapter a
+ * route's persona key is its channel ID, so sessions register under channel IDs
+ * and the direct lookup is getSessionByPersona(channelId).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -20,7 +24,7 @@ import { describe, test, expect, beforeEach } from 'bun:test'
 import { homedir } from 'os'
 import {
   registerSession,
-  getSessionByChannel,
+  getSessionByPersona,
   getSessionByCwd,
   _resetRegistry,
 } from '../src/registry.ts'
@@ -87,10 +91,10 @@ function makeRoutingConfig(opts: {
 
 /**
  * Simulate the channel routing decision from server.ts handleMessage
- * (non-DM branch, lines ~550–563).
+ * (non-DM branch).
  *
  * Mirrors the fixed logic exactly:
- *   1. getSessionByChannel → targetSession
+ *   1. getSessionByPersona(channelId) → targetSession
  *   2. if (!targetSession && default_route && !routes[channelId]) → fall through
  *
  * Returns { targetSession, usedDefaultRoute } so tests can inspect the result.
@@ -99,11 +103,11 @@ function simulateChannelRoute(
   channelId: string,
   routingConfig: RoutingConfig | null,
 ): { targetSession: ReturnType<typeof getSessionByCwd>; usedDefaultRoute: boolean } {
-  const targetByChannel = routingConfig
-    ? getSessionByChannel(channelId)
+  const targetByPersona = routingConfig
+    ? getSessionByPersona(channelId)
     : undefined
 
-  let targetSession = targetByChannel
+  let targetSession = targetByPersona
   let usedDefaultRoute = false
 
   // Fixed guard: only fall through to default_route for channels NOT in routes

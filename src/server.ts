@@ -3,12 +3,14 @@
  * Slack Channel for Claude Code
  *
  * Two-way Slack ↔ Claude Code bridge via Socket Mode + MCP HTTP (StreamableHTTP).
- * Security: gate layer, outbound gate, file exfiltration guard, prompt hardening.
+ * Security: gate layer, persona posting scope, file exfiltration guard, bot token
+ * sent only to Slack-hosted file URLs.
  *
  * Multi-session routing: each Claude Code session connects to its own MCP Server
- * instance, assigned to a Slack channel via routing config. Inbound Slack messages
- * are dispatched to the session whose channel matches; outbound tool calls are
- * scoped to channels that session has received messages from.
+ * instance and is matched to a persona by the real path of its roots working
+ * directory. Inbound Slack messages are dispatched to the session whose channel
+ * matches; outbound tool calls post as the session's persona and are scoped to
+ * that persona's configured channels.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -34,14 +36,23 @@ import {
   defaultAccess,
   pruneExpired,
   assertSendable as libAssertSendable,
-  assertOutboundAllowed as libAssertOutboundAllowed,
   gate as libGate,
   hasGetStreamKey,
   type Access,
   type GateResult,
 } from './lib.ts'
-import { loadConfig, expandTilde, type PersonaConfig, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
-import { personaInstanceId } from './persona-identity.ts'
+import {
+  loadConfig,
+  expandTilde,
+  credentialsFilesToProtect,
+  resolveRealPath,
+  DEFAULT_CONFIG_PATH,
+  type Persona,
+  type PersonaConfig,
+  type RoutingConfig,
+  MCP_SERVER_NAME,
+} from './config.ts'
+import { personaInstanceId, renderPersonaRef } from './persona-identity.ts'
 import { routesToPersonaConfig } from './route-persona-adapter.ts'
 import {
   AGENT_DIRECTOR_LIVE_STATES,
@@ -91,8 +102,9 @@ import type { Database as ArchiveDatabase } from 'bun:sqlite'
 import {
   registerSession,
   unregisterByMcpSessionId,
-  getSessionByChannel,
+  getSessionByPersona,
   getSessionByCwd,
+  matchPersonaByRootsPath,
   resolveTransportForRequest,
   registerMcpSessionId,
   createSessionServer,
@@ -151,6 +163,8 @@ export function isHttpVerbose(env: NodeJS.ProcessEnv = process.env): boolean {
 // ---------------------------------------------------------------------------
 
 const STATE_DIR = process.env['SLACK_STATE_DIR'] || join(homedir(), '.claude', 'channels', 'slack')
+/** The configuration file main() loads; the file guard also reads it (b.av2 SR-5.2). */
+const CONFIG_PATH = DEFAULT_CONFIG_PATH
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'server.pid')
@@ -199,14 +213,14 @@ export function stopAllKeepAliveTimers(): void {
 mkdirSync(STATE_DIR, { recursive: true })
 mkdirSync(INBOX_DIR, { recursive: true })
 
-const { botToken, appToken } = loadTokens()
+const serverTokens = loadTokens()
 
 // ---------------------------------------------------------------------------
 // Slack clients
 // ---------------------------------------------------------------------------
 
-const web = new WebClient(botToken)
-const socket = new SocketModeClient({ appToken })
+const web = new WebClient(serverTokens.botToken)
+const socket = new SocketModeClient({ appToken: serverTokens.appToken })
 
 let botUserId = ''
 
@@ -286,19 +300,14 @@ function getAccess(): Access {
 // Security — assertSendable (file exfiltration guard)
 // ---------------------------------------------------------------------------
 
+/**
+ * Refuses files under the state directory outside the inbox, and every
+ * persona credentials file named by the applied config or by the config file
+ * currently on disk (b.av2 SR-5.2). The protected list is built per call.
+ */
 function assertSendable(filePath: string): void {
-  libAssertSendable(filePath, resolve(STATE_DIR), resolve(INBOX_DIR))
-}
-
-// ---------------------------------------------------------------------------
-// Security — outbound gate (per-session deliveredChannels)
-//
-// Task t2.c1r.zk.qm: each session has its own deliveredChannels Set.
-// Tool handlers call this with the session's own set, not a global one.
-// ---------------------------------------------------------------------------
-
-function assertOutboundAllowed(chatId: string, deliveredChannels: Set<string>): void {
-  libAssertOutboundAllowed(chatId, getAccess(), deliveredChannels)
+  const protectedPaths = credentialsFilesToProtect(personaConfig?.personas ?? [], CONFIG_PATH)
+  libAssertSendable(filePath, resolve(STATE_DIR), resolve(INBOX_DIR), protectedPaths)
 }
 
 // ---------------------------------------------------------------------------
@@ -322,12 +331,13 @@ async function gate(event: unknown): Promise<GateResult> {
 // Resolve user display name
 // ---------------------------------------------------------------------------
 
+// One cache for every persona: the server serves one workspace (b.av2 SR-11).
 const userNameCache = new Map<string, string>()
 
-async function resolveUserName(userId: string): Promise<string> {
+async function lookupUserName(client: WebClient, userId: string): Promise<string> {
   if (userNameCache.has(userId)) return userNameCache.get(userId)!
   try {
-    const res = await web.users.info({ user: userId })
+    const res = await client.users.info({ user: userId })
     const name =
       res.user?.profile?.display_name ||
       res.user?.profile?.real_name ||
@@ -340,18 +350,32 @@ async function resolveUserName(userId: string): Promise<string> {
   }
 }
 
+/** Display name for inbound dispatch, looked up on the module-scope client. */
+function resolveUserName(userId: string): Promise<string> {
+  return lookupUserName(web, userId)
+}
+
+/**
+ * Display name for a persona's tool call, looked up on the persona's client;
+ * the user ID itself when the persona has no client.
+ */
+function resolvePersonaUserName(personaKey: string, userId: string): Promise<string> {
+  const client = clientFor(personaKey)
+  return client ? lookupUserName(client, userId) : Promise.resolve(userId)
+}
+
 // ---------------------------------------------------------------------------
-// Tool dependencies shared by all session servers
+// Tool dependencies shared by all session servers. Each tool call reads the
+// persona and its client through these at call time (b.av2 SR-5.1).
 // ---------------------------------------------------------------------------
 
 const sessionToolDeps: SessionToolDeps = {
-  assertOutboundAllowed,
   assertSendable,
   getAccess,
-  web,
-  botToken,
+  getPersona: getAppliedPersona,
+  clientFor,
   inboxDir: INBOX_DIR,
-  resolveUserName,
+  resolveUserName: resolvePersonaUserName,
   consumeAck,
   serverPort: 0, // updated to actual port in main() before Bun.serve
 }
@@ -360,24 +384,41 @@ const sessionToolDeps: SessionToolDeps = {
 // Pending session factory
 //
 // Creates a Transport + Server pair for an init request before the session's
-// route is known. The session is held in the pending map until roots/list
-// resolves the CWD to a route.
+// persona is known. The session is held in the pending map until roots/list
+// matches its working directory to a persona.
 // ---------------------------------------------------------------------------
+
+/**
+ * A registered session for persona `key` closed: log it and schedule a
+ * restart of that persona in its working directory. `via` qualifies the log
+ * line (e.g. ` (SSE abort)`).
+ */
+function restartDisconnectedPersona(key: string, via: string): void {
+  const persona = getAppliedPersona(key)
+  if (!persona) {
+    console.error(`[slack] Session disconnected${via}: persona=${key} is not an applied persona`)
+    return
+  }
+  console.error(
+    `[slack] Session disconnected${via}: persona ${renderPersonaRef(persona.name, persona.key)} ` +
+    `cwd="${persona.working_directory}"`,
+  )
+  // Session-id resume is owned by agent-director (SR-1.3); launchSession
+  // relaunches the persona in its own working directory.
+  scheduleRestart(key, persona.working_directory)
+}
 
 function initPendingSession(): { pendingId: string; transport: WebStandardStreamableHTTPServerTransport } {
   const pendingId = crypto.randomUUID()
 
-  // Empty deliveredChannels set — shared by reference with SessionEntry on promotion
-  const deliveredChannels = new Set<string>()
-
-  // Stub entry for createSessionServer to close over deliveredChannels.
-  // cwd/channelId are placeholders; tools only use deliveredChannels.
+  // Stub entry the session's tool handlers close over. Its persona key stays
+  // empty (tools refuse) until roots matching promotes this same object in
+  // place with the persona key and the real-path cwd.
   const entryStub: SessionEntry = {
     cwd: '',
-    channelId: '',
+    personaKey: '',
     transport: null as unknown as WebStandardStreamableHTTPServerTransport,
     server: null as unknown as import('@modelcontextprotocol/sdk/server/index.js').Server,
-    deliveredChannels,
     connected: true,
     peerPort: 0,
   }
@@ -393,29 +434,18 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
       const pending = getPendingSession(mcpSessionId)
       if (pending) {
         removePendingSession(mcpSessionId)
-        console.error(`[slack] Session disconnected: pending (not yet routed)`)
+        console.error(`[slack] Session disconnected: pending (not yet matched to a persona)`)
         return
       }
-      const channelId = unregisterByMcpSessionId(mcpSessionId)
-      if (channelId) {
-        const cwd = routingConfig?.routes[channelId]?.cwd
-        if (cwd) {
-          console.error(`[slack] Session disconnected: channel=${channelId} cwd="${cwd}"`)
-          // Session-id resume is now owned by agent-director (SR-1.3); the
-          // sessionId arg to scheduleRestart is retained for API stability
-          // but ignored by launchSession.
-          scheduleRestart(channelId, cwd)
-        } else {
-          console.error(`[slack] Session disconnected: channel=${channelId}`)
-        }
-      }
+      const key = unregisterByMcpSessionId(mcpSessionId)
+      if (key) restartDisconnectedPersona(key, '')
     },
   })
 
   entryStub.transport = transport
   startSseKeepAlive(transport)
 
-  // Build the MCP server (closes over entryStub.deliveredChannels)
+  // Build the MCP server (its tools close over entryStub)
   const server = createSessionServer(entryStub, sessionToolDeps)
   entryStub.server = server
 
@@ -433,7 +463,7 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
 
   // Store as pending — pass entryStub so the promotion path can mutate it in
   // place, keeping tool handler closures in sync with the registry entry.
-  createPendingSession(pendingId, transport, server, deliveredChannels, entryStub)
+  createPendingSession(pendingId, transport, server, entryStub)
 
   // Wire server to transport
   server.connect(transport).catch((err) => {
@@ -448,9 +478,9 @@ function initPendingSession(): { pendingId: string; transport: WebStandardStream
 // Roots-based session identification
 //
 // Called after the MCP initialized notification. Calls roots/list on the
-// client, normalizes the CWD, and matches against the routing config.
-// On match: promotes the pending session to registered.
-// On no match or error: disconnects the session.
+// client and matches the first root's directory, by real path, to exactly one
+// applied persona (b.av2 SR-6.3). On match: promotes the pending session to
+// registered under the persona key. On no match or error: disconnects it.
 // ---------------------------------------------------------------------------
 
 /**
@@ -520,10 +550,11 @@ async function handleInitialized(
   // Extract filesystem path from file:// URI (use first root as CWD).
   // fileURLToPath handles percent-encoded characters and the triple-slash convention.
   const rawCwd = fileURLToPath(roots[0].uri)
-  const normalizedCwd = resolve(expandTilde(rawCwd))
+  const rootsPath = resolve(expandTilde(rawCwd))
+  const realCwd = resolveRealPath(rootsPath)
 
-  if (!routingConfig) {
-    console.error(`[slack] No routing config — disconnecting pending session "${pendingId}" (CWD: "${normalizedCwd}")`)
+  if (!personaConfig) {
+    console.error(`[slack] No persona config — disconnecting pending session "${pendingId}" (CWD: "${realCwd}")`)
     const pending = getPendingSession(pendingId)
     if (pending) {
       removePendingSession(pendingId)
@@ -532,13 +563,10 @@ async function handleInitialized(
     return
   }
 
-  // Find the route whose cwd matches (exact after normalization)
-  const matchedChannelId = Object.entries(routingConfig.routes).find(
-    ([, route]) => resolve(expandTilde(route.cwd)) === normalizedCwd,
-  )?.[0]
+  const persona = matchPersonaByRootsPath(rootsPath, personaConfig.personas)
 
-  if (!matchedChannelId) {
-    console.error(`[slack] Session connected with CWD "${normalizedCwd}" — no matching route`)
+  if (!persona) {
+    console.error(`[slack] Session connected with CWD "${realCwd}" — no matching persona`)
     const pending = getPendingSession(pendingId)
     if (pending) {
       removePendingSession(pendingId)
@@ -547,18 +575,20 @@ async function handleInitialized(
     return
   }
 
-  const existingSession = getSessionByCwd(normalizedCwd)
+  const ref = renderPersonaRef(persona.name, persona.key)
+  const existingSession = getSessionByPersona(persona.key)
 
-  // Promote pending → registered (removes from pendingSessionMap internally)
-  registerSession(normalizedCwd, matchedChannelId, pendingId)
+  // Promote pending → registered (removes from pendingSessionMap internally;
+  // the pending stub becomes the registered entry).
+  registerSession(realCwd, persona.key, pendingId)
 
   // Register MCP session ID for future HTTP request routing
-  registerMcpSessionId(pendingId, matchedChannelId)
+  registerMcpSessionId(pendingId, persona.key)
 
   if (existingSession) {
-    console.error(`[slack] Session replaced existing connection for CWD "${normalizedCwd}"`)
+    console.error(`[slack] Session replaced existing connection for persona ${ref}`)
   }
-  console.error(`[slack] Session connected: channel=${matchedChannelId} cwd="${normalizedCwd}"`)
+  console.error(`[slack] Session connected: persona ${ref} cwd="${realCwd}"`)
 }
 
 // ---------------------------------------------------------------------------
@@ -599,7 +629,6 @@ async function handleMessage(event: unknown): Promise<void> {
       if (isDm) {
         // -----------------------------------------------------------------------
         // Task t2.c1r.3i.gp — DM deliver: route to default_dm_session
-        // Task t2.c1r.3i.bo — Add DM channel to that session's deliveredChannels
         // -----------------------------------------------------------------------
         if (!routingConfig?.default_dm_session) {
           // No DM session configured — drop silently
@@ -617,15 +646,14 @@ async function handleMessage(event: unknown): Promise<void> {
           )
           return
         }
-
-        // Task t2.c1r.3i.bo — add DM channel ID to that session's deliveredChannels
-        targetSession.deliveredChannels.add(channelId)
       } else {
         // -----------------------------------------------------------------------
         // Task t2.c1r.zk.3d — Find the session for this channel
         // -----------------------------------------------------------------------
+        // Registry lookups take the persona key: the channel ID under the
+        // route->persona adapter (E3 Task 7 re-keys inbound dispatch).
         targetSession = routingConfig
-          ? getSessionByChannel(channelId)
+          ? getSessionByPersona(channelId)
           : undefined
 
         // If no direct match, check default_route
@@ -722,11 +750,6 @@ async function handleMessage(event: unknown): Promise<void> {
           }
           return
         }
-
-        // -----------------------------------------------------------------------
-        // Task t2.c1r.zk.qm — Add channel to session's deliveredChannels
-        // -----------------------------------------------------------------------
-        targetSession.deliveredChannels.add(channelId)
       }
 
       const access = result.access!
@@ -795,16 +818,16 @@ async function handleMessage(event: unknown): Promise<void> {
           `mcpSessionId=${mcpSessionId} — message will not reach the bot; triggering recovery`
         )
 
-        // Recovery is keyed to the OWNING channel of the session, not the
-        // inbound channel. targetSession may have been resolved via
-        // default_route (getSessionByCwd) or the DM default_dm_session path, in
-        // which case channelId is not the owner. The instance id, tmux naming,
-        // backoff, and the pending/cap guards are all keyed by the owning
-        // channelId (the persona key under the route->persona adapter), so
+        // Recovery is keyed to the session's OWNING persona, not the inbound
+        // channel. targetSession may have been resolved via default_route
+        // (getSessionByCwd) or the DM default_dm_session path, in which case
+        // channelId is not the owner. The instance id, tmux naming, backoff,
+        // and the pending/cap guards are all keyed by the owner's persona key
+        // (the owning channel ID under the route->persona adapter), so
         // scheduling under the inbound channel could spawn a duplicate
         // instance on a shared cwd and miss the owner's in-flight restart/cap
         // state. The reply below stays on the inbound channelId.
-        const ownerChannelId = targetSession.channelId
+        const ownerChannelId = targetSession.personaKey
         const alreadyRestarting = isRestartPendingOrActive(ownerChannelId)
         const autoRestartDisabled = (routingConfig?.session_restart_delay ?? 60) === 0
         const capped = backoffIsAtCap(ownerChannelId, RESTART_FAILURE_CAP)
@@ -928,6 +951,15 @@ let routingConfig: RoutingConfig | null = null
  */
 let personaConfig: PersonaConfig | null = null
 
+/**
+ * The applied persona with this key, read from the current persona config at
+ * call time; undefined when there is none. The one by-key lookup: the
+ * notifier and the MCP tools both use it.
+ */
+function getAppliedPersona(key: string): Persona | undefined {
+  return personaConfig?.personas.find((p) => p.key === key)
+}
+
 // ---------------------------------------------------------------------------
 // Persona notices (b.av2 SR-7.2)
 // ---------------------------------------------------------------------------
@@ -957,7 +989,7 @@ function clientFor(key: string): WebClient | undefined {
  * JSONL safeguard send every persona notice through it (installed in main()).
  */
 const personaNotifier = createPersonaNotifier({
-  getPersona: (key) => personaConfig?.personas.find((p) => p.key === key),
+  getPersona: getAppliedPersona,
   clientFor,
   isDryRun,
   log: (line) => console.error(line),
@@ -1249,13 +1281,14 @@ export function _buildReconnectSessionAdapter(): (key: string) => Promise<'succe
 // HTTP routing strategy (roots-based session identity):
 //
 //   POST /mcp              — init request (no Mcp-Session-Id); creates a pending
-//                            session and resolves the route via roots/list
+//                            session and matches it to a persona via roots/list
 //   GET/POST/DELETE /mcp   — subsequent requests (Mcp-Session-Id header required)
 //   *                      — 404 for all other paths
 //
 // All Claude Code sessions point to the same URL: http://<host>:<port>/mcp
-// Route assignment happens after the MCP initialized notification when the
-// server calls roots/list and matches the CWD against config.json.
+// Persona assignment happens after the MCP initialized notification when the
+// server calls roots/list and matches the CWD, by real path, to the working
+// directory of exactly one applied persona.
 // ---------------------------------------------------------------------------
 
 export async function main(): Promise<void> {
@@ -1280,7 +1313,7 @@ export async function main(): Promise<void> {
   let mcpPort: number
 
   try {
-    routingConfig = loadConfig()
+    routingConfig = loadConfig(CONFIG_PATH)
     const appliedPersonas = routesToPersonaConfig(routingConfig)
     personaConfig = appliedPersonas
     // b.av2 SR-6.2: the trust patch precedes every launch. Installed as soon as
@@ -1452,8 +1485,9 @@ export async function main(): Promise<void> {
           )
         }
 
-        // Check if a session is connected for this channel
-        const targetSession = getSessionByChannel(channel)
+        // Check if a session is connected for this channel (the persona key
+        // under the route->persona adapter; E3 Task 8 re-keys /interject)
+        const targetSession = getSessionByPersona(channel)
         if (!targetSession || !targetSession.connected) {
           return new Response(
             JSON.stringify({ error: 'No active session for this channel' }),
@@ -1512,7 +1546,7 @@ export async function main(): Promise<void> {
         // entry is non-null here (null means init request, but we have a session ID)
 
         // Propagate peer port to registered sessions for tool call PID discovery
-        if (entry !== null && 'channelId' in entry) {
+        if (entry !== null && 'personaKey' in entry) {
           const remoteAddr = server.requestIP(req) as { address: string; port: number } | null
           if (remoteAddr?.port) (entry as SessionEntry).peerPort = remoteAddr.port
         }
@@ -1530,16 +1564,8 @@ export async function main(): Promise<void> {
             // after this GET request started (the SSE stream opens before
             // roots/list completes). Also guards against double-fire if
             // onsessionclosed already ran from an explicit DELETE.
-            const channelId = unregisterByMcpSessionId(mcpSessionId)
-            if (!channelId) return
-
-            const cwd = routingConfig?.routes[channelId]?.cwd
-            if (cwd) {
-              console.error(`[slack] Session disconnected (SSE abort): channel=${channelId} cwd="${cwd}"`)
-              scheduleRestart(channelId, cwd)
-            } else {
-              console.error(`[slack] Session disconnected (SSE abort): channel=${channelId}`)
-            }
+            const key = unregisterByMcpSessionId(mcpSessionId)
+            if (key) restartDisconnectedPersona(key, ' (SSE abort)')
           })
         }
 
@@ -1547,7 +1573,7 @@ export async function main(): Promise<void> {
       }
 
       // --- Init request: no Mcp-Session-Id ---
-      // Create a pending session; route resolved after roots/list in handleInitialized()
+      // Create a pending session; persona matched after roots/list in handleInitialized()
       const { transport } = initPendingSession()
       return transport.handleRequest(req)
     },
@@ -1610,10 +1636,9 @@ export async function main(): Promise<void> {
   // and the health-check tick consult this alongside isSessionConnected so a
   // connected-but-streamless session is treated as unhealthy, not "healed".
   // Factored here so the two dep objects below stay in exact agreement.
-  // Registry lookups take the persona key: the channel ID under the
-  // route->persona adapter, until E3 Task 5 re-keys the registry.
+  // The registry is keyed by persona key.
   const hasSessionStreamAdapter = (key: string): boolean => {
-    const session = getSessionByChannel(key)
+    const session = getSessionByPersona(key)
     return session ? hasGetStreamKey(session.transport) : false
   }
 
@@ -1622,7 +1647,7 @@ export async function main(): Promise<void> {
   initRestart({
     isSessionAlive: isSessionAliveAdapter,
     isSessionConnected: (key) => {
-      const session = getSessionByChannel(key)
+      const session = getSessionByPersona(key)
       return session?.connected === true
     },
     hasSessionStream: hasSessionStreamAdapter,
@@ -1706,7 +1731,7 @@ export async function main(): Promise<void> {
     // (registry entry with connected === true). Lets the tick notice
     // alive-but-disconnected rows and route them to scheduleRestart.
     isSessionConnected: (key) => {
-      const session = getSessionByChannel(key)
+      const session = getSessionByPersona(key)
       return session?.connected === true
     },
     // b.9cj: same stream-presence probe wired into initRestart above, so the

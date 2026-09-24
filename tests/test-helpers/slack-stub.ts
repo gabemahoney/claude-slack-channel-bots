@@ -4,12 +4,18 @@
  * `makeStubSlack(opts)` returns one independent fake Slack for one persona:
  * - Web API stubs (`web`, `createWebClient`) with capture arrays for
  *   `chat.postMessage`, `chat.update`, `reactions.add`/`remove`,
- *   `conversations.open`, `auth.test` and `users.info`;
+ *   `conversations.open`, `auth.test`, `users.info`, `filesUploadV2`,
+ *   `conversations.history`, `conversations.replies` and
+ *   `conversations.info`. Each client carries the bot token it was built
+ *   with as a non-enumerable `token` (as `WebClient.token`), checked through
+ *   `hasToken`, so printing or comparing a client never shows it;
  * - Socket Mode stubs (`createSocketClient`, `socket`, `sockets`) that register
  *   handlers, deliver events in the `{ event, body, ack }` shape `server.ts`
  *   consumes, record acks, drop on demand and can be started again;
- * - per-call scripted outcomes for `auth.test`, socket `start()` and
- *   `chat.postMessage` (`script`), falling back to success when exhausted;
+ * - per-call scripted outcomes for `auth.test`, socket `start()`,
+ *   `chat.postMessage`, `filesUploadV2`, `conversations.history`,
+ *   `conversations.replies` and `conversations.info` (`script`), falling back
+ *   to success when exhausted;
  * - a record of the options every client was built with (`options`).
  *
  * `makeStubSlackFactory()` adapts per-persona stubs to the connection
@@ -210,6 +216,14 @@ export interface StubSlackScript {
   authTest: WebApiOutcome[]
   connect: ConnectOutcome[]
   post: WebApiOutcome[]
+  /** `filesUploadV2`. */
+  upload: WebApiOutcome[]
+  /** `conversations.history`; an `ok` `result` can set `messages`. */
+  history: WebApiOutcome[]
+  /** `conversations.replies`; an `ok` `result` can set `messages`. */
+  replies: WebApiOutcome[]
+  /** `conversations.info`; an `ok` `result` can set `channel`. */
+  info: WebApiOutcome[]
 }
 
 export interface StubSlackOptions {
@@ -219,6 +233,19 @@ export interface StubSlackOptions {
   connect?: readonly ConnectOutcome[]
   /** Initial `chat.postMessage` outcomes. */
   post?: readonly WebApiOutcome[]
+  /** Initial `filesUploadV2` outcomes. */
+  upload?: readonly WebApiOutcome[]
+  /** Initial `conversations.history` outcomes. */
+  history?: readonly WebApiOutcome[]
+  /** Initial `conversations.replies` outcomes. */
+  replies?: readonly WebApiOutcome[]
+  /** Initial `conversations.info` outcomes. */
+  info?: readonly WebApiOutcome[]
+  /**
+   * Bot token of the ready `web` client. Default: a sentinel-bearing
+   * `fakeToken(BOT_TOKEN_PREFIX, …)` with a random suffix, distinct per stub.
+   */
+  token?: string
   /** Marker placed in every scripted failure where a real error can hold secrets. */
   leakMarker?: string
   /** Bot user ID `auth.test` returns. Default: a random `U…` ID, distinct per stub. */
@@ -235,11 +262,25 @@ export interface StubSlackOptions {
 
 /** The Web API surface the stub imitates, typed as the real `WebClient` methods. */
 export interface StubWebClient {
+  /**
+   * The bot token the client was built with, as `WebClient.token`. Not
+   * enumerable, so printing or comparing a client never shows it; assert with
+   * `hasToken`.
+   */
+  readonly token?: string
+  /** Whether the client carries exactly `expected`; assert on this so a failure prints no token. */
+  hasToken(expected: string): boolean
   auth: { test: WebClient['auth']['test'] }
   chat: { postMessage: WebClient['chat']['postMessage']; update: WebClient['chat']['update'] }
   reactions: { add: WebClient['reactions']['add']; remove: WebClient['reactions']['remove'] }
-  conversations: { open: WebClient['conversations']['open'] }
+  conversations: {
+    open: WebClient['conversations']['open']
+    history: WebClient['conversations']['history']
+    replies: WebClient['conversations']['replies']
+    info: WebClient['conversations']['info']
+  }
   users: { info: WebClient['users']['info'] }
+  filesUploadV2: WebClient['filesUploadV2']
 }
 
 /** Ack function handed to socket event listeners. Records into `acks`. */
@@ -342,6 +383,10 @@ export interface StubSlackCalls {
   reactionsRemove: Parameters<WebClient['reactions']['remove']>[0][]
   conversationsOpen: Parameters<WebClient['conversations']['open']>[0][]
   usersInfo: Parameters<WebClient['users']['info']>[0][]
+  filesUploadV2: Parameters<WebClient['filesUploadV2']>[0][]
+  conversationsHistory: Parameters<WebClient['conversations']['history']>[0][]
+  conversationsReplies: Parameters<WebClient['conversations']['replies']>[0][]
+  conversationsInfo: Parameters<WebClient['conversations']['info']>[0][]
 }
 
 export interface StubSlack {
@@ -353,9 +398,15 @@ export interface StubSlack {
   readonly calls: StubSlackCalls
   /** Options every client was built with, in build order. */
   readonly options: { web: StubWebClientBuild[]; socket: SocketModeOptions[] }
-  /** A Web API client for direct use; not in `options.web`. Behaves as if built with default options. */
+  /**
+   * A Web API client for direct use; not in `options.web`. Behaves as if built
+   * with default options and the `token` option (or its default).
+   */
   readonly web: StubWebClient
-  /** Build a Web API client, as `new WebClient(token, options)`. Recorded in `options.web`. */
+  /**
+   * Build a Web API client, as `new WebClient(token, options)`. Recorded in
+   * `options.web`; the client's `token` is the token received.
+   */
   createWebClient(token?: string, options?: WebClientOptions): StubWebClient
   /**
    * Build a socket client, as `new SocketModeClient(options)`. Recorded in
@@ -520,6 +571,10 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
     authTest: [...(opts.authTest ?? [])],
     connect: [...(opts.connect ?? [])],
     post: [...(opts.post ?? [])],
+    upload: [...(opts.upload ?? [])],
+    history: [...(opts.history ?? [])],
+    replies: [...(opts.replies ?? [])],
+    info: [...(opts.info ?? [])],
   }
   const calls: StubSlackCalls = {
     authTest: [],
@@ -529,15 +584,20 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
     reactionsRemove: [],
     conversationsOpen: [],
     usersInfo: [],
+    filesUploadV2: [],
+    conversationsHistory: [],
+    conversationsReplies: [],
+    conversationsInfo: [],
   }
   const options: StubSlack['options'] = { web: [], socket: [] }
   const sockets: StubSocketClient[] = []
   let tsSeq = 0
   let dmSeq = 0
+  let fileSeq = 0
 
   const nextTs = (): string => `1700000000.${String(++tsSeq).padStart(6, '0')}`
 
-  function buildWebClient(clientOptions: WebClientOptions | undefined): StubWebClient {
+  function buildWebClient(token: string, clientOptions: WebClientOptions | undefined): StubWebClient {
     const ctx = (method: string): CallContext => ({
       method,
       tokenPrefix: BOT_TOKEN_PREFIX,
@@ -545,7 +605,16 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
       timeoutMs: clientOptions?.timeout,
       marker,
     })
-    return {
+    /** The `ok` result a scripted outcome merges over the default, or none. */
+    const okResult = (outcome: WebApiOutcome | undefined): Readonly<Record<string, unknown>> =>
+      outcome?.kind === 'ok' ? (outcome.result ?? {}) : {}
+    /** A message-list call (`history`, `replies`): default an empty list. */
+    const messageList = (outcome: WebApiOutcome | undefined, method: string) =>
+      runWebApiCall(outcome, ctx(method), () =>
+        mergeDroppingUndefined({ ok: true, messages: [], has_more: false }, okResult(outcome)),
+      )
+    const client: StubWebClient = {
+      hasToken: (expected: string) => expected === token,
       auth: {
         test: (args) => {
           calls.authTest.push(args)
@@ -605,6 +674,33 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
           calls.conversationsOpen.push(args)
           return Promise.resolve({ ok: true, channel: { id: `D0STUB${String(++dmSeq).padStart(4, '0')}` } })
         },
+        history: (args) => {
+          calls.conversationsHistory.push(args)
+          return messageList(script.history.shift(), 'conversations.history')
+        },
+        replies: (args) => {
+          calls.conversationsReplies.push(args)
+          return messageList(script.replies.shift(), 'conversations.replies')
+        },
+        info: (args) => {
+          calls.conversationsInfo.push(args)
+          const outcome = script.info.shift()
+          return runWebApiCall(outcome, ctx('conversations.info'), () =>
+            mergeDroppingUndefined(
+              {
+                ok: true,
+                channel: {
+                  id: args.channel,
+                  name: `stub-${args.channel.toLowerCase()}`,
+                  is_channel: true,
+                  is_im: false,
+                  is_archived: false,
+                },
+              },
+              okResult(outcome),
+            ),
+          )
+        },
       },
       users: {
         info: (args) => {
@@ -622,7 +718,18 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
           })
         },
       },
+      filesUploadV2: (args) => {
+        calls.filesUploadV2.push(args)
+        const outcome = script.upload.shift()
+        return runWebApiCall(outcome, ctx('files.completeUploadExternal'), () => {
+          const id = `F0STUB${String(++fileSeq).padStart(4, '0')}`
+          return mergeDroppingUndefined({ ok: true, files: [{ ok: true, files: [{ id }] }] }, okResult(outcome))
+        })
+      },
     }
+    // Not enumerable, as E2's build records keep `token`: a printed or compared client never shows it.
+    Object.defineProperty(client, 'token', { value: token, enumerable: false })
+    return client
   }
 
   function buildSocketClient(socketOptions: SocketModeOptions): StubSocketClient {
@@ -843,10 +950,10 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
     script,
     calls,
     options,
-    web: buildWebClient(undefined),
+    web: buildWebClient(opts.token ?? fakeToken(BOT_TOKEN_PREFIX, `stub-web-${randomIdTail()}`), undefined),
     createWebClient(token = fakeToken(BOT_TOKEN_PREFIX, 'stub'), clientOptions) {
       options.web.push({ token, options: clientOptions })
-      return buildWebClient(clientOptions)
+      return buildWebClient(token, clientOptions)
     },
     createSocketClient(socketOptions = { appToken: fakeToken(APP_TOKEN_PREFIX, 'stub') }) {
       if (!socketOptions.appToken) {

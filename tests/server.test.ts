@@ -1,11 +1,10 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative, resolve } from 'node:path'
 import {
   gate,
   assertSendable,
-  assertOutboundAllowed,
   chunkText,
   sanitizeFilename,
   defaultAccess,
@@ -44,6 +43,7 @@ import type { FindMissingParams, SendKeysParams, StatusParams } from 'agent-dire
 import type { PersonaConfig } from '../src/config.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
 import { makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
+import { assertNoLeak, writeCredentialsFile } from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -390,64 +390,116 @@ describe('assertSendable', () => {
   const inboxDir = '/home/user/.claude/channels/slack/inbox'
 
   test('blocks .env in state dir', () => {
-    expect(() => assertSendable(`${stateDir}/.env`, stateDir, inboxDir)).toThrow('Blocked')
+    expect(() => assertSendable(`${stateDir}/.env`, stateDir, inboxDir, [])).toThrow('Blocked')
   })
 
   test('blocks access.json in state dir', () => {
-    expect(() => assertSendable(`${stateDir}/access.json`, stateDir, inboxDir)).toThrow('Blocked')
+    expect(() => assertSendable(`${stateDir}/access.json`, stateDir, inboxDir, [])).toThrow('Blocked')
   })
 
   test('blocks nested files in state dir', () => {
-    expect(() => assertSendable(`${stateDir}/subdir/secret`, stateDir, inboxDir)).toThrow('Blocked')
+    expect(() => assertSendable(`${stateDir}/subdir/secret`, stateDir, inboxDir, [])).toThrow('Blocked')
   })
 
   test('allows files in inbox/', () => {
-    expect(() => assertSendable(`${inboxDir}/photo.png`, stateDir, inboxDir)).not.toThrow()
+    expect(() => assertSendable(`${inboxDir}/photo.png`, stateDir, inboxDir, [])).not.toThrow()
   })
 
   test('allows files outside state dir entirely', () => {
-    expect(() => assertSendable('/tmp/output.txt', stateDir, inboxDir)).not.toThrow()
+    expect(() => assertSendable('/tmp/output.txt', stateDir, inboxDir, [])).not.toThrow()
   })
 
   test('allows home directory files', () => {
-    expect(() => assertSendable('/home/user/project/file.ts', stateDir, inboxDir)).not.toThrow()
+    expect(() => assertSendable('/home/user/project/file.ts', stateDir, inboxDir, [])).not.toThrow()
   })
 
   test('blocks traversal into state dir via ..', () => {
     // Path that traverses out of inbox/ back into the protected state dir
-    expect(() => assertSendable(`${inboxDir}/../access.json`, stateDir, inboxDir)).toThrow()
+    expect(() => assertSendable(`${inboxDir}/../access.json`, stateDir, inboxDir, [])).toThrow()
   })
 })
 
 // ---------------------------------------------------------------------------
-// assertOutboundAllowed()
+// assertSendable(): persona credentials files (b.av2 SR-5.2)
 // ---------------------------------------------------------------------------
 
-describe('assertOutboundAllowed', () => {
-  test('allows opted-in channels', () => {
-    const access = makeAccess({
-      channels: { C_OPT: { requireMention: false, allowFrom: [] } },
-    })
-    expect(() => assertOutboundAllowed('C_OPT', access, new Set())).not.toThrow()
+describe('assertSendable: credentials files', () => {
+  // Real files under a temp dir. The dir is realpath'd because the OS temp
+  // directory may itself be a symlink. Layout:
+  //   <dir>/a/credentials.json   the listed credentials file
+  //   <dir>/a/notes.txt          an unlisted sibling
+  //   <dir>/a/b/                 a directory below it
+  //   <dir>/alias.json         -> a/credentials.json   (file symlink)
+  //   <dir>/linkdir            -> a                    (parent-directory symlink)
+  let dir: string
+  let credPath: string
+  let stateDir: string
+  let inboxDir: string
+
+  beforeEach(() => {
+    dir = realpathSync(mkdtempSync(join(tmpdir(), 'cscb-sendable-')))
+    credPath = writeCredentialsFile(dir, 'a/credentials.json')
+    writeFileSync(join(dir, 'a', 'notes.txt'), 'not a credentials file')
+    mkdirSync(join(dir, 'a', 'b'))
+    symlinkSync(credPath, join(dir, 'alias.json'))
+    symlinkSync(join(dir, 'a'), join(dir, 'linkdir'))
+    stateDir = join(dir, 'state')
+    inboxDir = join(stateDir, 'inbox')
   })
 
-  test('allows delivered channels', () => {
-    const access = makeAccess()
-    const delivered = new Set(['D_DELIVERED'])
-    expect(() => assertOutboundAllowed('D_DELIVERED', access, delivered)).not.toThrow()
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
   })
 
-  test('blocks unknown channels', () => {
-    const access = makeAccess()
-    expect(() => assertOutboundAllowed('C_RANDO', access, new Set())).toThrow('Outbound gate')
+  /** The error `assertSendable` throws, or undefined when it allows the file. */
+  function refusal(filePath: string, protectedPaths: readonly string[]): Error | undefined {
+    try {
+      assertSendable(filePath, stateDir, inboxDir, protectedPaths)
+      return undefined
+    } catch (err) {
+      return err as Error
+    }
+  }
+
+  test.each([
+    ['its exact path', () => credPath],
+    ['a symlink to it', () => join(dir, 'alias.json')],
+    // `..` is collapsed lexically before the real path is taken (as the upload
+    // and the loader do), so this one also crosses the symlinked parent to
+    // differ lexically from the listed path.
+    ['a path with .. segments', () => `${dir}/a/b/../../linkdir/credentials.json`],
+    ['a symlinked parent directory', () => join(dir, 'linkdir', 'credentials.json')],
+    ['a relative path', () => relative(process.cwd(), credPath)],
+  ])('refuses the credentials file through %s', (_label, sendPath) => {
+    const err = refusal(sendPath(), [credPath])
+    expect(err?.message).toContain('persona credentials file')
+    expect(err?.message).toContain(resolve(sendPath()))
+    assertNoLeak(err)
   })
 
-  test('blocks channels not in either list', () => {
-    const access = makeAccess({
-      channels: { C_OTHER: { requireMention: false, allowFrom: [] } },
-    })
-    const delivered = new Set(['D_DIFFERENT'])
-    expect(() => assertOutboundAllowed('C_ATTACKER', access, delivered)).toThrow('Outbound gate')
+  test('allows an unlisted sibling in the same directory', () => {
+    expect(refusal(join(dir, 'a', 'notes.txt'), [credPath])).toBeUndefined()
+  })
+
+  test('refuses a listed path that does not exist, compared lexically', () => {
+    const missing = join(dir, 'gone', 'credentials.json')
+    expect(refusal(join(dir, 'gone', '.', 'credentials.json'), [missing])?.message)
+      .toContain('persona credentials file')
+    expect(refusal(join(dir, 'gone', 'other.json'), [missing])).toBeUndefined()
+  })
+
+  test('refuses each entry of a two-entry list', () => {
+    const second = writeCredentialsFile(dir, 'second/credentials.json')
+    const list = [credPath, second]
+    expect(refusal(credPath, list)?.message).toContain(credPath)
+    expect(refusal(second, list)?.message).toContain(second)
+  })
+
+  test('the state-dir rule is checked first', () => {
+    const inState = writeCredentialsFile(dir, 'state/credentials.json')
+    const err = refusal(inState, [inState])
+    expect(err?.message).toContain('cannot send files from state directory')
+    expect(err?.message).not.toContain('persona credentials file')
   })
 })
 

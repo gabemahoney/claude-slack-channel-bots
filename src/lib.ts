@@ -9,6 +9,7 @@
  */
 
 import { resolve } from 'path'
+import { resolveRealPath } from './config.ts'
 
 // ---------------------------------------------------------------------------
 // Constants (re-exported so server.ts and tests share the same values)
@@ -100,10 +101,26 @@ export function generateCode(): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Throws if `filePath` resolves to inside `stateDir` but outside `inboxDir`.
- * Both directory paths should be absolute (already resolved).
+ * Throws if `filePath` must not be sent (b.av2 SR-5.2):
+ *
+ * - it resolves to inside `stateDir` but outside `inboxDir` (a lexical prefix
+ *   test; both directory paths should be absolute, already resolved); or
+ * - its real path equals the real path of any of `protectedPaths`, the persona
+ *   credentials files named by the applied or current configuration (see
+ *   `credentialsFilesToProtect` in `config.ts`). Both sides are compared through
+ *   `resolveRealPath`, so a symlink to a credentials file or a non-normalised
+ *   path to one is refused too. `protectedPaths` must be tilde-expanded and is
+ *   required, so a caller cannot silently skip the credentials rule (pass an
+ *   empty list only when there really is nothing to protect).
+ *
+ * Never opens or reads the file; the error names only the blocked path.
  */
-export function assertSendable(filePath: string, stateDir: string, inboxDir: string): void {
+export function assertSendable(
+  filePath: string,
+  stateDir: string,
+  inboxDir: string,
+  protectedPaths: readonly string[],
+): void {
   const resolved = resolve(filePath)
 
   if (resolved.startsWith(stateDir) && !resolved.startsWith(inboxDir)) {
@@ -112,26 +129,12 @@ export function assertSendable(filePath: string, stateDir: string, inboxDir: str
         'Only files in inbox/ are sendable.',
     )
   }
-}
 
-// ---------------------------------------------------------------------------
-// Security — outbound gate
-// ---------------------------------------------------------------------------
-
-/**
- * Throws if `chatId` is neither an opted-in channel nor a previously-delivered
- * channel (DM that passed the inbound gate this session).
- */
-export function assertOutboundAllowed(
-  chatId: string,
-  access: Access,
-  deliveredChannels: ReadonlySet<string>,
-): void {
-  if (access.channels[chatId]) return
-  if (deliveredChannels.has(chatId)) return
-  throw new Error(
-    `Outbound gate: channel ${chatId} is not in the allowlist or opted-in channels.`,
-  )
+  if (protectedPaths.length === 0) return
+  const real = resolveRealPath(resolved)
+  if (protectedPaths.some((p) => resolveRealPath(p) === real)) {
+    throw new Error(`Blocked: cannot send ${resolved} — it is a persona credentials file.`)
+  }
 }
 
 // ---------------------------------------------------------------------------

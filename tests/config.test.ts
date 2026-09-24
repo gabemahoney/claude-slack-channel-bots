@@ -11,7 +11,7 @@ import {
   symlinkSync,
 } from 'fs'
 import { tmpdir } from 'os'
-import { join, resolve } from 'path'
+import { join, relative, resolve } from 'path'
 import { homedir } from 'os'
 import {
   applyDefaults,
@@ -23,6 +23,7 @@ import {
   prePersonaConversionMessage,
   resolvePersonaConfig,
   resolveRealPath,
+  credentialsFilesToProtect,
   type RouteEntry,
   type RoutingConfigInput,
   type RoutingConfig,
@@ -2118,5 +2119,97 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       expect(message).not.toContain(PLACEHOLDER)
       expect(message).not.toContain('JSON Parse error')
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// credentialsFilesToProtect (b.av2 SR-5.2)
+// ---------------------------------------------------------------------------
+
+describe('credentialsFilesToProtect (b.av2 SR-5.2)', () => {
+  let dir: string
+  let home: string
+  let lines: string[]
+  const originalConsole = { error: console.error, warn: console.warn, log: console.log }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'protect-config-'))
+    home = mkdtempSync(join(tmpdir(), 'protect-home-'))
+    lines = []
+    const capture = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+    console.error = capture
+    console.warn = capture
+    console.log = capture
+  })
+
+  afterEach(() => {
+    Object.assign(console, originalConsole)
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  /** The applied personas: one default persona whose credentials file exists under `dir`. */
+  function appliedPersonas() {
+    const personas = makePersonaConfig({}, dir).personas
+    writeCredentialsFile(dir, relative(dir, personas[0].credentials_file))
+    return personas
+  }
+
+  /** Build the list; every result and captured line must pass `assertNoLeak`. */
+  function build(applied: ReturnType<typeof appliedPersonas>, configPath: string): string[] {
+    const list = credentialsFilesToProtect(applied, configPath, home)
+    assertNoLeak({ list, lines })
+    return list
+  }
+
+  /** A current config file (file form) naming `credentials_file` for its one persona. */
+  const writeCurrent = (credentialsFile: string, persona: Partial<PersonaInput> = {}) =>
+    writeConfigFile(dir, makePersonaConfigInput({
+      personas: [makePersona({ name: 'current_bot', credentials_file: credentialsFile, ...persona }, dir)],
+    }, dir))
+
+  test('holds the applied personas\' paths and the paths the current config file names', () => {
+    const applied = appliedPersonas()
+    const current = writeCredentialsFile(dir, 'current/credentials.json')
+    expect(build(applied, writeCurrent(current))).toEqual([applied[0].credentials_file, current])
+  })
+
+  test('a path named only by the current config file is listed with no applied personas', () => {
+    const current = writeCredentialsFile(dir, 'current/credentials.json')
+    expect(build([], writeCurrent(current))).toEqual([current])
+  })
+
+  test('~ in the config path and in credentials_file expands under the injected home, never the OS home', () => {
+    writeConfigFile(home, makePersonaConfigInput({
+      personas: [makePersona({ credentials_file: '~/creds/credentials.json' }, dir)],
+    }, dir))
+    const list = build([], '~/config.json')
+    expect(list).toEqual([join(home, 'creds', 'credentials.json')])
+    expect(list).not.toContain(join(homedir(), 'creds', 'credentials.json'))
+  })
+
+  test('a current file that fails persona validation still contributes its credentials_file', () => {
+    const current = join(dir, 'current', 'credentials.json')
+    const path = writeCurrent(current, { working_directory: undefined })
+    expect(() => loadPersonaConfig(path, home)).toThrow()
+    expect(build([], path)).toEqual([current])
+  })
+
+  test.each([
+    ['a missing file', () => join(dir, 'absent.json')],
+    // A directory: reading it fails on every platform and as root.
+    ['an unreadable file', () => { mkdirSync(join(dir, 'unreadable.json')); return join(dir, 'unreadable.json') }],
+    ['invalid JSON', () => {
+      const path = join(dir, 'config.json')
+      writeFileSync(path, `{ "personas": [ { "credentials_file": "${fakeToken(BOT_TOKEN_PREFIX)}" `, 'utf-8')
+      return path
+    }],
+    ['a route-shaped file', () => writeConfigFile(dir, { routes: { C0TEST001: { cwd: join(dir, 'work') } } })],
+    ['a non-array personas', () => writeConfigFile(dir, { personas: { credentials_file: join(dir, 'x.json') } })],
+    ['a non-string credentials_file', () => writeConfigFile(dir, { personas: [{ name: 'x', credentials_file: 42 }] })],
+    ['a JSON null', () => writeConfigFile(dir, null)],
+  ])('%s yields only the applied personas\' paths, without throwing', (_label, setup) => {
+    const applied = appliedPersonas()
+    expect(build(applied, setup())).toEqual([applied[0].credentials_file])
   })
 })

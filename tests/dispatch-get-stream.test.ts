@@ -29,7 +29,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { _resetRegistry, registerSession, getSessionByChannel } from '../src/registry.ts'
+import { _resetRegistry, registerSession, getSessionByPersona } from '../src/registry.ts'
 import { hasGetStreamKey } from '../src/lib.ts'
 import {
   initRestart,
@@ -125,7 +125,8 @@ type ReplyVariant = 'restarting' | 'auto-disabled' | 'capped'
  *
  * Mirrors the b.9cj rewrite faithfully, keeping the two channel identities the
  * source distinguishes:
- *   - ownerChannelId = targetSession.channelId — everything recovery-keyed
+ *   - ownerChannelId = targetSession.personaKey (the owning channel ID under the
+ *     route->persona adapter) — everything recovery-keyed
  *     (isRestartPendingOrActive, backoffIsAtCap, scheduleRestart) uses THIS.
  *   - inboundChannelId — the channel the message arrived on; the reply posts
  *     HERE. When a session is resolved via default_route/DM these differ, and
@@ -348,29 +349,31 @@ describe('dispatch-site _GET_stream branch (b.sjy + b.9cj)', () => {
 // Reproduction (ticket step 1-2): register a session normally so
 // connected === true, then delete the '_GET_stream' entry from the transport's
 // _streamMapping WITHOUT closing the transport and WITHOUT a DELETE — connected
-// stays true. hasSessionStreamAdapter (getSessionByChannel → hasGetStreamKey,
+// stays true. hasSessionStreamAdapter (getSessionByPersona → hasGetStreamKey,
 // false when no session) is the src/server.ts probe wired into both dep
 // objects; this replicates its two lines over the real registry so the seam is
 // exercised end-to-end, not stubbed.
 // ---------------------------------------------------------------------------
 
 describe('b.9cj hasSessionStreamAdapter over the real registry', () => {
-  // The exact two-line adapter from src/server.ts main().
-  const hasSessionStreamAdapter = (channelId: string): boolean => {
-    const session = getSessionByChannel(channelId)
+  // The exact two-line adapter from src/server.ts main(). The registry is
+  // keyed by persona key.
+  const hasSessionStreamAdapter = (key: string): boolean => {
+    const session = getSessionByPersona(key)
     return session ? hasGetStreamKey(session.transport) : false
   }
 
   test('connected stays true but the adapter reports streamless after the SDK drops _GET_stream', () => {
-    const channelId = 'C_STREAMLESS'
+    // Persona key: the channel ID, as the route->persona adapter keys it.
+    const key = 'C_STREAMLESS'
     const transport = makeTransport(true) // registered WITH a _GET_stream entry
     const { server } = makeServer()
 
-    const entry = registerSession('/tmp/streamless-session', channelId, transport as any, server as any)
+    const entry = registerSession('/tmp/streamless-session', key, transport as any, server as any)
 
     // Freshly registered: connected and stream present.
     expect(entry.connected).toBe(true)
-    expect(hasSessionStreamAdapter(channelId)).toBe(true)
+    expect(hasSessionStreamAdapter(key)).toBe(true)
 
     // The SDK drops the standalone GET stream WITHOUT closing the transport and
     // WITHOUT a DELETE — connected must remain true (the steady state the bug
@@ -378,7 +381,7 @@ describe('b.9cj hasSessionStreamAdapter over the real registry', () => {
     ;(transport._streamMapping as Map<string, unknown>).delete('_GET_stream')
 
     expect(entry.connected).toBe(true)                 // unchanged — still "connected"
-    expect(hasSessionStreamAdapter(channelId)).toBe(false)  // but no longer deliverable
+    expect(hasSessionStreamAdapter(key)).toBe(false)  // but no longer deliverable
   })
 
   test('adapter returns false when there is no session at all', () => {

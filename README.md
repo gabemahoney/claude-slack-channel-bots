@@ -1,6 +1,6 @@
 # Claude Slack Channel Bots
 
-A single HTTP MCP server that holds one Slack Socket Mode connection and routes messages to multiple independent Claude Code sessions, each scoped to a different repo and reachable via its own Slack channel. Inbound messages are dispatched to whichever session owns the channel they arrived on; outbound tool calls are restricted to channels that session has previously received a message from.
+A single HTTP MCP server that holds one Slack Socket Mode connection and routes messages to multiple independent Claude Code sessions, each scoped to a different repo and reachable via its own Slack channel. Inbound messages are dispatched to whichever session owns the channel they arrived on; each bot's tool calls may post only to the channel(s) it is configured for.
 
 ---
 
@@ -427,11 +427,13 @@ Each MCP endpoint exposes the following tools to the connected Claude Code sessi
 
 | Tool | Description |
 |---|---|
-| `reply` | Send a message to a Slack channel or DM. Auto-chunks long text according to `textChunkLimit` and `chunkMode` in `access.json`. Supports file attachments. |
+| `reply` | Send a message to a Slack channel. Auto-chunks long text according to `textChunkLimit` and `chunkMode` in `access.json`. Supports file attachments. |
 | `react` | Add an emoji reaction to a Slack message. |
 | `edit_message` | Edit a previously sent message (bot's own messages only). |
 | `fetch_messages` | Fetch message history from a channel or thread. Returns oldest-first. |
-| `download_attachment` | Download attachments from a Slack message. Saves files to `STATE_DIR/inbox/`. Returns local file paths. |
+| `download_attachment` | Download attachments from a Slack message. Saves files to `STATE_DIR/inbox/`. Returns local file paths. Only files hosted by Slack are downloaded; external files are refused. |
+
+A tool call that targets a channel the bot is not configured for is refused with a tool error, and nothing is posted.
 
 ---
 
@@ -727,7 +729,7 @@ If the tag or any of those attributes no longer appears, the guard is dark or mi
 `start` exits with `missing prerequisite: config.json not found at <path>`. Run `bun postinstall.ts` to create a skeleton, or create the file manually. Verify `SLACK_STATE_DIR` matches the directory you populated.
 
 **config.json CWD mismatch**
-If a Claude Code session connects but immediately disconnects, the session's actual CWD does not match any `cwd` in `config.json`. Confirm the session's working directory matches the entry exactly (after tilde expansion). Duplicate CWDs across multiple routes are rejected at startup.
+If a Claude Code session connects but immediately disconnects, the session's actual CWD does not match any `cwd` in `config.json`. The session's working directory is compared with each configured `cwd` by real path (after tilde expansion, with symlinks resolved), so a symlinked path to the same directory also matches. If a second session connects from the same directory, it replaces the first. Duplicate CWDs across multiple routes are rejected at startup.
 
 **Bot not receiving messages in a new channel**
 After inviting the bot to a channel, Slack may not deliver messages until the bot is @mentioned for the first time. This is a Slack Socket Mode behavior — the first @mention activates event delivery for that channel. After that, all messages flow normally regardless of `requireMention` settings.

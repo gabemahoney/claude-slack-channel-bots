@@ -1,17 +1,34 @@
 /**
- * registry.test.ts — Tests for session registry and routing (Tasks t2.c1r.zk.6r, t2.c1r.zk.qm, t2.c1r.zk.3d)
+ * registry.test.ts — Persona-keyed MCP session registry and persona-scoped
+ * Slack tools (b.av2 SR-6.3, SR-5.1, SR-5.2 wiring, SR-12 instructions part).
+ *
+ * Tools are driven through the real MCP server (`createSessionServer`) with an
+ * in-memory MCP client. Each persona has its own `makeStubSlack` client, so a
+ * case can show which persona's client a call landed on. Every path is under
+ * the test's own `mkdtempSync` directory; no token literal appears here.
+ * The global `fetch` is stubbed for every test (it throws unless a test sets
+ * `h.fetchHandler`), so no test reaches the network, and every tool result
+ * and log line is leak-checked in `afterEach`.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { homedir } from 'os'
-import type { RouteEntry, RoutingConfig } from '../src/config.ts'
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import type { WebClient } from '@slack/web-api'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
+import type { Persona } from '../src/config.ts'
+import { assertSendable } from '../src/lib.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
 import {
   registerSession,
   unregisterSession,
+  unregisterByMcpSessionId,
   getSessionByCwd,
-  getSessionByChannel,
+  getSessionByPersona,
   registerMcpSessionId,
   resolveTransportForRequest,
   createPendingSession,
@@ -19,898 +36,1046 @@ import {
   removePendingSession,
   getAllPendingSessions,
   createSessionServer,
+  matchPersonaByRootsPath,
+  checkPersonaTarget,
+  isSlackHostedFileUrl,
   _resetRegistry,
   type SessionEntry,
-  type PendingSessionEntry,
   type SessionToolDeps,
 } from '../src/registry.ts'
-import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { trackAck, consumeAck, _resetAckTracker } from '../src/ack-tracker.ts'
+import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeStubSlack, type StubSlack } from './test-helpers/slack-stub.ts'
+import {
+  BOT_TOKEN_PREFIX,
+  LEAK_SENTINEL,
+  assertNoLeak,
+  fakeToken,
+  writeCredentialsFile,
+  writtenFile,
+} from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
-// Test helpers
+// Fixtures
 // ---------------------------------------------------------------------------
-
-/** Creates a minimal RouteEntry fixture. */
-function makeRoute(cwd = '/tmp'): RouteEntry {
-  return { cwd }
-}
-
-/** Creates a RoutingConfig with two test routes. */
-function makeRoutingConfig(opts: {
-  channelA?: string
-  cwdA?: string
-  channelB?: string
-  cwdB?: string
-  default_route?: string
-} = {}): RoutingConfig {
-  const channelA = opts.channelA ?? 'C_ALPHA'
-  const cwdA     = opts.cwdA     ?? '/tmp/alpha'
-  const channelB = opts.channelB ?? 'C_BETA'
-  const cwdB     = opts.cwdB     ?? '/tmp/beta'
-
-  const config: RoutingConfig = {
-    routes: {
-      [channelA]: makeRoute(cwdA),
-      [channelB]: makeRoute(cwdB),
-    },
-    bind: '127.0.0.1',
-    port: 3100,
-    session_restart_delay: 60,
-    health_check_interval: 120,
-    exit_timeout: 120,
-    stop_timeout: 30,
-    mcp_config_path: `${homedir()}/.claude/slack-mcp.json`,
-    cron_table_path: `${homedir()}/.claude/channels/slack/crontab`,
-    cron_log_path: `${homedir()}/.claude/channels/slack/cron.log`,
-    cozempic_prescription: 'standard',
-    system_prompt_mode: 'append',
-    resume_enabled: true,
-    stop_hook_bootstrap: true,
-    agent_director_poll_interval_ms: 1000,
-  }
-
-  if (opts.default_route !== undefined) {
-    config.default_route = opts.default_route
-  }
-
-  return config
-}
 
 /** Minimal stub for WebStandardStreamableHTTPServerTransport. */
-function makeTransport(): any {
-  return { handleRequest: () => {}, close: async () => {} }
+function makeTransport(sessionId?: string): any {
+  return { sessionId, handleRequest: () => {}, close: async () => {} }
 }
 
 /** Minimal stub for MCP Server. */
 function makeServer(): any {
-  return {
-    connect: async () => {},
-    notification: () => {},
-  }
+  return { connect: async () => {}, notification: () => {} }
 }
 
-/**
- * WebClient stub that captures reactions.remove and chat.postMessage calls.
- * Returns capture arrays alongside the stub so tests can assert on them.
- */
-function makeWebClient() {
-  const postMessageCalls: any[] = []
-  const reactionsRemoveCalls: any[] = []
-
-  const web: any = {
-    chat: {
-      postMessage: async (args: any) => {
-        postMessageCalls.push(args)
-        return { ok: true, ts: '111.222' }
-      },
-      update: async () => ({ ok: true }),
-    },
-    reactions: {
-      remove: async (args: any) => {
-        reactionsRemoveCalls.push(args)
-        return { ok: true }
-      },
-      add: async () => ({ ok: true }),
-    },
-    conversations: {
-      replies: async () => ({ messages: [] }),
-      history: async () => ({ messages: [] }),
-    },
-    filesUploadV2: async () => ({ ok: true }),
-  }
-
-  return { web, postMessageCalls, reactionsRemoveCalls }
+/** A pending-session entry stub, as server.ts builds before roots are known. */
+function makePendingStub(): SessionEntry {
+  return { cwd: '', personaKey: '', transport: makeTransport(), server: makeServer(), connected: false, peerPort: 0 }
 }
 
-/** Build a SessionToolDeps fixture with sensible test defaults. */
-function makeDeps(web: any, overrides: Partial<SessionToolDeps> = {}): SessionToolDeps {
-  return {
-    assertOutboundAllowed: () => {},
-    assertSendable: () => {},
-    getAccess: () => ({
-      dmPolicy: 'pairing' as const,
-      allowFrom: [],
-      channels: {},
-      pending: {},
-      ackReaction: 'eyes',
-    }),
-    web,
-    botToken: 'xoxb-test',
-    inboxDir: '/tmp',
-    resolveUserName: async (userId: string) => userId,
+const A_ALL = 'C0ALPHA01'
+const A_MENTIONS = 'C0ALPHA02'
+const B_CHANNEL = 'C0BETA001'
+const UNCONFIGURED = 'C0NOPE001'
+const MSG_TS = '1700000000.000100'
+
+type ToolName = 'reply' | 'react' | 'edit_message' | 'fetch_messages' | 'download_attachment'
+type ToolResult = { isError?: boolean; content: Array<{ type: string; text: string }> }
+
+/** Arguments for each tool aimed at `target`. */
+const TOOL_ARGS: Record<ToolName, (target: string) => Record<string, unknown>> = {
+  reply: (t) => ({ chat_id: t, text: 'hello' }),
+  react: (t) => ({ chat_id: t, message_id: MSG_TS, emoji: 'thumbsup' }),
+  edit_message: (t) => ({ chat_id: t, message_id: MSG_TS, text: 'edited' }),
+  fetch_messages: (t) => ({ channel: t }),
+  download_attachment: (t) => ({ chat_id: t, message_id: MSG_TS }),
+}
+
+/** The capture array each tool's first Slack call lands in. */
+const TOOL_CAPTURE: Record<ToolName, keyof StubSlack['calls']> = {
+  reply: 'postMessage',
+  react: 'reactionsAdd',
+  edit_message: 'update',
+  fetch_messages: 'conversationsHistory',
+  download_attachment: 'conversationsReplies',
+}
+
+const TOOLS = Object.keys(TOOL_ARGS) as ToolName[]
+
+/** Every Slack call recorded on a stub, across all capture arrays. */
+function slackCallCount(stub: StubSlack): number {
+  return Object.values(stub.calls).reduce((n, list) => n + list.length, 0)
+}
+
+interface Harness {
+  dir: string
+  stateDir: string
+  inboxDir: string
+  credentialsFile: string
+  /** Persona A: 'Alpha Bot', channels A_ALL (all) and A_MENTIONS (mentions). */
+  alpha: Persona
+  /** Persona B: 'Beta Bot', channel B_CHANNEL. */
+  beta: Persona
+  /** The persona lookup behind `deps.getPersona`; edit between calls. */
+  personas: Map<string, Persona>
+  /** Per-persona stubs behind `deps.clientFor`; edit between calls. */
+  clients: Map<string, StubSlack>
+  alphaToken: string
+  deps: SessionToolDeps
+  /** console.error lines captured during the test. */
+  lines: string[]
+  /** Every tool result returned through `openSession`; leak-checked in `afterEach`. */
+  results: ToolResult[]
+  /** Every `fetch` call made during the test (the global `fetch` is stubbed for every test). */
+  fetches: FetchCall[]
+  /** Answers each stubbed `fetch`; throws by default, so no test can reach the network. */
+  fetchHandler: (url: string) => Response | Promise<Response>
+}
+
+/** One stubbed `fetch` call: its URL, `Authorization` header and `redirect` mode. */
+interface FetchCall {
+  url: string
+  auth: string | null
+  redirect: RequestRedirect | undefined
+}
+
+const realFetch = globalThis.fetch
+
+let h: Harness
+let openClients: Client[] = []
+let savedDryRun: string | undefined
+let consoleSpy: ReturnType<typeof spyOn> | undefined
+
+function makeHarness(): Harness {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'registry-test-')))
+  const config = makeMultiPersonaConfig(
+    [
+      { name: 'Alpha Bot', channels: [{ id: A_ALL, delivery: 'all' }, { id: A_MENTIONS, delivery: 'mentions' }] },
+      { name: 'Beta Bot', channels: [{ id: B_CHANNEL, delivery: 'all' }] },
+    ],
+    dir,
+  )
+  const [alpha, beta] = config.personas as [Persona, Persona]
+  for (const p of config.personas) mkdirSync(p.working_directory, { recursive: true })
+  const stateDir = join(dir, 'state')
+  const inboxDir = join(stateDir, 'inbox')
+  mkdirSync(inboxDir, { recursive: true })
+  const credentialsFile = writeCredentialsFile(dir, 'alpha-credentials.json')
+  const alphaToken = fakeToken(BOT_TOKEN_PREFIX, 'alpha')
+  const personas = new Map(config.personas.map((p) => [p.key, p]))
+  const clients = new Map<string, StubSlack>([
+    [alpha.key, makeStubSlack({ token: alphaToken, leakMarker: LEAK_SENTINEL })],
+    [beta.key, makeStubSlack({ token: fakeToken(BOT_TOKEN_PREFIX, 'beta'), leakMarker: LEAK_SENTINEL })],
+  ])
+  const deps: SessionToolDeps = {
+    assertSendable: (p) => assertSendable(p, stateDir, inboxDir, [credentialsFile]),
+    getAccess: () => ({ dmPolicy: 'pairing' as const, allowFrom: [], channels: {}, pending: {}, ackReaction: 'eyes' }),
+    getPersona: (key) => personas.get(key),
+    clientFor: (key) => clients.get(key)?.web as unknown as WebClient | undefined,
+    inboxDir,
+    resolveUserName: async (_key, userId) => userId,
     consumeAck,
     serverPort: 0,
-    ...overrides,
+  }
+  return {
+    dir, stateDir, inboxDir, credentialsFile, alpha, beta, personas, clients, alphaToken, deps,
+    lines: [],
+    results: [],
+    fetches: [],
+    fetchHandler: () => {
+      throw new Error('unexpected fetch in registry.test.ts')
+    },
   }
 }
 
-/** Connect a server to an in-memory client, run fn, then close the client. */
-async function withClient(server: any, fn: (client: Client) => Promise<void>): Promise<void> {
+/** Open an in-memory MCP client on a session server built over `entry`. */
+async function openSession(entry: SessionEntry, deps: SessionToolDeps = h.deps) {
+  const server = createSessionServer(entry, deps)
   const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair()
   await server.connect(serverTransport)
   const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} })
   await client.connect(clientTransport)
-  try {
-    await fn(client)
-  } finally {
-    await client.close()
+  openClients.push(client)
+  return {
+    client,
+    call: async (name: string, args: Record<string, unknown>) => {
+      const result = (await client.callTool({ name, arguments: args })) as ToolResult
+      h.results.push(result)
+      return result
+    },
   }
 }
 
-// ---------------------------------------------------------------------------
-// Reset registry state before each test
-// ---------------------------------------------------------------------------
+/** Register persona `p`'s session and open a client on it. */
+function openPersonaSession(p: Persona) {
+  return openSession(registerSession(p.working_directory, p.key, makeTransport(), makeServer()))
+}
+
+function stubOf(p: Persona): StubSlack {
+  return h.clients.get(p.key)!
+}
+
+function totalSlackCalls(): number {
+  return [...h.clients.values()].reduce((n, s) => n + slackCallCount(s), 0)
+}
+
+function refusal(p: Persona, target: string): string {
+  return `Persona ${renderPersonaRef(p.name, p.key)} may not target ${JSON.stringify(target)}: it is not one of the persona's configured channels.`
+}
 
 beforeEach(() => {
   _resetRegistry()
+  _resetAckTracker()
+  savedDryRun = process.env['SLACK_DRY_RUN']
+  delete process.env['SLACK_DRY_RUN']
+  h = makeHarness()
+  consoleSpy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+    h.lines.push(args.map(String).join(' '))
+  })
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input instanceof Request ? input.url : input)
+    h.fetches.push({ url, auth: new Headers(init?.headers).get('Authorization'), redirect: init?.redirect })
+    return h.fetchHandler(url)
+  }) as typeof fetch
+})
+
+afterEach(async () => {
+  for (const c of openClients) await c.close()
+  openClients = []
+  consoleSpy?.mockRestore()
+  if (savedDryRun === undefined) delete process.env['SLACK_DRY_RUN']
+  else process.env['SLACK_DRY_RUN'] = savedDryRun
+  globalThis.fetch = realFetch
+  rmSync(h.dir, { recursive: true, force: true })
+  assertNoLeak({ lines: h.lines, results: h.results }, 'registry.test afterEach')
 })
 
 // ---------------------------------------------------------------------------
-// Session Registry Tests
+// Registry CRUD, keyed by persona
 // ---------------------------------------------------------------------------
 
-describe('registerSession', () => {
-  test('registers a session successfully', () => {
-    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
+describe('registerSession / unregisterSession / getSessionByPersona', () => {
+  test('registers a session under its persona key', () => {
+    const entry = registerSession('/tmp/a', 'persona_a', makeTransport(), makeServer())
 
     expect(entry.cwd).toBe('/tmp/a')
-    expect(entry.channelId).toBe('C_A')
+    expect(entry.personaKey).toBe('persona_a')
     expect(entry.connected).toBe(true)
+    expect(getSessionByPersona('persona_a')).toBe(entry)
   })
 
-  test('seeds deliveredChannels with the assigned channelId', () => {
-    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
-
-    expect(entry.deliveredChannels.has('C_A')).toBe(true)
-    expect(entry.deliveredChannels.size).toBe(1)
-  })
-
-  test('replaces an existing session when re-registering for the same route', () => {
-    const first = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
-    const second = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
+  test('re-registering the same persona replaces the session and marks the old one disconnected', () => {
+    const first = registerSession('/tmp/a', 'persona_a', makeTransport(), makeServer())
+    const second = registerSession('/tmp/b', 'persona_a', makeTransport(), makeServer())
 
     expect(second).not.toBe(first)
-    expect(getSessionByCwd('/tmp/a')).toBe(second)
+    expect(getSessionByPersona('persona_a')).toBe(second)
+    expect(first.connected).toBe(false)
   })
 
-  test('allows re-registration after the previous session was unregistered', () => {
-    registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
-    unregisterSession('C_A')
+  test('re-registration after unregister yields a connected session', () => {
+    registerSession('/tmp/a', 'persona_a', makeTransport(), makeServer())
+    unregisterSession('persona_a')
 
-    // Should not throw
-    const entry2 = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
-    expect(entry2.connected).toBe(true)
-  })
-})
-
-describe('unregisterSession', () => {
-  test('removes a registered session', () => {
-    registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
-    unregisterSession('C_A')
-
-    expect(getSessionByCwd('/tmp/a')).toBeUndefined()
+    expect(registerSession('/tmp/a', 'persona_a', makeTransport(), makeServer()).connected).toBe(true)
   })
 
-  test('is a no-op for unknown route names', () => {
-    // Should not throw
+  test('unregisterSession removes the session; unknown keys are a no-op', () => {
+    registerSession('/tmp/a', 'persona_a', makeTransport(), makeServer())
+    unregisterSession('persona_a')
+
+    expect(getSessionByPersona('persona_a')).toBeUndefined()
     expect(() => unregisterSession('nonexistent')).not.toThrow()
   })
+
+  test('getSessionByPersona misses an unregistered key', () => {
+    expect(getSessionByPersona('persona_unknown')).toBeUndefined()
+  })
+
+  test('stale close: closing the replaced MCP session leaves the newer session registered and connected', () => {
+    registerSession('/tmp/a', 'persona_a', makeTransport('mcp-old'), makeServer())
+    registerMcpSessionId('mcp-old', 'persona_a')
+    const newer = registerSession('/tmp/a', 'persona_a', makeTransport('mcp-new'), makeServer())
+    registerMcpSessionId('mcp-new', 'persona_a')
+
+    expect(unregisterByMcpSessionId('mcp-old')).toBeUndefined()
+
+    expect(getSessionByPersona('persona_a')).toBe(newer)
+    expect(newer.connected).toBe(true)
+    expect(resolveTransportForRequest(new Request('http://localhost/mcp', { headers: { 'mcp-session-id': 'mcp-new' } }))).toBe(newer)
+  })
+
+  test('closing the current MCP session unregisters it and returns the persona key', () => {
+    const entry = registerSession('/tmp/a', 'persona_a', makeTransport('mcp-1'), makeServer())
+    registerMcpSessionId('mcp-1', 'persona_a')
+
+    expect(unregisterByMcpSessionId('mcp-1')).toBe('persona_a')
+    expect(entry.connected).toBe(false)
+    expect(getSessionByPersona('persona_a')).toBeUndefined()
+  })
 })
 
-describe('getSessionByCwd', () => {
-  test('returns the registered entry for a known route', () => {
-    registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
+describe('getSessionByCwd (real path)', () => {
+  test('returns the session for its working directory; undefined for another', () => {
+    const entry = registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer())
 
-    const found = getSessionByCwd('/tmp/a')
-    expect(found).toBeDefined()
-    expect(found!.cwd).toBe('/tmp/a')
+    expect(getSessionByCwd(h.alpha.working_directory)).toBe(entry)
+    expect(getSessionByCwd(h.beta.working_directory)).toBeUndefined()
   })
 
-  test('returns undefined for a nonexistent route', () => {
-    expect(getSessionByCwd('no-such-route')).toBeUndefined()
+  test('a symlink to a registered session working directory finds that session', () => {
+    const entry = registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer())
+    const link = join(h.dir, 'alpha-link')
+    symlinkSync(h.alpha.working_directory, link)
+
+    expect(getSessionByCwd(link)).toBe(entry)
   })
 })
 
-describe('getSessionByChannel', () => {
-  test('returns entry for a channel that has a configured route', () => {
-    registerSession('/tmp/alpha', 'C_ALPHA', makeTransport(), makeServer())
+describe('b.xnf regression — persona-keyed isolation', () => {
+  test('two personas sharing a cwd keep distinct live sessions', () => {
+    const a = registerSession('/tmp/shared', 'persona_a', makeTransport(), makeServer())
+    const b = registerSession('/tmp/shared', 'persona_b', makeTransport(), makeServer())
 
-    const found = getSessionByChannel('C_ALPHA')
-    expect(found).toBeDefined()
-    expect(found!.channelId).toBe('C_ALPHA')
-    expect(found!.cwd).toBe('/tmp/alpha')
+    expect(getSessionByPersona('persona_a')).toBe(a)
+    expect(getSessionByPersona('persona_b')).toBe(b)
+    expect(a.connected).toBe(true)
+    expect(b.connected).toBe(true)
   })
 
-  test('returns undefined for a channel not in the routing config', () => {
-    const found = getSessionByChannel('C_UNKNOWN')
-    expect(found).toBeUndefined()
-  })
+  test('an unregistered key does not find a session that shares its cwd', () => {
+    registerSession('/tmp/shared', 'persona_real', makeTransport(), makeServer())
 
-  test('returns undefined when route is configured but session is not registered', () => {
-    // Do NOT register a session for C_ALPHA
-    const found = getSessionByChannel('C_ALPHA')
-    expect(found).toBeUndefined()
+    expect(getSessionByPersona('persona_hijacker')).toBeUndefined()
   })
 })
 
 // ---------------------------------------------------------------------------
-// resolveTransportForRequest Tests
+// resolveTransportForRequest
 // ---------------------------------------------------------------------------
 
 describe('resolveTransportForRequest', () => {
-  function makeRequest(headers: Record<string, string> = {}): Request {
-    return new Request('http://localhost/mcp/route-a', { headers })
-  }
+  const req = (id?: string) => new Request('http://localhost/mcp', { headers: id ? { 'mcp-session-id': id } : {} })
 
-  test('returns null for init request (no Mcp-Session-Id header)', () => {
-    const result = resolveTransportForRequest(makeRequest())
-    expect(result).toBeNull()
+  test('init request (no Mcp-Session-Id) → null; unknown ID → undefined', () => {
+    expect(resolveTransportForRequest(req())).toBeNull()
+    expect(resolveTransportForRequest(req('unknown-uuid'))).toBeUndefined()
   })
 
-  test('returns undefined for unknown Mcp-Session-Id', () => {
-    const result = resolveTransportForRequest(
-      makeRequest({ 'mcp-session-id': 'unknown-uuid' }),
-    )
-    expect(result).toBeUndefined()
-  })
+  test('known ID → the registered entry; disconnected → undefined', () => {
+    const entry = registerSession('/tmp/a', 'persona_a', makeTransport(), makeServer())
+    registerMcpSessionId('uuid-1', 'persona_a')
 
-  test('returns SessionEntry for a known Mcp-Session-Id', () => {
-    const transport = makeTransport()
-    const entry = registerSession('/tmp/a', 'C_A', transport, makeServer())
-    registerMcpSessionId('test-uuid-123', 'C_A')
-
-    const result = resolveTransportForRequest(
-      makeRequest({ 'mcp-session-id': 'test-uuid-123' }),
-    )
-    expect(result).toBe(entry)
-  })
-
-  test('returns undefined when session is registered but not connected', () => {
-    registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
-    registerMcpSessionId('test-uuid-123', 'C_A')
-
-    // Mark the session as disconnected
-    const entry = getSessionByCwd('/tmp/a')!
+    expect(resolveTransportForRequest(req('uuid-1'))).toBe(entry)
     entry.connected = false
+    expect(resolveTransportForRequest(req('uuid-1'))).toBeUndefined()
+  })
 
-    const result = resolveTransportForRequest(
-      makeRequest({ 'mcp-session-id': 'test-uuid-123' }),
-    )
-    expect(result).toBeUndefined()
+  test('pending ID → the pending entry; after promotion → the registered entry', () => {
+    const pending = createPendingSession('pend-1', makeTransport(), makeServer())
+    expect(resolveTransportForRequest(req('pend-1'))).toBe(pending)
+
+    const entry = registerSession('/tmp/p', 'persona_p', 'pend-1')
+    registerMcpSessionId('pend-1', 'persona_p')
+    expect(resolveTransportForRequest(req('pend-1'))).toBe(entry)
   })
 })
 
 // ---------------------------------------------------------------------------
-// Inbound Routing Tests
+// Pending sessions and promotion
 // ---------------------------------------------------------------------------
 
-describe('inbound routing — getSessionByChannel', () => {
-  test('message to channel A routes to session A', () => {
-    const entryA = registerSession('/tmp/alpha', 'C_ALPHA', makeTransport(), makeServer())
-    registerSession('/tmp/beta', 'C_BETA', makeTransport(), makeServer())
-
-    const found = getSessionByChannel('C_ALPHA')
-    expect(found).toBe(entryA)
-  })
-
-  test('message to channel B routes to session B', () => {
-    registerSession('/tmp/alpha', 'C_ALPHA', makeTransport(), makeServer())
-    const entryB = registerSession('/tmp/beta', 'C_BETA', makeTransport(), makeServer())
-
-    const found = getSessionByChannel('C_BETA')
-    expect(found).toBe(entryB)
-  })
-
-  test('unrouted channel returns undefined (no default_route configured)', () => {
-    const found = getSessionByChannel('C_UNROUTED')
-    expect(found).toBeUndefined()
-  })
-
-  test('channel with no connected session returns undefined', () => {
-    // Session registered but disconnected
-    const entry = registerSession('/tmp/alpha', 'C_ALPHA', makeTransport(), makeServer())
-    entry.connected = false
-
-    // getSessionByChannel returns the entry regardless of connected state;
-    // the caller (handleMessage in server.ts) checks .connected.
-    // Test the combined check, mirroring how server.ts uses it:
-    const found = getSessionByChannel('C_ALPHA')
-    const liveSession = found && found.connected ? found : undefined
-
-    expect(liveSession).toBeUndefined()
-  })
-
-  test('unrouted channel can fall back to default_route session when looked up by route name', () => {
-    // Simulate the default_route fallback pattern used in server.ts handleMessage:
-    // if getSessionByChannel returns undefined, try getSessionByCwd(config.default_route)
-    const config = makeRoutingConfig({
-      channelA: 'C_DEFAULT', cwdA: '/tmp/default',
-      channelB: 'C_OTHER',   cwdB: '/tmp/other',
-      default_route: '/tmp/default',
-    })
-    const defaultEntry = registerSession('/tmp/default', 'C_DEFAULT', makeTransport(), makeServer())
-
-    // C_UNROUTED is not in routes, so getSessionByChannel returns undefined
-    const direct = getSessionByChannel('C_UNROUTED')
-    expect(direct).toBeUndefined()
-
-    // Fallback: look up via default_route
-    const fallback = getSessionByCwd(config.default_route!)
-    expect(fallback).toBe(defaultEntry)
-  })
-
-  test('unrouted channel is dropped when no default_route (fallback lookup returns undefined)', () => {
-    const config = makeRoutingConfig() // no default_route
-
-    const direct = getSessionByChannel('C_UNROUTED')
-    expect(direct).toBeUndefined()
-
-    // No default_route to fall back to
-    expect(config.default_route).toBeUndefined()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Outbound Scoping Tests
-// ---------------------------------------------------------------------------
-
-describe('outbound scoping — deliveredChannels', () => {
-  test('deliveredChannels is seeded with the session channelId at registration', () => {
-    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
-
-    expect(entry.deliveredChannels.has('C_A')).toBe(true)
-  })
-
-  test('session can reply to its assigned channel (in deliveredChannels)', () => {
-    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
-
-    // C_A was seeded into deliveredChannels on registration
-    expect(entry.deliveredChannels.has('C_A')).toBe(true)
-  })
-
-  test("session cannot reply to another session's channel (not in deliveredChannels)", () => {
-    const entryA = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
-
-    // C_B belongs to another session; it should not be in entryA's deliveredChannels
-    expect(entryA.deliveredChannels.has('C_B')).toBe(false)
-  })
-
-  test('deliveredChannels grows as new messages arrive from additional channels', () => {
-    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
-    expect(entry.deliveredChannels.size).toBe(1)
-
-    // Simulate inbound message dispatch adding a new channel (as server.ts does)
-    entry.deliveredChannels.add('C_NEW')
-
-    expect(entry.deliveredChannels.has('C_NEW')).toBe(true)
-    expect(entry.deliveredChannels.size).toBe(2)
-  })
-
-  test('two sessions have independent deliveredChannels sets', () => {
-    const entryA = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
-    const entryB = registerSession('/tmp/b', 'C_B', makeTransport(), makeServer())
-
-    entryA.deliveredChannels.add('C_EXTRA')
-
-    expect(entryA.deliveredChannels.has('C_EXTRA')).toBe(true)
-    expect(entryB.deliveredChannels.has('C_EXTRA')).toBe(false)
-  })
-})
-
-describe('assertOutboundAllowed — per-session state', () => {
-  // Test the function from lib.ts using per-session deliveredChannels,
-  // mirroring how server.ts wires it up.
-  test('allows reply to channel in deliveredChannels', async () => {
-    const { assertOutboundAllowed } = await import('../src/lib.ts')
-    const { defaultAccess } = await import('../src/lib.ts')
-
-    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
-    const access = defaultAccess()
-
-    // C_A is in deliveredChannels (seeded at registration)
-    expect(() => assertOutboundAllowed('C_A', access, entry.deliveredChannels)).not.toThrow()
-  })
-
-  test('blocks reply to channel not in deliveredChannels or access channels', async () => {
-    const { assertOutboundAllowed } = await import('../src/lib.ts')
-    const { defaultAccess } = await import('../src/lib.ts')
-
-    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
-    const access = defaultAccess()
-
-    expect(() =>
-      assertOutboundAllowed('C_FOREIGN', access, entry.deliveredChannels),
-    ).toThrow('Outbound gate')
-  })
-
-  test('session A cannot reply to session B channel via per-session deliveredChannels', async () => {
-    const { assertOutboundAllowed } = await import('../src/lib.ts')
-    const { defaultAccess } = await import('../src/lib.ts')
-
-    const entryA = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
-    registerSession('/tmp/b', 'C_B', makeTransport(), makeServer())
-    const access = defaultAccess()
-
-    // entryA's deliveredChannels only contains C_A, not C_B
-    expect(() =>
-      assertOutboundAllowed('C_B', access, entryA.deliveredChannels),
-    ).toThrow('Outbound gate')
-  })
-
-  test('after delivering a message, session can reply to the new channel', async () => {
-    const { assertOutboundAllowed } = await import('../src/lib.ts')
-    const { defaultAccess } = await import('../src/lib.ts')
-
-    const entry = registerSession('/tmp/a', 'C_A', makeTransport(), makeServer())
-    const access = defaultAccess()
-
-    // Simulate inbound message delivery adding C_NEW to this session's set
-    entry.deliveredChannels.add('C_NEW')
-
-    expect(() =>
-      assertOutboundAllowed('C_NEW', access, entry.deliveredChannels),
-    ).not.toThrow()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Pending Session Tests (Task t3.256.pw.ro.uw)
-// ---------------------------------------------------------------------------
-
-describe('createPendingSession / getPendingSession / removePendingSession / getAllPendingSessions', () => {
-  test('createPendingSession stores and returns a PendingSessionEntry', () => {
+describe('pending sessions', () => {
+  test('create / get / remove / list / reset', () => {
     const transport = makeTransport()
     const server = makeServer()
-    const delivered = new Set<string>()
+    const entry = createPendingSession('pid-1', transport, server)
+    createPendingSession('pid-2', makeTransport(), makeServer())
 
-    const entry = createPendingSession('pending-id-1', transport, server, delivered)
-
-    expect(entry.pendingId).toBe('pending-id-1')
     expect(entry.transport).toBe(transport)
     expect(entry.server).toBe(server)
-    expect(entry.deliveredChannels).toBe(delivered)
     expect(typeof entry.createdAt).toBe('number')
-  })
-
-  test('getPendingSession returns the stored entry by ID', () => {
-    const entry = createPendingSession('pid-2', makeTransport(), makeServer(), new Set())
-
-    const found = getPendingSession('pid-2')
-    expect(found).toBe(entry)
-  })
-
-  test('getPendingSession returns undefined for unknown ID', () => {
+    expect(getPendingSession('pid-1')).toBe(entry)
     expect(getPendingSession('no-such-id')).toBeUndefined()
-  })
+    expect(getAllPendingSessions().map((e) => e.pendingId).sort()).toEqual(['pid-1', 'pid-2'])
 
-  test('removePendingSession removes the entry', () => {
-    createPendingSession('pid-3', makeTransport(), makeServer(), new Set())
-    removePendingSession('pid-3')
-
-    expect(getPendingSession('pid-3')).toBeUndefined()
-  })
-
-  test('removePendingSession is a no-op for unknown IDs', () => {
+    removePendingSession('pid-1')
+    expect(getPendingSession('pid-1')).toBeUndefined()
     expect(() => removePendingSession('nonexistent')).not.toThrow()
-  })
 
-  test('getAllPendingSessions returns all pending entries', () => {
-    createPendingSession('pid-a', makeTransport(), makeServer(), new Set())
-    createPendingSession('pid-b', makeTransport(), makeServer(), new Set())
-
-    const all = getAllPendingSessions()
-    const ids = all.map((e) => e.pendingId).sort()
-    expect(ids).toEqual(['pid-a', 'pid-b'])
-  })
-
-  test('getAllPendingSessions returns empty array when no pending sessions', () => {
+    _resetRegistry()
     expect(getAllPendingSessions()).toEqual([])
   })
 
-  test('_resetRegistry clears pending sessions', () => {
-    createPendingSession('pid-reset', makeTransport(), makeServer(), new Set())
-    expect(getAllPendingSessions()).toHaveLength(1)
+  test('stub-less promotion creates a fresh entry under the persona key and removes the pending entry', () => {
+    const transport = makeTransport()
+    const server = makeServer()
+    createPendingSession('stubless', transport, server)
 
-    _resetRegistry()
+    const entry = registerSession('/tmp/sl', 'persona_sl', 'stubless')
 
-    expect(getAllPendingSessions()).toHaveLength(0)
+    expect(entry).toEqual({ cwd: '/tmp/sl', personaKey: 'persona_sl', transport, server, connected: true, peerPort: 0 })
+    expect(getSessionByPersona('persona_sl')).toBe(entry)
+    expect(getPendingSession('stubless')).toBeUndefined()
+  })
+
+  test('promotion throws for an unknown pending ID', () => {
+    expect(() => registerSession('/tmp/bad', 'persona_bad', 'nonexistent-pending-id')).toThrow()
+  })
+
+  test('promotion mutates the pending stub in place and sets the persona key', () => {
+    const stub = makePendingStub()
+    createPendingSession('pid-stub', makeTransport(), makeServer(), stub)
+
+    const entry = registerSession(h.alpha.working_directory, h.alpha.key, 'pid-stub')
+
+    expect(entry).toBe(stub)
+    expect(stub.personaKey).toBe(h.alpha.key)
+    expect(stub.cwd).toBe(h.alpha.working_directory)
+    expect(stub.connected).toBe(true)
+  })
+
+  test('a server built on a pending stub refuses tools until promotion, then uses the promoted persona client', async () => {
+    const stub = makePendingStub()
+    const session = await openSession(stub)
+    createPendingSession('pid-live', makeTransport(), makeServer(), stub)
+
+    const before = await session.call('reply', TOOL_ARGS.reply(A_ALL))
+    expect(before.isError).toBe(true)
+    expect(before.content[0]!.text).toBe('Tool "reply" refused: this session is not matched to a persona.')
+    expect(totalSlackCalls()).toBe(0)
+
+    registerSession(h.alpha.working_directory, h.alpha.key, 'pid-live')
+    const after = await session.call('reply', TOOL_ARGS.reply(A_ALL))
+
+    expect(after.isError).toBeUndefined()
+    expect(stubOf(h.alpha).calls.postMessage).toHaveLength(1)
+    expect(slackCallCount(stubOf(h.beta))).toBe(0)
+  })
+
+  test('stand-in persona (key = channel ID) promoted from a pending stub replies to its channel', async () => {
+    const standIn = makeStandInPersonaConfig({ C0STAND01: {} }, h.dir).personas[0]!
+    h.personas.set(standIn.key, standIn)
+    h.clients.set(standIn.key, makeStubSlack({ token: fakeToken(BOT_TOKEN_PREFIX, 'standin') }))
+    const stub = makePendingStub()
+    const session = await openSession(stub)
+    createPendingSession('pid-standin', makeTransport(), makeServer(), stub)
+    registerSession(standIn.working_directory, standIn.key, 'pid-standin')
+
+    const result = await session.call('reply', TOOL_ARGS.reply('C0STAND01'))
+
+    expect(result.isError).toBeUndefined()
+    expect(h.clients.get('C0STAND01')!.calls.postMessage.map((c) => c.channel)).toEqual(['C0STAND01'])
   })
 })
 
-describe('registerSession — promotion path (pending → registered)', () => {
-  test('promotes a pending session to registered using pendingId', () => {
-    const transport = makeTransport()
-    const server = makeServer()
-    const delivered = new Set<string>()
+// ---------------------------------------------------------------------------
+// Roots cwd → persona matching (real path)
+// ---------------------------------------------------------------------------
 
-    createPendingSession('prom-id-1', transport, server, delivered)
-
-    const entry = registerSession('/tmp/x', 'C_X', 'prom-id-1')
-
-    expect(entry.cwd).toBe('/tmp/x')
-    expect(entry.channelId).toBe('C_X')
-    expect(entry.transport).toBe(transport)
-    expect(entry.connected).toBe(true)
-  })
-
-  test('promotion seeds deliveredChannels with the channelId', () => {
-    const delivered = new Set<string>()
-    createPendingSession('prom-id-2', makeTransport(), makeServer(), delivered)
-
-    const entry = registerSession('/tmp/y', 'C_Y', 'prom-id-2')
-
-    expect(entry.deliveredChannels.has('C_Y')).toBe(true)
-  })
-
-  test('promotion shares the deliveredChannels set by reference', () => {
-    const delivered = new Set<string>()
-    createPendingSession('prom-id-3', makeTransport(), makeServer(), delivered)
-
-    const entry = registerSession('/tmp/z', 'C_Z', 'prom-id-3')
-
-    // Both references should be the same Set object
-    expect(entry.deliveredChannels).toBe(delivered)
-  })
-
-  test('promotion removes the pending entry', () => {
-    createPendingSession('prom-id-4', makeTransport(), makeServer(), new Set())
-    registerSession('/tmp/w', 'C_W', 'prom-id-4')
-
-    expect(getPendingSession('prom-id-4')).toBeUndefined()
-  })
-
-  test('promotion throws if pendingId not found', () => {
-    expect(() => registerSession('/tmp/bad', 'C_BAD', 'nonexistent-pending-id')).toThrow()
-  })
-
-  test('stub-less promotion: creates a fresh SessionEntry when no stub was provided', () => {
-    const transport = makeTransport()
-    const server = makeServer()
-    const delivered = new Set<string>()
-
-    // createPendingSession called WITHOUT a stub — exercises the else branch in registerSession
-    createPendingSession('stubless-id', transport, server, delivered)
-
-    const entry = registerSession('/tmp/stubless', 'C_SL', 'stubless-id')
-
-    // A new object must be returned (not undefined)
-    expect(entry).toBeDefined()
-    expect(entry.cwd).toBe('/tmp/stubless')
-    expect(entry.channelId).toBe('C_SL')
-    expect(entry.transport).toBe(transport)
-    expect(entry.server).toBe(server)
-    expect(entry.connected).toBe(true)
-    expect(entry.peerPort).toBe(0)
-
-    // deliveredChannels seeded with channelId on promotion
-    expect(entry.deliveredChannels.has('C_SL')).toBe(true)
-
-    // Pending entry must be cleaned up after promotion
-    expect(getPendingSession('stubless-id')).toBeUndefined()
-  })
-})
-
-describe('resolveTransportForRequest — pending session path', () => {
-  function makeRequest(headers: Record<string, string> = {}): Request {
-    return new Request('http://localhost/mcp', { headers })
+describe('matchPersonaByRootsPath', () => {
+  /** Personas A and B with real dirs, C with a nonexistent one; returns the roots path for a case. */
+  function setup() {
+    const missing = join(h.dir, 'missing-wd')
+    const personaC: Persona = { ...h.beta, index: 2, name: 'Gamma Bot', key: 'gamma_bot', working_directory: missing }
+    const personas = [h.alpha, h.beta, personaC]
+    mkdirSync(join(h.alpha.working_directory, 'child'))
+    symlinkSync(h.alpha.working_directory, join(h.dir, 'alpha-link'))
+    mkdirSync(join(h.dir, 'unconfigured'))
+    return { personas, missing, personaC }
   }
 
-  test('returns PendingSessionEntry for a pending Mcp-Session-Id', () => {
-    const transport = makeTransport()
-    const pending = createPendingSession('pend-uuid-1', transport, makeServer(), new Set())
+  test.each<[string, (s: ReturnType<typeof setup>) => string, 'alpha' | 'beta' | 'gamma' | 'none']>([
+    ['the exact working directory', () => h.alpha.working_directory, 'alpha'],
+    ['a symlink to the working directory', () => join(h.dir, 'alpha-link'), 'alpha'],
+    ['a symlink with a trailing slash', () => `${join(h.dir, 'alpha-link')}/`, 'alpha'],
+    ['a symlinked path with a `..` segment', () => `${join(h.dir, 'alpha-link')}/child/..`, 'alpha'],
+    ['a nonexistent path, compared lexically', (s) => join(s.missing, 'sub', '..'), 'gamma'],
+    ["another persona's working directory", () => h.beta.working_directory, 'beta'],
+    ['an unconfigured directory', () => join(h.dir, 'unconfigured'), 'none'],
+  ])('%s', (_label, rootsPath, expected) => {
+    const s = setup()
+    const logs: string[] = []
+    const matched = matchPersonaByRootsPath(rootsPath(s), s.personas, { log: (l) => logs.push(l) })
+    const want = { alpha: h.alpha, beta: h.beta, gamma: s.personaC, none: undefined }[expected]
 
-    const result = resolveTransportForRequest(makeRequest({ 'mcp-session-id': 'pend-uuid-1' }))
-    expect(result).toBe(pending)
+    expect(matched?.key).toBe(want?.key)
+    expect(logs).toEqual([])
   })
 
-  test('returns undefined for a Mcp-Session-Id that is neither registered nor pending', () => {
-    const result = resolveTransportForRequest(makeRequest({ 'mcp-session-id': 'totally-unknown' }))
-    expect(result).toBeUndefined()
-  })
+  test('two personas sharing one real path (one via a symlink) match nothing and log exactly one line', () => {
+    const link = join(h.dir, 'alpha-link')
+    symlinkSync(h.alpha.working_directory, link)
+    const twin: Persona = { ...h.beta, working_directory: link }
+    const logs: string[] = []
 
-  test('returns registered SessionEntry (not pending) after promotion', () => {
-    const transport = makeTransport()
-    createPendingSession('pend-uuid-2', transport, makeServer(), new Set())
+    const matched = matchPersonaByRootsPath(h.alpha.working_directory, [h.alpha, twin], { log: (l) => logs.push(l) })
 
-    // Promote to registered and map the MCP session ID
-    const entry = registerSession('/tmp/promoted', 'C_P', 'pend-uuid-2')
-    registerMcpSessionId('pend-uuid-2', 'C_P')
-
-    // Should now resolve to the SessionEntry, not the PendingSessionEntry
-    const result = resolveTransportForRequest(makeRequest({ 'mcp-session-id': 'pend-uuid-2' }))
-    expect(result).toBe(entry)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Ack Reaction Removal Tests (Task t3.xrm.9d.n1.3c)
-// ---------------------------------------------------------------------------
-
-describe('reply tool — ack reaction removal', () => {
-  const TEST_CHANNEL = 'C_TEST'
-  const TEST_CWD = '/tmp/test-ack'
-  const TEST_MSG_TS = '1000000.111111'
-
-  beforeEach(() => {
-    _resetAckTracker()
-  })
-
-  test('ackReaction configured + reply with message_id → reactions.remove called with correct params', async () => {
-    const entry = registerSession(TEST_CWD, TEST_CHANNEL, makeTransport(), makeServer())
-    const { web, reactionsRemoveCalls } = makeWebClient()
-    const server = createSessionServer(entry, makeDeps(web))
-
-    trackAck(TEST_CHANNEL, TEST_MSG_TS)
-
-    await withClient(server, async (client) => {
-      await client.callTool({ name: 'reply', arguments: { chat_id: TEST_CHANNEL, text: 'hi', message_id: TEST_MSG_TS } })
-    })
-
-    expect(reactionsRemoveCalls).toHaveLength(1)
-    expect(reactionsRemoveCalls[0]).toEqual({
-      channel: TEST_CHANNEL,
-      timestamp: TEST_MSG_TS,
-      name: 'eyes',
-    })
-  })
-
-  test('second reply with same message_id → no second reactions.remove call', async () => {
-    const entry = registerSession(TEST_CWD, TEST_CHANNEL, makeTransport(), makeServer())
-    const { web, reactionsRemoveCalls } = makeWebClient()
-    const server = createSessionServer(entry, makeDeps(web))
-
-    trackAck(TEST_CHANNEL, TEST_MSG_TS)
-
-    await withClient(server, async (client) => {
-      await client.callTool({ name: 'reply', arguments: { chat_id: TEST_CHANNEL, text: 'first', message_id: TEST_MSG_TS } })
-      await client.callTool({ name: 'reply', arguments: { chat_id: TEST_CHANNEL, text: 'second', message_id: TEST_MSG_TS } })
-    })
-
-    expect(reactionsRemoveCalls).toHaveLength(1)
-  })
-
-  test('reactions.remove throws → reply still succeeds', async () => {
-    const entry = registerSession(TEST_CWD, TEST_CHANNEL, makeTransport(), makeServer())
-    const { web } = makeWebClient()
-    web.reactions.remove = async () => { throw new Error('reaction_not_found') }
-    const server = createSessionServer(entry, makeDeps(web))
-
-    trackAck(TEST_CHANNEL, TEST_MSG_TS)
-
-    let result: any
-    await withClient(server, async (client) => {
-      result = await client.callTool({ name: 'reply', arguments: { chat_id: TEST_CHANNEL, text: 'hi', message_id: TEST_MSG_TS } })
-    })
-
-    expect(result.isError).toBeFalsy()
-    expect(result.content[0].text).toContain('Sent')
-  })
-
-  test('ackReaction not configured → no reactions.remove call', async () => {
-    const entry = registerSession(TEST_CWD, TEST_CHANNEL, makeTransport(), makeServer())
-    const { web, reactionsRemoveCalls } = makeWebClient()
-    // Access without ackReaction — server.ts only calls trackAck when ackReaction is set,
-    // so consumeAck will return false and reactions.remove will never be called.
-    const server = createSessionServer(entry, makeDeps(web, {
-      getAccess: () => ({ dmPolicy: 'pairing' as const, allowFrom: [], channels: {}, pending: {} }),
-    }))
-
-    // No trackAck call — simulates server.ts skipping ack tracking when no ackReaction
-
-    await withClient(server, async (client) => {
-      await client.callTool({ name: 'reply', arguments: { chat_id: TEST_CHANNEL, text: 'hi', message_id: TEST_MSG_TS } })
-    })
-
-    expect(reactionsRemoveCalls).toHaveLength(0)
-  })
-
-  test('reply without message_id → no reactions.remove call', async () => {
-    const entry = registerSession(TEST_CWD, TEST_CHANNEL, makeTransport(), makeServer())
-    const { web, reactionsRemoveCalls } = makeWebClient()
-    const server = createSessionServer(entry, makeDeps(web))
-
-    trackAck(TEST_CHANNEL, TEST_MSG_TS)
-
-    await withClient(server, async (client) => {
-      await client.callTool({ name: 'reply', arguments: { chat_id: TEST_CHANNEL, text: 'hi' } })
-    })
-
-    expect(reactionsRemoveCalls).toHaveLength(0)
+    expect(matched).toBeUndefined()
+    expect(logs).toHaveLength(1)
   })
 })
 
 // ---------------------------------------------------------------------------
-// Dry-Run Mode Tests
+// Posting scope
 // ---------------------------------------------------------------------------
 
-describe('dry-run mode', () => {
-  const DRY_CWD = '/tmp/dry-run-test'
-  const DRY_CHANNEL = 'C_DRY'
-  const DRY_MSG_TS = '9999999.000001'
+describe('checkPersonaTarget', () => {
+  test.each([
+    ['a configured `all` channel', A_ALL, true],
+    ['a configured `mentions` channel', A_MENTIONS, true],
+    ["another persona's channel", B_CHANNEL, false],
+    ['an unconfigured channel', UNCONFIGURED, false],
+    ['a D… conversation', 'D0DIRECT1', false],
+    ['a U… user ID', 'U0USER001', false],
+    ['an empty value', '', false],
+  ])('%s → allowed=%p', (_label, target, allowed) => {
+    const check = checkPersonaTarget(h.alpha, target)
 
-  let savedDryRunEnv: string | undefined
+    expect(check).toEqual(allowed ? { allowed: true } : { allowed: false, message: refusal(h.alpha, target) })
+  })
+})
 
+describe('tool posting scope (through the MCP server)', () => {
+  test.each(TOOLS.flatMap((tool) => [A_ALL, A_MENTIONS].map((target) => [tool, target] as const)))(
+    "%s to A's channel %s passes and lands on A's client only",
+    async (tool, target) => {
+      const session = await openPersonaSession(h.alpha)
+
+      const result = await session.call(tool, TOOL_ARGS[tool](target))
+
+      expect(result.isError).toBeUndefined()
+      const captured = stubOf(h.alpha).calls[TOOL_CAPTURE[tool]] as Array<{ channel?: string }>
+      expect(captured.map((c) => c.channel)).toEqual([target])
+      expect(slackCallCount(stubOf(h.beta))).toBe(0)
+    },
+  )
+
+  test.each(TOOLS.flatMap((tool) => [B_CHANNEL, UNCONFIGURED, 'D0DIRECT1', 'U0USER001'].map((target) => [tool, target] as const)))(
+    '%s to %s is refused with a tool error naming persona and target, and no Slack call',
+    async (tool, target) => {
+      const session = await openPersonaSession(h.alpha)
+
+      const result = await session.call(tool, TOOL_ARGS[tool](target))
+
+      expect(result.isError).toBe(true)
+      expect(result.content[0]!.text).toBe(refusal(h.alpha, target))
+      expect(totalSlackCalls()).toBe(0)
+    },
+  )
+
+  test('reply posts carry no username or icon override', async () => {
+    const session = await openPersonaSession(h.alpha)
+
+    await session.call('reply', { chat_id: A_ALL, text: 'hi', thread_ts: MSG_TS })
+
+    expect(stubOf(h.alpha).calls.postMessage).toEqual([
+      { channel: A_ALL, text: 'hi', thread_ts: MSG_TS, unfurl_links: false, unfurl_media: false },
+    ])
+    expect(Object.keys(stubOf(h.alpha).calls.postMessage[0]!)).toEqual(
+      expect.not.arrayContaining(['username', 'icon_emoji', 'icon_url']),
+    )
+  })
+})
+
+describe('dry run (SLACK_DRY_RUN=1)', () => {
   beforeEach(() => {
-    savedDryRunEnv = process.env['SLACK_DRY_RUN']
     process.env['SLACK_DRY_RUN'] = '1'
   })
 
-  afterEach(() => {
-    if (savedDryRunEnv === undefined) {
-      delete process.env['SLACK_DRY_RUN']
-    } else {
-      process.env['SLACK_DRY_RUN'] = savedDryRunEnv
-    }
+  test.each(TOOLS)('%s to a configured channel returns the dry-run result with no Slack call', async (tool) => {
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call(tool, TOOL_ARGS[tool](A_ALL))
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0]!.text).toStartWith('[dry-run]')
+    expect(totalSlackCalls()).toBe(0)
   })
 
-  /**
-   * WebClient spy that tracks ALL method calls across every sub-namespace.
-   * If any Slack API method is called, apiCalls will be non-empty.
-   */
-  function makeSpyWebClient() {
-    const apiCalls: { method: string; args: any }[] = []
+  test.each(TOOLS)('%s to an unconfigured channel is still refused (scope runs before dry run)', async (tool) => {
+    const session = await openPersonaSession(h.alpha)
 
-    const spy = (method: string) => async (args: any) => {
-      apiCalls.push({ method, args })
-      return { ok: true, ts: '111.222', messages: [] }
-    }
+    const result = await session.call(tool, TOOL_ARGS[tool](UNCONFIGURED))
 
-    const web: any = {
-      chat: {
-        postMessage: spy('chat.postMessage'),
-        update: spy('chat.update'),
-      },
-      reactions: {
-        add: spy('reactions.add'),
-        remove: spy('reactions.remove'),
-      },
-      conversations: {
-        replies: spy('conversations.replies'),
-        history: spy('conversations.history'),
-      },
-      filesUploadV2: spy('files.uploadV2'),
-    }
-
-    return { web, apiCalls }
-  }
-
-  test('reply — skips Slack API and returns dry-run response', async () => {
-    const entry = registerSession(DRY_CWD, DRY_CHANNEL, makeTransport(), makeServer())
-    const { web, apiCalls } = makeSpyWebClient()
-    const server = createSessionServer(entry, makeDeps(web))
-
-    let result: any
-    await withClient(server, async (client) => {
-      result = await client.callTool({ name: 'reply', arguments: { chat_id: DRY_CHANNEL, text: 'hello' } })
-    })
-
-    expect(apiCalls).toHaveLength(0)
-    expect(result.content[0].text).toContain('[dry-run]')
-    expect(result.isError).toBeFalsy()
-  })
-
-  test('react — skips Slack API and returns dry-run response', async () => {
-    const entry = registerSession(DRY_CWD, DRY_CHANNEL, makeTransport(), makeServer())
-    const { web, apiCalls } = makeSpyWebClient()
-    const server = createSessionServer(entry, makeDeps(web))
-
-    let result: any
-    await withClient(server, async (client) => {
-      result = await client.callTool({ name: 'react', arguments: { chat_id: DRY_CHANNEL, message_id: DRY_MSG_TS, emoji: 'thumbsup' } })
-    })
-
-    expect(apiCalls).toHaveLength(0)
-    expect(result.content[0].text).toContain('[dry-run]')
-    expect(result.isError).toBeFalsy()
-  })
-
-  test('edit_message — skips Slack API and returns dry-run response', async () => {
-    const entry = registerSession(DRY_CWD, DRY_CHANNEL, makeTransport(), makeServer())
-    const { web, apiCalls } = makeSpyWebClient()
-    const server = createSessionServer(entry, makeDeps(web))
-
-    let result: any
-    await withClient(server, async (client) => {
-      result = await client.callTool({ name: 'edit_message', arguments: { chat_id: DRY_CHANNEL, message_id: DRY_MSG_TS, text: 'edited' } })
-    })
-
-    expect(apiCalls).toHaveLength(0)
-    expect(result.content[0].text).toContain('[dry-run]')
-    expect(result.isError).toBeFalsy()
-  })
-
-  test('fetch_messages — skips Slack API and returns dry-run response', async () => {
-    const entry = registerSession(DRY_CWD, DRY_CHANNEL, makeTransport(), makeServer())
-    const { web, apiCalls } = makeSpyWebClient()
-    const server = createSessionServer(entry, makeDeps(web))
-
-    let result: any
-    await withClient(server, async (client) => {
-      result = await client.callTool({ name: 'fetch_messages', arguments: { channel: DRY_CHANNEL } })
-    })
-
-    expect(apiCalls).toHaveLength(0)
-    expect(result.content[0].text).toContain('[dry-run]')
-    expect(result.isError).toBeFalsy()
-  })
-
-  test('download_attachment — skips Slack API and returns dry-run response', async () => {
-    const entry = registerSession(DRY_CWD, DRY_CHANNEL, makeTransport(), makeServer())
-    const { web, apiCalls } = makeSpyWebClient()
-    const server = createSessionServer(entry, makeDeps(web))
-
-    let result: any
-    await withClient(server, async (client) => {
-      result = await client.callTool({ name: 'download_attachment', arguments: { chat_id: DRY_CHANNEL, message_id: DRY_MSG_TS } })
-    })
-
-    expect(apiCalls).toHaveLength(0)
-    expect(result.content[0].text).toContain('[dry-run]')
-    expect(result.isError).toBeFalsy()
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(refusal(h.alpha, UNCONFIGURED))
   })
 })
 
 // ---------------------------------------------------------------------------
-// Regression tests: b.xnf — channelId-keyed registry prevents CWD-collision hijack
+// Call-time resolution and refusals
 // ---------------------------------------------------------------------------
 
-describe('b.xnf regression — channelId routing isolation', () => {
-  test('two sessions with the same cwd but different channelIds do not collide', () => {
-    const SHARED_CWD = '/tmp/shared-project'
-    const entryA = registerSession(SHARED_CWD, 'C_FIRST', makeTransport(), makeServer())
-    const entryB = registerSession(SHARED_CWD, 'C_SECOND', makeTransport(), makeServer())
+describe('call-time resolution', () => {
+  test("swapping A's client between calls sends the second call through the new client", async () => {
+    const session = await openPersonaSession(h.alpha)
+    const first = stubOf(h.alpha)
+    await session.call('reply', TOOL_ARGS.reply(A_ALL))
 
-    // Both should be retrievable by their channelId
-    expect(getSessionByChannel('C_FIRST')).toBe(entryA)
-    expect(getSessionByChannel('C_SECOND')).toBe(entryB)
+    const replacement = makeStubSlack({ token: fakeToken(BOT_TOKEN_PREFIX, 'alpha-2') })
+    h.clients.set(h.alpha.key, replacement)
+    await session.call('reply', TOOL_ARGS.reply(A_ALL))
 
-    // Verify both are live and distinct
-    expect(entryA).not.toBe(entryB)
-    expect(entryA.connected).toBe(true)
-    expect(entryB.connected).toBe(true)
+    expect(first.calls.postMessage).toHaveLength(1)
+    expect(replacement.calls.postMessage).toHaveLength(1)
   })
 
-  test('getSessionByChannel returns undefined for an unregistered channelId even if another session shares the cwd', () => {
-    const SHARED_CWD = '/tmp/shared-project'
-    // Register a real session for C_REAL
-    registerSession(SHARED_CWD, 'C_REAL', makeTransport(), makeServer())
+  test("changing A's channel list between calls to the same target changes the outcome", async () => {
+    const session = await openPersonaSession(h.alpha)
+    expect((await session.call('reply', TOOL_ARGS.reply(A_MENTIONS))).isError).toBeUndefined()
 
-    // C_HIJACKER has no registered session — should not find C_REAL's session
-    const found = getSessionByChannel('C_HIJACKER')
-    expect(found).toBeUndefined()
+    h.personas.set(h.alpha.key, { ...h.alpha, channels: [{ id: A_ALL, delivery: 'all' }] })
+    const second = await session.call('reply', TOOL_ARGS.reply(A_MENTIONS))
+
+    expect(second.isError).toBe(true)
+    expect(second.content[0]!.text).toBe(refusal(h.alpha, A_MENTIONS))
+    expect(stubOf(h.alpha).calls.postMessage).toHaveLength(1)
   })
 
-  test('registering a second session for the same channelId replaces the first (last-writer-wins)', () => {
-    const first = registerSession('/tmp/a', 'C_X', makeTransport(), makeServer())
-    expect(first.connected).toBe(true)
+  test.each<[string, () => void, (p: Persona) => string]>([
+    [
+      'the persona lookup no longer returns the key',
+      () => h.personas.delete(h.alpha.key),
+      (p) => `Tool "reply" refused: persona key=${p.key} is not an applied persona.`,
+    ],
+    [
+      'clientFor returns nothing for the persona',
+      () => h.clients.delete(h.alpha.key),
+      (p) => `Tool "reply" refused: the Slack client for persona ${renderPersonaRef(p.name, p.key)} is not available.`,
+    ],
+  ])('%s → tool error and no Slack call', async (_label, breakIt, message) => {
+    const alphaStub = stubOf(h.alpha)
+    const session = await openPersonaSession(h.alpha)
+    breakIt()
 
-    const second = registerSession('/tmp/b', 'C_X', makeTransport(), makeServer())
+    const result = await session.call('reply', TOOL_ARGS.reply(A_ALL))
 
-    // Second registration wins
-    expect(getSessionByChannel('C_X')).toBe(second)
-    // First was marked disconnected
-    expect(first.connected).toBe(false)
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(message(h.alpha))
+    expect(slackCallCount(alphaStub) + totalSlackCalls()).toBe(0)
+  })
+
+  test('download_attachment with no bot token on the client → tool error and no Slack call', async () => {
+    h.clients.set(h.alpha.key, makeStubSlack({ token: '' }))
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('download_attachment', TOOL_ARGS.download_attachment(A_ALL))
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(
+      `Tool "download_attachment" refused: the Slack bot token for persona ${renderPersonaRef(h.alpha.name, h.alpha.key)} is not available.`,
+    )
+    expect(totalSlackCalls()).toBe(0)
+  })
+})
+
+describe('Slack call failures', () => {
+  test.each<[ToolName, 'post' | 'history' | 'replies', { kind: 'platform'; error: string } | { kind: 'network' }, string]>([
+    ['reply', 'post', { kind: 'platform', error: 'not_in_channel' }, ' (not_in_channel)'],
+    ['reply', 'post', { kind: 'network' }, ''],
+    ['fetch_messages', 'history', { kind: 'platform', error: 'channel_not_found' }, ' (channel_not_found)'],
+    ['download_attachment', 'replies', { kind: 'platform', error: 'missing_scope' }, ' (missing_scope)'],
+  ])('%s with a failing %s (%o) → token-safe tool error', async (tool, queue, outcome, reason) => {
+    stubOf(h.alpha).script[queue].push(outcome)
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call(tool, TOOL_ARGS[tool](A_ALL))
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(
+      `Tool "${tool}" failed for persona ${renderPersonaRef(h.alpha.name, h.alpha.key)}: the tool call failed${reason}.`,
+    )
+    assertNoLeak({ result, lines: h.lines })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// download_attachment: the bearer token goes only to https://files.slack.com
+// ---------------------------------------------------------------------------
+
+describe('isSlackHostedFileUrl', () => {
+  test.each<[string, unknown, boolean]>([
+    ['an https files.slack.com URL', 'https://files.slack.com/files-pri/T0-F0/a.txt', true],
+    ['one with a query string', 'https://files.slack.com/files-pri/T0-F0/a.txt?pub_secret=x', true],
+    ['an upper-case host', 'https://FILES.SLACK.COM/a.txt', true],
+    ['the explicit default port', 'https://files.slack.com:443/a.txt', true],
+    ['http:', 'http://files.slack.com/a.txt', false],
+    ['a lookalike host (suffix)', 'https://files.slack.com.evil.example/a.txt', false],
+    ['a lookalike host (prefix)', 'https://evilfiles.slack.com/a.txt', false],
+    ['another Slack host', 'https://slack.com/a.txt', false],
+    ['a third-party host naming files.slack.com in its path', 'https://evil.example/files.slack.com/a.txt', false],
+    ['a non-default port', 'https://files.slack.com:8443/a.txt', false],
+    ['userinfo (user and password)', 'https://u:p@files.slack.com/a.txt', false],
+    ['userinfo (user only)', 'https://u@files.slack.com/a.txt', false],
+    ['no scheme (unparseable)', 'files.slack.com/a.txt', false],
+    ['free text (unparseable)', 'not a url', false],
+    ['an empty string', '', false],
+    ['undefined', undefined, false],
+    ['null', null, false],
+    ['a number', 42, false],
+    ['a URL object', new URL('https://files.slack.com/a.txt'), false],
+  ])('%s → %p', (_label, url, expected) => {
+    expect(isSlackHostedFileUrl(url)).toBe(expected)
+  })
+})
+
+describe('download_attachment', () => {
+  const FILES = 'https://files.slack.com'
+  /** A query string on every fixture URL; it must never reach a result or a log. */
+  const QUERY = `?pub_secret=${LEAK_SENTINEL}`
+
+  const outPath = (name: string) => join(h.inboxDir, `1700000000_000100_${name}`)
+  const slackFile = (id: string, name: string) => ({ id, name, url_private_download: `${FILES}/files-pri/T0-${id}/${name}${QUERY}` })
+  const redirect = (location?: string) => new Response(null, { status: 302, headers: location ? { Location: location } : {} })
+  const ref = () => renderPersonaRef(h.alpha.name, h.alpha.key)
+  const notHosted = (label: string) =>
+    `Tool "download_attachment" refused: file ${label} is not hosted by Slack, so persona ${ref()}'s bot token is not sent for it (only https://files.slack.com is trusted).`
+  const redirectRefusal = (label: string, why: string) =>
+    `Tool "download_attachment" refused: file ${label} ${why}; persona ${ref()}'s bot token is only sent to https://files.slack.com.`
+  const OFFSITE = 'redirected away from https://files.slack.com, so it is not hosted by Slack'
+
+  /** Script the message's files on A's stub and call download_attachment on A's session. */
+  async function download(files: Array<Record<string, unknown>>) {
+    stubOf(h.alpha).script.replies.push({ kind: 'ok', result: { messages: [{ ts: MSG_TS, files }] } })
+    const session = await openPersonaSession(h.alpha)
+    return session.call('download_attachment', TOOL_ARGS.download_attachment(A_ALL))
+  }
+
+  /** Every fetch went to https://files.slack.com with A's bearer token and manual redirects. */
+  function expectTokenOnlySentToSlackFiles() {
+    for (const f of h.fetches) {
+      expect(new URL(f.url).origin).toBe(FILES)
+      expect(f.auth === `Bearer ${h.alphaToken}`).toBe(true)
+      expect(f.redirect).toBe('manual')
+    }
+  }
+
+  function expectNoUrlQuery(result: ToolResult) {
+    expect(JSON.stringify({ result, lines: h.lines })).not.toContain('pub_secret')
+  }
+
+  test("sends A's bot token as the bearer to files.slack.com and writes only into the inbox", async () => {
+    h.fetchHandler = () => new Response('file-body')
+
+    const result = await download([slackFile('F0FILE001', 'report.txt')])
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0]!.text).toBe(`Downloaded 1 file(s):\n${outPath('report.txt')}`)
+    expect(h.fetches.map((f) => f.url)).toEqual([`${FILES}/files-pri/T0-F0FILE001/report.txt${QUERY}`])
+    expectTokenOnlySentToSlackFiles()
+    expect(readFileSync(outPath('report.txt'), 'utf-8')).toBe('file-body')
+    expect(readdirSync(h.inboxDir)).toEqual(['1700000000_000100_report.txt'])
+    expect(slackCallCount(stubOf(h.beta))).toBe(0)
+    expectNoUrlQuery(result)
+    assertNoLeak({ result, lines: h.lines, inbox: writtenFile(h.inboxDir) })
+  })
+
+  test.each<[string, Array<Record<string, unknown>>, string]>([
+    ['an is_external file on a files.slack.com URL', [{ ...slackFile('F0EXT0001', 'e.txt'), is_external: true }], 'F0EXT0001'],
+    ["a mode: 'external' file on a files.slack.com URL", [{ ...slackFile('F0EXT0002', 'e.txt'), mode: 'external' }], 'F0EXT0002'],
+    ['an external file with no URL', [{ id: 'F0EXT0003', name: 'e.txt', is_external: true }], 'F0EXT0003'],
+    [
+      'a third-party URL (malformed file ID → labelled by position)',
+      [{ id: 'not/an id', name: 'x.txt', url_private_download: `https://example.com/x.txt${QUERY}` }],
+      '#1',
+    ],
+    [
+      'a Slack-hosted file followed by a lookalike-host url_private',
+      [slackFile('F0FILE001', 'a.txt'), { name: 'b.txt', url_private: `https://files.slack.com.evil.example/b.txt${QUERY}` }],
+      '#2',
+    ],
+  ])('%s → the whole call is refused before any fetch', async (_label, files, label) => {
+    h.fetchHandler = () => new Response('file-body')
+
+    const result = await download(files)
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(notHosted(label))
+    expect(h.fetches).toEqual([])
+    expect(readdirSync(h.inboxDir)).toEqual([])
+    expectNoUrlQuery(result)
+  })
+
+  test('a same-origin redirect is followed with the token and the file is downloaded', async () => {
+    h.fetchHandler = (url) =>
+      url.includes('/download/') ? new Response('file-body') : redirect('/files-pri/T0-F0FILE001/download/report.txt')
+
+    const result = await download([slackFile('F0FILE001', 'report.txt')])
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0]!.text).toBe(`Downloaded 1 file(s):\n${outPath('report.txt')}`)
+    expect(h.fetches.map((f) => f.url)).toEqual([
+      `${FILES}/files-pri/T0-F0FILE001/report.txt${QUERY}`,
+      `${FILES}/files-pri/T0-F0FILE001/download/report.txt`,
+    ])
+    expectTokenOnlySentToSlackFiles()
+    expect(readFileSync(outPath('report.txt'), 'utf-8')).toBe('file-body')
+    expectNoUrlQuery(result)
+  })
+
+  test.each([
+    ['another host', 'https://evil.example/report.txt'],
+    ['a lookalike host', 'https://files.slack.com.evil.example/report.txt'],
+    ['http: on the Slack host', 'http://files.slack.com/report.txt'],
+    ['a non-default port on the Slack host', 'https://files.slack.com:8443/report.txt'],
+  ])('a redirect to %s is refused and never fetched', async (_label, location) => {
+    h.fetchHandler = () => redirect(location)
+
+    const result = await download([slackFile('F0FILE001', 'report.txt')])
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(redirectRefusal('F0FILE001', OFFSITE))
+    expect(h.fetches.map((f) => f.url)).toEqual([`${FILES}/files-pri/T0-F0FILE001/report.txt${QUERY}`])
+    expectTokenOnlySentToSlackFiles()
+    expect(readdirSync(h.inboxDir)).toEqual([])
+    expectNoUrlQuery(result)
+  })
+
+  test.each([
+    [3, true],
+    [4, false],
+  ])('%p same-origin redirects → downloaded=%p, after exactly 4 fetches', async (hops, downloaded) => {
+    h.fetchHandler = (url) => {
+      const n = Number(new URL(url).pathname.split('/').pop())
+      return n < hops ? redirect(`/hop/${n + 1}`) : new Response('file-body')
+    }
+
+    const result = await download([{ id: 'F0FILE001', name: 'report.txt', url_private_download: `${FILES}/hop/0${QUERY}` }])
+
+    expect(h.fetches).toHaveLength(4)
+    expectTokenOnlySentToSlackFiles()
+    if (downloaded) {
+      expect(result.isError).toBeUndefined()
+      expect(result.content[0]!.text).toBe(`Downloaded 1 file(s):\n${outPath('report.txt')}`)
+    } else {
+      expect(result.isError).toBe(true)
+      expect(result.content[0]!.text).toBe(redirectRefusal('F0FILE001', 'redirected more than 3 times'))
+      expect(readdirSync(h.inboxDir)).toEqual([])
+    }
+    expectNoUrlQuery(result)
+  })
+
+  test('a 3xx with no Location skips the file → "Failed to download any files."', async () => {
+    h.fetchHandler = () => redirect()
+
+    const result = await download([slackFile('F0FILE001', 'report.txt')])
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0]!.text).toBe('Failed to download any files.')
+    expect(h.fetches).toHaveLength(1)
+    expectTokenOnlySentToSlackFiles()
+    expect(readdirSync(h.inboxDir)).toEqual([])
+  })
+
+  test('a redirect refusal after an earlier file was written lists the already-downloaded path', async () => {
+    h.fetchHandler = (url) => (url.includes('/b.txt') ? redirect('https://evil.example/b.txt') : new Response('a-body'))
+
+    const result = await download([slackFile('F0FILE001', 'a.txt'), slackFile('F0FILE002', 'b.txt')])
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(
+      `${redirectRefusal('F0FILE002', OFFSITE)} Already downloaded before this refusal:\n${outPath('a.txt')}`,
+    )
+    expect(h.fetches.map((f) => f.url)).toEqual([
+      `${FILES}/files-pri/T0-F0FILE001/a.txt${QUERY}`,
+      `${FILES}/files-pri/T0-F0FILE002/b.txt${QUERY}`,
+    ])
+    expectTokenOnlySentToSlackFiles()
+    expect(readFileSync(outPath('a.txt'), 'utf-8')).toBe('a-body')
+    expect(readdirSync(h.inboxDir)).toEqual(['1700000000_000100_a.txt'])
+    expectNoUrlQuery(result)
+  })
+
+  test('a non-Slack failure (fetch network error) → the generic "tool call failed" wording, token-safe', async () => {
+    h.fetchHandler = () => {
+      throw new TypeError(`fetch failed ${LEAK_SENTINEL}`)
+    }
+
+    const result = await download([slackFile('F0FILE001', 'report.txt')])
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(`Tool "download_attachment" failed for persona ${ref()}: the tool call failed.`)
+    expect(h.fetches).toHaveLength(1)
+    expect(readdirSync(h.inboxDir)).toEqual([])
+    expectNoUrlQuery(result)
+    assertNoLeak({ result, lines: h.lines })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// fetch_messages: persona-keyed user names, history and thread replies
+// ---------------------------------------------------------------------------
+
+describe('fetch_messages', () => {
+  const M1 = { ts: '1700000000.000100', user: 'U1', text: 'first' }
+  const M2 = { ts: '1700000000.000200', user: 'U2', text: 'second' }
+
+  test.each<[string, Record<string, unknown>, 'history' | 'replies', typeof M1[], 'conversationsHistory' | 'conversationsReplies', Record<string, unknown>]>([
+    ['conversations.history (newest first, returned oldest first)', {}, 'history', [M2, M1], 'conversationsHistory', { channel: A_ALL, limit: 20 }],
+    ['conversations.replies for thread_ts', { thread_ts: MSG_TS }, 'replies', [M1, M2], 'conversationsReplies', { channel: A_ALL, ts: MSG_TS, limit: 20 }],
+  ])("%s: names resolved through A's persona key", async (_label, extra, queue, messages, capture, callArgs) => {
+    stubOf(h.alpha).script[queue].push({ kind: 'ok', result: { messages } })
+    const resolved: Array<[string, string]> = []
+    const deps: SessionToolDeps = {
+      ...h.deps,
+      resolveUserName: async (key, userId) => {
+        resolved.push([key, userId])
+        return `name-${userId}`
+      },
+    }
+    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), deps)
+
+    const result = await session.call('fetch_messages', { channel: A_ALL, ...extra })
+
+    expect(result.isError).toBeUndefined()
+    expect(JSON.parse(result.content[0]!.text)).toEqual([
+      { ts: M1.ts, user: 'name-U1', user_id: 'U1', text: 'first' },
+      { ts: M2.ts, user: 'name-U2', user_id: 'U2', text: 'second' },
+    ])
+    expect(resolved).toEqual([[h.alpha.key, 'U1'], [h.alpha.key, 'U2']])
+    const calls = stubOf(h.alpha).calls
+    expect(calls[capture]).toEqual([callArgs] as any)
+    expect(calls.conversationsHistory.length + calls.conversationsReplies.length).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// reply: file guard wiring and uploads
+// ---------------------------------------------------------------------------
+
+describe('reply files', () => {
+  test('a credentials file is refused before any Slack call', async () => {
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [h.credentialsFile] })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(`Blocked: cannot send ${h.credentialsFile} — it is a persona credentials file.`)
+    expect(totalSlackCalls()).toBe(0)
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test('a sendable file is uploaded through the persona client after the text', async () => {
+    const file = join(h.inboxDir, 'out.txt')
+    writeFileSync(file, 'data')
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [file], thread_ts: MSG_TS })
+
+    expect(result.isError).toBeUndefined()
+    expect(stubOf(h.alpha).calls.postMessage).toHaveLength(1)
+    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file, thread_ts: MSG_TS }] as any)
+    expect(slackCallCount(stubOf(h.beta))).toBe(0)
+    expect(existsSync(file)).toBe(true)
+  })
+
+  test('a symlink re-pointed at a credentials file while the text posts is refused at its upload', async () => {
+    const plain = join(h.inboxDir, 'out.txt')
+    writeFileSync(plain, 'data')
+    const benign = join(h.inboxDir, 'benign.txt')
+    writeFileSync(benign, 'benign')
+    const link = join(h.inboxDir, 'link.txt')
+    symlinkSync(benign, link)
+    const stub = stubOf(h.alpha)
+    const post = stub.web.chat.postMessage
+    let postedTs = ''
+    stub.web.chat.postMessage = (async (args: Parameters<typeof post>[0]) => {
+      rmSync(link)
+      symlinkSync(h.credentialsFile, link)
+      const res = await post(args)
+      postedTs = res.ts as string
+      return res
+    }) as typeof post
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'here', files: [plain, link] })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(
+      `Blocked: cannot send ${link} — it is a persona credentials file. ` +
+        `The reply text was already posted (1 message(s) to ${A_ALL} [ts: ${postedTs}]); ` +
+        '1 of 2 file(s) were uploaded before this refusal.',
+    )
+    expect(postedTs).not.toBe('')
+    expect(stub.calls.postMessage).toHaveLength(1)
+    expect(stub.calls.filesUploadV2).toEqual([{ channel_id: A_ALL, file: plain }] as any)
+    assertNoLeak({ result, lines: h.lines })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Ack reaction removal
+// ---------------------------------------------------------------------------
+
+describe('reply — ack reaction removal', () => {
+  test("a tracked ack is removed once, through the persona's client", async () => {
+    trackAck(A_ALL, MSG_TS)
+    const session = await openPersonaSession(h.alpha)
+
+    await session.call('reply', { chat_id: A_ALL, text: 'first', message_id: MSG_TS })
+    await session.call('reply', { chat_id: A_ALL, text: 'second', message_id: MSG_TS })
+
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([{ channel: A_ALL, timestamp: MSG_TS, name: 'eyes' }])
+    expect(slackCallCount(stubOf(h.beta))).toBe(0)
+  })
+
+  test('a failing reactions.remove does not fail the reply', async () => {
+    trackAck(A_ALL, MSG_TS)
+    stubOf(h.alpha).web.reactions.remove = async () => {
+      throw new Error('reaction_not_found')
+    }
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'hi', message_id: MSG_TS })
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0]!.text).toStartWith('Sent 1 message(s)')
+  })
+
+  test.each([
+    ['no ack tracked', false, { chat_id: A_ALL, text: 'hi', message_id: MSG_TS }],
+    ['reply without message_id', true, { chat_id: A_ALL, text: 'hi' }],
+  ])('%s → no reactions.remove call', async (_label, tracked, args) => {
+    if (tracked) trackAck(A_ALL, MSG_TS)
+    const session = await openPersonaSession(h.alpha)
+
+    await session.call('reply', args)
+
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tool list and MCP instructions
+// ---------------------------------------------------------------------------
+
+describe('tool list and instructions', () => {
+  test('lists exactly the five tools with their inputs and required inputs unchanged', async () => {
+    const { client } = await openPersonaSession(h.alpha)
+
+    const { tools } = await client.listTools()
+
+    expect(
+      Object.fromEntries(
+        tools.map((t) => [t.name, { properties: Object.keys(t.inputSchema.properties ?? {}), required: t.inputSchema.required }]),
+      ),
+    ).toEqual({
+      reply: { properties: ['chat_id', 'text', 'thread_ts', 'files', 'message_id'], required: ['chat_id', 'text'] },
+      react: { properties: ['chat_id', 'message_id', 'emoji'], required: ['chat_id', 'message_id', 'emoji'] },
+      edit_message: { properties: ['chat_id', 'message_id', 'text'], required: ['chat_id', 'message_id', 'text'] },
+      fetch_messages: { properties: ['channel', 'limit', 'thread_ts'], required: ['channel'] },
+      download_attachment: { properties: ['chat_id', 'message_id'], required: ['chat_id', 'message_id'] },
+    })
+  })
+
+  test('instructions carry no pairing or access-control wording and still say to pass chat_id back', async () => {
+    const { client } = await openPersonaSession(h.alpha)
+
+    const instructions = client.getInstructions() ?? ''
+
+    expect(instructions).not.toMatch(/pairing|access\.json|\/slack-channel:access|allowlist/i)
+    expect(instructions).toContain('Reply with the reply tool — pass chat_id back.')
   })
 })

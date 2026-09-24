@@ -9,13 +9,14 @@
  *   1. gate()         — access-control decision (deliver / drop / pair)
  *   2. isDm check     — ev.channel_type === 'im'
  *   3. getSessionByCwd(routingConfig.default_dm_session)
- *   4. targetSession.deliveredChannels.add(channelId)  — on delivery
- *   5. targetSession.server.notification(...)           — dispatch to session
+ *   4. targetSession.server.notification(...)           — dispatch to session
  *
  * Because handleMessage cannot be imported without initialising the live Slack
  * socket and WebClient, we test each step of its logic independently by:
  *   - calling gate() directly from lib.ts
- *   - manipulating the session registry directly from registry.ts
+ *   - manipulating the session registry directly from registry.ts (sessions are
+ *     registered under a persona key; under the route->persona adapter that is
+ *     the channel ID)
  *   - asserting on registry state / notification call counts
  *
  * SPDX-License-Identifier: MIT
@@ -25,7 +26,6 @@ import { describe, test, expect, beforeEach } from 'bun:test'
 import { homedir } from 'os'
 import {
   gate,
-  assertOutboundAllowed,
   defaultAccess,
   type Access,
   type GateOptions,
@@ -115,12 +115,11 @@ function makeRoutingConfig(opts: {
  * 'deliver' branch. Returns { delivered, targetSession } so tests can
  * inspect the result.
  *
- * Logic mirrors server.ts lines 334–359:
+ * Logic mirrors server.ts handleMessage's DM branch:
  *   if (isDm) {
  *     if (!routingConfig?.default_dm_session) return (drop)
  *     targetSession = getSessionByCwd(routingConfig.default_dm_session)
  *     if (!targetSession || !targetSession.connected) return (drop)
- *     targetSession.deliveredChannels.add(channelId)
  *     targetSession.server.notification(...)
  *   }
  */
@@ -137,9 +136,6 @@ function simulateDmDeliver(
   if (!targetSession || !targetSession.connected) {
     return { delivered: false, targetSession }
   }
-
-  // Add DM channel to session's deliveredChannels (t2.c1r.3i.bo)
-  targetSession.deliveredChannels.add(channelId)
 
   // Dispatch to the session's server (simulated)
   targetSession.server.notification({
@@ -264,138 +260,7 @@ describe('DM routing — dropped when default_dm_session session not connected',
 })
 
 // ---------------------------------------------------------------------------
-// Test 4 — DM channel ID added to DM session's deliveredChannels on delivery
-// ---------------------------------------------------------------------------
-
-describe('DM routing — DM channel added to deliveredChannels', () => {
-  test('DM channel ID is added to the session deliveredChannels after delivery', async () => {
-    const { server } = makeServer()
-    const entry = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), server as any)
-    entry.server = server
-
-    // Before delivery, DM channel is NOT in deliveredChannels
-    expect(entry.deliveredChannels.has('D_DM1')).toBe(false)
-
-    const routingConfig = makeRoutingConfig({ default_dm_session: '/tmp/dm-session' })
-
-    const { delivered } = simulateDmDeliver('D_DM1', routingConfig)
-
-    expect(delivered).toBe(true)
-    // After delivery, DM channel IS in deliveredChannels
-    expect(entry.deliveredChannels.has('D_DM1')).toBe(true)
-  })
-
-  test('multiple DM channels from different users are all tracked', async () => {
-    const { server } = makeServer()
-    const entry = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), server as any)
-    entry.server = server
-
-    const routingConfig = makeRoutingConfig({ default_dm_session: '/tmp/dm-session' })
-
-    simulateDmDeliver('D_USER1', routingConfig)
-    simulateDmDeliver('D_USER2', routingConfig)
-    simulateDmDeliver('D_USER3', routingConfig)
-
-    expect(entry.deliveredChannels.has('D_USER1')).toBe(true)
-    expect(entry.deliveredChannels.has('D_USER2')).toBe(true)
-    expect(entry.deliveredChannels.has('D_USER3')).toBe(true)
-  })
-
-  test('adding the same DM channel twice is idempotent', async () => {
-    const { server } = makeServer()
-    const entry = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), server as any)
-    entry.server = server
-
-    const routingConfig = makeRoutingConfig({ default_dm_session: '/tmp/dm-session' })
-
-    simulateDmDeliver('D_DM1', routingConfig)
-    simulateDmDeliver('D_DM1', routingConfig)
-
-    // Set semantics: D_DM1 still only appears once
-    const channels = Array.from(entry.deliveredChannels).filter((c) => c === 'D_DM1')
-    expect(channels).toHaveLength(1)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Test 5 — DM session can reply to DM channel after receiving a DM
-//          (outbound scoping via assertOutboundAllowed)
-// ---------------------------------------------------------------------------
-
-describe('DM routing — outbound scoping after DM delivery', () => {
-  test('session can reply to DM channel after it has been added to deliveredChannels', () => {
-    const { server } = makeServer()
-    const entry = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), server as any)
-    entry.server = server
-
-    const routingConfig = makeRoutingConfig({ default_dm_session: '/tmp/dm-session' })
-    simulateDmDeliver('D_DM1', routingConfig)
-
-    const access = makeAccess()
-
-    // D_DM1 is now in deliveredChannels — outbound should be allowed
-    expect(() =>
-      assertOutboundAllowed('D_DM1', access, entry.deliveredChannels),
-    ).not.toThrow()
-  })
-
-  test('session cannot reply to a DM channel it has not received a message from', () => {
-    const { server } = makeServer()
-    const entry = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), server as any)
-    entry.server = server
-
-    const access = makeAccess()
-
-    // D_DM_NEVER was never delivered — outbound should be blocked
-    expect(() =>
-      assertOutboundAllowed('D_DM_NEVER', access, entry.deliveredChannels),
-    ).toThrow('Outbound gate')
-  })
-
-  test('delivering to one DM channel does not unlock another DM channel', () => {
-    const { server } = makeServer()
-    const entry = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), server as any)
-    entry.server = server
-
-    const routingConfig = makeRoutingConfig({ default_dm_session: '/tmp/dm-session' })
-    simulateDmDeliver('D_DM1', routingConfig)
-
-    const access = makeAccess()
-
-    // D_DM2 was never delivered to this session
-    expect(() =>
-      assertOutboundAllowed('D_DM2', access, entry.deliveredChannels),
-    ).toThrow('Outbound gate')
-  })
-
-  test('channel session cannot reply to DM channels that belong to another session', () => {
-    const { server: serverA } = makeServer()
-    const entryA = registerSession('/tmp/channel-session', 'C_CHANNEL', makeTransport(), serverA as any)
-    entryA.server = serverA
-
-    const { server: serverB } = makeServer()
-    const entryB = registerSession('/tmp/dm-session', 'C_BOT', makeTransport(), serverB as any)
-    entryB.server = serverB
-
-    const routingConfig = makeRoutingConfig({ default_dm_session: '/tmp/dm-session' })
-    simulateDmDeliver('D_DM1', routingConfig)
-
-    const access = makeAccess()
-
-    // entryB received the DM, so it can reply
-    expect(() =>
-      assertOutboundAllowed('D_DM1', access, entryB.deliveredChannels),
-    ).not.toThrow()
-
-    // entryA did not receive the DM, so it cannot reply
-    expect(() =>
-      assertOutboundAllowed('D_DM1', access, entryA.deliveredChannels),
-    ).toThrow('Outbound gate')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Test 6 — Pairing flow runs server-side (gate returns pair)
+// Test 4 — Pairing flow runs server-side (gate returns pair)
 // ---------------------------------------------------------------------------
 
 describe('DM routing — pairing flow runs server-side', () => {
