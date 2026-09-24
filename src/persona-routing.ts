@@ -1,37 +1,45 @@
 /**
- * persona-routing.ts — Inbound Slack delivery per persona (b.av2 SR-4.1 and
- * SR-4.2, SR-10.3 `unclaimed-channel`).
+ * persona-routing.ts — Inbound Slack delivery per persona (b.av2 SR-4.1,
+ * SR-4.2, SR-4.4, SR-10.3 `unclaimed-channel`).
  *
  * Every `message` and `app_mention` event a persona's connection receives
  * feeds that persona's single pipeline:
  *
  * 1. Intake (`receive`): the event is acked first, before anything else. Then,
  *    for each receiving persona, the archive is written through the archive
- *    seam (unconditionally, before any decision) and that persona's pipeline
- *    runs. Each persona's run is isolated: a throw is caught and logged, naming
- *    the persona, and never stops another persona's run.
- * 2. Decision: one call to `decideDelivery` (`src/delivery-decision.ts`, the
+ *    seam (unconditionally, before dedupe and any decision) and that persona's
+ *    pipeline runs. Each persona's run is isolated: a throw is caught and
+ *    logged, naming the persona, and never stops another persona's run.
+ * 2. Dedupe (b.av2 SR-4.1): P's own store (`src/inbound-dedupe.ts`), kept
+ *    per persona key for the life of this routing instance (so it survives a
+ *    reopen of P's connection), records the event's (channel, ts). A key P
+ *    already saw within the retention window, such as the second of the
+ *    `message` / `app_mention` pair or a Slack redelivery, stops here with no
+ *    decision, dispatch, reaction, recovery, post or log line. An event
+ *    without a channel or ts is not keyed and carries on.
+ * 3. Decision: one call to `decideDelivery` (`src/delivery-decision.ts`, the
  *    only module holding channel-delivery rules) with P's key, bot user ID,
  *    bot ID and channel entries and the applied personas. It returns deliver
  *    with `via`, or drop with a reason.
- * 3. Drop logging: a channel no applied persona lists logs one
+ * 4. Drop logging: a channel no applied persona lists logs one
  *    `unclaimed-channel` line naming the channel and P; a channel another
  *    applied persona lists logs nothing; a DM logs one interim
  *    `persona-dm-dropped` line; any other reason logs one plain line naming
  *    the author ID. No drop line carries message text.
- * 4. Dispatch: P's session is looked up by persona key; the ack reaction is
+ * 5. Dispatch: P's session is looked up by persona key; the ack reaction is
  *    added through P's client; the message goes as `notifications/claude/channel`
  *    to P's session only, with `chat_id` set to the source conversation. The
  *    meta `user` is the author's display name, or for an author without
  *    `user` (webhook, `bot_message`) the event's `username`, else its
- *    `bot_profile.name`, else its bot ID.
- * 5. Lost message: when P has no live session, or its session has lost its GET
+ *    `bot_profile.name`, else its bot ID. The meta also carries the author's
+ *    `user_id` (or, for an author without `user`, its `bot_id`; never both)
+ *    and `via`, how the message reached P (b.av2 SR-4.4).
+ * 6. Lost message: when P has no live session, or its session has lost its GET
  *    stream, the message is dropped, a human-triggered restart of P is
  *    scheduled when the restart guards allow (b.kvq / b.9cj), and one reply
  *    saying so is posted in the source conversation through P's client.
  *
- * Deferred rules and where they are completed: dedupe and the `via`,
- * `user_id` and `bot_id` meta (E4 Task 2); DM delivery (E6, which replaces
+ * Deferred rules and where they are completed: DM delivery (E6, which replaces
  * the interim DM drop and its line); the lost-message notice to P's
  * destination (E8, which replaces the source-conversation replies below); the
  * ack reaction's source and keying (E9; today it comes from `access.json`).
@@ -39,8 +47,8 @@
  * Side-effect free (b.av2 SR-13.1): importing this module creates no Slack
  * client, reads no token, file or environment variable, starts no timer and
  * logs nothing. Every Slack client, the persona config, the bot identity, the
- * name resolver, the archive writer, the ack-reaction source and the logger
- * are injected through `createPersonaRouting`. The session lookup comes from
+ * name resolver, the archive writer, the ack-reaction source, the logger and
+ * (optionally) the dedupe clock are injected through `createPersonaRouting`. The session lookup comes from
  * the registry and the restart guards from the restart and backoff modules,
  * so tests drive their real state. This module never calls agent-director.
  *
@@ -64,6 +72,7 @@ import {
   UNCLAIMED_CHANNEL,
 } from './persona-diagnostics.ts'
 import { describeSlackCallFailure } from './persona-connection-errors.ts'
+import { createInboundDedupeStore, type InboundDedupeStore } from './inbound-dedupe.ts'
 import { getSessionByPersona } from './registry.ts'
 import { isRestartPendingOrActive, RESTART_FAILURE_CAP, scheduleRestart } from './restart.ts'
 import { isAtCap } from './backoff.ts'
@@ -143,6 +152,8 @@ export interface PersonaRoutingDeps {
   getAccess(): Pick<Access, 'ackReaction'>
   /** Writes one log line. */
   log(line: string): void
+  /** Clock for the per-persona dedupe stores, in milliseconds; defaults to `Date.now`. */
+  dedupeClock?: () => number
 }
 
 /** A persona-routing instance. */
@@ -201,6 +212,19 @@ type LostMessageBranch = 'no-session' | 'streamless'
 
 /** Build a persona-routing instance over the injected dependencies. */
 export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
+  /** Each persona's dedupe store, by persona key; never shared between personas. */
+  const dedupeStores = new Map<string, InboundDedupeStore>()
+
+  /** P's dedupe store, created on first use. */
+  function dedupeStoreFor(key: string): InboundDedupeStore {
+    let store = dedupeStores.get(key)
+    if (!store) {
+      store = createInboundDedupeStore(deps.dedupeClock)
+      dedupeStores.set(key, store)
+    }
+    return store
+  }
+
   /** The persona reference for a key: its rendered name when applied, else the bare key. */
   function refForKey(key: string): string {
     const persona = deps.getPersonaConfig()?.personas.find((p) => p.key === key)
@@ -218,7 +242,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     await Promise.all(keys.map((key) => runIsolated(key, event)))
   }
 
-  /** Archive, then run P's pipeline; never rejects. */
+  /** Archive, drop a duplicate silently, else run P's pipeline; never rejects. */
   async function runIsolated(key: string, event: object): Promise<void> {
     try {
       deps.archive(key, event)
@@ -226,7 +250,9 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       deps.log(`[slack] persona-routing: archive write failed for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
     }
     try {
-      await runPipeline(key, event as Record<string, unknown>)
+      const ev = event as Record<string, unknown>
+      if (dedupeStoreFor(key).record(ev['channel'], ev['ts']) === 'duplicate') return
+      await runPipeline(key, ev)
     } catch (err) {
       deps.log(`[slack] persona-routing: error handling event for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
     }
@@ -447,9 +473,11 @@ function describeAuthor(ev: Record<string, unknown>): string {
 }
 
 /**
- * Today's `<channel>` meta: source conversation, message ID, user, ts, thread
- * and attachments. `delivery` is the decision that let the message through;
- * E4 Task 2 adds its `via` (and the author IDs) to the meta.
+ * The `<channel>` meta of a delivered Slack message: source conversation,
+ * message ID, user label, the author's ID (`user_id`, or `bot_id` for an
+ * author without `user`; never both), ts, `via` from the decision that let the
+ * message through (b.av2 SR-4.4), thread and attachments. Injected prompts
+ * (`/interject`, cron) build their own meta and never come through here.
  */
 function buildMeta(
   ev: Record<string, unknown>,
@@ -461,8 +489,13 @@ function buildMeta(
     chat_id: chatId,
     message_id: ev['ts'] as string,
     user: userName,
-    ts: ev['ts'] as string,
   }
+  const user = ev['user']
+  const botId = ev['bot_id']
+  if (typeof user === 'string' && user !== '') meta.user_id = user
+  else if (typeof botId === 'string' && botId !== '') meta.bot_id = botId
+  meta.ts = ev['ts'] as string
+  meta.via = delivery.via
   if (ev['thread_ts']) meta.thread_ts = ev['thread_ts'] as string
 
   const files = ev['files'] as Array<Record<string, unknown>> | undefined

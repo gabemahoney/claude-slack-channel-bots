@@ -52,7 +52,13 @@ import {
   LOST_MESSAGE_STARTED_REPLY,
 } from '../src/persona-routing.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
-import { makeChannelMessage, type SlackEvent, type StubSlackOptions } from './test-helpers/slack-stub.ts'
+import {
+  makeAppMention,
+  makeChannelMessage,
+  mentionText,
+  type SlackEvent,
+  type StubSlackOptions,
+} from './test-helpers/slack-stub.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { indicesOf, stripComments } from './test-helpers/source-audit.ts'
 import {
@@ -331,6 +337,49 @@ describe('b.kvq (3) second message while restart pending/active does not stack a
 
     launchResolve(true)
     await Bun.sleep(1)
+  })
+})
+
+// ===========================================================================
+// b.av2 SR-4.1 — a duplicate of a lost message triggers nothing more.
+// A channel mention reaches the persona as a `message` and an `app_mention`
+// with the same (channel, ts), and Slack may redeliver either. The persona's
+// dedupe store sits before the lost-message branch, so the pair and any later
+// redelivery give one reply and one recovery.
+// ===========================================================================
+
+describe('b.kvq x SR-4.1 a duplicated mention for a sessionless persona recovers once', () => {
+  test('a `message` then `app_mention` of the same mention: one reply and one recovery; a redelivery after the launch adds nothing', async () => {
+    const h = makeHarness()
+    const text = `${mentionText(h.p('alpha').stub.identity.botUserId)} are you there?`
+    const message = makeChannelMessage({ channel: ALPHA_HOME, text })
+    const mention = makeAppMention({ channel: ALPHA_HOME, text, ts: message.ts })
+    expect(mention.ts).toBe(message.ts)
+
+    await h.deliver(message, h.alpha.key)
+    await h.deliver(mention, h.alpha.key)
+
+    // Without dedupe the app_mention would find the restart pending and post
+    // a second, "restarting" reply.
+    expect(h.allPosts()).toEqual([
+      { key: h.alpha.key, channel: ALPHA_HOME, text: LOST_MESSAGE_STARTED_REPLY },
+    ])
+    expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
+    expectBetaUntouched(h)
+    await Bun.sleep(WAIT_MS)
+    expect(h.launches).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
+    // The launch has finished, so no restart guard would stop a second recovery.
+    expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
+
+    // Slack redelivers both events: a duplicate does nothing and logs nothing.
+    const logsBefore = [...h.logs]
+    await h.deliver(message, h.alpha.key)
+    await h.deliver(mention, h.alpha.key)
+
+    expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
+    expect(h.allPosts()).toHaveLength(1)
+    expect(h.logs).toEqual(logsBefore)
+    expectBetaUntouched(h)
   })
 })
 

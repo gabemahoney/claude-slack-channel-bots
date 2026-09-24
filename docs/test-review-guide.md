@@ -17,6 +17,7 @@ When reviewing tests, check for:
 - [ ] Test names describe the scenario and expected outcome
 - [ ] No false positives — tests would fail if the feature broke
 - [ ] Assertions are specific (`.toBe('allow')` not `.toBeTruthy()`)
+- [ ] A multi-persona delivery test asserts every persona's exact deliveries (count, `chat_id` and `via`), including the personas that get nothing; asserting only that the expected persona got at least one is a defect
 - [ ] No hardcoded values that should come from factory functions
 
 ### Isolation

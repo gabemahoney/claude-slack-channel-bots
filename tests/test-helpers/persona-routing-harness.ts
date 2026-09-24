@@ -20,6 +20,10 @@
  * - a line capture for the module's log seam (`h.logs`) and an order capture
  *   (`h.order`) for ack, archive, config and identity reads.
  *
+ * Every call builds a new routing, so every harness starts with empty
+ * per-persona dedupe stores; `dedupeClock` injects their clock (default
+ * `Date.now`).
+ *
  * The harness calls `initRestart` and registers sessions; reset the registry,
  * restart, backoff and ack-tracker state between tests with
  * `resetRoutingState()`.
@@ -187,6 +191,8 @@ export interface RoutingHarnessOptions {
   restartDelayS?: number
   /** Replaces the restart deps' launch outcome, e.g. a promise held open. */
   launchSession?: RestartFakeOptions['launchSession']
+  /** Clock for the per-persona dedupe stores (e.g. a fake clock's `now`); default the module's (`Date.now`). */
+  dedupeClock?: PersonaRoutingDeps['dedupeClock']
 }
 
 export interface RoutingHarness {
@@ -328,6 +334,7 @@ export function makeRoutingHarness(
     },
     getAccess: () => ({ ackReaction: opts.ackReaction }),
     log: (line) => { h.logs.push(line) },
+    dedupeClock: opts.dedupeClock,
   })
 
   initRestart(restartDeps)

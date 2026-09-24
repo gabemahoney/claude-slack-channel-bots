@@ -1060,4 +1060,31 @@ describe('tool list and instructions', () => {
     expect(instructions).not.toMatch(/pairing|access\.json|\/slack-channel:access|allowlist/i)
     expect(instructions).toContain('Reply with the reply tool — pass chat_id back.')
   })
+
+  // b.av2 SR-12: the tag attributes, the channel via values and persona mentions.
+  // Key tokens only, so harmless rewording does not break the case.
+  test('instructions name chat_id, user_id, bot_id and via, list the channel via values and say <@ID> reaches a user or persona', async () => {
+    const { client } = await openPersonaSession(h.alpha)
+
+    const instructions = client.getInstructions() ?? ''
+
+    for (const token of ['chat_id', 'user_id', 'bot_id', 'via']) expect(instructions).toMatch(new RegExp(`\\b${token}\\b`))
+    // The sentence that lists the via values, so a stray word elsewhere cannot satisfy it.
+    const viaList = instructions.split('\n').find((line) => /^via\b/.test(line)) ?? ''
+    for (const value of ['mention', 'broadcast', 'receive_all_shared', 'receive_all']) {
+      expect(viaList).toMatch(new RegExp(`\\b${value} \\(`))
+    }
+    // E6 adds dm as a via value and flips this expectation.
+    expect(viaList).not.toMatch(/\bdm\b/)
+    expect(instructions).toMatch(/<@ID>[^\n]*mentions a Slack user or another persona/)
+  })
+
+  test('instructions say a message without via is an injected prompt needing no reply unless it asks', async () => {
+    const { client } = await openPersonaSession(h.alpha)
+
+    const instructions = client.getInstructions() ?? ''
+
+    expect(instructions).toMatch(/without via is an injected prompt/)
+    expect(instructions).toMatch(/no reply unless it asks/)
+  })
 })

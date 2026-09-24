@@ -45,7 +45,7 @@ import {
   LOST_MESSAGE_RESTARTING_REPLY,
 } from '../src/persona-routing.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
-import { makeChannelMessage } from './test-helpers/slack-stub.ts'
+import { makeAppMention, makeChannelMessage, mentionText } from './test-helpers/slack-stub.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import {
   makeRestartDeps,
@@ -212,6 +212,47 @@ describe('dispatch-site _GET_stream branch (b.sjy + b.9cj)', () => {
     expectBetaUntouched(a)
     await Bun.sleep(WAIT_MS)
     expect(a.h.launches).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Streamless, duplicated mention (b.av2 SR-4.1): a mention reaches the
+  // persona as a `message` and an `app_mention` with the same (channel, ts),
+  // and Slack may redeliver either. The persona's dedupe store sits before
+  // dispatch, so the pair gives one reply, one recovery and no notification,
+  // and a redelivery after the launch adds nothing.
+  // -------------------------------------------------------------------------
+  test('b.9cj streamless duplicated mention: a `message` / `app_mention` pair gives one reply, one recovery, no notification', async () => {
+    const a = makeAlpha({ hasGetStream: false, restartDelayS: FAST_DELAY_S })
+    const text = `${mentionText(a.h.p('alpha').stub.identity.botUserId)} hello`
+    const message = makeChannelMessage({ channel: ALPHA_SECOND, text })
+    const mention = makeAppMention({ channel: ALPHA_SECOND, text, ts: message.ts })
+    expect(mention.ts).toBe(message.ts)
+
+    await a.h.receive(message, ['alpha'])
+    await a.h.receive(mention, ['alpha'])
+
+    expect(a.h.p('alpha').notifications).toHaveLength(0)
+    // Without dedupe the app_mention would reach the branch again and post a
+    // second reply.
+    expect(a.h.allPosts()).toEqual([{ key: a.alpha.key, channel: ALPHA_SECOND, text: LOST_MESSAGE_RESTARTING_REPLY }])
+    expect(isRestartPendingOrActive(a.alpha.key)).toBe(true)
+    expectBetaUntouched(a)
+    const ref = renderPersonaRef(a.alpha.name, a.alpha.key)
+    expect(a.h.logs.filter((l) => l.startsWith(`[slack] DROP: no _GET_stream for persona ${ref} chat_id=${ALPHA_SECOND}`))).toHaveLength(1)
+    await Bun.sleep(WAIT_MS)
+    expect(a.h.launches).toEqual([{ key: a.alpha.key, cwd: a.sessionCwd }])
+    // The launch has finished, so no restart guard would stop a second recovery.
+    expect(isRestartPendingOrActive(a.alpha.key)).toBe(false)
+
+    // Slack redelivers both events: a duplicate does nothing and logs nothing.
+    const logsBefore = [...a.h.logs]
+    await a.h.receive(message, ['alpha'])
+    await a.h.receive(mention, ['alpha'])
+
+    expect(isRestartPendingOrActive(a.alpha.key)).toBe(false)
+    expect(a.h.allPosts()).toHaveLength(1)
+    expect(a.h.p('alpha').notifications).toHaveLength(0)
+    expect(a.h.logs).toEqual(logsBefore)
   })
 
   // -------------------------------------------------------------------------

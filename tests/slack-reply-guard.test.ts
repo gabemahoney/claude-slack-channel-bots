@@ -17,10 +17,10 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { resolve, join } from 'node:path'
-import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
@@ -405,5 +405,59 @@ describe('slack-reply-guard.sh — b.wr5 injected prompts and reminder provenanc
     const r = runGuard(harness(join(FIX, 'verbatim-live-no-reply.jsonl'), true))
     expect(r.exitCode).toBe(0)
     expect(r.stderr).toBe('')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Plan b.ob2 E4 — delivered Slack tags now carry `via` and `user_id` or
+// `bot_id`. Until E10 the guard ignores `via`, so a tag with the new
+// attributes must get exactly the result the unmodified fixture gets.
+//
+// Derived at test time, never checked in (E10 owns the SR-13.4 fixture set):
+// each row copies an existing fixture into a mkdtempSync directory with ONE
+// edit to its single opening <channel> tag — `user_id="…"` or `bot_id="…"`
+// inserted right after the `user` attribute, and `via="…"` appended as the
+// last attribute. A delivered tag puts `via` elsewhere (after `ts`); the
+// guard reads attributes by name, so their position does not matter here.
+// Everything else is byte-for-byte the source fixture.
+// ---------------------------------------------------------------------------
+
+describe('slack-reply-guard.sh — tags carrying via and user_id / bot_id (b.ob2 E4)', () => {
+  let tmp: string
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'srg-via-'))
+  })
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true })
+  })
+
+  // Attribute quotes are JSON-escaped (\") in the raw JSONL text.
+  function deriveWithViaTag(fixture: string, author: 'user_id' | 'bot_id', via: string): string {
+    const raw = readFileSync(join(FIX, fixture), 'utf-8')
+    const authorAttr = ` ${author}=\\"${author === 'user_id' ? 'U0TESTAUTHOR' : 'B0TESTAUTHOR'}\\"`
+    const derived = raw.replace(/<channel [^>]*>/, (tag) =>
+      tag.replace(/ user=\\"[^"]*\\"/, (userAttr) => userAttr + authorAttr).replace(/>$/, ` via=\\"${via}\\">`),
+    )
+    // Both inserts landed in the opening tag, so the case cannot pass vacuously.
+    expect(derived).toMatch(new RegExp(`<channel [^>]*${author}=[^>]* via=\\\\"${via}\\\\">`))
+    const path = join(tmp, `${via}-${fixture}`)
+    writeFileSync(path, derived)
+    return path
+  }
+
+  test.each([
+    ['verbatim-live-no-reply.jsonl', 'user_id', 'mention', 2],
+    ['verbatim-live-no-reply.jsonl', 'bot_id', 'receive_all', 2],
+    ['slack-no-reply.jsonl', 'user_id', 'receive_all_shared', 2],
+    ['verbatim-live-with-reply.jsonl', 'user_id', 'mention', 0],
+  ] as const)('%s with %s and via=%s → same exit code (%i) and stderr as the unmodified fixture', (fixture, author, via, exitCode) => {
+    const original = runGuard(harness(join(FIX, fixture)))
+    const derived = runGuard(harness(deriveWithViaTag(fixture, author, via)))
+
+    // The source fixture takes the path the row names: the reminder, or silence after a reply.
+    expect(original.exitCode).toBe(exitCode)
+    if (exitCode === 2) expect(original.stderr).toContain(REPLY_TOOL)
+    else expect(original.stderr).toBe('')
+    expect(derived).toEqual(original)
   })
 })

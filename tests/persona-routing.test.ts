@@ -25,12 +25,15 @@
  * server wires them (`makeManagedRouting`).
  *
  * Owns AC 1, AC 2 and 12 (persona-routing leg; the tool-level scope stays in
- * registry.test.ts) and AC 52. The delivery rules themselves (SR-4.2) live in
- * src/delivery-decision.ts and are covered exhaustively by
+ * registry.test.ts), AC 52, and the SR-14 shared-channel contract end to end
+ * (AC 6, 7, 8, 9, 10, 11, 16 and 18). The delivery rules themselves (SR-4.2)
+ * live in src/delivery-decision.ts and are covered exhaustively by
  * tests/delivery-decision.test.ts; this file proves the pipeline is wired to
- * them (subtypes, bot and webhook authors, bot-ID self-exclusion, broadcasts)
- * and pins the E3 behaviour the rules keep. E4 Task 2 adds dedupe, `via` and
- * the author meta, and E6 replaces the interim DM drop.
+ * them (subtypes, bot and webhook authors, bot-ID self-exclusion, broadcasts),
+ * pins the E3 behaviour the rules keep, and covers the per-persona dedupe and
+ * the one archive row (SR-4.1) and the author and `via` meta (SR-4.4). Every
+ * harness has fresh dedupe stores reading this test's fake clock. E6 replaces
+ * the interim DM drop.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -41,6 +44,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { LOST_MESSAGE_RESTARTING_REPLY, LOST_MESSAGE_STARTED_REPLY } from '../src/persona-routing.ts'
+import { INBOUND_DEDUPE_RETENTION_MS } from '../src/inbound-dedupe.ts'
+import type { Via } from '../src/delivery-decision.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { checkPersonaTarget, unregisterSession } from '../src/registry.ts'
 import { initRestart, isRestartPendingOrActive } from '../src/restart.ts'
@@ -73,6 +78,7 @@ import {
 } from './test-helpers/persona-routing-harness.ts'
 import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import { makeManagedRouting } from './test-helpers/persona-routing-managed.ts'
+import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 
 // ---------------------------------------------------------------------------
 // Channels
@@ -96,9 +102,11 @@ type Harness = RoutingHarness
 let dir: string
 let consoleLines: string[]
 let consoleSpy: ReturnType<typeof spyOn>
+/** This test's dedupe clock; each harness gets fresh per-persona dedupe stores reading it. */
+let clock: FakeClock
 
 function makeHarness(specs: PersonaSpec[], opts: RoutingHarnessOptions = {}): Harness {
-  return makeRoutingHarness(specs, dir, opts)
+  return makeRoutingHarness(specs, dir, { dedupeClock: () => clock.now(), ...opts })
 }
 
 /** Everything a case captured, for `assertNoLeak`. */
@@ -129,6 +137,7 @@ function ac1Specs(): PersonaSpec[] {
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'persona-routing-'))
+  clock = createFakeClock()
   resetRoutingState()
   consoleLines = []
   consoleSpy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
@@ -250,7 +259,7 @@ describe('delivery rules against the receiving persona P', () => {
   /** P's and Q's bot user IDs, and P's bot ID. */
   type Ids = { p: string; q: string; pBot: string }
 
-  // One row per wiring case; E4 Task 2 appends the SR-14 matrix and dedupe rows here.
+  // One row per wiring case; the SR-14 shared-channel matrix and dedupe have their own blocks below.
   // The optional fourth element is a fragment P's one logged drop line must contain. It is read
   // through a rest parameter: a fourth named parameter would make Bun pass a `done` callback to
   // the three-element rows.
@@ -302,7 +311,7 @@ describe('delivery rules against the receiving persona P', () => {
     expect(isRestartPendingOrActive(P.persona.key)).toBe(false)
   })
 
-  test('delivered meta and text follow today\'s shape, with the user name looked up on P\'s client', async () => {
+  test('SR-4.4: a threaded file post keeps today\'s meta and text alongside the author\'s user_id and via, with the user name looked up on P\'s client', async () => {
     const h = makeHarness(specs())
     const P = h.p('Pilot')
     const Q = h.p('Quill')
@@ -320,12 +329,14 @@ describe('delivery rules against the receiving persona P', () => {
     const { method, params } = P.notifications[0]!
     expect(method).toBe('notifications/claude/channel')
     expect(params.content).toBe('please review')
-    expect(params.meta).toMatchObject({
+    expect(params.meta).toEqual({
       chat_id: PMENT,
       message_id: event.ts as string,
-      ts: event.ts as string,
-      thread_ts: '1700000000.000001',
       user: 'stub-user',
+      user_id: event.user as string,
+      ts: event.ts as string,
+      via: 'mention',
+      thread_ts: '1700000000.000001',
       attachment_count: '1',
       attachments: 'report.pdf (application/pdf, 2048 bytes)',
     })
@@ -754,5 +765,276 @@ describe('per-persona identities (connection manager)', () => {
     } finally {
       await h.manager.stopAll()
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SR-14 shared-channel matrix (b.av2 SR-13.5; AC 6-11, 16, 18), dedupe, the
+// one-archive-row rule (SR-4.1) and the delivered meta (SR-4.4).
+//
+// Real Slack fans one channel message out to every persona app in the channel
+// and also sends an `app_mention` to each persona the text mentions directly,
+// so `fanOut` feeds the `message` on the connection of every persona that
+// lists the channel, then its `app_mention` twin on each directly mentioned
+// persona's connection. Delivery counts then prove dedupe and self-exclusion
+// together.
+// ---------------------------------------------------------------------------
+
+/** A's home channel (A `all`). */
+const MX_HOME = 'C0MXHOME1'
+/** Coordination channel: A, B and C all `mentions`. */
+const MX_COORD = 'C0MXCOORD'
+/** Shared channel: D and E both `all`. */
+const MX_SHARED = 'C0MXSHARE'
+
+const MX_NAMES = ['A', 'B', 'C', 'D', 'E'] as const
+type MxName = typeof MX_NAMES[number]
+
+/** The matrix fixture: A `all` at home and `mentions` in coordination; B, C `mentions` in coordination; D, E `all` in the shared channel. */
+function matrixSpecs(): PersonaSpec[] {
+  return [
+    { name: 'A', channels: [{ id: MX_HOME, delivery: 'all' }, { id: MX_COORD, delivery: 'mentions' }] },
+    { name: 'B', channels: [{ id: MX_COORD, delivery: 'mentions' }] },
+    { name: 'C', channels: [{ id: MX_COORD, delivery: 'mentions' }] },
+    { name: 'D', channels: [{ id: MX_SHARED, delivery: 'all' }] },
+    { name: 'E', channels: [{ id: MX_SHARED, delivery: 'all' }] },
+  ]
+}
+
+/** The `app_mention` Slack sends alongside `event` to a persona it mentions: same channel, ts, text and author. */
+function appMentionTwin(event: SlackEvent): SlackEvent {
+  return makeAppMention({ channel: event.channel, ts: event.ts, text: event.text, user: event.user, bot_id: event.bot_id })
+}
+
+/**
+ * Feed `event` as Slack fans it out: the `message` on each connection in
+ * `connections` (default: every persona that lists the channel), then the
+ * `app_mention` twin on each of those whose bot user the text mentions.
+ */
+async function fanOut(h: Harness, event: SlackEvent, connections?: readonly string[]): Promise<void> {
+  const names = connections ?? h.all.filter((x) => x.persona.channels.some((c) => c.id === event.channel)).map((x) => x.persona.name)
+  await receiveOnEach(h, event, names)
+  const text = String(event.text ?? '')
+  const mentioned = names.filter((n) => text.includes(`<@${h.p(n).stub.identity.botUserId}`))
+  await receiveOnEach(h, appMentionTwin(event), mentioned)
+}
+
+/** A post by persona `name`: its bot user and bot ID, as Slack delivers a persona's `chat.postMessage`. */
+function personaPost(h: Harness, name: string, overrides: Record<string, unknown>): SlackEvent {
+  const { botUserId, botId } = h.p(name).stub.identity
+  return makeBotMessage({ user: botUserId, bot_id: botId, ...overrides })
+}
+
+/** Each persona's deliveries as `{ chat_id, via }`, for one exact comparison per case. */
+function deliveries(h: Harness, names: readonly string[] = MX_NAMES): Record<string, Array<{ chat_id: string; via: string }>> {
+  return Object.fromEntries(names.map((n) => [n, h.p(n).notifications.map((x) => ({ chat_id: x.params.meta.chat_id!, via: x.params.meta.via! }))]))
+}
+
+describe('SR-14 shared-channel matrix (AC 6, 7, 8, 9, 10, 11, 16)', () => {
+  type Author = 'person' | 'other-app bot' | 'webhook' | MxName
+  interface MatrixCase {
+    ac: string
+    name: string
+    channel: string
+    author: Author
+    /** Message text, given each persona's bot user mention. */
+    text: (m: Record<MxName, string>) => string
+    /** Each persona that gets the message, with its `via`; the rest get nothing. */
+    expected: Partial<Record<MxName, Via>>
+    /** Connections the message arrives on; default every persona that lists the channel. */
+    feed?: MxName[]
+  }
+  /** A matrix row plus its per-persona title fields (`1 <via>` or `0`). */
+  const row = (c: MatrixCase) => ({
+    ...c,
+    ...Object.fromEntries(MX_NAMES.map((n) => [n, c.expected[n] ? `1 ${c.expected[n]}` : '0'])) as Record<MxName, string>,
+  })
+
+  test.each([
+    row({ ac: 'AC 6 / AC 16', name: 'plain post in A\'s home (sole receive-all)', channel: MX_HOME, author: 'person', text: () => 'status update', expected: { A: 'receive_all' } }),
+    row({ ac: 'AC 6', name: 'plain post in coordination', channel: MX_COORD, author: 'person', text: () => 'status update', expected: {} }),
+    row({ ac: 'AC 6', name: 'mention of A in coordination', channel: MX_COORD, author: 'person', text: (m) => `${m.A} can you look?`, expected: { A: 'mention' } }),
+    row({ ac: 'AC 7', name: '<!here> in coordination', channel: MX_COORD, author: 'person', text: () => `${broadcastText('here')} standup`, expected: { A: 'broadcast', B: 'broadcast', C: 'broadcast' } }),
+    row({ ac: 'AC 7', name: '<!channel> in coordination', channel: MX_COORD, author: 'person', text: () => `${broadcastText('channel')} standup`, expected: { A: 'broadcast', B: 'broadcast', C: 'broadcast' } }),
+    row({ ac: 'AC 7', name: 'labelled <!here|here> in coordination', channel: MX_COORD, author: 'person', text: () => `${broadcastText('here', 'here')} standup`, expected: { A: 'broadcast', B: 'broadcast', C: 'broadcast' } }),
+    row({ ac: 'AC 8', name: 'A\'s own <!channel> post', channel: MX_COORD, author: 'A', text: () => `${broadcastText('channel')} build is green`, expected: { B: 'broadcast', C: 'broadcast' } }),
+    row({ ac: 'AC 9', name: 'broadcast+mention', channel: MX_COORD, author: 'person', text: (m) => `${broadcastText('here')} ${m.A} please lead`, expected: { A: 'mention', B: 'broadcast', C: 'broadcast' } }),
+    row({ ac: 'AC 10', name: 'mention of A in its receive-all home', channel: MX_HOME, author: 'person', text: (m) => `${m.A} ping`, expected: { A: 'mention' } }),
+    row({ ac: 'AC 11', name: 'other app\'s bot mentions B', channel: MX_COORD, author: 'other-app bot', text: (m) => `${m.B} build failed`, expected: { B: 'mention' } }),
+    row({ ac: 'AC 11', name: 'webhook (no user) mentions B', channel: MX_COORD, author: 'webhook', text: (m) => `${m.B} deploy done`, expected: { B: 'mention' } }),
+    row({ ac: 'AC 11', name: 'persona A mentions B', channel: MX_COORD, author: 'A', text: (m) => `${m.B} over to you`, expected: { B: 'mention' } }),
+    row({ ac: 'AC 16', name: 'plain post in the shared channel', channel: MX_SHARED, author: 'person', text: () => 'status update', expected: { D: 'receive_all_shared', E: 'receive_all_shared' } }),
+    row({ ac: 'AC 16', name: 'plain post in the shared channel, E down (D\'s connection only)', channel: MX_SHARED, author: 'person', text: () => 'status update', expected: { D: 'receive_all_shared' }, feed: ['D'] }),
+  ])('$ac $name: A=$A, B=$B, C=$C, D=$D, E=$E', async (c) => {
+    const h = makeHarness(matrixSpecs())
+    const mentions = Object.fromEntries(MX_NAMES.map((n) => [n, mentionText(h.p(n).stub.identity.botUserId)])) as Record<MxName, string>
+    const base = { channel: c.channel, text: c.text(mentions) }
+    const event = c.author === 'person' ? makeChannelMessage(base)
+      : c.author === 'other-app bot' ? makeBotMessage(base)
+        : c.author === 'webhook' ? makeWebhookPost(base)
+          : personaPost(h, c.author, base)
+
+    await fanOut(h, event, c.feed)
+
+    expect(deliveries(h)).toEqual(Object.fromEntries(MX_NAMES.map((n) => {
+      const via = c.expected[n]
+      return [n, via ? [{ chat_id: c.channel, via }] : []]
+    })))
+    // A delivery never replies or restarts; a drop never does either.
+    expect(h.allPosts()).toEqual([])
+    expect(h.launches).toEqual([])
+    assertNoLeak(captured(h))
+  })
+
+  test('AC 18: 20 alternating persona mentions in coordination (A mentions B, B mentions A, ...), with no clock advance, each reach the addressee once with via=mention; 20 deliveries in all, no limit or counter', async () => {
+    const h = makeHarness(matrixSpecs())
+    const sent: Record<MxName, string[]> = { A: [], B: [], C: [], D: [], E: [] }
+
+    for (let i = 0; i < 20; i++) {
+      const [author, addressee] = i % 2 === 0 ? (['A', 'B'] as const) : (['B', 'A'] as const)
+      const ts = `1700000500.${String(i + 1).padStart(6, '0')}`
+      await fanOut(h, personaPost(h, author, { channel: MX_COORD, ts, text: `${mentionText(h.p(addressee).stub.identity.botUserId)} turn ${i + 1}` }))
+      sent[addressee].push(ts)
+    }
+
+    for (const n of MX_NAMES) {
+      const got = h.p(n).notifications.map((x) => x.params.meta)
+      expect(got.map((m) => ({ message_id: m.message_id, chat_id: m.chat_id, via: m.via })))
+        .toEqual(sent[n].map((ts) => ({ message_id: ts, chat_id: MX_COORD, via: 'mention' })))
+    }
+    expect(h.all.reduce((sum, x) => sum + x.notifications.length, 0)).toBe(20)
+  })
+})
+
+describe('SR-4.1 per-persona dedupe through the pipeline', () => {
+  /** A mention of A in coordination, as a `message` and as its `app_mention` twin. */
+  function mentionPair(h: Harness): { message: SlackEvent; appMention: SlackEvent } {
+    const message = makeChannelMessage({ channel: MX_COORD, text: `${mentionText(h.p('A').stub.identity.botUserId)} hi` })
+    return { message, appMention: appMentionTwin(message) }
+  }
+
+  test.each<[string, (p: { message: SlackEvent; appMention: SlackEvent }) => SlackEvent[]]>([
+    ['`message` then `app_mention`', (p) => [p.message, p.appMention]],
+    ['`app_mention` then `message`', (p) => [p.appMention, p.message]],
+    ['the same `message` redelivered', (p) => [p.message, p.message]],
+  ])('%s on A\'s one connection: one notification, one ack reaction, one dispatch', async (_label, order) => {
+    const h = makeHarness(matrixSpecs(), { ackReaction: 'eyes' })
+    const A = h.p('A')
+    const pair = mentionPair(h)
+
+    for (const event of order(pair)) await h.receive(event, ['A'])
+
+    expect(A.notifications.map((n) => n.params.meta.via)).toEqual(['mention'])
+    expect(A.stub.calls.reactionsAdd).toEqual([{ channel: MX_COORD, timestamp: pair.message.ts as string, name: 'eyes' }])
+    expect(lines(h, 'Dispatching to persona')).toHaveLength(1)
+    // Both events were acked.
+    expect(h.order.filter((m) => m === 'ack')).toHaveLength(2)
+  })
+
+  test('dedupe is per persona key: one (channel, ts) fed to D and E gets one notification each, and later redeliveries on each key (as after a connection reopen, which reaches the routing only as the key) are still collapsed', async () => {
+    const h = makeHarness(matrixSpecs())
+    const event = makeChannelMessage({ channel: MX_SHARED })
+
+    await h.receive(event, ['D', 'E'])
+    await h.receive(event, ['E'])
+    await h.receive(event, ['D'])
+    await h.receiveKeys(event, h.keys(['D', 'E']))
+
+    expect(deliveries(h, ['D', 'E'])).toEqual({
+      D: [{ chat_id: MX_SHARED, via: 'receive_all_shared' }],
+      E: [{ chat_id: MX_SHARED, via: 'receive_all_shared' }],
+    })
+  })
+
+  test.each([
+    ['just inside the retention window: still collapsed', INBOUND_DEDUPE_RETENTION_MS - 1, 1],
+    ['at the end of the retention window: processed again', INBOUND_DEDUPE_RETENTION_MS, 2],
+  ])('a redelivery %s (injected clock)', async (_label, advanceMs, expected) => {
+    const h = makeHarness(matrixSpecs())
+    const event = makeChannelMessage({ channel: MX_HOME })
+
+    await h.receive(event, ['A'])
+    await clock.advance(advanceMs)
+    await h.receive(event, ['A'])
+
+    expect(h.p('A').notifications.map((n) => n.params.meta.message_id)).toEqual(Array(expected).fill(event.ts))
+  })
+
+  test('dedupe state belongs to the routing instance: a second createPersonaRouting delivers the same event again', async () => {
+    const event = makeChannelMessage({ channel: MX_HOME })
+    const first = makeHarness(matrixSpecs())
+    await first.receive(event, ['A'])
+    resetRoutingState()
+    const second = makeHarness(matrixSpecs())
+    await second.receive(event, ['A'])
+
+    expect(first.p('A').notifications).toHaveLength(1)
+    expect(second.p('A').notifications).toHaveLength(1)
+  })
+})
+
+describe('SR-4.1 one archive row per (channel, ts)', () => {
+  let archive: ReturnType<typeof buildTempArchiveDb>
+  let db: ReturnType<typeof openArchiveDatabase>
+
+  beforeEach(() => {
+    archive = buildTempArchiveDb([], MX_SHARED)
+    db = openArchiveDatabase(archive.dbPath)
+  })
+
+  afterEach(() => {
+    db.close()
+    archive.cleanup()
+  })
+
+  // The write count shows every receipt reached the archive seam: D and E; A, B and C plus A's `app_mention`.
+  test.each<[string, (h: Harness) => SlackEvent, number]>([
+    ['a message received by D and E', () => makeChannelMessage({ channel: MX_SHARED }), 2],
+    ['a mention of A received as `message` and `app_mention`', (h) => makeChannelMessage({ channel: MX_COORD, text: `${mentionText(h.p('A').stub.identity.botUserId)} hi` }), 4],
+  ])('%s leaves exactly one archive row', async (_label, build, writes) => {
+    const h = makeHarness(matrixSpecs(), { archiveDb: db })
+    const event = build(h)
+
+    await fanOut(h, event)
+    await Promise.all(h.archiveWrites)
+
+    expect(h.archiveWrites).toHaveLength(writes)
+    expect(db.query('SELECT channel_id FROM messages').all()).toEqual([{ channel_id: event.channel as string }])
+  })
+})
+
+describe('SR-4.4 delivered meta: author ID and via', () => {
+  test.each<[string, (h: Harness) => SlackEvent, (ev: SlackEvent) => Record<string, string>]>([
+    ['a person\'s post carries user_id (the author) and no bot_id', () => makeChannelMessage({ channel: MX_SHARED }), (ev) => ({ user: 'stub-user', user_id: ev.user as string })],
+    ['a webhook post (no user) carries bot_id and no user_id', () => makeWebhookPost({ channel: MX_SHARED }), (ev) => ({ user: 'stub-webhook', bot_id: ev.bot_id as string })],
+    ['a bot_message with a bot profile and no user carries bot_id and no user_id', () => makeBotMessage({ channel: MX_SHARED, subtype: 'bot_message', user: undefined }), (ev) => ({ user: 'stub-bot', bot_id: ev.bot_id as string })],
+    ['another persona\'s post (bot user and bot ID) carries that persona\'s bot user as user_id and no bot_id', (h) => personaPost(h, 'E', { channel: MX_SHARED }), (ev) => ({ user: 'stub-user', user_id: ev.user as string })],
+  ])('%s', async (_label, build, author) => {
+    const h = makeHarness(matrixSpecs())
+    const event = build(h)
+
+    await h.receive(event, ['D'])
+
+    expect(h.p('D').notifications.map((n) => n.params.meta)).toEqual([{
+      chat_id: MX_SHARED,
+      message_id: event.ts as string,
+      ...author(event),
+      ts: event.ts as string,
+      via: 'receive_all_shared',
+    }])
+  })
+
+  test('P\'s own mention token (plain and labelled) is stripped from the content; another persona\'s mention and a broadcast stay', async () => {
+    const h = makeHarness(matrixSpecs())
+    const a = h.p('A').stub.identity.botUserId
+    const b = h.p('B').stub.identity.botUserId
+    const text = `${mentionText(a)} ${mentionText(b, 'beta')} ${broadcastText('here')} sync up ${mentionText(a, 'alpha')} now`
+
+    await fanOut(h, makeChannelMessage({ channel: MX_COORD, text }))
+
+    const content = (n: MxName) => h.p(n).notifications.map((x) => ({ via: x.params.meta.via, content: x.params.content }))
+    expect(content('A')).toEqual([{ via: 'mention', content: `${mentionText(b, 'beta')} ${broadcastText('here')} sync up now` }])
+    expect(content('B')).toEqual([{ via: 'mention', content: `${mentionText(a)} ${broadcastText('here')} sync up ${mentionText(a, 'alpha')} now` }])
+    expect(content('C')).toEqual([{ via: 'broadcast', content: text }])
   })
 })

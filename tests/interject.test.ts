@@ -351,9 +351,11 @@ describe('/interject notification meta (SR-9.2)', () => {
     ['an omitted sender', {}, 'interject'],
     ['an empty sender', { sender: '' }, 'interject'],
     ['a non-string sender', { sender: 42 }, 'interject'],
-  ])('%s → meta.user %p', async (_label, extra, user) => {
+  ])('%s → meta is exactly { user, ts } with the expected user (no via, user_id or bot_id)', async (_label, extra, user) => {
     await interject({ persona: B_NAME, message: 'hi', ...extra })
     expect(b.calls[0]!.params.meta.user).toBe(user)
+    // b.av2 SR-9.2: the reply guard (E10) tells injected prompts by the absence of via.
+    expect(Object.keys(b.calls[0]!.params.meta).sort()).toEqual(['ts', 'user'])
   })
 
   // The b.wr5 reply guard treats a ts without six fractional digits as an

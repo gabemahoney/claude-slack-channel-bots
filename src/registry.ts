@@ -529,7 +529,13 @@ async function fetchSlackHostedFile(url: string, token: string): Promise<SlackFi
 const MCP_INSTRUCTIONS = [
   'The sender reads Slack, not this session. Anything you want them to see must go through the reply tool.',
   '',
-  'Messages from Slack arrive as <channel source="slack" chat_id="C..." message_id="1234567890.123456" user="jeremy" thread_ts="..." ts="...">.',
+  'Messages from Slack arrive as <channel source="slack" chat_id="C..." message_id="1234567890.123456" user="jeremy" user_id="U..." thread_ts="..." ts="..." via="mention">.',
+  'user_id is the author\'s Slack user ID. When a bot or integration without a user posted the message, the tag carries bot_id instead of user_id.',
+  'via says how the message reached you: mention (you were @mentioned), broadcast (@here or @channel), ' +
+    'receive_all_shared (a channel where you and at least one other persona receive every message), ' +
+    'receive_all (a channel where you alone receive every message).',
+  '<@ID> in message text mentions a Slack user or another persona. Mention another persona the same way, with <@ID>, to address it.',
+  'A message without via is an injected prompt (a scheduled prompt or an /interject message). It needs no reply unless it asks for one.',
   'If the tag has attachment_count, call download_attachment(chat_id, message_id) to fetch them.',
   'Reply with the reply tool — pass chat_id back. Use thread_ts to reply in a thread.',
   'Pass message_id (the triggering message ts) to reply to automatically remove the ack reaction when done.',

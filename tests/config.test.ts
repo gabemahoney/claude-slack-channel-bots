@@ -205,7 +205,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
   const withPersonas = (...personas: PersonaInput[]) => makePersonaConfigInput({ personas })
 
   describe('valid load', () => {
-    test('AC 3: two personas sharing a channel, one also in a second channel, resolve with keys and defaults — the two-channel persona loads as a single persona holding both channels', () => {
+    test('AC 3 / AC 16: two personas sharing a channel, one also in a second channel, resolve with keys and defaults — the two-channel persona loads as a single persona holding both channels, and both personas hold the shared channel as delivery: all', () => {
       const config = load(withPersonas(
         makePersona({
           name: 'Ops Bot',
@@ -218,8 +218,11 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         [0, 'Ops Bot', personaKey('Ops Bot')],
         [1, 'review_bot', personaKey('review_bot')],
       ])
-      expect(config.personas[0].channels.map((c) => c.id)).toEqual(['C0TEST001', 'G0TEST002'])
-      expect(config.personas[1].channels.map((c) => c.id)).toEqual(['C0TEST001'])
+      expect(config.personas[0].channels).toEqual([
+        { id: 'C0TEST001', delivery: 'all' },
+        { id: 'G0TEST002', delivery: 'all' },
+      ])
+      expect(config.personas[1].channels).toEqual([{ id: 'C0TEST001', delivery: 'all' }])
       // AC 3: the persona in two channels is one persona, not one per channel.
       expect(config.personas.filter((p) => p.name === 'Ops Bot')).toHaveLength(1)
       for (const persona of config.personas) {

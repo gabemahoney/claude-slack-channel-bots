@@ -325,7 +325,211 @@ Pass: one row per persona after the cycle, and A answers the new message.
 
 ## Bot-to-bot, broadcast and persona-post event capture (appended by E4)
 
-Placeholder. E4 fills in this section.
+These checks verify AC 7, 8, 11 and 18 and b.av2 SR-4.1 (per-persona dedupe),
+SR-4.2 (the delivery decision, including own-post exclusion and no limit on
+bot-to-bot delivery) and SR-4.4 (the `user_id` / `bot_id` and `via` tag
+attributes). They also capture the real Slack event shape of a persona's post.
+That shape is the evidence behind the delivery module's self-exclusion by bot
+user ID or bot ID, and behind its handling of the `bot_message` subtype.
+
+Like the rest of this plan, the section runs only on the test workspace and
+the test host's server, never on the production install. The Safety section
+applies unchanged. Run it after Check 7, on the server Check 1 started. If the
+server was stopped since, confirm with `hostname` and `whoami` that this is
+still the test host and its user, then run `unset SLACK_BOT_TOKEN
+SLACK_APP_TOKEN` and `claude-slack-channel-bots start`. Do not rerun the
+check1 pre-flight: it fails on the `service=cscb` rows Checks 1–7 created,
+which the restart resumes.
+
+### Setup for these checks
+
+Nothing is added to `config.json`. The layout from Setup is what these checks
+rely on: coordination holds only A and B, both mentions-only there, and C is
+in no channel.
+
+Note two more IDs from Slack (open each app's profile in the workspace and
+copy its member ID). They replace the placeholders below:
+
+- `<A_BOT_USER_ID>`: app A's bot user ID (`U…`).
+- `<B_BOT_USER_ID>`: app B's bot user ID (`U…`).
+
+Check 8 records A's bot ID (`B…`) as `<A_BOT_ID>`.
+
+A message's `<TS>` is its Slack timestamp. Take it from the message's
+**Copy link** URL: the last path part is `p` followed by 16 digits; put a dot
+before the last six digits (`p1790000000123456` is `1790000000.123456`).
+
+### How to observe delivered tags
+
+The persona's session transcript is the authoritative record of what reached
+the persona. Every delivered Slack message appears in it as a user entry whose
+content starts with a `<channel …>` tag. The count of those tags for a
+message's `<TS>` is its delivery count, and the tag's attributes give `via` and
+the author's `user_id` or `bot_id`.
+
+The plan's `config.json` sets no `claude_config_dir`, so each transcript is
+under `~/.claude/projects/`, in the directory named after the persona's
+working directory. Define this read-only helper in the tester's shell. It
+prints every delivered tag for one message in one persona's current
+transcript:
+
+```sh
+tags() {  # usage: tags a|b|c <TS>
+  local t
+  t="$(ls -t ~/.claude/projects/*-cscb-live-"$1"/*.jsonl | head -1)"
+  jq -r 'select(.type == "user") | .message.content
+         | if type == "string" then . else (.[]? | .text? // empty) end' "$t" \
+    | grep -oE '<channel source="slack[^"]*"[^>]*>' | grep -F " ts=\"$2\""
+}
+```
+
+It reads only `type == "user"` entries: the transcript also records a queue
+entry for each incoming message, which would double the count. Do not ask a
+persona to quote its own tag; its answer is not evidence.
+
+`~/.claude/channels/slack/server.log` corroborates the transcript with these
+lines:
+
+- `[slack] RAW message event persona=<key>: …` and `[slack] RAW app_mention event persona=<key>: …`: one per event the persona's connection received. The text after the colon is the first 300 characters of the event JSON.
+- `[slack] Dispatching to persona "<name>" (key=<key>) chat_id=<channel> …`: one per message delivered to that persona.
+- `[slack] persona "<name>" (key=<key>) dropped message from channel=<channel> user=<U…>: <reason>` (or `bot_id=<B…>` for an author without a user): one per message the persona's pipeline dropped, for example with reason `own` or `not-mentioned`.
+
+A duplicate event, such as the second of a `message` / `app_mention` pair,
+logs its RAW line and nothing else.
+
+### Check 8: persona-post event shape (SR-4.2)
+
+Steps:
+
+1. In A-home, post: "Post this exact text in coordination, chat_id `<COORDINATION_CHANNEL_ID>`, with no formatting and no files: `<@<B_BOT_USER_ID>> shape check, no reply needed`. Then reply here with the word posted."
+2. When A says posted, copy the link of A's coordination post and work out its `<TS>`.
+3. Find the raw event B's connection logged for that post:
+
+   ```sh
+   grep -F 'RAW message event persona=persona_b:' ~/.claude/channels/slack/server.log | grep -F '<TS>'
+   ```
+
+   If the `ts` falls outside the 300-character prefix, match the line by the post's text and time instead, and note that in the results.
+4. Run `tags b <TS>` and `tags a <TS>`.
+
+The post must stay this short. The RAW line shows only the first 300
+characters of the event JSON, and a longer text pushes the fields below out
+of it. The message archive records neither `bot_id` nor `subtype`, so it is
+not a source for this check.
+
+Record from the RAW line, in the Notes column (IDs are not secrets):
+
+- `user`: present or absent, and its value.
+- `bot_id`: present or absent, and its value. Its value is `<A_BOT_ID>` from here on.
+- `subtype`: its value, or "absent" when no `subtype` key appears in the logged part. A bot post's event JSON is always longer than the prefix, so the RAW line alone can't tell a missing `subtype` from one cut off. A's `own` drop (below) settles it: the delivery module drops an undeliverable subtype as `non-message` before it checks the author (SR-4.2 step 1 in `src/delivery-decision.ts`), so an `own` drop means the subtype was absent or deliverable.
+- `app_id` and any `bot_profile` field, if visible within the prefix.
+
+Expected:
+
+- The event carries `user` = `<A_BOT_USER_ID>`, or `bot_id` = A's bot ID, or both.
+- `subtype` is recorded as absent or `bot_message`.
+- A's pipeline drops the post as its own: `server.log` has `[slack] persona "persona_a" (key=persona_a) dropped message from channel=<COORDINATION_CHANNEL_ID> user=<A_BOT_USER_ID>: own` (or `bot_id=<A_BOT_ID>`), and `tags a <TS>` prints nothing.
+- B's pipeline delivers it: `tags b <TS>` prints exactly one tag, with `via="mention"` and `user_id="<A_BOT_USER_ID>"` (or `bot_id="<A_BOT_ID>"` when the event has no `user`).
+
+The post mentions B because B is mentions-only in coordination; a plain post
+would reach B's connection but B's pipeline would drop it as `not-mentioned`.
+
+Pass: every expected item holds, `user` and `bot_id` could be read, and
+`subtype` is recorded as above (an absent `subtype` is not a failure). If
+`user` or `bot_id` cannot be read because it falls outside the prefix (the
+logged JSON is cut off before it), or the shape differs from what the
+delivery module assumes (the expectations above), file a bug with the RAW
+line (it holds no token) instead of passing. No server code or logging is
+changed for this check.
+
+### Check 9: one mention is delivered once (SR-4.1)
+
+Steps:
+
+1. In coordination, post "@CSCB Test A reply with the word once." and work out its `<TS>`.
+2. Run:
+
+   ```sh
+   grep -F 'persona=persona_a:' ~/.claude/channels/slack/server.log | grep -F '<TS>'
+   tags a <TS>
+   ```
+
+Expected:
+
+- `server.log` has two RAW lines for `persona=persona_a` with this `<TS>`: one `RAW message event` and one `RAW app_mention event`. If the `ts` is outside a line's prefix, match that line by its time.
+- `tags a <TS>` prints exactly one tag, with `via="mention"` and `user_id="<OPERATOR_USER_ID>"`.
+- Exactly one `Dispatching to persona "persona_a" (key=persona_a) chat_id=<COORDINATION_CHANNEL_ID>` line appears for the message (its `text=` field shows the message text).
+- A replies "once" in coordination one time, under A's name and avatar.
+
+Pass: Slack sent two events, and A received the message exactly once.
+
+### Check 10: `@here` and `@channel` wake the mention-only personas (AC 7)
+
+Steps:
+
+1. In coordination, post "@here reply with the word here-check." (Slack sends `@here` as `<!here>`.) Confirm Slack's notify prompt if it shows one. Work out the post's `<TS>`.
+2. Run `tags a <TS>`, `tags b <TS>` and `tags c <TS>`, and `grep -F 'persona=persona_c:' ~/.claude/channels/slack/server.log | grep -F '<TS>'`.
+3. Repeat steps 1 and 2 with "@channel reply with the word channel-check."
+
+Expected, for each of the two posts:
+
+- `tags a <TS>` and `tags b <TS>` each print exactly one tag, with `via="broadcast"` and `user_id="<OPERATOR_USER_ID>"`.
+- A and B each reply in coordination under their own name and avatar.
+- C receives nothing: `tags c <TS>` prints nothing and there is no RAW line with `persona=persona_c` for the post.
+
+Pass: A and B each receive both broadcasts once with `via="broadcast"`, and C receives neither.
+
+### Check 11: a persona's own `@here` does not wake it (AC 8)
+
+Steps:
+
+1. In A-home, post: "Post this exact text in coordination, chat_id `<COORDINATION_CHANNEL_ID>`: `<!here> own broadcast check, no reply needed`. Then reply here with the word posted."
+2. When A says posted, work out the `<TS>` of A's coordination post.
+3. Run `tags a <TS>` and `tags b <TS>`.
+
+Expected:
+
+- A's post shows in coordination as an `@here` under A's name and avatar.
+- A is not woken: `tags a <TS>` prints nothing, and `server.log` has A's drop line for the post with reason `own`, as in Check 8.
+- B receives it once: `tags b <TS>` prints exactly one tag, with `via="broadcast"` and `user_id="<A_BOT_USER_ID>"` (or `bot_id="<A_BOT_ID>"`).
+
+Pass: A drops its own broadcast, and B, the only other persona in coordination, receives it once.
+
+### Check 12: two personas converse with no limit (AC 11, AC 18, SR-4.2)
+
+This check starts a conversation between two bots. The tester ends it (step
+4); nothing in the server stops it.
+
+Steps:
+
+1. In A-home, post: "In coordination, chat_id `<COORDINATION_CHANNEL_ID>`, post a message that mentions `<@<B_BOT_USER_ID>>` and asks B what 7 times 6 is. Tell B to mention you as `<@<A_BOT_USER_ID>>` in every answer. Each time B answers, reply to B in coordination, mentioning it, with one more short arithmetic question. Keep going until I tell you to stop."
+2. Work out the `<TS>` of A's first coordination post, and of B's reply to it. Run `tags b <TS of A's post>` and `tags a <TS of B's reply>`.
+3. Let the exchange run until A and B have each posted at least two more times after B's first reply. Take one later post from each and check it with `tags` in the same way.
+4. **Stop the exchange.** In coordination, post "@CSCB Test A @CSCB Test B stop the exchange now. Do not post in this channel again." Wait two minutes and watch coordination.
+5. Search the log for any limit or throttle message:
+
+   ```sh
+   grep -inE 'limit|throttl|loop|too many' ~/.claude/channels/slack/server.log
+   ```
+
+Expected:
+
+- `tags b <TS of A's post>` prints exactly one tag, with `via="mention"` and `user_id="<A_BOT_USER_ID>"` (or `bot_id="<A_BOT_ID>"`).
+- B replies in coordination under B's own name and avatar, which differ from A's, and its reply mentions A.
+- `tags a <TS of B's reply>` prints exactly one tag, with `via="mention"` and `user_id="<B_BOT_USER_ID>"` (or B's `bot_id`), and A answers it.
+- The later posts checked in step 3 are each delivered exactly once to the persona they mention, with `via="mention"`.
+- Every turn is delivered: no turn goes unanswered until the stop, and each has its `Dispatching to persona` line.
+- No server-side limit, counter or throttle message appears, in Slack or in `server.log`. The step 5 search returns no line about bot-to-bot delivery. Judge each match it returns; Slack API rate-limit lines unrelated to delivery are not a failure but go in Notes.
+
+Whether the personas obey the stop message is the bots' behaviour, not the
+server's, so it does not decide this check. If either persona keeps posting
+two minutes after the stop message, end the exchange with the Teardown
+commands and record that in Notes; the check's result rests on the Expected
+items above.
+
+Pass: B receives A's mention once with A's identity and answers as itself,
+and the exchange continues for at least two more turns each with no limit or
+throttle message.
 
 ## DMs (appended by E6)
 
@@ -372,6 +576,6 @@ retired: `rm ~/.config/cscb-test/*-credentials.json`.
 The operator adds one row per run. Record pass or fail only, never a token or
 a log excerpt containing one.
 
-| Date | Build commit | Host / user | Check 1 | Check 2 | Check 3 | Check 4 | Check 5 | Check 6 | Check 7 | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|
-| | | | | | | | | | | |
+| Date | Build commit | Host / user | Check 1 | Check 2 | Check 3 | Check 4 | Check 5 | Check 6 | Check 7 | Check 8 | Check 9 | Check 10 | Check 11 | Check 12 | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| | | | | | | | | | | | | | | | |
