@@ -13,6 +13,10 @@
  * - it starts the poller with `clientFor` and `getPersona: getAppliedPersona`,
  *   and with the one destination resolver the persona notifier also gets, so
  *   a persona's DM is opened once for both;
+ * - it gives the poller and the notifier the one destination hold, built over
+ *   that resolver on the real clock, so a persona's prompts and notices share
+ *   one `persona-destination-failed` episode (b.av2 SR-7.1), and `shutdown()`
+ *   cancels it;
  * - it derives no persona key from an action ID.
  *
  * Why a static audit: main() cannot run in a unit test (the agent-director
@@ -24,7 +28,7 @@
 
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
-import { callsOf, indicesOf, objectProperties, onlyCallArguments, stripComments } from './test-helpers/source-audit.ts'
+import { balancedAfter, callsOf, indicesOf, objectProperties, onlyCallArguments, stripComments } from './test-helpers/source-audit.ts'
 
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(readFileSync('src/server.ts', 'utf-8'))
@@ -59,5 +63,32 @@ describe('server.ts wires the permission poller by persona (b.av2 SR-7.1)', () =
     const resolver = decls[0]!
     expect(objectProperties(onlyCallArguments(SERVER_CODE, 'startPermissionPoller')).get('destinations')).toBe(resolver)
     expect(objectProperties(onlyCallArguments(SERVER_CODE, 'createPersonaNotifier')).get('destinations')).toBe(resolver)
+  })
+
+  test('the poller and the persona notifier get the one createPersonaDestinationHold hold, built over that same resolver, so a persona\'s prompts and notices share one episode', () => {
+    const decls = [...SERVER_CODE.matchAll(/\bconst\s+(\w+)\s*=\s*createPersonaDestinationHold\s*\(/g)].map((m) => m[1])
+    expect(decls).toHaveLength(1)
+    expect(callsOf(SERVER_CODE, 'createPersonaDestinationHold')).toHaveLength(1)
+    const hold = decls[0]!
+    const resolver = [...SERVER_CODE.matchAll(/\bconst\s+(\w+)\s*=\s*createPersonaDestinations\s*\(/g)].map((m) => m[1])[0]
+    const holdProps = objectProperties(onlyCallArguments(SERVER_CODE, 'createPersonaDestinationHold'))
+    expect(holdProps.get('destinations')).toBe(resolver)
+    expect(holdProps.get('getPersona')).toBe('getAppliedPersona')
+    expect(holdProps.get('clientFor')).toBe('clientFor')
+    // No clock: the real one (a fake clock is for tests only).
+    expect(holdProps.has('clock')).toBe(false)
+    expect(objectProperties(onlyCallArguments(SERVER_CODE, 'startPermissionPoller')).get('destinationHold')).toBe(hold)
+    expect(objectProperties(onlyCallArguments(SERVER_CODE, 'createPersonaNotifier')).get('destinationHold')).toBe(hold)
+  })
+
+  test('shutdown cancels every persona\'s destination hold (held notices and retry timers), once', () => {
+    const hold = [...SERVER_CODE.matchAll(/\bconst\s+(\w+)\s*=\s*createPersonaDestinationHold\s*\(/g)].map((m) => m[1])[0]!
+    const fn = SERVER_CODE.search(/\basync\s+function\s+shutdown\s*\(/)
+    expect(fn).toBeGreaterThan(-1)
+    const [start, end] = balancedAfter(SERVER_CODE, SERVER_CODE.indexOf(')', fn), '{', '}')
+    const cancels = indicesOf(new RegExp(`\\b${hold}\\s*\\.\\s*cancelAll\\s*\\(\\s*\\)`, 'g'), SERVER_CODE)
+    expect(cancels).toHaveLength(1)
+    expect(cancels[0]!).toBeGreaterThan(start)
+    expect(cancels[0]!).toBeLessThan(end)
   })
 })

@@ -84,6 +84,7 @@ import {
 } from './session-manager.ts'
 import { createPersonaNotifier } from './persona-notifier.ts'
 import { createPersonaDestinations } from './persona-destination.ts'
+import { createPersonaDestinationHold } from './persona-destination-hold.ts'
 import { createPersonaRouting, hasSessionStream } from './persona-routing.ts'
 import { createPersonaConnectionManager, type PersonaConnectionManager } from './persona-connections.ts'
 import { createUnhandledRejectionHandler, describeThrownValue } from './persona-connection-errors.ts'
@@ -673,6 +674,24 @@ function getAppliedPersona(key: string): Persona | undefined {
 const personaDestinations = createPersonaDestinations({ log: (line) => console.error(line) })
 
 /**
+ * The one destination hold (b.av2 SR-7.1): when a post to a persona's
+ * destination fails, holds that persona's prompts and notices, retries them
+ * on the SR-3.2 backoff and logs one `persona-destination-failed` line per
+ * episode. Shared by the notifier and the permission poller, so one persona's
+ * prompts and notices share one episode. Built at module scope like the
+ * notifier it is given to: side-effect-free, no Slack call, and no timer until
+ * a notice is held (the real clock is its default). E12's teardown reaches a
+ * persona's `cancel(key)` here, beside `personaDestinations.forget(key)`;
+ * shutdown cancels every persona.
+ */
+const personaDestinationHold = createPersonaDestinationHold({
+  destinations: personaDestinations,
+  getPersona: getAppliedPersona,
+  clientFor,
+  log: (line) => console.error(line),
+})
+
+/**
  * The one per-persona notifier. Outage state, the session manager and the
  * JSONL safeguard send every persona notice through it (installed in main()).
  * A notice raised while its persona has no client is held, and flushed when
@@ -682,6 +701,7 @@ const personaNotifier = createPersonaNotifier({
   getPersona: getAppliedPersona,
   clientFor,
   destinations: personaDestinations,
+  destinationHold: personaDestinationHold,
   isDryRun,
   log: (line) => console.error(line),
 })
@@ -707,6 +727,9 @@ async function shutdown(signal: string): Promise<void> {
   // Every persona's bring-up retry (directory re-checks); the manager's Slack
   // retries stop with stopAll() below.
   bringUps?.cancelAll()
+  // Every persona's held notices and destination retry timer; one line per
+  // persona whose held notices are dropped unposted.
+  personaDestinationHold.cancelAll()
   stopAllKeepAliveTimers()
 
   console.error(`[slack] Received ${signal} — shutting down`)
@@ -1138,6 +1161,7 @@ export async function main(): Promise<void> {
       getClient,
       clientFor,
       destinations: personaDestinations,
+      destinationHold: personaDestinationHold,
       getPersona: getAppliedPersona,
       // b.av2 SR-6.4: a not-up persona's rows are skipped, its prompts and
       // wedge state held until it is up.

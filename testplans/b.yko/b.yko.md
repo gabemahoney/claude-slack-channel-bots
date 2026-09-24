@@ -200,12 +200,12 @@ unset SLACK_BOT_TOKEN SLACK_APP_TOKEN
 env | grep -c -E '^SLACK_(BOT|APP)_TOKEN=' # must print 0
 ```
 
-### Limits of this build (E3)
+### Expected in this setup
 
-These are expected in this build and are not failures:
+These are expected and are not failures:
 
-- B's and C's `dm` destination only writes its prompts and notices to `server.log` until E7.
-- So the E3 checks cover B only by its coordination-channel mention, and C only by its `agent-director` row. The DMs section (E6) checks B and C over DMs.
+- The E3 checks cover B only by its coordination-channel mention, and C only by its `agent-director` row. The DMs section (E6) and the DM prompts section (E7) check B and C over DMs.
+- B's and C's permission prompts and notices go to the operator's DM with that persona's app, never to a channel.
 - A has DMs off in this setup (no `dm` field), so a DM to A is dropped until the DMs section turns A's DMs on.
 
 ---
@@ -546,9 +546,9 @@ running. If the server was stopped since, restart it as the E4 section says
 (confirm `hostname` and `whoami`, unset the token variables, `start`; do not
 rerun the check1 pre-flight).
 
-Until E7, a `dm`-destination persona's permission prompts are only written to
-`server.log`. So no step here asks B or C for work that needs a tool
-approval, and nothing here waits for a prompt to reach C's contact.
+**Run order:** Check 19 (in "DM prompts", below) runs in this section, after
+Check 15 and before Check 16. It needs a contact that has never had a DM with
+C's app, and Check 16 step 2 creates that DM.
 
 ### Setup for these checks
 
@@ -810,6 +810,10 @@ Pass: each DM is delivered once with `via="dm"` to the persona whose app receive
 
 C has zero channels, DMs on, a `dm` destination and `dm.contact` set.
 
+Run Check 19 (in "DM prompts") first. Its prompt opened the operator's DM
+with C, so step 2 below posts into that DM and its ID is the `<C_DM_ID>`
+Check 19 noted.
+
 Steps:
 
 1. Confirm C's start in the restart's lines (from "Turn A's DMs on"):
@@ -914,7 +918,150 @@ Pass: the edit that added the mention woke A exactly once with `via="mention"`, 
 
 ## DM prompts (appended by E7)
 
-Placeholder. E7 fills in this section, including prompts to B's and C's `dm` destination.
+These checks verify AC 29, 34 and 44 and b.av2 SR-7.1 (a persona's permission
+prompts go to its own destination, a channel or the DM with its contact) and
+SR-3.1 (each persona posts under its own app identity). A prompt in a DM is
+answered with its buttons like a channel prompt.
+
+Like the rest of this plan, the section runs only on the test workspace and
+the test host's server, never on the production install. The Safety section
+applies unchanged.
+
+**Run order:** Check 19 runs inside the DMs section, after Check 15 and before
+Check 16 (see that section's run order). Checks 20 and 21 run after Check 18,
+on the server that is already running. If the server was stopped since,
+restart it as the E4 section says (confirm `hostname` and `whoami`, unset the
+token variables, `start`; do not rerun the check1 pre-flight).
+
+### Setup for these checks
+
+Nothing is added to `config.json`. Confirm that B and C have DMs on, the
+operator as `dm.contact` and a `dm` destination:
+
+```sh
+jq -c '.personas[] | select(.name == "persona_b" or .name == "persona_c") | {name, dm, permission_prompts}' \
+  ~/.claude/channels/slack/config.json
+```
+
+It must print two lines, for `persona_b` and `persona_c`, each with
+`"dm":{"enabled":true,"contact":"<OPERATOR_USER_ID>"}` and
+`"permission_prompts":"dm"`. Every app carries `im:write` (see the DMs
+section's setup).
+
+The permission trail records every prompt post: which instance posted, to
+which conversation, and whether it succeeded. Define this read-only helper
+next to `since` (it prints no message text):
+
+```sh
+TRAIL=~/.claude/channels/slack/permission-trail.jsonl
+posts() {  # usage: posts <trail mark>
+  tail -n +"$(($1 + 1))" "$TRAIL" \
+    | jq -c 'select(.event == "cscb.chat_post.attempted") | {claude_instance_id, channel, ok, error}'
+}
+```
+
+Each check records a trail mark next to its log mark, as
+`TMARK=$(wc -l < "$TRAIL")`, and reads only the posts after it.
+
+The permission request each check raises is the one from Check 5: a shell
+command that writes the current date to a named file in the persona's working
+directory. Answer every prompt in Slack, promptly, and never in a persona's
+terminal.
+
+### Check 19: C's first prompt opens the DM with its contact (AC 44)
+
+Run this after Check 15 and before Check 16, with this section's setup done
+first.
+
+Precondition: the operator has never had a DM with app C. C is in no channel,
+so the only way to ask C for work without a DM is its terminal.
+
+Steps:
+
+1. In the operator's Slack sidebar and **Apps** list, look for a conversation with "CSCB Test C".
+   - None: this is a **first run**.
+   - One exists (an earlier run of this plan opened it; Slack DMs can't be deleted): this is a **rerun**. Note its ID as `<C_DM_ID>` from any message's **Copy link** URL.
+
+   Record "first run" or "rerun" in Notes.
+2. Record where the log and the trail end: `MARK=$(wc -l < "$LOG"); TMARK=$(wc -l < "$TRAIL")`.
+3. Attach to C's session with `tmux attach -t slack_bot_persona_c`. Type this at C's prompt and press Enter: "Run a shell command that writes the current date to a file named dm-prompt-c.txt in your working directory. Do not post anything to Slack." Detach with `Ctrl-b d`, without answering anything in the pane.
+4. Wait for the prompt in Slack (up to one minute). On a first run, work out `<C_DM_ID>` from the prompt's **Copy link** URL.
+5. Run:
+
+   ```sh
+   posts "$TMARK" | grep -F cscb_persona_c
+   since "$MARK" | grep -F 'persona-destination-failed:'
+   ```
+
+6. Click **Allow** on the prompt. Then run `ls ~/cscb-live/c/dm-prompt-c.txt`.
+
+Expected:
+
+- First run: a new DM from app C appears for the operator, under C's name and avatar, and its first message is the permission prompt with **Allow** and **Deny** buttons. The DM didn't exist before, so C's first prompt opened it (`conversations.open`) before posting.
+- Rerun: the prompt arrives in the existing DM with C (`<C_DM_ID>`, the one step 1 found), under C's name and avatar, and no second conversation with C appears.
+- The prompt appears in no channel: not in A-home, not in coordination.
+- `posts` prints one line for `cscb_persona_c`, with `"ok":true` and `"channel":"<C_DM_ID>"` (a `D…` ID).
+- The `persona-destination-failed` grep prints nothing.
+- **Allow** updates the prompt in place to `*Permission* — Allowed`, and the file exists.
+
+A `persona-destination-failed` line naming `missing_scope` and `im:write` means app C lacks `im:write`: fix it as the DMs section's setup says, then rerun this check.
+
+Pass: C's prompt was delivered as a DM from C's app to the operator (opening the DM on a first run, into the existing DM on a rerun), appeared in no channel, and its button resolved the request.
+
+### Check 20: B's prompt arrives by DM and its button resolves it (AC 29)
+
+The DM between the operator and B exists since Check 15 (`<B_DM_ID>`).
+
+Steps:
+
+1. Record where the log and the trail end: `MARK=$(wc -l < "$LOG"); TMARK=$(wc -l < "$TRAIL")`.
+2. In coordination, post "@CSCB Test B run a shell command that writes the current date to a file named dm-prompt-b.txt in your working directory."
+3. Wait for the prompt (up to one minute), then run:
+
+   ```sh
+   posts "$TMARK" | grep -F cscb_persona_b
+   since "$MARK" | grep -F 'persona-destination-failed:'
+   ```
+
+4. Click **Allow** on the prompt. Wait for B to finish, then run `ls ~/cscb-live/b/dm-prompt-b.txt`.
+
+Expected:
+
+- The permission prompt appears in the operator's DM with B (`<B_DM_ID>`), under B's name and avatar, with **Allow** and **Deny** buttons.
+- No prompt appears in coordination, where the request started, or in any other channel.
+- `posts` prints one line for `cscb_persona_b`, with `"ok":true` and `"channel":"<B_DM_ID>"`.
+- The `persona-destination-failed` grep prints nothing.
+- **Allow** updates the DM message in place to `*Permission* — Allowed`. B goes on with the work, and the file exists.
+
+Pass: B's prompt arrived only in the DM with B, under B's identity, and **Allow** resolved it there.
+
+### Check 21: A's channel prompt and B's DM prompt route independently (AC 34)
+
+Steps:
+
+1. Record where the log and the trail end: `MARK=$(wc -l < "$LOG"); TMARK=$(wc -l < "$TRAIL")`.
+2. In coordination, post "@CSCB Test A @CSCB Test B each of you, run a shell command that writes the current date to a file in your working directory: A names it route-a.txt, B names it route-b.txt."
+3. Wait until both prompts are showing, and don't click either yet. Run:
+
+   ```sh
+   posts "$TMARK" | grep -E 'cscb_persona_(a|b)'
+   ```
+
+4. Click **Deny** on B's prompt. Look at A's prompt. Deny any further prompt B raises for this task.
+5. Click **Allow** on A's prompt. Look at B's prompt.
+6. When A has finished, run `ls ~/cscb-live/a/route-a.txt ~/cscb-live/b/route-b.txt`.
+
+Expected:
+
+- A's prompt appears in A-home, under A's name and avatar. It does not appear in coordination or in any DM.
+- B's prompt appears in the operator's DM with B (`<B_DM_ID>`), under B's name and avatar. It does not appear in A-home, coordination or any other channel.
+- Nothing is cross-posted: A-home holds no prompt of B's, and the DM with B holds no prompt of A's.
+- In `posts`, the first line for `cscb_persona_a` has `"channel":"<A_HOME_CHANNEL_ID>"` and the first line for `cscb_persona_b` has `"channel":"<B_DM_ID>"`, both `"ok":true`. More lines from one persona (it raised more requests) go in Notes; they are not a failure.
+- Step 4: B's prompt updates to `*Permission* — Denied by operator`; A's prompt is unchanged, with its buttons.
+- Step 5: A's prompt updates to `*Permission* — Allowed`; B's stays `Denied by operator`.
+- `ls` lists `route-a.txt` and reports that `route-b.txt` does not exist.
+
+Pass: both prompts were pending at once, each at its own persona's destination under its own identity, and each button resolved only its own request.
 
 ## Lost message (appended by E8)
 
@@ -963,6 +1110,6 @@ retired: `rm ~/.config/cscb-test/*-credentials.json`.
 The operator adds one row per run. Record pass or fail only, never a token or
 a log excerpt containing one.
 
-| Date | Build commit | Host / user | Check 1 | Check 2 | Check 3 | Check 4 | Check 5 | Check 6 | Check 7 | Check 8 | Check 9 | Check 10 | Check 11 | Check 12 | Check 13 | Check 14 | Check 15 | Check 16 | Check 17 | Check 18 | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| | | | | | | | | | | | | | | | | | | | | | |
+| Date | Build commit | Host / user | Check 1 | Check 2 | Check 3 | Check 4 | Check 5 | Check 6 | Check 7 | Check 8 | Check 9 | Check 10 | Check 11 | Check 12 | Check 13 | Check 14 | Check 15 | Check 16 | Check 17 | Check 18 | Check 19 | Check 20 | Check 21 | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| | | | | | | | | | | | | | | | | | | | | | | | | |

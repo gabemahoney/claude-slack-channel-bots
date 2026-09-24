@@ -780,6 +780,8 @@ Flow:
 
 While a persona is not up (broken or retrying), its instance keeps running but its permission prompts are not posted and its already-posted prompts are left as they are. They appear, or get their verdict, on the first poll after the persona comes up.
 
+If Slack refuses a post to the persona's destination, see "A permission prompt or notice doesn't arrive" under [Troubleshooting](#troubleshooting).
+
 ### Slack app prerequisites
 
 The Slack app must have **interactivity enabled** with **Socket Mode** as the delivery method. Open your Slack app config → **Interactivity & Shortcuts** → toggle **Interactivity** on. No Request URL is needed; Socket Mode delivers interaction payloads over the existing socket. This is included automatically if you created the app from `slack-app-manifest.yml`.
@@ -923,6 +925,18 @@ Add the channel to a persona's `channels` and restart the server.
 
 **Permission relay not working**
 Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json`.
+
+**A permission prompt or notice doesn't arrive**
+When Slack refuses a post to a persona's destination, the server holds the persona's prompts and notices and retries them with backoff. Once Slack accepts posts again, held notices are delivered, and a prompt is posted if its request is still open. It logs one `persona-destination-failed` line in `server.log` naming the persona, its destination and Slack's error, and one `cleared` line when posting works again:
+
+```sh
+grep persona-destination-failed ~/.claude/channels/slack/server.log
+```
+
+- `missing_scope` (the line names `im:write`): add the scope and re-install the Slack app; see the `im:write` note under [Direct messages](#direct-messages-dmenabled).
+- `not_in_channel`: invite the persona's app to its `permission_prompts` channel.
+
+Up to 20 notices per persona are kept while it retries; past that the oldest is dropped. The `debug-slack-channel-bots` skill has the full entry for `persona-destination-failed`.
 
 **Bot appears dead / posts a "blocked on a native Claude Code permission prompt" warning**
 The bot is wedged in `check_permission` on a native Claude Code TUI prompt that never reached Slack (a permission decision AD recorded but could not deliver). The bot stops responding, and after ~90 s the poller posts a one-shot warning naming the persona to the persona's destination (a channel or a DM with its contact). Recover by inspecting the native prompt with `agent-director read-pane --claude-instance-id <id>`, then killing and respawning the session (`agent-director kill <id>` or tmux-kill, then let the server restart it or `claude-slack-channel-bots stop && claude-slack-channel-bots start`). Do **not** use `send-keys` — agent-director hard-rejects it while the spawn is in this relayed permission state. The warning fires once per wedge episode; the detector re-arms if the bot later wedges again.

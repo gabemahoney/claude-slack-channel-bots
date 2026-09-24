@@ -42,7 +42,11 @@
  *     `spawn-failure-post` startup error and restart-path stderr line, whose
  *     cause names a failed DM open's step and code,
  *     through the real per-persona notifier installed with
- *     `setSessionNotifier`.
+ *     `setSessionNotifier`. A failed post or DM open is held by the
+ *     destination hold (b.av2 SR-7.1), on a fake clock: one
+ *     `persona-destination-failed` line per episode, retries on the SR-3.2
+ *     backoff, delivery in raised order once the cause clears, and the
+ *     failure callback run once per notice, not per retry.
  *
  * Most blocks use a stand-in persona keyed by its channel ID
  * (`makeStandInPersonaConfig`), so their `cscb_<channelId>` ids and outage
@@ -105,6 +109,8 @@ import {
 import { UNATTRIBUTABLE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
 import { resolveJsonlPath } from '../src/cozempic.ts'
 import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
+import type { PersonaDestinationHold } from '../src/persona-destination-hold.ts'
+import { PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import {
   makeDeferredConnect,
@@ -319,6 +325,8 @@ afterEach(() => {
   _resetInFlightLaunches()
   _resetPreLaunchTrustPatcher()
   setSessionNotifier(undefined)
+  installedHold?.cancelAll()
+  installedHold = undefined
   process.env = savedEnv as NodeJS.ProcessEnv
   rmSync(fixtureDir, { recursive: true, force: true })
 })
@@ -397,12 +405,19 @@ function webMethods(h: NotifierHarness, key: string): string[] {
   return h.stub(key).web.callLog.map((c) => c.method)
 }
 
+/** The destination hold of this test's installed notifier; cancelled in afterEach. */
+let installedHold: PersonaDestinationHold | undefined
+
 /**
  * Build the real persona notifier over `cfg` (`makeNotifierHarness`: one
  * `makeStubSlack` stub per persona) and install its `notify` through
  * `setSessionNotifier` (reset to no notifier in afterEach). Every persona is
  * validated unless `validated: false`; `post` scripts the notice persona's
  * `chat.postMessage` outcomes; `leakMarker` goes to every stub.
+ *
+ * The notifier's destination hold (b.av2 SR-7.1, `h.hold`) runs on the
+ * harness's fake clock (`h.clock`), so a notice held after a failed post
+ * creates no real timer: its retry runs only when the test moves the clock.
  */
 function installNoticeNotifier(
   cfg: PersonaConfig,
@@ -413,9 +428,18 @@ function installNoticeNotifier(
     post: opts.post ? { [NOTICE_KEY]: opts.post } : undefined,
     leakMarker: opts.leakMarker,
   })
+  installedHold = h.hold
   setSessionNotifier(h.notifier.notify)
   return h
 }
+
+/** The notifier's `persona-destination-failed` lines (episode opened and cleared). */
+function destinationFailedLines(h: NotifierHarness): string[] {
+  return h.logs.filter((l) => l.startsWith(`[slack] ${PERSONA_DESTINATION_FAILED}: `))
+}
+
+/** The expected `persona-destination-failed` line prefix for the notice persona (personas[0]). */
+const NOTICE_DIAG_PREFIX = `[slack] ${PERSONA_DESTINATION_FAILED}: personas[0] ${renderPersonaRef(NOTICE_NAME, NOTICE_KEY)}: `
 
 /** Capture console.error output for the duration of `fn`, then restore. */
 async function withCapturedErr(fn: () => Promise<void> | void): Promise<string> {
@@ -5866,6 +5890,124 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     expect(h.stub(OTHER_KEY).callLog).toHaveLength(1)
   })
 
+  // --- a failed flush is held and retried (b.av2 SR-7.1 failure part) ------
+
+  test('held then failed (dm): notices held before validation whose flushed DM open fails missing_scope are held under one episode line naming im:write, retried on backoff and posted once each, in raised order, after the cause clears', async () => {
+    const readLog = captureStartupErrors()
+    installGenericSpawnFailure()
+    const cfg = makeDmNoticeConfig()
+    const h = installNoticeNotifier(cfg, { validated: false, leakMarker: LEAK_SENTINEL })
+    const dmStub = h.stub(NOTICE_KEY)
+    // Sticky: every open fails with missing_scope (the app lacks im:write) until the test clears it.
+    dmStub.script.open.push(...Array<WebApiOutcome>(1000).fill({ kind: 'platform', error: 'missing_scope' }))
+    const episodeLine =
+      `${NOTICE_DIAG_PREFIX}conversations.open failed for destination=dm with error missing_scope — ` +
+      'the Slack app lacks the im:write scope: re-install the app with im:write to grant it; ' +
+      'holding its permission prompts and notices and retrying with backoff'
+    const clearedLine =
+      `${NOTICE_DIAG_PREFIX}cleared: destination=dm accepts posts again ` +
+      '(was conversations.open error missing_scope); delivering what was held'
+
+    const errLog = await withCapturedErr(async () => {
+      // Raised before validation: the dm persona's spawn failure (startup) and restart cap (not startup), then the channel persona's cap.
+      expect((await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)).action).toBe('failed')
+      notifyRestartCapReached(NOTICE_KEY)
+      notifyRestartCapReached(OTHER_KEY)
+      await settleNotices()
+      // The pre-validation hold: no open and no post on either client.
+      expect(dmStub.callLog).toEqual([])
+      expect(h.stub(OTHER_KEY).callLog).toEqual([])
+
+      // Validated and flushed: the two notices share one open, which fails; nothing is posted.
+      h.validate(NOTICE_KEY)
+      h.validate(OTHER_KEY)
+      await Promise.all([h.notifier.flush(NOTICE_KEY), h.notifier.flush(OTHER_KEY)])
+      await settleNotices()
+      expect(webMethods(h, NOTICE_KEY)).toEqual(['conversations.open'])
+      expect(dmStub.calls.conversationsOpen).toEqual([{ users: NOTICE_CONTACT }])
+      expect(h.posts(NOTICE_KEY)).toHaveLength(0)
+      // One episode line for both notices, naming the persona and im:write; both held, in raised order, for a 5 s retry.
+      expect(destinationFailedLines(h)).toEqual([episodeLine])
+      expect(h.hold.view(NOTICE_KEY)).toEqual({ held: true, heldNotices: 2, nextDueAt: 5_000 })
+      expect(h.clock.pending().map((t) => t.delayMs)).toEqual([5_000])
+      // Each notice's failure callback ran once: one startup record for the spawn failure.
+      expect(countStartupEntries(readLog(), 'spawn-failure-post')).toBe(1)
+      expect(readLog()).toContain(
+        `[spawn-failure-post] failed to post spawn failure for persona=${NOTICE_KEY} — conversations.open code=missing_scope: `,
+      )
+
+      // The channel persona's flush is unchanged: one post to its channel, no open, no episode of its own.
+      expect(webMethods(h, OTHER_KEY)).toEqual(['chat.postMessage'])
+      expect(h.posts(OTHER_KEY).map((p) => p.channel)).toEqual([OTHER_DEST])
+      expect(h.posts(OTHER_KEY)[0]!.text).toContain('Error: `SpawnCapReached`')
+      expect(h.hold.view(OTHER_KEY)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+
+      // A notice raised while the episode is open joins the held ones: no Slack call, no line.
+      notifySpawnFailure(NOTICE_KEY, errGeneric('spawn', 'ErrLateNotice'), false)
+      await settleNotices()
+      expect(dmStub.callLog).toHaveLength(1)
+      expect(h.hold.view(NOTICE_KEY).heldNotices).toBe(3)
+
+      // Nothing is retried before the retry is due.
+      await h.clock.advance(4_999)
+      expect(dmStub.callLog).toHaveLength(1)
+
+      // The first retry fails too: one more open, no post, no line, no second record; the wait doubles.
+      expect(await h.clock.runNext()).toBe(1)
+      expect(webMethods(h, NOTICE_KEY)).toEqual(['conversations.open', 'conversations.open'])
+      expect(destinationFailedLines(h)).toEqual([episodeLine])
+      expect(h.hold.view(NOTICE_KEY)).toEqual({ held: true, heldNotices: 3, nextDueAt: 15_000 })
+      expect(h.clock.pending().map((t) => t.delayMs)).toEqual([10_000])
+      expect(countStartupEntries(readLog(), 'spawn-failure-post')).toBe(1)
+
+      // The cause clears (the app is re-installed with im:write): the next retry opens the DM and posts every held notice once, in raised order.
+      dmStub.script.open.length = 0
+      dmStub.script.open.push(openedDm(NOTICE_DM))
+      expect(await h.clock.runNext()).toBe(1)
+    })
+
+    expect(webMethods(h, NOTICE_KEY)).toEqual([
+      'conversations.open', 'conversations.open', 'conversations.open',
+      'chat.postMessage', 'chat.postMessage', 'chat.postMessage',
+    ])
+    const dmPosts = h.posts(NOTICE_KEY)
+    expect(dmPosts.map((p) => p.channel)).toEqual([NOTICE_DM, NOTICE_DM, NOTICE_DM])
+    expect(dmPosts[0]!.text).toContain('Error: `ErrSpawnBroken`')
+    expect(dmPosts[1]!.text).toContain('Error: `SpawnCapReached`')
+    expect(dmPosts[2]!.text).toContain('Error: `ErrLateNotice`')
+    for (const post of dmPosts) {
+      expect(Object.keys(post).sort()).toEqual(['channel', 'text'])
+      expect(post.text.startsWith(`Persona ${renderPersonaRef(NOTICE_NAME, NOTICE_KEY)}: `)).toBe(true)
+    }
+    // One cleared line; nothing left held and no timer.
+    expect(destinationFailedLines(h)).toEqual([episodeLine, clearedLine])
+    expect(h.hold.view(NOTICE_KEY)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    expect(h.clock.pendingCount()).toBe(0)
+    // Each failure callback ran once, at its notice's first failed attempt: one record, one stderr line (the restart cap's).
+    expect(countStartupEntries(readLog(), 'spawn-failure-post')).toBe(1)
+    const stderrLines = errLog.split('\n').filter((line) => line.startsWith('[slack] spawn-failure-post: '))
+    expect(stderrLines).toHaveLength(1)
+    expect(stderrLines[0]).toContain(`for persona=${NOTICE_KEY}: conversations.open code=missing_scope: `)
+    // No per-notice drop line: nothing was dropped.
+    expect(h.logs.filter((l) => l.includes('failed to post notice') || l.includes('dropped'))).toEqual([])
+
+    // Neither hold posts anything twice: more flushes and a long wait change nothing.
+    await Promise.all([h.notifier.flush(NOTICE_KEY), h.notifier.flush(OTHER_KEY)])
+    await h.clock.advance(600_000)
+    await settleNotices()
+    expect(h.posts(NOTICE_KEY)).toHaveLength(3)
+    expect(dmStub.callLog).toHaveLength(6)
+    expect(h.stub(OTHER_KEY).callLog).toHaveLength(1)
+
+    // Once cleared a new notice posts at once, to the cached DM, with no open.
+    notifyRestartCapReached(NOTICE_KEY)
+    await settleNotices()
+    expect(webMethods(h, NOTICE_KEY).slice(6)).toEqual(['chat.postMessage'])
+    expect(h.posts(NOTICE_KEY)[3]!.channel).toBe(NOTICE_DM)
+    expect(destinationFailedLines(h)).toHaveLength(2)
+    assertNoLeak({ startupErrorsLog: readLog(), errLog, logs: h.logs }, 'held then failed dm flush')
+  })
+
   test('restart cap: notifyRestartCapReached posts one SpawnCapReached notice to the persona destination', async () => {
     const cfg = makeNoticeConfig()
     const h = installNoticeNotifier(cfg)
@@ -5887,44 +6029,109 @@ describe('persona notices (b.av2 SR-7.2)', () => {
   // not console.error) and to startup-errors.log, so the log file stands for
   // the stderr line; console.error output and the notifier's lines are
   // captured and checked too.
+  //
+  // One destination failure (a platform refusal) through the whole cycle: the
+  // hold's episode line, retries and cleared line alongside the session
+  // manager's one record. The hold's own schedule is proven in
+  // persona-destination-hold.test.ts, so the rows after it assert only what
+  // the session manager owns.
+  test('spawn-failure-post: a rejected (platform) startup spawn-failure post records exactly one token-free entry; the notice is held, retried on backoff and posted once the destination accepts it', async () => {
+    const outcome: WebApiOutcome = { kind: 'platform', error: 'not_in_channel' }
+    const readLog = captureStartupErrors()
+    installGenericSpawnFailure()
+    const cfg = makeNoticeConfig()
+    // The first attempt and the first retry fail; the second retry is posted.
+    const h = installNoticeNotifier(cfg, { post: [outcome, outcome], leakMarker: LEAK_SENTINEL })
+
+    let action: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      action = (await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)).action
+      await settleNotices()
+    })
+
+    expect(action).toBe('failed')
+    expect(h.posts(NOTICE_KEY)).toHaveLength(1)
+    const log = readLog()
+    expect(countStartupEntries(log, 'spawn-failure-post')).toBe(1)
+    // The cause is the describer's type and code, never the error message.
+    expect(log).toContain(`failed to post spawn failure for persona=${NOTICE_KEY} — Error code=slack_webapi_platform_error`)
+    expect(log).not.toContain('error occurred')
+    // A destination failure: no per-notice drop line; one episode line instead, and the notice is held for a 5 s retry.
+    expect(h.logs.filter((l) => l.includes('failed to post notice'))).toEqual([])
+    expect(destinationFailedLines(h)).toEqual([
+      `${NOTICE_DIAG_PREFIX}chat.postMessage failed for destination=${NOTICE_DEST} with error not_in_channel; ` +
+        'holding its permission prompts and notices and retrying with backoff',
+    ])
+    expect(h.hold.view(NOTICE_KEY)).toEqual({ held: true, heldNotices: 1, nextDueAt: 5_000 })
+    expect(h.clock.pending().map((t) => t.delayMs)).toEqual([5_000])
+
+    // The first retry fails too: no post lands, no line, no second record; the wait doubles.
+    const retryErrLog = await withCapturedErr(async () => {
+      expect(await h.clock.runNext()).toBe(1)
+    })
+    expect(h.posts(NOTICE_KEY)).toHaveLength(2)
+    expect(destinationFailedLines(h)).toHaveLength(1)
+    expect(countStartupEntries(readLog(), 'spawn-failure-post')).toBe(1)
+    expect(retryErrLog).not.toContain('spawn-failure-post')
+    expect(h.clock.pending().map((t) => t.delayMs)).toEqual([10_000])
+    expect(h.hold.view(NOTICE_KEY)).toEqual({ held: true, heldNotices: 1, nextDueAt: 15_000 })
+
+    // The second retry is posted: the same notice to the same destination, one cleared line, nothing left held.
+    await withCapturedErr(async () => {
+      expect(await h.clock.runNext()).toBe(1)
+    })
+    const posts = h.posts(NOTICE_KEY)
+    expect(posts).toHaveLength(3)
+    expect(posts.map((p) => p.channel)).toEqual([NOTICE_DEST, NOTICE_DEST, NOTICE_DEST])
+    expect(new Set(posts.map((p) => p.text)).size).toBe(1)
+    expect(posts[0]!.text).toContain('Error: `ErrSpawnBroken`')
+    expect(destinationFailedLines(h)).toEqual([
+      expect.stringContaining('holding its permission prompts and notices'),
+      `${NOTICE_DIAG_PREFIX}cleared: destination=${NOTICE_DEST} accepts posts again ` +
+        '(was chat.postMessage error not_in_channel); delivering what was held',
+    ])
+    expect(h.hold.view(NOTICE_KEY)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(countStartupEntries(readLog(), 'spawn-failure-post')).toBe(1)
+    expect(h.posts(OTHER_KEY)).toHaveLength(0)
+    assertNoLeak({ startupErrorsLog: readLog(), errLog: `${errLog}\n${retryErrLog}`, logs: h.logs }, 'spawn-failure-post platform')
+  })
+
+  // [label, the post's failure, its Web API error code]
   const LEAKY_POST_FAILURES: [string, WebApiOutcome, string][] = [
     ['network', { kind: 'network' }, 'slack_webapi_request_error'],
     ['http 503', { kind: 'http', status: 503 }, 'slack_webapi_http_error'],
-    ['platform', { kind: 'platform', error: 'not_in_channel' }, 'slack_webapi_platform_error'],
   ]
 
   test.each(LEAKY_POST_FAILURES)(
-    'spawn-failure-post: a rejected (%s) startup spawn-failure post records exactly one token-free entry',
+    'spawn-failure-post: a rejected (%s) startup spawn-failure post records exactly one token-free entry, not another after a failed retry',
     async (_label, outcome, code) => {
       const readLog = captureStartupErrors()
       installGenericSpawnFailure()
       const cfg = makeNoticeConfig()
-      const h = installNoticeNotifier(cfg, { post: [outcome], leakMarker: LEAK_SENTINEL })
+      const h = installNoticeNotifier(cfg, { post: [outcome, outcome], leakMarker: LEAK_SENTINEL })
 
-      let action: string | undefined
       const errLog = await withCapturedErr(async () => {
-        action = (await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)).action
+        await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)
         await settleNotices()
+        expect(await h.clock.runNext()).toBe(1)
       })
 
-      expect(action).toBe('failed')
-      expect(h.posts(NOTICE_KEY)).toHaveLength(1)
+      expect(h.posts(NOTICE_KEY)).toHaveLength(2)
       const log = readLog()
       expect(countStartupEntries(log, 'spawn-failure-post')).toBe(1)
       // The cause is the describer's type and code, never the error message.
       expect(log).toContain(`failed to post spawn failure for persona=${NOTICE_KEY} — Error code=${code}`)
       expect(log).not.toContain('error occurred')
-      // The notifier logged the failed post once; there is no retry.
-      expect(h.logs.filter((l) => l.includes('failed to post notice'))).toHaveLength(1)
       assertNoLeak({ startupErrorsLog: log, errLog, logs: h.logs }, `spawn-failure-post ${_label}`)
     },
   )
 
-  test('spawn-failure-post: a held startup notice whose flushed post is rejected records exactly one token-free entry', async () => {
+  test('spawn-failure-post: a held startup notice whose flushed post is rejected records no entry before the flush and exactly one token-free entry after it, not another after a failed retry', async () => {
     const readLog = captureStartupErrors()
     installGenericSpawnFailure()
     const cfg = makeNoticeConfig()
-    const h = installNoticeNotifier(cfg, { validated: false, post: [{ kind: 'network' }], leakMarker: LEAK_SENTINEL })
+    const h = installNoticeNotifier(cfg, { validated: false, post: [{ kind: 'network' }, { kind: 'network' }], leakMarker: LEAK_SENTINEL })
 
     const errLog = await withCapturedErr(async () => {
       await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)
@@ -5934,50 +6141,57 @@ describe('persona notices (b.av2 SR-7.2)', () => {
       h.validate(NOTICE_KEY)
       await h.notifier.flush(NOTICE_KEY)
       await settleNotices()
+      expect(countStartupEntries(readLog(), 'spawn-failure-post')).toBe(1)
+
+      expect(await h.clock.runNext()).toBe(1)
     })
 
-    expect(h.posts(NOTICE_KEY)).toHaveLength(1)
+    expect(h.posts(NOTICE_KEY)).toHaveLength(2)
     expect(countStartupEntries(readLog(), 'spawn-failure-post')).toBe(1)
     assertNoLeak({ startupErrorsLog: readLog(), errLog, logs: h.logs }, 'held spawn-failure-post')
   })
 
-  test('spawn-failure-post: a rejected restart-cap notice post records none and logs token-free', async () => {
+  test('spawn-failure-post: a rejected restart-cap notice post records none and logs one token-free line, not another after a failed retry', async () => {
     const readLog = captureStartupErrors()
     const cfg = makeNoticeConfig()
-    const h = installNoticeNotifier(cfg, { post: [{ kind: 'network' }], leakMarker: LEAK_SENTINEL })
+    const h = installNoticeNotifier(cfg, { post: [{ kind: 'network' }, { kind: 'network' }], leakMarker: LEAK_SENTINEL })
 
     const errLog = await withCapturedErr(async () => {
       notifyRestartCapReached(NOTICE_KEY)
       await settleNotices()
+      expect(await h.clock.runNext()).toBe(1)
     })
 
-    expect(h.posts(NOTICE_KEY)).toHaveLength(1)
+    expect(h.posts(NOTICE_KEY)).toHaveLength(2)
     expect(countStartupEntries(readLog(), 'spawn-failure-post')).toBe(0)
-    // Outside startup the failure is logged instead.
-    expect(errLog).toContain(`[slack] spawn-failure-post: failed to post spawn failure for persona=${NOTICE_KEY}`)
+    // Outside startup the failure is logged instead, once.
+    const lines = errLog.split('\n').filter((line) => line.startsWith('[slack] spawn-failure-post: '))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain(`[slack] spawn-failure-post: failed to post spawn failure for persona=${NOTICE_KEY}`)
     assertNoLeak({ startupErrorsLog: readLog(), errLog, logs: h.logs }, 'restart-cap spawn-failure-post')
   })
 
-  test('spawn-failure-post: a rejected restart-path (launchSession) notice post records none and logs token-free', async () => {
+  test('spawn-failure-post: a rejected restart-path (launchSession) notice post records none and logs one token-free line, not another after a failed retry', async () => {
     const readLog = captureStartupErrors()
     installGenericSpawnFailure()
     const cfg = makeNoticeConfig()
-    const h = installNoticeNotifier(cfg, { post: [{ kind: 'network' }], leakMarker: LEAK_SENTINEL })
+    const h = installNoticeNotifier(cfg, { post: [{ kind: 'network' }, { kind: 'network' }], leakMarker: LEAK_SENTINEL })
 
     let launched: boolean | 'skipped' | undefined
     const errLog = await withCapturedErr(async () => {
       launched = await launchSession(NOTICE_KEY, cfg)
       await settleNotices()
+      expect(await h.clock.runNext()).toBe(1)
     })
 
     expect(launched).toBe(false)
-    expect(h.posts(NOTICE_KEY)).toHaveLength(1)
-    expect(h.posts(NOTICE_KEY)[0]!.channel).toBe(NOTICE_DEST)
+    expect(h.posts(NOTICE_KEY).map((p) => p.channel)).toEqual([NOTICE_DEST, NOTICE_DEST])
     expect(h.posts(OTHER_KEY)).toHaveLength(0)
     // Non-startup: no startup-errors.log entry of any class.
-    expect(countStartupEntries(readLog(), 'spawn-failure-post')).toBe(0)
     expect(readLog()).toBe('')
-    expect(errLog).toContain(`[slack] spawn-failure-post: failed to post spawn failure for persona=${NOTICE_KEY}`)
+    const lines = errLog.split('\n').filter((line) => line.startsWith('[slack] spawn-failure-post: '))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain(`[slack] spawn-failure-post: failed to post spawn failure for persona=${NOTICE_KEY}`)
     assertNoLeak({ errLog, logs: h.logs }, 'launchSession spawn-failure-post')
   })
 

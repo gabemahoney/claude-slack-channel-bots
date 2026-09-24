@@ -10,14 +10,20 @@
  * - `clientFor` returns the persona's stub `web` while its key is in
  *   `validated`, and undefined otherwise (not validated yet);
  * - `isDryRun` reads a flag the test sets with `setDryRun`;
- * - `log` appends to `logs`.
+ * - `log` appends to `logs`;
+ * - the notifier's destination hold (`h.hold`, which holds and retries a
+ *   notice whose destination fails) is built over its own destination
+ *   resolver (`h.destinations`), the same lookups and `log`, on a fake clock
+ *   (`h.clock`, or the `clock` option): never the real clock, so a held
+ *   notice starts no real timer and its retries run only when the test moves
+ *   the clock (`h.clock.runNext()`, `h.clock.advance(ms)`).
  *
  * The harness installs nothing: pass `h.notifier.notify` to the notice site
  * under test (`setSessionNotifier`, `initOutageState({ notify })`, the
  * safeguard's `notify` argument).
  *
- * Isolation (b.av2 SR-13.2): no module-scope state, no I/O, no timers, no
- * token literal. The stubs' failures carry `leakMarker` when given.
+ * Isolation (b.av2 SR-13.2): no module-scope state, no I/O, no real timers,
+ * no token literal. The stubs' failures carry `leakMarker` when given.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -25,7 +31,10 @@
 import type { WebClient } from '@slack/web-api'
 
 import type { Persona, PersonaConfig } from '../../src/config.ts'
+import { createPersonaDestinationHold, type PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
+import { createPersonaDestinations, type PersonaDestinations } from '../../src/persona-destination.ts'
 import { createPersonaNotifier, type PersonaNotifier } from '../../src/persona-notifier.ts'
+import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { makeStubSlack, type StubSlack, type WebApiOutcome } from './slack-stub.ts'
 
 /** One captured `chat.postMessage` call, as the notifier makes it. */
@@ -46,6 +55,8 @@ export interface NotifierHarnessOptions {
   leakMarker?: string
   /** Initial dry-run flag. Default false. */
   dryRun?: boolean
+  /** The destination hold's clock and timers. Default: a new `createFakeClock()`. */
+  clock?: FakeClock
 }
 
 export interface NotifierHarness {
@@ -57,8 +68,14 @@ export interface NotifierHarness {
   readonly stubs: ReadonlyMap<string, StubSlack>
   /** Keys whose client counts as validated; `validate(key)` adds one. */
   readonly validated: Set<string>
-  /** The notifier's log lines, in order. */
+  /** The notifier's log lines, in order (the hold's and the resolver's included). */
   readonly logs: string[]
+  /** The fake clock the destination hold runs on. */
+  readonly clock: FakeClock
+  /** The destination hold the notifier hands notices to. */
+  readonly hold: PersonaDestinationHold
+  /** The destination resolver the hold posts through. */
+  readonly destinations: PersonaDestinations
   /** The stub for `key`; throws when the config has no such persona. */
   stub(key: string): StubSlack
   /** Mark `key`'s client validated (does not flush). */
@@ -90,14 +107,23 @@ export function makeNotifierHarness(
   )
   const logs: string[] = []
   let dryRun = opts.dryRun ?? false
+  const clock = opts.clock ?? createFakeClock()
+  const getPersona = (key: string): Persona | undefined => personas.find((p) => p.key === key)
+  const clientFor = (key: string): WebClient | undefined =>
+    validated.has(key) ? (stubs.get(key)?.web as unknown as WebClient | undefined) : undefined
+  const log = (line: string): void => {
+    logs.push(line)
+  }
+  const destinations = createPersonaDestinations({ log })
+  const hold = createPersonaDestinationHold({ destinations, getPersona, clientFor, clock, log })
 
   const notifier = createPersonaNotifier({
-    getPersona: (key) => personas.find((p) => p.key === key),
-    clientFor: (key) => (validated.has(key) ? (stubs.get(key)?.web as unknown as WebClient | undefined) : undefined),
+    getPersona,
+    clientFor,
+    destinations,
+    destinationHold: hold,
     isDryRun: () => dryRun,
-    log: (line) => {
-      logs.push(line)
-    },
+    log,
   })
 
   function stub(key: string): StubSlack {
@@ -114,6 +140,9 @@ export function makeNotifierHarness(
     stubs,
     validated,
     logs,
+    clock,
+    hold,
+    destinations,
     stub,
     validate: (key) => {
       validated.add(key)

@@ -267,10 +267,7 @@ export function classifySlackValidationError(error: unknown, check: SlackValidat
     // Slack refusing the token: only a well-formed Slack error code can be.
     if (!isSlackErrorCode(rawSlackError)) return unreachable(check, 'unknown')
     if (TRANSIENT_SLACK_PLATFORM_ERRORS.has(rawSlackError)) {
-      const retryAfter = rawSlackError === 'ratelimited'
-        ? validRetryAfter(readProp(readProp(data, 'response_metadata'), 'retryAfter'))
-        : undefined
-      return unreachable(check, 'platform-transient', { slackError: rawSlackError, retryAfter })
+      return unreachable(check, 'platform-transient', { slackError: rawSlackError, retryAfter: slackRetryAfterSeconds(error) })
     }
     return refused(check, rawSlackError)
   }
@@ -278,7 +275,7 @@ export function classifySlackValidationError(error: unknown, check: SlackValidat
   if (code === WEB_API_REQUEST_ERROR) return unreachable(check, 'network')
   if (code === WEB_API_HTTP_ERROR) return unreachable(check, 'http-status', { status: validStatus(readProp(error, 'statusCode')) })
   if (code === WEB_API_RATE_LIMITED_ERROR) {
-    return unreachable(check, 'rate-limited', { retryAfter: validRetryAfter(readProp(error, 'retryAfter')) })
+    return unreachable(check, 'rate-limited', { retryAfter: slackRetryAfterSeconds(error) })
   }
   if (code === SLACK_TIMEOUT_CODE) return unreachable(check, 'timeout')
   if (typeof code === 'string' && code.startsWith(SOCKET_MODE_CODE_PREFIX)) return unreachable(check, 'network')
@@ -392,6 +389,21 @@ function readProp(obj: unknown, prop: string): unknown {
 /** Whether a value is a Slack error code safe to copy: a short lower-case identifier. */
 function isSlackErrorCode(value: unknown): value is string {
   return typeof value === 'string' && SLACK_ERROR_CODE_RE.test(value)
+}
+
+/**
+ * The `retryAfter` (seconds) a rejected Slack Web API call carries: the
+ * library's rate-limited error, or a platform error whose Slack error is
+ * `ratelimited`; `undefined` for any other value or when it is not a finite
+ * non-negative number. Copies nothing else. Never throws.
+ */
+export function slackRetryAfterSeconds(error: unknown): number | undefined {
+  const code = readProp(error, 'code')
+  if (code === WEB_API_RATE_LIMITED_ERROR) return validRetryAfter(readProp(error, 'retryAfter'))
+  if (code !== WEB_API_PLATFORM_ERROR) return undefined
+  const data = readProp(error, 'data')
+  if (readProp(data, 'error') !== 'ratelimited') return undefined
+  return validRetryAfter(readProp(readProp(data, 'response_metadata'), 'retryAfter'))
 }
 
 /** `retryAfter` (seconds) when it is a finite non-negative number, else `undefined`. */

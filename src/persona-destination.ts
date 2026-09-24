@@ -226,12 +226,15 @@ export function describeDestinationFailure(failure: DestinationFailure): string 
  */
 export function describeDestinationFailureCause(failure: DestinationFailure): string {
   if (failure.step === 'chat.postMessage') return describeThrownValue(failure.error)
-  const head = `conversations.open code=${safeCode(failure.code)}`
+  const head = `conversations.open code=${safeFailureCode(failure.code)}`
   return 'error' in failure ? `${head}: ${describeThrownValue(failure.error)}` : head
 }
 
-/** The failure code when it is safe to log, else `unknown_error`. */
-function safeCode(code: string): string {
+/**
+ * A failure's code when it is a short identifier (`isSafeIdentifier`), else
+ * `unknown_error`: the form a log line or a trail event may carry. Pure.
+ */
+export function safeFailureCode(code: string): string {
   return isSafeIdentifier(code) ? code : 'unknown_error'
 }
 

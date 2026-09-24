@@ -21,7 +21,7 @@
  * The label set grows as later work lands (E2 Task 2 added credentials-refused
  * and Slack-unreachable, E2 Task 3 connection lost/restored, E3 Task 7 the
  * unclaimed channel and the DM drop, E5 Task 1 the per-persona start
- * line; later Epics theirs).
+ * line, E7 Task 2 the destination failure; later Epics theirs).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -91,6 +91,17 @@ export const PERSONA_DM_DROPPED = 'persona-dm-dropped'
  */
 export const PERSONA_START = 'persona-start'
 
+/**
+ * A post to a persona's destination (its `permission_prompts` channel, or its
+ * DM with `dm.contact`) failed: the open (`conversations.open`) or the post
+ * (`chat.postMessage`) was refused or did not go through (b.av2 SR-7.1). The
+ * persona's prompts and notices are held and retried with backoff. Logged
+ * once when the episode starts, naming the destination, the failed step and
+ * the Slack error code (and `im:write` for `missing_scope` on the open), and
+ * once when it clears.
+ */
+export const PERSONA_DESTINATION_FAILED = 'persona-destination-failed'
+
 /** Every persona diagnostic class label, in a fixed order. */
 export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_START,
@@ -105,6 +116,7 @@ export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_DIRECTORY_UNUSABLE,
   UNCLAIMED_CHANNEL,
   PERSONA_DM_DROPPED,
+  PERSONA_DESTINATION_FAILED,
 ] as const
 
 /** A persona diagnostic class label (closed set). */

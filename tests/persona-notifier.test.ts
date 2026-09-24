@@ -10,16 +10,26 @@
  * nothing, notices raised before the persona's client is validated are held
  * and flushed per persona (at most
  * `MAX_HELD_NOTICES_PER_PERSONA` per persona: past it the oldest held notice
- * is dropped with one log line and never posted), and a failed open or post
- * is logged and the whole failure (step, code, thrown value) handed to the
- * caller's failure callback without ever rejecting. An injected resolver is
- * the one the notifier uses (its cached DM is reused).
+ * is dropped with one log line and never posted). A notice whose open or post
+ * fails at the destination (b.av2 SR-7.1: `missing_scope` on the DM open,
+ * `not_in_channel`, Slack unreachable) is handed to the destination hold: it
+ * is held, never lost, and retried on the SR-3.2 backoff (5 s, 10 s, 20 s …)
+ * with one `persona-destination-failed` line per episode (naming `im:write`
+ * for `missing_scope` on the open) and one cleared line, posted in raised
+ * order once the cause clears, and its failure callback runs once however
+ * many retries fail. A post refused for the message itself (`invalid_blocks`,
+ * `msg_too_long`) is logged per notice and dropped, opening no episode. The
+ * hold's own schedule, epochs and cap are proven in
+ * `persona-destination-hold.test.ts`; this file keeps one case per failure
+ * kind and the notifier-level rules. Nothing rejects. An injected resolver is
+ * the one used (its cached DM is reused).
  *
  * Pure module under test: built from injected fakes only, through the shared
  * `makeNotifierHarness` (`makeStubSlack` Web stubs, a validated-key set, a
- * dry-run flag and a line capture). No token is used; every stub carries
- * `LEAK_SENTINEL` and `afterEach` runs `assertNoLeak` over every captured log
- * line and post.
+ * dry-run flag, a line capture and a destination hold on a fake clock, so no
+ * real timer runs and retries fire only on `h.clock.runNext()`). No token is
+ * used; every stub carries `LEAK_SENTINEL` and `afterEach` runs `assertNoLeak`
+ * over every captured log line and post.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
@@ -32,7 +42,9 @@ import type { WebClient } from '@slack/web-api'
 import type { Persona } from '../src/config.ts'
 import { MAX_HELD_NOTICES_PER_PERSONA, createPersonaNotifier, formatPersonaNotice } from '../src/persona-notifier.ts'
 import { createPersonaDestinations, type DestinationFailure } from '../src/persona-destination.ts'
+import { createPersonaDestinationHold } from '../src/persona-destination-hold.ts'
 import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
 import { stubOpenedDmId, type WebApiOutcome } from './test-helpers/slack-stub.ts'
@@ -85,7 +97,9 @@ function makeFixture(baseDir: string): Fixture {
     baseDir,
   )
   const [A, B, D] = config.personas as [Persona, Persona, Persona]
-  return { h: makeNotifierHarness(config, { validated: false, leakMarker: LEAK_SENTINEL }), A, B, D }
+  // Enough microtask turns per timer for a retry to post 20 held notices in one `runNext`.
+  const clock = createFakeClock({ flushTurns: 500 })
+  return { h: makeNotifierHarness(config, { validated: false, leakMarker: LEAK_SENTINEL, clock }), A, B, D }
 }
 
 /** Validate the persona's client and flush its held notices. */
@@ -97,6 +111,27 @@ async function validateAndFlush(p: Persona): Promise<void> {
 const ref = (p: Persona) => renderPersonaRef(p.name, p.key)
 const texts = (p: Persona) => h.posts(p.key).map((c) => c.text)
 
+/** Every call on `queue` fails with `outcome` until `recover(queue)`. */
+function failAlways(queue: WebApiOutcome[], outcome: WebApiOutcome): void {
+  queue.push(...Array<WebApiOutcome>(1000).fill(outcome))
+}
+
+/** The cause clears: calls on `queue` succeed again. */
+function recover(queue: WebApiOutcome[]): void {
+  queue.length = 0
+}
+
+/** The start of the one `persona-destination-failed` line an episode opens. */
+const episodeStart = (p: Persona, step: string, destination: string, code: string) =>
+  `[slack] persona-destination-failed: personas[${p.index}] ${ref(p)}: ${step} failed for destination=${destination} with error ${code}`
+
+/** The start of the line that ends the episode. */
+const clearedStart = (p: Persona, destination: string) =>
+  `[slack] persona-destination-failed: personas[${p.index}] ${ref(p)}: cleared: destination=${destination} accepts posts again`
+
+/** A persona's hold with nothing held. */
+const NOT_HELD = { held: false, heldNotices: 0, nextDueAt: undefined }
+
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'persona-notifier-'))
   f = makeFixture(dir)
@@ -104,6 +139,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  h.hold.cancelAll()
   assertNoLeak({ lines: h.logs, posts: h.allPosts() })
   rmSync(dir, { recursive: true, force: true })
 })
@@ -206,15 +242,17 @@ describe('the persona reference uses the stored key (SR-7.2)', () => {
     assertNoLeak({ lines: s.logs })
   })
 
-  test('the failed-post log line names the persona with its stored key', async () => {
-    const { s, p } = standIn({ post: [{ kind: 'network' }] })
+  test.each<[string, WebApiOutcome, string]>([
+    ['the dropped-notice line (a payload error)', { kind: 'platform', error: 'invalid_blocks' }, 'persona-notifier: failed to post notice for '],
+    ['the persona-destination-failed line (Slack unreachable)', { kind: 'network' }, 'persona-destination-failed: personas[0] '],
+  ])('%s names the persona with its stored key', async (_label, outcome, head) => {
+    const { s, p } = standIn({ post: [outcome] })
 
     await s.notifier.notify(p.key, 'body')
 
     expect(s.logs).toHaveLength(1)
-    expect(s.logs[0]).toStartWith(
-      `[slack] persona-notifier: failed to post notice for ${renderPersonaRef(p.name, p.key)} to ${STAND_IN}: `,
-    )
+    expect(s.logs[0]).toStartWith(`[slack] ${head}${renderPersonaRef(p.name, p.key)}`)
+    s.hold.cancelAll()
     assertNoLeak({ lines: s.logs, posts: s.allPosts() })
   })
 })
@@ -252,23 +290,23 @@ describe('dm-destination notices (SR-7.2)', () => {
     expect(h.posts(f.D.key)).toEqual(['D1', 'D2', 'D3', 'D4'].map((t) => ({ channel: dmId(), text: formatPersonaNotice(f.D, t) })))
   })
 
-  test.each<[string, WebApiOutcome, string, string, boolean]>([
-    ['missing_scope', { kind: 'platform', error: 'missing_scope' }, ' (reason=missing_scope): ', 'missing_scope', true],
-    ['no conversation ID', { kind: 'ok', result: { channel: undefined } }, ' (reason=no_conversation_id)', 'no_conversation_id', false],
+  test.each<[string, WebApiOutcome, string, boolean]>([
+    ['missing_scope', { kind: 'platform', error: 'missing_scope' }, 'missing_scope', true],
+    ['no conversation ID', { kind: 'ok', result: { channel: undefined } }, 'no_conversation_id', false],
   ])(
-    'a failed DM open (%s) posts nothing, logs one line naming the persona and conversations.open, and calls the callback once with the open step and code; the next notice opens again',
-    async (_label, outcome, tail, code, withError) => {
+    'a failed DM open (%s) holds the notice: nothing posted, one persona-destination-failed line naming conversations.open (im:write for missing_scope only), the callback once with the open step and code; a notice raised meanwhile waits; the retry opens again and posts both in raised order',
+    async (_label, outcome, code, isMissingScope) => {
       h.validate(f.D.key)
       h.stub(f.D.key).script.open.push(outcome)
       const failures: DestinationFailure[] = []
 
       await expect(h.notifier.notify(f.D.key, 'x', { onPostFailure: (err) => failures.push(err) })).resolves.toBeUndefined()
+      await h.notifier.notify(f.D.key, 'y')
 
-      expect(h.posts(f.D.key)).toEqual([])
+      expect(methods(f.D)).toEqual(['conversations.open'])
       expect(h.logs).toHaveLength(1)
-      expect(h.logs[0]).toStartWith(
-        `[slack] persona-notifier: failed to post notice for ${ref(f.D)}: could not open its DM destination (conversations.open)${tail}`,
-      )
+      expect(h.logs[0]).toStartWith(episodeStart(f.D, 'conversations.open', 'dm', code))
+      expect(h.logs[0]!.includes('im:write')).toBe(isMissingScope)
       expect(h.logs[0]).not.toContain('An API error occurred')
       // The whole failure: the open step and its code, no channel (nothing was posted).
       expect(failures).toHaveLength(1)
@@ -277,14 +315,50 @@ describe('dm-destination notices (SR-7.2)', () => {
       expect(failure!.step).toBe('conversations.open')
       expect(failure!.code).toBe(code)
       expect(failure!.channelId).toBeUndefined()
-      if (withError) expect(failure!.error).toBeInstanceOf(Error)
+      if (isMissingScope) expect(failure!.error).toBeInstanceOf(Error)
       // No thrown value at all (the cause describer keys on its absence).
       else expect('error' in failure!).toBe(false)
+      expect(h.hold.view(f.D.key)).toEqual({ held: true, heldNotices: 2, nextDueAt: 5_000 })
 
-      await h.notifier.notify(f.D.key, 'y')
-      expect(methods(f.D)).toEqual(['conversations.open', 'conversations.open', 'chat.postMessage'])
+      await h.clock.runNext()
+
+      expect(methods(f.D)).toEqual(['conversations.open', 'conversations.open', 'chat.postMessage', 'chat.postMessage'])
+      expect(h.posts(f.D.key)).toEqual(['x', 'y'].map((t) => ({ channel: dmId(), text: formatPersonaNotice(f.D, t) })))
+      expect(h.logs).toHaveLength(2)
+      expect(h.logs[1]).toStartWith(clearedStart(f.D, 'dm'))
+      expect(failures).toHaveLength(1)
+      expect(h.hold.view(f.D.key)).toEqual(NOT_HELD)
     },
   )
+
+  test('several notices held before validation and flushed onto a failing shared DM open log one episode line, not one per notice; each callback runs once; they post in raised order once the open succeeds', async () => {
+    const failed: string[] = []
+    for (const n of ['D1', 'D2', 'D3']) await h.notifier.notify(f.D.key, n, { onPostFailure: () => failed.push(n) })
+    failAlways(h.stub(f.D.key).script.open, { kind: 'platform', error: 'missing_scope' })
+
+    await validateAndFlush(f.D)
+
+    // The flush's three attempts shared one open, and its one failure opened one episode.
+    expect(methods(f.D)).toEqual(['conversations.open'])
+    expect(h.logs).toHaveLength(1)
+    expect(h.logs[0]).toStartWith(episodeStart(f.D, 'conversations.open', 'dm', 'missing_scope'))
+    expect(h.logs[0]).toContain('im:write')
+    expect(failed).toEqual(['D1', 'D2', 'D3'])
+    // The flush's later failures did not move the retry either.
+    expect(h.hold.view(f.D.key)).toEqual({ held: true, heldNotices: 3, nextDueAt: 5_000 })
+
+    await h.clock.runNext()
+    expect(methods(f.D)).toEqual(['conversations.open', 'conversations.open'])
+    expect(h.logs).toHaveLength(1)
+
+    recover(h.stub(f.D.key).script.open)
+    await h.clock.runNext()
+
+    expect(h.posts(f.D.key)).toEqual(['D1', 'D2', 'D3'].map((t) => ({ channel: dmId(), text: formatPersonaNotice(f.D, t) })))
+    expect(h.logs).toHaveLength(2)
+    expect(h.logs[1]).toStartWith(clearedStart(f.D, 'dm'))
+    expect(failed).toEqual(['D1', 'D2', 'D3'])
+  })
 
   test('an injected destination resolver is the one used: a DM it already opened is reused, with no second conversations.open', async () => {
     // A resolver shared with another caller (the permission poller, in the
@@ -293,12 +367,19 @@ describe('dm-destination notices (SR-7.2)', () => {
     const destinations = createPersonaDestinations({ log: (line) => h.logs.push(line) })
     expect(await destinations.post(f.D, web, { text: 'prompt' })).toMatchObject({ outcome: 'posted', channelId: dmId() })
     expect(methods(f.D)).toEqual(['conversations.open', 'chat.postMessage'])
+    const getPersona = (key: string) => h.personas.find((p) => p.key === key)
+    const clientFor = (key: string) => h.stub(key).web as unknown as WebClient
+    const log = (line: string) => {
+      h.logs.push(line)
+    }
+    // Wired as the server wires it: the shared resolver, and a hold over it (on a fake clock).
     const notifier = createPersonaNotifier({
-      getPersona: (key) => h.personas.find((p) => p.key === key),
-      clientFor: (key) => h.stub(key).web as unknown as WebClient,
+      getPersona,
+      clientFor,
       destinations,
+      destinationHold: createPersonaDestinationHold({ destinations, getPersona, clientFor, clock: createFakeClock(), log }),
       isDryRun: () => false,
-      log: (line) => h.logs.push(line),
+      log,
     })
 
     await notifier.notify(f.D.key, 'notice')
@@ -308,19 +389,7 @@ describe('dm-destination notices (SR-7.2)', () => {
     expect(h.logs).toEqual([])
   })
 
-  test('a failed post to the opened DM logs the D… ID with its reason and calls the callback once', async () => {
-    h.validate(f.D.key)
-    h.stub(f.D.key).script.post.push({ kind: 'platform', error: 'not_in_channel' })
-    const failures: unknown[] = []
-
-    await h.notifier.notify(f.D.key, 'x', { onPostFailure: (err) => failures.push(err) })
-
-    expect(h.logs).toHaveLength(1)
-    expect(h.logs[0]).toStartWith(`[slack] persona-notifier: failed to post notice for ${ref(f.D)} to ${dmId()} (reason=not_in_channel): `)
-    expect(failures).toHaveLength(1)
-  })
-
-  test('a dm destination the resolver refuses (DMs off) makes no Slack call and does not call the failure callback', async () => {
+  test('a dm destination the resolver refuses (DMs off) makes no Slack call, does not call the failure callback and holds nothing', async () => {
     h.personas.splice(h.personas.indexOf(f.D), 1, { ...f.D, dm: { enabled: false, contact: 'U0DELTA01' } })
     h.validate(f.D.key)
     const failures: unknown[] = []
@@ -332,6 +401,8 @@ describe('dm-destination notices (SR-7.2)', () => {
     expect(h.logs).toHaveLength(1)
     expect(h.logs[0]).toContain(ref(f.D))
     expect(h.logs[0]).toContain('dm.enabled is not true')
+    expect(h.hold.view(f.D.key)).toEqual(NOT_HELD)
+    expect(h.clock.pendingCount()).toBe(0)
   })
 
   test('dry run: a dm-destination notice makes no Slack call of any kind, before or after validation', async () => {
@@ -361,6 +432,27 @@ describe('notices that are logged, not posted', () => {
     expect(h.logs).toHaveLength(1)
     expect(h.logs[0]).toContain(ref(f.A))
     expect(h.logs[0]).not.toContain('Error:')
+  })
+
+  test('SR-3.4: in dry run a notice for a persona whose stub would fail makes no Slack call and nothing is held', async () => {
+    h.validate(f.A.key)
+    h.validate(f.D.key)
+    h.setDryRun(true)
+    failAlways(h.stub(f.A.key).script.post, { kind: 'platform', error: 'not_in_channel' })
+    failAlways(h.stub(f.D.key).script.open, { kind: 'platform', error: 'missing_scope' })
+
+    await h.notifier.notify(f.A.key, 'a')
+    await h.notifier.notify(f.D.key, 'd')
+
+    for (const p of [f.A, f.B, f.D]) {
+      expect(h.stub(p.key).callLog).toEqual([])
+      expect(h.hold.view(p.key)).toEqual(NOT_HELD)
+    }
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(h.logs).toEqual([
+      `[slack] dry-run: would post notice for ${ref(f.A)}: a`,
+      `[slack] dry-run: would post notice for ${ref(f.D)}: d`,
+    ])
   })
 
   test('an unknown key posts nothing, logs once and does not throw', async () => {
@@ -486,31 +578,154 @@ describe('hold and flush per persona (SR-7.2)', () => {
   })
 })
 
+
+// ---------------------------------------------------------------------------
+// Destination failures: held, retried on backoff, logged once per episode
+// ---------------------------------------------------------------------------
+
+describe('destination failures are held and retried, one line per episode (SR-7.1, SR-10.3)', () => {
+  // [label, persona, the stub queue that fails, its outcome, failed step, code, names im:write]
+  test.each<[string, (x: Fixture) => Persona, 'open' | 'post', WebApiOutcome, string, string, boolean]>([
+    ['missing_scope on the DM open', (x) => x.D, 'open', { kind: 'platform', error: 'missing_scope' }, 'conversations.open', 'missing_scope', true],
+    ['not_in_channel on a channel destination', (x) => x.A, 'post', { kind: 'platform', error: 'not_in_channel' }, 'chat.postMessage', 'not_in_channel', false],
+    ['not_in_channel on the opened DM', (x) => x.D, 'post', { kind: 'platform', error: 'not_in_channel' }, 'chat.postMessage', 'not_in_channel', false],
+    ['Slack unreachable on a channel destination', (x) => x.B, 'post', { kind: 'network' }, 'chat.postMessage', 'network_error', false],
+  ])(
+    '%s: the notices are held with no post, one line names the persona, the callback runs once, retries at 5 s, 10 s, 20 s log nothing, and once it clears both post once in raised order through its own client',
+    async (_label, pick, queue, outcome, step, code, namesImWrite) => {
+      const p = pick(f)
+      const isDm = p.permission_prompts === 'dm'
+      const destination = isDm ? 'dm' : p.permission_prompts
+      const postedTo = isDm ? stubOpenedDmId(p.dm.contact!) : p.permission_prompts
+      const stub = h.stub(p.key)
+      const attempts = () => stub.callLog.filter((c) => c.method === step).length
+      h.validate(p.key)
+      failAlways(stub.script[queue], outcome)
+      const failures: DestinationFailure[] = []
+
+      await h.notifier.notify(p.key, 'Spawn failure:\n  Error: boom', { onPostFailure: (x) => failures.push(x) })
+      await h.notifier.notify(p.key, 'second')
+
+      // One attempt, of the first notice only; the second waits behind it.
+      expect(attempts()).toBe(1)
+      expect(texts(p).every((t) => t === formatPersonaNotice(p, 'Spawn failure:\n  Error: boom'))).toBe(true)
+      expect(h.logs).toHaveLength(1)
+      expect(h.logs[0]).toStartWith(episodeStart(p, step, destination, code))
+      expect(h.logs[0]!.includes('im:write')).toBe(namesImWrite)
+      expect(failures).toHaveLength(1)
+      expect(failures[0]).toMatchObject({ outcome: 'failed', step, code })
+      expect(h.hold.view(p.key)).toEqual({ held: true, heldNotices: 2, nextDueAt: 5_000 })
+
+      // Retries on the SR-3.2 backoff: nothing before each is due, one attempt each, no line, no callback.
+      await h.clock.advance(4_999)
+      expect(attempts()).toBe(1)
+      const retriedAt: number[] = []
+      for (let i = 0; i < 3; i++) {
+        await h.clock.runNext()
+        retriedAt.push(h.clock.now())
+      }
+      expect(retriedAt).toEqual([5_000, 15_000, 35_000])
+      expect(attempts()).toBe(4)
+      expect(texts(p).every((t) => t === formatPersonaNotice(p, 'Spawn failure:\n  Error: boom'))).toBe(true)
+      expect(h.logs).toHaveLength(1)
+      expect(failures).toHaveLength(1)
+
+      recover(stub.script[queue])
+      await h.clock.runNext()
+
+      expect(h.clock.now()).toBe(75_000)
+      // Each notice posted exactly once, in raised order, to the destination (a DM's `D…` ID, never the contact).
+      const failedPosts = queue === 'post' ? 4 : 0
+      expect(h.posts(p.key).slice(failedPosts)).toEqual(
+        ['Spawn failure:\n  Error: boom', 'second'].map((t) => ({ channel: postedTo, text: formatPersonaNotice(p, t) })),
+      )
+      expect(h.logs).toHaveLength(2)
+      expect(h.logs[1]).toStartWith(clearedStart(p, destination))
+      expect(failures).toHaveLength(1)
+      expect(h.hold.view(p.key)).toEqual(NOT_HELD)
+      expect(h.clock.pendingCount()).toBe(0)
+      // Only the persona's own client made a call.
+      for (const other of h.personas.filter((q) => q.key !== p.key)) expect(h.stub(other.key).callLog).toEqual([])
+    },
+  )
+
+  test('two failing personas each get their own line and schedule; one clearing delivers only its notices while the other stays held', async () => {
+    h.validate(f.A.key)
+    h.validate(f.B.key)
+    h.validate(f.D.key)
+    failAlways(h.stub(f.A.key).script.post, { kind: 'platform', error: 'not_in_channel' })
+    failAlways(h.stub(f.D.key).script.open, { kind: 'platform', error: 'missing_scope' })
+
+    await h.notifier.notify(f.A.key, 'a1')
+    await h.notifier.notify(f.D.key, 'd1')
+    await h.notifier.notify(f.B.key, 'b1')
+
+    expect(h.logs).toHaveLength(2)
+    expect(h.logs[0]).toStartWith(episodeStart(f.A, 'chat.postMessage', f.A.permission_prompts, 'not_in_channel'))
+    expect(h.logs[0]).not.toContain('im:write')
+    expect(h.logs[1]).toStartWith(episodeStart(f.D, 'conversations.open', 'dm', 'missing_scope'))
+    expect(h.logs[1]).toContain('im:write')
+    // B, not failing, posts at once and is never held.
+    expect(texts(f.B)).toEqual([formatPersonaNotice(f.B, 'b1')])
+    expect(h.hold.view(f.B.key)).toEqual(NOT_HELD)
+
+    recover(h.stub(f.A.key).script.post)
+    await h.clock.runNext() // both personas' first retries are due at 5 s
+
+    expect(texts(f.A)).toEqual(['a1', 'a1'].map((t) => formatPersonaNotice(f.A, t)))
+    expect(h.posts(f.D.key)).toEqual([])
+    expect(h.logs).toHaveLength(3)
+    expect(h.logs[2]).toStartWith(clearedStart(f.A, f.A.permission_prompts))
+    expect(h.hold.view(f.A.key)).toEqual(NOT_HELD)
+    expect(h.hold.view(f.D.key)).toEqual({ held: true, heldNotices: 1, nextDueAt: 15_000 })
+
+    recover(h.stub(f.D.key).script.open)
+    await h.clock.runNext()
+
+    expect(h.clock.now()).toBe(15_000)
+    expect(h.posts(f.D.key)).toEqual([{ channel: stubOpenedDmId(f.D.dm.contact!), text: formatPersonaNotice(f.D, 'd1') }])
+    expect(h.logs).toHaveLength(4)
+    expect(h.logs[3]).toStartWith(clearedStart(f.D, 'dm'))
+    expect(texts(f.B)).toHaveLength(1)
+  })
+
+  test('a held notice dropped past MAX_HELD_NOTICES_PER_PERSONA while its destination fails is named in the drop line by its first line only', async () => {
+    const notice = (i: number) => `A-held-${String(i).padStart(2, '0')}\n  detail line ${i}`
+    h.validate(f.A.key)
+    failAlways(h.stub(f.A.key).script.post, { kind: 'platform', error: 'not_in_channel' })
+
+    for (let i = 1; i <= MAX_HELD_NOTICES_PER_PERSONA + 1; i++) await h.notifier.notify(f.A.key, notice(i))
+
+    const dropLines = h.logs.filter((l) => l.includes('oldest held notice dropped'))
+    expect(dropLines).toHaveLength(1)
+    expect(dropLines[0]).toEndWith(': A-held-01')
+    expect(dropLines[0]).not.toContain('detail line')
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Failed posts and the failure callback
 // ---------------------------------------------------------------------------
 
 // [label, scripted post outcome, the failure's code]
 const FAILURES: [string, WebApiOutcome, string][] = [
-  ['network', { kind: 'network' }, 'network_error'],
   ['platform', { kind: 'platform', error: 'channel_not_found' }, 'channel_not_found'],
   ['reject(undefined)', { kind: 'reject', value: undefined }, 'unknown_error'],
 ]
 
-describe('failed posts (SR-11 spawn-failure-post class)', () => {
+describe('failed posts and the failure callback (SR-11 spawn-failure-post class)', () => {
   test.each(FAILURES)(
-    'a rejected immediate post (%s) is logged naming the persona and calls the callback once; other personas still post',
+    'a rejected immediate post (%s): notify resolves and the callback gets the whole failure, the rejection included',
     async (_label, outcome, code) => {
       h.validate(f.A.key)
-      h.validate(f.B.key)
       h.stub(f.A.key).script.post.push(outcome)
       const failures: DestinationFailure[] = []
 
       await expect(
         h.notifier.notify(f.A.key, 'Spawn failure', { onPostFailure: (failure) => failures.push(failure) }),
       ).resolves.toBeUndefined()
-      await h.notifier.notify(f.B.key, 'still here')
 
+      expect(h.posts(f.A.key)).toHaveLength(1)
       expect(failures).toHaveLength(1)
       const [failure] = failures
       expect(failure!.step).toBe('chat.postMessage')
@@ -520,13 +735,10 @@ describe('failed posts (SR-11 spawn-failure-post class)', () => {
       expect('error' in failure!).toBe(true)
       if (outcome.kind === 'reject') expect(failure!.error).toBeUndefined()
       else expect(failure!.error).toBeInstanceOf(Error)
-      expect(h.logs).toHaveLength(1)
-      expect(h.logs[0]).toContain(ref(f.A))
-      expect(h.posts(f.B.key)).toHaveLength(1)
     },
   )
 
-  test('a held notice with a callback whose flushed post is rejected calls that callback once', async () => {
+  test('a notice held before validation whose flushed post is rejected calls its callback once and is retried; the other flushed notice posts and never calls its callback', async () => {
     const failures: unknown[] = []
     const successes: unknown[] = []
     await h.notifier.notify(f.A.key, 'fails', { onPostFailure: (err) => failures.push(err) })
@@ -535,26 +747,25 @@ describe('failed posts (SR-11 spawn-failure-post class)', () => {
 
     await expect(validateAndFlush(f.A)).resolves.toBeUndefined()
 
+    // Both flushed posts were issued together; only the first failed.
     expect(failures).toHaveLength(1)
     expect(successes).toHaveLength(0)
     expect(h.posts(f.A.key)).toHaveLength(2)
     expect(h.logs).toHaveLength(1)
     expect(h.logs[0]).toContain(ref(f.A))
+    expect(h.hold.view(f.A.key)).toEqual({ held: true, heldNotices: 1, nextDueAt: 5_000 })
+
+    await h.clock.runNext()
+
+    expect(texts(f.A)).toEqual(['fails', 'succeeds', 'fails'].map((t) => formatPersonaNotice(f.A, t)))
+    expect(failures).toHaveLength(1)
+    expect(successes).toHaveLength(0)
+    expect(h.logs).toHaveLength(2)
   })
 
-  test('a rejected post raised without a callback only logs', async () => {
+  test('a failure callback that throws is logged once and does not reject; the notice is still held and posted', async () => {
     h.validate(f.A.key)
-    h.stub(f.A.key).script.post.push({ kind: 'network' })
-
-    await expect(h.notifier.notify(f.A.key, 'no callback')).resolves.toBeUndefined()
-
-    expect(h.logs).toHaveLength(1)
-    expect(h.logs[0]).toContain(ref(f.A))
-  })
-
-  test('a failure callback that throws is logged and does not reject', async () => {
-    h.validate(f.A.key)
-    h.stub(f.A.key).script.post.push({ kind: 'network' })
+    failAlways(h.stub(f.A.key).script.post, { kind: 'network' })
 
     await expect(
       h.notifier.notify(f.A.key, 'x', {
@@ -563,14 +774,24 @@ describe('failed posts (SR-11 spawn-failure-post class)', () => {
         },
       }),
     ).resolves.toBeUndefined()
+    await h.clock.runNext()
 
     expect(h.logs).toHaveLength(2)
     expect(h.logs.every((l) => l.includes(ref(f.A)))).toBe(true)
+    expect(h.logs.filter((l) => l.includes('callback threw'))).toHaveLength(1)
+    expect(h.hold.view(f.A.key).heldNotices).toBe(1)
+
+    recover(h.stub(f.A.key).script.post)
+    await h.clock.runNext()
+
+    expect(h.posts(f.A.key)).toHaveLength(3)
+    expect(h.logs).toHaveLength(3)
   })
 
-  test('a postMessage that throws synchronously is logged once, calls the callback once, and notify resolves', async () => {
+  test('a postMessage that throws synchronously is held under one line, calls the callback once, notify resolves, and it posts once the client answers', async () => {
     h.validate(f.A.key)
     const web = h.stub(f.A.key).web
+    const original = web.chat.postMessage
     const thrown = Object.assign(new Error(`sync failure ${LEAK_SENTINEL}`), { code: 'slack_webapi_request_error' })
     let calls = 0
     web.chat.postMessage = (() => {
@@ -582,66 +803,56 @@ describe('failed posts (SR-11 spawn-failure-post class)', () => {
     await expect(
       h.notifier.notify(f.A.key, 'x', { onPostFailure: (failure) => failures.push(failure) }),
     ).resolves.toBeUndefined()
+    await h.clock.runNext()
 
-    expect(calls).toBe(1)
+    expect(calls).toBe(2)
     expect(failures).toHaveLength(1)
     expect(failures[0]!.step).toBe('chat.postMessage')
     expect(failures[0]!.channelId).toBe(f.A.permission_prompts)
     expect(failures[0]!.error).toBe(thrown)
     expect(h.logs).toHaveLength(1)
-    expect(h.logs[0]).toStartWith(
-      `[slack] persona-notifier: failed to post notice for ${ref(f.A)} to ${f.A.permission_prompts}: Error code=slack_webapi_request_error`,
-    )
+    expect(h.logs[0]).toStartWith(episodeStart(f.A, 'chat.postMessage', f.A.permission_prompts, 'network_error'))
+
+    web.chat.postMessage = original
+    await h.clock.runNext()
+
+    expect(texts(f.A)).toEqual([formatPersonaNotice(f.A, 'x')])
+    expect(h.logs).toHaveLength(2)
   })
 })
 
 // ---------------------------------------------------------------------------
-// Failed-post log line: Slack platform reason, never free text
+// Failure log lines: Slack platform reason, never free text
 // ---------------------------------------------------------------------------
 
-describe('failed-post log line (SR-10.3 token-safe)', () => {
-  /** Script one rejected post for A, raise a notice and return the single log line. */
-  async function failedLine(outcome: WebApiOutcome): Promise<string> {
-    h.validate(f.A.key)
-    h.stub(f.A.key).script.post.push(outcome)
-    await h.notifier.notify(f.A.key, 'x')
-    expect(h.logs).toHaveLength(1)
-    return h.logs[0]!
-  }
+describe('failure log lines (SR-10.3 token-safe)', () => {
+  test.each<[string, (x: Fixture) => Persona, string, (x: Fixture) => string]>([
+    ['invalid_blocks on a channel destination', (x) => x.A, 'invalid_blocks', (x) => x.A.permission_prompts],
+    ['msg_too_long in the opened DM', (x) => x.D, 'msg_too_long', (x) => stubOpenedDmId(x.D.dm.contact!)],
+  ])(
+    'a post refused for the message itself (%s) is dropped, not held: one per-notice line with the short reason beside the destination, the callback once, no episode; the next notice posts at once',
+    async (_label, pick, code, where) => {
+      const p = pick(f)
+      h.validate(p.key)
+      h.stub(p.key).script.post.push({ kind: 'platform', error: code })
+      const failures: DestinationFailure[] = []
 
-  test('a platform error carries its short Slack reason beside the destination', async () => {
-    const line = await failedLine({ kind: 'platform', error: 'not_in_channel' })
+      await h.notifier.notify(p.key, 'x', { onPostFailure: (x) => failures.push(x) })
 
-    expect(line).toStartWith(
-      `[slack] persona-notifier: failed to post notice for ${ref(f.A)} to ${f.A.permission_prompts} (reason=not_in_channel): `,
-    )
-    expect(line).toContain('code=slack_webapi_platform_error')
-    // Never the error message.
-    expect(line).not.toContain('An API error occurred')
-  })
+      expect(h.logs).toHaveLength(1)
+      expect(h.logs[0]).toStartWith(`[slack] persona-notifier: failed to post notice for ${ref(p)} to ${where(f)} (reason=${code}): `)
+      expect(h.logs[0]).toContain('code=slack_webapi_platform_error')
+      // Never the error message.
+      expect(h.logs[0]).not.toContain('An API error occurred')
+      expect(failures).toHaveLength(1)
+      expect(failures[0]).toMatchObject({ step: 'chat.postMessage', code, channelId: where(f) })
+      expect(h.hold.view(p.key)).toEqual(NOT_HELD)
+      expect(h.clock.pendingCount()).toBe(0)
 
-  test.each<[string, WebApiOutcome]>([
-    ['a request error (no platform reason)', { kind: 'network' }],
-    ['a platform error with no data.error', { kind: 'platform' }],
-    ['an HTTP error', { kind: 'http', status: 503 }],
-  ])('%s logs no reason', async (_label, outcome) => {
-    const line = await failedLine(outcome)
+      await h.notifier.notify(p.key, 'y')
 
-    expect(line).toStartWith(`[slack] persona-notifier: failed to post notice for ${ref(f.A)} to ${f.A.permission_prompts}: `)
-    expect(line).not.toContain('reason=')
-    expect(line).not.toContain('error occurred')
-  })
-
-  test.each<[string, string]>([
-    ['spaces', 'channel is not here'],
-    ['a hyphen and the sentinel', `bad-reason-${LEAK_SENTINEL}`],
-    ['a newline', 'not_in_channel\nsecond line'],
-    ['more than 64 characters', `a${'b'.repeat(64)}`],
-  ])('a platform reason with %s is never logged', async (_label, reason) => {
-    const line = await failedLine({ kind: 'platform', error: reason })
-
-    expect(line).not.toContain('reason=')
-    expect(line).not.toContain(reason)
-    expect(line).toContain('code=slack_webapi_platform_error')
-  })
+      expect(texts(p)).toEqual(['x', 'y'].map((t) => formatPersonaNotice(p, t)))
+      expect(h.logs).toHaveLength(1)
+    },
+  )
 })

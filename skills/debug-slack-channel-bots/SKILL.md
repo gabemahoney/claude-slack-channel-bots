@@ -58,9 +58,11 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
 5. **No class line, but the persona still isn't served?** See
    [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running)
    and [Other lines you may see](#other-lines-you-may-see).
-6. **A `reply` to a user ID, or a `"dm"` destination's prompts or notices,
-   fail with `missing_scope`?** See
+6. **A `reply` to a user ID fails with `missing_scope`?** See
    [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite).
+   **Permission prompts or notices don't arrive?** Look for a
+   [`persona-destination-failed`](#persona-destination-failed) line for the
+   persona.
 
 ---
 
@@ -122,7 +124,7 @@ A persona diagnostic line looks like this:
 | `personas[1]` | The persona's position in `config.json`'s `personas` array, counting from 0. |
 | `"Ops Bot"` | The persona's name, JSON-quoted as configured. |
 | `(key=ops_bot_5e2526f3)` | The persona's key, derived from its name. |
-| `path="…"` | The file or directory the line is about: the credentials file for credentials and Slack classes, the working directory for directory classes. Absent on `persona-start` and `unclaimed-channel`/`persona-dm-dropped`. |
+| `path="…"` | The file or directory the line is about: the credentials file for credentials and Slack classes, the working directory for directory classes. Absent on `persona-start`, `unclaimed-channel`, `persona-dm-dropped` and `persona-destination-failed`. |
 | After `path="…": ` (or `(key=<key>): ` when there is no path) | The cause. It may itself contain `: `. A bad token is named only by its key (`bot_token`, `app_token`) and the rule it breaks, never by value. |
 
 **The key.** A name of 1–40 characters using only `a-z`, `0-9` and `_` is its
@@ -350,6 +352,79 @@ running, is kept but not served. Healthy personas are unaffected.
   arrives without `channel_type`, so it logs `unclaimed-channel` instead (see
   [`unclaimed-channel`](#unclaimed-channel)).
 
+### `persona-destination-failed`
+
+- **State:** the persona stays `up`; this is about its permission prompts,
+  stuck-prompt warnings and server notices.
+- **Lines:** one when the failure starts, one when it clears:
+  - `[slack] persona-destination-failed: personas[<i>] "<name>" (key=<key>): <step> failed for destination=<dest> with error <code>; holding its permission prompts and notices and retrying with backoff`
+  - `[slack] persona-destination-failed: personas[<i>] "<name>" (key=<key>): cleared: destination=<dest> accepts posts again (was <step> error <code>); delivering what was held`
+
+  `<dest>` is the persona's `permission_prompts` value: a channel ID, or
+  `dm`. `<step>` is `conversations.open` (opening the DM with `dm.contact`,
+  for `dm` only) or `chat.postMessage` (the post). For `missing_scope` on
+  `conversations.open` the start line has
+  ` — the Slack app lacks the im:write scope: re-install the app with im:write to grant it`
+  after the code.
+- **Meaning:** A post to the persona's destination failed, so the server holds
+  that persona's prompts and notices and retries them, instead of dropping
+  them or failing again every second:
+  - nothing more is tried for the persona until its next retry, 5 s after the
+    failure, then doubling to one every 300 s, with no limit on attempts. A
+    rate-limit wait is never shorter than Slack asks for;
+  - server notices wait in order, at most 20 per persona (past that the
+    oldest is dropped with a line; see
+    [Other lines you may see](#other-lines-you-may-see));
+  - a permission request stays open in agent-director. Its prompt is posted
+    at the first retry that succeeds, if the request is still open then;
+  - the line is logged once per episode. Failed retries log nothing;
+  - a spawn-failure notice that fails at startup writes a `spawn-failure-post`
+    record to `startup-errors.log` at its first failed attempt. The notice is
+    still held, so the record can be followed by the `cleared:` line and the
+    notice's delivery.
+
+  Buttons on prompts already posted keep working, and their verdict updates
+  are not held. Other personas are unaffected.
+- **Cause and fix, by the error the line names:**
+  - `missing_scope` (the line names `im:write`): the persona's Slack app was
+    installed before it had the `im:write` scope, so it can't open the DM with
+    its contact. Follow
+    [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite).
+    It covers the scope, the re-install and the check for a changed bot
+    token. The server keeps retrying, so once the app has `im:write`, a later
+    retry delivers what was held.
+  - `not_in_channel`: the persona's app isn't a member of its
+    `permission_prompts` channel. Invite the app to that channel (in Slack,
+    `/invite @<app name>` in the channel).
+  - Any other error: another Slack error such as `channel_not_found` or
+    `is_archived`, or a network error or timeout (`network_error`,
+    `unknown_error`, …). It's held and retried the same way. Check that the
+    channel the line names exists, isn't archived and has the persona's app
+    in it (for `dm`, that `dm.contact` is a user in the workspace), that the
+    persona's app is still installed, and that the server's host can reach
+    Slack. The Slack client retries a network failure itself first, for up to
+    about 30 minutes, so a network outage can reach this line late.
+- **Recovery:** No server restart is needed. At the next retry (at most
+  5 minutes after the fix) the held notices and any still-open prompt appear
+  at the destination under the persona's name and avatar, and `server.log`
+  has the `cleared:` line. With nothing held and no prompt pending, no retry
+  runs: the `cleared:` line comes with the persona's next prompt or notice.
+  A later failure starts a new episode with a new line. A server restart
+  drops held notices and logs `persona-destination-hold: shutting down — <n>
+  held notice(s) … dropped, not posted` (see
+  [Other lines you may see](#other-lines-you-may-see)). A request still open
+  after the restart has its prompt posted once the destination accepts posts.
+- **Answering a held request:** it can still be answered in the persona's
+  terminal. Once agent-director's relay window for the request elapses,
+  Claude asks at the persona's tmux pane (`tmux attach -t slack_bot_<key>`).
+  A request answered there is closed, and no prompt is posted for it.
+- **Not this class:** a post Slack refuses for the message itself
+  (`invalid_blocks`, `msg_too_long`, `no_text`, …) holds nothing. It logs
+  `[slack] permission-poller: chat.postMessage failed for <instance> …` on
+  every attempt for a prompt, or
+  `[slack] persona-notifier: failed to post notice for <ref> to <id> …` once
+  for a notice, which is dropped. Report it as a bug, with the line.
+
 ---
 
 ## Combined and related cases
@@ -469,9 +544,10 @@ its MCP session, but everything it sends to Slack fails:
   `download_attachment`) return a tool error to the instance:
   `Tool "<tool>" failed for persona "<name>" (key=<key>): the tool call failed (<Slack error code>).`
 - `server.log` has the matching line:
-  `[slack] Tool "<tool>" failed for persona "<name>" (key=<key>): …`,
-  and other posts for the persona (permission prompts, notices) log Slack
-  errors there too.
+  `[slack] Tool "<tool>" failed for persona "<name>" (key=<key>): …`;
+- its permission prompts and notices are held, with one
+  [`persona-destination-failed`](#persona-destination-failed) line naming the
+  Slack error (for example `token_revoked` or `invalid_auth`).
 
 The next server start runs `auth.test`, which refuses the token: the persona
 then logs `persona-credentials-refused` with `bot_token refused by auth.test`
@@ -491,17 +567,11 @@ and is `broken`.
   line. Nothing is posted.
 - **Same cause, prompts and notices:** a persona whose `permission_prompts`
   is `"dm"` opens its DM with `dm.contact` the same way, so its permission
-  prompts, stuck-prompt warnings and server notices fail too. Nothing is
-  posted, and `server.log` has these lines, each ending in
-  `(reason=missing_scope): …`:
-  - `[slack] permission-poller: conversations.open failed for <instance> …`
-    for a prompt. Each poller tick (about once a second by default) tries
-    again, so the line repeats for as long as the prompt stays open;
-  - `[slack] permission-poller: wedge warning conversations.open failed for <ref> (<instance>) …`
-    for a stuck-prompt warning, repeated about every 30 seconds while the
-    spawn stays stuck;
-  - `[slack] persona-notifier: failed to post notice for <ref>: could not open its DM destination (conversations.open) …`
-    for a server notice, once per notice (it is not posted again).
+  prompts, stuck-prompt warnings and server notices can't be posted either.
+  They are held, not lost: `server.log` has one
+  [`persona-destination-failed`](#persona-destination-failed) line naming
+  `conversations.open`, `missing_scope` and `im:write`, and the server
+  retries with backoff (up to 5 minutes apart), logging nothing per attempt.
 - **Cause:** starting a DM with a user (a `reply` to a user ID, or a persona
   whose `permission_prompts` is `"dm"`) needs the `im:write` bot scope. The
   persona's Slack app was created, or last installed, from a manifest without
@@ -520,9 +590,12 @@ and is `broken`.
      name and bot display name to the shipped defaults.
   2. Re-install the app to the workspace (Slack prompts for it after a scope
      change).
-  3. Try the `reply` to the user ID again; a pending permission prompt is
-     posted by DM on the poller's next tick. No server restart is needed
-     while the bot token is unchanged.
+  3. Try the `reply` to the user ID again. Held prompts and notices need
+     nothing: the persona's next retry, at most 5 minutes later, opens the
+     DM and posts them, and `server.log` has the `persona-destination-failed`
+     `cleared:` line. With nothing held or pending no retry runs, and the
+     `cleared:` line comes with the persona's next prompt or notice. No server
+     restart is needed while the bot token is unchanged.
 - **The bot token after the re-install:** Slack adds the new scope to the
   app's existing grant, and the shipped manifest has token rotation off, so
   the Bot User OAuth Token normally stays the same. The operator checks this
@@ -545,8 +618,13 @@ and is `broken`.
 | `[slack] Session connected: persona "<name>" (key=<key>) cwd="<path>"` | The persona's instance registered: it's being served. |
 | `[slack] Session connected with CWD "<path>" — no matching persona` | A Claude session connected from a directory that is no persona's `working_directory` (compared by real path). It is not registered: the server disconnects it. Start it from the persona's directory, or fix `working_directory`. |
 | `[slack] persona-destination: <ref> has permission_prompts set to "dm" but dm.enabled is not true — no DM opened and nothing posted` (or `… dm.contact is not set …`; for a prompt the line starts `[slack] permission-poller: <ref>` and ends `— prompt for <instance> (request_token=…) not posted and no DM opened`) | The persona's prompt or notice had a `"dm"` destination without DMs on or a contact, which the loader rejects, so it should not happen. Nothing is sent. Report it as a bug, with the persona's lines. |
+| `[slack] persona-destination-hold: more than 20 notices held for "<name>" (key=<key>) while its destination fails — oldest held notice dropped, not posted: <first line>` | The persona's destination has been failing for a while (see [`persona-destination-failed`](#persona-destination-failed)) and more than 20 notices are waiting. The oldest is dropped; the line shows its first line. Fix the destination. |
+| `[slack] persona-destination-hold: persona=<key> is no longer applied — <n> held notice(s) dropped, not posted` | The persona was removed from the configuration while notices waited for its failing destination. They are dropped. Nothing to do. |
+| `[slack] persona-destination-hold: shutting down — <n> held notice(s) for "<name>" (key=<key>) dropped, not posted` | The server stopped while the persona's destination was failing. Its held notices are lost; its still-open prompts are posted after the next start. Fix the destination (see [`persona-destination-failed`](#persona-destination-failed)). |
+| `[slack] persona-destination-hold: hold cancelled — <n> held notice(s) for "<name>" (key=<key>) dropped, not posted` | The persona's held notices were dropped without being posted. Nothing to do. |
+| `[slack] persona-destination-hold: persona or client lookup threw for persona=<key>: … — held notices wait and retry with backoff` | An internal error while retrying the persona's held notices. They keep waiting and are retried with backoff. Report it as a bug, with the persona's lines around it. |
 | `[slack] Fatal: configuration error — …` | The server refused `config.json` and exited. See [Configuration rejections](#configuration-rejections). |
-| `… launch after its bring-up retry failed: …`, `… working-directory retry failed: …`, `… handling its change from up to <outcome> failed: …`, `persona … not brought up: Slack bring-up threw: …`, `persona <step> failed: personas[<i>] …`, `unhandled rejection (process keeps running): …` | An internal error. The server keeps running. Report it as a bug, with the persona's lines around it. |
+| `… launch after its bring-up retry failed: …`, `… working-directory retry failed: …`, `… handling its change from up to <outcome> failed: …`, `persona … not brought up: Slack bring-up threw: …`, `persona <step> failed: personas[<i>] …`, `persona-destination-hold: retry of held notices failed for persona=<key>: …`, `persona-destination-hold: notice failure callback threw for persona=<key>: …`, `unhandled rejection (process keeps running): …` | An internal error. The server keeps running. Report it as a bug, with the persona's lines around it. |
 
 ---
 

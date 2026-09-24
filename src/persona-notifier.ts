@@ -23,15 +23,22 @@
  *   time, so once the queue is full each new notice drops the oldest held
  *   one, which is logged (one line, the notice's first line) and never
  *   posted;
- * - otherwise: posted to the destination. For a `dm` destination the DM is
- *   opened (or taken from the resolver's cache) at this point, so a held
- *   notice opens it only when flushed after validation, never before. A
- *   failed open or post is logged token-safely and the failure (step,
- *   error class, rejection) handed to the caller's failure callback; there is no retry. The log line carries
- *   the error type/code and, when it is a short identifier, Slack's platform
- *   reason (e.g. `not_in_channel`); never the error message. A `dm`
- *   destination the resolver refuses (DMs off or no contact, which the loader
- *   rejects) is logged by the resolver and not posted.
+ * - otherwise: handed to the destination hold (`persona-destination-hold.ts`,
+ *   shared with the permission poller), which posts it to the destination at
+ *   once unless the persona is held. For a `dm` destination the DM is opened
+ *   (or taken from the resolver's cache) at the attempt, so a notice held
+ *   before validation opens it only when flushed after, never before. When
+ *   the post fails at the destination (the open or the post refused, Slack
+ *   unreachable) the hold keeps the notice and retries it on the SR-3.2
+ *   backoff, logging one `persona-destination-failed` line per episode, not
+ *   one per notice or attempt; the notice is never lost to it. A post that
+ *   fails for the message itself (`invalid_blocks`, `msg_too_long`, …) is
+ *   logged here token-safely and dropped: the log line carries the error
+ *   type/code and, when it is a short identifier, Slack's platform reason;
+ *   never the error message. Either way the caller's failure callback runs
+ *   once, at the notice's first failed attempt. A `dm` destination the
+ *   resolver refuses (DMs off or no contact, which the loader rejects) is
+ *   logged by the resolver and not posted.
  *
  * Held notices are per persona (b.av2 SR-3.3): flushing one persona never
  * touches another's queue.
@@ -39,12 +46,14 @@
  * Shared helper: `formatPersonaNotice` (a notice text carrying the persona
  * reference) is pure and exported. The permission poller uses it for its
  * stuck-prompt warning, which needs the post's outcome and so cannot go
- * through `notify`; the poller posts through the same destination resolver.
+ * through `notify`; the poller posts through the same destination hold and
+ * resolver.
  *
  * Pure module (b.av2 SR-13.1): no module-scope state, no I/O of its own, no
- * timers and nothing runs at import. All state lives in the instance the
- * factory returns; the Slack client, the persona lookup, the destination
- * resolver, the dry-run predicate and the logger are injected.
+ * timers of its own and nothing runs at import. All state lives in the
+ * instance the factory returns; the Slack client, the persona lookup, the
+ * destination hold (or the resolver to build one), the dry-run predicate and
+ * the logger are injected.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -55,10 +64,17 @@ import { renderPersonaRef } from './persona-identity.ts'
 import { describeThrownValue, slackPlatformReason } from './persona-connection-errors.ts'
 import {
   createPersonaDestinations,
-  describeDestinationFailure,
   type DestinationFailure,
   type PersonaDestinations,
 } from './persona-destination.ts'
+import {
+  MAX_HELD_NOTICES_PER_PERSONA,
+  createPersonaDestinationHold,
+  type HoldNotice,
+  type PersonaDestinationHold,
+} from './persona-destination-hold.ts'
+
+export { MAX_HELD_NOTICES_PER_PERSONA }
 
 // ---------------------------------------------------------------------------
 // Types
@@ -70,8 +86,9 @@ export interface PersonaNoticeOptions {
    * Called with the failure (the step, the error class and, when one was
    * thrown, the rejection) when the notice's Slack post fails (or, for a `dm`
    * destination, the `conversations.open` before it), whether it was posted
-   * at once or held and flushed later. Not called for a dropped, dry-run or
-   * refused notice.
+   * at once or held and flushed later. Called once, at the notice's first
+   * failed attempt: the destination hold's later retries of the same notice
+   * don't call it again. Not called for a dropped, dry-run or refused notice.
    */
   onPostFailure?: (failure: DestinationFailure) => void
 }
@@ -91,9 +108,17 @@ export interface PersonaNotifierDeps {
   clientFor(key: string): WebClient | undefined
   /**
    * The destination resolver (per-persona DM cache) shared with the permission
-   * poller. Defaults to an instance of the notifier's own.
+   * poller. Used only to build the notifier's own destination hold when
+   * `destinationHold` is not given; defaults to an instance of its own.
    */
   destinations?: PersonaDestinations
+  /**
+   * The destination hold (per-persona episodes, retries and held notices)
+   * shared with the permission poller, which every notice for a validated
+   * persona is handed to. Defaults to one of the notifier's own, over
+   * `destinations`, the persona and client lookups, the real clock and `log`.
+   */
+  destinationHold?: PersonaDestinationHold
   /** True in dry run: nothing is posted. */
   isDryRun(): boolean
   /** Writes one log line. */
@@ -117,14 +142,6 @@ export interface PersonaNotifier {
    */
   flush(key: string): Promise<void>
 }
-
-/**
- * Most notices held for one persona while its client is not validated
- * (b.av2 SR-7.2). Past it the oldest held notice is dropped with a log line,
- * so the queue keeps the most recent notices and a persona that is broken or
- * retrying for a long time holds a bounded amount.
- */
-export const MAX_HELD_NOTICES_PER_PERSONA = 20
 
 /** A notice held until its persona's client is validated. */
 interface HeldNotice {
@@ -178,31 +195,43 @@ export function notifySafely(
 /** Build a notifier over the injected persona lookup, clients, dry-run predicate and logger. */
 export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifier {
   const held = new Map<string, HeldNotice[]>()
-  const destinations = deps.destinations ?? createPersonaDestinations({ log: deps.log })
+  const destinationHold = deps.destinationHold ?? createPersonaDestinationHold({
+    destinations: deps.destinations ?? createPersonaDestinations({ log: deps.log }),
+    getPersona: deps.getPersona,
+    clientFor: deps.clientFor,
+    log: deps.log,
+  })
 
-  // For a channel destination the Slack call is made before the first
-  // `await`, so calling `post` issues the post synchronously; only the
-  // settling is awaited. A `dm` destination is resolved first (the open, or
-  // the cached conversation).
-  async function post(persona: Persona, client: WebClient, notice: HeldNotice): Promise<void> {
+  /**
+   * Log a failed post that the hold does not retry: a failure specific to the
+   * notice, which only `chat.postMessage` reports (every open failure is held).
+   */
+  function logDroppedFailure(ref: string, failure: DestinationFailure): void {
+    const reason = slackPlatformReason(failure.error)
+    const where = reason ? `${failure.channelId} (reason=${reason})` : failure.channelId
+    deps.log(`[slack] persona-notifier: failed to post notice for ${ref} to ${where}: ${describeThrownValue(failure.error)}`)
+  }
+
+  // Handed to the hold, which for a channel destination issues the post
+  // before the first `await` when the persona is not held, so calling `post`
+  // issues it synchronously; only the settling is awaited. A `dm` destination
+  // is resolved first (the open, or the cached conversation).
+  function post(persona: Persona, client: WebClient, notice: HeldNotice): Promise<void> {
     const ref = renderPersonaRef(persona.name, persona.key)
-    const result = await destinations.post(persona, client, { text: formatPersonaNotice(persona, notice.text) })
-    if (result.outcome !== 'failed') return
-    if (result.step === 'conversations.open') {
-      deps.log(
-        `[slack] persona-notifier: failed to post notice for ${ref}: could not open its DM destination ` +
-          `(conversations.open)${describeDestinationFailure(result)}`,
-      )
-    } else {
-      const reason = slackPlatformReason(result.error)
-      const where = reason ? `${result.channelId} (reason=${reason})` : result.channelId
-      deps.log(`[slack] persona-notifier: failed to post notice for ${ref} to ${where}: ${describeThrownValue(result.error)}`)
+    const holdNotice: HoldNotice = {
+      message: { text: formatPersonaNotice(persona, notice.text) },
+      summary: firstNoticeLine(notice.text),
+      onAttemptFailed: (failure, info) => {
+        if (!info.held) logDroppedFailure(ref, failure)
+        if (!info.first) return
+        try {
+          notice.options?.onPostFailure?.(failure)
+        } catch (cbErr) {
+          deps.log(`[slack] persona-notifier: failure callback threw for ${ref}: ${describeThrownValue(cbErr)}`)
+        }
+      },
     }
-    try {
-      notice.options?.onPostFailure?.(result)
-    } catch (cbErr) {
-      deps.log(`[slack] persona-notifier: failure callback threw for ${ref}: ${describeThrownValue(cbErr)}`)
-    }
+    return destinationHold.deliver(persona, client, holdNotice)
   }
 
   async function notify(key: string, text: string, options?: PersonaNoticeOptions): Promise<void> {

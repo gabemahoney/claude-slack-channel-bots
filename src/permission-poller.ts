@@ -32,8 +32,10 @@
  *      Else post a fresh Block Kit prompt to the persona's destination and
  *      register the live entry. A persona whose client is unavailable, or
  *      whose `dm` destination is refused (DMs off or no contact), is logged
- *      once per open request and not tracked; a failed open or post is logged
- *      and trailed and not tracked. A later tick retries all of these.
+ *      once per open request and not tracked. A failed open or post is
+ *      trailed and not tracked. A later tick retries all of these, except
+ *      that a persona held by the destination hold (below) is not attempted
+ *      until its retry is due.
  *   4. Newly-closed reconciliation (SR-2.4): for each live entry whose
  *      composite key was NOT observed this tick (excluding non-conforming
  *      spawns), call `get-permission`, render the verdict-distinct
@@ -46,6 +48,20 @@
  * Per-spawn request_id advancement is no longer a special path — the
  * composite key means a "new" token simply appears as an unseen entry and
  * the old token naturally falls out of the seen-set on the next tick.
+ *
+ * Destination failures (b.av2 SR-7.1): every new prompt and stuck-prompt
+ * warning goes through the destination hold (`persona-destination-hold.ts`,
+ * shared with the notifier), which answers whether the persona may be
+ * attempted now. When a post fails at the destination (`missing_scope` on the
+ * DM open, `not_in_channel`, Slack unreachable, …) the persona is held: no
+ * Slack call is made for it, and no `post_attempted` row decision emitted,
+ * until its retry is due on the SR-3.2 backoff, and the prompt stays
+ * untracked, so a later tick derives it again. The hold logs one
+ * `persona-destination-failed` line per episode instead of a line per
+ * attempt; every real attempt still emits its trail event. A failure of the
+ * message itself (`invalid_blocks`, `msg_too_long`, …) does not hold the
+ * persona: it is logged and trailed per attempt and tried again next tick.
+ * Closing updates and clicks are never gated (an update is not a post).
  *
  * A persona that is not up (b.av2 SR-6.4, the injected `isPersonaUp`) keeps
  * its instance, but the poller leaves it alone: its rows get no `get`, no
@@ -89,9 +105,16 @@ import {
   describeDestinationFailure,
   describeDmDestinationRefusal,
   dmDestinationRefusal,
+  safeFailureCode,
   type DestinationSlackClient,
   type PersonaDestinations,
 } from './persona-destination.ts'
+import {
+  createPersonaDestinationHold,
+  isDestinationFailure,
+  type HoldAttempt,
+  type PersonaDestinationHold,
+} from './persona-destination-hold.ts'
 import { PERSONA_LABEL_KEY, renderPersonaRef } from './persona-identity.ts'
 import { formatPersonaNotice } from './persona-notifier.ts'
 import { emitTrail as defaultEmitTrail } from './permission-trail.ts'
@@ -192,10 +215,21 @@ export interface PollerDeps {
   clientFor: (key: string) => PollerSlackClient | undefined
   /**
    * The destination resolver (per-persona DM cache) shared with the
-   * notifier. Defaults to a module-level instance, reset by
+   * notifier. Used only to build the default destination hold when
+   * `destinationHold` is not given (the poller posts through the hold, never
+   * through this directly); a `destinationHold` that is given must be built
+   * over this same resolver. Defaults to a module-level instance, reset by
    * `_resetPollerState`.
    */
   destinations?: PersonaDestinations
+  /**
+   * The destination hold (per-persona episodes and retries) shared with the
+   * notifier: a new prompt or stuck-prompt warning is attempted only when it
+   * allows. Defaults to a module-level instance over `destinations` and the
+   * real clock, reset by `_resetPollerState`; the poller alone never makes it
+   * set a timer (it holds no notices).
+   */
+  destinationHold?: PersonaDestinationHold
   /**
    * The applied persona with this key, or undefined. Read on every tick, so a
    * swapped persona set is seen at once.
@@ -333,6 +367,8 @@ let skippedTicks = 0
 let depsRef: PollerDeps | null = null
 /** The destination resolver used when `PollerDeps.destinations` is not given. */
 let defaultDestinations: PersonaDestinations | null = null
+/** The destination hold used when `PollerDeps.destinationHold` is not given. */
+let defaultDestinationHold: PersonaDestinationHold | null = null
 
 // ---------------------------------------------------------------------------
 // Module-state accessors (used by the click handler)
@@ -374,6 +410,8 @@ export function _resetPollerState(): void {
   skippedTicks = 0
   depsRef = null
   defaultDestinations = null
+  defaultDestinationHold?.cancelAll()
+  defaultDestinationHold = null
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +480,18 @@ function destinationsFor(deps: PollerDeps): PersonaDestinations {
   return defaultDestinations
 }
 
+/** The injected destination hold, else the module-level default over `destinationsFor(deps)`. */
+function destinationHoldFor(deps: PollerDeps): PersonaDestinationHold {
+  if (deps.destinationHold) return deps.destinationHold
+  defaultDestinationHold ??= createPersonaDestinationHold({
+    destinations: destinationsFor(deps),
+    getPersona: (key) => deps.getPersona(key),
+    clientFor: (key) => deps.clientFor(key),
+    log: (line) => logViaDeps(deps, line),
+  })
+  return defaultDestinationHold
+}
+
 /**
  * SR-V-2.3 row-decision emitter. Builds a `cscb.poller.row_decision` event
  * with the canonical envelope fields and the action identifier. `request_token`
@@ -487,21 +537,25 @@ function buildWedgeWarningText(persona: Pick<Persona, 'name' | 'key'>, claudeIns
 /**
  * b.fae F4 / b.av2 SR-7.2 — deliver the one-shot wedge warning to the
  * persona's destination (its channel, or its DM, opened if needed) as one
- * top-level message (no thread_ts) through the persona's client. Returns true
- * only when the post succeeds, so the latch may be set. A client that is
- * unavailable, or a `dm` destination the resolver refuses, counts as a failed
- * post (false) with no Slack call and no trail event, so the retry throttle
- * governs the next attempt. Every actual attempt emits
- * `cscb.poller.wedge_detected` with `channel` equal to the conversation posted
- * to; a failed DM open emits it with `ok: false` and no `channel`.
+ * top-level message (no thread_ts) through the persona's client, as the
+ * destination hold's `attempt` (which the caller obtained and releases).
+ * `text` is the warning, built before the attempt was begun. Returns true only
+ * when the post succeeds, so the latch may be set. A client that is
+ * unavailable, or a `dm` destination the resolver refuses, counts as a failed post (false) with no Slack call and no trail
+ * event, so the retry throttle governs the next attempt. Every actual attempt
+ * emits `cscb.poller.wedge_detected` with `channel` equal to the conversation
+ * posted to; a failed DM open emits it with `ok: false` and no `channel`. A
+ * destination failure is logged by the hold (once per episode); only a
+ * failure of the message itself is logged here.
  */
 async function postWedgeWarning(
   deps: PollerDeps,
+  attempt: HoldAttempt,
   claudeInstanceId: string,
   persona: Persona,
+  text: string,
 ): Promise<boolean> {
   const ref = renderPersonaRef(persona.name, persona.key)
-  const text = buildWedgeWarningText(persona, claudeInstanceId)
   const web = deps.clientFor(persona.key)
   if (!web) {
     logViaDeps(
@@ -512,7 +566,7 @@ async function postWedgeWarning(
     return false
   }
   const emit = deps.emitTrail ?? defaultEmitTrail
-  const result = await destinationsFor(deps).post(persona, web, { text })
+  const result = await attempt.post(persona, web, { text })
   if (result.outcome === 'refused') return false
   if (result.outcome === 'posted') {
     emit({
@@ -526,18 +580,20 @@ async function postWedgeWarning(
     return true
   }
   // b.emk convention: failures land in BOTH server.log and the trail JSONL.
-  const step = result.step === 'chat.postMessage' ? 'postMessage' : result.step
-  logViaDeps(
-    deps,
-    `[slack] permission-poller: wedge warning ${step} failed for ${ref} (${claudeInstanceId})` +
-      describeDestinationFailure(result),
-  )
+  // A destination failure reaches server.log as the hold's episode line.
+  if (!isDestinationFailure(result)) {
+    logViaDeps(
+      deps,
+      `[slack] permission-poller: wedge warning postMessage failed for ${ref} (${claudeInstanceId})` +
+        describeDestinationFailure(result),
+    )
+  }
   const event: Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown } = {
     event: 'cscb.poller.wedge_detected',
     claude_instance_id: claudeInstanceId,
     text,
     ok: false,
-    error: result.code,
+    error: safeFailureCode(result.code),
   }
   if (result.channelId !== undefined) event.channel = result.channelId
   emit(event)
@@ -555,8 +611,11 @@ async function postWedgeWarning(
  * transient chat.postMessage failure retries on a later tick instead of
  * permanently swallowing the episode's one warning. Retries are throttled to
  * one per {@link wedgeWarnRetryTicks} so a Slack outage cannot storm the API
- * at a 200 ms interval. The detector is re-armed by `reconcileWedgeStates`
- * dropping the spawn's state the moment it leaves the wedged condition.
+ * at a 200 ms interval. A retry is also attempted only when the destination
+ * hold allows (b.av2 SR-7.1): while the persona is held nothing is attempted
+ * or logged, and the throttle is left as it is. The detector is re-armed by
+ * `reconcileWedgeStates` dropping the spawn's state the moment it leaves the
+ * wedged condition.
  */
 async function observeWedgeCandidate(
   deps: PollerDeps,
@@ -582,15 +641,24 @@ async function observeWedgeCandidate(
   ) {
     return
   }
-  state.lastWarnAttemptTicks = state.emptyTicks
-  logViaDeps(
-    deps,
-    `[slack] permission-poller: spawn ${claudeInstanceId} for ${renderPersonaRef(persona.name, persona.key)} wedged in check_permission with zero open rows for ${state.emptyTicks} ticks (~${Math.round((state.emptyTicks * deps.intervalMs) / 1000)}s) — sending one-shot warning`,
-  )
-  const warned = await postWedgeWarning(deps, claudeInstanceId, persona)
-  // b.fae F3: latch only on success; a failed post leaves warningFired false so
-  // a subsequent tick retries and exactly one message lands on recovery.
-  if (warned) state.warningFired = true
+  const text = buildWedgeWarningText(persona, claudeInstanceId)
+  const attempt = destinationHoldFor(deps).begin(persona.key)
+  if (!attempt) return
+  // The attempt always ends, even on a throw (a no-op after its post), so a
+  // retrying persona is never left held with no timer.
+  try {
+    state.lastWarnAttemptTicks = state.emptyTicks
+    logViaDeps(
+      deps,
+      `[slack] permission-poller: spawn ${claudeInstanceId} for ${renderPersonaRef(persona.name, persona.key)} wedged in check_permission with zero open rows for ${state.emptyTicks} ticks (~${Math.round((state.emptyTicks * deps.intervalMs) / 1000)}s) — sending one-shot warning`,
+    )
+    const warned = await postWedgeWarning(deps, attempt, claudeInstanceId, persona, text)
+    // b.fae F3: latch only on success; a failed post leaves warningFired false so
+    // a subsequent tick retries and exactly one message lands on recovery.
+    if (warned) state.warningFired = true
+  } finally {
+    attempt.release()
+  }
 }
 
 /**
@@ -893,9 +961,12 @@ function forgetUnobservedUnposted(seenComposite: Set<string>, skippedThisTick: S
  * SR-7.1). A `dm` destination the resolver would refuse (DMs off or no
  * contact; the loader rejects both) is logged once and not tracked, with no
  * Slack call. A persona whose client is unavailable is logged once and not
- * tracked, so a later tick retries it. Otherwise the `post_attempted` row
- * decision is emitted and the prompt is posted through the persona's client
- * to its destination: the channel, or the DM (opened if needed).
+ * tracked, so a later tick retries it. A persona the destination hold is
+ * holding (its retry not due, or in flight) gets no Slack call, no row
+ * decision and no line; the prompt stays untracked for a later tick.
+ * Otherwise the `post_attempted` row decision is emitted and the prompt is
+ * posted through the persona's client to its destination: the channel, or
+ * the DM (opened if needed).
  */
 async function dispatchPermissionPrompt(
   deps: PollerDeps,
@@ -929,56 +1000,97 @@ async function dispatchPermissionPrompt(
     return
   }
   unpostedPrompts.delete(compositeKey)
-  emitRowDecision(deps, 'post_attempted', row.claude_instance_id, permission.request_token)
-  await postPermissionPrompt(deps, web, row, persona, permission)
+  // Built before the attempt is begun, so a row the builder rejects (it
+  // throws) never takes an attempt.
+  const prompt = buildPromptMessage(row, permission)
+  const attempt = destinationHoldFor(deps).begin(persona.key)
+  if (!attempt) return
+  // The attempt always ends, even on a throw (a no-op after its post), so a
+  // retrying persona is never left held with no timer.
+  try {
+    emitRowDecision(deps, 'post_attempted', row.claude_instance_id, permission.request_token)
+    if (prompt.toolInputUnparsed) {
+      logViaDeps(deps, `[slack] permission-poller: tool_input not JSON-parseable for ${row.claude_instance_id} — using raw string`)
+    }
+    await postPermissionPrompt(deps, attempt, web, row, persona, permission, prompt)
+  } finally {
+    attempt.release()
+  }
+}
+
+/** A prompt's message, built before its attempt is begun. */
+interface PromptMessage {
+  text: string
+  blocks: ReturnType<typeof buildPermissionBlocks>
+  /** `tool_input` was not a JSON object string; the raw string was used (logged once the attempt is begun). */
+  toolInputUnparsed: boolean
 }
 
 /**
- * Post the prompt to the persona's destination through the resolver and
- * register the live entry with the conversation it was posted in. Every
- * attempt emits one `cscb.chat_post.attempted`; a failed DM open emits it
- * with `ok: false` and no `channel`. A refusal (logged by the resolver) makes
- * no Slack call and emits nothing.
+ * Build the prompt's text and Block Kit blocks. Throws when the builder
+ * rejects the row (e.g. an instance ID without the `cscb_` prefix or an empty
+ * request token). Logs nothing: an unparseable `tool_input` is reported by
+ * the caller only when an attempt is made, so a held persona's rows log
+ * nothing per tick.
  */
-async function postPermissionPrompt(
-  deps: PollerDeps,
-  web: PollerSlackClient,
-  row: ListRow,
-  persona: Persona,
-  permission: PermissionRequestRow,
-): Promise<void> {
+function buildPromptMessage(row: ListRow, permission: PermissionRequestRow): PromptMessage {
   // tool_input is a raw JSON string per the typed contract; parse for the
   // Block Kit builder, fall back to the raw string + warning on parse fail.
   let toolInput: Record<string, unknown>
+  let toolInputUnparsed = false
   try {
     const parsed = JSON.parse(permission.tool_input) as unknown
     toolInput = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>)
       : { raw: permission.tool_input }
   } catch {
-    logViaDeps(deps, `[slack] permission-poller: tool_input not JSON-parseable for ${row.claude_instance_id} — using raw string`)
+    toolInputUnparsed = true
     toolInput = { raw: permission.tool_input }
   }
-
   const blocks = buildPermissionBlocks(
     permission.tool_name,
     toolInput,
     row.claude_instance_id,
     permission.request_token,
   )
+  return { text: `🤖🛠️ permission request: ${permission.tool_name}`, blocks, toolInputUnparsed }
+}
 
-  const text = `🤖🛠️ permission request: ${permission.tool_name}`
+/**
+ * Post the prompt (built by `buildPromptMessage`) to the persona's
+ * destination as the destination hold's `attempt` (which reports the outcome
+ * to the hold; the caller releases it) and register the live
+ * entry with the conversation it was posted in. Every attempt emits one
+ * `cscb.chat_post.attempted`; a failed DM open emits it with `ok: false` and
+ * no `channel`. A destination failure is logged by the hold, once per
+ * episode; a failure of the message itself is logged here, per attempt. A
+ * refusal (logged by the resolver) makes no Slack call and emits nothing.
+ */
+async function postPermissionPrompt(
+  deps: PollerDeps,
+  attempt: HoldAttempt,
+  web: PollerSlackClient,
+  row: ListRow,
+  persona: Persona,
+  permission: PermissionRequestRow,
+  prompt: PromptMessage,
+): Promise<void> {
+  const { text, blocks } = prompt
   const emit = deps.emitTrail ?? defaultEmitTrail
-  const result = await destinationsFor(deps).post(persona, web, { text, blocks })
+  const result = await attempt.post(persona, web, { text, blocks })
   if (result.outcome === 'refused') return
   if (result.outcome === 'failed') {
     // b.emk: failures land in BOTH server.log (real-time visibility) AND the
     // trail JSONL (after-the-fact debugging). Success paths stay trail-only,
-    // preserving the SR-V-2.4 asymmetric-behavior fix.
-    logViaDeps(
-      deps,
-      `[slack] permission-poller: ${result.step} failed for ${row.claude_instance_id}${describeDestinationFailure(result)}`,
-    )
+    // preserving the SR-V-2.4 asymmetric-behavior fix. A destination failure
+    // reaches server.log as the hold's episode line (b.av2 SR-7.1), so a
+    // held persona's retries don't log one line each.
+    if (!isDestinationFailure(result)) {
+      logViaDeps(
+        deps,
+        `[slack] permission-poller: ${result.step} failed for ${row.claude_instance_id}${describeDestinationFailure(result)}`,
+      )
+    }
     const event: Omit<TrailEventBase, 'ts'> & { [extra: string]: unknown } = {
       event: 'cscb.chat_post.attempted',
       claude_instance_id: row.claude_instance_id,
@@ -986,7 +1098,7 @@ async function postPermissionPrompt(
       text,
       blocks,
       ok: false,
-      error: result.code,
+      error: safeFailureCode(result.code),
     }
     if (result.channelId !== undefined) event.channel = result.channelId
     emit(event)
@@ -1167,7 +1279,15 @@ export function startPermissionPoller(deps: PollerDeps): void {
   depsRef = deps
   const setIntervalFn = deps.setInterval ?? setInterval
   pollerHandle = setIntervalFn(() => {
-    // Fire-and-forget. runTick itself never throws.
+    // Fire-and-forget. runTick catches agent-director read failures, but it
+    // has no catch around a row: a row the prompt builder rejects (an instance
+    // ID without the `cscb_` prefix, or an empty `request_token`), or a
+    // throwing injected `emitTrail` or `log`, ends the tick at that row. Later
+    // rows, the wedge re-arm and the closed-request check are skipped for that
+    // tick, and this promise rejects (in production the server's
+    // `unhandledRejection` handler logs it). The tick's `finally` still clears
+    // the in-flight flag, and any hold attempt begun is released, so the next
+    // tick runs as usual.
     void runTick(deps)
   }, deps.intervalMs) as unknown as ReturnType<typeof setInterval>
 }
