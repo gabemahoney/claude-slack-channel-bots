@@ -17,6 +17,10 @@
  *
  * Nothing else is read, and the value is never serialised.
  *
+ * `slackPlatformReason` reads one more field for callers that want it: the
+ * Slack platform reason (`data.error`), under the same short-identifier check
+ * as `code`.
+ *
  * `createUnhandledRejectionHandler(log)` returns a listener for the process's
  * `unhandledRejection` event that logs one `[slack]` line built with the
  * describer and returns: it never throws, rethrows or exits, so one persona's
@@ -66,6 +70,16 @@ export function describeThrownValue(value: unknown): string {
   } catch {
     return 'unknown'
   }
+}
+
+/**
+ * The Slack platform reason of a rejected Web API call (`err.data.error`, e.g.
+ * `not_in_channel`), only when it passes the same short-identifier check as
+ * `code`; otherwise undefined. Free text is never returned. Never throws.
+ */
+export function slackPlatformReason(value: unknown): string | undefined {
+  const reason = readProp(readProp(value, 'data'), 'error')
+  return typeof reason === 'string' && SAFE_IDENTIFIER_RE.test(reason) ? reason : undefined
 }
 
 /** The constructor name of an `Error`, when it is a safe identifier; otherwise `Error`. */

@@ -143,7 +143,7 @@ beforeEach(() => {
   // Initialize outage-state so withOutageDetection does not throw during
   // poller ticks. The test body overrides via initOutageState with the full
   // sharedClient (which carries decide) before invoking handlePermissionClick.
-  initOutageState({ getClient: () => ({} as unknown as Client), postToChannel: () => {} })
+  initOutageState({ getClient: () => ({} as unknown as Client), notify: () => {} })
 })
 
 afterEach(() => {
@@ -221,7 +221,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     }
     const getClient = () => sharedClient
 
-    initOutageState({ getClient: getClient as unknown as () => Client, postToChannel: () => {} })
+    initOutageState({ getClient: getClient as unknown as () => Client, notify: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -256,7 +256,7 @@ describe('SR-8.4 capstone — two-row plural projection end-to-end', () => {
     // -----------------------------------------------------------------
     // Click row A as ALLOW
     // -----------------------------------------------------------------
-    initOutageState({ getClient: getClient as unknown as () => Client, postToChannel: () => {} })
+    initOutageState({ getClient: getClient as unknown as () => Client, notify: () => {} })
     const allowActionId = encodePermissionActionId('allow', INSTANCE_C, TOK_A)
     const allowHandled = await handlePermissionClick(allowActionId, {
       web: chat.web as never,

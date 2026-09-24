@@ -84,7 +84,7 @@ import {
 
 let trailTempDir: string
 let origStateDir: string | undefined
-let outageEmissions: Array<{ channelId: string; text: string }> = []
+let outageEmissions: Array<{ key: string; text: string }> = []
 
 beforeAll(() => {
   trailTempDir = mkdtempSync(join(tmpdir(), 'poller-trail-isolation-'))
@@ -110,7 +110,7 @@ beforeEach(() => {
   setClientForTests(makeStubClient() as unknown as Parameters<typeof setClientForTests>[0])
   initOutageState({
     getClient: moduleGetClient,
-    postToChannel: (channelId, text) => { outageEmissions.push({ channelId, text }) },
+    notify: (key, text) => { outageEmissions.push({ key, text }) },
   })
 })
 
@@ -1928,7 +1928,7 @@ describe('b.en2 Epic 6 — withOutageDetection wrapper integration', () => {
     // ad-unreachable flag raised for the row's channel.
     expect(getOutageFlags(ROW_CHANNEL).has('ad-unreachable')).toBe(true)
     // Onset Slack message carries the binaryPath detail.
-    const onset = outageEmissions.find(e => e.channelId === ROW_CHANNEL)
+    const onset = outageEmissions.find(e => e.key === ROW_CHANNEL)
     expect(onset).toBeDefined()
     expect(onset!.text).toContain('/bin/ad')
     // Per-event Slack postMessage suppressed (no double-noise).
@@ -1985,7 +1985,7 @@ describe('b.en2 Epic 6 — withOutageDetection wrapper integration', () => {
     // ad-unreachable flag raised for the entry's channel.
     expect(getOutageFlags(ROW_CHANNEL).has('ad-unreachable')).toBe(true)
     // Onset Slack message carries the binaryPath detail.
-    const onset = outageEmissions.find(e => e.channelId === ROW_CHANNEL)
+    const onset = outageEmissions.find(e => e.key === ROW_CHANNEL)
     expect(onset).toBeDefined()
     expect(onset!.text).toContain('/bin/ad')
     // Entry preserved — no chat.update (outage-class error is a skip, not a close).

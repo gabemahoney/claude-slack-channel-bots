@@ -17,10 +17,18 @@
  *     whose channel label is not in routingConfig.routes.
  *   - SR-8.6 invariant: every successful spawn call site passes
  *     relay_mode='on'.
+ *   - Persona notices (b.av2 SR-7.2): spawn failure (generic, dialog-approval
+ *     timeout, self-heal failure, restart cap), lost and inconclusive history,
+ *     held-until-validated notices and the `spawn-failure-post` startup error,
+ *     through the real per-persona notifier installed with
+ *     `setSessionNotifier`.
  *
  * Most blocks use a stand-in persona keyed by its channel ID (the shape the
- * E3 route→persona adapter produces), so their `cscb_<channelId>` ids, outage
- * keys and notice channels are unchanged.
+ * E3 route→persona adapter produces), so their `cscb_<channelId>` ids and
+ * outage keys are unchanged. Every test gets a bare notice capture
+ * (`notices`); the notice-routing cases replace it with the real notifier
+ * over a two-persona config whose notice persona's name, key and destination
+ * all differ.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -63,7 +71,14 @@ import {
   _resetDialogDeadGracePolls,
   _setSpawnHomeDir,
   _resetSpawnHomeDir,
+  setSessionNotifier,
+  notifySpawnFailure,
+  notifyRestartCapReached,
 } from '../src/session-manager.ts'
+import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
+import type { WebApiOutcome } from './test-helpers/slack-stub.ts'
+import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
+import { LEAK_SENTINEL, assertNoLeak } from './test-helpers/credentials.ts'
 import { type Persona, type PersonaConfig, resolveRealPath } from '../src/config.ts'
 import { configDirLabelValue, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { routesToPersonaConfig } from '../src/route-persona-adapter.ts'
@@ -89,7 +104,7 @@ import {
 } from './test-helpers/agent-director-stub.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
-import { messagesSince } from './test-helpers/archive-db.ts'
+import { buildTempArchiveDb, messagesSince } from './test-helpers/archive-db.ts'
 import {
   initOutageState,
   getOutageFlags,
@@ -101,6 +116,7 @@ import {
   ErrTmuxNotAvailable,
   ErrCwdNotFound,
 } from '../src/agent-director-errors.ts'
+import { RESTART_FAILURE_CAP } from '../src/restart.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -149,8 +165,16 @@ function useSpawnHome(name = 'home'): string {
   return home
 }
 
-/** Capture of outage-state Slack emissions (onsets + all-clears) across each test. */
-let outageEmissions: Array<{ channelId: string; text: string }> = []
+/** Capture of outage-state notices (onsets + all-clears), by persona key, across each test. */
+let outageEmissions: Array<{ key: string; text: string }> = []
+
+/**
+ * Bare capture of every session-manager notice raised during the test: the
+ * recording sink `beforeEach` installs through `setSessionNotifier`. Enough
+ * for "no notice" assertions; routing is asserted through the real notifier
+ * (`installNoticeNotifier`), which replaces this sink for its test.
+ */
+let notices: Array<{ key: string; text: string; options?: PersonaNoticeOptions }> = []
 
 let savedEnv: NodeJS.ProcessEnv
 
@@ -170,8 +194,10 @@ beforeEach(() => {
   outageEmissions = []
   initOutageState({
     getClient,
-    postToChannel: (channelId, text) => { outageEmissions.push({ channelId, text }) },
+    notify: (key, text) => { outageEmissions.push({ key, text }) },
   })
+  notices = []
+  setSessionNotifier((key, text, options) => { notices.push({ key, text, options }) })
   // Default the raw-tmux dialog seams to safe no-ops so unit tests never shell
   // out to real tmux (b.vub). Dead-row tests override these to drive behavior.
   _setTmuxCapturePane(async () => '')
@@ -195,6 +221,7 @@ afterEach(() => {
   _resetDialogDeadGracePolls()
   _resetOutageState()
   _resetSpawnHomeDir()
+  setSessionNotifier(undefined)
   process.env = savedEnv as NodeJS.ProcessEnv
   rmSync(fixtureDir, { recursive: true, force: true })
 })
@@ -203,21 +230,119 @@ afterEach(() => {
 // b.en2 Epic 4 shared helpers
 // ---------------------------------------------------------------------------
 
-/** Build a minimal mock WebClient to assert postSpawnFailureToChannel was NOT called. */
-function makeMockWeb(): {
-  web: { chat: { postMessage: (...a: unknown[]) => Promise<unknown> } }
-  calls: unknown[][]
-} {
-  const calls: unknown[][] = []
-  const web = { chat: { postMessage: async (...a: unknown[]) => { calls.push(a); return {} } } }
-  return { web, calls }
+// ---------------------------------------------------------------------------
+// Persona notices (b.av2 SR-7.2) — the real notifier over per-persona stubs
+// ---------------------------------------------------------------------------
+
+/** The notice persona: its name differs from its key. */
+const NOTICE_NAME = 'Ops Desk'
+const NOTICE_KEY = personaKey(NOTICE_NAME)
+/** Its destination (`permission_prompts`): its second channel, an `all` one. */
+const NOTICE_DEST = 'C0DEST001'
+/** Its first channel, `mentions` only: never a notice target. */
+const NOTICE_MENTIONS = 'C0MENT002'
+/** The second persona, whose stub must never see a notice for the first. */
+const OTHER_NAME = 'Other Bot'
+const OTHER_KEY = personaKey(OTHER_NAME)
+const OTHER_DEST = 'C0OTHER03'
+
+/**
+ * Two personas: the notice persona (first channel NOTICE_MENTIONS, destination
+ * its second channel NOTICE_DEST, so a post to its first channel is told apart
+ * from a post to its destination) and a second one with its own destination.
+ */
+function makeNoticeConfig(overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): PersonaConfig {
+  return makeMultiPersonaConfig(
+    [
+      {
+        name: NOTICE_NAME,
+        working_directory: '/x',
+        channels: [
+          { id: NOTICE_MENTIONS, delivery: 'mentions' },
+          { id: NOTICE_DEST, delivery: 'all' },
+        ],
+        permission_prompts: NOTICE_DEST,
+      },
+      {
+        name: OTHER_NAME,
+        working_directory: '/y',
+        channels: [{ id: OTHER_DEST, delivery: 'all' }],
+        permission_prompts: OTHER_DEST,
+      },
+    ],
+    fixtureDir,
+    overrides,
+  )
 }
 
-/** Pre-raise all three outage flags for a channel so success-clear tests start with full bad-stretch. */
-function preSetAllFlags(channelId: string): void {
-  setOutageFlag(channelId, 'cwd-unreachable', '/test/cwd')
-  setOutageFlag(channelId, 'ad-unreachable', '/bin/ad')
-  setOutageFlag(channelId, 'tmux-unavailable')
+/**
+ * Build the real persona notifier over `cfg` (`makeNotifierHarness`: one
+ * `makeStubSlack` stub per persona) and install its `notify` through
+ * `setSessionNotifier` (reset to no notifier in afterEach). Every persona is
+ * validated unless `validated: false`; `post` scripts the notice persona's
+ * `chat.postMessage` outcomes; `leakMarker` goes to every stub.
+ */
+function installNoticeNotifier(
+  cfg: PersonaConfig,
+  opts: { validated?: boolean; post?: WebApiOutcome[]; leakMarker?: string } = {},
+): NotifierHarness {
+  const h = makeNotifierHarness(cfg, {
+    validated: opts.validated ?? true,
+    post: opts.post ? { [NOTICE_KEY]: opts.post } : undefined,
+    leakMarker: opts.leakMarker,
+  })
+  setSessionNotifier(h.notifier.notify)
+  return h
+}
+
+/** Capture console.error output for the duration of `fn`, then restore. */
+async function withCapturedErr(fn: () => Promise<void> | void): Promise<string> {
+  const lines: string[] = []
+  const orig = console.error
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+  try {
+    await fn()
+  } finally {
+    console.error = orig
+  }
+  return lines.join('\n')
+}
+
+/** Let fire-and-forget notice posts (and their rejection handlers) settle. */
+async function settleNotices(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+/**
+ * Assert exactly one notice was posted, to the notice persona's destination
+ * only, through its own client, as a top-level message whose text names the
+ * persona in rendered form and never identifies it by a channel ID; nothing
+ * is posted through the other persona's client. Returns the posted text.
+ */
+function expectOneNoticeToDestination(h: NotifierHarness): string {
+  const posts = h.posts(NOTICE_KEY)
+  expect(posts).toHaveLength(1)
+  const post = posts[0]!
+  expect(post.channel).toBe(NOTICE_DEST)
+  // Top-level, the persona's own identity: exactly channel + text.
+  expect(Object.keys(post).sort()).toEqual(['channel', 'text'])
+  expect(post.text.startsWith(`Persona ${renderPersonaRef(NOTICE_NAME, NOTICE_KEY)}: `)).toBe(true)
+  expect(post.text).not.toContain(NOTICE_DEST)
+  expect(post.text).not.toContain(NOTICE_MENTIONS)
+  expect(h.posts(OTHER_KEY)).toHaveLength(0)
+  return post.text
+}
+
+/** Number of `[<classLabel>]` entries in a startup-errors.log body. */
+function countStartupEntries(log: string, classLabel: string): number {
+  return log.split('\n').filter((line) => line.includes(`] [${classLabel}] `)).length
+}
+
+/** Pre-raise all three outage flags for a persona key so success-clear tests start with full bad-stretch. */
+function preSetAllFlags(key: string): void {
+  setOutageFlag(key, 'cwd-unreachable', '/test/cwd')
+  setOutageFlag(key, 'ad-unreachable', '/bin/ad')
+  setOutageFlag(key, 'tmux-unavailable')
 }
 
 // ---------------------------------------------------------------------------
@@ -645,10 +770,10 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
   // b.2oy — resume rejects with ErrSpawnNotFound (row vanished between the
   // dead-session verdict and resume: operator delete, expire, race). Recovery
   // must fresh-spawn directly with the original params — NO kill, NO delete,
-  // no channel-facing failure post — and report 'spawned'. Pre-fix this fell
+  // no spawn-failure notice — and report 'spawned'. Pre-fix this fell
   // into the generic resume-catch, which posted a Slack "spawn failure" and
   // returned action: 'failed'.
-  test('b.2oy: ErrSpawnNotFound on resume → fresh spawn (no kill, no delete, no channel post)', async () => {
+  test('b.2oy: ErrSpawnNotFound on resume → fresh spawn (no kill, no delete, no spawn-failure notice)', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
@@ -663,10 +788,9 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
       resumeError: errSpawnNotFound(),
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
     })
-    const { web, calls } = makeMockWeb()
     const home = useSpawnHome()
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result).toEqual({ key: 'C', action: 'spawned' })
     // initial collision spawn + the fresh spawn after ErrSpawnNotFound
     expect(spawnCalls).toHaveLength(2)
@@ -676,14 +800,15 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     // row was already gone — no kill and no delete of a missing row
     expect(killCalls).toHaveLength(0)
     expect(deleteCalls).toHaveLength(0)
-    // no channel-facing spawn-failure post
-    expect(calls).toHaveLength(0)
+    // no spawn-failure notice
+    expect(notices).toHaveLength(0)
   })
 
   // b.2oy — ErrSpawnNotFound recovery still surfaces genuine spawn failures.
   // Resume throws ErrSpawnNotFound, then the fresh spawn fails with a generic
-  // error → 'failed' and postSpawnFailureToChannel fires.
-  test('b.2oy: ErrSpawnNotFound on resume + fresh spawn fails → failed + channel post', async () => {
+  // error → 'failed' and a spawn-failure notice goes to the persona's
+  // destination (b.av2 SR-7.2).
+  test('b.2oy: ErrSpawnNotFound on resume + fresh spawn fails → failed + spawn-failure notice to the persona destination', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     const readLog = captureStartupErrors()
@@ -695,16 +820,20 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
         cannedErr<import('agent-director').SpawnResult>(errGeneric('spawn', 'ErrSpawnBroken')),
       ],
       resumeError: errSpawnNotFound(),
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      getResult: cannedGetResult({ claude_instance_id: `cscb_${NOTICE_KEY}`, state: 'ended' }),
     })
-    const { web, calls } = makeMockWeb()
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
+    const cfg = makeNoticeConfig()
+    const h = installNoticeNotifier(cfg)
+    const result = await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)
+    await settleNotices()
     expect(result.action).toBe('failed')
     expect(spawnCalls).toHaveLength(2)
     expect(deleteCalls).toHaveLength(0)
-    // generic spawn failure is surfaced to the channel
-    expect(calls.length).toBeGreaterThanOrEqual(1)
+    // generic spawn failure is surfaced to the persona's destination only
+    const text = expectOneNoticeToDestination(h)
+    expect(text).toContain('Spawn failure:\n')
+    expect(text).toContain('Error: `ErrSpawnBroken`')
+    expect(text).toContain('Remediation: Check server.log for details.')
     // startup-error side effect is part of the tested contract
     expect(readLog()).toContain('[spawn-failed]')
   })
@@ -902,17 +1031,16 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
         cannedOk<import('agent-director').SendKeysResult>({}),
       ],
     })
-    const { web, calls } = makeMockWeb()
-    const result = await reconnectMcp('C', web as never)
+    const result = await reconnectMcp('C')
     expect(result).toBe('ok')
     expect(ensureCalls).toBe(1)
     expect(sendKeysCalls).toHaveLength(2)
     expect(sendKeysCalls[1].text).toContain('/mcp reconnect')
-    // Retry succeeded — no Slack failure post
-    expect(calls).toHaveLength(0)
+    // Retry succeeded — no failure notice
+    expect(notices).toHaveLength(0)
   })
 
-  test('reconnectMcp: retry after ErrTmuxSendKeys also fails → dead-session (b.3ce: caller recovers, no failure post)', async () => {
+  test('reconnectMcp: retry after ErrTmuxSendKeys also fails → dead-session (b.3ce: caller recovers, no failure notice)', async () => {
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     let ensureCalls = 0
     _setTmuxServerEnsurer(async () => { ensureCalls++ })
@@ -920,13 +1048,12 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
       sendKeysCalls,
       sendKeysError: errTmuxSendKeys(), // persistent — first attempt AND retry fail
     })
-    const { web, calls } = makeMockWeb()
-    const result = await reconnectMcp('C', web as never)
+    const result = await reconnectMcp('C')
     expect(result).toBe('dead-session')
     expect(ensureCalls).toBe(1) // self-heal attempted exactly once (single retry)
     expect(sendKeysCalls).toHaveLength(2)
-    // b.3ce: dead-session hands recovery to the caller — no premature failure post
-    expect(calls).toHaveLength(0)
+    // b.3ce: dead-session hands recovery to the caller — no premature failure notice
+    expect(notices).toHaveLength(0)
   })
 
   test('reconnectMcp: non-tmux sendKeys error → no self-heal, no retry', async () => {
@@ -937,7 +1064,7 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
       sendKeysCalls,
       sendKeysError: errGeneric('send-keys', 'ErrSomethingElse'),
     })
-    const result = await reconnectMcp('C', undefined)
+    const result = await reconnectMcp('C')
     expect(result).toBe('failed')
     expect(ensureCalls).toBe(0)
     expect(sendKeysCalls).toHaveLength(1)
@@ -1017,7 +1144,7 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
-    expect(readLog()).toBe('') // resume-failure path posts to Slack; no reconnect-failed startup entry
+    expect(readLog()).toBe('') // resume-failure path raises a spawn-failure notice; no reconnect-failed startup entry
   })
 
   test('startupSessionManager: unrecoverable channels are counted (no false "0 failed")', async () => {
@@ -1941,7 +2068,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     })
     const readLog = captureStartupErrors()
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, undefined, false)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, false)
 
     expect(result.action).toBe('spawned')
     expect(readLog()).toBe('')
@@ -2036,7 +2163,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
   // New behavior tests for merged approver (b.4ie)
   // -------------------------------------------------------------------------
 
-  test('cap hit: sticky pending + unrecognized pane → records dev-channels-approve-not-ready, no sendKeys, posts Slack failure (isStartup=true)', async () => {
+  test('cap hit: sticky pending + unrecognized pane → records dev-channels-approve-not-ready, no sendKeys, posts a spawn-failure notice to the persona destination (isStartup=true)', async () => {
     _setDialogReadyTimeoutMs(30)
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     installStub({
@@ -2046,16 +2173,19 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       readPaneResults: [{ pane: 'unrelated pane text' }],
     })
     const readLog = captureStartupErrors()
-    const { web, calls } = makeMockWeb()
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
+    const cfg = makeNoticeConfig()
+    const h = installNoticeNotifier(cfg)
+    await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)
+    await settleNotices()
 
     expect(sendKeysCalls).toHaveLength(0)
     const log = readLog()
     expect(log).toContain('[dev-channels-approve-not-ready]')
-    expect(log).toContain(`for ${renderPersonaRef('C', 'C')} —`)
-    // cap path must also fire postSpawnFailureToChannel (core requirement of b.4ie)
-    expect(calls.length).toBeGreaterThanOrEqual(1)
+    expect(log).toContain(`for ${renderPersonaRef(NOTICE_NAME, NOTICE_KEY)} —`)
+    // cap path must also raise the spawn-failure notice (core requirement of b.4ie)
+    const text = expectOneNoticeToDestination(h)
+    expect(text).toContain('Spawn failure:\n')
+    expect(text).toContain('Error: `DialogApprovalTimeout`')
   })
 
   test('dead state: sticky ended + no needle (grace exhausted) → records dev-channels-approve-spawn-died', async () => {
@@ -2148,7 +2278,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       ],
     })
 
-    await approvePreSessionDialogs('C', undefined, true)
+    await approvePreSessionDialogs('C', true)
 
     // Raw tmux was used, keyed on the deterministic session name.
     expect(rawCaptured).toContain('slack_bot_C')
@@ -2171,7 +2301,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       ],
     })
 
-    await approvePreSessionDialogs('C', undefined, true)
+    await approvePreSessionDialogs('C', true)
 
     expect(rawEntered).toEqual(['slack_bot_C'])
   })
@@ -2190,7 +2320,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     })
     const readLog = captureStartupErrors()
 
-    await approvePreSessionDialogs('C', undefined, true)
+    await approvePreSessionDialogs('C', true)
 
     expect(sendKeysCalls).toHaveLength(0)
     expect(rawEntered).toHaveLength(0)
@@ -2297,9 +2427,8 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     expect(killedSessions).toEqual([`slack_bot_${key}`])
   })
 
-  test('b.vub: ErrTmuxSessionCreate self-heal that fails on retry → posts Slack failure', async () => {
+  test('b.vub: ErrTmuxSessionCreate self-heal that fails on retry → spawn-failure notice to the persona destination', async () => {
     _setTmuxSessionKiller(async () => { /* orphan killed but retry still fails */ })
-    const { web, calls } = makeMockWeb()
     const readLog = captureStartupErrors()
     installStub({
       // fresh spawn throws tmux-create; retry spawn also throws (generic)
@@ -2308,11 +2437,15 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
         cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
       ],
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
+    const cfg = makeNoticeConfig()
+    const h = installNoticeNotifier(cfg)
+    const result = await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)
+    await settleNotices()
 
     expect(result.action).toBe('failed')
-    expect(calls.length).toBeGreaterThanOrEqual(1)
+    const text = expectOneNoticeToDestination(h)
+    expect(text).toContain('Spawn failure:\n')
+    expect(text).toContain(`Error: \`${errTmuxSessionCreate('spawn').errName}\``)
     expect(readLog()).toContain('[spawn-failed]')
   })
 })
@@ -2328,7 +2461,7 @@ const CWD = '/test/cwd'
 // ---------------------------------------------------------------------------
 // Group A: 13 non-dialog wrapped catch sites
 // Each asserts: outage-class typed error raises the matching flag AND
-// postSpawnFailureToChannel (web.chat.postMessage) is NOT invoked.
+// no spawn-failure notice is raised.
 // ---------------------------------------------------------------------------
 
 describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
@@ -2336,37 +2469,34 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   // Site #1 — reconnectMcp → sendKeys
   // -------------------------------------------------------------------------
 
-  test('site #1: reconnectMcp ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
-    const { web, calls } = makeMockWeb()
+  test('site #1: reconnectMcp ErrSystemInstallDisappeared → ad-unreachable, no spawn-failure notice', async () => {
     installStub({ sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN) })
-    const result = await reconnectMcp('C', web as never)
+    const result = await reconnectMcp('C')
     expect(result).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
-    expect(calls).toHaveLength(0)
+    expect(notices).toHaveLength(0)
   })
 
-  test('site #1b: reconnectMcp ErrTmuxNotAvailable → tmux-unavailable, no postSpawnFailureToChannel', async () => {
-    const { web, calls } = makeMockWeb()
+  test('site #1b: reconnectMcp ErrTmuxNotAvailable → tmux-unavailable, no spawn-failure notice', async () => {
     installStub({ sendKeysError: new ErrTmuxNotAvailable('send-keys', 'ErrTmuxNotAvailable', 'tmux not available') })
-    const result = await reconnectMcp('C', web as never)
+    const result = await reconnectMcp('C')
     expect(result).toBe('failed')
     expect(getOutageFlags('C').has('tmux-unavailable')).toBe(true)
-    expect(calls).toHaveLength(0)
+    expect(notices).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
   // Site #8 — waitForWaitingAndReconnect → status
   // -------------------------------------------------------------------------
 
-  test('site #8: waitForWaitingAndReconnect ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
-    const { web, calls } = makeMockWeb()
+  test('site #8: waitForWaitingAndReconnect ErrSystemInstallDisappeared → ad-unreachable, no spawn-failure notice', async () => {
     _setWaitForWaitingTimeoutMs(50)
     installStub({ statusError: new ErrSystemInstallDisappeared('status', BIN) })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
-    const result = await waitForWaitingAndReconnect('C', cfg, web as never)
+    const result = await waitForWaitingAndReconnect('C', cfg)
     expect(result).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
-    expect(calls).toHaveLength(0)
+    expect(notices).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
@@ -2374,8 +2504,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   // kill errors are silently ignored by tryKill, but the outage flag IS raised.
   // -------------------------------------------------------------------------
 
-  test('site #9: tryKill kill ErrSystemInstallDisappeared → ad-unreachable, error ignored (no postSpawnFailureToChannel)', async () => {
-    const { web, calls } = makeMockWeb()
+  test('site #9: tryKill kill ErrSystemInstallDisappeared → ad-unreachable, error ignored (no spawn-failure notice)', async () => {
     // collision → get=ended → resume_enabled=false → kill throws (flag set, ignored)
     // delete also throws so flow terminates without a fresh spawn that would clear the flag
     installStub({
@@ -2385,18 +2514,17 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       deleteError: new ErrSystemInstallDisappeared('delete', BIN),
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
-    expect(calls).toHaveLength(0)
+    expect(notices).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
   // Site #10 — tryDelete → delete
   // -------------------------------------------------------------------------
 
-  test('site #10: tryDelete delete ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
-    const { web, calls } = makeMockWeb()
+  test('site #10: tryDelete delete ErrSystemInstallDisappeared → ad-unreachable, no spawn-failure notice', async () => {
     installStub({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
@@ -2404,61 +2532,58 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       deleteError: new ErrSystemInstallDisappeared('delete', BIN),
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
-    expect(calls).toHaveLength(0)
+    expect(notices).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
   // Site #11 — spawnForPersona initial spawn (withSpawnDetection)
   // -------------------------------------------------------------------------
 
-  test('site #11: initial spawn ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
-    const { web, calls } = makeMockWeb()
+  test('site #11: initial spawn ErrSystemInstallDisappeared → ad-unreachable, no spawn-failure notice', async () => {
     installStub({ spawnError: new ErrSystemInstallDisappeared('spawn', BIN) })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
-    expect(calls).toHaveLength(0)
+    expect(notices).toHaveLength(0)
   })
 
-  test('site #11b: initial spawn ErrCwdNotFound → cwd-unreachable with route.cwd as detail, no postSpawnFailureToChannel', async () => {
-    const { web, calls } = makeMockWeb()
+  test('site #11b: initial spawn ErrCwdNotFound → cwd-unreachable with the persona working_directory as detail, no spawn-failure notice', async () => {
     installStub({ spawnError: new ErrCwdNotFound('spawn', 'ErrCwdNotFound', `cwd ${CWD} does not exist`) })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
-    // The detail should be route.cwd (from withSpawnDetection's routeCwd arg)
-    expect(outageEmissions.some(e => e.text.includes(CWD))).toBe(true)
-    expect(calls).toHaveLength(0)
+    // The detail is the persona's working_directory (withSpawnDetection's
+    // workingDirectory arg), in an onset notice for the persona key
+    expect(outageEmissions.some(e => e.key === 'C' && e.text.includes(CWD))).toBe(true)
+    expect(notices).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
   // Site #12 — spawnForPersona collision-get (withOutageDetection)
   // -------------------------------------------------------------------------
 
-  test('site #12: collision-get ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
-    const { web, calls } = makeMockWeb()
+  test('site #12: collision-get ErrSystemInstallDisappeared → ad-unreachable, no spawn-failure notice', async () => {
     installStub({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getError: new ErrSystemInstallDisappeared('get', BIN),
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
-    expect(calls).toHaveLength(0)
+    expect(notices).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
   // Site #13 — spawnForPersona retry-spawn after ErrSpawnNotFound
   // -------------------------------------------------------------------------
 
-  test('site #13: retry-spawn after ErrSpawnNotFound ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
-    const { web, calls } = makeMockWeb()
+  test('site #13: retry-spawn after ErrSpawnNotFound ErrSystemInstallDisappeared → ad-unreachable, no spawn-failure notice', async () => {
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
@@ -2467,18 +2592,17 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       getError: errSpawnNotFound(),
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
-    expect(calls).toHaveLength(0)
+    expect(notices).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
   // Site #14 — spawnForPersona fresh-spawn after kill+delete (resume_enabled=false)
   // -------------------------------------------------------------------------
 
-  test('site #14: fresh-spawn after kill+delete ErrCwdNotFound → cwd-unreachable, no postSpawnFailureToChannel', async () => {
-    const { web, calls } = makeMockWeb()
+  test('site #14: fresh-spawn after kill+delete ErrCwdNotFound → cwd-unreachable, no spawn-failure notice', async () => {
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
@@ -2487,36 +2611,34 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
-    expect(calls).toHaveLength(0)
+    expect(notices).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
   // Site #15 — spawnForPersona resume (withSpawnDetection)
   // -------------------------------------------------------------------------
 
-  test('site #15: resume ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
-    const { web, calls } = makeMockWeb()
+  test('site #15: resume ErrSystemInstallDisappeared → ad-unreachable, no spawn-failure notice', async () => {
     installStub({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
       resumeError: new ErrSystemInstallDisappeared('resume', BIN),
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
-    expect(calls).toHaveLength(0)
+    expect(notices).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
   // Site #16 — spawnForPersona spawn after ErrNoSessionId → delete → spawn
   // -------------------------------------------------------------------------
 
-  test('site #16: spawn after ErrNoSessionId-delete ErrCwdNotFound → cwd-unreachable, no postSpawnFailureToChannel', async () => {
-    const { web, calls } = makeMockWeb()
+  test('site #16: spawn after ErrNoSessionId-delete ErrCwdNotFound → cwd-unreachable, no spawn-failure notice', async () => {
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
@@ -2526,18 +2648,17 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       resumeError: errNoSessionId(),
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
-    expect(calls).toHaveLength(0)
+    expect(notices).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
   // Site #17 — spawnForPersona spawn after ErrSpawnNotResumable → kill+delete → spawn
   // -------------------------------------------------------------------------
 
-  test('site #17: spawn after ErrSpawnNotResumable kill+delete ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
-    const { web, calls } = makeMockWeb()
+  test('site #17: spawn after ErrSpawnNotResumable kill+delete ErrSystemInstallDisappeared → ad-unreachable, no spawn-failure notice', async () => {
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
@@ -2547,10 +2668,10 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       resumeError: errSpawnNotResumable(),
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
-    expect(calls).toHaveLength(0)
+    expect(notices).toHaveLength(0)
   })
 
 })
@@ -2576,9 +2697,9 @@ describe('wrapper-migration: dialog outage cases (Group B)', () => {
     _setDialogReadyTimeoutMs(50)
     installStub({ statusError: errSID() })
     // status throws every poll → transient → cap hit → resolves
-    await expect(approvePreSessionDialogs(CH, undefined, false)).resolves.toBeUndefined()
+    await expect(approvePreSessionDialogs(CH, false)).resolves.toBeUndefined()
     expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
-    expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
+    expect(outageEmissions.some(e => e.key === CH && e.text.includes(BIN))).toBe(true)
   })
 
   test('readPane outage: status=pending, readPane throws ErrSystemInstallDisappeared → ad-unreachable, resolves (cap hit)', async () => {
@@ -2587,9 +2708,9 @@ describe('wrapper-migration: dialog outage cases (Group B)', () => {
       statusResult: { state: 'pending' },
       readPaneError: errSID(),
     })
-    await expect(approvePreSessionDialogs(CH, undefined, false)).resolves.toBeUndefined()
+    await expect(approvePreSessionDialogs(CH, false)).resolves.toBeUndefined()
     expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
-    expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
+    expect(outageEmissions.some(e => e.key === CH && e.text.includes(BIN))).toBe(true)
   })
 
   test('sendKeys outage: status=pending + dialog pane, sendKeys throws ErrSystemInstallDisappeared → ad-unreachable, resolves (cap hit)', async () => {
@@ -2600,9 +2721,9 @@ describe('wrapper-migration: dialog outage cases (Group B)', () => {
       readPaneResults: [{ pane: DEV_CHANNELS_DIALOG_NEEDLE }],
       sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN),
     })
-    await expect(approvePreSessionDialogs(CH, undefined, false)).resolves.toBeUndefined()
+    await expect(approvePreSessionDialogs(CH, false)).resolves.toBeUndefined()
     expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
-    expect(outageEmissions.some(e => e.channelId === CH && e.text.includes(BIN))).toBe(true)
+    expect(outageEmissions.some(e => e.key === CH && e.text.includes(BIN))).toBe(true)
   })
 })
 
@@ -2623,7 +2744,7 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
 
   function assertAllClear(): void {
     expect(getOutageFlags(CH).size).toBe(0)
-    const allClear = outageEmissions.filter(e => e.channelId === CH && e.text.includes('All clear'))
+    const allClear = outageEmissions.filter(e => e.key === CH && e.text.includes('All clear'))
     expect(allClear).toHaveLength(1)
     expect(allClear[0].text).toContain('ad-unreachable')
     expect(allClear[0].text).toContain('cwd-unreachable')
@@ -2638,7 +2759,7 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
     setupFlags()
     installStub({})
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, false)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, false)
     expect(result.action).toBe('spawned')
     assertAllClear()
   })
@@ -2657,7 +2778,7 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
       getError: errSpawnNotFound(),
     })
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, false)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, false)
     expect(result.action).toBe('spawned')
     assertAllClear()
   })
@@ -2676,7 +2797,7 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
       getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
     })
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, false)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, false)
     expect(result.action).toBe('spawned')
     assertAllClear()
   })
@@ -2692,7 +2813,7 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
       getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
     })
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, false)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, false)
     expect(result.action).toBe('resumed')
     assertAllClear()
   })
@@ -2712,7 +2833,7 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
       resumeError: errNoSessionId(),
     })
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, false)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, false)
     expect(result.action).toBe('spawned')
     assertAllClear()
   })
@@ -2732,7 +2853,7 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
       resumeError: errSpawnNotResumable(),
     })
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, false)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, false)
     expect(result.action).toBe('spawned')
     assertAllClear()
   })
@@ -2759,19 +2880,6 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     while (archiveCleanups.length > 0) archiveCleanups.pop()!()
   })
 
-  /** Capture console.error output for the duration of `fn`, then restore. */
-  async function withCapturedErr(fn: () => Promise<void>): Promise<string> {
-    const lines: string[] = []
-    const orig = console.error
-    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
-    try {
-      await fn()
-    } finally {
-      console.error = orig
-    }
-    return lines.join('\n')
-  }
-
   /** Build a temp archive DB holding `count` post-spawn messages for CH. */
   function makeArchiveWithMessagesSince(startedAt: string, count: number): string {
     const built = messagesSince(startedAt, CH, count)
@@ -2791,18 +2899,21 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     getError?: Error
     spawnCalls?: import('agent-director').SpawnParams[]
     deleteCalls?: import('agent-director').DeleteParams[]
+    /** Persona key the row belongs to; default the stand-in CH. */
+    key?: string
   }) {
+    const key = opts.key ?? CH
     return installStub({
       spawnCalls: opts.spawnCalls,
       deleteCalls: opts.deleteCalls,
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${key}` }),
       ],
       resumeError: errJsonlMissing(opts.jsonlDescription),
       getResult: opts.getError
         ? undefined
-        : cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended', ...opts.getResult }),
+        : cannedGetResult({ claude_instance_id: `cscb_${key}`, state: 'ended', ...opts.getResult }),
       getError: opts.getError,
     })
   }
@@ -2931,7 +3042,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         getResult: { jsonl_path: '/data/proj/sess-1.jsonl', claude_session_id: 'sess-1', cwd: CWD },
       })
       const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-      await spawnForPersona(personaOf(cfg, CH), cfg, undefined, true)
+      await spawnForPersona(personaOf(cfg, CH), cfg, true)
     })
   }
 
@@ -2990,7 +3101,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         getResult: { jsonl_path: '/data/proj/sess-2.jsonl', claude_session_id: 'sess-2', cwd: CWD },
       })
       const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-      const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, true)
+      const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
       // Never throws — the fresh-spawn still happens. No message_archive_db is
       // configured here, so the diagnosis is inconclusive (c-config).
       expect(result.action).toBe('fresh-after-inconclusive-amnesia')
@@ -3004,11 +3115,10 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
 
   // --- Classification triad: never-created (quiet) ------------------------
   // No archived messages since spawn → lossless. Quiet: no startup-error, no
-  // channel post; action still fresh-after-amnesia.
-  test('never-created: 0 archived messages since spawn → quiet (no startup-error, no channel post)', async () => {
+  // persona notice; action still fresh-after-amnesia.
+  test('never-created: 0 archived messages since spawn → quiet (no startup-error, no persona notice)', async () => {
     const readLog = captureStartupErrors()
     const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 0)
-    const { web, calls } = makeMockWeb()
     installAmnesia({
       getResult: {
         jsonl_path: '/data/proj/sess-3.jsonl',
@@ -3018,13 +3128,13 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       },
     })
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, web as never, true)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
 
     // b.fwu: evidence-based never-created is the DIAGNOSED-lossless case — it
     // stays quiet and is bucketed as the ordinary fresh-after-amnesia action,
     // NOT the undiagnosable fresh-after-inconclusive-amnesia.
     expect(result.action).toBe('fresh-after-amnesia')
-    expect(calls).toHaveLength(0) // no channel post at all
+    expect(notices).toHaveLength(0) // no persona notice at all
     const log = readLog()
     expect(log).not.toContain('jsonl-transcript-lost-on-resume') // quiet
     expect(log).not.toContain('jsonl-diagnosis-inconclusive') // not inconclusive
@@ -3032,31 +3142,46 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
 
   // --- Classification triad: lost (loud) ----------------------------------
   // Archived messages > 0 since spawn → real context destroyed. Loud:
-  // recordStartupError('jsonl-transcript-lost-on-resume') + channel post. The
-  // startup error is recorded only when isStartup=true, so this drives that.
-  test('lost: archived messages since spawn > 0 → startup-error recorded + channel post', async () => {
+  // recordStartupError('jsonl-transcript-lost-on-resume') + a persona notice to
+  // the persona's destination (b.av2 SR-7.2). The startup error is recorded
+  // only when isStartup=true, so this drives that.
+  test('lost: archived messages since spawn > 0 → startup-error recorded + persona notice to the destination', async () => {
     const readLog = captureStartupErrors()
-    const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 4)
-    const { web, calls } = makeMockWeb()
+    // Four post-spawn messages under the persona key (what the archive count
+    // reads today) and under its destination, its only `delivery: all` channel
+    // (what E3 Task 4 counts), so the count is 4 either way.
+    const startedAt = '2026-09-20T05:00:00Z'
+    const boundary = Date.parse(startedAt) / 1000
+    const rows = [1, 2, 3, 4].flatMap((i) => [
+      { ts: boundary + i, channel: NOTICE_KEY },
+      { ts: boundary + i, channel: NOTICE_DEST },
+    ])
+    const archive = buildTempArchiveDb(rows, NOTICE_KEY)
+    archiveCleanups.push(archive.cleanup)
     installAmnesia({
+      key: NOTICE_KEY,
       getResult: {
         jsonl_path: '/data/proj/sess-4.jsonl',
         claude_session_id: 'sess-4',
         cwd: CWD,
-        started_at: '2026-09-20T05:00:00Z',
+        started_at: startedAt,
       },
     })
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, web as never, true)
+    const cfg = makeNoticeConfig({ message_archive_db: archive.dbPath })
+    const h = installNoticeNotifier(cfg)
+    const result = await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg, true)
+    await settleNotices()
 
     expect(result.action).toBe('fresh-after-amnesia')
     // Operator-visible: startup-error entry embedding the archived count.
     const log = readLog()
     expect(log).toContain('jsonl-transcript-lost-on-resume')
     expect(log).toContain('4 message(s)')
-    // And a channel post to the affected channel.
-    expect(calls).toHaveLength(1)
-    expect((calls[0][0] as { channel: string }).channel).toBe(CH)
+    // And a persona notice to the persona's destination only.
+    const text = expectOneNoticeToDestination(h)
+    expect(text).toContain('message archive shows 4 message(s) since I started')
+    expect(text).toContain('my conversation memory has been lost')
+    expect(text).not.toContain('could not determine whether my prior')
   })
 
   // --- Classification triad: inconclusive (row fetch fails) ---------------
@@ -3086,7 +3211,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       return cannedGetResult({ claude_instance_id: params.claude_instance_id, state: 'ended' })
     }
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, true)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
 
     expect(result.action).toBe('fresh-after-inconclusive-amnesia')
     expect(deleteCalls).toHaveLength(1) // delete+fresh policy unchanged
@@ -3266,27 +3391,29 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(result.succeeded).toBe(1)
   })
 
-  // Channel-post wording for an inconclusive case must be UNCERTAINTY-shaped,
+  // Notice wording for an inconclusive case must be UNCERTAINTY-shaped,
   // never the 'lost' "destroyed"/"memory has been lost" wording — a false
   // "your history was destroyed" is its own harm.
-  test('inconclusive channel post is worded as uncertainty, not the lost "destroyed" wording', async () => {
-    captureStartupErrors()
-    const { web, calls } = makeMockWeb()
+  test('inconclusive persona notice is worded as uncertainty, not the lost "destroyed" wording', async () => {
+    const readLog = captureStartupErrors()
     installAmnesia({
+      key: NOTICE_KEY,
       getResult: { jsonl_path: '/data/proj/sess-u.jsonl', claude_session_id: 'sess-u', cwd: CWD },
     })
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir) // c-config → inconclusive
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, web as never, true)
+    const cfg = makeNoticeConfig() // no message_archive_db: c-config → inconclusive
+    const h = installNoticeNotifier(cfg)
+    const result = await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg, true)
+    await settleNotices()
 
     expect(result.action).toBe('fresh-after-inconclusive-amnesia')
-    expect(calls).toHaveLength(1)
-    const posted = calls[0][0] as { channel: string; text: string }
-    expect(posted.channel).toBe(CH)
+    expect(readLog()).toContain('jsonl-diagnosis-inconclusive')
+    const text = expectOneNoticeToDestination(h)
     // Uncertainty wording present.
-    expect(posted.text).toContain('could not determine whether my prior')
+    expect(text).toContain('on restart I was started fresh;')
+    expect(text).toContain('could not determine whether my prior')
     // 'lost'-branch wording absent.
-    expect(posted.text).not.toContain('my memory of this channel has been lost')
-    expect(posted.text).not.toContain('message archive shows')
+    expect(text).not.toContain('has been lost')
+    expect(text).not.toContain('message archive shows')
   })
 
   // --- ErrNoSessionId sibling still 'spawned' (not amnesia) ---------------
@@ -3303,7 +3430,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       resumeError: errNoSessionId(),
     })
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, true)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
     expect(result.action).toBe('spawned')
   })
 })
@@ -3316,7 +3443,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
 // keeps the b.wrb diagnosis ceremony) and ErrJsonlNeverWritten (the session
 // never wrote one — provably nothing to lose). Pre-fix the new name matched no
 // branch in the resume ladder, so it hit the generic tail: action 'failed', a
-// spawn-failure post, and restart.ts retrying the same impossible resume with
+// spawn-failure notice, and restart.ts retrying the same impossible resume with
 // a doubling backoff forever.
 // ---------------------------------------------------------------------------
 
@@ -3359,18 +3486,17 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
   // Pre-fix this same test FAILS on every assertion that matters: the resume
   // rejection fell through to the generic tail, so action was 'failed', the
   // row was never deleted, no fresh spawn was issued (spawnCalls === 1) and
-  // postSpawnFailureToChannel posted into the channel. Verified against
+  // a spawn-failure notice was posted into the channel. Verified against
   // main:src/session-manager.ts, whose branch condition is
   // `err instanceof ErrNoSessionId || err instanceof ErrJsonlMissing`.
-  test('REGRESSION: resume ErrJsonlNeverWritten → delete + fresh spawn, action=spawned, no channel post, no diagnosis get', async () => {
+  test('REGRESSION: resume ErrJsonlNeverWritten → delete + fresh spawn, action=spawned, no spawn-failure notice, no diagnosis get', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     const getCalls: import('agent-director').GetParams[] = []
     installNeverWritten({ spawnCalls, deleteCalls, getCalls })
-    const { web, calls } = makeMockWeb()
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
 
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, web as never, true)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
 
     // AC-2/AC-3: plain success action — not 'failed', and not borrowed from the
     // amnesia vocabulary, because nothing was lost.
@@ -3380,8 +3506,8 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
     expect(deleteCalls[0].claude_instance_id).toEqual([`cscb_${CH}`])
     expect(spawnCalls).toHaveLength(2)
     expect(spawnCalls[1].claude_instance_id).toBe(`cscb_${CH}`)
-    // AC-4: no spawn-failure post to the channel.
-    expect(calls).toHaveLength(0)
+    // AC-4: no spawn-failure notice.
+    expect(notices).toHaveLength(0)
     // AC-3: only the collision-recovery get ran. diagnoseJsonlMissing fetches
     // the row a second time, so a single get proves the diagnosis was skipped.
     expect(getCalls).toHaveLength(1)
@@ -3392,10 +3518,9 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
   // the adapter boundary rather than replicating restart.ts's timer.
   test('launchSession adapter returns true → restart.ts records success, schedules no retry', async () => {
     installNeverWritten()
-    const { web } = makeMockWeb()
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
 
-    expect(await launchSession(CH, cfg, web as never)).toBe(true)
+    expect(await launchSession(CH, cfg)).toBe(true)
   })
 
   // The restart path's adapter looks the key up among the applied personas; an
@@ -3411,14 +3536,13 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
       if (typeof fn !== 'function') continue
       record[name] = (...args: unknown[]) => { verbs.push(name); return (fn as (...a: unknown[]) => unknown)(...args) }
     }
-    const { web, calls } = makeMockWeb()
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
 
-    expect(await launchSession('C_UNKNOWN', cfg, web as never)).toBe(false)
+    expect(await launchSession('C_UNKNOWN', cfg)).toBe(false)
 
     expect(spawnCalls).toHaveLength(0)
     expect(verbs).toEqual([])
-    expect(calls).toHaveLength(0)
+    expect(notices).toHaveLength(0)
   })
 
   // AC-3: the startup summary must stay honest — a never-written transcript is
@@ -3434,5 +3558,210 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
     expect(result.freshAfterInconclusiveAmnesia).toBe(0)
     expect(result.failed).toBe(0)
     expect(result.perPersona).toEqual([{ key: CH, action: 'spawned' }])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-7.2 — persona notices: hold until validated, restart cap,
+// spawn-failure-post startup error, and the notifier seam
+// ---------------------------------------------------------------------------
+
+describe('persona notices (b.av2 SR-7.2)', () => {
+  /** A startup spawn whose first spawn call fails with a generic error. */
+  function installGenericSpawnFailure(): void {
+    installStub({ spawnError: errGeneric('spawn', 'ErrSpawnBroken') })
+  }
+
+  test('held: a startup spawn failure raised before the persona client is validated posts nothing until the flush, then exactly once', async () => {
+    captureStartupErrors()
+    installGenericSpawnFailure()
+    const cfg = makeNoticeConfig()
+    const h = installNoticeNotifier(cfg, { validated: false })
+
+    const result = await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)
+    await settleNotices()
+    expect(result.action).toBe('failed')
+    // Held: nothing posted on either persona's client.
+    expect(h.posts(NOTICE_KEY)).toHaveLength(0)
+    expect(h.posts(OTHER_KEY)).toHaveLength(0)
+
+    // A flush while the client is still unvalidated keeps holding it.
+    await h.notifier.flush(NOTICE_KEY)
+    expect(h.posts(NOTICE_KEY)).toHaveLength(0)
+
+    // Validate the persona, then flush: exactly one notice, to its destination.
+    h.validate(NOTICE_KEY)
+    await h.notifier.flush(NOTICE_KEY)
+    await h.notifier.flush(OTHER_KEY)
+    const text = expectOneNoticeToDestination(h)
+    expect(text).toContain('Spawn failure:\n')
+    expect(text).toContain('Error: `ErrSpawnBroken`')
+
+    // A second flush posts nothing more.
+    await h.notifier.flush(NOTICE_KEY)
+    expect(h.posts(NOTICE_KEY)).toHaveLength(1)
+  })
+
+  test('restart cap: notifyRestartCapReached posts one SpawnCapReached notice to the persona destination', async () => {
+    const cfg = makeNoticeConfig()
+    const h = installNoticeNotifier(cfg)
+
+    notifyRestartCapReached(NOTICE_KEY)
+    await settleNotices()
+
+    const text = expectOneNoticeToDestination(h)
+    expect(text).toContain('Spawn failure:\n')
+    expect(text).toContain('Error: `SpawnCapReached`')
+    expect(text).toContain(`${RESTART_FAILURE_CAP} consecutive session-launch failures`)
+    expect(text).toContain('automatic restarts are suspended for this persona')
+  })
+
+  // --- spawn-failure-post (b.av2 SR-11, startup-errors.log classes) --------
+
+  // Every scripted post failure carries LEAK_SENTINEL (message, original,
+  // headers, data). recordStartupError writes the same line to stderr (fd 2,
+  // not console.error) and to startup-errors.log, so the log file stands for
+  // the stderr line; console.error output and the notifier's lines are
+  // captured and checked too.
+  const LEAKY_POST_FAILURES: [string, WebApiOutcome, string][] = [
+    ['network', { kind: 'network' }, 'slack_webapi_request_error'],
+    ['http 503', { kind: 'http', status: 503 }, 'slack_webapi_http_error'],
+    ['platform', { kind: 'platform', error: 'not_in_channel' }, 'slack_webapi_platform_error'],
+  ]
+
+  test.each(LEAKY_POST_FAILURES)(
+    'spawn-failure-post: a rejected (%s) startup spawn-failure post records exactly one token-free entry',
+    async (_label, outcome, code) => {
+      const readLog = captureStartupErrors()
+      installGenericSpawnFailure()
+      const cfg = makeNoticeConfig()
+      const h = installNoticeNotifier(cfg, { post: [outcome], leakMarker: LEAK_SENTINEL })
+
+      let action: string | undefined
+      const errLog = await withCapturedErr(async () => {
+        action = (await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)).action
+        await settleNotices()
+      })
+
+      expect(action).toBe('failed')
+      expect(h.posts(NOTICE_KEY)).toHaveLength(1)
+      const log = readLog()
+      expect(countStartupEntries(log, 'spawn-failure-post')).toBe(1)
+      // The cause is the describer's type and code, never the error message.
+      expect(log).toContain(`failed to post spawn failure for persona=${NOTICE_KEY} — Error code=${code}`)
+      expect(log).not.toContain('error occurred')
+      // The notifier logged the failed post once; there is no retry.
+      expect(h.logs.filter((l) => l.includes('failed to post notice'))).toHaveLength(1)
+      assertNoLeak({ startupErrorsLog: log, errLog, logs: h.logs }, `spawn-failure-post ${_label}`)
+    },
+  )
+
+  test('spawn-failure-post: a held startup notice whose flushed post is rejected records exactly one token-free entry', async () => {
+    const readLog = captureStartupErrors()
+    installGenericSpawnFailure()
+    const cfg = makeNoticeConfig()
+    const h = installNoticeNotifier(cfg, { validated: false, post: [{ kind: 'network' }], leakMarker: LEAK_SENTINEL })
+
+    const errLog = await withCapturedErr(async () => {
+      await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)
+      await settleNotices()
+      expect(countStartupEntries(readLog(), 'spawn-failure-post')).toBe(0)
+
+      h.validate(NOTICE_KEY)
+      await h.notifier.flush(NOTICE_KEY)
+      await settleNotices()
+    })
+
+    expect(h.posts(NOTICE_KEY)).toHaveLength(1)
+    expect(countStartupEntries(readLog(), 'spawn-failure-post')).toBe(1)
+    assertNoLeak({ startupErrorsLog: readLog(), errLog, logs: h.logs }, 'held spawn-failure-post')
+  })
+
+  test('spawn-failure-post: a rejected restart-cap notice post records none and logs token-free', async () => {
+    const readLog = captureStartupErrors()
+    const cfg = makeNoticeConfig()
+    const h = installNoticeNotifier(cfg, { post: [{ kind: 'network' }], leakMarker: LEAK_SENTINEL })
+
+    const errLog = await withCapturedErr(async () => {
+      notifyRestartCapReached(NOTICE_KEY)
+      await settleNotices()
+    })
+
+    expect(h.posts(NOTICE_KEY)).toHaveLength(1)
+    expect(countStartupEntries(readLog(), 'spawn-failure-post')).toBe(0)
+    // Outside startup the failure is logged instead.
+    expect(errLog).toContain(`[slack] spawn-failure-post: failed to post spawn failure for persona=${NOTICE_KEY}`)
+    assertNoLeak({ startupErrorsLog: readLog(), errLog, logs: h.logs }, 'restart-cap spawn-failure-post')
+  })
+
+  test('spawn-failure-post: a rejected restart-path (launchSession) notice post records none and logs token-free', async () => {
+    const readLog = captureStartupErrors()
+    installGenericSpawnFailure()
+    const cfg = makeNoticeConfig()
+    const h = installNoticeNotifier(cfg, { post: [{ kind: 'network' }], leakMarker: LEAK_SENTINEL })
+
+    let launched: boolean | undefined
+    const errLog = await withCapturedErr(async () => {
+      launched = await launchSession(NOTICE_KEY, cfg)
+      await settleNotices()
+    })
+
+    expect(launched).toBe(false)
+    expect(h.posts(NOTICE_KEY)).toHaveLength(1)
+    expect(h.posts(NOTICE_KEY)[0]!.channel).toBe(NOTICE_DEST)
+    expect(h.posts(OTHER_KEY)).toHaveLength(0)
+    // Non-startup: no startup-errors.log entry of any class.
+    expect(countStartupEntries(readLog(), 'spawn-failure-post')).toBe(0)
+    expect(readLog()).toBe('')
+    expect(errLog).toContain(`[slack] spawn-failure-post: failed to post spawn failure for persona=${NOTICE_KEY}`)
+    assertNoLeak({ errLog, logs: h.logs }, 'launchSession spawn-failure-post')
+  })
+
+  // --- The setSessionNotifier seam ----------------------------------------
+
+  test('no notifier installed: a notice is logged by its first line, never thrown', async () => {
+    setSessionNotifier(undefined)
+    const errLog = await withCapturedErr(() => {
+      notifySpawnFailure(NOTICE_KEY, errGeneric('spawn', 'ErrSpawnBroken'))
+    })
+    expect(errLog).toContain(
+      `[slack] session-manager: no notifier installed — notice for persona=${NOTICE_KEY} not posted: Spawn failure:`,
+    )
+    // Only the first line of the notice is logged.
+    expect(errLog).not.toContain('ErrSpawnBroken')
+  })
+
+  test.each([
+    ['throws', () => { throw new Error('sink exploded') }],
+    ['rejects', () => Promise.reject(new Error('sink exploded'))],
+  ] as const)('a notifier that %s is contained: the spawn still reports failed and the error is logged', async (_label, sink) => {
+    captureStartupErrors()
+    installGenericSpawnFailure()
+    const cfg = makeNoticeConfig()
+    setSessionNotifier(sink)
+
+    let action: string | undefined
+    const errLog = await withCapturedErr(async () => {
+      action = (await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)).action
+      await settleNotices()
+    })
+
+    expect(action).toBe('failed')
+    expect(errLog).toContain(`[slack] session-manager: notifier failed for persona=${NOTICE_KEY}: `)
+  })
+
+  test('the bare capture records the notice under the persona key with its body only', async () => {
+    captureStartupErrors()
+    installGenericSpawnFailure()
+    const cfg = makeNoticeConfig()
+
+    await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)
+
+    expect(notices).toHaveLength(1)
+    expect(notices[0].key).toBe(NOTICE_KEY)
+    // The session manager passes the body; the notifier adds the persona reference.
+    expect(notices[0].text.startsWith('Spawn failure:\n')).toBe(true)
+    expect(notices[0].text).not.toContain(NOTICE_NAME)
+    expect(typeof notices[0].options?.onPostFailure).toBe('function')
   })
 })

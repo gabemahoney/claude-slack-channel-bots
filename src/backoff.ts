@@ -1,10 +1,15 @@
 /**
- * backoff.ts — Per-channel consecutive-failure counter with exponential backoff.
+ * backoff.ts — Per-persona session-restart failure counter with exponential backoff.
+ *
+ * The session-restart counters (900 s ceiling, 5-failure cap) are keyed by
+ * persona key (b.av2 SR-6.3). They are separate from the persona Slack-retry
+ * schedule in `src/persona-retry-schedule.ts`: both are per persona, but they
+ * count different things and share no state.
  *
  * Pure module: no imports from server, session-manager, or restart.
  * No timers, no I/O, no import-time side effects.
  * State is in-process only — lost on server restart by design (restart
- * re-runs startup reconcile, which gives each channel a fresh attempt).
+ * re-runs startup reconcile, which gives each persona a fresh attempt).
  *
  * The delay arithmetic itself is exported statelessly as
  * `doublingBackoffDelay`, for callers that hold their own attempt count.
@@ -16,11 +21,11 @@
 // Module-scoped state
 // ---------------------------------------------------------------------------
 
-/** Consecutive failure count per channelId. */
+/** Consecutive session-restart failure count per persona key. */
 const failureCounts = new Map<string, number>()
 
 /**
- * Cap-notified latch per channelId.
+ * Cap-notified latch per persona key.
  * true once the cap-transition message has been sent for the current episode;
  * cleared by recordSuccess() or _resetBackoffState().
  */
@@ -31,13 +36,13 @@ const capNotified = new Map<string, boolean>()
 // ---------------------------------------------------------------------------
 
 /**
- * Increment the consecutive-failure counter for channelId.
+ * Increment the consecutive-failure counter for persona `key`.
  * Returns the new count (post-increment).
  */
-export function recordFailure(channelId: string): number {
-  const prev = failureCounts.get(channelId) ?? 0
+export function recordFailure(key: string): number {
+  const prev = failureCounts.get(key) ?? 0
   const next = prev + 1
-  failureCounts.set(channelId, next)
+  failureCounts.set(key, next)
   return next
 }
 
@@ -47,12 +52,12 @@ export function recordFailure(channelId: string): number {
 
 /**
  * Reset the consecutive-failure counter and the cap-notified latch for
- * channelId. Called on any successful spawn/resume/launch or successful
+ * persona `key`. Called on any successful spawn/resume/launch or successful
  * send-keys reconnect.
  */
-export function recordSuccess(channelId: string): void {
-  failureCounts.delete(channelId)
-  capNotified.delete(channelId)
+export function recordSuccess(key: string): void {
+  failureCounts.delete(key)
+  capNotified.delete(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -60,10 +65,10 @@ export function recordSuccess(channelId: string): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Return the current consecutive-failure count for channelId (0 if none).
+ * Return the current consecutive-failure count for persona `key` (0 if none).
  */
-export function getFailureCount(channelId: string): number {
-  return failureCounts.get(channelId) ?? 0
+export function getFailureCount(key: string): number {
+  return failureCounts.get(key) ?? 0
 }
 
 // ---------------------------------------------------------------------------
@@ -84,8 +89,8 @@ export function getFailureCount(channelId: string): number {
  *   4 → 900s  (960 clamped)
  *   5 → 900s  (1920 clamped)
  */
-export function nextBackoffDelay(channelId: string, baseDelaySeconds: number): number {
-  return doublingBackoffDelay(baseDelaySeconds, getFailureCount(channelId), RESTART_BACKOFF_CEILING_S)
+export function nextBackoffDelay(key: string, baseDelaySeconds: number): number {
+  return doublingBackoffDelay(baseDelaySeconds, getFailureCount(key), RESTART_BACKOFF_CEILING_S)
 }
 
 /** Ceiling of the restart backoff ladder (`nextBackoffDelay`), in seconds. */
@@ -102,7 +107,7 @@ const RESTART_BACKOFF_CEILING_S = 900
  *
  * Holds no state, so a caller that keeps its own attempt count (for example
  * a per-persona retry schedule, b.av2 SR-3.2) can reuse it without touching
- * this module's per-channel counters.
+ * this module's session-restart counters.
  *
  * Overflow-safe for a positive `base` and a finite `ceiling`: once
  * `2^priorAttempts` overflows to `Infinity` the product is `Infinity` and
@@ -122,10 +127,10 @@ export function doublingBackoffDelay(base: number, priorAttempts: number, ceilin
 // ---------------------------------------------------------------------------
 
 /**
- * Returns true when channelId has reached or exceeded cap consecutive failures.
+ * Returns true when persona `key` has reached or exceeded cap consecutive failures.
  */
-export function isAtCap(channelId: string, cap: number): boolean {
-  return getFailureCount(channelId) >= cap
+export function isAtCap(key: string, cap: number): boolean {
+  return getFailureCount(key) >= cap
 }
 
 // ---------------------------------------------------------------------------
@@ -142,10 +147,10 @@ export function isAtCap(channelId: string, cap: number): boolean {
  * — below cap it returns false early without setting the latch. In normal usage
  * it is called only when isAtCap returns true.
  */
-export function shouldNotifyCap(channelId: string, cap: number): boolean {
-  if (getFailureCount(channelId) < cap) return false
-  if (capNotified.get(channelId)) return false
-  capNotified.set(channelId, true)
+export function shouldNotifyCap(key: string, cap: number): boolean {
+  if (getFailureCount(key) < cap) return false
+  if (capNotified.get(key)) return false
+  capNotified.set(key, true)
   return true
 }
 
@@ -154,7 +159,7 @@ export function shouldNotifyCap(channelId: string, cap: number): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * Clear all per-channel state. Mirrors _resetRestartState() in restart.ts.
+ * Clear all per-persona state. Mirrors _resetRestartState() in restart.ts.
  * Use only in tests (beforeEach cleanup).
  */
 export function _resetBackoffState(): void {

@@ -5,6 +5,9 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   initRestart,
   scheduleRestart,
@@ -24,6 +27,8 @@ import {
   _resetFindMissingMemo,
   _setTmuxServerEnsurer,
   _resetTmuxServerEnsurer,
+  notifyRestartCapReached,
+  setSessionNotifier,
 } from '../src/session-manager.ts'
 import {
   setClientForTests,
@@ -36,9 +41,11 @@ import {
 import { makeStubClient } from './test-helpers/agent-director-stub.ts'
 import { errTmuxSendKeys } from './test-helpers/agent-director-stub.ts'
 import type { Client } from 'agent-director'
-import type { WebClient } from '@slack/web-api'
 import type { FindMissingParams, SendKeysParams, StatusParams } from 'agent-director'
-import { personaInstanceId } from '../src/persona-identity.ts'
+import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
+import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
+import type { Persona } from '../src/config.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -47,6 +54,8 @@ import { personaInstanceId } from '../src/persona-identity.ts'
 const FAST_DELAY_S = 0.01  // 10 ms timer — fast enough for tests
 const SLOW_DELAY_S = 9999  // large enough to never fire during a test
 const WAIT_MS = 50         // wait after scheduling; long enough for FAST_DELAY_S to fire
+const CAP_BASE_DELAY_S = 0.001  // 1 ms base for the cap-driving helper below
+const CAP_MARGIN_MS = 40        // margin above each computed backoff delay
 
 // ---------------------------------------------------------------------------
 // Factory
@@ -57,21 +66,22 @@ type DepsOpts = {
   isSessionConnectedResult?: boolean  // default: false (not yet reconnected)
   hasSessionStreamResult?: boolean  // default: true (stream present — prior semantics)
   launchSessionResult?: boolean   // default: true (launch succeeds)
-  launchSession?: (channelId: string, cwd: string, sessionId?: string) => Promise<boolean>  // override entire launchSession
+  launchSession?: (key: string, cwd: string, sessionId?: string) => Promise<boolean>  // override entire launchSession
   restartDelay?: number           // default: FAST_DELAY_S
   isShuttingDown?: boolean        // default: false
+  onCapReached?: (key: string) => void  // called after the capture (e.g. the real cap-notice function)
 }
 
 function makeDeps(opts: DepsOpts = {}): RestartDeps & {
   isSessionAliveCalls: string[]
   killSessionCalls: string[]
-  launchSessionCalls: Array<{ channelId: string; cwd: string; sessionId: string | undefined }>
+  launchSessionCalls: Array<{ key: string; cwd: string; sessionId: string | undefined }>
   reconnectSessionCalls: string[]
   onCapReachedCalls: string[]
 } {
   const isSessionAliveCalls: string[] = []
   const killSessionCalls: string[] = []
-  const launchSessionCalls: Array<{ channelId: string; cwd: string; sessionId: string | undefined }> = []
+  const launchSessionCalls: Array<{ key: string; cwd: string; sessionId: string | undefined }> = []
   const reconnectSessionCalls: string[] = []
   const onCapReachedCalls: string[] = []
 
@@ -82,30 +92,46 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     reconnectSessionCalls,
     onCapReachedCalls,
 
-    async isSessionAlive(channelId) {
-      isSessionAliveCalls.push(channelId)
+    async isSessionAlive(key) {
+      isSessionAliveCalls.push(key)
       return opts.isSessionAliveResult ?? false
     },
-    isSessionConnected(_channelId) {
+    isSessionConnected(_key) {
       return opts.isSessionConnectedResult ?? false
     },
-    hasSessionStream(_channelId) {
+    hasSessionStream(_key) {
       return opts.hasSessionStreamResult ?? true
     },
-    async reconnectSession(channelId) {
-      reconnectSessionCalls.push(channelId)
+    async reconnectSession(key) {
+      reconnectSessionCalls.push(key)
     },
-    async killSession(channelId) {
-      killSessionCalls.push(channelId)
+    async killSession(key) {
+      killSessionCalls.push(key)
     },
-    async launchSession(channelId, cwd, sessionId) {
-      launchSessionCalls.push({ channelId, cwd, sessionId })
-      if (opts.launchSession) return opts.launchSession(channelId, cwd, sessionId)
+    async launchSession(key, cwd, sessionId) {
+      launchSessionCalls.push({ key, cwd, sessionId })
+      if (opts.launchSession) return opts.launchSession(key, cwd, sessionId)
       return opts.launchSessionResult ?? true
     },
     getRestartDelay: () => opts.restartDelay ?? FAST_DELAY_S,
     isShuttingDown: () => opts.isShuttingDown ?? false,
-    onCapReached: (channelId) => { onCapReachedCalls.push(channelId) },
+    onCapReached: (key) => {
+      onCapReachedCalls.push(key)
+      opts.onCapReached?.(key)
+    },
+  }
+}
+
+/**
+ * Drive `count` consecutive failed launches for persona `key` (deps must fail
+ * its launches and use CAP_BASE_DELAY_S), waiting out each backoff delay from
+ * the persona's own current failure count.
+ */
+async function driveFailures(key: string, cwd: string, count: number): Promise<void> {
+  for (let i = 0; i < count; i++) {
+    const backoffDelayMs = Math.min(CAP_BASE_DELAY_S * Math.pow(2, getFailureCount(key)), 900) * 1000
+    scheduleRestart(key, cwd)
+    await Bun.sleep(backoffDelayMs + CAP_MARGIN_MS)
   }
 }
 
@@ -127,11 +153,11 @@ describe('scheduleRestart', () => {
     const deps = makeDeps()
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     expect(deps.launchSessionCalls).toHaveLength(1)
-    expect(deps.launchSessionCalls[0].channelId).toBe('C_TEST1')
+    expect(deps.launchSessionCalls[0].key).toBe('test_bot_1')
     expect(deps.launchSessionCalls[0].cwd).toBe('/cwd/test')
   })
 
@@ -139,7 +165,7 @@ describe('scheduleRestart', () => {
     const deps = makeDeps({ restartDelay: 0 })
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     expect(deps.launchSessionCalls).toHaveLength(0)
@@ -149,12 +175,12 @@ describe('scheduleRestart', () => {
     const deps = makeDeps({ isSessionAliveResult: true })
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     expect(deps.isSessionAliveCalls).toHaveLength(1)
     expect(deps.reconnectSessionCalls).toHaveLength(1)
-    expect(deps.reconnectSessionCalls[0]).toBe('C_TEST1')
+    expect(deps.reconnectSessionCalls[0]).toBe('test_bot_1')
     expect(deps.launchSessionCalls).toHaveLength(0)
   })
 
@@ -167,7 +193,7 @@ describe('scheduleRestart', () => {
     }
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     expect(reconnectCalled).toBe(true)
@@ -178,7 +204,7 @@ describe('scheduleRestart', () => {
     const deps = makeDeps({ isShuttingDown: true })
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     expect(deps.launchSessionCalls).toHaveLength(0)
@@ -196,7 +222,7 @@ describe('scheduleRestart', () => {
     })
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     // Genuinely healed: the guard returns before any recovery action.
@@ -217,11 +243,11 @@ describe('scheduleRestart', () => {
     })
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     // The alive branch ran reconnectSession — the guard did NOT short-circuit.
-    expect(deps.reconnectSessionCalls).toEqual(['C_TEST1'])
+    expect(deps.reconnectSessionCalls).toEqual(['test_bot_1'])
     expect(deps.launchSessionCalls).toHaveLength(0)
   })
 
@@ -229,24 +255,24 @@ describe('scheduleRestart', () => {
     const deps = makeDeps({ isSessionAliveResult: false })
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     expect(deps.killSessionCalls).toHaveLength(1)
-    expect(deps.killSessionCalls[0]).toBe('C_TEST1')
+    expect(deps.killSessionCalls[0]).toBe('test_bot_1')
     expect(deps.launchSessionCalls).toHaveLength(1)
-    expect(deps.launchSessionCalls[0].channelId).toBe('C_TEST1')
+    expect(deps.launchSessionCalls[0].key).toBe('test_bot_1')
   })
 
   test('8. restart with stored session ID — launchSession receives session ID argument', async () => {
     const deps = makeDeps()
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test', 'saved-session-123')
+    scheduleRestart('test_bot_1', '/cwd/test', 'saved-session-123')
     await Bun.sleep(WAIT_MS)
 
     expect(deps.launchSessionCalls).toHaveLength(1)
-    expect(deps.launchSessionCalls[0].channelId).toBe('C_TEST1')
+    expect(deps.launchSessionCalls[0].key).toBe('test_bot_1')
     expect(deps.launchSessionCalls[0].cwd).toBe('/cwd/test')
     expect(deps.launchSessionCalls[0].sessionId).toBe('saved-session-123')
   })
@@ -255,7 +281,7 @@ describe('scheduleRestart', () => {
     const deps = makeDeps()
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     expect(deps.launchSessionCalls).toHaveLength(1)
@@ -266,13 +292,13 @@ describe('scheduleRestart', () => {
     const deps = makeDeps({ launchSessionResult: true })
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test', 'saved-session-123')
+    scheduleRestart('test_bot_1', '/cwd/test', 'saved-session-123')
     await Bun.sleep(WAIT_MS)
 
     expect(deps.launchSessionCalls).toHaveLength(1)
     expect(deps.launchSessionCalls[0].sessionId).toBe('saved-session-123')
     // No failure tracking exists — restart retries indefinitely on death
-    expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
+    expect(isRestartPendingOrActive('test_bot_1')).toBe(false)
   })
 })
 
@@ -285,8 +311,8 @@ describe('cancelAllRestartTimers', () => {
     const deps = makeDeps() // FAST_DELAY_S = 10 ms
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/one')
-    scheduleRestart('C_TEST2', '/cwd/two')
+    scheduleRestart('test_bot_1', '/cwd/one')
+    scheduleRestart('test_bot_2', '/cwd/two')
 
     // Cancel synchronously before the 10 ms timers can fire
     cancelAllRestartTimers()
@@ -303,17 +329,17 @@ describe('cancelAllRestartTimers', () => {
 // ---------------------------------------------------------------------------
 
 describe('isRestartPendingOrActive', () => {
-  test('returns false for channel with no timer and no active launch', () => {
-    expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
+  test('returns false for persona with no timer and no active launch', () => {
+    expect(isRestartPendingOrActive('test_bot_1')).toBe(false)
   })
 
   test('returns true after scheduleRestart is called (timer pending, not yet fired)', () => {
     const deps = makeDeps({ restartDelay: SLOW_DELAY_S })
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
 
-    expect(isRestartPendingOrActive('C_TEST1')).toBe(true)
+    expect(isRestartPendingOrActive('test_bot_1')).toBe(true)
   })
 
   test('returns true while launchSession is in progress', async () => {
@@ -323,10 +349,10 @@ describe('isRestartPendingOrActive', () => {
     const deps = makeDeps({ launchSession: () => launchPromise })
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS) // timer has fired; launchSession is now awaiting
 
-    expect(isRestartPendingOrActive('C_TEST1')).toBe(true)
+    expect(isRestartPendingOrActive('test_bot_1')).toBe(true)
 
     launchResolve(true)
     await Bun.sleep(1) // let finally block run
@@ -339,13 +365,13 @@ describe('isRestartPendingOrActive', () => {
     const deps = makeDeps({ launchSession: () => launchPromise })
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     launchResolve(true)
     await Bun.sleep(1)
 
-    expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
+    expect(isRestartPendingOrActive('test_bot_1')).toBe(false)
   })
 
   test('returns false after launchSession completes with failure', async () => {
@@ -355,27 +381,27 @@ describe('isRestartPendingOrActive', () => {
     const deps = makeDeps({ launchSession: () => launchPromise })
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     launchResolve(false)
     await Bun.sleep(1)
 
-    expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
+    expect(isRestartPendingOrActive('test_bot_1')).toBe(false)
   })
 
-  test('returns false for different channel while another has restart in progress', async () => {
+  test('returns false for different persona while another has restart in progress', async () => {
     let launchResolve!: (ok: boolean) => void
     const launchPromise = new Promise<boolean>((res) => { launchResolve = res })
 
     const deps = makeDeps({ launchSession: () => launchPromise })
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
-    expect(isRestartPendingOrActive('C_TEST1')).toBe(true)
-    expect(isRestartPendingOrActive('C_TEST2')).toBe(false)
+    expect(isRestartPendingOrActive('test_bot_1')).toBe(true)
+    expect(isRestartPendingOrActive('test_bot_2')).toBe(false)
 
     launchResolve(true)
     await Bun.sleep(1)
@@ -385,12 +411,12 @@ describe('isRestartPendingOrActive', () => {
     const deps = makeDeps({ restartDelay: SLOW_DELAY_S })
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
-    expect(isRestartPendingOrActive('C_TEST1')).toBe(true)
+    scheduleRestart('test_bot_1', '/cwd/test')
+    expect(isRestartPendingOrActive('test_bot_1')).toBe(true)
 
     cancelAllRestartTimers()
 
-    expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
+    expect(isRestartPendingOrActive('test_bot_1')).toBe(false)
   })
 
   test('regression b.2ir: returns true while isSessionAlive is pending (race window between pendingRestartTimers.delete and activeLaunches.add is closed)', async () => {
@@ -402,7 +428,7 @@ describe('isRestartPendingOrActive', () => {
     const alivePromise = new Promise<boolean>((res) => { aliveResolve = res })
 
     const deps: RestartDeps = {
-      isSessionAlive: (_channelId) => alivePromise,  // never resolves until we say so
+      isSessionAlive: (_key) => alivePromise,  // never resolves until we say so
       isSessionConnected: () => false,
       hasSessionStream: () => true,
       reconnectSession: async () => {},
@@ -410,17 +436,17 @@ describe('isRestartPendingOrActive', () => {
       launchSession: async () => true,
       getRestartDelay: () => FAST_DELAY_S,
       isShuttingDown: () => false,
-      onCapReached: (_channelId) => { /* no-op stub */ },
+      onCapReached: (_key) => { /* no-op stub */ },
     }
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS) // timer has fired; isSessionAlive is now awaiting
 
-    // pendingRestartTimers no longer has C_TEST1 (timer removed itself),
+    // pendingRestartTimers no longer has test_bot_1 (timer removed itself),
     // so the only thing keeping isRestartPendingOrActive true is activeLaunches.
     // Before the fix this returned false; after the fix it must return true.
-    expect(isRestartPendingOrActive('C_TEST1')).toBe(true)
+    expect(isRestartPendingOrActive('test_bot_1')).toBe(true)
 
     aliveResolve(false) // avoid dangling promise
     await Bun.sleep(1)  // let finally block run
@@ -439,14 +465,14 @@ describe('_resetRestartState', () => {
     const deps = makeDeps({ launchSession: () => launchPromise })
     initRestart(deps)
 
-    scheduleRestart('C_TEST1', '/cwd/test')
+    scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS) // launch is now in progress
 
-    expect(isRestartPendingOrActive('C_TEST1')).toBe(true)
+    expect(isRestartPendingOrActive('test_bot_1')).toBe(true)
 
     _resetRestartState()
 
-    expect(isRestartPendingOrActive('C_TEST1')).toBe(false)
+    expect(isRestartPendingOrActive('test_bot_1')).toBe(false)
 
     launchResolve(true) // resolve to avoid dangling promise
   })
@@ -476,10 +502,10 @@ describe('backoff integration (SR-29.3)', () => {
     const deps = makeDeps({ launchSessionResult: false })
     initRestart(deps)
 
-    scheduleRestart('C_BACKOFF', '/cwd/test')
+    scheduleRestart('backoff_bot', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
-    expect(getFailureCount('C_BACKOFF')).toBe(1)
+    expect(getFailureCount('backoff_bot')).toBe(1)
   })
 
   test('(1b) launchSession=true resets getFailureCount to 0', async () => {
@@ -487,18 +513,18 @@ describe('backoff integration (SR-29.3)', () => {
     initRestart(deps)
 
     // Accumulate a failure first
-    scheduleRestart('C_BACKOFF', '/cwd/test')
+    scheduleRestart('backoff_bot', '/cwd/test')
     await Bun.sleep(WAIT_MS)
-    expect(getFailureCount('C_BACKOFF')).toBe(1)
+    expect(getFailureCount('backoff_bot')).toBe(1)
 
     // Now succeed — deps returns true by default once opts is refreshed
     // Re-init with success result and fire again
     const deps2 = makeDeps({ launchSessionResult: true })
     initRestart(deps2)
-    scheduleRestart('C_BACKOFF', '/cwd/test')
+    scheduleRestart('backoff_bot', '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
-    expect(getFailureCount('C_BACKOFF')).toBe(0)
+    expect(getFailureCount('backoff_bot')).toBe(0)
   })
 
   // -------------------------------------------------------------------------
@@ -506,7 +532,7 @@ describe('backoff integration (SR-29.3)', () => {
   // -------------------------------------------------------------------------
 
   test('(2) 5 consecutive failures → onCapReached EXACTLY once; no pending timer after cap', async () => {
-    const CHANNEL = 'C_CAP'
+    const KEY = 'cap_bot'
     const CAP = 5
     let launchCount = 0
 
@@ -518,7 +544,7 @@ describe('backoff integration (SR-29.3)', () => {
 
     const deps = makeDeps({
       restartDelay: BASE_DELAY_S,
-      launchSession: async (_channelId) => {
+      launchSession: async (_key) => {
         launchCount++
         return false
       },
@@ -529,26 +555,26 @@ describe('backoff integration (SR-29.3)', () => {
     // Wait per iteration = min(BASE_DELAY_S * 2^i, 900) * 1000 ms + MARGIN_MS.
     for (let i = 0; i < CAP; i++) {
       const backoffDelayMs = Math.min(BASE_DELAY_S * Math.pow(2, i), 900) * 1000
-      scheduleRestart(CHANNEL, '/cwd/test')
+      scheduleRestart(KEY, '/cwd/test')
       await Bun.sleep(backoffDelayMs + MARGIN_MS)
     }
 
     // onCapReached fired exactly once (on the 5th failure)
     expect(deps.onCapReachedCalls).toHaveLength(1)
-    expect(deps.onCapReachedCalls[0]).toBe(CHANNEL)
+    expect(deps.onCapReachedCalls[0]).toBe(KEY)
 
     // getFailureCount is at cap
-    expect(getFailureCount(CHANNEL)).toBe(CAP)
-    expect(isAtCap(CHANNEL, CAP)).toBe(true)
+    expect(getFailureCount(KEY)).toBe(CAP)
+    expect(isAtCap(KEY, CAP)).toBe(true)
 
     // No pending timer after cap — restart.ts returned early without scheduling.
     // This is the load-bearing assertion alongside onCapReachedCalls length 1:
     // once at cap, restart.ts arms no further timer.
-    expect(isRestartPendingOrActive(CHANNEL)).toBe(false)
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
 
     // NOTE: this test drives exactly CAP scheduleRestart calls, so launchCount==CAP
     // is guaranteed by the driver, not proven by restart.ts. The "no 6th launch"
-    // property — that a subsequent health tick does NOT re-launch a capped channel —
+    // property — that a subsequent health tick does NOT re-launch a capped persona —
     // is the tick-guard's job and is covered in health-check.test.ts.
   })
 
@@ -558,7 +584,7 @@ describe('backoff integration (SR-29.3)', () => {
   // -------------------------------------------------------------------------
 
   test('(3) post-cap scheduleRestart re-attempt: success resets isAtCap; onCapReached not re-fired', async () => {
-    const CHANNEL = 'C_CAP_THEN_RECOVER'
+    const KEY = 'cap_then_recover_bot'
     const CAP = 5
     let launchCount = 0
 
@@ -578,11 +604,11 @@ describe('backoff integration (SR-29.3)', () => {
 
     for (let i = 0; i < CAP; i++) {
       const backoffDelayMs = Math.min(BASE_DELAY_S * Math.pow(2, i), 900) * 1000
-      scheduleRestart(CHANNEL, '/cwd/test')
+      scheduleRestart(KEY, '/cwd/test')
       await Bun.sleep(backoffDelayMs + MARGIN_MS)
     }
 
-    expect(isAtCap(CHANNEL, CAP)).toBe(true)
+    expect(isAtCap(KEY, CAP)).toBe(true)
     expect(failingDeps.onCapReachedCalls).toHaveLength(1)
 
     // Phase 2: an inbound trigger (explicit scheduleRestart — simulates user message
@@ -593,12 +619,12 @@ describe('backoff integration (SR-29.3)', () => {
     initRestart(recoveringDeps)
 
     const backoffAtCap = Math.min(BASE_DELAY_S * Math.pow(2, CAP), 900) * 1000
-    scheduleRestart(CHANNEL, '/cwd/test')
+    scheduleRestart(KEY, '/cwd/test')
     await Bun.sleep(backoffAtCap + MARGIN_MS)
 
     // Successful launch resets the cap
-    expect(isAtCap(CHANNEL, CAP)).toBe(false)
-    expect(getFailureCount(CHANNEL)).toBe(0)
+    expect(isAtCap(KEY, CAP)).toBe(false)
+    expect(getFailureCount(KEY)).toBe(0)
 
     // onCapReached did NOT re-fire during this recovery (new deps, no calls)
     expect(recoveringDeps.onCapReachedCalls).toHaveLength(0)
@@ -628,24 +654,24 @@ describe('backoff integration (SR-29.3)', () => {
   // -------------------------------------------------------------------------
 
   test('(4a) reconnect result=success resets getFailureCount to 0', async () => {
-    const CHANNEL = 'C_RECONNECT_SUCCESS'
+    const KEY = 'reconnect_success_bot'
 
     // Pre-seed a failure count so there is something to reset
     const failDeps = makeDeps({ launchSessionResult: false })
     initRestart(failDeps)
-    scheduleRestart(CHANNEL, '/cwd/test')
+    scheduleRestart(KEY, '/cwd/test')
     await Bun.sleep(WAIT_MS)
-    expect(getFailureCount(CHANNEL)).toBe(1)
+    expect(getFailureCount(KEY)).toBe(1)
 
     // Now simulate alive=true with reconnect returning 'success'
     const reconnectDeps = makeDeps({ isSessionAliveResult: true })
-    reconnectDeps.reconnectSession = async (_channelId) => 'success'
+    reconnectDeps.reconnectSession = async (_key) => 'success'
     initRestart(reconnectDeps)
 
-    scheduleRestart(CHANNEL, '/cwd/test')
+    scheduleRestart(KEY, '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
-    expect(getFailureCount(CHANNEL)).toBe(0)
+    expect(getFailureCount(KEY)).toBe(0)
   })
 
   test('(4b) reconnect result=escalate-dead leaves counter unchanged at reconnect site (single-counting-site pin; no cap accumulation)', async () => {
@@ -658,78 +684,78 @@ describe('backoff integration (SR-29.3)', () => {
     // failure and asserts the count remains 1 — so escalate-dead ticks never
     // accumulate toward the b.7u6 5-spawn cap (a pre-seeded failure stays put,
     // and repeated escalate-dead ticks would leave it there rather than climbing).
-    const CHANNEL = 'C_RECONNECT_ESCALATE'
+    const KEY = 'reconnect_escalate_bot'
 
     // Pre-seed a failure so "unchanged" is distinguishable from "reset to 0"
     const failDeps = makeDeps({ launchSessionResult: false })
     initRestart(failDeps)
-    scheduleRestart(CHANNEL, '/cwd/test')
+    scheduleRestart(KEY, '/cwd/test')
     await Bun.sleep(WAIT_MS)
-    expect(getFailureCount(CHANNEL)).toBe(1)
+    expect(getFailureCount(KEY)).toBe(1)
 
     // Simulate alive=true with reconnect returning 'escalate-dead'
     const escapingDeps = makeDeps({ isSessionAliveResult: true })
-    escapingDeps.reconnectSession = async (_channelId) => 'escalate-dead'
+    escapingDeps.reconnectSession = async (_key) => 'escalate-dead'
     initRestart(escapingDeps)
 
-    scheduleRestart(CHANNEL, '/cwd/test')
+    scheduleRestart(KEY, '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     // Counter UNCHANGED at the reconnect site — neither incremented nor reset.
     // No cap accumulation (b.7u6): the escalate-dead tick did not climb the
     // failure count toward the 5-spawn cap, and onCapReached never fired.
-    expect(getFailureCount(CHANNEL)).toBe(1)
-    expect(isAtCap(CHANNEL, RESTART_FAILURE_CAP)).toBe(false)
+    expect(getFailureCount(KEY)).toBe(1)
+    expect(isAtCap(KEY, RESTART_FAILURE_CAP)).toBe(false)
     expect(escapingDeps.onCapReachedCalls).toHaveLength(0)
   })
 
   test('(4c) reconnect result=transient leaves counter unchanged at reconnect site', async () => {
-    const CHANNEL = 'C_RECONNECT_TRANSIENT'
+    const KEY = 'reconnect_transient_bot'
 
     // Pre-seed a failure so "unchanged" is distinguishable from "reset to 0"
     const failDeps = makeDeps({ launchSessionResult: false })
     initRestart(failDeps)
-    scheduleRestart(CHANNEL, '/cwd/test')
+    scheduleRestart(KEY, '/cwd/test')
     await Bun.sleep(WAIT_MS)
-    expect(getFailureCount(CHANNEL)).toBe(1)
+    expect(getFailureCount(KEY)).toBe(1)
 
     const transientDeps = makeDeps({ isSessionAliveResult: true })
-    transientDeps.reconnectSession = async (_channelId) => 'transient'
+    transientDeps.reconnectSession = async (_key) => 'transient'
     initRestart(transientDeps)
 
-    scheduleRestart(CHANNEL, '/cwd/test')
+    scheduleRestart(KEY, '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     // Counter unchanged — counting is not done at the reconnect site
-    expect(getFailureCount(CHANNEL)).toBe(1)
+    expect(getFailureCount(KEY)).toBe(1)
   })
 
   test('(4d) reconnect throws (undefined result) — counter unchanged at reconnect site', async () => {
-    const CHANNEL = 'C_RECONNECT_THROW'
+    const KEY = 'reconnect_throw_bot'
 
     // Pre-seed a failure so "unchanged" is distinguishable from "reset to 0"
     const failDeps = makeDeps({ launchSessionResult: false })
     initRestart(failDeps)
-    scheduleRestart(CHANNEL, '/cwd/test')
+    scheduleRestart(KEY, '/cwd/test')
     await Bun.sleep(WAIT_MS)
-    expect(getFailureCount(CHANNEL)).toBe(1)
+    expect(getFailureCount(KEY)).toBe(1)
 
     const throwingDeps = makeDeps({ isSessionAliveResult: true })
-    throwingDeps.reconnectSession = async (_channelId) => {
+    throwingDeps.reconnectSession = async (_key) => {
       throw new Error('sendKeys failed')
     }
     initRestart(throwingDeps)
 
-    scheduleRestart(CHANNEL, '/cwd/test')
+    scheduleRestart(KEY, '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     // Counter unchanged — the catch block sets result=undefined, no recordFailure
-    expect(getFailureCount(CHANNEL)).toBe(1)
+    expect(getFailureCount(KEY)).toBe(1)
   })
 
   // -------------------------------------------------------------------------
   // (5) SR-25.4 no-stacking: pending-timer dedupe still works alongside
-  //     backoff. A second scheduleRestart for the same channel cancels the
+  //     backoff. A second scheduleRestart for the same persona cancels the
   //     first timer (cancel-and-replace semantic).
   // -------------------------------------------------------------------------
 
@@ -737,7 +763,7 @@ describe('backoff integration (SR-29.3)', () => {
   // (6) b.9a7 — reconnect defer contract. A tick-driven reconnect that returns
   //     'transient' (e.g. the server.ts adapter deferring a `working` session,
   //     hazard 2 / b.rmy) or that fails must not consume the b.7u6 cap and must
-  //     leave the channel free for a later tick to retry: no launchSession, no
+  //     leave the persona free for a later tick to retry: no launchSession, no
   //     killSession, no recordFailure, no onCapReached, and no pending timer
   //     re-armed from restart.ts (the tick is the retry driver, not re-entry).
   // -------------------------------------------------------------------------
@@ -747,65 +773,210 @@ describe('backoff integration (SR-29.3)', () => {
     // is already pinned by 4c): the working-state defer takes NO recovery action
     // and restart.ts does NOT re-enter scheduleRestart — the tick is the retry
     // driver. This asserts the observable no-op side of the defer contract.
-    const CHANNEL = 'C_9A7_DEFER'
+    const KEY = 'defer_9a7_bot'
     const deps = makeDeps({ isSessionAliveResult: true })
-    deps.reconnectSession = async (channelId) => {
-      deps.reconnectSessionCalls.push(channelId)
+    deps.reconnectSession = async (key) => {
+      deps.reconnectSessionCalls.push(key)
       return 'transient'
     }
     initRestart(deps)
 
-    scheduleRestart(CHANNEL, '/cwd/test')
+    scheduleRestart(KEY, '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     // Reconnect was attempted, but the defer path leaves the turn undisturbed:
     // no kill, no relaunch.
-    expect(deps.reconnectSessionCalls).toEqual([CHANNEL])
+    expect(deps.reconnectSessionCalls).toEqual([KEY])
     expect(deps.killSessionCalls).toHaveLength(0)
     expect(deps.launchSessionCalls).toHaveLength(0)
     // restart.ts does NOT re-enter scheduleRestart — no pending timer remains;
     // the next health-check tick is the retry driver.
-    expect(isRestartPendingOrActive(CHANNEL)).toBe(false)
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
   })
 
   test('(6b) b.9a7: repeated reconnect failures never consume the cap (single counting site)', async () => {
-    const CHANNEL = 'C_9A7_RETRY'
+    const KEY = 'retry_9a7_bot'
     const deps = makeDeps({ isSessionAliveResult: true })
     // Every reconnect attempt fails (throws → undefined result). Simulate the
     // tick re-driving scheduleRestart many times over.
-    deps.reconnectSession = async (channelId) => {
-      deps.reconnectSessionCalls.push(channelId)
+    deps.reconnectSession = async (key) => {
+      deps.reconnectSessionCalls.push(key)
       throw new Error('sendKeys failed')
     }
     initRestart(deps)
 
     for (let i = 0; i < RESTART_FAILURE_CAP + 3; i++) {
-      scheduleRestart(CHANNEL, '/cwd/test')
+      scheduleRestart(KEY, '/cwd/test')
       await Bun.sleep(WAIT_MS)
     }
 
     // Reconnect was attempted every time, but the reconnect path never counts a
     // failure, so the cap is never reached despite far more than CAP attempts.
     expect(deps.reconnectSessionCalls.length).toBe(RESTART_FAILURE_CAP + 3)
-    expect(getFailureCount(CHANNEL)).toBe(0)
-    expect(isAtCap(CHANNEL, RESTART_FAILURE_CAP)).toBe(false)
+    expect(getFailureCount(KEY)).toBe(0)
+    expect(isAtCap(KEY, RESTART_FAILURE_CAP)).toBe(false)
     expect(deps.onCapReachedCalls).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // (7) b.av2 SR-6.3 — backoff, cap latch and pending timers are per persona
+  //     key: capping persona A leaves persona B's state untouched.
+  // -------------------------------------------------------------------------
+
+  test('(7) two personas: capping A fires onCapReached once for A; B\'s count, cap latch and pending timer are untouched and B still launches', async () => {
+    const A = 'persona_a'
+    const B = 'persona_b'
+    let bLaunchOk = false
+    const deps = makeDeps({
+      restartDelay: CAP_BASE_DELAY_S,
+      launchSession: async (key) => (key === B ? bLaunchOk : false),
+    })
+    initRestart(deps)
+
+    // B: one failure on record, then a pending (never-firing) timer.
+    await driveFailures(B, '/cwd/b', 1)
+    deps.getRestartDelay = () => SLOW_DELAY_S
+    scheduleRestart(B, '/cwd/b')
+    deps.getRestartDelay = () => CAP_BASE_DELAY_S
+
+    // A: fail to the cap.
+    await driveFailures(A, '/cwd/a', RESTART_FAILURE_CAP)
+
+    expect(deps.onCapReachedCalls).toEqual([A])
+    expect(getFailureCount(A)).toBe(RESTART_FAILURE_CAP)
+    expect(isRestartPendingOrActive(A)).toBe(false)
+    // B is exactly as it was: one failure, not at cap, timer still pending.
+    expect(getFailureCount(B)).toBe(1)
+    expect(isAtCap(B, RESTART_FAILURE_CAP)).toBe(false)
+    expect(isRestartPendingOrActive(B)).toBe(true)
+    expect(deps.launchSessionCalls.filter((c) => c.key === B)).toHaveLength(1)
+
+    // B still schedules (replacing its pending timer) and launches.
+    bLaunchOk = true
+    await driveFailures(B, '/cwd/b', 1)
+    expect(deps.launchSessionCalls.filter((c) => c.key === B)).toHaveLength(2)
+    expect(getFailureCount(B)).toBe(0)
+    expect(getFailureCount(A)).toBe(RESTART_FAILURE_CAP)
+
+    // A's cap latch is A's alone: B reaching the cap notifies for B too.
+    bLaunchOk = false
+    await driveFailures(B, '/cwd/b', RESTART_FAILURE_CAP)
+    expect(deps.onCapReachedCalls).toEqual([A, B])
   })
 
   test('(5) SR-25.4 no-stacking: second scheduleRestart cancels first pending timer (cancel-and-replace)', async () => {
     const deps = makeDeps({ restartDelay: SLOW_DELAY_S, launchSessionResult: false })
     initRestart(deps)
 
-    scheduleRestart('C_NOSTACK', '/cwd/test')
-    expect(isRestartPendingOrActive('C_NOSTACK')).toBe(true)
+    scheduleRestart('nostack_bot', '/cwd/test')
+    expect(isRestartPendingOrActive('nostack_bot')).toBe(true)
 
     // A second call cancels the first and replaces it — still one pending timer
-    scheduleRestart('C_NOSTACK', '/cwd/test')
-    expect(isRestartPendingOrActive('C_NOSTACK')).toBe(true)
+    scheduleRestart('nostack_bot', '/cwd/test')
+    expect(isRestartPendingOrActive('nostack_bot')).toBe(true)
 
     // Only one pending timer exists (cancel-and-replace): counter has not changed
     // because no timer has fired yet
-    expect(getFailureCount('C_NOSTACK')).toBe(0)
+    expect(getFailureCount('nostack_bot')).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Restart cap notice (b.av2 SR-7.2) — `onCapReached` calls the session
+// manager's `notifyRestartCapReached`, which goes through the real per-persona
+// notifier installed with `setSessionNotifier`. Each persona has its own stub
+// Slack, so the post's client, destination and text are all observable.
+// ---------------------------------------------------------------------------
+
+describe('restart cap notice goes to the persona destination (b.av2 SR-7.2)', () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'restart-cap-notice-'))
+  })
+
+  afterEach(() => {
+    setSessionNotifier(undefined)
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  /**
+   * Two personas and the real notifier over one stub Slack each, installed
+   * with `setSessionNotifier`. A's destination is its second channel, so a
+   * post to "the channel" (its first) is distinguishable from a post to the
+   * destination.
+   */
+  function setupCapNotice(): { a: Persona; b: Persona; h: NotifierHarness } {
+    const config = makeMultiPersonaConfig([
+      {
+        name: 'Alpha Bot',
+        channels: [{ id: 'C0ALPHA01', delivery: 'all' }, { id: 'C0ALPHAPR', delivery: 'all' }],
+        permission_prompts: 'C0ALPHAPR',
+      },
+      { name: 'beta_bot' },
+    ], dir)
+    const [a, b] = config.personas as [Persona, Persona]
+    const h = makeNotifierHarness(config)
+    setSessionNotifier(h.notifier.notify)
+    return { a, b, h }
+  }
+
+  /** Let the fire-and-forget cap notice post settle. */
+  async function settleNotices(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+
+  test('cap for persona A posts exactly one notice on A\'s client to A\'s permission_prompts channel, naming A; nothing on B', async () => {
+    const { a, b, h } = setupCapNotice()
+
+    const deps = makeDeps({
+      restartDelay: CAP_BASE_DELAY_S,
+      launchSessionResult: false,
+      onCapReached: notifyRestartCapReached,
+    })
+    initRestart(deps)
+
+    await driveFailures(a.key, a.working_directory, RESTART_FAILURE_CAP)
+
+    expect(deps.onCapReachedCalls).toEqual([a.key])
+    const posts = h.posts(a.key)
+    expect(posts).toEqual([{ channel: 'C0ALPHAPR', text: expect.any(String) }])
+    expect(h.posts(b.key)).toHaveLength(0)
+    expect(h.logs).toEqual([])
+
+    const text = posts[0]!.text
+    expect(text.startsWith(`Persona ${renderPersonaRef(a.name, a.key)}: `)).toBe(true)
+    expect(text).toContain('`SpawnCapReached`')
+    expect(text).not.toMatch(/this channel/i)
+    for (const id of ['C0ALPHA01', 'C0ALPHAPR']) expect(text).not.toContain(id)
+  })
+
+  test('a further failed re-attempt after the cap was reached and notified does not notify again (PM N7)', async () => {
+    const { a, b, h } = setupCapNotice()
+
+    const deps = makeDeps({
+      restartDelay: CAP_BASE_DELAY_S,
+      launchSessionResult: false,
+      onCapReached: notifyRestartCapReached,
+    })
+    initRestart(deps)
+
+    await driveFailures(a.key, a.working_directory, RESTART_FAILURE_CAP)
+    await settleNotices()
+    expect(deps.onCapReachedCalls).toEqual([a.key])
+    expect(h.posts(a.key)).toHaveLength(1)
+
+    // An explicit re-attempt (e.g. an inbound message) while capped fails again:
+    // the failure is counted, but the once-per-episode latch holds.
+    await driveFailures(a.key, a.working_directory, 1)
+    await settleNotices()
+
+    expect(deps.launchSessionCalls.filter((c) => c.key === a.key)).toHaveLength(RESTART_FAILURE_CAP + 1)
+    expect(getFailureCount(a.key)).toBe(RESTART_FAILURE_CAP + 1)
+    expect(deps.onCapReachedCalls).toEqual([a.key])
+    expect(h.posts(a.key)).toHaveLength(1)
+    expect(h.posts(b.key)).toHaveLength(0)
+    expect(h.logs).toEqual([])
   })
 })
 
@@ -868,7 +1039,7 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     })
     _resetOutageState()
     initOutageState({
-      postToChannel: () => {},
+      notify: () => {},
       getClient: () => stub as unknown as Client,
     })
     setClientForTests(stub as unknown as Client)
@@ -876,7 +1047,7 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
 
     // The adapter resolves the instance ID from the persona key alone
     // (b.av2 SR-2.2) — the stand-in key is the channel ID, C_DEADTMUX.
-    const reconnectSession = _buildReconnectSessionAdapter({} as unknown as WebClient)
+    const reconnectSession = _buildReconnectSessionAdapter()
 
     const deps: RestartDeps & { killSessionCalls: string[]; launchSessionCalls: string[] } = {
       killSessionCalls,
@@ -885,8 +1056,8 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
       isSessionConnected() { return false },
       hasSessionStream() { return true },
       reconnectSession,
-      async killSession(channelId) { killSessionCalls.push(channelId) },
-      async launchSession(channelId) { launchSessionCalls.push(channelId); return true },
+      async killSession(key) { killSessionCalls.push(key) },
+      async launchSession(key) { launchSessionCalls.push(key); return true },
       getRestartDelay: () => FAST_DELAY_S,
       isShuttingDown: () => false,
       onCapReached: () => {},
@@ -906,14 +1077,14 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
   })
 
   test('tick 1: alive+dead-tmux verdict fires exactly one internal findMissing sweep (no kill/relaunch); tick 2: session dead → kill+relaunch', async () => {
-    const CHANNEL = 'C_DEADTMUX'
+    const KEY = 'C_DEADTMUX'
     const { deps, findMissingCalls, statusCalls, sendKeysCalls, setAlive } = makeRealAdapterDeps()
     initRestart(deps)
 
     // --- Tick 1: row still looks alive; the real adapter runs reconnectMcp,
     // which returns 'dead-session' → 'escalate-dead', firing the internal sweep.
     setAlive(true)
-    scheduleRestart(CHANNEL, '/cwd/test')
+    scheduleRestart(KEY, '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
     // The existing memoized sweep ran exactly once — this is CSCB's own recovery,
@@ -923,11 +1094,11 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     expect(deps.killSessionCalls).toHaveLength(0)
     expect(deps.launchSessionCalls).toHaveLength(0)
     // Single counting site: escalate-dead never records a failure.
-    expect(getFailureCount(CHANNEL)).toBe(0)
-    expect(isAtCap(CHANNEL, RESTART_FAILURE_CAP)).toBe(false)
+    expect(getFailureCount(KEY)).toBe(0)
+    expect(isAtCap(KEY, RESTART_FAILURE_CAP)).toBe(false)
     // The adapter's AD calls address the persona's cscb_<key> instance: one
     // status probe, then the send-keys reconnect and its one self-heal retry.
-    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(CHANNEL)])
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(KEY)])
     expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C_DEADTMUX', 'cscb_C_DEADTMUX'])
 
     // --- Tick 2: the sweep has (in production) reconciled the row to `missing`,
@@ -936,10 +1107,10 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     // prior sweep's TTL — we are simulating a LATER tick past the memo window.
     _resetFindMissingMemo()
     setAlive(false)
-    scheduleRestart(CHANNEL, '/cwd/test')
+    scheduleRestart(KEY, '/cwd/test')
     await Bun.sleep(WAIT_MS)
 
-    expect(deps.killSessionCalls).toEqual([CHANNEL])
-    expect(deps.launchSessionCalls).toEqual([CHANNEL])
+    expect(deps.killSessionCalls).toEqual([KEY])
+    expect(deps.launchSessionCalls).toEqual([KEY])
   })
 })

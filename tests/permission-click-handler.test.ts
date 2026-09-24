@@ -83,7 +83,7 @@ beforeEach(() => {
   // Initialize outage-state so withOutageDetection (used in the poller) does
   // not throw during seedLiveEntry ticks. Per-test calls to initOutageState
   // below override this with the decide-stub for click-handler assertions.
-  initOutageState({ getClient: () => ({} as unknown as Client), postToChannel: () => {} })
+  initOutageState({ getClient: () => ({} as unknown as Client), notify: () => {} })
 })
 
 // ---------------------------------------------------------------------------
@@ -196,7 +196,7 @@ async function seedLiveEntry(opts: {
       ],
     }),
   })
-  initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
+  initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
   startPermissionPoller({
     getClient,
     web: chat.web as never,
@@ -255,7 +255,7 @@ async function seedTwoSiblings(opts: {
       ],
     }),
   })
-  initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
+  initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
   startPermissionPoller({
     getClient,
     web: chat.web as never,
@@ -366,7 +366,7 @@ describe('handlePermissionClick — happy path', () => {
     const messageTs = entryBefore!.messageTs
 
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const handled = await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
       {
@@ -399,7 +399,7 @@ describe('handlePermissionClick — happy path', () => {
       requestToken: TOKEN_A,
     })
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
 
     await handlePermissionClick(
       encodePermissionActionId('deny', INSTANCE_C, TOKEN_A),
@@ -428,7 +428,7 @@ describe('handlePermissionClick — happy path', () => {
     // its method directly (the click handler reuses seed.chat.web).
     const chatForClick = makeChatStub({ updateError: new Error('Slack API down') })
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
 
     const logs: unknown[][] = []
     const result = await handlePermissionClick(
@@ -470,7 +470,7 @@ describe('handlePermissionClick — decide-wire invariant (SR-4.1 / SR-7.2)', ()
       requestToken: TOKEN_A,
     })
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
       {
@@ -496,7 +496,7 @@ describe('handlePermissionClick — stale click (SR-4.2)', () => {
     // (production payloads always carry a channel).
     const chat = makeChatStub()
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const result = await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_C),
       {
@@ -529,7 +529,7 @@ describe('handlePermissionClick — stale click (SR-4.2)', () => {
       requestToken: TOKEN_A,
     })
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('deny', INSTANCE_C, TOKEN_C),
       {
@@ -559,7 +559,7 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
       requestToken: TOKEN_A,
     })
     const decide = makeDecideStub({ throwOn: errAlreadyDecided() })
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const logs: unknown[][] = []
 
     const result = await handlePermissionClick(
@@ -587,7 +587,7 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
       requestToken: TOKEN_A,
     })
     const decide = makeDecideStub({ throwOn: errInvalidFlags() })
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const logs: unknown[][] = []
 
     const result = await handlePermissionClick(
@@ -618,7 +618,7 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
       requestToken: TOKEN_A,
     })
     const decide = makeDecideStub({ throwOn: errAmbiguousRequest() })
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const logs: unknown[][] = []
 
     const result = await handlePermissionClick(
@@ -644,7 +644,7 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
       requestToken: TOKEN_A,
     })
     const decide = makeDecideStub({ throwOn: new Error('something exploded') })
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const logs: unknown[][] = []
 
     const result = await handlePermissionClick(
@@ -680,7 +680,7 @@ describe('handlePermissionClick — ErrRelayFallenBack (b.qi1)', () => {
     const messageTs = getLivePermission(INSTANCE_C, TOKEN_A)!.messageTs
     const trail = makeTrailCapture()
     const decide = makeDecideStub({ throwOn: errRelayFallenBack() })
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const logs: unknown[][] = []
 
     const result = await handlePermissionClick(
@@ -736,7 +736,7 @@ describe('handlePermissionClick — ErrRelayFallenBack (b.qi1)', () => {
     const chat = makeChatStub()
     const trail = makeTrailCapture()
     const decide = makeDecideStub({ throwOn: errRelayFallenBack() })
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
 
     const result = await handlePermissionClick(
       encodePermissionActionId('deny', INSTANCE_C, TOKEN_C),
@@ -781,7 +781,7 @@ describe('handlePermissionClick — sibling independence (SR-4.5)', () => {
 
     // Click sibling A.
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
       {
@@ -843,7 +843,7 @@ describe('trail events — cscb.chat_update.attempted (click-handler-triggered)'
     const entry = getLivePermission(INSTANCE_C, TOKEN_A)!
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
       {
@@ -871,7 +871,7 @@ describe('trail events — cscb.chat_update.attempted (click-handler-triggered)'
     })
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('deny', INSTANCE_C, TOKEN_A),
       {
@@ -898,7 +898,7 @@ describe('trail events — cscb.chat_update.attempted (click-handler-triggered)'
     const chatForClick = makeChatStub({ updateError: platformError })
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
       {
@@ -921,7 +921,7 @@ describe('trail events — cscb.chat_update.attempted (click-handler-triggered)'
     })
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_C),
       {
@@ -951,7 +951,7 @@ describe('trail events — cscb.click_handler.invoked', () => {
     const entry = getLivePermission(INSTANCE_C, TOKEN_A)!
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const actionId = encodePermissionActionId('allow', INSTANCE_C, TOKEN_A)
     await handlePermissionClick(
       actionId,
@@ -976,7 +976,7 @@ describe('trail events — cscb.click_handler.invoked', () => {
   test('live_pending=false when no LivePermission entry exists at click time', async () => {
     // No seed — the live map is empty.
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const trail = makeTrailCapture()
     const chatForClick = makeChatStub()
     const actionId = encodePermissionActionId('deny', INSTANCE_C, TOKEN_A)
@@ -1023,7 +1023,7 @@ describe('trail events — cscb.click_handler.invoked', () => {
     })
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
       {
@@ -1052,7 +1052,7 @@ describe('trail events — cscb.ad_decide.attempted', () => {
     })
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
       {
@@ -1078,7 +1078,7 @@ describe('trail events — cscb.ad_decide.attempted', () => {
     })
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('deny', INSTANCE_C, TOKEN_A),
       {
@@ -1100,7 +1100,7 @@ describe('trail events — cscb.ad_decide.attempted', () => {
     })
     const trail = makeTrailCapture()
     const decide = makeDecideStub({ throwOn: errAlreadyDecided() })
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
       {
@@ -1122,7 +1122,7 @@ describe('trail events — cscb.ad_decide.attempted', () => {
     })
     const trail = makeTrailCapture()
     const decide = makeDecideStub({ throwOn: errInvalidFlags() })
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
       {
@@ -1145,7 +1145,7 @@ describe('trail events — cscb.ad_decide.attempted', () => {
     })
     const trail = makeTrailCapture()
     const decide = makeDecideStub({ throwOn: errAmbiguousRequest() })
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
       {
@@ -1168,7 +1168,7 @@ describe('trail events — cscb.ad_decide.attempted', () => {
     })
     const trail = makeTrailCapture()
     const decide = makeDecideStub({ throwOn: new Error('network timeout') })
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
       {
@@ -1191,7 +1191,7 @@ describe('trail events — cscb.ad_decide.attempted', () => {
     })
     const trail = makeTrailCapture()
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_B),
       {
@@ -1225,7 +1225,7 @@ describe('handlePermissionClick — wrapper outage short-circuit', () => {
       channelId: CHANNEL_CH,
       requestToken: TOKEN_A,
     })
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const logCalls: unknown[][] = []
     const handled = await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
@@ -1252,7 +1252,7 @@ describe('handlePermissionClick — wrapper outage short-circuit', () => {
       channelId: CHANNEL_CH,
       requestToken: TOKEN_A,
     })
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const trail = makeTrailCapture()
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
@@ -1283,7 +1283,7 @@ describe('handlePermissionClick — wrapper outage short-circuit', () => {
       channelId: CHANNEL_CH,
       requestToken: TOKEN_A,
     })
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const trail = makeTrailCapture()
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
@@ -1304,7 +1304,7 @@ describe('handlePermissionClick — wrapper outage short-circuit', () => {
 describe('handlePermissionClick — log-and-bypass (no resolvable ctxChannel)', () => {
   test('no context.channel + no earlyEntry → 0 decide calls, no outage flag, diagnostic log emitted', async () => {
     const decide = makeDecideStub()
-    initOutageState({ getClient: () => decide.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const logLines: string[] = []
     const ACTION_ID = encodePermissionActionId('allow', INSTANCE_C, TOKEN_A)
     const handled = await handlePermissionClick(

@@ -86,7 +86,7 @@ beforeEach(() => {
   savedEnv = { ...process.env }
   _setDialogPollIntervalMs(1)
   _setDialogReadyTimeoutMs(50)
-  initOutageState({ postToChannel: () => {}, getClient })
+  initOutageState({ notify: () => {}, getClient })
   // Safe no-op raw-tmux seams so unit tests never shell out to real tmux (b.vub).
   _setTmuxCapturePane(async () => '')
   _setTmuxSendEnter(async () => {})
@@ -139,7 +139,7 @@ describe('approvePreSessionDialogs (trust needle, b.4ie)', () => {
     })
     const readLog = captureStartupErrors()
 
-    await approvePreSessionDialogs(key, undefined, true)
+    await approvePreSessionDialogs(key, true)
 
     // Enter sent once with allow_pending:true and correct instance id
     expect(sendKeysCalls).toHaveLength(1)
@@ -175,7 +175,7 @@ describe('approvePreSessionDialogs (trust needle, b.4ie)', () => {
     })
     const readLog = captureStartupErrors()
 
-    await approvePreSessionDialogs('C', undefined, true)
+    await approvePreSessionDialogs('C', true)
 
     expect(sendKeysCalls).toHaveLength(0)
     expect(readPaneCalls).toHaveLength(0)
@@ -196,7 +196,7 @@ describe('approvePreSessionDialogs (trust needle, b.4ie)', () => {
     })
     const readLog = captureStartupErrors()
 
-    await approvePreSessionDialogs('C', undefined, true)
+    await approvePreSessionDialogs('C', true)
 
     // Never sent Enter (no needle)
     expect(sendKeysCalls).toHaveLength(0)
@@ -213,7 +213,7 @@ describe('approvePreSessionDialogs (trust needle, b.4ie)', () => {
     })
     const readLog = captureStartupErrors()
 
-    await approvePreSessionDialogs('ops_bot', undefined, true, '"Ops Bot" (key=ops_bot)')
+    await approvePreSessionDialogs('ops_bot', true, '"Ops Bot" (key=ops_bot)')
 
     const log = readLog()
     expect(log).toContain('[dev-channels-approve-not-ready]')
@@ -241,7 +241,7 @@ describe('approvePreSessionDialogs (trust needle, b.4ie)', () => {
     })
     const readLog = captureStartupErrors()
 
-    await approvePreSessionDialogs('C', undefined, true)
+    await approvePreSessionDialogs('C', true)
 
     expect(sendKeysCalls).toHaveLength(0)
     // The raw-tmux fallback read the persona's slack_bot_<key> session
@@ -272,7 +272,7 @@ describe('approvePreSessionDialogs (trust needle, b.4ie)', () => {
     })
     const readLog = captureStartupErrors()
 
-    await approvePreSessionDialogs('ops_bot', undefined, true)
+    await approvePreSessionDialogs('ops_bot', true)
 
     const session = personaTmuxSessionName('ops_bot')
     expect(session).toBe('slack_bot_ops_bot')
@@ -301,7 +301,7 @@ describe('approvePreSessionDialogs (trust needle, b.4ie)', () => {
       readPaneResults: [{ pane: TRUST_PANE }],
     })
 
-    await approvePreSessionDialogs('C', undefined, true)
+    await approvePreSessionDialogs('C', true)
 
     expect(sendKeysCalls.length).toBeGreaterThanOrEqual(2)
   })

@@ -45,17 +45,18 @@ import { personaInstanceId } from './persona-identity.ts'
 import { routesToPersonaConfig } from './route-persona-adapter.ts'
 import {
   AGENT_DIRECTOR_LIVE_STATES,
-  flushSpawnFailureQueue,
   launchSession,
-  postSpawnFailureToChannel,
+  notifyRestartCapReached,
   reconcileOrphans,
   reconnectMcp,
+  setSessionNotifier,
   startupSessionManager,
   sweepDeadTmuxChannel,
 } from './session-manager.ts'
+import { createPersonaNotifier } from './persona-notifier.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { ErrSpawnNotFound } from 'agent-director'
-import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable, ErrSpawnCapReached } from './agent-director-errors.ts'
+import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from './agent-director-errors.ts'
 import { getClient, closeClient } from './agent-director-client.ts'
 import {
   emitBlockActionReceived,
@@ -72,7 +73,7 @@ import {
   isRestartPendingOrActive,
   RESTART_FAILURE_CAP,
 } from './restart.ts'
-import { initHealthCheck, startHealthCheck, stopHealthCheck } from './health-check.ts'
+import { buildPersonaWorkList, initHealthCheck, startHealthCheck, stopHealthCheck } from './health-check.ts'
 import { isAtCap as backoffIsAtCap } from './backoff.ts'
 import { loadTokens, isDryRun } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
@@ -925,6 +926,41 @@ let routingConfig: RoutingConfig | null = null
 let personaConfig: PersonaConfig | null = null
 
 // ---------------------------------------------------------------------------
+// Persona notices (b.av2 SR-7.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * True once Slack is validated: set right after Socket Mode connects, where
+ * held persona notices are flushed. Never set in dry run.
+ */
+let slackValidated = false
+
+/**
+ * The validated Web client for persona `key`: the module-scope client once
+ * Slack is validated and `key` is an applied persona; undefined before that,
+ * in dry run and for any other key.
+ *
+ * TRANSITIONAL — re-pointed in E3 Task 9 at the persona's own client from the
+ * connection manager (validated per persona).
+ */
+function clientFor(key: string): WebClient | undefined {
+  if (!slackValidated || isDryRun()) return undefined
+  if (!personaConfig?.personas.some((p) => p.key === key)) return undefined
+  return web
+}
+
+/**
+ * The one per-persona notifier. Outage state, the session manager and the
+ * JSONL safeguard send every persona notice through it (installed in main()).
+ */
+const personaNotifier = createPersonaNotifier({
+  getPersona: (key) => personaConfig?.personas.find((p) => p.key === key),
+  clientFor,
+  isDryRun,
+  log: (line) => console.error(line),
+})
+
+// ---------------------------------------------------------------------------
 // Graceful shutdown
 // ---------------------------------------------------------------------------
 
@@ -1008,33 +1044,32 @@ process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
  */
 export function _buildIsSessionAliveAdapter(
   getPersonaConfig: () => PersonaConfig | null | undefined,
-): (channelId: string) => Promise<boolean> {
-  // `channelId` is the persona key (the channel ID under the route->persona
-  // adapter); restart and health-check still name it by channel.
-  return async (channelId: string) => {
+): (key: string) => Promise<boolean> {
+  // `key` is the persona key (the channel ID under the route->persona adapter).
+  return async (key: string) => {
     const config = getPersonaConfig()
-    if (!config?.personas.some((p) => p.key === channelId)) return false
-    const claude_instance_id = personaInstanceId(channelId)
+    if (!config?.personas.some((p) => p.key === key)) return false
+    const claude_instance_id = personaInstanceId(key)
     try {
       const r = await getClient().status({ claude_instance_id })
-      clearOutageFlag(channelId, 'ad-unreachable')
-      clearOutageFlag(channelId, 'tmux-unavailable')
+      clearOutageFlag(key, 'ad-unreachable')
+      clearOutageFlag(key, 'tmux-unavailable')
       return AGENT_DIRECTOR_LIVE_STATES.has(r.state)
     } catch (err) {
       if (err instanceof ErrSpawnNotFound) {
-        clearOutageFlag(channelId, 'ad-unreachable')
-        clearOutageFlag(channelId, 'tmux-unavailable')
+        clearOutageFlag(key, 'ad-unreachable')
+        clearOutageFlag(key, 'tmux-unavailable')
         return false
       }
       if (err instanceof ErrSystemInstallDisappeared) {
-        setOutageFlag(channelId, 'ad-unreachable', err.binaryPath)
+        setOutageFlag(key, 'ad-unreachable', err.binaryPath)
         return false
       }
       if (err instanceof ErrTmuxNotAvailable) {
-        setOutageFlag(channelId, 'tmux-unavailable')
+        setOutageFlag(key, 'tmux-unavailable')
         return false
       }
-      console.error(`[slack] isSessionAlive: status error for channel=${channelId}:`, err)
+      console.error(`[slack] isSessionAlive: status error for persona=${key}:`, err)
       return false
     }
   }
@@ -1113,18 +1148,16 @@ export function _buildStatRouteImpl(deps?: {
  *
  * @internal
  */
-export function _buildReconnectSessionAdapter(
-  web: WebClient,
-): (channelId: string) => Promise<'success' | 'escalate-dead' | 'transient'> {
-  // `channelId` is the persona key (the channel ID under the route->persona adapter).
-  return async (channelId: string) => {
+export function _buildReconnectSessionAdapter(): (key: string) => Promise<'success' | 'escalate-dead' | 'transient'> {
+  // `key` is the persona key (the channel ID under the route->persona adapter).
+  return async (key: string) => {
     try {
-      const claude_instance_id = personaInstanceId(channelId)
-      const st = await withOutageDetection(channelId, undefined, (client) =>
+      const claude_instance_id = personaInstanceId(key)
+      const st = await withOutageDetection(key, undefined, (client) =>
         client.status({ claude_instance_id }),
       )
       if (st.state === 'working') {
-        console.error(`[slack] reconnectSession: channel=${channelId} is working — deferring /mcp reconnect to a later tick (b.9a7/b.rmy)`)
+        console.error(`[slack] reconnectSession: persona=${key} is working — deferring /mcp reconnect to a later tick (b.9a7/b.rmy)`)
         return 'transient'
       }
     } catch {
@@ -1148,7 +1181,7 @@ export function _buildReconnectSessionAdapter(
     // removing it is a separate operator decision). Not counting here keeps
     // failures attributed to the launchSession site, which owns the single
     // counting site (SR-25.1).
-    const result = await reconnectMcp(channelId, isDryRun() ? undefined : web)
+    const result = await reconnectMcp(key)
     if (result === 'ok') return 'success'
     if (result === 'dead-session') {
       // b.sv7: trigger the internal memoized findMissing sweep (b.m4r) before
@@ -1162,7 +1195,7 @@ export function _buildReconnectSessionAdapter(
       // post-reboot case (b.nk5 — /tmp wiped, ALL channels dead-tmux at once)
       // is served correctly by the single in-flight-shared sweep: one
       // findMissing reconciles the whole store for every escalating channel.
-      await sweepDeadTmuxChannel(channelId, result)
+      await sweepDeadTmuxChannel(key, result)
       return 'escalate-dead'
     }
     return 'transient'
@@ -1249,14 +1282,15 @@ export async function main(): Promise<void> {
     }
   }
 
+  // Every persona notice goes through the one per-persona notifier: it holds
+  // a notice until Slack is validated and logs instead of posting in dry run.
   initOutageState({
-    postToChannel: (channelId, text) => {
-      web.chat.postMessage({ channel: channelId, text }).catch((err) => {
-        console.error(`[slack] outage-state: postMessage failed for channel=${channelId}:`, err)
-      })
+    notify: (key, text) => {
+      void personaNotifier.notify(key, text)
     },
     getClient,
   })
+  setSessionNotifier(personaNotifier.notify)
 
   if (isDryRun()) {
     console.error('[slack] Running in dry-run mode — Slack disabled')
@@ -1274,8 +1308,8 @@ export async function main(): Promise<void> {
     await socket.start()
     console.error('[slack] Socket Mode connected')
 
-    if (routingConfig) {
-      resetAllToHealthy(Object.keys(routingConfig.routes))
+    if (personaConfig) {
+      resetAllToHealthy(personaConfig.personas.map((p) => p.key))
     }
 
     // SR-2.1 permission poller — single-threaded interval loop monitors AD
@@ -1288,8 +1322,12 @@ export async function main(): Promise<void> {
       })
     }
 
-    // Drain pre-Socket-Mode spawn-failure queue (SR-1.1 channel-post path).
-    flushSpawnFailureQueue(web)
+    // Slack is validated: post each applied persona's held notices, one
+    // persona at a time, through that persona's client (b.av2 SR-7.2).
+    slackValidated = true
+    for (const persona of personaConfig?.personas ?? []) {
+      void personaNotifier.flush(persona.key)
+    }
   }
 
   // Propagate resolved port to tool deps for peer PID discovery
@@ -1523,54 +1561,47 @@ export async function main(): Promise<void> {
   // and the health-check tick consult this alongside isSessionConnected so a
   // connected-but-streamless session is treated as unhealthy, not "healed".
   // Factored here so the two dep objects below stay in exact agreement.
-  const hasSessionStreamAdapter = (channelId: string): boolean => {
-    const session = getSessionByChannel(channelId)
+  // Registry lookups take the persona key: the channel ID under the
+  // route->persona adapter, until E3 Task 5 re-keys the registry.
+  const hasSessionStreamAdapter = (key: string): boolean => {
+    const session = getSessionByChannel(key)
     return session ? hasGetStreamKey(session.transport) : false
   }
 
-  // Initialize restart module with library-backed adapters
+  // Initialize restart module with library-backed adapters. Every key is a
+  // persona key.
   initRestart({
     isSessionAlive: isSessionAliveAdapter,
-    isSessionConnected: (channelId) => {
-      const session = getSessionByChannel(channelId)
+    isSessionConnected: (key) => {
+      const session = getSessionByChannel(key)
       return session?.connected === true
     },
     hasSessionStream: hasSessionStreamAdapter,
-    reconnectSession: _buildReconnectSessionAdapter(web),
-    // restart.ts names the persona key `channelId` (the channel ID under the
-    // route->persona adapter).
-    killSession: async (channelId) => {
+    reconnectSession: _buildReconnectSessionAdapter(),
+    killSession: async (key) => {
       try {
-        await withOutageDetection(channelId, undefined, (client) =>
-          client.kill({ claude_instance_id: personaInstanceId(channelId) })
+        await withOutageDetection(key, undefined, (client) =>
+          client.kill({ claude_instance_id: personaInstanceId(key) })
         )
       } catch (err) {
         if (err instanceof ErrSpawnNotFound) return
         if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) return
-        console.error(`[slack] killSession (restart adapter): error for channel=${channelId}:`, err)
+        console.error(`[slack] killSession (restart adapter): error for persona=${key}:`, err)
       }
     },
-    launchSession: async (channelId) => {
+    launchSession: async (key) => {
       if (!personaConfig) return false
       // Launches the applied persona with this key; false when there is none.
       // resume vs fresh is handled inside spawnForPersona (SR-1.4
       // collision-then-act). The cwd and session-id arguments from the legacy
       // restart deps are ignored — the persona carries its working directory
       // and AD owns the resume state, not CSCB.
-      return await launchSession(channelId, personaConfig, isDryRun() ? undefined : web)
+      return await launchSession(key, personaConfig)
     },
     getRestartDelay: () => routingConfig?.session_restart_delay ?? 60,
     isShuttingDown: () => shuttingDown,
-    onCapReached: (channelId) => {
-      // Post a synthetic spawn-failure message to the channel indicating the
-      // consecutive-failure cap has been reached (SR-25.3). ErrSpawnCapReached
-      // is a CSCB-synthetic subclass (see agent-director-errors.ts) so
-      // remediationHint can surface a specific hint via instanceof (SR-0.2).
-      const err = new ErrSpawnCapReached(
-        `${RESTART_FAILURE_CAP} consecutive session-launch failures — automatic restarts suspended`,
-      )
-      postSpawnFailureToChannel(channelId, err, isDryRun() ? undefined : web, false)
-    },
+    // The persona's restart-cap notice (SR-25.3), built in the session manager.
+    onCapReached: (key) => notifyRestartCapReached(key),
   })
 
   // SR-1.6: orphan reconciliation BEFORE per-route reconcile. Spawns whose
@@ -1591,14 +1622,14 @@ export async function main(): Promise<void> {
   }
 
   // b.zak: preventative JSONL-persistence safeguard. Detect non-persistent
-  // storage roots (Layer 1) and channels whose transcript would be treated as
+  // storage roots (Layer 1) and personas whose transcript would be treated as
   // missing on resume (Layer 2) and say so LOUDLY, BEFORE startupSessionManager
   // runs the resume path that silently deletes+fresh-spawns on ErrJsonlMissing.
-  // Awaited but wrapped so a rejection can never kill startup; dry-run passes
-  // undefined web to suppress Slack posts (same pattern as startupSessionManager).
+  // Awaited but wrapped so a rejection can never kill startup. Its notices go
+  // through the per-persona notifier, which only logs them in dry run.
   if (routingConfig) {
     try {
-      await runJsonlPersistenceSafeguard(routingConfig, isDryRun() ? undefined : web)
+      await runJsonlPersistenceSafeguard(routingConfig, personaNotifier.notify)
     } catch (err) {
       console.error('[slack] Warning: jsonl-persistence safeguard failed — continuing:', err)
     }
@@ -1613,11 +1644,11 @@ export async function main(): Promise<void> {
   }
 
   // Per-persona reconcile via library: spawnForPersona dispatches fresh-spawn or
-  // collision-handling per SR-1.4, once per persona. Failures are surfaced to
-  // the persona's Slack channel; the server stays up.
+  // collision-handling per SR-1.4, once per persona. Failures raise a notice to
+  // the persona's destination; the server stays up.
   if (personaConfig) {
     try {
-      await startupSessionManager(personaConfig, undefined, isDryRun() ? undefined : web)
+      await startupSessionManager(personaConfig)
     } catch (err) {
       console.error('[slack] Warning: session startup failed — continuing:', err)
     }
@@ -1629,24 +1660,20 @@ export async function main(): Promise<void> {
     // b.9a7: same connectedness adapter wired into initRestart above
     // (registry entry with connected === true). Lets the tick notice
     // alive-but-disconnected rows and route them to scheduleRestart.
-    isSessionConnected: (channelId) => {
-      const session = getSessionByChannel(channelId)
+    isSessionConnected: (key) => {
+      const session = getSessionByChannel(key)
       return session?.connected === true
     },
     // b.9cj: same stream-presence probe wired into initRestart above, so the
     // tick can notice connected-but-streamless rows and route them to recovery.
     hasSessionStream: hasSessionStreamAdapter,
     isRestartPendingOrActive,
-    isAtCap: (channelId) => backoffIsAtCap(channelId, RESTART_FAILURE_CAP),
+    isAtCap: (key) => backoffIsAtCap(key, RESTART_FAILURE_CAP),
     statRoute: _buildStatRouteImpl(),
     scheduleRestart,
     isShuttingDown: () => shuttingDown,
-    getRoutes: () => {
-      if (!routingConfig) return {}
-      return Object.fromEntries(
-        Object.entries(routingConfig.routes).map(([channelId, route]) => [channelId, route.cwd]),
-      )
-    },
+    // One entry per applied persona: key → working directory.
+    getPersonas: () => (personaConfig ? buildPersonaWorkList(personaConfig) : {}),
   })
 
   if (routingConfig) {

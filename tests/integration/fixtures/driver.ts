@@ -10,7 +10,8 @@
  * that shipped the bug — real agent-director + real tmux, a real
  * --dangerously-load-development-channels dialog, the CSCB approver, and the
  * resume lap — is reachable by calling the SAME production functions directly
- * with web=undefined and WITHOUT SLACK_DRY_RUN. That is what this driver does.
+ * with no Slack client or notifier and WITHOUT SLACK_DRY_RUN. That is what this
+ * driver does.
  *
  * It imports from the INSTALLED package (the tarball under test), so it exercises
  * shipped code, not the working tree.
@@ -103,11 +104,11 @@ async function main(): Promise<void> {
   await runAgentDirectorStartupGate()
 
   // spawnForPersona goes through withSpawnDetection/withOutageDetection, which
-  // need outage-state wired. Post-to-channel is log-only (no Slack in CI).
+  // need outage-state wired. The persona notice hook is log-only (no Slack in CI).
   initOutageState({
     getClient,
-    postToChannel: (channelId: string, text: string) => {
-      console.error(`[driver] outage-post channel=${channelId}: ${text}`)
+    notify: (key: string, text: string) => {
+      console.error(`[driver] outage-notice persona=${key}: ${text}`)
     },
   })
 
@@ -123,7 +124,7 @@ async function main(): Promise<void> {
   // -------------------------------------------------------------------------
   // Phase 1 — fresh spawn must get PAST the dev-channels dialog.
   // -------------------------------------------------------------------------
-  const r1 = await spawnForPersona(persona, personaCfg, undefined, true)
+  const r1 = await spawnForPersona(persona, personaCfg, true)
   if (r1.action === 'failed') driverFail(`phase1 spawnForPersona returned failed`)
 
   const s1 = await waitForLive(instanceId, 30_000)
@@ -191,7 +192,7 @@ async function main(): Promise<void> {
   // -------------------------------------------------------------------------
   // Phase 2 — the regression: resume must drive PAST the dialog again.
   // -------------------------------------------------------------------------
-  const r2 = await spawnForPersona(persona, personaCfg, undefined, true)
+  const r2 = await spawnForPersona(persona, personaCfg, true)
   if (r2.action === 'failed') driverFail(`phase2 spawnForPersona returned failed (resume did not recover)`)
 
   const s2 = await waitForLive(instanceId, 30_000)

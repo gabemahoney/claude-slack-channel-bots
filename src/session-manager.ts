@@ -14,8 +14,8 @@
  *      observed state (ended/missing → resume or kill+delete+spawn; waiting
  *      → /mcp reconnect via sendKeys; working → wait for waiting then
  *      reconnect; pending/check_permission/ask_user → no-op).
- *   3. Any other error surfaces to the persona's Slack channel via
- *      `postSpawnFailureToChannel` and is logged.
+ *   3. Any other error raises a spawn-failure notice for the persona via
+ *      `notifySpawnFailure` (through the per-persona notifier) and is logged.
  *
  * Orphan reconciliation (SR-1.6) lists every `service=cscb` spawn and
  * kills+deletes any whose `channel` label is missing or not in
@@ -39,7 +39,6 @@ import {
   ErrTmuxSessionCreate,
 } from 'agent-director'
 import type { ListRow, SpawnParams, FindMissingResult, GetResult } from 'agent-director'
-import type { WebClient } from '@slack/web-api'
 
 import { checkCozempicAvailable, resolveJsonlPath } from './cozempic.ts'
 import {
@@ -70,6 +69,9 @@ import {
   ErrSpawnCapReached,
 } from './agent-director-errors.ts'
 import { recordStartupError } from './startup-errors.ts'
+import { firstNoticeLine, notifySafely, type PersonaNoticeOptions, type PersonaNotify } from './persona-notifier.ts'
+import { describeThrownValue } from './persona-connection-errors.ts'
+import { RESTART_FAILURE_CAP } from './restart.ts'
 import { isDryRun } from './tokens.ts'
 import { makeDefaultArchiveCount, rfc3339ToEpochSeconds } from './jsonl-persistence-check.ts'
 import { realpathSync, statSync } from 'node:fs'
@@ -137,69 +139,80 @@ export function personaConfigDirLabelValue(
 }
 
 // ---------------------------------------------------------------------------
-// Spawn-failure queue — Slack-error surface (SR-1.1 channel-post path)
+// Persona notices — spawn failure, restart cap, transcript loss (b.av2 SR-7.2)
 // ---------------------------------------------------------------------------
 
-interface SpawnFailureEntry {
-  channelId: string
-  error: AgentDirectorError
-  remediation: string
-}
-
-const spawnFailureQueue: SpawnFailureEntry[] = []
+/**
+ * The one sink every session-manager notice goes through. Production installs
+ * the per-persona notifier's `notify` (`src/persona-notifier.ts`), which
+ * posts to the persona's destination under its identity, adds the persona
+ * reference, holds a notice until the persona's client is validated, and
+ * logs instead of posting in dry run.
+ */
+let noticeSink: PersonaNotify | undefined
 
 /**
- * Surface a spawn-related failure to the bot's configured Slack channel.
- * Before Socket Mode is up, queue the entry; `flushSpawnFailureQueue` drains
- * the queue once the WebClient is authenticated. Dry-run logs to stderr only.
+ * Install the notice sink, or clear it by passing undefined. With no sink
+ * installed (unit tests, the integration driver) a notice is logged, never
+ * posted, and never throws.
  */
-export function postSpawnFailureToChannel(
-  channelId: string,
-  error: AgentDirectorError,
-  web?: WebClient,
-  isStartup = true,
-): void {
-  const remediation = remediationHint(error)
+export function setSessionNotifier(notify: PersonaNotify | undefined): void {
+  noticeSink = notify
+}
 
-  if (!web) {
-    spawnFailureQueue.push({ channelId, error, remediation })
+/** Send one notice body for persona `key` through the installed sink. Never throws. */
+function sendPersonaNotice(key: string, text: string, options?: PersonaNoticeOptions): void {
+  if (!noticeSink) {
+    console.error(`[slack] session-manager: no notifier installed — notice for ${keyRef(key)} not posted: ${firstNoticeLine(text)}`)
     return
   }
-
-  if (isDryRun()) {
-    console.error(
-      `[slack] dry-run: would post spawn failure for channel=${channelId} errName=${error.errName} remediation="${remediation}"`,
-    )
-    return
-  }
-
-  const text =
-    `Spawn failure for channel \`${channelId}\`:\n` +
-    `  Error: \`${error.errName}\` — ${error.errDescription.slice(0, 300)}\n` +
-    `  Remediation: ${remediation}`
-
-  web.chat.postMessage({ channel: channelId, text }).catch((err) => {
-    if (isStartup) {
-      recordStartupError('spawn-failure-post', `failed to post spawn failure to channel=${channelId}`, err)
-    } else {
-      console.error(`[slack] spawn-failure-post: failed to post spawn failure to channel=${channelId}`, err)
-    }
+  notifySafely(noticeSink, key, text, options, (err) => {
+    console.error(`[slack] session-manager: notifier failed for ${keyRef(key)}: ${describeThrownValue(err)}`)
   })
+}
+
+/**
+ * Raise a spawn-failure notice for persona `key`: the error name, the
+ * truncated description and a remediation hint. When a startup notice's post
+ * fails, the `spawn-failure-post` startup error is recorded; outside startup
+ * the failure is logged.
+ */
+export function notifySpawnFailure(key: string, error: AgentDirectorError, isStartup = true): void {
+  const ref = keyRef(key)
+  const text =
+    `Spawn failure:\n` +
+    `  Error: \`${error.errName}\` — ${error.errDescription.slice(0, 300)}\n` +
+    `  Remediation: ${remediationHint(error)}`
+  sendPersonaNotice(key, text, {
+    onPostFailure: (err) => {
+      if (isStartup) {
+        // Token-safe cause: a Slack rejection's message can carry secrets, so
+        // only the describer's type/code/frames reach stderr and the log file.
+        recordStartupError('spawn-failure-post', `failed to post spawn failure for ${ref}`, describeThrownValue(err))
+      } else {
+        console.error(`[slack] spawn-failure-post: failed to post spawn failure for ${ref}: ${describeThrownValue(err)}`)
+      }
+    },
+  })
+}
+
+/**
+ * Raise the restart-cap notice for persona `key` (restart.ts `onCapReached`):
+ * a non-startup spawn-failure notice carrying `ErrSpawnCapReached`, whose
+ * remediation says automatic restarts are suspended for this persona.
+ */
+export function notifyRestartCapReached(key: string): void {
+  const err = new ErrSpawnCapReached(
+    `${RESTART_FAILURE_CAP} consecutive session-launch failures — automatic restarts suspended`,
+  )
+  notifySpawnFailure(key, err, false)
 }
 
 function remediationHint(error: AgentDirectorError): string {
   if (error instanceof ErrInstanceIdCollision) return 'spawn dispatcher bug — please report'
   if (error instanceof ErrSpawnNotFound) return 'transient — restarting the server should resolve'
-  if (error instanceof ErrSpawnCapReached) return 'restart the server to retry — automatic restarts are suspended for this channel'
+  if (error instanceof ErrSpawnCapReached) return 'restart the server to retry — automatic restarts are suspended for this persona'
   return 'Check server.log for details.'
-}
-
-/** Drain the pre-auth queue once Socket Mode is up. Called from server.ts main(). */
-export function flushSpawnFailureQueue(web: WebClient): void {
-  while (spawnFailureQueue.length > 0) {
-    const entry = spawnFailureQueue.shift()!
-    postSpawnFailureToChannel(entry.channelId, entry.error, web)
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -305,7 +318,6 @@ export type ReconnectOutcome = 'ok' | 'failed' | 'dead-session'
  */
 export async function reconnectMcp(
   key: string,
-  web?: WebClient,
   ref: string = keyRef(key),
 ): Promise<ReconnectOutcome> {
   const claude_instance_id = personaInstanceId(key)
@@ -338,13 +350,13 @@ export async function reconnectMcp(
           // via resume/fresh-spawn instead of posting a terminal failure.
           return 'dead-session'
         }
-        postSpawnFailureToChannel(key, e2, web)
+        notifySpawnFailure(key, e2)
         return 'failed'
       }
     }
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('send-keys', 'UnknownError', String(err))
     console.error(`[slack] reconnectMcp: send-keys failed for ${ref}: ${e.errName}`)
-    postSpawnFailureToChannel(key, e, web)
+    notifySpawnFailure(key, e)
     return 'failed'
   }
 }
@@ -539,7 +551,6 @@ export function _resetDialogDeadGracePolls(): void {
  */
 export async function approvePreSessionDialogs(
   key: string,
-  web: WebClient | undefined,
   isStartup: boolean,
   ref: string = keyRef(key),
 ): Promise<void> {
@@ -631,7 +642,7 @@ export async function approvePreSessionDialogs(
   const msg = `spawn never reached a live state within ${_dialogReadyTimeoutMs}ms for ${ref} — dialog unrecognized or session hung (dev-needle='${DEV_CHANNELS_DIALOG_NEEDLE}')`
   console.error(`[slack] approvePreSessionDialogs: ${msg}`)
   if (isStartup) recordStartupError('dev-channels-approve-not-ready', msg)
-  postSpawnFailureToChannel(key, new AgentDirectorError('status', 'DialogApprovalTimeout', msg), web, isStartup)
+  notifySpawnFailure(key, new AgentDirectorError('status', 'DialogApprovalTimeout', msg), isStartup)
 }
 
 // ---------------------------------------------------------------------------
@@ -849,7 +860,6 @@ async function tmuxFallbackVerdict(
 export async function waitForWaitingAndReconnect(
   key: string,
   config: PersonaConfig,
-  web?: WebClient,
   ref: string = keyRef(key),
 ): Promise<ReconnectOutcome> {
   const claude_instance_id = personaInstanceId(key)
@@ -897,12 +907,12 @@ export async function waitForWaitingAndReconnect(
       }
       const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('status', 'UnknownError', String(err))
       console.error(`[slack] waitForWaitingAndReconnect: status error for ${ref}: ${e.errName}`)
-      postSpawnFailureToChannel(key, e, web)
+      notifySpawnFailure(key, e)
       return 'failed'
     }
 
     if (state === 'waiting') {
-      return reconnectMcp(key, web, ref)
+      return reconnectMcp(key, ref)
     }
 
     if (state === 'working') {
@@ -1130,7 +1140,6 @@ async function selfHealTmuxCollisionAndRespawn(
 /** Delete the spawn row; surface failures. Returns whether the delete succeeded. */
 async function tryDelete(
   key: string,
-  web: WebClient | undefined,
   isStartup: boolean,
   ref: string,
 ): Promise<boolean> {
@@ -1144,7 +1153,7 @@ async function tryDelete(
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('delete', 'UnknownError', String(err))
     console.error(`[slack] tryDelete: failed for ${ref}: ${e.errName}`)
     if (isStartup) recordStartupError('spawn-failed', `delete failed for ${ref}: ${e.errName}`, e)
-    postSpawnFailureToChannel(key, e, web, isStartup)
+    notifySpawnFailure(key, e, isStartup)
     return false
   }
 }
@@ -1240,7 +1249,6 @@ async function diagnoseJsonlMissing(
   persona: Persona,
   config: PersonaConfig,
   err: ErrJsonlMissing,
-  web: WebClient | undefined,
   isStartup: boolean,
 ): Promise<'lost' | 'never-created' | 'inconclusive'> {
   const { key } = persona
@@ -1270,7 +1278,6 @@ async function diagnoseJsonlMissing(
       ref,
       claudeInstanceId,
       `could not fetch the agent-director row (${String(getErr)}); AD reported: ${adDetail}`,
-      web,
       isStartup,
       err,
     )
@@ -1336,23 +1343,13 @@ async function diagnoseJsonlMissing(
     console.error(`[slack] ErrJsonlMissing diagnostic: ${detail}`)
     // Operator-visible signal — reuse the existing startup-errors mechanism.
     if (isStartup) recordStartupError('jsonl-transcript-lost-on-resume', detail, err)
-    // And a channel post so it is not buried in logs.
-    if (web !== undefined) {
-      web.chat
-        .postMessage({
-          channel: key,
-          text:
-            `⚠️ CSCB: on restart my conversation transcript could not be found, but the message archive shows ` +
-            `${archivedSinceSpawn} message(s) since I started — my memory of this channel has been lost and I ` +
-            `was started fresh. An operator should investigate transcript storage. Paths tried: ${candidateStr}`,
-        })
-        .catch((postErr: unknown) => {
-          console.error(
-            `[slack] ErrJsonlMissing diagnostic: failed to post lost-transcript notice to ${ref}:`,
-            postErr,
-          )
-        })
-    }
+    // And a persona notice so it is not buried in logs.
+    sendPersonaNotice(
+      key,
+      `⚠️ CSCB: on restart my conversation transcript could not be found, but the message archive shows ` +
+        `${archivedSinceSpawn} message(s) since I started — my conversation memory has been lost and I ` +
+        `was started fresh. An operator should investigate transcript storage. Paths tried: ${candidateStr}`,
+    )
     return 'lost'
   }
 
@@ -1363,7 +1360,7 @@ async function diagnoseJsonlMissing(
     // NEVER-CREATED (evidence-based): the archive was consulted and proved zero
     // archived activity since spawn. Claude writes the .jsonl lazily on first
     // message; an idle-since-spawn channel simply never had one. Expected and
-    // lossless — quiet log, no error, no channel post, counted as an ordinary
+    // lossless — quiet log, no error, no persona notice, counted as an ordinary
     // fresh-spawn.
     console.error(
       `[slack] ErrJsonlMissing diagnostic: ${ref} instance=${claudeInstanceId} — transcript never ` +
@@ -1398,7 +1395,6 @@ async function diagnoseJsonlMissing(
     ref,
     claudeInstanceId,
     `${reason}. Transcript candidates tried (${detailProvenance}): ${candidateStr}`,
-    web,
     isStartup,
     err,
   )
@@ -1409,7 +1405,7 @@ async function diagnoseJsonlMissing(
  * b.fwu: emit the operator-visible signal for an INCONCLUSIVE ErrJsonlMissing
  * diagnosis — one where we could not determine whether prior history was lost.
  * Follows the 'lost' branch's pattern (recordStartupError guarded by isStartup
- * + a channel post), but worded as UNCERTAINTY, not loss: a false "your history
+ * + a persona notice), but worded as UNCERTAINTY, not loss: a false "your history
  * was destroyed" is its own harm. Never throws.
  */
 function reportInconclusiveDiagnosis(
@@ -1417,7 +1413,6 @@ function reportInconclusiveDiagnosis(
   ref: string,
   claudeInstanceId: string,
   reason: string,
-  web: WebClient | undefined,
   isStartup: boolean,
   err: ErrJsonlMissing,
 ): void {
@@ -1427,22 +1422,12 @@ function reportInconclusiveDiagnosis(
     `history was lost because ${reason}.`
   console.error(`[slack] ErrJsonlMissing diagnostic: ${detail}`)
   if (isStartup) recordStartupError('jsonl-diagnosis-inconclusive', detail, err)
-  if (web !== undefined) {
-    web.chat
-      .postMessage({
-        channel: key,
-        text:
-          `⚠️ CSCB: on restart this channel was restarted fresh; I could not determine whether my prior ` +
-          `conversation history was preserved (diagnosis inconclusive: ${reason}). An operator should ` +
-          `investigate.`,
-      })
-      .catch((postErr: unknown) => {
-        console.error(
-          `[slack] ErrJsonlMissing diagnostic: failed to post inconclusive-diagnosis notice to ${ref}:`,
-          postErr,
-        )
-      })
-  }
+  sendPersonaNotice(
+    key,
+    `⚠️ CSCB: on restart I was started fresh; I could not determine whether my prior ` +
+      `conversation history was preserved (diagnosis inconclusive: ${reason}). An operator should ` +
+      `investigate.`,
+  )
 }
 
 /**
@@ -1459,7 +1444,6 @@ async function resumeOrFreshSpawn(
   persona: Persona,
   params: SpawnParams,
   config: PersonaConfig,
-  web: WebClient | undefined,
   isStartup: boolean,
   opts?: { reconcileMissingFirst?: boolean },
 ): Promise<SpawnPersonaResult> {
@@ -1468,11 +1452,11 @@ async function resumeOrFreshSpawn(
   if (config.resume_enabled === false) {
     console.error(`[slack] spawnForPersona: resume_enabled=false — kill+delete+fresh for ${ref}`)
     await tryKill(key)
-    if (!(await tryDelete(key, web, isStartup, ref))) return { key, action: 'failed' }
+    if (!(await tryDelete(key, isStartup, ref))) return { key, action: 'failed' }
     try {
       await withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
       console.error(`[slack] spawnForPersona: fresh-spawned (after kill+delete) for ${ref}`)
-      await approvePreSessionDialogs(key, web, isStartup, ref)
+      await approvePreSessionDialogs(key, isStartup, ref)
       return { key, action: 'spawned' }
     } catch (err) {
       if (
@@ -1486,7 +1470,7 @@ async function resumeOrFreshSpawn(
       const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
       console.error(`[slack] spawnForPersona: fresh spawn after delete failed for ${ref}: ${e.errName}`)
       if (isStartup) recordStartupError('spawn-failed', `fresh spawn after delete failed for ${ref}: ${e.errName}`, e)
-      postSpawnFailureToChannel(key, e, web, isStartup)
+      notifySpawnFailure(key, e, isStartup)
       return { key, action: 'failed' }
     }
   }
@@ -1515,7 +1499,7 @@ async function resumeOrFreshSpawn(
     // b.vub: a resumed bot faces the same --dangerously-load-development-channels
     // dialog. Its AD row is still `missing`/`ended` while blocked at the dialog
     // (SessionStart hasn't re-fired), so the pane-first approver drives it past.
-    await approvePreSessionDialogs(key, web, isStartup, ref)
+    await approvePreSessionDialogs(key, isStartup, ref)
     return { key, action: 'resumed' }
   } catch (err) {
     if (err instanceof ErrTmuxSessionCreate) {
@@ -1526,7 +1510,7 @@ async function resumeOrFreshSpawn(
       try {
         const r = await selfHealTmuxCollisionAndRespawn(persona, params, ref)
         console.error(`[slack] spawnForPersona: self-heal spawn succeeded after ErrTmuxSessionCreate for ${ref} instanceId=${r.claude_instance_id}`)
-        await approvePreSessionDialogs(key, web, isStartup, ref)
+        await approvePreSessionDialogs(key, isStartup, ref)
         return { key, action: 'spawned' }
       } catch (err2) {
         if (
@@ -1540,7 +1524,7 @@ async function resumeOrFreshSpawn(
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForPersona: self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${e.errName}`)
         if (isStartup) recordStartupError('spawn-failed', `self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${e.errName}`, e)
-        postSpawnFailureToChannel(key, e, web, isStartup)
+        notifySpawnFailure(key, e, isStartup)
         return { key, action: 'failed' }
       }
     }
@@ -1549,7 +1533,7 @@ async function resumeOrFreshSpawn(
       // b.jgf: AD 0.10.0 split the old "no transcript" condition in two.
       // ErrJsonlNeverWritten asserts the session never wrote a transcript at
       // all, so a fresh spawn is lossless BY DEFINITION — it gets no diagnosis
-      // ceremony, no amnesia action and no channel post, just the delete+fresh
+      // ceremony, no amnesia action and no persona notice, just the delete+fresh
       // below and a successful action so restart.ts stops retrying. Only
       // ErrJsonlMissing (a transcript path was recorded but is not there now)
       // carries the ambiguity that the b.wrb/b.fwu machinery exists to resolve.
@@ -1559,13 +1543,13 @@ async function resumeOrFreshSpawn(
       // made operator-visible inside diagnoseJsonlMissing itself.
       let jsonlDiagnosis: 'lost' | 'never-created' | 'inconclusive' | undefined
       if (err instanceof ErrJsonlMissing) {
-        jsonlDiagnosis = await diagnoseJsonlMissing(persona, config, err, web, isStartup)
+        jsonlDiagnosis = await diagnoseJsonlMissing(persona, config, err, isStartup)
       }
-      if (!(await tryDelete(key, web, isStartup, ref))) return { key, action: 'failed' }
+      if (!(await tryDelete(key, isStartup, ref))) return { key, action: 'failed' }
       try {
         await withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
         console.error(`[slack] spawnForPersona: fresh-spawned (after delete) for ${ref}`)
-        await approvePreSessionDialogs(key, web, isStartup, ref)
+        await approvePreSessionDialogs(key, isStartup, ref)
         // A fresh-spawn that replaced a resume because the transcript was gone
         // is amnesia, not a clean spawn — surface it as its own action so the
         // startup summary does not count it as an ordinary "ok". b.fwu: split
@@ -1600,7 +1584,7 @@ async function resumeOrFreshSpawn(
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForPersona: fresh spawn after delete failed for ${ref}: ${e.errName}`)
         if (isStartup) recordStartupError('spawn-failed', `fresh spawn after delete failed for ${ref}: ${e.errName}`, e)
-        postSpawnFailureToChannel(key, e, web, isStartup)
+        notifySpawnFailure(key, e, isStartup)
         return { key, action: 'failed' }
       }
     }
@@ -1608,10 +1592,10 @@ async function resumeOrFreshSpawn(
       // Row is non-terminal but resume rejected — defensive: kill + delete + spawn
       console.error(`[slack] spawnForPersona: ErrSpawnNotResumable for ${ref} — kill+delete+fresh`)
       await tryKill(key)
-      if (!(await tryDelete(key, web, isStartup, ref))) return { key, action: 'failed' }
+      if (!(await tryDelete(key, isStartup, ref))) return { key, action: 'failed' }
       try {
         await withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
-        await approvePreSessionDialogs(key, web, isStartup, ref)
+        await approvePreSessionDialogs(key, isStartup, ref)
         return { key, action: 'spawned' }
       } catch (err2) {
         if (
@@ -1624,7 +1608,7 @@ async function resumeOrFreshSpawn(
         }
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         if (isStartup) recordStartupError('spawn-failed', `fresh spawn failed for ${ref}: ${e.errName}`, e)
-        postSpawnFailureToChannel(key, e, web, isStartup)
+        notifySpawnFailure(key, e, isStartup)
         return { key, action: 'failed' }
       }
     }
@@ -1637,7 +1621,7 @@ async function resumeOrFreshSpawn(
       try {
         await withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
         console.error(`[slack] spawnForPersona: fresh-spawned (after ErrSpawnNotFound on resume) for ${ref}`)
-        await approvePreSessionDialogs(key, web, isStartup, ref)
+        await approvePreSessionDialogs(key, isStartup, ref)
         return { key, action: 'spawned' }
       } catch (err2) {
         if (
@@ -1651,7 +1635,7 @@ async function resumeOrFreshSpawn(
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForPersona: fresh spawn after ErrSpawnNotFound on resume failed for ${ref}: ${e.errName}`)
         if (isStartup) recordStartupError('spawn-failed', `fresh spawn after ErrSpawnNotFound on resume failed for ${ref}: ${e.errName}`, e)
-        postSpawnFailureToChannel(key, e, web, isStartup)
+        notifySpawnFailure(key, e, isStartup)
         return { key, action: 'failed' }
       }
     }
@@ -1665,7 +1649,7 @@ async function resumeOrFreshSpawn(
     }
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('resume', 'UnknownError', String(err))
     console.error(`[slack] spawnForPersona: resume failed for ${ref}: ${e.errName}`)
-    postSpawnFailureToChannel(key, e, web, isStartup)
+    notifySpawnFailure(key, e, isStartup)
     return { key, action: 'failed' }
   }
 }
@@ -1687,7 +1671,6 @@ async function resumeOrFreshSpawn(
 export async function spawnForPersona(
   persona: Persona,
   config: PersonaConfig,
-  web?: WebClient,
   isStartup = true,
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
@@ -1703,7 +1686,7 @@ export async function spawnForPersona(
   try {
     const r = await withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
     console.error(`[slack] spawnForPersona: spawned ${ref} instanceId=${r.claude_instance_id}`)
-    await approvePreSessionDialogs(key, web, isStartup, ref)
+    await approvePreSessionDialogs(key, isStartup, ref)
     return { key, action: 'spawned' }
   } catch (err) {
     if (err instanceof ErrInstanceIdCollision) {
@@ -1716,7 +1699,7 @@ export async function spawnForPersona(
       try {
         const r = await selfHealTmuxCollisionAndRespawn(persona, params, ref)
         console.error(`[slack] spawnForPersona: self-heal spawn succeeded after ErrTmuxSessionCreate for ${ref} instanceId=${r.claude_instance_id}`)
-        await approvePreSessionDialogs(key, web, isStartup, ref)
+        await approvePreSessionDialogs(key, isStartup, ref)
         return { key, action: 'spawned' }
       } catch (err2) {
         if (
@@ -1730,7 +1713,7 @@ export async function spawnForPersona(
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForPersona: self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${e.errName}`)
         if (isStartup) recordStartupError('spawn-failed', `self-heal spawn after ErrTmuxSessionCreate failed for ${ref}: ${e.errName}`, e)
-        postSpawnFailureToChannel(key, e, web, isStartup)
+        notifySpawnFailure(key, e, isStartup)
         return { key, action: 'failed' }
       }
     } else if (
@@ -1744,7 +1727,7 @@ export async function spawnForPersona(
       const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
       console.error(`[slack] spawnForPersona: spawn failed for ${ref}: ${e.errName}`)
       if (isStartup) recordStartupError('spawn-failed', `spawn failed for ${ref}: ${e.errName}`, e)
-      postSpawnFailureToChannel(key, e, web, isStartup)
+      notifySpawnFailure(key, e, isStartup)
       return { key, action: 'failed' }
     }
   }
@@ -1761,7 +1744,7 @@ export async function spawnForPersona(
       try {
         const r = await withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
         console.error(`[slack] spawnForPersona: retry-spawn succeeded for ${ref} instanceId=${r.claude_instance_id}`)
-        await approvePreSessionDialogs(key, web, isStartup, ref)
+        await approvePreSessionDialogs(key, isStartup, ref)
         return { key, action: 'spawned' }
       } catch (err2) {
         if (
@@ -1775,7 +1758,7 @@ export async function spawnForPersona(
         const e = err2 instanceof AgentDirectorError ? err2 : new AgentDirectorError('spawn', 'UnknownError', String(err2))
         console.error(`[slack] spawnForPersona: retry-spawn also failed for ${ref}: ${e.errName}`)
         if (isStartup) recordStartupError('spawn-failed', `retry-spawn failed for ${ref}: ${e.errName}`, e)
-        postSpawnFailureToChannel(key, e, web, isStartup)
+        notifySpawnFailure(key, e, isStartup)
         return { key, action: 'failed' }
       }
     }
@@ -1784,14 +1767,14 @@ export async function spawnForPersona(
     }
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('get', 'UnknownError', String(err))
     console.error(`[slack] spawnForPersona: get failed for ${ref}: ${e.errName}`)
-    postSpawnFailureToChannel(key, e, web, isStartup)
+    notifySpawnFailure(key, e, isStartup)
     return { key, action: 'failed' }
   }
 
   console.error(`[slack] spawnForPersona: collision resolved, state=${state} for ${ref}`)
 
   if (state === 'ended' || state === 'missing') {
-    return resumeOrFreshSpawn(persona, params, config, web, isStartup)
+    return resumeOrFreshSpawn(persona, params, config, isStartup)
   }
 
   if (state === 'waiting') {
@@ -1801,10 +1784,10 @@ export async function spawnForPersona(
     // spawn (tmux session wiped by a reboot while the AD row froze at
     // `waiting`) — recover exactly like the ended/missing states instead of
     // giving up.
-    const outcome = await reconnectMcp(key, web, ref)
+    const outcome = await reconnectMcp(key, ref)
     if (outcome === 'dead-session') {
       console.error(`[slack] spawnForPersona: dead tmux session for ${ref} (state=waiting) — recovering via resume/fresh-spawn`)
-      return resumeOrFreshSpawn(persona, params, config, web, isStartup, { reconcileMissingFirst: true })
+      return resumeOrFreshSpawn(persona, params, config, isStartup, { reconcileMissingFirst: true })
     }
     if (outcome !== 'ok') {
       console.error(`[slack] spawnForPersona: reconnect failed for ${ref}`)
@@ -1821,10 +1804,10 @@ export async function spawnForPersona(
     // (a long turn isn't an error); 'dead-session' when the process is provably
     // gone (ended/missing, or the timeout sweep + status verdict — b.ecw) or the
     // tmux session provably doesn't exist (spawn-not-found — b.c3o).
-    const outcome = await waitForWaitingAndReconnect(key, config, web, ref)
+    const outcome = await waitForWaitingAndReconnect(key, config, ref)
     if (outcome === 'dead-session') {
       console.error(`[slack] spawnForPersona: dead tmux session for ${ref} (state=working) — recovering via resume/fresh-spawn`)
-      return resumeOrFreshSpawn(persona, params, config, web, isStartup, { reconcileMissingFirst: true })
+      return resumeOrFreshSpawn(persona, params, config, isStartup, { reconcileMissingFirst: true })
     }
     if (outcome !== 'ok') {
       console.error(`[slack] spawnForPersona: reconnect failed for ${ref}`)
@@ -1968,7 +1951,6 @@ export interface StartupSessionManagerResult {
 export async function startupSessionManager(
   config: PersonaConfig,
   options?: { concurrency?: number },
-  web?: WebClient,
 ): Promise<StartupSessionManagerResult> {
   await checkCozempicAvailable()
 
@@ -2025,7 +2007,7 @@ export async function startupSessionManager(
 
   async function processPersona(persona: Persona): Promise<void> {
     try {
-      const result = await spawnForPersona(persona, config, web)
+      const result = await spawnForPersona(persona, config)
       perPersona.push({ key: persona.key, action: result.action })
       tally(result.action)
     } catch (err) {
@@ -2116,10 +2098,9 @@ export async function startupSessionManager(
 export async function launchSession(
   key: string,
   config: PersonaConfig,
-  web?: WebClient,
 ): Promise<boolean> {
   const persona = config.personas.find((p) => p.key === key)
   if (!persona) return false
-  const result = await spawnForPersona(persona, config, web, false)
+  const result = await spawnForPersona(persona, config, false)
   return result.action !== 'failed'
 }

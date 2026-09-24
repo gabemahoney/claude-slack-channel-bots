@@ -60,7 +60,7 @@ beforeEach(() => {
   // Initialize outage-state so withOutageDetection does not throw during ticks.
   // Tests that need a specific client (e.g. decide) override via initOutageState
   // inside the test body.
-  initOutageState({ getClient: () => ({} as unknown as Client), postToChannel: () => {} })
+  initOutageState({ getClient: () => ({} as unknown as Client), notify: () => {} })
 })
 
 afterEach(() => {
@@ -159,7 +159,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
-    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -199,7 +199,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
-    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -250,7 +250,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
       getPermission: async (p: GetPermissionParams): Promise<GetPermissionResult> =>
         cannedGetPermissionResponse({ request_token: p.request_token, decision: 'allow', decision_reason: null }),
     })
-    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -307,7 +307,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
-    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -339,7 +339,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
-    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -363,7 +363,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     const decideStub: { client: { decide: (p: DecideParams) => Promise<DecideResult> } } = {
       client: { decide: async (_p: DecideParams) => ({}) },
     }
-    initOutageState({ getClient: () => decideStub.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decideStub.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       actionId,
       { web: chat.web as never },
@@ -402,7 +402,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
-    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -416,7 +416,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
     const decideStub: { client: { decide: (p: DecideParams) => Promise<DecideResult> } } = {
       client: { decide: async (_p: DecideParams) => ({}) },
     }
-    initOutageState({ getClient: () => decideStub.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decideStub.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
       { web: chat.web as never },
@@ -447,7 +447,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         permission_requests: [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })],
       }),
     })
-    initOutageState({ getClient: () => getClient() as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => getClient() as unknown as Client, notify: () => {} })
     startPermissionPoller({
       getClient,
       web: chat.web as never,
@@ -465,7 +465,7 @@ describe('permission-poller — trail file end-to-end (Epic 2)', () => {
         },
       },
     }
-    initOutageState({ getClient: () => decideStub.client as unknown as Client, postToChannel: () => {} })
+    initOutageState({ getClient: () => decideStub.client as unknown as Client, notify: () => {} })
     await handlePermissionClick(
       encodePermissionActionId('allow', INSTANCE_C, TOKEN_A),
       { web: chat.web as never },

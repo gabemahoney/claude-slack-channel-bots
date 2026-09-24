@@ -215,12 +215,15 @@ Don't wrap simple domain strings in constants (`const STATUS_OPEN = 'open'`) —
 Use `beforeEach` to reset module-scoped state between tests:
 
 - Registry: `_resetRegistry()` (exported from registry.ts)
+- Restart, backoff, health check and outage state: `_resetRestartState()`, `_resetBackoffState()`, `_resetHealthCheckState()`, `_resetOutageState()`
+- Session-manager notice sink: install a recording sink with `setSessionNotifier(sink)` in `beforeEach` and clear it with `setSessionNotifier(undefined)` in `afterEach`, so no sink leaks into a later file
 - Test-local Maps/Sets: reassign in `beforeEach`
 
 ### Stubbing External Dependencies
 
 - **WebClient**: Persona code uses the Slack stub's Web API clients and `calls` capture arrays (see Slack Stub). Pre-persona suites keep their local stub functions (e.g., `stubPostMessage`, `stubChatUpdate`) that record calls to a capture array and return mock responses, until E3 moves them over
 - **SocketModeClient**: Persona code uses the Slack stub's socket clients and event factories (see Slack Stub). Pre-persona suites keep simulating events by directly calling the handler logic with mock payloads, until E3
+- **Persona notices**: Notice sites never post through a Web client of their own; they take a notify sink. Assert a site's notices through a recording sink: `initOutageState({ notify, getClient })`, `setSessionNotifier(sink)` for the session manager, or the `notify` argument of `runJsonlPersistenceSafeguard`. The sink captures the key and the notice body, without the persona prefix. To prove destination, identity or hold-and-flush, use `makeNotifierHarness(config, opts?)` from `tests/test-helpers/persona-notifier.ts` instead of wiring stubs by hand. It builds the real `createPersonaNotifier` over one `makeStubSlack` stub per persona and installs nothing: pass `h.notifier.notify` to the site under test. Options: `validated` (`true` by default, `false`, or a key list), per-key `post` outcomes, `leakMarker`, `dryRun`. Assert with `h.posts(key)`, `h.totalPosts()` and `h.logs`; `h.validate(key)` marks a client validated, `h.setDryRun(on)` flips dry run, editing `h.personas` simulates a reload, and `h.allPosts()` feeds `assertNoLeak`. `tests/persona-notifier.test.ts` is the reference. Don't stub a module-scope `WebClient` for notices.
 - **server.ts side effects**: Cannot import server.ts in tests (module-scope side effects). Instead, replicate the relevant logic in a self-contained test server or test the extracted pure functions
 
 ### Module Mocks (mock.module)

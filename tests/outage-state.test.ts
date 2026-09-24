@@ -6,7 +6,10 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { Client } from 'agent-director'
 import {
   ErrSystemInstallDisappeared,
@@ -24,10 +27,15 @@ import {
   withOutageDetection,
   withSpawnDetection,
   ALL_CLEAR_TEMPLATE,
+  ONSET_TEMPLATES,
   type ClassRecord,
   type OutageClass,
 } from '../src/outage-state.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
 import { makeStubClient } from './test-helpers/agent-director-stub.ts'
+import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import type { StubSlack } from './test-helpers/slack-stub.ts'
+import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
 import {
   auditGetClientAllowlist,
   enclosingScope,
@@ -38,19 +46,28 @@ import {
 // Harness helpers
 // ---------------------------------------------------------------------------
 
-type Emission = { channelId: string; text: string }
+/** One captured `notify` call: the persona key and the notice body. */
+type Emission = { key: string; text: string }
 
 /**
- * makeHarness — builds a fresh per-test emissions array + postToChannel capture.
+ * Persona keys. Outage state is keyed by persona key (b.av2 SR-6.3); it never
+ * resolves a key, so plain in-form keys stand in for applied personas.
+ */
+const P1 = 'persona_one'
+const P2 = 'persona_two'
+const P9 = 'persona_nine'
+
+/**
+ * makeHarness — builds a fresh per-test emissions array + `notify` capture.
  * Calls _resetOutageState() and initOutageState() so the module is ready.
  */
-function makeHarness(overridePost?: (channelId: string, text: string) => void): {
+function makeHarness(overrideNotify?: (key: string, text: string) => void): {
   emissions: Emission[]
 } {
   const emissions: Emission[] = []
   _resetOutageState()
   initOutageState({
-    postToChannel: overridePost ?? ((channelId, text) => { emissions.push({ channelId, text }) }),
+    notify: overrideNotify ?? ((key, text) => { emissions.push({ key, text }) }),
     getClient: () => makeStubClient() as unknown as Client,
   })
   return { emissions }
@@ -72,101 +89,101 @@ describe('cases 1-9: single-flag lifecycle', () => {
 
   test('1. fresh setOutageFlag ad-unreachable → one onset, flag set contains ad-unreachable', () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'ad-unreachable', '/bin/agent-director')
+    setOutageFlag(P1, 'ad-unreachable', '/bin/agent-director')
     expect(emissions).toHaveLength(1)
-    expect(emissions[0].channelId).toBe('C1')
+    expect(emissions[0].key).toBe(P1)
     expect(emissions[0].text).toMatch(/agent-director unreachable/)
-    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
-    expect(getOutageFlags('C1').size).toBe(1)
+    expect(getOutageFlags(P1).has('ad-unreachable')).toBe(true)
+    expect(getOutageFlags(P1).size).toBe(1)
   })
 
   test('2. repeated setOutageFlag → no second emission, flag set unchanged', () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'ad-unreachable', '/bin/agent-director')
-    setOutageFlag('C1', 'ad-unreachable', '/bin/agent-director')
+    setOutageFlag(P1, 'ad-unreachable', '/bin/agent-director')
+    setOutageFlag(P1, 'ad-unreachable', '/bin/agent-director')
     expect(emissions).toHaveLength(1)
-    expect(getOutageFlags('C1').size).toBe(1)
+    expect(getOutageFlags(P1).size).toBe(1)
   })
 
   test('3. setOutageFlag cwd-unreachable /foo → one cwd-onset containing /foo', () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'cwd-unreachable', '/foo')
+    setOutageFlag(P1, 'cwd-unreachable', '/foo')
     expect(emissions).toHaveLength(1)
     expect(emissions[0].text).toContain('/foo')
-    expect(emissions[0].text).toMatch(/Route cwd unreachable/)
-    expect(getOutageFlags('C1').has('cwd-unreachable')).toBe(true)
+    expect(emissions[0].text).toMatch(/Working directory unreachable/)
+    expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
   })
 
   test('4. setOutageFlag ad then cwd → exactly two onsets, one per class', () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
-    setOutageFlag('C1', 'cwd-unreachable', '/foo')
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'cwd-unreachable', '/foo')
     expect(emissions).toHaveLength(2)
     expect(emissions[0].text).toMatch(/agent-director unreachable/)
-    expect(emissions[1].text).toMatch(/Route cwd unreachable/)
-    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
-    expect(getOutageFlags('C1').has('cwd-unreachable')).toBe(true)
+    expect(emissions[1].text).toMatch(/Working directory unreachable/)
+    expect(getOutageFlags(P1).has('ad-unreachable')).toBe(true)
+    expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
   })
 
   test('5. clearOutageFlag ad with only ad set → one all-clear naming ad-unreachable + detail; flags empty', () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'ad-unreachable', '/bin/agent-director')
+    setOutageFlag(P1, 'ad-unreachable', '/bin/agent-director')
     // clear the onset emission; track only the all-clear
     const before = emissions.length
-    clearOutageFlag('C1', 'ad-unreachable')
+    clearOutageFlag(P1, 'ad-unreachable')
     const newEmissions = emissions.slice(before)
     expect(newEmissions).toHaveLength(1)
     expect(newEmissions[0].text).toMatch(/All clear/)
     expect(newEmissions[0].text).toContain('ad-unreachable')
     expect(newEmissions[0].text).toContain('/bin/agent-director')
-    expect(getOutageFlags('C1').size).toBe(0)
+    expect(getOutageFlags(P1).size).toBe(0)
   })
 
   test('6. clearOutageFlag ad with both ad+cwd set → silent; flags = {cwd-unreachable}', () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
-    setOutageFlag('C1', 'cwd-unreachable', '/foo')
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'cwd-unreachable', '/foo')
     const before = emissions.length
-    clearOutageFlag('C1', 'ad-unreachable')
+    clearOutageFlag(P1, 'ad-unreachable')
     expect(emissions.length).toBe(before) // no new emission
-    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(false)
-    expect(getOutageFlags('C1').has('cwd-unreachable')).toBe(true)
-    expect(getOutageFlags('C1').size).toBe(1)
+    expect(getOutageFlags(P1).has('ad-unreachable')).toBe(false)
+    expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
+    expect(getOutageFlags(P1).size).toBe(1)
   })
 
   test('7. clearOutageFlag cwd after case-6 state → all-clear naming BOTH classes; flags empty', () => {
     const { emissions } = makeHarness()
     // Replicate case-6 state
-    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
-    setOutageFlag('C1', 'cwd-unreachable', '/foo')
-    clearOutageFlag('C1', 'ad-unreachable') // silent
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'cwd-unreachable', '/foo')
+    clearOutageFlag(P1, 'ad-unreachable') // silent
     const before = emissions.length
-    clearOutageFlag('C1', 'cwd-unreachable')
+    clearOutageFlag(P1, 'cwd-unreachable')
     const newEmissions = emissions.slice(before)
     expect(newEmissions).toHaveLength(1)
     expect(newEmissions[0].text).toMatch(/All clear/)
     expect(newEmissions[0].text).toContain('ad-unreachable')
     expect(newEmissions[0].text).toContain('cwd-unreachable')
-    expect(getOutageFlags('C1').size).toBe(0)
+    expect(getOutageFlags(P1).size).toBe(0)
   })
 
   test('8. clearOutageFlag cwd with only cwd set → immediate all-clear', () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'cwd-unreachable', '/foo')
+    setOutageFlag(P1, 'cwd-unreachable', '/foo')
     const before = emissions.length
-    clearOutageFlag('C1', 'cwd-unreachable')
+    clearOutageFlag(P1, 'cwd-unreachable')
     const newEmissions = emissions.slice(before)
     expect(newEmissions).toHaveLength(1)
     expect(newEmissions[0].text).toMatch(/All clear/)
     expect(newEmissions[0].text).toContain('cwd-unreachable')
-    expect(getOutageFlags('C1').size).toBe(0)
+    expect(getOutageFlags(P1).size).toBe(0)
   })
 
   test('9. clearOutageFlag for never-set flag → silent no-op', () => {
     const { emissions } = makeHarness()
-    clearOutageFlag('C1', 'ad-unreachable')
+    clearOutageFlag(P1, 'ad-unreachable')
     expect(emissions).toHaveLength(0)
-    expect(getOutageFlags('C1').size).toBe(0)
+    expect(getOutageFlags(P1).size).toBe(0)
   })
 })
 
@@ -179,13 +196,13 @@ describe('cases 10-14: bad-stretch history, reset, template, post-failure, start
 
   test('10. intra-stretch flap: raise ad → raise cwd → clear ad (silent) → raise ad again → clear cwd (silent) → clear ad → all-clear names ad-unreachable once, no timestamp', () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')  // onset ad
-    setOutageFlag('C1', 'cwd-unreachable', '/foo')     // onset cwd
-    clearOutageFlag('C1', 'ad-unreachable')             // silent (cwd still set)
-    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')   // onset ad again
-    clearOutageFlag('C1', 'cwd-unreachable')            // silent (ad still set)
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')  // onset ad
+    setOutageFlag(P1, 'cwd-unreachable', '/foo')     // onset cwd
+    clearOutageFlag(P1, 'ad-unreachable')             // silent (cwd still set)
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')   // onset ad again
+    clearOutageFlag(P1, 'cwd-unreachable')            // silent (ad still set)
     const before = emissions.length
-    clearOutageFlag('C1', 'ad-unreachable')             // all-clear
+    clearOutageFlag(P1, 'ad-unreachable')             // all-clear
     const newEmissions = emissions.slice(before)
     expect(newEmissions).toHaveLength(1)
     const msg = newEmissions[0].text
@@ -197,37 +214,37 @@ describe('cases 10-14: bad-stretch history, reset, template, post-failure, start
 
   test('11. resetAllToHealthy → silent; subsequent setOutageFlag re-emits fresh onset', () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
-    setOutageFlag('C2', 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P2, 'ad-unreachable', '/bin/ad')
     const before = emissions.length
-    resetAllToHealthy(['C1', 'C2'])
+    resetAllToHealthy([P1, P2])
     expect(emissions.length).toBe(before) // silent — no all-clear
-    expect(getOutageFlags('C1').size).toBe(0)
-    expect(getOutageFlags('C2').size).toBe(0)
+    expect(getOutageFlags(P1).size).toBe(0)
+    expect(getOutageFlags(P2).size).toBe(0)
     // Post-reset, a fresh onset MUST emit (not deduped)
-    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
     expect(emissions.length).toBe(before + 1)
     expect(emissions[before].text).toMatch(/agent-director unreachable/)
   })
 
-  test('12. postToChannel synchronous failure propagates; state mutation already applied', () => {
+  test('12. notify synchronous failure propagates; state mutation already applied', () => {
     let throwNext = false
     const emissions: Emission[] = []
     _resetOutageState()
     initOutageState({
-      postToChannel: (channelId, text) => {
+      notify: (key, text) => {
         if (throwNext) throw new Error('slack-post-failed')
-        emissions.push({ channelId, text })
+        emissions.push({ key, text })
       },
       getClient: () => makeStubClient() as unknown as Client,
     })
     throwNext = true
-    expect(() => setOutageFlag('C1', 'ad-unreachable', '/bin/ad')).toThrow('slack-post-failed')
+    expect(() => setOutageFlag(P1, 'ad-unreachable', '/bin/ad')).toThrow('slack-post-failed')
     // State mutation happened before the emit, so re-call is deduped (silent)
     throwNext = false
-    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
     expect(emissions).toHaveLength(0) // dedupe — no new emission
-    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
+    expect(getOutageFlags(P1).has('ad-unreachable')).toBe(true)
   })
 
   test('13. ALL_CLEAR_TEMPLATE renders both classes in stable order; no ISO-8601 substring', () => {
@@ -251,14 +268,14 @@ describe('cases 10-14: bad-stretch history, reset, template, post-failure, start
     void rec.enteredAtIso
   })
 
-  test('14. startup bounded pair: onset then immediate clear → 2 emissions; correct content + channelId', () => {
+  test('14. startup bounded pair: onset then immediate clear → 2 emissions; correct content + persona key', () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'cwd-unreachable', '/foo')
-    clearOutageFlag('C1', 'cwd-unreachable')
+    setOutageFlag(P1, 'cwd-unreachable', '/foo')
+    clearOutageFlag(P1, 'cwd-unreachable')
     expect(emissions).toHaveLength(2)
-    expect(emissions[0].channelId).toBe('C1')
-    expect(emissions[0].text).toMatch(/Route cwd unreachable/)
-    expect(emissions[1].channelId).toBe('C1')
+    expect(emissions[0].key).toBe(P1)
+    expect(emissions[0].text).toMatch(/Working directory unreachable/)
+    expect(emissions[1].key).toBe(P1)
     expect(emissions[1].text).toMatch(/All clear.*cwd-unreachable/)
   })
 })
@@ -273,20 +290,20 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     const { emissions } = makeHarness()
     const err = new ErrSystemInstallDisappeared('spawn', '/bin/ad')
     await expect(
-      withOutageDetection('C1', '/cwd', async (_client) => { throw err })
+      withOutageDetection(P1, '/cwd', async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrSystemInstallDisappeared)
-    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
+    expect(getOutageFlags(P1).has('ad-unreachable')).toBe(true)
     expect(emissions).toHaveLength(1)
     expect(emissions[0].text).toContain('/bin/ad')
   })
 
-  test('15b. withOutageDetection ErrCwdNotFound + routeCwd → cwd-unreachable raised; error rethrows', async () => {
+  test('15b. withOutageDetection ErrCwdNotFound + workingDirectory → cwd-unreachable raised; error rethrows', async () => {
     const { emissions } = makeHarness()
     const err = new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd not found')
     await expect(
-      withOutageDetection('C1', '/foo', async (_client) => { throw err })
+      withOutageDetection(P1, '/foo', async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrCwdNotFound)
-    expect(getOutageFlags('C1').has('cwd-unreachable')).toBe(true)
+    expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
     expect(emissions).toHaveLength(1)
     expect(emissions[0].text).toContain('/foo')
   })
@@ -295,80 +312,80 @@ describe('cases 15-19: withOutageDetection and withSpawnDetection', () => {
     const { emissions } = makeHarness()
     const err = new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'not found')
     await expect(
-      withOutageDetection('C1', '/cwd', async (_client) => { throw err })
+      withOutageDetection(P1, '/cwd', async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrSpawnNotFound)
-    expect(getOutageFlags('C1').size).toBe(0)
+    expect(getOutageFlags(P1).size).toBe(0)
     expect(emissions).toHaveLength(0)
   })
 
   test('16a. withOutageDetection success: clears ad+tmux → all-clear emits naming both', async () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
-    setOutageFlag('C1', 'tmux-unavailable')
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'tmux-unavailable')
     const before = emissions.length
-    await withOutageDetection('C1', '/cwd', async (_client) => 'ok')
+    await withOutageDetection(P1, '/cwd', async (_client) => 'ok')
     const newEmissions = emissions.slice(before)
     expect(newEmissions).toHaveLength(1)
     expect(newEmissions[0].text).toMatch(/All clear/)
     expect(newEmissions[0].text).toContain('ad-unreachable')
     expect(newEmissions[0].text).toContain('tmux-unavailable')
-    expect(getOutageFlags('C1').size).toBe(0)
+    expect(getOutageFlags(P1).size).toBe(0)
   })
 
   test('16b. withOutageDetection success with cwd also set: ad+tmux clear is silent; cwd-unreachable remains', async () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
-    setOutageFlag('C1', 'tmux-unavailable')
-    setOutageFlag('C1', 'cwd-unreachable', '/foo')
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'tmux-unavailable')
+    setOutageFlag(P1, 'cwd-unreachable', '/foo')
     const before = emissions.length
-    await withOutageDetection('C1', '/cwd', async (_client) => 'ok')
+    await withOutageDetection(P1, '/cwd', async (_client) => 'ok')
     expect(emissions.length).toBe(before) // silent — cwd still set
-    expect(getOutageFlags('C1').has('cwd-unreachable')).toBe(true)
-    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(false)
-    expect(getOutageFlags('C1').has('tmux-unavailable')).toBe(false)
+    expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
+    expect(getOutageFlags(P1).has('ad-unreachable')).toBe(false)
+    expect(getOutageFlags(P1).has('tmux-unavailable')).toBe(false)
   })
 
   test('17. withOutageDetection success: cwd-unreachable NOT cleared by non-spawn verb', async () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'cwd-unreachable', '/foo')
+    setOutageFlag(P1, 'cwd-unreachable', '/foo')
     const before = emissions.length
-    await withOutageDetection('C1', '/cwd', async (_client) => 'ok')
+    await withOutageDetection(P1, '/cwd', async (_client) => 'ok')
     expect(emissions.length).toBe(before) // silent (only cwd, so clear of ad+tmux is a no-op)
-    expect(getOutageFlags('C1').has('cwd-unreachable')).toBe(true)
+    expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
   })
 
   test('18. withSpawnDetection success: clears cwd+ad+tmux; all-clear names all three', async () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
-    setOutageFlag('C1', 'tmux-unavailable')
-    setOutageFlag('C1', 'cwd-unreachable', '/foo')
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'tmux-unavailable')
+    setOutageFlag(P1, 'cwd-unreachable', '/foo')
     const before = emissions.length
-    await withSpawnDetection('C1', '/foo', async (_client) => 'ok')
+    await withSpawnDetection(P1, '/foo', async (_client) => 'ok')
     const newEmissions = emissions.slice(before)
     expect(newEmissions).toHaveLength(1)
     expect(newEmissions[0].text).toMatch(/All clear/)
     expect(newEmissions[0].text).toContain('ad-unreachable')
     expect(newEmissions[0].text).toContain('tmux-unavailable')
     expect(newEmissions[0].text).toContain('cwd-unreachable')
-    expect(getOutageFlags('C1').size).toBe(0)
+    expect(getOutageFlags(P1).size).toBe(0)
   })
 
   test('19. withSpawnDetection ErrCwdNotFound: cwd-unreachable raised; ad/tmux NOT cleared; error rethrows', async () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
-    setOutageFlag('C1', 'tmux-unavailable')
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P1, 'tmux-unavailable')
     const before = emissions.length
     const err = new ErrCwdNotFound('spawn', 'ErrCwdNotFound', 'cwd not found')
     await expect(
-      withSpawnDetection('C1', '/foo', async (_client) => { throw err })
+      withSpawnDetection(P1, '/foo', async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrCwdNotFound)
-    expect(getOutageFlags('C1').has('cwd-unreachable')).toBe(true)
-    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
-    expect(getOutageFlags('C1').has('tmux-unavailable')).toBe(true)
+    expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
+    expect(getOutageFlags(P1).has('ad-unreachable')).toBe(true)
+    expect(getOutageFlags(P1).has('tmux-unavailable')).toBe(true)
     // Only the cwd onset emitted; ad+tmux not cleared
     const newEmissions = emissions.slice(before)
     expect(newEmissions).toHaveLength(1)
-    expect(newEmissions[0].text).toMatch(/Route cwd unreachable/)
+    expect(newEmissions[0].text).toMatch(/Working directory unreachable/)
   })
 })
 
@@ -384,19 +401,19 @@ describe('cases 20-21: flap cycles and never-set no-op', () => {
 
     // Throw 1 → onset
     await expect(
-      withOutageDetection('C1', '/cwd', async (_client) => { throw err })
+      withOutageDetection(P1, '/cwd', async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrSystemInstallDisappeared)
 
     // Succeed 1 → all-clear
-    await withOutageDetection('C1', '/cwd', async (_client) => 'ok')
+    await withOutageDetection(P1, '/cwd', async (_client) => 'ok')
 
     // Throw 2 → onset
     await expect(
-      withOutageDetection('C1', '/cwd', async (_client) => { throw err })
+      withOutageDetection(P1, '/cwd', async (_client) => { throw err })
     ).rejects.toBeInstanceOf(ErrSystemInstallDisappeared)
 
     // Succeed 2 → all-clear
-    await withOutageDetection('C1', '/cwd', async (_client) => 'ok')
+    await withOutageDetection(P1, '/cwd', async (_client) => 'ok')
 
     expect(emissions).toHaveLength(4)
     expect(emissions[0].text).toMatch(/agent-director unreachable/)  // onset 1
@@ -405,13 +422,165 @@ describe('cases 20-21: flap cycles and never-set no-op', () => {
     expect(emissions[3].text).toMatch(/All clear/)                   // all-clear 2
   })
 
-  test('21. clearOutageFlag on never-touched channel → silent; getOutageFlags returns empty set', () => {
+  test('21. clearOutageFlag on never-touched persona → silent; getOutageFlags returns empty set', () => {
     makeHarness()
-    clearOutageFlag('C9', 'ad-unreachable')
-    expect(getOutageFlags('C9').size).toBe(0)
-    // Confirm C9 is isolated — activity on another channel doesn't bleed in
-    setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
-    expect(getOutageFlags('C9').size).toBe(0)
+    clearOutageFlag(P9, 'ad-unreachable')
+    expect(getOutageFlags(P9).size).toBe(0)
+    // Confirm P9 is isolated — activity on another persona doesn't bleed in
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    expect(getOutageFlags(P9).size).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Persona keying — notice wording, per-persona isolation, and the AC 25
+// destination leg through the real per-persona notifier (b.av2 SR-6.3, SR-7.2)
+// ---------------------------------------------------------------------------
+
+describe('persona-keyed notices', () => {
+  const ALL_CLASSES: OutageClass[] = ['ad-unreachable', 'tmux-unavailable', 'cwd-unreachable']
+
+  test('onset and all-clear texts name no route or channel and carry no persona reference (the notifier adds it)', () => {
+    const texts = [
+      ...ALL_CLASSES.map((cls) => ONSET_TEMPLATES[cls]('/some/detail')),
+      ALL_CLEAR_TEMPLATE(new Map(ALL_CLASSES.map((cls) => [cls, { detail: '/some/detail' }]))),
+    ]
+    for (const text of texts) {
+      expect(text).not.toMatch(/route/i)
+      expect(text).not.toMatch(/channel/i)
+      expect(text).not.toMatch(/\bPersona "/)
+      expect(text).not.toContain('key=')
+      expect(text).not.toMatch(/\dT\d/)
+    }
+    // The fleet-wide classes say they affect every persona.
+    expect(ONSET_TEMPLATES['ad-unreachable']('/bin/ad')).toContain('affects every persona')
+    expect(ONSET_TEMPLATES['tmux-unavailable']()).toContain('affects every persona')
+    // cwd-unreachable points at the persona's working directory, not a route.
+    const cwd = ONSET_TEMPLATES['cwd-unreachable']('/work/dir')
+    expect(cwd).toMatch(/Working directory unreachable/)
+    expect(cwd).toContain('/work/dir')
+    expect(cwd).toContain('`working_directory`')
+    expect(cwd).not.toMatch(/remove this/i)
+  })
+
+  test('two personas: raise/clear for A emits only for A; B is untouched and a same-class raise for B is not deduped against A', () => {
+    const { emissions } = makeHarness()
+    const forKey = (key: string) => emissions.filter((e) => e.key === key)
+
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    expect(emissions).toHaveLength(1)
+    expect(forKey(P1)).toHaveLength(1)
+    expect(forKey(P2)).toHaveLength(0)
+    expect(getOutageFlags(P2).size).toBe(0)
+
+    clearOutageFlag(P1, 'ad-unreachable')
+    expect(emissions).toHaveLength(2)
+    expect(forKey(P1)).toHaveLength(2)
+    expect(forKey(P1)[1].text).toMatch(/All clear/)
+    expect(forKey(P2)).toHaveLength(0)
+    expect(getOutageFlags(P2).size).toBe(0)
+
+    // A holds the flag; the same class raised for B still emits B's own onset.
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P2, 'ad-unreachable', '/bin/ad')
+    expect(emissions).toHaveLength(4)
+    expect(emissions[3].key).toBe(P2)
+    expect(emissions[3].text).toMatch(/agent-director unreachable/)
+    expect(getOutageFlags(P1).has('ad-unreachable')).toBe(true)
+    expect(getOutageFlags(P2).has('ad-unreachable')).toBe(true)
+
+    // Clearing B leaves A's flag and history alone: A's later clear is A's own all-clear.
+    clearOutageFlag(P2, 'ad-unreachable')
+    expect(emissions).toHaveLength(5)
+    expect(emissions[4].key).toBe(P2)
+    expect(getOutageFlags(P1).has('ad-unreachable')).toBe(true)
+    clearOutageFlag(P1, 'ad-unreachable')
+    expect(emissions).toHaveLength(6)
+    expect(emissions[5].key).toBe(P1)
+    expect(emissions[5].text).toMatch(/All clear/)
+    expect(forKey(P1)).toHaveLength(4)
+    expect(forKey(P2)).toHaveLength(2)
+  })
+
+  describe('AC 25 (outage-state leg): notices reach only the persona destination through the real notifier', () => {
+    let dir: string
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'outage-state-ac25-'))
+    })
+
+    afterEach(() => {
+      rmSync(dir, { recursive: true, force: true })
+    })
+
+    function setup(): { stubA: StubSlack; stubB: StubSlack; refA: string; refB: string; keyA: string; destA: string; lines: string[] } {
+      // Names differ from keys, and each persona's destination is a channel
+      // that differs from its key and from its first channel.
+      const config = makeMultiPersonaConfig(
+        [
+          {
+            name: 'Alpha Ops',
+            channels: [{ id: 'C0ALPHA01', delivery: 'all' }, { id: 'C0ALPHA02', delivery: 'all' }],
+            permission_prompts: 'C0ALPHA02',
+          },
+          {
+            name: 'Bravo Ops',
+            channels: [{ id: 'C0BRAVO01', delivery: 'all' }],
+            permission_prompts: 'C0BRAVO01',
+          },
+        ],
+        dir,
+      )
+      const [a, b] = config.personas
+      const h = makeNotifierHarness(config)
+      _resetOutageState()
+      initOutageState({
+        notify: (key, text) => { void h.notifier.notify(key, text) },
+        getClient: () => makeStubClient() as unknown as Client,
+      })
+      expect(a.key).not.toBe(a.permission_prompts)
+      return {
+        stubA: h.stub(a.key),
+        stubB: h.stub(b.key),
+        refA: renderPersonaRef(a.name, a.key),
+        refB: renderPersonaRef(b.name, b.key),
+        keyA: a.key,
+        destA: a.permission_prompts,
+        lines: h.logs,
+      }
+    }
+
+    test('raise then clear for A → one post each on A\'s client to A\'s permission_prompts channel naming A; nothing on B', async () => {
+      const { stubA, stubB, refA, refB, keyA, destA, lines } = setup()
+
+      setOutageFlag(keyA, 'ad-unreachable', '/bin/ad')
+      await Promise.resolve()
+      expect(stubA.calls.postMessage).toHaveLength(1)
+      const onset = stubA.calls.postMessage[0] as { channel: string; text: string }
+      // Exactly channel + text: top-level, no thread or identity override.
+      expect(Object.keys(onset).sort()).toEqual(['channel', 'text'])
+      expect(onset.channel).toBe(destA)
+      expect(onset.text).toContain(refA)
+      expect(onset.text).not.toContain(refB)
+      expect(onset.text).toMatch(/agent-director unreachable/)
+      expect(onset.text).toContain('/bin/ad')
+      expect(stubB.calls.postMessage).toHaveLength(0)
+
+      clearOutageFlag(keyA, 'ad-unreachable')
+      await Promise.resolve()
+      expect(stubA.calls.postMessage).toHaveLength(2)
+      const allClear = stubA.calls.postMessage[1] as { channel: string; text: string }
+      expect(Object.keys(allClear).sort()).toEqual(['channel', 'text'])
+      expect(allClear.channel).toBe(destA)
+      expect(allClear.text).toContain(refA)
+      expect(allClear.text).not.toContain(refB)
+      expect(allClear.text).toMatch(/All clear/)
+      expect(allClear.text).toContain('ad-unreachable')
+      expect(stubB.calls.postMessage).toHaveLength(0)
+
+      // No drop, dry-run or failure path was taken.
+      expect(lines).toEqual([])
+    })
   })
 })
 
@@ -496,55 +665,55 @@ describe('static audits', () => {
 
   test('23 Part B. resetAllToHealthy is silent + idempotent across consecutive calls', () => {
     const { emissions } = makeHarness()
-    setOutageFlag('C1', 'ad-unreachable', '/x')
-    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
+    setOutageFlag(P1, 'ad-unreachable', '/x')
+    expect(getOutageFlags(P1).has('ad-unreachable')).toBe(true)
     const beforeFirst = emissions.length
 
-    resetAllToHealthy(['C1'])
-    expect(getOutageFlags('C1').size).toBe(0)
+    resetAllToHealthy([P1])
+    expect(getOutageFlags(P1).size).toBe(0)
     expect(emissions.length).toBe(beforeFirst)  // silent: no emission
 
-    resetAllToHealthy(['C1'])
-    expect(getOutageFlags('C1').size).toBe(0)
+    resetAllToHealthy([P1])
+    expect(getOutageFlags(P1).size).toBe(0)
     expect(emissions.length).toBe(beforeFirst)  // still silent on second call
   })
 
   test('24. mixed-source two-flag composition: tick + wrapper raise both; spawn-success all-clear names both', async () => {
     const { emissions } = makeHarness()
 
-    // Step 1: simulate the tick raising cwd-unreachable for C1.
+    // Step 1: simulate the tick raising cwd-unreachable for P1.
     // The tick's effect on the state machine is one setOutageFlag call —
     // exercising it directly is semantically equivalent to driving the tick
     // body, and keeps this case a pure outage-state composition test.
-    setOutageFlag('C1', 'cwd-unreachable', '/route/cwd')
+    setOutageFlag(P1, 'cwd-unreachable', '/persona/workdir')
 
     // Step 2: drive the wrapper to raise ad-unreachable from a spawn throw.
     const adErr = new ErrSystemInstallDisappeared('spawn', '/bin/ad')
     const spawnStub = async () => { throw adErr }
     await expect(
-      withSpawnDetection('C1', '/route/cwd', spawnStub),
+      withSpawnDetection(P1, '/persona/workdir', spawnStub),
     ).rejects.toThrow(ErrSystemInstallDisappeared)
 
     // Assert: two onsets in order.
     expect(emissions).toHaveLength(2)
-    expect(emissions[0].channelId).toBe('C1')
-    expect(emissions[0].text).toMatch(/Route cwd unreachable/)
-    expect(emissions[0].text).toContain('/route/cwd')
-    expect(emissions[1].channelId).toBe('C1')
+    expect(emissions[0].key).toBe(P1)
+    expect(emissions[0].text).toMatch(/Working directory unreachable/)
+    expect(emissions[0].text).toContain('/persona/workdir')
+    expect(emissions[1].key).toBe(P1)
     expect(emissions[1].text).toMatch(/agent-director unreachable/)
     expect(emissions[1].text).toContain('/bin/ad')
-    expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
-    expect(getOutageFlags('C1').has('cwd-unreachable')).toBe(true)
+    expect(getOutageFlags(P1).has('ad-unreachable')).toBe(true)
+    expect(getOutageFlags(P1).has('cwd-unreachable')).toBe(true)
 
     // Step 3: flip the spawn stub to succeed; withSpawnDetection clears both.
     const successStub = async () => 'ok'
-    const result = await withSpawnDetection('C1', '/route/cwd', successStub)
+    const result = await withSpawnDetection(P1, '/persona/workdir', successStub)
     expect(result).toBe('ok')
 
     // Exactly one new emission (the all-clear). Three total now.
     expect(emissions).toHaveLength(3)
     const allClear = emissions[2]
-    expect(allClear.channelId).toBe('C1')
+    expect(allClear.key).toBe(P1)
     expect(allClear.text).toMatch(/All clear/)
     // SRD stable rendering order: ad-unreachable BEFORE cwd-unreachable.
     const adIdx = allClear.text.indexOf('ad-unreachable')
@@ -553,8 +722,8 @@ describe('static audits', () => {
     expect(cwdIdx).toBeGreaterThan(-1)
     expect(adIdx).toBeLessThan(cwdIdx)
     expect(allClear.text).toContain('/bin/ad')
-    expect(allClear.text).toContain('/route/cwd')
-    expect(getOutageFlags('C1').size).toBe(0)
+    expect(allClear.text).toContain('/persona/workdir')
+    expect(getOutageFlags(P1).size).toBe(0)
   })
 })
 

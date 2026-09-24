@@ -52,8 +52,9 @@ import { AgentDirectorError } from 'agent-director'
 
 /**
  * CSCB-synthetic error — never emitted by the agent-director library. Minted by
- * the restart backoff cap path (server.ts onCapReached) when a channel hits the
- * consecutive session-launch failure cap and automatic restarts are suspended.
+ * the restart backoff cap path (`notifyRestartCapReached` in session-manager.ts,
+ * called from restart.ts `onCapReached`) when a persona hits the consecutive
+ * session-launch failure cap and automatic restarts are suspended.
  * Branched on via `instanceof` in remediationHint (SR-0.2 — no string matching).
  */
 export class ErrSpawnCapReached extends AgentDirectorError {

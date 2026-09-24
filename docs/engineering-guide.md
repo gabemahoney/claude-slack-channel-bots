@@ -84,7 +84,7 @@ When a managed session's MCP connection closes, `onsessionclosed` calls `schedul
 
 ### Failure Limiting
 
-Consecutive relaunch failures are tracked per channel by `src/backoff.ts` — a pure, import-free module with no timers or I/O (see SR-25). The module exposes a simple counter API consumed one-way by restart/health-check/server wiring. `restart.ts` counts at a single site: the `launchSession` boolean outcome (SR-25.1). A successful launch — or a successful MCP reconnect on the alive-but-disconnected path — calls `recordSuccess`; the failing `launchSession` branch calls `recordFailure`. The reconnect path never calls `recordFailure`: an `'escalate-dead'` or `'transient'` reconnect does not re-enter `scheduleRestart`, so counting stays tied to actual launch attempts rather than a non-launch reconnect site. On `'escalate-dead'` restart.ts still returns without re-entering, but the verdict is no longer a silent dead end — the `_buildReconnectSessionAdapter` mapping first awaits `sweepDeadTmuxChannel` (an operator log line plus the memoized `reconcileMissingSweep`, b.m4r), reconciling the dead-tmux row to `missing` so the next tick relaunches it internally rather than waiting on the external `~/startup/find-missing-loop.sh` (now belt-and-braces). The sweep records neither success nor failure, so SR-25.1 (counting only at `launchSession`) is unchanged. That is not a dead end (b.9a7): the periodic health-check tick is the retry driver, re-observing the channel each interval and calling `scheduleRestart` again while it is still alive-but-disconnected or once it goes dead, so a failed or deferred reconnect is retried on a bounded cadence.
+Consecutive relaunch failures are tracked per persona, keyed by persona key (b.av2 SR-6.3), by `src/backoff.ts` — a pure, import-free module with no timers or I/O (see SR-25). The module exposes a simple counter API consumed one-way by restart/health-check/server wiring. `restart.ts` counts at a single site: the `launchSession` boolean outcome (SR-25.1). A successful launch — or a successful MCP reconnect on the alive-but-disconnected path — calls `recordSuccess`; the failing `launchSession` branch calls `recordFailure`. The reconnect path never calls `recordFailure`: an `'escalate-dead'` or `'transient'` reconnect does not re-enter `scheduleRestart`, so counting stays tied to actual launch attempts rather than a non-launch reconnect site. On `'escalate-dead'` restart.ts still returns without re-entering, but the verdict is no longer a silent dead end — the `_buildReconnectSessionAdapter` mapping first awaits `sweepDeadTmuxChannel` (an operator log line plus the memoized `reconcileMissingSweep`, b.m4r), reconciling the dead-tmux row to `missing` so the next tick relaunches it internally rather than waiting on the external `~/startup/find-missing-loop.sh` (now belt-and-braces). The sweep records neither success nor failure, so SR-25.1 (counting only at `launchSession`) is unchanged. That is not a dead end (b.9a7): the periodic health-check tick is the retry driver, re-observing the persona each interval and calling `scheduleRestart` again while it is still alive-but-disconnected or once it goes dead, so a failed or deferred reconnect is retried on a bounded cadence.
 
 #### Exponential backoff
 
@@ -99,17 +99,17 @@ Each successive failure doubles the restart delay, starting from `session_restar
 | 4 | 900 s |
 | 5+ | 900 s |
 
-Formula: `min(base * 2^preFailureCount, 900)`. `nextBackoffDelay(channelId, baseDelaySeconds)` returns this value using the count recorded before the current failure attempt.
+Formula: `min(base * 2^preFailureCount, 900)`. `nextBackoffDelay(key, baseDelaySeconds)` returns this value for persona `key` using the count recorded before the current failure attempt.
 
-The arithmetic is also exported statelessly as `doublingBackoffDelay(base, priorAttempts, ceiling)` for callers that keep their own attempt count; `nextBackoffDelay` delegates to it with the 900 s ceiling. The session-restart ladder above, its 5-failure cap and its per-channel counters are unchanged.
+The arithmetic is also exported statelessly as `doublingBackoffDelay(base, priorAttempts, ceiling)` for callers that keep their own attempt count; `nextBackoffDelay` delegates to it with the 900 s ceiling. The session-restart ladder above, its 5-failure cap and its counters are keyed by persona key.
 
-Persona Slack-unreachable retries (b.av2 SR-3.2) use a separate schedule in `src/persona-retry-schedule.ts`: 5 s doubling to 300 s, no attempt cap, and never shorter than Slack's `retryAfter`. Create one schedule per persona and retry purpose with `createPersonaRetrySchedule`; don't use the per-channel counters for personas.
+Persona Slack-unreachable retries (b.av2 SR-3.2) use a separate schedule in `src/persona-retry-schedule.ts`: 5 s doubling to 300 s, no attempt cap, and never shorter than Slack's `retryAfter`. Create one schedule per persona and retry purpose with `createPersonaRetrySchedule`. Don't use the session-restart counters for Slack retries: both are per persona, but they count different failures and share no state.
 
 #### Cap at 5 consecutive failures
 
-After 5 consecutive failures, `isAtCap(channelId, RESTART_FAILURE_CAP)` returns `true` (`RESTART_FAILURE_CAP = 5` is exported from `restart.ts` and referenced by `server.ts` and the health-check wiring — no hardcoded literal). Capped channels are skipped by the health-check tick — the poller calls `isAtCap` before `scheduleRestart` and skips the channel when it is true.
+After 5 consecutive failures, `isAtCap(key, RESTART_FAILURE_CAP)` returns `true` (`RESTART_FAILURE_CAP = 5` is exported from `restart.ts` and referenced by `server.ts` and the health-check wiring — no hardcoded literal). Capped personas are skipped by the health-check tick — the poller calls `isAtCap` before `scheduleRestart` and skips the persona when it is true.
 
-A capped channel recovers **only via a server restart**. The in-process counter is lost on restart by design; startup reconcile then re-runs for all configured routes, giving each channel a fresh attempt.
+A capped persona recovers **only via a server restart**. The in-process counter is lost on restart by design; startup reconcile then re-runs for every persona, giving each a fresh attempt.
 
 Sending a message in the channel does **not** revive a capped route. A channel capped by 5 consecutive `launchSession` failures has no registered session, so an inbound message hits the drop branch in `server.ts` ("No live session for channel … — dropping message"). As of b.kvq that drop branch *can* trigger a recovery `scheduleRestart` for a configured-but-sessionless channel, but it explicitly checks `backoffIsAtCap(ownerChannelId, RESTART_FAILURE_CAP)` first and, when the route is at the cap, does **not** fire — it posts an honest "this channel has hit its restart-failure limit and will NOT recover on its own — an operator must restart the server" reply instead. The cap is therefore still honored on the inbound path; firing a restart would only burn a spawn attempt against a route that cannot come up. Only a server restart clears the in-process counter and gives the route a fresh attempt.
 
@@ -129,37 +129,37 @@ The drop branch has four reply outcomes (the dropped message itself is always lo
 
 #### SpawnCapReached notification (once per episode)
 
-On the transition to 5 consecutive failures, the `launchSession`-failure branch calls `shouldNotifyCap(channelId, RESTART_FAILURE_CAP)`; on its single `true` return it invokes `deps.onCapReached(channelId)`, which posts a distinct `SpawnCapReached` message to the channel (a top-level channel message via `postSpawnFailureToChannel` — no `thread_ts`) and schedules **no** further timer. Subsequent failures in the same capped episode are silent. `shouldNotifyCap` implements this latch: it returns `true` on the first call at cap, then latches to `false` until the counter is reset.
+On the transition to 5 consecutive failures, the `launchSession`-failure branch calls `shouldNotifyCap(key, RESTART_FAILURE_CAP)`; on its single `true` return it invokes `deps.onCapReached(key)` and schedules **no** further timer. `onCapReached` calls the session manager's cap-notice function, `notifyRestartCapReached(key)`, which raises a distinct `SpawnCapReached` notice through the per-persona notifier (`src/persona-notifier.ts`). The notifier posts it to the persona's destination under the persona's identity, as one top-level message with no `thread_ts`, and prefixes it with the persona reference. Raise restart, spawn, outage and transcript notices through the notifier; never post them from `restart.ts`, `server.ts` or `session-manager.ts` directly. Subsequent failures in the same capped episode are silent. `shouldNotifyCap` implements this latch: it returns `true` on the first call at cap, then latches to `false` until the counter is reset.
 
 #### Counter reset semantics
 
-`recordSuccess(channelId)` resets the consecutive-failure count and clears the cap-notified latch. It is called on any successful launch or successful MCP reconnect. Both state values reset together — a fresh episode starts from 0 failures with the cap-notification latch cleared.
+`recordSuccess(key)` resets the persona's consecutive-failure count and clears the cap-notified latch. It is called on any successful launch or successful MCP reconnect. Both state values reset together — a fresh episode starts from 0 failures with the cap-notification latch cleared.
 
 #### State lifetime
 
-The backoff state is in-process only — no persistence. A server restart resets all counters. This is intentional: the server re-runs startup reconcile on start, so each channel gets a clean shot at reconnection after a process restart.
+The backoff state is in-process only — no persistence. A server restart resets all counters. This is intentional: the server re-runs startup reconcile on start, so each persona gets a clean shot at reconnection after a process restart.
 
 ### Log Messages
 
-All restart activity is logged to stderr with the `[slack]` prefix:
+All restart activity is logged to stderr with the `[slack]` prefix. `<key>` is the persona key (the channel ID under the transitional route→persona adapter):
 
 | Message | Meaning |
 |---|---|
-| `[slack] Scheduling restart for channel=<id> in <N>s (backoff)` | Restart timer queued; delay is the backoff ladder value |
-| `[slack] Auto-restart disabled (delay=0) — skipping restart for channel=<id>` | Restart skipped; feature disabled |
-| `[slack] Session already reconnected — skipping restart for channel=<id>` | Session re-established MCP on its own; no action needed |
-| `[slack] Session alive but disconnected — reconnecting MCP for channel=<id>` | Alive session; sending `/mcp reconnect` instead of relaunching |
-| `[slack] Relaunching session for channel=<id> cwd="<path>"` | Relaunch attempt starting |
-| `[slack] Session relaunch failed for channel=<id>` | Relaunch failed; failure counter incremented |
-| `[slack] Cap reached for channel=<id> — notifying and stopping restarts` | 5th consecutive failure; `SpawnCapReached` posted, no more timers scheduled |
-| `[slack] health-check: channel=<id> is at cap — skipping tick (SR-25.3/25.4)` | Poller skipped a capped channel on this tick |
-| `[slack] reconnectSession: channel=<id> is working — deferring /mcp reconnect to a later tick (b.9a7/b.rmy)` | A tick-driven reconnect declined to poke a mid-long-turn (`working`) session; the next tick retries once the turn settles |
-| `[slack] Skipping restart — server is shutting down (channel=<id>)` | Timer fired during shutdown; abort |
-| `[slack] Cancelled restart timer for channel=<id>` | Pending timer cleared on graceful shutdown |
+| `[slack] Scheduling restart for persona=<key> in <N>s (backoff)` | Restart timer queued; delay is the backoff ladder value |
+| `[slack] Auto-restart disabled (delay=0) — skipping restart for persona=<key>` | Restart skipped; feature disabled |
+| `[slack] Session already reconnected — skipping restart for persona=<key>` | Session re-established MCP on its own; no action needed |
+| `[slack] Session alive but disconnected — reconnecting MCP for persona=<key>` | Alive session; sending `/mcp reconnect` instead of relaunching |
+| `[slack] Relaunching session for persona=<key> cwd="<path>"` | Relaunch attempt starting |
+| `[slack] Session relaunch failed for persona=<key>` | Relaunch failed; failure counter incremented |
+| `[slack] Cap reached for persona=<key> — notifying and stopping restarts` | 5th consecutive failure; `SpawnCapReached` notice raised through the notifier, no more timers scheduled |
+| `[slack] health-check: persona=<key> is at cap — skipping tick (SR-25.3/25.4)` | Poller skipped a capped persona on this tick |
+| `[slack] reconnectSession: persona=<key> is working — deferring /mcp reconnect to a later tick (b.9a7/b.rmy)` | A tick-driven reconnect declined to poke a mid-long-turn (`working`) session; the next tick retries once the turn settles |
+| `[slack] Skipping restart — server is shutting down (persona=<key>)` | Timer fired during shutdown; abort |
+| `[slack] Cancelled restart timer for persona=<key>` | Pending timer cleared on graceful shutdown |
 
 ## Health-Check Poller
 
-`health-check.ts` runs a `setInterval` loop that checks every configured route on a fixed cadence and schedules recovery for sessions that are dead — and, as of b.9a7, for sessions that are alive (AD live state) but MCP-disconnected — when they are not already being recovered. Both cases route through `scheduleRestart`, which then reconnects or relaunches per case. The alive-but-disconnected case requires `!connected` on two consecutive ticks before firing, to avoid poking a freshly-launched session that has not yet registered its MCP connection.
+`health-check.ts` runs a `setInterval` loop that checks every applied persona on a fixed cadence and schedules recovery for sessions that are dead — and, as of b.9a7, for sessions that are alive (AD live state) but MCP-disconnected — when they are not already being recovered. Both cases route through `scheduleRestart`, which then reconnects or relaunches per case. The alive-but-disconnected case requires `!connected` on two consecutive ticks before firing, to avoid poking a freshly-launched session that has not yet registered its MCP connection.
 
 ### Configuration
 
@@ -167,15 +167,15 @@ All restart activity is logged to stderr with the `[slack]` prefix:
 
 ### Async Interval Pattern
 
-Each tick fires an `async` callback. The callback iterates routes sequentially to keep concurrent `client.status(...)` traffic predictable. Errors on a single channel are caught and logged; they do not abort the rest of the iteration. agent-director's library Client is internally safe for concurrent verb calls (see SR-0.1).
+Each tick fires an `async` callback. The callback iterates the persona work list sequentially to keep concurrent `client.status(...)` traffic predictable. `HealthCheckDeps.getPersonas()` supplies it as persona key → working directory; production wires the pure `buildPersonaWorkList(personaConfig)`, one entry per persona however many channels it lists. Errors on a single persona are caught and logged; they do not abort the rest of the iteration. agent-director's library Client is internally safe for concurrent verb calls (see SR-0.1).
 
 ```typescript
 intervalId = setInterval(async () => {
-  for (const [channelId, cwd] of Object.entries(routes)) {
+  for (const [key, cwd] of Object.entries(deps.getPersonas())) {
     try {
       // check and maybe scheduleRestart
     } catch (err) {
-      console.error(`[slack] health-check: error checking channel=${channelId}:`, err)
+      console.error(`[slack] health-check: error checking persona=${key}:`, err)
     }
   }
 }, intervalSeconds * 1000)
@@ -183,18 +183,18 @@ intervalId = setInterval(async () => {
 
 ### Coordination with restart.ts and backoff.ts
 
-Before calling `scheduleRestart`, the poller queries two guards:
+Before calling `scheduleRestart`, the poller queries two guards, both keyed by persona key:
 
-- `isRestartPendingOrActive(channelId)` from `restart.ts` — returns `true` if a restart timer is queued or a launch is in flight; skip to avoid double-launching.
-- `isAtCap(channelId, RESTART_FAILURE_CAP)` from `backoff.ts`, injected as `HealthCheckDeps.isAtCap` — returns `true` if the channel has reached the consecutive-failure cap; skip the tick for this channel. A capped channel recovers only via a server restart (see SR-25). The tick guard only stops the *poller* from re-scheduling. The `scheduleRestart` path is itself cap-exempt, but neither message trigger revives a capped-dead route: the streamless trigger (in the streamless branch of `handleMessage`) reaches `scheduleRestart` only for a session that is registered yet missing its `_GET_stream` (which a capped-dead route does not have), and as of b.9cj it also checks `backoffIsAtCap(ownerChannelId, RESTART_FAILURE_CAP)` itself and declines to fire at the cap; the b.kvq inbound drop-branch trigger (the `humanTrigger` `scheduleRestart` in the "No live session … — dropping message" branch) likewise checks `backoffIsAtCap` and declines at the cap, replying that an operator must restart the server. Both branches key every guard and the `scheduleRestart` call on the owning channel — for a `default_route` channel that is the direct route owning the shared cwd, not the inbound channel.
+- `isRestartPendingOrActive(key)` from `restart.ts` — returns `true` if a restart timer is queued or a launch is in flight; skip to avoid double-launching.
+- `isAtCap(key, RESTART_FAILURE_CAP)` from `backoff.ts`, injected as `HealthCheckDeps.isAtCap` — returns `true` if the persona has reached the consecutive-failure cap; skip the tick for this persona. A capped persona recovers only via a server restart (see SR-25). The tick guard only stops the *poller* from re-scheduling. The `scheduleRestart` path is itself cap-exempt, but neither message trigger revives a capped-dead route: the streamless trigger (in the streamless branch of `handleMessage`) reaches `scheduleRestart` only for a session that is registered yet missing its `_GET_stream` (which a capped-dead route does not have), and as of b.9cj it also checks `backoffIsAtCap(ownerChannelId, RESTART_FAILURE_CAP)` itself and declines to fire at the cap; the b.kvq inbound drop-branch trigger (the `humanTrigger` `scheduleRestart` in the "No live session … — dropping message" branch) likewise checks `backoffIsAtCap` and declines at the cap, replying that an operator must restart the server. Both branches key every guard and the `scheduleRestart` call on the owning channel — for a `default_route` channel that is the direct route owning the shared cwd, not the inbound channel.
 
-When neither guard fires, the poller checks liveness, connectedness, and stream presence via `isSessionAlive(channelId)`, `isSessionConnected(channelId)` (added in b.9a7, wrapping the same registry-`connected` adapter restart.ts uses), and `hasSessionStream(channelId)` (added in b.9cj — one shared `getSessionByChannel` → `hasGetStreamKey(transport)` adapter wired into both `HealthCheckDeps` and `RestartDeps` so the tick and the restart guard stay in exact agreement):
+When neither guard fires, the poller checks liveness, connectedness, and stream presence via `isSessionAlive(key)`, `isSessionConnected(key)` (added in b.9a7, wrapping the same registry-`connected` adapter restart.ts uses), and `hasSessionStream(key)` (added in b.9cj — one shared `getSessionByChannel` → `hasGetStreamKey(transport)` adapter wired into both `HealthCheckDeps` and `RestartDeps` so the tick and the restart guard stay in exact agreement):
 
-- **Dead** (`!alive`) → `scheduleRestart(channelId, cwd)` immediately — the same function used by the reactive `onsessionclosed` path.
-- **Alive but not deliverable** (`alive && (!connected || !hasSessionStream)`) → increment a per-channel consecutive-failing streak; `scheduleRestart` fires only once the streak reaches two consecutive ticks (the freshly-launched false-positive guard). Both the MCP-disconnected (b.9a7) and connected-but-streamless (b.9cj) cases share this one branch and streak: a session between `registerSession` and its stream re-open is legitimately streamless for a moment and must not be poked mid-boot, the same hazard the disconnected case already debounced. restart.ts then reconnects a disconnected row (deferring a `working` row — `reconnectSession` returns `'transient'` on `working` — so a mid-long-turn session is not poked, b.rmy invariant preserved) or recovers a streamless one.
+- **Dead** (`!alive`) → `scheduleRestart(key, cwd)` immediately — the same function used by the reactive `onsessionclosed` path.
+- **Alive but not deliverable** (`alive && (!connected || !hasSessionStream)`) → increment a per-persona consecutive-failing streak; `scheduleRestart` fires only once the streak reaches two consecutive ticks (the freshly-launched false-positive guard). Both the MCP-disconnected (b.9a7) and connected-but-streamless (b.9cj) cases share this one branch and streak: a session between `registerSession` and its stream re-open is legitimately streamless for a moment and must not be poked mid-boot, the same hazard the disconnected case already debounced. restart.ts then reconnects a disconnected row (deferring a `working` row — `reconnectSession` returns `'transient'` on `working` — so a mid-long-turn session is not poked, b.rmy invariant preserved) or recovers a streamless one.
 - **Alive, connected, AND stream present** → healthy; reset the streak.
 
-The capped-channel skip above covers the alive-but-not-deliverable path too: a capped channel gets no tick-driven reconnect, deliberately, so the b.kvq operator contract ("will NOT recover on its own") is not quietly contradicted.
+The capped-persona skip above covers the alive-but-not-deliverable path too: a capped persona gets no tick-driven reconnect, deliberately, so the b.kvq operator contract ("will NOT recover on its own") is not quietly contradicted.
 
 ## Avoiding Duplicated Effort with agent-director
 

@@ -1,19 +1,22 @@
 /**
- * outage-state.ts — Channel-scoped outage-flag state machine + Slack emit surface.
+ * outage-state.ts — Persona-keyed outage-flag state machine + notice emit surface.
  *
- * Tracks three orthogonal outage classes per routed Slack channel and emits
- * onset / all-clear messages via the injected `postToChannel` hook. The module
- * is intentionally free of Date / timestamp logic — operators scroll back to
- * the onset message for timing context.
+ * Tracks three orthogonal outage classes per persona (b.av2 SR-6.3), keyed by
+ * persona key, and emits onset / all-clear notices via the injected `notify`
+ * hook, which production wires to the per-persona notifier
+ * (`src/persona-notifier.ts`): the notice goes to that persona's destination
+ * and the notifier adds the persona reference (b.av2 SR-7.2). The module is
+ * intentionally free of Date / timestamp logic — operators scroll back to the
+ * onset message for timing context.
  *
  * Public API surface (all exported):
  *   - initOutageState(deps)                — install production dependencies
- *   - getOutageFlags(channelId)            — read live flag set
- *   - setOutageFlag(channelId, cls, detail?)  — raise flag + emit onset message
- *   - clearOutageFlag(channelId, cls)      — lower flag; emits all-clear when set empties
- *   - resetAllToHealthy(channelIds)        — silent bulk wipe (boot-time reset)
- *   - withOutageDetection(ch, cwd, fn)     — AD verb wrapper; raises/clears flags on error/success
- *   - withSpawnDetection(ch, cwd, fn)      — like withOutageDetection + clears cwd-unreachable on success
+ *   - getOutageFlags(key)                  — read live flag set
+ *   - setOutageFlag(key, cls, detail?)     — raise flag + emit onset notice
+ *   - clearOutageFlag(key, cls)            — lower flag; emits all-clear when set empties
+ *   - resetAllToHealthy(keys)              — silent bulk wipe (boot-time reset)
+ *   - withOutageDetection(key, dir, fn)    — AD verb wrapper; raises/clears flags on error/success
+ *   - withSpawnDetection(key, dir, fn)     — like withOutageDetection + clears cwd-unreachable on success
  *   - _resetOutageState()                  — test-only state reset
  *
  * Template exports (used by tests):
@@ -46,8 +49,8 @@ export interface ClassRecord {
   detail?: string
 }
 
-/** Per-channel state entry. */
-interface ChannelEntry {
+/** Per-persona state entry. */
+interface PersonaEntry {
   /** Currently active outage flags. */
   flags: Set<OutageClass>
   /** Class → detail record for the current bad stretch. Reset to empty Map on all-clear. */
@@ -56,8 +59,12 @@ interface ChannelEntry {
 
 /** Dependencies injected via `initOutageState` — wires the module to production Slack + AD. */
 export interface OutageStateDeps {
-  /** Fire-and-forget Slack post; errors MUST be handled internally by the caller. */
-  postToChannel(channelId: string, text: string): void
+  /**
+   * Fire-and-forget notice for the persona with this key: synchronous, and
+   * errors MUST be handled internally by the caller. Production wires the
+   * per-persona notifier, which adds the persona reference to `text`.
+   */
+  notify(key: string, text: string): void
   /** Return the singleton AD Client. Same semantics as getClient() in agent-director-client.ts. */
   getClient(): Client
 }
@@ -67,24 +74,24 @@ export interface OutageStateDeps {
 // ---------------------------------------------------------------------------
 
 let deps: OutageStateDeps | undefined
-const entries = new Map<string, ChannelEntry>()
+const entries = new Map<string, PersonaEntry>()
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Lazy-create a ChannelEntry for `channelId` on first access. */
-function entryFor(channelId: string): ChannelEntry {
-  let entry = entries.get(channelId)
+/** Lazy-create a PersonaEntry for persona `key` on first access. */
+function entryFor(key: string): PersonaEntry {
+  let entry = entries.get(key)
   if (!entry) {
     entry = { flags: new Set(), badStretchClasses: new Map() }
-    entries.set(channelId, entry)
+    entries.set(key, entry)
   }
   return entry
 }
 
 // ---------------------------------------------------------------------------
-// Slack message templates
+// Notice templates
 // ---------------------------------------------------------------------------
 
 /** Stable iteration order for the all-clear template. */
@@ -97,21 +104,23 @@ const STABLE_CLASS_ORDER: OutageClass[] = [
 /**
  * ONSET_TEMPLATES — one template function per outage class.
  * The optional `detail` parameter carries class-specific context
- * (binary path for ad-unreachable; cwd path for cwd-unreachable).
+ * (binary path for ad-unreachable; the persona's working directory for
+ * cwd-unreachable). The templates carry no persona reference: the notifier
+ * adds it.
  */
 export const ONSET_TEMPLATES: Record<OutageClass, (detail?: string) => string> = {
   'ad-unreachable': (binaryPath?: string) =>
-    `:rotating_light: *agent-director unreachable* — affects every routed channel.\nBinary: \`${binaryPath ?? '<unknown>'}\`\nRemediation: reinstall agent-director.`,
+    `:rotating_light: *agent-director unreachable* — affects every persona.\nBinary: \`${binaryPath ?? '<unknown>'}\`\nRemediation: reinstall agent-director.`,
 
   'tmux-unavailable': (_detail?: string) =>
-    `:rotating_light: *tmux unavailable* — affects every routed channel.\nRemediation: install or repair tmux.`,
+    `:rotating_light: *tmux unavailable* — affects every persona.\nRemediation: install or repair tmux.`,
 
-  'cwd-unreachable': (cwd?: string) =>
-    `:rotating_light: *Route cwd unreachable* — \`${cwd ?? '<unknown>'}\`\nRemediation: restore the directory or remove this route from \`config.json\`.`,
+  'cwd-unreachable': (workingDirectory?: string) =>
+    `:rotating_light: *Working directory unreachable* — \`${workingDirectory ?? '<unknown>'}\`\nRemediation: restore the directory or correct this persona's \`working_directory\` in \`config.json\`.`,
 }
 
 /**
- * ALL_CLEAR_TEMPLATE — renders a Slack all-clear message from the bad-stretch
+ * ALL_CLEAR_TEMPLATE — renders an all-clear notice from the bad-stretch
  * history snapshot. Entries are emitted in the stable class order regardless
  * of the order flags were raised. No timestamps.
  */
@@ -132,19 +141,19 @@ export function ALL_CLEAR_TEMPLATE(resolved: Map<OutageClass, ClassRecord>): str
 
 /**
  * initOutageState — installs production dependencies. Called once from
- * `src/server.ts:main()` after `routingConfig` is loaded, before the
- * Socket Mode connect block.
+ * `src/server.ts:main()` after the config is loaded, before the Socket Mode
+ * connect block.
  */
 export function initOutageState(d: OutageStateDeps): void {
   deps = d
 }
 
 /**
- * getOutageFlags — returns the live read-only flag set for `channelId`.
+ * getOutageFlags — returns the live read-only flag set for persona `key`.
  * Returns an empty `ReadonlySet` sentinel when no entry exists yet.
  */
-export function getOutageFlags(channelId: string): ReadonlySet<OutageClass> {
-  return entries.get(channelId)?.flags ?? (new Set<OutageClass>() as ReadonlySet<OutageClass>)
+export function getOutageFlags(key: string): ReadonlySet<OutageClass> {
+  return entries.get(key)?.flags ?? (new Set<OutageClass>() as ReadonlySet<OutageClass>)
 }
 
 // ---------------------------------------------------------------------------
@@ -152,54 +161,54 @@ export function getOutageFlags(channelId: string): ReadonlySet<OutageClass> {
 // ---------------------------------------------------------------------------
 
 /**
- * setOutageFlag — raises `cls` for `channelId` and emits an onset Slack
- * message. Same-flag re-raise is a silent no-op (dedupe).
+ * setOutageFlag — raises `cls` for persona `key` and emits an onset notice.
+ * Same-flag re-raise is a silent no-op (dedupe).
  *
- * State mutates BEFORE the emit so a synchronous throw in `postToChannel`
+ * State mutates BEFORE the emit so a synchronous throw in `notify`
  * cannot cause double-emission on the next observation.
  */
-export function setOutageFlag(channelId: string, cls: OutageClass, detail?: string): void {
+export function setOutageFlag(key: string, cls: OutageClass, detail?: string): void {
   if (!deps) return
-  const entry = entryFor(channelId)
+  const entry = entryFor(key)
   if (entry.flags.has(cls)) return // same-flag dedupe
   // Mutate state BEFORE emit (SR-V-2.x state-before-emit contract).
   entry.flags.add(cls)
   entry.badStretchClasses.set(cls, { detail })
-  deps.postToChannel(channelId, ONSET_TEMPLATES[cls](detail))
+  deps.notify(key, ONSET_TEMPLATES[cls](detail))
 }
 
 /**
- * clearOutageFlag — lowers `cls` for `channelId`. Emits the all-clear Slack
- * message ONLY when the clear leaves the flag set empty and there is a
+ * clearOutageFlag — lowers `cls` for persona `key`. Emits the all-clear
+ * notice ONLY when the clear leaves the flag set empty and there is a
  * non-empty bad-stretch history (i.e., at least one onset was recorded).
  * Intermediate clears (flag set still non-empty after removal) are silent.
  *
  * State mutates BEFORE the emit (same contract as setOutageFlag).
  */
-export function clearOutageFlag(channelId: string, cls: OutageClass): void {
+export function clearOutageFlag(key: string, cls: OutageClass): void {
   if (!deps) return
-  const entry = entries.get(channelId)
+  const entry = entries.get(key)
   if (!entry) return
   if (!entry.flags.has(cls)) return // same-state dedupe
   // Mutate state BEFORE emit.
   entry.flags.delete(cls)
   if (entry.flags.size === 0 && entry.badStretchClasses.size > 0) {
-    // Snapshot history and reset BEFORE the postToChannel call.
+    // Snapshot history and reset BEFORE the notify call.
     const snapshot = new Map(entry.badStretchClasses)
     entry.badStretchClasses = new Map()
-    deps.postToChannel(channelId, ALL_CLEAR_TEMPLATE(snapshot))
+    deps.notify(key, ALL_CLEAR_TEMPLATE(snapshot))
   }
 }
 
 /**
- * resetAllToHealthy — silently wipes every channel's flag set and bad-stretch
- * history to a clean slate. No `postToChannel` calls. Called at boot by
- * server.ts immediately after `socket.start()` as a defensive boundary for
- * pre-auth observations (added in Epic 2).
+ * resetAllToHealthy — silently wipes each given persona's flag set and
+ * bad-stretch history to a clean slate. No `notify` calls. Called at boot by
+ * server.ts with the applied persona keys immediately after `socket.start()`
+ * as a defensive boundary for pre-auth observations (added in Epic 2).
  */
-export function resetAllToHealthy(channelIds: string[]): void {
-  for (const channelId of channelIds) {
-    entries.set(channelId, { flags: new Set(), badStretchClasses: new Map() })
+export function resetAllToHealthy(keys: string[]): void {
+  for (const key of keys) {
+    entries.set(key, { flags: new Set(), badStretchClasses: new Map() })
   }
 }
 
@@ -214,8 +223,9 @@ export function resetAllToHealthy(channelIds: string[]): void {
  * On error:
  *   - ErrSystemInstallDisappeared → raises 'ad-unreachable' (detail = binaryPath)
  *   - ErrTmuxNotAvailable         → raises 'tmux-unavailable'
- *   - ErrCwdNotFound / ErrCwdNotADirectory → raises 'cwd-unreachable' (detail = routeCwd)
- *     UNLESS routeCwd is undefined, in which case logs loudly and rethrows
+ *   - ErrCwdNotFound / ErrCwdNotADirectory → raises 'cwd-unreachable' (detail =
+ *     workingDirectory, the persona's working directory) UNLESS
+ *     workingDirectory is undefined, in which case logs loudly and rethrows
  *     WITHOUT raising the flag (defensive carve-out for verb-class drift).
  *   - Other errors → no flag change; rethrow unchanged.
  *
@@ -224,8 +234,8 @@ export function resetAllToHealthy(channelIds: string[]): void {
  * The original error is always rethrown so callers can handle it normally.
  */
 export async function withOutageDetection<T>(
-  channelId: string,
-  routeCwd: string | undefined,
+  key: string,
+  workingDirectory: string | undefined,
   fn: (client: Client) => Promise<T>,
 ): Promise<T> {
   if (!deps) {
@@ -235,20 +245,20 @@ export async function withOutageDetection<T>(
   }
   try {
     const result = await fn(deps.getClient())
-    clearOutageFlag(channelId, 'ad-unreachable')
-    clearOutageFlag(channelId, 'tmux-unavailable')
+    clearOutageFlag(key, 'ad-unreachable')
+    clearOutageFlag(key, 'tmux-unavailable')
     return result
   } catch (err) {
     if (err instanceof ErrSystemInstallDisappeared) {
-      setOutageFlag(channelId, 'ad-unreachable', err.binaryPath)
+      setOutageFlag(key, 'ad-unreachable', err.binaryPath)
     } else if (err instanceof ErrTmuxNotAvailable) {
-      setOutageFlag(channelId, 'tmux-unavailable')
+      setOutageFlag(key, 'tmux-unavailable')
     } else if (err instanceof ErrCwdNotFound || err instanceof ErrCwdNotADirectory) {
-      if (routeCwd !== undefined) {
-        setOutageFlag(channelId, 'cwd-unreachable', routeCwd)
+      if (workingDirectory !== undefined) {
+        setOutageFlag(key, 'cwd-unreachable', workingDirectory)
       } else {
         console.error(
-          `[slack] outage-state: withOutageDetection: cwd error on channel=${channelId} but routeCwd is undefined — verb-class drift; rethrowing without raising flag`,
+          `[slack] outage-state: withOutageDetection: cwd error on persona=${key} but workingDirectory is undefined — verb-class drift; rethrowing without raising flag`,
           err,
         )
       }
@@ -260,16 +270,16 @@ export async function withOutageDetection<T>(
 /**
  * withSpawnDetection — like `withOutageDetection` but also clears
  * 'cwd-unreachable' on success. Spawn and resume verbs are the only calls
- * that actually exercise the route's cwd, so cwd health is only confirmed
- * by a successful spawn/resume.
+ * that actually exercise the persona's working directory, so its health is
+ * only confirmed by a successful spawn/resume.
  */
 export async function withSpawnDetection<T>(
-  channelId: string,
-  routeCwd: string | undefined,
+  key: string,
+  workingDirectory: string | undefined,
   fn: (client: Client) => Promise<T>,
 ): Promise<T> {
-  const result = await withOutageDetection(channelId, routeCwd, fn)
-  clearOutageFlag(channelId, 'cwd-unreachable')
+  const result = await withOutageDetection(key, workingDirectory, fn)
+  clearOutageFlag(key, 'cwd-unreachable')
   return result
 }
 

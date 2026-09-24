@@ -34,6 +34,7 @@ When reviewing tests, check for:
 - [ ] No `sleep` or timing-dependent assertions longer than 100ms
 - [ ] Capture arrays used to verify side effects (API calls, messages sent)
 - [ ] Persona and connection suites fake Slack with `makeStubSlack` from `tests/test-helpers/slack-stub.ts` and its event factories; a hand-rolled WebClient or SocketModeClient stub in such a suite is a defect
+- [ ] Notice-site tests (outage state, session manager, JSONL safeguard) assert through a recording notify sink, and destination or hold-and-flush tests use `makeNotifierHarness` from `tests/test-helpers/persona-notifier.ts`, the real `createPersonaNotifier` over one `makeStubSlack` stub per persona (see the testing guide's Persona notices entry); a hand-wired notifier over hand-built stubs, a module-scope `WebClient` stub for notices, or a `setSessionNotifier` sink left installed after the test, is a defect
 - [ ] Slack failure cases use the stub's scripted outcomes with `leakMarker` set to `LEAK_SENTINEL`, and assert on the classification, not on the error text
 - [ ] Backoff, retry and timeout tests never wait in real time: pure schedules are called directly, timers and clocks are injected fakes, and a never-settling call is ended through the stub or the injected clock
 - [ ] `retryAfter` cases assert the wait is never shorter than `retryAfter`, converting seconds to milliseconds

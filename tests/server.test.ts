@@ -40,7 +40,6 @@ import {
   _setTmuxServerEnsurer,
   _resetTmuxServerEnsurer,
 } from '../src/session-manager.ts'
-import type { WebClient } from '@slack/web-api'
 import type { FindMissingParams, SendKeysParams, StatusParams } from 'agent-director'
 import type { PersonaConfig } from '../src/config.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
@@ -619,7 +618,7 @@ describe('defaultAccess', () => {
 // ---------------------------------------------------------------------------
 
 describe('_buildIsSessionAliveAdapter', () => {
-  type Emission = { channelId: string; text: string }
+  type Emission = { key: string; text: string }
 
   /** Per-test temp dir: `baseDir` for the stand-in persona fixtures. */
   let baseDir: string
@@ -647,7 +646,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     const statusCalls: StatusParams[] = []
     _resetOutageState()
     initOutageState({
-      postToChannel: (channelId, text) => { emissions.push({ channelId, text }) },
+      notify: (key, text) => { emissions.push({ key, text }) },
       getClient: () => makeStubClient() as unknown as Client,
     })
     const stubOpts = statusError
@@ -685,7 +684,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(getOutageFlags('C1').size).toBe(0)
     const newEmissions = emissions.slice(before)
     expect(newEmissions).toHaveLength(1)
-    expect(newEmissions[0].channelId).toBe('C1')
+    expect(newEmissions[0].key).toBe('C1')
     expect(newEmissions[0].text).toMatch(/All clear/)
     expect(newEmissions[0].text).toContain('ad-unreachable')
     expect(newEmissions[0].text).toContain('tmux-unavailable')
@@ -724,7 +723,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
     expect(getOutageFlags('C1').has('tmux-unavailable')).toBe(false)
     expect(emissions).toHaveLength(1)
-    expect(emissions[0].channelId).toBe('C1')
+    expect(emissions[0].key).toBe('C1')
     expect(emissions[0].text).toMatch(/agent-director unreachable/)
     expect(emissions[0].text).toContain(binaryPath)
   })
@@ -741,7 +740,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(getOutageFlags('C1').has('tmux-unavailable')).toBe(true)
     expect(getOutageFlags('C1').has('ad-unreachable')).toBe(false)
     expect(emissions).toHaveLength(1)
-    expect(emissions[0].channelId).toBe('C1')
+    expect(emissions[0].key).toBe('C1')
     expect(emissions[0].text).toMatch(/tmux unavailable/)
     // ONSET_TEMPLATES['tmux-unavailable'] ignores the detail arg — nothing extra
     expect(emissions[0].text).not.toContain('undefined')
@@ -830,7 +829,7 @@ describe('_buildReconnectSessionAdapter', () => {
     })
     _resetOutageState()
     initOutageState({
-      postToChannel: () => {},
+      notify: () => {},
       getClient: () => stub as unknown as Client,
     })
     setClientForTests(stub as unknown as Client)
@@ -841,7 +840,7 @@ describe('_buildReconnectSessionAdapter', () => {
     return {
       // The builder resolves the instance ID from the persona key alone
       // (b.av2 SR-2.2); it takes no config getter.
-      adapter: _buildReconnectSessionAdapter({} as unknown as WebClient),
+      adapter: _buildReconnectSessionAdapter(),
       statusCalls,
       sendKeysCalls,
       findMissingCalls,

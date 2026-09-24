@@ -1,6 +1,6 @@
 /**
  * jsonl-persistence-check.ts — Startup safeguard: detect JSONL transcript loss
- * BEFORE the resume path silently throws ErrJsonlMissing and wipes a channel.
+ * BEFORE the resume path silently throws ErrJsonlMissing and wipes a persona's memory.
  *
  * Two layers, both fire-safe (never throw, never block startup):
  *
@@ -10,14 +10,20 @@
  *     checkJsonlPersistence(config, readMountinfo?) — { nonPersistent[], warnings[] }
  *   A root on tmpfs/ramfs means resume is structurally impossible on this host.
  *
- *   Layer 2 — per-channel missing-transcript check (the 2026-09-20 incident class):
- *     For each route, fetch the AD row and stat the persisted vs fallback JSONL
- *     path. If the persisted path is gone but a transcript exists (fallback path
- *     or archived messages since spawn), the resume path WILL wipe the channel —
- *     say so loudly. Idle-since-spawn channels stay quiet.
+ *   Layer 2 — per-persona missing-transcript check (the 2026-09-20 incident class):
+ *     For each persona key (the config's route keys, which are the persona
+ *     keys under the route->persona adapter), fetch the AD row and stat the
+ *     persisted vs fallback JSONL path. If the persisted path is gone but a
+ *     transcript exists (fallback path or archived messages since spawn), the
+ *     resume path WILL wipe the persona's memory — say so loudly.
+ *     Idle-since-spawn personas stay quiet.
+ *
+ * Warnings reach Slack only through the persona-keyed notice seam (production:
+ * the per-persona notifier, b.av2 SR-7.2), which posts to the persona's
+ * destination and adds the persona reference.
  *
  * Every external effect (mountinfo read, stat, AD get, archive query, error
- * record, Slack post) is injectable so the Test Writer needs no mock.module.
+ * record, notice) is injectable so the Test Writer needs no mock.module.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -25,14 +31,15 @@
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { Database } from 'bun:sqlite'
-import type { WebClient } from '@slack/web-api'
 import type { GetResult } from 'agent-director'
 import type { RoutingConfig, ServerSettings } from './config.ts'
 import { recordStartupError as defaultRecordStartupError } from './startup-errors.ts'
 import { withOutageDetection } from './outage-state.ts'
 import { ErrSpawnNotFound } from './agent-director-errors.ts'
 import { personaInstanceId } from './persona-identity.ts'
+import { describeThrownValue } from './persona-connection-errors.ts'
 import { resolveJsonlPath } from './cozempic.ts'
+import { notifySafely, type PersonaNotify } from './persona-notifier.ts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -53,10 +60,10 @@ export interface JsonlPersistenceSafeguardDeps {
   /** Stats a path; returns true when it exists and is non-empty. Default: real statSync. */
   statFn?: (path: string) => boolean
   /**
-   * Fetches the AD row for a channel's instance id (Layer 2). Default routes
-   * through withOutageDetection so AD-unreachable is flagged per channel.
+   * Fetches the AD row for a persona's instance id (Layer 2). Default routes
+   * through withOutageDetection so AD-unreachable is flagged per persona.
    */
-  getRow?: (channelId: string, claudeInstanceId: string) => Promise<GetResult>
+  getRow?: (key: string, claudeInstanceId: string) => Promise<GetResult>
   /**
    * Counts archived messages for a channel with timestamp strictly after
    * `sinceEpochSeconds`. Returns null when the archive is unconfigured or
@@ -64,7 +71,6 @@ export interface JsonlPersistenceSafeguardDeps {
    */
   archiveCountSince?: (channelId: string, sinceEpochSeconds: number) => number | null
   recordStartupError?: typeof defaultRecordStartupError
-  postFn?: (web: WebClient, channelId: string, text: string) => Promise<void>
 }
 
 // ---------------------------------------------------------------------------
@@ -273,10 +279,10 @@ function defaultStatFn(path: string): boolean {
 
 /**
  * Default AD row fetch — routed through withOutageDetection (the sanctioned
- * single CSCB→AD entry point) so an AD outage is flagged against this channel.
+ * single CSCB→AD entry point) so an AD outage is flagged against this persona.
  */
-function defaultGetRow(channelId: string, claudeInstanceId: string): Promise<GetResult> {
-  return withOutageDetection(channelId, undefined, (client) =>
+function defaultGetRow(key: string, claudeInstanceId: string): Promise<GetResult> {
+  return withOutageDetection(key, undefined, (client) =>
     client.get({ claude_instance_id: claudeInstanceId }),
   )
 }
@@ -326,11 +332,6 @@ export function makeDefaultArchiveCount(
   }
 }
 
-/** Default Slack post: fire-and-forget chat.postMessage. */
-async function defaultPostFn(web: WebClient, channelId: string, text: string): Promise<void> {
-  await web.chat.postMessage({ channel: channelId, text })
-}
-
 /** Parse an RFC3339 timestamp to epoch seconds; null on unparseable input. */
 export function rfc3339ToEpochSeconds(value: string): number | null {
   if (!value) return null
@@ -339,48 +340,64 @@ export function rfc3339ToEpochSeconds(value: string): number | null {
 }
 
 // ---------------------------------------------------------------------------
-// Layer 2 — per-channel transcript check
+// Notice seam
 // ---------------------------------------------------------------------------
 
 /**
- * Classifies one channel's transcript health and fires the appropriate loud /
- * quiet signal. Isolated per channel — any thrown error is caught by the
- * caller's per-channel try/catch, never aborting the sweep.
+ * Send one warning for persona `key` through the notice seam. Production always
+ * passes the per-persona notifier, dry run included (the notifier then logs
+ * instead of posting); no seam (a unit test) means nothing is sent. Never
+ * throws.
+ */
+function sendNotice(notify: PersonaNotify | undefined, key: string, text: string): void {
+  if (!notify) return
+  notifySafely(notify, key, text, undefined, (err) => {
+    console.error(`[slack] jsonl-persistence-check: notice failed for persona=${key}: ${describeThrownValue(err)}`)
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2 — per-persona transcript check
+// ---------------------------------------------------------------------------
+
+/**
+ * Classifies one persona's transcript health and fires the appropriate loud /
+ * quiet signal. Isolated per persona — any thrown error is caught by the
+ * caller's per-persona try/catch, never aborting the sweep.
  */
 async function checkChannelTranscript(
   config: RoutingConfig,
-  channelId: string,
-  web: WebClient | undefined,
+  key: string,
+  notify: PersonaNotify | undefined,
   statFn: (path: string) => boolean,
-  getRow: (channelId: string, id: string) => Promise<GetResult>,
+  getRow: (key: string, id: string) => Promise<GetResult>,
   archiveCountSince: (channelId: string, sinceEpochSeconds: number) => number | null,
   recordError: typeof defaultRecordStartupError,
-  postFn: (web: WebClient, channelId: string, text: string) => Promise<void>,
 ): Promise<void> {
   // Under the route->persona adapter the persona key is the channel ID.
-  const claudeInstanceId = personaInstanceId(channelId)
+  const claudeInstanceId = personaInstanceId(key)
 
   let row: GetResult
   try {
-    row = await getRow(channelId, claudeInstanceId)
+    row = await getRow(key, claudeInstanceId)
   } catch (err) {
     if (err instanceof ErrSpawnNotFound) {
       // Case 1: no row — nothing to lose.
-      console.error(`[slack] jsonl-persistence-check: no AD row for channel=${channelId} — nothing to resume`)
+      console.error(`[slack] jsonl-persistence-check: no AD row for persona=${key} — nothing to resume`)
       return
     }
     // Case 6: any other AD/get error — warn and move on.
-    console.error(`[slack] jsonl-persistence-check: AD get failed for channel=${channelId} — skipping:`, err)
+    console.error(`[slack] jsonl-persistence-check: AD get failed for persona=${key} — skipping:`, err)
     return
   }
 
   // Case 1 (cont.): row exists but never produced a session — nothing to lose.
   if (!row.claude_session_id) {
-    console.error(`[slack] jsonl-persistence-check: channel=${channelId} has no claude_session_id — nothing to resume`)
+    console.error(`[slack] jsonl-persistence-check: persona=${key} has no claude_session_id — nothing to resume`)
     return
   }
 
-  const effectiveConfigDir = resolveEffectiveConfigDir(config, channelId)
+  const effectiveConfigDir = resolveEffectiveConfigDir(config, key)
   const persistedPath = row.jsonl_path
   const fallbackPath = resolveJsonlPath(row.cwd, row.claude_session_id, effectiveConfigDir)
 
@@ -393,25 +410,21 @@ async function checkChannelTranscript(
 
   // Case 4: persisted gone but fallback exists — the transcript is on disk and
   // AD 0.8.0 only stats the persisted path on resume, so it WILL throw
-  // ErrJsonlMissing and the resume path will wipe this channel. LOUD.
+  // ErrJsonlMissing and the resume path will wipe this persona's memory. LOUD.
   if (fallbackExists) {
     const detail =
-      `channel=${channelId} instance=${claudeInstanceId}: AD persisted jsonl_path is missing/empty ` +
+      `persona=${key} instance=${claudeInstanceId}: AD persisted jsonl_path is missing/empty ` +
       `("${persistedPath}") but the transcript EXISTS at the resolved fallback path ("${fallbackPath}"). ` +
       `Resume will throw ErrJsonlMissing and fresh-spawn, destroying conversation history that is on disk.`
     recordError(ERR_KEY_STALE_PATH, detail)
-    if (web !== undefined) {
-      postFn(
-        web,
-        channelId,
-        `⚠️ CSCB startup warning: my saved conversation transcript exists on disk (\`${fallbackPath}\`) but ` +
-          `agent-director's recorded path (\`${persistedPath || '(empty)'}\`) points elsewhere. On resume this ` +
-          `would be treated as missing and my memory would be wiped. An operator should reconcile the path ` +
-          `before the next restart.`,
-      ).catch((err: unknown) => {
-        console.error(`[slack] jsonl-persistence-check: failed to post stale-path warning to channel=${channelId}:`, err)
-      })
-    }
+    sendNotice(
+      notify,
+      key,
+      `⚠️ CSCB startup warning: my saved conversation transcript exists on disk (\`${fallbackPath}\`) but ` +
+        `agent-director's recorded path (\`${persistedPath || '(empty)'}\`) points elsewhere. On resume this ` +
+        `would be treated as missing and my memory would be wiped. An operator should reconcile the path ` +
+        `before the next restart.`,
+    )
     return
   }
 
@@ -419,36 +432,32 @@ async function checkChannelTranscript(
   // using the message archive as evidence.
   const startedAtEpoch = rfc3339ToEpochSeconds(row.started_at)
   const archivedSinceSpawn =
-    startedAtEpoch === null ? null : archiveCountSince(channelId, startedAtEpoch)
+    startedAtEpoch === null ? null : archiveCountSince(key, startedAtEpoch)
 
   if (archivedSinceSpawn !== null && archivedSinceSpawn > 0) {
     // Conversation provably happened since spawn, yet no transcript survives. LOST.
     const detail =
-      `channel=${channelId} instance=${claudeInstanceId}: no transcript at persisted ("${persistedPath}") ` +
+      `persona=${key} instance=${claudeInstanceId}: no transcript at persisted ("${persistedPath}") ` +
       `or fallback ("${fallbackPath}") path, but the message archive holds ${archivedSinceSpawn} message(s) ` +
       `since spawn (started_at=${row.started_at}). Conversation history has been LOST; resume will fresh-spawn.`
     recordError(ERR_KEY_LOST, detail)
-    if (web !== undefined) {
-      postFn(
-        web,
-        channelId,
-        `⚠️ CSCB startup warning: my conversation transcript file is gone from disk, but the message archive ` +
-          `shows ${archivedSinceSpawn} message(s) since I started. My memory of this channel has been lost and ` +
-          `resume will start me fresh. An operator should investigate the transcript storage.`,
-      ).catch((err: unknown) => {
-        console.error(`[slack] jsonl-persistence-check: failed to post lost-transcript warning to channel=${channelId}:`, err)
-      })
-    }
+    sendNotice(
+      notify,
+      key,
+      `⚠️ CSCB startup warning: my conversation transcript file is gone from disk, but the message archive ` +
+        `shows ${archivedSinceSpawn} message(s) since I started. My conversation memory has been lost and ` +
+        `resume will start me fresh. An operator should investigate the transcript storage.`,
+    )
     return
   }
 
   // Quiet-but-informative: no transcript anywhere and no archived activity since
-  // spawn (or archive unavailable). Expected for a channel idle since spawn —
+  // spawn (or archive unavailable). Expected for a persona idle since spawn —
   // Claude creates the .jsonl lazily on first message. No loud error, no Slack.
   console.error(
-    `[slack] jsonl-persistence-check: channel=${channelId} has no transcript yet ` +
+    `[slack] jsonl-persistence-check: persona=${key} has no transcript yet ` +
       `(persisted="${persistedPath}", fallback="${fallbackPath}") and no archived activity since spawn — ` +
-      `expected for an idle-since-spawn channel; resume will fresh-spawn.`,
+      `expected for an idle-since-spawn persona; resume will fresh-spawn.`,
   )
 }
 
@@ -458,26 +467,28 @@ async function checkChannelTranscript(
 
 /**
  * Startup safeguard: runs Layer 1 (non-persistent storage) then Layer 2
- * (per-channel transcript loss detection). Designed to be awaited between
+ * (per-persona transcript loss detection). Designed to be awaited between
  * trustBootstrap and startupSessionManager in main(), wrapped so a rejection
  * can never kill startup.
  *
+ * `notify` is the persona-keyed notice seam: it takes a persona key and a
+ * notice body (production: the per-persona notifier).
+ *
  * - Non-persistent root: recordStartupError(jsonl-non-persistent) + one
- *   chat.postMessage per routed channel (when web is provided).
+ *   notice per persona whose effective JSONL root is that root.
  * - Unresolvable root fstype: recordStartupError(jsonl-persistence-check-warning),
- *   no Slack post.
- * - Per-channel stale-path / lost-transcript: loud (record + Slack to that channel).
- * - Idle-since-spawn channel: single quiet console line, no loud signal.
- * - web undefined (dry-run): no Slack posts; loud errors still recorded.
+ *   no notice.
+ * - Per-persona stale-path / lost-transcript: loud (record + notice to that persona).
+ * - Idle-since-spawn persona: single quiet console line, no loud signal.
+ * - notify undefined (a unit test): no notices; loud errors still recorded.
  * - Own unexpected failure: one warning line, returns (never throws).
  */
 export async function runJsonlPersistenceSafeguard(
   config: RoutingConfig,
-  web: WebClient | undefined,
+  notify: PersonaNotify | undefined,
   deps?: JsonlPersistenceSafeguardDeps,
 ): Promise<void> {
   const recordError = deps?.recordStartupError ?? defaultRecordStartupError
-  const postFn = deps?.postFn ?? defaultPostFn
   const readMountinfo = deps?.readMountinfo
   const statFn = deps?.statFn ?? defaultStatFn
   const getRow = deps?.getRow ?? defaultGetRow
@@ -486,29 +497,26 @@ export async function runJsonlPersistenceSafeguard(
   try {
     // Layer 1 — non-persistent storage.
     const { nonPersistent, warnings } = checkJsonlPersistence(config, readMountinfo)
-    const channelIds = Object.keys(config.routes)
+    // The persona keys: the route keys under the route->persona adapter.
+    const keys = Object.keys(config.routes)
 
     for (const root of nonPersistent) {
       recordError(
         ERR_KEY_NON_PERSISTENT,
         `JSONL storage root is on a non-persistent filesystem (tmpfs/ramfs) — resume is structurally impossible on this host. root="${root}"`,
       )
-      if (web !== undefined) {
-        // Roots are per-channel (resolveEffectiveConfigDir), so post only to the
-        // channels whose effective JSONL root is this flagged non-persistent root.
-        const defaultConfigDir = `${homedir()}/.claude`
-        for (const channelId of channelIds) {
-          const effectiveConfigDir = resolveEffectiveConfigDir(config, channelId) ?? defaultConfigDir
-          if (`${effectiveConfigDir}/projects` !== root) continue
-          postFn(
-            web,
-            channelId,
-            `⚠️ CSCB startup warning: my conversation storage at \`${root}\` is on a non-persistent filesystem ` +
-              `(tmpfs/ramfs). Session resume will not survive a reboot on this host.`,
-          ).catch((err: unknown) => {
-            console.error(`[slack] jsonl-persistence-check: failed to post non-persistent warning to channel=${channelId}:`, err)
-          })
-        }
+      // Roots are per persona (resolveEffectiveConfigDir), so notify only the
+      // personas whose effective JSONL root is this flagged non-persistent root.
+      const defaultConfigDir = `${homedir()}/.claude`
+      for (const key of keys) {
+        const effectiveConfigDir = resolveEffectiveConfigDir(config, key) ?? defaultConfigDir
+        if (`${effectiveConfigDir}/projects` !== root) continue
+        sendNotice(
+          notify,
+          key,
+          `⚠️ CSCB startup warning: my conversation storage at \`${root}\` is on a non-persistent filesystem ` +
+            `(tmpfs/ramfs). Session resume will not survive a reboot on this host.`,
+        )
       }
     }
 
@@ -519,21 +527,20 @@ export async function runJsonlPersistenceSafeguard(
       )
     }
 
-    // Layer 2 — per-channel transcript loss. Isolated per channel.
-    for (const channelId of channelIds) {
+    // Layer 2 — per-persona transcript loss. Isolated per persona.
+    for (const key of keys) {
       try {
         await checkChannelTranscript(
           config,
-          channelId,
-          web,
+          key,
+          notify,
           statFn,
           getRow,
           archiveCountSince,
           recordError,
-          postFn,
         )
       } catch (err) {
-        console.error(`[slack] jsonl-persistence-check: unexpected error checking channel=${channelId} — continuing:`, err)
+        console.error(`[slack] jsonl-persistence-check: unexpected error checking persona=${key} — continuing:`, err)
       }
     }
   } catch (err) {

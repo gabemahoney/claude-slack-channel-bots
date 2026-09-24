@@ -65,7 +65,7 @@ import {
   type PersonaSocketEventName,
   type PersonaSocketEventPayload,
 } from '../src/persona-connections.ts'
-import { createUnhandledRejectionHandler } from '../src/persona-connection-errors.ts'
+import { createUnhandledRejectionHandler, slackPlatformReason } from '../src/persona-connection-errors.ts'
 import {
   checkPersonaLocalBringUp,
   checkPersonaWorkingDirectory,
@@ -2440,6 +2440,66 @@ describe('unhandledRejection handler (SR-3.3)', () => {
     })
 
     expect(() => handler(new Error('rejected'))).not.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// slackPlatformReason (SR-10.3): data.error only when it is a short identifier
+// ---------------------------------------------------------------------------
+
+describe('slackPlatformReason (SR-10.3)', () => {
+  /** An Error carrying `data` as a Slack platform error does. */
+  const withData = (data: unknown): Error => Object.assign(new Error(`An API error occurred ${LEAK_SENTINEL}`), { data })
+
+  test.each<[string, unknown, string]>([
+    ['a Slack platform error', sentinelSlackError('slack_webapi_platform_error', 'not_in_channel'), 'not_in_channel'],
+    ['a plain object shaped like one', { data: { error: 'channel_not_found' } }, 'channel_not_found'],
+    ['a 64-character identifier', withData({ error: `a${'b'.repeat(63)}` }), `a${'b'.repeat(63)}`],
+  ])('%s: returns the reason', (_label, value, reason) => {
+    expect(slackPlatformReason(value)).toBe(reason)
+  })
+
+  test.each<[string, unknown]>([
+    ['no data', new Error('boom')],
+    ['data without error', withData({ ok: false })],
+    ['a non-string error', withData({ error: 42 })],
+    ['a hyphen (a token always has one)', withData({ error: fakeToken(BOT_TOKEN_PREFIX, 'reason') })],
+    ['a bare hyphen', withData({ error: '-' })],
+    ['spaces', withData({ error: 'not in channel' })],
+    ['a newline', withData({ error: 'not_in_channel\nsecond' })],
+    ['more than 64 characters', withData({ error: `a${'b'.repeat(64)}` })],
+    ['an empty string', withData({ error: '' })],
+    ['a leading digit', withData({ error: '1abc' })],
+    ['a request error with no data.error', sentinelSlackError('slack_webapi_request_error')],
+    ['undefined', undefined],
+    ['null', null],
+    ['a string', 'not_in_channel'],
+    ['data that is a string', withData('not_in_channel')],
+  ])('%s: returns undefined', (_label, value) => {
+    expect(slackPlatformReason(value)).toBeUndefined()
+  })
+
+  test('a throwing getter on data or data.error makes it return undefined, never throw', () => {
+    const throwingData = Object.defineProperty(new Error('x'), 'data', {
+      get() {
+        throw new Error(`getter ${LEAK_SENTINEL}`)
+      },
+    })
+    const throwingError = withData(
+      Object.defineProperty({}, 'error', {
+        get() {
+          throw new Error(`getter ${LEAK_SENTINEL}`)
+        },
+      }),
+    )
+
+    for (const value of [throwingData, throwingError]) {
+      let result: unknown = 'not called'
+      expect(() => {
+        result = slackPlatformReason(value)
+      }).not.toThrow()
+      expect(result).toBeUndefined()
+    }
   })
 })
 
