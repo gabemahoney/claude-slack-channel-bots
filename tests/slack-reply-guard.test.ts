@@ -332,6 +332,11 @@ describe('slack-reply-guard.sh — additional fixtures', () => {
 //     verbatim-interject-no-reply.jsonl with message_id and ts changed from
 //     "1789861303.035" to "1789861303" (what String(Date.now() / 1000) gives
 //     on an exact second).
+//   interject-persona-meta-no-reply.jsonl
+//     verbatim-interject-custom-label-no-reply.jsonl with the chat_id and
+//     message_id attributes removed from its opening <channel> tag: the
+//     persona-targeted /interject meta of b.av2 SR-9.2 (user and ts only).
+//     Source, user and the "1789916660.95" ts are unchanged.
 //   compact-summary-no-reply.jsonl
 //     verbatim-compact-summary-after-reply.jsonl with line 2 replaced by the
 //     unreplied assistant entry. The assistant entry sits between the Slack
@@ -370,6 +375,7 @@ describe('slack-reply-guard.sh — b.wr5 injected prompts and reminder provenanc
     ['verbatim-interject-no-reply.jsonl', '/interject with the default sender label'],
     ['verbatim-interject-custom-label-no-reply.jsonl', '/interject with a custom sender label'],
     ['interject-whole-second-ts-no-reply.jsonl', '/interject sent on an exact second (whole-number ts)'],
+    ['interject-persona-meta-no-reply.jsonl', 'persona-targeted /interject — meta is user and ts only, no chat_id or message_id'],
     ['cron-then-interject-no-reply.jsonl', 'cron then /interject back to back'],
     ['cron-quoting-slack-wrapper-no-reply.jsonl', 'cron envelope quoting a real Slack wrapper — only the envelope at the start counts'],
     ['plain-quoting-slack-wrapper-no-reply.jsonl', 'plain message quoting a Slack wrapper mid-text'],

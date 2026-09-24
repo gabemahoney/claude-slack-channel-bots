@@ -2,8 +2,8 @@
  * persona-identity.test.ts — persona key rule and derived identifiers.
  *
  * Covers b.av2 SR-2.1 (key rule and fit constraints), SR-2.2 (instance ID,
- * tmux name, labels, spawn env), SR-10.3 (persona-reference rendering) and
- * SR-13.1 (no import side effects).
+ * tmux name, labels, spawn env), SR-9.1/SR-9.3 (persona target resolution),
+ * SR-10.3 (persona-reference rendering) and SR-13.1 (no import side effects).
  *
  * Expected keys are literals computed independently from the spec (SHA-256
  * of the UTF-8 name, outside this code base), never by calling personaKey:
@@ -31,6 +31,7 @@ import {
   personaTmuxSessionName,
   renderPersonaRef,
   resolveClaudeConfigDir,
+  resolvePersonaTarget,
 } from '../src/persona-identity.ts'
 import { encodePermissionActionId, parsePermissionActionId } from '../src/permission-action-id.ts'
 
@@ -220,6 +221,40 @@ describe('renderPersonaRef', () => {
 
   test('escapes quotes, backslashes and newlines onto one line', () => {
     expect(renderPersonaRef('Say "hi"\\\nnow', 'k1')).toBe('"Say \\"hi\\"\\\\\\nnow" (key=k1)')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Target resolution (b.av2 SR-9.1, SR-9.3)
+// ---------------------------------------------------------------------------
+
+describe('resolvePersonaTarget', () => {
+  // Ops Bot's key is its hashed form (see renderPersonaRef above), so its name
+  // and key differ; Build Bot comes second so a match is not just personas[0].
+  const OPS = { name: 'Ops Bot', key: 'ops_bot_5e2526f3' }
+  const BUILD = { name: 'Build Bot', key: 'build_bot_0a1b2c3d' }
+  const CONFIG = { personas: [OPS, BUILD] }
+
+  test.each([
+    ['Ops Bot by name', 'Ops Bot', OPS],
+    ['Ops Bot by key', 'ops_bot_5e2526f3', OPS],
+    ['Build Bot by name', 'Build Bot', BUILD],
+    ['Build Bot by key', 'build_bot_0a1b2c3d', BUILD],
+  ])('%s returns that persona', (_label, target, expected) => {
+    expect(resolvePersonaTarget(CONFIG, target)).toBe(expected)
+  })
+
+  test.each([
+    ['an unknown target', CONFIG, 'Nobody'],
+    ['a name in a different case', CONFIG, 'ops bot'],
+    ['a key in a different case', CONFIG, 'OPS_BOT_5E2526F3'],
+    ['a name with a trailing space', CONFIG, 'Ops Bot '],
+    ['a key with a trailing space', CONFIG, 'ops_bot_5e2526f3 '],
+    ['an empty target', CONFIG, ''],
+    ['a null config', null, 'Ops Bot'],
+    ['an undefined config', undefined, 'Ops Bot'],
+  ])('%s returns undefined', (_label, config, target) => {
+    expect(resolvePersonaTarget(config, target)).toBeUndefined()
   })
 })
 

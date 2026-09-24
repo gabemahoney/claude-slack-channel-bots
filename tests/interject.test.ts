@@ -1,456 +1,464 @@
 /**
- * interject.test.ts — Integration tests for the /interject endpoint (SR-8.3, SR-8.4)
+ * interject.test.ts — The `/interject` handler (b.av2 SR-9.1, SR-9.2, SR-10.2,
+ * SR-13.1; AC 50's `/interject` leg).
  *
- * Since server.ts executes side effects at module scope (reads .env, connects Socket
- * Mode, binds HTTP), it cannot be imported in tests. Instead we replicate the
- * /interject endpoint logic in a self-contained Bun.serve() test server that uses
- * in-process stubs in place of the real session registry and MCP server.
+ * Drives the real `handleInterject` from src/interject.ts with injected
+ * dependencies: a two-persona config from `makeMultiPersonaConfig`, stub
+ * sessions keyed by persona key that capture `notification` calls, a fixed
+ * clock and a capturing logger. Most cases call the handler directly; the
+ * body-size cap and the loopback check also run over a real HTTP request to a
+ * port-0 `Bun.serve` bound to 127.0.0.1 in this process, the way server.ts
+ * hands the request over (`server.requestIP(req)?.address`).
+ *
+ * server.ts cannot be imported (module-scope side effects), so its delegation
+ * to the handler and its cron-target resolver are checked statically against
+ * its comment-stripped source text.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, beforeEach, afterAll } from 'bun:test'
+import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+import {
+  INTERJECT_BODY_CAP_BYTES,
+  handleInterject,
+  type InterjectDeps,
+  type InterjectSession,
+} from '../src/interject.ts'
+import type { PersonaConfig } from '../src/config.ts'
+import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
+import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { indicesOf, stripComments } from './test-helpers/source-audit.ts'
 
 // ---------------------------------------------------------------------------
-// Types (mirrored from server.ts)
+// Fixture: persona A has a name with capitals and a space (so its key is the
+// hashed form), persona B a plain `a-z0-9_` name (its key is its name). Their
+// channels are the helper's C0TEST001 / C0TEST002, which no key equals.
 // ---------------------------------------------------------------------------
 
-interface MockMcpServer {
-  notification: (n: { method: string; params: unknown }) => void
+const A_NAME = 'Planner Bot'
+const A_KEY = personaKey(A_NAME)
+const B_NAME = 'reviewer'
+const B_KEY = personaKey(B_NAME)
+
+/** Fixed clock: 1_700_000_000.123 s. */
+const NOW_MS = 1_700_000_000_123
+
+interface CapturedNotification {
+  method: string
+  params: { content: string; meta: Record<string, string> }
 }
 
-interface MockSession {
-  channel: string
-  cwd: string
-  connected: boolean
-  server: MockMcpServer
+interface StubSession {
+  session: InterjectSession
+  calls: CapturedNotification[]
 }
 
-// ---------------------------------------------------------------------------
-// Shared mutable state — captured by closure in the test server.
-// Reassigning or mutating in beforeEach is visible to the server handler.
-// ---------------------------------------------------------------------------
-
-let routingConfig: { routes: Record<string, { cwd: string }> } | null = null
-
-// sessions keyed by channel — mirrors the getSessionByPersona(channel) lookup
-// (a stand-in persona's key is its channel ID)
-const sessions = new Map<string, MockSession>()
-
-// Capture array for notification() calls — reset in beforeEach via .length = 0
-const notificationCalls: Array<{ method: string; params: unknown }> = []
-
-// ---------------------------------------------------------------------------
-// Factory functions
-// ---------------------------------------------------------------------------
-
-function makeRoutingConfig(channels: string[] = ['C_TEST']): { routes: Record<string, { cwd: string }> } {
-  const routes: Record<string, { cwd: string }> = {}
-  for (const ch of channels) {
-    routes[ch] = { cwd: '/tmp/test-project' }
-  }
-  return { routes }
-}
-
-function makeSession(overrides: Partial<MockSession> & { channel: string }): MockSession {
-  return {
-    cwd: '/tmp/test-project',
-    connected: true,
-    server: {
-      notification: (n) => notificationCalls.push(n),
+/** A stub session that records each notification; `result` is what it returns. */
+function makeStubSession(connected = true, result: () => Promise<void> = () => Promise.resolve()): StubSession {
+  const calls: CapturedNotification[] = []
+  const server = {
+    notification: (n: CapturedNotification) => {
+      calls.push(n)
+      return result()
     },
-    ...overrides,
   }
+  return { session: { connected, server } as unknown as InterjectSession, calls }
 }
 
-// ---------------------------------------------------------------------------
-// Test server — replicates /interject handler logic verbatim from server.ts
-// Binds on port 0 so OS assigns a free port (no conflicts).
-// ---------------------------------------------------------------------------
-
-const testServer = Bun.serve({
-  port: 0,
-  async fetch(req: Request, server: any): Promise<Response> {
-    const url = new URL(req.url)
-
-    if (url.pathname !== '/interject') {
-      return new Response(JSON.stringify({ error: 'Not Found' }), { status: 404 })
-    }
-
-    if (req.method !== 'POST') {
-      return new Response(JSON.stringify({ error: 'Method Not Allowed' }), {
-        status: 405,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    }
-
-    const remoteAddr = server.requestIP(req)
-    const remoteHost = remoteAddr?.address ?? ''
-    if (remoteHost !== '127.0.0.1' && remoteHost !== '::1' && !remoteHost.startsWith('::ffff:127.')) {
-      return new Response(JSON.stringify({ error: 'Forbidden' }), {
-        status: 403,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    }
-
-    const bodyText = await req.text()
-    if (new TextEncoder().encode(bodyText).byteLength > 32768) {
-      return new Response(JSON.stringify({ error: 'Request body too large (max 32KB)' }), {
-        status: 413,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    }
-
-    let body: { channel?: unknown; message?: unknown; sender?: unknown }
-    try {
-      body = JSON.parse(bodyText)
-    } catch {
-      return new Response(JSON.stringify({ error: 'Invalid JSON' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    }
-
-    const { channel, message, sender } = body
-    if (typeof channel !== 'string' || !channel) {
-      return new Response(
-        JSON.stringify({ error: 'Missing or invalid field: channel (string) required' }),
-        { status: 400, headers: { 'Content-Type': 'application/json' } },
-      )
-    }
-    if (typeof message !== 'string' || !message) {
-      return new Response(
-        JSON.stringify({ error: 'Missing or invalid field: message (string) required' }),
-        { status: 400, headers: { 'Content-Type': 'application/json' } },
-      )
-    }
-
-    const route = routingConfig?.routes[channel]
-    if (!route) {
-      return new Response(
-        JSON.stringify({ error: 'Channel not found in routing config' }),
-        { status: 404, headers: { 'Content-Type': 'application/json' } },
-      )
-    }
-
-    const targetSession = sessions.get(channel)
-    if (!targetSession || !targetSession.connected) {
-      return new Response(
-        JSON.stringify({ error: 'No active session for this channel' }),
-        { status: 503, headers: { 'Content-Type': 'application/json' } },
-      )
-    }
-
-    const senderLabel = typeof sender === 'string' && sender ? sender : 'interject'
-    const ts = String(Date.now() / 1000)
-    const meta: Record<string, string> = {
-      chat_id: channel,
-      message_id: ts,
-      user: senderLabel,
-      ts,
-    }
-
-    targetSession.server.notification({
-      method: 'notifications/claude/channel',
-      params: { content: message, meta },
-    })
-
-    return new Response(JSON.stringify({ ok: true, channel, cwd: targetSession.cwd }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    })
-  },
-})
-
-const BASE_URL = `http://127.0.0.1:${testServer.port}`
-
-// ---------------------------------------------------------------------------
-// Reset state between tests
-// ---------------------------------------------------------------------------
+let dir: string
+let config: PersonaConfig | null
+let sessions: Map<string, InterjectSession>
+let a: StubSession
+let b: StubSession
+let logs: string[]
 
 beforeEach(() => {
-  routingConfig = null
-  sessions.clear()
-  notificationCalls.length = 0
+  dir = mkdtempSync(join(tmpdir(), 'cscb-interject-'))
+  config = makeMultiPersonaConfig([{ name: A_NAME }, { name: B_NAME }], dir)
+  a = makeStubSession()
+  b = makeStubSession()
+  sessions = new Map([
+    [A_KEY, a.session],
+    [B_KEY, b.session],
+  ])
+  logs = []
 })
+
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true })
+})
+
+function deps(): InterjectDeps {
+  return {
+    getPersonaConfig: () => config,
+    getSessionByPersona: (key) => sessions.get(key),
+    now: () => NOW_MS,
+    log: (line) => logs.push(line),
+  }
+}
+
+/** Call the handler directly. A string body is sent raw; anything else as JSON. */
+function interject(
+  body: unknown,
+  opts: { method?: string; remote?: string | null | undefined } = {},
+): Promise<Response> {
+  const method = opts.method ?? 'POST'
+  const init: RequestInit = { method, headers: { 'Content-Type': 'application/json' } }
+  if (method !== 'GET' && method !== 'HEAD' && body !== undefined) {
+    init.body = typeof body === 'string' ? body : JSON.stringify(body)
+  }
+  const remote = 'remote' in opts ? opts.remote : '127.0.0.1'
+  return handleInterject(new Request('http://127.0.0.1/interject', init), remote, deps())
+}
+
+function expectNoDelivery(): void {
+  expect(a.calls).toHaveLength(0)
+  expect(b.calls).toHaveLength(0)
+}
+
+// ---------------------------------------------------------------------------
+// In-process HTTP path: port 0 on 127.0.0.1, handed over as server.ts does.
+// ---------------------------------------------------------------------------
+
+const httpServer = Bun.serve({
+  hostname: '127.0.0.1',
+  port: 0,
+  fetch: (req, server) => handleInterject(req, server.requestIP(req)?.address, deps()),
+})
+const HTTP_URL = `http://127.0.0.1:${httpServer.port}/interject`
 
 afterAll(() => {
-  testServer.stop()
+  httpServer.stop(true)
+})
+
+/** UTF-8 byte length. */
+function byteLength(s: string): number {
+  return new TextEncoder().encode(s).byteLength
+}
+
+/**
+ * A serialized body for persona B of exactly `bytes` UTF-8 bytes. The message
+ * opens with a two-byte character, so the byte count exceeds the character
+ * count and a character-counting cap would get the boundary wrong.
+ */
+function bodyOfBytes(bytes: number): { text: string; message: string } {
+  const head = 'é'
+  const overhead = byteLength(JSON.stringify({ persona: B_NAME, message: head }))
+  const message = head + 'x'.repeat(bytes - overhead)
+  const text = JSON.stringify({ persona: B_NAME, message })
+  expect(byteLength(text)).toBe(bytes)
+  return { text, message }
+}
+
+// ---------------------------------------------------------------------------
+// SR-9.1 status table
+// ---------------------------------------------------------------------------
+
+describe('/interject status table (SR-9.1)', () => {
+  test.each([
+    ['GET', 405],
+    ['PUT', 405],
+    ['DELETE', 405],
+  ] as const)('%s → %i Method Not Allowed, nothing delivered', async (method, status) => {
+    const res = await interject({ persona: B_NAME, message: 'hi' }, { method })
+    expect(res.status).toBe(status)
+    expect(await res.json()).toEqual({ error: 'Method Not Allowed' })
+    expectNoDelivery()
+  })
+
+  test.each([
+    ['10.0.0.5'],
+    ['192.168.1.20'],
+    ['::ffff:10.0.0.5'],
+    ['fe80::1'],
+    [''],
+    [null],
+    [undefined],
+  ])('remote address %p → 403, nothing delivered', async (remote) => {
+    const res = await interject({ persona: B_NAME, message: 'hi' }, { remote })
+    expect(res.status).toBe(403)
+    expect(await res.json()).toEqual({ error: 'Forbidden' })
+    expectNoDelivery()
+  })
+
+  test.each([['127.0.0.1'], ['::1'], ['::ffff:127.0.0.1']])('loopback remote address %s → 200', async (remote) => {
+    const res = await interject({ persona: B_NAME, message: 'hi' }, { remote })
+    expect(res.status).toBe(200)
+    expect(b.calls).toHaveLength(1)
+  })
+
+  test.each([
+    ['missing persona', { message: 'hi' }],
+    ['numeric persona', { persona: 42, message: 'hi' }],
+    ['null persona', { persona: null, message: 'hi' }],
+    ['object persona', { persona: { name: B_NAME }, message: 'hi' }],
+    ['empty persona', { persona: '', message: 'hi' }],
+    ['legacy channel-only body (SR-10.2)', { channel: 'C0TEST002', message: 'hi' }],
+    ['JSON array body', '[]'],
+    ['JSON string body', JSON.stringify(B_NAME)],
+    ['JSON number body', '42'],
+    ['JSON null body', 'null'],
+  ])('%s → 400 naming persona, nothing delivered', async (_label, body) => {
+    const res = await interject(body)
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ error: 'Missing or invalid field: persona (string) required' })
+    expectNoDelivery()
+  })
+
+  test.each([
+    ['missing message', { persona: B_NAME }],
+    ['empty message', { persona: B_NAME, message: '' }],
+    ['numeric message', { persona: B_NAME, message: 7 }],
+  ])('%s → 400 naming message, nothing delivered', async (_label, body) => {
+    const res = await interject(body)
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ error: 'Missing or invalid field: message (string) required' })
+    expectNoDelivery()
+  })
+
+  test('invalid JSON → 400 Invalid JSON, nothing delivered', async () => {
+    const res = await interject('not valid json {{{')
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ error: 'Invalid JSON' })
+    expectNoDelivery()
+  })
+
+  test.each([
+    ['unknown name', 'nobody'],
+    ['a channel ID of a persona (channels are not targets, SR-10.2)', 'C0TEST002'],
+    ['the name in another case', 'REVIEWER'],
+    ["A's key with a trailing space", `${A_KEY} `],
+  ])('%s → 404, nothing delivered', async (_label, persona) => {
+    const res = await interject({ persona, message: 'hi' })
+    expect(res.status).toBe(404)
+    expect(await res.json()).toEqual({ error: 'Persona not found in the applied config' })
+    expectNoDelivery()
+  })
+
+  test.each([
+    ['a config with zero personas', () => makeMultiPersonaConfig([], dir)],
+    ['a null applied config', () => null],
+  ])('%s → 404 for a persona that exists elsewhere, nothing delivered', async (_label, build) => {
+    config = build()
+    const res = await interject({ persona: B_NAME, message: 'hi' })
+    expect(res.status).toBe(404)
+    expectNoDelivery()
+  })
+
+  test.each([
+    ['no session registered', (): StubSession | undefined => undefined],
+    ['a disconnected session', (): StubSession | undefined => makeStubSession(false)],
+  ])('%s → 503, nothing delivered', async (_label, build) => {
+    const stub = build()
+    if (stub) sessions.set(B_KEY, stub.session)
+    else sessions.delete(B_KEY)
+    const res = await interject({ persona: B_NAME, message: 'hi' })
+    expect(res.status).toBe(503)
+    expect(await res.json()).toEqual({ error: 'No active session for this persona' })
+    expectNoDelivery()
+    expect(stub?.calls ?? []).toHaveLength(0)
+  })
 })
 
 // ---------------------------------------------------------------------------
-// SR-8.3 / SR-8.4 Test Cases
+// Body-size cap, over a real loopback HTTP request
 // ---------------------------------------------------------------------------
 
-describe('/interject endpoint', () => {
-  // TC-1: Happy path — valid channel + message → 200, notification delivered
-  test('TC-1: POST valid channel+message returns 200 and delivers notification', async () => {
-    routingConfig = makeRoutingConfig(['C_TEST'])
-    sessions.set('C_TEST', makeSession({ channel: 'C_TEST' }))
+describe('/interject 32 KB body cap (in-process HTTP, port 0)', () => {
+  test('the cap is 32768 bytes', () => {
+    expect(INTERJECT_BODY_CAP_BYTES).toBe(32768)
+  })
 
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: 'C_TEST', message: 'Hello from interject' }),
-    })
-
+  test('a body of exactly 32768 UTF-8 bytes is accepted and delivered whole', async () => {
+    const { text, message } = bodyOfBytes(32768)
+    const res = await fetch(HTTP_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: text })
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { ok: boolean; channel: string; cwd: string }
-    expect(body.ok).toBe(true)
-    expect(body.channel).toBe('C_TEST')
-    expect(body.cwd).toBe('/tmp/test-project')
-
-    // SR-8.4: verify notification shape
-    expect(notificationCalls).toHaveLength(1)
-    const notif = notificationCalls[0]!
-    expect(notif.method).toBe('notifications/claude/channel')
-    const params = notif.params as { content: string; meta: Record<string, string> }
-    expect(params.content).toBe('Hello from interject')
-    expect(params.meta.chat_id).toBe('C_TEST')
-    expect(params.meta.user).toBe('interject')
-    expect(typeof params.meta.message_id).toBe('string')
-    expect(Number(params.meta.message_id)).toBeGreaterThan(1_000_000_000)
-    expect(typeof params.meta.ts).toBe('string')
-    expect(Number(params.meta.ts)).toBeGreaterThan(1_000_000_000)
+    expect(b.calls).toHaveLength(1)
+    expect(b.calls[0]!.params.content).toBe(message)
+    expect(a.calls).toHaveLength(0)
   })
 
-  // TC-2: Missing channel field → 400 with field-specific error
-  test('TC-2: Missing channel returns 400 with field-specific error', async () => {
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: 'Hello' }),
-    })
-
-    expect(res.status).toBe(400)
-    const body = (await res.json()) as { error: string }
-    expect(body.error).toContain('channel')
-  })
-
-  // TC-3: Missing message field → 400 with field-specific error
-  test('TC-3: Missing message returns 400 with field-specific error', async () => {
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: 'C_TEST' }),
-    })
-
-    expect(res.status).toBe(400)
-    const body = (await res.json()) as { error: string }
-    expect(body.error).toContain('message')
-  })
-
-  // TC-4: Empty string message → 400
-  test('TC-4: Empty string message returns 400', async () => {
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: 'C_TEST', message: '' }),
-    })
-
-    expect(res.status).toBe(400)
-    const body = (await res.json()) as { error: string }
-    expect(body.error).toContain('message')
-  })
-
-  // TC-5: Invalid JSON → 400 with "Invalid JSON"
-  test('TC-5: Invalid JSON body returns 400 with "Invalid JSON"', async () => {
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: 'not valid json {{{',
-    })
-
-    expect(res.status).toBe(400)
-    const body = (await res.json()) as { error: string }
-    expect(body.error).toBe('Invalid JSON')
-  })
-
-  // TC-6a: GET → 405
-  test('TC-6a: GET /interject returns 405', async () => {
-    const res = await fetch(`${BASE_URL}/interject`, { method: 'GET' })
-    expect(res.status).toBe(405)
-  })
-
-  // TC-6b: PUT → 405
-  test('TC-6b: PUT /interject returns 405', async () => {
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'PUT',
-      body: JSON.stringify({}),
-    })
-    expect(res.status).toBe(405)
-  })
-
-  // TC-6c: DELETE → 405
-  test('TC-6c: DELETE /interject returns 405', async () => {
-    const res = await fetch(`${BASE_URL}/interject`, { method: 'DELETE' })
-    expect(res.status).toBe(405)
-  })
-
-  // TC-7: Channel not in routing config → 404
-  test('TC-7: Channel not in routing config returns 404', async () => {
-    routingConfig = makeRoutingConfig(['C_KNOWN'])
-
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: 'C_UNKNOWN', message: 'Hello' }),
-    })
-
-    expect(res.status).toBe(404)
-    const body = (await res.json()) as { error: string }
-    expect(body.error).toContain('Channel not found')
-  })
-
-  // TC-8a: Channel in config but no session in registry → 503
-  test('TC-8a: Channel in config with no active session returns 503', async () => {
-    routingConfig = makeRoutingConfig(['C_TEST'])
-    // no session registered
-
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: 'C_TEST', message: 'Hello' }),
-    })
-
-    expect(res.status).toBe(503)
-    const body = (await res.json()) as { error: string }
-    expect(body.error).toContain('No active session')
-  })
-
-  // TC-8b: Channel in config, session exists but connected=false → 503
-  test('TC-8b: Channel in config with disconnected session returns 503', async () => {
-    routingConfig = makeRoutingConfig(['C_TEST'])
-    sessions.set('C_TEST', makeSession({ channel: 'C_TEST', connected: false }))
-
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: 'C_TEST', message: 'Hello' }),
-    })
-
-    expect(res.status).toBe(503)
-    const body = (await res.json()) as { error: string }
-    expect(body.error).toContain('No active session')
-  })
-
-  // TC-9: Body larger than 32KB → 413
-  test('TC-9: Body larger than 32KB returns 413', async () => {
-    // 32769 'x' chars → 32769 bytes (exceeds 32768 limit)
-    const oversized = 'x'.repeat(32769)
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: oversized,
-    })
-
+  test('a body of 32769 UTF-8 bytes → 413, nothing delivered', async () => {
+    const { text } = bodyOfBytes(32769)
+    const res = await fetch(HTTP_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: text })
     expect(res.status).toBe(413)
-    const body = (await res.json()) as { error: string }
-    expect(body.error).toContain('too large')
+    expect(await res.json()).toEqual({ error: 'Request body too large (max 32KB)' })
+    expectNoDelivery()
   })
+})
 
-  // TC-10: Custom sender → meta.user uses provided value (SR-8.4)
-  test('TC-10: Custom sender field is reflected in notification meta.user', async () => {
-    routingConfig = makeRoutingConfig(['C_TEST'])
-    sessions.set('C_TEST', makeSession({ channel: 'C_TEST' }))
+// ---------------------------------------------------------------------------
+// AC 50 — only the named persona is reached
+// ---------------------------------------------------------------------------
 
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: 'C_TEST', message: 'Test message', sender: 'alice' }),
-    })
-
+describe('AC 50: /interject reaches only the named persona', () => {
+  test.each([
+    ['by name', A_NAME],
+    ['by key', A_KEY],
+  ])("AC 50: persona A addressed %s → 200 with A's name, one notification on A, none on B", async (_label, persona) => {
+    const res = await interject({ persona, message: 'for A only' })
     expect(res.status).toBe(200)
-    expect(notificationCalls).toHaveLength(1)
-    const params = (notificationCalls[0]!.params as { content: string; meta: Record<string, string> })
-    expect(params.meta.user).toBe('alice')
+    expect(await res.json()).toEqual({ ok: true, persona: A_NAME })
+    expect(a.calls).toHaveLength(1)
+    expect(a.calls[0]!.params.content).toBe('for A only')
+    expect(b.calls).toHaveLength(0)
+    expect(logs.some((l) => l.includes(renderPersonaRef(A_NAME, A_KEY)))).toBe(true)
   })
 
-  // TC-11: Default sender (omitted) → meta.user is "interject" (SR-8.4)
-  test('TC-11: Omitted sender defaults meta.user to "interject"', async () => {
-    routingConfig = makeRoutingConfig(['C_TEST'])
-    sessions.set('C_TEST', makeSession({ channel: 'C_TEST' }))
-
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: 'C_TEST', message: 'Test message' }),
-    })
-
+  test('AC 50: a request for B reaches only B', async () => {
+    const res = await interject({ persona: B_NAME, message: 'for B only' })
     expect(res.status).toBe(200)
-    expect(notificationCalls).toHaveLength(1)
-    const params = (notificationCalls[0]!.params as { content: string; meta: Record<string, string> })
-    expect(params.meta.user).toBe('interject')
+    expect(await res.json()).toEqual({ ok: true, persona: B_NAME })
+    expect(b.calls).toHaveLength(1)
+    expect(a.calls).toHaveLength(0)
   })
 
-  // Edge: empty string sender falls back to "interject"
-  test('Empty string sender falls back to default "interject"', async () => {
-    routingConfig = makeRoutingConfig(['C_TEST'])
-    sessions.set('C_TEST', makeSession({ channel: 'C_TEST' }))
-
-    const res = await fetch(`${BASE_URL}/interject`, {
+  test('AC 50: a real loopback HTTP request by key reaches only that persona', async () => {
+    const res = await fetch(HTTP_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: 'C_TEST', message: 'Test message', sender: '' }),
+      body: JSON.stringify({ persona: A_KEY, message: 'over http' }),
     })
-
     expect(res.status).toBe(200)
-    const params = (notificationCalls[0]!.params as { content: string; meta: Record<string, string> })
-    expect(params.meta.user).toBe('interject')
+    expect(await res.json()).toEqual({ ok: true, persona: A_NAME })
+    expect(a.calls).toHaveLength(1)
+    expect(b.calls).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SR-9.2 — notification shape and meta
+// ---------------------------------------------------------------------------
+
+describe('/interject notification meta (SR-9.2)', () => {
+  test('method and content unchanged; meta is exactly { user, ts } — no chat_id, message_id or via', async () => {
+    await interject({ persona: B_NAME, message: 'Hello from interject', sender: 'cscb-cron:tick' })
+    expect(b.calls).toEqual([
+      {
+        method: 'notifications/claude/channel',
+        params: { content: 'Hello from interject', meta: { user: 'cscb-cron:tick', ts: '1700000000.123' } },
+      },
+    ])
+    expect(Object.keys(b.calls[0]!.params.meta).sort()).toEqual(['ts', 'user'])
   })
 
-  // Edge: non-string channel (number) → 400
-  test('Non-string channel returns 400', async () => {
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: 42, message: 'Hello' }),
-    })
-
-    expect(res.status).toBe(400)
-    const body = (await res.json()) as { error: string }
-    expect(body.error).toContain('channel')
+  test.each([
+    ['a custom sender', { sender: 'ops-script' }, 'ops-script'],
+    ['an omitted sender', {}, 'interject'],
+    ['an empty sender', { sender: '' }, 'interject'],
+    ['a non-string sender', { sender: 42 }, 'interject'],
+  ])('%s → meta.user %p', async (_label, extra, user) => {
+    await interject({ persona: B_NAME, message: 'hi', ...extra })
+    expect(b.calls[0]!.params.meta.user).toBe(user)
   })
 
-  // Edge: notification not delivered on error paths (no side effects on 400)
-  test('No notification is delivered when request is invalid', async () => {
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: 'C_TEST' }), // missing message
-    })
-
-    expect(res.status).toBe(400)
-    expect(notificationCalls).toHaveLength(0)
-  })
-
-  // Edge: routingConfig is null (not yet set) → 404
-  test('Null routingConfig returns 404 for any channel', async () => {
-    routingConfig = null
-
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: 'C_TEST', message: 'Hello' }),
-    })
-
-    expect(res.status).toBe(404)
-  })
-
-  // SR-8.4: message_id and ts are both the same timestamp string
-  test('SR-8.4: notification meta.message_id and meta.ts are equal timestamp strings', async () => {
-    routingConfig = makeRoutingConfig(['C_TEST'])
-    sessions.set('C_TEST', makeSession({ channel: 'C_TEST' }))
-
-    const res = await fetch(`${BASE_URL}/interject`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: 'C_TEST', message: 'Timestamp check' }),
-    })
-
+  // The b.wr5 reply guard treats a ts without six fractional digits as an
+  // injected prompt; ts is String(epoch ms / 1000), never a Slack-shaped ts.
+  test.each([
+    [1_700_000_000_123, '1700000000.123'],
+    [1_700_000_000_120, '1700000000.12'],
+    [1_700_000_000_000, '1700000000'],
+  ])('clock %i ms → ts %p (Unix seconds, never six fractional digits)', async (nowMs, ts) => {
+    const res = await handleInterject(
+      new Request('http://127.0.0.1/interject', { method: 'POST', body: JSON.stringify({ persona: B_NAME, message: 'hi' }) }),
+      '127.0.0.1',
+      { ...deps(), now: () => nowMs },
+    )
     expect(res.status).toBe(200)
-    const params = (notificationCalls[0]!.params as { content: string; meta: Record<string, string> })
-    expect(params.meta.message_id).toBe(params.meta.ts)
-    expect(Number(params.meta.ts)).toBeGreaterThan(1_000_000_000)
+    const meta = b.calls[0]!.params.meta
+    expect(meta.ts).toBe(ts)
+    expect(Number(meta.ts)).toBe(nowMs / 1000)
+    expect(meta.ts).not.toMatch(/\.\d{6}$/)
+  })
+
+  test('with the default clock, ts is the current Unix time in seconds and not Slack-shaped', async () => {
+    const before = Date.now() / 1000
+    const res = await handleInterject(
+      new Request('http://127.0.0.1/interject', { method: 'POST', body: JSON.stringify({ persona: B_NAME, message: 'hi' }) }),
+      '127.0.0.1',
+      { ...deps(), now: undefined },
+    )
+    const after = Date.now() / 1000
+    expect(res.status).toBe(200)
+    const ts = b.calls[0]!.params.meta.ts!
+    expect(ts).toMatch(/^\d+(\.\d{1,3})?$/)
+    expect(Number(ts)).toBeGreaterThanOrEqual(before)
+    expect(Number(ts)).toBeLessThanOrEqual(after)
+  })
+
+  test('a notification that rejects later still answers 200 and logs the failure with the persona', async () => {
+    const failing = makeStubSession(true, () => Promise.reject(new Error('transport closed')))
+    sessions.set(B_KEY, failing.session)
+    const res = await interject({ persona: B_NAME, message: 'hi' })
+    expect(res.status).toBe(200)
+    expect(failing.calls).toHaveLength(1)
+    await Bun.sleep(0)
+    const failure = logs.find((l) => l.includes('failed'))
+    expect(failure).toContain(`notification to persona ${renderPersonaRef(B_NAME, B_KEY)} failed`)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Static wiring: server.ts delegates /interject to the handler module and
+// resolves cron targets through resolvePersonaTarget
+// ---------------------------------------------------------------------------
+
+describe('server.ts wires /interject and cron targets by persona (static audit)', () => {
+  // Comments stripped (see stripComments), so commented-out code or prose
+  // naming a call can never satisfy an assertion.
+  const SERVER_CODE = stripComments(readFileSync(join(import.meta.dir, '..', 'src', 'server.ts'), 'utf-8'))
+
+  /** The `/interject` branch: from its path test to the next path test. */
+  function interjectBranch(): string {
+    const starts = indicesOf(/url\.pathname\s*===\s*'\/interject'/g, SERVER_CODE)
+    expect(starts).toHaveLength(1)
+    const next = SERVER_CODE.indexOf('url.pathname', starts[0]! + 1)
+    return SERVER_CODE.slice(starts[0]!, next === -1 ? undefined : next)
+  }
+
+  /** The argument text of the only `createCronDispatcher(...)` call, parentheses excluded. */
+  function cronDispatcherArguments(): string {
+    const calls = indicesOf(/\bcreateCronDispatcher\s*\(/g, SERVER_CODE)
+    expect(calls).toHaveLength(1)
+    const open = SERVER_CODE.indexOf('(', calls[0]!)
+    let depth = 0
+    for (let i = open; i < SERVER_CODE.length; i++) {
+      if (SERVER_CODE[i] === '(') depth++
+      else if (SERVER_CODE[i] === ')' && --depth === 0) return SERVER_CODE.slice(open + 1, i)
+    }
+    throw new Error('unbalanced createCronDispatcher call')
+  }
+
+  test('imports handleInterject from ./interject.ts', () => {
+    expect(SERVER_CODE).toMatch(/import\s*\{[^}]*\bhandleInterject\b[^}]*\}\s*from\s*['"]\.\/interject\.ts['"]/)
+  })
+
+  test('the /interject branch returns handleInterject with the request, its remote address and the persona deps', () => {
+    const branch = interjectBranch()
+    expect(branch).toMatch(/return\s+handleInterject\(\s*req,\s*server\.requestIP\(req\)\?\.address,/)
+    expect(branch).toMatch(/getPersonaConfig:\s*\(\)\s*=>\s*personaConfig\b/)
+    expect(branch).toContain('getSessionByPersona')
+    expect(branch).not.toContain('notifications/claude/channel')
+  })
+
+  test('the cron dispatcher resolves each target to a persona key against the applied persona config', () => {
+    expect(SERVER_CODE).toMatch(
+      /import\s*\{[^}]*\bresolvePersonaTarget\b[^}]*\}\s*from\s*['"]\.\/persona-identity\.ts['"]/,
+    )
+    expect(cronDispatcherArguments()).toMatch(
+      /\bresolveTarget\s*:\s*\(\s*target\s*\)\s*=>\s*resolvePersonaTarget\(\s*personaConfig\s*,\s*target\s*\)\s*\?\.\s*key\b/,
+    )
+  })
+
+  test.each([
+    ['Channel not found in routing config'],
+    ['No active session for this channel'],
+    ['Missing or invalid field: channel'],
+  ])('the old inline handler text %p is gone', (text) => {
+    expect(SERVER_CODE).not.toContain(text)
   })
 })

@@ -23,7 +23,9 @@
  *   Append-only: no pruning, no rotation, no size checks, no read-back.
  *
  * Line layout (five space-delimited fields; one record = one physical line):
- *   <ISO-8601 UTC ms timestamp> <identity|-> <channel|-> <outcome> <detail>
+ *   <ISO-8601 UTC ms timestamp> <identity|-> <target|-> <outcome> <detail>
+ * `target` is the persona target exactly as written in the crontable (a
+ * persona name or key, b.av2 SR-9.3), or `-` when the line has none.
  * The first four fields are single tokens (internal whitespace escaped) so
  * `grep <outcome-class>` matches exactly that class's records. `detail` leads
  * with key=value tokens (prompt=, status=, errno=, line=) then free text.
@@ -50,12 +52,12 @@ import { dirname } from 'node:path'
  * interpretable. Do not omit it.
  */
 export type CronOutcome =
-  /** Prompt delivered to the target channel successfully. */
+  /** Prompt delivered to the target persona's session successfully. */
   | 'delivered'
-  /** No live session for the target channel — message dropped. */
+  /** No live, connected session for the target persona (HTTP 503) — message dropped. */
   | 'no-session'
-  /** Target channel is not a configured/known channel. */
-  | 'unknown-channel'
+  /** The target is not a persona in the applied configuration (HTTP 404). */
+  | 'unknown-persona'
   /** Prompt file did not exist at fire time. */
   | 'prompt-missing'
   /** Prompt file existed but could not be read. */
@@ -64,7 +66,7 @@ export type CronOutcome =
   | 'prompt-oversize'
   /** The crontable line could not be parsed. */
   | 'parse-error'
-  /** Belt-and-braces class for an unexpected HTTP status (503→no-session and 404→unknown-channel are handled separately) or a network failure on the localhost POST. */
+  /** Belt-and-braces class for an unexpected HTTP status (503→no-session and 404→unknown-persona are handled separately) or a network failure on the localhost POST. */
   | 'http-error'
   /** All-bots fire skipped while fan-out remains deferred to E4 — emitted by the cron dispatcher. */
   | 'fanout-deferred'
@@ -92,13 +94,13 @@ export interface CronLogDetail {
 /**
  * One cron-fire outcome record. `timestamp` is a UTC ISO-8601 string with ms
  * precision (e.g. `new Date().toISOString()`). `identity` is the schedule
- * identity or `-`; `channel` is the target channel id or `-` (pre-fan-out
- * failures have no channel yet).
+ * identity or `-`; `target` is the persona target as written in the crontable
+ * (a name or key) or `-` (pre-fan-out failures have no target yet).
  */
 export interface CronLogRecord {
   timestamp: string
   identity: string
-  channel: string
+  target: string
   outcome: CronOutcome
   detail?: CronLogDetail
 }
@@ -107,7 +109,7 @@ export interface CronLogRecord {
 // Pure half — field sanitization
 // ---------------------------------------------------------------------------
 
-/** Sentinel used for an absent identity/channel. */
+/** Sentinel used for an absent identity/target. */
 const ABSENT = '-'
 
 /**
@@ -120,7 +122,7 @@ function escapeNewlines(value: string): string {
 }
 
 /**
- * Render a single-token positional field (timestamp, identity, channel,
+ * Render a single-token positional field (timestamp, identity, target,
  * outcome). Newlines are escaped and any remaining internal whitespace run is
  * replaced with a single `_` so the token cannot shift later fields —
  * `grep <outcome>` stays exact and field position is preserved. An
@@ -174,13 +176,13 @@ function joinFields(fields: readonly string[], detail: string): string {
 /**
  * Format one outcome record as a single physical line (no trailing newline —
  * the writer adds it). Five fields:
- *   <ts> <identity|-> <channel|-> <outcome> <detail>
+ *   <ts> <identity|-> <target|-> <outcome> <detail>
  */
 export function formatOutcomeLine(record: CronLogRecord): string {
   const fields = [
     sanitizeToken(record.timestamp),
     sanitizeToken(record.identity),
-    sanitizeToken(record.channel),
+    sanitizeToken(record.target),
     sanitizeToken(record.outcome),
   ]
   return joinFields(fields, formatDetail(record.detail))
@@ -211,18 +213,18 @@ export function formatSummaryLine(
  * Format an informational line. Shares the five-field layout with `info` in
  * the outcome position — a deliberate public seam for the scheduler's future
  * "scheduler started, N schedules loaded" marker (PD-4; Task 3 consumes this).
- * `identity` and `channel` default to `-` since info lines are not fire-scoped.
+ * `identity` and `target` default to `-` since info lines are not fire-scoped.
  */
 export function formatInfoLine(
   timestamp: string,
   text: string,
   identity: string = ABSENT,
-  channel: string = ABSENT,
+  target: string = ABSENT,
 ): string {
   const fields = [
     sanitizeToken(timestamp),
     sanitizeToken(identity),
-    sanitizeToken(channel),
+    sanitizeToken(target),
     'info',
   ]
   return joinFields(fields, sanitizeText(text))
@@ -232,19 +234,19 @@ export function formatInfoLine(
  * Format a warning line. Shares the five-field layout with `warn` in the
  * outcome position — a LINE KIND, not an outcome class, so it is deliberately
  * absent from `CronOutcome`, and the token is distinct from every outcome
- * class so `grep warn` matches exactly warn lines. `identity` and `channel`
+ * class so `grep warn` matches exactly warn lines. `identity` and `target`
  * default to `-` since warn lines are not fire-scoped.
  */
 export function formatWarnLine(
   timestamp: string,
   text: string,
   identity: string = ABSENT,
-  channel: string = ABSENT,
+  target: string = ABSENT,
 ): string {
   const fields = [
     sanitizeToken(timestamp),
     sanitizeToken(identity),
-    sanitizeToken(channel),
+    sanitizeToken(target),
     'warn',
   ]
   return joinFields(fields, sanitizeText(text))
@@ -265,9 +267,9 @@ export interface CronLog {
   /** Append a per-fire summary line. */
   summary(timestamp: string, identity: string, delivered: number, failed: number): void
   /** Append an informational line (scheduler-started seam). */
-  info(timestamp: string, text: string, identity?: string, channel?: string): void
+  info(timestamp: string, text: string, identity?: string, target?: string): void
   /** Append a warning line. */
-  warn(timestamp: string, text: string, identity?: string, channel?: string): void
+  warn(timestamp: string, text: string, identity?: string, target?: string): void
 }
 
 /**
@@ -322,11 +324,11 @@ export function createCronLog(path: string): CronLog {
     summary(timestamp: string, identity: string, delivered: number, failed: number): void {
       append(formatSummaryLine(timestamp, identity, delivered, failed), identity, 'summary')
     },
-    info(timestamp: string, text: string, identity: string = ABSENT, channel: string = ABSENT): void {
-      append(formatInfoLine(timestamp, text, identity, channel), identity, 'info')
+    info(timestamp: string, text: string, identity: string = ABSENT, target: string = ABSENT): void {
+      append(formatInfoLine(timestamp, text, identity, target), identity, 'info')
     },
-    warn(timestamp: string, text: string, identity: string = ABSENT, channel: string = ABSENT): void {
-      append(formatWarnLine(timestamp, text, identity, channel), identity, 'warn')
+    warn(timestamp: string, text: string, identity: string = ABSENT, target: string = ABSENT): void {
+      append(formatWarnLine(timestamp, text, identity, target), identity, 'warn')
     },
   }
 }

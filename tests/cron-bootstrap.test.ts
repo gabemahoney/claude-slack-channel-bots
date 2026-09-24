@@ -109,11 +109,40 @@ describe('ensureCrontableExists — non-EEXIST fs error', () => {
 // Group 5 — header/parser integration
 // ---------------------------------------------------------------------------
 
+/** Shape of a Slack channel, group or DM ID (e.g. C0123ABC), which the header must not use as a target. */
+const SLACK_ID_SHAPE = /\b[CDG][A-Z0-9]{6,}\b/
+
+/** The header's example data lines: the line after each `# Example` line, uncommented. */
+function headerExampleLines(): string[] {
+  const lines = CRONTABLE_TEMPLATE_HEADER.split('\n')
+  return lines.flatMap((l, i) => (l.startsWith('# Example') ? [lines[i + 1]!.replace(/^#\s*/, '')] : []))
+}
+
 describe('CRONTABLE_TEMPLATE_HEADER — parser integration', () => {
   test('parseCrontable yields zero schedules and zero errors', () => {
     const result = parseCrontable(CRONTABLE_TEMPLATE_HEADER)
     expect(result.schedules).toEqual([])
     expect(result.errors).toEqual([])
+  })
+
+  test('the uncommented examples parse: one explicit persona-target line, then the all-bots line', () => {
+    const examples = headerExampleLines()
+    expect(examples).toHaveLength(2)
+    const { schedules, errors } = parseCrontable(examples.join('\n'))
+    expect(errors).toEqual([])
+    expect(schedules.map((s) => s.targets.kind)).toEqual(['explicit', 'all-bots'])
+    const explicit = schedules[0]!.targets
+    const targets = explicit.kind === 'explicit' ? explicit.targets : []
+    expect(targets.length).toBeGreaterThan(1)
+    for (const t of targets) expect(t).not.toMatch(SLACK_ID_SHAPE)
+  })
+
+  test('mentions CSCB_PERSONA for self-targeting', () => {
+    expect(CRONTABLE_TEMPLATE_HEADER).toContain('CSCB_PERSONA')
+  })
+
+  test('has no Slack-channel-ID-shaped example target', () => {
+    expect(CRONTABLE_TEMPLATE_HEADER).not.toMatch(SLACK_ID_SHAPE)
   })
 })
 
@@ -142,6 +171,10 @@ const schedStart = README.indexOf(SCHEDULED_PROMPTS_H2)
 const schedEnd = schedStart >= 0 ? README.indexOf('\n## ', schedStart + SCHEDULED_PROMPTS_H2.length) : -1
 const SCHEDULED_SECTION =
   schedStart >= 0 ? README.slice(schedStart, schedEnd >= 0 ? schedEnd : undefined) : README
+// The section's own prose, without the embedded header: the header already
+// names CSCB_PERSONA, unknown-persona and name-or-key targets, so the new facts
+// must be stated in the README's prose, not only inside the embedded block.
+const SCHEDULED_PROSE = SCHEDULED_SECTION.replace(CRONTABLE_TEMPLATE_HEADER.trim(), '')
 
 describe('README / CRONTABLE_TEMPLATE_HEADER drift guard', () => {
   test('README embeds the exported header constant verbatim', () => {
@@ -182,5 +215,18 @@ describe('README — mandated crontable/scheduler facts', () => {
   test('documents relative-path-resolves-against-crontable-directory rule', () => {
     expect(SCHEDULED_SECTION).toContain('relative')
     expect(SCHEDULED_SECTION).toContain("crontable's own directory")
+  })
+
+  test('documents targets as persona names or keys (outside the embedded header)', () => {
+    expect(SCHEDULED_PROSE).toContain('name or its key')
+  })
+
+  test('documents CSCB_PERSONA for self-scheduling (outside the embedded header)', () => {
+    expect(SCHEDULED_PROSE).toContain('CSCB_PERSONA')
+  })
+
+  test('documents the unknown-persona outcome (outside the embedded header) and not the retired channel class', () => {
+    expect(SCHEDULED_PROSE).toContain('unknown-persona')
+    expect(SCHEDULED_SECTION).not.toContain('unknown-channel')
   })
 })

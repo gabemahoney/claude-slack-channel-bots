@@ -37,7 +37,7 @@ export const CRONTABLE_TEMPLATE_HEADER = `# CSCB crontable — scheduled prompts
 #
 # One schedule per line. Fields are positional and whitespace-delimited:
 #
-#   <min> <hour> <dom> <mon> <dow> <prompt-path> [<channel-id>[,<channel-id>...]]
+#   <min> <hour> <dom> <mon> <dow> <prompt-path> [<persona>[,<persona>...]]
 #
 #   tokens 1-5 : a standard 5-field cron expression (minute hour day-of-month
 #                month day-of-week).
@@ -45,16 +45,24 @@ export const CRONTABLE_TEMPLATE_HEADER = `# CSCB crontable — scheduled prompts
 #                line with more than 7 whitespace-delimited tokens is a parse
 #                error (a path with spaces is unrepresentable). The prompt
 #                file's content is capped at 32KB (enforced when the job fires).
-#   token 7    : OPTIONAL comma-separated list of Slack channel IDs to target.
-#                Omit it entirely to target ALL bots — that omission IS the
-#                all-bots form. There is NO all-bots wildcard: a literal '*' in
-#                the channel position is a parse error, not "all channels".
+#   token 7    : OPTIONAL comma-separated list of personas to target, each
+#                written as the persona's name or its key. Naming a persona
+#                twice (by name, by key, or both) delivers to it once. A name
+#                containing whitespace or a comma cannot be written here —
+#                write that persona's key instead. A bot can target itself
+#                with the key in its CSCB_PERSONA environment variable. A
+#                target that names no persona is logged unknown-persona.
+#                Omit the token entirely to target ALL bots — that omission IS
+#                the all-bots form. All-bots fan-out is not delivered yet: such
+#                a line is logged fanout-deferred each time it fires. There is
+#                NO all-bots wildcard: a literal '*' in the target position is
+#                a parse error, not "all personas".
 #
 # Lines beginning with '#' and blank lines are ignored. A malformed line is
 # skipped on its own; sibling lines still schedule.
 #
-# Example (every day at 09:00, run grooming-tick.md, target two channels):
-#   0 9 * * * /home/horde/prompts/grooming-tick.md C0123ABC,C0456DEF
+# Example (every day at 09:00, run grooming-tick.md, target two personas):
+#   0 9 * * * /home/horde/prompts/grooming-tick.md planner,reviewer
 #
 # Example (every hour on the hour, run standup.md, target all bots):
 #   0 * * * * /home/horde/prompts/standup.md

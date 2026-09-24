@@ -9,10 +9,13 @@
  * stopped immediately, so validation creates no live schedule.
  *
  * Line format (positional, space-delimited, split on whitespace runs):
- *   <min> <hour> <dom> <mon> <dow> <prompt-path> [<channel-id>[,<channel-id>...]]
+ *   <min> <hour> <dom> <mon> <dow> <prompt-path> [<persona>[,<persona>...]]
  *   tokens 1-5 : standard 5-field cron expression (validated via croner)
  *   token 6    : prompt-file path, kept VERBATIM (no expansion/resolution)
- *   token 7    : optional comma-separated Slack channel-ID list
+ *   token 7    : optional comma-separated persona target list — persona names
+ *                or keys (b.av2 SR-9.3), kept VERBATIM: this parser never
+ *                resolves or validates a target against any config (the cron
+ *                dispatcher resolves them at fire time)
  *                (a literal `*` is a PARSE ERROR — omission is the all-bots form)
  *
  * `#` comment lines and blank/whitespace-only lines are skipped silently.
@@ -39,15 +42,26 @@ export type CronParseErrorReason =
   | 'missing-prompt-path'
   /** more than 7 tokens: unrepresentable path-with-spaces / too many tokens. */
   | 'path-with-spaces'
-  /** token 7 present but malformed (empty elements: leading/trailing/double comma). */
+  /**
+   * token 7 (the target list) present but malformed (empty elements:
+   * leading/trailing/double comma). The reason string predates persona
+   * targets and is kept so existing log lines and triage greps stay valid.
+   */
   | 'malformed-channel-list'
-  /** token 7 is a literal `*` — wildcard channel list explicitly rejected. */
+  /**
+   * token 7 (the target list) is a literal `*` — a wildcard target list is
+   * explicitly rejected. Reason string kept for the same reason as above.
+   */
   | 'wildcard-channel-list'
 
-/** Channel targeting for a schedule: every bot, or an explicit ID list. */
-export type CronChannels =
+/**
+ * Persona targeting for a schedule: every bot, or an explicit list of persona
+ * targets (names or keys) exactly as written, in written order, duplicates
+ * included (the dispatcher resolves each to a key and dedupes).
+ */
+export type CronTargets =
   | { kind: 'all-bots' }
-  | { kind: 'explicit'; channelIds: string[] }
+  | { kind: 'explicit'; targets: string[] }
 
 /** A successfully parsed crontable line. */
 export interface CronSchedule {
@@ -57,8 +71,8 @@ export interface CronSchedule {
   expression: string
   /** The prompt-file path, kept verbatim from token 6 (no expansion). */
   promptPath: string
-  /** Target channels: all-bots marker or explicit channel-ID list. */
-  channels: CronChannels
+  /** Target personas: all-bots marker or explicit persona target list. */
+  targets: CronTargets
   /** The raw line text, verbatim (downstream at-most-once keying depends on it). */
   rawLine: string
 }
@@ -87,7 +101,7 @@ export interface CronParseResult {
 const CRON_FIELD_COUNT = 5
 /** Minimum token count for a data line: 5 cron fields + prompt path. */
 const MIN_TOKENS = CRON_FIELD_COUNT + 1
-/** Maximum token count: 5 cron fields + prompt path + channel list. */
+/** Maximum token count: 5 cron fields + prompt path + target list. */
 const MAX_TOKENS = CRON_FIELD_COUNT + 2
 /** Identity namespace prefix (PD-1). */
 const IDENTITY_PREFIX = 'cscb-cron:'
@@ -157,17 +171,17 @@ function parseLine(rawLine: string, lineNumber: number): LineOutcome {
 
   const promptPath = tokens[CRON_FIELD_COUNT]!
 
-  // Optional channel list (token 7).
-  let channels: CronChannels
+  // Optional persona target list (token 7), kept verbatim.
+  let targets: CronTargets
   if (tokens.length === MAX_TOKENS) {
     const listToken = tokens[MAX_TOKENS - 1]!
     if (listToken === '*') return fail('wildcard-channel-list')
-    const channelIds = listToken.split(',')
+    const written = listToken.split(',')
     // Malformed when any element is empty (leading/trailing/double comma).
-    if (channelIds.some((id) => id === '')) return fail('malformed-channel-list')
-    channels = { kind: 'explicit', channelIds }
+    if (written.some((target) => target === '')) return fail('malformed-channel-list')
+    targets = { kind: 'explicit', targets: written }
   } else {
-    channels = { kind: 'all-bots' }
+    targets = { kind: 'all-bots' }
   }
 
   return {
@@ -176,7 +190,7 @@ function parseLine(rawLine: string, lineNumber: number): LineOutcome {
       identity: IDENTITY_PREFIX + basenameWithoutExtension(promptPath),
       expression,
       promptPath,
-      channels,
+      targets,
       rawLine,
     },
   }

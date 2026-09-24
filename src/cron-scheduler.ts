@@ -72,7 +72,7 @@ import type { CronDispatcher } from './cron-dispatch.ts'
 /** Milliseconds in one minute — the tick period and the match-window width. */
 const MINUTE_MS = 60_000
 
-/** Sentinel for a log field with no channel/identity (parse-error lines). */
+/** Sentinel for a log field with no target/identity (parse-error lines). */
 const NO_FIELD = '-'
 
 // ---------------------------------------------------------------------------
@@ -257,14 +257,14 @@ export function createCronScheduler(deps: CronSchedulerDeps): CronScheduler {
 
     const { schedules, errors } = parseCrontable(text)
 
-    // Each parse error → one outcome record (identity '-', channel '-') with
+    // Each parse error → one outcome record (identity '-', target '-') with
     // line=<n> and the reason; rawLine goes in free text (operator-authored,
     // not secret). Emitted once per load, hence once per detected change.
     for (const e of errors) {
       cronLog.outcome({
         timestamp: clock.now().toISOString(),
         identity: NO_FIELD,
-        channel: NO_FIELD,
+        target: NO_FIELD,
         outcome: 'parse-error',
         detail: { line: e.lineNumber, text: `${e.reason} rawLine=${e.rawLine}` },
       })

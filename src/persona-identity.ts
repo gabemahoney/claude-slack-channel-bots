@@ -3,7 +3,8 @@
  *
  * A persona is addressed everywhere by its key (b.av2 SR-2.1). This module
  * owns the key rule, the persona-reference rendering used by logs, previews
- * and errors (b.av2 SR-2.2, SR-10.3), and the pure derivations of every
+ * and errors (b.av2 SR-2.2, SR-10.3), the name-or-key target resolver used
+ * by `/interject` and the crontable (b.av2 SR-9.1, SR-9.3), and the pure derivations of every
  * agent-director and tmux identifier a persona gets (b.av2 SR-2.2): instance
  * ID, tmux session name, labels (including the `config_dir` label) and the
  * spawn-environment values.
@@ -134,6 +135,25 @@ export function personaKey(name: string): string {
  */
 export function renderPersonaRef(name: string, key: string = personaKey(name)): string {
   return `${JSON.stringify(name)} (key=${key})`
+}
+
+/**
+ * Resolve a persona target — a persona name or key, as written in an
+ * `/interject` body or a crontable target list (b.av2 SR-9.1, SR-9.3) — to
+ * the persona whose name or key equals it exactly (case-sensitive, no
+ * trimming). Returns undefined for a null or absent config and for a target
+ * that matches no persona.
+ *
+ * The match is unambiguous for a loaded config: the loader rejects any
+ * persona whose name or key equals another persona's name or key (b.av2
+ * SR-1.5). Generic over the persona shape so this module needs no import of
+ * the config loader.
+ */
+export function resolvePersonaTarget<P extends { name: string; key: string }>(
+  config: { personas: readonly P[] } | null | undefined,
+  target: string,
+): P | undefined {
+  return config?.personas.find((p) => p.name === target || p.key === target)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,17 +1,29 @@
 /**
  * crontable.test.ts — unit tests for the pure crontable parser.
  *
- * Pure module: string in, records out. No fs, no mocks, no test servers.
- * Assertions are plain input-string → output-record checks.
+ * Pure module: string in, records out. No mocks, no test servers. Assertions
+ * are plain input-string → output-record checks. Token 7 is a list of persona
+ * targets (names or keys, b.av2 SR-9.3) kept verbatim; the parser resolves
+ * nothing. The AC 50 case passes a parsed schedule through the dispatcher's
+ * exported resolve step with the real name-or-key resolver; its persona config
+ * is built in memory (the temp dir is only a path base, nothing is written).
  */
 
-import { describe, test, expect } from 'bun:test'
+import { afterAll, beforeAll, describe, test, expect } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+import type { PersonaConfig } from '../src/config.ts'
+import { resolveDeliveryTargets } from '../src/cron-dispatch.ts'
 import {
   parseCrontable,
   type CronSchedule,
   type CronParseError,
   type CronParseErrorReason,
 } from '../src/crontable.ts'
+import { personaKey, resolvePersonaTarget } from '../src/persona-identity.ts'
+import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 
 // ---------------------------------------------------------------------------
 // Factories / helpers
@@ -21,12 +33,12 @@ import {
 function makeLine(opts?: {
   expr?: string
   path?: string
-  channels?: string
+  targets?: string
 }): string {
   const expr = opts?.expr ?? '*/5 * * * *'
   const path = opts?.path ?? '~/prompts/grooming-tick.md'
   const parts = [expr, path]
-  if (opts?.channels !== undefined) parts.push(opts.channels)
+  if (opts?.targets !== undefined) parts.push(opts.targets)
   return parts.join(' ')
 }
 
@@ -55,7 +67,7 @@ describe('valid lines', () => {
     const line = makeLine({
       expr: '0 9 * * 1',
       path: '~/prompts/x.md',
-      channels: 'C123,C456',
+      targets: 'alpha,beta_1234abcd',
     })
     const s = onlySchedule(line)
 
@@ -63,18 +75,18 @@ describe('valid lines', () => {
     expect(s.expression).toBe('0 9 * * 1')
     // Prompt path is kept literal — no tilde/relative expansion.
     expect(s.promptPath).toBe('~/prompts/x.md')
-    expect(s.channels).toEqual({ kind: 'explicit', channelIds: ['C123', 'C456'] })
+    expect(s.targets).toEqual({ kind: 'explicit', targets: ['alpha', 'beta_1234abcd'] })
     // Raw line preserved verbatim (downstream at-most-once keys on it).
     expect(s.rawLine).toBe(line)
   })
 
-  test('single explicit channel parses to a one-element list', () => {
-    const s = onlySchedule(makeLine({ channels: 'C999' }))
-    expect(s.channels).toEqual({ kind: 'explicit', channelIds: ['C999'] })
+  test('single explicit target parses to a one-element list', () => {
+    const s = onlySchedule(makeLine({ targets: 'planner' }))
+    expect(s.targets).toEqual({ kind: 'explicit', targets: ['planner'] })
   })
 
   test('rawLine preserves surrounding/interior whitespace verbatim', () => {
-    const raw = '  0 9 * * 1   ~/prompts/x.md   C1  '
+    const raw = '  0 9 * * 1   ~/prompts/x.md   alpha  '
     const { schedules } = parseCrontable(raw)
     expect(schedules).toHaveLength(1)
     expect(schedules[0]!.rawLine).toBe(raw)
@@ -82,26 +94,52 @@ describe('valid lines', () => {
     expect(schedules[0]!.expression).toBe('0 9 * * 1')
   })
 
-  test('arbitrary/unknown channel IDs are accepted (no existence check)', () => {
-    const s = onlySchedule(makeLine({ channels: 'not-a-real-channel,ZZZ,#nope' }))
-    expect(s.channels).toEqual({
+  test('arbitrary/unknown targets are accepted (no resolution or existence check)', () => {
+    const s = onlySchedule(makeLine({ targets: 'not-a-real-persona,ZZZ,#nope' }))
+    expect(s.targets).toEqual({
       kind: 'explicit',
-      channelIds: ['not-a-real-channel', 'ZZZ', '#nope'],
+      targets: ['not-a-real-persona', 'ZZZ', '#nope'],
+    })
+  })
+
+  test('a name with capitals and no whitespace or comma parses verbatim; duplicates are kept', () => {
+    const s = onlySchedule(makeLine({ targets: 'Planner,Planner' }))
+    expect(s.targets).toEqual({ kind: 'explicit', targets: ['Planner', 'Planner'] })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Persona keys always tokenize (b.av2 SR-2.1)
+// ---------------------------------------------------------------------------
+
+describe('persona keys as token 7', () => {
+  test.each([
+    ['plain a-z0-9_ name', 'planner_2'],
+    ['name with capitals', 'Planner'],
+    ['name with spaces', 'Ops Bot'],
+    ['name with no ASCII letters or digits', 'ボット'],
+    ['name long enough to be truncated and hashed', 'A Very Long Persona Name That Exceeds The Forty Character Stem'],
+  ])('the key of a %s parses alone and inside a two-element list', (_label, name) => {
+    const key = personaKey(name)
+    expect(onlySchedule(makeLine({ targets: key })).targets).toEqual({ kind: 'explicit', targets: [key] })
+    expect(onlySchedule(makeLine({ targets: `${key},other` })).targets).toEqual({
+      kind: 'explicit',
+      targets: [key, 'other'],
     })
   })
 })
 
 // ---------------------------------------------------------------------------
-// Omitted channel list → all-bots marker
+// Omitted target list → all-bots marker
 // ---------------------------------------------------------------------------
 
-describe('omitted channel list', () => {
+describe('omitted target list', () => {
   test('yields the all-bots marker, distinguishable from an empty explicit list', () => {
-    const s = onlySchedule(makeLine({ channels: undefined }))
-    expect(s.channels.kind).toBe('all-bots')
+    const s = onlySchedule(makeLine({ targets: undefined }))
+    expect(s.targets.kind).toBe('all-bots')
     // The marker is NOT an empty explicit list — an empty list is not representable.
-    expect(s.channels).not.toEqual({ kind: 'explicit', channelIds: [] })
-    expect(s.channels).toEqual({ kind: 'all-bots' })
+    expect(s.targets).not.toEqual({ kind: 'explicit', targets: [] })
+    expect(s.targets).toEqual({ kind: 'all-bots' })
   })
 })
 
@@ -142,11 +180,11 @@ describe('bad-line classes', () => {
     ['99 * * * * ~/p.md', 'invalid-expression', 'out-of-range minute (6 tokens)'],
     ['*/5 * * * *', 'missing-prompt-path', 'only 5 tokens, no prompt path'],
     ['not a cron here', 'missing-prompt-path', 'four garbage tokens, no path'],
-    ['*/5 * * * * ~/a b.md C1', 'path-with-spaces', 'path with a space (8 tokens)'],
-    ['*/5 * * * * ~/p.md C1,', 'malformed-channel-list', 'trailing comma'],
-    ['*/5 * * * * ~/p.md C1,,C2', 'malformed-channel-list', 'double comma'],
-    ['*/5 * * * * ~/p.md ,C1', 'malformed-channel-list', 'leading comma'],
-    ['*/5 * * * * ~/p.md *', 'wildcard-channel-list', 'literal star channel'],
+    ['*/5 * * * * ~/a b.md alpha', 'path-with-spaces', 'path with a space (8 tokens)'],
+    ['*/5 * * * * ~/p.md alpha,', 'malformed-channel-list', 'trailing comma'],
+    ['*/5 * * * * ~/p.md alpha,,beta', 'malformed-channel-list', 'double comma'],
+    ['*/5 * * * * ~/p.md ,alpha', 'malformed-channel-list', 'leading comma'],
+    ['*/5 * * * * ~/p.md *', 'wildcard-channel-list', 'literal star target'],
   ])('line %j → reason %s (%s)', (line, reason) => {
     const err = onlyError(line)
     expect(err.reason).toBe(reason)
@@ -154,8 +192,8 @@ describe('bad-line classes', () => {
     expect(err.lineNumber).toBe(1)
   })
 
-  test('literal * in channel position is an error, NOT an all-bots schedule', () => {
-    const { schedules, errors } = parseCrontable(makeLine({ channels: '*' }))
+  test('literal * in target position is an error, NOT an all-bots schedule', () => {
+    const { schedules, errors } = parseCrontable(makeLine({ targets: '*' }))
     expect(schedules).toEqual([])
     expect(errors).toHaveLength(1)
     expect(errors[0]!.reason).toBe('wildcard-channel-list')
@@ -163,21 +201,21 @@ describe('bad-line classes', () => {
 
   // Positional 5-field contract: a 6-field croner-valid expression plus a path
   // is 7 tokens. The parser only reads tokens 1-5 as the expression, so the 6th
-  // cron field is misread as the prompt path and the path becomes the channel
+  // cron field is misread as the prompt path and the path becomes the target
   // list — it does NOT silently accept the 6-field form as the schedule minute.
   test('6-field croner-valid expr + path is read positionally (5-field contract)', () => {
-    // '0 0 1 1 1 1 ~/p.md' → expr='0 0 1 1 1', promptPath='1', channels='~/p.md'
+    // '0 0 1 1 1 1 ~/p.md' → expr='0 0 1 1 1', promptPath='1', targets='~/p.md'
     const s = onlySchedule('0 0 1 1 1 1 ~/p.md')
     expect(s.expression).toBe('0 0 1 1 1')
     expect(s.promptPath).toBe('1')
-    expect(s.channels).toEqual({ kind: 'explicit', channelIds: ['~/p.md'] })
+    expect(s.targets).toEqual({ kind: 'explicit', targets: ['~/p.md'] })
   })
 
   test('a wrong-field-count line where a path-looking token lands in field 5 is rejected', () => {
-    // '* * * * ~/p.md C1' is 6 tokens: tokens 1-5 = '* * * * ~/p.md' — the path
-    // token occupies cron field 5, so croner rejects the expression. This pins
-    // the strict positional 5-field contract.
-    const err = onlyError('* * * * ~/p.md C1')
+    // '* * * * ~/p.md alpha' is 6 tokens: tokens 1-5 = '* * * * ~/p.md' — the
+    // path token occupies cron field 5, so croner rejects the expression. This
+    // pins the strict positional 5-field contract.
+    const err = onlyError('* * * * ~/p.md alpha')
     expect(err.reason).toBe('invalid-expression')
   })
 
@@ -206,7 +244,7 @@ describe('bad-line classes', () => {
     const text = [
       'zz * * * * ~/p.md', // invalid-expression (line 1)
       '*/5 * * * *', // missing-prompt-path (line 2)
-      '*/5 * * * * ~/p.md C1,,C2', // malformed-channel-list (line 3)
+      '*/5 * * * * ~/p.md alpha,,beta', // malformed-channel-list (line 3)
       '*/5 * * * * ~/p.md *', // wildcard-channel-list (line 4)
     ].join('\n')
     const { schedules, errors } = parseCrontable(text)
@@ -259,5 +297,50 @@ describe('identity derivation', () => {
     expect(schedules[1]!.identity).toBe('cscb-cron:daily')
     // Same label, but distinct records with distinct prompt paths.
     expect(schedules[0]!.promptPath).not.toBe(schedules[1]!.promptPath)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC 50 — parse, then the dispatcher's resolve step: a name and its key
+// deliver once (b.av2 SR-9.3). Real name-or-key resolver over two personas.
+// ---------------------------------------------------------------------------
+
+describe('AC 50: parse then resolve', () => {
+  const PLANNER = 'Planner'
+  const PLANNER_KEY = personaKey(PLANNER)
+  const REVIEWER = 'reviewer'
+  let baseDir: string
+  let config: PersonaConfig
+
+  beforeAll(() => {
+    baseDir = mkdtempSync(join(tmpdir(), 'cscb-crontable-personas-'))
+    config = makeMultiPersonaConfig([{ name: PLANNER }, { name: REVIEWER }], baseDir)
+  })
+
+  afterAll(() => {
+    rmSync(baseDir, { recursive: true, force: true })
+  })
+
+  function resolveLine(targets: string | undefined): ReturnType<typeof resolveDeliveryTargets> {
+    return resolveDeliveryTargets(onlySchedule(makeLine({ targets })), (t) => resolvePersonaTarget(config, t)?.key)
+  }
+
+  test('a line naming one persona by name and by key yields exactly one target: the key, logged as first written', () => {
+    const s = onlySchedule(makeLine({ targets: `${PLANNER},${PLANNER_KEY}` }))
+    // The parser keeps both written targets; the resolve step collapses them.
+    expect(s.targets).toEqual({ kind: 'explicit', targets: [PLANNER, PLANNER_KEY] })
+    expect(resolveLine(`${PLANNER},${PLANNER_KEY}`)).toEqual([{ persona: PLANNER_KEY, written: PLANNER }])
+  })
+
+  test('two personas keep first-seen order; an unknown target is kept once with its written text', () => {
+    expect(resolveLine(`${REVIEWER},nobody,${PLANNER_KEY},nobody,${PLANNER}`)).toEqual([
+      { persona: personaKey(REVIEWER), written: REVIEWER },
+      { persona: 'nobody', written: 'nobody' },
+      { persona: PLANNER_KEY, written: PLANNER_KEY },
+    ])
+  })
+
+  test('an all-bots schedule yields no targets', () => {
+    expect(resolveLine(undefined)).toEqual([])
   })
 })

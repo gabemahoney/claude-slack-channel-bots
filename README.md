@@ -418,19 +418,21 @@ A tool call that targets a channel the bot is not configured for is refused with
 
 ## Interject
 
-POST to `/interject` to inject a message into an active Claude session from localhost. Only requests from `127.0.0.1` or `::1` are accepted — external callers are rejected with 403. The bot sees it as described in [Messages a bot receives](#messages-a-bot-receives); the Slack Reply Guard does not remind it to reply.
+POST to `/interject` to inject a message into a persona's running Claude instance from localhost. The message reaches only the named persona's instance, never any other persona. Only requests from `127.0.0.1` or `::1` are accepted — external callers are rejected with 403. The bot sees it as described in [Messages a bot receives](#messages-a-bot-receives); the Slack Reply Guard does not remind it to reply.
+
+An injected message carries no Slack conversation. If you want the bot to post a reply in Slack, say in the message text where to post it.
 
 ### Request
 
 ```sh
 curl -X POST http://localhost:<port>/interject \
   -H "Content-Type: application/json" \
-  -d '{"channel": "C1234567890", "message": "Hello from a script", "sender": "my-cron-job"}'
+  -d '{"persona": "planner", "message": "Hello from a script", "sender": "my-cron-job"}'
 ```
 
 | Field | Required | Description |
 |---|---|---|
-| `channel` | yes | Slack channel ID matching an entry in `config.json → routes`. |
+| `persona` | yes | The target persona's name or its key. A bot can address itself with the key in its `CSCB_PERSONA` environment variable. |
 | `message` | yes | Text to inject into the session. |
 | `sender` | no | Label attached to the injected message. Defaults to `"interject"`. |
 
@@ -439,36 +441,38 @@ curl -X POST http://localhost:<port>/interject \
 On success, returns HTTP 200:
 
 ```json
-{ "ok": true, "channel": "C1234567890", "cwd": "/path/to/session" }
+{ "ok": true, "persona": "planner" }
 ```
+
+`persona` is the target persona's name, even when the request named it by key.
 
 ### Error conditions
 
 | Status | Meaning |
 |---|---|
-| 400 | Invalid JSON or missing required field (`channel` or `message`). |
+| 400 | Invalid JSON, or a missing, empty or non-string `persona` or `message`. |
 | 403 | Request did not originate from localhost. |
-| 404 | Channel not found in `config.json → routes`. |
+| 404 | No persona in the applied configuration has that name or key. |
 | 405 | Must use POST method. |
 | 413 | Request body exceeds 32KB. |
-| 503 | Channel is routed but no active session is connected. |
+| 503 | The persona has no live connected session. |
 
 ### Example: crontab reminder
 
-For recurring prompts, prefer the built-in scheduler (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)) — it needs no host cron and delivers straight into a bot channel. The host-crontab example below is an alternative when you already run `cron`:
+For recurring prompts, prefer the built-in scheduler (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)) — it needs no host cron and delivers straight to a persona. The host-crontab example below is an alternative when you already run `cron`:
 
 ```sh
 # crontab -e
 0 9 * * 1 curl -s -X POST http://localhost:3100/interject \
   -H "Content-Type: application/json" \
-  -d '{"channel": "C1234567890", "message": "Weekly reminder: update the changelog before standup.", "sender": "cron"}'
+  -d '{"persona": "planner", "message": "Weekly reminder: update the changelog before standup.", "sender": "cron"}'
 ```
 
 ---
 
 ## Scheduled Prompts (cscb_cron)
 
-The server fires scheduled prompts into bot channels once per minute, reading them from a crontable. Each fire is delivered as an `/interject` message into the target channel, exactly as if a script had POSTed it.
+The server fires scheduled prompts into personas once per minute, reading them from a crontable. Each fire is delivered as an `/interject` message to the target persona, exactly as if a script had POSTed it.
 
 ### The crontable
 
@@ -487,7 +491,7 @@ On first boot the server auto-creates the crontable with this self-documenting h
 #
 # One schedule per line. Fields are positional and whitespace-delimited:
 #
-#   <min> <hour> <dom> <mon> <dow> <prompt-path> [<channel-id>[,<channel-id>...]]
+#   <min> <hour> <dom> <mon> <dow> <prompt-path> [<persona>[,<persona>...]]
 #
 #   tokens 1-5 : a standard 5-field cron expression (minute hour day-of-month
 #                month day-of-week).
@@ -495,32 +499,42 @@ On first boot the server auto-creates the crontable with this self-documenting h
 #                line with more than 7 whitespace-delimited tokens is a parse
 #                error (a path with spaces is unrepresentable). The prompt
 #                file's content is capped at 32KB (enforced when the job fires).
-#   token 7    : OPTIONAL comma-separated list of Slack channel IDs to target.
-#                Omit it entirely to target ALL bots — that omission IS the
-#                all-bots form. There is NO all-bots wildcard: a literal '*' in
-#                the channel position is a parse error, not "all channels".
+#   token 7    : OPTIONAL comma-separated list of personas to target, each
+#                written as the persona's name or its key. Naming a persona
+#                twice (by name, by key, or both) delivers to it once. A name
+#                containing whitespace or a comma cannot be written here —
+#                write that persona's key instead. A bot can target itself
+#                with the key in its CSCB_PERSONA environment variable. A
+#                target that names no persona is logged unknown-persona.
+#                Omit the token entirely to target ALL bots — that omission IS
+#                the all-bots form. All-bots fan-out is not delivered yet: such
+#                a line is logged fanout-deferred each time it fires. There is
+#                NO all-bots wildcard: a literal '*' in the target position is
+#                a parse error, not "all personas".
 #
 # Lines beginning with '#' and blank lines are ignored. A malformed line is
 # skipped on its own; sibling lines still schedule.
 #
-# Example (every day at 09:00, run grooming-tick.md, target two channels):
-#   0 9 * * * /home/horde/prompts/grooming-tick.md C0123ABC,C0456DEF
+# Example (every day at 09:00, run grooming-tick.md, target two personas):
+#   0 9 * * * /home/horde/prompts/grooming-tick.md planner,reviewer
 #
 # Example (every hour on the hour, run standup.md, target all bots):
 #   0 * * * * /home/horde/prompts/standup.md
 ```
 
-Each schedule is one line of **exactly 5 cron fields**, then the prompt-file path, then an optional comma-separated channel list:
+Each schedule is one line of **exactly 5 cron fields**, then the prompt-file path, then an optional comma-separated list of personas, each written as the persona's name or its key:
 
 ```
-0 9 * * 1 /home/horde/prompts/weekly-report.md C0123ABC,C0456DEF
+0 9 * * 1 /home/horde/prompts/weekly-report.md planner,reviewer
 ```
 
 Rules:
 
 - **Exactly 5 cron fields** (minute hour day-of-month month day-of-week). Croner's 6-field (seconds-precision) and `@macro` forms are **not** supported.
-- **Omit the channel list to target ALL bots** — the omission itself is the all-bots form. (All-bots delivery is currently deferred — see [Delivery semantics](#delivery-semantics).)
-- **No `*` wildcard in the channel position.** A literal `*` where a channel ID belongs is a parse error, not "all channels".
+- **Name each persona by its name or its key.** A persona named twice — by name, by key, or both — receives the prompt once.
+- **Use the key for a name with whitespace or a comma.** Such a name cannot be written in a crontable line.
+- **Omit the persona list to target ALL bots** — the omission itself is the all-bots form. (All-bots delivery is currently deferred — see [Delivery semantics](#delivery-semantics).)
+- **No `*` wildcard in the persona position.** A literal `*` where a persona belongs is a parse error, not "all personas".
 - **Prompt paths cannot contain spaces.** A path with spaces is unrepresentable; the extra tokens make the line a parse error and it is skipped.
 - **`#` comments and blank lines are allowed** and ignored.
 - **A bad line is skipped and logged** (as `parse-error` in the cron log), never fatal — sibling lines still schedule.
@@ -531,7 +545,11 @@ Because the count is positional, a **6-field line silently mis-parses instead of
 0 0 1 1 1 1 ~/prompts/p.md
 ```
 
-Here the 6th field (`1`) is taken as the prompt path and the real path (`~/prompts/p.md`) is taken as the channel list. No error is raised — every slot is filled with something syntactically acceptable — so the schedule fires on a nonsense cadence against a nonsense path. Keep expressions to exactly 5 fields.
+Here the 6th field (`1`) is taken as the prompt path and the real path (`~/prompts/p.md`) is taken as the persona list. No error is raised — every slot is filled with something syntactically acceptable — so the schedule fires on a nonsense cadence against a nonsense path. Keep expressions to exactly 5 fields.
+
+**Upgrading a crontable that names channels.** The server never rewrites an existing crontable, so channel-ID targets are not converted. Once your config defines personas, a Slack channel ID no longer names a bot, so edit each such line to a persona name or key; until you do, the target logs `unknown-persona`.
+
+An existing crontable also keeps its old comment header, which still tells bots to write channel IDs. Replace that comment block by hand with the header shown above.
 
 ### Path resolution
 
@@ -543,42 +561,48 @@ The prompt-file path resolves as follows:
 
 ### How fires appear
 
-A scheduled fire arrives in the channel as an `/interject` message whose `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. The [Slack Reply Guard](#slack-reply-guard-stop-hook) never reminds a bot to reply to a scheduled prompt. Each schedule delivers its own message independently, so when several schedules match the same minute for the same channel each one arrives as its own `/interject` message.
+A scheduled fire reaches only the target persona's instance, as an `/interject` message with no Slack conversation attached. Its `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. The [Slack Reply Guard](#slack-reply-guard-stop-hook) never reminds a bot to reply to a scheduled prompt. Because a fire carries no channel, a prompt file that wants a Slack reply must say where to post it. Each schedule delivers its own message independently, so when several schedules match the same minute for the same persona each one arrives as its own `/interject` message.
 
 ### The cron log
 
-Every fire outcome is recorded in the cron log at `cron_log_path` (default `<config dir>/cron.log`; override with the `cron_log_path` key). Each attempt writes one line per target channel plus a per-fire summary line carrying `delivered=N failed=M` counts. The log is plain text, so `grep no-session cron.log` yields readable lines.
+Every fire outcome is recorded in the cron log at `cron_log_path` (default `<config dir>/cron.log`; override with the `cron_log_path` key). Each attempt writes one line per persona targeted (showing the target as first written in the crontable), plus a per-fire summary line carrying `delivered=N failed=M` counts. The log is plain text, so `grep no-session cron.log` yields readable lines.
 
 The `outcome` field of each line is one of these classes:
 
 | Outcome | What happened | What to do |
 |---|---|---|
-| `delivered` | The prompt reached the target channel's session. | Nothing — success. |
-| `no-session` | The channel is routed but no live session is connected, so the message was dropped. | Bring the session up. Failed fires are **never** retried or queued (see below). |
-| `unknown-channel` | The target channel is not in `config.json → routes`. | Fix the channel ID in the crontable, or add the route. |
+| `delivered` | The prompt reached the target persona's session. | Nothing — success. |
+| `no-session` | The persona exists but has no live connected session, so the message was dropped. | Bring the session up. Failed fires are **never** retried or queued (see below). |
+| `unknown-persona` | No persona in the applied configuration has that name or key. | Correct the target in the crontable. |
 | `prompt-missing` | The prompt file did not exist at fire time. | Create the file or correct its path in the crontable. |
 | `prompt-unreadable` | The prompt file existed but could not be read (see the `errno`). | Fix file permissions or the path. |
 | `prompt-oversize` | The prompt exceeds the 32KB `/interject` cap and was skipped, never truncated. | Shorten the prompt file. |
 | `parse-error` | The crontable line could not be parsed. | Fix the line — see the crontable header for the format. |
 | `http-error` | The localhost POST hit an unexpected HTTP status or a network failure. | Check that the server is listening on loopback (see the `bind` note below) and inspect the `errno`/`status` in the line. |
-| `fanout-deferred` | A channel-less (all-bots) line was matched but not delivered. | None — all-bots fan-out is not yet enabled; give the line an explicit channel to deliver it today. |
+| `fanout-deferred` | A line with no persona list (all-bots) was matched but not delivered. | None — all-bots fan-out is not yet enabled; give the line an explicit persona to deliver it today. |
 
 ### Delivery semantics
 
-- **No retry.** A failed fire is logged and dropped — never queued or re-sent. A channel with no live session fails every fire until its session is running again; the server does not queue the missed prompts.
+- **No retry.** A failed fire is logged and dropped — never queued or re-sent. A persona with no live session fails every fire until its session is running again; the server does not queue the missed prompts.
 - **Missed fires are skipped, not caught up.** While the server is down, no scheduled prompts fire, and they are not replayed on restart. The `scheduler started, N schedules loaded` line in the cron log marks when scheduling resumed, bounding the outage window.
 - **Edits take effect within a minute — no restart.** The scheduler checks the crontable fresh on every tick, so an edit by hand or a line appended by a bot starts (or stops) firing within about a minute. The server is never restarted for a schedule change.
 - **Deleting the crontable stops all schedules.** Nothing fires from that moment, a WARN appears in the cron log, and the server re-creates the file empty (with its header) within about two minutes — detection and re-creation happen on separate once-a-minute passes, so the re-create lands up to two tick boundaries after the deletion. Add lines back and they schedule on the next check.
 - **Server-local time.** Cron expressions are evaluated in the server's local timezone.
-- **Channel-less lines are deferred.** A line with no channel is currently matched but logged `fanout-deferred` and not delivered. Give a line an explicit channel to have it fire.
+- **Lines without a persona list are deferred.** A line with no persona list is currently matched but logged `fanout-deferred` and not delivered. Give a line an explicit persona to have it fire.
 - **`bind` must include loopback.** The scheduler delivers via `127.0.0.1`, so a `bind` set to a single non-loopback interface makes every fire fail with `http-error`. Use the default `127.0.0.1` or `0.0.0.0`.
 
 ### Bot self-scheduling
 
-Every managed session carries the resolved crontable path in the `CSCB_CRONTABLE_PATH` environment variable, so a bot can schedule its own prompts without being told where the crontable lives. Discover it from inside a session:
+Every managed session carries the resolved crontable path in the `CSCB_CRONTABLE_PATH` environment variable and its own persona key in `CSCB_PERSONA`, so a bot can schedule its own prompts without being told where the crontable lives or what to call itself. Discover both from inside a session:
 
 ```sh
-echo $CSCB_CRONTABLE_PATH
+echo $CSCB_CRONTABLE_PATH $CSCB_PERSONA
+```
+
+To schedule a prompt for itself, a bot appends a line whose persona list is its `CSCB_PERSONA` key:
+
+```sh
+echo "0 9 * * 1-5 prompts/standup.md $CSCB_PERSONA" >> "$CSCB_CRONTABLE_PATH"
 ```
 
 The crontable is the single source of truth for schedules. When adding a schedule, **append** a new line — never rewrite, reorder, or delete other lines. An appended line starts firing within about a minute; no server restart is needed.
@@ -633,8 +657,8 @@ Every message reaches a bot as its text wrapped in a `<channel source="slack-cha
 | Direct message | Not delivered to any bot in this version. The server drops it and logs `persona-dm-dropped` lines, one for each bot. | — | — |
 | Channel message that @mentions the bot | Goes to the bot routed to that channel in `routes`. The bot's @mention is removed from the text. A message in a channel with no route is not delivered. | `chat_id` = the channel ID, `user` = the sender's Slack display name (falling back to real name, then Slack username, then user ID), `message_id` and `ts` = the Slack timestamp (for example `1789936743.069939`). Also `thread_ts` for a thread reply, and `attachment_count` and `attachments` when files are attached. | Yes, channel wording |
 | Channel message, when the bot receives everything | A bot receives every message in its routed channel, from any sender other than itself. | Same as the @mention row | Yes, channel wording |
-| cscb_cron scheduled prompt | The server's scheduler posts it to `/interject` for the target channel. | `chat_id` = the target channel, `user="cscb-cron:<prompt-file-basename>"`, `message_id` and `ts` = the server clock in seconds, with at most three decimal places | No |
-| `/interject` message | A localhost script POSTs it (see [Interject](#interject)). | `chat_id` = the request's `channel`, `user` = the request's `sender` (default `interject`), `message_id` and `ts` in the same form as a scheduled prompt | No |
+| cscb_cron scheduled prompt | The server's scheduler posts it to `/interject`; it reaches only the target persona's instance. | `user="cscb-cron:<prompt-file-basename>"` and `ts` = the server clock in seconds, with at most three decimal places | No |
+| `/interject` message | A localhost script POSTs it (see [Interject](#interject)); it reaches only the named persona's instance. | `user` = the request's `sender` (default `interject`) and `ts` in the same form as a scheduled prompt | No |
 
 Points to handle in a bot's prompt:
 

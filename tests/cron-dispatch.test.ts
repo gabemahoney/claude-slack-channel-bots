@@ -1,18 +1,24 @@
 /**
- * cron-dispatch.test.ts — Unit tests for src/cron-dispatch.ts (Task 2 on b.he5).
+ * cron-dispatch.test.ts — Unit tests for src/cron-dispatch.ts (Task 2 on b.he5;
+ * persona targets per b.av2 SR-9.3).
  *
  * The dispatcher delivers one matched CronSchedule via a localhost HTTP POST to
  * the server's own /interject. Per the "Self-Contained Test Servers" pattern in
- * docs/testing-guide.md (and tests/interject.test.ts), we stand up a real
- * `Bun.serve({ port: 0 })` test server, hand its actual bound port to the
- * factory, and record every request (method, path, parsed body, and RAW body
- * text for byte-identity assertions) into a closure array reset each test.
- * Responses are scripted per-channel. Outcomes are read back by parsing the
- * REAL createCronLog temp file into its five space-delimited fields and
- * asserting on structured fields, never on free-text prose.
+ * docs/testing-guide.md, we stand up a real `Bun.serve({ port: 0 })` recording
+ * server, hand its actual bound port to the factory, and record every request
+ * (method, path, parsed body, and RAW body text for byte-identity assertions)
+ * into a closure array reset each test. Responses are scripted per POSTed
+ * `persona` value. Outcomes are read back by parsing the REAL createCronLog temp
+ * file into its five space-delimited fields and asserting on structured fields,
+ * never on free-text prose.
+ *
+ * Targets are persona names or keys. The dispatcher is built with the real
+ * name-or-key resolver (`resolvePersonaTarget`) over a replaceable two-persona
+ * config, so name→key resolution and dedupe run exactly as in production.
  *
  * No top-level mock.module (a pretest gate forbids it); no mocks at all. No
- * real sleeps. Never touches ~/.claude/channels/slack/ or any real channel ID.
+ * real sleeps. No import of server.ts; never touches ~/.claude/channels/slack/
+ * or any real channel ID; never POSTs anywhere but a port-0 test server.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -22,42 +28,76 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, wr
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import type { PersonaConfig } from '../src/config.ts'
 import { createCronLog } from '../src/cron-log.ts'
 import type { CronSchedule } from '../src/crontable.ts'
 import { createCronDispatcher } from '../src/cron-dispatch.ts'
+import { INTERJECT_BODY_CAP_BYTES } from '../src/interject.ts'
+import { personaKey, resolvePersonaTarget } from '../src/persona-identity.ts'
+import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 
 // ---------------------------------------------------------------------------
-// Test HTTP server — records every request, responds per-channel scriptable.
+// Personas. PLANNER's name differs from its key (capital letter, no whitespace
+// or comma, so it tokenizes as written); REVIEWER's name is its own key.
 // ---------------------------------------------------------------------------
+
+const PLANNER = 'Planner'
+const PLANNER_KEY = personaKey(PLANNER)
+const REVIEWER = 'reviewer'
+const REVIEWER_KEY = personaKey(REVIEWER)
+
+/** The config the injected resolver reads at every fire; tests may replace it. */
+let personaConfig: PersonaConfig | null
+
+// ---------------------------------------------------------------------------
+// Test HTTP server — records every request, responds per-target scriptable.
+// ---------------------------------------------------------------------------
+
+interface PostBody {
+  persona?: unknown
+  channel?: unknown
+  message?: unknown
+  sender?: unknown
+}
 
 interface CapturedRequest {
   method: string
   path: string
   /** Parsed JSON body (best effort). */
-  body: { channel?: unknown; message?: unknown; sender?: unknown }
+  body: PostBody
   /** The RAW body text exactly as received — for byte-identity assertions. */
   raw: string
 }
 
 const requests: CapturedRequest[] = []
 
-/** Per-channel scripted HTTP status; default 200 when unset. */
-let responseByChannel: Map<string, number>
+/** Per-target (POSTed `persona` value) scripted HTTP status; default 200. */
+let responseByTarget: Map<string, number>
+
+/** The `persona` field of a raw body, or '' when absent or unparseable. */
+function personaOf(raw: string): string {
+  try {
+    const p = (JSON.parse(raw) as PostBody).persona
+    return typeof p === 'string' ? p : ''
+  } catch {
+    return ''
+  }
+}
 
 const testServer = Bun.serve({
+  hostname: '127.0.0.1',
   port: 0,
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url)
     const raw = await req.text()
-    let body: { channel?: unknown; message?: unknown; sender?: unknown } = {}
+    let body: PostBody = {}
     try {
       body = JSON.parse(raw)
     } catch {
       /* leave body empty on parse failure */
     }
     requests.push({ method: req.method, path: url.pathname, body, raw })
-    const channel = typeof body.channel === 'string' ? body.channel : ''
-    const status = responseByChannel.get(channel) ?? 200
+    const status = responseByTarget.get(personaOf(raw)) ?? 200
     return new Response(JSON.stringify({ status }), { status })
   },
 })
@@ -77,11 +117,16 @@ function makeTempDir(prefix: string): string {
   return dir
 }
 
+/** Two-persona config (PLANNER, REVIEWER) under a fresh temp dir. */
+function makeTwoPersonaConfig(): PersonaConfig {
+  return makeMultiPersonaConfig([{ name: PLANNER }, { name: REVIEWER }], makeTempDir('cscb-persona-cfg-'))
+}
+
 /** One parsed cron-log line, split into its five contract fields. */
 interface LogLine {
   timestamp: string
   identity: string
-  channel: string
+  target: string
   outcome: string
   /** The remaining detail field (key=value tokens then free text). */
   detail: string
@@ -101,11 +146,11 @@ function readLog(logPath: string): LogLine[] {
     .map((line) => {
       // Five space-delimited fields; detail (5th) may itself contain spaces.
       const parts = line.split(' ')
-      const [timestamp, identity, channel, outcome, ...rest] = parts
+      const [timestamp, identity, target, outcome, ...rest] = parts
       return {
         timestamp: timestamp ?? '',
         identity: identity ?? '',
-        channel: channel ?? '',
+        target: target ?? '',
         outcome: outcome ?? '',
         detail: rest.join(' '),
       }
@@ -123,7 +168,9 @@ function token(detail: string, key: string): string | undefined {
 /**
  * Build a dispatcher + real cron-log over fresh temp files. Returns the
  * dispatcher, the log path, and a `lines()` reader. `cronTablePath` defaults to
- * a file inside a fresh temp dir so relative prompt paths resolve there.
+ * a file inside a fresh temp dir so relative prompt paths resolve there. The
+ * resolver is the real name-or-key resolver over `personaConfig`, read on
+ * every call.
  */
 function makeHarness(opts: { cronTablePath?: string; port?: number; deliverTimeoutMs?: number } = {}): {
   fire: (s: CronSchedule) => Promise<void>
@@ -139,6 +186,7 @@ function makeHarness(opts: { cronTablePath?: string; port?: number; deliverTimeo
     port: opts.port ?? PORT,
     cronLog,
     cronTablePath,
+    resolveTarget: (target) => resolvePersonaTarget(personaConfig, target)?.key,
     // Optional per-request deadline; omitted → factory default (production 3 s).
     ...(opts.deliverTimeoutMs !== undefined ? { deliverTimeoutMs: opts.deliverTimeoutMs } : {}),
   })
@@ -150,21 +198,28 @@ function makeHarness(opts: { cronTablePath?: string; port?: number; deliverTimeo
   }
 }
 
+/** Write `content` to a fresh temp prompt file and return its path. */
+function writePrompt(content: string, name = 'p.md'): string {
+  const path = join(makeTempDir('cscb-prompt-test-'), name)
+  writeFileSync(path, content)
+  return path
+}
+
 // ---------------------------------------------------------------------------
 // Schedule factory
 // ---------------------------------------------------------------------------
 
 function explicitSchedule(
   promptPath: string,
-  channelIds: string[],
+  targets: string[],
   identity = 'cscb-cron:test',
 ): CronSchedule {
   return {
     identity,
     expression: '* * * * *',
     promptPath,
-    channels: { kind: 'explicit', channelIds },
-    rawLine: `* * * * * ${promptPath} ${channelIds.join(',')}`,
+    targets: { kind: 'explicit', targets },
+    rawLine: `* * * * * ${promptPath} ${targets.join(',')}`,
   }
 }
 
@@ -173,7 +228,7 @@ function allBotsSchedule(promptPath: string, identity = 'cscb-cron:test'): CronS
     identity,
     expression: '* * * * *',
     promptPath,
-    channels: { kind: 'all-bots' },
+    targets: { kind: 'all-bots' },
     rawLine: `* * * * * ${promptPath}`,
   }
 }
@@ -184,13 +239,13 @@ function allBotsSchedule(promptPath: string, identity = 'cscb-cron:test'): CronS
 
 beforeEach(() => {
   requests.length = 0
-  responseByChannel = new Map()
+  responseByTarget = new Map()
   tempDirs = []
+  personaConfig = makeTwoPersonaConfig()
 })
 
 afterEach(() => {
   for (const dir of tempDirs) {
-    // chmod back so an unreadable-file test dir can be removed.
     try {
       rmSync(dir, { recursive: true, force: true })
     } catch {
@@ -218,7 +273,7 @@ describe('all-bots marker', () => {
     const lines = h.lines()
     const deferred = lines.filter((l) => l.outcome === 'fanout-deferred')
     expect(deferred).toHaveLength(1)
-    expect(deferred[0]!.channel).toBe('-')
+    expect(deferred[0]!.target).toBe('-')
     expect(deferred[0]!.identity).toBe('cscb-cron:test')
 
     const summaries = lines.filter((l) => l.outcome === 'summary')
@@ -239,7 +294,7 @@ describe('all-bots marker', () => {
 // ---------------------------------------------------------------------------
 
 describe('prompt-missing', () => {
-  test('nonexistent file → prompt-missing (channel -), 0/N summary, zero POSTs', async () => {
+  test('nonexistent file → prompt-missing (target -), 0/N summary, zero POSTs', async () => {
     const dir = makeTempDir('cscb-prompt-test-')
     const promptPath = join(dir, 'gone.md')
     // Never created (or delete to be explicit).
@@ -247,12 +302,12 @@ describe('prompt-missing', () => {
     unlinkSync(promptPath)
 
     const h = makeHarness()
-    await h.fire(explicitSchedule(promptPath, ['C_A', 'C_B']))
+    await h.fire(explicitSchedule(promptPath, [PLANNER, REVIEWER]))
 
     const lines = h.lines()
     const missing = lines.filter((l) => l.outcome === 'prompt-missing')
     expect(missing).toHaveLength(1)
-    expect(missing[0]!.channel).toBe('-')
+    expect(missing[0]!.target).toBe('-')
     expect(token(missing[0]!.detail, 'prompt')).toBe(promptPath)
 
     const summary = lines.find((l) => l.outcome === 'summary')!
@@ -284,7 +339,7 @@ describe('prompt-unreadable', () => {
     }
 
     const h = makeHarness()
-    await h.fire(explicitSchedule(promptPath, ['C_A']))
+    await h.fire(explicitSchedule(promptPath, [PLANNER]))
 
     // Restore perms so afterEach cleanup can remove the file.
     if (process.getuid?.() !== 0) chmodSync(promptPath, 0o644)
@@ -292,7 +347,7 @@ describe('prompt-unreadable', () => {
     const lines = h.lines()
     const unreadable = lines.filter((l) => l.outcome === 'prompt-unreadable')
     expect(unreadable).toHaveLength(1)
-    expect(unreadable[0]!.channel).toBe('-')
+    expect(unreadable[0]!.target).toBe('-')
     expect(token(unreadable[0]!.detail, 'errno')).toBeDefined()
 
     const summary = lines.find((l) => l.outcome === 'summary')!
@@ -304,17 +359,22 @@ describe('prompt-unreadable', () => {
 })
 
 // ---------------------------------------------------------------------------
-// 4. Oversize boundary pair — computed from the ACTUAL serialized envelope.
+// 4. Oversize boundary pair — computed from the ACTUAL serialized envelope
+// `{ persona, message, sender }`, with persona = the resolved key.
 // ---------------------------------------------------------------------------
 
 describe('oversize boundary', () => {
-  const CAP = 32768
-  const CHANNEL = 'C_BIG'
+  // The dispatcher imports its cap from the handler module; pin both.
+  const CAP = INTERJECT_BODY_CAP_BYTES
   const IDENTITY = 'cscb-cron:big'
+
+  test('the handler cap the dispatcher shares is 32768 bytes', () => {
+    expect(CAP).toBe(32768)
+  })
 
   /** Byte overhead of the envelope with empty ASCII message content. */
   function envelopeOverhead(): number {
-    const empty = JSON.stringify({ channel: CHANNEL, message: '', sender: IDENTITY })
+    const empty = JSON.stringify({ persona: PLANNER_KEY, message: '', sender: IDENTITY })
     return new TextEncoder().encode(empty).byteLength
   }
 
@@ -323,15 +383,14 @@ describe('oversize boundary', () => {
     // Plain ASCII 'a' → 1 byte each, no JSON escaping, so body byteLength is
     // overhead + content.length. Target exactly CAP.
     const content = 'a'.repeat(CAP - overhead)
-    const dir = makeTempDir('cscb-prompt-test-')
-    const promptPath = join(dir, 'big.md')
-    writeFileSync(promptPath, content)
+    const promptPath = writePrompt(content, 'big.md')
 
-    const expectedBody = JSON.stringify({ channel: CHANNEL, message: content, sender: IDENTITY })
+    const expectedBody = JSON.stringify({ persona: PLANNER_KEY, message: content, sender: IDENTITY })
     expect(new TextEncoder().encode(expectedBody).byteLength).toBe(CAP)
 
     const h = makeHarness()
-    await h.fire(explicitSchedule(promptPath, [CHANNEL], IDENTITY))
+    // Written by name: the POSTed (and measured) body carries the key.
+    await h.fire(explicitSchedule(promptPath, [PLANNER], IDENTITY))
 
     expect(requests).toHaveLength(1)
     // Byte-identity: the raw body the server received IS the expected string.
@@ -347,20 +406,18 @@ describe('oversize boundary', () => {
   test('just-over (exactly 32769 bytes) → prompt-oversize, NO POST', async () => {
     const overhead = envelopeOverhead()
     const content = 'a'.repeat(CAP + 1 - overhead)
-    const dir = makeTempDir('cscb-prompt-test-')
-    const promptPath = join(dir, 'toobig.md')
-    writeFileSync(promptPath, content)
+    const promptPath = writePrompt(content, 'toobig.md')
 
-    const expectedBody = JSON.stringify({ channel: CHANNEL, message: content, sender: IDENTITY })
+    const expectedBody = JSON.stringify({ persona: PLANNER_KEY, message: content, sender: IDENTITY })
     expect(new TextEncoder().encode(expectedBody).byteLength).toBe(CAP + 1)
 
     const h = makeHarness()
-    await h.fire(explicitSchedule(promptPath, [CHANNEL], IDENTITY))
+    await h.fire(explicitSchedule(promptPath, [PLANNER], IDENTITY))
 
     expect(requests).toHaveLength(0)
     const oversize = h.lines().filter((l) => l.outcome === 'prompt-oversize')
     expect(oversize).toHaveLength(1)
-    expect(oversize[0]!.channel).toBe(CHANNEL)
+    expect(oversize[0]!.target).toBe(PLANNER)
 
     const summary = h.lines().find((l) => l.outcome === 'summary')!
     expect(token(summary.detail, 'delivered')).toBe('0')
@@ -376,19 +433,17 @@ describe('HTTP status → outcome mapping', () => {
   test.each([
     [200, 'delivered'],
     [503, 'no-session'],
-    [404, 'unknown-channel'],
+    [404, 'unknown-persona'],
     [500, 'http-error'],
   ])('status %i → %s', async (status, expectedOutcome) => {
-    const dir = makeTempDir('cscb-prompt-test-')
-    const promptPath = join(dir, 'p.md')
-    writeFileSync(promptPath, 'ping')
+    const promptPath = writePrompt('ping')
 
-    responseByChannel.set('C_X', status as number)
+    responseByTarget.set(REVIEWER_KEY, status as number)
     const h = makeHarness()
-    await h.fire(explicitSchedule(promptPath, ['C_X']))
+    await h.fire(explicitSchedule(promptPath, [REVIEWER_KEY]))
 
     const lines = h.lines()
-    const outcomes = lines.filter((l) => l.channel === 'C_X')
+    const outcomes = lines.filter((l) => l.target === REVIEWER_KEY)
     expect(outcomes).toHaveLength(1)
     expect(outcomes[0]!.outcome).toBe(expectedOutcome)
 
@@ -405,18 +460,16 @@ describe('HTTP status → outcome mapping', () => {
   test('connection refused (dead port) → http-error', async () => {
     // Bind a second server on port 0, capture its port, then stop it — that
     // port is now dead. Never hardcode a port.
-    const dead = Bun.serve({ port: 0, fetch: () => new Response('x') })
+    const dead = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('x') })
     const deadPort = dead.port as number
     dead.stop()
 
-    const dir = makeTempDir('cscb-prompt-test-')
-    const promptPath = join(dir, 'p.md')
-    writeFileSync(promptPath, 'ping')
+    const promptPath = writePrompt('ping')
 
     const h = makeHarness({ port: deadPort })
-    await h.fire(explicitSchedule(promptPath, ['C_DEAD']))
+    await h.fire(explicitSchedule(promptPath, [PLANNER]))
 
-    const line = h.lines().find((l) => l.channel === 'C_DEAD')!
+    const line = h.lines().find((l) => l.target === PLANNER)!
     expect(line.outcome).toBe('http-error')
     // No live server captured a request (requests array untouched by dead port).
     expect(requests).toHaveLength(0)
@@ -428,19 +481,29 @@ describe('HTTP status → outcome mapping', () => {
 // ---------------------------------------------------------------------------
 
 describe('body fidelity', () => {
-  test('sender === identity, message === file content, channel === target', async () => {
-    const dir = makeTempDir('cscb-prompt-test-')
-    const promptPath = join(dir, 'msg.md')
+  test('sender === identity, message === file content, persona === resolved key, no channel field', async () => {
     const content = 'Grooming tick: check the queue please.'
-    writeFileSync(promptPath, content)
+    const promptPath = writePrompt(content, 'msg.md')
 
     const h = makeHarness()
-    await h.fire(explicitSchedule(promptPath, ['C_FID'], 'cscb-cron:msg'))
+    await h.fire(explicitSchedule(promptPath, [PLANNER], 'cscb-cron:msg'))
 
     expect(requests).toHaveLength(1)
     expect(requests[0]!.body.sender).toBe('cscb-cron:msg')
     expect(requests[0]!.body.message).toBe(content)
-    expect(requests[0]!.body.channel).toBe('C_FID')
+    expect(requests[0]!.body.persona).toBe(PLANNER_KEY)
+    expect(Object.keys(requests[0]!.body).sort()).toEqual(['message', 'persona', 'sender'])
+  })
+
+  test('a target given by name: the outcome line holds the name as written, the POST the key', async () => {
+    const promptPath = writePrompt('by name')
+
+    const h = makeHarness()
+    await h.fire(explicitSchedule(promptPath, [PLANNER]))
+
+    expect(requests.map((r) => r.body.persona)).toEqual([PLANNER_KEY])
+    const outcomes = h.lines().filter((l) => l.outcome !== 'summary')
+    expect(outcomes.map((l) => [l.target, l.outcome])).toEqual([[PLANNER, 'delivered']])
   })
 })
 
@@ -457,7 +520,7 @@ describe('path resolution', () => {
     const resolved = join(homedir(), rel)
 
     const h = makeHarness()
-    await h.fire(explicitSchedule(`~/${rel}`, ['C_A']))
+    await h.fire(explicitSchedule(`~/${rel}`, [PLANNER]))
 
     const missing = h.lines().find((l) => l.outcome === 'prompt-missing')!
     expect(token(missing.detail, 'prompt')).toBe(resolved)
@@ -476,26 +539,24 @@ describe('path resolution', () => {
     writeFileSync(promptFile, content)
 
     const h = makeHarness({ cronTablePath })
-    await h.fire(explicitSchedule('prompts/foo.md', ['C_REL']))
+    await h.fire(explicitSchedule('prompts/foo.md', [PLANNER]))
 
     expect(requests).toHaveLength(1)
     expect(requests[0]!.body.message).toBe(content)
-    const line = h.lines().find((l) => l.channel === 'C_REL')!
+    const line = h.lines().find((l) => l.target === PLANNER)!
     expect(token(line.detail, 'prompt')).toBe(promptFile)
   })
 
   test('absolute path is used as-is and delivers its content', async () => {
-    const dir = makeTempDir('cscb-prompt-test-')
-    const promptPath = join(dir, 'abs.md')
     const content = 'absolute prompt body'
-    writeFileSync(promptPath, content)
+    const promptPath = writePrompt(content, 'abs.md')
 
     const h = makeHarness()
-    await h.fire(explicitSchedule(promptPath, ['C_ABS']))
+    await h.fire(explicitSchedule(promptPath, [REVIEWER]))
 
     expect(requests).toHaveLength(1)
     expect(requests[0]!.body.message).toBe(content)
-    const line = h.lines().find((l) => l.channel === 'C_ABS')!
+    const line = h.lines().find((l) => l.target === REVIEWER)!
     expect(token(line.detail, 'prompt')).toBe(promptPath)
   })
 })
@@ -506,22 +567,20 @@ describe('path resolution', () => {
 
 describe('multi-target mixed fire', () => {
   test('200 + 404 → per-target classes, both attempted, summary delivered=1 failed=1', async () => {
-    const dir = makeTempDir('cscb-prompt-test-')
-    const promptPath = join(dir, 'multi.md')
-    writeFileSync(promptPath, 'multi body')
+    const promptPath = writePrompt('multi body', 'multi.md')
 
-    responseByChannel.set('C_OK', 200)
-    responseByChannel.set('C_404', 404)
+    responseByTarget.set(PLANNER_KEY, 200)
+    responseByTarget.set(REVIEWER_KEY, 404)
 
     const h = makeHarness()
-    await h.fire(explicitSchedule(promptPath, ['C_OK', 'C_404']))
+    await h.fire(explicitSchedule(promptPath, [PLANNER, REVIEWER]))
 
     // Both targets attempted → two requests.
     expect(requests).toHaveLength(2)
 
     const lines = h.lines()
-    expect(lines.find((l) => l.channel === 'C_OK')!.outcome).toBe('delivered')
-    expect(lines.find((l) => l.channel === 'C_404')!.outcome).toBe('unknown-channel')
+    expect(lines.find((l) => l.target === PLANNER)!.outcome).toBe('delivered')
+    expect(lines.find((l) => l.target === REVIEWER)!.outcome).toBe('unknown-persona')
 
     const summaries = lines.filter((l) => l.outcome === 'summary')
     expect(summaries).toHaveLength(1)
@@ -536,12 +595,10 @@ describe('multi-target mixed fire', () => {
 
 describe('fresh-read', () => {
   test('rewriting the prompt between fires makes the second POST carry new content', async () => {
-    const dir = makeTempDir('cscb-prompt-test-')
-    const promptPath = join(dir, 'live.md')
-    writeFileSync(promptPath, 'first content')
+    const promptPath = writePrompt('first content', 'live.md')
 
     const h = makeHarness()
-    const s = explicitSchedule(promptPath, ['C_FRESH'])
+    const s = explicitSchedule(promptPath, [PLANNER])
 
     await h.fire(s)
     writeFileSync(promptPath, 'second content')
@@ -600,6 +657,7 @@ describe('deliver deadline (accepting-but-silent peer)', () => {
    */
   function startSilentServer(): number {
     const server = Bun.serve({
+      hostname: '127.0.0.1',
       port: 0,
       fetch(): Promise<Response> {
         // Never settles: the connection stays open, no response is ever sent.
@@ -614,10 +672,7 @@ describe('deliver deadline (accepting-but-silent peer)', () => {
     'wedged peer → fire completes, one http-error with TimeoutError detail, plus summary',
     async () => {
       const silentPort = startSilentServer()
-
-      const dir = makeTempDir('cscb-prompt-test-')
-      const promptPath = join(dir, 'p.md')
-      writeFileSync(promptPath, 'ping')
+      const promptPath = writePrompt('ping')
 
       // Short per-request deadline so the wedged peer trips fast (production is
       // 3 s). If fire() ever returns here, the deadline worked.
@@ -625,12 +680,12 @@ describe('deliver deadline (accepting-but-silent peer)', () => {
 
       // This await is the anti-hang assertion: without the fix it never resolves
       // and the 2000 ms test timeout below fails the test fast.
-      await h.fire(explicitSchedule(promptPath, ['C_WEDGED']))
+      await h.fire(explicitSchedule(promptPath, [PLANNER]))
 
       const lines = h.lines()
 
       // Exactly one outcome for the wedged target, classed http-error.
-      const wedged = lines.filter((l) => l.channel === 'C_WEDGED')
+      const wedged = lines.filter((l) => l.target === PLANNER)
       expect(wedged).toHaveLength(1)
       expect(wedged[0]!.outcome).toBe('http-error')
       // TimeoutError detail: errno token is the DOMException name (not legacy 23).
@@ -652,27 +707,17 @@ describe('deliver deadline (accepting-but-silent peer)', () => {
   test(
     'mixed fire (healthy + wedged) → healthy delivered, wedged http-error, summary counts both',
     async () => {
-      const silentPort = startSilentServer()
-
-      const dir = makeTempDir('cscb-prompt-test-')
-      const promptPath = join(dir, 'multi.md')
-      writeFileSync(promptPath, 'multi body')
+      const promptPath = writePrompt('multi body', 'multi.md')
 
       // A dispatcher targets exactly one port, so to exercise one healthy + one
       // wedged target in a SINGLE fire we need one server that answers 200 for
-      // the healthy channel and hangs (never settles) for the wedged channel.
+      // the healthy persona and hangs (never settles) for the wedged persona.
       const mixedServer = Bun.serve({
+        hostname: '127.0.0.1',
         port: 0,
         async fetch(req: Request): Promise<Response> {
-          const raw = await req.text()
-          let channel = ''
-          try {
-            channel = (JSON.parse(raw) as { channel?: unknown }).channel as string
-          } catch {
-            /* leave channel empty */
-          }
-          if (channel === 'C_WEDGED') {
-            // Never settles for the wedged channel.
+          if (personaOf(await req.text()) === PLANNER_KEY) {
+            // Never settles for the wedged persona.
             return new Promise<Response>(() => {})
           }
           return new Response(JSON.stringify({ status: 200 }), { status: 200 })
@@ -686,12 +731,12 @@ describe('deliver deadline (accepting-but-silent peer)', () => {
       // Healthy target first, wedged second — proves the sequential loop
       // continues past a healthy delivery to attempt (and time out) the wedged
       // one, and that the wedged hang does not swallow the earlier outcome.
-      await h.fire(explicitSchedule(promptPath, ['C_OK', 'C_WEDGED']))
+      await h.fire(explicitSchedule(promptPath, [REVIEWER, PLANNER]))
 
       const lines = h.lines()
-      expect(lines.find((l) => l.channel === 'C_OK')!.outcome).toBe('delivered')
+      expect(lines.find((l) => l.target === REVIEWER)!.outcome).toBe('delivered')
 
-      const wedged = lines.filter((l) => l.channel === 'C_WEDGED')
+      const wedged = lines.filter((l) => l.target === PLANNER)
       expect(wedged).toHaveLength(1)
       expect(wedged[0]!.outcome).toBe('http-error')
       expect(token(wedged[0]!.detail, 'errno')).toBe('TimeoutError')
@@ -710,7 +755,7 @@ describe('deliver deadline (accepting-but-silent peer)', () => {
 // ---------------------------------------------------------------------------
 //
 // The owner reversed the same-minute prompt-concatenation optimization (b.qby):
-// N schedules matching one minute for the same channel are PLAIN CRON — N
+// N schedules matching one minute for the same persona are PLAIN CRON — N
 // separate fire()s, each its own /interject POST carrying only its own prompt
 // and its own plain identity sender. The dispatcher has no fireGroup; the
 // scheduler calls fire() once per matched schedule. These tests are the
@@ -718,7 +763,7 @@ describe('deliver deadline (accepting-but-silent peer)', () => {
 // "\n\n"-joined body, or a `cscb-cron:a+b+c` combined sender) fails them.
 
 describe('same-minute independent fires (no concatenation)', () => {
-  test('N schedules to one channel → N separate POSTs, each its own body + plain sender, no grouped= token', async () => {
+  test('N schedules to one persona → N separate POSTs, each its own body + plain sender, no grouped= token', async () => {
     const dir = makeTempDir('cscb-prompt-test-')
     const p1 = join(dir, 'p1.md')
     const p2 = join(dir, 'p2.md')
@@ -727,21 +772,20 @@ describe('same-minute independent fires (no concatenation)', () => {
     writeFileSync(p2, 'PROMPT-TWO')
     writeFileSync(p3, 'PROMPT-THREE')
 
-    const CHANNEL = 'C_MINUTE'
     const h = makeHarness()
     // The scheduler dispatches per schedule in crontable line order; replicate
     // that here by firing each in order.
-    await h.fire(explicitSchedule(p1, [CHANNEL], 'cscb-cron:alpha'))
-    await h.fire(explicitSchedule(p2, [CHANNEL], 'cscb-cron:beta'))
-    await h.fire(explicitSchedule(p3, [CHANNEL], 'cscb-cron:gamma'))
+    await h.fire(explicitSchedule(p1, [REVIEWER], 'cscb-cron:alpha'))
+    await h.fire(explicitSchedule(p2, [REVIEWER], 'cscb-cron:beta'))
+    await h.fire(explicitSchedule(p3, [REVIEWER], 'cscb-cron:gamma'))
 
     // Three SEPARATE POSTs — never a single concatenated body.
     expect(requests).toHaveLength(3)
     // Each POST carries ONLY its own prompt, in fire (= crontable line) order,
-    // to the shared channel, with a plain single-schedule sender. A combined
+    // to the shared persona, with a plain single-schedule sender. A combined
     // "\n\n"-joined body or a `cscb-cron:alpha+beta+gamma` sender fails here.
     expect(requests.map((r) => r.body.message)).toEqual(['PROMPT-ONE', 'PROMPT-TWO', 'PROMPT-THREE'])
-    expect(requests.map((r) => r.body.channel)).toEqual([CHANNEL, CHANNEL, CHANNEL])
+    expect(requests.map((r) => r.body.persona)).toEqual([REVIEWER_KEY, REVIEWER_KEY, REVIEWER_KEY])
     expect(requests.map((r) => r.body.sender)).toEqual([
       'cscb-cron:alpha',
       'cscb-cron:beta',
@@ -752,7 +796,7 @@ describe('same-minute independent fires (no concatenation)', () => {
 
     // Three independent delivered outcome lines, one per schedule, NONE carrying
     // a grouped= token (that token was the concatenation feature's marker).
-    const delivered = lines.filter((l) => l.channel === CHANNEL && l.outcome === 'delivered')
+    const delivered = lines.filter((l) => l.target === REVIEWER && l.outcome === 'delivered')
     expect(delivered).toHaveLength(3)
     expect(delivered.map((l) => l.identity).sort()).toEqual([
       'cscb-cron:alpha',
@@ -772,39 +816,44 @@ describe('same-minute independent fires (no concatenation)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// 12. resolveTargets dedupe — a duplicate channel in one line's explicit list
-// (operator typo `C1,C1`) targets that channel at most ONCE.
+// 12. AC 50 — one persona named twice in one line (by name and/or key, or an
+// operator typo repeating it) is resolved to its key BEFORE dedupe and is
+// targeted at most ONCE.
 // ---------------------------------------------------------------------------
 
-describe('duplicate channel in one schedule', () => {
-  test('explicit list `C1,C1` → exactly ONE POST, plain (non-grouped) sender, one outcome, summary 1/0', async () => {
-    const dir = makeTempDir('cscb-prompt-test-')
-    const CHANNEL = 'C_DUP'
+describe('AC 50: a persona named twice in one line delivers once', () => {
+  test.each([
+    ['name then key', [PLANNER, PLANNER_KEY]],
+    ['key then name', [PLANNER_KEY, PLANNER]],
+    ['name twice', [PLANNER, PLANNER]],
+    ['key twice', [PLANNER_KEY, PLANNER_KEY]],
+  ])('%s → exactly ONE POST carrying the key, plain sender, one delivered line, summary 1/0', async (_label, targets) => {
     const promptBody = 'dedupe me'
-    const promptPath = join(dir, 'dup.md')
-    writeFileSync(promptPath, promptBody)
+    const promptPath = writePrompt(promptBody, 'dup.md')
 
     const h = makeHarness()
-    // Same channel listed twice on one line. Without dedupe the schedule would
-    // be its own second contributor to CHANNEL: two POSTs, or one grouped POST
-    // with a self-doubled sender (`cscb-cron:dup+dup`).
-    await h.fire(explicitSchedule(promptPath, [CHANNEL, CHANNEL], 'cscb-cron:dup'))
+    // Without resolve-then-dedupe the schedule would be its own second
+    // contributor to PLANNER: two POSTs, or one grouped POST with a
+    // self-doubled sender (`cscb-cron:dup+dup`).
+    await h.fire(explicitSchedule(promptPath, targets, 'cscb-cron:dup'))
 
-    // Exactly ONE POST, carrying the plain single-schedule sender (no `+dup`
-    // self-doubling) and the prompt content once (no self-concatenation).
+    // Exactly ONE POST, carrying the key, the plain single-schedule sender (no
+    // `+dup` self-doubling) and the prompt content once (no self-concatenation).
     expect(requests).toHaveLength(1)
-    expect(requests[0]!.body.channel).toBe(CHANNEL)
+    expect(requests[0]!.body.persona).toBe(PLANNER_KEY)
     expect(requests[0]!.body.message).toBe(promptBody)
     expect(requests[0]!.body.sender).toBe('cscb-cron:dup')
 
     const lines = h.lines()
 
-    // Exactly one delivered outcome line for the channel, with NO grouped=
-    // token (single contributor after dedupe).
-    const delivered = lines.filter((l) => l.channel === CHANNEL && l.outcome === 'delivered')
-    expect(delivered).toHaveLength(1)
-    expect(delivered[0]!.identity).toBe('cscb-cron:dup')
-    expect(token(delivered[0]!.detail, 'grouped')).toBeUndefined()
+    // Exactly one outcome line, delivered, under the FIRST-written target, with
+    // NO grouped= token (single contributor after dedupe).
+    const outcomes = lines.filter((l) => l.outcome !== 'summary')
+    expect(outcomes).toHaveLength(1)
+    expect(outcomes[0]!.outcome).toBe('delivered')
+    expect(outcomes[0]!.target).toBe(targets[0]!)
+    expect(outcomes[0]!.identity).toBe('cscb-cron:dup')
+    expect(token(outcomes[0]!.detail, 'grouped')).toBeUndefined()
 
     // One summary, delivered=1 failed=0 (one target, not two).
     const summaries = lines.filter((l) => l.outcome === 'summary')
@@ -812,5 +861,71 @@ describe('duplicate channel in one schedule', () => {
     expect(summaries[0]!.identity).toBe('cscb-cron:dup')
     expect(token(summaries[0]!.detail, 'delivered')).toBe('1')
     expect(token(summaries[0]!.detail, 'failed')).toBe('0')
+  })
+
+  test('a line naming both personas (each twice) → two POSTs, one per persona, in first-seen order', async () => {
+    const promptPath = writePrompt('both')
+
+    const h = makeHarness()
+    await h.fire(explicitSchedule(promptPath, [REVIEWER, PLANNER, REVIEWER_KEY, PLANNER_KEY]))
+
+    expect(requests.map((r) => r.body.persona)).toEqual([REVIEWER_KEY, PLANNER_KEY])
+    const outcomes = h.lines().filter((l) => l.outcome !== 'summary')
+    expect(outcomes.map((l) => [l.target, l.outcome])).toEqual([
+      [REVIEWER, 'delivered'],
+      [PLANNER, 'delivered'],
+    ])
+    const summary = h.lines().find((l) => l.outcome === 'summary')!
+    expect(token(summary.detail, 'delivered')).toBe('2')
+    expect(token(summary.detail, 'failed')).toBe('0')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 13. Unknown target — names no persona in the applied config.
+// ---------------------------------------------------------------------------
+
+describe('unknown target', () => {
+  test('POSTed once as written, 404 → unknown-persona with the written text, sibling still delivered', async () => {
+    const promptPath = writePrompt('hello')
+    // The handler answers 404 for a persona absent from the applied config.
+    responseByTarget.set('nobody', 404)
+
+    const h = makeHarness()
+    await h.fire(explicitSchedule(promptPath, ['nobody', REVIEWER, 'nobody']))
+
+    // The unknown text is POSTed once (deduped by its written text), then the
+    // sibling valid target by its key.
+    expect(requests.map((r) => r.body.persona)).toEqual(['nobody', REVIEWER_KEY])
+
+    const outcomes = h.lines().filter((l) => l.outcome !== 'summary')
+    expect(outcomes.map((l) => [l.target, l.outcome])).toEqual([
+      ['nobody', 'unknown-persona'],
+      [REVIEWER, 'delivered'],
+    ])
+    const summary = h.lines().find((l) => l.outcome === 'summary')!
+    expect(token(summary.detail, 'delivered')).toBe('1')
+    expect(token(summary.detail, 'failed')).toBe('1')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 14. Fire-time resolution — the resolver is consulted on every fire.
+// ---------------------------------------------------------------------------
+
+describe('fire-time resolution', () => {
+  test('replacing the config between two fires changes the key the second fire POSTs', async () => {
+    const promptPath = writePrompt('resolve me')
+    // First config: only REVIEWER, so PLANNER resolves to nothing.
+    personaConfig = makeMultiPersonaConfig([{ name: REVIEWER }], makeTempDir('cscb-persona-cfg-'))
+
+    const h = makeHarness()
+    const s = explicitSchedule(promptPath, [PLANNER])
+
+    await h.fire(s)
+    personaConfig = makeTwoPersonaConfig()
+    await h.fire(s)
+
+    expect(requests.map((r) => r.body.persona)).toEqual([PLANNER, PLANNER_KEY])
   })
 })

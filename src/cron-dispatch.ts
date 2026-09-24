@@ -2,14 +2,21 @@
  * cron-dispatch.ts — Fire/delivery path for one matched cron schedule
  * (Task 2 on b.he5; decisions 1/7, D-Q4, D-Q5 on b.grx).
  *
- * `createCronDispatcher({ port, cronLog, cronTablePath })` returns a handle
- * whose single method `fire(schedule)` delivers ONE already-parsed
- * `CronSchedule` and records every outcome via the injected cron-log handle.
- * The dispatcher is INERT: it imports nothing from server.ts, starts no
- * listener, holds no timer, reads no crontable, and never fires on its own —
- * Task 3's tick loop is the only intended caller. Delivery is a localhost HTTP
- * POST to the server's own `/interject` endpoint AS-IS (decision 7), which
- * gives us the 32KB cap and 503 semantics for free.
+ * `createCronDispatcher({ port, cronLog, cronTablePath, resolveTarget })`
+ * returns a handle whose single method `fire(schedule)` delivers ONE
+ * already-parsed `CronSchedule` and records every outcome via the injected
+ * cron-log handle. The dispatcher is INERT: it imports nothing from server.ts,
+ * starts no listener, holds no timer, reads no crontable or config, and never
+ * fires on its own — Task 3's tick loop is the only intended caller. Delivery
+ * is a localhost HTTP POST to the server's own `/interject` endpoint AS-IS
+ * (decision 7; handler in src/interject.ts), which gives us the 32KB cap and
+ * 503 semantics for free.
+ *
+ * Targets are personas (b.av2 SR-9.3). A schedule's target list holds persona
+ * names or keys as written; the injected `resolveTarget` maps each to its
+ * persona key at FIRE time (so a changed persona set takes effect at the next
+ * fire), and the POST body is `{ persona: <key>, message, sender }`. Log lines
+ * name the target as written.
  *
  * Same-minute delivery is PLAIN CRON: N schedules matching one minute produce
  * N independent fire()s, one per line in crontable order, each its own
@@ -17,10 +24,11 @@
  * reversed that optimization (b.qby); the scheduler calls fire() per schedule.
  *
  * fire() has a fixed internal shape (PM review — this is E4's seam):
- *   resolve-targets → (all-bots marker → fanout-deferred branch) → per-target
- *   loop that is AGNOSTIC to where the targets came from.
- * E4 (all-bots fan-out) must later change ONLY the resolve step plus one
- * constructor dependency; the loop below never special-cases all-bots and
+ *   resolve-targets (`resolveDeliveryTargets`: resolve each written target to
+ *   a persona key, then dedupe) → (all-bots marker → fanout-deferred branch)
+ *   → per-target loop that is AGNOSTIC to where the targets came from.
+ * b.he5 E4 (all-bots fan-out) must later change ONLY the resolve step plus
+ * one constructor dependency; the loop below never special-cases all-bots and
  * never fuses resolution into itself. Do not collapse these stages.
  *
  * Summary convention (pinned — apply everywhere): `failed` counts targets
@@ -43,19 +51,18 @@ import { dirname, isAbsolute, resolve } from 'node:path'
 import { expandTilde } from './config.ts'
 import type { CronSchedule } from './crontable.ts'
 import type { CronLog, CronLogDetail, CronOutcome } from './cron-log.ts'
+import { INTERJECT_BODY_CAP_BYTES } from './interject.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/**
- * UTF-8 byte ceiling for the serialized /interject body. Byte-identical to the
- * /interject handler's own check at src/server.ts (`new TextEncoder().encode(
- * bodyText).byteLength > 32768`). Pinned here so the two cannot drift: because
- * we measure the EXACT string we POST and refuse to send anything over this
- * cap, a 413 from the handler is structurally impossible.
- */
-const INTERJECT_BODY_CAP_BYTES = 32768
+// The serialized-body ceiling is INTERJECT_BODY_CAP_BYTES, imported from the
+// /interject handler module (src/interject.ts), whose own check measures the
+// UTF-8 bytes of the request body the same way. Sharing the constant keeps the
+// two from drifting: because we measure the EXACT string we POST and refuse to
+// send anything over this cap, a 413 from the handler is structurally
+// impossible.
 
 /**
  * Per-request deadline (ms) for the /interject POST in deliver(), applied as
@@ -87,12 +94,54 @@ const INTERJECT_BODY_CAP_BYTES = 32768
  */
 const DEFAULT_DELIVER_TIMEOUT_MS = 3000
 
-/** Sentinel for a log field with no channel (pre-per-target failures). */
-const NO_CHANNEL = '-'
+/** Sentinel for a log field with no target (pre-per-target failures). */
+const NO_TARGET = '-'
 
 // ---------------------------------------------------------------------------
 // Surface
 // ---------------------------------------------------------------------------
+
+/**
+ * Maps a persona target as written in the crontable (a name or key) to that
+ * persona's key, or undefined when no applied persona matches. Called at fire
+ * time; production wires it over the server's current applied persona config.
+ */
+export type CronTargetResolver = (target: string) => string | undefined
+
+/** One delivery a fire makes, in order. */
+export interface CronDeliveryTarget {
+  /**
+   * The `persona` value POSTed to /interject: the resolved persona key, or the
+   * target as written when it resolves to nothing (so the handler answers 404).
+   */
+  persona: string
+  /** The target as first written in the crontable — the log's target field. */
+  written: string
+}
+
+/**
+ * The resolve-targets stage of fire() (b.he5 E4's seam): resolve each written
+ * target to its persona key, THEN dedupe, keeping first-seen order. Two
+ * written targets that resolve to the same key (a persona named by name and by
+ * key, or named twice) make one delivery, logged under the first-written text.
+ * An unresolved target is kept once per distinct written text and POSTed
+ * as written. Deduping on the POSTed value covers both rules. The all-bots
+ * marker yields no targets (fire() handles it in its fanout-deferred branch
+ * before calling this). Pure: no I/O, no config read — `resolveTarget` is the
+ * only input beyond the schedule.
+ */
+export function resolveDeliveryTargets(
+  schedule: CronSchedule,
+  resolveTarget: CronTargetResolver,
+): CronDeliveryTarget[] {
+  if (schedule.targets.kind !== 'explicit') return []
+  const byPersona = new Map<string, CronDeliveryTarget>()
+  for (const written of schedule.targets.targets) {
+    const persona = resolveTarget(written) ?? written
+    if (!byPersona.has(persona)) byPersona.set(persona, { persona, written })
+  }
+  return [...byPersona.values()]
+}
 
 /** Constructor dependencies for the dispatcher. */
 export interface CronDispatcherDeps {
@@ -105,6 +154,12 @@ export interface CronDispatcherDeps {
    * file's directory (see `resolvePromptPath`), so the dispatcher needs it.
    */
   cronTablePath: string
+  /**
+   * Maps a written target to its persona key (see `CronTargetResolver`).
+   * Called on every fire, never cached, so the dispatcher itself reads no
+   * config.
+   */
+  resolveTarget: CronTargetResolver
   /**
    * Optional override for the per-request /interject deadline (ms). Defaults to
    * DEFAULT_DELIVER_TIMEOUT_MS. Exists ONLY so a test can exercise the
@@ -177,18 +232,18 @@ function readPromptFresh(resolvedPath: string): PromptRead {
 
 /**
  * Map an /interject HTTP status to its outcome class. Verified against the
- * handler at src/server.ts /interject:
- *   200 → delivered        (session got the notification)
+ * handler in src/interject.ts (`handleInterject`):
+ *   200 → delivered        (the persona's session got the notification)
  *   503 → no-session       (no live/connected session — decision 1: no retry,
  *                           no queue, no scheduleRestart interaction)
- *   404 → unknown-channel  (channel absent from routing config)
+ *   404 → unknown-persona  (no persona in the applied config has that name or key)
  *   any other status → http-error (belt-and-braces; e.g. 400/403/405/500).
  * A 413 is unreachable here — we never POST over the cap.
  */
 function outcomeForStatus(status: number): CronOutcome {
   if (status === 200) return 'delivered'
   if (status === 503) return 'no-session'
-  if (status === 404) return 'unknown-channel'
+  if (status === 404) return 'unknown-persona'
   return 'http-error'
 }
 
@@ -197,31 +252,15 @@ function outcomeForStatus(status: number): CronOutcome {
 // ---------------------------------------------------------------------------
 
 /**
- * Create a cron dispatcher bound to a port, cron-log handle, and crontable
- * path. The returned `fire` delivers one schedule; it never throws — every
- * failure path becomes a logged outcome plus the per-fire summary.
+ * Create a cron dispatcher bound to a port, cron-log handle, crontable path
+ * and target resolver. The returned `fire` delivers one schedule; it never
+ * throws — every failure path becomes a logged outcome plus the per-fire
+ * summary.
  */
 export function createCronDispatcher(deps: CronDispatcherDeps): CronDispatcher {
-  const { port, cronLog, cronTablePath } = deps
+  const { port, cronLog, cronTablePath, resolveTarget } = deps
   const deliverTimeoutMs = deps.deliverTimeoutMs ?? DEFAULT_DELIVER_TIMEOUT_MS
   const interjectUrl = `http://127.0.0.1:${port}/interject`
-
-  /**
-   * Resolve the concrete target channel list for a schedule. E4's seam: for
-   * an all-bots schedule this is where fan-out expansion will slot in; today
-   * only explicit lists produce targets (all-bots is handled by its own
-   * deferral branch in fire(), never reaching the loop).
-   *
-   * Duplicate channel IDs within one schedule's explicit list (e.g. `C1,C1`,
-   * an operator typo) are deduped here, preserving first-seen order — one line
-   * targets a channel at most once, so a self-duplicated ID does not POST the
-   * same prompt to the same channel twice within one fire.
-   */
-  function resolveTargets(schedule: CronSchedule): string[] {
-    return schedule.channels.kind === 'explicit'
-      ? [...new Set(schedule.channels.channelIds)]
-      : []
-  }
 
   /**
    * POST one measured body to /interject and map the result to an outcome +
@@ -273,11 +312,11 @@ export function createCronDispatcher(deps: CronDispatcherDeps): CronDispatcher {
     // All-bots marker: no read, no POST. Fan-out is not yet enabled (E4), so
     // the target set is undefined; log one fanout-deferred line + a 0/0
     // summary (see the pinned-convention note in the module header) and stop.
-    if (schedule.channels.kind === 'all-bots') {
+    if (schedule.targets.kind === 'all-bots') {
       cronLog.outcome({
         timestamp,
         identity,
-        channel: NO_CHANNEL,
+        target: NO_TARGET,
         outcome: 'fanout-deferred',
         detail: { text: 'all-bots fan-out not yet enabled' },
       })
@@ -285,18 +324,21 @@ export function createCronDispatcher(deps: CronDispatcherDeps): CronDispatcher {
       return
     }
 
-    const targets = resolveTargets(schedule)
+    // Resolve at fire time (E4's seam): a changed persona set takes effect
+    // at the next fire. Resolution happens before the prompt read so a
+    // missing prompt counts every intended delivery as failed.
+    const targets = resolveDeliveryTargets(schedule, resolveTarget)
 
     // --- fire-time path resolution + fresh prompt read --------------------
     const resolvedPath = resolvePromptPath(schedule.promptPath, cronTablePath)
     const read = readPromptFresh(resolvedPath)
     if (!read.ok) {
-      // Missing/unreadable → one pre-fan-out outcome line (no channel) then a
+      // Missing/unreadable → one pre-fan-out outcome line (no target) then a
       // summary counting every intended target as failed; no POST.
       cronLog.outcome({
         timestamp,
         identity,
-        channel: NO_CHANNEL,
+        target: NO_TARGET,
         outcome: read.outcome,
         detail: { promptPath: resolvedPath, errno: read.errno },
       })
@@ -310,11 +352,13 @@ export function createCronDispatcher(deps: CronDispatcherDeps): CronDispatcher {
     // Sequential; EVERY target is attempted even after an earlier failure.
     let delivered = 0
     let failed = 0
-    for (const channel of targets) {
-      // Build the exact serialized body. sender = schedule identity (D-Q4):
-      // without it /interject defaults senderLabel to 'interject' and a cron
-      // fire is indistinguishable from peer-bot traffic.
-      const body = JSON.stringify({ channel, message: content, sender: identity })
+    for (const { persona, written } of targets) {
+      // Build the exact serialized body. persona = the resolved key (or the
+      // written text when unresolved, so the handler answers 404). sender =
+      // schedule identity (D-Q4): without it /interject defaults the sender
+      // label to 'interject' and a cron fire is indistinguishable from
+      // peer-bot traffic.
+      const body = JSON.stringify({ persona, message: content, sender: identity })
 
       // Oversize predicate on the EXACT serialized string, byte-identical to
       // the /interject handler's own check (see INTERJECT_BODY_CAP_BYTES).
@@ -325,7 +369,7 @@ export function createCronDispatcher(deps: CronDispatcherDeps): CronDispatcher {
         cronLog.outcome({
           timestamp,
           identity,
-          channel,
+          target: written,
           outcome: 'prompt-oversize',
           detail: {
             promptPath: resolvedPath,
@@ -342,7 +386,7 @@ export function createCronDispatcher(deps: CronDispatcherDeps): CronDispatcher {
       cronLog.outcome({
         timestamp,
         identity,
-        channel,
+        target: written,
         outcome,
         detail: { promptPath: resolvedPath, ...detail },
       })

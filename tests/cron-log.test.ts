@@ -27,6 +27,7 @@ import {
   type CronLogRecord,
   type CronLogDetail,
 } from '../src/cron-log.ts'
+import { personaKey } from '../src/persona-identity.ts'
 
 // ---------------------------------------------------------------------------
 // Test isolation
@@ -66,7 +67,7 @@ function makeRecord(overrides: Partial<CronLogRecord> = {}): CronLogRecord {
   return {
     timestamp: TS,
     identity: 'daily-standup',
-    channel: 'C0123',
+    target: 'planner',
     outcome: 'delivered',
     ...overrides,
   }
@@ -77,7 +78,7 @@ function makeDetail(overrides: Partial<CronLogDetail> = {}): CronLogDetail {
   return { ...overrides }
 }
 
-/** Split a formatted line into [ts, identity, channel, outcome, detail...]. */
+/** Split a formatted line into [ts, identity, target, outcome, detail...]. */
 function fields(line: string): string[] {
   return line.split(' ')
 }
@@ -107,17 +108,25 @@ function makeFileParentObstruction(name: string): { fileParent: string; badPath:
   return { fileParent, badPath: join(fileParent, 'cron.log') }
 }
 
-const ALL_OUTCOMES: CronOutcome[] = [
+const OUTCOME_CLASSES = [
   'delivered',
   'no-session',
-  'unknown-channel',
+  'unknown-persona',
   'prompt-missing',
   'prompt-unreadable',
   'prompt-oversize',
   'parse-error',
   'http-error',
   'fanout-deferred',
-]
+] as const satisfies readonly CronOutcome[]
+
+/**
+ * Compile-time guard (`bun run typecheck`): the list above names every member
+ * of the CronOutcome union; `satisfies` above rejects any non-member.
+ */
+const COVERS_UNION: [Exclude<CronOutcome, (typeof OUTCOME_CLASSES)[number]>] extends [never] ? true : false = true
+
+const ALL_OUTCOMES: CronOutcome[] = [...OUTCOME_CLASSES]
 
 // ---------------------------------------------------------------------------
 // Pure formatting — five-field layout
@@ -131,25 +140,34 @@ describe('formatOutcomeLine — five-field layout', () => {
     const f = fields(line)
     expect(f[0]).toBe(TS)
     expect(f[1]).toBe('daily-standup')
-    expect(f[2]).toBe('C0123')
+    expect(f[2]).toBe('planner')
     expect(f[3]).toBe('delivered')
     // Detail is the remaining (fifth) field, possibly multi-token free text.
     expect(f.slice(4).join(' ')).toBe('hello world')
   })
 
-  test('positional identity/channel tokens do not shift outcome position', () => {
+  test('positional identity/target tokens do not shift outcome position', () => {
     // Whitespace in a positional token collapses to _, preserving field index.
     const line = formatOutcomeLine(
-      makeRecord({ identity: 'my schedule', channel: 'C 9' }),
+      makeRecord({ identity: 'my schedule', target: 'Ops Bot' }),
     )
     const f = fields(line)
     expect(f[1]).toBe('my_schedule')
-    expect(f[2]).toBe('C_9')
+    expect(f[2]).toBe('Ops_Bot')
     expect(f[3]).toBe('delivered')
   })
 
-  test('absent identity/channel render as the "-" sentinel', () => {
-    const line = formatOutcomeLine(makeRecord({ identity: '-', channel: '-' }))
+  test.each([
+    ['a hashed persona key', personaKey('Ops Bot')],
+    ['a persona name', 'Planner'],
+  ])('%s written as the target comes out unchanged in field 3', (_label, target) => {
+    const f = fields(formatOutcomeLine(makeRecord({ target, outcome: 'unknown-persona' })))
+    expect(f[2]).toBe(target)
+    expect(f[3]).toBe('unknown-persona')
+  })
+
+  test('absent identity/target render as the "-" sentinel', () => {
+    const line = formatOutcomeLine(makeRecord({ identity: '-', target: '-' }))
     const f = fields(line)
     expect(f[1]).toBe('-')
     expect(f[2]).toBe('-')
@@ -159,7 +177,7 @@ describe('formatOutcomeLine — five-field layout', () => {
     // sanitizeToken maps '' to the ABSENT sentinel (src/cron-log.ts:130-131).
     // (A whitespace-only run collapses to a single '_' via the \s+ replace, not
     // to the sentinel — only a truly-empty value hits the ABSENT branch.)
-    const line = formatOutcomeLine(makeRecord({ identity: '', channel: '   ' }))
+    const line = formatOutcomeLine(makeRecord({ identity: '', target: '   ' }))
     const f = fields(line)
     expect(f[1]).toBe('-')
     expect(f[2]).toBe('_')
@@ -178,6 +196,11 @@ describe('formatOutcomeLine — five-field layout', () => {
 // ---------------------------------------------------------------------------
 
 describe('all nine outcome classes round-trip into the log', () => {
+  test('the list is the CronOutcome union: nine distinct classes', () => {
+    expect(COVERS_UNION).toBe(true)
+    expect(new Set(ALL_OUTCOMES).size).toBe(9)
+  })
+
   test.each(ALL_OUTCOMES)('outcome=%s appears in field 4 of the written line', (outcome) => {
     const log = createCronLog(logPath)
     log.outcome(makeRecord({ outcome }))
@@ -231,7 +254,7 @@ describe('detail key=value tokens', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Pre-fan-out failures record "-" as the target channel
+// Pre-fan-out failures record "-" as the target
 // ---------------------------------------------------------------------------
 
 describe('pre-fan-out failures', () => {
@@ -239,9 +262,9 @@ describe('pre-fan-out failures', () => {
     ['parse-error'],
     ['prompt-missing'],
     ['fanout-deferred'],
-  ])('outcome=%s with no target records "-" in the channel field', (outcome) => {
+  ])('outcome=%s with no target records "-" in the target field', (outcome) => {
     const log = createCronLog(logPath)
-    log.outcome(makeRecord({ channel: '-', outcome }))
+    log.outcome(makeRecord({ target: '-', outcome }))
     const f = fields(readLines()[0])
     expect(f[2]).toBe('-')
     expect(f[3]).toBe(outcome)
@@ -312,17 +335,17 @@ describe('formatWarnLine', () => {
     expect(f.slice(4).join(' ')).toBe('crontable vanished, keeping last known schedules')
   })
 
-  test('supplied identity/channel occupy their positional fields', () => {
-    const f = fields(formatWarnLine(TS, 'stat failed', 'daily-standup', 'C0123'))
+  test('supplied identity/target occupy their positional fields', () => {
+    const f = fields(formatWarnLine(TS, 'stat failed', 'daily-standup', 'planner'))
     expect(f[1]).toBe('daily-standup')
-    expect(f[2]).toBe('C0123')
+    expect(f[2]).toBe('planner')
     expect(f[3]).toBe('warn')
   })
 
-  test('whitespace in identity/channel collapses so warn keeps field position', () => {
-    const f = fields(formatWarnLine(TS, 'stat failed', 'my schedule', 'C 9'))
+  test('whitespace in identity/target collapses so warn keeps field position', () => {
+    const f = fields(formatWarnLine(TS, 'stat failed', 'my schedule', 'Ops Bot'))
     expect(f[1]).toBe('my_schedule')
-    expect(f[2]).toBe('C_9')
+    expect(f[2]).toBe('Ops_Bot')
     expect(f[3]).toBe('warn')
   })
 
@@ -341,24 +364,35 @@ describe('formatWarnLine', () => {
     for (const line of others) expect(line).not.toContain('warn')
     expect(formatWarnLine(TS, 'vanished')).toContain('warn')
   })
+
+  test('grep unknown-persona matches unknown-persona lines exactly — no other line kind contains it', () => {
+    const others = [
+      ...ALL_OUTCOMES.filter((o) => o !== 'unknown-persona').map((outcome) => formatOutcomeLine(makeRecord({ outcome }))),
+      formatSummaryLine(TS, 'daily-standup', 1, 0),
+      formatInfoLine(TS, 'scheduler started, 4 schedules loaded'),
+      formatWarnLine(TS, 'vanished'),
+    ]
+    for (const line of others) expect(line).not.toContain('unknown-persona')
+    expect(formatOutcomeLine(makeRecord({ outcome: 'unknown-persona' }))).toContain('unknown-persona')
+  })
 })
 
 describe('warn() through the writer handle', () => {
   test('appends a warn line alongside the other kinds without truncating them', () => {
     const log = createCronLog(logPath)
     log.outcome(makeRecord())
-    log.warn(TS, 'crontable vanished', 'daily-standup', 'C0123')
+    log.warn(TS, 'crontable vanished', 'daily-standup', 'planner')
 
     const lines = readLines()
     expect(lines).toHaveLength(2)
     const f = fields(lines[1])
     expect(f[1]).toBe('daily-standup')
-    expect(f[2]).toBe('C0123')
+    expect(f[2]).toBe('planner')
     expect(f[3]).toBe('warn')
     expect(f.slice(4).join(' ')).toBe('crontable vanished')
   })
 
-  test('omitted identity/channel are written as the "-" sentinel', () => {
+  test('omitted identity/target are written as the "-" sentinel', () => {
     const log = createCronLog(logPath)
     log.warn(TS, 'stat failed')
     const f = fields(readLines()[0])

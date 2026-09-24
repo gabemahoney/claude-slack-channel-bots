@@ -49,7 +49,7 @@ import {
   type RoutingConfig,
   MCP_SERVER_NAME,
 } from './config.ts'
-import { personaInstanceId, renderPersonaRef } from './persona-identity.ts'
+import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import { routesToPersonaConfig } from './route-persona-adapter.ts'
 import {
   AGENT_DIRECTOR_LIVE_STATES,
@@ -118,6 +118,7 @@ import { runAgentDirectorStartupGate } from './agent-director-startup.ts'
 import { installSlackChannelBotTemplate } from './agent-director-template.ts'
 import { createCronLog } from './cron-log.ts'
 import { createCronDispatcher } from './cron-dispatch.ts'
+import { handleInterject } from './interject.ts'
 import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
 import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy, withOutageDetection } from './outage-state.ts'
 
@@ -1138,87 +1139,13 @@ export async function main(): Promise<void> {
 
 
       // -----------------------------------------------------------------------
-      // /interject — inject a message into an active session from localhost
+      // /interject — inject a message into one persona's session from
+      // localhost (b.av2 SR-9.1; handler in src/interject.ts)
       // -----------------------------------------------------------------------
       if (url.pathname === '/interject') {
-        if (req.method !== 'POST') {
-          return new Response(JSON.stringify({ error: 'Method Not Allowed' }), { status: 405, headers: { 'Content-Type': 'application/json' } })
-        }
-        const remoteAddr = server.requestIP(req)
-        const remoteHost = remoteAddr?.address ?? ''
-        if (remoteHost !== '127.0.0.1' && remoteHost !== '::1' && !remoteHost.startsWith('::ffff:127.')) {
-          return new Response(JSON.stringify({ error: 'Forbidden' }), { status: 403, headers: { 'Content-Type': 'application/json' } })
-        }
-
-        const bodyText = await req.text()
-        if (new TextEncoder().encode(bodyText).byteLength > 32768) {
-          return new Response(JSON.stringify({ error: 'Request body too large (max 32KB)' }), {
-            status: 413,
-            headers: { 'Content-Type': 'application/json' },
-          })
-        }
-
-        let body: { channel?: unknown; message?: unknown; sender?: unknown }
-        try {
-          body = JSON.parse(bodyText)
-        } catch {
-          return new Response(JSON.stringify({ error: 'Invalid JSON' }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' },
-          })
-        }
-
-        const { channel, message, sender } = body
-        if (typeof channel !== 'string' || !channel) {
-          return new Response(
-            JSON.stringify({ error: 'Missing or invalid field: channel (string) required' }),
-            { status: 400, headers: { 'Content-Type': 'application/json' } },
-          )
-        }
-        if (typeof message !== 'string' || !message) {
-          return new Response(
-            JSON.stringify({ error: 'Missing or invalid field: message (string) required' }),
-            { status: 400, headers: { 'Content-Type': 'application/json' } },
-          )
-        }
-
-        // Check if the channel exists in routing config
-        const route = routingConfig?.routes[channel]
-        if (!route) {
-          return new Response(
-            JSON.stringify({ error: 'Channel not found in routing config' }),
-            { status: 404, headers: { 'Content-Type': 'application/json' } },
-          )
-        }
-
-        // Check if a session is connected for this channel (the persona key
-        // under the route->persona adapter; E3 Task 8 re-keys /interject)
-        const targetSession = getSessionByPersona(channel)
-        if (!targetSession || !targetSession.connected) {
-          return new Response(
-            JSON.stringify({ error: 'No active session for this channel' }),
-            { status: 503, headers: { 'Content-Type': 'application/json' } },
-          )
-        }
-
-        const senderLabel = typeof sender === 'string' && sender ? sender : 'interject'
-        const ts = String(Date.now() / 1000)
-        const meta: Record<string, string> = {
-          chat_id: channel,
-          message_id: ts,
-          user: senderLabel,
-          ts,
-        }
-
-        console.error(`[slack] /interject: delivering to session cwd="${targetSession.cwd}" channel=${channel} sender="${senderLabel}" message="${message.slice(0, 80)}"`)
-        targetSession.server.notification({
-          method: 'notifications/claude/channel',
-          params: { content: message, meta },
-        })
-
-        return new Response(JSON.stringify({ ok: true, channel, cwd: targetSession.cwd }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
+        return handleInterject(req, server.requestIP(req)?.address, {
+          getPersonaConfig: () => personaConfig,
+          getSessionByPersona,
         })
       }
 
@@ -1316,6 +1243,8 @@ export async function main(): Promise<void> {
         port: boundPort,
         cronLog,
         cronTablePath: routingConfig.cron_table_path,
+        // Resolved against the applied persona config at each fire.
+        resolveTarget: (target) => resolvePersonaTarget(personaConfig, target)?.key,
       })
       cronScheduler = createCronScheduler({
         dispatcher,
