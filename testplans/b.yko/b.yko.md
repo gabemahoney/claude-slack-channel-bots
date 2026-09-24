@@ -1065,7 +1065,137 @@ Pass: both prompts were pending at once, each at its own persona's destination u
 
 ## Lost message (appended by E8)
 
-Placeholder. E8 fills in this section.
+This check verifies AC 26 and b.av2 SR-4.6 (a message that finds no live,
+stream-bearing session is not delivered, and recovery follows the
+human-trigger rules) and SR-7.3 (the persona's permission-prompt destination
+is told that a message was lost, who sent it and the recovery state, with no
+message text, and nothing else is posted in the source conversation). It also
+checks, in passing, SR-7.2 (the notice is posted under the persona's own
+identity) and SR-4.5 (a lost message gets no acknowledgement reaction).
+
+Like the rest of this plan, the section runs only on the test workspace and
+the test host's server, never on the production install. The Safety section
+applies unchanged.
+
+**Run order:** run it after Check 21, on the server that is already running.
+If the server was stopped since, restart it as the E4 section says (confirm
+`hostname` and `whoami`, unset the token variables, `start`; do not rerun the
+check1 pre-flight). The section's own teardown brings A back, so later
+sections start from a healthy state.
+
+### Setup for these checks
+
+The check needs auto-restart off, so the killed instance stays down, and an
+acknowledgement reaction configured, so its absence means something.
+
+First confirm an acknowledgement reaction is configured, so the single
+restart below picks it up. Until a later Epic moves it, the reaction is
+`ackReaction` in `~/.claude/channels/slack/access.json`:
+
+```sh
+jq -r '.ackReaction // empty' ~/.claude/channels/slack/access.json   # must print an emoji name
+```
+
+If it prints nothing, set one now, and note it for the teardown:
+
+```sh
+A=~/.claude/channels/slack/access.json
+jq '.ackReaction = "eyes"' "$A" > "$A.tmp" && mv "$A.tmp" "$A"
+ACK_ADDED=1
+```
+
+The restart below makes the server read the reaction even when
+`SLACK_ACCESS_MODE=static`, where `access.json` is read only at `start`.
+Without a configured reaction the "no reaction" result proves nothing, so
+the check can't pass.
+
+`session_restart_delay` is a server-wide `config.json` key that the server
+reads once, at `start`. Setting it needs the guarded stop and start of "Turn
+A's DMs on", with this edit in place of the `dm` line:
+
+1. Define `guard()` as in "Turn A's DMs on" step 1, if this shell doesn't have it.
+2. Stop the test server only if the guard passes, as in "Turn A's DMs on" step 2 (it records `LOG_MARK`). If it prints `NOT THE TEST HOST - stop` or `config.json.last-applied exists - stop`, do nothing more in this section and record that in Notes.
+3. Record the current value, then set it to `0`:
+
+   ```sh
+   CFG=~/.claude/channels/slack/config.json
+   ORIG_DELAY=$(jq -c '.session_restart_delay' "$CFG"); echo "ORIG_DELAY=$ORIG_DELAY"
+   jq '.session_restart_delay = 0' "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
+   jq -e '.session_restart_delay == 0' "$CFG"   # must print true
+   ```
+
+   `ORIG_DELAY=null` means the key was absent (the default, 60 s). Keep `ORIG_DELAY` for the teardown.
+4. Start the test server as in "Turn A's DMs on" step 4, and wait for it as in step 5. The same Expected items apply: each persona's `Session connected` line, `0 failed, 0 not brought up`, and no failure line.
+
+A's destination is A-home (`"permission_prompts": "<A_HOME_CHANNEL_ID>"`). A
+is mentions-only in coordination, so the message must mention A.
+
+### Check 22: a message to a downed persona is reported at its destination, not in the channel (AC 26)
+
+Steps:
+
+1. Run `agent-director list --label service=cscb` and confirm A's row, `cscb_persona_a`, is there.
+2. Record where the log ends: `MARK=$(wc -l < "$LOG")`.
+3. Kill A's instance, as Check 7 does: `tmux kill-session -t slack_bot_persona_a`. Wait until the disconnect shows (up to one minute):
+
+   ```sh
+   since "$MARK" | grep -E 'Session disconnected.*"persona_a" \(key=persona_a\)|Auto-restart disabled \(delay=0\) — skipping restart for persona=persona_a'
+   ```
+
+4. Record where the log ends again: `MARK2=$(wc -l < "$LOG")`.
+5. As the operator, in coordination, post "@CSCB Test A lost-message check lost-marker-7Q3Z, reply with the word back." The marker `lost-marker-7Q3Z` is how the notice is checked for message text. Work out the message's `<TS>`.
+6. Wait two minutes, watching A-home and coordination. Then run:
+
+   ```sh
+   since "$MARK2" | grep -F 'No live session for persona "persona_a" (key=persona_a)'
+   since "$MARK2" | grep -F 'DROP: no _GET_stream for persona "persona_a"'
+   since "$MARK2" | grep -F 'Dispatching to persona "persona_a"'
+   since "$MARK2" | grep -F 'persona-destination-failed:'
+   since "$MARK2" | grep -F 'Scheduling restart for persona=persona_a'
+   tags a <TS>
+   ```
+
+7. Look at the message in coordination for any reaction, and at A-home and coordination for every post made after it.
+
+Expected:
+
+- Step 3 prints a `[slack] Session disconnected` line for `persona "persona_a" (key=persona_a)` and at least one `[slack] Auto-restart disabled (delay=0) — skipping restart for persona=persona_a` line. A does not come back while the check runs.
+- Step 6's first command prints exactly one line: `[slack] No live session for persona "persona_a" (key=persona_a) chat_id=<COORDINATION_CHANNEL_ID> — dropping message`. (If it prints nothing and the second command prints a `[slack] DROP: no _GET_stream for persona "persona_a" (key=persona_a) chat_id=<COORDINATION_CHANNEL_ID> …` line instead, A's session was still registered without its stream; that branch reports the same way, so the rest of the check applies. Record which line appeared in Notes.)
+- On the `No live session` path, the `Dispatching` command prints nothing. On the DROP path, it prints exactly one `[slack] Dispatching to persona "persona_a" (key=persona_a) chat_id=<COORDINATION_CHANNEL_ID> … hasGetStream=false …` line, logged just before the DROP line.
+- The `persona-destination-failed` and `Scheduling restart` commands print nothing, and `tags a <TS>` prints nothing: the message was not delivered, and no restart was started.
+- Exactly one new message appears in A-home: the lost-message notice, posted by app A (A's name and avatar). It reads, as Slack renders it: `Persona "persona_a" (key=persona_a): ⚠️ Message lost — a message from <sender> was not delivered to this persona's instance and was not saved; it will not be delivered later. Recovery: auto-restart disabled — the instance will not restart on its own; restart the server to recover.`
+- `<sender>` is the operator's Slack name as the workspace shows it (display name, else full name), or `<OPERATOR_USER_ID>` if the name can't be looked up. It is plain text, not an @-mention.
+- The notice doesn't contain `lost-marker-7Q3Z` or any other words from the message.
+- Nothing appears in coordination after the operator's message: no reply, notice or other post from A, B, C or the server, including in a thread.
+- The message in coordination has no reaction from A: the configured `ackReaction` emoji is not on it.
+
+A notice in coordination, a second lost-message notice, or the marker in the
+notice fails this check. So does an `ackReaction` on the message.
+
+Teardown for this check (operator step on the test host), run whatever the result:
+
+1. Stop the test server only if the guard passes, as in "Turn A's DMs on" step 2 (it records a new `LOG_MARK`).
+2. Restore the delay:
+
+   ```sh
+   CFG=~/.claude/channels/slack/config.json
+   if [ "$ORIG_DELAY" = null ]; then jq 'del(.session_restart_delay)' "$CFG"; else jq --argjson d "$ORIG_DELAY" '.session_restart_delay = $d' "$CFG"; fi > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
+   jq -c '.session_restart_delay' "$CFG"   # must print the ORIG_DELAY value
+   ```
+
+3. If the setup added the reaction (`ACK_ADDED=1`), remove it: `A=~/.claude/channels/slack/access.json; jq 'del(.ackReaction)' "$A" > "$A.tmp" && mv "$A.tmp" "$A"`.
+4. Start the test server as in "Turn A's DMs on" step 4, and wait for it as in step 5, with the same Expected items. A's instance is brought up again, resumed or fresh-spawned.
+5. In A-home, post "Reply with the word back." A replies "back" in A-home under its own name and avatar.
+
+If A doesn't answer after the restart, record that in Notes: later sections
+need all three personas up.
+
+Pass: A's instance was down with auto-restart off, the message was dropped
+with the `No live session` (or `DROP: no _GET_stream`) line, exactly one
+lost-message notice naming the operator and "auto-restart disabled" appeared
+in A-home under A's identity without the marker, nothing was posted in
+coordination, the message got no `ackReaction`, and A answered again after
+the teardown.
 
 ## Reboot (appended by E11)
 
@@ -1097,6 +1227,10 @@ run starts from it: once the server is stopped, delete the
 `jq -e '.personas[0] | has("dm") | not' ~/.claude/channels/slack/config.json`
 must print `true`.
 
+If the lost-message section stopped before its own teardown, restore
+`session_restart_delay` (and remove an `ackReaction` it added) as that
+teardown's steps 2 and 3 say, once the server is stopped.
+
 A rerun of the DMs section needs a second test user that A has never
 messaged: the one used here now has a DM with A (Check 17 opened it).
 
@@ -1110,6 +1244,6 @@ retired: `rm ~/.config/cscb-test/*-credentials.json`.
 The operator adds one row per run. Record pass or fail only, never a token or
 a log excerpt containing one.
 
-| Date | Build commit | Host / user | Check 1 | Check 2 | Check 3 | Check 4 | Check 5 | Check 6 | Check 7 | Check 8 | Check 9 | Check 10 | Check 11 | Check 12 | Check 13 | Check 14 | Check 15 | Check 16 | Check 17 | Check 18 | Check 19 | Check 20 | Check 21 | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| | | | | | | | | | | | | | | | | | | | | | | | | |
+| Date | Build commit | Host / user | Check 1 | Check 2 | Check 3 | Check 4 | Check 5 | Check 6 | Check 7 | Check 8 | Check 9 | Check 10 | Check 11 | Check 12 | Check 13 | Check 14 | Check 15 | Check 16 | Check 17 | Check 18 | Check 19 | Check 20 | Check 21 | Check 22 | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| | | | | | | | | | | | | | | | | | | | | | | | | | |

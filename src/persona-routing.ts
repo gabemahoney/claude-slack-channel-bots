@@ -31,29 +31,35 @@
  *    logs one `persona-dm-dropped` line naming P and `dm.enabled`, and makes
  *    no Slack call; any other reason logs one plain line naming the author
  *    ID. No drop line carries message text.
- * 5. Dispatch: P's session is looked up by persona key; the ack reaction is
- *    added through P's client; the message goes as `notifications/claude/channel`
- *    to P's session only, with `chat_id` set to the source conversation (the
- *    channel, or the DM conversation). The
- *    meta `user` is the author's display name, or for an author without
- *    `user` (webhook, `bot_message`) the event's `username`, else its
+ * 5. Dispatch: the author's label is resolved, then P's session is looked up by
+ *    persona key and its GET stream probed. Only a message that will actually
+ *    be sent gets the ack reaction (through P's client) and an ack-tracker
+ *    entry; then it goes as `notifications/claude/channel` to P's session
+ *    only, with `chat_id` set to the source conversation (the channel, or the
+ *    DM conversation). Nothing is awaited between the session read and the
+ *    send. The meta `user` is the author's display name, or for an author
+ *    without `user` (webhook, `bot_message`) the event's `username`, else its
  *    `bot_profile.name`, else its bot ID. The meta also carries the author's
  *    `user_id` (or, for an author without `user`, its `bot_id`; never both)
  *    and `via`, how the message reached P (b.av2 SR-4.4).
- * 6. Lost message: when P has no live session, or its session has lost its GET
- *    stream, the message is dropped, a human-triggered restart of P is
- *    scheduled when the restart guards allow (b.kvq / b.9cj), and one reply
- *    saying so is posted in the source conversation through P's client.
+ * 6. Lost message (b.av2 SR-4.6, SR-7.3): when P has no live session, or its
+ *    session has lost its GET stream, the message is dropped with no ack
+ *    reaction, a human-triggered restart of P is scheduled only in the
+ *    "starting now" state (`src/lost-message.ts` decides the state from the
+ *    restart guards), and one lost-message notice naming the sender and the
+ *    state goes to P's destination through the injected `notify`. Nothing is
+ *    posted in the source conversation, and the message text is never in the
+ *    notice.
  *
- * Deferred rules and where they are completed: the lost-message notice to P's
- * destination (E8, which replaces the source-conversation replies below); the
- * ack reaction's source and keying (E9; today it comes from `access.json`).
+ * Deferred rule and where it is completed: the ack reaction's source and
+ * keying (E9; today it comes from `access.json`).
  *
  * Side-effect free (b.av2 SR-13.1): importing this module creates no Slack
  * client, reads no token, file or environment variable, starts no timer and
  * logs nothing. Every Slack client, the persona config, the bot identity, the
- * name resolver, the archive writer, the ack-reaction source, the logger and
- * (optionally) the dedupe clock are injected through `createPersonaRouting`. The session lookup comes from
+ * name resolver, the archive writer, the ack-reaction source, the notice sink,
+ * the logger and (optionally) the dedupe clock are injected through
+ * `createPersonaRouting`. The session lookup comes from
  * the registry and the restart guards from the restart and backoff modules,
  * so tests drive their real state. This module never calls agent-director.
  *
@@ -76,12 +82,14 @@ import {
   PERSONA_DM_DROPPED,
   UNCLAIMED_CHANNEL,
 } from './persona-diagnostics.ts'
-import { describeSlackCallFailure } from './persona-connection-errors.ts'
+import { describeSlackCallFailure, describeThrownValue } from './persona-connection-errors.ts'
 import { createInboundDedupeStore, type InboundDedupeStore } from './inbound-dedupe.ts'
 import { getSessionByPersona } from './registry.ts'
 import { isRestartPendingOrActive, RESTART_FAILURE_CAP, scheduleRestart } from './restart.ts'
 import { isAtCap } from './backoff.ts'
 import { trackAck } from './ack-tracker.ts'
+import { buildLostMessageNotice, decideLostMessageState } from './lost-message.ts'
+import type { PersonaNotify } from './persona-notifier.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -99,37 +107,12 @@ const UNKNOWN_AUTHOR = 'unknown'
 /** Author shown in a drop line for an event with neither `user` nor `bot_id`. */
 const NO_AUTHOR_PLACEHOLDER = '(none)'
 
-// Lost-message replies (b.kvq / b.9cj), posted in the source conversation.
-// Kept byte-identical to the pre-persona replies until E8 replaces them.
-
-/** A restart of the persona is already pending or running. */
-export const LOST_MESSAGE_RESTARTING_REPLY =
-  'Your message was not delivered. The session is restarting — please retry in a moment.'
-
-/** `session_restart_delay` is 0: nothing will restart the persona. */
-export const LOST_MESSAGE_AUTO_RESTART_DISABLED_REPLY =
-  'Your message was not delivered and was not saved. Auto-restart is disabled for this channel, ' +
-  'so it will NOT recover on its own — an operator must restart the server.'
-
-/** The persona is at the restart-failure cap. */
-export const LOST_MESSAGE_CAPPED_REPLY =
-  'Your message was not delivered and was not saved. This channel has hit its restart-failure limit ' +
-  'and will NOT recover on its own — an operator must restart the server.'
-
-/** No session: a human-triggered restart was just scheduled. */
-export const LOST_MESSAGE_STARTED_REPLY =
-  'Your message was not delivered and was not saved. I have started the session for this channel — ' +
-  'please retry in a moment.'
-
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 /** The Slack `ack` handed over with a Socket Mode event. */
 export type SlackAck = () => Promise<void> | void
-
-/** Which restart-guard outcome a lost message gets (b.kvq / b.9cj). */
-export type LostMessageOutcome = 'restarting' | 'auto-restart-disabled' | 'capped' | 'recover'
 
 /** The persona config fields this module reads. */
 export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_restart_delay'>
@@ -145,7 +128,11 @@ export interface PersonaRoutingDeps {
   getBotIdentity(key: string): SlackBotIdentity | undefined
   /** P's validated Slack Web client, or undefined when it has none (before validation, dry run). */
   clientFor(key: string): WebClient | undefined
-  /** A user's display name, looked up through P's client. */
+  /**
+   * A user's display name, looked up through P's client. Should resolve to the
+   * user ID when no name is found; a rejection is tolerated and treated the
+   * same way (the label falls back to the user ID).
+   */
   resolveUserName(key: string, userId: string): Promise<string>
   /**
    * Write the event to the message archive on behalf of P (name lookups on
@@ -155,6 +142,12 @@ export interface PersonaRoutingDeps {
   archive(key: string, event: unknown): void
   /** The ack-reaction source (`access.json` until E9). */
   getAccess(): Pick<Access, 'ackReaction'>
+  /**
+   * Raise a notice at persona P's destination (the persona notifier's
+   * `notify`, which adds P's reference and posts through the shared
+   * destination hold). Used for the lost-message notice.
+   */
+  notify: PersonaNotify
   /** Writes one log line. */
   log(line: string): void
   /** Clock for the per-persona dedupe stores, in milliseconds; defaults to `Date.now`. */
@@ -191,29 +184,8 @@ export function hasSessionStream(key: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Lost-message restart guard (b.kvq / b.9cj)
-// ---------------------------------------------------------------------------
-
-/**
- * The shared restart-guard decision for a message persona `key` could not
- * take, in today's order: a restart already pending or running; auto-restart
- * disabled (`restartDelaySeconds` 0); the persona at `RESTART_FAILURE_CAP`;
- * otherwise `recover` (the caller schedules a human-triggered restart). Reads
- * the real restart and backoff state; changes nothing.
- */
-export function decideLostMessageRecovery(key: string, restartDelaySeconds: number): LostMessageOutcome {
-  if (isRestartPendingOrActive(key)) return 'restarting'
-  if (restartDelaySeconds === 0) return 'auto-restart-disabled'
-  if (isAtCap(key, RESTART_FAILURE_CAP)) return 'capped'
-  return 'recover'
-}
-
-// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
-
-/** Which lost-message branch applies: no live session (b.kvq), or a streamless one (b.9cj). */
-type LostMessageBranch = 'no-session' | 'streamless'
 
 /** Build a persona-routing instance over the injected dependencies. */
 export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
@@ -331,31 +303,22 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     const chatId = ev['channel'] as string
     const ts = ev['ts'] as string
 
-    const noLiveSession = async (): Promise<void> => {
-      deps.log(`[slack] No live session for persona ${ref} chat_id=${chatId} — dropping message`)
-      await handleLostMessage(persona, chatId, persona.working_directory, 'no-session', config)
-    }
+    // The author label is resolved first, for the meta of a delivered message
+    // and for the notice of a lost one alike.
+    const userName = await resolveAuthorLabel(persona, ev)
 
-    const initial = getSessionByPersona(persona.key)
-    if (!initial || !initial.connected) {
-      await noLiveSession()
-      return
-    }
-
-    const userName = await resolveAuthorLabel(persona.key, ev)
-    await addAckReaction(persona.key, chatId, ts)
-
-    const meta = buildMeta(ev, chatId, userName, delivery)
-    const text = stripPersonaMention((ev['text'] as string | undefined) || '', botUserId)
-
-    // Re-read P's session after the awaits above: the session may have been
-    // replaced or dropped meanwhile. From here to notification() nothing is
+    // Read P's session after the await above, so a session replaced or dropped
+    // during the lookup is seen. From here to notification() nothing is
     // awaited, so the stream probe and the send act on this one session (b.9cj).
     const session = getSessionByPersona(persona.key)
     if (!session || !session.connected) {
-      await noLiveSession()
+      deps.log(`[slack] No live session for persona ${ref} chat_id=${chatId} — dropping message`)
+      await handleLostMessage(persona, persona.working_directory, userName, config)
       return
     }
+
+    const meta = buildMeta(ev, chatId, userName, delivery)
+    const text = stripPersonaMention((ev['text'] as string | undefined) || '', botUserId)
     const hasStream = hasGetStreamKey(session.transport)
     const mcpSessionId = session.transport.sessionId ?? '(unset)'
     deps.log(
@@ -365,15 +328,18 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     )
     if (!hasStream) {
       // b.9cj: the SDK has dropped the GET stream, so notification() would
-      // vanish without a throw. Do not send it; recover and say so instead.
+      // vanish without a throw. Do not send it; recover and tell P's
+      // destination instead.
       deps.log(
         `[slack] DROP: no _GET_stream for persona ${ref} chat_id=${chatId} cwd="${session.cwd}" ` +
         `mcpSessionId=${mcpSessionId} — message will not reach the bot; triggering recovery`,
       )
-      await handleLostMessage(persona, chatId, session.cwd, 'streamless', config)
+      await handleLostMessage(persona, session.cwd, userName, config)
       return
     }
 
+    // The message is dispatched: only now does it get the ack reaction.
+    addAckReaction(persona.key, chatId, ts)
     await session.server.notification({
       method: CHANNEL_NOTIFICATION_METHOD,
       params: { content: text, meta },
@@ -385,68 +351,68 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
    * the event has a `user`; otherwise (webhook, `bot_message`) a name the
    * event carries, with no Slack call (see `botAuthorLabel`).
    */
-  async function resolveAuthorLabel(key: string, ev: Record<string, unknown>): Promise<string> {
+  async function resolveAuthorLabel(persona: Persona, ev: Record<string, unknown>): Promise<string> {
     const user = ev['user']
-    if (typeof user === 'string' && user !== '') return deps.resolveUserName(key, user)
-    return botAuthorLabel(ev)
+    if (typeof user !== 'string' || user === '') return botAuthorLabel(ev)
+    try {
+      return await deps.resolveUserName(persona.key, user)
+    } catch (err) {
+      // A failed lookup must not lose the message: the label falls back to the
+      // user ID, as a lookup that finds no name does.
+      deps.log(
+        `[slack] persona-routing: user-name lookup for persona ${renderPersonaRef(persona.name, persona.key)} ` +
+        `failed, using the user ID: ${describeThrownValue(err)}`,
+      )
+      return user
+    }
   }
 
-  /** Today's ack reaction and ack tracking, through P's client; skipped when P has none. */
-  async function addAckReaction(key: string, channel: string, ts: string): Promise<void> {
+  /**
+   * Today's ack reaction and ack tracking, through P's client, for a message
+   * being dispatched; skipped when there is no reaction or P has no client.
+   * Synchronous: the entry is recorded and the reaction call issued, not
+   * awaited, so nothing is awaited between the stream probe and the send. A
+   * failed reaction is non-critical.
+   */
+  function addAckReaction(key: string, channel: string, ts: string): void {
     const reaction = deps.getAccess().ackReaction
     if (!reaction) return
     const client = deps.clientFor(key)
     if (!client) return
-    try {
-      await client.reactions.add({ channel, timestamp: ts, name: reaction })
-    } catch { /* non-critical */ }
     trackAck(channel, ts)
+    try {
+      client.reactions.add({ channel, timestamp: ts, name: reaction }).catch(() => { /* non-critical */ })
+    } catch { /* non-critical */ }
   }
 
   /**
-   * b.kvq / b.9cj: the message is lost. Apply the shared restart guards for P,
-   * schedule a human-triggered restart of P in `cwd` when they allow it, and
-   * reply in the source conversation. The message itself is never delivered
-   * or replayed, and the reply never implies otherwise.
+   * b.av2 SR-4.6, SR-7.3: the message is lost. Decide the recovery state from
+   * P's real restart guards (pending, auto-restart disabled, cap), schedule a
+   * human-triggered restart of P in `cwd` only when the state is
+   * `starting-now`, and raise one lost-message notice naming `senderLabel`
+   * and the state at P's destination. Nothing is posted in the source
+   * conversation. The notice is awaited so it is issued before dispatch
+   * returns; a failing sink is logged, never thrown.
    */
   async function handleLostMessage(
     persona: Persona,
-    chatId: string,
     cwd: string,
-    branch: LostMessageBranch,
+    senderLabel: string,
     config: PersonaRoutingConfig,
   ): Promise<void> {
-    let reply: string
-    switch (decideLostMessageRecovery(persona.key, config.session_restart_delay)) {
-      case 'restarting':
-        reply = LOST_MESSAGE_RESTARTING_REPLY
-        break
-      case 'auto-restart-disabled':
-        reply = LOST_MESSAGE_AUTO_RESTART_DISABLED_REPLY
-        break
-      case 'capped':
-        reply = LOST_MESSAGE_CAPPED_REPLY
-        break
-      case 'recover':
-        scheduleRestart(persona.key, cwd, undefined, { humanTrigger: true })
-        reply = branch === 'no-session' ? LOST_MESSAGE_STARTED_REPLY : LOST_MESSAGE_RESTARTING_REPLY
-        break
-    }
-    await postLostMessageReply(persona, chatId, reply)
-  }
-
-  /** Post one top-level reply through P's client. Failures are logged, never thrown. */
-  async function postLostMessageReply(persona: Persona, chatId: string, text: string): Promise<void> {
-    const ref = renderPersonaRef(persona.name, persona.key)
-    const client = deps.clientFor(persona.key)
-    if (!client) {
-      deps.log(`[slack] persona ${ref} has no validated Slack client — lost-message reply to chat_id=${chatId} not posted`)
-      return
-    }
+    const state = decideLostMessageState({
+      isRestartPending: () => isRestartPendingOrActive(persona.key),
+      isAutoRestartDisabled: () => config.session_restart_delay === 0,
+      isAtRestartLimit: () => isAtCap(persona.key, RESTART_FAILURE_CAP),
+    })
+    if (state === 'starting-now') scheduleRestart(persona.key, cwd, undefined, { humanTrigger: true })
     try {
-      await client.chat.postMessage({ channel: chatId, text })
+      await deps.notify(persona.key, buildLostMessageNotice(senderLabel, state))
     } catch (err) {
-      deps.log(`[slack] failed to post lost-message reply for persona ${ref} to chat_id=${chatId}${describeSlackCallFailure(err)}`)
+      deps.log(
+        `[slack] persona-routing: lost-message notice for persona ${renderPersonaRef(persona.name, persona.key)} ` +
+        `failed: ${describeThrownValue(err)}`,
+      )
     }
   }
 

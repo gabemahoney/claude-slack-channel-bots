@@ -14,8 +14,9 @@
  *   inbox directories.
  * - The connection seams (SR-3.1, SR-3.4, SR-4.1, SR-7.2): the manager's dry
  *   run and up→flush listener, `connections = <manager>`, `clientFor` and
- *   `identityFor` over the connection view, the routing's identity, client and
- *   archive seams, and the archive writer's per-persona resolver source.
+ *   `identityFor` over the connection view, the routing's identity, client,
+ *   archive and notice (`notify`, the persona notifier's, SR-7.3) seams, and
+ *   the archive writer's per-persona resolver source.
  * - The one destination resolver (SR-7.1): built at module scope and shared
  *   by the persona notifier and the permission poller.
  * - The bring-up controller (SR-6.1, SR-6.4): the start's bring-up, told
@@ -373,6 +374,19 @@ describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, 
     expect(props.has('getBotUserId')).toBe(false)
     expect(props.get('clientFor')).toBe('clientFor')
     expect(props.get('archive')).toMatch(/^\((\w+), (\w+)\) => archiveWrite\?\.\(\1, \2\)$/)
+  })
+
+  test('the persona routing raises lost-message notices through the one persona notifier\'s notify (b.av2 SR-7.3), with every argument passed on', () => {
+    const notifier = constOf('createPersonaNotifier')
+    const notify = onlyCallProps('createPersonaRouting').get('notify')
+    expect(notify).toBeDefined()
+    if (notify === `${notifier}.notify`) {
+      // Read at build time: the notifier must already exist (no temporal dead zone at import).
+      expect(onlyCallOf('createPersonaRouting')).toBeGreaterThan(onlyCallOf('createPersonaNotifier'))
+    } else {
+      // Read at call time, so the routing may be built before the notifier.
+      expect(notify).toMatch(new RegExp(`^\\((\\w+), (\\w+), (\\w+)\\) => ${notifier}\\.notify\\(\\1, \\2, \\3\\)$`))
+    }
   })
 
   test('archiveWrite is set only inside main(), to the persona archive writer over the name resolver source on clientFor', () => {

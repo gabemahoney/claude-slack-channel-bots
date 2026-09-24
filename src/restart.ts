@@ -165,7 +165,7 @@ export function scheduleRestart(
   let delay = nextBackoffDelay(key, baseDelay)
 
   // b.kvq: an explicit human message clamps the wait DOWN to a small ceiling so
-  // a person messaging the persona isn't told to wait out a 900s backoff. This
+  // a message lost to a down persona doesn't leave it down for a 900s backoff. This
   // does not touch the failure counter — each attempt still counts toward
   // backoff/cap accounting — and the re-entrancy guard at the call site keeps a
   // chatty persona to one in-flight launch at a time.

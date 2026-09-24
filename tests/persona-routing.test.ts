@@ -45,7 +45,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { LOST_MESSAGE_RESTARTING_REPLY, LOST_MESSAGE_STARTED_REPLY } from '../src/persona-routing.ts'
+import { buildLostMessageNotice, type LostMessageState } from '../src/lost-message.ts'
 import { INBOUND_DEDUPE_RETENTION_MS } from '../src/inbound-dedupe.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
@@ -117,6 +117,14 @@ function captured(h: Harness): Record<string, unknown> {
 }
 
 const lines = (h: Harness, needle: string) => h.logs.filter((l) => l.includes(needle))
+
+/**
+ * The one Slack post a lost message makes: persona `name`'s lost-message
+ * notice (from `sender`, in `state`), on its own stub, at its destination.
+ */
+function lostNoticePost(h: Harness, name: string, destination: string, sender: string, state: LostMessageState) {
+  return { key: h.p(name).persona.key, channel: destination, text: h.noticeText(name, buildLostMessageNotice(sender, state)) }
+}
 
 /** Every captured line (module log seam and console) that contains `text`. */
 const linesWithText = (h: Harness, text: string) => [...h.logs, ...consoleLines].filter((l) => l.includes(text))
@@ -195,15 +203,19 @@ describe('AC 1: two personas, home channels and a shared mention-only channel', 
     assertNoLeak(captured(h))
   })
 
-  test('AC 1: a message in B\'s home channel while B has no session is not delivered to A, and only B recovers and replies (b.7a4)', async () => {
-    const h = makeHarness(ac1Specs(), { sessions: ['Alpha Bot'] })
+  test('AC 1: a message in B\'s home channel while B has no session is not delivered to A, and only B recovers and raises the lost-message notice (b.7a4)', async () => {
+    // B's destination is the shared channel CS, so the source CB differs from it.
+    const specs = ac1Specs()
+    specs[1] = { ...specs[1]!, permission_prompts: CS }
+    const h = makeHarness(specs, { sessions: ['Alpha Bot'] })
     const A = h.p('Alpha Bot')
     const B = h.p('Beta Bot')
     await receiveOnEach(h, makeChannelMessage({ channel: CB }))
 
     expect(A.notifications).toHaveLength(0)
     expect(slackCalls(A.stub)).toBe(0)
-    expect(posts(B.stub).map((c) => ({ channel: c.channel, text: c.text }))).toEqual([{ channel: CB, text: LOST_MESSAGE_STARTED_REPLY }])
+    expect(h.allPosts()).toEqual([lostNoticePost(h, 'Beta Bot', CS, 'stub-user', 'starting-now')])
+    expect(h.postsTo(CB)).toEqual([])
     expect(isRestartPendingOrActive(B.persona.key)).toBe(true)
     expect(isRestartPendingOrActive(A.persona.key)).toBe(false)
   })
@@ -740,27 +752,31 @@ describe('intake', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Lost message (b.kvq no session / b.9cj streamless), keyed to the persona.
-// One smoke case here; the branches and guards are owned by
+// Lost message (b.av2 SR-4.6, SR-7.3; b.kvq no session / b.9cj streamless),
+// keyed to the persona. One smoke case here; the branches, guards and the
+// source × destination matrix are owned by
 // tests/inbound-recovery-drop-branch.test.ts (no session) and
 // tests/dispatch-get-stream.test.ts (streamless).
 // ---------------------------------------------------------------------------
 
-describe('lost message: reply and recovery keyed to the persona, through its client', () => {
-  test('smoke: P (the second persona) has no session: one "started" reply to the source channel on P\'s stub, a restart of P in its working directory, nothing for the other persona', async () => {
+describe('lost message: notice at the persona\'s destination and recovery keyed to the persona, through its client', () => {
+  test('smoke: P (the second persona) has no session: one "starting now" notice at P\'s destination on P\'s stub, nothing in the source channel, a restart of P in its working directory, nothing for the other persona', async () => {
     const h = makeHarness(
       [
         { name: 'Other Bot', channels: [{ id: CB, delivery: 'all' }] },
-        { name: 'Lost Bot', channels: [{ id: CA, delivery: 'all' }] },
+        // Destination CA (the first channel); the message arrives in CS.
+        { name: 'Lost Bot', channels: [{ id: CA, delivery: 'all' }, { id: CS, delivery: 'all' }] },
       ],
       { sessions: ['Other Bot'] },
     )
     const lost = h.p('Lost Bot')
     const other = h.p('Other Bot')
 
-    await receiveOnEach(h, makeChannelMessage({ channel: CA }))
+    await receiveOnEach(h, makeChannelMessage({ channel: CS, text: 'lost-message-body-marker' }))
 
-    expect(h.allPosts()).toEqual([{ key: lost.persona.key, channel: CA, text: LOST_MESSAGE_STARTED_REPLY }])
+    expect(h.allPosts()).toEqual([lostNoticePost(h, 'Lost Bot', CA, 'stub-user', 'starting-now')])
+    expect(h.postsTo(CS)).toEqual([])
+    expect(h.allPosts()[0]!.text).not.toContain('lost-message-body-marker')
     expect(other.notifications).toHaveLength(0)
     expect(isRestartPendingOrActive(other.persona.key)).toBe(false)
     await waitFor(() => h.launches.length > 0)
@@ -770,16 +786,20 @@ describe('lost message: reply and recovery keyed to the persona, through its cli
 })
 
 // ---------------------------------------------------------------------------
-// Dispatch acts on P's session as it is after the name lookup and ack
-// reaction (b.9cj race, PM S1): the stream probe, the log line and the
-// notification (or the drop) all use the session read after those awaits.
+// Dispatch acts on P's session as it is after the awaited name lookup (b.9cj
+// race, PM S1): the stream probe, the log line and the notification (or the
+// drop) all use the session read after that await.
 // ---------------------------------------------------------------------------
 
 describe('dispatch uses P\'s session as registered after the awaited lookup', () => {
-  /** Other Bot first, Race Bot (the receiving persona P) second; both `all` in their own channel. */
+  /**
+   * Other Bot first, Race Bot (the receiving persona P) second. P's
+   * destination is CB (its first channel); each message arrives in CS, so a
+   * notice posted to the source would show up there.
+   */
   const raceSpecs = (): PersonaSpec[] => [
     { name: 'Other Bot', channels: [{ id: CA, delivery: 'all' }] },
-    { name: 'Race Bot', channels: [{ id: CB, delivery: 'all' }] },
+    { name: 'Race Bot', channels: [{ id: CB, delivery: 'all' }, { id: CS, delivery: 'all' }] },
   ]
 
   /** A harness whose name lookup for P runs `during` before it resolves. */
@@ -797,60 +817,63 @@ describe('dispatch uses P\'s session as registered after the awaited lookup', ()
     return h
   }
 
-  test('a newer session with its stream registers during the lookup (the first was streamless): the notification goes to the new session only, with no DROP line and no reply', async () => {
+  test('a newer session with its stream registers during the lookup (the first was streamless): the notification goes to the new session only, with no DROP line and no notice', async () => {
     let fresh: ReturnType<Harness['registerFor']> | undefined
     const h = raceHarness({ firstStreamless: true }, (x) => { fresh = x.registerFor('Race Bot', { tag: 'new' }) })
     const P = h.p('Race Bot')
     const ref = renderPersonaRef(P.persona.name, P.persona.key)
 
-    await h.receive(makeChannelMessage({ channel: CB }), ['Race Bot'])
+    await h.receive(makeChannelMessage({ channel: CS }), ['Race Bot'])
 
-    expect(fresh!.notifications.map((n) => n.params.meta.chat_id)).toEqual([CB])
+    expect(fresh!.notifications.map((n) => n.params.meta.chat_id)).toEqual([CS])
     expect(P.notifications).toHaveLength(0)
     expect(h.p('Other Bot').notifications).toHaveLength(0)
-    const dispatched = lines(h, `Dispatching to persona ${ref} chat_id=${CB}`)
+    const dispatched = lines(h, `Dispatching to persona ${ref} chat_id=${CS}`)
     expect(dispatched).toHaveLength(1)
     expect(dispatched[0]).toContain(`cwd="${fresh!.cwd}" mcpSessionId=${fresh!.mcpSessionId} hasGetStream=true connected=true`)
     expect(lines(h, 'DROP:')).toEqual([])
     expect(h.allPosts()).toEqual([])
+    expect(h.notices).toEqual([])
     expect(h.all.map((x) => isRestartPendingOrActive(x.persona.key))).toEqual([false, false])
     assertNoLeak(captured(h))
   })
 
-  test('a newer streamless session registers during the lookup (the first had its stream): a DROP line names the new session, nothing is notified, and recovery restarts in the new session\'s cwd', async () => {
+  test('a newer streamless session registers during the lookup (the first had its stream): a DROP line names the new session, nothing is notified, recovery restarts in the new session\'s cwd and P\'s destination gets one "starting now" notice', async () => {
     let fresh: ReturnType<Harness['registerFor']> | undefined
     const h = raceHarness({ firstStreamless: false }, (x) => { fresh = x.registerFor('Race Bot', { tag: 'new', streamless: true }) })
     const P = h.p('Race Bot')
     const ref = renderPersonaRef(P.persona.name, P.persona.key)
     h.restartDelayS = 0.005
 
-    await h.receive(makeChannelMessage({ channel: CB }), ['Race Bot'])
+    await h.receive(makeChannelMessage({ channel: CS }), ['Race Bot'])
 
-    const dropped = lines(h, `DROP: no _GET_stream for persona ${ref} chat_id=${CB}`)
+    const dropped = lines(h, `DROP: no _GET_stream for persona ${ref} chat_id=${CS}`)
     expect(dropped).toHaveLength(1)
     expect(dropped[0]).toContain(`cwd="${fresh!.cwd}" mcpSessionId=${fresh!.mcpSessionId}`)
     expect(lines(h, `Dispatching to persona ${ref}`)[0]).toContain(`mcpSessionId=${fresh!.mcpSessionId} hasGetStream=false connected=true`)
     expect(fresh!.notifications).toHaveLength(0)
     expect(P.notifications).toHaveLength(0)
-    expect(h.allPosts()).toEqual([{ key: P.persona.key, channel: CB, text: LOST_MESSAGE_RESTARTING_REPLY }])
+    expect(h.allPosts()).toEqual([lostNoticePost(h, 'Race Bot', CB, 'a-human', 'starting-now')])
+    expect(h.postsTo(CS)).toEqual([])
     await waitFor(() => h.launches.length > 0)
     expect(h.launches).toEqual([{ key: P.persona.key, cwd: fresh!.cwd }])
     expect(isRestartPendingOrActive(h.p('Other Bot').persona.key)).toBe(false)
     assertNoLeak(captured(h))
   })
 
-  test('P\'s session goes away during the lookup: the no-session branch runs (no DROP line, no notification, "started" reply)', async () => {
+  test('P\'s session goes away during the lookup: the no-session branch runs (no DROP line, no notification, one "starting now" notice at P\'s destination)', async () => {
     const h = raceHarness({ firstStreamless: false }, (x) => { unregisterSession(x.p('Race Bot').persona.key) })
     const P = h.p('Race Bot')
     const ref = renderPersonaRef(P.persona.name, P.persona.key)
 
-    await h.receive(makeChannelMessage({ channel: CB }), ['Race Bot'])
+    await h.receive(makeChannelMessage({ channel: CS }), ['Race Bot'])
 
-    expect(lines(h, `No live session for persona ${ref} chat_id=${CB}`)).toHaveLength(1)
+    expect(lines(h, `No live session for persona ${ref} chat_id=${CS}`)).toHaveLength(1)
     expect(lines(h, 'DROP:')).toEqual([])
     expect(lines(h, 'Dispatching to persona')).toEqual([])
     expect(P.notifications).toHaveLength(0)
-    expect(h.allPosts()).toEqual([{ key: P.persona.key, channel: CB, text: LOST_MESSAGE_STARTED_REPLY }])
+    expect(h.allPosts()).toEqual([lostNoticePost(h, 'Race Bot', CB, 'a-human', 'starting-now')])
+    expect(h.postsTo(CS)).toEqual([])
     expect(isRestartPendingOrActive(P.persona.key)).toBe(true)
     expect(isRestartPendingOrActive(h.p('Other Bot').persona.key)).toBe(false)
     assertNoLeak(captured(h))

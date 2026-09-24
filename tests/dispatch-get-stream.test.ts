@@ -5,18 +5,27 @@
  * When the receiving persona P has a connected session whose transport has
  * lost its standalone GET stream (`_GET_stream`), the MCP SDK's send() would
  * evaporate silently. The dispatch path in src/persona-routing.ts therefore
- * does NOT call notification(): it applies the restart guards for P, schedules
- * a human-triggered restart of P in the session's cwd (recover case only) and
- * replies in the source channel through P's own client. When the stream is
- * present, notification() fires with `chat_id` = the source channel and
- * nothing else happens.
+ * does NOT call notification() and adds no ack reaction. It decides the
+ * recovery state from P's restart guards (restarting, starting now,
+ * auto-restart disabled, restart limit reached), schedules a human-triggered
+ * restart of P in the session's cwd only when starting now, and raises one
+ * lost-message notice naming the sender and the state at P's
+ * permission-prompt destination, through P's own client (b.av2 SR-4.6,
+ * SR-7.3). Nothing is posted in the conversation the message came from, and
+ * the notice carries no message text. When the stream is present,
+ * notification() fires with `chat_id` = the source channel and nothing else
+ * happens.
  *
  * These tests drive the real module (`createPersonaRouting(deps).receive`)
  * through the shared harness (tests/test-helpers/persona-routing-harness.ts)
  * with a persona registered in the real registry, the real restart.ts and
- * backoff.ts state, and one `makeStubSlack` client per persona. The receiving
- * persona (alpha) is the SECOND persona of the config, and each case also
- * checks that the first persona (beta) got no restart and no post. The
+ * backoff.ts state, the real persona notifier and destination hold (on the
+ * harness's fake clock), and one `makeStubSlack` client per persona. The
+ * receiving persona (alpha) is the SECOND persona of the config, and each
+ * case also checks that the first persona (beta) got no restart and no post.
+ * Alpha's destination is either its first channel (the message arrives in its
+ * second) or a DM with its contact. The notice is compared with the real
+ * builder's output for the expected state, never with a copied string. The
  * stream-presence probe is the module's exported `hasSessionStream`, the one
  * the restart guard and the health check also use. The no-session branch
  * (b.kvq) is covered by tests/inbound-recovery-drop-branch.test.ts.
@@ -37,22 +46,28 @@ import {
   RESTART_FAILURE_CAP,
 } from '../src/restart.ts'
 import { recordFailure } from '../src/backoff.ts'
+import { consumeAck } from '../src/ack-tracker.ts'
 import type { Persona } from '../src/config.ts'
-import {
-  hasSessionStream,
-  LOST_MESSAGE_AUTO_RESTART_DISABLED_REPLY,
-  LOST_MESSAGE_CAPPED_REPLY,
-  LOST_MESSAGE_RESTARTING_REPLY,
-} from '../src/persona-routing.ts'
+import { hasSessionStream } from '../src/persona-routing.ts'
+import { buildLostMessageNotice, type LostMessageState } from '../src/lost-message.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
-import { makeAppMention, makeChannelMessage, mentionText } from './test-helpers/slack-stub.ts'
+import {
+  makeAppMention,
+  makeChannelMessage,
+  makeDeferredWebApiCall,
+  mentionText,
+  stubOpenedDmId,
+} from './test-helpers/slack-stub.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
+import type { PersonaSpec } from './test-helpers/persona-config.ts'
 import {
   makeRestartDeps,
   makeRoutingHarness,
   makeSessionServer,
   makeTransport,
   resetRoutingState,
+  stateOf,
+  waitFor,
   NEVER_FIRE_RESTART_DELAY_S,
   type RoutingHarness,
   type RoutingHarnessOptions,
@@ -69,6 +84,22 @@ const WAIT_MS = 50
 const ALPHA_FIRST = 'C0ALPHA01'
 const ALPHA_SECOND = 'C0ALPHA02'
 
+/** Alpha's DM contact, for the `dm` destination rows. */
+const ALPHA_CONTACT = 'U0ALPHACN1'
+
+/** The message's author, and the name the stub's `users.info` gives every user. */
+const SENDER_ID = 'U0SENDER01'
+const SENDER_NAME = 'stub-user'
+
+/** The dispatched message's text: it must never reach a notice. */
+const MESSAGE_TEXT = 'lost-body-marker-9cj'
+
+/**
+ * Ack reaction configured for every case, so a reaction on a lost message, or
+ * its ack-tracker entry, would show.
+ */
+const ACK_REACTION = 'eyes'
+
 // ---------------------------------------------------------------------------
 // Harness: beta (first, no session) and alpha (second, the receiving persona,
 // with one registered session whose stream is present or not)
@@ -77,19 +108,25 @@ const ALPHA_SECOND = 'C0ALPHA02'
 let dir: string
 let harnesses: RoutingHarness[] = []
 
-type Alpha = { h: RoutingHarness; alpha: Persona; beta: Persona; sessionCwd: string }
+/** Where alpha's permission prompts (and lost-message notices) go. */
+type Destination = 'channel' | 'dm'
+
+type Alpha = { h: RoutingHarness; alpha: Persona; beta: Persona; sessionCwd: string; destination: string }
 
 function makeAlpha(opts: {
   hasGetStream: boolean
+  destination?: Destination
   sessionRestartDelay?: number
   restartDelayS?: number
   launchSession?: RoutingHarnessOptions['launchSession']
 }): Alpha {
+  const alphaSpec: PersonaSpec = {
+    name: 'alpha',
+    channels: [{ id: ALPHA_FIRST, delivery: 'all' }, { id: ALPHA_SECOND, delivery: 'all' }],
+    ...(opts.destination === 'dm' ? { dm: { enabled: true, contact: ALPHA_CONTACT }, permission_prompts: 'dm' } : {}),
+  }
   const h = makeRoutingHarness(
-    [
-      { name: 'beta' },
-      { name: 'alpha', channels: [{ id: ALPHA_FIRST, delivery: 'all' }, { id: ALPHA_SECOND, delivery: 'all' }] },
-    ],
+    [{ name: 'beta' }, alphaSpec],
     dir,
     {
       sessions: ['alpha'],
@@ -97,16 +134,24 @@ function makeAlpha(opts: {
       overrides: { session_restart_delay: opts.sessionRestartDelay ?? 60 },
       restartDelayS: opts.restartDelayS ?? NEVER_FIRE_RESTART_DELAY_S,
       launchSession: opts.launchSession,
+      ackReaction: ACK_REACTION,
     },
   )
   harnesses.push(h)
   const [beta, alpha] = h.config!.personas as [Persona, Persona]
-  return { h, alpha, beta, sessionCwd: h.p('alpha').sessionCwd! }
+  // Alpha's default destination is its first channel, not the source channel.
+  const destination = opts.destination === 'dm' ? stubOpenedDmId(ALPHA_CONTACT) : ALPHA_FIRST
+  return { h, alpha, beta, sessionCwd: h.p('alpha').sessionCwd!, destination }
 }
 
-/** Deliver one message to alpha in its second channel; returns alpha's session's notifications. */
-async function dispatchToAlpha(a: Alpha): Promise<RoutingHarness['all'][number]['notifications']> {
-  await a.h.receive(makeChannelMessage({ channel: ALPHA_SECOND, text: 'hello' }), ['alpha'])
+/** A human's message to alpha in its second channel. */
+function alphaMessage(): ReturnType<typeof makeChannelMessage> {
+  return makeChannelMessage({ channel: ALPHA_SECOND, user: SENDER_ID, text: MESSAGE_TEXT })
+}
+
+/** Deliver `event` (default: a new `alphaMessage()`) to alpha; returns alpha's session's notifications. */
+async function dispatchToAlpha(a: Alpha, event = alphaMessage()): Promise<RoutingHarness['all'][number]['notifications']> {
+  await a.h.receive(event, ['alpha'])
   return a.h.p('alpha').notifications
 }
 
@@ -114,6 +159,26 @@ async function dispatchToAlpha(a: Alpha): Promise<RoutingHarness['all'][number][
 function expectBetaUntouched(a: Alpha): void {
   expect(isRestartPendingOrActive(a.beta.key)).toBe(false)
   expect(a.h.allPosts().filter((p) => p.key === a.beta.key)).toEqual([])
+}
+
+/**
+ * Exactly one Slack post happened: alpha's lost-message notice for `state`,
+ * naming the sender, through alpha's client at its destination, with no
+ * message text, nothing in the source channel and no ack reaction anywhere.
+ */
+function expectOneLostNotice(a: Alpha, state: LostMessageState): void {
+  const body = buildLostMessageNotice(SENDER_NAME, state)
+  expect(a.h.notices).toEqual([{ key: a.alpha.key, text: body }])
+  expect(a.h.allPosts()).toEqual([{ key: a.alpha.key, channel: a.destination, text: a.h.noticeText('alpha', body) }])
+  expect(a.h.postsTo(ALPHA_SECOND)).toEqual([])
+
+  const posted = a.h.allPosts()[0]!.text!
+  expect(posted).toContain(SENDER_NAME)
+  expect(stateOf(posted)).toBe(state)
+  expect(posted).not.toContain(MESSAGE_TEXT)
+  // The sender's name was looked up through alpha's own client.
+  expect(a.h.p('alpha').stub.calls.usersInfo.map((c) => c?.user)).toEqual([SENDER_ID])
+  for (const x of a.h.all) expect(x.stub.calls.reactionsAdd).toEqual([])
 }
 
 beforeEach(() => {
@@ -125,11 +190,53 @@ beforeEach(() => {
 afterEach(() => {
   try {
     assertNoLeak(harnesses.map((h) => h.captured()))
+    // Every notice here reaches its destination, so the hold keeps no timer.
+    for (const h of harnesses) expect(h.holdClock.pendingCount()).toBe(0)
   } finally {
+    for (const h of harnesses) h.hold.cancelAll()
     resetRoutingState()
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// ---------------------------------------------------------------------------
+// Streamless-state arrangement
+// ---------------------------------------------------------------------------
+
+/** Alpha set up so the next streamless message finds P's restart guards in `state`. */
+interface Arranged {
+  a: Alpha
+  /** Lets a held launch finish. */
+  release(): void
+}
+
+async function arrangeState(state: LostMessageState, destination: Destination): Promise<Arranged> {
+  // restart.ts itself could launch (fast delay), so a wrongly scheduled
+  // restart would show up as a launch.
+  const base = { hasGetStream: false, destination, restartDelayS: FAST_DELAY_S }
+  switch (state) {
+    case 'restarting': {
+      // A launch for alpha is in flight and held open.
+      let launchResolve!: (ok: boolean) => void
+      const held = new Promise<boolean>((res) => { launchResolve = res })
+      const a = makeAlpha({ ...base, launchSession: () => held })
+      scheduleRestart(a.alpha.key, a.sessionCwd)
+      await waitFor(() => a.h.launches.length === 1)
+      expect(a.h.launches).toHaveLength(1)
+      expect(isRestartPendingOrActive(a.alpha.key)).toBe(true)
+      return { a, release: () => launchResolve(true) }
+    }
+    case 'starting-now':
+      return { a: makeAlpha(base), release: () => {} }
+    case 'auto-restart-disabled':
+      return { a: makeAlpha({ ...base, sessionRestartDelay: 0 }), release: () => {} }
+    case 'restart-limit-reached': {
+      const a = makeAlpha(base)
+      for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(a.alpha.key)
+      return { a, release: () => {} }
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -137,104 +244,126 @@ afterEach(() => {
 
 describe('dispatch-site _GET_stream branch (b.sjy + b.9cj)', () => {
   // -------------------------------------------------------------------------
-  // Streamless, recover case: no notification, real scheduleRestart keyed to
-  // the persona (not the source channel), launched in the session's cwd, and
-  // RESTARTING reply to the source channel on the persona's client. Pre-fix
-  // this branch called notification() (silently dropped by the SDK) and never
-  // replied to the sender. The b.sjy instrumentation logs the dispatch line
-  // and the DROP line naming the session.
+  // Streamless, each recovery state × each destination kind: no
+  // notification(), no ack reaction, a launch only when starting now (keyed to
+  // the persona, not the source channel, in the session's cwd), and one
+  // lost-message notice at alpha's destination through alpha's client, with
+  // nothing in the source channel. The b.sjy instrumentation logs the
+  // dispatch line and the DROP line naming the session.
   // -------------------------------------------------------------------------
-  test('b.9cj streamless recover: no notification(); restart keyed to the persona in the session cwd; reply to the source channel', async () => {
-    const a = makeAlpha({ hasGetStream: false, restartDelayS: FAST_DELAY_S })
+  const STATES: readonly [LostMessageState, boolean, number][] = [
+    // state, restart pending or active after the message, launches after it
+    ['restarting', true, 1], // the in-flight launch only; none stacked
+    ['starting-now', true, 1],
+    ['auto-restart-disabled', false, 0],
+    ['restart-limit-reached', false, 0],
+  ]
+  const DESTINATIONS: readonly Destination[] = ['channel', 'dm']
+  const ROWS = DESTINATIONS.flatMap((d) => STATES.map(([s, pending, launches]) => [s, d, pending, launches] as const))
 
-    const notifications = await dispatchToAlpha(a)
+  test.each(ROWS)('b.9cj streamless %s, %s destination: no notification(), its recovery, one destination notice, nothing in the source channel', async (state, destination, pending, launches) => {
+    const { a, release } = await arrangeState(state, destination)
+    const event = alphaMessage()
+
+    const notifications = await dispatchToAlpha(a, event)
 
     expect(notifications).toHaveLength(0)
-    // Real scheduleRestart placed a pending timer under the persona key …
-    expect(isRestartPendingOrActive(a.alpha.key)).toBe(true)
-    // … and NOT under the source channel (mis-keying regression).
+    // No ack reaction and no ack-tracker entry for a lost message (the
+    // reaction itself is checked in expectOneLostNotice).
+    expect(consumeAck(ALPHA_SECOND, event.ts as string)).toBe(false)
+    expect(isRestartPendingOrActive(a.alpha.key)).toBe(pending)
+    // Never keyed by the source channel (mis-keying regression).
     expect(isRestartPendingOrActive(ALPHA_SECOND)).toBe(false)
-    expect(a.h.allPosts()).toEqual([{ key: a.alpha.key, channel: ALPHA_SECOND, text: LOST_MESSAGE_RESTARTING_REPLY }])
+    expectOneLostNotice(a, state)
     expectBetaUntouched(a)
     const ref = renderPersonaRef(a.alpha.name, a.alpha.key)
     const mcpSessionId = `mcp-${a.alpha.key}`
     expect(a.h.logs.filter((l) => l.startsWith(`[slack] Dispatching to persona ${ref} chat_id=${ALPHA_SECOND} cwd="${a.sessionCwd}" mcpSessionId=${mcpSessionId} hasGetStream=false connected=true`))).toHaveLength(1)
     expect(a.h.logs.filter((l) => l.startsWith(`[slack] DROP: no _GET_stream for persona ${ref} chat_id=${ALPHA_SECOND} cwd="${a.sessionCwd}" mcpSessionId=${mcpSessionId}`))).toHaveLength(1)
 
-    // The launch relaunches the session where it ran, not the configured default.
+    // A stacked or wrongly scheduled timer would have fired by now. A launch
+    // relaunches the session where it ran, not the configured default.
     await Bun.sleep(WAIT_MS)
-    expect(a.h.launches).toEqual([{ key: a.alpha.key, cwd: a.sessionCwd }])
+    expect(a.h.launches).toHaveLength(launches)
+    if (launches > 0) expect(a.h.launches).toEqual([{ key: a.alpha.key, cwd: a.sessionCwd }])
+
+    release()
+    await Bun.sleep(1)
   })
 
   // -------------------------------------------------------------------------
-  // Streamless, already-restarting: a launch for the persona is in flight, so
-  // no second launch is stacked; still replies "restarting". (The recover case
-  // replies the same text, so the launch count is what tells them apart.)
+  // Restarting and starting now are reported differently. The first message
+  // starts a restart (starting now) whose launch is held open; the second
+  // finds it under way (restarting). Two notices, same sender, different text.
   // -------------------------------------------------------------------------
-  test('b.9cj streamless already-restarting: no new launch, RESTARTING reply', async () => {
+  test('b.9cj streamless: "starting now" and "restarting" give different notices', async () => {
     let launchResolve!: (ok: boolean) => void
     const held = new Promise<boolean>((res) => { launchResolve = res })
     const a = makeAlpha({ hasGetStream: false, restartDelayS: FAST_DELAY_S, launchSession: () => held })
-    scheduleRestart(a.alpha.key, a.sessionCwd)
-    await Bun.sleep(WAIT_MS) // timer fired; the launch is in flight
-    expect(isRestartPendingOrActive(a.alpha.key)).toBe(true)
 
-    const notifications = await dispatchToAlpha(a)
-    await Bun.sleep(WAIT_MS) // a stacked timer would have fired by now
+    await dispatchToAlpha(a)
+    await a.h.receive(makeChannelMessage({ channel: ALPHA_SECOND, user: SENDER_ID, text: MESSAGE_TEXT }), ['alpha'])
 
-    expect(notifications).toHaveLength(0)
+    const posts = a.h.allPosts()
+    expect(posts.map((p) => p.channel)).toEqual([ALPHA_FIRST, ALPHA_FIRST])
+    const [first, second] = posts.map((p) => p.text!) as [string, string]
+    expect(stateOf(first)).toBe('starting-now')
+    expect(stateOf(second)).toBe('restarting')
+    expect(first).not.toBe(second)
+    for (const text of [first, second]) expect(text).toContain(SENDER_NAME)
+    await waitFor(() => a.h.launches.length > 0)
     expect(a.h.launches).toHaveLength(1)
-    expect(a.h.allPosts()).toEqual([{ key: a.alpha.key, channel: ALPHA_SECOND, text: LOST_MESSAGE_RESTARTING_REPLY }])
-    expectBetaUntouched(a)
 
     launchResolve(true)
     await Bun.sleep(1)
   })
 
   // -------------------------------------------------------------------------
-  // Streamless, auto-restart disabled / capped: no scheduleRestart, the
-  // branch's reply to the source channel on the persona's client.
+  // The notice is awaited: dispatch returns only once the destination post
+  // has been answered, so a caller (and every case above) can assert on the
+  // notice right after the receive.
   // -------------------------------------------------------------------------
-  test.each([
-    ['auto-restart-disabled (session_restart_delay 0)', 0, false, LOST_MESSAGE_AUTO_RESTART_DISABLED_REPLY],
-    ['capped (persona at the restart-failure cap)', 60, true, LOST_MESSAGE_CAPPED_REPLY],
-  ] as const)('b.9cj streamless %s: no notification(), no scheduleRestart, its reply', async (_label, delay, capped, expected) => {
-    // restart.ts itself could launch (fast delay), so a wrongly scheduled
-    // restart would show up as a launch.
-    const a = makeAlpha({ hasGetStream: false, sessionRestartDelay: delay, restartDelayS: FAST_DELAY_S })
-    if (capped) for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(a.alpha.key)
+  test('b.9cj streamless: the receive settles only after the notice post is answered', async () => {
+    const a = makeAlpha({ hasGetStream: false })
+    const post = makeDeferredWebApiCall()
+    a.h.p('alpha').stub.script.post.push(post.outcome)
 
-    const notifications = await dispatchToAlpha(a)
+    let returned = false
+    const receiving = dispatchToAlpha(a).then(() => { returned = true })
+    await waitFor(() => a.h.allPosts().length === 1)
+    await Bun.sleep(5)
 
-    expect(notifications).toHaveLength(0)
-    expect(isRestartPendingOrActive(a.alpha.key)).toBe(false)
-    expect(a.h.allPosts()).toEqual([{ key: a.alpha.key, channel: ALPHA_SECOND, text: expected }])
-    expectBetaUntouched(a)
-    await Bun.sleep(WAIT_MS)
-    expect(a.h.launches).toHaveLength(0)
+    expect(a.h.allPosts().map((p) => p.channel)).toEqual([ALPHA_FIRST])
+    expect(returned).toBe(false)
+
+    post.settle()
+    await receiving
+    expect(returned).toBe(true)
+    expectOneLostNotice(a, 'starting-now')
   })
 
   // -------------------------------------------------------------------------
   // Streamless, duplicated mention (b.av2 SR-4.1): a mention reaches the
   // persona as a `message` and an `app_mention` with the same (channel, ts),
   // and Slack may redeliver either. The persona's dedupe store sits before
-  // dispatch, so the pair gives one reply, one recovery and no notification,
+  // dispatch, so the pair gives one notice, one recovery and no notification,
   // and a redelivery after the launch adds nothing.
   // -------------------------------------------------------------------------
-  test('b.9cj streamless duplicated mention: a `message` / `app_mention` pair gives one reply, one recovery, no notification', async () => {
+  test('b.9cj streamless duplicated mention: a `message` / `app_mention` pair gives one notice, one recovery, no notification', async () => {
     const a = makeAlpha({ hasGetStream: false, restartDelayS: FAST_DELAY_S })
-    const text = `${mentionText(a.h.p('alpha').stub.identity.botUserId)} hello`
-    const message = makeChannelMessage({ channel: ALPHA_SECOND, text })
-    const mention = makeAppMention({ channel: ALPHA_SECOND, text, ts: message.ts })
+    const text = `${mentionText(a.h.p('alpha').stub.identity.botUserId)} ${MESSAGE_TEXT}`
+    const message = makeChannelMessage({ channel: ALPHA_SECOND, user: SENDER_ID, text })
+    const mention = makeAppMention({ channel: ALPHA_SECOND, user: SENDER_ID, text, ts: message.ts })
     expect(mention.ts).toBe(message.ts)
 
     await a.h.receive(message, ['alpha'])
     await a.h.receive(mention, ['alpha'])
 
     expect(a.h.p('alpha').notifications).toHaveLength(0)
-    // Without dedupe the app_mention would reach the branch again and post a
-    // second reply.
-    expect(a.h.allPosts()).toEqual([{ key: a.alpha.key, channel: ALPHA_SECOND, text: LOST_MESSAGE_RESTARTING_REPLY }])
+    // Without dedupe the app_mention would reach the branch again and raise a
+    // second notice.
+    expectOneLostNotice(a, 'starting-now')
+    expect(consumeAck(ALPHA_SECOND, message.ts as string)).toBe(false)
     expect(isRestartPendingOrActive(a.alpha.key)).toBe(true)
     expectBetaUntouched(a)
     const ref = renderPersonaRef(a.alpha.name, a.alpha.key)
@@ -251,25 +380,32 @@ describe('dispatch-site _GET_stream branch (b.sjy + b.9cj)', () => {
 
     expect(isRestartPendingOrActive(a.alpha.key)).toBe(false)
     expect(a.h.allPosts()).toHaveLength(1)
+    expect(a.h.notices).toHaveLength(1)
     expect(a.h.p('alpha').notifications).toHaveLength(0)
     expect(a.h.logs).toEqual(logsBefore)
   })
 
   // -------------------------------------------------------------------------
-  // Stream-PRESENT branch: notification() fires once to the source channel;
-  // no reply and no restart.
+  // Stream-PRESENT branch: notification() fires once to the source channel
+  // with the ack reaction on the message; no notice, no post and no restart.
   // -------------------------------------------------------------------------
-  test('b.9cj stream-present: one notification() with chat_id = source channel, no reply and no restart', async () => {
+  test('b.9cj stream-present: one notification() with chat_id = source channel, no notice, no post and no restart', async () => {
     const a = makeAlpha({ hasGetStream: true })
+    const event = alphaMessage()
 
-    const notifications = await dispatchToAlpha(a)
+    const notifications = await dispatchToAlpha(a, event)
 
     expect(notifications).toHaveLength(1)
     expect(notifications[0]!.method).toBe('notifications/claude/channel')
     expect(notifications[0]!.params.meta.chat_id).toBe(ALPHA_SECOND)
+    expect(a.h.notices).toEqual([])
     expect(a.h.allPosts()).toEqual([])
     expect(isRestartPendingOrActive(a.alpha.key)).toBe(false)
     expectBetaUntouched(a)
+    // Only a dispatched message gets the ack reaction.
+    expect(a.h.p('alpha').stub.calls.reactionsAdd.map((c) => [c?.channel, c?.name])).toEqual([[ALPHA_SECOND, ACK_REACTION]])
+    // … and is tracked, so the reply can remove it.
+    expect(consumeAck(ALPHA_SECOND, event.ts as string)).toBe(true)
     const ref = renderPersonaRef(a.alpha.name, a.alpha.key)
     expect(a.h.logs.filter((l) => l.includes(`Dispatching to persona ${ref} chat_id=${ALPHA_SECOND}`) && l.includes('hasGetStream=true connected=true'))).toHaveLength(1)
     expect(a.h.logs.filter((l) => l.includes('DROP:'))).toEqual([])

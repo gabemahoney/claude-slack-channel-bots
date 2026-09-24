@@ -22,6 +22,13 @@
  * under test (`setSessionNotifier`, `initOutageState({ notify })`, the
  * safeguard's `notify` argument).
  *
+ * `makeNotifierStack(deps)` is the wiring on its own: a destination resolver,
+ * the destination hold over it on a fake clock, and the notifier handing
+ * notices to that hold, all over the caller's persona and client lookups and
+ * one log, as `src/server.ts` builds them. The harness above and the routing
+ * helpers (tests/test-helpers/persona-routing-harness.ts,
+ * tests/test-helpers/persona-routing-managed.ts) build their notifier with it.
+ *
  * Isolation (b.av2 SR-13.2): no module-scope state, no I/O, no real timers,
  * no token literal. The stubs' failures carry `leakMarker` when given.
  *
@@ -41,6 +48,51 @@ import { makeStubSlack, type StubSlack, type WebApiOutcome } from './slack-stub.
 export interface NoticePost {
   channel: string
   text: string
+}
+
+/** The lookups, clock and log `makeNotifierStack` builds the notifier over. */
+export interface NotifierStackDeps {
+  /** The applied persona for a key, read at call time. */
+  getPersona(key: string): Persona | undefined
+  /** The persona's Web API client, or undefined when it has none (not validated yet). */
+  clientFor(key: string): WebClient | undefined
+  /** The destination hold's clock and timers. Default: a new `createFakeClock()`. */
+  clock?: FakeClock
+  /** Dry-run flag, read at call time. Default: never dry run. */
+  isDryRun?: () => boolean
+  /** Every line the resolver, the hold and the notifier log. */
+  log(line: string): void
+}
+
+/** The notifier and the pieces it was built with. */
+export interface NotifierStack {
+  readonly notifier: PersonaNotifier
+  /** The destination hold the notifier hands notices to, on `clock`. */
+  readonly hold: PersonaDestinationHold
+  /** The destination resolver the hold posts through. */
+  readonly destinations: PersonaDestinations
+  /** The fake clock the destination hold runs on. */
+  readonly clock: FakeClock
+}
+
+/**
+ * The real destination resolver, destination hold (on a fake clock, never the
+ * real one) and persona notifier, wired as `src/server.ts` wires them.
+ */
+export function makeNotifierStack(deps: NotifierStackDeps): NotifierStack {
+  const { getPersona, clientFor, log } = deps
+  const clock = deps.clock ?? createFakeClock()
+  const destinations = createPersonaDestinations({ log })
+  const hold = createPersonaDestinationHold({ destinations, getPersona, clientFor, clock, log })
+  const notifier = createPersonaNotifier({
+    getPersona,
+    clientFor,
+    destinations,
+    destinationHold: hold,
+    isDryRun: deps.isDryRun ?? (() => false),
+    log,
+  })
+  return { notifier, hold, destinations, clock }
 }
 
 export interface NotifierHarnessOptions {
@@ -107,21 +159,16 @@ export function makeNotifierHarness(
   )
   const logs: string[] = []
   let dryRun = opts.dryRun ?? false
-  const clock = opts.clock ?? createFakeClock()
   const getPersona = (key: string): Persona | undefined => personas.find((p) => p.key === key)
   const clientFor = (key: string): WebClient | undefined =>
     validated.has(key) ? (stubs.get(key)?.web as unknown as WebClient | undefined) : undefined
   const log = (line: string): void => {
     logs.push(line)
   }
-  const destinations = createPersonaDestinations({ log })
-  const hold = createPersonaDestinationHold({ destinations, getPersona, clientFor, clock, log })
-
-  const notifier = createPersonaNotifier({
+  const { notifier, hold, destinations, clock } = makeNotifierStack({
     getPersona,
     clientFor,
-    destinations,
-    destinationHold: hold,
+    clock: opts.clock,
     isDryRun: () => dryRun,
     log,
   })

@@ -17,8 +17,25 @@
  *   `h.launches`, and the restart delay is read from `h.restartDelayS` at call
  *   time. `launchSession` replaces the launch outcome (hold a launch open to
  *   keep the persona in flight);
- * - a line capture for the module's log seam (`h.logs`) and an order capture
- *   (`h.order`) for ack, archive, config and identity reads.
+ * - the real persona notifier as the injected `notify`, built by
+ *   `makeNotifierStack` (tests/test-helpers/persona-notifier.ts) over the
+ *   same `clientFor` and stubs and the applied config (`h.config`, read at
+ *   call time), never in dry run, so a lost-message notice is a
+ *   `chat.postMessage` on the persona's own stub at its destination (a
+ *   channel, or for `permission_prompts: 'dm'` the DM `conversations.open`
+ *   returns). Its destination hold (`h.hold`) runs on a fake clock
+ *   (`h.holdClock`), never the real one. A persona whose client is
+ *   unavailable has its notices held until `h.notifier.flush(key)`. Every
+ *   notice the routing raises is also recorded, body only, in `h.notices`;
+ *   the `notify` option replaces the notifier (for example with a throwing
+ *   sink);
+ * - the user-name lookup, as src/server.ts does it: `users.info` through the
+ *   persona's client from `clientFor`, or the user ID when the persona has no
+ *   client (`h.clients.setUnavailable`); the `resolveUserName` option
+ *   replaces it;
+ * - a line capture for the module's log seam, the notifier and the hold
+ *   (`h.logs`), and an order capture (`h.order`) for ack, archive, config and
+ *   identity reads.
  *
  * Every call builds a new routing, so every harness starts with empty
  * per-persona dedupe stores; `dedupeClock` injects their clock (default
@@ -26,7 +43,9 @@
  *
  * The harness calls `initRestart` and registers sessions; reset the registry,
  * restart, backoff and ack-tracker state between tests with
- * `resetRoutingState()`.
+ * `resetRoutingState()`. A case that can hold a notice (a failing destination)
+ * calls `h.hold.cancelAll()` in teardown; the hold's timers are on
+ * `h.holdClock`, so nothing fires unless the test moves it.
  *
  * Isolation (b.av2 SR-13.2): every path is under the caller's `baseDir`; no
  * I/O of its own, no timers, no token literal.
@@ -42,6 +61,9 @@ import type { WebStandardStreamableHTTPServerTransport } from '@modelcontextprot
 
 import type { Persona, PersonaConfig } from '../../src/config.ts'
 import { createPersonaRouting, type PersonaRoutingDeps } from '../../src/persona-routing.ts'
+import { formatPersonaNotice, type PersonaNotifier } from '../../src/persona-notifier.ts'
+import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
+import type { LostMessageState } from '../../src/lost-message.ts'
 import { registerSession, _resetRegistry } from '../../src/registry.ts'
 import { initRestart, _resetRestartState, type RestartDeps } from '../../src/restart.ts'
 import { _resetBackoffState } from '../../src/backoff.ts'
@@ -56,12 +78,43 @@ import { makeMultiPersonaConfig, type PersonaSpec } from './persona-config.ts'
 import { makeStubSlack, type StubSlack, type StubSlackOptions } from './slack-stub.ts'
 import { makePersonaClients, posts, type PersonaClients } from './permission-relay-harness.ts'
 import { LEAK_SENTINEL } from './credentials.ts'
+import type { FakeClock } from './fake-clock.ts'
+import { makeNotifierStack } from './persona-notifier.ts'
 
 /** Default restart delay (seconds): the restart timer fires within a few ms. */
 export const FAST_RESTART_DELAY_S = 0.005
 
 /** A restart delay (seconds) that never fires during a test. */
 export const NEVER_FIRE_RESTART_DELAY_S = 9999
+
+// ---------------------------------------------------------------------------
+// Lost-message recovery states
+// ---------------------------------------------------------------------------
+
+/** The four recovery states a lost-message notice reports (b.av2 SR-7.3), in decision order. */
+export const LOST_MESSAGE_STATES: readonly LostMessageState[] = [
+  'restarting',
+  'starting-now',
+  'auto-restart-disabled',
+  'restart-limit-reached',
+]
+
+/**
+ * The phrase that identifies each recovery state in a notice, so a state is
+ * told apart by its text and not only by equality with the builder's output.
+ */
+export const LOST_STATE_PHRASES: Readonly<Record<LostMessageState, RegExp>> = {
+  'restarting': /\brestarting\b/i,
+  'starting-now': /\bstarting now\b/i,
+  'auto-restart-disabled': /\bauto-restart disabled\b/i,
+  'restart-limit-reached': /\brestart limit reached\b/i,
+}
+
+/** The one recovery state a notice text identifies, or `none` / `several`. */
+export function stateOf(text: string | undefined): LostMessageState | 'none' | 'several' {
+  const found = LOST_MESSAGE_STATES.filter((s) => LOST_STATE_PHRASES[s].test(text ?? ''))
+  return found.length === 1 ? found[0]! : found.length === 0 ? 'none' : 'several'
+}
 
 // ---------------------------------------------------------------------------
 // Sessions
@@ -184,7 +237,7 @@ export interface RoutingHarnessOptions {
   ackReaction?: string
   /** The archive DB the archive seam writes to; the seam is a no-op without one. */
   archiveDb?: Database
-  /** Replaces the user-name lookup (default: `users.info` on P's stub). */
+  /** Replaces the user-name lookup (default: `users.info` on P's client from `clientFor`, the user ID when it has none). */
   resolveUserName?: PersonaRoutingDeps['resolveUserName']
   /** Server-wide config overrides (e.g. `session_restart_delay`). */
   overrides?: Partial<Omit<PersonaConfig, 'personas'>>
@@ -194,6 +247,21 @@ export interface RoutingHarnessOptions {
   launchSession?: RestartFakeOptions['launchSession']
   /** Clock for the per-persona dedupe stores (e.g. a fake clock's `now`); default the module's (`Date.now`). */
   dedupeClock?: PersonaRoutingDeps['dedupeClock']
+  /** Replaces the routing's `notify` (default: the real notifier, `h.notifier.notify`); calls are still recorded in `h.notices`. */
+  notify?: PersonaRoutingDeps['notify']
+}
+
+/** One notice the routing raised: the persona key and the body, without the notifier's persona prefix. */
+export interface RaisedNotice {
+  key: string
+  text: string
+}
+
+/** One captured `chat.postMessage`, tagged with the key of the persona whose stub made it. */
+export interface HarnessPost {
+  key: string
+  channel: string
+  text: string | undefined
 }
 
 export interface RoutingHarness {
@@ -222,7 +290,19 @@ export interface RoutingHarness {
   /** Register a (further) session for the named persona in the real registry; a live one is replaced. */
   registerFor(name: string, opts?: RegisterSessionOptions): SessionHandle
   /** Every `chat.postMessage` on every stub, tagged with the stub's persona key, in persona order. */
-  allPosts(): Array<{ key: string; channel: string; text: string | undefined }>
+  allPosts(): HarnessPost[]
+  /** The `chat.postMessage` calls to conversation `channel` (a `C…` or `D…` ID), on any persona's stub. */
+  postsTo(channel: string): HarnessPost[]
+  /** The real persona notifier the routing's `notify` defaults to (`flush(key)` posts held notices). */
+  notifier: PersonaNotifier
+  /** The notifier's destination hold (holds and retries a notice whose destination fails), on `holdClock`. */
+  hold: PersonaDestinationHold
+  /** The fake clock the destination hold runs on. */
+  holdClock: FakeClock
+  /** Every notice the routing raised through `notify`, in order (body only). */
+  notices: RaisedNotice[]
+  /** The text the notifier posts for persona `name` and notice body `body` (its persona prefix, then the body). */
+  noticeText(name: string, body: string): string
   /** Everything the harness captured, for `assertNoLeak`. */
   captured(): Record<string, unknown>
 }
@@ -284,6 +364,14 @@ export function makeRoutingHarness(
 
   const restartDeps = makeRestartDeps({ restartDelayS: () => h.restartDelayS, launchSession: opts.launchSession })
 
+  // The notifier and its hold, as server.ts builds them: the applied persona
+  // read at call time, the same client lookup as the routing, one log. (`h`
+  // is read only when they are called.)
+  const log = (line: string): void => { h.logs.push(line) }
+  const getPersona = (key: string): Persona | undefined => h.config?.personas.find((p) => p.key === key)
+  const webClientFor = (key: string) => clients.clientFor(key) as unknown as WebClient | undefined
+  const { notifier, hold, clock: holdClock } = makeNotifierStack({ getPersona, clientFor: webClientFor, log })
+
   const h: RoutingHarness = {
     config,
     p: byName,
@@ -309,15 +397,29 @@ export function makeRoutingHarness(
     allPosts: () => handles.flatMap((x) =>
       posts(x.stub).map((c) => ({ key: x.persona.key, channel: c.channel, text: c.text })),
     ),
+    postsTo: (channel) => h.allPosts().filter((c) => c.channel === channel),
+    notifier,
+    hold,
+    holdClock,
+    notices: [],
+    noticeText: (name, body) => formatPersonaNotice(byName(name).persona, body),
     captured: () => ({
       logs: h.logs,
       calls: Object.fromEntries(handles.map((x) => [x.persona.name, x.stub.calls])),
       notifications: [...handles.map((x) => x.notifications), ...extraNotifications],
       posts: h.allPosts(),
+      notices: h.notices,
     }),
   }
 
+  const notify: PersonaRoutingDeps['notify'] = opts.notify ?? ((key, text, options) => notifier.notify(key, text, options))
   const resolver = (key: string) => createNameResolver(byKey(key)!.stub.web as unknown as NameResolverWebClient)
+  // As server.ts: the lookup goes through the persona's client, and a persona
+  // with no client (not validated yet, dry run) gets the user ID.
+  const resolveUserName: PersonaRoutingDeps['resolveUserName'] = async (key, userId) => {
+    const client = webClientFor(key)
+    return client ? createNameResolver(client as unknown as NameResolverWebClient).resolveUserName(userId) : userId
+  }
   const routing = createPersonaRouting({
     getPersonaConfig: () => {
       h.order.push('config')
@@ -327,14 +429,18 @@ export function makeRoutingHarness(
       h.order.push(`identity:${key}`)
       return byKey(key)?.stub.identity
     },
-    clientFor: (key) => clients.clientFor(key) as unknown as WebClient | undefined,
-    resolveUserName: opts.resolveUserName ?? ((key, userId) => resolver(key).resolveUserName(userId)),
+    clientFor: webClientFor,
+    resolveUserName: opts.resolveUserName ?? resolveUserName,
     archive: (key, event) => {
       h.order.push(`archive:${key}`)
       if (opts.archiveDb) h.archiveWrites.push(archiveSlackMessage(opts.archiveDb, event as SlackMessageEvent, resolver(key)))
     },
     getAccess: () => ({ ackReaction: opts.ackReaction }),
-    log: (line) => { h.logs.push(line) },
+    notify: (key, text, options) => {
+      h.notices.push({ key, text })
+      return notify(key, text, options)
+    },
+    log,
     dedupeClock: opts.dedupeClock,
   })
 

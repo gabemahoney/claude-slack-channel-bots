@@ -21,6 +21,7 @@ When reviewing tests, check for:
 - [ ] No false positives — tests would fail if the feature broke
 - [ ] Assertions are specific (`.toBe('allow')` not `.toBeTruthy()`)
 - [ ] A multi-persona delivery test asserts every persona's exact deliveries (count, `chat_id` and `via`), including the personas that get nothing; asserting only that the expected persona got at least one is a defect
+- [ ] A "nothing posted there" claim (for example, a lost message posts nothing in a source conversation that is not its destination) is a zero-count assertion on that exact target, such as `expect(h.postsTo(source)).toEqual([])`, and the test's source differs from the destination; a persona's destination defaults to its first channel, so a source that is also the destination hides a source post behind the expected notice
 - [ ] No hardcoded values that should come from factory functions
 
 ### Isolation

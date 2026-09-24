@@ -41,7 +41,13 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
 
 1. **Persona is silent, `/interject` returns 503 for it, or its scheduled
    prompts log `no-session`.** Find its key: the `persona-start` line for its
-   name (see [Reading a persona line](#reading-a-persona-line)).
+   name (see [Reading a persona line](#reading-a-persona-line)). If the
+   persona is up but its instance can't take messages, each message sent to
+   it is lost: its destination (its `permission_prompts` channel, or its DM
+   with `dm.contact`) has a *Message lost* notice whose `Recovery:` wording
+   says whether a server restart is needed, and `server.log` has a
+   `No live session` or `DROP: no _GET_stream` line (see
+   [Other lines you may see](#other-lines-you-may-see)).
 2. **Pull every line for that key** from `server.log` (see
    [The server log](#the-server-log)).
 3. **Match the class** of the first failure line after its latest
@@ -616,6 +622,10 @@ and is `broken`.
 |---|---|
 | `[slack] persona "<name>" (key=<key>): up after its bring-up retry (directory\|Slack) — launching` | A retrying persona came up and is launched from its retry. Normal recovery. |
 | `[slack] Session connected: persona "<name>" (key=<key>) cwd="<path>"` | The persona's instance registered: it's being served. |
+| `[slack] No live session for persona "<name>" (key=<key>) chat_id=<id> — dropping message` | The persona is up, but its instance has no live MCP session, so a message for it is lost: not delivered, not saved and not replayed later. Nothing else is posted in `<id>`, the conversation it came from (the notice below lands there only when `<id>` is the destination), and it gets no ack reaction. The persona posts one lost-message notice to its destination: `Persona "<name>" (key=<key>): :warning: *Message lost* — a message from <sender> …`, naming the sender (display name, else user ID; for a bot or webhook post, its name or bot ID) and ending in a `Recovery:` state, never the message text. `restarting` and `starting now`: the instance is being restarted; resend once it's back. `auto-restart disabled` and `restart limit reached`: the notice says to restart the server to recover. If the notice doesn't arrive, look for a [`persona-destination-failed`](#persona-destination-failed) line. |
+| `[slack] DROP: no _GET_stream for persona "<name>" (key=<key>) chat_id=<id> cwd="<path>" mcpSessionId=<id> — message will not reach the bot; triggering recovery` | The instance's session is registered and looks connected, but its message stream is gone (the `Dispatching to persona …` line just before it has `hasGetStream=false`). The message is lost exactly as for `No live session` above: the same lost-message notice at the destination, nothing else in the source conversation. |
+| `[slack] persona-routing: user-name lookup for persona "<name>" (key=<key>) failed, using the user ID: …` | The sender's display name couldn't be looked up through the persona's Slack client. The message is handled as usual, with the sender named by user ID (in the delivered message, or in a lost-message notice). Nothing to do unless it repeats; then check the persona's app and the host's Slack connectivity. |
+| `[slack] persona-routing: lost-message notice for persona "<name>" (key=<key>) failed: …` | An internal error raising a lost-message notice: the message was lost and its recovery still ran, but no notice reaches the destination. Report it as a bug, with the persona's lines around it. |
 | `[slack] Session connected with CWD "<path>" — no matching persona` | A Claude session connected from a directory that is no persona's `working_directory` (compared by real path). It is not registered: the server disconnects it. Start it from the persona's directory, or fix `working_directory`. |
 | `[slack] persona-destination: <ref> has permission_prompts set to "dm" but dm.enabled is not true — no DM opened and nothing posted` (or `… dm.contact is not set …`; for a prompt the line starts `[slack] permission-poller: <ref>` and ends `— prompt for <instance> (request_token=…) not posted and no DM opened`) | The persona's prompt or notice had a `"dm"` destination without DMs on or a contact, which the loader rejects, so it should not happen. Nothing is sent. Report it as a bug, with the persona's lines. |
 | `[slack] persona-destination-hold: more than 20 notices held for "<name>" (key=<key>) while its destination fails — oldest held notice dropped, not posted: <first line>` | The persona's destination has been failing for a while (see [`persona-destination-failed`](#persona-destination-failed)) and more than 20 notices are waiting. The oldest is dropped; the line shows its first line. Fix the destination. |

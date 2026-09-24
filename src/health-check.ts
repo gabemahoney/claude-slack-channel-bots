@@ -183,9 +183,10 @@ export function startHealthCheck(intervalSeconds: number): void {
           //
           // b.9a7 design decision 1 (DELIBERATE): this skip covers the new
           // alive-but-disconnected reconnect path too — a capped persona gets NO
-          // tick-driven reconnect. The b.kvq user-facing reply promises a capped
-          // persona "will NOT recover on its own — an operator must restart the
-          // server"; a quiet tick-driven /mcp reconnect would contradict that.
+          // tick-driven reconnect. The lost-message notice at the persona's
+          // destination reports a capped persona as "restart limit reached":
+          // automatic restarts are suspended and the operator must restart the
+          // server; a quiet tick-driven /mcp reconnect would contradict that.
           // Revisiting this (reconnects are far cheaper than relaunches) is a
           // separate decision — do not silently flip it here.
           if (deps.isAtCap(key)) {

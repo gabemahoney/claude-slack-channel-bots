@@ -636,6 +636,10 @@ const personaRouting = createPersonaRouting({
   resolveUserName: resolvePersonaUserName,
   archive: (key, event) => archiveWrite?.(key, event),
   getAccess,
+  // Lost-message notices go through the one notifier. It is built further
+  // down, so it is read at call time: naming it here would throw while this
+  // module is still loading.
+  notify: (key, text, options) => personaNotifier.notify(key, text, options),
   log: (line) => console.error(line),
 })
 
@@ -692,8 +696,9 @@ const personaDestinationHold = createPersonaDestinationHold({
 })
 
 /**
- * The one per-persona notifier. Outage state, the session manager and the
- * JSONL safeguard send every persona notice through it (installed in main()).
+ * The one per-persona notifier. Outage state, the session manager, the JSONL
+ * safeguard (installed in main()) and the persona routing's lost-message
+ * notices send every persona notice through it.
  * A notice raised while its persona has no client is held, and flushed when
  * that persona reports up (the manager's status listener).
  */

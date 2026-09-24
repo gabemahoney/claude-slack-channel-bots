@@ -8,10 +8,15 @@
  * seams the server passes: `getBotIdentity` from the harness's identity getter
  * (`createPersonaIdentityLookup`), `clientFor` from its client lookup
  * (`createPersonaClientLookup`), the user-name lookup on the receiving
- * persona's own client (`users.info`, the ID when it has no client), and the
- * archive seam the caller passes (default: none). It registers one session per
- * harness persona in the real registry (a fake transport holding
- * `_GET_stream` and a server that records `notifications/claude/channel`).
+ * persona's own client (`users.info`, the ID when it has no client), the
+ * archive seam the caller passes (default: none), and as `notify` the real
+ * persona notifier, built by `makeNotifierStack`
+ * (tests/test-helpers/persona-notifier.ts) over the harness's
+ * applied-persona and client lookups, never in dry run, whose destination
+ * hold runs on its own fake clock, never the real one or the connection
+ * manager's. It registers one session per harness persona in the real
+ * registry (a fake transport holding `_GET_stream` and a server that records
+ * `notifications/claude/channel`).
  *
  * `tests/test-helpers/persona-routing-harness.ts` is the stub-client
  * counterpart; use this one when the routing must read the connection
@@ -29,6 +34,7 @@ import { join } from 'node:path'
 import { createPersonaRouting, type PersonaRouting, type PersonaRoutingDeps } from '../../src/persona-routing.ts'
 import { registerSession } from '../../src/registry.ts'
 import type { ConnectionHarness } from './persona-connection-harness.ts'
+import { makeNotifierStack } from './persona-notifier.ts'
 import { makeSessionServer, makeTransport, type ChannelNotification } from './persona-routing-harness.ts'
 
 export interface ManagedRoutingOptions {
@@ -53,6 +59,8 @@ export function makeManagedRouting(h: ConnectionHarness, baseDir: string, opts: 
     notifications.set(p.key, captured)
   }
   const logs: string[] = []
+  const log = (line: string): void => void logs.push(line)
+  const { notifier } = makeNotifierStack({ getPersona: h.getPersona, clientFor: h.clientFor, log })
   const routing = createPersonaRouting({
     getPersonaConfig: () => h.config,
     getBotIdentity: (key) => h.identityFor(key),
@@ -65,7 +73,8 @@ export function makeManagedRouting(h: ConnectionHarness, baseDir: string, opts: 
     },
     archive: opts.archive ?? (() => {}),
     getAccess: () => ({}),
-    log: (line) => void logs.push(line),
+    notify: (key, text, options) => notifier.notify(key, text, options),
+    log,
   })
   return { routing, logs, notifications }
 }
