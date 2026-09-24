@@ -14,7 +14,7 @@ Each source module has a corresponding test file in the project root:
 |--------|-----------|---------------|
 | lib.ts | server.test.ts | gate(), assertSendable, assertOutboundAllowed, chunkText, sanitizeFilename |
 | config.ts | config.test.ts | applyDefaults, validateConfig, expandTilde, resolveConfig, loadConfig |
-| registry.ts | registry.test.ts | Session registry CRUD, routing, pending sessions |
+| registry.ts | registry.test.ts | Session registry CRUD, routing, pending sessions; download_attachment token scope (isSlackHostedFileUrl accepts only https://files.slack.com; external or third-party files refused before any fetch; off-origin redirects refused and never fetched; at most `MAX_DOWNLOAD_REDIRECTS` redirects), with refusals as tool errors |
 | server.ts (DM routing) | dm-routing.test.ts | DM routing via gate() + registry |
 | server.ts (permission relay) | permission-poller.test.ts, permission-click-handler.test.ts | SR-2.1 poller loop and Block Kit click handler |
 
@@ -63,6 +63,7 @@ Use `beforeEach` to reset module-scoped state between tests:
 
 - **WebClient**: Create stub functions (e.g., `stubPostMessage`, `stubChatUpdate`) that record calls to a capture array and return mock responses
 - **SocketModeClient**: Simulate events by directly calling the handler logic with mock payloads
+- **Global `fetch`**: `tests/registry.test.ts` stubs `globalThis.fetch` for every test, so no test reaches the network. A file-level `beforeEach` installs the stub and an `afterEach` restores the real `fetch`; never install it at file top level. The stub records each call's URL, `Authorization` header and `redirect` mode in `fetches`, then answers through `fetchHandler`, which throws by default. A test that expects a fetch sets `fetchHandler` and asserts on `fetches`, with a fake bot token
 - **server.ts side effects**: Cannot import server.ts in tests (module-scope side effects). Instead, replicate the relevant logic in a self-contained test server or test the extracted pure functions
 
 ### Module Mocks (mock.module)

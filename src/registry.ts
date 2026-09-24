@@ -367,6 +367,91 @@ export interface SessionToolDeps {
   serverPort: number
 }
 
+// ---------------------------------------------------------------------------
+// Attachment downloads — where the bot token may go
+// ---------------------------------------------------------------------------
+
+/** The only host the bot token is ever sent to by `download_attachment`. */
+const SLACK_FILES_HOST = 'files.slack.com'
+const SLACK_FILES_ORIGIN = `https://${SLACK_FILES_HOST}`
+
+/** Most redirects `download_attachment` follows for one file. */
+export const MAX_DOWNLOAD_REDIRECTS = 3
+
+/**
+ * True only for an `https:` URL whose host is exactly `files.slack.com` (default
+ * port, no user info). Anything else — another host, a lookalike subdomain,
+ * `http:`, an explicit port, an unparseable value — is not Slack-hosted, and
+ * the bot token must not be sent to it.
+ */
+export function isSlackHostedFileUrl(url: unknown): boolean {
+  if (typeof url !== 'string') return false
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return false
+  }
+  return (
+    parsed.protocol === 'https:' &&
+    parsed.host === SLACK_FILES_HOST &&
+    parsed.username === '' &&
+    parsed.password === ''
+  )
+}
+
+/**
+ * How a file is named in a `download_attachment` refusal: its Slack file ID
+ * when it has a well-formed one, else its 1-based position on the message.
+ * Never the URL (its query string could carry a secret) or the free-text name.
+ */
+function fileLabel(file: { id?: unknown }, index: number): string {
+  return typeof file.id === 'string' && /^[A-Z0-9]+$/.test(file.id) ? file.id : `#${index + 1}`
+}
+
+/** Outcome of `fetchSlackHostedFile`. */
+type SlackFileFetch =
+  | { kind: 'ok'; body: Buffer }
+  | { kind: 'failed' }
+  | { kind: 'refused'; reason: 'offsite' | 'too-many-redirects' }
+
+/**
+ * Fetch a Slack-hosted file with the bot token, never letting the
+ * `Authorization` header reach another origin. `url` must already have passed
+ * `isSlackHostedFileUrl`. Redirects are handled manually and followed only
+ * while they stay on https://files.slack.com, at most `MAX_DOWNLOAD_REDIRECTS`
+ * times; a redirect elsewhere, or past the limit, is `refused`. A redirect
+ * that cannot be followed (no readable or parseable `Location`) and a non-2xx
+ * final response are `failed`. Network errors propagate.
+ */
+async function fetchSlackHostedFile(url: string, token: string): Promise<SlackFileFetch> {
+  let current = url
+  for (let hop = 0; ; hop++) {
+    const resp = await fetch(current, {
+      headers: { Authorization: `Bearer ${token}` },
+      redirect: 'manual',
+    })
+    const isRedirect = resp.type === 'opaqueredirect' || (resp.status >= 300 && resp.status < 400)
+    if (!isRedirect) {
+      if (!resp.ok) return { kind: 'failed' }
+      return { kind: 'ok', body: Buffer.from(await resp.arrayBuffer()) }
+    }
+
+    resp.body?.cancel().catch(() => {})
+    if (hop >= MAX_DOWNLOAD_REDIRECTS) return { kind: 'refused', reason: 'too-many-redirects' }
+    const location = resp.headers.get('location')
+    if (!location) return { kind: 'failed' }
+    let next: string
+    try {
+      next = new URL(location, current).href
+    } catch {
+      return { kind: 'failed' }
+    }
+    if (!isSlackHostedFileUrl(next)) return { kind: 'refused', reason: 'offsite' }
+    current = next
+  }
+}
+
 const MCP_INSTRUCTIONS = [
   'The sender reads Slack, not this session. Anything you want them to see must go through the reply tool.',
   '',
@@ -678,7 +763,9 @@ export function createSessionServer(
       }
 
       // ---------------------------------------------------------------------
-      // download_attachment
+      // download_attachment — file fetches authorised with the bot token,
+      // never logged, and sent only to https://files.slack.com (see
+      // fetchSlackHostedFile).
       // ---------------------------------------------------------------------
       case 'download_attachment': {
         assertOutboundAllowed(args.chat_id, entry.deliveredChannels)
@@ -701,21 +788,59 @@ export function createSessionServer(
           return { content: [{ type: 'text', text: 'No files found on that message.' }] }
         }
 
+        // The bearer token goes only to https://files.slack.com. Every file is
+        // checked before any download; an external (remote) file or any other
+        // URL refuses the whole call. Refusals never echo the URL.
+        const files = msg.files as any[]
+        for (let i = 0; i < files.length; i++) {
+          const file = files[i]
+          const url = file.url_private_download || file.url_private
+          const external = file.is_external === true || file.mode === 'external'
+          if (!external && !url) continue
+          if (external || !isSlackHostedFileUrl(url)) {
+            return {
+              content: [{
+                type: 'text',
+                text:
+                  `Tool "${name}" refused: file ${fileLabel(file, i)} is not hosted by Slack, so the ` +
+                  `bot token is not sent for it (only ${SLACK_FILES_ORIGIN} is trusted).`,
+              }],
+              isError: true,
+            }
+          }
+        }
+
         const paths: string[] = []
-        for (const file of msg.files) {
+        for (let i = 0; i < files.length; i++) {
+          const file = files[i]
           const url = file.url_private_download || file.url_private
           if (!url) continue
 
           const safeName = sanitizeFilename(file.name || `file_${Date.now()}`)
           const outPath = join(inboxDir, `${messageTs.replace('.', '_')}_${safeName}`)
 
-          const resp = await fetch(url, {
-            headers: { Authorization: `Bearer ${deps.botToken}` },
-          })
-          if (!resp.ok) continue
+          const fetched = await fetchSlackHostedFile(url, deps.botToken)
+          if (fetched.kind === 'failed') continue
+          if (fetched.kind === 'refused') {
+            const why =
+              fetched.reason === 'offsite'
+                ? `redirected away from ${SLACK_FILES_ORIGIN}, so it is not hosted by Slack`
+                : `redirected more than ${MAX_DOWNLOAD_REDIRECTS} times`
+            const already = paths.length
+              ? ` Already downloaded before this refusal:\n${paths.join('\n')}`
+              : ''
+            return {
+              content: [{
+                type: 'text',
+                text:
+                  `Tool "${name}" refused: file ${fileLabel(file, i)} ${why}; the ` +
+                  `bot token is only sent to ${SLACK_FILES_ORIGIN}.${already}`,
+              }],
+              isError: true,
+            }
+          }
 
-          const buffer = Buffer.from(await resp.arrayBuffer())
-          writeFileSync(outPath, buffer)
+          writeFileSync(outPath, fetched.body)
           paths.push(outPath)
         }
 
