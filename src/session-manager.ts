@@ -754,8 +754,8 @@ export function _resetWaitForWaitingTimeoutMs(): void {
  *
  * 10s is chosen to comfortably cover one startup reconcile wave (the whole
  * concurrency=3 wave over the fleet completes well inside this window) and to
- * collapse a same-tick escalate-dead burst: when N channels escalate together
- * (b.nk5 fleet shape — /tmp wiped, every channel dead-tmux at once), those
+ * collapse a same-tick escalate-dead burst: when N personas escalate together
+ * (b.nk5 fleet shape — /tmp wiped, every persona dead-tmux at once), those
  * `sweepDeadTmuxChannel` callers deliberately land INSIDE the window and share
  * the single in-flight/memoized sweep — one findMissing reconciles the whole
  * store for all of them. Across ticks the 10s TTL is far shorter than the
@@ -847,7 +847,7 @@ async function reconcileMissingSweep(key: string, logPrefix: string, ref: string
  * hits dead-tmux and must share this exact logic — do NOT inline the sweep at
  * another call site).
  *
- * When the tick/restart path decides a channel's tmux session is provably dead
+ * When the tick/restart path decides a persona's tmux session is provably dead
  * while its AD row still looks alive ('dead-session' → 'escalate-dead'), CSCB
  * recovers itself instead of silently waiting on the external
  * `~/startup/find-missing-loop.sh`: emit an operator-visible log line, then run
@@ -943,7 +943,7 @@ export async function waitForWaitingAndReconnect(
   // b.m4r: a bot killed mid-turn never fires SessionEnd, so its AD row freezes
   // at `working`. Without a reconcile, the poll below spins on `status` for the
   // full 10-minute window before the timeout branch's sweep + status finally
-  // decides — the channel stays down that whole time. Run AD's per-row,
+  // decides — the persona stays down that whole time. Run AD's per-row,
   // evidence-based findMissing sweep ONCE up front (agent-director plan b.93m,
   // t1.93m.hp: degraded-mode guard removed, shipped ≥ 0.8.0). A genuinely-dead
   // row reconciles to `missing`, so the FIRST status poll below hits the
@@ -1002,7 +1002,7 @@ export async function waitForWaitingAndReconnect(
     // dead bot; routing it to resumeOrFreshSpawn lets b.vub's
     // selfHealTmuxCollisionAndRespawn reap the orphan tmux session on
     // ErrTmuxSessionCreate. (The old tmux-alive → 'ok' behavior deferred a dead
-    // channel to the health-check for minutes.) Live transient states
+    // persona to the health-check for minutes.) Live transient states
     // (ask_user, check_permission, pending) still fall through to 'ok' below.
     if (state === 'ended' || state === 'missing') {
       console.error(`[slack] waitForWaitingAndReconnect: ${ref} transitioned to state=${state} (claude process gone) — dead session`)

@@ -1,6 +1,6 @@
 # Claude Slack Channel Bots
 
-A single HTTP MCP server that holds one Slack Socket Mode connection and routes messages to multiple independent Claude Code sessions, each scoped to a different repo and reachable via its own Slack channel. Inbound messages are dispatched to whichever session owns the channel they arrived on; each bot's tool calls may post only to the channel(s) it is configured for.
+A single HTTP MCP server that runs several independent Claude Code bots, called personas. Each persona has its own Slack app and identity (name and avatar), one Claude Code instance with its own working directory, and is reachable from the Slack channels it is configured into. The server holds one Slack Socket Mode connection per persona and delivers each message to the persona whose app received it; each persona's tool calls may post only to the channels it is configured into, as that persona.
 
 ---
 
@@ -20,19 +20,23 @@ A single HTTP MCP server that holds one Slack Socket Mode connection and routes 
    bun pm -g trust claude-slack-channel-bots
    ```
 
-   Bun blocks the lifecycle scripts of untrusted packages, so the postinstall does not run on the plain `install` above — you must trust the package for it to fire. The `-g` flag targets the global install; without it `bun pm trust` looks for a `package.json` in the current directory and errors with `No package.json was found`. (Run `bun pm -g untrusted` to confirm it is listed first.) The postinstall then creates skeleton config files in `~/.claude/channels/slack/`. Skip this step and a later `start` fails with `missing prerequisite: config.json`.
+   Bun blocks the lifecycle scripts of untrusted packages, so the postinstall does not run on the plain `install` above — you must trust the package for it to fire. The `-g` flag targets the global install; without it `bun pm trust` looks for a `package.json` in the current directory and errors with `No package.json was found`. (Run `bun pm -g untrusted` to confirm it is listed first.) The postinstall then creates skeleton config files in `~/.claude/channels/slack/` (or in `SLACK_STATE_DIR` when it is set and non-empty, the same directory the server reads). Skip this step and a later `start` fails with `missing prerequisite: config.json`.
 
 3. **Run the setup skill:**
 
-   The package includes a Claude Code skill at `skills/setup-slack-channel-bots/` that walks you through the entire configuration. Copy or symlink it into `~/.claude/skills/`, then run:
+   The package includes a Claude Code skill at `skills/setup-slack-channel-bots/`. Copy or symlink it into `~/.claude/skills/`, then run:
 
    ```sh
    claude /setup-slack-channel-bots
    ```
 
-   It handles Slack app creation, tokens, routing, access control, hooks, and validation — and skips anything already configured.
+   It covers the Slack app manifest, the system prompt file, `access.json`, the agent-director check and hook cleanup, and skips anything already configured. Until the skill is updated for personas, skip its token and routing steps (exporting token variables and writing `config.json`): the server reads no token from the environment and refuses a `config.json` with `routes`.
 
-4. **Start the server:**
+4. **Create your personas:**
+
+   Create one Slack app per persona from `slack-app-manifest.yml`. Write each app's tokens to its own credentials file, then list the personas in `config.json`. See [Personas (config.json)](#personas-configjson) and [Credentials files](#credentials-files).
+
+5. **Start the server:**
 
    ```sh
    claude-slack-channel-bots start
@@ -135,25 +139,21 @@ who haven't yet installed CSCB at all.
 
 ### Environment Variables
 
-Tokens and runtime options are read from environment variables. There is no `.env` file — export these in your shell profile.
+Runtime options are read from environment variables. None of them is required, and Slack tokens are never read from the environment: each persona's tokens live in its own credentials file (see [Credentials files](#credentials-files)). There is no `.env` file — export any of these in your shell profile.
 
 | Variable | Description |
 |---|---|
-| `SLACK_BOT_TOKEN` | Slack bot token (`xoxb-…`). Required. Granted by the OAuth install flow. |
-| `SLACK_APP_TOKEN` | Slack app-level token (`xapp-…`). Required. Generated under Basic Information → App-Level Tokens with the `connections:write` scope. |
 | `SLACK_STATE_DIR` | Override the directory where `config.json`, `access.json`, and runtime state are stored. Defaults to `~/.claude/channels/slack`. |
 | `SLACK_ACCESS_MODE` | Set to `static` to load `access.json` once at startup and cache it for the lifetime of the process rather than re-reading it on every event. Useful in high-throughput environments where disk reads are a concern. |
-| `SLACK_DRY_RUN` | Set to `1` to start the server without Slack credentials. Token validation is skipped, Socket Mode and `web.auth.test()` are not called, and MCP tool calls (`reply`, `react`, etc.) are logged instead of sent. Useful for integration testing. |
+| `SLACK_DRY_RUN` | Set to `1` (or `true` / `yes`) to start the server without Slack. No credentials file is read and no Slack call is made. Each persona runs with a placeholder identity (`U000DRY_<key>`), and MCP tool calls (`reply`, `react`, etc.) and server notices are logged instead of sent. Useful for integration testing. |
 | `CSCB_LOG_MAX_BYTES` | Rotate `server.log` / `clean_restart.log` when the active file reaches this many bytes. Defaults to `10485760` (10 MiB). Values `<= 0` or non-numeric are ignored. |
 | `CSCB_LOG_KEEP` | Number of rotated generations to retain (`server.log.1` … `server.log.N`). Defaults to `5`. Set to `0` to keep none (the log is truncated instead of rolled). Values `< 0` or non-numeric are ignored. |
 | `CSCB_AD_VERBOSE` | Set to a truthy value (`1`, `true`, `yes`, `on`) to restore the agent-director library's per-poll `SubprocessClient: <verb> ok` success dumps in `server.log`. Off by default — these routine dumps are dropped so the log stays readable. Failures and warnings from agent-director always pass through regardless of this flag. Read once at server startup, so it takes effect on server restart. |
-| `CSCB_HTTP_VERBOSE` | Set to a truthy value (`1`, `true`, `yes`, `on`) to restore the per-request MCP access line (`HTTP <method> <path> session=…`) in `server.log`. Off by default — the `/mcp` endpoint is hit on every client poll and SSE open, so these routine lines are dropped to keep the log readable. Session connect/disconnect, route mismatches, and errors are logged unconditionally regardless of this flag. Checked per request, so it takes effect without a restart. |
+| `CSCB_HTTP_VERBOSE` | Set to a truthy value (`1`, `true`, `yes`, `on`) to restore the per-request MCP access line (`HTTP <method> <path> session=…`) in `server.log`. Off by default — the `/mcp` endpoint is hit on every client poll and SSE open, so these routine lines are dropped to keep the log readable. Session connect/disconnect, sessions with no matching persona, and errors are logged unconditionally regardless of this flag. Checked per request, so it takes effect without a restart. |
 
 Shell profile example:
 
 ```sh
-export SLACK_BOT_TOKEN=xoxb-your-bot-token
-export SLACK_APP_TOKEN=xapp-your-app-token
 # Optional overrides:
 export SLACK_STATE_DIR=~/.config/slack-channel-bots
 export SLACK_ACCESS_MODE=static
@@ -163,97 +163,177 @@ export SLACK_DRY_RUN=1
 
 ---
 
-### Routing (config.json)
+### Personas (config.json)
 
-`config.json` is read from `~/.claude/channels/slack/config.json` by default. Override the directory with `SLACK_STATE_DIR`.
+`config.json` is read from `~/.claude/channels/slack/config.json` by default. Override the directory with `SLACK_STATE_DIR`. The server needs only this file and the credentials files it names.
 
-A skeleton file is created by postinstall. Populate it before running `start`.
+Each bot is a **persona**: one Slack app, one Claude instance with its own working directory, and the channels it is configured into. Create one Slack app per persona (see `slack-app-manifest.yml`); that app gives the persona its own name and avatar in Slack.
 
-#### Complete example
+Postinstall creates a skeleton with an empty persona list. An empty list is valid: the server starts with no personas.
 
 ```json
 {
-  "routes": {
-    "C0123456789": { "cwd": "~/projects/alpha" },
-    "C9876543210": { "cwd": "~/projects/beta" }
-  },
-  "bind": "127.0.0.1",
-  "port": 3100,
-  "session_restart_delay": 60,
-  "health_check_interval": 120,
-  "exit_timeout": 120,
-  "stop_timeout": 30,
-  "mcp_config_path": "~/.claude/slack-mcp.json",
-  "cozempic_prescription": "standard"
+  "personas": []
 }
 ```
 
-#### Field reference
+#### Example
+
+Two personas share the channel `C0555555555`. `planner` receives every message in its home channel `C0123456789` and only its @mentions in the shared channel. `reviewer` receives only its @mentions in the shared channel.
+
+```json
+{
+  "personas": [
+    {
+      "name": "planner",
+      "credentials_file": "~/.config/cscb/planner-credentials.json",
+      "working_directory": "~/projects/alpha",
+      "channels": [
+        { "id": "C0123456789", "delivery": "all" },
+        { "id": "C0555555555", "delivery": "mentions" }
+      ],
+      "permission_prompts": "C0123456789"
+    },
+    {
+      "name": "reviewer",
+      "credentials_file": "~/.config/cscb/reviewer-credentials.json",
+      "working_directory": "~/projects/beta",
+      "channels": [
+        { "id": "C0555555555", "delivery": "mentions" }
+      ],
+      "permission_prompts": "C0555555555"
+    }
+  ],
+  "port": 3100
+}
+```
+
+#### Persona fields
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | yes | The persona's name, used in logs, `/interject` and the crontable. Each persona also has a **key**: the name itself when it is 1–40 characters of `a-z`, `0-9` and `_`, otherwise a derived form. Logs show both, as `"planner" (key=planner)`. |
+| `credentials_file` | yes | Path to the persona's [credentials file](#credentials-files). Absolute, `~` or `~/…`. |
+| `working_directory` | yes | Working directory of the persona's Claude instance. Absolute, `~` or `~/…`. |
+| `channels` | yes, unless `dm.enabled` is `true` | The channels the persona is in. Each entry is `{ "id": "<channel ID>", "delivery": "all" \| "mentions" }`: `all` delivers every message in the channel, `mentions` only messages that @mention the persona. Invite the persona's Slack app to each channel. |
+| `permission_prompts` | yes | The persona's **destination**: where its permission prompts and server notices are posted. One of the persona's own channel IDs, or `"dm"`. |
+| `claude_config_dir` | no | Claude config directory for this persona. Defaults to the top-level `claude_config_dir`. See [Per-persona `claude_config_dir` override](#per-persona-claude_config_dir-override). |
+| `stop_hook_bootstrap` | no | Slack Reply Guard switch for this persona. Defaults to the top-level `stop_hook_bootstrap`. See [Per-persona `stop_hook_bootstrap` override](#per-persona-stop_hook_bootstrap-override). |
+| `dm` | no | Direct-message settings: `{ "enabled": <boolean>, "contact": "<user ID>" }`. `enabled` defaults to `false`. `contact` is a Slack user ID such as `U0123456789` (starting with `U` or `W`), the person a `"dm"` destination addresses. DMs are not delivered to any persona in this version. |
+
+A `"dm"` destination is accepted, but in this version its prompts and notices are only written to `server.log`, not sent to Slack.
+
+The rules that most often trip a first config:
+
+- A persona needs at least one channel unless `dm.enabled` is `true`.
+- `permission_prompts` must be `"dm"` or one of the persona's own `channels` IDs.
+- A `"dm"` destination needs `dm.enabled: true` and a `dm.contact`.
+- No two personas may share a `working_directory` or a `credentials_file`, compared by real path. Names and keys must be unique too.
+- Channel IDs are Slack channel IDs such as `C0123456789`, not channel names.
+- Unknown fields are rejected, at the top level and inside each persona.
+
+The server checks the whole file at start. Any error stops the start, and the message names the persona (`personas[<i>]`) and the field.
+
+#### Credentials files
+
+Each persona's Slack tokens live in its own credentials file, and `config.json` names that file only by path. The file is a JSON object with exactly two keys:
+
+```json
+{
+  "bot_token": "xoxb-PLACEHOLDER",
+  "app_token": "xapp-PLACEHOLDER"
+}
+```
+
+`bot_token` is the app's bot token (`xoxb-…`), granted when you install the app to the workspace. `app_token` is an app-level token (`xapp-…`) with the `connections:write` scope, generated under Basic Information → App-Level Tokens.
+
+Use one file per persona and keep it private (`chmod 600`). Never put a token in `config.json`, a ticket or a chat.
+
+#### Server-wide settings
+
+These top-level fields apply to the whole server.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `routes` | object | required | Map of Slack channel ID → route entry. Each entry requires a `cwd` field: the working directory for that session. Used to identify sessions via `roots/list` after MCP handshake. `~` is expanded. Each `cwd` must be unique across all routes. May also include an optional `claude_config_dir` string (see below). |
 | `bind` | string | `"127.0.0.1"` | Interface the HTTP server binds to. Use `"0.0.0.0"` to expose on all interfaces. The in-process cron scheduler delivers via `127.0.0.1`, so `bind` must include loopback (the default, or `0.0.0.0`) for scheduled fires to work. |
 | `port` | number | `3100` | Port the HTTP server listens on. |
 | `session_restart_delay` | number | `60` | Seconds to wait before auto-restarting a dead session. Set to `0` to disable auto-restart. Must be non-negative. |
 | `health_check_interval` | number | `120` | Seconds between periodic liveness polls. Set to `0` to disable. Must be non-negative. |
-| `exit_timeout` | number | `120` | Seconds to wait for a managed Claude Code session to exit gracefully during `clean_restart` before force-killing its tmux session. |
+| `exit_timeout` | number | `120` | Seconds to wait for a managed Claude Code session to exit gracefully during `clean_restart` or `stop --stop-bots` before force-killing it through agent-director. |
 | `stop_timeout` | number | `30` | Seconds to wait for the server process to exit after `SIGTERM` before escalating to `SIGKILL`. |
 | `mcp_config_path` | string | `~/.claude/slack-mcp.json` | Path to the MCP config file passed to Claude Code when launching managed sessions. |
 | `append_system_prompt_file` | string | — | Path to a file appended to every managed session's system prompt via `--append-system-prompt-file`. Missing file silently skipped. See `skills/EXAMPLE_CLAUDE.md` for a template. |
 | `system_prompt_mode` | string | `"append"` | Controls how `append_system_prompt_file` is applied. `"append"`: the custom prompt file is appended on top of `CLAUDE.md` (default, current behavior). `"none"`: only `CLAUDE.md` is used; `append_system_prompt_file` is ignored even if set. Use `"none"` when the project's `CLAUDE.md` already contains everything the bot needs. |
 | `cozempic_prescription` | string | `"standard"` | Cozempic cleaning intensity before resume. Valid values: `gentle`, `standard`, `aggressive`. Has no effect if cozempic is not installed. |
 | `message_archive_db` | string | — | Path to a SQLite DB where every inbound Slack message is archived in real time. Parent directories are created if missing; schema is initialized on first open. Compatible with the `archive-messages.py` backfill script — both can write concurrently. Feature is disabled when absent. |
-| `claude_config_dir` | string | — | Path to a Claude on-disk config directory. When set, managed sessions launch with `CLAUDE_CONFIG_DIR='<resolved-path>'` so the bot authenticates against a specific account. `~` is expanded and the path is resolved to absolute. Per-route `routes[id].claude_config_dir` overrides this top-level value for individual channels. When neither is set, Claude's own default applies. Must be non-empty when set. |
+| `claude_config_dir` | string | — | Default Claude on-disk config directory for every persona. When a persona has one (its own or this default), its session launches with `CLAUDE_CONFIG_DIR='<resolved-path>'` so the bot authenticates against a specific account. `~` is expanded and the path is resolved to absolute. A persona's own `claude_config_dir` overrides this value. When neither is set, Claude's own default applies. Must be non-empty when set. |
 | `resume_enabled` | boolean | `true` | When `true` (default), a bot whose session died — including after a host reboot or pod resume — comes back with its prior conversation history intact instead of starting fresh. When `false`, the session manager always performs a fresh launch instead of resuming, both on startup and on runtime auto-restart, even when a stored session exists. Set `false` as a workaround if your Claude Code version crashes with "sandbox required but unavailable" on resume (a known regression in v2.1.120). Requires a system-installed `agent-director` ≥ 0.8.0 for reboot recovery to actually restore history. |
-| `agent_director_poll_interval_ms` | number | `1000` | Poll interval (ms) for the agent-director permission relay tick. Must be a positive integer in `[200, 3_600_000]`. Replaces the pre-rename `claude_director_poll_interval_ms` — the old name is rejected at startup. Unknown top-level config fields are also rejected to surface stale configs after the rename. |
-| `stop_hook_bootstrap` | boolean | `true` | Controls whether the server installs the CSCB-managed Slack Reply Guard Stop hook into `<claude_config_dir>/settings.json` at boot (see [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook)). Set to `false` to disable installation for every route and to actively remove any previously-installed managed entry. Per-route `routes[id].stop_hook_bootstrap` overrides this top-level value. Non-boolean values are rejected by config validation at startup. |
+| `agent_director_poll_interval_ms` | number | `1000` | Poll interval (ms) for the agent-director permission relay tick. Must be a positive integer in `[200, 3_600_000]`. Replaces the pre-rename `claude_director_poll_interval_ms` — the old name is rejected at startup. |
+| `stop_hook_bootstrap` | boolean | `true` | Default for every persona: whether the server installs the CSCB-managed Slack Reply Guard Stop hook into `<claude_config_dir>/settings.json` at boot (see [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook)). Set to `false` to disable installation and to actively remove any previously-installed managed entry. A persona's own `stop_hook_bootstrap` overrides this value. Non-boolean values are rejected at startup. |
 | `cron_table_path` | string | `<config dir>/crontab` | Path to the crontable for the built-in cron scheduler (`cscb_cron`). Defaults to `crontab` in the directory of the loaded `config.json`. `~` is expanded like other path keys. The resolved path is exported into every managed session as `CSCB_CRONTABLE_PATH` so bots can find the crontable and self-schedule (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)). Must be a non-empty string when set. Changing it requires a server restart. |
 | `cron_log_path` | string | `<config dir>/cron.log` | Path to the `cscb_cron` log file. Defaults to `cron.log` in the directory of the loaded `config.json`. `~` is expanded like other path keys. Must be a non-empty string when set. Changing it requires a server restart. |
 | `cron_log_max_bytes` | number | — | Size cap in bytes for the cron log. Must be a positive integer when set. Cron-log pruning is disabled when absent. Changing it requires a server restart. |
 
-#### Per-route `claude_config_dir` override
+#### Per-persona `claude_config_dir` override
 
-When you want different bot sessions to authenticate as different Claude accounts (e.g. one channel runs as a personal Max account, another as a corporate account), set `claude_config_dir` on the individual route. Per-route values take priority over the top-level `claude_config_dir`; routes without their own override fall back to the top-level value.
+When you want different personas to authenticate as different Claude accounts (e.g. one runs as a personal Max account, another as a corporate account), set `claude_config_dir` on the individual persona. A persona's own value takes priority over the top-level `claude_config_dir`; personas without one fall back to the top-level value.
 
 ```json
 {
-  "routes": {
-    "C_PERSONAL": {
-      "cwd": "~/projects/alpha",
+  "personas": [
+    {
+      "name": "planner",
+      "credentials_file": "~/.config/cscb/planner-credentials.json",
+      "working_directory": "~/projects/alpha",
+      "channels": [{ "id": "C0123456789", "delivery": "all" }],
+      "permission_prompts": "C0123456789",
       "claude_config_dir": "~/.claude-maxauth"
     },
-    "C_CORPORATE": {
-      "cwd": "~/projects/beta"
+    {
+      "name": "reviewer",
+      "credentials_file": "~/.config/cscb/reviewer-credentials.json",
+      "working_directory": "~/projects/beta",
+      "channels": [{ "id": "C0987654321", "delivery": "all" }],
+      "permission_prompts": "C0987654321"
     }
-  },
+  ],
   "claude_config_dir": "~/.claude-corp"
 }
 ```
 
-`C_PERSONAL` launches with the Max account; `C_CORPORATE` falls through to the top-level value and uses the corporate account. Use `claude auth login --claudeai` (or `--console`) with `CLAUDE_CONFIG_DIR` set to the same directory to populate each config dir before starting the server.
+`planner` launches with the Max account; `reviewer` falls through to the top-level value and uses the corporate account. Use `claude auth login --claudeai` (or `--console`) with `CLAUDE_CONFIG_DIR` set to the same directory to populate each config dir before starting the server.
 
-#### Per-route `stop_hook_bootstrap` override
+Changing a persona's effective `claude_config_dir` or its `working_directory` makes that persona start fresh, without its prior conversation, at its next launch. The old transcript stays in the old config directory. The [Troubleshooting](#troubleshooting) entry "Bots come back with no memory of the prior conversation" says when that launch happens.
 
-Set `stop_hook_bootstrap` on an individual route to override the top-level default for that one bot. Per-route values win over the top-level value; routes without their own value inherit the top-level default (which is itself `true` when absent).
+#### Per-persona `stop_hook_bootstrap` override
+
+Set `stop_hook_bootstrap` on an individual persona to override the top-level default for that one bot. A persona's own value wins over the top-level value; personas without one inherit the top-level default (which is itself `true` when absent).
 
 ```json
 {
-  "routes": {
-    "C_EDIT_ONLY_BOT": {
-      "cwd": "~/projects/gamma",
+  "personas": [
+    {
+      "name": "editor",
+      "credentials_file": "~/.config/cscb/editor-credentials.json",
+      "working_directory": "~/projects/gamma",
+      "channels": [{ "id": "C0123456789", "delivery": "all" }],
+      "permission_prompts": "C0123456789",
       "claude_config_dir": "~/.claude-gamma",
       "stop_hook_bootstrap": false
     },
-    "C_NORMAL_BOT": {
-      "cwd": "~/projects/delta",
+    {
+      "name": "helper",
+      "credentials_file": "~/.config/cscb/helper-credentials.json",
+      "working_directory": "~/projects/delta",
+      "channels": [{ "id": "C0987654321", "delivery": "all" }],
+      "permission_prompts": "C0987654321",
       "claude_config_dir": "~/.claude-delta"
     }
-  }
+  ]
 }
 ```
 
-A per-route opt-out only *fully* disables the guard for that bot when the route owns a **dedicated** `claude_config_dir` — see [Shared-dir aggregation](#shared-dir-aggregation) for the interaction when routes share a dir.
+A per-persona opt-out only *fully* disables the guard for that bot when the persona has a **dedicated** `claude_config_dir` — see [Shared-dir aggregation](#shared-dir-aggregation) for the interaction when personas share a dir.
 
 ---
 
@@ -261,7 +341,7 @@ A per-route opt-out only *fully* disables the guard for that bot when the route 
 
 `access.json` is read from `~/.claude/channels/slack/access.json` by default (same directory as `config.json`). A skeleton file with defaults is created by postinstall. The file is written with `0600` permissions.
 
-`access.json` controls only the acknowledgement reaction and how long replies are chunked. Which messages a bot receives is set by `routes` in `config.json` (see [Messages a bot receives](#messages-a-bot-receives)).
+`access.json` controls only the acknowledgement reaction and how long replies are chunked. Which messages a bot receives is set by each persona's `channels` in `config.json` (see [Messages a bot receives](#messages-a-bot-receives)).
 
 #### Complete example
 
@@ -308,21 +388,45 @@ The `claude-slack-channel-bots` binary exposes three subcommands.
 
 ### `claude-slack-channel-bots start`
 
-Checks prerequisites, then daemonizes the server.
+Checks that the configuration file exists, starts the server in the background, and waits for it to get through startup.
 
-**Prerequisite checks (in order):**
-
-1. `SLACK_BOT_TOKEN` is set — fails with `missing prerequisite: SLACK_BOT_TOKEN environment variable` if absent.
-2. `SLACK_APP_TOKEN` is set — fails with `missing prerequisite: SLACK_APP_TOKEN environment variable` if absent.
-3. `config.json` exists at `STATE_DIR/config.json` — fails with the full path if not found.
-
-Once the server daemonizes, the SR-5.1 startup gate runs inside the child process: it imports `agent-director`, constructs the singleton Client, runs `client.version()`, and verifies `~/.agent-director/state.db` is owned by the current user. Failures land in `startup-errors.log` (see [Startup errors](#startup-errors)). The previous `tmux -V` probe at the CLI level has been removed — agent-director enforces tmux availability at spawn time.
-
-If all checks pass, the parent process spawns a detached child process and exits immediately, printing the child PID. The child starts the server and writes its PID to `STATE_DIR/server.pid`. Conversation context is preserved across server restarts when possible.
+**Prerequisite check:** `config.json` exists at `STATE_DIR/config.json`, the same file the server loads. If it does not, `start` exits 1 with:
 
 ```
-[slack] Server starting in background (PID 12345)
+missing prerequisite: config.json not found at <path>
 ```
+
+`start` reads no Slack token and needs no token environment variable. The server checks the file's contents, and each persona's credentials file, once it runs.
+
+The server first runs the agent-director startup gate: it imports `agent-director`, constructs the singleton Client, runs `client.version()`, and verifies `~/.agent-director/state.db` is owned by the current user. Failures land in `startup-errors.log` (see [Startup errors](#startup-errors)). agent-director enforces tmux availability at spawn time. The server then loads the configuration and starts listening, and only then writes its PID to `STATE_DIR/server.pid`. Conversation context is preserved across server restarts when possible.
+
+`start` waits up to 30 seconds for that PID file. The outcomes are:
+
+- **The server is up:** `start` prints this line and exits 0.
+
+  ```
+  [slack] Server starting in background (PID 12345)
+  ```
+
+- **The server exits during startup:** `start` exits 1. It prints why the server stopped, followed by the last lines (at most 20) the server wrote to `server.log`, which carry the server's own reason:
+
+  ```
+  [slack] Server failed to start (exit code 1). From /home/you/.claude/channels/slack/server.log:
+  ```
+
+- **The server is still starting after 30 seconds:** `start` exits 0 and leaves it running.
+
+  ```
+  [slack] Server is still starting in the background (PID 12345) after 30s — its log is /home/you/.claude/channels/slack/server.log
+  ```
+
+A configuration from before personas stops the start. The server writes the conversion error to `server.log` and exits, so `start` shows the same line on the terminal and exits 1. In `server.log`, where each line is prefixed with a timestamp, it reads:
+
+```
+[slack] Fatal: configuration error — loadPersonaConfig: invalid persona config in "<path>": Persona config validation error: "<key>" belongs to the pre-persona configuration shape, which is no longer accepted. The configuration must be converted to personas: rewrite it by hand as a "personas" array. Nothing is converted automatically and the file has not been changed.
+```
+
+`<key>` is the first pre-persona key found in the file. Any other invalid configuration fails the same way, with a message naming the persona and the field. A server that is already running makes the new one exit with `[slack] Server is already running (PID <pid>). Exiting.`, so `start` exits 1.
 
 ### `claude-slack-channel-bots stop`
 
@@ -340,9 +444,9 @@ Plain `stop` leaves the managed bots running — they are meant to survive a ser
 claude-slack-channel-bots stop --stop-bots
 ```
 
-This mirrors `clean_restart`'s order: the server is stopped **first**, then the bot teardown runs for each route — pause the bot, poll until it exits (or up to `exit_timeout` seconds), then force-kill on timeout. Teardown kills but never deletes each row, preserving its `claude_session_id` so the bots can resume their conversation history on the next start. Stopping the server first prevents its `onsessionclosed`/`scheduleRestart` handler from respawning a just-exited bot mid-teardown (which would delete its `ended` row and history). Use it when you want a clean, flushed shutdown of the bots (for example before a host reboot).
+This mirrors `clean_restart`'s order: the server is stopped **first**, then the bot teardown runs for each persona in `config.json`, addressing its instance as `cscb_<key>` — pause the bot, poll until it exits (or up to `exit_timeout` seconds), then force-kill on timeout. Teardown kills but never deletes each row, preserving its `claude_session_id` so the bots can resume their conversation history on the next start. Stopping the server first prevents its `onsessionclosed`/`scheduleRestart` handler from respawning a just-exited bot mid-teardown (which would delete its `ended` row and history). Use it when you want a clean, flushed shutdown of the bots (for example before a host reboot).
 
-If agent-director is unreachable, the teardown **fails loudly** — the command prints the error and exits non-zero rather than silently reporting a clean stop. (A missing config is best-effort: teardown is skipped but the server stop still succeeds, since the server is already down.)
+If agent-director is unreachable, the teardown **fails loudly** — the command prints the error and exits non-zero rather than silently reporting a clean stop. (A config that cannot be loaded, a missing or pre-persona file included, is best-effort: teardown is skipped with `[slack] stop --stop-bots: could not load config — skipping bot teardown:` and the server stop still succeeds, since the server is already down.)
 
 ### `claude-slack-channel-bots clean_restart`
 
@@ -352,15 +456,21 @@ Gracefully exits all managed Claude Code sessions, then stops and starts the ser
 claude-slack-channel-bots clean_restart
 ```
 
-For each configured route, calls `client.pause({claude_instance_id})` via agent-director and polls `client.status(...)` until the spawn transitions to `ended` / `missing` (or `client.list(...)` returns no row). If the spawn does not exit within `exit_timeout` seconds (default 120s), the spawn is force-killed via `client.kill(...)`. Teardown kills but never deletes each row, preserving its `claude_session_id` so bots resume their conversation history on the next start. All routes are processed in parallel. After the server restarts, the SR-1.4 collision-then-act dispatcher decides resume-vs-fresh per route — agent-director owns Claude session-id state, not CSCB.
+For each persona in `config.json`, calls `client.pause({claude_instance_id})` via agent-director with the persona's instance ID `cscb_<key>`, and polls `client.status(...)` until the spawn transitions to `ended` / `missing` (or `client.status(...)` fails with `ErrSpawnNotFound` because the row is gone). If the spawn does not exit within `exit_timeout` seconds (default 120s), the spawn is force-killed via `client.kill(...)`. Teardown kills but never deletes each row, preserving its `claude_session_id` so bots resume their conversation history on the next start. All personas are processed in parallel. After the server restarts, the SR-1.4 collision-then-act dispatcher decides resume-vs-fresh per persona — agent-director owns Claude session-id state, not CSCB.
 
-A benign kill outcome — the row already being gone — is tolerated per-route and does not abort the restart. Any other per-route teardown failure, including a pause failure that escalates to a kill which then fails to reach agent-director, is fatal: it fails loudly and aborts the restart (non-zero exit).
+`clean_restart` logs its progress to `STATE_DIR/clean_restart.log`. The lines that end it with an error (config load failure, agent-director initialization failure, teardown failure, start failure) are also printed to the terminal.
+
+`clean_restart` loads `config.json` first. If it cannot (a missing or pre-persona file included), it exits 1 with `[slack] clean_restart: failed to load config:` and the loader's error, and nothing is stopped.
+
+A benign kill outcome — the row already being gone — is tolerated per persona and does not abort the restart. Any other per-persona teardown failure, including a pause failure that escalates to a kill which then fails to reach agent-director, is fatal: it fails loudly and aborts the restart (non-zero exit).
 
 Behavior by case:
 
-- **No configured routes:** skips the shutdown phase and proceeds directly to stop/start.
+- **No personas** (`"personas": []`): nothing is torn down; the server is stopped and started.
+- **A persona with no instance:** logs `[slack] teardownBots: no spawn row for persona "<name>" (key=<key>) — skipping` and continues.
 - **Server already stopped:** `stop` reports `server is not running`; `start` then brings up a fresh server.
-- **agent-director unreachable:** teardown fails loudly and the restart is aborted (non-zero exit); no new server is started. The `no spawn row` message appears only when a route genuinely has no spawn, never when the client failed to reach agent-director.
+- **Server fails to start again:** `clean_restart` exits non-zero with `[slack] clean_restart: start failed with exit code <n>`; the reason is in `server.log`.
+- **agent-director unreachable:** teardown fails loudly and the restart is aborted (non-zero exit); no new server is started. The `no spawn row` message appears only when a persona genuinely has no spawn, never when the client failed to reach agent-director.
 
 ### PID file
 
@@ -381,22 +491,30 @@ To install the version of CSCB sitting in your working copy (so the globally-lin
 Skip the CLI and run the server directly with Bun for development or debugging:
 
 ```sh
-bun server.ts
+bun src/server.ts
 ```
 
-On startup the server prints the MCP endpoint and example config:
+It loads the same `config.json` that `start` checks for; a missing file stops it with `[slack] Fatal: configuration error — The configuration file "<path>" does not exist. The server requires the configuration file to start.` On startup the server prints the persona count, the MCP endpoint and example config:
 
 ```
-[slack] Loaded routing config: 2 route(s)
-[slack] Socket Mode connected
+[slack] Loaded persona config: 2 persona(s)
 [slack] MCP server listening on http://127.0.0.1:3100/mcp
 
+Save this to ~/.claude/slack-mcp.json:
 {
   "mcpServers": {
-    "slack-channel-router": { "type": "http", "url": "http://127.0.0.1:3100/mcp" }
+    "slack-channel-router": {
+      "type": "http",
+      "url": "http://127.0.0.1:3100/mcp"
+    }
   }
 }
+
+Then launch Claude from a project directory with:
+  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:slack-channel-router
 ```
+
+With `SLACK_DRY_RUN=1`, `[slack] Running in dry-run mode — Slack disabled` follows the persona count.
 
 ---
 
@@ -617,9 +735,9 @@ Flow:
 
 1. agent-director moves the spawn into `check_permission` state when Claude requests a tool permission.
 2. CSCB's poller (`src/permission-poller.ts`) runs `client.list({ state: ['check_permission'], label: ['service=cscb'] })` at the `agent_director_poll_interval_ms` cadence (default 1000 ms).
-3. For each new spawn, `client.get(...)` returns the open `permission_request` (tool name + tool input + integer `request_id`). CSCB identifies the bot that owns the spawn from its `persona` label and posts the Block Kit prompt to that bot's channel as that bot.
-4. The operator clicks Allow / Deny in Slack. CSCB resolves the click through the same bot: it calls `client.decide({ claude_instance_id, decision, request_token })` and, as that bot, updates the message to "*Permission* — Allowed" or "*Permission* — Denied by operator".
-5. If a tracked prompt drops out of `check_permission` for any reason other than a Slack click (timeout, external `decide`, crash), the next poller tick replaces the buttons with "expired".
+3. For each new spawn, `client.get(...)` returns the open permission request (tool name, tool input and an opaque `request_token`). CSCB identifies the persona that owns the spawn from its `persona` label and posts the Block Kit prompt to the persona's destination (its `permission_prompts` channel) as that persona.
+4. The operator clicks Allow / Deny in Slack. CSCB resolves the click through the same persona: it calls `client.decide({ claude_instance_id, decision, request_token })` and, as that persona, updates the message to "*Permission* — Allowed" or "*Permission* — Denied by operator".
+5. If a tracked prompt closes for any reason other than a Slack click, the next poller tick replaces the buttons with the verdict: "⏱ *Permission* — Timed out", "🪦 *Permission* — Session ended", "*Permission* — Allowed", "*Permission* — Denied by operator", or "*Permission* — Denied (closed)" when the reason is unknown.
 
 ### Slack app prerequisites
 
@@ -627,11 +745,11 @@ The Slack app must have **interactivity enabled** with **Socket Mode** as the de
 
 ### AskUserQuestion
 
-The `AskUserQuestion` tool is denied for every CSCB-spawned bot via the agent-director template (`deny: ['AskUserQuestion']`). Bots respond to operator questions via the Slack `reply` MCP tool instead. There is no `ask-relay.sh` hook and no `/ask` HTTP route.
+The `AskUserQuestion` tool is denied for every CSCB-spawned bot via the agent-director template (`deny: ['AskUserQuestion']`). Bots respond to operator questions via the Slack `reply` MCP tool instead. There is no `ask-relay.sh` hook and no `/ask` HTTP endpoint.
 
 ### Memory-directory reads
 
-The template also pre-allows each bot to read its own persistent-memory directory, so those reads don't surface a permission prompt to a human. One `Read(//<config-dir>/projects/*/memory/**)` rule is derived per distinct Claude config directory in your routing config (a route's `claude_config_dir`, the top-level `claude_config_dir`, or the `~/.claude` default). The rule is scoped to `projects/*/memory/**` only — never the config-dir root, which holds live credentials — so it never pre-authorizes credential reads.
+The template also pre-allows each bot to read its own persistent-memory directory, so those reads don't surface a permission prompt to a human. One `Read(//<config-dir>/projects/*/memory/**)` rule is derived per distinct Claude config directory across your personas (a persona's own `claude_config_dir`, the top-level `claude_config_dir`, or the `~/.claude` default). The rule is scoped to `projects/*/memory/**` only — never the config-dir root, which holds live credentials — so it never pre-authorizes credential reads.
 
 ---
 
@@ -654,9 +772,9 @@ Every message reaches a bot as its text wrapped in a `<channel source="slack-cha
 
 | Source | How it gets to the bot | Tag attributes | Reminder? |
 |---|---|---|---|
-| Direct message | Not delivered to any bot in this version. The server drops it and logs `persona-dm-dropped` lines, one for each bot. | — | — |
-| Channel message that @mentions the bot | Goes to the bot routed to that channel in `routes`. The bot's @mention is removed from the text. A message in a channel with no route is not delivered. | `chat_id` = the channel ID, `user` = the sender's Slack display name (falling back to real name, then Slack username, then user ID), `message_id` and `ts` = the Slack timestamp (for example `1789936743.069939`). Also `thread_ts` for a thread reply, and `attachment_count` and `attachments` when files are attached. | Yes, channel wording |
-| Channel message, when the bot receives everything | A bot receives every message in its routed channel, from any sender other than itself. | Same as the @mention row | Yes, channel wording |
+| Direct message | Not delivered to any persona in this version. The server drops it and logs a `persona-dm-dropped` line naming the persona whose app received it. | — | — |
+| Channel message that @mentions the bot | Goes to the persona when the channel is one of its `channels`, with either `delivery`. The persona's @mention is removed from the text. A message in a channel no persona is configured into is not delivered. | `chat_id` = the channel ID, `user` = the sender's Slack display name (falling back to real name, then Slack username, then user ID), `message_id` and `ts` = the Slack timestamp (for example `1789936743.069939`). Also `thread_ts` for a thread reply, and `attachment_count` and `attachments` when files are attached. | Yes, channel wording |
+| Channel message in a `delivery: all` channel | The persona receives every message in the channel, from any sender other than itself. In a `delivery: mentions` channel it receives only messages that @mention it. | Same as the @mention row | Yes, channel wording |
 | cscb_cron scheduled prompt | The server's scheduler posts it to `/interject`; it reaches only the target persona's instance. | `user="cscb-cron:<prompt-file-basename>"` and `ts` = the server clock in seconds, with at most three decimal places | No |
 | `/interject` message | A localhost script POSTs it (see [Interject](#interject)); it reaches only the named persona's instance. | `user` = the request's `sender` (default `interject`) and `ts` in the same form as a scheduled prompt | No |
 
@@ -665,11 +783,11 @@ Points to handle in a bot's prompt:
 - **Nothing marks an @mention.** The mention is removed from the text and no attribute records it, so a bot in a receive-everything channel cannot tell an @mention from any other message.
 - **A channel @mention currently arrives twice.** Slack sends both a `message` event and an `app_mention` event for it, and the server delivers both. The two copies have the same `message_id`. Answer it once.
 - **`/interject` sender labels are free-form.** Any localhost caller can set any `user` value, including one that starts with `cscb-cron:`. To tell an injected message from a Slack message, check `ts`: Slack timestamps always have six decimal places, and injected ones have at most three. The guard relies on this check too.
-- **Bots on the same server never see each other's Slack posts.** They all post as one Slack app, and the server drops that app's own messages.
+- **Personas can see each other's Slack posts.** Each persona posts as its own Slack app, and the server drops only a persona's own messages. Another persona's post reaches it like any other message: in a `delivery: all` channel always, in a `delivery: mentions` channel when the post @mentions it.
 
 ### What the server writes, and where
 
-CSCB owns installing the hook on your behalf. On every server boot, alongside the trust-folder bootstrap, the server walks every route, groups them by effective `claude_config_dir` (per-route override falls back to the top-level value), and patches `<claude_config_dir>/settings.json` in place. For each dir it ensures **exactly one** managed Stop-hook group of the shape:
+CSCB owns installing the hook on your behalf. On every server boot, alongside the trust-folder bootstrap, the server walks every persona, groups them by effective `claude_config_dir` (a persona's own value falls back to the top-level value), and patches `<claude_config_dir>/settings.json` in place. For each dir it ensures **exactly one** managed Stop-hook group of the shape:
 
 ```jsonc
 {
@@ -687,27 +805,27 @@ The command is an absolute path to the script inside CSCB's installed package tr
 
 ### Timing: on-disk at every boot, effective at next Claude process start
 
-The bootstrap rewrites `settings.json` on **every** CSCB boot, so the on-disk entry always reflects the currently-installed release's absolute path. Claude Code, however, only reads hook configuration when a Claude process starts. On a CSCB restart, live sessions are reconnected and keep their already-running Claude processes — they will not pick up an updated hook path until the next fresh spawn or the next resume of a dead/missing session for that route.
+The bootstrap rewrites `settings.json` on **every** CSCB boot, so the on-disk entry always reflects the currently-installed release's absolute path. Claude Code, however, only reads hook configuration when a Claude process starts. On a CSCB restart, live sessions are reconnected and keep their already-running Claude processes — they will not pick up an updated hook path until the next fresh spawn or the next resume of a dead/missing session for that persona.
 
 ### Shared-dir aggregation
 
-The install/remove decision is per **directory**, not per route. If two routes resolve to the same `claude_config_dir`, the managed entry is installed when at least one of them has the guard enabled, and removed only when all of them have it disabled. Consequence: a per-route opt-out fully disables the guard for a bot only when that route owns a *dedicated* `claude_config_dir`. A route that shares a dir with any enabled route still gets the guard on that shared dir.
+The install/remove decision is per **directory**, not per persona. If two personas resolve to the same `claude_config_dir`, the managed entry is installed when at least one of them has the guard enabled, and removed only when all of them have it disabled. Consequence: a per-persona opt-out fully disables the guard for a bot only when that persona has a *dedicated* `claude_config_dir`. A persona that shares a dir with any enabled persona still gets the guard on that shared dir.
 
 ### Personal-dir refusal
 
-The bootstrap refuses to touch the operator's own `~/.claude` directory. If a route's effective `claude_config_dir` resolves (via `realpathSync`, with a lexical fallback for paths that do not exist on disk) to your home `.claude` dir, nothing is written and a startup error is recorded. This prevents CSCB from ever installing a bot-oriented Stop hook into your interactive Claude Code config.
+The bootstrap refuses to touch the operator's own `~/.claude` directory. If a persona's effective `claude_config_dir` resolves (via `realpathSync`, with a lexical fallback for paths that do not exist on disk) to your home `.claude` dir, nothing is written and a startup error is recorded. This prevents CSCB from ever installing a bot-oriented Stop hook into your interactive Claude Code config.
 
 ### Bots without a `claude_config_dir`
 
-Routes with no effective `claude_config_dir` — neither per-route nor top-level — are skipped. Empty or whitespace-only values are treated as absent (so `resolve("")` never lands in the process cwd). If you want the guard on a bot, give its route a real `claude_config_dir`.
+Personas with no effective `claude_config_dir` — neither their own nor top-level — are skipped. Empty or whitespace-only values are treated as absent (so `resolve("")` never lands in the process cwd). If you want the guard on a bot, give its persona a real `claude_config_dir`.
 
 ### v1 limitations — opt these bots out
 
-The v1 guard only recognises a reply via `mcp__slack-channel-router__reply`. Bots whose only Slack surface is `edit_message` or `react` end their turn without producing a matching `tool_use`, so the guard reminds them after every Slack message and costs them one extra, useless continuation each time. **Opt these bots out** by setting `stop_hook_bootstrap: false` on the route (see the field reference below), and give the route a dedicated `claude_config_dir` — see [Shared-dir aggregation](#shared-dir-aggregation).
+The v1 guard only recognises a reply via `mcp__slack-channel-router__reply`. Bots whose only Slack surface is `edit_message` or `react` end their turn without producing a matching `tool_use`, so the guard reminds them after every Slack message and costs them one extra, useless continuation each time. **Opt these bots out** by setting `stop_hook_bootstrap: false` on the persona (see [Per-persona `stop_hook_bootstrap` override](#per-persona-stop_hook_bootstrap-override)), and give the persona a dedicated `claude_config_dir` — see [Shared-dir aggregation](#shared-dir-aggregation).
 
 ### Opting out
 
-The `stop_hook_bootstrap` boolean lives on the top level of `config.json` and on individual routes. It defaults to `true`. Set it to `false` at the top level to disable the bootstrap for every route; set it on an individual route to override the top-level default for one bot. See the [Field reference](#field-reference) and [Per-route `stop_hook_bootstrap` override](#per-route-stop_hook_bootstrap-override) below for the field details and the per-route-vs-shared-dir interaction.
+The `stop_hook_bootstrap` boolean lives on the top level of `config.json` and on individual personas. It defaults to `true`. Set it to `false` at the top level to disable the bootstrap for every persona; set it on an individual persona to override the top-level default for one bot. See [Server-wide settings](#server-wide-settings) and [Per-persona `stop_hook_bootstrap` override](#per-persona-stop_hook_bootstrap-override) above for the field details and the per-persona-vs-shared-dir interaction.
 
 ### Tag drift — fail-open, verify after upgrades
 
@@ -725,14 +843,11 @@ If the tag or any of those attributes no longer appears, the guard is dark or mi
 
 ## Troubleshooting
 
-**Missing environment variables**
-`start` exits with `missing prerequisite: SLACK_BOT_TOKEN environment variable` or `SLACK_APP_TOKEN environment variable`. Export both tokens in your shell profile and open a new terminal before running `start`.
-
 **config.json not found**
-`start` exits with `missing prerequisite: config.json not found at <path>`. Run `bun postinstall.ts` to create a skeleton, or create the file manually. Verify `SLACK_STATE_DIR` matches the directory you populated.
+`start` exits with `missing prerequisite: config.json not found at <path>`. Run `bun src/postinstall.ts` from the installed package directory to create the skeleton (`{"personas": []}`), or create the file manually. Verify `SLACK_STATE_DIR` matches the directory you populated.
 
-**config.json CWD mismatch**
-If a Claude Code session connects but immediately disconnects, the session's actual CWD does not match any `cwd` in `config.json`. The session's working directory is compared with each configured `cwd` by real path (after tilde expansion, with symlinks resolved), so a symlinked path to the same directory also matches. If a second session connects from the same directory, it replaces the first. Duplicate CWDs across multiple routes are rejected at startup.
+**Session connects but has no persona**
+If a Claude Code session connects but immediately disconnects, `server.log` shows `Session connected with CWD "<path>" — no matching persona`: the session's working directory is no persona's `working_directory`. It is compared with each persona's `working_directory` by real path (after tilde expansion, with symlinks resolved), so a symlinked path to the same directory also matches. If a second session connects from the same directory, it replaces the first. Two personas with the same working directory are rejected when the configuration loads.
 
 **Bot not receiving messages in a new channel**
 After inviting the bot to a channel, Slack may not deliver messages until the bot is @mentioned for the first time. This is a Slack Socket Mode behavior — the first @mention activates event delivery for that channel. After that, all messages flow normally.
@@ -740,34 +855,34 @@ After inviting the bot to a channel, Slack may not deliver messages until the bo
 **File attachment fails after a long wait**
 Each attempt of a Slack request is limited to 30 s, and that includes uploading a file attached with `reply`. An upload that takes longer than 30 s fails on every attempt, so the tool returns an error only after about 30 minutes, once the standard retries are spent. This is not a hang: send smaller files, or split a large attachment into several smaller ones.
 
-**Messages in a channel with no route are not delivered**
-A channel with no entry in `config.json → routes` reaches no bot. Each such message logs `unclaimed-channel` lines naming the channel in `server.log`:
+**Messages in a channel no persona is configured into are not delivered**
+A channel that is in no persona's `channels` reaches no bot, even when a persona's Slack app is a member. Each such message logs an `unclaimed-channel` line naming the channel and the persona whose app received it in `server.log`:
 
 ```sh
 grep unclaimed-channel ~/.claude/channels/slack/server.log
 ```
 
-Add a `routes` entry for the channel and restart the server.
+Add the channel to a persona's `channels` and restart the server.
 
 **Permission relay not working**
 Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json`.
 
 **Bot appears dead / posts a "blocked on a native Claude Code permission prompt" warning**
-The bot is wedged in `check_permission` on a native Claude Code TUI prompt that never reached Slack (a permission decision AD recorded but could not deliver). The bot stops responding, and after ~90 s the poller posts a one-shot channel warning. Recover by inspecting the native prompt with `agent-director read-pane --claude-instance-id <id>`, then killing and respawning the session (`agent-director kill <id>` or tmux-kill, then let the server restart it or `claude-slack-channel-bots stop && claude-slack-channel-bots start`). Do **not** use `send-keys` — agent-director hard-rejects it while the spawn is in this relayed permission state. The warning fires once per wedge episode; the detector re-arms if the bot later wedges again.
+The bot is wedged in `check_permission` on a native Claude Code TUI prompt that never reached Slack (a permission decision AD recorded but could not deliver). The bot stops responding, and after ~90 s the poller posts a one-shot warning naming the persona to the persona's destination. Recover by inspecting the native prompt with `agent-director read-pane --claude-instance-id <id>`, then killing and respawning the session (`agent-director kill <id>` or tmux-kill, then let the server restart it or `claude-slack-channel-bots stop && claude-slack-channel-bots start`). Do **not** use `send-keys` — agent-director hard-rejects it while the spawn is in this relayed permission state. The warning fires once per wedge episode; the detector re-arms if the bot later wedges again.
 
 **Session not restarting after crash**
-Auto-restart backs off exponentially on repeated launch failures — the delay doubles from `session_restart_delay` (default 60s) on each consecutive failure, up to a 15-minute ceiling. After 5 consecutive failures the route hits a cap: a `SpawnCapReached` message is posted to the channel and automatic restarts stop.
+Auto-restart backs off exponentially on repeated launch failures — the delay doubles from `session_restart_delay` (default 60s) on each consecutive failure, up to a 15-minute ceiling. After 5 consecutive failures the persona hits a cap: a `SpawnCapReached` notice naming the persona is posted to the persona's destination (its `permission_prompts`) and automatic restarts stop.
 
-Sending a message in a channel whose session is dead but not yet capped triggers a fast recovery: the restart is scheduled immediately (the backoff delay is clamped down to 5 seconds for an explicit human trigger, never raised), and the sender is told the session is starting and to retry in a moment. The dropped message itself is **not** delivered or replayed — recovery only starts the session; you must resend after it comes up. This human trigger still counts each failed launch toward the backoff/cap, and a restart already pending or active is not stacked.
+A message delivered to a persona whose session is dead but not yet capped triggers a fast recovery: the restart is scheduled immediately (the backoff delay is clamped down to 5 seconds for an explicit human trigger, never raised), and the sender is told the session is starting and to retry in a moment. The dropped message itself is **not** delivered or replayed — recovery only starts the session; you must resend after it comes up. This human trigger still counts each failed launch toward the backoff/cap, and a restart already pending or active is not stacked.
 
-A **capped** route (or one with auto-restart disabled via `session_restart_delay: 0`) does **not** recover on an inbound message — firing another launch there would only burn a spawn attempt against a route that cannot come up. The sender is told plainly that the channel will not self-recover and an operator must restart the server. To clear the cap and retry, restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`; the failure counter is in-process and cleared on restart, giving each route a fresh attempt. To disable auto-restart entirely, set `session_restart_delay` to `0` in `config.json`.
+A **capped** persona (or any persona when auto-restart is disabled via `session_restart_delay: 0`) does **not** recover on an inbound message — firing another launch there would only burn a spawn attempt against a persona that cannot come up. The sender is told plainly that the channel will not self-recover and an operator must restart the server. To clear the cap and retry, restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`; the failure counter is in-process and cleared on restart, giving each persona a fresh attempt. To disable auto-restart entirely, set `session_restart_delay` to `0` in `config.json`.
 
 **Bot alive but silently unresponsive (MCP disconnected)**
-A bot can stay running yet lose its MCP connection to the server — the process is alive but no longer reachable, so it stops responding without ever emitting a disconnect event. The periodic health-check recovers this automatically: once a channel is seen alive-but-disconnected on two consecutive ticks, the health-check schedules a reconnect (or a relaunch if the process has since died), so a stranded channel comes back with no inbound message and no server restart. The recovery lands within roughly two `health_check_interval` periods (default 120 s each) plus the restart backoff delay (default `session_restart_delay` 60 s) before the reconnect runs — about 3–5 minutes with default settings. A bot mid-turn (`working` state) is deliberately left alone and reconnected on a later tick once its turn settles.
+A bot can stay running yet lose its MCP connection to the server — the process is alive but no longer reachable, so it stops responding without ever emitting a disconnect event. The periodic health-check recovers this automatically: once a persona is seen alive-but-disconnected on two consecutive ticks, the health-check schedules a reconnect (or a relaunch if the process has since died), so a stranded persona comes back with no inbound message and no server restart. The recovery lands within roughly two `health_check_interval` periods (default 120 s each) plus the restart backoff delay (default `session_restart_delay` 60 s) before the reconnect runs — about 3–5 minutes with default settings. A bot mid-turn (`working` state) is deliberately left alone and reconnected on a later tick once its turn settles.
 
-A closely related symptom is a bot that still *looks* connected but silently drops every inbound message — its underlying message stream went away without the connection registering as closed. The same health-check path recovers this on the same two-consecutive-tick cadence, so no inbound message or server restart is needed. If a message does arrive on such a channel before recovery lands, the sender is told the message was not delivered and to retry in a moment, rather than getting silence.
+A closely related symptom is a bot that still *looks* connected but silently drops every inbound message — its underlying message stream went away without the connection registering as closed. The same health-check path recovers this on the same two-consecutive-tick cadence, so no inbound message or server restart is needed. If a message for such a persona arrives before recovery lands, the sender is told the message was not delivered and to retry in a moment, rather than getting silence.
 
-To verify recovery in the field, tail `server.log` for a stranded channel and confirm a tick-driven recovery lands — look for a `[slack] Scheduling restart for persona=<channel-id> in <N>s (backoff)` line and a `[slack] Session alive but disconnected — reconnecting MCP for persona=<channel-id>` line naming that channel's ID (and, when the bot was mid-turn, a `deferring /mcp reconnect to a later tick (b.9a7/b.rmy)` line first). A **capped** route is exempt: the health-check skips it entirely, including reconnects, so a capped channel still requires a server restart (see below).
+To verify recovery in the field, tail `server.log` for a stranded persona and confirm a tick-driven recovery lands — look for a `[slack] Scheduling restart for persona=<key> in <N>s (backoff)` line and a `[slack] Session alive but disconnected — reconnecting MCP for persona=<key>` line naming that persona's key (and, when the bot was mid-turn, a `[slack] reconnectSession: persona=<key> is working — deferring /mcp reconnect to a later tick (b.9a7/b.rmy)` line first). A **capped** persona is exempt: the health-check skips it entirely, including reconnects, so a capped persona still requires a server restart (see above).
 
 **Session stuck during clean_restart**
 If a session does not exit within `exit_timeout` seconds (default 120s), `clean_restart` force-kills the spawn via `agent-director kill` and proceeds. To manually recover, run `agent-director list --label service=cscb` to find lingering spawns and `agent-director kill <claude_instance_id>` to clear them, then `claude-slack-channel-bots stop && claude-slack-channel-bots start`.
@@ -778,14 +893,14 @@ This is intentional: when agent-director is unreachable, the teardown cannot run
 **Bots come back with no memory of the prior conversation after a reboot**
 With `resume_enabled: true`, a bot whose host rebooted (or pod resumed) should return with its conversation history. If it comes back amnesiac, confirm the system-installed `agent-director` is **≥ 0.8.0** (`agent-director version`) — reboot recovery relies on capabilities added in that release. Note that `bun run install-check` does **not** confirm this: its client floor is `0.7.0`, lower than the reboot-recovery requirement, so install-check passes on a `0.7.x` binary that still yields amnesiac bots. Verify the resume requirement directly with `agent-director version`. Note: legacy sessions created before upgrading to 0.8.0 may lose history exactly once on their first post-upgrade recovery, then resume cleanly thereafter.
 
-A bot also starts fresh, by design, when its session no longer matches the config. Config edits take effect only when the server starts. If you change a route's `cwd`, the next server start replaces the session instead of resuming it. If you change a route's effective `claude_config_dir`, the bot starts fresh the next time it would be resumed: after `clean_restart`, after `stop --stop-bots` then `start`, after a reboot, or when the bot dies. A bot that keeps running across a plain `stop` and `start` keeps its old config directory until then. The old transcript stays in the old config directory. The first start after upgrading from an earlier release also replaces every existing bot once, because the server removes managed sessions it cannot attribute. The log names the reason: search `server.log` for `sweeping row`, `replacing the row` or `not resuming; spawning fresh`.
+A bot also starts fresh, by design, when its session no longer matches the config. Config edits take effect only when the server starts. If you change a persona's `working_directory`, the next server start replaces the session instead of resuming it. If you change a persona's effective `claude_config_dir` (its own or the top-level default), the bot starts fresh the next time it would be resumed: after `clean_restart`, after `stop --stop-bots` then `start`, after a reboot, or when the bot dies. A bot that keeps running across a plain `stop` and `start` keeps its old config directory until then. The old transcript stays in the old config directory. The first start after upgrading from an earlier release also replaces every existing bot once, because the server removes managed sessions it cannot attribute. The log names the reason: search `server.log` for `sweeping row`, `replacing the row` or `not resuming; spawning fresh`.
 
 **Session crashes on resume with "sandbox required but unavailable"**
 This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json` to disable `--resume` entirely — the bot will always start a fresh Claude session instead of resuming a prior conversation, both on startup and on runtime auto-restart:
 
 ```json
 {
-  "routes": { ... },
+  "personas": [ ... ],
   "resume_enabled": false
 }
 ```
@@ -822,12 +937,12 @@ Classes you may see:
 
 The following classes are **non-fatal warnings** about conversation-memory loss. They are recorded to the same log but never exit the process or block startup. The first four are written by the JSONL-persistence safeguard, which runs *before* the resume path to warn about an *impending* loss; the last two (`jsonl-transcript-lost-on-resume`, `jsonl-diagnosis-inconclusive`) are written *by the resume path itself* when it tried to resume a row and either confirmed a wipe or could not determine whether one occurred:
 
-- `jsonl-non-persistent` — a session-transcript storage root (`<claude_config_dir>/projects`) is on a `tmpfs`/`ramfs` mount, so nothing there survives a reboot and session resume is structurally impossible on this host. A warning is also posted to the affected channels — those whose transcript storage root is the flagged mount, not every routed channel. Move the config dir to a persistent filesystem.
+- `jsonl-non-persistent` — a session-transcript storage root (`<claude_config_dir>/projects`) is on a `tmpfs`/`ramfs` mount, so nothing there survives a reboot and session resume is structurally impossible on this host. A warning is also posted to the destination of each affected persona — those whose transcript storage root is the flagged mount, not every persona. Move the config dir to a persistent filesystem.
 - `jsonl-persistence-check-warning` — the safeguard could not determine the filesystem type of a transcript storage root (unreadable/unparseable `/proc/self/mountinfo`, or an unresolvable path), so persistence is unverified. No Slack post is made. Investigate the mount before relying on resume.
-- `jsonl-transcript-stale-path` — a channel's saved transcript exists on disk at the resolved fallback path, but agent-director's recorded `jsonl_path` points elsewhere (missing/empty). On the next restart the resume path would treat it as missing and wipe the channel's memory. A warning is posted to that channel; an operator should reconcile the path before restarting.
-- `jsonl-transcript-lost` — a channel's transcript is gone from disk (neither the recorded nor the fallback path exists), yet the message archive shows messages in that channel since the bot spawned. Conversation history has been lost and resume will start the bot fresh. A warning is posted to that channel. Requires `message_archive_db` to be configured for the archive evidence.
-- `jsonl-transcript-lost-on-resume` — resume actually threw `ErrJsonlMissing` for a channel, the bot was delete+fresh-spawned, and the message archive shows messages in that channel since it spawned — so conversation history was destroyed by this recovery, not merely at risk. A warning is also posted to that channel. This is the resume path's own after-the-fact report (distinct from the pre-resume `jsonl-transcript-lost` warning above); the log line names every transcript path tried and whether each came from agent-director or was computed locally. A missing transcript on a channel that was *idle since spawn* — the archive was consulted and shows zero messages since spawn — is expected (the transcript is created lazily on first message) and produces a quiet log line only, no error class and no channel post. Requires `message_archive_db` for the archive evidence; when the archive cannot be consulted the case is instead reported as `jsonl-diagnosis-inconclusive` below.
-- `jsonl-diagnosis-inconclusive` — resume threw `ErrJsonlMissing` and the bot was delete+fresh-spawned, but the diagnosis could not determine whether conversation history was lost: the agent-director row could not be fetched, `started_at` was unparseable, the message archive could not be read, or `message_archive_db` is not configured at all. Because "inconclusive" correlates with the same storage problems that cause real loss, this is surfaced (not silently downgraded to a benign never-created): the line records *why* the diagnosis failed, and a warning is posted to the channel worded as uncertainty ("on restart I was started fresh; I could not determine whether my prior conversation history was preserved") rather than as a confirmed loss. When the reason is an unconfigured archive, the message notes that diagnosis is impossible without `message_archive_db` and suggests enabling it. These channels are counted separately in the startup summary as `fresh-after-inconclusive-amnesia` (distinct from the `fresh-after-amnesia` count).
+- `jsonl-transcript-stale-path` — a persona's saved transcript exists on disk at the resolved fallback path, but agent-director's recorded `jsonl_path` points elsewhere (missing/empty). On the next restart the resume path would treat it as missing and wipe the persona's memory. A warning is posted to the persona's destination; an operator should reconcile the path before restarting.
+- `jsonl-transcript-lost` — a persona's transcript is gone from disk (neither the recorded nor the fallback path exists), yet the message archive shows messages in the persona's `delivery: all` channels since the bot spawned. Only those channels are counted. Conversation history has been lost and resume will start the bot fresh. A warning is posted to the persona's destination. Requires `message_archive_db` to be configured for the archive evidence. When the archive shows nothing, the safeguard logs a quiet line only: no transcript is expected for a persona idle since spawn, and for a persona with a `delivery: mentions` channel or DMs on a zero count proves nothing. A row the server will replace rather than resume (its working directory or config directory changed) is not checked.
+- `jsonl-transcript-lost-on-resume` — resume actually threw `ErrJsonlMissing` for a persona, the bot was delete+fresh-spawned, and the message archive shows messages in the persona's `delivery: all` channels since it spawned — so conversation history was destroyed by this recovery, not merely at risk. Only those channels are counted. A warning is also posted to the persona's destination. This is the resume path's own after-the-fact report (distinct from the pre-resume `jsonl-transcript-lost` warning above); the log line names every transcript path tried and whether each came from agent-director or was computed locally. A missing transcript on a persona that was *idle since spawn* — the archive was consulted and shows zero messages since spawn, and every one of the persona's channels is `delivery: all` with DMs off — is expected (the transcript is created lazily on first message) and produces a quiet log line only, no error class and no Slack post. Requires `message_archive_db` for the archive evidence; when the archive cannot be consulted the case is instead reported as `jsonl-diagnosis-inconclusive` below.
+- `jsonl-diagnosis-inconclusive` — resume threw `ErrJsonlMissing` and the bot was delete+fresh-spawned, but the diagnosis could not determine whether conversation history was lost: the agent-director row could not be fetched, `started_at` was unparseable, the message archive could not be read, `message_archive_db` is not configured at all, or the archive shows zero messages but the persona has a `delivery: mentions` channel or DMs on, so a zero count cannot show it was idle (the archive cannot attribute messages from `mentions` channels or DMs to a persona). Because "inconclusive" correlates with the same storage problems that cause real loss, this is surfaced (not silently downgraded to a benign never-created): the line records *why* the diagnosis failed, and a warning is posted to the persona's destination worded as uncertainty ("on restart I was started fresh; I could not determine whether my prior conversation history was preserved") rather than as a confirmed loss. When the reason is an unconfigured archive, the message notes that diagnosis is impossible without `message_archive_db` and suggests enabling it. These personas are counted separately in the startup summary as `fresh-after-inconclusive-amnesia` (distinct from the `fresh-after-amnesia` count).
 
 ---
 
@@ -901,7 +1016,16 @@ For operators upgrading from a pre-`agent-director` install:
 6. **Optional cleanup**: `~/.claude/channels/slack/sessions.json` and `sessions.json.last` are no longer read or written. CSCB ignores them; you can safely `rm` them after a successful boot.
 7. **`tmux` is no longer a CSCB-direct prereq** but is still required transitively via agent-director — keep it installed.
 
-After step 1, every CSCB bot is spawned through `client.spawn(...)` with `relay_mode='on'`. The green/red Slack button UX is byte-identical to the pre-migration behavior; the action_id shape changes from `perm_(allow|deny)_<uuid>` to `perm_(allow|deny)_cscb_<channelId>_<request_token>` (where `<request_token>` is a UUIDv4 minted by agent-director) but this is invisible to end users.
+After step 1, every CSCB bot is spawned through `client.spawn(...)` with `relay_mode='on'`. The green/red Slack button UX is byte-identical to the pre-migration behavior; the action_id shape changes from `perm_(allow|deny)_<uuid>` to `perm_(allow|deny)_cscb_<key>_<request_token>` (where `<key>` is the persona key and `<request_token>` is a UUIDv4 minted by agent-director) but this is invisible to end users.
+
+### Upgrading to personas
+
+This version configures bots as personas. When you upgrade from an earlier version:
+
+- **Rewrite `config.json` by hand.** A configuration from an earlier version is rejected at start with an error saying it must be converted to personas. Nothing is converted automatically and the file is not changed. Write a `personas` list as described in [Personas (config.json)](#personas-configjson); the server-wide settings keep their names.
+- **Move the tokens into credentials files.** Slack tokens are no longer read from environment variables. Create one [credentials file](#credentials-files) per persona, then remove the token exports from your shell profile.
+- **Give each persona its own Slack app.** Your existing app can serve one persona; create another app for each additional persona.
+- **Expect each bot to start fresh once.** Bot instances created before this version are replaced at the first start after the upgrade, so each persona starts once without its prior conversation.
 
 ---
 

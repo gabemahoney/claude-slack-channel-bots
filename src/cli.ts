@@ -3,24 +3,77 @@
  * cli.ts — Command-line entry point for the Slack Channel Router.
  *
  * Subcommands:
- *   start  — Validate prerequisites then launch server in the background.
- *   stop   — Send SIGTERM to a running server via its PID file.
+ *   start          — Check that the configuration file exists, launch the
+ *                    server in the background, and report an early startup
+ *                    failure of the daemon.
+ *   stop           — Send SIGTERM to a running server via its PID file.
+ *                    `--stop-bots` also exits every configured persona's
+ *                    instance.
+ *   clean_restart  — Exit every configured persona's instance, then stop and
+ *                    start the server.
+ *
+ * The CLI reads the configuration file the server loads
+ * (`resolveServerConfigPath`, b.av2 SR-8.7) with the persona loader, and
+ * reads no Slack token: each persona's tokens live in its credentials file,
+ * which only the server reads (b.av2 SR-10.2).
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { homedir } from 'os'
-import { join, resolve } from 'path'
-import { existsSync, openSync, readFileSync, unlinkSync } from 'fs'
-import { spawnSync } from 'child_process'
+import { join } from 'path'
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, unlinkSync } from 'fs'
+import { spawn, spawnSync } from 'child_process'
 import { isProcessRunning } from './pid.ts'
-import { loadConfig as configLoadConfig, type RoutingConfig } from './config.ts'
+import {
+  loadPersonaConfig,
+  resolveServerConfigPath,
+  resolveServerStateDir,
+  type Persona,
+  type PersonaConfig,
+} from './config.ts'
 import { initLogging } from './logging.ts'
-import { isDryRun } from './tokens.ts'
 import { ErrSpawnNotFound } from './agent-director-errors.ts'
 import { getClient } from './agent-director-client.ts'
-import { PERSONA_LABEL_PREFIX, SERVICE_LABEL, personaInstanceId } from './persona-identity.ts'
+import type { Client } from 'agent-director'
+import { personaInstanceId, renderPersonaRef } from './persona-identity.ts'
 import { runStartupGate } from './agent-director-startup.ts'
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/**
+ * How long `start` waits for the daemon it spawned to get past startup
+ * (b.av2 SR-1.7, SR-8.7): long enough for the agent-director startup gate,
+ * the configuration load and the template refresh that precede the PID file.
+ */
+export const DAEMON_STARTUP_WAIT_MS = 30_000
+
+/** How often `start` checks the daemon while it waits. */
+export const DAEMON_STARTUP_POLL_MS = 100
+
+/** Most `server.log` lines `start` repeats when the daemon exits during startup. */
+export const DAEMON_FAILURE_LOG_LINES = 20
+
+// ---------------------------------------------------------------------------
+// Daemon child
+// ---------------------------------------------------------------------------
+
+/** Options `start` spawns the daemon with (b.acn: detached, no inherited stdio). */
+export interface DaemonSpawnOptions {
+  detached: true
+  stdio: ['ignore', number, number]
+  env: NodeJS.ProcessEnv
+}
+
+/** The part of a spawned daemon child that `start` uses. */
+export interface DaemonChild {
+  /** Undefined when the spawn failed (an `error` event follows). */
+  readonly pid?: number
+  unref(): void
+  once(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown
+  once(event: 'error', listener: (err: Error) => void): unknown
+}
 
 // ---------------------------------------------------------------------------
 // Injectable dependency interface
@@ -29,28 +82,52 @@ import { runStartupGate } from './agent-director-startup.ts'
 export interface CliDeps {
   /** Run a command and return its exit code (or null if spawn failed). */
   spawnSync: (cmd: string, args: string[]) => { status: number | null }
-  /** Current process environment. */
-  env: NodeJS.ProcessEnv
+  /** Spawn the detached server daemon (`start`'s parent path). */
+  spawnDaemon: (cmd: string, args: string[], opts: DaemonSpawnOptions) => DaemonChild
+  /** Open a file for appending (creating it) and return its descriptor: the daemon's `server.log`. */
+  openLogAppend: (path: string) => number
+  /** Close a descriptor `openLogAppend` returned. */
+  closeFd: (fd: number) => void
+  /**
+   * Redirect console.error / console.log to a log file (`initLogging` in
+   * production): the daemon child's `server.log`, clean_restart's
+   * `clean_restart.log`. May throw; both callers treat a failure as non-fatal.
+   */
+  initLogging: (path: string) => void
   /** Check whether a file path exists. */
   existsSync: (path: string) => boolean
   /** Read a file as UTF-8 text. */
   readFileSync: (path: string) => string
+  /** Size of a file in bytes; 0 when it cannot be read. */
+  fileSize: (path: string) => number
+  /** A file's bytes from `offset` to the end, as UTF-8 text; '' when it cannot be read. */
+  readFileFrom: (path: string, offset: number) => string
+  /** Current time in milliseconds (the daemon startup wait's clock). */
+  now: () => number
+  /** Resolve after `ms` milliseconds (the daemon startup wait's clock). */
+  sleep: (ms: number) => Promise<void>
   /** Remove a file. */
   unlinkSync: (path: string) => void
   /** Check whether a PID corresponds to a running process. */
   isProcessRunning: (pid: number) => boolean
   /** Kill a process with the given signal. */
   kill: (pid: number, signal: string | number) => void
-  /** Resolve STATE_DIR from env or default. */
+  /** The server's state directory (`resolveServerStateDir` in production). */
   resolveStateDir: () => string
+  /** The configuration file the server loads (`resolveServerConfigPath` in production). */
+  resolveConfigPath: () => string
   /** Launch the server. Resolves when server startup completes (or throws). */
   startServer: () => Promise<void>
   /** Exit the process. */
   exit: (code: number) => never
-  /** Load the routing configuration. */
-  loadConfig: () => RoutingConfig
   /**
-   * b.qwo: initialize the agent-director Client singleton before any per-channel
+   * Load the persona configuration at `path` (`loadPersonaConfig` in
+   * production). Throws the loader's error unchanged, including E1's
+   * conversion error for a pre-persona file (b.av2 SR-1.7).
+   */
+  loadConfig: (path: string) => PersonaConfig
+  /**
+   * b.qwo: initialize the agent-director Client singleton before any per-persona
    * teardown work. clean_restart / `stop --stop-bots` run in a short-lived CLI
    * process that never runs the server startup gate, so getClient() would throw
    * (the b.qps root cause). Production wires this to the non-exiting
@@ -60,26 +137,53 @@ export interface CliDeps {
    * already-installed stub.
    */
   initClient?: () => Promise<void>
-  /** Query the agent-director state for a channel. Returns null when the row is absent. */
-  directorStatus: (channelId: string) => Promise<{ state: string } | null>
-  /** Politely shut down the spawn for a channel via client.pause. */
-  directorPause: (channelId: string) => Promise<void>
   /**
-   * Hard-terminate the spawn for a channel via client.kill. May throw
-   * ErrSpawnNotFound for an already-gone row; the real deps absorb it and
-   * teardownBots also tolerates it at the call sites — the double-layer
+   * Query the agent-director state of a persona's instance, addressed by its
+   * instance ID (`cscb_<key>`). Returns null only when the row is absent
+   * (ErrSpawnNotFound); every other error propagates (b.qwo).
+   */
+  directorStatus: (instanceId: string) => Promise<{ state: string } | null>
+  /** Politely shut down a persona's instance (`cscb_<key>`) via client.pause. */
+  directorPause: (instanceId: string) => Promise<void>
+  /**
+   * Hard-terminate a persona's instance (`cscb_<key>`) via client.kill. May
+   * throw ErrSpawnNotFound for an already-gone row; the real deps absorb it
+   * and teardownBots also tolerates it at the call sites — the double-layer
    * leniency is intentional (b.dnt).
    */
-  directorKill: (channelId: string) => Promise<void>
+  directorKill: (instanceId: string) => Promise<void>
 }
 
 // ---------------------------------------------------------------------------
-// Default STATE_DIR resolver
+// Log reads for the daemon startup report (production deps)
 // ---------------------------------------------------------------------------
 
-function defaultStateDir(): string {
-  const fromEnv = process.env['SLACK_STATE_DIR']
-  return fromEnv ? resolve(fromEnv) : join(homedir(), '.claude', 'channels', 'slack')
+function fileSize(path: string): number {
+  try {
+    return statSync(path).size
+  } catch {
+    return 0
+  }
+}
+
+function readFileFrom(path: string, offset: number): string {
+  let fd: number
+  try {
+    fd = openSync(path, 'r')
+  } catch {
+    return ''
+  }
+  try {
+    const start = Math.max(0, offset)
+    const length = Math.max(0, fstatSync(fd).size - start)
+    const buf = Buffer.alloc(length)
+    const read = readSync(fd, buf, 0, length, start)
+    return buf.subarray(0, read).toString('utf-8')
+  } catch {
+    return ''
+  } finally {
+    closeSync(fd)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -125,95 +229,29 @@ export interface CliHandlers {
  */
 export function createCli(deps: CliDeps): CliHandlers {
   /**
-   * b.4dk: per-route graceful bot teardown — SR-11 Event 12's pause/poll/kill
+   * b.4dk: per-persona graceful bot teardown — SR-11 Event 12's pause/poll/kill
    * sequence, extracted so both clean_restart and `stop --stop-bots` reuse the
    * exact same tested logic instead of duplicating it.
    *
-   * For each route: precheck the row state; skip absent/terminal rows;
-   * client.pause() (sends `/exit` → SessionEnd reason prompt_input_exit → the
-   * row reaches `ended`); poll client.status() with exponential backoff until
-   * ended/missing or exit_timeout elapses; on timeout escalate to
-   * client.kill(). NOTE: a kill escalation does NOT guarantee an `ended` row —
-   * that residual case is recovered later via the findMissing→resume path.
+   * Runs once per persona of the configuration file (b.av2 SR-8.7), addressing
+   * each persona's instance as `cscb_<key>`; see `teardownPersona`. A config
+   * with no personas tears down nothing.
    */
-  async function teardownBots(routes: RoutingConfig['routes'], exit_timeout: number): Promise<void> {
+  async function teardownBots(personas: readonly Persona[], exit_timeout: number): Promise<void> {
     // b.qwo: the precheck's directorStatus() reaches agent-director. If AD is
     // unreachable (the b.qps/incident-2026-09-18 root cause: getClient() throws
     // in the short-lived CLI process, or the AD binary is down), that error MUST
-    // NOT be swallowed as a per-channel "no spawn row — skipping" no-op. We let
+    // NOT be swallowed as a per-persona "no spawn row — skipping" no-op. We let
     // the precheck error propagate to Promise.allSettled as a rejection, then
     // throw a loud aggregate error after the loop so callers exit non-zero and
     // never proceed to `start`. b.dnt: escalation/timeout kill failures on a
     // present row also reject into the aggregate now — only the benign
-    // ErrSpawnNotFound already-gone race stays per-channel handled below.
-    const results = await Promise.allSettled(Object.entries(routes).map(async ([channelId]) => {
-      // Precheck: any row? If not, nothing to do.
-      // NOTE (b.qwo): errors here (AD unreachable / uninitialized client)
-      // intentionally propagate — they become allSettled rejections handled
-      // by the post-loop loud-failure check. "no spawn row" is reported ONLY
-      // when directorStatus resolves to null (row genuinely absent).
-      const precheck = await deps.directorStatus(channelId)
-      if (precheck === null) {
-        console.error(`[slack] teardownBots: no spawn row for channel=${channelId} — skipping`)
-        return
-      }
-      const state = precheck.state
-      if (state === 'ended' || state === 'missing') {
-        console.error(`[slack] teardownBots: channel=${channelId} already terminal (state=${state}) — skipping`)
-        return
-      }
-
-      // pause and poll for terminal transition
-      try {
-        await deps.directorPause(channelId)
-      } catch (err) {
-        console.error(`[slack] teardownBots: pause failed for channel=${channelId} — escalating to kill:`, err)
-        // b.dnt: the kill's outcome decides this channel's fate. A benign
-        // ErrSpawnNotFound (row genuinely already gone) resolves quietly;
-        // any other kill error (e.g. AD died mid-teardown) rethrows so it
-        // rejects into the Promise.allSettled aggregate below. SR-0.2:
-        // branch via the typed class, never on error strings.
-        try {
-          await deps.directorKill(channelId)
-        } catch (killErr) {
-          if (!(killErr instanceof ErrSpawnNotFound)) throw killErr
-        }
-        return
-      }
-
-      const timeoutMs = exit_timeout * 1000
-      const startTime = Date.now()
-      let delay = 100
-      const maxDelay = 2_000
-
-      while (Date.now() - startTime < timeoutMs) {
-        await new Promise<void>((r) => setTimeout(r, delay))
-        delay = Math.min(delay * 2, maxDelay)
-        const pollResult = await deps.directorStatus(channelId)
-        if (pollResult === null || pollResult.state === 'ended' || pollResult.state === 'missing') {
-          const elapsed = Date.now() - startTime
-          console.error(`[slack] teardownBots: channel=${channelId} exited cleanly in ${elapsed}ms`)
-          return
-        }
-      }
-
-      // Timeout — force kill via agent-director
-      const elapsed = Date.now() - startTime
-      try {
-        await deps.directorKill(channelId)
-        console.error(`[slack] teardownBots: channel=${channelId} force-killed after ${elapsed}ms`)
-      } catch (err) {
-        console.error(`[slack] teardownBots: kill failed for channel=${channelId}:`, err)
-        // b.dnt: same rule as the escalation path — a throwing kill here means
-        // AD is dead mid-teardown, not a benign already-gone row. Rethrow so it
-        // rejects into the aggregate; swallow only the benign ErrSpawnNotFound.
-        if (!(err instanceof ErrSpawnNotFound)) throw err
-      }
-    }))
+    // ErrSpawnNotFound already-gone race stays per-persona handled.
+    const results = await Promise.allSettled(personas.map((persona) => teardownPersona(persona, exit_timeout)))
 
     // b.qwo: loud AD-unreachable failure. A rejected settlement here is an
     // agent-director error — from the connectivity/precheck at the top of a
-    // channel's teardown, from a directorStatus poll-loop call, or
+    // persona's teardown, from a directorStatus poll-loop call, or
     // (b.dnt) from an escalation/timeout kill that failed with anything other
     // than the benign ErrSpawnNotFound already-gone race — never a normal
     // terminal-row skip, which resolves. Surface every one and throw so the
@@ -225,9 +263,87 @@ export function createCli(deps: CliDeps): CliHandlers {
         console.error('[slack] teardownBots: agent-director error during teardown:', r.reason)
       }
       throw new Error(
-        `teardownBots: agent-director error — teardown incomplete for ${rejected.length} channel(s); ` +
-          `other channels may already have been paused or killed; rows are never deleted, safe to retry`,
+        `teardownBots: agent-director error — teardown incomplete for ${rejected.length} persona(s); ` +
+          `other personas may already have been paused or killed; rows are never deleted, safe to retry`,
       )
+    }
+  }
+
+  /**
+   * One persona's teardown: precheck the row state of `cscb_<key>`; skip an
+   * absent/terminal row; client.pause() (sends `/exit` → SessionEnd reason
+   * prompt_input_exit → the row reaches `ended`); poll client.status() with
+   * exponential backoff until ended/missing or exit_timeout elapses; on
+   * timeout escalate to client.kill(). NOTE: a kill escalation does NOT
+   * guarantee an `ended` row — that residual case is recovered later via the
+   * findMissing→resume path. Log lines name the persona as its JSON-quoted
+   * name with its key (b.av2 SR-2.2).
+   */
+  async function teardownPersona(persona: Persona, exit_timeout: number): Promise<void> {
+    const id = personaInstanceId(persona.key)
+    const ref = renderPersonaRef(persona.name, persona.key)
+
+    // Precheck: any row? If not, nothing to do.
+    // NOTE (b.qwo): errors here (AD unreachable / uninitialized client)
+    // intentionally propagate — they become allSettled rejections handled
+    // by teardownBots' loud-failure check. "no spawn row" is reported ONLY
+    // when directorStatus resolves to null (row genuinely absent).
+    const precheck = await deps.directorStatus(id)
+    if (precheck === null) {
+      console.error(`[slack] teardownBots: no spawn row for persona ${ref} — skipping`)
+      return
+    }
+    const state = precheck.state
+    if (state === 'ended' || state === 'missing') {
+      console.error(`[slack] teardownBots: persona ${ref} already terminal (state=${state}) — skipping`)
+      return
+    }
+
+    // pause and poll for terminal transition
+    try {
+      await deps.directorPause(id)
+    } catch (err) {
+      console.error(`[slack] teardownBots: pause failed for persona ${ref} — escalating to kill:`, err)
+      // b.dnt: the kill's outcome decides this persona's fate. A benign
+      // ErrSpawnNotFound (row genuinely already gone) resolves quietly;
+      // any other kill error (e.g. AD died mid-teardown) rethrows so it
+      // rejects into the Promise.allSettled aggregate. SR-0.2: branch via
+      // the typed class, never on error strings.
+      try {
+        await deps.directorKill(id)
+      } catch (killErr) {
+        if (!(killErr instanceof ErrSpawnNotFound)) throw killErr
+      }
+      return
+    }
+
+    const timeoutMs = exit_timeout * 1000
+    const startTime = Date.now()
+    let delay = 100
+    const maxDelay = 2_000
+
+    while (Date.now() - startTime < timeoutMs) {
+      await new Promise<void>((r) => setTimeout(r, delay))
+      delay = Math.min(delay * 2, maxDelay)
+      const pollResult = await deps.directorStatus(id)
+      if (pollResult === null || pollResult.state === 'ended' || pollResult.state === 'missing') {
+        const elapsed = Date.now() - startTime
+        console.error(`[slack] teardownBots: persona ${ref} exited cleanly in ${elapsed}ms`)
+        return
+      }
+    }
+
+    // Timeout — force kill via agent-director
+    const elapsed = Date.now() - startTime
+    try {
+      await deps.directorKill(id)
+      console.error(`[slack] teardownBots: persona ${ref} force-killed after ${elapsed}ms`)
+    } catch (err) {
+      console.error(`[slack] teardownBots: kill failed for persona ${ref}:`, err)
+      // b.dnt: same rule as the escalation path — a throwing kill here means
+      // AD is dead mid-teardown, not a benign already-gone row. Rethrow so it
+      // rejects into the aggregate; swallow only the benign ErrSpawnNotFound.
+      if (!(err instanceof ErrSpawnNotFound)) throw err
     }
   }
 
@@ -235,28 +351,23 @@ export function createCli(deps: CliDeps): CliHandlers {
     // tmux is no longer a CSCB-direct prerequisite — agent-director owns the
     // tmux integration. CSCB still requires it transitively but the
     // SR-5.1 startup gate is the single source of truth for runtime checks.
+    //
+    // No token check (b.av2 SR-10.2): the server reads each persona's tokens
+    // from its credentials file, never from the environment.
 
-    // Check required Slack tokens (skipped in dry-run mode)
-    if (!isDryRun()) {
-      if (!deps.env['SLACK_BOT_TOKEN']) {
-        console.error('missing prerequisite: SLACK_BOT_TOKEN environment variable')
-        deps.exit(1)
-      }
-      if (!deps.env['SLACK_APP_TOKEN']) {
-        console.error('missing prerequisite: SLACK_APP_TOKEN environment variable')
-        deps.exit(1)
-      }
-    }
-
-    // Check config.json exists
+    // b.av2 SR-8.7: the configuration file the server loads must exist. Its
+    // contents are not checked here: the server validates them at start, and
+    // `start` reports that failure from the daemon's log (see
+    // `awaitDaemonStartup`).
     const stateDir = deps.resolveStateDir()
-    const routingJson = join(stateDir, 'config.json')
-    if (!deps.existsSync(routingJson)) {
-      console.error(`missing prerequisite: config.json not found at ${routingJson}`)
+    const configPath = deps.resolveConfigPath()
+    if (!deps.existsSync(configPath)) {
+      console.error(`missing prerequisite: config.json not found at ${configPath}`)
       deps.exit(1)
     }
 
-    // All checks passed — daemonize: parent exits, child continues as server
+    // All checks passed — daemonize: the parent spawns the daemon and waits for
+    // its startup outcome, the child continues as the server.
     // In Bun, we detect the child vs parent by an env marker.
     //
     // b.acn: the marker alone is untrustworthy. If _CLI_DAEMON_CHILD leaks into
@@ -271,26 +382,115 @@ export function createCli(deps: CliDeps): CliHandlers {
       delete process.env['_CLI_DAEMON_CHILD']
     }
     if (!process.env['_CLI_DAEMON_CHILD']) {
-      // Parent: spawn a detached background child and exit
-      const { spawn } = await import('child_process')
+      // Parent: spawn a detached background child, then report its startup.
       const logPath = join(stateDir, 'server.log')
-      const logFd = openSync(logPath, 'a')
+      const logOffset = deps.fileSize(logPath)
+      const logFd = deps.openLogAppend(logPath)
       const childEnv: NodeJS.ProcessEnv = { ...process.env, _CLI_DAEMON_CHILD: '1' }
-      const child = spawn(process.execPath, [import.meta.filename, 'start'], {
-        detached: true,
-        stdio: ['ignore', logFd, logFd],
-        env: childEnv,
-      })
+      let child: DaemonChild
+      try {
+        child = deps.spawnDaemon(process.execPath, [import.meta.filename, 'start'], {
+          detached: true,
+          stdio: ['ignore', logFd, logFd],
+          env: childEnv,
+        })
+      } finally {
+        // The daemon holds its own copy of the descriptor; the parent's is not
+        // needed while it waits (up to DAEMON_STARTUP_WAIT_MS).
+        deps.closeFd(logFd)
+      }
       child.unref()
-      console.error(`[slack] Server starting in background (PID ${child.pid})`)
-      deps.exit(0)
+      await awaitDaemonStartup(child, join(stateDir, 'server.pid'), logPath, logOffset)
+      return
     }
 
     // Child (daemon): redirect stderr/stdout to server.log
-    try { initLogging(join(stateDir, 'server.log')) } catch { /* best-effort: log redirect failure is non-fatal */ }
+    try { deps.initLogging(join(stateDir, 'server.log')) } catch { /* best-effort: log redirect failure is non-fatal */ }
 
     // Child (daemon): start the server
     await deps.startServer()
+  }
+
+  /**
+   * `start`'s parent path after the spawn (b.av2 SR-1.7, SR-8.7): wait up to
+   * DAEMON_STARTUP_WAIT_MS for the daemon to exit or to write its own PID to
+   * the PID file, which the server does once it is listening, after the
+   * configuration load. Then exit:
+   *
+   * - the daemon wrote its PID: 0, with the "Server starting in background"
+   *   line;
+   * - the daemon exited (or could not be spawned): 1, repeating the lines
+   *   this run appended to `server.log`, which carry the server's own fatal
+   *   reason (E1's conversion error verbatim for a pre-persona file). Server
+   *   log lines never carry a token (b.av2 SR-10.3);
+   * - the wait expired: 0, saying the server is still starting and where its
+   *   log is. The daemon is never signalled.
+   */
+  async function awaitDaemonStartup(
+    child: DaemonChild,
+    pidFile: string,
+    logPath: string,
+    logOffset: number,
+  ): Promise<void> {
+    // Set by the child's events; the first one wins.
+    const outcome: { failure: string | null } = { failure: null }
+    child.once('exit', (code, signal) => {
+      outcome.failure ??= signal !== null ? `killed by ${signal}` : `exit code ${code}`
+    })
+    child.once('error', (err) => {
+      outcome.failure ??= `could not be launched: ${err.message}`
+    })
+
+    const deadline = deps.now() + DAEMON_STARTUP_WAIT_MS
+    for (;;) {
+      if (outcome.failure !== null) {
+        reportDaemonFailure(outcome.failure, logPath, logOffset)
+        deps.exit(1)
+      }
+      if (daemonWrotePid(pidFile, child.pid)) {
+        console.error(`[slack] Server starting in background (PID ${child.pid})`)
+        deps.exit(0)
+      }
+      if (deps.now() >= deadline) {
+        console.error(
+          `[slack] Server is still starting in the background (PID ${child.pid}) after ` +
+            `${DAEMON_STARTUP_WAIT_MS / 1000}s — its log is ${logPath}`,
+        )
+        deps.exit(0)
+      }
+      await deps.sleep(DAEMON_STARTUP_POLL_MS)
+    }
+  }
+
+  /** True when the PID file names `pid`: the daemon got past startup. */
+  function daemonWrotePid(pidFile: string, pid: number | undefined): boolean {
+    if (pid === undefined || !deps.existsSync(pidFile)) return false
+    try {
+      return parseInt(deps.readFileSync(pidFile).trim(), 10) === pid
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Write the daemon's startup failure to stderr: the last
+   * DAEMON_FAILURE_LOG_LINES non-empty lines appended to `server.log` since
+   * `logOffset`. A log now shorter than the offset was rotated, so it is read
+   * from its start.
+   */
+  function reportDaemonFailure(failure: string, logPath: string, logOffset: number): void {
+    const from = deps.fileSize(logPath) < logOffset ? 0 : logOffset
+    const lines = deps.readFileFrom(logPath, from)
+      .split('\n')
+      .map((line) => line.trimEnd())
+      .filter((line) => line !== '')
+      .slice(-DAEMON_FAILURE_LOG_LINES)
+    if (lines.length === 0) {
+      console.error(`[slack] Server failed to start (${failure}); it wrote nothing to ${logPath}`)
+      return
+    }
+    console.error(`[slack] Server failed to start (${failure}). From ${logPath}:`)
+    for (const line of lines) console.error(line)
   }
 
   async function stop(opts?: { stopBots?: boolean }): Promise<void> {
@@ -303,8 +503,8 @@ export function createCli(deps: CliDeps): CliHandlers {
     // clean_restart's production-proven order (phase 2 server stop before
     // teardown). If teardown ran while the daemon were still alive, a bot's
     // graceful `/exit` would close its MCP session and the live server's
-    // onsessionclosed handler (src/server.ts:381-403) would scheduleRestart the
-    // channel, respawning it fresh (deleting its `ended` row and history) before
+    // onsessionclosed handler (src/server.ts) would scheduleRestart the
+    // persona, respawning it fresh (deleting its `ended` row and history) before
     // SIGTERM lands. directorPause is an agent-director client subprocess that
     // needs no live CSCB daemon (SessionEnd hooks are wired by agent-director
     // into the spawned claude process and call the AD binary), so teardown works
@@ -329,11 +529,12 @@ export function createCli(deps: CliDeps): CliHandlers {
         }
       }
 
-      // Config load is best-effort: a config problem logs and skips teardown
-      // without failing the stop (the server is already down; b.4dk behavior).
-      let config: RoutingConfig | null = null
+      // Config load is best-effort: a config problem (a pre-persona file
+      // included) logs and skips teardown without failing the stop (the server
+      // is already down; b.4dk behavior).
+      let config: PersonaConfig | null = null
       try {
-        config = deps.loadConfig()
+        config = deps.loadConfig(deps.resolveConfigPath())
       } catch (err) {
         console.error('[slack] stop --stop-bots: could not load config — skipping bot teardown:', err)
       }
@@ -343,7 +544,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       if (config !== null) {
         console.error('[slack] stop --stop-bots: gracefully exiting managed bots')
         try {
-          await teardownBots(config.routes, config.exit_timeout)
+          await teardownBots(config.personas, config.exit_timeout)
         } catch (err) {
           console.error('[slack] stop --stop-bots: bot teardown failed:', err)
           deps.exit(1)
@@ -385,10 +586,11 @@ export function createCli(deps: CliDeps): CliHandlers {
       return 0
     }
 
-    // Load stop_timeout from config (fall back to 30s if unavailable)
+    // Load stop_timeout from config (fall back to 30s if unavailable, a
+    // pre-persona file included)
     let stopTimeoutMs = 30_000
     try {
-      const config = deps.loadConfig()
+      const config = deps.loadConfig(deps.resolveConfigPath())
       if (typeof config.stop_timeout === 'number') {
         stopTimeoutMs = config.stop_timeout * 1000
       }
@@ -427,17 +629,26 @@ export function createCli(deps: CliDeps): CliHandlers {
   }
 
   async function clean_restart(): Promise<void> {
-    try { initLogging(join(deps.resolveStateDir(), 'clean_restart.log')) } catch { /* best-effort */ }
+    // Everything below goes to clean_restart.log. A fatal line is also written
+    // to the stderr in place before the redirect, so a failed clean_restart
+    // says why on the terminal instead of a bare exit 1. These lines name
+    // paths, persona refs and loader/agent-director errors, never a token.
+    const terminalError = console.error
+    try { deps.initLogging(join(deps.resolveStateDir(), 'clean_restart.log')) } catch { /* best-effort */ }
+    const fatal = (...args: unknown[]): void => {
+      console.error(...args)
+      if (console.error !== terminalError) terminalError(...args)
+    }
 
-    // Phase 1: Load config
-    let config: RoutingConfig
+    // Phase 1: Load config (the persona set to tear down)
+    let config: PersonaConfig
     try {
-      config = deps.loadConfig()
+      config = deps.loadConfig(deps.resolveConfigPath())
     } catch (err) {
-      console.error('[slack] clean_restart: failed to load config:', err)
+      fatal('[slack] clean_restart: failed to load config:', err)
       deps.exit(1)
     }
-    const { routes, exit_timeout } = config!
+    const { personas, exit_timeout } = config!
 
     // Phase 2: Stop the server daemon
     console.error('[slack] clean_restart: stopping server')
@@ -446,7 +657,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       console.error(`[slack] clean_restart: stop returned non-zero exit code: ${stopResult.status}`)
     }
 
-    // Phase 2.5 (b.qwo): initialize the AD Client singleton before per-channel
+    // Phase 2.5 (b.qwo): initialize the AD Client singleton before per-persona
     // work. This CLI process does NOT run the server startup gate, so without
     // explicit init getClient() throws (the b.qps root cause). We use the
     // non-exiting runStartupGate variant so a gate failure surfaces here as a
@@ -455,21 +666,21 @@ export function createCli(deps: CliDeps): CliHandlers {
       try {
         await deps.initClient()
       } catch (err) {
-        console.error('[slack] clean_restart: agent-director initialization failed:', err)
+        fatal('[slack] clean_restart: agent-director initialization failed:', err)
         deps.exit(1)
       }
     }
 
-    // Phases 3-4: SR-11 Event 12 — per-route pause/poll/kill teardown via
-    // agent-director (shared with `stop --stop-bots`).
+    // Phases 3-4: SR-11 Event 12 — per-persona pause/poll/kill teardown via
+    // agent-director (shared with `stop --stop-bots`), addressing `cscb_<key>`.
     //
     // b.qwo: teardownBots throws if AD is unreachable during the precheck. A
     // failed teardown must abort the restart — never proceed to `start` on top
     // of bots we could not reach.
     try {
-      await teardownBots(routes, exit_timeout)
+      await teardownBots(personas, exit_timeout)
     } catch (err) {
-      console.error('[slack] clean_restart: bot teardown failed — aborting restart:', err)
+      fatal('[slack] clean_restart: bot teardown failed — aborting restart:', err)
       deps.exit(1)
     }
 
@@ -477,7 +688,7 @@ export function createCli(deps: CliDeps): CliHandlers {
     console.error('[slack] clean_restart: starting server')
     const startResult = deps.spawnSync(process.execPath, [process.argv[1], 'start'])
     if (startResult.status !== 0) {
-      console.error(`[slack] clean_restart: start failed with exit code ${startResult.status}`)
+      fatal(`[slack] clean_restart: start failed with exit code ${startResult.status}`)
       deps.exit(startResult.status ?? 1)
     }
     console.error('[slack] clean_restart: done')
@@ -487,31 +698,50 @@ export function createCli(deps: CliDeps): CliHandlers {
 }
 
 // ---------------------------------------------------------------------------
-// agent-director instance lookup
+// Production agent-director operations for the persona teardown
 // ---------------------------------------------------------------------------
 
+/** The agent-director operations `teardownBots` uses (the `director*` CliDeps). */
+export type DirectorOps = Pick<CliDeps, 'directorStatus' | 'directorPause' | 'directorKill'>
+
+/** The part of the agent-director Client that `createDirectorOps` calls. */
+export type DirectorClient = Pick<Client, 'status' | 'pause' | 'kill'>
+
 /**
- * Resolve a persona's actual claude_instance_id by querying agent-director's
- * label index: the rows labelled `service=cscb` and `persona=<key>`. Spawns
- * are named `cscb_<key>`; until the CLI moves to the persona set (E3 Task 10)
- * the key is the channel ID of the route being torn down.
+ * Build the production `directorStatus` / `directorPause` / `directorKill`
+ * deps over `getClient` (the agent-director singleton accessor in production).
+ * `getClient` is called on every operation, so the Client installed by
+ * `initClient` is picked up and an uninstalled one throws at the call.
  *
- * When more than one row carries the label, the row named exactly
- * `cscb_<key>` wins; otherwise the first row.
- *
- * b.qwo: returns null ONLY when no cscb row carries the persona label (empty
- * list). All other errors (AD connection refused, uninitialized client,
- * binary unreachable, etc.) PROPAGATE. The previous bare `catch { return
- * null }` was the b.qps / incident-2026-09-18 root cause: it collapsed an
- * AD-unreachable throw into a "no row" null, so the teardown skipped every
- * channel and silently no-op'd. AD-unreachable must fail loudly, and "no
- * spawn row" must mean the row is genuinely absent.
+ * Each `id` is a persona's instance ID, `cscb_<key>` (b.av2 SR-8.7). b.qwo:
+ * only ErrSpawnNotFound means "no row" — `directorStatus` returns null and
+ * `directorKill` returns normally; every other error (AD unreachable, no
+ * Client installed, a call timeout, …) propagates so the teardown fails
+ * loudly. `directorPause` passes every error through.
  */
-export async function resolveCscbInstanceId(key: string): Promise<string | null> {
-  const r = await getClient().list({ label: [SERVICE_LABEL, `${PERSONA_LABEL_PREFIX}${key}`] })
-  if (r.spawns.length === 0) return null
-  const exact = r.spawns.find((s) => s.claude_instance_id === personaInstanceId(key))
-  return (exact ?? r.spawns[0]).claude_instance_id
+export function createDirectorOps(getClient: () => DirectorClient): DirectorOps {
+  return {
+    directorStatus: async (id) => {
+      try {
+        const r = await getClient().status({ claude_instance_id: id })
+        return { state: r.state }
+      } catch (err) {
+        if (err instanceof ErrSpawnNotFound) return null
+        throw err
+      }
+    },
+    directorPause: async (id) => {
+      await getClient().pause({ claude_instance_id: id })
+    },
+    directorKill: async (id) => {
+      try {
+        await getClient().kill({ claude_instance_id: id })
+      } catch (err) {
+        if (err instanceof ErrSpawnNotFound) return
+        throw err
+      }
+    },
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -533,18 +763,28 @@ if (import.meta.main) {
     process.exit(1)
   }
 
+  const directorOps = createDirectorOps(getClient)
+
   const realDeps: CliDeps = {
     spawnSync: (cmd, args) => spawnSync(cmd, args, { stdio: 'ignore' }),
-    env: process.env,
+    spawnDaemon: (cmd, args, opts) => spawn(cmd, args, opts),
+    openLogAppend: (path) => openSync(path, 'a'),
+    closeFd: (fd) => closeSync(fd),
+    initLogging,
     existsSync,
     readFileSync: (path) => readFileSync(path, 'utf-8'),
+    fileSize,
+    readFileFrom,
+    now: () => Date.now(),
+    sleep: (ms) => new Promise<void>((r) => setTimeout(r, ms)),
     unlinkSync,
     isProcessRunning,
     kill: (pid, signal) => process.kill(pid, signal as NodeJS.Signals),
-    resolveStateDir: defaultStateDir,
+    resolveStateDir: () => resolveServerStateDir(),
+    resolveConfigPath: () => resolveServerConfigPath(),
     startServer: async () => { const { main } = await import('./server.ts'); return main() },
     exit: (code) => process.exit(code),
-    loadConfig: () => configLoadConfig(),
+    loadConfig: (path) => loadPersonaConfig(path),
     // b.qwo: install the AD Client singleton via the non-exiting startup gate
     // before teardown. runStartupGate performs Client.create() + setClient() and
     // returns a typed outcome; on failure we throw so the caller (clean_restart /
@@ -557,32 +797,9 @@ if (import.meta.main) {
         )
       }
     },
-    directorStatus: async (channelId) => {
-      // Resolve the actual claude_instance_id by label; null when no cscb row
-      // carries this key's persona label.
-      const id = await resolveCscbInstanceId(channelId)
-      if (id === null) return null
-      try {
-        const r = await getClient().status({ claude_instance_id: id })
-        return { state: r.state }
-      } catch (err) {
-        if (err instanceof ErrSpawnNotFound) return null
-        throw err
-      }
-    },
-    directorPause: async (channelId) => {
-      const id = (await resolveCscbInstanceId(channelId)) ?? personaInstanceId(channelId)
-      await getClient().pause({ claude_instance_id: id })
-    },
-    directorKill: async (channelId) => {
-      try {
-        const id = (await resolveCscbInstanceId(channelId)) ?? personaInstanceId(channelId)
-        await getClient().kill({ claude_instance_id: id })
-      } catch (err) {
-        if (err instanceof ErrSpawnNotFound) return
-        throw err
-      }
-    },
+    directorStatus: directorOps.directorStatus,
+    directorPause: directorOps.directorPause,
+    directorKill: directorOps.directorKill,
   }
 
   const cli = createCli(realDeps)

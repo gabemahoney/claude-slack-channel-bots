@@ -20,17 +20,24 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import {
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
   statSync,
 } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import { Client, resolveSystemBinary } from 'agent-director'
 
 const CSCB_CHECKOUT_ROOT = resolve(import.meta.dirname, '..')
-const TEST_CONFIG_DIR = `/tmp/cscb-hook-abs-${Date.now()}-${process.pid}`
+// One temp root per run holds both the isolated CLAUDE_CONFIG_DIR and the
+// agent-director store, so the test never opens or creates the real
+// ~/.agent-director/state.db (b.av2 SR-13.2) and cleans up in one rmSync.
+const TEST_ROOT = mkdtempSync(join(tmpdir(), 'cscb-hook-abs-'))
+const TEST_CONFIG_DIR = join(TEST_ROOT, 'claude-config')
+const TEST_STORE_PATH = join(TEST_ROOT, 'agent-director', 'state.db')
 const TEST_INSTANCE_ID = `cscb_hook_abs_${Date.now()}_${process.pid}`
 
 let adAvailable = false
@@ -52,8 +59,9 @@ beforeAll(async () => {
   mkdirSync(TEST_CONFIG_DIR, { recursive: true })
 
   try {
+    mkdirSync(join(TEST_ROOT, 'agent-director'), { recursive: true })
     client = await Client.create({
-      storePath: '~/.agent-director/state.db',
+      storePath: TEST_STORE_PATH,
       createIfMissing: true,
     })
   } catch (err) {
@@ -88,8 +96,8 @@ afterAll(async () => {
   if (client) {
     try { client.close() } catch { /* close is no-op on failure */ }
   }
-  if (existsSync(TEST_CONFIG_DIR)) {
-    try { rmSync(TEST_CONFIG_DIR, { recursive: true, force: true }) } catch { /* best-effort */ }
+  if (existsSync(TEST_ROOT)) {
+    try { rmSync(TEST_ROOT, { recursive: true, force: true }) } catch { /* best-effort */ }
   }
 })
 

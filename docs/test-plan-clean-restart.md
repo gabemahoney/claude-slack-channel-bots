@@ -1,5 +1,7 @@
 # Test Plan: clean_restart Lifecycle
 
+> This plan predates the persona runtime and is kept for history; it does not describe current behavior. See `docs/architecture.md` (Clean Restart) and `tests/cli.test.ts` for the current design and tests.
+
 Covers the 30 test cases (T1–T30) defined in the SRD for the `clean_restart` subcommand and its surrounding startup/shutdown lifecycle. Tests are grouped by functional area.
 
 Files under test:

@@ -26,8 +26,9 @@
  */
 
 import { describe, test, expect } from 'bun:test'
-import { readFileSync, readdirSync, existsSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { readFileSync, readdirSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import semver from 'semver'
 
@@ -103,7 +104,24 @@ type PackProbe =
  * we key strictly off stdout + exit status for the file list.
  */
 function npmPackProbe(): PackProbe {
-  const probe = spawnSync('npm', ['--version'], { encoding: 'utf-8' })
+  // npm writes its cache, debug logs and update-notifier stamp under
+  // ~/.npm by default. Point every npm child at a throwaway cache so the test
+  // never touches the real npm cache.
+  const cacheDir = mkdtempSync(join(tmpdir(), 'cscb-npm-cache-'))
+  try {
+    return npmPackProbeWithCache(cacheDir)
+  } finally {
+    rmSync(cacheDir, { recursive: true, force: true })
+  }
+}
+
+function npmPackProbeWithCache(cacheDir: string): PackProbe {
+  const env = {
+    ...process.env,
+    npm_config_cache: cacheDir,
+    npm_config_update_notifier: 'false',
+  }
+  const probe = spawnSync('npm', ['--version'], { encoding: 'utf-8', env })
   if (probe.error || probe.status !== 0) return { kind: 'skip' }
 
   // npm is present from here on — any failure below is a real packaging fault,
@@ -111,6 +129,7 @@ function npmPackProbe(): PackProbe {
   const res = spawnSync('npm', ['pack', '--dry-run', '--json'], {
     cwd: REPO_ROOT,
     encoding: 'utf-8',
+    env,
     // No packfile is written in --dry-run mode; only the JSON manifest matters.
   })
   if (res.error || res.status !== 0) {

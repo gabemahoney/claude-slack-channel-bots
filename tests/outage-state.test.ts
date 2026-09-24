@@ -742,7 +742,7 @@ describe('getClient() allowlist content-anchoring (b.qbn)', () => {
   // and the allowlist entry that anchors it. Reused across cases.
   const baseSource = [
     `export async function reconcileOrphans(`,
-    `  routingConfig: RoutingConfig,`,
+    `  personaConfig: PersonaConfig,`,
     `): Promise<void> {`,
     `  const client = getClient()`,
     `  return client.list()`,
@@ -755,7 +755,7 @@ describe('getClient() allowlist content-anchoring (b.qbn)', () => {
   test('AC-1: inserting comment/JSDoc lines above an allowed site → no violations, no stale entries', () => {
     const withComments = [
       `export async function reconcileOrphans(`,
-      `  routingConfig: RoutingConfig,`,
+      `  personaConfig: PersonaConfig,`,
       `): Promise<void> {`,
       `  // freshly inserted line comment`,
       `  /**`,
@@ -792,7 +792,7 @@ describe('getClient() allowlist content-anchoring (b.qbn)', () => {
   test('AC-3: relocating an allowed call into a DIFFERENT function → violation AND stale entry', () => {
     const relocated = [
       `export async function reconcileOrphans(`,
-      `  routingConfig: RoutingConfig,`,
+      `  personaConfig: PersonaConfig,`,
       `): Promise<void> {`,
       `  return`,
       `}`,
@@ -817,7 +817,7 @@ describe('getClient() allowlist content-anchoring (b.qbn)', () => {
   test('duplicate identical call in the same function → violation (counts are enforced)', () => {
     const dup = [
       `export async function reconcileOrphans(`,
-      `  routingConfig: RoutingConfig,`,
+      `  personaConfig: PersonaConfig,`,
       `): Promise<void> {`,
       `  const client = getClient()`,
       `  const client = getClient()`,

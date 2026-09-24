@@ -9,7 +9,11 @@
 #
 # This test exercises the REAL agent-director + REAL tmux spawn/resume path (no
 # SLACK_DRY_RUN) via a small driver that calls the shipped spawnForPersona /
-# approvePreSessionDialogs directly (the full daemon needs Slack creds CI lacks).
+# approvePreSessionDialogs directly (the full daemon needs each persona's Slack
+# credentials file, which CI lacks). The driver builds a one-persona config
+# (DRIVER_PERSONA, one channel DRIVER_PERSONA_CHANNEL, working directory
+# DRIVER_WORKING_DIRECTORY) through the installed package's persona resolver;
+# its instance is cscb_<persona key>.
 # A stub `claude` on PATH stands in for the model: it prints the exact
 # dev-channels dialog and fires SessionStart on Enter, so the test is
 # deterministic and does not burn the Anthropic API.
@@ -24,8 +28,9 @@ TEST_NAME="test-4-resume-dialog"
 PKG_DIR="/test-repo/node_modules/claude-slack-channel-bots"
 FIXTURES="/tests/integration/fixtures"
 DRIVER_LOG="/tmp/test-4-driver.log"
-DRIVER_CHANNEL="C_RESUME"
-DRIVER_CWD="/tmp/test-repo-resume"
+DRIVER_PERSONA="resume_test"
+DRIVER_PERSONA_CHANNEL="C0RESUME1"
+DRIVER_WORKING_DIRECTORY="/tmp/test-repo-resume"
 
 fail() {
     echo "FAIL: ${TEST_NAME}: $1" >&2
@@ -65,17 +70,18 @@ command -v claude >/dev/null 2>&1 \
 grep -q "I am using this for local development" "${STUB_BIN_DIR}/claude" \
     || fail "stub claude does not emit the dev-channels needle"
 
-# --- Route cwd ------------------------------------------------------------
-mkdir -p "${DRIVER_CWD}"
-git -C "${DRIVER_CWD}" init -q 2>/dev/null || true
+# --- Persona working directory ---------------------------------------------
+mkdir -p "${DRIVER_WORKING_DIRECTORY}"
+git -C "${DRIVER_WORKING_DIRECTORY}" init -q 2>/dev/null || true
 
 # --- Run the driver (NON-dry-run: SLACK_DRY_RUN deliberately unset) --------
 # Tee stderr (CSCB console.error, incl. any ErrTmuxSessionCreate) to a log for
 # the no-loop assertion; keep stdout (DRIVER: markers) for the phase asserts.
 set +e
 CSCB_PKG_DIR="${PKG_DIR}" \
-DRIVER_CHANNEL="${DRIVER_CHANNEL}" \
-DRIVER_CWD="${DRIVER_CWD}" \
+DRIVER_PERSONA="${DRIVER_PERSONA}" \
+DRIVER_PERSONA_CHANNEL="${DRIVER_PERSONA_CHANNEL}" \
+DRIVER_WORKING_DIRECTORY="${DRIVER_WORKING_DIRECTORY}" \
     bun "${FIXTURES}/driver.ts" > /tmp/test-4-driver.out 2> "${DRIVER_LOG}"
 DRIVER_RC=$?
 set -e
@@ -110,7 +116,7 @@ printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: PRECONDITION_OK' \
 printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: PHASE2_OK' \
     || fail "phase 2 (b.vub regression): resume did not re-approve the dialog / reach a live state"
 
-# 4. No ErrTmuxSessionCreate respawn loop for this channel.
+# 4. No ErrTmuxSessionCreate respawn loop for this persona.
 if grep -q 'ErrTmuxSessionCreate' "${DRIVER_LOG}"; then
     echo "--- ErrTmuxSessionCreate occurrences ---" >&2
     grep -n 'ErrTmuxSessionCreate' "${DRIVER_LOG}" >&2 || true

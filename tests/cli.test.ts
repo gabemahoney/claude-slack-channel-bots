@@ -1,34 +1,85 @@
 /**
- * cli.test.ts — Minimal coverage for the library-backed CLI surface.
+ * cli.test.ts — Coverage for the CLI surface (`start`, `stop`,
+ * `clean_restart`) at the createCli factory level, with all I/O injected.
  *
- * The pre-rewrite tmux-direct tests have been removed (SR-7.1). The new
- * surface (directorStatus / directorPause / directorKill) is exercised
- * here at the createCli factory level, with all I/O injected.
+ * Persona model (b.av2 SR-8.7, SR-10.2): the CLI reads no Slack token (AC 47,
+ * cli leg), reads the configuration file the server loads (`config.json` in
+ * the state directory) with the persona loader, and tears down exactly the
+ * configuration's personas, addressing each instance as `cscb_<key>`.
+ *
+ * Isolation (b.av2 SR-13.2): every real path sits under a per-test
+ * `mkdtempSync` directory removed in `afterEach`. The token variables are
+ * removed for the whole file (restored afterwards), so no case or failure
+ * message can see an ambient token. `start`'s daemon is always the injected
+ * fake `spawnDaemon`; the only real spawn is the usage-text test, which gets
+ * a built env (PATH, temp HOME, temp SLACK_STATE_DIR). Waits in `start` run on
+ * the shared fake clock.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'path'
-import type { CliDeps, CliHandlers } from '../src/cli.ts'
+import { join, resolve } from 'node:path'
+import {
+  DAEMON_FAILURE_LOG_LINES,
+  DAEMON_STARTUP_POLL_MS,
+  DAEMON_STARTUP_WAIT_MS,
+  createCli,
+  createDirectorOps,
+  type CliDeps,
+  type DaemonSpawnOptions,
+  type DirectorClient,
+  type DirectorOps,
+} from '../src/cli.ts'
 import { ErrCallTimeout, ErrSpawnNotFound } from '../src/agent-director-errors.ts'
-import { makeRoutingConfig } from './test-helpers/routing-config.ts'
+import {
+  loadPersonaConfig,
+  prePersonaConversionMessage,
+  resolveServerConfigPath,
+  resolveServerStateDir,
+  type PersonaConfig,
+} from '../src/config.ts'
+import { personaInstanceId, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
+import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import {
+  makeMultiPersonaConfig,
+  makePersona,
+  makePersonaConfigInput,
+  writeConfigFile,
+} from './test-helpers/persona-config.ts'
+import { stripComments, objectProperties } from './test-helpers/source-audit.ts'
 
-process.env['SLACK_BOT_TOKEN'] = 'xoxb-test-placeholder'
-process.env['SLACK_APP_TOKEN'] = 'xapp-test-placeholder'
+const CLI_SOURCE = resolve(import.meta.dir, '..', 'src', 'cli.ts')
+const TOKEN_VARS = ['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN'] as const
 
-let createCli: (deps: CliDeps) => CliHandlers
-let resolveCscbInstanceId: (key: string) => Promise<string | null>
+// ---------------------------------------------------------------------------
+// File-level isolation: no ambient token for any case (b.av2 SR-13.2)
+// ---------------------------------------------------------------------------
 
-beforeAll(async () => {
-  const mod = await import('../src/cli.ts')
-  createCli = mod.createCli
-  resolveCscbInstanceId = mod.resolveCscbInstanceId
+const savedTokenEnv: Record<string, string | undefined> = {}
+const originalConsoleError = console.error
+const originalConsoleLog = console.log
+
+beforeAll(() => {
+  for (const name of TOKEN_VARS) {
+    savedTokenEnv[name] = process.env[name]
+    delete process.env[name]
+  }
 })
+
+afterAll(() => {
+  for (const name of TOKEN_VARS) {
+    if (savedTokenEnv[name] === undefined) delete process.env[name]
+    else process.env[name] = savedTokenEnv[name]
+  }
+})
+
+/** One captured console line: the args joined with spaces, an Error as its message. */
+const formatLine = (args: unknown[]): string => args.map((a) => (a instanceof Error ? a.message : String(a))).join(' ')
 
 class ExitError extends Error {
   constructor(public readonly code: number) {
@@ -36,160 +87,544 @@ class ExitError extends Error {
   }
 }
 
-const STATE_DIR = '/fake/state'
-const PID_FILE = join(STATE_DIR, 'server.pid')
-const CONFIG_JSON = join(STATE_DIR, 'config.json')
+// Per-test temp tree: <root>/state is the state directory the CLI resolves.
+let root: string
+let stateDir: string
+let configPath: string
+let logPath: string
+let pidPath: string
+let stderr: string[]
+let errorSpy: ReturnType<typeof spyOn>
+let savedArgv: string[]
+
+beforeEach(() => {
+  root = mkdtempSync(join(tmpdir(), 'cscb-cli-'))
+  stateDir = join(root, 'state')
+  mkdirSync(stateDir)
+  configPath = join(stateDir, 'config.json')
+  logPath = join(stateDir, 'server.log')
+  pidPath = join(stateDir, 'server.pid')
+  // A config file exists by default; `start` checks for it.
+  writeConfigFile(stateDir, makePersonaConfigInput({ personas: [makePersona({ name: OPS_NAME }, root)] }, root))
+  savedArgv = process.argv
+  stderr = []
+  errorSpy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+    stderr.push(formatLine(args))
+  })
+})
+
+afterEach(() => {
+  errorSpy.mockRestore()
+  // Belt and braces: nothing may leave console redirected for later files.
+  console.error = originalConsoleError
+  console.log = originalConsoleLog
+  process.argv = savedArgv
+  delete process.env['_CLI_DAEMON_CHILD']
+  for (const name of TOKEN_VARS) delete process.env[name]
+  rmSync(root, { recursive: true, force: true })
+})
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+/** A persona whose name differs from its key, so name- or channel-addressing fails. */
+const OPS_NAME = 'Ops Bot'
+const OPS_CHANNEL = 'C0TEST001'
+const opsId = (): string => personaInstanceId(personaKey(OPS_NAME))
+
+function opsConfig(overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): PersonaConfig {
+  return makeMultiPersonaConfig([{ name: OPS_NAME, channels: [{ id: OPS_CHANNEL, delivery: 'all' }] }], root, overrides)
+}
+
+/** Two personas: Alpha is in two channels, Beta is in none with DMs on. */
+const ALPHA = {
+  name: 'Alpha Bot',
+  channels: [{ id: 'C0ALPHA01', delivery: 'all' as const }, { id: 'C0SHARED1', delivery: 'mentions' as const }],
+  permission_prompts: 'C0ALPHA01',
+}
+const BETA = { name: 'Beta', channels: [], dm: { enabled: true, contact: 'U0TEST001' }, permission_prompts: 'dm' }
+
+/** A fake daemon child: never a real process; records signals so "never signalled" is checkable. */
+class FakeDaemon extends EventEmitter {
+  unrefCalls = 0
+  readonly signals: unknown[] = []
+  constructor(public readonly pid: number | undefined) {
+    super()
+  }
+  unref(): void {
+    this.unrefCalls++
+  }
+  kill(signal?: unknown): boolean {
+    this.signals.push(signal)
+    return true
+  }
+}
+
+const DAEMON_PID = 999_999
+/** The descriptor the fake `openLogAppend` returns; never a real open file. */
+const LOG_FD = 57
+
+/** What a daemon script gets: the child and the clock to schedule its behaviour on. */
+interface DaemonCtl {
+  child: FakeDaemon
+  clock: FakeClock
+}
+
+/** Default daemon: writes its own PID to the PID file after 200 ms (ready). */
+const readyDaemon = ({ child, clock }: DaemonCtl): void => {
+  clock.setTimeout(() => writeFileSync(pidPath, `${child.pid}\n`), 200)
+}
 
 interface Overrides {
   spawnSyncStatus?: number | null
-  spawnSyncFn?: (cmd: string, args: string[]) => { status: number | null }
-  env?: NodeJS.ProcessEnv
-  existingPaths?: string[]
-  /** When true, existsSync returns true for every path (e.g. daemonize needs the state dir + config). */
-  existsAll?: boolean
-  pidFileContent?: string
+  /** Written to the real `<stateDir>/server.pid` before the call. */
+  serverPid?: number
   isProcessRunning?: (pid: number) => boolean
-  /** Override the resolved state dir (daemonize openSync()s <stateDir>/server.log for real). */
-  resolveStateDir?: () => string
-  loadConfig?: () => ReturnType<typeof makeRoutingConfig>
-  /**
-   * b.qwo: when provided, installs an initClient dep whose behavior mirrors the
-   * production wiring (runStartupGate → throw on failure). Omit to leave
-   * initClient undefined (the "stub singleton already installed" path, which
-   * callers skip). A function that throws simulates AD-unreachable at init.
-   */
+  /** Resolved config the stub loader returns; default `opsConfig()`. */
+  config?: PersonaConfig
+  loadConfig?: (path: string) => PersonaConfig
+  /** Daemon behaviour scheduled at spawn; default `readyDaemon`. */
+  daemon?: (ctl: DaemonCtl) => void
+  daemonPid?: number | undefined
+  /** Thrown by the fake `spawnDaemon` instead of returning a child. */
+  spawnDaemonError?: Error
+  /** Runs after the call is recorded; the default only records (console is never redirected). */
+  initLogging?: (path: string) => void
   initClient?: () => Promise<void>
-  directorStatus?: (channelId: string) => Promise<{ state: string } | null>
-  directorPause?: (channelId: string) => Promise<void>
-  directorKill?: (channelId: string) => Promise<void>
-  /** Called on every deps.kill(pid, signal) — lets tests observe SIGTERM/SIGKILL to the server pid. */
-  killFn?: (pid: number, signal: string) => void
+  directorStatus?: (id: string) => Promise<{ state: string } | null>
+  directorPause?: (id: string) => Promise<void>
+  directorKill?: (id: string) => Promise<void>
 }
 
 interface Bundle {
   deps: CliDeps
+  clock: FakeClock
   exitCodes: number[]
+  /** Fake-clock time of each exit. */
+  exitTimes: number[]
   spawnCalls: Array<{ cmd: string; args: string[] }>
+  daemonSpawns: Array<{ cmd: string; args: string[]; opts: DaemonSpawnOptions; child: FakeDaemon }>
+  logOpens: string[]
+  closedFds: number[]
+  logInits: string[]
+  loadPaths: string[]
+  statusCalls: string[]
   pauseCalls: string[]
   killCalls: string[]
-  statusCalls: string[]
-  /** Signals sent to the server pid via deps.kill(), in order (e.g. 'SIGTERM'). */
   serverSignals: string[]
-  /** Named side-effect events in call order — used to pin server-stop-vs-teardown ordering. */
   events: string[]
-  /** b.qwo: one entry per initClient invocation (the call's 0-based index); its
-   * length is the number of times the startup gate ran. Asserted in the
-   * initClient-ordering test to pin "gate runs exactly once, before teardown". */
   initClientCalls: number[]
-  /** Whether deps.startServer() was invoked (in-place server run). */
   readonly startServerCalled: boolean
 }
 
+/**
+ * Deps over the per-test temp state dir. The state dir and config path come
+ * from the real resolvers with an injected env naming the temp dir, the same
+ * functions production wires (see the wiring audit). File reads are real, on
+ * the temp tree; the director verbs, loader, spawns and clock are fakes.
+ */
 function makeDeps(o: Overrides = {}): Bundle {
+  const clock = createFakeClock()
   const exitCodes: number[] = []
-  const spawnCalls: Array<{ cmd: string; args: string[] }> = []
+  const exitTimes: number[] = []
+  const spawnCalls: Bundle['spawnCalls'] = []
+  const daemonSpawns: Bundle['daemonSpawns'] = []
+  const loadPaths: string[] = []
+  const logOpens: string[] = []
+  const closedFds: number[] = []
+  const logInits: string[] = []
+  const statusCalls: string[] = []
   const pauseCalls: string[] = []
   const killCalls: string[] = []
-  const statusCalls: string[] = []
   const serverSignals: string[] = []
   const events: string[] = []
   const initClientCalls: number[] = []
   let startServerCalled = false
-  const existing = new Set(o.existingPaths ?? [CONFIG_JSON])
+  if (o.serverPid !== undefined) writeFileSync(pidPath, `${o.serverPid}\n`)
+  const stateEnv = { SLACK_STATE_DIR: stateDir }
   const deps: CliDeps = {
     spawnSync: (cmd, args) => {
       spawnCalls.push({ cmd, args })
-      if (o.spawnSyncFn) return o.spawnSyncFn(cmd, args)
       return { status: o.spawnSyncStatus !== undefined ? o.spawnSyncStatus : 0 }
     },
-    env: o.env ?? { SLACK_BOT_TOKEN: 'xoxb', SLACK_APP_TOKEN: 'xapp' },
-    existsSync: (p) => (o.existsAll ? true : existing.has(p)),
-    readFileSync: (p) => {
-      if (p === PID_FILE && o.pidFileContent !== undefined) return o.pidFileContent
-      throw new Error('unexpected readFileSync ' + p)
+    spawnDaemon: (cmd, args, opts) => {
+      events.push('spawnDaemon')
+      if (o.spawnDaemonError) throw o.spawnDaemonError
+      const child = new FakeDaemon('daemonPid' in o ? o.daemonPid : DAEMON_PID)
+      daemonSpawns.push({ cmd, args, opts, child })
+      ;(o.daemon ?? readyDaemon)({ child, clock })
+      return child
     },
-    unlinkSync: () => { /* no-op */ },
+    openLogAppend: (path) => {
+      logOpens.push(path)
+      events.push('openLogAppend')
+      return LOG_FD
+    },
+    closeFd: (fd) => {
+      closedFds.push(fd)
+      events.push(`closeFd:${fd}`)
+    },
+    initLogging: (path) => {
+      logInits.push(path)
+      events.push('initLogging')
+      o.initLogging?.(path)
+    },
+    existsSync: (p) => existsSync(p),
+    readFileSync: (p) => readFileSync(p, 'utf-8'),
+    fileSize: (p) => (existsSync(p) ? statSync(p).size : 0),
+    readFileFrom: (p, offset) => (existsSync(p) ? readFileSync(p).subarray(offset).toString('utf-8') : ''),
+    now: () => clock.now(),
+    sleep: async (ms) => {
+      events.push('sleep')
+      await clock.advance(ms)
+    },
+    unlinkSync: () => { /* the stale PID file stays; nothing reads it again */ },
     isProcessRunning: o.isProcessRunning ?? (() => false),
-    kill: (pid, signal) => {
+    kill: (_pid, signal) => {
       serverSignals.push(String(signal))
       events.push(`server:${String(signal)}`)
-      o.killFn?.(pid as number, String(signal))
     },
-    resolveStateDir: o.resolveStateDir ?? (() => STATE_DIR),
+    resolveStateDir: () => resolveServerStateDir(root, stateEnv),
+    resolveConfigPath: () => resolveServerConfigPath(root, stateEnv),
     startServer: async () => { startServerCalled = true },
-    exit: (code) => { exitCodes.push(code); throw new ExitError(code) },
-    loadConfig: o.loadConfig ?? (() => makeRoutingConfig()),
-    // b.qwo: only install initClient when a test opts in; otherwise leave it
-    // undefined so createCli exercises the "stub already installed" skip path.
+    exit: (code) => {
+      exitCodes.push(code)
+      exitTimes.push(clock.now())
+      throw new ExitError(code)
+    },
+    loadConfig: (path) => {
+      loadPaths.push(path)
+      events.push('loadConfig')
+      return o.loadConfig ? o.loadConfig(path) : (o.config ?? opsConfig())
+    },
     ...(o.initClient
       ? {
           initClient: async () => {
-            // Record this call's 0-based index (so the array is [0], [0,1], …);
-            // length == number of gate invocations.
             initClientCalls.push(initClientCalls.length)
             events.push('initClient')
             return o.initClient!()
           },
         }
       : {}),
-    directorStatus: async (channelId) => {
-      statusCalls.push(channelId)
-      if (o.directorStatus) return o.directorStatus(channelId)
-      return null
+    directorStatus: async (id) => {
+      statusCalls.push(id)
+      return o.directorStatus ? o.directorStatus(id) : null
     },
-    directorPause: async (channelId) => {
-      pauseCalls.push(channelId)
-      events.push(`pause:${channelId}`)
-      if (o.directorPause) return o.directorPause(channelId)
+    directorPause: async (id) => {
+      pauseCalls.push(id)
+      events.push(`pause:${id}`)
+      if (o.directorPause) return o.directorPause(id)
     },
-    directorKill: async (channelId) => {
-      killCalls.push(channelId)
-      events.push(`kill:${channelId}`)
-      if (o.directorKill) return o.directorKill(channelId)
+    directorKill: async (id) => {
+      killCalls.push(id)
+      events.push(`kill:${id}`)
+      if (o.directorKill) return o.directorKill(id)
     },
   }
   return {
-    deps, exitCodes, spawnCalls, pauseCalls, killCalls, statusCalls, serverSignals, events,
-    initClientCalls,
+    deps, clock, exitCodes, exitTimes, spawnCalls, daemonSpawns, logOpens, closedFds, logInits, loadPaths,
+    statusCalls, pauseCalls, killCalls,
+    serverSignals, events, initClientCalls,
     get startServerCalled() { return startServerCalled },
   }
 }
 
-afterEach(() => {
-  delete process.env['_CLI_DAEMON_CHILD']
-})
+const startedServer = (b: Bundle): boolean => b.spawnCalls.some((c) => c.args.includes('start'))
+
+/** A `stop` bundle whose server is already gone (stale PID file → exit 0). */
+function makeStopDeps(o: Overrides = {}): Bundle {
+  return makeDeps({ serverPid: 4242, isProcessRunning: () => false, ...o })
+}
 
 // ---------------------------------------------------------------------------
-// start — pre-flight checks
+// start — pre-flight (AC 47, b.av2 SR-8.7, SR-10.2)
 // ---------------------------------------------------------------------------
 
-describe('start', () => {
-  test('rejects when SLACK_BOT_TOKEN missing', async () => {
-    const { deps, exitCodes } = makeDeps({ env: { SLACK_APP_TOKEN: 'xapp' } })
-    await expect(createCli(deps).start()).rejects.toBeInstanceOf(ExitError)
-    expect(exitCodes).toContain(1)
+describe('start — pre-flight', () => {
+  test.each([
+    ['unset', undefined],
+    ['set to placeholders', 'placeholder-not-a-credential'],
+  ])('AC 47: start passes pre-flight with the token variables %s (they are never read)', async (_label, value) => {
+    for (const name of TOKEN_VARS) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+    const b = makeDeps()
+
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
+
+    // Reached the daemonize path and reported a started daemon: no exit(1).
+    expect(b.daemonSpawns).toHaveLength(1)
+    expect(b.exitCodes).toEqual([0])
+    expect(stderr.join('\n')).not.toContain('missing prerequisite')
   })
 
-  test('rejects when SLACK_APP_TOKEN missing', async () => {
-    const { deps, exitCodes } = makeDeps({ env: { SLACK_BOT_TOKEN: 'xoxb' } })
-    await expect(createCli(deps).start()).rejects.toBeInstanceOf(ExitError)
-    expect(exitCodes).toContain(1)
+  test('AC 47: the code of src/cli.ts names neither SLACK_BOT_TOKEN nor SLACK_APP_TOKEN (static)', () => {
+    const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
+    expect(code).not.toContain('SLACK_BOT_TOKEN')
+    expect(code).not.toContain('SLACK_APP_TOKEN')
   })
 
-  test('rejects when config.json missing', async () => {
-    const { deps, exitCodes } = makeDeps({ existingPaths: [] })
-    await expect(createCli(deps).start()).rejects.toBeInstanceOf(ExitError)
-    expect(exitCodes).toContain(1)
+  test('no config.json in the state dir: exit 1, message names <stateDir>/config.json, nothing spawned', async () => {
+    rmSync(configPath)
+    const b = makeDeps()
+
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.exitCodes).toEqual([1])
+    expect(stderr).toContain(`missing prerequisite: config.json not found at ${configPath}`)
+    expect(b.daemonSpawns).toEqual([])
   })
 
   test('does NOT probe tmux on PATH (Epic 2: SR-5.1 owns runtime checks)', async () => {
-    const { deps, spawnCalls } = makeDeps()
-    process.env['_CLI_DAEMON_CHILD'] = '1'
-    try {
-      await createCli(deps).start()
-    } catch { /* daemonized path */ }
-    const tmuxProbes = spawnCalls.filter((c) => c.cmd === 'tmux')
-    expect(tmuxProbes).toHaveLength(0)
+    const b = makeDeps()
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
+    expect(b.spawnCalls.filter((c) => c.cmd === 'tmux')).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The CLI reads the configuration file the server loads (b.av2 SR-8.7)
+// ---------------------------------------------------------------------------
+
+describe('shared config path (SR-8.7)', () => {
+  /** A pre-persona key E1's loader rejects with its conversion message (b.av2 SR-1.7). */
+  const PRE_PERSONA_KEY = 'default_route'
+  const writePrePersonaFile = (): void => {
+    writeConfigFile(stateDir, { [PRE_PERSONA_KEY]: { cwd: join(root, 'work') } })
+  }
+
+  test('production deps resolve the state dir, config path and loader with the server functions (static)', () => {
+    const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
+    const props = objectProperties(code.slice(code.indexOf('const realDeps: CliDeps =')))
+    expect(props.get('resolveStateDir')).toBe('() => resolveServerStateDir()')
+    expect(props.get('resolveConfigPath')).toBe('() => resolveServerConfigPath()')
+    expect(props.get('loadConfig')).toBe('(path) => loadPersonaConfig(path)')
+  })
+
+  test('clean_restart loads exactly <stateDir>/config.json', async () => {
+    const b = makeDeps()
+    await createCli(b.deps).clean_restart()
+    expect(b.loadPaths).toEqual([configPath])
+  })
+
+  test('stop (live server) loads exactly <stateDir>/config.json', async () => {
+    let alive = true
+    const b = makeDeps({ serverPid: 4242, isProcessRunning: () => { const was = alive; alive = false; return was } })
+    await expect(createCli(b.deps).stop()).rejects.toBeInstanceOf(ExitError)
+    expect(b.loadPaths).toEqual([configPath])
+    expect(b.exitCodes).toEqual([0])
+  })
+
+  test('stop --stop-bots (live server) loads <stateDir>/config.json for the stop and again for the teardown', async () => {
+    let alive = true
+    const b = makeDeps({ serverPid: 4242, isProcessRunning: () => { const was = alive; alive = false; return was } })
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect(b.loadPaths).toEqual([configPath, configPath])
+    expect(b.statusCalls).toEqual([opsId()])
+  })
+
+  test('stop honours the config\'s stop_timeout: 0 sends SIGKILL right after SIGTERM to a server that stays up', async () => {
+    // With the 30 s default the SIGTERM wait would outlast the test's timeout.
+    const b: Bundle = makeDeps({
+      serverPid: 4242,
+      config: opsConfig({ stop_timeout: 0 }),
+      isProcessRunning: () => !b.serverSignals.includes('SIGKILL'),
+    })
+    await expect(createCli(b.deps).stop()).rejects.toBeInstanceOf(ExitError)
+    expect(b.serverSignals).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(b.exitCodes).toEqual([0])
+  })
+
+  test('clean_restart over a real two-persona file through the real loader tears down exactly cscb_<key> of each persona', async () => {
+    writeConfigFile(stateDir, makePersonaConfigInput({ personas: [makePersona(ALPHA, root), makePersona(BETA, root)] }, root))
+    const b = makeDeps({ loadConfig: (p) => loadPersonaConfig(p, root) })
+
+    await createCli(b.deps).clean_restart()
+
+    expect(new Set(b.statusCalls)).toEqual(new Set([personaInstanceId(personaKey(ALPHA.name)), personaInstanceId(personaKey(BETA.name))]))
+    expect(b.statusCalls).toHaveLength(2)
+    expect(startedServer(b)).toBe(true)
+  })
+
+  test('clean_restart given a pre-persona file (real loader) exits 1 with the conversion message, no director call, never starts', async () => {
+    writePrePersonaFile()
+    const b = makeDeps({ loadConfig: (p) => loadPersonaConfig(p, root) })
+
+    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.exitCodes).toEqual([1])
+    expect(stderr.join('\n')).toContain(prePersonaConversionMessage(PRE_PERSONA_KEY))
+    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+    expect(b.spawnCalls).toEqual([]) // neither stop nor start ran
+  })
+
+  test('stop --stop-bots given a pre-persona file (real loader) logs, skips teardown and still stops the server', async () => {
+    writePrePersonaFile()
+    let alive = true
+    const b = makeDeps({
+      serverPid: 4242,
+      isProcessRunning: () => { const was = alive; alive = false; return was },
+      loadConfig: (p) => loadPersonaConfig(p, root),
+    })
+
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.serverSignals).toEqual(['SIGTERM'])
+    expect(b.exitCodes).toEqual([0])
+    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+    expect(stderr.join('\n')).toContain('could not load config — skipping bot teardown')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// start — waiting for the daemon's startup outcome (b.av2 SR-1.7, SR-8.7)
+// ---------------------------------------------------------------------------
+
+describe('start — daemon startup wait', () => {
+  /** stderr lines after the "Server failed to start" header. */
+  function reportedLogLines(): string[] {
+    const at = stderr.findIndex((l) => l.startsWith('[slack] Server failed to start'))
+    return stderr.slice(at + 1)
+  }
+
+  test.each([
+    [1, null, 'exit code 1'],
+    [null, 'SIGKILL', 'killed by SIGKILL'],
+  ] as const)('daemon exits during the wait (%p, %p): exit 1 with only the lines it appended to server.log', async (code, signal, reason) => {
+    writeFileSync(logPath, '[slack] line from an earlier run\n')
+    const fatal = `[slack] Fatal: configuration error — ${prePersonaConversionMessage('default_route')}`
+    const b = makeDeps({
+      daemon: ({ child, clock }) => clock.setTimeout(() => {
+        appendFileSync(logPath, `\n${fatal}\n`)
+        child.emit('exit', code, signal)
+      }, 250),
+    })
+
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.exitCodes).toEqual([1])
+    expect(stderr).toContain(`[slack] Server failed to start (${reason}). From ${logPath}:`)
+    expect(reportedLogLines()).toEqual([fatal])
+    expect(b.startServerCalled).toBe(false)
+  })
+
+  test(`repeats at most the last DAEMON_FAILURE_LOG_LINES (${DAEMON_FAILURE_LOG_LINES}) non-empty lines`, async () => {
+    const lines = Array.from({ length: DAEMON_FAILURE_LOG_LINES + 5 }, (_, i) => `[slack] line ${i + 1}`)
+    const b = makeDeps({
+      daemon: ({ child, clock }) => clock.setTimeout(() => {
+        appendFileSync(logPath, lines.join('\n\n') + '\n')
+        child.emit('exit', 1, null)
+      }, 100),
+    })
+
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
+
+    expect(reportedLogLines()).toEqual(lines.slice(-DAEMON_FAILURE_LOG_LINES))
+  })
+
+  test('log rotated during the wait (now shorter than before): reported from its start', async () => {
+    writeFileSync(logPath, '[slack] old line that is longer than the new log\n'.repeat(10))
+    const b = makeDeps({
+      daemon: ({ child, clock }) => clock.setTimeout(() => {
+        writeFileSync(logPath, '[slack] Fatal: fresh\n')
+        child.emit('exit', 1, null)
+      }, 100),
+    })
+
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.exitCodes).toEqual([1])
+    expect(reportedLogLines()).toEqual(['[slack] Fatal: fresh'])
+  })
+
+  test('daemon exits having written nothing: exit 1, says it wrote nothing to server.log', async () => {
+    writeFileSync(logPath, '[slack] line from an earlier run\n')
+    const b = makeDeps({ daemon: ({ child, clock }) => clock.setTimeout(() => child.emit('exit', 1, null), 100) })
+
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.exitCodes).toEqual([1])
+    expect(stderr).toContain(`[slack] Server failed to start (exit code 1); it wrote nothing to ${logPath}`)
+    expect(stderr.join('\n')).not.toContain('earlier run')
+  })
+
+  test('spawn fails (`error` event): exit 1, could not be launched', async () => {
+    const b = makeDeps({
+      daemonPid: undefined,
+      daemon: ({ child, clock }) => clock.setTimeout(() => child.emit('error', new Error('spawn ENOENT')), 0),
+    })
+
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.exitCodes).toEqual([1])
+    expect(stderr).toContain(`[slack] Server failed to start (could not be launched: spawn ENOENT); it wrote nothing to ${logPath}`)
+  })
+
+  test('daemon writes its PID to the PID file: exit 0 with the starting-in-background line, before the bound', async () => {
+    const b = makeDeps() // readyDaemon: PID file at 200 ms
+
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.exitCodes).toEqual([0])
+    expect(stderr).toContain(`[slack] Server starting in background (PID ${DAEMON_PID})`)
+    expect(b.exitTimes[0]).toBeGreaterThanOrEqual(200)
+    expect(b.exitTimes[0]).toBeLessThan(200 + 2 * DAEMON_STARTUP_POLL_MS)
+  })
+
+  test('neither exit nor PID within the bound: exit 0 with the still-starting line, daemon never signalled', async () => {
+    // A PID file naming another process (a previous server) does not count as ready.
+    writeFileSync(pidPath, '4242\n')
+    const b = makeDeps({ daemon: () => { /* stays silent */ } })
+
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.exitCodes).toEqual([0])
+    expect(b.exitTimes[0]).toBeGreaterThanOrEqual(DAEMON_STARTUP_WAIT_MS)
+    expect(b.exitTimes[0]).toBeLessThan(DAEMON_STARTUP_WAIT_MS + DAEMON_STARTUP_POLL_MS)
+    expect(stderr).toContain(
+      `[slack] Server is still starting in the background (PID ${DAEMON_PID}) after ${DAEMON_STARTUP_WAIT_MS / 1000}s — its log is ${logPath}`,
+    )
+    expect(b.daemonSpawns[0]!.child.signals).toEqual([])
+    expect(b.serverSignals).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// start — the daemon's server.log descriptor (the parent never holds it open)
+// ---------------------------------------------------------------------------
+
+describe('start — server.log descriptor', () => {
+  test('opens <stateDir>/server.log, gives that fd to the daemon as stdout and stderr, closes it once after the spawn and before the wait', async () => {
+    const b = makeDeps()
+
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.logOpens).toEqual([logPath])
+    expect(b.daemonSpawns[0]!.opts.stdio).toEqual(['ignore', LOG_FD, LOG_FD])
+    expect(b.closedFds).toEqual([LOG_FD])
+    expect(b.events.slice(0, 4)).toEqual(['openLogAppend', 'spawnDaemon', `closeFd:${LOG_FD}`, 'sleep'])
+    expect(b.exitCodes).toEqual([0])
+  })
+
+  test('spawnDaemon throwing: the fd is still closed once and the error propagates', async () => {
+    const err = new Error('spawn EAGAIN')
+    const b = makeDeps({ spawnDaemonError: err })
+
+    await expect(createCli(b.deps).start()).rejects.toBe(err)
+
+    expect(b.closedFds).toEqual([LOG_FD])
+    expect(b.exitCodes).toEqual([])
+  })
+
+  test('production deps open the log for append, close it with closeSync and redirect with initLogging from ./logging.ts (static)', () => {
+    const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
+    const props = objectProperties(code.slice(code.indexOf('const realDeps: CliDeps =')))
+    expect(props.get('openLogAppend')).toBe("(path) => openSync(path, 'a')")
+    expect(props.get('closeFd')).toBe('(fd) => closeSync(fd)')
+    expect(props.get('initLogging')).toBe('initLogging')
+    expect(code).toMatch(/import\s*\{\s*initLogging\s*\}\s*from\s*'\.\/logging\.ts'/)
   })
 })
 
@@ -201,27 +636,21 @@ describe('start', () => {
 // the launcher's session/PGID so killing the launcher's group killed the server.
 // The fix: only trust the marker when the process is ALSO a session leader; a
 // set-but-not-leader marker is treated as a leak, cleared, and the parent path
-// re-detaches via a real detached spawn.
+// re-detaches via a detached spawn.
 //
-// Under `bun test` the test process is NOT a session leader (its session id
-// differs from its pid — verified: a real daemon child spawned with
-// detached:true would be a leader, we are not). So with the marker preset we
-// exercise exactly the leaked-marker scenario the bug describes:
+// Under `bun test` the test process is NOT a session leader, so with the marker
+// preset we exercise exactly the leaked-marker scenario:
 //   - fixed code  -> parent path: detached spawn + exit(0), startServer NOT run
 //   - pre-fix code -> child path: startServer run in-place (the bug)
 //
-// child_process.spawn is stubbed so no real server process is ever launched
-// (shared-infra safety); the daemonize path uses a dynamic import of
-// child_process, which mock.module intercepts.
+// The daemon is the injected fake `spawnDaemon`, so no real server process is
+// ever launched (shared-infra safety).
 // ---------------------------------------------------------------------------
 
-/**
- * Read the session id (field 4 after comm) from /proc/self/stat, the same way
- * src/cli.ts isSessionLeader() does. Returns null when /proc is unavailable.
- */
+/** Session id (field 4 after comm) from /proc/self/stat, as src/cli.ts reads it; null without /proc. */
 function readOwnSessionId(): number | null {
   try {
-    const stat = require('node:fs').readFileSync('/proc/self/stat', 'utf8') as string
+    const stat = readFileSync('/proc/self/stat', 'utf8')
     const fields = stat.slice(stat.lastIndexOf(') ') + 2).split(' ')
     const session = parseInt(fields[3] ?? '', 10)
     return Number.isNaN(session) ? null : session
@@ -230,58 +659,10 @@ function readOwnSessionId(): number | null {
   }
 }
 
-/** A spawned child that ran nothing: see the fake `spawn` below. */
-function fakeChild(): EventEmitter & { pid: number; stdout: EventEmitter; stderr: EventEmitter; unref(): void; kill(): boolean } {
-  const child = Object.assign(new EventEmitter(), {
-    pid: 999999,
-    stdout: new EventEmitter(),
-    stderr: new EventEmitter(),
-    unref: () => { /* no-op */ },
-    kill: () => false,
-  })
-  setImmediate(() => {
-    child.emit('exit', 1, null)
-    child.emit('close', 1, null)
-  })
-  return child
-}
-
 describe('start — daemonize session-leader guard (b.acn)', () => {
-  let scratchDir: string
-  // Each fake-spawn call records the real detach arguments so tests can assert
-  // that the respawn is a genuine `detached:true` background launch.
-  let spawnedCalls: Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }>
-
-  beforeAll(async () => {
-    const real = await import('node:child_process')
-    // Fake spawn: record (cmd, args, opts), never launch a real process; return
-    // a child that behaves like a real one that could not run what it was
-    // given. Under Bun 1.4, mock.restore() does not undo mock.module, so this
-    // fake stays installed for every later test file in the same `bun test`
-    // process (the cozempic probe in startupSessionManager awaits its child's
-    // `close`). The child therefore supports what a caller of spawn uses:
-    // `on`/`once` (an EventEmitter), `stdout`/`stderr` streams, `unref`,
-    // `kill` and `pid`; once the caller has attached its listeners it emits
-    // `exit` and then `close` with code 1 (nothing ran), as a failed command does.
-    const fakeSpawn = (cmd: string, args: string[], opts: Record<string, unknown>) => {
-      spawnedCalls?.push({ cmd, args, opts })
-      return fakeChild()
-    }
-    mock.module('node:child_process', () => ({ ...real, spawn: fakeSpawn }))
-    mock.module('child_process', () => ({ ...real, spawn: fakeSpawn }))
-  })
-
-  afterAll(() => {
-    mock.restore()
-  })
-
   beforeEach(() => {
-    // PRECONDITION (b.acn, reviewer finding #2): both leaked-marker tests below
-    // assume the `bun test` runner is NOT a session leader (its session id
-    // differs from its pid) — that is what makes a preset marker look "leaked".
-    // If the suite ever runs with bun AS a session leader (e.g. PID 1 under
-    // docker), the guard would trust the marker and run in-place, and these
-    // tests would fail confusingly. Fail loudly with a self-diagnosing message.
+    // PRECONDITION: the leaked-marker tests assume the runner is NOT a session
+    // leader. Fail loudly with a self-diagnosing message if it is (e.g. PID 1).
     const sid = readOwnSessionId()
     if (sid !== null && sid === process.pid) {
       throw new Error(
@@ -291,87 +672,140 @@ describe('start — daemonize session-leader guard (b.acn)', () => {
         `process (not PID 1 / not a session leader).`,
       )
     }
-
-    spawnedCalls = []
-    scratchDir = mkdtempSync(join(tmpdir(), 'cscb-acn-'))
-    // The daemonize parent path openSync()s <stateDir>/server.log for real, so
-    // the state dir must exist on disk.
   })
 
-  afterEach(() => {
-    delete process.env['_CLI_DAEMON_CHILD']
-    try { rmSync(scratchDir, { recursive: true, force: true }) } catch { /* ignore */ }
-  })
-
-  // Assert the recorded spawn is a real detach matching src/cli.ts (~line 159):
-  // detached:true, the _CLI_DAEMON_CHILD marker set in the child env, and stdio
-  // NOT inherited (so the child survives its parent's exit).
-  function expectRealDetach(call: { cmd: string; args: string[]; opts: Record<string, unknown> }) {
-    expect(call.opts['detached']).toBe(true)
-    const childEnv = call.opts['env'] as NodeJS.ProcessEnv
-    expect(childEnv['_CLI_DAEMON_CHILD']).toBe('1')
-    const stdio = call.opts['stdio']
-    expect(stdio).not.toBe('inherit')
-    if (Array.isArray(stdio)) {
-      expect(stdio).not.toContain('inherit')
-    }
-    // Respawn re-invokes this CLI with the `start` subcommand.
-    expect(call.args).toContain('start')
+  // The recorded spawn is a real detach: detached:true, the marker in the child
+  // env, stdio not inherited (the child survives its parent), the `start`
+  // subcommand, and the child unref'd.
+  function expectRealDetach(b: Bundle) {
+    expect(b.daemonSpawns).toHaveLength(1)
+    const { cmd, args, opts, child } = b.daemonSpawns[0]!
+    expect(cmd).toBe(process.execPath)
+    expect(opts.detached).toBe(true)
+    expect(opts.env['_CLI_DAEMON_CHILD']).toBe('1')
+    expect(opts.stdio).not.toContain('inherit')
+    expect(opts.stdio[0]).toBe('ignore')
+    expect(args).toContain('start')
+    expect(child.unrefCalls).toBe(1)
   }
 
   // REGRESSION (b.acn): fails with pre-fix code, passes with the fix.
   test('leaked _CLI_DAEMON_CHILD marker (not a session leader) re-detaches instead of running in-place', async () => {
-    const bundle = makeDeps({ existsAll: true, resolveStateDir: () => scratchDir })
-    // Simulate the leaked marker inherited from a launcher wrapper.
+    const b = makeDeps()
     process.env['_CLI_DAEMON_CHILD'] = '1'
 
-    await expect(createCli(bundle.deps).start()).rejects.toBeInstanceOf(ExitError)
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
 
-    // Fix: parent (re-detach) path — a detached child is spawned and we exit(0).
-    expect(spawnedCalls).toHaveLength(1)
-    expectRealDetach(spawnedCalls[0]!)
-    expect(bundle.exitCodes).toContain(0)
-    // The server must NOT be started in-place under the leaked marker.
-    expect(bundle.startServerCalled).toBe(false)
+    expectRealDetach(b)
+    expect(b.exitCodes).toEqual([0])
+    expect(b.startServerCalled).toBe(false)
   })
 
-  // Baseline: with no marker, the parent always detaches (unchanged by the fix).
-  // This anchors the regression test — it proves the spawn/exit(0) reflect the
-  // detach path and not some unrelated failure, and that the leaked-marker case
-  // above ends up in the SAME detach path a fresh launch takes.
+  // Baseline: with no marker, the parent always detaches.
   test('no marker at all: parent detaches and exits (baseline)', async () => {
-    const bundle = makeDeps({ existsAll: true, resolveStateDir: () => scratchDir })
-    delete process.env['_CLI_DAEMON_CHILD']
+    const b = makeDeps()
 
-    await expect(createCli(bundle.deps).start()).rejects.toBeInstanceOf(ExitError)
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
 
-    expect(spawnedCalls).toHaveLength(1)
-    expectRealDetach(spawnedCalls[0]!)
-    expect(bundle.exitCodes).toContain(0)
-    expect(bundle.startServerCalled).toBe(false)
+    expectRealDetach(b)
+    expect(b.exitCodes).toEqual([0])
+    expect(b.startServerCalled).toBe(false)
   })
 
   // b.av2 SR-10.2: `--reconcile-instance-ids` is retired, so `start` no longer
   // turns it into CSCB_RECONCILE_INSTANCE_IDS for the daemon child.
   test('--reconcile-instance-ids on argv is not forwarded to the daemon child as CSCB_RECONCILE_INSTANCE_IDS (SR-10.2)', async () => {
-    const savedArgv = process.argv
     const savedEnv = process.env['CSCB_RECONCILE_INSTANCE_IDS']
     // The child env copies process.env, so the runner's own value must not mask a forward.
     delete process.env['CSCB_RECONCILE_INSTANCE_IDS']
     process.argv = [...savedArgv, '--reconcile-instance-ids']
     try {
-      const bundle = makeDeps({ existsAll: true, resolveStateDir: () => scratchDir })
-      await expect(createCli(bundle.deps).start()).rejects.toBeInstanceOf(ExitError)
+      const b = makeDeps()
+      await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
 
-      expect(spawnedCalls).toHaveLength(1)
-      expectRealDetach(spawnedCalls[0]!)
-      const childEnv = spawnedCalls[0]!.opts['env'] as NodeJS.ProcessEnv
-      expect('CSCB_RECONCILE_INSTANCE_IDS' in childEnv).toBe(false)
+      expectRealDetach(b)
+      expect('CSCB_RECONCILE_INSTANCE_IDS' in b.daemonSpawns[0]!.opts.env).toBe(false)
     } finally {
-      process.argv = savedArgv
       if (savedEnv === undefined) delete process.env['CSCB_RECONCILE_INSTANCE_IDS']
       else process.env['CSCB_RECONCILE_INSTANCE_IDS'] = savedEnv
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Persona-set teardown (b.av2 SR-8.7): exactly the config's personas, by cscb_<key>
+// ---------------------------------------------------------------------------
+
+describe('persona-set teardown', () => {
+  const twoPersonas = (): PersonaConfig => makeMultiPersonaConfig([ALPHA, BETA], root)
+  const alphaId = (): string => personaInstanceId(personaKey(ALPHA.name))
+  const betaId = (): string => personaInstanceId(personaKey(BETA.name))
+
+  test.each([
+    ['clean_restart', (b: Bundle) => createCli(b.deps).clean_restart()],
+    ['stop --stop-bots', (b: Bundle) => createCli(b.deps).stop({ stopBots: true }).catch((e) => { if (!(e instanceof ExitError)) throw e })],
+  ])('%s: two personas (two channels; zero channels with DMs) each get one status, pause and kill on cscb_<key>, none by channel', async (_name, run) => {
+    const b = makeStopDeps({
+      config: twoPersonas(),
+      directorStatus: async () => ({ state: 'waiting' }),
+      directorPause: async () => { throw new Error('pause failed') }, // escalate → one kill each
+    })
+
+    await run(b)
+
+    const ids = [alphaId(), betaId()].sort()
+    expect([...b.statusCalls].sort()).toEqual(ids)
+    expect([...b.pauseCalls].sort()).toEqual(ids)
+    expect([...b.killCalls].sort()).toEqual(ids)
+    const channelIds = [...ALPHA.channels.map((c) => c.id)]
+    for (const call of [...b.statusCalls, ...b.pauseCalls, ...b.killCalls]) {
+      expect(channelIds.some((c) => call.includes(c))).toBe(false)
+    }
+    expect(b.exitCodes).not.toContain(1)
+  })
+
+  test('the instance ID is cscb_<key>, never the persona name or its channel', async () => {
+    const b = makeDeps({ directorStatus: async () => ({ state: 'ended' }) })
+    await createCli(b.deps).clean_restart()
+    expect(personaKey(OPS_NAME)).not.toBe(OPS_NAME) // precondition: name ≠ key
+    expect(b.statusCalls).toEqual([opsId()])
+  })
+
+  test('an absent row logs the persona reference ("<name>" (key=<key>)) and skips', async () => {
+    const b = makeDeps({ directorStatus: async () => null })
+    await createCli(b.deps).clean_restart()
+    expect(stderr).toContain(`[slack] teardownBots: no spawn row for persona ${renderPersonaRef(OPS_NAME, personaKey(OPS_NAME))} — skipping`)
+  })
+
+  test('clean_restart with an empty personas array: no director call, still stops and starts', async () => {
+    const b = makeDeps({ config: makeMultiPersonaConfig([], root), directorStatus: async () => ({ state: 'waiting' }) })
+    await createCli(b.deps).clean_restart()
+    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+    expect(b.spawnCalls.map((c) => c.args.at(-1))).toEqual(['stop', 'start'])
+    expect(b.exitCodes).toEqual([])
+  })
+
+  test('stop --stop-bots with an empty personas array: no director call, server stop exit 0', async () => {
+    const b = makeStopDeps({ config: makeMultiPersonaConfig([], root), directorStatus: async () => ({ state: 'waiting' }) })
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+    expect(b.exitCodes).toEqual([0])
+  })
+
+  test('one persona failing loudly still lets the other be torn down; the aggregate counts one persona', async () => {
+    const b = makeDeps({
+      config: twoPersonas(),
+      directorStatus: async (id) => {
+        if (id === alphaId()) throw new ErrCallTimeout('status', 35000, 30000)
+        return { state: 'waiting' }
+      },
+      directorPause: async () => { throw new Error('pause failed') },
+    })
+    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    expect(b.killCalls).toEqual([betaId()])
+    expect(b.exitCodes).toEqual([1])
+    expect(stderr.join('\n')).toContain('teardown incomplete for 1 persona(s)')
+    expect(startedServer(b)).toBe(false)
   })
 })
 
@@ -381,251 +815,311 @@ describe('start — daemonize session-leader guard (b.acn)', () => {
 
 describe('clean_restart', () => {
   test('genuinely-absent row (null) skips quietly and clean_restart still starts', async () => {
-    const { deps, exitCodes, statusCalls, pauseCalls, killCalls, spawnCalls } = makeDeps({
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
-      directorStatus: async () => null, // ErrSpawnNotFound branch — genuinely absent row
-    })
-    await createCli(deps).clean_restart()
-    expect(statusCalls).toEqual(['C'])
-    expect(pauseCalls).toEqual([])
-    expect(killCalls).toEqual([])
-    // Absent-row path is not an error: no exit(1), teardown is a legit no-op,
-    // and the restart still proceeds to start (spawnSync(..., 'start')). This
-    // pins the semantic distinction the bare catch erased: absent-row (null) →
-    // skip + proceed; AD error (throw) → loud abort (see b.qwo suite below).
-    expect(exitCodes).not.toContain(1)
-    expect(spawnCalls.some((c) => c.args.includes('start'))).toBe(true)
+    const b = makeDeps({ directorStatus: async () => null })
+    await createCli(b.deps).clean_restart()
+    expect(b.statusCalls).toEqual([opsId()])
+    expect(b.pauseCalls).toEqual([])
+    expect(b.killCalls).toEqual([])
+    // Absent-row (null) → skip + proceed; AD error (throw) → loud abort (b.qwo below).
+    expect(b.exitCodes).not.toContain(1)
+    expect(startedServer(b)).toBe(true)
   })
 
-  test('skips channels already in terminal state', async () => {
-    const { deps, pauseCalls } = makeDeps({
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
-      directorStatus: async () => ({ state: 'ended' }),
-    })
-    await createCli(deps).clean_restart()
-    expect(pauseCalls).toEqual([])
+  test('skips personas already in terminal state', async () => {
+    const b = makeDeps({ directorStatus: async () => ({ state: 'ended' }) })
+    await createCli(b.deps).clean_restart()
+    expect(b.pauseCalls).toEqual([])
   })
 
   test('pauses + reports cleanly when status transitions to terminal', async () => {
-    let callCount = 0
-    const { deps, pauseCalls, killCalls } = makeDeps({
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
-      directorStatus: async () => {
-        callCount++
-        if (callCount === 1) return { state: 'waiting' } // precheck
-        return { state: 'ended' } // post-pause poll terminal
-      },
+    let n = 0
+    const b = makeDeps({
+      directorStatus: async () => (++n === 1 ? { state: 'waiting' } : { state: 'ended' }), // precheck → terminal
     })
-    await createCli(deps).clean_restart()
-    expect(pauseCalls).toEqual(['C'])
-    expect(killCalls).toEqual([])
+    await createCli(b.deps).clean_restart()
+    expect(b.pauseCalls).toEqual([opsId()])
+    expect(b.killCalls).toEqual([])
   })
 
   test('escalates to kill on pause failure', async () => {
-    const { deps, killCalls } = makeDeps({
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+    const b = makeDeps({
       directorStatus: async () => ({ state: 'waiting' }),
       directorPause: async () => { throw new Error('pause failed') },
     })
-    await createCli(deps).clean_restart()
-    expect(killCalls).toEqual(['C'])
+    await createCli(b.deps).clean_restart()
+    expect(b.killCalls).toEqual([opsId()])
   })
 
-  // b.dnt: AD dies between the precheck and the pause. The precheck resolves
-  // live, pause throws (escalation fires), and the escalation KILL also throws a
-  // non-ErrSpawnNotFound error (AD dead mid-teardown). Pre-fix, the escalation's
-  // `catch { /* ignore */ }` (git HEAD:src/cli.ts ~:165) swallowed EVERY kill
-  // error, so this channel resolved and clean_restart proceeded to start (no
-  // exit 1) — the residual quiet-failure path this bug closes. Post-fix the
-  // non-benign kill error rethrows into the allSettled aggregate → loud throw →
-  // clean_restart exit(1), no start. Assert on behavior: kill attempted, and the
-  // command aborts loudly.
+  // b.dnt: AD dies between the precheck and the pause. The escalation kill also
+  // throws a non-ErrSpawnNotFound error; it rejects into the allSettled
+  // aggregate → loud throw → clean_restart exit(1), no start.
   test('b.dnt: escalation kill failing (non-ErrSpawnNotFound) rejects loudly (AD died mid-teardown)', async () => {
-    const { deps, exitCodes, killCalls, spawnCalls } = makeDeps({
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
-      directorStatus: async () => ({ state: 'waiting' }), // precheck live
-      directorPause: async () => { throw new Error('AD connection refused') }, // AD died → escalate
-      directorKill: async () => { throw new ErrCallTimeout('kill', 35000, 30000) }, // non-benign kill error
+    const b = makeDeps({
+      directorStatus: async () => ({ state: 'waiting' }),
+      directorPause: async () => { throw new Error('AD connection refused') },
+      directorKill: async () => { throw new ErrCallTimeout('kill', 35000, 30000) },
     })
-    await expect(createCli(deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
-    expect(killCalls).toEqual(['C']) // kill WAS attempted
-    expect(exitCodes).toContain(1) // loud aggregate throw → exit 1
-    expect(spawnCalls.some((c) => c.args.includes('start'))).toBe(false) // never started
+    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    expect(b.killCalls).toEqual([opsId()])
+    expect(b.exitCodes).toContain(1)
+    expect(startedServer(b)).toBe(false)
   })
 
-  // b.dnt: same escalation setup, but the kill throws the benign already-gone
-  // ErrSpawnNotFound race (row genuinely gone between pause and kill). That stays
-  // swallowed per-channel — the channel resolves, no aggregate rejection, no
-  // exit(1), and clean_restart proceeds to start.
+  // b.dnt: the benign already-gone ErrSpawnNotFound race stays per-persona handled.
   test('b.dnt: escalation kill failing with ErrSpawnNotFound stays quiet (benign already-gone race)', async () => {
-    const { deps, exitCodes, killCalls, spawnCalls } = makeDeps({
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
-      directorStatus: async () => ({ state: 'waiting' }), // precheck live
-      directorPause: async () => { throw new Error('pause failed') }, // escalate
+    const b = makeDeps({
+      directorStatus: async () => ({ state: 'waiting' }),
+      directorPause: async () => { throw new Error('pause failed') },
       directorKill: async () => { throw new ErrSpawnNotFound('kill', 'ErrSpawnNotFound', 'row gone') },
     })
-    await createCli(deps).clean_restart() // resolves — no rejection
-    expect(killCalls).toEqual(['C']) // kill WAS attempted
-    expect(exitCodes).not.toContain(1) // benign — no loud failure
-    expect(spawnCalls.some((c) => c.args.includes('start'))).toBe(true) // restart proceeds
+    await createCli(b.deps).clean_restart()
+    expect(b.killCalls).toEqual([opsId()])
+    expect(b.exitCodes).not.toContain(1)
+    expect(startedServer(b)).toBe(true)
   })
 })
 
 // ---------------------------------------------------------------------------
-// stop — b.4dk `--stop-bots` graceful bot teardown before server stop
+// clean_restart — clean_restart.log, with fatal lines also on the terminal
+// ---------------------------------------------------------------------------
+
+describe('clean_restart — clean_restart.log and the terminal', () => {
+  /** An initLogging that sends console.error to `log`, as the real one sends it to the file. */
+  const redirectTo = (log: string[]) => (): void => {
+    console.error = (...args: unknown[]) => { log.push(formatLine(args)) }
+  }
+
+  const FATAL: Array<[string, Overrides, string]> = [
+    ['config load fails', { loadConfig: () => { throw new Error('config boom') } }, '[slack] clean_restart: failed to load config: config boom'],
+    [
+      'agent-director initialization fails',
+      { initClient: async () => { throw new Error('startup gate failed') } },
+      '[slack] clean_restart: agent-director initialization failed: startup gate failed',
+    ],
+    [
+      'teardown fails',
+      { directorStatus: async () => { throw new Error('AD connection refused') } },
+      '[slack] clean_restart: bot teardown failed — aborting restart: teardownBots: agent-director error',
+    ],
+    // stop's non-zero exit is a non-fatal line: log only.
+    ['start fails', { spawnSyncStatus: 3 }, '[slack] clean_restart: start failed with exit code 3'],
+  ]
+
+  test.each(FATAL)('%s: the fatal line reaches the terminal once and the log once; no other line reaches the terminal', async (_name, o, line) => {
+    const log: string[] = []
+    const b = makeDeps({ ...o, initLogging: redirectTo(log) })
+
+    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.logInits).toEqual([join(stateDir, 'clean_restart.log')])
+    expect(stderr).toHaveLength(1)
+    expect(stderr[0]!.startsWith(line)).toBe(true)
+    expect(log.filter((l) => l === stderr[0])).toHaveLength(1)
+  })
+
+  test('a successful run redirects to <stateDir>/clean_restart.log before loading the config; every line goes to the log, none to the terminal', async () => {
+    const log: string[] = []
+    const b = makeDeps({ initLogging: redirectTo(log) })
+
+    await createCli(b.deps).clean_restart()
+
+    expect(b.logInits).toEqual([join(stateDir, 'clean_restart.log')])
+    expect(b.events.indexOf('initLogging')).toBeLessThan(b.events.indexOf('loadConfig'))
+    expect(stderr).toEqual([])
+    expect(log).toContain('[slack] clean_restart: stopping server')
+    expect(log).toContain('[slack] clean_restart: done')
+  })
+
+  test('initLogging throwing: clean_restart still runs, its lines stay on the terminal and the fatal line appears once', async () => {
+    const b = makeDeps({ spawnSyncStatus: 3, initLogging: () => { throw new Error('EACCES') } })
+
+    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.exitCodes).toEqual([3])
+    expect(stderr).toContain('[slack] clean_restart: stopping server')
+    expect(stderr.filter((l) => l === '[slack] clean_restart: start failed with exit code 3')).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// createDirectorOps — the production director deps (b.qwo, b.dnt)
+// ---------------------------------------------------------------------------
+
+describe('createDirectorOps', () => {
+  const OPS: Array<keyof DirectorOps> = ['directorStatus', 'directorPause', 'directorKill']
+
+  /** A fake Client whose verbs record [verb, request] and throw `fail` when given. */
+  function fakeClient(fail?: Error): { client: DirectorClient; calls: Array<[string, unknown]> } {
+    const calls: Array<[string, unknown]> = []
+    const verb = (name: string, result: object) => async (req: unknown) => {
+      calls.push([name, req])
+      if (fail) throw fail
+      return result
+    }
+    const client = { status: verb('status', { state: 'working' }), pause: verb('pause', {}), kill: verb('kill', {}) }
+    return { client: client as unknown as DirectorClient, calls }
+  }
+
+  const notFound = (): Error => new ErrSpawnNotFound('status', 'ErrSpawnNotFound', 'row gone')
+  const refused = (): Error => new Error('AD connection refused')
+  const timeout = (): Error => new ErrCallTimeout('status', 35000, 30000)
+
+  test.each([
+    ['directorStatus', 'ErrSpawnNotFound', 'resolves null', notFound],
+    ['directorStatus', 'a connection error', 'rejects', refused],
+    ['directorStatus', 'ErrCallTimeout', 'rejects', timeout],
+    ['directorKill', 'ErrSpawnNotFound', 'resolves', notFound],
+    ['directorKill', 'a connection error', 'rejects', refused],
+    ['directorKill', 'ErrCallTimeout', 'rejects', timeout],
+    ['directorPause', 'ErrSpawnNotFound', 'rejects', notFound],
+    ['directorPause', 'a connection error', 'rejects', refused],
+    ['directorPause', 'ErrCallTimeout', 'rejects', timeout],
+  ] as const)('%s when the Client throws %s: %s', async (op, _name, outcome, makeErr) => {
+    const err = makeErr()
+    const call = createDirectorOps(() => fakeClient(err).client)[op](opsId())
+    if (outcome === 'rejects') await expect(call).rejects.toBe(err)
+    else expect(await call).toBe(outcome === 'resolves null' ? null : undefined)
+  })
+
+  test.each(OPS)('%s rejects with getClient\'s own error when getClient throws (no Client installed)', async (op) => {
+    const err = new Error('agent-director client not initialized')
+    await expect(createDirectorOps(() => { throw err })[op](opsId())).rejects.toBe(err)
+  })
+
+  test('getClient is called on every op (a Client installed later is used) and each verb gets cscb_<key> as claude_instance_id', async () => {
+    let installed: DirectorClient | null = null
+    let gets = 0
+    const ops = createDirectorOps(() => {
+      gets++
+      if (installed === null) throw new Error('agent-director client not initialized')
+      return installed
+    })
+    await expect(ops.directorStatus(opsId())).rejects.toThrow('agent-director client not initialized')
+    const { client, calls } = fakeClient()
+    installed = client
+
+    expect(await ops.directorStatus(opsId())).toEqual({ state: 'working' })
+    await ops.directorPause(opsId())
+    await ops.directorKill(opsId())
+
+    expect(gets).toBe(4)
+    const req = { claude_instance_id: opsId() }
+    expect(calls).toEqual([['status', req], ['pause', req], ['kill', req]])
+  })
+
+  test('production deps take directorStatus / directorPause / directorKill from createDirectorOps(getClient) (static)', () => {
+    const code = stripComments(readFileSync(CLI_SOURCE, 'utf-8'))
+    expect(code).toMatch(/import\s*\{\s*getClient\s*\}\s*from\s*'\.\/agent-director-client\.ts'/)
+    const made = [...code.matchAll(/\bconst\s+(\w+)\s*=\s*createDirectorOps\s*\(\s*getClient\s*\)/g)]
+    expect(made).toHaveLength(1)
+    const props = objectProperties(code.slice(code.indexOf('const realDeps: CliDeps =')))
+    for (const op of OPS) expect(props.get(op)).toBe(`${made[0]![1]}.${op}`)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// stop — b.4dk `--stop-bots` graceful bot teardown
 //
-// `stop({ stopBots: true })` reuses clean_restart's per-route pause/poll/kill
-// teardown (extracted into teardownBots) BEFORE stopping the server. Plain
-// `stop()` must never touch the director verbs — bots survive server restarts.
+// `stop({ stopBots: true })` reuses clean_restart's per-persona pause/poll/kill
+// teardown (teardownBots) AFTER stopping the server. Plain `stop()` never
+// touches the director verbs — bots survive server restarts.
 // ---------------------------------------------------------------------------
 
 describe('stop --stop-bots (b.4dk)', () => {
-  /**
-   * Configure a `stop` bundle whose server is already gone (stale PID file →
-   * exit(0)) so the test focuses on the pre-stop bot-teardown behavior. The
-   * teardown runs BEFORE the server-stop block, so it completes regardless.
-   */
-  function makeStopDeps(o: Overrides = {}): Bundle {
-    return makeDeps({
-      // existsAll makes the PID file "present"; isProcessRunning defaults false
-      // → stale-PID branch → exit(0). No real signals are ever sent.
-      existsAll: true,
-      pidFileContent: '4242',
-      isProcessRunning: () => false,
-      ...o,
-    })
-  }
-
-  test('stopBots: per-route pause runs and server still stops', async () => {
+  test('stopBots: per-persona pause runs and server still stops', async () => {
     let n = 0
-    const { deps, pauseCalls, killCalls, statusCalls, exitCodes } = makeStopDeps({
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
-      directorStatus: async () => {
-        n++
-        return n === 1 ? { state: 'waiting' } : { state: 'ended' } // precheck → post-pause terminal
-      },
+    const b = makeStopDeps({
+      directorStatus: async () => (++n === 1 ? { state: 'waiting' } : { state: 'ended' }),
     })
-    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
-    expect(pauseCalls).toEqual(['C'])
-    expect(killCalls).toEqual([])
-    expect(statusCalls[0]).toBe('C') // teardown precheck ran
-    expect(exitCodes).toContain(0) // server stop still reached (stale PID → exit 0)
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect(b.pauseCalls).toEqual([opsId()])
+    expect(b.killCalls).toEqual([])
+    expect(b.statusCalls[0]).toBe(opsId())
+    expect(b.exitCodes).toContain(0)
   })
 
   test('stopBots: pause timeout escalates to kill, server still stops', async () => {
-    const { deps, pauseCalls, killCalls, exitCodes } = makeStopDeps({
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } }, exit_timeout: 0 }),
-      directorStatus: async () => ({ state: 'waiting' }), // never reaches terminal
-    })
-    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
-    expect(pauseCalls).toEqual(['C'])
-    expect(killCalls).toEqual(['C']) // exit_timeout=0 → immediate kill escalation
-    expect(exitCodes).toContain(0)
+    const b = makeStopDeps({ config: opsConfig({ exit_timeout: 0 }), directorStatus: async () => ({ state: 'waiting' }) })
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect(b.pauseCalls).toEqual([opsId()])
+    expect(b.killCalls).toEqual([opsId()]) // exit_timeout=0 → immediate kill escalation
+    expect(b.exitCodes).toContain(0)
   })
 
-  // b.dnt: timeout-path kill failure. Precheck live, pause SUCCEEDS, the poll
-  // never reaches terminal (exit_timeout=0 → immediate timeout), then the
-  // force-kill throws a non-ErrSpawnNotFound error (AD died mid-teardown).
-  // Pre-fix the timeout kill's `catch { logged }` (git HEAD:src/cli.ts ~:200)
-  // swallowed it and the channel resolved. Post-fix it rethrows into the
-  // aggregate → loud throw → exit(1) (not the stale-PID exit(0)). Assert kill
-  // attempted and the command exits non-zero.
+  // b.dnt: timeout-path kill failing with a non-benign error rejects into the
+  // aggregate → exit(1), not the stale-PID exit(0).
   test('stopBots: timeout-path kill failing (non-ErrSpawnNotFound) rejects loudly (b.dnt)', async () => {
-    const { deps, pauseCalls, killCalls, exitCodes } = makeStopDeps({
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } }, exit_timeout: 0 }),
-      directorStatus: async () => ({ state: 'waiting' }), // never reaches terminal → force-kill
+    const b = makeStopDeps({
+      config: opsConfig({ exit_timeout: 0 }),
+      directorStatus: async () => ({ state: 'waiting' }),
       directorPause: async () => { /* pause succeeds */ },
       directorKill: async () => { throw new ErrCallTimeout('kill', 35000, 30000) },
     })
-    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
-    expect(pauseCalls).toEqual(['C']) // pause succeeded first
-    expect(killCalls).toEqual(['C']) // timeout-path kill attempted
-    expect(exitCodes).toContain(1) // loud teardown failure, not the stale-PID exit(0)
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect(b.pauseCalls).toEqual([opsId()])
+    expect(b.killCalls).toEqual([opsId()])
+    expect(b.exitCodes).toContain(1)
   })
 
-  // b.dnt: same timeout-path setup, but the force-kill throws the benign
-  // already-gone ErrSpawnNotFound race (row genuinely gone between pause and
-  // kill). That stays swallowed per-channel — the channel resolves, no aggregate
-  // rejection, no loud exit(1), and the server stop proceeds normally to the
-  // stale-PID exit(0).
+  // b.dnt: the benign ErrSpawnNotFound race on the timeout path stays quiet.
   test('stopBots: timeout-path kill failing with ErrSpawnNotFound stays quiet, server still stops (b.dnt)', async () => {
-    const { deps, pauseCalls, killCalls, exitCodes } = makeStopDeps({
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } }, exit_timeout: 0 }),
-      directorStatus: async () => ({ state: 'waiting' }), // never reaches terminal → force-kill
+    const b = makeStopDeps({
+      config: opsConfig({ exit_timeout: 0 }),
+      directorStatus: async () => ({ state: 'waiting' }),
       directorPause: async () => { /* pause succeeds */ },
       directorKill: async () => { throw new ErrSpawnNotFound('kill', 'ErrSpawnNotFound', 'row gone') },
     })
-    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
-    expect(pauseCalls).toEqual(['C']) // pause succeeded first
-    expect(killCalls).toEqual(['C']) // timeout-path kill attempted
-    expect(exitCodes).not.toContain(1) // benign — no loud teardown failure
-    expect(exitCodes).toContain(0) // server stop still reached (stale PID → exit 0)
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect(b.pauseCalls).toEqual([opsId()])
+    expect(b.killCalls).toEqual([opsId()])
+    expect(b.exitCodes).not.toContain(1)
+    expect(b.exitCodes).toContain(0)
   })
 
-  test('stopBots: teardown error does NOT block server stop', async () => {
-    const { deps, exitCodes } = makeStopDeps({
-      // loadConfig throws inside the stopBots block → caught, logged, server stop proceeds.
-      loadConfig: () => { throw new Error('config boom') },
-    })
-    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
-    expect(exitCodes).toContain(0)
+  test('stopBots: a config load error does NOT block server stop and runs no director verb', async () => {
+    const b = makeStopDeps({ loadConfig: () => { throw new Error('config boom') } })
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect(b.exitCodes).toEqual([0])
+    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
   })
 
-  // b.4dk ordering guarantee: the server must be stopped BEFORE any bot teardown
-  // begins, so the live daemon's onsessionclosed→scheduleRestart cannot respawn a
-  // bot mid-teardown. A regression to teardown-first would put pause:C before the
-  // server SIGTERM and fail this test. A LIVE server pid (isProcessRunning true
-  // then false) forces a real SIGTERM through deps.kill so the ordering is
-  // observable in the shared `events` log.
+  // b.4dk ordering: the server is stopped BEFORE any bot teardown begins, so the
+  // live daemon cannot respawn a persona mid-teardown.
   test('stopBots: server SIGTERM precedes any director verb (teardown-first regression guard)', async () => {
     let alive = true
-    const { deps, events } = makeDeps({
-      existsAll: true,
-      pidFileContent: '4242',
-      isProcessRunning: () => { const was = alive; alive = false; return was }, // live once, then gone
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } }, stop_timeout: 1, exit_timeout: 0 }),
-      directorStatus: async () => ({ state: 'waiting' }), // stays live → pause fires, poll times out fast (exit_timeout=0)
+    const b = makeDeps({
+      serverPid: 4242,
+      isProcessRunning: () => { const was = alive; alive = false; return was },
+      config: opsConfig({ stop_timeout: 1, exit_timeout: 0 }),
+      directorStatus: async () => ({ state: 'waiting' }),
     })
-    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
-    const firstServer = events.indexOf('server:SIGTERM')
-    const firstPause = events.findIndex((e) => e.startsWith('pause:'))
-    expect(firstServer).toBeGreaterThanOrEqual(0) // server was signalled
-    expect(firstPause).toBeGreaterThanOrEqual(0) // bot teardown ran
-    expect(firstServer).toBeLessThan(firstPause) // server stop happened FIRST
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    const firstServer = b.events.indexOf('server:SIGTERM')
+    const firstPause = b.events.findIndex((e) => e.startsWith('pause:'))
+    expect(firstServer).toBeGreaterThanOrEqual(0)
+    expect(firstPause).toBeGreaterThanOrEqual(0)
+    expect(firstServer).toBeLessThan(firstPause)
   })
 
   test.each([[undefined], [{}]])(
     'plain stop(%p) never touches director verbs (bots survive server restarts)',
     async (opts) => {
-      const { deps, pauseCalls, killCalls, statusCalls } = makeStopDeps({
-        loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
-        directorStatus: async () => ({ state: 'waiting' }),
-      })
-      await expect(createCli(deps).stop(opts)).rejects.toBeInstanceOf(ExitError)
-      expect(pauseCalls).toEqual([])
-      expect(killCalls).toEqual([])
-      expect(statusCalls).toEqual([]) // no teardown precheck at all
+      const b = makeStopDeps({ directorStatus: async () => ({ state: 'waiting' }) })
+      await expect(createCli(b.deps).stop(opts)).rejects.toBeInstanceOf(ExitError)
+      expect(b.pauseCalls).toEqual([])
+      expect(b.killCalls).toEqual([])
+      expect(b.statusCalls).toEqual([])
     },
   )
 })
 
-// ---------------------------------------------------------------------------
-// clean_restart — regression: teardown still runs via the extracted closure
-// ---------------------------------------------------------------------------
-
 describe('clean_restart teardown-via-closure regression (b.4dk)', () => {
-  test('clean_restart still pauses each live route (shared teardownBots closure)', async () => {
+  test('clean_restart still pauses each live persona (shared teardownBots closure)', async () => {
     let n = 0
-    const { deps, pauseCalls, killCalls } = makeDeps({
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
-      directorStatus: async () => {
-        n++
-        return n === 1 ? { state: 'waiting' } : { state: 'ended' }
-      },
-    })
-    await createCli(deps).clean_restart()
-    expect(pauseCalls).toEqual(['C']) // same pause/poll/kill teardown as before the extraction
-    expect(killCalls).toEqual([])
+    const b = makeDeps({ directorStatus: async () => (++n === 1 ? { state: 'waiting' } : { state: 'ended' }) })
+    await createCli(b.deps).clean_restart()
+    expect(b.pauseCalls).toEqual([opsId()])
+    expect(b.killCalls).toEqual([])
   })
 })
 
@@ -633,66 +1127,38 @@ describe('clean_restart teardown-via-closure regression (b.4dk)', () => {
 // b.qwo — AD-unreachable teardown must fail LOUDLY, never a silent no-op
 //
 // Root cause (b.qps / incident-2026-09-18): getClient() threw in the short-lived
-// CLI process (no server startup gate), and a bare `catch { return null }` in
-// resolveCscbInstanceId + a swallow in teardownBots collapsed that into a
-// per-channel "no spawn row — skipping". Every channel was skipped, teardown was
-// a silent no-op, and clean_restart happily proceeded to `start`.
-//
-// The fix: directorStatus/precheck errors propagate; teardownBots throws an
-// aggregate on any rejected settlement; clean_restart and `stop --stop-bots`
-// exit(1) on teardown failure and NEVER proceed to start. These tests model
-// AD-unreachable as a directorStatus() throw (the precheck's only AD call in the
-// injected surface) — the exact failure the bare catch used to swallow.
+// CLI process (no server startup gate) and the error was collapsed into a
+// per-bot "no spawn row — skipping". Every bot was skipped and clean_restart
+// proceeded to `start`. Now directorStatus errors propagate (null only for
+// ErrSpawnNotFound); teardownBots throws an aggregate; clean_restart and
+// `stop --stop-bots` exit(1) and never start.
 // ---------------------------------------------------------------------------
 
 describe('b.qwo — teardown fails loudly when agent-director is unreachable', () => {
-  // REGRESSION GUARD. Pre-fix teardownBots wrapped the whole per-channel body in
-  // a try/catch that logged and returned; an AD-unreachable throw was swallowed
-  // and clean_restart proceeded to start(). Post-fix the throw propagates, the
-  // aggregate re-throw fires, and clean_restart exits(1) BEFORE starting.
-  test('clean_restart aborts (exit 1, no start) when directorStatus throws (AD unreachable)', async () => {
-    const { deps, exitCodes, pauseCalls, killCalls, spawnCalls } = makeDeps({
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
-      directorStatus: async () => { throw new Error('AD connection refused') },
-    })
-    await expect(createCli(deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
-    // Loud failure: exit(1), and the server was NEVER started on top of bots we
-    // could not reach (the b.qps silent-no-op-then-start bug). clean_restart
-    // starts the new server by spawnSync(..., 'start'); that must not have run.
-    expect(exitCodes).toContain(1)
-    expect(spawnCalls.some((c) => c.args.includes('start'))).toBe(false)
-    // No pause/kill happened because the precheck itself could not reach AD —
-    // and critically it was NOT misreported as "no spawn row — skipping".
-    expect(pauseCalls).toEqual([])
-    expect(killCalls).toEqual([])
+  test.each([
+    ['a connection error', () => new Error('AD connection refused')],
+    ['ErrCallTimeout', () => new ErrCallTimeout('status', 35000, 30000)],
+  ])('clean_restart aborts (exit 1, no start) when directorStatus throws %s — never "no spawn row"', async (_name, makeErr) => {
+    const b = makeDeps({ directorStatus: async () => { throw makeErr() } })
+    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    expect(b.exitCodes).toContain(1)
+    expect(startedServer(b)).toBe(false)
+    expect(b.pauseCalls).toEqual([])
+    expect(b.killCalls).toEqual([])
+    expect(stderr.join('\n')).not.toContain('no spawn row')
   })
 
-  // REGRESSION GUARD. `stop --stop-bots` shares teardownBots. Pre-fix the outer
-  // try/catch logged "bot teardown error" and let the stop report success. A
-  // stale PID (exit 0) would otherwise be the exit code; post-fix the loud
-  // teardown failure exits(1) instead.
   test('stop --stop-bots exits 1 when directorStatus throws (AD unreachable)', async () => {
-    const { deps, exitCodes } = makeDeps({
-      existsAll: true,
-      pidFileContent: '4242',
-      isProcessRunning: () => false, // stale PID → server-stop block would exit(0)
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
-      directorStatus: async () => { throw new Error('AD connection refused') },
-    })
-    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
-    // Loud failure from the teardown, not the clean stale-PID exit(0).
-    expect(exitCodes).toContain(1)
+    const b = makeStopDeps({ directorStatus: async () => { throw new Error('AD connection refused') } })
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect(b.exitCodes).toContain(1)
+    expect(stderr.join('\n')).not.toContain('no spawn row')
   })
 
-  // Kill-never-delete (acceptance criterion "rows are paused/killed, never
-  // deleted"). Real guard over src/cli.ts, not the injected stub: the teardown
-  // path must never call a delete/destroy verb on the AD client. Extends the
-  // case-22-style static audit — grep the CLI teardown surface and fail on any
-  // delete verb. (The runtime pause→kill-escalation this used to duplicate is
-  // already covered by 'stopBots: pause timeout escalates to kill' ~:416.)
+  // Kill-never-delete: static guard over src/cli.ts — the teardown path must
+  // never call a delete/destroy verb on the AD client.
   test('src/cli.ts teardown surface calls no delete/destroy verb (kill-never-delete, static audit)', async () => {
-    const { readFileSync } = await import('node:fs')
-    const src = readFileSync(resolve(import.meta.dir, '..', 'src', 'cli.ts'), 'utf-8')
+    const src = readFileSync(CLI_SOURCE, 'utf-8')
     // Ban any AD delete verb reachable from teardown: directorDelete, a bare
     // deps.delete(...), or a director*.delete(...)/destroy(...) call. Comment /
     // JSDoc lines are excluded so prose like "never deletes" does not trip it.
@@ -706,59 +1172,40 @@ describe('b.qwo — teardown fails loudly when agent-director is unreachable', (
   })
 })
 
-// ---------------------------------------------------------------------------
-// b.qwo — initClient gate: AD singleton must be installed before teardown, and
-// a gate failure is a loud exit(1), never a silently-skipped teardown.
-// ---------------------------------------------------------------------------
-
 describe('b.qwo — initClient startup gate', () => {
-  test('clean_restart calls initClient before any director verb', async () => {
+  test('clean_restart calls initClient once, before any director verb', async () => {
     let n = 0
-    const { deps, events, initClientCalls } = makeDeps({
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+    const b = makeDeps({
       initClient: async () => { /* gate ok */ },
-      // Live route (waiting → then terminal) so a real pause:C lands in `events`,
-      // giving the ordering assertion a second event to order against — a
-      // terminal-only status would emit no director verb and make the check
-      // vacuous. Mirrors the b.4dk SIGTERM-ordering pattern (~:445).
-      directorStatus: async () => {
-        n++
-        return n === 1 ? { state: 'waiting' } : { state: 'ended' } // precheck → post-pause terminal
-      },
+      directorStatus: async () => (++n === 1 ? { state: 'waiting' } : { state: 'ended' }),
     })
-    await createCli(deps).clean_restart()
-    // initClient ran exactly once, and it precedes the first director verb.
-    expect(initClientCalls).toEqual([0])
-    const initIdx = events.indexOf('initClient')
-    const firstPause = events.findIndex((e) => e.startsWith('pause:'))
+    await createCli(b.deps).clean_restart()
+    expect(b.initClientCalls).toEqual([0])
+    const initIdx = b.events.indexOf('initClient')
+    const firstPause = b.events.findIndex((e) => e.startsWith('pause:'))
     expect(initIdx).toBeGreaterThanOrEqual(0)
-    expect(firstPause).toBeGreaterThan(initIdx) // pause happened, and after init
+    expect(firstPause).toBeGreaterThan(initIdx)
   })
 
   test('clean_restart exits 1 (no start) when initClient throws', async () => {
-    const { deps, exitCodes, spawnCalls, statusCalls } = makeDeps({
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+    const b = makeDeps({
       initClient: async () => { throw new Error('startup gate failed') },
       directorStatus: async () => ({ state: 'waiting' }),
     })
-    await expect(createCli(deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
-    expect(exitCodes).toContain(1)
-    expect(spawnCalls.some((c) => c.args.includes('start'))).toBe(false)
-    expect(statusCalls).toEqual([]) // never reached teardown precheck
+    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+    expect(b.exitCodes).toContain(1)
+    expect(startedServer(b)).toBe(false)
+    expect(b.statusCalls).toEqual([])
   })
 
   test('stop --stop-bots exits 1 when initClient throws', async () => {
-    const { deps, exitCodes, statusCalls } = makeDeps({
-      existsAll: true,
-      pidFileContent: '4242',
-      isProcessRunning: () => false,
-      loadConfig: () => makeRoutingConfig({ routes: { C: { cwd: '/x' } } }),
+    const b = makeStopDeps({
       initClient: async () => { throw new Error('startup gate failed') },
       directorStatus: async () => ({ state: 'waiting' }),
     })
-    await expect(createCli(deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
-    expect(exitCodes).toContain(1)
-    expect(statusCalls).toEqual([]) // teardown never began
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+    expect(b.exitCodes).toContain(1)
+    expect(b.statusCalls).toEqual([])
   })
 })
 
@@ -767,144 +1214,18 @@ describe('b.qwo — initClient startup gate', () => {
 // ---------------------------------------------------------------------------
 
 describe('unknown subcommand', () => {
-  const CLI_SCRIPT = resolve(import.meta.dir, '..', 'src', 'cli.ts')
-  let tempHome: string
-
-  beforeEach(() => {
-    tempHome = mkdtempSync(join(tmpdir(), 'cscb-cli-usage-'))
-  })
-
-  afterEach(() => {
-    rmSync(tempHome, { recursive: true, force: true })
-  })
-
-  test('`trail` subcommand hits the unknown-subcommand error path (non-zero exit, no "trail" or retired reconcile flag in usage)', () => {
-    const result = spawnSync('bun', [CLI_SCRIPT, 'trail'], {
+  test('`trail` hits the usage error (non-zero exit; no "trail", retired reconcile flag or token variable in usage)', () => {
+    const result = spawnSync(process.execPath, [CLI_SOURCE, 'trail'], {
       encoding: 'utf-8',
-      // Temp HOME and state dir so the spawned CLI never sees the real home (b.av2 SR-13.2).
-      env: {
-        ...process.env,
-        HOME: tempHome,
-        SLACK_STATE_DIR: join(tempHome, 'state'),
-        SLACK_BOT_TOKEN: 'xoxb-test',
-        SLACK_APP_TOKEN: 'xapp-test',
-      },
+      // A built env (b.av2 SR-13.2): temp HOME and state dir, no token, nothing else from process.env.
+      env: { PATH: process.env['PATH'] ?? '', HOME: root, SLACK_STATE_DIR: stateDir },
     })
-    // Must exit non-zero
     expect(result.status).not.toBe(0)
-    // Usage text must not list `trail` as a valid subcommand
     const output = (result.stderr ?? '') + (result.stdout ?? '')
     expect(output).not.toMatch(/\btrail\b/)
-    // b.av2 SR-10.2: the retired reconcile flag and its env variable are not advertised.
     expect(output).not.toContain('--reconcile-instance-ids')
     expect(output).not.toContain('CSCB_RECONCILE_INSTANCE_IDS')
-    // Usage text should mention the valid subcommands
+    for (const name of TOKEN_VARS) expect(output).not.toContain(name)
     expect(output).toContain('start')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// resolveCscbInstanceId — the teardown's persona-label lookup (b.av2 SR-2.2)
-//
-// Spawns carry only `service=cscb`, `persona=<key>` and `config_dir=…` (the
-// interim `channel=<key>` label is gone since E3 Task 6), so the CLI teardown
-// must find a bot's row by its persona label. Were it still to query `channel`,
-// it would find no row for any bot and the teardown would silently do nothing
-// (the b.qps / b.qwo incident class). The b.qwo pins stay: null ONLY for an
-// empty list; every agent-director error propagates. Under the route→persona
-// adapter the CLI passes channel IDs, which equal the persona keys.
-//
-// Isolation (b.av2 SR-13.2): a stub agent-director client installed through
-// setClientForTests — no real binary, no startup gate, no server start.
-// ---------------------------------------------------------------------------
-
-describe('resolveCscbInstanceId: persona-label lookup', () => {
-  type Stub = typeof import('./test-helpers/agent-director-stub.ts')
-  type AdClient = typeof import('../src/agent-director-client.ts')
-  let stub: Stub
-  let adClient: AdClient
-
-  beforeAll(async () => {
-    stub = await import('./test-helpers/agent-director-stub.ts')
-    adClient = await import('../src/agent-director-client.ts')
-  })
-
-  afterEach(() => {
-    adClient.resetClientForTests()
-  })
-
-  /** Install a stub client whose `list` answers with `listResult` / `listError`. */
-  function install(opts: Parameters<Stub['makeStubClient']>[0]): import('agent-director').ListParams[] {
-    const listCalls: import('agent-director').ListParams[] = []
-    const client = stub.makeStubClient({ ...opts, listCalls })
-    adClient.setClientForTests(client as unknown as Parameters<AdClient['setClientForTests']>[0])
-    return listCalls
-  }
-
-  test('one row for key k: a single list by exactly service=cscb and persona=k (no channel label) returns cscb_k', async () => {
-    const listCalls = install({ listResult: { spawns: [stub.cannedListRow({ claude_instance_id: 'cscb_k' })] } })
-
-    expect(await resolveCscbInstanceId('k')).toBe('cscb_k')
-
-    expect(listCalls).toHaveLength(1)
-    expect(listCalls[0]!.label).toEqual(['service=cscb', 'persona=k'])
-    expect(listCalls[0]!.label!.some((l) => l.startsWith('channel='))).toBe(false)
-  })
-
-  test('a channel-ID key (route→persona adapter) is looked up by persona=<channel ID>', async () => {
-    const listCalls = install({ listResult: { spawns: [stub.cannedListRow({ claude_instance_id: 'cscb_C0AMDDZEHCY' })] } })
-
-    expect(await resolveCscbInstanceId('C0AMDDZEHCY')).toBe('cscb_C0AMDDZEHCY')
-
-    expect(listCalls.map((c) => c.label)).toEqual([['service=cscb', 'persona=C0AMDDZEHCY']])
-  })
-
-  test('several rows carry the label: the row named exactly cscb_<key> wins over an earlier leftover', async () => {
-    install({
-      listResult: {
-        spawns: [
-          stub.cannedListRow({ claude_instance_id: 'cscb_general_k', labels: { service: 'cscb', persona: 'k' } }),
-          stub.cannedListRow({ claude_instance_id: 'cscb_k' }),
-        ],
-      },
-    })
-
-    expect(await resolveCscbInstanceId('k')).toBe('cscb_k')
-  })
-
-  test('several rows and none named cscb_<key>: the first row is returned', async () => {
-    install({
-      listResult: {
-        spawns: [
-          stub.cannedListRow({ claude_instance_id: 'cscb_general_k', labels: { service: 'cscb', persona: 'k' } }),
-          stub.cannedListRow({ claude_instance_id: 'cscb_other_k', labels: { service: 'cscb', persona: 'k' } }),
-        ],
-      },
-    })
-
-    expect(await resolveCscbInstanceId('k')).toBe('cscb_general_k')
-  })
-
-  test('empty list: null', async () => {
-    const listCalls = install({ listResult: { spawns: [] } })
-
-    expect(await resolveCscbInstanceId('k')).toBeNull()
-    expect(listCalls).toHaveLength(1)
-  })
-
-  test.each([
-    ['ErrCallTimeout', () => stub.errCallTimeout('list')],
-    ['a connection error', () => new Error('AD connection refused')],
-  ])('a list error (%s) propagates: the call rejects with that error and never returns null', async (_name, makeErr) => {
-    const err = makeErr()
-    install({ listError: err })
-
-    await expect(resolveCscbInstanceId('k')).rejects.toBe(err)
-  })
-
-  test('no client installed (the b.qps root cause: no startup gate ran): the call rejects, never null', async () => {
-    adClient.resetClientForTests()
-
-    await expect(resolveCscbInstanceId('k')).rejects.toThrow('getClient() called before the startup gate')
   })
 })

@@ -25,7 +25,9 @@ When reviewing tests, check for:
 - [ ] No shared mutable state leaking between tests
 - [ ] Test servers bind to port 0 (no port conflicts)
 - [ ] No test leaves a process-level listener (such as `unhandledRejection`) installed: the handler is called directly, or any listener a test registers is removed in `afterEach`
-- [ ] Tests that write configuration or other state files do so only in a `mkdtempSync` directory removed in `afterEach`, pass every path (and any home directory) explicitly, and never read or write `~/.claude/channels/slack` or `~/.agent-director` or start a server against the real home
+- [ ] Tests that write configuration or other state files do so only in a `mkdtempSync` directory removed in `afterEach`, pass every path (and any home directory) explicitly, and never read or write `~/.claude`, `~/.agent-director` (a real agent-director `Client` opens its `state.db`) or `~/.npm`, or start a server or run the CLI entry point against the real home
+- [ ] No test sets or relies on a real Slack token: any `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` a suite sets is a fake, restored afterwards, and every token follows the fakes-only rule under Credentials and Leak Checks
+- [ ] Integration scripts and their driver (`tests/integration/*.sh`, `tests/integration/fixtures/driver.ts`) are run only through the `ci` skill in the `cscb-ci` container; a change or instruction that runs them on a host is a defect
 
 ### Patterns
 - [ ] Factory functions used for fixtures (not inline object literals)

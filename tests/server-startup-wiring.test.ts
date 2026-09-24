@@ -168,9 +168,11 @@ describe('main() loads the persona config through the persona loader (SR-1.7, SR
     expect(configImports).toHaveLength(1)
     const names = configImports[0]![1]!.split(',').map((n) => n.trim().replace(/^type\s+/, ''))
     expect(names).toContain('loadStartPersonaConfig')
-    for (const routeName of ['loadConfig', 'resolveConfig', 'applyDefaults', 'validateConfig', 'RoutingConfig']) {
+    for (const routeName of ['loadConfig', 'resolveConfig', 'applyDefaults', 'validateConfig']) {
       expect(names).not.toContain(routeName)
     }
+    // No route type either (the removed route config types all contained "Rout").
+    expect(names.filter((n) => /rout/i.test(n))).toEqual([])
   })
 
   test('loads CONFIG_PATH (the server config path) once, inside main(), and exits 1 when loading fails', () => {

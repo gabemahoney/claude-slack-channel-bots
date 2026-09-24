@@ -256,8 +256,16 @@ src/cli.ts start` from the repo — customer-shaped boot.
   stale pidfile is removed with a logged warning so a later `stop` can't act on a
   wrong PID. When no daemon is live, any residual pidfile is removed before
   launch.
-- Tokens are sourced from `~/xoxb` / `~/xapp` (files, referenced by name — never
-  echo their contents).
+- Slack tokens do not come from the wrapper. From the persona release on,
+  `start` checks no token variable and the server reads each persona's tokens
+  only from the credentials file its `config.json` entry names; a
+  `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` export from `~/xoxb` / `~/xapp` is
+  ignored and can be dropped from `start_cscb`. Reference those files by name
+  only — never echo their contents.
+- `config.json` must be in the persona format before that release boots. A
+  route-keyed file (`routes`, `default_route`, `default_dm_session`) stops the
+  server with the conversion error, and `start` exits 1 after repeating that
+  error from `server.log`.
 
 **This change takes effect only on the next reboot or an authorized restart.**
 The running CSCB daemon (launched earlier by absolute path from the tree) keeps

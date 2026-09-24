@@ -151,7 +151,7 @@ import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy, wit
  * OFF by default (mirrors b.brv's CSCB_AD_VERBOSE). Set CSCB_HTTP_VERBOSE to a
  * truthy value (`1`, `true`, `yes`, `on`, case-insensitive) to restore the
  * per-request line for transport debugging. Real events (session connect /
- * disconnect / route mismatch / errors) are logged unconditionally elsewhere.
+ * disconnect / persona mismatch / errors) are logged unconditionally elsewhere.
  *
  * Exported as an env-parameterized seam (mirrors b.brv's isVerbose in
  * agent-director-logger.ts) so behavior can be tested by injecting `env`;
@@ -884,9 +884,9 @@ export function _buildReconnectSessionAdapter(): (key: string) => Promise<'succe
       // harmless at the ~120s health-check tick cadence — a memoized-stale
       // answer costs at most ONE extra tick, because the following tick's
       // escalate-dead sweeps again well past the TTL. And the fleet-wide
-      // post-reboot case (b.nk5 — /tmp wiped, ALL channels dead-tmux at once)
+      // post-reboot case (b.nk5 — /tmp wiped, ALL personas dead-tmux at once)
       // is served correctly by the single in-flight-shared sweep: one
-      // findMissing reconciles the whole store for every escalating channel.
+      // findMissing reconciles the whole store for every escalating persona.
       await sweepDeadTmuxChannel(key, result)
       return 'escalate-dead'
     }

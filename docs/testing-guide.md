@@ -8,12 +8,12 @@
 
 ## Test File Organization
 
-Each source module has a corresponding test file in the project root:
+Each source module has a corresponding test file under `tests/`:
 
 | Source | Test File | What It Tests |
 |--------|-----------|---------------|
 | lib.ts | server.test.ts | assertSendable (state-dir rule; also refuses each listed credentials file by real path, symlinks included), chunkText, sanitizeFilename |
-| config.ts | config.test.ts | applyDefaults, validateConfig, expandTilde, resolveConfig, loadConfig; resolveServerStateDir / resolveServerConfigPath (`SLACK_STATE_DIR` made absolute, the home default when it is unset or empty, read at call time); loadStartPersonaConfig (a missing or unreadable file gets the start message naming the path; conversion and other load errors pass through unchanged); resolveRealPath (real path, lexical fallback, injected realpath); persona loader (resolvePersonaConfig, loadPersonaConfig), cross-persona rejections (duplicate name or key, shared working_directory or credentials_file), non-collision controls, SR-14 rejection table; credentialsFilesToProtect (applied and current-file credentials paths, tolerant of an unreadable or unparseable file); every persona rejection passes `assertNoLeak` |
+| config.ts | config.test.ts | expandTilde; resolveServerStateDir / resolveServerConfigPath (`SLACK_STATE_DIR` made absolute, the home default when it is unset or empty, read at call time); loadStartPersonaConfig (a missing or unreadable file gets the start message naming the path; conversion and other load errors pass through unchanged); resolveRealPath (real path, lexical fallback, injected realpath); persona loader (resolvePersonaConfig, loadPersonaConfig), cross-persona rejections (duplicate name or key, shared working_directory or credentials_file), non-collision controls, SR-14 rejection table; credentialsFilesToProtect (applied and current-file credentials paths, tolerant of an unreadable or unparseable file); every persona rejection passes `assertNoLeak` |
 | registry.ts | registry.test.ts | Persona-keyed session registry CRUD (newer session replaces older, stale-close guard), pending sessions and in-place promotion, matchPersonaByRootsPath (real-path roots cwd → exactly one persona), the posting-scope check checkPersonaTarget and the persona-scoped tools' refusals as tool errors |
 | persona-routing.ts | persona-routing.test.ts | SR-4.2 core delivery per receiving persona (own messages dropped, `all` vs `mentions`, a channel the persona isn't in), the `unclaimed-channel` line (and silence when another persona lists the channel), the interim DM drop line, multi-channel personas (each message carries its source `chat_id`), per-persona isolation, intake (one ack before the archive write and any decision, a failed ack still delivers), one lost-message smoke case, and the dispatch race (P's session replaced or gone during the awaited lookup) |
 | persona-routing.ts (lost-message branches) | inbound-recovery-drop-branch.test.ts, dispatch-get-stream.test.ts | The b.kvq no-session branch and the b.9cj streamless branch, driven through the real module: restart guards and `scheduleRestart` keyed by persona, the four reply outcomes posted through the persona's client to the source conversation, no `notification()` on a streamless session; a source audit that `src/server.ts` holds no copy of the branch |
@@ -31,9 +31,29 @@ Each source module has a corresponding test file in the project root:
 | persona-start.ts (createPersonaRelaunchGate), health-check.ts (work list) | persona-relaunch-gate.test.ts | The gate's truth table over every connection status and an unknown persona; its line logged once per persona per non-serving state, re-armed when the persona serves again; end to end over the real manager and health check, a persona whose first Slack attempt was unreachable is skipped on every tick (no stat, probe or restart) until it is `up` |
 | server.ts (start-up wiring) | server-startup-wiring.test.ts | Source audit of `main()`: no Slack client built and no token read in server.ts; the persona loader and the fatal config path; the `unhandledRejection` handler installed before any persona connects; the connection manager's arguments; `connections`, `clientFor`, `identityFor`, the routing and `archiveWrite` wiring; `startupSessionManager` handed the bring-up deps; the relaunch gate on the restart launch and the health-check work list; `getRestartDelay` reading the loaded config; `mkdirSync` inside `main()` before the PID check; the permission poller only outside dry run; the file guard's protected list; importing server.ts in a child process with a temp HOME touches nothing under it |
 | tokens.ts | tokens.test.ts | isDryRun (`SLACK_DRY_RUN` truthy values) |
-| backoff.ts | backoff.test.ts | Per-channel failure counts, nextBackoffDelay, doublingBackoffDelay (doubling per prior attempt, clamped to the ceiling), isAtCap, shouldNotifyCap, per-channel isolation |
+| backoff.ts | backoff.test.ts | Per-persona failure counts, nextBackoffDelay, doublingBackoffDelay (doubling per prior attempt, clamped to the ceiling), isAtCap, shouldNotifyCap, per-persona isolation |
+| cli.ts | cli.test.ts | `start` over injected `CliDeps` (the log open/close and redirect order, the config-path prerequisite, no token check, the daemon startup wait and its early-failure report, the b.acn session-leader guard); `stop` and `stop --stop-bots`; `clean_restart` (its `clean_restart.log` redirect, each fatal line on the terminal once); teardown over the persona set addressing `cscb_<key>`, with the b.qwo/b.dnt loud-failure rules; `createDirectorOps` over a stub client |
+| postinstall.ts | postinstall.test.ts | Skeleton files written only when absent (`config.json` is `{"personas": []}`), the legacy `routing.json` migration, skill symlinks |
 
 New features that add significant logic should get their own test file (e.g., `session-manager.test.ts`).
+
+## Isolation (SR-13.2)
+
+Tests never touch the real home or a real install. A dev-tree test once ran against the real home and caused a production outage.
+
+- **Temp directories only.** Every file a test reads or writes (config, credentials, state directory, crontable, logs, working directories, agent-director store) sits under the test's own `mkdtempSync` directory, passed explicitly, and removed in `afterEach`.
+- **Never the real home.** No test reads or writes `~/.claude`, `~/.claude/channels/slack`, `~/.agent-director` or `~/.npm`, and no path in a fixture resolves to them. Code that falls back to `os.homedir()` is tested through `runInFakeHome` (see Credentials Fixtures and Leak Checks); code that takes a home or `SLACK_STATE_DIR` gets a temp one.
+- **No real server or CLI.** No test calls `main()`, runs `src/server.ts` or `src/cli.ts` as an entry point, or starts a real daemon in-process. The one exception is the usage-text test in `tests/cli.test.ts` (`unknown subcommand`), which runs `src/cli.ts` in a child `bun` process with a temp HOME and a built env (`PATH`, `HOME`, `SLACK_STATE_DIR` and nothing else) and never reaches a subcommand. The CLI is otherwise tested through `createCli` with injected `CliDeps`; `server.ts` through its importable modules (see Importing server.ts).
+- **CLI log seams.** `openLogAppend`, `closeFd` and `initLogging` are `CliDeps`, so CLI tests inject fakes: no real descriptor is opened and `console` is never taken over. To see which lines reach the log and which the terminal, inject an `initLogging` that swaps `console.error` for a recorder and restore it afterwards. The agent-director calls are built by the exported `createDirectorOps(getClient)`; test it by passing a stub client, not by installing a Client singleton.
+- **Fake tokens only.** See the rules under Credentials Fixtures and Leak Checks.
+
+### Integration scripts run only in docker CI
+
+The integration scripts (`tests/integration/*.sh`), their driver (`tests/integration/fixtures/driver.ts`) and `tests/runner.sh` install the packed package, write a persona config, start the server and spawn bots. They run only inside the `cscb-ci` docker container, started by the `ci` skill (`/ci`), which runs `tests/runner.sh` and reports `PASS` or `FAIL`.
+
+- Never run them on a dev box or on any host without container support, and never against the real home. If docker is not available, report the integration run as not done; don't run the scripts directly.
+- Their config and credentials files are written inside the container; the scripts never read a config from the host.
+- `bun test` does not run them. `tests/integration/session-leader.test.ts` is the one `bun test` file under `tests/integration/`: it spawns only a throwaway child and touches no CSCB state.
 
 ## Fixture Patterns
 
@@ -50,7 +70,7 @@ makeServer() — minimal MCP server stub
 
 Always use factory functions instead of hardcoding fixture values in individual tests. When a new field is added to a type, update the factory function — all tests automatically pick up the default.
 
-Persona-loader tests, and tests of persona-keyed code such as `spawnForPersona`, `startupSessionManager` and `launchSession` in `src/session-manager.ts`, use the shared persona-config helper, `tests/test-helpers/persona-config.ts`, instead of local route factories. Tests of the route loader (`loadConfig`, now read only by `cli.ts`) keep using the route helpers until that loader is removed. The persona-config helper provides:
+Persona-loader tests, and tests of persona-keyed code such as `spawnForPersona`, `startupSessionManager` and `launchSession` in `src/session-manager.ts`, use the shared persona-config helper, `tests/test-helpers/persona-config.ts`. It is the only config fixture; a route-keyed config appears only as raw JSON in a pre-persona rejection case. The CLI's `loadConfig` dependency returns a resolved `PersonaConfig`, so CLI tests build it with these helpers too. The persona-config helper provides:
 
 ```
 makePersona(overrides?, baseDir?) — one PersonaInput entry in file form; default paths sit under baseDir
@@ -103,7 +123,7 @@ Rules:
 
 - **Fakes only.** Tests use only tokens from `fakeToken`, `makeCredentials` or `writeCredentialsFile`, so every token embeds `LEAK_SENTINEL`. No test file contains a token literal, not even a fake one; build it at runtime from the prefix constants.
 - **Check everything captured.** Every test that handles credentials runs `assertNoLeak` over its captured log lines, errors and results, including rejected calls and failure paths. Pass them together as one object so a failure names the leaking item (for example `captured.lines[2]`). Wrap any file the code wrote in `writtenFile`.
-- **Override the token environment.** A suite that touches `SLACK_BOT_TOKEN` or `SLACK_APP_TOKEN` sets both to fakes for its whole run and restores the previous values afterwards, so an ambient real token can never reach a failure message.
+- **Override the token environment.** Nothing in `src/` reads `SLACK_BOT_TOKEN` or `SLACK_APP_TOKEN`, so tests normally leave them alone. A suite that sets either (for example to show that `start` or the connection manager ignores them) sets both to fakes for its whole run and restores the previous values afterwards, so an ambient real token can never reach a failure message.
 - **Why the failure is safe.** `assertNoLeak` reports which item leaked and whether it held the sentinel or a token-like value, never the leaked text. Rule text such as "must start with" a bare prefix passes.
 
 Isolation (SR-13.2) applies to credentials files, crontables, cron logs and working-directory fixtures exactly as it does to config files:
@@ -313,7 +333,7 @@ describe('MyTest', () => {
 })
 ```
 
-**Fake children must behave like real ones.** Under Bun 1.4, `mock.restore()` does not undo `mock.module`, so a `child_process` fake stays installed for later files. A fake `spawn` must return an EventEmitter-like child (`on`/`once`, `stdout`/`stderr` streams, `unref`, `kill`, `pid`) that emits `exit` and `close`, as `fakeChild()` in `tests/cli.test.ts` does.
+**Fake children must behave like real ones.** Under Bun 1.4, `mock.restore()` does not undo `mock.module`, so a `child_process` fake stays installed for later files. A fake `spawn` must return an EventEmitter-like child (`on`/`once`, `stdout`/`stderr` streams, `unref`, `kill`, `pid`) that emits `exit` and `close`. Prefer injection over a module mock: the CLI's daemon spawn is a `CliDeps` seam (`spawnDaemon`), so CLI tests pass a fake child there and need no `child_process` mock.
 
 **Enforcement.** `scripts/check-no-toplevel-mock-module.ts` runs as part of `pretest`. It scans all files under `tests/` and fails the test run if any line at column 0 (zero leading whitespace) contains `mock.module(` or `mock.restore(`.
 

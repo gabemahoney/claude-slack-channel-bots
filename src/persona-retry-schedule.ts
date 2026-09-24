@@ -12,7 +12,7 @@
  * Each caller creates its own schedule (one per persona and retry purpose)
  * with `createPersonaRetrySchedule`; a schedule holds only its own failure
  * count. There is no module-scope state, so nothing spans two personas
- * (SR-3.3), and `backoff.ts`'s per-channel counters and cap are not used —
+ * (SR-3.3), and `backoff.ts`'s per-persona counters and cap are not used —
  * only its stateless `doublingBackoffDelay` arithmetic.
  *
  * The schedule returns waits; it creates no timers and reads no clock.

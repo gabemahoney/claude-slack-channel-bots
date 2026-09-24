@@ -13,9 +13,6 @@
  * creates no credentials file or directory (E2's credentials helper writes
  * credentials files) and holds no token-like literal.
  *
- * Replaces tests/test-helpers/routing-config.ts once E3 removes the route
- * loader; until then both exist side by side.
- *
  * SPDX-License-Identifier: MIT
  */
 
@@ -187,8 +184,8 @@ export function makeMultiPersonaConfig(
 }
 
 /**
- * A resolved configuration of stand-in personas, the shape the route→persona
- * adapter produces: one persona per entry of `personas`, in insertion order,
+ * A resolved configuration of stand-in personas, each keyed by a channel ID:
+ * one persona per entry of `personas`, in insertion order,
  * each named and keyed by its channel ID (the record key), in that one `all`
  * channel with permission prompts there and DMs off. The record value adds
  * or overrides further fields (`working_directory`, `claude_config_dir`, …);

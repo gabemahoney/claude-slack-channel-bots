@@ -3,7 +3,7 @@
  *
  * All assertions are deterministic: no sleeps, no timers, no mock.module.
  * Delay assertions use getFailureCount/nextBackoffDelay directly.
- * Base delay sourced from makeRoutingConfig, not literals.
+ * Base delay sourced from makePersonaConfig, not literals.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -19,14 +19,14 @@ import {
   shouldNotifyCap,
   _resetBackoffState,
 } from '../src/backoff.ts'
-import { makeRoutingConfig } from './test-helpers/routing-config.ts'
+import { makePersonaConfig } from './test-helpers/persona-config.ts'
 
 // ---------------------------------------------------------------------------
-// Constants — base sourced from makeRoutingConfig, not literals
+// Constants — base sourced from makePersonaConfig, not literals
 // ---------------------------------------------------------------------------
 
-const config = makeRoutingConfig()
-const BASE_S = config.session_restart_delay  // 60 s per routing-config.ts default
+const config = makePersonaConfig()
+const BASE_S = config.session_restart_delay  // 60 s per persona-config.ts default
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -86,7 +86,7 @@ describe('recordSuccess', () => {
 })
 
 // ---------------------------------------------------------------------------
-// nextBackoffDelay — ladder from makeRoutingConfig base
+// nextBackoffDelay — ladder from makePersonaConfig base
 //
 // Formula: min(base * 2^preFailureCount, 900)
 // preFailureCount = getFailureCount(channelId) at the time of the call.
@@ -100,9 +100,9 @@ describe('recordSuccess', () => {
 //   5 → 900s     (60 * 2^5 = 1920 → clamped)
 // ---------------------------------------------------------------------------
 
-describe('nextBackoffDelay — exponential ladder (base from makeRoutingConfig)', () => {
+describe('nextBackoffDelay — exponential ladder (base from makePersonaConfig)', () => {
   // Table columns: [base, preCount, expected]. Two bases prove the formula is
-  // parametric (not hard-coded to the default): BASE_S (60) from makeRoutingConfig
+  // parametric (not hard-coded to the default): BASE_S (60) from makePersonaConfig
   // and a non-default 30. Each row records `preCount` failures, then asserts the
   // next delay = min(base * 2^preCount, 900).
   test.each([

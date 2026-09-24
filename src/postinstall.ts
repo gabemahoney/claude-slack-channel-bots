@@ -7,6 +7,11 @@
  * already exist.  Safe to re-run: existing files are never modified.
  * Migrates routing.json → config.json if the old file is present.
  *
+ * The config.json skeleton is the empty persona configuration
+ * `{"personas": []}` (b.av2 SR-1.7): it loads with zero personas. An existing
+ * config.json is never touched, whatever its shape; a pre-persona one gets
+ * the conversion error when the server starts.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -14,7 +19,7 @@ import { existsSync, mkdirSync, writeFileSync, symlinkSync, readlinkSync, unlink
 import { homedir } from 'os'
 import { dirname, join, resolve } from 'path'
 import { defaultAccess } from './lib.ts'
-import { MCP_SERVER_NAME } from './config.ts'
+import { MCP_SERVER_NAME, resolveServerStateDir } from './config.ts'
 
 /**
  * Read the agent-director dependency range from the shipping package.json.
@@ -39,7 +44,7 @@ export function readAdDependencyRange(): string {
 // ---------------------------------------------------------------------------
 
 export interface PostinstallOptions {
-  /** Override the state directory (defaults to SLACK_STATE_DIR env var or ~/.claude/channels/slack/) */
+  /** Override the state directory (defaults to the server's: a non-empty SLACK_STATE_DIR, else ~/.claude/channels/slack/) */
   stateDir?: string
   /** Override the MCP config path (defaults to ~/.claude/slack-mcp.json) */
   mcpConfigPath?: string
@@ -50,10 +55,9 @@ export interface PostinstallOptions {
 // ---------------------------------------------------------------------------
 
 export function runPostinstall(options: PostinstallOptions = {}): void {
-  const stateDir =
-    options.stateDir ??
-    process.env['SLACK_STATE_DIR'] ??
-    join(homedir(), '.claude', 'channels', 'slack')
+  // The server's state directory (resolveServerStateDir): an empty
+  // SLACK_STATE_DIR means unset, and a relative one resolves the same way.
+  const stateDir = options.stateDir ?? resolveServerStateDir()
 
   const mcpConfigPath =
     options.mcpConfigPath ?? join(homedir(), '.claude', 'slack-mcp.json')
@@ -70,11 +74,11 @@ export function runPostinstall(options: PostinstallOptions = {}): void {
     console.log(`Migrated routing.json → config.json`)
   }
 
-  // Create skeleton config.json if neither old nor new file exists
+  // Create the empty persona skeleton if neither old nor new file exists
   if (existsSync(configPath)) {
     console.log(`skipped: ${configPath}`)
   } else {
-    writeFileSync(configPath, JSON.stringify({ routes: {} }, null, 2) + '\n')
+    writeFileSync(configPath, JSON.stringify({ personas: [] }, null, 2) + '\n')
     console.log(`created: ${configPath}`)
   }
 

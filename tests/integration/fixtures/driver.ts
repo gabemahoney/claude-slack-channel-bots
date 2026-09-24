@@ -5,8 +5,9 @@
  * WHY A DRIVER INSTEAD OF THE FULL DAEMON
  * ---------------------------------------
  * The b.vub bug lives entirely in spawnForPersona / approvePreSessionDialogs.
- * Launching the whole daemon non-dry-run requires real Slack credentials
- * (web.auth.test + Socket Mode) which CI does not have. But the exact code path
+ * Launching the whole daemon non-dry-run requires each persona's real Slack
+ * credentials file (auth.test + one Socket Mode connection per persona), which
+ * CI does not have. But the exact code path
  * that shipped the bug — real agent-director + real tmux, a real
  * --dangerously-load-development-channels dialog, the CSCB approver, and the
  * resume lap — is reachable by calling the SAME production functions directly
@@ -14,7 +15,20 @@
  * driver does.
  *
  * It imports from the INSTALLED package (the tarball under test), so it exercises
- * shipped code, not the working tree.
+ * shipped code, not the working tree. It builds a one-persona configuration
+ * through the package's persona resolver (resolvePersonaConfig), exactly as the
+ * daemon's loader does: one channel that also takes permission prompts, the
+ * working directory DRIVER_WORKING_DIRECTORY, and a credentials_file path that
+ * is never read (the driver opens no Slack connection). The instance ID is
+ * cscb_<key>, with the key derived from the persona name.
+ *
+ * INPUTS (env)
+ * ------------
+ *   CSCB_PKG_DIR               installed package dir
+ *   DRIVER_PERSONA             persona name (default `resume_test`; an in-form
+ *                              name, so the key equals the name)
+ *   DRIVER_PERSONA_CHANNEL     the persona's one channel ID (default `C0RESUME1`)
+ *   DRIVER_WORKING_DIRECTORY   the persona's working directory
  *
  * SCENARIO
  * --------
@@ -52,15 +66,17 @@ const { runAgentDirectorStartupGate } = await import(`${PKG}/src/agent-director-
 const { initOutageState } = await import(`${PKG}/src/outage-state.ts`)
 const { installSlackChannelBotTemplate } = await import(`${PKG}/src/agent-director-template.ts`)
 const { spawnForPersona } = await import(`${PKG}/src/session-manager.ts`)
-const { personaInstanceId } = await import(`${PKG}/src/persona-identity.ts`)
-const { routesToPersonaConfig } = await import(`${PKG}/src/route-persona-adapter.ts`)
-const { applyDefaults } = await import(`${PKG}/src/config.ts`)
+const { personaInstanceId, personaKey } = await import(`${PKG}/src/persona-identity.ts`)
+const { resolvePersonaConfig } = await import(`${PKG}/src/config.ts`)
 const { getClient } = await import(`${PKG}/src/agent-director-client.ts`)
 
 const LIVE_STATES = new Set(['waiting', 'working', 'ask_user', 'check_permission'])
 
-const CHANNEL = process.env['DRIVER_CHANNEL'] ?? 'C_RESUME'
-const CWD = process.env['DRIVER_CWD'] ?? '/tmp/test-repo-resume'
+const PERSONA_NAME = process.env['DRIVER_PERSONA'] ?? 'resume_test'
+const PERSONA_CHANNEL = process.env['DRIVER_PERSONA_CHANNEL'] ?? 'C0RESUME1'
+const WORKING_DIRECTORY = process.env['DRIVER_WORKING_DIRECTORY'] ?? '/tmp/test-repo-resume'
+/** Never read: the driver opens no Slack connection. Outside the working directory. */
+const UNUSED_CREDENTIALS_FILE = '/tmp/test-4-unused-credentials.json'
 
 function driverFail(reason: string): never {
   console.log(`DRIVER_FAIL: ${reason}`)
@@ -88,17 +104,30 @@ async function waitForLive(instanceId: string, timeoutMs: number): Promise<strin
 }
 
 async function main(): Promise<void> {
-  // Build the routing config the same way the daemon does.
-  const cfg = applyDefaults({
-    routes: { [CHANNEL]: { cwd: CWD } },
-    bind: '127.0.0.1',
-    port: 3100,
-  })
-  // The spawn entry point is persona-keyed: run the route config through the
-  // route->persona adapter, whose stand-in key is the channel ID, so the
-  // instance ID stays cscb_<CHANNEL>.
-  const personaCfg = routesToPersonaConfig(cfg)
-  const persona = personaCfg.personas[0]
+  // Build the persona config through the same resolver the daemon's loader
+  // uses (defaults applied, paths resolved). The config dir only anchors the
+  // cron path defaults, which the spawn path never reads.
+  const personaCfg = resolvePersonaConfig(
+    {
+      personas: [
+        {
+          name: PERSONA_NAME,
+          credentials_file: UNUSED_CREDENTIALS_FILE,
+          working_directory: WORKING_DIRECTORY,
+          channels: [{ id: PERSONA_CHANNEL, delivery: 'all' }],
+          permission_prompts: PERSONA_CHANNEL,
+        },
+      ],
+      bind: '127.0.0.1',
+      port: 3100,
+    },
+    WORKING_DIRECTORY,
+  )
+  const key = personaKey(PERSONA_NAME)
+  const persona = personaCfg.personas.find((p: { key: string }) => p.key === key)
+  if (personaCfg.personas.length !== 1 || !persona) {
+    driverFail(`config: expected one persona with key ${key}, got ${personaCfg.personas.length}`)
+  }
 
   // Real AD Client via the production startup gate (installs the singleton).
   await runAgentDirectorStartupGate()
@@ -118,7 +147,7 @@ async function main(): Promise<void> {
   // prints only the dev-channels dialog, never the trust dialog.
   await installSlackChannelBotTemplate(personaCfg)
 
-  const instanceId = personaInstanceId(persona.key)
+  const instanceId = personaInstanceId(key)
 
   // Clean slate: remove any stale row/session from a prior run.
   try { await getClient().kill({ claude_instance_id: instanceId }) } catch { /* ignore */ }
