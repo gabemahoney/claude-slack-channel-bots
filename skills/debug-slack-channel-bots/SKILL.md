@@ -69,6 +69,9 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    **Permission prompts or notices don't arrive?** Look for a
    [`persona-destination-failed`](#persona-destination-failed) line for the
    persona.
+7. **A persona isn't reminded to reply in Slack, or is reminded after being
+   opted out?** See
+   [A persona isn't reminded to reply](#a-persona-isnt-reminded-to-reply-or-is-reminded-after-opting-out).
 
 ---
 
@@ -613,6 +616,50 @@ and is `broken`.
   [Checking a credentials file's shape](#checking-a-credentials-files-shape)
   confirms the file without showing the token. Never ask for, read, print or
   compare a token value in the chat.
+
+---
+
+## A persona isn't reminded to reply, or is reminded after opting out
+
+- **Symptom:** a persona ends a turn that started from a Slack message without
+  replying, and gets no reminder to reply (the Slack Reply Guard's Stop-hook
+  message), although its `stop_hook_bootstrap` should be `true`. Or the
+  reverse: a persona set to `stop_hook_bootstrap: false` is still reminded.
+- **How it works:** before each launch of a persona (spawn, resume or
+  restart) the server writes the persona's effective `stop_hook_bootstrap` to
+  its record, `reply-guard/<key>` in the state directory, as `true` or
+  `false`. The reminder comes from the CSCB-managed Stop hook in the
+  persona's `claude_config_dir`/`settings.json`, and the hook reminds only
+  when the persona's own record reads `true`. Personas sharing one
+  `claude_config_dir` share the hook, but each follows its own record.
+- **Confirm,** read only (replace `ops_bot` with the key; `$STATE` as in
+  [The server log](#the-server-log)):
+
+  ```sh
+  cat "$STATE/reply-guard/ops_bot"; echo
+  grep -h -E 'stop-hook-bootstrap|reply-guard' "$STATE"/startup-errors.log "$STATE"/server.log 2>/dev/null | tail -n 40
+  jq '.hooks.Stop' "<the persona's claude_config_dir>/settings.json"
+  ```
+
+  The server rewrites the record at every launch. Never edit or delete it by
+  hand; change `config.json` instead.
+- **Causes and fixes:**
+
+  | Cause | How to confirm | Fix |
+  |---|---|---|
+  | The effective value isn't what you expect. A persona without its own `stop_hook_bootstrap` inherits the top-level one (default `true`). | The persona's entry and the top level of `config.json`. | With the operator's say-so, set `stop_hook_bootstrap` on the persona's entry (it overrides the top level), then relaunch it as in the next row. |
+  | The value changed after the persona's instance launched. A running instance keeps the value it launched with; a change applies at the persona's next launch. A plain server restart reconnects to an instance that is still running, which is not a launch. | The record holds the old value. | With the operator's say-so, run `claude-slack-channel-bots clean_restart`. It relaunches every persona (resume or fresh spawn), cutting off their current turns, and each launch rewrites the persona's record. |
+  | No `claude_config_dir` is configured for the persona (nor at the top level). No hook is installed for it, so it gets no reminder. | `server.log` has `[slack] stop-hook-bootstrap: "<name>" (key=<key>) has no claude_config_dir — skipping`. | Give the persona (or the top level) a `claude_config_dir` of its own, then `clean_restart`. The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
+  | Its `claude_config_dir` resolves to the operator's own `~/.claude`. The server never writes there, so the persona gets no reminder. | `startup-errors.log` has a `stop-hook-bootstrap-refuse-home` entry (recorded once per server start); `server.log` has `refusing to touch operator's own ~/.claude` at each launch. | Point the persona at a different `claude_config_dir`, then `clean_restart`. The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
+  | `jq` is not on the host's `PATH`. The hook is installed but can't read the transcript, so it never reminds. | `startup-errors.log` has a `stop-hook-bootstrap-jq-missing` entry. | Install `jq`. No restart is needed; the next turn is checked. |
+  | The hook couldn't be installed: the directory is missing, or its `settings.json` is unreadable or not valid JSON (left untouched). | `startup-errors.log` (at start) or `server.log` (at a launch) has `stop-hook-bootstrap-dir-missing`, `stop-hook-bootstrap-not-a-dir` or `stop-hook-bootstrap-settings-…`; the `jq` command above shows no `slack-reply-guard.sh` entry. | Create the directory or fix the file, then `clean_restart`. |
+  | The record couldn't be written at launch. The stale record is removed, so the persona gets no reminder until its next launch. | No record file; `server.log` has `[slack] reply-guard: could not write the record for "<name>" (key=<key>) at <path>`. | Fix the state directory's permissions or free space, then `clean_restart`. |
+  | Reminded after opting out: the instance launched while the value was `true`. | The record reads `true`. | `clean_restart` (second row). |
+
+- **Not a fault:** the hook reminds at most once per turn, only for a turn
+  that started from a Slack message the persona received, and only when it
+  hasn't replied with the `reply` tool. A persona that replies, or a turn
+  started by a scheduled prompt or `/interject`, gets no reminder.
 
 ---
 

@@ -4,6 +4,18 @@
  * Drives the script as a real subprocess via spawnSync, feeding Stop-hook
  * harness JSON on stdin and asserting exit code + stderr.
  *
+ * Record gate (b.av2 SR-9.4): the guard reminds only when the record
+ * `<argument>/<CSCB_PERSONA>` reads `true` (one trailing newline tolerated);
+ * a missing argument, variable or record, or any other content, is a silent
+ * exit 0. Default setup (b.av2 SR-13.4): every run gets a fresh
+ * makeReplyGuardRecordDir state directory holding a `true` record for
+ * TEST_KEY, its record directory `<state dir>/reply-guard` as the only
+ * argument, and CSCB_PERSONA=TEST_KEY. The child environment is built
+ * explicitly (PATH and, unless a case unsets it, CSCB_PERSONA) and never
+ * inherits from the test process. Only the record-gate block departs from
+ * the default; the retry and missing-jq cases pair their exit 0 with a
+ * control on the same setup that exits 2.
+ *
  * A `<channel source="slack…">` envelope is a delivered Slack message only when
  * it carries a `via` attribute (b.ob2 SR-9.4); an envelope without `via` is an
  * injected prompt and never triggers the reminder. The reminder states the
@@ -18,8 +30,16 @@
  *     opening tag's attributes are read, and a non-Slack envelope carrying
  *     `via` never counting.
  *   - Every original Slack-wrapper fixture (no `via`) is an injected prompt
- *     and exits 0, including AC 51's `injected-no-reply.jsonl`.
+ *     and exits 0 under a `true` record, including AC 51's
+ *     `injected-no-reply.jsonl`.
  *   - Every via-carrying copy keeps its original's b.wr5 / SR-6.3 result.
+ *   - The record-gate block: a positive control and the reminding cases
+ *     (`true` plus a newline, a record directory path with a space and a
+ *     single quote, a 49-character hashed key), then every no-reminder case
+ *     (no or empty argument, CSCB_PERSONA unset, empty or not a key, a
+ *     nonexistent directory, no record, `false`, unrecognised or empty
+ *     content, a neighbour's `true` record, a directory in the record's
+ *     place, `../<name>` traversal) and the gate running before the jq check.
  *
  * Fixture provenance is recorded above the injected-prompt describe block.
  *
@@ -31,6 +51,15 @@ import { spawnSync } from 'node:child_process'
 import { resolve, join } from 'node:path'
 import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync, readFileSync, symlinkSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import { PERSONA_KEY_MAX_LENGTH, personaKey } from '../src/persona-identity.ts'
+import {
+  makeReplyGuardRecordDir,
+  RECORD_EMPTY,
+  RECORD_FALSE,
+  RECORD_TRUE,
+  RECORD_TRUE_NEWLINE,
+  type ReplyGuardRecordDir,
+} from './test-helpers/reply-guard-record.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 const SCRIPT = join(REPO_ROOT, 'stop-hooks', 'slack-reply-guard.sh')
@@ -42,19 +71,83 @@ interface RunResult {
   stderr: string
 }
 
-function runGuard(
-  stdinJson: string,
-  opts: { env?: NodeJS.ProcessEnv } = {},
-): RunResult {
-  const result = spawnSync(SCRIPT, [], {
+// The persona key every default run uses. The record gate accepts it.
+const TEST_KEY = 'reply_guard_test'
+
+/**
+ * Everything a run passes to the guard besides stdin. The child environment
+ * is built from these fields alone, never from process.env, so no run
+ * inherits CSCB_PERSONA (or anything else) from the test process.
+ */
+interface GuardSetup {
+  /** The guard's arguments; the default setup passes `[recordDir]`. */
+  args: string[]
+  /** CSCB_PERSONA in the child; `null` leaves it unset. */
+  persona: string | null
+  /** PATH in the child; defaults to the test process's PATH. */
+  path?: string
+  /** Kill the child after this many milliseconds; defaults to 20 000. */
+  timeoutMs?: number
+}
+
+function spawnGuard(stdinJson: string, setup: GuardSetup): RunResult {
+  const env: Record<string, string> = { PATH: setup.path ?? process.env.PATH ?? '/usr/bin:/bin' }
+  if (setup.persona !== null) env.CSCB_PERSONA = setup.persona
+  const result = spawnSync(SCRIPT, setup.args, {
     input: stdinJson,
     encoding: 'utf-8',
-    env: opts.env ?? process.env,
+    env,
+    timeout: setup.timeoutMs ?? 20_000,
   })
   return {
     exitCode: result.status ?? -1,
     stdout: result.stdout ?? '',
     stderr: result.stderr ?? '',
+  }
+}
+
+/** The default setup over `rec`: its record directory as the argument and TEST_KEY. */
+function defaultSetup(rec: ReplyGuardRecordDir): GuardSetup {
+  return { args: [rec.recordDir], persona: TEST_KEY }
+}
+
+/**
+ * Run `fn` with a fresh helper record directory holding a `true` record for
+ * TEST_KEY and the default setup over it; the directory is removed afterwards.
+ */
+function withTrueRecord<T>(fn: (setup: GuardSetup, rec: ReplyGuardRecordDir) => T): T {
+  const rec = makeReplyGuardRecordDir({ records: { [TEST_KEY]: RECORD_TRUE } })
+  try {
+    return fn(defaultSetup(rec), rec)
+  } finally {
+    rec.cleanup()
+  }
+}
+
+/** Run the guard under the default record setup (a `true` record for TEST_KEY). */
+function runGuard(stdinJson: string): RunResult {
+  return withTrueRecord((setup) => spawnGuard(stdinJson, setup))
+}
+
+const MISSING_JQ_WARNING = 'slack-reply-guard: jq not found on PATH; failing open\n'
+
+/**
+ * Run `fn` with a PATH that is a scratch dir holding only `bash` (for the
+ * /usr/bin/env shebang) and `cat` (the stdin read), so `command -v jq` fails.
+ */
+function withNoJqPath<T>(fn: (shimDir: string) => T): T {
+  const tmp = mkdtempSync(join(tmpdir(), 'srg-nojq-'))
+  try {
+    const shimDir = join(tmp, 'bin')
+    mkdirSync(shimDir, { recursive: true })
+    for (const name of ['bash', 'cat']) {
+      const src = [`/usr/bin/${name}`, `/bin/${name}`].find((p) => existsSync(p))
+      if (src === undefined) throw new Error(`missing-jq setup: no ${name} in /usr/bin or /bin`)
+      symlinkSync(src, join(shimDir, name))
+    }
+    return fn(shimDir)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
   }
 }
 
@@ -181,10 +274,18 @@ describe('slack-reply-guard.sh — SR-6.2 exit-code contract', () => {
     expect(r.stderr).toContain(REPLY_TOOL)
   })
 
-  test('SR-6.2 case 4: stop_hook_active=true on a delivered no-reply transcript (via-slack-no-reply.jsonl) → exit 0', () => {
-    const r = runGuard(harness(join(FIX, 'via-slack-no-reply.jsonl'), true))
-    expect(r.exitCode).toBe(0)
-    expect(r.stderr).toBe('')
+  test('SR-6.2 case 4: stop_hook_active=true on a delivered no-reply transcript (via-slack-no-reply.jsonl) under a true record → exit 0; the same run with stop_hook_active=false (control) → exit 2', () => {
+    withTrueRecord((setup) => {
+      const transcript = join(FIX, 'via-slack-no-reply.jsonl')
+      const r = spawnGuard(harness(transcript, true), setup)
+      expect(r.exitCode).toBe(0)
+      expect(r.stderr).toBe('')
+      // Control: same record, argument, CSCB_PERSONA and transcript; only
+      // stop_hook_active changes, so the exit 0 above came from the retry path.
+      const control = spawnGuard(harness(transcript, false), setup)
+      expect(control.exitCode).toBe(2)
+      expect(control.stderr).toBe(`${reminder('mention', 'C555')}\n`)
+    })
   })
 
   // -------------------------------------------------------------------------
@@ -249,30 +350,25 @@ describe('slack-reply-guard.sh — SR-6.2 exit-code contract', () => {
       expect(r.exitCode).toBe(0)
     })
 
-    test('jq missing from PATH on a delivered no-reply transcript (via-slack-no-reply.jsonl) → exit 0 with the one-line missing-jq warning', () => {
-      // PATH is a scratch dir holding only `bash` (for the /usr/bin/env
-      // shebang) and `cat` (the stdin read), so `command -v jq` fails.
-      const tmp = mkdtempSync(join(tmpdir(), 'srg-nojq-'))
-      try {
-        const shimDir = join(tmp, 'bin')
-        mkdirSync(shimDir, { recursive: true })
-        for (const name of ['bash', 'cat']) {
-          const src = [`/usr/bin/${name}`, `/bin/${name}`].find((p) => existsSync(p))
-          if (src === undefined) throw new Error(`missing-jq setup: no ${name} in /usr/bin or /bin`)
-          symlinkSync(src, join(shimDir, name))
-        }
-        const r = runGuard(harness(join(FIX, 'via-slack-no-reply.jsonl')), {
-          env: { ...process.env, PATH: shimDir },
-        })
-        // The guard's missing-jq warning, exactly: the exit 0 came from the
-        // missing-jq branch, not from an earlier failure (bash or cat missing)
-        // or from the transcript.
-        expect(r.exitCode).toBe(0)
-        expect(r.stderr).toBe('slack-reply-guard: jq not found on PATH; failing open\n')
-        expect(r.stdout).toBe('')
-      } finally {
-        rmSync(tmp, { recursive: true, force: true })
-      }
+    test('jq missing from PATH on a delivered no-reply transcript (via-slack-no-reply.jsonl) under a true record → exit 0 with the one-line missing-jq warning; the same run with the full PATH (control) → exit 2', () => {
+      withNoJqPath((shimDir) =>
+        withTrueRecord((setup) => {
+          const input = harness(join(FIX, 'via-slack-no-reply.jsonl'))
+          // The restricted PATH carries the same record, argument and
+          // explicit CSCB_PERSONA as the control.
+          const r = spawnGuard(input, { ...setup, path: shimDir })
+          // The guard's missing-jq warning, exactly: the exit 0 came from the
+          // missing-jq branch, not from an earlier failure (bash or cat
+          // missing), the record gate or the transcript.
+          expect(r.exitCode).toBe(0)
+          expect(r.stderr).toBe(MISSING_JQ_WARNING)
+          expect(r.stdout).toBe('')
+          // Control: only PATH changes.
+          const control = spawnGuard(input, setup)
+          expect(control.exitCode).toBe(2)
+          expect(control.stderr).toBe(`${reminder('mention', 'C555')}\n`)
+        }),
+      )
     })
   })
 })
@@ -647,10 +743,19 @@ describe('slack-reply-guard.sh — via detection and provenance wordings (b.ob2 
 // ---------------------------------------------------------------------------
 
 describe('slack-reply-guard.sh — injected prompts (no via) never trigger the reminder', () => {
-  test('AC 51: injected-no-reply.jsonl (scheduled prompt, user and ts only, asks for no reply) → exit 0, silent', () => {
-    const r = runGuard(harness(join(FIX, 'injected-no-reply.jsonl')))
-    expect(r.exitCode).toBe(0)
-    expect(r.stderr).toBe('')
+  test('AC 51: injected-no-reply.jsonl (scheduled prompt, user and ts only, asks for no reply) under a true record, the record directory argument and CSCB_PERSONA → exit 0, silent', () => {
+    withTrueRecord((setup, rec) => {
+      expect(rec.readRecord(TEST_KEY)).toBe(RECORD_TRUE)
+      const r = spawnGuard(harness(join(FIX, 'injected-no-reply.jsonl')), setup)
+      expect(r.exitCode).toBe(0)
+      expect(r.stderr).toBe('')
+      expect(r.stdout).toBe('')
+      // Control: the same setup reminds for a delivered message, so the exit 0
+      // above is the injected prompt's, not the record gate's.
+      const control = spawnGuard(harness(join(FIX, 'mention-no-reply.jsonl')), setup)
+      expect(control.exitCode).toBe(2)
+      expect(control.stderr).toBe(`${reminder('mention', 'C0B1ZJJLJ9M')}\n`)
+    })
   })
 
   test.each([
@@ -723,9 +828,185 @@ describe('slack-reply-guard.sh — b.wr5 cases on via-carrying copies', () => {
     expect(r.stderr).toBe(stderr)
   })
 
-  test('b.wr5 retry with stop_hook_active=true: via-verbatim-live-no-reply.jsonl → exit 0, silent (reminder shown once)', () => {
-    const r = runGuard(harness(join(FIX, 'via-verbatim-live-no-reply.jsonl'), true))
+  test('b.wr5 retry with stop_hook_active=true: via-verbatim-live-no-reply.jsonl under a true record → exit 0, silent (reminder shown once); the same run with stop_hook_active=false (control) → exit 2', () => {
+    withTrueRecord((setup) => {
+      const transcript = join(FIX, 'via-verbatim-live-no-reply.jsonl')
+      const r = spawnGuard(harness(transcript, true), setup)
+      expect(r.exitCode).toBe(0)
+      expect(r.stderr).toBe('')
+      // Control: only stop_hook_active changes.
+      const control = spawnGuard(harness(transcript, false), setup)
+      expect(control.exitCode).toBe(2)
+      expect(control.stderr).toBe(`${reminder('receive_all', 'C0B1ZJJLJ9M')}\n`)
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-9.4 — the per-persona record gate. The guard reminds only when the
+// record `<argument>/<CSCB_PERSONA>` reads `true` (one trailing newline
+// tolerated); anything else is a silent exit 0 (fail-open). Every case runs on
+// mention-no-reply.jsonl, which exits 2 with GATE_LINE under the default
+// setup (the positive control below), so each exit 0 comes from the gate.
+// Each case builds its own helper record directory and GuardSetup; the parent
+// process's CSCB_PERSONA is set to TEST_KEY during every run, so a runner
+// that leaked it into the child would turn the unset case into an exit 2.
+// ---------------------------------------------------------------------------
+
+const GATE_FIXTURE = 'mention-no-reply.jsonl'
+const GATE_LINE = `${reminder('mention', 'C0B1ZJJLJ9M')}\n`
+const NEIGHBOUR_KEY = 'reply_guard_neighbour'
+// A hashed key of the maximum length (40-character stem, `_`, 8 hex digits).
+const HASHED_KEY = personaKey(`Reply Guard ${'x'.repeat(40)}`)
+
+interface GateCase {
+  /** Records to write up front (key to content); none means no record directory. */
+  records?: Record<string, string>
+  /** Create the (empty) record directory even with no records. */
+  createRecordDir?: boolean
+  /** Put the state directory under a parent whose name has a space and a quote. */
+  spaceAndQuote?: boolean
+  /** Extra setup under the state directory, before the run. */
+  prepare?: (rec: ReplyGuardRecordDir) => void
+  /** The run's setup; defaults to defaultSetup(rec). */
+  setup?: (rec: ReplyGuardRecordDir) => GuardSetup
+}
+
+function runGateCase(c: GateCase, opts: { path?: string } = {}): RunResult {
+  const rec = makeReplyGuardRecordDir({
+    records: c.records,
+    createRecordDir: c.createRecordDir,
+    spaceAndQuote: c.spaceAndQuote,
+  })
+  const saved = process.env.CSCB_PERSONA
+  process.env.CSCB_PERSONA = TEST_KEY
+  try {
+    c.prepare?.(rec)
+    const setup = c.setup?.(rec) ?? defaultSetup(rec)
+    return spawnGuard(harness(join(FIX, GATE_FIXTURE)), { ...setup, path: opts.path ?? setup.path })
+  } finally {
+    if (saved === undefined) delete process.env.CSCB_PERSONA
+    else process.env.CSCB_PERSONA = saved
+    rec.cleanup()
+  }
+}
+
+const TRUE_RECORD = { [TEST_KEY]: RECORD_TRUE }
+
+describe('slack-reply-guard.sh — per-persona record gate (b.av2 SR-9.4)', () => {
+  test.each<[string, GateCase]>([
+    ['positive control: default setup (true record, record directory argument, CSCB_PERSONA)', { records: TRUE_RECORD }],
+    ['a true record followed by a newline', { records: { [TEST_KEY]: RECORD_TRUE_NEWLINE } }],
+    [
+      'a record directory whose path contains a space and a single quote (the argument is read as one path)',
+      {
+        records: TRUE_RECORD,
+        spaceAndQuote: true,
+        prepare: (rec) => {
+          expect(rec.recordDir).toContain(' ')
+          expect(rec.recordDir).toContain("'")
+        },
+      },
+    ],
+    [
+      `a ${PERSONA_KEY_MAX_LENGTH}-character hashed key with a true record`,
+      {
+        records: { [HASHED_KEY]: RECORD_TRUE },
+        prepare: () => expect(HASHED_KEY.length).toBe(PERSONA_KEY_MAX_LENGTH),
+        setup: (rec) => ({ args: [rec.recordDir], persona: HASHED_KEY }),
+      },
+    ],
+  ])('reminds: %s → exit 2 with the full mention wording', (_label, c) => {
+    const r = runGateCase(c)
+    expect(r.exitCode).toBe(2)
+    expect(r.stderr).toBe(GATE_LINE)
+  })
+
+  test.each<[string, GateCase]>([
+    ['no argument', { records: TRUE_RECORD, setup: () => ({ args: [], persona: TEST_KEY }) }],
+    ['an empty argument', { records: TRUE_RECORD, setup: () => ({ args: [''], persona: TEST_KEY }) }],
+    [
+      'CSCB_PERSONA unset (the parent process has it set; the child must not inherit it)',
+      { records: TRUE_RECORD, setup: (rec) => ({ args: [rec.recordDir], persona: null }) },
+    ],
+    ['CSCB_PERSONA set to an empty string', { records: TRUE_RECORD, setup: (rec) => ({ args: [rec.recordDir], persona: '' }) }],
+    ['the argument naming a directory that does not exist (the record directory was never created)', {}],
+    [
+      'the argument naming a directory that does not exist, beside a record directory holding a true record',
+      { records: TRUE_RECORD, setup: (rec) => ({ args: [join(rec.stateDir, 'no-such-dir')], persona: TEST_KEY }) },
+    ],
+    ['no record for the key (record directory present)', { createRecordDir: true }],
+    ['a false record', { records: { [TEST_KEY]: RECORD_FALSE } }],
+    ['an unrecognised record: TRUE', { records: { [TEST_KEY]: 'TRUE' } }],
+    ['an unrecognised record: true followed by two newlines', { records: { [TEST_KEY]: 'true\n\n' } }],
+    ['an unrecognised record: true followed by CRLF', { records: { [TEST_KEY]: 'true\r\n' } }],
+    ['an unrecognised record: a leading space before true', { records: { [TEST_KEY]: ' true' } }],
+    // Five characters, so they pass the 6-character read limit and only the
+    // exact match rejects them (a gate accepting anything starting with true
+    // would remind).
+    ['an unrecognised record: true followed by a space', { records: { [TEST_KEY]: 'true ' } }],
+    ['an unrecognised record: true followed by a carriage return', { records: { [TEST_KEY]: 'true\r' } }],
+    ['an empty record file', { records: { [TEST_KEY]: RECORD_EMPTY } }],
+    ['a true record only for a neighbour key (no record of its own)', { records: { [NEIGHBOUR_KEY]: RECORD_TRUE } }],
+    [
+      'a true record for a neighbour key beside its own false record',
+      { records: { [NEIGHBOUR_KEY]: RECORD_TRUE, [TEST_KEY]: RECORD_FALSE } },
+    ],
+    [
+      'the record path is a directory, not a file',
+      { createRecordDir: true, prepare: (rec) => mkdirSync(rec.recordPath(TEST_KEY)) },
+    ],
+    [
+      'the record path is a FIFO with no writer (never opened, so the run does not block)',
+      {
+        createRecordDir: true,
+        prepare: (rec) => {
+          const made = spawnSync('mkfifo', [rec.recordPath(TEST_KEY)])
+          expect(made.status).toBe(0)
+        },
+        // Opening the FIFO would block forever; a short kill turns a
+        // regression into a quick failure (exit code -1).
+        setup: (rec) => ({ ...defaultSetup(rec), timeoutMs: 3_000 }),
+      },
+    ],
+    [
+      'CSCB_PERSONA set to ../<name> while <state dir>/<name> holds true (traversal refused)',
+      {
+        createRecordDir: true,
+        prepare: (rec) => writeFileSync(join(rec.stateDir, TEST_KEY), RECORD_TRUE),
+        setup: (rec) => ({ args: [rec.recordDir], persona: `../${TEST_KEY}` }),
+      },
+    ],
+    [
+      'CSCB_PERSONA not in key form (uppercase) with a true record under that exact name',
+      {
+        records: { Reply_Guard_Test: RECORD_TRUE },
+        setup: (rec) => ({ args: [rec.recordDir], persona: 'Reply_Guard_Test' }),
+      },
+    ],
+    [
+      `CSCB_PERSONA one character over ${PERSONA_KEY_MAX_LENGTH} with a true record under that exact name`,
+      {
+        records: { [`${HASHED_KEY}0`]: RECORD_TRUE },
+        setup: (rec) => ({ args: [rec.recordDir], persona: `${HASHED_KEY}0` }),
+      },
+    ],
+  ])('no reminder: %s → exit 0, silent', (_label, c) => {
+    const r = runGateCase(c)
     expect(r.exitCode).toBe(0)
     expect(r.stderr).toBe('')
+    expect(r.stdout).toBe('')
+  })
+
+  test('the gate runs before the jq check: a false record with jq missing from PATH → exit 0 with no missing-jq warning', () => {
+    withNoJqPath((shimDir) => {
+      const r = runGateCase({ records: { [TEST_KEY]: RECORD_FALSE } }, { path: shimDir })
+      expect(r.exitCode).toBe(0)
+      expect(r.stderr).toBe('')
+      // Control: a true record on the same PATH gets the warning.
+      const control = runGateCase({ records: TRUE_RECORD }, { path: shimDir })
+      expect(control.exitCode).toBe(0)
+      expect(control.stderr).toBe(MISSING_JQ_WARNING)
+    })
   })
 })

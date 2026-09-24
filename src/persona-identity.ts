@@ -41,6 +41,13 @@ export const PERSONA_KEY_MAX_LENGTH = PERSONA_KEY_MAX_STEM_LENGTH + 1 + PERSONA_
 /** A name matching this pattern is its own key. */
 export const PERSONA_KEY_IN_FORM_RE: RegExp = new RegExp(`^[a-z0-9_]{1,${PERSONA_KEY_MAX_STEM_LENGTH}}$`)
 
+/**
+ * Every persona key matches this pattern, hashed keys included (up to
+ * `PERSONA_KEY_MAX_LENGTH`). Validate a key with it before using it in a path;
+ * `PERSONA_KEY_IN_FORM_RE` only says whether a name is its own key.
+ */
+export const PERSONA_KEY_RE: RegExp = new RegExp(`^[a-z0-9_]{1,${PERSONA_KEY_MAX_LENGTH}}$`)
+
 // ---------------------------------------------------------------------------
 // Derived-identifier constants (b.av2 SR-2.2)
 // ---------------------------------------------------------------------------

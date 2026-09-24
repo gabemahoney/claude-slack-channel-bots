@@ -7,7 +7,7 @@
 # call the mcp__slack-channel-router__reply tool afterwards.
 #
 # The reminder is declinable, not a mandate: it states how the message reached
-# the bot (its provenance, picked by `via` — see section 4) and tells the bot it
+# the bot (its provenance, picked by `via` — see section 5) and tells the bot it
 # may simply end the turn when no reply is needed. The five provenance kinds:
 #   dm                  — a direct message
 #   mention             — a direct @mention in a channel
@@ -27,10 +27,32 @@
 # An injected message delivered right after a delivered one does not hide the
 # delivered one.
 #
+# Per-persona enablement (see section 2): several personas can share one Claude
+# config dir, so the hook's presence there does not mean this persona wants the
+# reminder. Before each launch the server writes the persona's effective
+# stop_hook_bootstrap as `true` or `false` to a record file named after the
+# persona key, in the record directory `<server state dir>/reply-guard`. The
+# guard reminds only when the record for its own persona reads exactly `true`
+# (one trailing newline is tolerated).
+#
 # Fail-open: any error, missing input, malformed transcript, or missing jq
-# results in exit 0. The ONLY exit-2 path is a trigger run (see section 4)
+# results in exit 0. So does each of these, silently:
+#   - the argument is absent or empty
+#   - CSCB_PERSONA is unset, empty, or not a persona key (^[a-z0-9_]{1,49}$)
+#   - the record <argument>/<CSCB_PERSONA> is missing, not a regular file,
+#     unreadable or empty
+#   - the record reads anything other than `true` (e.g. `false`)
+# A persona whose record is not `true` exits before the jq check, so it gets no
+# missing-jq warning. The ONLY exit-2 path is a trigger run (see section 5)
 # containing a delivered Slack envelope (one carrying `via`), with no matching
-# tool_use after the earliest such message and stop_hook_active=false.
+# tool_use after the earliest such message and stop_hook_active=false, for a
+# persona whose record reads `true`.
+#
+# Arguments: $1 is the record directory (`<server state dir>/reply-guard`).
+# The managed hook's command passes it quoted, so it may contain spaces.
+#
+# Environment: CSCB_PERSONA is the persona key; the instance inherits it from
+# its spawn environment. It names the record to read.
 #
 # Input (stdin, single read): JSON from the Claude Code Stop hook harness with
 # at minimum session_id, transcript_path, stop_hook_active.
@@ -43,13 +65,44 @@ set -u
 INPUT="$(cat)" || exit 0
 [ -n "${INPUT}" ] || exit 0
 
-# --- 2. jq is required for transcript parsing. Fail open if absent. ---------
+# --- 2. Per-persona gate: continue only when this persona's record is true. -
+# Runs after the stdin read (so the harness's write never meets a closed pipe)
+# and before the jq check, using only bash builtins. Every "no" is a silent
+# exit 0; a disabled persona gets no jq warning either.
+RECORD_DIR="${1:-}"
+[ -n "${RECORD_DIR}" ] || exit 0
+
+PERSONA="${CSCB_PERSONA:-}"
+# The persona-key form, spelled out letter by letter so no locale can widen a
+# range. It also keeps the value from steering the read outside RECORD_DIR
+# (no "/", no "..", no empty name).
+[[ "${PERSONA}" =~ ^[_0123456789abcdefghijklmnopqrstuvwxyz]{1,49}$ ]] || exit 0
+
+RECORD_FILE="${RECORD_DIR}/${PERSONA}"
+# A regular, readable file only: a directory or a FIFO never counts, and a
+# FIFO would otherwise block the read.
+[ -f "${RECORD_FILE}" ] || exit 0
+[ -r "${RECORD_FILE}" ] || exit 0
+
+# Read at most 6 characters, stopping at a NUL. read returns non-zero only when
+# it hit end of file first, so a zero status means the file holds a NUL or more
+# than 6 characters, which is never "true" or "true" plus one newline.
+RECORD=""
+if IFS= read -r -d '' -n 6 RECORD 2>/dev/null < "${RECORD_FILE}"; then
+  exit 0
+fi
+case "${RECORD}" in
+  "true" | $'true\n') ;;
+  *) exit 0 ;;
+esac
+
+# --- 3. jq is required for transcript parsing. Fail open if absent. ---------
 if ! command -v jq >/dev/null 2>&1; then
   echo "slack-reply-guard: jq not found on PATH; failing open" >&2
   exit 0
 fi
 
-# --- 3. Extract the three fields we care about. -----------------------------
+# --- 4. Extract the three fields we care about. -----------------------------
 STOP_HOOK_ACTIVE="$(printf '%s' "${INPUT}" | jq -r '.stop_hook_active // false' 2>/dev/null)" || exit 0
 if [ "${STOP_HOOK_ACTIVE}" = "true" ]; then
   # One-retry-loop protection: never block a retry.
@@ -61,7 +114,7 @@ TRANSCRIPT_PATH="$(printf '%s' "${INPUT}" | jq -r '.transcript_path // ""' 2>/de
 [ -r "${TRANSCRIPT_PATH}" ] || exit 0
 [ -s "${TRANSCRIPT_PATH}" ] || exit 0
 
-# --- 4. Single-pass jq program. ---------------------------------------------
+# --- 5. Single-pass jq program. ---------------------------------------------
 # Reads the transcript exactly once. Emits one line:
 #   VIOLATION <kind> <chat_id>   — reminder due; <kind> is the provenance
 #   VIOLATION <kind>             — reminder due; chat_id absent or not a Slack id
@@ -220,7 +273,7 @@ JQ_OUT="$(jq -rRn '
     end
 ' "${TRANSCRIPT_PATH}" 2>/dev/null)" || exit 0
 
-# --- 5. Emit result. --------------------------------------------------------
+# --- 6. Emit result. --------------------------------------------------------
 REMINDER_TAIL="and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn."
 
 case "${JQ_OUT}" in

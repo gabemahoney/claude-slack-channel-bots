@@ -31,6 +31,16 @@
  *     so no test installs the production patch or writes a `.claude.json`),
  *     once per ladder, before its first spawn or resume, on every launch path;
  *     never in dry run or for a joining caller; a throw is only logged.
+ *   - b.av2 SR-9.4 / SR-6.2 pre-launch reply guard: the real
+ *     `preLaunchReplyGuard`, installed with `setPreLaunchReplyGuard` over a
+ *     `mkdtempSync` state directory (the seam and the launched-with dirs are
+ *     reset in afterEach, so no other test writes a record). The persona's
+ *     record holds its effective value, and the managed hook is in place,
+ *     immediately before every spawn and resume, at each call site that
+ *     makes one (one row per site, plus the ticket's named paths); a live
+ *     or no-op row and dry run launch nothing, and the optimistic spawn's step
+ *     is undone on ErrInstanceIdCollision (E10 Director decision 9); an
+ *     unwritable record is one log line and the launch goes on.
  *   - b.av2 SR-7.4 transcript-loss diagnosis: only the persona's
  *     `delivery: all` channels are counted, and a zero count is inconclusive
  *     for a persona with a `mentions` channel or DMs on.
@@ -104,8 +114,17 @@ import {
   notifyRestartCapReached,
   setPreLaunchTrustPatcher,
   _resetPreLaunchTrustPatcher,
+  _resetPreLaunchReplyGuard,
   type StartupPersonaOutcome,
 } from '../src/session-manager.ts'
+import {
+  _resetLaunchedWithDirs,
+  getLaunchedWithDir,
+  managedHookCommand,
+  preLaunchReplyGuard,
+} from '../src/stop-hook-bootstrap.ts'
+import { makeReplyGuardRecordDir, type ReplyGuardRecordDir } from './test-helpers/reply-guard-record.ts'
+import { installRecordingReplyGuard, observeLaunchCalls, type LaunchCall } from './test-helpers/reply-guard-launch.ts'
 import { UNATTRIBUTABLE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
 import { resolveJsonlPath } from '../src/cozempic.ts'
 import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
@@ -324,6 +343,8 @@ afterEach(() => {
   _resetSpawnHomeDir()
   _resetInFlightLaunches()
   _resetPreLaunchTrustPatcher()
+  _resetPreLaunchReplyGuard()
+  _resetLaunchedWithDirs()
   setSessionNotifier(undefined)
   installedHold?.cancelAll()
   installedHold = undefined
@@ -1284,9 +1305,10 @@ function labelConfig(
  * to it; `waiting` meets a dead session through persistent ErrTmuxSendKeys;
  * `working` through the up-front findMissing sweep reconciling the row to
  * `missing`. The resumed or fresh session reports `waiting`, so the dialog
- * approver returns at once. Returns the installed stub.
+ * approver returns at once. `key` is the persona's key (default the stand-in
+ * `C`). Returns the installed stub.
  */
-function installResumeEntry(entry: ResumeEntry, row: CannedGetResult, calls: LadderCalls): StubClient {
+function installResumeEntry(entry: ResumeEntry, row: CannedGetResult, calls: LadderCalls, key = 'C'): StubClient {
   const state = entry.split(' ')[0] as 'ended' | 'missing' | 'waiting' | 'working'
   if (state === 'waiting' || state === 'working') _setTmuxServerEnsurer(async () => {})
   if (state === 'working') _setWaitForWaitingTimeoutMs(30)
@@ -1294,11 +1316,11 @@ function installResumeEntry(entry: ResumeEntry, row: CannedGetResult, calls: Lad
     ...calls,
     spawnQueue: [
       cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-      cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${key}` }),
     ],
     getResult: { ...row, state },
     sendKeysError: state === 'waiting' ? errTmuxSendKeys() : undefined,
-    findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
+    findMissingResult: cannedFindMissing({ count: 1, ids: [`cscb_${key}`] }),
     statusFn: () =>
       ({
         state:
@@ -1537,17 +1559,7 @@ type LaunchEvent = 'patch' | 'spawn' | 'resume'
  * delegate to the stub's own verb, so its call captures and queues still apply.
  */
 function recordLaunchCalls(stub: StubClient, events: LaunchEvent[]): StubClient {
-  const spawn = stub.spawn.bind(stub)
-  const resume = stub.resume.bind(stub)
-  stub.spawn = (params) => {
-    events.push('spawn')
-    return spawn(params)
-  }
-  stub.resume = (params) => {
-    events.push('resume')
-    return resume(params)
-  }
-  return stub
+  return observeLaunchCalls(stub, (call) => events.push(call))
 }
 
 /**
@@ -1785,6 +1797,392 @@ describe('pre-launch trust patch (b.av2 SR-6.2)', () => {
     expect(patched).toHaveLength(0)
     expect(calls.spawnCalls).toHaveLength(1)
     expect(readFileSync(claudeJson).equals(before)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-9.4 / SR-6.2 — the reply-guard pre-launch step precedes every
+// spawn and resume (E10 Director decisions 1, 2 and 9)
+// ---------------------------------------------------------------------------
+//
+// The real `preLaunchReplyGuard` is installed through `setPreLaunchReplyGuard`
+// (`installRecordingReplyGuard`, tests/test-helpers/reply-guard-launch.ts),
+// bound to a per-test `mkdtempSync` state directory (`makeReplyGuardRecordDir`,
+// removed in afterEach) and the test's applied persona set. The file-level
+// afterEach resets the seam and the launched-with directories. The persona
+// has a hashed key (`Guard Desk`), because a record key must be a real
+// persona key, and its own temp claude_config_dir, so the launch-time hook
+// pass only ever writes under the fixture directory.
+//
+// Order comes from one shared log: the installed step appends 'guard', its
+// undo 'undo', and the stub's `spawn` / `resume` their verb
+// (`observeLaunchCalls`, same helper). At each spawn or
+// resume the stub also snapshots the record's exact text, the launched-with
+// directory and whether the persona's settings.json holds the managed hook.
+
+/** The reply-guard persona: its name differs from its hashed key. */
+const GUARD_NAME = 'Guard Desk'
+const GUARD_KEY = personaKey(GUARD_NAME)
+const GUARD_INSTANCE = `${PERSONA_INSTANCE_ID_PREFIX}${GUARD_KEY}`
+
+/** One entry of the reply-guard order log. */
+type GuardEvent = 'guard' | 'undo' | 'spawn' | 'resume'
+
+/** What the stub saw at one spawn or resume call. */
+interface GuardSnapshot {
+  call: LaunchCall
+  /** The record's exact text, or null when there is none. */
+  record: string | null
+  launchedWith: string | undefined
+  /** Whether the persona's settings.json held the managed reply-guard hook. */
+  hooked: boolean
+}
+
+describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
+  let rg: ReplyGuardRecordDir
+
+  beforeEach(() => {
+    rg = makeReplyGuardRecordDir()
+  })
+
+  afterEach(() => {
+    rg.cleanup()
+  })
+
+  type SpawnResult = import('agent-director').SpawnResult
+  const collision = () => cannedErr<SpawnResult>(errInstanceIdCollision())
+  const spawnOk = () => cannedOk<SpawnResult>({ claude_instance_id: GUARD_INSTANCE })
+
+  /**
+   * The reply-guard persona with a real working directory and its own real
+   * claude_config_dir; `spec` adds persona fields.
+   */
+  function guardConfig(spec: { stop_hook_bootstrap?: boolean } = {}): { cfg: PersonaConfig; persona: Persona; configDir: string } {
+    useSpawnHome()
+    const configDir = fixtureSubdir('claude-config')
+    const cfg = makeMultiPersonaConfig(
+      [{ name: GUARD_NAME, working_directory: fixtureSubdir('work'), claude_config_dir: configDir, ...spec }],
+      fixtureDir,
+      { agent_director_poll_interval_ms: 1 },
+    )
+    return { cfg, persona: personaOf(cfg, GUARD_KEY), configDir }
+  }
+
+  /** Whether `dir`/settings.json holds the managed hook for this test's state directory. */
+  function hookedIn(dir: string): boolean {
+    const path = join(dir, 'settings.json')
+    if (!existsSync(path)) return false
+    return readFileSync(path, 'utf-8').includes(JSON.stringify(managedHookCommand(rg.stateDir)))
+  }
+
+  /**
+   * Log each spawn / resume through `stub` to `events` and snapshot the
+   * persona's record, launched-with dir and hook at that moment.
+   */
+  function observeGuardCalls(stub: StubClient, configDir: string, events: GuardEvent[], seen: GuardSnapshot[]): StubClient {
+    return observeLaunchCalls(stub, (call) => {
+      events.push(call)
+      seen.push({ call, record: rg.readRecord(GUARD_KEY), launchedWith: getLaunchedWithDir(GUARD_KEY), hooked: hookedIn(configDir) })
+    })
+  }
+
+  /** A ladder row for the reply-guard persona (its cwd and config_dir label match unless overridden). */
+  function guardRow(cfg: PersonaConfig, overrides: PersonaGetResultOverrides = {}): CannedGetResult {
+    return personaRow(cfg, GUARD_KEY, overrides)
+  }
+
+  /** One launch path: how to reach it, its `spawnForPersona` action and its order log. */
+  interface GuardPath {
+    install: (cfg: PersonaConfig, calls: LadderCalls) => StubClient
+    expected: string
+    events: GuardEvent[]
+  }
+
+  /** A stub whose first spawn collides with a row `row` and whose resume rejects with `resumeError`. */
+  function installResumeRejects(row: CannedGetResult, calls: LadderCalls, resumeError: Error): StubClient {
+    _setTmuxSessionKiller(async () => {})
+    return installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getResult: row, resumeError })
+  }
+
+  const SPAWN = ['guard', 'spawn'] as const satisfies readonly GuardEvent[]
+  /** The optimistic spawn met a row: its step is undone before the ladder goes on. */
+  const COLLIDED = ['guard', 'spawn', 'undo'] as const satisfies readonly GuardEvent[]
+  const RESUME = ['guard', 'resume'] as const satisfies readonly GuardEvent[]
+
+  /**
+   * The ticket's named paths (fresh spawn; resume of an ended or missing row;
+   * dead-session recovery; a fresh spawn after a cwd or config_dir mismatch),
+   * which between them reach the optimistic spawn, `client.resume` and
+   * `replaceWithFreshSpawn`, plus one row for each other spawn call site: the
+   * single retry after ErrSpawnNotFound on the post-collision get, the
+   * self-heal respawn, and each fallback spawn in `resumeOrFreshSpawn`.
+   * Paths that share a call site with a row here (resume_enabled false, a
+   * dead working row, the other delete-then-spawn resume errors, the restart
+   * adapter — covered end to end in restart.test.ts) have no row of their own.
+   */
+  const GUARD_PATHS: Array<[string, GuardPath]> = [
+    ['fresh spawn', {
+      install: (_cfg, calls) => installStub({ ...calls }),
+      expected: 'spawned',
+      events: [...SPAWN],
+    }],
+    ['resume of an ended row', {
+      install: (cfg, calls) => installResumeEntry('ended', guardRow(cfg), calls, GUARD_KEY),
+      expected: 'resumed',
+      events: [...COLLIDED, ...RESUME],
+    }],
+    ['resume of a missing row', {
+      install: (cfg, calls) => installResumeEntry('missing', guardRow(cfg), calls, GUARD_KEY),
+      expected: 'resumed',
+      events: [...COLLIDED, ...RESUME],
+    }],
+    ['dead-session recovery from a waiting row', {
+      install: (cfg, calls) => installResumeEntry('waiting (dead session)', guardRow(cfg), calls, GUARD_KEY),
+      expected: 'resumed',
+      events: [...COLLIDED, ...RESUME],
+    }],
+    ['live row in another directory (cwd mismatch): kill + delete + fresh spawn', {
+      install: (cfg, calls) =>
+        installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getResult: guardRow(cfg, { state: 'waiting', cwd: fixtureSubdir('elsewhere') }) }),
+      expected: 'spawned',
+      events: [...COLLIDED, ...SPAWN],
+    }],
+    ['ended row with a changed config_dir label: delete + fresh spawn', {
+      install: (cfg, calls) => {
+        const labels = { ...guardRow(cfg).labels, config_dir: personaConfigDirLabelValue(fixtureSubdir('earlier-config'), ladderHome()) }
+        return installResumeEntry('ended', guardRow(cfg, { labels }), calls, GUARD_KEY)
+      },
+      expected: 'spawned',
+      events: [...COLLIDED, ...SPAWN],
+    }],
+    ['ErrSpawnNotFound on the post-collision get: the single retry spawn', {
+      install: (_cfg, calls) => installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getError: errSpawnNotFound() }),
+      expected: 'spawned',
+      events: [...COLLIDED, ...SPAWN],
+    }],
+    ['self-heal respawn after ErrTmuxSessionCreate on the first spawn', {
+      install: (_cfg, calls) => {
+        _setTmuxSessionKiller(async () => {})
+        return installStub({ ...calls, spawnQueue: [cannedErr<SpawnResult>(errTmuxSessionCreate('spawn')), spawnOk()] })
+      },
+      expected: 'spawned',
+      // Not a collision: the first step is not undone, and the respawn runs its own.
+      events: [...SPAWN, ...SPAWN],
+    }],
+    ['resume ErrJsonlMissing: delete + fresh spawn', {
+      install: (cfg, calls) => installResumeRejects(guardRow(cfg, { state: 'ended' }), calls, errJsonlMissing()),
+      expected: 'fresh-after-inconclusive-amnesia',
+      events: [...COLLIDED, ...RESUME, ...SPAWN],
+    }],
+    ['resume ErrSpawnNotResumable: kill + delete + fresh spawn', {
+      install: (cfg, calls) => installResumeRejects(guardRow(cfg, { state: 'ended' }), calls, errSpawnNotResumable()),
+      expected: 'spawned',
+      events: [...COLLIDED, ...RESUME, ...SPAWN],
+    }],
+    ['resume ErrSpawnNotFound: fresh spawn', {
+      install: (cfg, calls) => installResumeRejects(guardRow(cfg, { state: 'ended' }), calls, errSpawnNotFound()),
+      expected: 'spawned',
+      events: [...COLLIDED, ...RESUME, ...SPAWN],
+    }],
+  ]
+
+  test.each(GUARD_PATHS)('%s: the record holds the effective value, and the hook is in place, before each spawn or resume', async (_name, path) => {
+    captureStartupErrors()
+    const { cfg, persona, configDir } = guardConfig()
+    const events: GuardEvent[] = []
+    const seen: GuardSnapshot[] = []
+    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
+    const calls = newLadderCalls()
+    observeGuardCalls(path.install(cfg, calls), configDir, events, seen)
+
+    let result: unknown
+    await withCapturedErr(async () => {
+      result = await spawnForPersona(persona, cfg)
+    })
+
+    expect(result).toEqual({ key: GUARD_KEY, action: path.expected })
+    // Each spawn and resume is immediately preceded by its own step.
+    expect(events).toEqual(path.events)
+    expect(seen.map((s) => s.call)).toEqual(path.events.filter((e): e is LaunchCall => e === 'spawn' || e === 'resume'))
+    for (const snap of seen) {
+      expect(snap).toEqual({ call: snap.call, record: 'true', launchedWith: configDir, hooked: true })
+    }
+    // The launch leaves the persona's record and launched-with dir in place.
+    expect(rg.readRecord(GUARD_KEY)).toBe('true')
+    expect(getLaunchedWithDir(GUARD_KEY)).toBe(configDir)
+  })
+
+  // Production reads only the persona's own effective `stop_hook_bootstrap`
+  // (the loader's inheritance is covered in stop-hook-bootstrap.test.ts), and
+  // GUARD_PATHS covers `true`; this is the `false` value on each launch verb.
+  test.each([
+    ['fresh spawn', 'spawned', ['spawn']],
+    ['resume of an ended row', 'resumed', ['spawn', 'resume']],
+  ] as const)('stop_hook_bootstrap false (%s): the record reads exactly false before each call and no hook is installed', async (path, action, verbs) => {
+    const { cfg, persona, configDir } = guardConfig({ stop_hook_bootstrap: false })
+    expect(persona.stop_hook_bootstrap).toBe(false)
+    const events: GuardEvent[] = []
+    const seen: GuardSnapshot[] = []
+    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
+    const calls = newLadderCalls()
+    const stub = path === 'fresh spawn'
+      ? installStub({ ...calls })
+      : installResumeEntry('ended', guardRow(cfg), calls, GUARD_KEY)
+    observeGuardCalls(stub, configDir, events, seen)
+
+    await withCapturedErr(async () => {
+      expect(await spawnForPersona(persona, cfg)).toEqual({ key: GUARD_KEY, action })
+    })
+
+    expect(seen.map((s) => s.call)).toEqual([...verbs])
+    // The exact text `false`, and no managed hook for a disabled persona.
+    for (const snap of seen) expect(snap).toEqual({ call: snap.call, record: 'false', launchedWith: configDir, hooked: false })
+    expect(rg.readRecord(GUARD_KEY)).toBe('false')
+  })
+
+  /**
+   * Leave the persona's running instance as an earlier launch left it: that
+   * launch's real step, for the persona as it was then (`then`), over the
+   * persona set as it was then.
+   */
+  function launchedEarlier(persona: Persona, then: Partial<Persona>): void {
+    const earlier = { ...persona, ...then }
+    preLaunchReplyGuard(earlier, [earlier], rg.stateDir)
+  }
+
+  // Every live state runs the same undo; one reconnect branch and one no-op
+  // branch here (the decision-9 table below covers a live waiting row).
+  test.each([
+    ['working', 'reconnected'],
+    ['pending', 'no-op'],
+  ] as const)('a live %s row (%s): no launch, so the running instance keeps its record, launched-with dir and hook', async (state, action) => {
+    // The instance launched enabled; the persona is now configured off.
+    const { cfg, persona, configDir } = guardConfig({ stop_hook_bootstrap: false })
+    launchedEarlier(persona, { stop_hook_bootstrap: true })
+    expect(rg.readRecord(GUARD_KEY)).toBe('true')
+    expect(hookedIn(configDir)).toBe(true)
+    const events: GuardEvent[] = []
+    const seen: GuardSnapshot[] = []
+    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
+    const calls = newLadderCalls()
+    observeGuardCalls(installStub({ ...calls, spawnQueue: [collision()], getResult: guardRow(cfg, { state }) }), configDir, events, seen)
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    await withCapturedErr(async () => {
+      result = await spawnForPersona(persona, cfg)
+    })
+
+    expect(result).toEqual({ key: GUARD_KEY, action })
+    // Only the optimistic spawn ran a step, and it was undone (decision 9).
+    expect(events).toEqual([...COLLIDED])
+    expect(calls.spawnCalls).toHaveLength(1)
+    expect(calls.resumeCalls).toHaveLength(0)
+    expect(rg.readRecord(GUARD_KEY)).toBe('true')
+    expect(getLaunchedWithDir(GUARD_KEY)).toBe(configDir)
+    expect(hookedIn(configDir)).toBe(true)
+  })
+
+  test.each([
+    {
+      label: 'a record reading true from the running instance, the persona now off',
+      spec: { stop_hook_bootstrap: false },
+      earlier: { stop_hook_bootstrap: true } as Partial<Persona> | undefined,
+      atCall: { record: 'false', dir: 'current', hooked: false },
+      after: { record: 'true', dir: 'current', hooked: true },
+    },
+    {
+      label: 'a record reading false and another launched-with dir, the persona now on',
+      spec: { stop_hook_bootstrap: true },
+      earlier: { stop_hook_bootstrap: false, claude_config_dir: 'previous' } as Partial<Persona> | undefined,
+      atCall: { record: 'true', dir: 'current', hooked: true },
+      after: { record: 'false', dir: 'previous', hooked: true },
+    },
+    {
+      label: 'no record and no launched-with dir',
+      spec: { stop_hook_bootstrap: true },
+      earlier: undefined,
+      atCall: { record: 'true', dir: 'current', hooked: true },
+      after: { record: null, dir: undefined, hooked: true },
+    },
+  ] as const)('decision 9: the optimistic spawn meets ErrInstanceIdCollision (live waiting row) — $label: its step is undone', async ({ spec, earlier, atCall, after }) => {
+    const { cfg, persona, configDir } = guardConfig(spec)
+    const previousDir = fixtureSubdir('previous-config')
+    const dirOf = (d: 'current' | 'previous' | undefined) => (d === 'current' ? configDir : d === 'previous' ? previousDir : undefined)
+    if (earlier) {
+      launchedEarlier(persona, { ...earlier, ...(earlier.claude_config_dir ? { claude_config_dir: previousDir } : {}) })
+    }
+    const before = rg.readRecord(GUARD_KEY)
+    const events: GuardEvent[] = []
+    const seen: GuardSnapshot[] = []
+    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
+    const calls = newLadderCalls()
+    observeGuardCalls(installStub({ ...calls, spawnQueue: [collision()], getResult: guardRow(cfg, { state: 'waiting' }) }), configDir, events, seen)
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    await withCapturedErr(async () => {
+      result = await spawnForPersona(persona, cfg)
+    })
+
+    expect(result).toEqual({ key: GUARD_KEY, action: 'reconnected' })
+    expect(events).toEqual([...COLLIDED])
+    // The step ran before the optimistic spawn…
+    expect(seen).toEqual([{ call: 'spawn', record: atCall.record, launchedWith: dirOf(atCall.dir), hooked: atCall.hooked }])
+    // …and the undo restored the previous text (or deleted the record), the
+    // launched-with dir and, through the re-run launch pass, the hook.
+    expect(rg.readRecord(GUARD_KEY)).toBe(after.record)
+    expect(rg.readRecord(GUARD_KEY)).toBe(before)
+    expect(getLaunchedWithDir(GUARD_KEY)).toBe(dirOf(after.dir))
+    expect(hookedIn(configDir)).toBe(after.hooked)
+  })
+
+  test('dry run: no step runs — no record, record directory, launched-with dir or settings.json — and nothing is launched', async () => {
+    process.env['SLACK_DRY_RUN'] = '1'
+    const { cfg, persona, configDir } = guardConfig()
+    const events: GuardEvent[] = []
+    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
+    const calls = newLadderCalls()
+    observeGuardCalls(installStub({ ...calls }), configDir, events, [])
+
+    await withCapturedErr(async () => {
+      expect(await spawnForPersona(persona, cfg)).toEqual({ key: GUARD_KEY, action: 'no-op' })
+      expect(await launchSession(GUARD_KEY, cfg)).toBe(true)
+    })
+
+    expect(events).toEqual([])
+    expect(calls).toEqual(newLadderCalls())
+    expect(existsSync(rg.recordDir)).toBe(false)
+    expect(getLaunchedWithDir(GUARD_KEY)).toBeUndefined()
+    expect(existsSync(join(configDir, 'settings.json'))).toBe(false)
+  })
+
+  test('the record cannot be written (a regular file where reply-guard/ belongs): the spawn still reaches agent-director and one log line names the persona key', async () => {
+    const readLog = captureStartupErrors()
+    const { cfg, persona, configDir } = guardConfig()
+    // A file, not a directory: unwritable even for root, which ignores mode bits.
+    writeFileSync(rg.recordDir, 'not a directory')
+    const events: GuardEvent[] = []
+    const seen: GuardSnapshot[] = []
+    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
+    const calls = newLadderCalls()
+    observeGuardCalls(installStub({ ...calls }), configDir, events, seen)
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(persona, cfg)
+    })
+
+    expect(result).toEqual({ key: GUARD_KEY, action: 'spawned' })
+    expect(events).toEqual([...SPAWN])
+    expect(calls.spawnCalls.map((p) => p.claude_instance_id)).toEqual([GUARD_INSTANCE])
+    const lines = errLog.split('\n').filter((l) => l.includes('reply-guard: could not write the record'))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toStartWith(`[slack] reply-guard: could not write the record for ${renderPersonaRef(GUARD_NAME, GUARD_KEY)} at `)
+    expect(lines[0]).toContain(`key=${GUARD_KEY}`)
+    expect(lines[0]).toContain('launching anyway')
+    // The file is left as it was; the failure is a log line, not a startup error or a notice.
+    expect(readFileSync(rg.recordDir, 'utf-8')).toBe('not a directory')
+    expect(readLog()).toBe('')
+    expect(notices).toHaveLength(0)
   })
 })
 

@@ -76,6 +76,7 @@ import {
   notifyRestartCapReached,
   reconcileOrphans,
   reconnectMcp,
+  setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
   setSessionNotifier,
   spawnForPersona,
@@ -109,7 +110,7 @@ import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from './agent-direct
 import { getClient, closeClient } from './agent-director-client.ts'
 import { trustBootstrap, trustPatchPersona } from './trust-bootstrap.ts'
 import { runJsonlPersistenceSafeguard } from './jsonl-persistence-check.ts'
-import { stopHookBootstrap } from './stop-hook-bootstrap.ts'
+import { preLaunchReplyGuard, stopHookBootstrap } from './stop-hook-bootstrap.ts'
 import { startPermissionPoller, stopPermissionPoller } from './permission-poller.ts'
 import {
   initRestart,
@@ -1059,6 +1060,14 @@ export async function main(): Promise<void> {
   // initRestart — so no launch path (start, restart or a human trigger) can
   // run unpatched.
   setPreLaunchTrustPatcher(trustPatchPersona)
+  // b.av2 SR-9.4: the reply-guard steps (record, launched-with dir, hook
+  // install) run immediately before each spawn or resume. The step gets a
+  // getter for the applied persona set (read at the launch and again by its
+  // undo, never a snapshot) and the server's own state directory. With no
+  // persona config the installed step does nothing: no record, no patch.
+  setPreLaunchReplyGuard((persona) =>
+    personaConfig === null ? undefined : preLaunchReplyGuard(persona, () => personaConfig?.personas, STATE_DIR),
+  )
   console.error(`[slack] Loaded persona config: ${personaConfig.personas.length} persona(s)`)
   // The loaded config, for closures below (it is never replaced after this).
   const appliedConfig: PersonaConfig = personaConfig
@@ -1386,12 +1395,13 @@ export async function main(): Promise<void> {
     console.error('[slack] Warning: jsonl-persistence safeguard failed — continuing:', err)
   }
 
-  // b.osj: install (or remove) the CSCB-managed Stop hook in each applied
-  // persona's effective claude_config_dir settings.json before any spawn
-  // fires. Runs for both real and dry-run modes (config-file patch, not a
+  // b.osj / b.av2 SR-9.4: install (or remove) the CSCB-managed Stop hook in
+  // each applied persona's effective claude_config_dir settings.json before
+  // any spawn fires; its command names this server's reply-guard record
+  // directory. Runs for both real and dry-run modes (config-file patch, not a
   // session operation). Never throws — per-dir failures are recorded via
   // recordStartupError.
-  stopHookBootstrap(personaConfig)
+  stopHookBootstrap(personaConfig, STATE_DIR)
 
   // b.av2 SR-6.1: bring each applied persona up — one persona-start line,
   // the local credentials check (skipped in dry run), the working-directory

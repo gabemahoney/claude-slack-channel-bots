@@ -5,7 +5,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -46,7 +46,11 @@ import {
   launchSession as launchPersonaSession,
   notifyRestartCapReached,
   setSessionNotifier,
+  _resetPreLaunchReplyGuard,
 } from '../src/session-manager.ts'
+import { _resetLaunchedWithDirs, getLaunchedWithDir } from '../src/stop-hook-bootstrap.ts'
+import { makeReplyGuardRecordDir, type ReplyGuardRecordDir } from './test-helpers/reply-guard-record.ts'
+import { installRecordingReplyGuard, observeLaunchCalls, type LaunchCall } from './test-helpers/reply-guard-launch.ts'
 import {
   setClientForTests,
   resetClientForTests,
@@ -56,9 +60,18 @@ import {
   initOutageState,
 } from '../src/outage-state.ts'
 import { makeStubClient } from './test-helpers/agent-director-stub.ts'
-import { errGeneric, errSpawnNotFound, errTmuxSendKeys, holdSpawns, type SpawnHold } from './test-helpers/agent-director-stub.ts'
+import {
+  cannedErr,
+  cannedGetResult,
+  errGeneric,
+  errInstanceIdCollision,
+  errSpawnNotFound,
+  errTmuxSendKeys,
+  holdSpawns,
+  type SpawnHold,
+} from './test-helpers/agent-director-stub.ts'
 import type { Client } from 'agent-director'
-import type { DeleteParams, FindMissingParams, KillParams, SendKeysParams, SpawnParams, StatusParams } from 'agent-director'
+import type { DeleteParams, FindMissingParams, KillParams, ResumeParams, SendKeysParams, SpawnParams, SpawnResult, StatusParams } from 'agent-director'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
@@ -164,6 +177,14 @@ async function driveFailures(key: string, cwd: string, count: number): Promise<v
 beforeEach(() => {
   _resetRestartState()
   _resetBackoffState()
+})
+
+// No test outside the reply-guard block installs the pre-launch reply guard,
+// so no other launch here writes a record; reset it (and the launched-with
+// dirs) after every test all the same.
+afterEach(() => {
+  _resetPreLaunchReplyGuard()
+  _resetLaunchedWithDirs()
 })
 
 // ---------------------------------------------------------------------------
@@ -1855,5 +1876,159 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     expect(launchResults).toEqual([{ key: b.key, ok: true }, { key: a.key, ok: true }])
     expect(spawnsFor(a)).toHaveLength(1)
     expect(spawnsFor(b)).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Restart-triggered relaunch: the reply-guard record precedes the launch
+// (b.av2 SR-6.2, SR-9.4). `RestartDeps.launchSession` is the session
+// manager's REAL launch adapter, and the REAL `preLaunchReplyGuard` is
+// installed with `setPreLaunchReplyGuard` over a `mkdtempSync` state
+// directory (`makeReplyGuardRecordDir`), removed in afterEach with every
+// persona path. The persona has its own temp claude_config_dir, so the
+// launch-time hook pass writes only there. At each spawn or resume the stub
+// snapshots the persona's record and launched-with dir; the installed step
+// and its undo log to the same order log (`installRecordingReplyGuard` and
+// `observeLaunchCalls`, tests/test-helpers/reply-guard-launch.ts).
+// ---------------------------------------------------------------------------
+
+describe('restart: the reply-guard record holds the effective value before the relaunch reaches agent-director (b.av2 SR-6.2, SR-9.4)', () => {
+  let dir: string
+  let rg: ReplyGuardRecordDir
+  let configDir: string
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+  /** The installed step ('guard'), its undo ('undo') and the stub's 'spawn' / 'resume', in order. */
+  let events: string[]
+  /** The record text (null when absent) and launched-with dir at each spawn or resume. */
+  let seen: Array<{ call: LaunchCall; record: string | null; launchedWith: string | undefined }>
+  let spawnCalls: SpawnParams[]
+  let resumeCalls: ResumeParams[]
+  let sendKeysCalls: SendKeysParams[]
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'restart-reply-guard-'))
+    rg = makeReplyGuardRecordDir()
+    configDir = join(dir, 'claude-config')
+    mkdirSync(configDir)
+    events = []
+    seen = []
+    spawnCalls = []
+    resumeCalls = []
+    sendKeysCalls = []
+    errLines = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+    setSessionNotifier(() => {})
+    _resetInFlightLaunches()
+    _setSpawnHomeDir(dir)
+    _setDialogPollIntervalMs(1)
+    _setDialogReadyTimeoutMs(200)
+    _setTmuxCapturePane(async () => '')
+    _setTmuxSendEnter(async () => {})
+    _setTmuxSessionProber(async () => true)
+    _setTmuxServerEnsurer(async () => {})
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    cancelAllRestartTimers()
+    _resetInFlightLaunches()
+    resetClientForTests()
+    _resetOutageState()
+    setSessionNotifier(undefined)
+    _resetSpawnHomeDir()
+    _resetDialogPollIntervalMs()
+    _resetDialogReadyTimeoutMs()
+    _resetTmuxDialogHelpers()
+    _resetTmuxSessionProber()
+    _resetTmuxServerEnsurer()
+    rg.cleanup()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  /**
+   * One persona, `Alpha Desk` (a hashed key), with the given effective
+   * stop_hook_bootstrap and its own claude_config_dir; the real reply guard
+   * installed over it; and a stub AD client whose row is gone (`row: 'gone'`,
+   * the spawn succeeds) or `ended` (the spawn collides and the row resumes).
+   */
+  function setup(stopHookBootstrap: boolean, row: 'gone' | 'ended'): { config: PersonaConfig; a: Persona } {
+    const config = makeMultiPersonaConfig(
+      [{ name: 'Alpha Desk', claude_config_dir: configDir, stop_hook_bootstrap: stopHookBootstrap }],
+      dir,
+      { agent_director_poll_interval_ms: 1 },
+    )
+    const [a] = config.personas as [Persona]
+    mkdirSync(a.working_directory, { recursive: true })
+    installRecordingReplyGuard(config.personas, rg.stateDir, events)
+    const stub = observeLaunchCalls(makeStubClient({
+      statusFn: () => ({ state: 'waiting' }),
+      spawnCalls,
+      resumeCalls,
+      sendKeysCalls,
+      spawnQueue: row === 'ended' ? [cannedErr<SpawnResult>(errInstanceIdCollision())] : undefined,
+      getResult: cannedGetResult({ state: 'ended' }, a, dir),
+    }), (call) => {
+      events.push(call)
+      seen.push({ call, record: rg.readRecord(a.key), launchedWith: getLaunchedWithDir(a.key) })
+    })
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+    setClientForTests(stub as unknown as Client)
+    return { config, a }
+  }
+
+  /** Poll (foreground) until `cond` holds or `ms` elapse. */
+  async function waitFor(cond: () => boolean, ms = 1000): Promise<void> {
+    const deadline = Date.now() + ms
+    while (!cond() && Date.now() < deadline) await Bun.sleep(5)
+  }
+
+  // One relaunch through the real adapter; every launch path and both values
+  // are covered against the ladder in session-manager.test.ts.
+  test('dead session, ended row, stop_hook_bootstrap false: the record reads false before each relaunch call (the optimistic spawn is undone, then resume)', async () => {
+    const { config, a } = setup(false, 'ended')
+    const results: Array<boolean | 'skipped'> = []
+    const deps = makeDeps({
+      isSessionAliveResult: false,
+      launchSession: async (key) => {
+        const ok = await launchPersonaSession(key, config)
+        results.push(ok)
+        return ok
+      },
+    })
+    initRestart(deps)
+
+    scheduleRestart(a.key, a.working_directory)
+    await waitFor(() => results.length > 0)
+
+    expect(deps.killSessionCalls).toEqual([a.key])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([a.key])
+    expect(results).toEqual([true])
+    expect(events).toEqual(['guard', 'spawn', 'undo', 'guard', 'resume'])
+    expect(seen.map((s) => s.call)).toEqual(['spawn', 'resume'])
+    for (const snap of seen) expect(snap).toEqual({ call: snap.call, record: 'false', launchedWith: configDir })
+    expect(resumeCalls).toHaveLength(1)
+    expect(rg.readRecord(a.key)).toBe('false')
+    expect(getFailureCount(a.key)).toBe(0)
+  })
+
+  test('live session: the restart reconnects through the real adapter — no launch, no reply-guard step, no record', async () => {
+    const { a } = setup(true, 'gone')
+    const deps = makeDeps({ isSessionAliveResult: true })
+    deps.reconnectSession = _buildReconnectSessionAdapter()
+    initRestart(deps)
+
+    scheduleRestart(a.key, a.working_directory)
+    await waitFor(() => sendKeysCalls.length > 0 && !isRestartPendingOrActive(a.key))
+
+    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(a.key)])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(events).toEqual([])
+    expect(spawnCalls).toEqual([])
+    expect(rg.readRecord(a.key)).toBeNull()
+    expect(getLaunchedWithDir(a.key)).toBeUndefined()
   })
 })

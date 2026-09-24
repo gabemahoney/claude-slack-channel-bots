@@ -27,6 +27,11 @@
  * joins the running ladder. Every ladder run first calls the installed
  * pre-launch trust patcher (`setPreLaunchTrustPatcher`, b.av2 SR-6.2), so the
  * persona's `.claude.json` trust flags are set before any spawn or resume.
+ * Immediately before each `client.spawn` / `client.resume` it calls the
+ * installed pre-launch reply guard (`setPreLaunchReplyGuard`, b.av2 SR-9.4):
+ * the persona's reply-guard record, launched-with dir and managed Stop hook.
+ * A path that only reconnects to a live instance or does nothing runs no
+ * reply-guard step (the optimistic spawn's steps are undone on a collision).
  *
  * The start sweep (`reconcileOrphans`, b.av2 SR-6.3) lists every
  * `service=cscb` spawn and kills+deletes any with no `persona` label, a
@@ -63,7 +68,7 @@ import {
   ErrTmuxSendKeys,
   ErrTmuxSessionCreate,
 } from 'agent-director'
-import type { ListRow, SpawnParams, FindMissingResult, GetResult } from 'agent-director'
+import type { Client, ListRow, SpawnParams, FindMissingResult, GetResult } from 'agent-director'
 
 import { checkCozempicAvailable, resolveJsonlPath } from './cozempic.ts'
 import {
@@ -95,6 +100,7 @@ import {
   ErrSpawnCapReached,
 } from './agent-director-errors.ts'
 import { recordStartupError } from './startup-errors.ts'
+import type { ReplyGuardUndo } from './stop-hook-bootstrap.ts'
 import { firstNoticeLine, notifySafely, type PersonaNoticeOptions, type PersonaNotify } from './persona-notifier.ts'
 import type { PersonaBringUpFailure } from './persona-start.ts'
 import type { PersonaBringUpController, PersonaBringUpOutcome } from './persona-bringup-controller.ts'
@@ -1257,7 +1263,7 @@ async function selfHealTmuxCollisionAndRespawn(
     `[slack] spawnForPersona: ErrTmuxSessionCreate for ${ref} — killing orphan tmux session "${sessionName}" and retrying spawn once`,
   )
   await _killTmuxSession(sessionName)
-  return withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
+  return launchWithReplyGuard(persona, ref, (client) => client.spawn(params))
 }
 
 /** Delete the spawn row; surface failures. Returns whether the delete succeeded. */
@@ -1325,7 +1331,7 @@ async function replaceWithFreshSpawn(
   }
 
   try {
-    await withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
+    await launchWithReplyGuard(persona, ref, (client) => client.spawn(params))
     console.error(`[slack] spawnForPersona: fresh-spawned (after ${opts.kill ? 'kill+delete' : 'delete'}) for ${ref}`)
     await approvePreSessionDialogs(key, isStartup, ref)
     return { key, action: 'spawned' }
@@ -1691,7 +1697,7 @@ async function resumeOrFreshSpawn(
   // resume_enabled: attempt resume
   console.error(`[slack] spawnForPersona: attempting resume for ${ref}`)
   try {
-    await withSpawnDetection(key, persona.working_directory, (client) => client.resume({ claude_instance_id: personaInstanceId(key) }))
+    await launchWithReplyGuard(persona, ref, (client) => client.resume({ claude_instance_id: personaInstanceId(key) }))
     console.error(`[slack] spawnForPersona: resumed ${ref}`)
     // b.vub: a resumed bot faces the same --dangerously-load-development-channels
     // dialog. Its AD row is still `missing`/`ended` while blocked at the dialog
@@ -1744,7 +1750,7 @@ async function resumeOrFreshSpawn(
       }
       if (!(await tryDelete(key, isStartup, ref))) return { key, action: 'failed' }
       try {
-        await withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
+        await launchWithReplyGuard(persona, ref, (client) => client.spawn(params))
         console.error(`[slack] spawnForPersona: fresh-spawned (after delete) for ${ref}`)
         await approvePreSessionDialogs(key, isStartup, ref)
         // A fresh-spawn that replaced a resume because the transcript was gone
@@ -1791,7 +1797,7 @@ async function resumeOrFreshSpawn(
       await tryKill(key)
       if (!(await tryDelete(key, isStartup, ref))) return { key, action: 'failed' }
       try {
-        await withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
+        await launchWithReplyGuard(persona, ref, (client) => client.spawn(params))
         await approvePreSessionDialogs(key, isStartup, ref)
         return { key, action: 'spawned' }
       } catch (err2) {
@@ -1816,7 +1822,7 @@ async function resumeOrFreshSpawn(
       // recovery into action: 'failed'. Mirrors the caller-level retry below.
       console.error(`[slack] spawnForPersona: ErrSpawnNotFound on resume for ${ref} — fresh-spawn`)
       try {
-        await withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
+        await launchWithReplyGuard(persona, ref, (client) => client.spawn(params))
         console.error(`[slack] spawnForPersona: fresh-spawned (after ErrSpawnNotFound on resume) for ${ref}`)
         await approvePreSessionDialogs(key, isStartup, ref)
         return { key, action: 'spawned' }
@@ -1889,6 +1895,76 @@ function runPreLaunchTrustPatch(persona: Persona, ref: string): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Pre-launch reply guard (b.av2 SR-9.4, SR-6.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs the reply-guard steps before one persona's launch (record write,
+ * launched-with update, launch-time hook pass) and may return an undo for a
+ * launch that turns out not to be one.
+ */
+export type PreLaunchReplyGuard = (persona: Persona) => ReplyGuardUndo | void
+
+/**
+ * The one pre-launch reply guard. Production installs `preLaunchReplyGuard`
+ * from `src/stop-hook-bootstrap.ts`, closed over the server's state directory
+ * and a getter for the applied persona set. With none installed (unit tests,
+ * the integration driver) no record is written and no settings are patched;
+ * nothing here resolves a state directory.
+ */
+let preLaunchReplyGuard: PreLaunchReplyGuard | undefined
+
+/** Install the pre-launch reply guard (production: `server.ts`). */
+export function setPreLaunchReplyGuard(guard: PreLaunchReplyGuard): void {
+  preLaunchReplyGuard = guard
+}
+
+/** Test-only seam: remove any installed pre-launch reply guard. */
+export function _resetPreLaunchReplyGuard(): void {
+  preLaunchReplyGuard = undefined
+}
+
+/**
+ * Run the installed pre-launch reply guard for `persona`, immediately before
+ * an agent-director spawn or resume. A throw is logged with the persona
+ * reference and never reaches the ladder. Returns the guard's undo, if any.
+ */
+function runPreLaunchReplyGuard(persona: Persona, ref: string): ReplyGuardUndo | undefined {
+  if (!preLaunchReplyGuard) return undefined
+  try {
+    return preLaunchReplyGuard(persona) ?? undefined
+  } catch (err) {
+    console.error(`[slack] spawnForPersona: pre-launch reply guard failed for ${ref} — launching anyway: ${describeThrownValue(err)}`)
+    return undefined
+  }
+}
+
+/** Run a reply-guard undo; a throw is logged and never reaches the ladder. */
+function undoPreLaunchReplyGuard(undo: ReplyGuardUndo | undefined, ref: string): void {
+  if (!undo) return
+  try {
+    undo()
+  } catch (err) {
+    console.error(`[slack] spawnForPersona: undoing the pre-launch reply guard failed for ${ref}: ${describeThrownValue(err)}`)
+  }
+}
+
+/**
+ * An agent-director call that starts the persona's instance (`client.spawn`
+ * or `client.resume`), preceded immediately by the reply-guard steps. Every
+ * spawn and resume in the ladder goes through here except the optimistic
+ * first spawn, which also undoes the steps when it meets a live instance.
+ */
+function launchWithReplyGuard<T>(
+  persona: Persona,
+  ref: string,
+  call: (client: Client) => Promise<T>,
+): Promise<T> {
+  runPreLaunchReplyGuard(persona, ref)
+  return withSpawnDetection(persona.key, persona.working_directory, call)
+}
+
 /**
  * In-flight launches by persona key (b.av2 SR-6.3): at most one ladder per
  * persona runs at a time. Holds only unsettled launches; an entry is removed
@@ -1921,7 +1997,10 @@ export function isLaunchInFlight(key: string): boolean {
  *    module's `launchSession` both come through here. Keys are independent.
  * 3. Run the installed pre-launch trust patcher for the persona (b.av2
  *    SR-6.2) once, before any spawn or resume the ladder makes.
- *    Then attempt `client.spawn(...)`. On success → done.
+ *    Then attempt `client.spawn(...)`. On success → done. Every spawn and
+ *    resume below is immediately preceded by the installed pre-launch reply
+ *    guard (b.av2 SR-9.4); the optimistic spawn undoes its reply-guard steps
+ *    on `ErrInstanceIdCollision`, so a reconnect or no-op changes nothing.
  * 4. `ErrInstanceIdCollision` → `client.get(...)`, then:
  *    - the row's `cwd` differs from the persona's working_directory by real
  *      path (`compareRowToPersona`) → kill + delete + fresh spawn, whatever
@@ -1982,7 +2061,15 @@ async function runPersonaLadder(
   runPreLaunchTrustPatch(persona, ref)
 
   // Attempt fresh spawn ---
+  // b.av2 SR-9.4: the reply-guard steps run immediately before every spawn or
+  // resume, never on a path that only reconnects to a live instance or does
+  // nothing. This optimistic spawn is a launch only when no row exists; a
+  // collision means an instance already exists, so its steps are undone
+  // (record, launched-with dir and hook install restored) and any later spawn
+  // or resume below runs them again.
+  let replyGuardUndo: ReplyGuardUndo | undefined
   try {
+    replyGuardUndo = runPreLaunchReplyGuard(persona, ref)
     const r = await withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
     console.error(`[slack] spawnForPersona: spawned ${ref} instanceId=${r.claude_instance_id}`)
     await approvePreSessionDialogs(key, isStartup, ref)
@@ -1990,6 +2077,7 @@ async function runPersonaLadder(
   } catch (err) {
     if (err instanceof ErrInstanceIdCollision) {
       // Collision → fall through to get-then-act
+      undoPreLaunchReplyGuard(replyGuardUndo, ref)
       console.error(`[slack] spawnForPersona: ErrInstanceIdCollision for ${ref} — fetching current state`)
     } else if (err instanceof ErrTmuxSessionCreate) {
       // b.vub: fresh spawn collided on the deterministic tmux session name held
@@ -2040,7 +2128,7 @@ async function runPersonaLadder(
       // Race: row deleted between spawn-collision and get. Retry spawn once.
       console.error(`[slack] spawnForPersona: ErrSpawnNotFound after collision for ${ref} — retrying spawn (single retry)`)
       try {
-        const r = await withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
+        const r = await launchWithReplyGuard(persona, ref, (client) => client.spawn(params))
         console.error(`[slack] spawnForPersona: retry-spawn succeeded for ${ref} instanceId=${r.claude_instance_id}`)
         await approvePreSessionDialogs(key, isStartup, ref)
         return { key, action: 'spawned' }
