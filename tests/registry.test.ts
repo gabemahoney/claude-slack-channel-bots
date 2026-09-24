@@ -27,7 +27,6 @@ import {
   registerSession,
   unregisterSession,
   unregisterByMcpSessionId,
-  getSessionByCwd,
   getSessionByPersona,
   registerMcpSessionId,
   resolveTransportForRequest,
@@ -313,23 +312,6 @@ describe('registerSession / unregisterSession / getSessionByPersona', () => {
     expect(unregisterByMcpSessionId('mcp-1')).toBe('persona_a')
     expect(entry.connected).toBe(false)
     expect(getSessionByPersona('persona_a')).toBeUndefined()
-  })
-})
-
-describe('getSessionByCwd (real path)', () => {
-  test('returns the session for its working directory; undefined for another', () => {
-    const entry = registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer())
-
-    expect(getSessionByCwd(h.alpha.working_directory)).toBe(entry)
-    expect(getSessionByCwd(h.beta.working_directory)).toBeUndefined()
-  })
-
-  test('a symlink to a registered session working directory finds that session', () => {
-    const entry = registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer())
-    const link = join(h.dir, 'alpha-link')
-    symlinkSync(h.alpha.working_directory, link)
-
-    expect(getSessionByCwd(link)).toBe(entry)
   })
 })
 

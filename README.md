@@ -177,8 +177,6 @@ A skeleton file is created by postinstall. Populate it before running `start`.
     "C0123456789": { "cwd": "~/projects/alpha" },
     "C9876543210": { "cwd": "~/projects/beta" }
   },
-  "default_route": "~/projects/alpha",
-  "default_dm_session": "~/projects/alpha",
   "bind": "127.0.0.1",
   "port": 3100,
   "session_restart_delay": 60,
@@ -195,8 +193,6 @@ A skeleton file is created by postinstall. Populate it before running `start`.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `routes` | object | required | Map of Slack channel ID → route entry. Each entry requires a `cwd` field: the working directory for that session. Used to identify sessions via `roots/list` after MCP handshake. `~` is expanded. Each `cwd` must be unique across all routes. May also include an optional `claude_config_dir` string (see below). |
-| `default_route` | string | — | CWD path to use when a message arrives on a channel with no explicit entry in `routes`. Must match an existing route `cwd`. The channel also needs a `channels` entry in `access.json`, or its messages are dropped. Channels that are in `routes` but whose session is not yet registered have their messages dropped — they do not fall back to `default_route`. |
-| `default_dm_session` | string | — | CWD path of the session that handles direct messages. Must match an existing route `cwd`. |
 | `bind` | string | `"127.0.0.1"` | Interface the HTTP server binds to. Use `"0.0.0.0"` to expose on all interfaces. The in-process cron scheduler delivers via `127.0.0.1`, so `bind` must include loopback (the default, or `0.0.0.0`) for scheduled fires to work. |
 | `port` | number | `3100` | Port the HTTP server listens on. |
 | `session_restart_delay` | number | `60` | Seconds to wait before auto-restarting a dead session. Set to `0` to disable auto-restart. Must be non-negative. |
@@ -265,23 +261,12 @@ A per-route opt-out only *fully* disables the guard for that bot when the route 
 
 `access.json` is read from `~/.claude/channels/slack/access.json` by default (same directory as `config.json`). A skeleton file with defaults is created by postinstall. The file is written with `0600` permissions.
 
-Channels with a `routes` entry in `config.json` are automatically allowed — you do not need to list them here. Add a `channels` entry for per-channel overrides like requiring @mentions or restricting which users can trigger the bot, or to let a channel with no `routes` entry reach `default_route` (an empty `{}` entry is enough).
-
-The `slack-channel-access` skill manages pairings and allowlist entries at runtime.
+`access.json` controls only the acknowledgement reaction and how long replies are chunked. Which messages a bot receives is set by `routes` in `config.json` (see [Messages a bot receives](#messages-a-bot-receives)).
 
 #### Complete example
 
 ```json
 {
-  "dmPolicy": "pairing",
-  "allowFrom": ["U0123456789"],
-  "channels": {
-    "C9876543210": {
-      "requireMention": true,
-      "allowFrom": ["U0123456789", "U9876543210"]
-    }
-  },
-  "pending": {},
   "ackReaction": "eyes",
   "textChunkLimit": 3000,
   "chunkMode": "newline"
@@ -292,12 +277,6 @@ The `slack-channel-access` skill manages pairings and allowlist entries at runti
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `dmPolicy` | `"pairing"` \| `"allowlist"` \| `"disabled"` | `"pairing"` | Controls who can DM the bot. `pairing`: unknown users receive a one-time code and are added to `allowFrom` after verification. `allowlist`: only users in `allowFrom` are accepted. `disabled`: all DMs are dropped. |
-| `allowFrom` | string[] | `[]` | Slack user IDs allowed to DM the bot unconditionally (regardless of `dmPolicy`). |
-| `channels` | object | `{}` | Per-channel policies. Channels with a `routes` entry in `config.json` are allowed automatically. Add an entry to customize behavior (e.g. require @mention or restrict users), or to admit a channel with no `routes` entry so it reaches `default_route`. Each entry is a `ChannelPolicy`. |
-| `channels[id].requireMention` | boolean | `false` | When `true`, messages in that channel are only delivered if the bot is `@mentioned`. |
-| `channels[id].allowFrom` | string[] | `[]` | When non-empty, restricts delivery to the listed Slack user IDs for that channel. |
-| `pending` | object | `{}` | Managed by the server. Stores in-flight pairing codes indexed by code string. Do not edit manually. |
 | `ackReaction` | string | — | Emoji name (without colons) to react with when a message is received and dispatched. Automatically removed when the bot sends its first reply. |
 | `textChunkLimit` | number | — | Maximum character count per Slack message when chunking long replies. Controlled by the `reply` tool. |
 | `chunkMode` | `"length"` \| `"newline"` | — | How to split overlong replies. `length`: hard split at `textChunkLimit` characters. `newline`: split at newline boundaries without exceeding `textChunkLimit`. |
@@ -651,9 +630,9 @@ Every message reaches a bot as its text wrapped in a `<channel source="slack-cha
 
 | Source | How it gets to the bot | Tag attributes | Reminder? |
 |---|---|---|---|
-| Direct message | Goes only to the bot whose `cwd` is `default_dm_session`. Dropped if that is unset or the bot is down. `dmPolicy` and `allowFrom` in `access.json` control who can DM. | `chat_id="D…"`, `user` = the sender's Slack display name (falling back to real name, then Slack username, then user ID), `message_id` and `ts` = the Slack timestamp (for example `1789936743.069939`). Also `thread_ts` for a thread reply, and `attachment_count` and `attachments` when files are attached. | Yes, direct-message wording |
-| Channel message that @mentions the bot | Goes to the channel's bot: its `routes` entry, or `default_route` for a channel with no `routes` entry that is listed under `channels` in `access.json` (unlisted, it is dropped). The bot's @mention is removed from the text. | Same as a direct message, with the channel ID in `chat_id` | Yes, channel wording |
-| Channel message, when the bot receives everything | By default a bot receives every message in its channel. Setting `requireMention: true` for the channel in `access.json` limits it to @mentions, and `channels[id].allowFrom` limits who it hears. | Same as the @mention row | Yes, channel wording |
+| Direct message | Not delivered to any bot in this version. The server drops it and logs `persona-dm-dropped` lines, one for each bot. | — | — |
+| Channel message that @mentions the bot | Goes to the bot routed to that channel in `routes`. The bot's @mention is removed from the text. A message in a channel with no route is not delivered. | `chat_id` = the channel ID, `user` = the sender's Slack display name (falling back to real name, then Slack username, then user ID), `message_id` and `ts` = the Slack timestamp (for example `1789936743.069939`). Also `thread_ts` for a thread reply, and `attachment_count` and `attachments` when files are attached. | Yes, channel wording |
+| Channel message, when the bot receives everything | A bot receives every message in its routed channel, from any sender other than itself. | Same as the @mention row | Yes, channel wording |
 | cscb_cron scheduled prompt | The server's scheduler posts it to `/interject` for the target channel. | `chat_id` = the target channel, `user="cscb-cron:<prompt-file-basename>"`, `message_id` and `ts` = the server clock in seconds, with at most three decimal places | No |
 | `/interject` message | A localhost script POSTs it (see [Interject](#interject)). | `chat_id` = the request's `channel`, `user` = the request's `sender` (default `interject`), `message_id` and `ts` in the same form as a scheduled prompt | No |
 
@@ -732,13 +711,19 @@ If the tag or any of those attributes no longer appears, the guard is dark or mi
 If a Claude Code session connects but immediately disconnects, the session's actual CWD does not match any `cwd` in `config.json`. The session's working directory is compared with each configured `cwd` by real path (after tilde expansion, with symlinks resolved), so a symlinked path to the same directory also matches. If a second session connects from the same directory, it replaces the first. Duplicate CWDs across multiple routes are rejected at startup.
 
 **Bot not receiving messages in a new channel**
-After inviting the bot to a channel, Slack may not deliver messages until the bot is @mentioned for the first time. This is a Slack Socket Mode behavior — the first @mention activates event delivery for that channel. After that, all messages flow normally regardless of `requireMention` settings.
+After inviting the bot to a channel, Slack may not deliver messages until the bot is @mentioned for the first time. This is a Slack Socket Mode behavior — the first @mention activates event delivery for that channel. After that, all messages flow normally.
 
 **File attachment fails after a long wait**
 Each attempt of a Slack request is limited to 30 s, and that includes uploading a file attached with `reply`. An upload that takes longer than 30 s fails on every attempt, so the tool returns an error only after about 30 minutes, once the standard retries are spent. This is not a hang: send smaller files, or split a large attachment into several smaller ones.
 
-**Channel not in access.json**
-Messages to channels not listed in `access.json → channels` and not present in `config.json → routes` are silently dropped. Use the `claude-slack-channels-config` skill or edit `access.json` directly to add the channel ID with a `ChannelPolicy` entry.
+**Messages in a channel with no route are not delivered**
+A channel with no entry in `config.json → routes` reaches no bot. Each such message logs `unclaimed-channel` lines naming the channel in `server.log`:
+
+```sh
+grep unclaimed-channel ~/.claude/channels/slack/server.log
+```
+
+Add a `routes` entry for the channel and restart the server.
 
 **Permission relay not working**
 Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json`.

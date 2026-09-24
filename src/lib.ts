@@ -2,8 +2,10 @@
  * lib.ts — Pure, testable functions extracted from the Slack Channel MCP server.
  *
  * All functions here are side-effect-free (or accept their dependencies as
- * parameters) so they can be imported by server.test.ts without starting the
- * Slack socket or loading credentials.
+ * parameters) so they can be imported by tests without starting the Slack
+ * socket or loading credentials: the stream-presence check, the `access.json`
+ * settings model (ack reaction and reply chunking, until E9), the file
+ * exfiltration guard, text chunking and attachment-name sanitising.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -12,23 +14,24 @@ import { resolve } from 'path'
 import { resolveRealPath } from './config.ts'
 
 // ---------------------------------------------------------------------------
-// Constants (re-exported so server.ts and tests share the same values)
+// MCP transport stream presence
 // ---------------------------------------------------------------------------
 
 // True iff the standalone GET SSE stream entry "_GET_stream" is present in the
-// MCP SDK transport's internal _streamMapping — used by handleMessage to detect
-// silent-drop conditions before forwarding a Slack message.
+// MCP SDK transport's internal _streamMapping. Used by persona-routing.ts's
+// dispatch path (on the exact session it sends to) and its stream-presence
+// probe (`hasSessionStream`) to detect silent-drop conditions before
+// forwarding a Slack message.
 export function hasGetStreamKey(transport: unknown): boolean {
   const mapping = (transport as any)?._streamMapping
   return typeof mapping?.has === 'function' && mapping.has('_GET_stream')
 }
 
-export const MAX_PENDING = 3
-export const MAX_PAIRING_REPLIES = 2
-export const PAIRING_EXPIRY_MS = 60 * 60 * 1000 // 1 hour
-
 // ---------------------------------------------------------------------------
-// Types
+// Access model (access.json)
+//
+// Kept as stored until E9 removes it. Only `ackReaction` and the chunk
+// settings are read; the other fields no longer affect delivery.
 // ---------------------------------------------------------------------------
 
 export type DmPolicy = 'pairing' | 'allowlist' | 'disabled'
@@ -56,15 +59,6 @@ export interface Access {
   chunkMode?: 'length' | 'newline'
 }
 
-export type GateAction = 'deliver' | 'drop' | 'pair'
-
-export interface GateResult {
-  action: GateAction
-  access?: Access
-  code?: string
-  isResend?: boolean
-}
-
 // ---------------------------------------------------------------------------
 // Access helpers
 // ---------------------------------------------------------------------------
@@ -76,24 +70,6 @@ export function defaultAccess(): Access {
     channels: {},
     pending: {},
   }
-}
-
-export function pruneExpired(access: Access): void {
-  const now = Date.now()
-  for (const [code, entry] of Object.entries(access.pending)) {
-    if (entry.expiresAt <= now) {
-      delete access.pending[code]
-    }
-  }
-}
-
-export function generateCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' // No 0/O/1/I confusion
-  let code = ''
-  for (let i = 0; i < 6; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)]
-  }
-  return code
 }
 
 // ---------------------------------------------------------------------------
@@ -171,118 +147,4 @@ export function chunkText(text: string, limit: number, mode: 'length' | 'newline
 
 export function sanitizeFilename(name: string): string {
   return name.replace(/[\[\]\n\r;]/g, '_').replace(/\.\./g, '_')
-}
-
-// ---------------------------------------------------------------------------
-// Gate function
-//
-// Accepts access state and a saveAccess callback as parameters rather than
-// calling module-level singletons, making it fully testable in isolation.
-// ---------------------------------------------------------------------------
-
-export interface GateOptions {
-  /** Pre-loaded, pre-pruned access state */
-  access: Access
-  /** Whether we're in static mode (no persistence writes) */
-  staticMode: boolean
-  /** Persist the mutated access object (only called when staticMode is false) */
-  saveAccess: (access: Access) => void
-  /** Current bot user ID for mention detection */
-  botUserId: string
-  /**
-   * Set of channel IDs from config.json. Any channel in this set is
-   * implicitly opted-in even if it has no entry in access.json's channels map.
-   * access.json entries still take precedence for per-channel overrides.
-   */
-  routeChannels?: ReadonlySet<string>
-}
-
-export async function gate(event: unknown, opts: GateOptions): Promise<GateResult> {
-  const ev = event as Record<string, unknown>
-
-  // 1. Drop our own bot messages (but allow messages from other bots)
-  if (ev['bot_id'] && ev['user'] === opts.botUserId) return { action: 'drop' }
-
-  // 2. Drop non-message subtypes (message_changed, message_deleted, etc.)
-  if (ev['subtype'] && ev['subtype'] !== 'file_share') return { action: 'drop' }
-
-  // 3. No user ID = drop
-  if (!ev['user']) return { action: 'drop' }
-
-  const { access, staticMode, saveAccess, botUserId } = opts
-
-  // 4. DM handling
-  if (ev['channel_type'] === 'im') {
-    const userId = ev['user'] as string
-
-    if (access.allowFrom.includes(userId)) {
-      return { action: 'deliver', access }
-    }
-    if (access.dmPolicy === 'allowlist' || access.dmPolicy === 'disabled') {
-      return { action: 'drop' }
-    }
-
-    // Pairing mode — check if there's already a pending code for this user
-    for (const [code, entry] of Object.entries(access.pending)) {
-      if (entry.senderId === userId) {
-        if (entry.replies < MAX_PAIRING_REPLIES) {
-          entry.replies++
-          if (!staticMode) saveAccess(access)
-          return { action: 'pair', code, isResend: true }
-        }
-        return { action: 'drop' } // Hit reply cap
-      }
-    }
-
-    // Cap total pending
-    if (Object.keys(access.pending).length >= MAX_PENDING) {
-      return { action: 'drop' }
-    }
-
-    // Generate new pairing code
-    const code = generateCode()
-    access.pending[code] = {
-      senderId: userId,
-      chatId: ev['channel'] as string,
-      createdAt: Date.now(),
-      expiresAt: Date.now() + PAIRING_EXPIRY_MS,
-      replies: 1,
-    }
-    if (!staticMode) saveAccess(access)
-    return { action: 'pair', code, isResend: false }
-  }
-
-  // 5. Channel handling — opt-in per channel ID
-  //
-  // A channel is allowed if it has an explicit entry in access.json OR if it
-  // appears in config.json (routeChannels). Channels in config.json are
-  // implicitly opted-in; access.json entries provide per-channel overrides
-  // (requireMention, allowFrom). If neither applies, drop.
-  const channel = ev['channel'] as string
-  const { routeChannels } = opts
-  const isRouted = routeChannels ? routeChannels.has(channel) : false
-  const policy = access.channels[channel]
-
-  if (!policy && !isRouted) return { action: 'drop' }
-
-  // Use the explicit policy if present, otherwise fall back to permissive defaults.
-  // Merge with defaults so partial entries (e.g. missing allowFrom) don't crash.
-  const defaults = { requireMention: false, allowFrom: [] as string[] }
-  const effectivePolicy = policy ? { ...defaults, ...policy } : defaults
-
-  if (effectivePolicy.allowFrom.length > 0 && !effectivePolicy.allowFrom.includes(ev['user'] as string)) {
-    return { action: 'drop' }
-  }
-
-  if (effectivePolicy.requireMention && !isMentioned(ev, botUserId)) {
-    return { action: 'drop' }
-  }
-
-  return { action: 'deliver', access }
-}
-
-function isMentioned(event: Record<string, unknown>, botUserId: string): boolean {
-  if (!botUserId) return false
-  const text = (event['text'] as string | undefined) || ''
-  return text.includes(`<@${botUserId}>`)
 }

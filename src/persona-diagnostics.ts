@@ -19,7 +19,8 @@
  * These lines never go to `startup-errors.log`, and no log file is added.
  *
  * The label set grows as later work lands (E2 Task 2 added credentials-refused
- * and Slack-unreachable, E2 Task 3 connection lost/restored; later Epics theirs).
+ * and Slack-unreachable, E2 Task 3 connection lost/restored, E3 Task 7 the
+ * unclaimed channel and the interim DM drop; later Epics theirs).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -68,6 +69,20 @@ export const PERSONA_DIRECTORY_MISSING = 'persona-directory-missing'
 /** The working directory is not a usable directory, or is another applied persona's. */
 export const PERSONA_DIRECTORY_UNUSABLE = 'persona-directory-unusable'
 
+/**
+ * A message arrived in a channel that no applied persona lists (b.av2 SR-4.2,
+ * SR-10.3). Logged by each receiving persona; the cause names the channel.
+ * Not logged when another applied persona lists the channel.
+ */
+export const UNCLAIMED_CHANNEL = 'unclaimed-channel'
+
+/**
+ * Interim: a direct message reached a persona and was dropped, because DMs are
+ * not delivered yet whatever `dm.enabled` says. The cause names the
+ * conversation. Replaced when DM delivery lands.
+ */
+export const PERSONA_DM_DROPPED = 'persona-dm-dropped'
+
 /** Every persona diagnostic class label, in a fixed order. */
 export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_CREDENTIALS_MISSING,
@@ -79,6 +94,8 @@ export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_CONNECTION_RESTORED,
   PERSONA_DIRECTORY_MISSING,
   PERSONA_DIRECTORY_UNUSABLE,
+  UNCLAIMED_CHANNEL,
+  PERSONA_DM_DROPPED,
 ] as const
 
 /** A persona diagnostic class label (closed set). */

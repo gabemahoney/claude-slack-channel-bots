@@ -47,8 +47,8 @@ export interface HealthCheckDeps {
    * must not schedule more restarts once a cap has been signalled.
    * Inbound user messages do NOT re-arm recovery for a capped persona: a
    * capped-dead persona has no registered session, so inbound messages are
-   * dropped before reaching scheduleRestart (see the no-live-session branch
-   * of `handleMessage` in src/server.ts).
+   * dropped before reaching scheduleRestart (see the lost-message branch
+   * in src/persona-routing.ts, which checks the cap itself).
    * Recovery for such a persona comes from a server restart, which clears the
    * in-process backoff/cap state on boot.
    */
@@ -158,8 +158,8 @@ export function startHealthCheck(intervalSeconds: number): void {
           // restarts for personas that have reached the consecutive-failure cap.
           // The cap is not clearable from the inbound message path: a capped-dead
           // persona has no registered session, so inbound messages are dropped
-          // (the no-live-session branch of `handleMessage` in src/server.ts) and
-          // never reach scheduleRestart. The in-process cap/backoff state clears
+          // (the lost-message branch in src/persona-routing.ts, which checks the
+          // cap itself) and never reach scheduleRestart. The in-process cap/backoff state clears
           // only on a server restart.
           //
           // b.9a7 design decision 1 (DELIBERATE): this skip covers the new

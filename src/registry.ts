@@ -314,23 +314,6 @@ export function unregisterSession(personaKey: string): void {
   console.error(`[registry] Unregistered session for persona=${personaKey}`)
 }
 
-/**
- * Look up a session by its working directory, compared by real path
- * (`resolveRealPath`). `cwd` must already be tilde-expanded.
- * Linear search through registry values since the registry is keyed by
- * persona key.
- *
- * TRANSITIONAL — only the `default_route` / `default_dm_session` lookups in
- * `server.ts` use this; removed with them in E3 Task 7.
- */
-export function getSessionByCwd(cwd: string): SessionEntry | undefined {
-  const target = resolveRealPath(cwd)
-  for (const entry of registry.values()) {
-    if (resolveRealPath(entry.cwd) === target) return entry
-  }
-  return undefined
-}
-
 /** Look up the session registered for a persona key. */
 export function getSessionByPersona(
   personaKey: string,

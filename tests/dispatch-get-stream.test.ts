@@ -1,219 +1,134 @@
 /**
- * dispatch-get-stream.test.ts — Tests for the b.sjy instrumentation patch and
- * the b.9cj streamless-deliver rewrite of handleMessage.
+ * dispatch-get-stream.test.ts — the b.sjy instrumentation and the b.9cj
+ * streamless-dispatch branch, per persona.
  *
- * Verifies the dispatch-site logic in handleMessage (server.ts:780-836):
- *   - When _GET_stream is absent from transport._streamMapping, the branch does
- *     NOT call notification() (the SDK's send() would evaporate silently).
- *     Instead it selects a three-state reply and, only in the recover case,
- *     calls scheduleRestart keyed to the session's OWNING channel with
- *     { humanTrigger: true }, then replies to the INBOUND channel and returns.
- *   - When _GET_stream IS present, notification() fires and nothing else.
+ * When the receiving persona P has a connected session whose transport has
+ * lost its standalone GET stream (`_GET_stream`), the MCP SDK's send() would
+ * evaporate silently. The dispatch path in src/persona-routing.ts therefore
+ * does NOT call notification(): it applies the restart guards for P, schedules
+ * a human-triggered restart of P in the session's cwd (recover case only) and
+ * replies in the source channel through P's own client. When the stream is
+ * present, notification() fires with `chat_id` = the source channel and
+ * nothing else happens.
  *
- * handleMessage cannot be imported directly (server.ts has module-scope side
- * effects: Slack client init, token load, etc.). We follow the same pattern as
- * dm-routing.test.ts — replicate only the relevant sub-logic in a
- * simulateDispatch helper and test it in isolation.
- *
- * REPLICATION GAP (honestly stated): simulateDispatch re-implements the
- * server.ts branch; it cannot catch the *call* to hasGetStreamKey being deleted
- * from server.ts, nor the reply strings drifting in server.ts. To narrow the
- * string gap, the reply constants below are asserted against by name; if a
- * source string changes, update the constant here in the same change. The
- * scheduleRestart / isRestartPendingOrActive / isAtCap composition is the REAL
- * restart.ts + backoff.ts machinery (not stubbed), so the three-state guard
- * (already-restarting / auto-restart-disabled / capped / recover) is genuinely
- * exercised.
+ * These tests drive the real module (`createPersonaRouting(deps).receive`)
+ * through the shared harness (tests/test-helpers/persona-routing-harness.ts)
+ * with a persona registered in the real registry, the real restart.ts and
+ * backoff.ts state, and one `makeStubSlack` client per persona. The receiving
+ * persona (alpha) is the SECOND persona of the config, and each case also
+ * checks that the first persona (beta) got no restart and no post. The
+ * stream-presence probe is the module's exported `hasSessionStream`, the one
+ * the restart guard and the health check also use. The no-session branch
+ * (b.kvq) is covered by tests/inbound-recovery-drop-branch.test.ts.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { _resetRegistry, registerSession, getSessionByPersona } from '../src/registry.ts'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { registerSession } from '../src/registry.ts'
 import { hasGetStreamKey } from '../src/lib.ts'
 import {
   initRestart,
   scheduleRestart,
   isRestartPendingOrActive,
-  cancelAllRestartTimers,
-  _resetRestartState,
   RESTART_FAILURE_CAP,
-  type RestartDeps,
 } from '../src/restart.ts'
-import { isAtCap, recordFailure, _resetBackoffState } from '../src/backoff.ts'
+import { recordFailure } from '../src/backoff.ts'
+import type { Persona } from '../src/config.ts'
+import {
+  hasSessionStream,
+  LOST_MESSAGE_AUTO_RESTART_DISABLED_REPLY,
+  LOST_MESSAGE_CAPPED_REPLY,
+  LOST_MESSAGE_RESTARTING_REPLY,
+} from '../src/persona-routing.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
+import { makeChannelMessage } from './test-helpers/slack-stub.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
+import {
+  makeRestartDeps,
+  makeRoutingHarness,
+  makeSessionServer,
+  makeTransport,
+  resetRoutingState,
+  NEVER_FIRE_RESTART_DELAY_S,
+  type RoutingHarness,
+  type RoutingHarnessOptions,
+} from './test-helpers/persona-routing-harness.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Large enough that the timer never fires during any test. */
-const NEVER_FIRE_DELAY_S = 9999
+const FAST_DELAY_S = 0.01
+const WAIT_MS = 50
+
+/** Alpha's two channels; the message arrives in the second (non-first) one. */
+const ALPHA_FIRST = 'C0ALPHA01'
+const ALPHA_SECOND = 'C0ALPHA02'
 
 // ---------------------------------------------------------------------------
-// Factory helpers
+// Harness: beta (first, no session) and alpha (second, the receiving persona,
+// with one registered session whose stream is present or not)
 // ---------------------------------------------------------------------------
 
-/** Minimal transport stub. _streamMapping controls _GET_stream presence. */
-function makeTransport(hasGetStream: boolean): any {
-  const streamMapping = new Map<string, unknown>()
-  if (hasGetStream) {
-    streamMapping.set('_GET_stream', { controller: { enqueue: () => {} }, encoder: new TextEncoder() })
-  }
-  return {
-    _streamMapping: streamMapping,
-    sessionId: 'test-mcp-session-id',
-    handleRequest: () => {},
-    close: async () => {},
-  }
-}
+let dir: string
+let harnesses: RoutingHarness[] = []
 
-/** Minimal MCP server stub. */
-function makeServer(): { server: any; notifications: any[] } {
-  const notifications: any[] = []
-  return {
-    server: {
-      connect: async () => {},
-      notification: (msg: any) => { notifications.push(msg) },
+type Alpha = { h: RoutingHarness; alpha: Persona; beta: Persona; sessionCwd: string }
+
+function makeAlpha(opts: {
+  hasGetStream: boolean
+  sessionRestartDelay?: number
+  restartDelayS?: number
+  launchSession?: RoutingHarnessOptions['launchSession']
+}): Alpha {
+  const h = makeRoutingHarness(
+    [
+      { name: 'beta' },
+      { name: 'alpha', channels: [{ id: ALPHA_FIRST, delivery: 'all' }, { id: ALPHA_SECOND, delivery: 'all' }] },
+    ],
+    dir,
+    {
+      sessions: ['alpha'],
+      streamless: opts.hasGetStream ? [] : ['alpha'],
+      overrides: { session_restart_delay: opts.sessionRestartDelay ?? 60 },
+      restartDelayS: opts.restartDelayS ?? NEVER_FIRE_RESTART_DELAY_S,
+      launchSession: opts.launchSession,
     },
-    notifications,
-  }
+  )
+  harnesses.push(h)
+  const [beta, alpha] = h.config!.personas as [Persona, Persona]
+  return { h, alpha, beta, sessionCwd: h.p('alpha').sessionCwd! }
 }
 
-/**
- * Stub RestartDeps with a large delay (timer never fires) so we can use
- * isRestartPendingOrActive() as a synchronous proxy for "was scheduleRestart called".
- */
-function makeRestartDeps(): RestartDeps {
-  return {
-    async isSessionAlive() { return false },
-    isSessionConnected() { return false },
-    hasSessionStream() { return true },
-    async reconnectSession() {},
-    async killSession() {},
-    async launchSession() { return true },
-    getRestartDelay: () => NEVER_FIRE_DELAY_S,
-    isShuttingDown: () => false,
-    onCapReached: (_channelId) => { /* no-op stub */ },
-  }
+/** Deliver one message to alpha in its second channel; returns alpha's session's notifications. */
+async function dispatchToAlpha(a: Alpha): Promise<RoutingHarness['all'][number]['notifications']> {
+  await a.h.receive(makeChannelMessage({ channel: ALPHA_SECOND, text: 'hello' }), ['alpha'])
+  return a.h.p('alpha').notifications
 }
 
-// ---------------------------------------------------------------------------
-// Reply-string constants — kept in lock-step with src/server.ts:807-829.
-// These mirror the source three-state reply text. Asserting toBe(<CONSTANT>)
-// is only as honest as this replication; if a source string changes it must be
-// changed here too (see REPLICATION GAP in the file header).
-// ---------------------------------------------------------------------------
-
-/** server.ts alreadyRestarting AND recover branches share this string. */
-const RESTARTING_REPLY =
-  'Your message was not delivered. The session is restarting — please retry in a moment.'
-
-/** server.ts autoRestartDisabled branch. */
-const AUTO_DISABLED_REPLY =
-  'Your message was not delivered and was not saved. Auto-restart is disabled for this channel, ' +
-  'so it will NOT recover on its own — an operator must restart the server.'
-
-/** server.ts capped branch. */
-const CAPPED_REPLY =
-  'Your message was not delivered and was not saved. This channel has hit its restart-failure limit ' +
-  'and will NOT recover on its own — an operator must restart the server.'
-
-type ReplyVariant = 'restarting' | 'auto-disabled' | 'capped'
-
-/**
- * Simulate the streamless dispatch branch in handleMessage (server.ts:780-836).
- *
- * Mirrors the b.9cj rewrite faithfully, keeping the two channel identities the
- * source distinguishes:
- *   - ownerChannelId = targetSession.personaKey (the owning channel ID under the
- *     route->persona adapter) — everything recovery-keyed
- *     (isRestartPendingOrActive, backoffIsAtCap, scheduleRestart) uses THIS.
- *   - inboundChannelId — the channel the message arrived on; the reply posts
- *     HERE. When a session is resolved via default_route/DM these differ, and
- *     mis-keying recovery to the inbound channel is the bug this guards.
- *
- * Three-state reply (server.ts order): alreadyRestarting → RESTARTING_REPLY (no
- * new launch); autoRestartDisabled (session_restart_delay === 0) →
- * AUTO_DISABLED_REPLY; capped → CAPPED_REPLY; else → scheduleRestart(owner, cwd,
- * undefined, { humanTrigger: true }) then RESTARTING_REPLY. scheduleRestart is
- * called ONLY in the else branch. notification() is NEVER called on this branch.
- *
- * Uses the REAL isRestartPendingOrActive / isAtCap / scheduleRestart, so the
- * guard is genuinely exercised over restart.ts + backoff.ts state.
- */
-function simulateStreamlessDispatch(
-  ownerChannelId: string,
-  inboundChannelId: string,
-  cwd: string,
-  transport: any,
-  server: any,
-  sessionRestartDelay: number,
-  postMessage: (channelId: string, text: string) => void,
-): { notificationCalled: boolean; variant: ReplyVariant; scheduled: boolean } {
-  // This helper only models the streamless branch; caller guarantees no stream.
-  if (hasGetStreamKey(transport)) {
-    throw new Error('simulateStreamlessDispatch called with a stream-present transport')
-  }
-
-  const alreadyRestarting = isRestartPendingOrActive(ownerChannelId)
-  const autoRestartDisabled = (sessionRestartDelay ?? 60) === 0
-  const capped = isAtCap(ownerChannelId, RESTART_FAILURE_CAP)
-
-  let variant: ReplyVariant
-  let scheduled = false
-  let replyText: string
-  if (alreadyRestarting) {
-    variant = 'restarting'
-    replyText = RESTARTING_REPLY
-  } else if (autoRestartDisabled) {
-    variant = 'auto-disabled'
-    replyText = AUTO_DISABLED_REPLY
-  } else if (capped) {
-    variant = 'capped'
-    replyText = CAPPED_REPLY
-  } else {
-    scheduleRestart(ownerChannelId, cwd, undefined, { humanTrigger: true })
-    scheduled = true
-    variant = 'restarting'
-    replyText = RESTARTING_REPLY
-  }
-
-  // Reply posts to the INBOUND channel, not the owner.
-  postMessage(inboundChannelId, replyText)
-  return { notificationCalled: false, variant, scheduled }
+/** The first persona (beta) got no restart and no post. */
+function expectBetaUntouched(a: Alpha): void {
+  expect(isRestartPendingOrActive(a.beta.key)).toBe(false)
+  expect(a.h.allPosts().filter((p) => p.key === a.beta.key)).toEqual([])
 }
-
-/** Stream-PRESENT branch: notification() fires, nothing else. */
-function simulateStreamDispatch(
-  channelId: string,
-  transport: any,
-  server: any,
-): { notificationCalled: boolean } {
-  if (!hasGetStreamKey(transport)) {
-    throw new Error('simulateStreamDispatch called with a streamless transport')
-  }
-  server.notification({
-    method: 'notifications/claude/channel',
-    params: { content: 'hello', meta: { chat_id: channelId } },
-  })
-  return { notificationCalled: true }
-}
-
-// ---------------------------------------------------------------------------
-// Setup / teardown
-// ---------------------------------------------------------------------------
 
 beforeEach(() => {
-  _resetRegistry()
-  _resetRestartState()
-  _resetBackoffState()
-  initRestart(makeRestartDeps())
+  dir = mkdtempSync(join(tmpdir(), 'dispatch-get-stream-'))
+  harnesses = []
+  resetRoutingState()
 })
 
 afterEach(() => {
-  cancelAllRestartTimers()
-  _resetRestartState()
-  _resetBackoffState()
+  try {
+    assertNoLeak(harnesses.map((h) => h.captured()))
+  } finally {
+    resetRoutingState()
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -221,171 +136,156 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('dispatch-site _GET_stream branch (b.sjy + b.9cj)', () => {
-  // Distinct owner vs inbound channels so mis-keying recovery to the inbound
-  // channel (the bug the owner-keying guards) is caught: the session is owned
-  // by OWNER but the message arrives on INBOUND (e.g. via default_route / DM).
-  const OWNER = 'C_OWNER'
-  const INBOUND = 'C_INBOUND'
-  const CWD = '/tmp/streamless-session'
-
   // -------------------------------------------------------------------------
   // Streamless, recover case: no notification, real scheduleRestart keyed to
-  // the OWNER channel (not inbound), reply RESTARTING_REPLY to the INBOUND
-  // channel. Pre-fix this branch called notification() (silently dropped by the
-  // SDK) and never replied to the sender.
+  // the persona (not the source channel), launched in the session's cwd, and
+  // RESTARTING reply to the source channel on the persona's client. Pre-fix
+  // this branch called notification() (silently dropped by the SDK) and never
+  // replied to the sender. The b.sjy instrumentation logs the dispatch line
+  // and the DROP line naming the session.
   // -------------------------------------------------------------------------
-  test('b.9cj streamless recover: no notification(); real scheduleRestart keyed to OWNER; reply to INBOUND', () => {
-    const transport = makeTransport(false) // _GET_stream absent
-    const { server, notifications } = makeServer()
-    const replies: Array<{ channelId: string; text: string }> = []
+  test('b.9cj streamless recover: no notification(); restart keyed to the persona in the session cwd; reply to the source channel', async () => {
+    const a = makeAlpha({ hasGetStream: false, restartDelayS: FAST_DELAY_S })
 
-    const result = simulateStreamlessDispatch(
-      OWNER, INBOUND, CWD, transport, server, 60,
-      (ch, text) => { replies.push({ channelId: ch, text }) },
-    )
+    const notifications = await dispatchToAlpha(a)
 
-    // notification() is NOT called on the streamless branch.
-    expect(result.notificationCalled).toBe(false)
     expect(notifications).toHaveLength(0)
+    // Real scheduleRestart placed a pending timer under the persona key …
+    expect(isRestartPendingOrActive(a.alpha.key)).toBe(true)
+    // … and NOT under the source channel (mis-keying regression).
+    expect(isRestartPendingOrActive(ALPHA_SECOND)).toBe(false)
+    expect(a.h.allPosts()).toEqual([{ key: a.alpha.key, channel: ALPHA_SECOND, text: LOST_MESSAGE_RESTARTING_REPLY }])
+    expectBetaUntouched(a)
+    const ref = renderPersonaRef(a.alpha.name, a.alpha.key)
+    const mcpSessionId = `mcp-${a.alpha.key}`
+    expect(a.h.logs.filter((l) => l.startsWith(`[slack] Dispatching to persona ${ref} chat_id=${ALPHA_SECOND} cwd="${a.sessionCwd}" mcpSessionId=${mcpSessionId} hasGetStream=false connected=true`))).toHaveLength(1)
+    expect(a.h.logs.filter((l) => l.startsWith(`[slack] DROP: no _GET_stream for persona ${ref} chat_id=${ALPHA_SECOND} cwd="${a.sessionCwd}" mcpSessionId=${mcpSessionId}`))).toHaveLength(1)
 
-    // Real scheduleRestart placed a pending timer under the OWNER channel …
-    expect(result.scheduled).toBe(true)
-    expect(isRestartPendingOrActive(OWNER)).toBe(true)
-    // … and NOT under the inbound channel (mis-keying regression).
-    expect(isRestartPendingOrActive(INBOUND)).toBe(false)
-
-    // Reply posted to the INBOUND channel with the honest "restarting" text.
-    expect(result.variant).toBe('restarting')
-    expect(replies).toEqual([{ channelId: INBOUND, text: RESTARTING_REPLY }])
+    // The launch relaunches the session where it ran, not the configured default.
+    await Bun.sleep(WAIT_MS)
+    expect(a.h.launches).toEqual([{ key: a.alpha.key, cwd: a.sessionCwd }])
   })
 
   // -------------------------------------------------------------------------
-  // Streamless, already-restarting: a restart is pending on the OWNER channel,
-  // so no second launch is stacked; still replies "restarting" to INBOUND.
+  // Streamless, already-restarting: a launch for the persona is in flight, so
+  // no second launch is stacked; still replies "restarting". (The recover case
+  // replies the same text, so the launch count is what tells them apart.)
   // -------------------------------------------------------------------------
-  test('b.9cj streamless already-restarting: no new launch, RESTARTING reply', () => {
-    const transport = makeTransport(false)
-    const { server } = makeServer()
-    const replies: Array<{ channelId: string; text: string }> = []
+  test('b.9cj streamless already-restarting: no new launch, RESTARTING reply', async () => {
+    let launchResolve!: (ok: boolean) => void
+    const held = new Promise<boolean>((res) => { launchResolve = res })
+    const a = makeAlpha({ hasGetStream: false, restartDelayS: FAST_DELAY_S, launchSession: () => held })
+    scheduleRestart(a.alpha.key, a.sessionCwd)
+    await Bun.sleep(WAIT_MS) // timer fired; the launch is in flight
+    expect(isRestartPendingOrActive(a.alpha.key)).toBe(true)
 
-    // Prime a pending restart on the OWNER channel.
-    scheduleRestart(OWNER, CWD)
-    expect(isRestartPendingOrActive(OWNER)).toBe(true)
+    const notifications = await dispatchToAlpha(a)
+    await Bun.sleep(WAIT_MS) // a stacked timer would have fired by now
 
-    const result = simulateStreamlessDispatch(
-      OWNER, INBOUND, CWD, transport, server, 60,
-      (ch, text) => { replies.push({ channelId: ch, text }) },
-    )
+    expect(notifications).toHaveLength(0)
+    expect(a.h.launches).toHaveLength(1)
+    expect(a.h.allPosts()).toEqual([{ key: a.alpha.key, channel: ALPHA_SECOND, text: LOST_MESSAGE_RESTARTING_REPLY }])
+    expectBetaUntouched(a)
 
-    // No second scheduleRestart fired from the branch.
-    expect(result.scheduled).toBe(false)
-    expect(result.variant).toBe('restarting')
-    expect(replies).toEqual([{ channelId: INBOUND, text: RESTARTING_REPLY }])
+    launchResolve(true)
+    await Bun.sleep(1)
   })
 
   // -------------------------------------------------------------------------
-  // Streamless, auto-restart disabled (session_restart_delay === 0): no
-  // scheduleRestart, AUTO_DISABLED reply to INBOUND.
+  // Streamless, auto-restart disabled / capped: no scheduleRestart, the
+  // branch's reply to the source channel on the persona's client.
   // -------------------------------------------------------------------------
-  test('b.9cj streamless auto-restart-disabled: no scheduleRestart, AUTO_DISABLED reply', () => {
-    const transport = makeTransport(false)
-    const { server } = makeServer()
-    const replies: Array<{ channelId: string; text: string }> = []
+  test.each([
+    ['auto-restart-disabled (session_restart_delay 0)', 0, false, LOST_MESSAGE_AUTO_RESTART_DISABLED_REPLY],
+    ['capped (persona at the restart-failure cap)', 60, true, LOST_MESSAGE_CAPPED_REPLY],
+  ] as const)('b.9cj streamless %s: no notification(), no scheduleRestart, its reply', async (_label, delay, capped, expected) => {
+    // restart.ts itself could launch (fast delay), so a wrongly scheduled
+    // restart would show up as a launch.
+    const a = makeAlpha({ hasGetStream: false, sessionRestartDelay: delay, restartDelayS: FAST_DELAY_S })
+    if (capped) for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(a.alpha.key)
 
-    const result = simulateStreamlessDispatch(
-      OWNER, INBOUND, CWD, transport, server, 0, // delay 0 → disabled
-      (ch, text) => { replies.push({ channelId: ch, text }) },
-    )
+    const notifications = await dispatchToAlpha(a)
 
-    expect(result.scheduled).toBe(false)
-    expect(isRestartPendingOrActive(OWNER)).toBe(false)
-    expect(result.variant).toBe('auto-disabled')
-    expect(replies).toEqual([{ channelId: INBOUND, text: AUTO_DISABLED_REPLY }])
+    expect(notifications).toHaveLength(0)
+    expect(isRestartPendingOrActive(a.alpha.key)).toBe(false)
+    expect(a.h.allPosts()).toEqual([{ key: a.alpha.key, channel: ALPHA_SECOND, text: expected }])
+    expectBetaUntouched(a)
+    await Bun.sleep(WAIT_MS)
+    expect(a.h.launches).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
-  // Streamless, at the restart-failure cap: no scheduleRestart, CAPPED reply.
-  // Drives the real backoff state to the cap via recordFailure.
+  // Stream-PRESENT branch: notification() fires once to the source channel;
+  // no reply and no restart.
   // -------------------------------------------------------------------------
-  test('b.9cj streamless capped: no scheduleRestart, CAPPED reply', () => {
-    const transport = makeTransport(false)
-    const { server } = makeServer()
-    const replies: Array<{ channelId: string; text: string }> = []
+  test('b.9cj stream-present: one notification() with chat_id = source channel, no reply and no restart', async () => {
+    const a = makeAlpha({ hasGetStream: true })
 
-    // Push the OWNER channel to the failure cap in real backoff state.
-    for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(OWNER)
-    expect(isAtCap(OWNER, RESTART_FAILURE_CAP)).toBe(true)
+    const notifications = await dispatchToAlpha(a)
 
-    const result = simulateStreamlessDispatch(
-      OWNER, INBOUND, CWD, transport, server, 60,
-      (ch, text) => { replies.push({ channelId: ch, text }) },
-    )
-
-    expect(result.scheduled).toBe(false)
-    expect(result.variant).toBe('capped')
-    expect(replies).toEqual([{ channelId: INBOUND, text: CAPPED_REPLY }])
-  })
-
-  // -------------------------------------------------------------------------
-  // Stream-PRESENT branch: notification() fires; no reply, no restart.
-  // -------------------------------------------------------------------------
-  test('b.9cj stream-present: notification() fires, no reply and no restart', () => {
-    const transport = makeTransport(true) // _GET_stream present
-    const { server, notifications } = makeServer()
-
-    const result = simulateStreamDispatch(OWNER, transport, server)
-
-    expect(result.notificationCalled).toBe(true)
     expect(notifications).toHaveLength(1)
-    // Nothing recovery-side happened.
-    expect(isRestartPendingOrActive(OWNER)).toBe(false)
+    expect(notifications[0]!.method).toBe('notifications/claude/channel')
+    expect(notifications[0]!.params.meta.chat_id).toBe(ALPHA_SECOND)
+    expect(a.h.allPosts()).toEqual([])
+    expect(isRestartPendingOrActive(a.alpha.key)).toBe(false)
+    expectBetaUntouched(a)
+    const ref = renderPersonaRef(a.alpha.name, a.alpha.key)
+    expect(a.h.logs.filter((l) => l.includes(`Dispatching to persona ${ref} chat_id=${ALPHA_SECOND}`) && l.includes('hasGetStream=true connected=true'))).toHaveLength(1)
+    expect(a.h.logs.filter((l) => l.includes('DROP:'))).toEqual([])
   })
 })
 
 // ---------------------------------------------------------------------------
 // b.9cj — the connected-but-streamless state, constructed exactly as the SDK
-// produces it, driving the REAL hasSessionStreamAdapter composition.
+// produces it, driving the routing module's real stream-presence probe over
+// the real registry.
 //
-// Reproduction (ticket step 1-2): register a session normally so
-// connected === true, then delete the '_GET_stream' entry from the transport's
-// _streamMapping WITHOUT closing the transport and WITHOUT a DELETE — connected
-// stays true. hasSessionStreamAdapter (getSessionByPersona → hasGetStreamKey,
-// false when no session) is the src/server.ts probe wired into both dep
-// objects; this replicates its two lines over the real registry so the seam is
-// exercised end-to-end, not stubbed.
+// Reproduction: register a session normally so connected === true, then
+// delete the '_GET_stream' entry from the transport's _streamMapping WITHOUT
+// closing the transport and WITHOUT a DELETE — connected stays true.
 // ---------------------------------------------------------------------------
 
-describe('b.9cj hasSessionStreamAdapter over the real registry', () => {
-  // The exact two-line adapter from src/server.ts main(). The registry is
-  // keyed by persona key.
-  const hasSessionStreamAdapter = (key: string): boolean => {
-    const session = getSessionByPersona(key)
-    return session ? hasGetStreamKey(session.transport) : false
-  }
-
-  test('connected stays true but the adapter reports streamless after the SDK drops _GET_stream', () => {
-    // Persona key: the channel ID, as the route->persona adapter keys it.
-    const key = 'C_STREAMLESS'
-    const transport = makeTransport(true) // registered WITH a _GET_stream entry
-    const { server } = makeServer()
-
-    const entry = registerSession('/tmp/streamless-session', key, transport as any, server as any)
-
-    // Freshly registered: connected and stream present.
-    expect(entry.connected).toBe(true)
-    expect(hasSessionStreamAdapter(key)).toBe(true)
-
-    // The SDK drops the standalone GET stream WITHOUT closing the transport and
-    // WITHOUT a DELETE — connected must remain true (the steady state the bug
-    // describes).
-    ;(transport._streamMapping as Map<string, unknown>).delete('_GET_stream')
-
-    expect(entry.connected).toBe(true)                 // unchanged — still "connected"
-    expect(hasSessionStreamAdapter(key)).toBe(false)  // but no longer deliverable
+describe('b.9cj hasSessionStream over the real registry', () => {
+  test('a freshly registered session with its GET stream reports true', () => {
+    registerSession(join(dir, 'stream-session'), 'p_stream', makeTransport('mcp-p_stream'), makeSessionServer([]))
+    expect(hasSessionStream('p_stream')).toBe(true)
   })
 
-  test('adapter returns false when there is no session at all', () => {
-    expect(hasSessionStreamAdapter('C_NO_SESSION')).toBe(false)
+  test('connected stays true but the probe reports streamless after the SDK drops _GET_stream', () => {
+    const transport = makeTransport('mcp-p_streamless')
+    const entry = registerSession(join(dir, 'streamless-session'), 'p_streamless', transport, makeSessionServer([]))
+    expect(hasSessionStream('p_streamless')).toBe(true)
+
+    ;(transport as unknown as { _streamMapping: Map<string, unknown> })._streamMapping.delete('_GET_stream')
+
+    expect(entry.connected).toBe(true)                  // unchanged — still "connected"
+    expect(hasSessionStream('p_streamless')).toBe(false) // but no longer deliverable
+  })
+
+  test('returns false when there is no session at all', () => {
+    expect(hasSessionStream('p_no_session')).toBe(false)
+  })
+
+  // The restart guard is wired with this probe (src/server.ts): a session that
+  // is alive and connected but streamless is not "already reconnected".
+  test.each([
+    [true, 0],
+    [false, 1],
+  ])('restart.ts with the real probe: stream present=%p → reconnectSession called %p time(s)', async (stream, reconnects) => {
+    registerSession(join(dir, 'restart-probe'), 'p_restart', makeTransport('mcp-p_restart', !stream), makeSessionServer([]))
+    let reconnectCalls = 0
+    initRestart({
+      ...makeRestartDeps({ restartDelayS: FAST_DELAY_S }),
+      async isSessionAlive() { return true },
+      isSessionConnected() { return true },
+      hasSessionStream,
+      async reconnectSession() { reconnectCalls++; return 'success' },
+    })
+
+    scheduleRestart('p_restart', join(dir, 'restart-probe'))
+    await Bun.sleep(WAIT_MS)
+
+    expect(reconnectCalls).toBe(reconnects)
   })
 })
 

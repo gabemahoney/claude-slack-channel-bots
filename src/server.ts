@@ -3,14 +3,17 @@
  * Slack Channel for Claude Code
  *
  * Two-way Slack ↔ Claude Code bridge via Socket Mode + MCP HTTP (StreamableHTTP).
- * Security: gate layer, persona posting scope, file exfiltration guard, bot token
- * sent only to Slack-hosted file URLs.
+ * Security: per-persona delivery rules, persona posting scope, file exfiltration
+ * guard, bot token sent only to Slack-hosted file URLs.
  *
  * Multi-session routing: each Claude Code session connects to its own MCP Server
  * instance and is matched to a persona by the real path of its roots working
- * directory. Inbound Slack messages are dispatched to the session whose channel
- * matches; outbound tool calls post as the session's persona and are scoped to
- * that persona's configured channels.
+ * directory. Inbound Slack messages go through each receiving persona's
+ * pipeline in `persona-routing.ts`: a persona hears only the channels it is
+ * configured into (every message in a `delivery: all` channel, only its direct
+ * mentions in a `delivery: mentions` one), and a delivered message reaches that
+ * persona's session only. Outbound tool calls post as the session's persona and
+ * are scoped to that persona's configured channels.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -24,9 +27,7 @@ import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
 import {
   readFileSync,
-  writeFileSync,
   mkdirSync,
-  chmodSync,
   existsSync,
   renameSync,
   promises as fsPromises,
@@ -34,12 +35,8 @@ import {
 
 import {
   defaultAccess,
-  pruneExpired,
   assertSendable as libAssertSendable,
-  gate as libGate,
-  hasGetStreamKey,
   type Access,
-  type GateResult,
 } from './lib.ts'
 import {
   loadConfig,
@@ -67,6 +64,7 @@ import {
   sweepDeadTmuxChannel,
 } from './session-manager.ts'
 import { createPersonaNotifier } from './persona-notifier.ts'
+import { createPersonaRouting, hasSessionStream } from './persona-routing.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { ErrSpawnNotFound } from 'agent-director'
 import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from './agent-director-errors.ts'
@@ -91,7 +89,7 @@ import { buildPersonaWorkList, initHealthCheck, startHealthCheck, stopHealthChec
 import { isAtCap as backoffIsAtCap } from './backoff.ts'
 import { loadTokens, isDryRun } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
-import { trackAck, consumeAck } from './ack-tracker.ts'
+import { consumeAck } from './ack-tracker.ts'
 import {
   openArchiveDatabase,
   createNameResolver,
@@ -104,7 +102,6 @@ import {
   registerSession,
   unregisterByMcpSessionId,
   getSessionByPersona,
-  getSessionByCwd,
   matchPersonaByRootsPath,
   resolveTransportForRequest,
   registerMcpSessionId,
@@ -123,9 +120,6 @@ import { createCronLog } from './cron-log.ts'
 import { createCronDispatcher } from './cron-dispatch.ts'
 import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
 import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy, withOutageDetection } from './outage-state.ts'
-
-// Re-export constants so they stay in one place (lib.ts)
-export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -251,7 +245,7 @@ function archiveInboundMessage(event: unknown): void {
 // removed (SR-7.1).
 
 // ---------------------------------------------------------------------------
-// Access control — load / save / prune
+// Access settings — load (ack reaction and reply chunking until E9)
 // ---------------------------------------------------------------------------
 
 function loadAccess(): Access {
@@ -268,13 +262,6 @@ function loadAccess(): Access {
   }
 }
 
-function saveAccess(access: Access): void {
-  const tmp = ACCESS_FILE + '.tmp'
-  writeFileSync(tmp, JSON.stringify(access, null, 2), 'utf-8')
-  chmodSync(tmp, 0o600)
-  renameSync(tmp, ACCESS_FILE)
-}
-
 // ---------------------------------------------------------------------------
 // Static mode
 // ---------------------------------------------------------------------------
@@ -284,17 +271,11 @@ let staticAccess: Access | null = null
 
 if (STATIC_MODE) {
   staticAccess = loadAccess()
-  pruneExpired(staticAccess)
-  if (staticAccess.dmPolicy === 'pairing') {
-    staticAccess.dmPolicy = 'allowlist'
-  }
 }
 
 function getAccess(): Access {
   if (STATIC_MODE && staticAccess) return staticAccess
-  const access = loadAccess()
-  pruneExpired(access)
-  return access
+  return loadAccess()
 }
 
 // ---------------------------------------------------------------------------
@@ -309,23 +290,6 @@ function getAccess(): Access {
 function assertSendable(filePath: string): void {
   const protectedPaths = credentialsFilesToProtect(personaConfig?.personas ?? [], CONFIG_PATH)
   libAssertSendable(filePath, resolve(STATE_DIR), resolve(INBOX_DIR), protectedPaths)
-}
-
-// ---------------------------------------------------------------------------
-// Gate function
-// ---------------------------------------------------------------------------
-
-async function gate(event: unknown): Promise<GateResult> {
-  const routeChannels = routingConfig
-    ? new Set(Object.keys(routingConfig.routes))
-    : undefined
-  return libGate(event, {
-    access: getAccess(),
-    staticMode: STATIC_MODE,
-    saveAccess,
-    botUserId,
-    routeChannels,
-  })
 }
 
 // ---------------------------------------------------------------------------
@@ -351,14 +315,9 @@ async function lookupUserName(client: WebClient, userId: string): Promise<string
   }
 }
 
-/** Display name for inbound dispatch, looked up on the module-scope client. */
-function resolveUserName(userId: string): Promise<string> {
-  return lookupUserName(web, userId)
-}
-
 /**
- * Display name for a persona's tool call, looked up on the persona's client;
- * the user ID itself when the persona has no client.
+ * Display name for a persona's inbound dispatch or tool call, looked up on the
+ * persona's client; the user ID itself when the persona has no client.
  */
 function resolvePersonaUserName(personaKey: string, userId: string): Promise<string> {
   const client = clientFor(personaKey)
@@ -593,284 +552,32 @@ async function handleInitialized(
 }
 
 // ---------------------------------------------------------------------------
-// Inbound message handler
-//
-// Task t2.c1r.zk.3d: Route inbound Slack messages to the correct session.
+// Inbound delivery per persona (b.av2 SR-4.1, SR-4.2 core)
 // ---------------------------------------------------------------------------
 
-async function handleMessage(event: unknown): Promise<void> {
-  const result = await gate(event)
-  const ev = event as Record<string, unknown>
-
-  switch (result.action) {
-    case 'drop':
-      console.error(`[slack] Gate dropped message from channel=${ev['channel']} user=${ev['user']}`)
-      return
-
-    case 'pair': {
-      const msg = result.isResend
-        ? `Your pairing code is still: *${result.code}*\nAsk the Claude Code user to run: \`/slack-channel:access pair ${result.code}\``
-        : `Hi! I need to verify you before connecting.\nYour pairing code: *${result.code}*\nAsk the Claude Code user to run: \`/slack-channel:access pair ${result.code}\``
-
-      await web.chat.postMessage({
-        channel: ev['channel'] as string,
-        text: msg,
-        unfurl_links: false,
-        unfurl_media: false,
-      })
-      return
-    }
-
-    case 'deliver': {
-      const channelId = ev['channel'] as string
-      const isDm = ev['channel_type'] === 'im'
-
-      let targetSession: SessionEntry | undefined
-
-      if (isDm) {
-        // -----------------------------------------------------------------------
-        // Task t2.c1r.3i.gp — DM deliver: route to default_dm_session
-        // -----------------------------------------------------------------------
-        if (!routingConfig?.default_dm_session) {
-          // No DM session configured — drop silently
-          console.error(
-            `[slack] DM from channel ${channelId} but no default_dm_session configured — dropping`,
-          )
-          return
-        }
-
-        targetSession = getSessionByCwd(routingConfig.default_dm_session)
-
-        if (!targetSession || !targetSession.connected) {
-          console.error(
-            `[slack] DM session for CWD "${routingConfig.default_dm_session}" not live — dropping message`,
-          )
-          return
-        }
-      } else {
-        // -----------------------------------------------------------------------
-        // Task t2.c1r.zk.3d — Find the session for this channel
-        // -----------------------------------------------------------------------
-        // Registry lookups take the persona key: the channel ID under the
-        // route->persona adapter (E3 Task 7 re-keys inbound dispatch).
-        targetSession = routingConfig
-          ? getSessionByPersona(channelId)
-          : undefined
-
-        // If no direct match, check default_route
-        if (!targetSession && routingConfig?.default_route && !routingConfig.routes[channelId]) {
-          targetSession = getSessionByCwd(routingConfig.default_route)
-        }
-
-        if (!targetSession || !targetSession.connected) {
-          // No live session for this channel
-          console.error(
-            `[slack] No live session for channel ${channelId} — dropping message`,
-          )
-          // b.kvq: recover a dead/capped route on an explicit inbound message.
-          // Determine the configured cwd for this channel AND the channel that
-          // OWNS the session on that cwd. A channel is "configured" if it has a
-          // direct route OR falls under default_route (same precedence used
-          // above when resolving targetSession).
-          //
-          // Recovery must be keyed to the OWNING channel, not the inbound one:
-          // the spawn's instance id + tmux name derive from the persona key
-          // (the channelId under the route->persona adapter), and the restart
-          // guards/backoff are keyed by channelId. For a direct route the
-          // owning channel IS the inbound channel. For default_route the
-          // session is owned by the direct route whose cwd === default_route
-          // (config.ts guarantees such a route exists — default_route must
-          // match a defined route CWD, and CWDs are unique per channel).
-          // Keying to the inbound channel there would spawn a SECOND instance
-          // on the shared cwd and its guards could not see the owning
-          // session's in-flight restart or cap state.
-          const directRoute = routingConfig?.routes[channelId]
-          let cwd: string | undefined
-          let ownerChannelId: string | undefined
-          if (directRoute) {
-            cwd = directRoute.cwd
-            ownerChannelId = channelId
-          } else if (routingConfig?.default_route && !routingConfig.routes[channelId]) {
-            cwd = routingConfig.default_route
-            // Resolve the direct route that owns the session on default_route.
-            for (const [ownerId, route] of Object.entries(routingConfig.routes)) {
-              if (route.cwd === cwd) {
-                ownerChannelId = ownerId
-                break
-              }
-            }
-            // If no owning route is found (should be impossible per config
-            // validation), drop silently rather than schedule under the inbound
-            // channelId and spawn a duplicate/unrecoverable instance.
-            if (!ownerChannelId) {
-              cwd = undefined
-            }
-          }
-
-          if (cwd && ownerChannelId) {
-            // The dropped message itself is lost — recovery only starts a
-            // session; it does NOT deliver or replay this message. The reply
-            // below must never imply otherwise.
-            const alreadyRestarting = isRestartPendingOrActive(ownerChannelId)
-            const autoRestartDisabled = (routingConfig?.session_restart_delay ?? 60) === 0
-            const capped = backoffIsAtCap(ownerChannelId, RESTART_FAILURE_CAP)
-
-            let replyText: string
-            if (alreadyRestarting) {
-              // A restart is already pending/active — do not stack a second
-              // launch. Telling the sender to retry shortly is honest here.
-              replyText =
-                'Your message was not delivered. The session is restarting — please retry in a moment.'
-            } else if (autoRestartDisabled) {
-              // getRestartDelay()===0: auto-restart is off. scheduleRestart
-              // would early-return, so do not pretend recovery is underway.
-              replyText =
-                'Your message was not delivered and was not saved. Auto-restart is disabled for this channel, ' +
-                'so it will NOT recover on its own — an operator must restart the server.'
-            } else if (capped) {
-              // At the consecutive-failure cap: firing another launch would only
-              // burn a spawn attempt against a route that cannot come up (the cap
-              // exists precisely to stop that), and in-process backoff clears only
-              // on a server restart. Bound the human trigger here rather than
-              // spawn-looping, and say so plainly.
-              replyText =
-                'Your message was not delivered and was not saved. This channel has hit its restart-failure limit ' +
-                'and will NOT recover on its own — an operator must restart the server.'
-            } else {
-              // Live route, no session, under cap, auto-restart enabled: trigger
-              // a fast human-clamped recovery. This message is still lost.
-              scheduleRestart(ownerChannelId, cwd, undefined, { humanTrigger: true })
-              replyText =
-                'Your message was not delivered and was not saved. I have started the session for this channel — ' +
-                'please retry in a moment.'
-            }
-
-            try {
-              await web.chat.postMessage({ channel: channelId, text: replyText })
-            } catch { /* non-critical */ }
-          }
-          return
-        }
-      }
-
-      const access = result.access!
-      const userName = await resolveUserName(ev['user'] as string)
-
-      // Ack reaction
-      if (access.ackReaction) {
-        try {
-          await web.reactions.add({
-            channel: channelId,
-            timestamp: ev['ts'] as string,
-            name: access.ackReaction,
-          })
-        } catch { /* non-critical */ }
-        trackAck(channelId, ev['ts'] as string)
-      }
-
-      // Build meta attributes for the <channel> tag
-      const meta: Record<string, string> = {
-        chat_id: channelId,
-        message_id: ev['ts'] as string,
-        user: userName,
-        ts: ev['ts'] as string,
-      }
-
-      if (ev['thread_ts']) {
-        meta.thread_ts = ev['thread_ts'] as string
-      }
-
-      const evFiles = ev['files'] as any[] | undefined
-      if (evFiles?.length) {
-        const { sanitizeFilename } = await import('./lib.ts')
-        const fileDescs = evFiles.map((f: any) => {
-          const name = sanitizeFilename(f.name || 'unnamed')
-          return `${name} (${f.mimetype || 'unknown'}, ${f.size || '?'} bytes)`
-        })
-        meta.attachment_count = String(evFiles.length)
-        meta.attachments = fileDescs.join('; ')
-      }
-
-      // Strip bot mention from text if present
-      let text = (ev['text'] as string | undefined) || ''
-      if (botUserId) {
-        text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
-      }
-
-      // Dispatch to the session's Server instance
-      const transport = targetSession.transport as any
-      const hasGetStream = hasGetStreamKey(transport)
-      const mcpSessionId = targetSession.transport.sessionId ?? '(unset)'
-      console.error(
-        `[slack] Dispatching to session cwd="${targetSession.cwd}" channel=${channelId} ` +
-        `mcpSessionId=${mcpSessionId} hasGetStream=${hasGetStream} ` +
-        `connected=${targetSession.connected} text="${text.slice(0, 80)}"`
-      )
-      if (!hasGetStream) {
-        // b.9cj: the registry says connected but the SDK has silently dropped
-        // the standalone GET SSE stream, so notification() would evaporate with
-        // no throw and no return value. Do NOT send it — the message provably
-        // cannot reach the bot. Trigger recovery (which now actually fires:
-        // restart.ts no longer waves a connected-but-streamless session through
-        // as "already reconnected"), and give the sender the same honest
-        // "not delivered" reply a disconnected session gets on the b.kvq path.
-        console.error(
-          `[slack] DROP: no _GET_stream for cwd="${targetSession.cwd}" channel=${channelId} ` +
-          `mcpSessionId=${mcpSessionId} — message will not reach the bot; triggering recovery`
-        )
-
-        // Recovery is keyed to the session's OWNING persona, not the inbound
-        // channel. targetSession may have been resolved via default_route
-        // (getSessionByCwd) or the DM default_dm_session path, in which case
-        // channelId is not the owner. The instance id, tmux naming, backoff,
-        // and the pending/cap guards are all keyed by the owner's persona key
-        // (the owning channel ID under the route->persona adapter), so
-        // scheduling under the inbound channel could spawn a duplicate
-        // instance on a shared cwd and miss the owner's in-flight restart/cap
-        // state. The reply below stays on the inbound channelId.
-        const ownerChannelId = targetSession.personaKey
-        const alreadyRestarting = isRestartPendingOrActive(ownerChannelId)
-        const autoRestartDisabled = (routingConfig?.session_restart_delay ?? 60) === 0
-        const capped = backoffIsAtCap(ownerChannelId, RESTART_FAILURE_CAP)
-
-        let replyText: string
-        if (alreadyRestarting) {
-          // A restart is already pending/active — do not stack a second launch.
-          replyText =
-            'Your message was not delivered. The session is restarting — please retry in a moment.'
-        } else if (autoRestartDisabled) {
-          // getRestartDelay()===0: auto-restart is off. scheduleRestart would
-          // early-return, so do not pretend recovery is underway.
-          replyText =
-            'Your message was not delivered and was not saved. Auto-restart is disabled for this channel, ' +
-            'so it will NOT recover on its own — an operator must restart the server.'
-        } else if (capped) {
-          // At the consecutive-failure cap: firing another launch would only
-          // burn a spawn attempt against a route that cannot come up. Bound the
-          // human trigger here rather than spawn-looping, and say so plainly.
-          replyText =
-            'Your message was not delivered and was not saved. This channel has hit its restart-failure limit ' +
-            'and will NOT recover on its own — an operator must restart the server.'
-        } else {
-          // Live session, streamless, under cap, auto-restart enabled: trigger a
-          // fast human-clamped recovery. This message is still lost.
-          scheduleRestart(ownerChannelId, targetSession.cwd, undefined, { humanTrigger: true })
-          replyText =
-            'Your message was not delivered. The session is restarting — please retry in a moment.'
-        }
-
-        try {
-          await web.chat.postMessage({ channel: channelId, text: replyText })
-        } catch { /* non-critical */ }
-        return
-      }
-      targetSession.server.notification({
-        method: 'notifications/claude/channel',
-        params: { content: text, meta },
-      })
-    }
-  }
+/** Keys of the applied personas; empty when there is no persona config. */
+function appliedPersonaKeys(): string[] {
+  return personaConfig?.personas.map((p) => p.key) ?? []
 }
+
+/**
+ * The one persona-routing instance. Each socket event is handed to it with
+ * every applied persona as a receiver: until E3 Task 9 there is one Socket
+ * Mode connection, which every stand-in persona shares.
+ */
+const personaRouting = createPersonaRouting({
+  getPersonaConfig: () => personaConfig,
+  // TRANSITIONAL — re-pointed in E3 Task 9 at each persona's own identity from
+  // the connection manager. Until then every applied persona shares the one
+  // module-scope bot user (`U000DRY` in dry run).
+  getBotUserId: (key) => (getAppliedPersona(key) ? botUserId : undefined),
+  clientFor,
+  resolveUserName: resolvePersonaUserName,
+  // Today's archive writer and resolver; the per-persona resolver is E3 Task 9's.
+  archive: (_key, event) => archiveInboundMessage(event),
+  getAccess,
+  log: (line) => console.error(line),
+})
 
 // Permission Block Kit builders moved to src/permission-poller.ts
 // (SR-2.1/2.2 — owns the message + action_id encoding).
@@ -879,28 +586,17 @@ async function handleMessage(event: unknown): Promise<void> {
 // Socket Mode event routing
 // ---------------------------------------------------------------------------
 
+// Both events go to the persona-routing intake, which acks first. With no
+// persona config (the MCP_HOST / MCP_PORT fallback) there is no receiver, so
+// the event is acked and nothing is delivered.
 socket.on('message', async ({ event, ack }) => {
   console.error('[slack] RAW message event:', JSON.stringify(event)?.slice(0, 300))
-  await ack()
-  if (!event) return
-  archiveInboundMessage(event)
-  try {
-    await handleMessage(event)
-  } catch (err) {
-    console.error('[slack] Error handling message:', err)
-  }
+  await personaRouting.receive(event, ack, appliedPersonaKeys())
 })
 
 socket.on('app_mention', async ({ event, ack }) => {
   console.error('[slack] RAW app_mention event:', JSON.stringify(event)?.slice(0, 300))
-  await ack()
-  if (!event) return
-  archiveInboundMessage(event)
-  try {
-    await handleMessage(event)
-  } catch (err) {
-    console.error('[slack] Error handling mention:', err)
-  }
+  await personaRouting.receive(event, ack, appliedPersonaKeys())
 })
 
 socket.on('interactive', async (evt) => {
@@ -1640,17 +1336,11 @@ export async function main(): Promise<void> {
   // back to "dead" defensively — health-check will retry.
   const isSessionAliveAdapter = _buildIsSessionAliveAdapter(() => personaConfig)
 
-  // b.9cj: shared stream-presence probe. A session can be `connected === true`
-  // in the registry while the SDK has silently deleted its `_GET_stream` map
-  // entry, in which state messages cannot reach the bot. Both the restart guard
-  // and the health-check tick consult this alongside isSessionConnected so a
-  // connected-but-streamless session is treated as unhealthy, not "healed".
-  // Factored here so the two dep objects below stay in exact agreement.
-  // The registry is keyed by persona key.
-  const hasSessionStreamAdapter = (key: string): boolean => {
-    const session = getSessionByPersona(key)
-    return session ? hasGetStreamKey(session.transport) : false
-  }
+  // b.9cj: the restart guard and the health-check tick share persona-routing's
+  // stream-presence probe (`hasSessionStream`), the same `_GET_stream` check
+  // the dispatch path applies to the session it sends to, so a
+  // connected-but-streamless session is treated as unhealthy, not "healed",
+  // everywhere alike.
 
   // Initialize restart module with library-backed adapters. Every key is a
   // persona key.
@@ -1660,7 +1350,7 @@ export async function main(): Promise<void> {
       const session = getSessionByPersona(key)
       return session?.connected === true
     },
-    hasSessionStream: hasSessionStreamAdapter,
+    hasSessionStream,
     reconnectSession: _buildReconnectSessionAdapter(),
     killSession: _buildKillSessionAdapter(),
     launchSession: async (key) => {
@@ -1746,7 +1436,7 @@ export async function main(): Promise<void> {
     },
     // b.9cj: same stream-presence probe wired into initRestart above, so the
     // tick can notice connected-but-streamless rows and route them to recovery.
-    hasSessionStream: hasSessionStreamAdapter,
+    hasSessionStream,
     isRestartPendingOrActive,
     isAtCap: (key) => backoffIsAtCap(key, RESTART_FAILURE_CAP),
     statRoute: _buildStatRouteImpl(),

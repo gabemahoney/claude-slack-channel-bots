@@ -749,7 +749,7 @@ describe('no writes', () => {
 // ---------------------------------------------------------------------------
 
 describe('diagnostic lines', () => {
-  test('the label set is exactly the nine credentials, Slack-validation, connection and directory classes', () => {
+  test('the label set is exactly the credentials, Slack-validation, connection, directory, unclaimed-channel and DM-drop classes', () => {
     expect([...PERSONA_DIAGNOSTIC_CLASSES].sort()).toEqual([
       'persona-connection-lost',
       'persona-connection-restored',
@@ -759,7 +759,9 @@ describe('diagnostic lines', () => {
       'persona-credentials-unreadable',
       'persona-directory-missing',
       'persona-directory-unusable',
+      'persona-dm-dropped',
       'persona-slack-unreachable',
+      'unclaimed-channel',
     ])
   })
 
