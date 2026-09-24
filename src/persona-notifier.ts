@@ -16,7 +16,11 @@
  * - channel destination whose client is not validated yet: held in that
  *   persona's own queue, in raised order, until `flush(key)` (or the first
  *   notice raised once the client is validated, which posts the held ones
- *   first);
+ *   first). A queue holds at most `MAX_HELD_NOTICES_PER_PERSONA` notices: a
+ *   persona that is broken or retrying may stay without a client for a long
+ *   time, so once the queue is full each new notice drops the oldest held
+ *   one, which is logged (one line, the notice's first line) and never
+ *   posted;
  * - otherwise: posted. A rejected post is caught, logged token-safely and
  *   handed to the caller's failure callback; there is no retry. The log line
  *   carries the error type/code and, when it is a short identifier, Slack's
@@ -100,6 +104,14 @@ export interface PersonaNotifier {
 export type PersonaDestination =
   | { kind: 'channel'; channelId: string }
   | { kind: 'dm' }
+
+/**
+ * Most notices held for one persona while its client is not validated
+ * (b.av2 SR-7.2). Past it the oldest held notice is dropped with a log line,
+ * so the queue keeps the most recent notices and a persona that is broken or
+ * retrying for a long time holds a bounded amount.
+ */
+export const MAX_HELD_NOTICES_PER_PERSONA = 20
 
 /** A notice held until its persona's client is validated. */
 interface HeldNotice {
@@ -204,14 +216,29 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
     const client = deps.clientFor(key)
     const queue = held.get(key)
     if (!client || queue) {
-      if (queue) queue.push({ text, options })
-      else held.set(key, [{ text, options }])
+      hold(key, ref, { text, options })
       // A validated persona with notices still held posts them first, so
       // notices always post in raised order.
       if (client) await flush(key)
       return
     }
     await post(persona, destination.channelId, client, { text, options })
+  }
+
+  /** Append to the persona's queue; past the bound, drop (log, never post) the oldest held notice. */
+  function hold(key: string, ref: string, notice: HeldNotice): void {
+    let queue = held.get(key)
+    if (!queue) {
+      queue = []
+      held.set(key, queue)
+    }
+    queue.push(notice)
+    if (queue.length <= MAX_HELD_NOTICES_PER_PERSONA) return
+    const dropped = queue.shift()!
+    deps.log(
+      `[slack] persona-notifier: more than ${MAX_HELD_NOTICES_PER_PERSONA} notices held for ${ref} — ` +
+        `oldest held notice dropped, not posted: ${firstNoticeLine(dropped.text)}`,
+    )
   }
 
   async function flush(key: string): Promise<void> {

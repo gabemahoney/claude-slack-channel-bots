@@ -18,9 +18,9 @@
  *   The default `onEvent` acks and records nothing else;
  * - with `files: true`, each persona's credentials file (mode 0600, holding
  *   exactly its two fake tokens, via `writeCredentialsFile`) and its working
- *   directory, so the real start procedure (`connectPersona`,
- *   `bringUpPersona`, `startupSessionManager` with `bringUp`) passes steps 1
- *   and 2 for it. A test breaks one by removing or replacing it afterwards;
+ *   directory, so the real start procedure (`createPersonaBringUpController`,
+ *   alone or as `startupSessionManager`'s `bringUp`) passes steps 1 and 2 for
+ *   it. A test breaks one by removing or replacing it afterwards;
  * - `h.connections`: a recording stand-in for the manager's `bringUp`, to pass
  *   as the start procedure's `connections`. Each call appends `slack:<key>` to
  *   `h.order` and a record to `h.bringUpCalls` (whether it got tokens, and

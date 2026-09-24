@@ -139,6 +139,7 @@ export function makeRestartDeps(opts: RestartFakeOptions = {}): RestartDeps & { 
   const delay = opts.restartDelayS ?? FAST_RESTART_DELAY_S
   return {
     launches,
+    canRestart: () => true,
     isSessionAlive: async () => false,
     isSessionConnected: () => false,
     hasSessionStream: () => false,

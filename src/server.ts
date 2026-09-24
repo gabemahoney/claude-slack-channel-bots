@@ -14,9 +14,11 @@
  *
  * Slack: one connection per persona, run by the connection manager
  * (`persona-connections.ts`) and brought up at start through the SR-6.1
- * procedure (`startupSessionManager` → `connectPersona`, then the launch).
- * Only a persona whose connection is serving is relaunched by the health
- * check or a restart (`createPersonaRelaunchGate`). Each persona's
+ * procedure (`startupSessionManager` → the bring-up controller in
+ * `persona-bringup-controller.ts`, then the launch). Each persona ends its
+ * start `up`, `broken` or `retrying`; retries run on the persona's own timers
+ * and launch it once it is up. Only a persona that is up is touched by the
+ * health check or a restart (`createPersonaRelaunchGate`). Each persona's
  * `message`, `app_mention` and `interactive` events reach the event router
  * (`persona-event-router.ts`) tagged with that persona's key.
  *
@@ -71,6 +73,7 @@ import {
   reconnectMcp,
   setPreLaunchTrustPatcher,
   setSessionNotifier,
+  spawnForPersona,
   startupSessionManager,
   sweepDeadTmuxChannel,
 } from './session-manager.ts'
@@ -80,11 +83,13 @@ import { createPersonaConnectionManager, type PersonaConnectionManager } from '.
 import { createUnhandledRejectionHandler, describeThrownValue } from './persona-connection-errors.ts'
 import { createPersonaEventRouter } from './persona-event-router.ts'
 import {
+  composePersonaStatusListeners,
   createPersonaClientLookup,
   createPersonaIdentityLookup,
   createPersonaRelaunchGate,
   createPersonaUpFlushListener,
 } from './persona-start.ts'
+import { createPersonaBringUpController, type PersonaBringUpController } from './persona-bringup-controller.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { ErrSpawnNotFound } from 'agent-director'
 import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from './agent-director-errors.ts'
@@ -222,6 +227,12 @@ export function stopAllKeepAliveTimers(): void {
 // ---------------------------------------------------------------------------
 
 let connections: PersonaConnectionManager | undefined
+
+/**
+ * The per-persona bring-up outcomes and retries; built in main(), told of
+ * every connection status by the manager's listener, cancelled on shutdown.
+ */
+let bringUps: PersonaBringUpController | undefined
 
 /** The manager's per-persona queries, answering nothing before main() builds it. */
 const connectionView: Pick<PersonaConnectionManager, 'status' | 'webClient' | 'identity'> = {
@@ -632,6 +643,9 @@ async function shutdown(signal: string): Promise<void> {
     cronScheduler = null
   }
   cancelAllRestartTimers()
+  // Every persona's bring-up retry (directory re-checks); the manager's Slack
+  // retries stop with stopAll() below.
+  bringUps?.cancelAll()
   stopAllKeepAliveTimers()
 
   console.error(`[slack] Received ${signal} — shutting down`)
@@ -1001,7 +1015,11 @@ export async function main(): Promise<void> {
   // b.av2 SR-3.1: one Slack connection per persona. Each connection's
   // `message`, `app_mention` and `interactive` events reach the event router
   // with that persona's key; each time a persona reports up its held notices
-  // are flushed (SR-7.2). Nothing connects until the bring-up pass below.
+  // are flushed (SR-7.2), and a persona that reaches up from retrying its
+  // bring-up is launched by the bring-up controller (SR-6.1). Nothing
+  // connects until the bring-up pass below. The controller is built over this
+  // manager, so the listener reaches it through the module-scope `bringUps`,
+  // assigned right after it is built and before anything connects.
   const manager = createPersonaConnectionManager({
     onEvent: createPersonaEventRouter({
       routing: personaRouting,
@@ -1011,15 +1029,30 @@ export async function main(): Promise<void> {
     }),
     log: (line) => console.error(line),
     dryRun: isDryRun(),
-    onStatus: createPersonaUpFlushListener(personaNotifier),
+    onStatus: composePersonaStatusListeners(
+      createPersonaUpFlushListener(personaNotifier),
+      (key, status) => bringUps?.onConnectionStatus(key, status),
+    ),
   })
   connections = manager
 
-  // Only a persona whose connection is serving may be relaunched: the health
-  // check's work list and the restart launch both ask this gate, so a persona
-  // that was not brought up is never launched past its failed steps. It logs
-  // once per persona per non-serving state.
-  const canRelaunch = createPersonaRelaunchGate(manager, (line) => console.error(line))
+  // b.av2 SR-6.1 / SR-6.4: each persona's bring-up outcome (up, broken or
+  // retrying) and its retries on its own timers. A persona that reaches up
+  // through a retry is launched from there, through the one-launch-in-flight
+  // guard restarts use; its restart counter is not touched.
+  const personaBringUps = createPersonaBringUpController({
+    connections: manager,
+    dryRun: isDryRun(),
+    log: (line) => console.error(line),
+    launch: (persona) => spawnForPersona(persona, appliedConfig, false),
+  })
+  bringUps = personaBringUps
+
+  // Only a persona that is up may be restarted or relaunched: the health
+  // check's work list, the restart module (before any kill or reconnect) and
+  // the restart launch all ask this gate, so a broken or retrying persona's
+  // instance is never touched. It logs once per persona per non-serving state.
+  const canRelaunch = createPersonaRelaunchGate(manager, (line) => console.error(line), personaBringUps)
 
   if (isDryRun()) {
     console.error('[slack] Running in dry-run mode — Slack disabled')
@@ -1195,6 +1228,7 @@ export async function main(): Promise<void> {
   // Initialize restart module with library-backed adapters. Every key is a
   // persona key.
   initRestart({
+    canRestart: canRelaunch,
     isSessionAlive: isSessionAliveAdapter,
     isSessionConnected: (key) => {
       const session = getSessionByPersona(key)
@@ -1209,8 +1243,8 @@ export async function main(): Promise<void> {
       // resume vs fresh is handled inside spawnForPersona (SR-1.4
       // collision-then-act). The cwd and session-id arguments from the legacy
       // restart deps are ignored — the persona carries its working directory
-      // and AD owns the resume state, not CSCB. A persona whose connection is
-      // not serving is skipped (neither success nor failure).
+      // and AD owns the resume state, not CSCB. A persona that is not up is
+      // skipped (neither success nor failure).
       return await launchSession(key, personaConfig, { canLaunch: canRelaunch })
     },
     getRestartDelay: () => appliedConfig.session_restart_delay,
@@ -1256,20 +1290,17 @@ export async function main(): Promise<void> {
   // recordStartupError.
   stopHookBootstrap(personaConfig)
 
-  // b.av2 SR-6.1: bring each applied persona up — the local credentials check
-  // (skipped in dry run), the working-directory check, Slack validation and
-  // connection through the manager, then the launch (spawnForPersona: fresh
-  // spawn or collision handling per SR-1.4). A persona failing a step before
-  // the launch is not brought up (its checks or the manager log why); a launch
-  // failure raises a notice to the persona's destination. The server stays up.
+  // b.av2 SR-6.1: bring each applied persona up — one persona-start line,
+  // the local credentials check (skipped in dry run), the working-directory
+  // check, Slack validation and connection through the manager, then, for
+  // each persona that is up, the launch (spawnForPersona: fresh spawn or
+  // collision handling per SR-1.4). The pass returns once every persona is
+  // up, broken or retrying; a broken or retrying persona is logged, never
+  // posted about, and a retrying one is launched later from its own retry.
+  // A launch failure raises a notice to the persona's destination. The
+  // server stays up.
   try {
-    await startupSessionManager(personaConfig, {
-      bringUp: {
-        connections: manager,
-        dryRun: isDryRun(),
-        log: (line) => console.error(line),
-      },
-    })
+    await startupSessionManager(personaConfig, { bringUp: personaBringUps })
   } catch (err) {
     console.error('[slack] Warning: session startup failed — continuing:', err)
   }
@@ -1292,9 +1323,9 @@ export async function main(): Promise<void> {
     statRoute: _buildStatRouteImpl(),
     scheduleRestart,
     isShuttingDown: () => shuttingDown,
-    // One entry per applied persona whose connection is serving: key →
-    // working directory. A persona not brought up (or not serving) is left
-    // out, so the tick never relaunches it; it joins once it reports up.
+    // One entry per applied persona that is up: key → working directory. A
+    // broken or retrying persona (or one whose connection is not serving) is
+    // left out, so the tick never touches it; it joins once it is up.
     getPersonas: () => (personaConfig ? buildPersonaWorkList(personaConfig, canRelaunch) : {}),
   })
 

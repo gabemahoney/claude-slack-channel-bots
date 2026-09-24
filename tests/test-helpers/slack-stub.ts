@@ -15,7 +15,8 @@
  * - per-call scripted outcomes for `auth.test`, socket `start()`,
  *   `chat.postMessage`, `chat.update`, `filesUploadV2`, `conversations.history`,
  *   `conversations.replies` and `conversations.info` (`script`), falling back
- *   to success when exhausted;
+ *   to success when exhausted; a Web API call scripted with a deferred outcome
+ *   (`makeDeferredWebApiCall`) answers only when the test settles it;
  * - a record of the options every client was built with (`options`).
  *
  * `makeStubSlackFactory()` adapts per-persona stubs to the connection
@@ -113,8 +114,8 @@ export type UnreachableOutcome =
   /** HTTP 429 with `rejectRateLimitedCalls`: a rate-limited error with `retryAfter` seconds. */
   | { kind: 'rate-limited'; retryAfter: number }
 
-/** One scripted Web API call result: `auth.test` or `chat.postMessage`. */
-export type WebApiOutcome =
+/** One scripted Web API call result the call settles with at once (or never): every kind but `deferred`. */
+export type SettledWebApiOutcome =
   /**
    * Success. `result` is merged over the default response; a key set to
    * `undefined` is removed (e.g. `{ result: { bot_id: undefined } }`).
@@ -133,12 +134,71 @@ export type WebApiOutcome =
   /** The call rejects with `value` exactly as given (a plain `Error`, a string, `undefined` …). */
   | { kind: 'reject'; value: unknown }
 
+/**
+ * A Web API call that answers only when the test settles it. Build with
+ * `makeDeferredWebApiCall`; the `answer` is internal.
+ */
+export interface DeferredWebApiOutcome {
+  kind: 'deferred'
+  readonly answer: Promise<SettledWebApiOutcome>
+}
+
+/** One scripted Web API call result (`auth.test`, `chat.postMessage`, …). */
+export type WebApiOutcome = SettledWebApiOutcome | DeferredWebApiOutcome
+
+/** A deferred Web API outcome and its settle control. */
+export interface DeferredWebApiCall {
+  /** Script this (`script.authTest.push(d.outcome)`); every call that takes it waits for `settle`. */
+  readonly outcome: DeferredWebApiOutcome
+  /** Whether `settle` was called. */
+  readonly settled: boolean
+  /**
+   * Answer the call: each waiting call then settles as if `outcome` (default
+   * `ok`) had been scripted. Settling after the caller abandoned the call
+   * makes it answer late. Throws if already settled.
+   */
+  settle(outcome?: SettledWebApiOutcome): void
+}
+
+/** A promise and the function that resolves it once; a second settle throws. */
+function makeSettleOnce<T>(what: string): { answer: Promise<T>; settled(): boolean; settle(value: T): void } {
+  let resolve: (value: T) => void = () => {}
+  let settled = false
+  const answer = new Promise<T>((res) => {
+    resolve = res
+  })
+  return {
+    answer,
+    settled: () => settled,
+    settle(value) {
+      if (settled) throw new Error(`slack-stub: a deferred ${what} outcome settles once`)
+      settled = true
+      resolve(value)
+    },
+  }
+}
+
+/** A Web API outcome that holds the call until the test calls `settle`. */
+export function makeDeferredWebApiCall(): DeferredWebApiCall {
+  const once = makeSettleOnce<SettledWebApiOutcome>('Web API')
+  const outcome: DeferredWebApiOutcome = { kind: 'deferred', answer: once.answer }
+  return {
+    outcome,
+    get settled() {
+      return once.settled()
+    },
+    settle(settledWith = { kind: 'ok' }) {
+      once.settle(settledWith)
+    },
+  }
+}
+
 /** A socket `start()` result the test can settle a `deferred` outcome with: every kind but `deferred`. */
 export type SettledConnectOutcome =
   /** `hello` arrives: `connected` is emitted and `start()` resolves. */
   | { kind: 'ok' }
   /** Web API failures of the `apps.connections.open` leg: `start()` rejects with the error. */
-  | Exclude<WebApiOutcome, { kind: 'ok' } | { kind: 'never' }>
+  | Exclude<SettledWebApiOutcome, { kind: 'ok' } | { kind: 'never' }>
   /** `apps.connections.open` answered without a URL: `start()` rejects with a plain `Error`. */
   | { kind: 'no-url' }
   /** WebSocket error before `hello`: `error`, `close`, `disconnected`; `start()` rejects with no value. */
@@ -190,23 +250,15 @@ export interface DeferredConnect {
  * manager abandoned the `start()` makes it resolve or reject late.
  */
 export function makeDeferredConnect(): DeferredConnect {
-  let answer: (outcome: SettledConnectOutcome) => void = () => {}
-  let settled = false
-  const outcome: DeferredConnectOutcome = {
-    kind: 'deferred',
-    answer: new Promise<SettledConnectOutcome>((resolve) => {
-      answer = resolve
-    }),
-  }
+  const once = makeSettleOnce<SettledConnectOutcome>('connect')
+  const outcome: DeferredConnectOutcome = { kind: 'deferred', answer: once.answer }
   return {
     outcome,
     get settled() {
-      return settled
+      return once.settled()
     },
     settle(settledWith = { kind: 'ok' }) {
-      if (settled) throw new Error('slack-stub: a deferred connect outcome settles once')
-      settled = true
-      answer(settledWith)
+      once.settle(settledWith)
     },
   }
 }
@@ -512,7 +564,7 @@ function rateLimitedError(retryAfter: number, marker: string | undefined): Error
 }
 
 /** The error a scripted Web API failure raises, or `undefined` for `ok`/`never`/`reject`. */
-function webApiFailure(outcome: WebApiOutcome | ConnectOutcome, ctx: CallContext): Error | undefined {
+function webApiFailure(outcome: SettledWebApiOutcome | SettledConnectOutcome, ctx: CallContext): Error | undefined {
   switch (outcome.kind) {
     case 'platform':
       return platformError(outcome.error, outcome.retryAfter, ctx.marker)
@@ -529,14 +581,23 @@ function webApiFailure(outcome: WebApiOutcome | ConnectOutcome, ctx: CallContext
   }
 }
 
-/** Run one scripted Web API call: resolve `success()`, reject, or never settle. */
-function runWebApiCall<T>(outcome: WebApiOutcome | undefined, ctx: CallContext, success: () => T): Promise<T> {
-  if (outcome === undefined) return Promise.resolve(success())
+/**
+ * Run one scripted Web API call: resolve `success(overrides)` (the `ok`
+ * outcome's `result`, or `{}`), reject, never settle, or, for `deferred`,
+ * wait for the test's answer and then do the same with it.
+ */
+function runWebApiCall<T>(
+  outcome: WebApiOutcome | undefined,
+  ctx: CallContext,
+  success: (overrides: Readonly<Record<string, unknown>>) => T,
+): Promise<T> {
+  if (outcome === undefined) return Promise.resolve(success({}))
+  if (outcome.kind === 'deferred') return outcome.answer.then((answered) => runWebApiCall(answered, ctx, success))
   if (outcome.kind === 'never') return new Promise<T>(() => {})
   if (outcome.kind === 'reject') return Promise.reject(outcome.value)
   const failure = webApiFailure(outcome, ctx)
   if (failure !== undefined) return Promise.reject(failure)
-  return Promise.resolve(success())
+  return Promise.resolve(success(outcome.kind === 'ok' ? (outcome.result ?? {}) : {}))
 }
 
 /** `base` with `overrides` merged over it; an override set to `undefined` removes the key. */
@@ -610,13 +671,10 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
       timeoutMs: clientOptions?.timeout,
       marker,
     })
-    /** The `ok` result a scripted outcome merges over the default, or none. */
-    const okResult = (outcome: WebApiOutcome | undefined): Readonly<Record<string, unknown>> =>
-      outcome?.kind === 'ok' ? (outcome.result ?? {}) : {}
     /** A message-list call (`history`, `replies`): default an empty list. */
     const messageList = (outcome: WebApiOutcome | undefined, method: string) =>
-      runWebApiCall(outcome, ctx(method), () =>
-        mergeDroppingUndefined({ ok: true, messages: [], has_more: false }, okResult(outcome)),
+      runWebApiCall(outcome, ctx(method), (overrides) =>
+        mergeDroppingUndefined({ ok: true, messages: [], has_more: false }, overrides),
       )
     const client: StubWebClient = {
       hasToken: (expected: string) => expected === token,
@@ -624,7 +682,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
         test: (args) => {
           calls.authTest.push(args)
           const outcome = script.authTest.shift()
-          return runWebApiCall(outcome, ctx('auth.test'), () =>
+          return runWebApiCall(outcome, ctx('auth.test'), (overrides) =>
             mergeDroppingUndefined(
               {
                 ok: true,
@@ -636,7 +694,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
                 bot_id: identity.botId,
                 is_enterprise_install: false,
               },
-              outcome?.kind === 'ok' ? (outcome.result ?? {}) : {},
+              overrides,
             ),
           )
         },
@@ -645,7 +703,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
         postMessage: (args) => {
           calls.postMessage.push(args)
           const outcome = script.post.shift()
-          return runWebApiCall(outcome, ctx('chat.postMessage'), () => {
+          return runWebApiCall(outcome, ctx('chat.postMessage'), (overrides) => {
             const ts = nextTs()
             const text = textOf(args)
             return mergeDroppingUndefined(
@@ -655,15 +713,15 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
                 ts,
                 message: { type: 'message', text, user: identity.botUserId, bot_id: identity.botId, ts },
               },
-              outcome?.kind === 'ok' ? (outcome.result ?? {}) : {},
+              overrides,
             )
           })
         },
         update: (args) => {
           calls.update.push(args)
           const outcome = script.update.shift()
-          return runWebApiCall(outcome, ctx('chat.update'), () =>
-            mergeDroppingUndefined({ ok: true, channel: args.channel, ts: args.ts, text: textOf(args) }, okResult(outcome)),
+          return runWebApiCall(outcome, ctx('chat.update'), (overrides) =>
+            mergeDroppingUndefined({ ok: true, channel: args.channel, ts: args.ts, text: textOf(args) }, overrides),
           )
         },
       },
@@ -693,7 +751,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
         info: (args) => {
           calls.conversationsInfo.push(args)
           const outcome = script.info.shift()
-          return runWebApiCall(outcome, ctx('conversations.info'), () =>
+          return runWebApiCall(outcome, ctx('conversations.info'), (overrides) =>
             mergeDroppingUndefined(
               {
                 ok: true,
@@ -705,7 +763,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
                   is_archived: false,
                 },
               },
-              okResult(outcome),
+              overrides,
             ),
           )
         },
@@ -729,9 +787,9 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
       filesUploadV2: (args) => {
         calls.filesUploadV2.push(args)
         const outcome = script.upload.shift()
-        return runWebApiCall(outcome, ctx('files.completeUploadExternal'), () => {
+        return runWebApiCall(outcome, ctx('files.completeUploadExternal'), (overrides) => {
           const id = `F0STUB${String(++fileSeq).padStart(4, '0')}`
-          return mergeDroppingUndefined({ ok: true, files: [{ ok: true, files: [{ id }] }] }, okResult(outcome))
+          return mergeDroppingUndefined({ ok: true, files: [{ ok: true, files: [{ id }] }] }, overrides)
         })
       },
     }

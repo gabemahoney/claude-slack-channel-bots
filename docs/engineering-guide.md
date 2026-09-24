@@ -14,7 +14,7 @@
 - **Pure logic** goes in dedicated modules (lib.ts, config.ts) — side-effect-free, importable by tests
 - **Stateful registries** go in their own modules (registry.ts) — module-scoped Maps, exported CRUD functions, `_reset` functions for tests
 - **Server wiring** stays in server.ts — building the connection manager and registering the per-persona event handler with it, HTTP routing, startup/shutdown, process lifecycle. Slack clients are created only by the connection manager through its injected `PersonaSlackClientFactory` (see Security), never at module scope and never in server.ts; server.ts reads a persona's client only through `clientFor(key)`. Importing server.ts must stay free of Slack clients, token reads and directory creation: that work belongs in `main()`
-- **Per-persona start and event routing** live in importable, side-effect-free modules: the SR-6.1 bring-up procedure (`connectPersona` for steps 1–3, `bringUpPersona` adding the launch) and the connection seams (`clientFor`, the identity lookup, the up-flush listener, the relaunch gate) in `src/persona-start.ts`, and the handler every persona connection forwards its `message`, `app_mention` and `interactive` events to in `src/persona-event-router.ts`. Put new start steps or event handling there, with dependencies injected, not in server.ts
+- **Per-persona start and event routing** live in importable, side-effect-free modules: the SR-6.1 bring-up steps (`checkPersonaLocalSteps` for steps 1–2, `connectPersonaSlack` for step 3) and the connection seams (`clientFor`, the identity lookup, the up-flush listener, the relaunch gate) in `src/persona-start.ts`, the per-persona outcomes, retries and launch after a retry in `src/persona-bringup-controller.ts`, and the handler every persona connection forwards its `message`, `app_mention` and `interactive` events to in `src/persona-event-router.ts`. Put new start steps or event handling there, with dependencies injected, not in server.ts
 - **Inbound delivery** lives in `src/persona-routing.ts`, which is importable and side-effect-free, with every client and source injected through `createPersonaRouting`. The event router only logs the RAW line and hands the event to its `receive` with the receiving persona's key; put drop logging and lost-message handling in the module, not in the router or server.ts, so tests drive the real code. The channel delivery rules themselves live only in the pure `src/delivery-decision.ts` (`decideDelivery`); add or change a rule there, not in the pipeline. Inbound dedupe (b.av2 SR-4.1) lives in the pure `src/inbound-dedupe.ts`: the routing keeps one store per persona key, built with its injected `dedupeClock`; the store counts and limits nothing, so don't add a rate or count check to it
 
 ### When to Extract
@@ -32,7 +32,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 - Log errors to stderr with the `[slack]` prefix: `console.error('[slack] context: description', err)`
 - Non-critical failures (reaction add, message update) use empty catch blocks with `/* non-critical */` or `/* ignore */`
 - Only start-wide failures exit the process with a clear message: a missing, unreadable, pre-persona or invalid config file (`[slack] Fatal: configuration error — …`, before any port, PID file, Slack connection or spawn) and the other start-wide steps (the startup gate, a PID conflict, the template refresh). The server loads no token, so there is no token failure to exit on
-- A per-persona bring-up failure (credentials, working directory, Slack validation or connection) never exits the process: it is logged through the persona diagnostics below and isolated to that persona, which is not brought up while the others and the server carry on. Don't add a `process.exit` or a thrown startup error on a per-persona path
+- A per-persona bring-up failure (credentials, working directory, Slack validation or connection) never exits the process: it is logged through the persona diagnostics below and isolated to that persona, which ends `broken` or `retrying` while the others and the server carry on (see Persona Bring-Up Retries). Don't add a `process.exit` or a thrown startup error on a per-persona path
 - Persona diagnostic lines (b.av2 SR-10.3) go through `src/persona-diagnostics.ts`. Add a new class to its closed label set, build the line with `formatPersonaDiagnostic()` or `personaCheckFailure()`, and emit it only through an injected logger, never with a direct `console` call in a pure module. The cause is one line, names a bad token by its key and the rule it breaks, never by its value, and never quotes file contents
 - On persona connection paths, log a thrown or rejected value only through `describeThrownValue()` in `src/persona-connection-errors.ts`, never the error object or its message: a Slack library error's message, request and headers can hold a token. For a failed Slack Web API call, end the log line with `describeSlackCallFailure()` from the same module, which adds the Slack platform reason when it is a safe identifier
 
@@ -87,7 +87,7 @@ When a managed session's MCP connection closes, `onsessionclosed` calls `schedul
 
 ### Failure Limiting
 
-Consecutive relaunch failures are tracked per persona, keyed by persona key (b.av2 SR-6.3), by `src/backoff.ts` — a pure, import-free module with no timers or I/O (see SR-25). The module exposes a simple counter API consumed one-way by restart/health-check/server wiring. `restart.ts` counts at a single site: the `launchSession` boolean outcome (SR-25.1). A successful launch — or a successful MCP reconnect on the alive-but-disconnected path — calls `recordSuccess`; the failing `launchSession` branch calls `recordFailure`. A `'skipped'` launch (the relaunch gate refused it because the persona's Slack connection is not serving) calls neither, so a persona that cannot be launched never burns its failure budget or trips the cap. Any new launch path that can decline to launch returns `'skipped'` rather than `false`. The reconnect path never calls `recordFailure`: an `'escalate-dead'` or `'transient'` reconnect does not re-enter `scheduleRestart`, so counting stays tied to actual launch attempts rather than a non-launch reconnect site. On `'escalate-dead'` restart.ts still returns without re-entering, but the verdict is no longer a silent dead end — the `_buildReconnectSessionAdapter` mapping first awaits `sweepDeadTmuxChannel` (an operator log line plus the memoized `reconcileMissingSweep`, b.m4r), reconciling the dead-tmux row to `missing` so the next tick relaunches it internally rather than waiting on the external `~/startup/find-missing-loop.sh` (now belt-and-braces). The sweep records neither success nor failure, so SR-25.1 (counting only at `launchSession`) is unchanged. That is not a dead end (b.9a7): the periodic health-check tick is the retry driver, re-observing the persona each interval and calling `scheduleRestart` again while it is still alive-but-disconnected or once it goes dead, so a failed or deferred reconnect is retried on a bounded cadence.
+Consecutive relaunch failures are tracked per persona, keyed by persona key (b.av2 SR-6.3), by `src/backoff.ts` — a pure, import-free module with no timers or I/O (see SR-25). The module exposes a simple counter API consumed one-way by restart/health-check/server wiring. `restart.ts` counts at a single site: the `launchSession` boolean outcome (SR-25.1). A successful launch — or a successful MCP reconnect on the alive-but-disconnected path — calls `recordSuccess`; the failing `launchSession` branch calls `recordFailure`. A `'skipped'` launch (the relaunch gate refused it because the persona is not up) calls neither, so a persona that cannot be launched never burns its failure budget or trips the cap. Most not-up personas never get that far, because `restart.ts` asks the same gate earlier (see [Not-up guard](#not-up-guard-bav2-sr-64)). Any new launch path that can decline to launch returns `'skipped'` rather than `false`. The reconnect path never calls `recordFailure`: an `'escalate-dead'` or `'transient'` reconnect does not re-enter `scheduleRestart`, so counting stays tied to actual launch attempts rather than a non-launch reconnect site. On `'escalate-dead'` restart.ts still returns without re-entering, but the verdict is no longer a silent dead end — the `_buildReconnectSessionAdapter` mapping first awaits `sweepDeadTmuxChannel` (an operator log line plus the memoized `reconcileMissingSweep`, b.m4r), reconciling the dead-tmux row to `missing` so the next tick relaunches it internally rather than waiting on the external `~/startup/find-missing-loop.sh` (now belt-and-braces). The sweep records neither success nor failure, so SR-25.1 (counting only at `launchSession`) is unchanged. That is not a dead end (b.9a7): the periodic health-check tick is the retry driver, re-observing the persona each interval and calling `scheduleRestart` again while it is still alive-but-disconnected or once it goes dead, so a failed or deferred reconnect is retried on a bounded cadence.
 
 #### Exponential backoff
 
@@ -106,7 +106,7 @@ Formula: `min(base * 2^preFailureCount, 900)`. `nextBackoffDelay(key, baseDelayS
 
 The arithmetic is also exported statelessly as `doublingBackoffDelay(base, priorAttempts, ceiling)` for callers that keep their own attempt count; `nextBackoffDelay` delegates to it with the 900 s ceiling. The session-restart ladder above, its 5-failure cap and its counters are keyed by persona key.
 
-Persona Slack-unreachable retries (b.av2 SR-3.2) use a separate schedule in `src/persona-retry-schedule.ts`: 5 s doubling to 300 s, no attempt cap, and never shorter than Slack's `retryAfter`. Create one schedule per persona and retry purpose with `createPersonaRetrySchedule`. Don't use the session-restart counters for Slack retries: both are per persona, but they count different failures and share no state.
+Persona bring-up retries (b.av2 SR-3.2: Slack-unreachable and directory-broken) use a separate schedule in `src/persona-retry-schedule.ts`: 5 s doubling to 300 s, no attempt cap, and never shorter than Slack's `retryAfter`. Create one schedule per persona and retry purpose with `createPersonaRetrySchedule`. Don't use the session-restart counters for bring-up retries: both are per persona, but they count different failures and share no state. See [Persona Bring-Up Retries](#persona-bring-up-retries).
 
 #### Cap at 5 consecutive failures
 
@@ -144,6 +144,15 @@ On the transition to 5 consecutive failures, the `launchSession`-failure branch 
 
 The backoff state is in-process only — no persistence. A server restart resets all counters. This is intentional: the server re-runs startup reconcile on start, so each persona gets a clean shot at reconnection after a process restart.
 
+#### Not-up guard (b.av2 SR-6.4)
+
+A persona that is not up (its bring-up is broken or retrying, or its Slack connection is not serving) is never restarted: its instance and agent-director row are left alone and its failure count is unchanged. `RestartDeps.canRestart(key)` (the server passes the relaunch gate) is asked at `scheduleRestart` entry (after the delay=0 and shutdown checks), at the top of the timer callback before `isSessionAlive`, and again right after `isSessionAlive` returns, before `reconnectSession` or `killSession` (`skipIfNotUp`). `launchSession`'s own gate is the backstop for a flip during the kill; its `'skipped'` counts as neither success nor failure.
+
+- **Check shutdown before the gate.** During shutdown every bring-up is cancelled, so the gate would answer false for every persona and log healthy ones as not relaunched. `scheduleRestart` returns on `isShuttingDown()` without asking it, and the timer callback checks shutdown first too.
+
+- **Ask the gate after every await, before touching the instance.** The liveness probe is an async agent-director call, and the persona can stop being up while it runs. A new step that awaits before a reconnect, kill or launch gets its own `skipIfNotUp` check after the await.
+- **A refusal records nothing.** Never call `recordFailure` or `recordSuccess` on a not-up skip; the persona's next restart after it comes up counts normally.
+
 ### Log Messages
 
 All restart activity is logged to stderr with the `[slack]` prefix. `<key>` is the persona key:
@@ -159,8 +168,26 @@ All restart activity is logged to stderr with the `[slack]` prefix. `<key>` is t
 | `[slack] Cap reached for persona=<key> — notifying and stopping restarts` | 5th consecutive failure; `SpawnCapReached` notice raised through the notifier, no more timers scheduled |
 | `[slack] health-check: persona=<key> is at cap — skipping tick (SR-25.3/25.4)` | Poller skipped a capped persona on this tick |
 | `[slack] reconnectSession: persona=<key> is working — deferring /mcp reconnect to a later tick (b.9a7/b.rmy)` | A tick-driven reconnect declined to poke a mid-long-turn (`working`) session; the next tick retries once the turn settles |
-| `[slack] Skipping restart — server is shutting down (persona=<key>)` | Timer fired during shutdown; abort |
+| `[slack] Skipping restart — server is shutting down (persona=<key>)` | `scheduleRestart` called, or a timer fired, during shutdown; no timer armed, gate not asked |
+| `[slack] Not scheduling restart for persona=<key> — the persona is not up (its bring-up has not succeeded, or its Slack connection is not serving)` | `canRestart` refused; no timer armed, nothing recorded |
+| `[slack] Skipping restart for persona=<key> — the persona is no longer up; its instance is left as it is` | `canRestart` refused when the timer fired (before the liveness probe) or right after the probe; no further probe, reconnect, kill or launch, nothing recorded |
 | `[slack] Cancelled restart timer for persona=<key>` | Pending timer cleared on graceful shutdown |
+
+The persona bring-up lines (`persona-start`, the broken-persona classes, directory cleared lines, the launch after a retry) are not restart lines. They're listed in docs/architecture.md, Logging, Persona bring-up lines.
+
+### Persona Bring-Up Retries
+
+A persona's bring-up ends `up`, `broken` or `retrying` (b.av2 SR-6.1). Slack-unreachable and directory-broken personas are retried; credentials-broken ones aren't. This is a second retry mechanism with different rules from auto-restart. It lives in `src/persona-bringup-controller.ts` (directory re-checks, the launch after a retry) and `src/persona-connections.ts` (Slack retries). See docs/architecture.md, Server-Managed Startup step 5.
+
+- **Never touch the restart counter or cap.** Bring-up retries use their own `createPersonaRetrySchedule` (5 s doubling to 300 s, no cap), never `backoff.ts`, `scheduleRestart` or `RESTART_FAILURE_CAP`. A missing directory is an operator fix that can take hours; a cap would leave the persona down after the fix, and counting it as a restart failure would cap a persona that never launched (AC 66).
+- **Keep retries on per-persona timers, outside `startupSessionManager`'s pool.** The start pass must return once every persona has an outcome; never await a retry there or give a retrying persona a pool slot. One slow or broken persona must not delay a healthy one (AC 23, 24).
+- **No timer, lock, queue or promise chain spans two personas.** Keep all retry state in the persona's own entry, and schedule the next re-check only after the previous one finished. A shared structure lets one persona's stall block another.
+- **Reuse the credentials read at the original bring-up.** A retry hands the manager the tokens held from the first read (or the last confirmed change, once confirmed changes exist); never re-read the file. An edit made meanwhile is a pending change for the operator to confirm (E11), not something a retry picks up silently (AC 66).
+- **Launch from the retry, once.** A persona that reaches `up` through a retry is launched from its own retry path through `spawnForPersona`, so it shares the one-launch-in-flight guard with restarts. Don't wait for the health check: until the launch, an inbound message would take the lost-message path.
+- **Keep the running-persona path separate.** A persona that is running and whose directory later disappears is not a bring-up retry: it keeps the restart backoff, cap and `cwd-unreachable` notice (b.av2 SR-11). Don't route it through the bring-up controller, and don't route a bring-up retry through restart.
+- **Log, never post.** Broken-persona and retry failures go to the server log only, through the injected logger: never to Slack under any identity, never held for a later flush and never to `startup-errors.log`. A persona that isn't up has no validated identity to post as, and posting under another persona's identity would leak one persona's state into another's channel.
+- **Log when a cause starts and when it clears, not on every attempt.** A retry that runs every 300 s for days would otherwise flood the log. A class change between attempts is the same episode and logs nothing.
+- **No token value in any line.** Name the persona, its `personas[i]` entry, its key and the file path; describe a bad token only by its key and the rule it breaks.
 
 ## Health-Check Poller
 
@@ -172,7 +199,7 @@ All restart activity is logged to stderr with the `[slack]` prefix. `<key>` is t
 
 ### Async Interval Pattern
 
-Each tick fires an `async` callback. The callback iterates the persona work list sequentially to keep concurrent `client.status(...)` traffic predictable. `HealthCheckDeps.getPersonas()` supplies it as persona key → working directory; production wires the pure `buildPersonaWorkList(personaConfig)`, one entry per persona however many channels it lists. Errors on a single persona are caught and logged; they do not abort the rest of the iteration. agent-director's library Client is internally safe for concurrent verb calls (see SR-0.1).
+Each tick fires an `async` callback. The callback iterates the persona work list sequentially to keep concurrent `client.status(...)` traffic predictable. `HealthCheckDeps.getPersonas()` supplies it as persona key → working directory; production wires the pure `buildPersonaWorkList(personaConfig, canRelaunch)`, one entry per persona that is up, however many channels it lists. Errors on a single persona are caught and logged; they do not abort the rest of the iteration. agent-director's library Client is internally safe for concurrent verb calls (see SR-0.1).
 
 ```typescript
 intervalId = setInterval(async () => {
@@ -187,6 +214,8 @@ intervalId = setInterval(async () => {
 ```
 
 ### Coordination with restart.ts and backoff.ts
+
+The work list already leaves out every persona that is not up (its bring-up is broken or retrying, or its Slack connection is not serving), so the tick never raises `cwd-unreachable` for, reconnects or relaunches such a persona; its bring-up retry owns it until it is up. Don't add a tick path that bypasses the work list. A persona left out of a tick's work list also loses its disconnected streak, as the pending-restart and cap skips do, so a persona that comes back up starts a fresh two-tick count instead of inheriting an observation from before it went down.
 
 Before calling `scheduleRestart`, the poller queries two guards, both keyed by persona key:
 

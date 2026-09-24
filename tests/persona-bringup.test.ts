@@ -1,95 +1,78 @@
 /**
- * persona-bringup.test.ts — The per-persona start procedure (b.av2 SR-6.1),
- * the per-persona flush of held notices (SR-7.2) and dry run (SR-3.4).
+ * persona-bringup.test.ts — The per-persona start procedure (b.av2 SR-6.1) as
+ * the server runs it, and the per-persona flush of held notices (SR-7.2).
  *
- * Drives `bringUpPersona` and `connectPersona` (src/persona-start.ts) over the
- * real connection manager, built by the shared connection harness
- * (`makeConnectionHarness` with `files: true`: E2's stub client factory, a
- * fake clock, each persona's credentials file and working directory), with a
- * launch recorder as step 4. Covers:
+ * Drives the real bring-up controller (`createPersonaBringUpController`, which
+ * runs `persona-start.ts`'s steps 1–3) over the real connection manager, built
+ * by the shared connection harness (`makeConnectionHarness` with `files: true`:
+ * the stub client factory, a fake clock, each persona's credentials file and
+ * working directory). Step 4 is the start pass (`startupSessionManager` with
+ * the controller as `bringUp`) launching through the real `spawnForPersona`
+ * over an agent-director stub client, and the controller's own launch after a
+ * retry goes the same way, as server.ts wires it. Covers:
  *
  *   - the SR-6.1 order per persona: credentials check, working-directory
  *     check, Slack validation and connection, then the launch, which runs
- *     only once that persona's connection is up;
- *   - `connectPersona`: steps 1–3 alone, each outcome, and never a launch;
- *   - a failure at steps 1–3 means the persona is not brought up: later steps
- *     do not run, the causes are logged token-safely, no startup error is
- *     recorded, and the other persona still comes up;
+ *     only once that persona's connection is up, with the tokens from its own
+ *     file;
+ *   - a Slack step that throws: broken with class `error`, one token-free
+ *     line, not retried, no launch;
  *   - a credentials path that is not a regular file (directory, FIFO,
- *     character device) is refused unread (the E2 carry; `CredentialsFs.fstatFile`);
- *   - dry run: no credentials read, no tokens passed on, no client built,
- *     distinct placeholder identities;
- *   - per-persona flush: validating A posts only A's held notices, through
- *     A's client, once (the E3 Task 2 carry);
+ *     character device) is refused unread through the bring-up (the E2 carry;
+ *     `CredentialsFs.fstatFile`);
+ *   - per-persona flush: A reaching up posts only A's held notices, through
+ *     A's client, once; B's are posted when B's retry brings it up (the E3
+ *     Task 2 carry);
  *   - end to end, no agent-director call is made for A across a drop, a
- *     rejected, an abandoned and a refused reopen, with the real event router
- *     and flush listener wired to the manager and the launch going through
- *     the real spawn entry point (the E2 carry).
+ *     rejected, an abandoned and a refused reopen, with the real event router,
+ *     flush listener and bring-up controller wired to the manager (the E2
+ *     carry).
  *
- * The startup pool (`startupSessionManager`: its bookkeeping, the launch pool
- * and a launch that throws) is pinned in tests/session-manager.test.ts.
+ * Each bring-up outcome by cause (credentials missing, unreadable, invalid or
+ * refused; directory missing or unusable; Slack unreachable), both causes at
+ * once, and dry run are pinned in tests/persona-connections.test.ts
+ * (`bring-up outcomes (E5)`); the start pool's bookkeeping in
+ * tests/session-manager.test.ts.
  *
  * Isolation (b.av2 SR-13.2): every path lives under a `mkdtempSync` directory
- * removed in afterEach; `SLACK_STATE_DIR` points inside it, and the token
- * environment variables are set to fakes for the whole file.
+ * removed in afterEach; `SLACK_STATE_DIR` points inside it, the spawn home is
+ * a temp directory, and the token environment variables are set to fakes for
+ * the whole file.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 
 import type { Persona, PersonaConfig } from '../src/config.ts'
+import { getClient } from '../src/agent-director-client.ts'
+import { _resetOutageState, initOutageState } from '../src/outage-state.ts'
 import { DEFAULT_WORKING_DIRECTORY_FS, type PersonaBringUpFs } from '../src/persona-bringup.ts'
+import { createPersonaBringUpController, type PersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import type { PersonaConnectionManager } from '../src/persona-connections.ts'
 import { DEFAULT_CREDENTIALS_FS } from '../src/persona-credentials.ts'
 import { createPersonaEventRouter } from '../src/persona-event-router.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { createPersonaNotifier, formatPersonaNotice, type PersonaNotifier } from '../src/persona-notifier.ts'
 import {
-  bringUpPersona,
-  connectPersona,
+  composePersonaStatusListeners,
   createPersonaClientLookup,
-  createPersonaIdentityLookup,
   createPersonaUpFlushListener,
-  type PersonaBringUpDeps,
-  type PersonaBringUpResult,
-  type PersonaBringUpStep,
-  type PersonaConnectDeps,
 } from '../src/persona-start.ts'
 import {
-  _resetDialogPollIntervalMs,
-  _resetDialogReadyTimeoutMs,
-  _resetInFlightLaunches,
-  _resetSpawnHomeDir,
-  _resetTmuxDialogHelpers,
-  _resetTmuxSessionProber,
-  _setDialogPollIntervalMs,
-  _setDialogReadyTimeoutMs,
-  _setSpawnHomeDir,
-  _setTmuxCapturePane,
-  _setTmuxSendEnter,
-  _setTmuxSessionProber,
   setSessionNotifier,
   spawnForPersona,
+  startupSessionManager,
+  type StartupSessionManagerResult,
 } from '../src/session-manager.ts'
-import { _resetOutageState, initOutageState } from '../src/outage-state.ts'
-import { getClient, resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
-import { makeStubClient, type StubClientOptions } from './test-helpers/agent-director-stub.ts'
-import {
-  APP_TOKEN_PREFIX,
-  BOT_TOKEN_PREFIX,
-  LEAK_SENTINEL,
-  assertNoLeak,
-  fakeToken,
-  writeCredentialsFile,
-} from './test-helpers/credentials.ts'
-import type { FakeClock } from './test-helpers/fake-clock.ts'
+import { installStubSpawnPath, resetStubSpawnPath, type StubSpawnPath } from './test-helpers/agent-director-stub.ts'
+import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
-import { makeChannelMessage, type StubSlackFactory, type StubSlackOptions } from './test-helpers/slack-stub.ts'
+import { makeChannelMessage, type StubSlackOptions } from './test-helpers/slack-stub.ts'
 
 // ---------------------------------------------------------------------------
 // Fixture: personas A and B, each with its own directory and credentials file
@@ -107,8 +90,16 @@ let savedEnv: Array<readonly [string, string | undefined]>
 let cfg: PersonaConfig
 let a: Persona
 let b: Persona
-/** Managers built by this test; stopped in afterEach. */
+/** Built by this test; cancelled and stopped in afterEach. */
 let managers: PersonaConnectionManager[]
+let controllers: PersonaBringUpController[]
+/** Launches the controllers started after a retry; awaited in afterEach, before the stub client is removed. */
+let retryLaunchesInFlight: Promise<unknown>[]
+/** The launch path's agent-director stub and every call it received. */
+let ad: StubSpawnPath
+/** Everything written to console.error (the start pass's and spawn's lines). */
+let consoleLines: string[]
+const originalError = console.error
 
 beforeEach(() => {
   savedEnv = ENV_KEYS.map((key) => [key, process.env[key]] as const)
@@ -120,10 +111,25 @@ beforeEach(() => {
   process.env['SLACK_APP_TOKEN'] = fakeToken(APP_TOKEN_PREFIX, 'env')
   delete process.env['SLACK_DRY_RUN']
   managers = []
+  controllers = []
+  retryLaunchesInFlight = []
+  consoleLines = []
+  console.error = (...args: unknown[]) => void consoleLines.push(args.map(String).join(' '))
+
+  // The launch (step 4) goes through the real spawnForPersona over a stub client.
+  ad = installStubSpawnPath(join(dir, 'home'))
+  setSessionNotifier(() => {})
+  initOutageState({ getClient, notify: () => {} })
 })
 
 afterEach(async () => {
+  for (const c of controllers) c.cancelAll()
+  await Promise.allSettled(retryLaunchesInFlight)
   await Promise.all(managers.map((m) => m.stopAll()))
+  console.error = originalError
+  resetStubSpawnPath()
+  setSessionNotifier(undefined)
+  _resetOutageState()
   for (const [key, value] of savedEnv) {
     if (value === undefined) delete process.env[key]
     else process.env[key] = value
@@ -134,10 +140,10 @@ afterEach(async () => {
 const startupErrorsLog = () => join(dir, 'state', 'startup-errors.log')
 
 // ---------------------------------------------------------------------------
-// Harness: the real manager over the stub factory and fake clock
+// Harness: the controller over the real manager, stub factory and fake clock
 // ---------------------------------------------------------------------------
 
-/** What the launch recorder saw when step 4 ran for a persona. */
+/** What the spawn recorder saw when step 4 reached agent-director for a persona. */
 interface LaunchRecord {
   key: string
   state: string | undefined
@@ -146,298 +152,198 @@ interface LaunchRecord {
 }
 
 interface HarnessOptions {
-  dryRun?: boolean
   /** Per-persona stub options (scripts); the leak marker is always on. */
   slack?: Partial<Record<'a' | 'b', StubSlackOptions>>
-  /** The launch throws for this key. */
-  launchThrowsFor?: string
-}
-
-/** Per-run options: `readFile: 'forbid'` makes any credentials read fail the test instead of reading. */
-interface RunOptions {
-  readFile?: 'real' | 'forbid'
-  fs?: Partial<PersonaBringUpFs>
+  /** Replaces the controller's step 3 (the harness's recording `bringUp` by default). */
+  bringUp?: PersonaConnectionManager['bringUp']
 }
 
 interface Harness {
   /** The shared connection harness (A and B with their files, the manager, stubs, fake clock). */
   conn: ConnectionHarness
-  manager: PersonaConnectionManager
-  clock: FakeClock
-  slack: StubSlackFactory
-  /** The manager's lines and the start procedure's lines, in order. */
+  controller: PersonaBringUpController
+  /** The manager's and the controller's lines, in order. */
   lines: string[]
   /** Step markers in the order they ran: `credentials:<key>`, `directory:<key>`, `slack:<key>`, `launch:<key>`. */
   order: string[]
+  /** One record per spawn, in call order. */
   launches: LaunchRecord[]
+  /** Keys the controller launched after a retry. */
+  retryLaunches: string[]
   /** Credentials file reads, by key. */
   reads: Map<string, number>
-  /** The start procedure's dependencies for one persona, without the launch. */
-  deps(persona: Persona, opts?: RunOptions): PersonaConnectDeps
-  /** Run steps 1–4 for one persona. */
-  run(persona: Persona, opts?: RunOptions): Promise<PersonaBringUpResult<string>>
+  /** Keys whose credentials file must never be read: a read fails the bring-up instead. */
+  forbidReads: Set<string>
+  /** Credentials-seam overrides consulted at call time. */
+  fsOverride: Partial<PersonaBringUpFs>
+  /** The persona key a credentials descriptor was opened for. */
+  keyOfFd(fd: number): string | undefined
+  /** The start pass as the server runs it (concurrency 1). */
+  startPass(): Promise<StartupSessionManagerResult>
   /** Everything captured, for `assertNoLeak`. */
   captured(extra?: Record<string, unknown>): Record<string, unknown>
 }
 
 /**
- * Build A and B on `makeConnectionHarness` (files written, leak marker on)
- * and set `cfg`, `a` and `b`. Tests arrange file-system failures after this.
+ * Build A and B on `makeConnectionHarness` (files written, leak marker on),
+ * the real controller over it with a recording file-system seam, and the
+ * manager's status listener wired to the controller as server.ts wires it
+ * (`h.conn.onStatus`; a test may compose more listeners in front). Sets
+ * `cfg`, `a` and `b`. Tests arrange file-system failures after this.
  */
 function makeHarness(opts: HarnessOptions = {}): Harness {
-  const dryRun = opts.dryRun ?? false
   const conn = makeConnectionHarness([{ name: A_NAME }, { name: B_NAME }], dir, {
-    dryRun,
     files: true,
     stubOptions: { [A_NAME]: opts.slack?.a ?? {}, [B_NAME]: opts.slack?.b ?? {} },
   })
   cfg = conn.config!
-  ;[a, b] = conn.personas
+  ;[a, b] = conn.personas as [Persona, Persona]
   const { manager, lines, order } = conn
   managers.push(manager)
   const launches: LaunchRecord[] = []
+  const retryLaunches: string[] = []
   const reads = new Map<string, number>()
+  const forbidReads = new Set<string>()
+  const fsOverride: Partial<PersonaBringUpFs> = {}
+  const fdKeys = new Map<number, string>()
+  const keyOf = (path: string, field: 'credentials_file' | 'working_directory') =>
+    conn.personas.find((p) => p[field] === path)?.key ?? path
 
-  async function launch(persona: Persona): Promise<string> {
-    order.push(`launch:${persona.key}`)
-    const stub = dryRun ? undefined : conn.stub(persona)
+  // Step 4 reaches agent-director: record the persona's connection as it stands then.
+  const realSpawn = ad.client.spawn.bind(ad.client)
+  ad.client.spawn = async (params) => {
+    const key = (params.claude_instance_id ?? '').replace(/^cscb_/, '')
+    order.push(`launch:${key}`)
+    const stub = conn.slack.persona(key)
     launches.push({
-      key: persona.key,
-      state: manager.status(persona.key)?.state,
-      socketConnected: stub?.sockets.some((s) => s.connected) ?? false,
-      authTests: stub?.calls.authTest.length ?? 0,
+      key,
+      state: manager.status(key)?.state,
+      socketConnected: stub.sockets.some((s) => s.connected),
+      authTests: stub.calls.authTest.length,
     })
-    if (opts.launchThrowsFor === persona.key) throw new Error(`launch failed for ${persona.key}`)
-    return `launched:${persona.key}`
+    return realSpawn(params)
   }
 
-  function deps(persona: Persona, runOpts: RunOptions = {}): PersonaConnectDeps {
-    const key = persona.key
-    const override = runOpts.fs ?? {}
-    const fs: Partial<PersonaBringUpFs> = {
-      ...override,
+  const controller = createPersonaBringUpController({
+    connections: { bringUp: opts.bringUp ?? conn.connections.bringUp, status: (key) => manager.status(key) },
+    dryRun: false,
+    log: (line) => void lines.push(line),
+    clock: conn.clock,
+    fs: {
       openFile: (path) => {
+        const key = keyOf(path, 'credentials_file')
         order.push(`credentials:${key}`)
-        return (override.openFile ?? DEFAULT_CREDENTIALS_FS.openFile)(path)
+        const fd = (fsOverride.openFile ?? DEFAULT_CREDENTIALS_FS.openFile)(path)
+        fdKeys.set(fd, key)
+        return fd
       },
+      fstatFile: (fd) => (fsOverride.fstatFile ?? DEFAULT_CREDENTIALS_FS.fstatFile)(fd),
       readFileFd: (fd) => {
+        const key = fdKeys.get(fd) ?? ''
         reads.set(key, (reads.get(key) ?? 0) + 1)
-        if (runOpts.readFile === 'forbid') throw new Error('the credentials file must not be read')
-        return (override.readFileFd ?? DEFAULT_CREDENTIALS_FS.readFileFd)(fd)
+        if (forbidReads.has(key)) throw new Error('the credentials file must not be read')
+        return (fsOverride.readFileFd ?? DEFAULT_CREDENTIALS_FS.readFileFd)(fd)
       },
       stat: (path) => {
-        order.push(`directory:${key}`)
-        return (override.stat ?? DEFAULT_WORKING_DIRECTORY_FS.stat)(path)
+        order.push(`directory:${keyOf(path, 'working_directory')}`)
+        return (fsOverride.stat ?? DEFAULT_WORKING_DIRECTORY_FS.stat)(path)
       },
-    }
-    return { applied: cfg.personas, dryRun, log: (line) => void lines.push(line), connections: conn.connections, fs }
-  }
+    },
+    launch: (persona) => {
+      retryLaunches.push(persona.key)
+      const launched = spawnForPersona(persona, cfg, false)
+      retryLaunchesInFlight.push(launched)
+      return launched
+    },
+  })
+  controllers.push(controller)
+  conn.onStatus = (key, status) => controller.onConnectionStatus(key, status)
 
   return {
     conn,
-    manager,
-    clock: conn.clock,
-    slack: conn.slack,
+    controller,
     lines,
     order,
     launches,
+    retryLaunches,
     reads,
-    deps,
-    run: (persona, runOpts) => bringUpPersona(persona, { ...deps(persona, runOpts), launch }),
-    captured: (extra = {}) => ({ lines, order, launches, bringUpCalls: conn.bringUpCalls, ...extra }),
+    forbidReads,
+    fsOverride,
+    keyOfFd: (fd) => fdKeys.get(fd),
+    startPass: () => startupSessionManager(cfg, { concurrency: 1, bringUp: controller }),
+    captured: (extra = {}) => ({ lines, order, launches, consoleLines, bringUpCalls: conn.bringUpCalls, ...extra }),
   }
-}
-
-/** Bring A then B up, in that order (the start pool at concurrency 1). */
-async function runBoth(h: Harness): Promise<Map<string, PersonaBringUpResult<string>>> {
-  const results = new Map<string, PersonaBringUpResult<string>>()
-  for (const persona of [a, b]) results.set(persona.key, await h.run(persona))
-  return results
 }
 
 /** The four step markers of a persona brought up and launched. */
 const fullOrder = (key: string) => [`credentials:${key}`, `directory:${key}`, `slack:${key}`, `launch:${key}`]
+const markersOf = (h: Harness, key: string) => h.order.filter((m) => m.endsWith(`:${key}`))
 
-/** B went through every step, was launched once after its connection was up, and its connection is up. */
-function expectBLaunched(h: Harness, results: Map<string, PersonaBringUpResult<string>>): void {
-  expect(results.get(b.key)).toEqual({ outcome: 'launched', launch: `launched:${b.key}` })
-  expect(h.order.filter((m) => m.endsWith(`:${b.key}`))).toEqual(fullOrder(b.key))
+/** B went through every step and was launched once, after its connection was up. */
+function expectBLaunched(h: Harness, result: StartupSessionManagerResult): void {
+  expect(result.perPersona.find((p) => p.key === b.key)).toEqual({ key: b.key, action: 'spawned' })
+  expect(markersOf(h, b.key)).toEqual(fullOrder(b.key))
   expect(h.launches.filter((l) => l.key === b.key)).toEqual([{ key: b.key, state: 'up', socketConnected: true, authTests: 1 }])
-}
-
-/** A was not brought up: no Slack step, no launch, no client built, and no startup error recorded. */
-function expectANotBroughtUp(h: Harness): void {
-  expect(h.order).not.toContain(`launch:${a.key}`)
-  expect(h.launches.map((l) => l.key)).not.toContain(a.key)
-  expect(existsSync(startupErrorsLog())).toBe(false)
 }
 
 // ---------------------------------------------------------------------------
 // SR-6.1: the order of the steps
 // ---------------------------------------------------------------------------
 
-describe('bringUpPersona: SR-6.1 order', () => {
-  test('each persona passes its credentials, directory and Slack steps, then is launched once, only after its connection is up', async () => {
+describe('start pass: SR-6.1 order', () => {
+  test('each persona passes its credentials, directory and Slack steps, then is launched once, only after its connection is up, with the tokens from its own file', async () => {
     const h = makeHarness()
 
-    const results = await runBoth(h)
+    const result = await h.startPass()
 
-    expect(h.order).toEqual([...fullOrder(a.key), ...fullOrder(b.key)])
-    expect(results.get(a.key)).toEqual({ outcome: 'launched', launch: `launched:${a.key}` })
-    expect(results.get(b.key)).toEqual({ outcome: 'launched', launch: `launched:${b.key}` })
-    // At launch the persona's auth.test had run and its socket was open, its status up.
-    expect(h.launches).toEqual([
-      { key: a.key, state: 'up', socketConnected: true, authTests: 1 },
-      { key: b.key, state: 'up', socketConnected: true, authTests: 1 },
-    ])
-    // The manager got each persona's tokens from its own file; the clients were built with them.
-    expect(h.conn.bringUpCalls).toEqual([
-      { key: a.key, gotTokens: true, ownTokens: true },
-      { key: b.key, gotTokens: true, ownTokens: true },
-    ])
     for (const persona of [a, b]) {
+      expect(result.perPersona.find((p) => p.key === persona.key)).toEqual({ key: persona.key, action: 'spawned' })
+      expect(markersOf(h, persona.key)).toEqual(fullOrder(persona.key))
+      // At launch the persona's auth.test had run and its socket was open, its status up.
+      expect(h.launches.filter((l) => l.key === persona.key)).toEqual([
+        { key: persona.key, state: 'up', socketConnected: true, authTests: 1 },
+      ])
+      // The manager got the persona's tokens from its own file, read once; the clients were built with them.
+      expect(h.reads.get(persona.key)).toBe(1)
       const own = h.conn.tokens(persona)
-      const [validation] = h.slack.buildsOf(persona.key, 'validation')
-      const [socket] = h.slack.buildsOf(persona.key, 'socket')
-      expect(validation.hasToken(own.botToken)).toBe(true)
-      expect(validation.hasToken(process.env['SLACK_BOT_TOKEN']!)).toBe(false)
-      expect(socket.hasToken(own.appToken)).toBe(true)
+      const [validation] = h.conn.slack.buildsOf(persona.key, 'validation')
+      const [socket] = h.conn.slack.buildsOf(persona.key, 'socket')
+      expect(validation!.hasToken(own.botToken)).toBe(true)
+      expect(validation!.hasToken(process.env['SLACK_BOT_TOKEN']!)).toBe(false)
+      expect(socket!.hasToken(own.appToken)).toBe(true)
     }
-    expect(h.reads.get(a.key)).toBe(1)
-    assertNoLeak(h.captured({ results: [...results.values()] }))
+    expect([...h.conn.bringUpCalls].sort((x, y) => x.key.localeCompare(y.key))).toEqual(
+      [a.key, b.key].sort().map((key) => ({ key, gotTokens: true, ownTokens: true })),
+    )
+    expect(h.retryLaunches).toEqual([])
+    assertNoLeak(h.captured({ result }))
   })
 })
 
 // ---------------------------------------------------------------------------
-// connectPersona: steps 1–3 alone (the startup pool runs them for every
-// persona at once and pools only the launches)
+// Step 3 throws (a programming error, not a Slack outcome)
 // ---------------------------------------------------------------------------
 
-describe('connectPersona: steps 1–3 only, never a launch', () => {
-  /** A's deps as `bringUpPersona` takes them, with a launch that must never run. */
-  function depsWithLaunch(h: Harness, launched: string[], overrides: Partial<PersonaConnectDeps> = {}): PersonaBringUpDeps<string> {
-    return { ...h.deps(a), ...overrides, launch: async (p) => (launched.push(p.key), 'launched') }
-  }
+describe('bring-up controller: a Slack step that throws', () => {
+  test('A is broken with class error and one token-free line naming it; nothing is retried or launched', async () => {
+    const h = makeHarness({ bringUp: async () => { throw new Error(`manager exploded ${LEAK_SENTINEL}`) } })
 
-  test.each<[string, (h: Harness) => void, StubSlackOptions, string[], Array<{ step: PersonaBringUpStep; class: string }> | undefined]>([
-    ['every step passes: connected', () => {}, {}, ['credentials', 'directory', 'slack'], undefined],
-    ['credentials file missing', () => rmSync(a.credentials_file), {}, ['credentials', 'directory'],
-      [{ step: 'credentials', class: 'persona-credentials-missing' }]],
-    ['working directory missing', () => rmSync(a.working_directory, { recursive: true }), {}, ['credentials', 'directory'],
-      [{ step: 'working-directory', class: 'persona-directory-missing' }]],
-    ['Slack refuses the bot token', () => {}, { authTest: [{ kind: 'platform', error: 'invalid_auth' }] }, ['credentials', 'directory', 'slack'],
-      [{ step: 'slack', class: 'persona-credentials-refused' }]],
-    ['Slack is unreachable (retrying its bring-up)', () => {}, { authTest: [{ kind: 'network' }] }, ['credentials', 'directory', 'slack'],
-      [{ step: 'slack', class: 'persona-slack-unreachable' }]],
-  ])('%s', async (_label, arrange, slackA, steps, failures) => {
-    const h = makeHarness({ slack: { a: slackA } })
-    arrange(h)
-    const launched: string[] = []
+    const summary = await h.controller.bringUp(a, cfg.personas)
 
-    const result = await connectPersona(a, depsWithLaunch(h, launched))
-
-    if (failures === undefined) {
-      expect(result).toEqual({ outcome: 'connected' })
-      expect(h.manager.status(a.key)?.state).toBe('up')
-    } else {
-      expect(result.outcome).toBe('not-brought-up')
-      if (result.outcome !== 'not-brought-up') return
-      expect(result.failures.map(({ step, class: cls }) => ({ step, class: cls }))).toEqual(failures)
-    }
-    expect(h.order).toEqual(steps.map((step) => `${step}:${a.key}`))
-    expect(launched).toEqual([])
-    expect(h.launches).toEqual([])
-    assertNoLeak(h.captured({ result }))
-  })
-
-  test('a Slack bring-up that throws: not brought up with class error, one token-free line naming A, no launch', async () => {
-    const h = makeHarness()
-    const launched: string[] = []
-    const connections = { bringUp: async () => { throw new Error(`manager exploded ${LEAK_SENTINEL}`) } }
-
-    const result = await connectPersona(a, depsWithLaunch(h, launched, { connections }))
-
-    expect(result).toEqual({
-      outcome: 'not-brought-up',
+    expect(summary).toEqual({
+      outcome: 'broken',
       failures: [{ step: 'slack', class: 'error', cause: expect.stringMatching(/^Slack bring-up threw: /) }],
     })
-    expect(h.lines).toEqual([expect.stringContaining(`[slack] persona ${renderPersonaRef(a.name, a.key)} not brought up: Slack bring-up threw: `)])
-    expect(launched).toEqual([])
-    assertNoLeak(h.captured({ result }))
-  })
-
-  test('dry run: no credentials read and no tokens handed on; connected', async () => {
-    const h = makeHarness({ dryRun: true })
-    rmSync(a.credentials_file)
-
-    const result = await connectPersona(a, h.deps(a, { readFile: 'forbid' }))
-
-    expect(result).toEqual({ outcome: 'connected' })
-    expect(h.order).toEqual([`directory:${a.key}`, `slack:${a.key}`])
-    expect(h.conn.bringUpCalls).toEqual([{ key: a.key, gotTokens: false, ownTokens: false }])
-    assertNoLeak(h.captured({ result }))
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Steps 1–2 failures: not brought up, later steps skipped
-// ---------------------------------------------------------------------------
-
-describe('bringUpPersona: local failures (steps 1 and 2)', () => {
-  const credentialsFile = () => a.credentials_file
-  const workDir = () => a.working_directory
-
-  test.each<[string, () => void, Array<{ step: PersonaBringUpStep; class: string }>]>([
-    [
-      'credentials file and working directory both missing: both causes logged',
-      () => {
-        rmSync(credentialsFile())
-        rmSync(workDir(), { recursive: true })
-      },
-      [
-        { step: 'credentials', class: 'persona-credentials-missing' },
-        { step: 'working-directory', class: 'persona-directory-missing' },
-      ],
-    ],
-    [
-      'credentials file missing only',
-      () => rmSync(credentialsFile()),
-      [{ step: 'credentials', class: 'persona-credentials-missing' }],
-    ],
-    [
-      'credentials file invalid (non-JSON holding the sentinel)',
-      () => writeCredentialsFile(dirname(credentialsFile()), 'credentials.json', `{${LEAK_SENTINEL}`),
-      [{ step: 'credentials', class: 'persona-credentials-invalid' }],
-    ],
-    [
-      'working directory unusable only (a file, not a directory)',
-      () => {
-        rmSync(workDir(), { recursive: true })
-        writeFileSync(workDir(), '', 'utf-8')
-      },
-      [{ step: 'working-directory', class: 'persona-directory-unusable' }],
-    ],
-  ])('%s: A is not brought up, no Slack client is built for it, and B comes up', async (_label, arrange, expected) => {
-    const h = makeHarness()
-    arrange()
-
-    const results = await runBoth(h)
-
-    const result = results.get(a.key)!
-    expect(result.outcome).toBe('not-brought-up')
-    if (result.outcome !== 'not-brought-up') return
-    expect(result.failures.map(({ step, class: cls }) => ({ step, class: cls }))).toEqual(expected)
-    // Both checks ran before either stopped the bring-up; nothing after them did.
-    expect(h.order.filter((m) => m.endsWith(`:${a.key}`))).toEqual([`credentials:${a.key}`, `directory:${a.key}`])
-    expect(h.slack.buildsOf(a.key)).toEqual([])
-    expectANotBroughtUp(h)
-    // One log line per cause, naming A in rendered form.
+    expect(h.controller.isUp(a.key)).toBe(false)
     const ref = renderPersonaRef(a.name, a.key)
-    for (const { class: cls } of expected) {
-      expect(h.lines.filter((l) => l.includes(cls) && l.includes(ref))).toHaveLength(1)
-    }
-    expectBLaunched(h, results)
-    assertNoLeak(h.captured({ results: [...results.values()] }))
+    expect(h.lines.filter((l) => l.includes('Slack bring-up threw'))).toEqual([
+      expect.stringContaining(`[slack] persona ${ref} not brought up: Slack bring-up threw: `),
+    ])
+    expect(h.conn.clock.pendingCount()).toBe(0)
+    await h.conn.clock.advance(3_600_000)
+    expect(h.retryLaunches).toEqual([])
+    expect(ad.callCount()).toBe(0)
+    assertNoLeak(h.captured({ summary }))
   })
 })
 
@@ -445,41 +351,44 @@ describe('bringUpPersona: local failures (steps 1 and 2)', () => {
 // Non-regular credentials files: refused before any read (E2 carry)
 // ---------------------------------------------------------------------------
 
-describe('bringUpPersona: a credentials path that is not a regular file is refused unread', () => {
-  /** Arrange A's credentials path, run A (reads forbidden) then B, and check A was refused as unreadable without a read. */
-  async function expectRefusedUnread(arrange: () => Partial<PersonaBringUpFs> | undefined): Promise<void> {
+describe('start pass: a credentials path that is not a regular file is refused unread', () => {
+  /** Arrange A's credentials path, run the start pass with A's reads forbidden, and check A was refused as unreadable without a read. */
+  async function expectRefusedUnread(arrange: (h: Harness) => void): Promise<void> {
     const h = makeHarness()
-    const fs = arrange()
-    const resultA = await h.run(a, { readFile: 'forbid', fs })
-    const resultB = await h.run(b)
+    arrange(h)
+    h.forbidReads.add(a.key)
 
-    expect(resultA.outcome).toBe('not-brought-up')
-    if (resultA.outcome !== 'not-brought-up') return
-    expect(resultA.failures.map(({ step, class: cls }) => ({ step, class: cls }))).toEqual([
-      { step: 'credentials', class: 'persona-credentials-unreadable' },
-    ])
+    const result = await h.startPass()
+
+    expect(result.perPersona.find((p) => p.key === a.key)).toEqual({
+      key: a.key,
+      action: 'not-brought-up',
+      outcome: 'broken',
+      failures: [{ step: 'credentials', class: 'persona-credentials-unreadable', cause: expect.any(String) }],
+    })
     expect(h.reads.get(a.key) ?? 0).toBe(0)
-    expect(h.slack.buildsOf(a.key)).toEqual([])
-    expectANotBroughtUp(h)
-    expectBLaunched(h, new Map([[b.key, resultB]]))
-    assertNoLeak(h.captured({ resultA, resultB }))
+    expect(markersOf(h, a.key)).toEqual([`credentials:${a.key}`, `directory:${a.key}`])
+    expect(h.conn.slack.buildsOf(a.key)).toEqual([])
+    expect(ad.spawnedIds()).toEqual([`cscb_${b.key}`])
+    expect(existsSync(startupErrorsLog())).toBe(false)
+    expectBLaunched(h, result)
+    assertNoLeak(h.captured({ result }))
   }
 
-  test.each<[string, () => Partial<PersonaBringUpFs> | undefined]>([
+  test.each<[string, (h: Harness) => void]>([
     ['a directory', () => {
       rmSync(a.credentials_file)
       mkdirSync(a.credentials_file)
-      return undefined
     }],
     ['a character device (a symlink to /dev/zero)', () => {
       rmSync(a.credentials_file)
       symlinkSync('/dev/zero', a.credentials_file)
-      return undefined
     }],
-    ['a FIFO, as the injected fstatFile reports it', () => ({
-      fstatFile: () => ({ isFile: () => false, isDirectory: () => false }),
-    })],
-  ])('%s', async (_label, arrange) => {
+    ['a FIFO, as the injected fstatFile reports it', (h) => {
+      h.fsOverride.fstatFile = (fd) =>
+        h.keyOfFd(fd) === a.key ? { isFile: () => false, isDirectory: () => false } : DEFAULT_CREDENTIALS_FS.fstatFile(fd)
+    }],
+  ])('%s: A is broken as unreadable with no read and no Slack client; B is launched', async (_label, arrange) => {
     await expectRefusedUnread(arrange)
   })
 
@@ -488,88 +397,7 @@ describe('bringUpPersona: a credentials path that is not a regular file is refus
     await expectRefusedUnread(() => {
       rmSync(a.credentials_file)
       expect(spawnSync('mkfifo', [a.credentials_file]).status).toBe(0)
-      return undefined
     })
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Step 3 failures: Slack refuses or cannot be reached
-// ---------------------------------------------------------------------------
-
-describe('bringUpPersona: Slack failures (step 3)', () => {
-  test.each<[string, StubSlackOptions, string, number]>([
-    ['Slack refuses A\'s bot token', { authTest: [{ kind: 'platform', error: 'invalid_auth' }] }, 'persona-credentials-refused', 0],
-    ['Slack is unreachable for A\'s auth.test', { authTest: [{ kind: 'network' }] }, 'persona-slack-unreachable', 0],
-    ['Slack refuses A\'s app token at the socket open', { connect: [{ kind: 'platform', error: 'invalid_auth' }] }, 'persona-credentials-refused', 1],
-    ['A\'s socket open cannot reach Slack', { connect: [{ kind: 'network' }] }, 'persona-slack-unreachable', 1],
-  ])('%s: A is not launched in this pass, one line names A, and B is unaffected', async (_label, script, cls, sockets) => {
-    const h = makeHarness({ slack: { a: script } })
-
-    const results = await runBoth(h)
-
-    const result = results.get(a.key)!
-    expect(result.outcome).toBe('not-brought-up')
-    if (result.outcome !== 'not-brought-up') return
-    expect(result.failures.map(({ step, class: c }) => ({ step, class: c }))).toEqual([{ step: 'slack', class: cls }])
-    expect(h.order.filter((m) => m.endsWith(`:${a.key}`))).toEqual([`credentials:${a.key}`, `directory:${a.key}`, `slack:${a.key}`])
-    expect(h.slack.buildsOf(a.key, 'socket')).toHaveLength(sockets)
-    expectANotBroughtUp(h)
-    const ref = renderPersonaRef(a.name, a.key)
-    const aLines = h.lines.filter((l) => l.includes(ref))
-    expect(aLines).toHaveLength(1)
-    expect(aLines[0]).toContain(cls)
-    expectBLaunched(h, results)
-    assertNoLeak(h.captured({ results: [...results.values()] }))
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Dry run (b.av2 SR-3.4)
-// ---------------------------------------------------------------------------
-
-describe('bringUpPersona: dry run (SR-3.4)', () => {
-  test('no credentials file is read, no tokens are passed on, no client is built; both launch with distinct placeholder identities', async () => {
-    const h = makeHarness({ dryRun: true })
-    rmSync(a.credentials_file)
-    rmSync(b.credentials_file)
-
-    const resultA = await h.run(a, { readFile: 'forbid' })
-    const resultB = await h.run(b, { readFile: 'forbid' })
-
-    expect(resultA).toEqual({ outcome: 'launched', launch: `launched:${a.key}` })
-    expect(resultB).toEqual({ outcome: 'launched', launch: `launched:${b.key}` })
-    // Step 1 is skipped entirely: no open, no read of the credentials path.
-    expect(h.order).toEqual([
-      `directory:${a.key}`, `slack:${a.key}`, `launch:${a.key}`,
-      `directory:${b.key}`, `slack:${b.key}`, `launch:${b.key}`,
-    ])
-    expect(h.reads.size).toBe(0)
-    expect(h.conn.bringUpCalls.map((c) => c.gotTokens)).toEqual([false, false])
-    expect(h.slack.builds).toEqual([])
-    const identityFor = createPersonaIdentityLookup(h.manager, () => cfg)
-    const clientFor = createPersonaClientLookup(h.manager, () => cfg)
-    const idA = identityFor(a.key)
-    const idB = identityFor(b.key)
-    expect(idA).toEqual({ botUserId: `U000DRY_${a.key}`, botId: `B000DRY_${a.key}` })
-    expect(idB).toEqual({ botUserId: `U000DRY_${b.key}`, botId: `B000DRY_${b.key}` })
-    expect(idA!.botUserId).not.toBe(idB!.botUserId)
-    expect(clientFor(a.key)).toBeUndefined()
-    assertNoLeak(h.captured({ resultA, resultB }))
-  })
-
-  test('the working-directory check still runs: a persona whose directory is missing is not brought up', async () => {
-    const h = makeHarness({ dryRun: true })
-    rmSync(a.working_directory, { recursive: true })
-
-    const resultA = await h.run(a, { readFile: 'forbid' })
-    const resultB = await h.run(b, { readFile: 'forbid' })
-
-    expect(resultA).toMatchObject({ outcome: 'not-brought-up', failures: [{ step: 'working-directory', class: 'persona-directory-missing' }] })
-    expect(h.order).not.toContain(`slack:${a.key}`)
-    expect(resultB.outcome).toBe('launched')
-    expect(h.launches.map((l) => l.key)).toEqual([b.key])
-    assertNoLeak(h.captured({ resultA, resultB }))
   })
 })
 
@@ -577,20 +405,23 @@ describe('bringUpPersona: dry run (SR-3.4)', () => {
 // Per-persona flush of held notices (b.av2 SR-7.2; E3 Task 2 carry)
 // ---------------------------------------------------------------------------
 
-describe('held notices flush per persona when its client is validated (SR-7.2)', () => {
-  test('validating A posts only A\'s held notices, in order, once, through A\'s client; B\'s stay held until B is up', async () => {
-    let notifier!: PersonaNotifier
-    const notifierLines: string[] = []
+describe('held notices flush per persona when it is up (SR-7.2)', () => {
+  test('A coming up posts only A\'s held notices, in order, once, through A\'s client; B\'s stay held until B\'s retry brings it up', async () => {
     // B's first auth.test cannot reach Slack; its retry 5 s later succeeds.
     const h = makeHarness({ slack: { b: { authTest: [{ kind: 'network' }] } } })
-    h.conn.onStatus = (key, status) => createPersonaUpFlushListener(notifier)(key, status)
-    notifier = createPersonaNotifier({
+    const notifierLines: string[] = []
+    const notifier = createPersonaNotifier({
       getPersona: (key) => cfg.personas.find((p) => p.key === key),
-      clientFor: createPersonaClientLookup(h.manager, () => cfg),
+      clientFor: createPersonaClientLookup(h.conn.manager, () => cfg),
       isDryRun: () => false,
       log: (line) => void notifierLines.push(line),
     })
-    const postsOf = (key: string) => h.slack.persona(key).calls.postMessage
+    // server.ts's status listener: the flush, then the controller.
+    h.conn.onStatus = composePersonaStatusListeners(
+      createPersonaUpFlushListener(notifier),
+      (key, status) => h.controller.onConnectionStatus(key, status),
+    )
+    const postsOf = (key: string) => h.conn.slack.persona(key).calls.postMessage
     const noticeTo = (persona: Persona, text: string) => ({ channel: persona.permission_prompts, text: formatPersonaNotice(persona, text) })
 
     // Raised before any bring-up: every notice is held.
@@ -599,26 +430,27 @@ describe('held notices flush per persona when its client is validated (SR-7.2)',
     await notifier.notify(a.key, 'second notice for A')
     expect(postsOf(a.key)).toEqual([])
 
-    const results = await runBoth(h)
-    await h.clock.flush()
+    const result = await h.startPass()
+    await h.conn.clock.flush()
 
-    expect(results.get(a.key)!.outcome).toBe('launched')
-    expect(results.get(b.key)!.outcome).toBe('not-brought-up')
+    expect(result.perPersona.find((p) => p.key === a.key)).toEqual({ key: a.key, action: 'spawned' })
+    expect(result.perPersona.find((p) => p.key === b.key)).toMatchObject({ action: 'not-brought-up', outcome: 'retrying' })
     expect(postsOf(a.key)).toEqual([noticeTo(a, 'first notice for A'), noticeTo(a, 'second notice for A')])
     expect(postsOf(b.key)).toEqual([])
 
     // A second transition of A to up (a drop and reopen) posts nothing again.
-    h.slack.persona(a.key).socket.drop()
-    await h.clock.flush()
-    expect(h.manager.status(a.key)?.state).toBe('up')
+    h.conn.slack.persona(a.key).socket.drop()
+    await h.conn.clock.flush()
+    expect(h.conn.manager.status(a.key)?.state).toBe('up')
     expect(postsOf(a.key)).toHaveLength(2)
 
-    // B's held notice was kept, and posts through B's client once B is up.
-    await h.clock.advance(5_000)
-    expect(h.manager.status(b.key)?.state).toBe('up')
+    // B's held notice was kept, and posts through B's client once B is up; the controller launches B.
+    await h.conn.clock.advance(5_000)
+    expect(h.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
     expect(postsOf(b.key)).toEqual([noticeTo(b, 'only notice for B')])
     expect(postsOf(a.key)).toHaveLength(2)
-    assertNoLeak(h.captured({ notifierLines, posts: [postsOf(a.key), postsOf(b.key)] }))
+    expect(h.retryLaunches).toEqual([b.key])
+    assertNoLeak(h.captured({ result, notifierLines, posts: [postsOf(a.key), postsOf(b.key)] }))
   })
 })
 
@@ -627,51 +459,17 @@ describe('held notices flush per persona when its client is validated (SR-7.2)',
 // ---------------------------------------------------------------------------
 
 describe('end to end: A\'s connection trouble makes no agent-director call', () => {
-  const originalError = console.error
-  let consoleLines: string[]
-
-  beforeEach(() => {
-    consoleLines = []
-    console.error = (...args: unknown[]) => void consoleLines.push(args.map(String).join(' '))
-    _setDialogPollIntervalMs(1)
-    _setDialogReadyTimeoutMs(200)
-    _setTmuxCapturePane(async () => '')
-    _setTmuxSendEnter(async () => {})
-    _setTmuxSessionProber(async () => true)
-    const home = join(dir, 'home')
-    mkdirSync(join(home, '.claude'), { recursive: true })
-    _setSpawnHomeDir(home)
-  })
-
-  afterEach(() => {
-    console.error = originalError
-    resetClientForTests()
-    setSessionNotifier(undefined)
-    _resetOutageState()
-    _resetDialogPollIntervalMs()
-    _resetDialogReadyTimeoutMs()
-    _resetTmuxDialogHelpers()
-    _resetTmuxSessionProber()
-    _resetSpawnHomeDir()
-    _resetInFlightLaunches()
-  })
-
-  test('after A is up and launched: a drop, a rejected reopen, an abandoned reopen and a refused reopen make zero agent-director calls; B keeps delivering', async () => {
-    // agent-director: the stub client, every call recorded.
-    const spawnCalls: import('agent-director').SpawnParams[] = []
-    const calls = {
-      versionCalls: [], makeTemplateCalls: [], spawnCalls, statusCalls: [], getCalls: [], sendKeysCalls: [],
-      readPaneCalls: [], killCalls: [], decideCalls: [], resumeCalls: [], findMissingCalls: [], deleteCalls: [],
-      listCalls: [], pauseCalls: [], getPermissionCalls: [], callLog: [],
-    } satisfies StubClientOptions
-    const adCallCount = () => Object.values(calls).reduce((sum, list: unknown[]) => sum + list.length, 0)
-    setClientForTests(makeStubClient(calls) as unknown as Parameters<typeof setClientForTests>[0])
-
-    // The server's wiring: the real event router and the real up→flush listener on the manager.
+  test('after the start pass launched A and B: a drop, a rejected reopen, an abandoned reopen and a refused reopen make zero agent-director calls and no launch; B keeps delivering', async () => {
+    // The server's wiring: the real event router, and the real flush listener and controller as the status listener.
     const received: Array<{ key: string; text: unknown }> = []
-    let notifier!: PersonaNotifier
-    let clientFor!: ReturnType<typeof createPersonaClientLookup>
     const h = makeHarness()
+    const clientFor = createPersonaClientLookup(h.conn.manager, () => cfg)
+    const notifier: PersonaNotifier = createPersonaNotifier({
+      getPersona: (key) => cfg.personas.find((p) => p.key === key),
+      clientFor,
+      isDryRun: () => false,
+      log: (line) => void consoleLines.push(line),
+    })
     h.conn.onEvent = createPersonaEventRouter({
       routing: {
         receive: async (event, ack, receiver) => {
@@ -679,51 +477,39 @@ describe('end to end: A\'s connection trouble makes no agent-director call', () 
           received.push({ key: receiver as string, text: (event as { text?: unknown } | undefined)?.text })
         },
       },
-      clientFor: (k) => clientFor(k),
+      clientFor,
       getPersona: (k) => cfg.personas.find((p) => p.key === k),
       log: (line) => void consoleLines.push(line),
     })
-    h.conn.onStatus = (key, status) => createPersonaUpFlushListener(notifier)(key, status)
-    clientFor = createPersonaClientLookup(h.manager, () => cfg)
-    notifier = createPersonaNotifier({
-      getPersona: (key) => cfg.personas.find((p) => p.key === key),
-      clientFor,
-      isDryRun: () => false,
-      log: (line) => void consoleLines.push(line),
-    })
+    h.conn.onStatus = composePersonaStatusListeners(
+      createPersonaUpFlushListener(notifier),
+      (key, status) => h.controller.onConnectionStatus(key, status),
+    )
     initOutageState({ getClient, notify: (key, text) => void notifier.notify(key, text) })
     setSessionNotifier(notifier.notify)
 
-    // Both personas brought up, then launched through the real spawn entry point.
-    const results: unknown[] = []
-    for (const persona of [a, b]) {
-      results.push(await bringUpPersona(persona, {
-        applied: cfg.personas,
-        dryRun: false,
-        log: (line) => void consoleLines.push(line),
-        connections: h.manager,
-        launch: (p) => spawnForPersona(p, cfg),
-      }))
-    }
-    expect(results).toEqual([
-      { outcome: 'launched', launch: { key: a.key, action: 'spawned' } },
-      { outcome: 'launched', launch: { key: b.key, action: 'spawned' } },
-    ])
-    expect(spawnCalls.map((p) => p.claude_instance_id)).toEqual([`cscb_${a.key}`, `cscb_${b.key}`])
-    const afterLaunch = adCallCount()
+    const result = await h.startPass()
+    expect([...result.perPersona].sort((x, y) => x.key.localeCompare(y.key))).toEqual(
+      [a.key, b.key].sort().map((key) => ({ key, action: 'spawned' })),
+    )
+    expect([...ad.spawnedIds()].sort()).toEqual([`cscb_${a.key}`, `cscb_${b.key}`].sort())
+    const afterLaunch = ad.callCount()
 
-    const stubA = h.slack.persona(a.key)
+    const stubA = h.conn.slack.persona(a.key)
     stubA.script.connect.push({ kind: 'network' }, { kind: 'never' }, { kind: 'platform', error: 'invalid_auth' })
     stubA.socket.drop()
     // Rejected at 0 s; the retry at 5 s hangs and is abandoned at 15 s; the retry at 25 s is refused.
-    await h.clock.advance(25_000)
+    await h.conn.clock.advance(25_000)
 
-    expect(h.manager.status(a.key)).toMatchObject({ state: 'broken', phase: 'reopen' })
-    expect(adCallCount()).toBe(afterLaunch)
+    // A's broken outcome, its refused line and "no retry timer" are pinned in
+    // tests/persona-connections.test.ts (AC 23, AC 24 later credentials failure).
+    expect(h.conn.manager.status(a.key)).toMatchObject({ state: 'broken', phase: 'reopen' })
+    expect(ad.callCount()).toBe(afterLaunch)
+    expect(h.retryLaunches).toEqual([])
     // B keeps delivering, tagged with B, through the real router.
-    await h.slack.persona(b.key).socket.deliver(makeChannelMessage({ text: 'still here' }))
+    await h.conn.slack.persona(b.key).socket.deliver(makeChannelMessage({ text: 'still here' }))
     expect(received).toEqual([{ key: b.key, text: 'still here' }])
-    expect(adCallCount()).toBe(afterLaunch)
-    assertNoLeak(h.captured({ consoleLines, results }))
+    expect(ad.callCount()).toBe(afterLaunch)
+    assertNoLeak(h.captured({ result }))
   })
 })

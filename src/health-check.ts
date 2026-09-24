@@ -109,6 +109,8 @@ let skippedTicks = 0
  * This map leaks nothing across contexts because it is cleared:
  *   - the moment a persona is observed connected (streak reset inline below),
  *   - when a reconnect is scheduled for it (consumed on fire, below),
+ *   - when a tick skips it: pending/active restart, at cap, or left out of the
+ *     tick's work list by the relaunch gate,
  *   - and wholesale by `_resetHealthCheckState` (the test-reset seam and the
  *     production stop path both call it).
  */
@@ -150,6 +152,14 @@ export function startHealthCheck(intervalSeconds: number): void {
     skippedTicks = 0
     try {
       const personas = deps.getPersonas()
+
+      // A persona the relaunch gate left out of this tick's work list (not up)
+      // is a third skip, beside pending-restart and cap: drop its streak the
+      // same way, so a persona that comes back up starts a fresh consecutive
+      // count instead of inheriting one observation from before it went down.
+      for (const key of disconnectedStreak.keys()) {
+        if (!Object.hasOwn(personas, key)) disconnectedStreak.delete(key)
+      }
 
       for (const [key, cwd] of Object.entries(personas)) {
         try {

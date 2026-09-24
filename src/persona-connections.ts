@@ -21,6 +21,12 @@
  * that failed. The persona is up only once `auth.test` returned both IDs and
  * `start()` resolved.
  *
+ * The 10 s bound on `auth.test`: a timer on the injected clock starts with
+ * the call; on expiry the call is abandoned and the attempt is
+ * Slack-unreachable (`SlackAuthTestTimeoutError`, reason `timeout`), never
+ * refused. The validation client's own request timeout starts only once the
+ * connection is made, so it does not bound a DNS or TCP-connect stall.
+ *
  * The 10 s bound (SR-3.3): a timer on the injected clock starts when `start()`
  * is called and restarts when the library signals the WebSocket phase has
  * begun (`authenticated`, `connecting`), so a slow `apps.connections.open`
@@ -76,7 +82,7 @@
  * import or at `createPersonaConnectionManager`; no environment access
  * (dry run is passed in). It imports nothing from the agent-director modules.
  * `server.ts` constructs one manager in `main()` and brings each persona up
- * through `bringUpPersona` (`persona-start.ts`).
+ * through the bring-up controller (`persona-bringup-controller.ts`).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -101,6 +107,8 @@ import {
 } from './persona-slack-clients.ts'
 import { createSlackEpisodeTracker, type SlackEpisodeTracker } from './persona-slack-episodes.ts'
 import {
+  SLACK_AUTH_TEST_TIMEOUT_MS,
+  SlackAuthTestTimeoutError,
   SlackStartTimeoutError,
   botIdentityFromAuthTest,
   classifySlackValidationError,
@@ -277,7 +285,7 @@ type AttemptResult =
 /** One in-flight attempt. */
 interface Attempt {
   settled: boolean
-  /** The 10 s bound on `start()`, while armed. */
+  /** The attempt's 10 s bound while armed: on `auth.test`, then on `start()`. */
   startTimer: TimerBox | undefined
   /** The socket client this attempt is opening, once built. */
   binding: SocketBinding | undefined
@@ -449,8 +457,9 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     }
     let identity = entry.identity
     if (phase === 'bring-up') {
-      const validated = await validate(tokens)
-      if (attempt.settled) return
+      const validated = await validate(attempt, tokens)
+      if (attempt.settled) return // abandoned at the 10 s bound, or cancelled
+      clearStartTimer(attempt)
       if (validated.kind !== 'up') {
         attempt.finish({ kind: 'failed', outcome: validated })
         return
@@ -473,8 +482,17 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     await openSocket(entry, attempt, tokens, identity)
   }
 
-  /** `auth.test` on a short-lived validation client (bot token). Never throws. */
-  async function validate(tokens: PersonaSlackTokens): Promise<SlackUpOutcome | SlackValidationFailure> {
+  /**
+   * `auth.test` on a short-lived validation client (bot token), under the
+   * manager's own 10 s bound on the injected clock (`SLACK_AUTH_TEST_TIMEOUT_MS`).
+   * On expiry the attempt is settled Slack-unreachable (`timeout`) and the
+   * call is abandoned: whatever it settles to later is caught and ignored.
+   * Never throws.
+   */
+  async function validate(attempt: Attempt, tokens: PersonaSlackTokens): Promise<SlackUpOutcome | SlackValidationFailure> {
+    armAttemptBound(attempt, SLACK_AUTH_TEST_TIMEOUT_MS, () => {
+      attempt.finish({ kind: 'failed', outcome: classifySlackValidationError(new SlackAuthTestTimeoutError(), 'auth.test') })
+    })
     try {
       const client = factory.createValidationClient(tokens.botToken, validationWebClientOptions())
       return botIdentityFromAuthTest(await client.auth.test())
@@ -530,6 +548,18 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   }
 
   function armStartTimer(attempt: Attempt, binding: SocketBinding): void {
+    armAttemptBound(attempt, PERSONA_START_TIMEOUT_MS, () => {
+      attempt.finish({ kind: 'failed', outcome: classifySlackValidationError(new SlackStartTimeoutError(), 'socket-mode') })
+      void retire(binding, true)
+    })
+  }
+
+  /**
+   * (Re)arm the attempt's one bound: after `delayMs` on the injected clock,
+   * `onExpiry` runs unless the attempt has settled or the bound was cleared
+   * or re-armed meanwhile. Settling the attempt clears it.
+   */
+  function armAttemptBound(attempt: Attempt, delayMs: number, onExpiry: () => void): void {
     clearStartTimer(attempt)
     const timer: TimerBox = { handle: undefined }
     attempt.startTimer = timer
@@ -537,9 +567,8 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
       if (attempt.startTimer !== timer) return
       attempt.startTimer = undefined
       if (attempt.settled) return
-      attempt.finish({ kind: 'failed', outcome: classifySlackValidationError(new SlackStartTimeoutError(), 'socket-mode') })
-      void retire(binding, true)
-    }, PERSONA_START_TIMEOUT_MS)
+      onExpiry()
+    }, delayMs)
   }
 
   function clearStartTimer(attempt: Attempt): void {

@@ -23,7 +23,9 @@ import {
   isAtCap,
   recordFailure,
 } from '../src/backoff.ts'
-import { _buildKillSessionAdapter, _buildReconnectSessionAdapter } from '../src/server.ts'
+import { _buildIsSessionAliveAdapter, _buildKillSessionAdapter, _buildReconnectSessionAdapter } from '../src/server.ts'
+import { createPersonaRelaunchGate } from '../src/persona-start.ts'
+import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
 import {
   _resetFindMissingMemo,
   _setTmuxServerEnsurer,
@@ -54,9 +56,9 @@ import {
   initOutageState,
 } from '../src/outage-state.ts'
 import { makeStubClient } from './test-helpers/agent-director-stub.ts'
-import { errGeneric, errTmuxSendKeys, holdSpawns, type SpawnHold } from './test-helpers/agent-director-stub.ts'
+import { errGeneric, errSpawnNotFound, errTmuxSendKeys, holdSpawns, type SpawnHold } from './test-helpers/agent-director-stub.ts'
 import type { Client } from 'agent-director'
-import type { FindMissingParams, KillParams, SendKeysParams, SpawnParams, StatusParams } from 'agent-director'
+import type { DeleteParams, FindMissingParams, KillParams, SendKeysParams, SpawnParams, StatusParams } from 'agent-director'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
@@ -108,6 +110,7 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     reconnectSessionCalls,
     onCapReachedCalls,
 
+    canRestart: () => true,
     async isSessionAlive(key) {
       isSessionAliveCalls.push(key)
       return opts.isSessionAliveResult ?? false
@@ -217,14 +220,39 @@ describe('scheduleRestart', () => {
     expect(deps.launchSessionCalls).toHaveLength(0)
   })
 
-  test('timer fires but isShuttingDown=true — launchSession never called', async () => {
-    const deps = makeDeps({ isShuttingDown: true })
+  // Shutdown at schedule time (no timer armed, the gate not asked) is pinned in
+  // the not-up guard block below; this is shutdown starting after scheduling.
+  test('shutdown starts after the restart was scheduled — the timer fires, asks neither the gate nor the probe, and kills, reconnects and launches nothing', async () => {
+    let shuttingDown = false
+    const gateAsked: string[] = []
+    const deps = makeDeps()
+    deps.isShuttingDown = () => shuttingDown
+    deps.canRestart = (key) => { gateAsked.push(key); return true }
     initRestart(deps)
 
     scheduleRestart('test_bot_1', '/cwd/test')
-    await Bun.sleep(WAIT_MS)
+    expect(isRestartPendingOrActive('test_bot_1')).toBe(true)
+    expect(gateAsked).toEqual(['test_bot_1'])
 
+    shuttingDown = true
+    const lines: string[] = []
+    const origConsoleError = console.error
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+    try {
+      await Bun.sleep(WAIT_MS)
+    } finally {
+      console.error = origConsoleError
+    }
+
+    // Only the schedule-time gate check: the timer returned at its shutdown check.
+    expect(lines).toEqual(['[slack] Skipping restart — server is shutting down (persona=test_bot_1)'])
+    expect(gateAsked).toEqual(['test_bot_1'])
+    expect(deps.isSessionAliveCalls).toHaveLength(0)
+    expect(deps.reconnectSessionCalls).toHaveLength(0)
+    expect(deps.killSessionCalls).toHaveLength(0)
     expect(deps.launchSessionCalls).toHaveLength(0)
+    expect(getFailureCount('test_bot_1')).toBe(0)
+    expect(isRestartPendingOrActive('test_bot_1')).toBe(false)
   })
 
   // b.9cj: the "already reconnected" early return is only taken when the session
@@ -445,6 +473,7 @@ describe('isRestartPendingOrActive', () => {
     const alivePromise = new Promise<boolean>((res) => { aliveResolve = res })
 
     const deps: RestartDeps = {
+      canRestart: () => true,
       isSessionAlive: (_key) => alivePromise,  // never resolves until we say so
       isSessionConnected: () => false,
       hasSessionStream: () => true,
@@ -882,9 +911,14 @@ describe('backoff integration (SR-29.3)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // (8) The relaunch gate: launchSession answers 'skipped' when the persona's
-  //     Slack connection is not serving. Nothing was attempted, so the
-  //     counter, backoff and cap latch are left exactly as they were.
+  // (8) The relaunch gate at the launch: launchSession answers 'skipped' when
+  //     the persona stopped being up after the timer's last `canRestart`
+  //     check (the one right after the liveness probe; true here, the
+  //     makeDeps default), i.e. during the kill, before the launch. Nothing
+  //     was attempted, so the counter, backoff and cap latch are left exactly
+  //     as they were. A persona that is not up at either timer check (before
+  //     or after the probe) never reaches the kill or the launch: see the
+  //     not-up guard block below.
   // -------------------------------------------------------------------------
 
   const GATED = 'gated_bot'
@@ -901,7 +935,9 @@ describe('backoff integration (SR-29.3)', () => {
     await driveFailures(GATED, '/cwd/gated', 2)
 
     expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([GATED, GATED])
-    // The kill before the launch still runs.
+    // The gate was still open at both timer checks (before and after the
+    // liveness probe), so the kill ran; only the launch saw the flip. (Not up
+    // at either check: no kill, pinned in the not-up guard block below.)
     expect(deps.killSessionCalls).toEqual([GATED, GATED])
     expect(getFailureCount(GATED)).toBe(RESTART_FAILURE_CAP - 1)
     expect(isAtCap(GATED, RESTART_FAILURE_CAP)).toBe(false)
@@ -931,6 +967,390 @@ describe('backoff integration (SR-29.3)', () => {
     // Only one pending timer exists (cancel-and-replace): counter has not changed
     // because no timer has fired yet
     expect(getFailureCount('nostack_bot')).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The not-up guard (b.av2 SR-6.3, SR-6.4): a persona that is not up (broken,
+// or retrying its bring-up) keeps its agent-director row and its running
+// instance. `RestartDeps.canRestart` is asked when a restart is scheduled
+// (unless restarts are disabled or the server is shutting down), when
+// its timer fires (before the liveness probe) and again after the probe
+// (before the reconnect or the kill). The case that matters is a restart scheduled while the persona was
+// up that fires after it became broken (e.g. Slack refused a token on a
+// reopen, SR-3.3). The persona's failure count and cap latch are never
+// touched by the guard, so an up persona follows today's backoff and cap.
+// ---------------------------------------------------------------------------
+
+describe('not-up guard: a persona that is not up is never restarted (b.av2 SR-6.4)', () => {
+  const KEY = 'notup_bot'
+  const OTHER = 'up_bot'
+  /** Personas the fake gate answers true for. */
+  let up: Set<string>
+  /** Every key `canRestart` was asked about, in order. */
+  let asked: string[]
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+
+  const skipLine = (key: string) =>
+    `[slack] Skipping restart for persona=${key} — the persona is no longer up; its instance is left as it is`
+  const refuseLine = (key: string) =>
+    `[slack] Not scheduling restart for persona=${key} — the persona is not up (its bring-up has not succeeded, or its Slack connection is not serving)`
+  const linesFor = (key: string, prefix: string) =>
+    errLines.filter((l) => l.startsWith(prefix) && l.includes(`persona=${key}`))
+
+  /** makeDeps with `canRestart` answering from `up` and recording each key asked. */
+  function makeGatedDeps(opts: DepsOpts = {}): ReturnType<typeof makeDeps> {
+    const deps = makeDeps({ restartDelay: CAP_BASE_DELAY_S, ...opts })
+    deps.canRestart = (key) => {
+      asked.push(key)
+      return up.has(key)
+    }
+    return deps
+  }
+
+  /** Wait out the timer `scheduleRestart(key)` armed from the key's current failure count. */
+  async function waitForTimer(key: string): Promise<void> {
+    await Bun.sleep(Math.min(CAP_BASE_DELAY_S * Math.pow(2, getFailureCount(key)), 900) * 1000 + CAP_MARGIN_MS)
+  }
+
+  beforeEach(() => {
+    up = new Set([KEY, OTHER])
+    asked = []
+    errLines = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    cancelAllRestartTimers()
+  })
+
+  test.each<[string, boolean]>([
+    ['its session dead (the kill + relaunch branch)', false],
+    ['its session alive (the reconnect branch)', true],
+  ])('a restart scheduled while up, whose persona is no longer up when the timer fires, probes, reconnects, kills and launches nothing; its count and cap latch are unchanged; the skip is logged — %s', async (_label, alive) => {
+    // One failure short of the cap: a counted failure would cap and notify.
+    for (let i = 0; i < RESTART_FAILURE_CAP - 1; i++) recordFailure(KEY)
+    const deps = makeGatedDeps({ isSessionAliveResult: alive, launchSessionResult: false })
+    initRestart(deps)
+
+    scheduleRestart(KEY, '/cwd/notup')
+    expect(isRestartPendingOrActive(KEY)).toBe(true)
+    expect(linesFor(KEY, '[slack] Scheduling restart')).toHaveLength(1)
+
+    // The persona stops being up before the timer fires.
+    up.delete(KEY)
+    await waitForTimer(KEY)
+
+    // Asked once when scheduled (up) and once when the timer fired (not up).
+    expect(asked).toEqual([KEY, KEY])
+    expect(deps.isSessionAliveCalls).toEqual([])
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(getFailureCount(KEY)).toBe(RESTART_FAILURE_CAP - 1)
+    expect(isAtCap(KEY, RESTART_FAILURE_CAP)).toBe(false)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+    expect(errLines.filter((l) => l === skipLine(KEY))).toHaveLength(1)
+    expect(linesFor(KEY, '[slack] Relaunching session')).toEqual([])
+
+    // Up again: the next restart runs as today, and its failed launch is the
+    // one that reaches the cap, since the guard left the count as it was.
+    up.add(KEY)
+    scheduleRestart(KEY, '/cwd/notup')
+    await waitForTimer(KEY)
+    expect(deps.isSessionAliveCalls).toEqual([KEY])
+    if (alive) {
+      expect(deps.reconnectSessionCalls).toEqual([KEY])
+      expect(deps.launchSessionCalls).toEqual([])
+      expect(getFailureCount(KEY)).toBe(RESTART_FAILURE_CAP - 1)
+    } else {
+      expect(deps.killSessionCalls).toEqual([KEY])
+      expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([KEY])
+      expect(getFailureCount(KEY)).toBe(RESTART_FAILURE_CAP)
+      expect(deps.onCapReachedCalls).toEqual([KEY])
+    }
+  })
+
+  test.each<[string, boolean]>([
+    ['the probe answers dead (the kill + relaunch branch)', false],
+    ['the probe answers alive and disconnected (the reconnect branch)', true],
+  ])('the persona stops being up while the liveness probe is pending: once the probe settles nothing is reconnected, killed or launched; its count and cap latch are unchanged; the skip is logged once — %s', async (_label, alive) => {
+    // One failure short of the cap: a counted failure would cap and notify.
+    for (let i = 0; i < RESTART_FAILURE_CAP - 1; i++) recordFailure(KEY)
+    const deps = makeGatedDeps({ launchSessionResult: false })
+    // Hold the probe open until the test settles it.
+    let settleProbe!: () => void
+    const probeEntered = new Promise<void>((entered) => {
+      deps.isSessionAlive = (key) => {
+        deps.isSessionAliveCalls.push(key)
+        entered()
+        return new Promise<boolean>((res) => { settleProbe = () => res(alive) })
+      }
+    })
+    initRestart(deps)
+
+    scheduleRestart(KEY, '/cwd/notup')
+    await probeEntered
+
+    // Up at scheduling and when the timer fired, so the probe ran.
+    expect(asked).toEqual([KEY, KEY])
+    expect(deps.isSessionAliveCalls).toEqual([KEY])
+    expect(isRestartPendingOrActive(KEY)).toBe(true)
+
+    // The persona stops being up mid-probe; then the probe answers.
+    up.delete(KEY)
+    settleProbe()
+    await Bun.sleep(WAIT_MS)
+
+    // Asked a third time after the probe (not up): it returned there.
+    expect(asked).toEqual([KEY, KEY, KEY])
+    expect(deps.isSessionAliveCalls).toEqual([KEY])
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(getFailureCount(KEY)).toBe(RESTART_FAILURE_CAP - 1)
+    expect(isAtCap(KEY, RESTART_FAILURE_CAP)).toBe(false)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+    expect(errLines.filter((l) => l === skipLine(KEY))).toHaveLength(1)
+    expect(linesFor(KEY, '[slack] Session alive but disconnected')).toEqual([])
+    expect(linesFor(KEY, '[slack] Relaunching session')).toEqual([])
+  })
+
+  test.each<[string, { humanTrigger?: boolean } | undefined]>([
+    ['a disconnect or health-check restart', undefined],
+    ['the human trigger', { humanTrigger: true }],
+  ])('scheduleRestart for a persona that is not up arms no timer and touches nothing, however often it is asked; each refusal is logged — %s', async (_label, opts) => {
+    up.delete(KEY)
+    recordFailure(KEY)
+    const deps = makeGatedDeps({ launchSessionResult: false })
+    initRestart(deps)
+
+    // More requests than the cap: none may count toward it.
+    const REQUESTS = RESTART_FAILURE_CAP + 1
+    for (let i = 0; i < REQUESTS; i++) {
+      scheduleRestart(KEY, '/cwd/notup', undefined, opts)
+      expect(isRestartPendingOrActive(KEY)).toBe(false)
+    }
+    await waitForTimer(KEY)
+
+    expect(asked).toEqual(Array(REQUESTS).fill(KEY))
+    expect(errLines.filter((l) => l === refuseLine(KEY))).toHaveLength(REQUESTS)
+    expect(linesFor(KEY, '[slack] Scheduling restart')).toEqual([])
+    expect(deps.isSessionAliveCalls).toEqual([])
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(getFailureCount(KEY)).toBe(1)
+    expect(isAtCap(KEY, RESTART_FAILURE_CAP)).toBe(false)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+  })
+
+  test('with restarts disabled (delay 0) the gate is not asked and the disabled line is the only one', async () => {
+    up.delete(KEY)
+    const deps = makeGatedDeps({ restartDelay: 0 })
+    initRestart(deps)
+
+    scheduleRestart(KEY, '/cwd/notup')
+
+    expect(asked).toEqual([])
+    expect(errLines).toEqual([`[slack] Auto-restart disabled (delay=0) — skipping restart for persona=${KEY}`])
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+  })
+
+  test('during shutdown (every bring-up cancelled, so no persona is up) an MCP stream abort\'s scheduleRestart arms no timer and does not ask the gate; the shutdown skip is the only line, never the not-up refusal', async () => {
+    // Graceful shutdown cancels the bring-up controller before the HTTP
+    // server's stop aborts every MCP stream: the gate would answer false.
+    up.clear()
+    recordFailure(KEY)
+    const deps = makeGatedDeps({ isShuttingDown: true, launchSessionResult: false })
+    initRestart(deps)
+
+    scheduleRestart(KEY, '/cwd/notup')
+    scheduleRestart(OTHER, '/cwd/up', undefined, { humanTrigger: true })
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+    expect(isRestartPendingOrActive(OTHER)).toBe(false)
+    await waitForTimer(KEY)
+
+    expect(asked).toEqual([])
+    expect(errLines).toEqual([
+      `[slack] Skipping restart — server is shutting down (persona=${KEY})`,
+      `[slack] Skipping restart — server is shutting down (persona=${OTHER})`,
+    ])
+    expect(deps.isSessionAliveCalls).toEqual([])
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.killSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(getFailureCount(KEY)).toBe(1)
+    expect(getFailureCount(OTHER)).toBe(0)
+    expect(deps.onCapReachedCalls).toEqual([])
+  })
+
+  test('an up persona beside a not-up one restarts exactly as today — killed, relaunched, each failure counted, the cap reached and notified once — while the not-up one\'s pending restart does nothing', async () => {
+    const deps = makeGatedDeps({ launchSessionResult: false })
+    initRestart(deps)
+
+    // KEY's restart is scheduled while it is up; it stops being up before it fires.
+    scheduleRestart(KEY, '/cwd/notup')
+    up.delete(KEY)
+
+    await driveFailures(OTHER, '/cwd/up', RESTART_FAILURE_CAP)
+
+    expect(deps.killSessionCalls).toEqual(Array(RESTART_FAILURE_CAP).fill(OTHER))
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual(Array(RESTART_FAILURE_CAP).fill(OTHER))
+    expect(deps.launchSessionCalls.every((c) => c.cwd === '/cwd/up')).toBe(true)
+    expect(getFailureCount(OTHER)).toBe(RESTART_FAILURE_CAP)
+    expect(isAtCap(OTHER, RESTART_FAILURE_CAP)).toBe(true)
+    expect(deps.onCapReachedCalls).toEqual([OTHER])
+    expect(isRestartPendingOrActive(OTHER)).toBe(false)
+
+    expect(deps.isSessionAliveCalls.filter((k) => k === KEY)).toEqual([])
+    expect(getFailureCount(KEY)).toBe(0)
+    expect(isRestartPendingOrActive(KEY)).toBe(false)
+    expect(errLines.filter((l) => l === skipLine(KEY))).toHaveLength(1)
+    expect(errLines.filter((l) => l === skipLine(OTHER) || l === refuseLine(OTHER))).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The not-up guard through the real gate and the real adapters (b.av2 SR-6.4).
+// `canRestart` is the server's relaunch gate (`createPersonaRelaunchGate` over
+// a fake connection status and bring-up outcome), and the liveness probe,
+// reconnect, kill and launch are the real adapters over one stub
+// agent-director client, so "left alone" is observed as no agent-director
+// call of any kind for that persona's instance.
+// ---------------------------------------------------------------------------
+
+describe('not-up guard through the real relaunch gate and adapters: no agent-director call for a persona that is not up (b.av2 SR-6.4)', () => {
+  let dir: string
+  let config: PersonaConfig
+  let a: Persona
+  let b: Persona
+  /** The fake connection manager's status per persona key. */
+  let statuses: Map<string, PersonaConnectionStatus>
+  /** Keys whose bring-up outcome is `up` (the bring-up controller's query). */
+  let outcomesUp: Set<string>
+  let gateLines: string[]
+  let statusCalls: StatusParams[]
+  let sendKeysCalls: SendKeysParams[]
+  let killCalls: KillParams[]
+  let deleteCalls: DeleteParams[]
+  let spawnCalls: SpawnParams[]
+  let findMissingCalls: FindMissingParams[]
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+
+  const UP: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0GUARD', botId: 'B0GUARD' } }
+  const REFUSED = { kind: 'credentials-refused' } as never
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'restart-notup-'))
+    config = makeMultiPersonaConfig([{ name: 'alpha_bot' }, { name: 'beta_bot' }], dir)
+    ;[a, b] = config.personas as [Persona, Persona]
+    statuses = new Map([[a.key, UP], [b.key, UP]])
+    outcomesUp = new Set([a.key, b.key])
+    gateLines = []
+    statusCalls = []
+    sendKeysCalls = []
+    killCalls = []
+    deleteCalls = []
+    spawnCalls = []
+    findMissingCalls = []
+    errLines = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+
+    // A's row is gone (a restart would kill and relaunch it); B's is live and
+    // idle (a restart reconnects it).
+    const stub = makeStubClient({
+      statusFn: (p) => (p.claude_instance_id === personaInstanceId(a.key) ? errSpawnNotFound() : { state: 'waiting' }),
+      statusCalls,
+      sendKeysCalls,
+      killCalls,
+      deleteCalls,
+      spawnCalls,
+      findMissingCalls,
+    })
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+    setClientForTests(stub as unknown as Client)
+    setSessionNotifier(() => {})
+    _setTmuxServerEnsurer(async () => {})
+    _resetFindMissingMemo()
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    cancelAllRestartTimers()
+    resetClientForTests()
+    _resetOutageState()
+    setSessionNotifier(undefined)
+    _resetTmuxServerEnsurer()
+    _resetFindMissingMemo()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  function makeRealDeps(): RestartDeps {
+    const gate = createPersonaRelaunchGate(
+      { status: (key) => statuses.get(key) },
+      (line) => { gateLines.push(line) },
+      { isUp: (key) => outcomesUp.has(key) },
+    )
+    return {
+      canRestart: gate,
+      isSessionAlive: _buildIsSessionAliveAdapter(() => config),
+      isSessionConnected: () => false,
+      hasSessionStream: () => false,
+      reconnectSession: _buildReconnectSessionAdapter(),
+      killSession: _buildKillSessionAdapter(),
+      launchSession: (key) => launchPersonaSession(key, config, { canLaunch: gate }),
+      getRestartDelay: () => CAP_BASE_DELAY_S,
+      isShuttingDown: () => false,
+      onCapReached: () => {},
+    }
+  }
+
+  const callsFor = (calls: Array<StatusParams | SendKeysParams>, p: Persona) =>
+    calls.filter((c) => c.claude_instance_id === personaInstanceId(p.key))
+
+  test.each<[string, () => void, string]>([
+    // The gate names the reason: the connection when it is not serving, the
+    // bring-up when the connection is serving but the outcome is not `up`.
+    ['Slack refused its token on a reopen (connection broken)', () => { statuses.set(a.key, { state: 'broken', phase: 'reopen', outcome: REFUSED }) }, 'its Slack connection is broken'],
+    ['its bring-up outcome stopped being up (connection still up)', () => { outcomesUp.delete(a.key) }, 'its bring-up has not succeeded'],
+  ])('A\'s restart, scheduled while up, fires after %s: A gets no status, send-keys, kill, delete, find-missing or spawn call and no count; B beside it is probed and reconnected as today', async (_label, flip, reason) => {
+    recordFailure(a.key)
+    initRestart(makeRealDeps())
+
+    scheduleRestart(a.key, a.working_directory)
+    scheduleRestart(b.key, b.working_directory)
+    expect(isRestartPendingOrActive(a.key)).toBe(true)
+    flip()
+    await Bun.sleep(WAIT_MS)
+
+    // Nothing reached agent-director for A: no probe, no `/mcp reconnect`, and
+    // (for anyone) no kill, delete, spawn or find-missing sweep.
+    expect(callsFor(statusCalls, a)).toEqual([])
+    expect(callsFor(sendKeysCalls, a)).toEqual([])
+    expect(killCalls).toEqual([])
+    expect(deleteCalls).toEqual([])
+    expect(spawnCalls).toEqual([])
+    expect(findMissingCalls).toEqual([])
+    expect(getFailureCount(a.key)).toBe(1)
+    expect(isRestartPendingOrActive(a.key)).toBe(false)
+    expect(gateLines).toEqual([`[slack] persona=${a.key}: not relaunched — ${reason}; eligible again once it is up`])
+    expect(errLines).toContain(`[slack] Skipping restart for persona=${a.key} — the persona is no longer up; its instance is left as it is`)
+
+    // B: the liveness probe and the reconnect adapter's probe, then one
+    // `/mcp reconnect`; never killed or respawned.
+    expect(callsFor(statusCalls, b)).toHaveLength(2)
+    expect(callsFor(sendKeysCalls, b)).toHaveLength(1)
+    expect(getFailureCount(b.key)).toBe(0)
   })
 })
 
@@ -1105,6 +1525,7 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     const deps: RestartDeps & { killSessionCalls: string[]; launchSessionCalls: string[] } = {
       killSessionCalls,
       launchSessionCalls,
+      canRestart: () => true,
       async isSessionAlive() { return alive },
       isSessionConnected() { return false },
       hasSessionStream() { return true },

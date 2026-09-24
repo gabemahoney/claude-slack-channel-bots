@@ -34,12 +34,12 @@
  * `cscb_<key>`, or a `cwd` other than its persona's working directory.
  *
  * At start, `startupSessionManager` brings each applied persona up through
- * the b.av2 SR-6.1 procedure (`persona-start.ts`): the local credentials and
- * working-directory checks, Slack validation and connection
- * (`connectPersona`, every persona at once), then the launch through
- * `spawnForPersona` (at most `concurrency` at a time). A restart
- * (`launchSession`) runs the launch only, and only while the caller's gate
- * says the persona's connection is serving.
+ * the b.av2 SR-6.1 procedure (`persona-start.ts`, driven by the bring-up
+ * controller in `persona-bringup-controller.ts`): the local credentials and
+ * working-directory checks, Slack validation and connection (every persona at
+ * once), then the launch through `spawnForPersona` (at most `concurrency` at
+ * a time) for each persona that is up. A restart (`launchSession`) runs the
+ * launch only, and only while the caller's gate says the persona is up.
  *
  * No tmux process-tree walks, no JSONL existence checks for resume eligibility:
  * the library encapsulates both.
@@ -90,7 +90,8 @@ import {
 } from './agent-director-errors.ts'
 import { recordStartupError } from './startup-errors.ts'
 import { firstNoticeLine, notifySafely, type PersonaNoticeOptions, type PersonaNotify } from './persona-notifier.ts'
-import { connectPersona, type PersonaBringUpFailure, type PersonaConnectDeps } from './persona-start.ts'
+import type { PersonaBringUpFailure } from './persona-start.ts'
+import type { PersonaBringUpController, PersonaBringUpOutcome } from './persona-bringup-controller.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { RESTART_FAILURE_CAP } from './restart.ts'
 import { isDryRun } from './tokens.ts'
@@ -2211,24 +2212,35 @@ export async function reconcileOrphans(
 
 /**
  * What `startupSessionManager` needs to run steps 1–3 of the SR-6.1 bring-up
- * procedure for each persona (`connectPersona`): the connection manager, the
- * dry-run flag, the logger and optional check / file-system overrides. The
- * applied set is supplied here; the launch (step 4) is `spawnForPersona`.
+ * procedure for each persona: the bring-up controller
+ * (`createPersonaBringUpController`), which gives each persona its outcome and
+ * runs its retries on the persona's own timers. The applied set is supplied
+ * here; the launch (step 4) at start is `spawnForPersona`.
  */
-export type StartupBringUpDeps = Omit<PersonaConnectDeps, 'applied'>
+export type StartupBringUpDeps = Pick<PersonaBringUpController, 'bringUp'>
 
-/** One persona's start outcome: a spawn outcome, or not brought up (steps 1–3) with its failures. */
+/**
+ * One persona's start outcome: a spawn outcome, or not brought up (steps 1–3:
+ * `broken` or `retrying`) with its causes.
+ */
 export type StartupPersonaOutcome =
   | { key: string; action: SpawnPersonaResult['action'] }
-  | { key: string; action: 'not-brought-up'; failures: PersonaBringUpFailure[] }
+  | {
+    key: string
+    action: 'not-brought-up'
+    outcome: Exclude<PersonaBringUpOutcome, 'up'>
+    failures: PersonaBringUpFailure[]
+  }
 
 export interface StartupSessionManagerResult {
   /** Any non-failed action (kept for callers that only care about liveness). */
   succeeded: number
   failed: number
   /**
-   * Personas not brought up: a step 1–3 failure (credentials, working
-   * directory, Slack). Not launched, and not counted as a failed spawn.
+   * Personas not brought up at start: `broken` or `retrying` after steps 1–3
+   * (credentials, working directory, Slack). Not launched by the start and
+   * not counted as a failed spawn; a `retrying` persona is launched later
+   * from its own retry, outside the pool.
    */
   notBroughtUp: number
   /** b.wrb: honest per-outcome breakdown of the succeeded personas. */
@@ -2255,16 +2267,20 @@ export interface StartupSessionManagerResult {
  * On server startup, bring every applied persona up once — a persona listed
  * in several channels still gets exactly one bring-up and one spawn.
  *
- * With `options.bringUp` (the server always passes it) each persona goes
- * through the b.av2 SR-6.1 procedure, in order: the local credentials check
- * (skipped in dry run), the working-directory check, Slack validation and
- * connection (`connectPersona`), then the launch (`spawnForPersona`). Steps
+ * With `options.bringUp` (the server always passes its bring-up controller)
+ * each persona goes through the b.av2 SR-6.1 procedure, in order: the local
+ * credentials check (skipped in dry run), the working-directory check, Slack
+ * validation and connection (the controller's `bringUp`, which also logs the
+ * persona's `persona-start` line), then the launch (`spawnForPersona`). Steps
  * 1–3 run for every persona at once, so no persona's Slack connection waits
  * behind another persona's launch; only the launches share a pool of at most
- * `concurrency` (default 3), taken in the order the personas become ready. A
- * step 1–3 failure means the persona is not brought up: it is counted apart
- * from spawn outcomes, records no startup error, posts no notice and is not a
- * failed spawn. Without `options.bringUp` each persona is launched directly
+ * `concurrency` (default 3), taken in the order the personas become ready. The
+ * pass returns once every persona has an outcome and every `up` persona's
+ * launch has settled: a `broken` or `retrying` persona is not brought up and
+ * never takes a pool slot (its retries run on its own timers, and a retry
+ * that succeeds launches it from there). It is counted apart from spawn
+ * outcomes, records no startup error, posts no notice and is not a failed
+ * spawn. Without `options.bringUp` each persona is launched directly
  * (steps 1–3 skipped), in config order through the same pool; only unit
  * tests of the launch ladder call it that way.
  *
@@ -2338,9 +2354,9 @@ export async function startupSessionManager(
    */
   async function launchPersona(persona: Persona): Promise<SpawnPersonaResult | undefined> {
     if (bringUp) {
-      const connected = await connectPersona(persona, { ...bringUp, applied: personas })
-      if (connected.outcome !== 'connected') {
-        perPersona.push({ key: persona.key, action: 'not-brought-up', failures: connected.failures })
+      const started = await bringUp.bringUp(persona, personas)
+      if (started.outcome !== 'up') {
+        perPersona.push({ key: persona.key, action: 'not-brought-up', outcome: started.outcome, failures: started.failures })
         notBroughtUp++
         return undefined
       }
@@ -2448,9 +2464,11 @@ function createLaunchPool(size: number): <T>(task: () => Promise<T>) => Promise<
  * a restart never repeats the credentials, working-directory or Slack steps.
  *
  * `options.canLaunch` (the server passes `createPersonaRelaunchGate`) is
- * asked first: when it answers false — the persona's Slack connection is not
- * serving, so steps 1–3 have not passed — nothing is launched and the result
- * is `'skipped'`, which restart.ts counts as neither a success nor a failure.
+ * asked first: when it answers false — the persona is not up (its Slack
+ * connection is not serving, or its bring-up is broken or retrying) —
+ * nothing is launched and the result is `'skipped'`, which restart.ts counts
+ * as neither a success nor a failure. restart.ts asks the same gate before
+ * any kill or reconnect; this check covers a flip in between.
  *
  * Returns true on any non-failed action (spawned / resumed / reconnected /
  * no-op), false on `failed` or when no applied persona has the key. The

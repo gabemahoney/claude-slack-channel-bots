@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, beforeEach, beforeAll, afterAll } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { describe, test, expect, beforeEach, beforeAll, afterAll, afterEach } from 'bun:test'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { stat as fsStat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -26,6 +27,19 @@ import {
 import { _buildStatRouteImpl } from '../src/server.ts'
 import { _resetBackoffState } from '../src/backoff.ts'
 import { makeMultiPersonaConfig, makePersonaConfig } from './test-helpers/persona-config.ts'
+import type { Persona } from '../src/config.ts'
+import type { PersonaConnectionManager } from '../src/persona-connections.ts'
+import { createPersonaRelaunchGate } from '../src/persona-start.ts'
+import {
+  createPersonaBringUpController,
+  type PersonaBringUpController,
+} from '../src/persona-bringup-controller.ts'
+import {
+  makeConnectionHarness,
+  type ConnectionHarness,
+  type ConnectionHarnessOptions,
+} from './test-helpers/persona-connection-harness.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -92,7 +106,12 @@ type DepsOpts = {
   statRouteHangs?: boolean           // if true, statRoute never resolves
   isShuttingDownResult?: boolean     // default: false
   personas?: Record<string, string>  // work list; default: { [KEY]: WD }
-  throwOnKey?: string                // isSessionAlive throws for this persona key
+  // Per-tick work lists, consumed one per tick (getPersonas call); the last
+  // repeats once exhausted. Takes precedence over `personas`. Lets a test drop
+  // a persona out of the work list for a bounded number of ticks, as the
+  // relaunch gate does for a persona that is not up.
+  personasSequence?: Array<Record<string, string>>
+  throwOnKey?: string               // isSessionAlive throws for this persona key
   maxTicks?: number                  // stop after this many tick bodies (isShuttingDown turns true)
 }
 
@@ -195,6 +214,8 @@ function makeDeps(opts: DepsOpts = {}): HealthCheckDeps & {
     },
     getPersonas() {
       ticks++
+      const seq = opts.personasSequence
+      if (seq && seq.length > 0) return seq[Math.min(ticks - 1, seq.length - 1)]
       return opts.personas ?? { [KEY]: WD }
     },
   }
@@ -812,6 +833,40 @@ describe('b.9a7 alive-but-disconnected tick recovery', () => {
     // was cleared by the cap skip rather than carried across.
     expect(deps.scheduleRestartAtConnectedCount[0]).toBe(3)
   })
+
+  test('12. streak cleared on not-up skip: a persona the relaunch gate leaves out of a tick\'s work list does NOT carry its disconnected streak back in (b.av2 SR-6.4)', async () => {
+    // The third count-resetting skip, beside pending (10) and cap (11): the
+    // relaunch gate leaves a persona that is not up out of the work list, and
+    // the tick drops its streak. STAY is in every tick's list and healthy, so
+    // tick 2's list is not empty — only DROP is missing from it.
+    //   tick1: [DROP, STAY] → DROP !connected → streak=1 (DROP connected call 1)
+    //   tick2: [STAY]       → DROP not in the list (streak cleared; no probe)
+    //   tick3: [DROP, STAY] → DROP !connected → FRESH streak=1 (call 2) — no fire
+    //   tick4: [DROP, STAY] → DROP !connected → streak=2 → FIRE (call 3)
+    // Without the clear, the streak of 1 from before DROP went down would
+    // survive, so its first observation after coming back (call 2) would fire.
+    const full = workList('Gate Drop', 'Gate Stay')
+    const [DROP, STAY] = Object.keys(full)
+    const onlyStay = { [STAY]: full[STAY] }
+    const deps = makeDeps({
+      isSessionAliveResult: true,
+      connectedSequence: { [DROP]: [false], [STAY]: [true] },
+      personasSequence: [full, onlyStay, full, full],  // last (full) repeats
+    })
+    initHealthCheck(deps)
+
+    startHealthCheck(FAST_INTERVAL_S)
+    await Bun.sleep(WAIT_MS)
+
+    // Anti-vacuity: tick 2 ran without DROP (not probed), STAY probed on every tick.
+    expect(deps.isSessionConnectedCalls.slice(0, 6)).toEqual([DROP, STAY, STAY, DROP, STAY, DROP])
+    expect(deps.scheduleRestartCalls.length).toBeGreaterThan(0)
+    expect(deps.scheduleRestartCalls.every((c) => c.key === DROP)).toBe(true)
+    expect(deps.scheduleRestartCalls[0].cwd).toBe(full[DROP])
+    // Two fresh observations after it came back were required — no reconnect
+    // or restart was scheduled on the first one.
+    expect(deps.scheduleRestartAtConnectedCount[0]).toBe(3)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -969,5 +1024,224 @@ describe('persona-keyed work list and streaks (b.av2 SR-6.3)', () => {
     expect(deps.tickCount()).toBe(2)
     expect(deps.isSessionConnectedCalls).toEqual(['persona_a', 'persona_b', 'persona_a', 'persona_b'])
     expect(deps.scheduleRestartCalls).toEqual([{ key: 'persona_a', cwd: personas.persona_a }])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-6.3 / SR-6.4 / SR-7.2 / SR-11 — only personas that are up are checked
+//
+// The server builds the tick's work list as
+// `buildPersonaWorkList(config, canRelaunch)`, where `canRelaunch` is
+// `createPersonaRelaunchGate(manager, log, bringUpController)`. These cases
+// run that wiring for real (the shared connection harness's manager and fake
+// clock, the real bring-up controller, the real gate, the real statRoute) and
+// drive the real health check one tick at a time with every session dead, so
+// any persona that reached a tick would be stat'd, probed and scheduled.
+//
+// The Slack-unreachable retrying leg is in tests/persona-relaunch-gate.test.ts;
+// here are the credentials-broken rows (local check and Slack refusal), the
+// directory-broken retrying row and its recovery, and a running persona whose
+// directory disappears after it came up (today's cwd-unreachable path).
+// ---------------------------------------------------------------------------
+
+describe('only personas that are up are checked (b.av2 SR-6.3, SR-6.4, SR-11)', () => {
+  let dir: string
+  let managers: PersonaConnectionManager[]
+  let controllers: PersonaBringUpController[]
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'health-check-up-'))
+    managers = []
+    controllers = []
+  })
+
+  afterEach(async () => {
+    _resetHealthCheckState()
+    for (const c of controllers) c.cancelAll()
+    await Promise.all(managers.map((m) => m.stopAll()))
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  /**
+   * The server's bring-up wiring over a connection harness: the controller
+   * (on the harness clock, recording retry launches) as the manager's status
+   * listener, and the relaunch gate over both. `breakPersona` runs after the
+   * harness wrote every persona's files and before any bring-up.
+   */
+  async function bringUpAll(names: string[], opts: {
+    stubOptions?: ConnectionHarnessOptions['stubOptions']
+    breakPersona?: (h: ConnectionHarness) => void
+  } = {}) {
+    const h = makeConnectionHarness(names.map((name) => ({ name })), dir, { files: true, stubOptions: opts.stubOptions })
+    managers.push(h.manager)
+    opts.breakPersona?.(h)
+    const lines: string[] = []
+    const log = (line: string) => void lines.push(line)
+    const launches: string[] = []
+    const controller = createPersonaBringUpController({
+      connections: h.manager,
+      dryRun: false,
+      log,
+      clock: h.clock,
+      launch: async (persona: Persona) => void launches.push(persona.key),
+    })
+    controllers.push(controller)
+    h.onStatus = (key, status) => controller.onConnectionStatus(key, status)
+    const outcomes: Record<string, string> = {}
+    for (const persona of h.personas) outcomes[persona.name] = (await controller.bringUp(persona, h.personas)).outcome
+    const canRelaunch = createPersonaRelaunchGate(h.manager, log, controller)
+    return { h, controller, canRelaunch, outcomes, launches, lines }
+  }
+
+  /**
+   * Start the real health check over `getPersonas`, every session dead, with
+   * the real statRoute on the real file system (a missing path answers as a
+   * non-directory rather than through the factory's error log). `tick()` lets exactly one more tick body run and
+   * resolves once every persona in its work list has finished (scheduled, or
+   * skipped at cap), so the assertions after it see the whole tick.
+   */
+  function startSteppedTicks(getPersonas: () => Record<string, string>, atCap: (key: string) => boolean = () => false) {
+    const statRoute = _buildStatRouteImpl({
+      stat: (path) => fsStat(path).catch(() => ({ isDirectory: () => false })),
+    })
+    const calls = {
+      stat: [] as string[], alive: [] as string[], pending: [] as string[], atCap: [] as string[], scheduled: [] as string[],
+    }
+    let allowed = 0
+    let ticks = 0
+    let expectedDone = 0
+    let done = 0
+    initHealthCheck({
+      isSessionAlive: async (key) => (calls.alive.push(key), false),
+      isSessionConnected: () => false,
+      hasSessionStream: () => false,
+      isRestartPendingOrActive: (key) => (calls.pending.push(key), false),
+      isAtCap: (key) => {
+        calls.atCap.push(key)
+        const capped = atCap(key)
+        if (capped) done++
+        return capped
+      },
+      statRoute: (cwd) => (calls.stat.push(cwd), statRoute(cwd)),
+      scheduleRestart: (key) => {
+        calls.scheduled.push(key)
+        done++
+      },
+      isShuttingDown: () => ticks >= allowed,
+      getPersonas: () => {
+        ticks++
+        const personas = getPersonas()
+        expectedDone += Object.keys(personas).length
+        return personas
+      },
+    })
+    startHealthCheck(0.002)
+    async function tick(): Promise<void> {
+      allowed++
+      for (let waited = 0; (ticks < allowed || done < expectedDone) && waited < 500; waited++) await Bun.sleep(1)
+      expect(ticks).toBe(allowed)
+      expect(done).toBe(expectedDone)
+    }
+    return { calls, tick }
+  }
+
+  const BROKEN_SPECS = ['Up Desk', 'Creds Missing', 'Slack Refused', 'Dir Missing']
+  const brokenRows = {
+    stubOptions: { 'Slack Refused': { authTest: [{ kind: 'platform' as const, error: 'invalid_auth' }] } },
+    breakPersona: (h: ConnectionHarness) => {
+      rmSync(h.p('Creds Missing').credentials_file)
+      rmSync(h.p('Dir Missing').working_directory, { recursive: true, force: true })
+    },
+  }
+
+  test('broken (credentials missing, Slack refused) and directory-retrying personas beside an up one: no tick stats, probes, schedules, caps or flags them; the up persona is checked every tick', async () => {
+    const { h, controller, canRelaunch, outcomes, launches, lines } = await bringUpAll(BROKEN_SPECS, brokenRows)
+    const up = h.p('Up Desk')
+    const notUp = ['Creds Missing', 'Slack Refused', 'Dir Missing'].map((name) => h.p(name))
+    expect(outcomes).toEqual({ 'Up Desk': 'up', 'Creds Missing': 'broken', 'Slack Refused': 'broken', 'Dir Missing': 'retrying' })
+    // Neither local failure opened a Slack connection (SR-6.4).
+    expect([h.manager.status(notUp[0].key), h.manager.status(notUp[2].key)]).toEqual([undefined, undefined])
+
+    const { calls, tick } = startSteppedTicks(() => buildPersonaWorkList(h.config!, canRelaunch))
+    for (let i = 0; i < 3; i++) await tick()
+
+    // Only the up persona reached any tick step, once per tick.
+    expect(calls.pending).toEqual([up.key, up.key, up.key])
+    expect(calls.atCap).toEqual([up.key, up.key, up.key])
+    expect(calls.stat).toEqual([up.working_directory, up.working_directory, up.working_directory])
+    expect(calls.alive).toEqual([up.key, up.key, up.key])
+    expect(calls.scheduled).toEqual([up.key, up.key, up.key])
+    // No outage flag and no notice for anyone: Dir Missing's absent directory
+    // raised no cwd-unreachable, and nothing reached Slack (SR-7.2).
+    for (const p of [up, ...notUp]) expect(getOutageFlags(p.key).size).toBe(0)
+    expect(notices).toEqual([])
+    // The tick left every outcome as it was; no retry launched anyone.
+    expect(notUp.map((p) => controller.state(p.key)?.outcome)).toEqual(['broken', 'broken', 'retrying'])
+    expect(launches).toEqual([])
+    assertNoLeak({ lines, managerLines: h.lines, calls })
+  })
+
+  test('a directory-retrying persona is excluded until its directory retry brings it up, then the next tick checks it; the broken ones stay out', async () => {
+    const { h, controller, canRelaunch, launches, lines } = await bringUpAll(BROKEN_SPECS, brokenRows)
+    const up = h.p('Up Desk')
+    const retrying = h.p('Dir Missing')
+
+    const { calls, tick } = startSteppedTicks(() => buildPersonaWorkList(h.config!, canRelaunch))
+    await tick()
+    // First re-check (5 s on the SR-3.2 schedule): still missing, still retrying.
+    await h.clock.advance(5_000)
+    expect(controller.state(retrying.key)?.outcome).toBe('retrying')
+    await tick()
+    expect(calls.scheduled).toEqual([up.key, up.key])
+
+    // The directory appears; the next re-check (10 s later) brings it up and
+    // the controller launches it from its own retry, not from the tick.
+    mkdirSync(retrying.working_directory, { recursive: true })
+    await h.clock.advance(10_000)
+    expect(controller.isUp(retrying.key)).toBe(true)
+    expect(launches).toEqual([retrying.key])
+
+    await tick()
+    expect(calls.scheduled).toEqual([up.key, up.key, up.key, retrying.key])
+    expect(calls.stat.slice(2)).toEqual([up.working_directory, retrying.working_directory])
+    expect(new Set(calls.alive)).toEqual(new Set([up.key, retrying.key]))
+    expect(getOutageFlags(retrying.key).size).toBe(0)
+    expect(notices).toEqual([])
+    assertNoLeak({ lines, managerLines: h.lines, calls })
+  })
+
+  test('SR-11: an up persona whose directory vanishes after it came up keeps today\'s path — cwd-unreachable raised once with a notice, restarts scheduled, then skipped at cap; no directory retry opens', async () => {
+    let capped = false
+    const { h, controller, canRelaunch, launches, lines } = await bringUpAll(['Up Desk'])
+    const up = h.p('Up Desk')
+    expect(controller.isUp(up.key)).toBe(true)
+    const pendingBefore = h.clock.pendingCount()
+
+    rmSync(up.working_directory, { recursive: true, force: true })
+    const { calls, tick } = startSteppedTicks(() => buildPersonaWorkList(h.config!, canRelaunch), () => capped)
+    await tick()
+    await tick()
+
+    // Still in the work list; stat fails, the flag is raised under its key
+    // with its directory, one onset notice across ticks, and each tick hands
+    // it to restart (whose backoff and counter apply).
+    expect(calls.stat).toEqual([up.working_directory, up.working_directory])
+    expect(getOutageFlags(up.key).has('cwd-unreachable')).toBe(true)
+    expect(notices).toEqual([{ key: up.key, text: ONSET_TEMPLATES['cwd-unreachable'](up.working_directory) }])
+    expect(calls.scheduled).toEqual([up.key, up.key])
+
+    // At the restart cap the tick skips it, as for any capped persona.
+    capped = true
+    await tick()
+    expect(calls.atCap).toEqual([up.key, up.key, up.key])
+    expect(calls.stat).toHaveLength(2)
+    expect(calls.scheduled).toEqual([up.key, up.key])
+
+    // The bring-up controller never took it over: still up, no directory
+    // cause, no re-check timer, no retry launch.
+    expect(controller.state(up.key)).toEqual({ outcome: 'up', causes: {} })
+    expect(h.clock.pendingCount()).toBe(pendingBefore)
+    expect(launches).toEqual([])
+    assertNoLeak({ lines, managerLines: h.lines, calls })
   })
 })

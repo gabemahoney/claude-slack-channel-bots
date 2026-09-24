@@ -23,9 +23,16 @@
  * Production code under test injects the stub via the `getClient` factory
  * passed to the startup gate (see src/agent-director-startup.ts).
  *
+ * `makeStubCallLog` / `stubCallCount` give a capture list for every verb and
+ * their total, and `installStubSpawnPath` / `resetStubSpawnPath` route the
+ * real persona launch path (`spawnForPersona`) to a fresh stub client with
+ * the dialog and tmux seams faked and a temp spawn home.
+ *
  * SPDX-License-Identifier: MIT
  */
 
+import { mkdirSync } from 'node:fs'
+import { join } from 'node:path'
 import {
   AgentDirectorError,
   ErrAlreadyDecided,
@@ -94,7 +101,22 @@ import {
   personaInstanceId,
   personaTmuxSessionName,
 } from '../../src/persona-identity.ts'
-import { personaConfigDirLabelValue } from '../../src/session-manager.ts'
+import {
+  _resetDialogPollIntervalMs,
+  _resetDialogReadyTimeoutMs,
+  _resetInFlightLaunches,
+  _resetSpawnHomeDir,
+  _resetTmuxDialogHelpers,
+  _resetTmuxSessionProber,
+  _setDialogPollIntervalMs,
+  _setDialogReadyTimeoutMs,
+  _setSpawnHomeDir,
+  _setTmuxCapturePane,
+  _setTmuxSendEnter,
+  _setTmuxSessionProber,
+  personaConfigDirLabelValue,
+} from '../../src/session-manager.ts'
+import { resetClientForTests, setClientForTests } from '../../src/agent-director-client.ts'
 import { makePersona } from './persona-config.ts'
 
 // ---------------------------------------------------------------------------
@@ -955,6 +977,97 @@ export function holdSpawns(stub: StubClient, shouldHold: (id: string) => boolean
       for (const h of held.splice(0)) h.resolve({ claude_instance_id: h.id })
     },
   }
+}
+
+// ---------------------------------------------------------------------------
+// Call log and the stubbed persona launch path
+// ---------------------------------------------------------------------------
+
+/** Every per-verb capture list `makeStubClient` fills, all present. */
+export type StubCallLog = Required<
+  Pick<
+    StubClientOptions,
+    | 'versionCalls'
+    | 'makeTemplateCalls'
+    | 'spawnCalls'
+    | 'statusCalls'
+    | 'getCalls'
+    | 'sendKeysCalls'
+    | 'readPaneCalls'
+    | 'killCalls'
+    | 'decideCalls'
+    | 'resumeCalls'
+    | 'findMissingCalls'
+    | 'deleteCalls'
+    | 'listCalls'
+    | 'pauseCalls'
+    | 'getPermissionCalls'
+  >
+>
+
+/** An empty capture list for every verb; pass it to `makeStubClient`. */
+export function makeStubCallLog(): StubCallLog {
+  return {
+    versionCalls: [], makeTemplateCalls: [], spawnCalls: [], statusCalls: [], getCalls: [], sendKeysCalls: [],
+    readPaneCalls: [], killCalls: [], decideCalls: [], resumeCalls: [], findMissingCalls: [], deleteCalls: [],
+    listCalls: [], pauseCalls: [], getPermissionCalls: [],
+  }
+}
+
+/** How many verb calls `log` recorded, over every verb. */
+export function stubCallCount(log: StubCallLog): number {
+  return Object.values(log).reduce((sum: number, calls: unknown[]) => sum + calls.length, 0)
+}
+
+/** The stub client `installStubSpawnPath` installed, and what it recorded. */
+export interface StubSpawnPath {
+  /** Every call the stub client received, by verb. */
+  readonly calls: StubCallLog
+  /** The installed client; a test may wrap its verbs (e.g. `spawn`). */
+  readonly client: StubClient
+  /** How many verb calls were recorded, over every verb. */
+  callCount(): number
+  /** The instance IDs spawned, in call order. */
+  spawnedIds(): string[]
+}
+
+/**
+ * Route the real persona launch path (`spawnForPersona`) to a fresh stub
+ * client with an empty call log: the client is installed as the process's
+ * agent-director client, the dialog poll runs at 1 ms with a 200 ms ready
+ * bound, tmux reads an empty pane, sends nothing and reports every session
+ * alive, and the spawn home is `homeDir` (its `.claude` directory is
+ * created). `homeDir` must be under the test's `mkdtempSync` directory.
+ * Undo everything with `resetStubSpawnPath` in `afterEach`.
+ */
+export function installStubSpawnPath(homeDir: string): StubSpawnPath {
+  const calls = makeStubCallLog()
+  const client = makeStubClient(calls)
+  setClientForTests(client as unknown as Parameters<typeof setClientForTests>[0])
+  _setDialogPollIntervalMs(1)
+  _setDialogReadyTimeoutMs(200)
+  _setTmuxCapturePane(async () => '')
+  _setTmuxSendEnter(async () => {})
+  _setTmuxSessionProber(async () => true)
+  mkdirSync(join(homeDir, '.claude'), { recursive: true })
+  _setSpawnHomeDir(homeDir)
+  return {
+    calls,
+    client,
+    callCount: () => stubCallCount(calls),
+    spawnedIds: () => calls.spawnCalls.map((params) => String(params.claude_instance_id)),
+  }
+}
+
+/** Undo `installStubSpawnPath`, and forget any launch still marked in flight. */
+export function resetStubSpawnPath(): void {
+  resetClientForTests()
+  _resetDialogPollIntervalMs()
+  _resetDialogReadyTimeoutMs()
+  _resetTmuxDialogHelpers()
+  _resetTmuxSessionProber()
+  _resetSpawnHomeDir()
+  _resetInFlightLaunches()
 }
 
 // ---------------------------------------------------------------------------

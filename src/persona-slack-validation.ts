@@ -118,21 +118,50 @@ export const UNKNOWN_SLACK_ERROR = 'unknown'
 /** Bound on the WebSocket phase of every Socket Mode `start()`, in milliseconds (b.av2 SR-3.3). */
 export const SLACK_START_TIMEOUT_MS = 10_000
 
-/** `code` of the start-timeout marker; the classifier maps it to Slack-unreachable (`timeout`). */
-export const SLACK_START_TIMEOUT_CODE = 'cscb_slack_start_timeout'
+/**
+ * Bound on a bring-up's `auth.test`, in milliseconds (10 s). The connection
+ * manager applies it on its own injected clock, because the validation
+ * client's request timeout is a socket idle timer that starts only after the
+ * connection is made: a DNS or TCP-connect stall would otherwise hold a
+ * bring-up for minutes.
+ */
+export const SLACK_AUTH_TEST_TIMEOUT_MS = 10_000
+
+/**
+ * `code` of the timeout markers (`SlackStartTimeoutError`,
+ * `SlackAuthTestTimeoutError`); the classifier maps it to Slack-unreachable
+ * (`timeout`) for whichever check it came from. Its value predates the
+ * `auth.test` marker and keeps its historical `start` wording.
+ */
+export const SLACK_TIMEOUT_CODE = 'cscb_slack_start_timeout'
 
 /**
  * Marker for "the WebSocket phase of `start()` was abandoned after
  * `SLACK_START_TIMEOUT_MS`" (b.av2 SR-3.3). The connection manager rejects
- * with it (or any value whose `code` is `SLACK_START_TIMEOUT_CODE`); the
+ * with it (or any value whose `code` is `SLACK_TIMEOUT_CODE`); the
  * classifier recognises it by that code, not by `instanceof`.
  */
 export class SlackStartTimeoutError extends Error {
-  readonly code = SLACK_START_TIMEOUT_CODE
+  readonly code = SLACK_TIMEOUT_CODE
 
   constructor() {
     super(`Socket Mode start() abandoned after ${SLACK_START_TIMEOUT_MS} ms`)
     this.name = 'SlackStartTimeoutError'
+  }
+}
+
+/**
+ * Marker for "`auth.test` got no answer within `SLACK_AUTH_TEST_TIMEOUT_MS`":
+ * the connection manager abandons the call and classifies this marker with
+ * the `auth.test` check, which makes the attempt Slack-unreachable
+ * (`timeout`), never refused.
+ */
+export class SlackAuthTestTimeoutError extends Error {
+  readonly code = SLACK_TIMEOUT_CODE
+
+  constructor() {
+    super(`auth.test abandoned after ${SLACK_AUTH_TEST_TIMEOUT_MS} ms`)
+    this.name = 'SlackAuthTestTimeoutError'
   }
 }
 
@@ -148,7 +177,10 @@ export type SlackUnreachableReason =
   | 'http-status'
   /** Web API rate-limited error; `retryAfter` holds its delay when valid. */
   | 'rate-limited'
-  /** The WebSocket phase of `start()` was abandoned (`SlackStartTimeoutError`). */
+  /**
+   * The call was abandoned at its 10 s bound: the WebSocket phase of `start()`
+   * (`SlackStartTimeoutError`) or `auth.test` (`SlackAuthTestTimeoutError`).
+   */
   | 'timeout'
   /** A transient platform error (`TRANSIENT_SLACK_PLATFORM_ERRORS`); `slackError` holds it. */
   | 'platform-transient'
@@ -248,7 +280,7 @@ export function classifySlackValidationError(error: unknown, check: SlackValidat
   if (code === WEB_API_RATE_LIMITED_ERROR) {
     return unreachable(check, 'rate-limited', { retryAfter: validRetryAfter(readProp(error, 'retryAfter')) })
   }
-  if (code === SLACK_START_TIMEOUT_CODE) return unreachable(check, 'timeout')
+  if (code === SLACK_TIMEOUT_CODE) return unreachable(check, 'timeout')
   if (typeof code === 'string' && code.startsWith(SOCKET_MODE_CODE_PREFIX)) return unreachable(check, 'network')
 
   if (check === 'socket-mode') {
@@ -286,6 +318,7 @@ export function botIdentityFromAuthTest(result: unknown): SlackUpOutcome | Slack
 
 /** Describe an unreachable reason for a cause, from the outcome's own fields only. */
 function describeReason(
+  check: SlackValidationCheck,
   reason: SlackUnreachableReason,
   fields: { slackError?: string; status?: number },
 ): string {
@@ -293,7 +326,10 @@ function describeReason(
     case 'network': return 'network or request error'
     case 'http-status': return fields.status === undefined ? 'HTTP error' : `HTTP status ${fields.status}`
     case 'rate-limited': return 'rate limited'
-    case 'timeout': return `WebSocket phase timed out after ${SLACK_START_TIMEOUT_MS / 1000} s`
+    case 'timeout':
+      return check === 'auth.test'
+        ? `no answer within ${SLACK_AUTH_TEST_TIMEOUT_MS / 1000} s`
+        : `WebSocket phase timed out after ${SLACK_START_TIMEOUT_MS / 1000} s`
     case 'platform-transient': return `Slack error ${fields.slackError ?? UNKNOWN_SLACK_ERROR}`
     case 'no-url': return 'no WebSocket URL returned'
     case 'socket-closed': return 'socket closed before hello'
@@ -315,7 +351,7 @@ function unreachable(
     check,
     key,
     reason,
-    cause: `Slack unreachable checking ${key} via ${SLACK_CHECK_DESCRIPTION[check]}: ${describeReason(reason, fields)}${wait}`,
+    cause: `Slack unreachable checking ${key} via ${SLACK_CHECK_DESCRIPTION[check]}: ${describeReason(check, reason, fields)}${wait}`,
   }
   if (fields.slackError !== undefined) outcome.slackError = fields.slackError
   if (fields.status !== undefined) outcome.status = fields.status

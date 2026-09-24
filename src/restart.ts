@@ -5,6 +5,12 @@
  * guards, backoff and the failure cap are keyed by persona key (b.av2 SR-6.3):
  * every dependency, the pending-timer map and the in-flight launch set take
  * the key, and log lines name it as `persona=<key>`.
+ * A persona that is not up (broken, or retrying its bring-up; b.av2 SR-6.4)
+ * is never restarted: `RestartDeps.canRestart` is asked before a timer is
+ * armed, again when it fires (before the liveness probe) and once more after
+ * the probe (before any reconnect or kill), so its instance and row are left
+ * alone and its failure count is unchanged. `launchSession`'s own gate is the
+ * backstop for a flip during the kill.
  * Isolated from server.ts side effects — injectable deps make it testable.
  *
  * SPDX-License-Identifier: MIT
@@ -45,6 +51,17 @@ export const HUMAN_TRIGGER_DELAY_CEILING = 5
 
 /** Restart dependencies. Every `key` is a persona key. */
 export interface RestartDeps {
+  /**
+   * Whether the persona may be restarted at all: false while it is not up (its
+   * bring-up is broken or retrying, or its Slack connection is not serving;
+   * b.av2 SR-6.4). Asked when a restart is scheduled, when its timer fires
+   * (before `isSessionAlive`) and again after that probe (before
+   * `reconnectSession` or `killSession`): a not-up persona's instance is
+   * never killed, reconnected, deleted or launched, and its failure count is
+   * left as it is. The server passes the relaunch gate
+   * (`createPersonaRelaunchGate`).
+   */
+  canRestart(key: string): boolean
   isSessionAlive(key: string): Promise<boolean>
   /** Check if the session already has a live MCP connection in the registry. */
   isSessionConnected(key: string): boolean
@@ -72,8 +89,8 @@ export interface RestartDeps {
   killSession(key: string): Promise<void>
   /**
    * `cwd` is the persona's working directory. `'skipped'`: the launch was
-   * declined (the persona's Slack connection is not serving), which counts as
-   * neither a success nor a failure.
+   * declined (the persona stopped being up after the last `canRestart`
+   * check), which counts as neither a success nor a failure.
    */
   launchSession(key: string, cwd: string, sessionId?: string): Promise<boolean | 'skipped'>
   getRestartDelay(): number
@@ -127,6 +144,21 @@ export function scheduleRestart(
     return
   }
 
+  // At shutdown every persona's bring-up is cancelled (so none is up) and the
+  // HTTP server's stop aborts every MCP stream, which lands here: arm no timer,
+  // and do not ask the relaunch gate, which would log a healthy persona as
+  // not relaunched.
+  if (deps.isShuttingDown()) {
+    console.error(`[slack] Skipping restart — server is shutting down (persona=${key})`)
+    return
+  }
+
+  // b.av2 SR-6.4: a persona that is not up gets no timer at all.
+  if (!deps.canRestart(key)) {
+    console.error(`[slack] Not scheduling restart for persona=${key} — the persona is not up (its bring-up has not succeeded, or its Slack connection is not serving)`)
+    return
+  }
+
   // Compute exponential backoff delay from the pre-failure count (SR-25.2).
   // nextBackoffDelay reads the CURRENT count (before this attempt's failure is
   // recorded) so the first failure uses base*2^0 = base, the second base*2^1, etc.
@@ -162,6 +194,12 @@ export function scheduleRestart(
         return
       }
 
+      // b.av2 SR-6.4: the persona stopped being up after this restart was
+      // scheduled (e.g. Slack refused a token on a reopen). Leave its instance
+      // and its row alone: no liveness probe, reconnect, kill or launch, and
+      // no success or failure recorded.
+      if (skipIfNotUp(deps, key)) return
+
       let alive: boolean
       try {
         alive = await deps.isSessionAlive(key)
@@ -169,6 +207,13 @@ export function scheduleRestart(
         console.error(`[slack] restart: isSessionAlive failed for persona=${key}:`, err)
         alive = false
       }
+
+      // Asked again after the liveness probe: it is an async agent-director
+      // call, and the persona may have stopped being up while it ran. This is
+      // the last check before `reconnectSession` or `killSession` touch the
+      // instance; `launchSession`'s own gate (`'skipped'` below) covers a flip
+      // during the kill.
+      if (skipIfNotUp(deps, key)) return
 
       if (alive) {
         // If the session already re-established its MCP connection (e.g. Claude
@@ -232,8 +277,11 @@ export function scheduleRestart(
       }
 
       if (ok === 'skipped') {
-        // Declined, not attempted (the gate logged why): the failure counter,
-        // backoff and cap latch are left exactly as they were.
+        // Declined, not attempted: the persona stopped being up between the
+        // last `canRestart` check above and the launch, and the launch's own
+        // gate (the same relaunch gate) logged why. The instance was already
+        // killed by then; the failure counter, backoff and cap latch are left
+        // exactly as they were.
         return
       }
 
@@ -264,6 +312,18 @@ export function scheduleRestart(
   }, delay * 1000)
 
   pendingRestartTimers.set(key, timer)
+}
+
+/**
+ * The timer-time not-up check (b.av2 SR-6.4): when `canRestart` answers false,
+ * log that the restart is skipped and the instance left as it is, and return
+ * true so the caller returns before touching the persona. Records neither a
+ * success nor a failure.
+ */
+function skipIfNotUp(d: RestartDeps, key: string): boolean {
+  if (d.canRestart(key)) return false
+  console.error(`[slack] Skipping restart for persona=${key} — the persona is no longer up; its instance is left as it is`)
+  return true
 }
 
 // ---------------------------------------------------------------------------

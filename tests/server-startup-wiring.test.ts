@@ -16,7 +16,11 @@
  *   run and up→flush listener, `connections = <manager>`, `clientFor` and
  *   `identityFor` over the connection view, the routing's identity, client and
  *   archive seams, and the archive writer's per-persona resolver source.
- * - The relaunch gate (SR-6.1): built over the manager and passed to the
+ * - The bring-up controller (SR-6.1, SR-6.4): the start's bring-up, told
+ *   every connection status, stored for shutdown and cancelled there before
+ *   the connections stop.
+ * - The relaunch gate (SR-6.1, SR-6.4): built over the manager and the
+ *   bring-up controller and passed to the restart module (`canRestart`), the
  *   restart launch and the health-check work list; the restart delay read
  *   from the applied config; the permission poller not started in dry run.
  * - SR-5.2: the file guard handed to the session tools protects every persona
@@ -230,19 +234,69 @@ describe('main() installs the unhandledRejection handler before any persona conn
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the bring-up gets the loaded config and its deps (SR-6.1)
+// Static audit: the bring-up gets the loaded config and the bring-up
+// controller; shutdown cancels the controller's retries (SR-6.1, SR-6.4)
 // ---------------------------------------------------------------------------
 
-describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona config', () => {
-  test('gets the loaded persona config and bring-up deps over the connection manager, with dry run passed through', () => {
-    const args = onlyCallArguments(SERVER_CODE, 'startupSessionManager')
-    expect(args.split(',')[0]!.trim()).toBe(loadedConfigName(SERVER_CODE))
+describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona config through the bring-up controller, which shutdown cancels (SR-6.1, SR-6.4)', () => {
+  test('gets the loaded persona config and, as its bring-up, the bring-up controller', () => {
+    const args = onlyCallArgs('startupSessionManager')
+    expect(args).toHaveLength(2)
+    expect(args[0]).toBe(loadedConfigName(SERVER_CODE))
+    const options = objectProperties(args[1]!)
+    expect([...options.keys()]).toEqual(['bringUp'])
+    expect(options.get('bringUp')).toBe(constOf('createPersonaBringUpController'))
+  })
 
-    const bringUpAt = args.search(/\bbringUp\s*:\s*\{/)
-    expect(bringUpAt).toBeGreaterThan(-1)
-    const bringUp = args.slice(...balancedAfter(args, bringUpAt, '{', '}'))
-    expect(bringUp).toMatch(new RegExp(`\\bconnections\\s*:\\s*${constOf('createPersonaConnectionManager')}\\b`))
-    expect(bringUp).toMatch(/\bdryRun\s*:\s*isDryRun\s*\(\s*\)/)
+  test('the bring-up controller is built once, inside main(), over the connection manager, with dry run passed through and spawnForPersona over the applied config as its launch', () => {
+    const at = onlyCallOf('createPersonaBringUpController')
+    expect(insideMain(at)).toBe(true)
+    expect(at).toBeGreaterThan(onlyCallOf('createPersonaConnectionManager'))
+    expect(at).toBeLessThan(onlyCallOf('startupSessionManager'))
+
+    const props = onlyCallProps('createPersonaBringUpController')
+    expect(props.get('connections')).toBe(constOf('createPersonaConnectionManager'))
+    expect(props.get('dryRun')).toBe('isDryRun()')
+    const launch = props.get('launch')
+    expect(launch).toMatch(/^\((\w+)\) => spawnForPersona\(\1, (\w+), false\)$/)
+    // The launch's config is the applied config getRestartDelay reads.
+    const appliedName = launch!.match(/spawnForPersona\(\w+, (\w+),/)![1]
+    expect(onlyCallProps('initRestart').get('getRestartDelay')).toBe(`() => ${appliedName}.session_restart_delay`)
+  })
+
+  test('main() stores the controller for the manager\'s status listener and for shutdown: `bringUps = <controller>` once, inside main(), right after it is built and before anything connects', () => {
+    expect(SERVER_CODE).toMatch(/^let\s+bringUps\s*:\s*PersonaBringUpController\s*\|\s*undefined\s*$/m)
+    const controller = constOf('createPersonaBringUpController')
+    const assigns = assignmentsTo('bringUps')
+    expect(assigns.map((a) => a.value)).toEqual([controller])
+    const at = assigns[0]!.at
+    expect(insideMain(at)).toBe(true)
+    expect(at).toBeGreaterThan(onlyCallOf('createPersonaBringUpController'))
+    // Nothing connects before the start pass: server.ts never calls a
+    // connection manager's bringUp itself, the controller does, from
+    // startupSessionManager. So the holder is set before any status can fire.
+    expect(indicesOf(/\.\s*bringUp\s*\(/g, SERVER_CODE)).toEqual([])
+    expect(at).toBeLessThan(onlyCallOf('startupSessionManager'))
+    // Right after it is built: the only code between the controller's
+    // construction and the assignment is the construction itself.
+    const [, callEnd] = balancedAfter(SERVER_CODE, onlyCallOf('createPersonaBringUpController'), '(', ')')
+    expect(SERVER_CODE.slice(callEnd + 1, at).trim()).toBe('')
+  })
+
+  test('shutdown cancels every persona\'s bring-up retry, once, before the Slack connections stop', () => {
+    const fn = SERVER_CODE.search(/\basync\s+function\s+shutdown\s*\(/)
+    expect(fn).toBeGreaterThan(-1)
+    const [start, end] = balancedAfter(SERVER_CODE, SERVER_CODE.indexOf(')', fn), '{', '}')
+    const inShutdown = (at: number) => at > start && at < end
+
+    const cancels = indicesOf(/\bbringUps\s*\?\.\s*cancelAll\s*\(\s*\)/g, SERVER_CODE)
+    expect(cancels).toHaveLength(1)
+    expect(inShutdown(cancels[0]!)).toBe(true)
+
+    const stops = indicesOf(/\bconnections\s*\?\.\s*stopAll\s*\(\s*\)/g, SERVER_CODE)
+    expect(stops).toHaveLength(1)
+    expect(inShutdown(stops[0]!)).toBe(true)
+    expect(cancels[0]!).toBeLessThan(stops[0]!)
   })
 })
 
@@ -256,7 +310,7 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
 // ---------------------------------------------------------------------------
 
 describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, SR-7.2)', () => {
-  test('the connection manager takes dry run from isDryRun() and flushes, on each up, the notifier every persona notice goes through', () => {
+  test('the connection manager takes dry run from isDryRun() and, on each status, flushes on up the notifier every persona notice goes through and tells the bring-up controller', () => {
     const notifier = constOf('createPersonaNotifier')
     // The notices' notifier: the session manager's sink and the outage state's notify.
     expect(onlyCallArgs('setSessionNotifier')).toEqual([`${notifier}.notify`])
@@ -264,7 +318,15 @@ describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, 
 
     const props = onlyCallProps('createPersonaConnectionManager')
     expect(props.get('dryRun')).toBe('isDryRun()')
-    expect(props.get('onStatus')).toBe(`createPersonaUpFlushListener(${notifier})`)
+    expect(props.get('onStatus')).toStartWith('composePersonaStatusListeners(')
+    const listeners = onlyCallArgs('composePersonaStatusListeners')
+    expect(listeners).toHaveLength(2)
+    expect(listeners[0]).toBe(`createPersonaUpFlushListener(${notifier})`)
+    // The controller is built after (and over) the manager, so the listener
+    // reaches it through the module-scope holder, never the local const (which
+    // would be in its temporal dead zone when the manager is built).
+    expect(listeners[1]).toMatch(/^\((\w+), (\w+)\) => bringUps\?\.onConnectionStatus\(\1, \2\)$/)
+    expect(listeners[1]).not.toContain(constOf('createPersonaBringUpController'))
   })
 
   test('main() points the lookups at the manager: `connections = <manager>` once, inside main(), before the bring-up', () => {
@@ -319,10 +381,19 @@ describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, 
 // ---------------------------------------------------------------------------
 
 describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) and reads the restart delay from the applied config', () => {
-  test('the relaunch gate is built once, inside main(), over the connection manager', () => {
+  test('the relaunch gate is built once, inside main(), over the connection manager and the bring-up controller\'s outcomes', () => {
     constOf('createPersonaRelaunchGate')
-    expect(insideMain(onlyCallOf('createPersonaRelaunchGate'))).toBe(true)
-    expect(onlyCallArgs('createPersonaRelaunchGate')[0]).toBe(constOf('createPersonaConnectionManager'))
+    const at = onlyCallOf('createPersonaRelaunchGate')
+    expect(insideMain(at)).toBe(true)
+    expect(at).toBeGreaterThan(onlyCallOf('createPersonaBringUpController'))
+    const args = onlyCallArgs('createPersonaRelaunchGate')
+    expect(args).toHaveLength(3)
+    expect(args[0]).toBe(constOf('createPersonaConnectionManager'))
+    expect(args[2]).toBe(constOf('createPersonaBringUpController'))
+  })
+
+  test('the restart module asks the gate before it touches a persona: canRestart is the gate (b.av2 SR-6.4)', () => {
+    expect(onlyCallProps('initRestart').get('canRestart')).toBe(constOf('createPersonaRelaunchGate'))
   })
 
   test('the restart module\'s launch passes the gate to launchSession as canLaunch', () => {

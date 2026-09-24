@@ -98,6 +98,7 @@ import {
   notifyRestartCapReached,
   setPreLaunchTrustPatcher,
   _resetPreLaunchTrustPatcher,
+  type StartupPersonaOutcome,
 } from '../src/session-manager.ts'
 import { UNATTRIBUTABLE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
 import { resolveJsonlPath } from '../src/cozempic.ts'
@@ -105,6 +106,11 @@ import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
 import { makeDeferredConnect, type DeferredConnect, type StubSlackOptions, type WebApiOutcome } from './test-helpers/slack-stub.ts'
 import type { PersonaConnectionManager } from '../src/persona-connections.ts'
 import type { PersonaBringUpStep } from '../src/persona-start.ts'
+import {
+  createPersonaBringUpController,
+  type PersonaBringUpController,
+  type PersonaBringUpOutcome,
+} from '../src/persona-bringup-controller.ts'
 import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
 import {
@@ -2216,18 +2222,23 @@ describe('startupSessionManager', () => {
 // ---------------------------------------------------------------------------
 // startupSessionManager with the SR-6.1 bring-up (b.av2 SR-6.1, SR-11)
 //
-// The server passes `bringUp`: each persona goes through its credentials,
-// working-directory and Slack steps before the launch. The procedure itself is
-// tested in tests/persona-bringup.test.ts; these cases pin the start pool's
-// bookkeeping: a step 1–3 failure is "not brought up", never a failed spawn,
-// a startup error or a notice.
+// The server passes its bring-up controller as `bringUp`: each persona goes
+// through its credentials, working-directory and Slack steps and ends `up`,
+// `broken` or `retrying`; only an `up` persona is launched by the pool. The
+// procedure and the controller are tested in tests/persona-bringup.test.ts and
+// tests/persona-connections.test.ts; these cases pin the start pool's
+// bookkeeping: a `broken` or `retrying` persona is "not brought up", never a
+// failed spawn, a startup error or a notice, and a retrying persona that
+// comes up later is launched outside the pool.
 // ---------------------------------------------------------------------------
 
 describe('startupSessionManager: SR-6.1 bring-up', () => {
   let managers: PersonaConnectionManager[] = []
+  let controllers: PersonaBringUpController[] = []
 
   beforeEach(() => {
     managers = []
+    controllers = []
     // This block handles credentials: an accidental environment read gets fakes (restored by the file's afterEach).
     process.env['SLACK_BOT_TOKEN'] = fakeToken(BOT_TOKEN_PREFIX, 'env')
     process.env['SLACK_APP_TOKEN'] = fakeToken(APP_TOKEN_PREFIX, 'env')
@@ -2235,6 +2246,7 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
   })
 
   afterEach(async () => {
+    for (const c of controllers) c.cancelAll()
     await Promise.all(managers.map((m) => m.stopAll()))
   })
 
@@ -2244,8 +2256,12 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
    * the real connection manager over the stub factory and a fake clock
    * (`makeConnectionHarness` with `files: true`). `slack` scripts each
    * persona's stub by name. `bringUp` is what the server passes to
-   * `startupSessionManager`; its `connections` records `slack:<key>` in
-   * `order`, and `lines` holds the manager's and the procedure's lines.
+   * `startupSessionManager`: the real bring-up controller over the harness's
+   * recording `connections` (which records `slack:<key>` in `order`) and the
+   * manager's status, on the harness's fake clock, with the manager's status
+   * listener wired to it and `spawnForPersona(persona, cfg, false)` as its
+   * launch after a retry, as server.ts wires it. `lines` holds the manager's
+   * and the controller's lines.
    */
   function bringUpFixture(slackA: StubSlackOptions = {}, names = ['Alpha Desk', 'Beta Ops'], slack: Record<string, StubSlackOptions> = {}) {
     const h = makeConnectionHarness(names.map((name) => ({ name })), fixtureDir, {
@@ -2255,15 +2271,17 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     managers.push(h.manager)
     const [a, b] = h.personas as [Persona, Persona]
     const lines = h.lines
-    return {
-      h,
-      cfg: h.config!,
-      a,
-      b,
-      lines,
-      order: h.order,
-      bringUp: { connections: h.connections, dryRun: false, log: (line: string) => void lines.push(line) },
-    }
+    const cfg = h.config!
+    const bringUp = createPersonaBringUpController({
+      connections: { bringUp: h.connections.bringUp, status: (key) => h.manager.status(key) },
+      dryRun: false,
+      log: (line) => void lines.push(line),
+      launch: (persona) => spawnForPersona(persona, cfg, false),
+      clock: h.clock,
+    })
+    controllers.push(bringUp)
+    h.onStatus = (key, status) => bringUp.onConnectionStatus(key, status)
+    return { h, cfg, a, b, lines, order: h.order, bringUp }
   }
 
   /** Poll `cond` (real time, 1 ms steps) for at most `ms`; the caller asserts afterwards. */
@@ -2271,11 +2289,15 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     for (let waited = 0; !cond() && waited < ms; waited++) await new Promise((r) => setTimeout(r, 1))
   }
 
-  test.each<[string, (f: ReturnType<typeof bringUpFixture>) => void, StubSlackOptions, PersonaBringUpStep, string]>([
-    ['credentials file missing (step 1)', (f) => rmSync(f.a.credentials_file), {}, 'credentials', 'persona-credentials-missing'],
-    ['working directory missing (step 2)', (f) => rmSync(f.a.working_directory, { recursive: true }), {}, 'working-directory', 'persona-directory-missing'],
-    ['Slack refuses A\'s bot token (step 3)', () => {}, { authTest: [{ kind: 'platform', error: 'invalid_auth' }] }, 'slack', 'persona-credentials-refused'],
-  ])('%s: A is not brought up — no spawn, no failed count, no startup error, no notice; B is launched', async (_label, arrange, slackA, step, cls) => {
+  // b.av2 SR-6.1: each cause gives A its outcome — credentials-broken is
+  // `broken`; directory-broken and Slack-unreachable are `retrying` (their
+  // retries run on the persona's own timers, which these cases never fire).
+  test.each<[string, (f: ReturnType<typeof bringUpFixture>) => void, StubSlackOptions, Exclude<PersonaBringUpOutcome, 'up'>, PersonaBringUpStep, string]>([
+    ['credentials file missing (step 1) → broken', (f) => rmSync(f.a.credentials_file), {}, 'broken', 'credentials', 'persona-credentials-missing'],
+    ['working directory missing (step 2) → retrying', (f) => rmSync(f.a.working_directory, { recursive: true }), {}, 'retrying', 'working-directory', 'persona-directory-missing'],
+    ['Slack refuses A\'s bot token (step 3) → broken', () => {}, { authTest: [{ kind: 'platform', error: 'invalid_auth' }] }, 'broken', 'slack', 'persona-credentials-refused'],
+    ['Slack unreachable for A (step 3) → retrying', () => {}, { authTest: [{ kind: 'network' }] }, 'retrying', 'slack', 'persona-slack-unreachable'],
+  ])('%s: A is not brought up — no spawn, no failed count, no startup error, no notice; B is launched', async (_label, arrange, slackA, outcome, step, cls) => {
     const readLog = captureStartupErrors()
     const spawnCalls: import('agent-director').SpawnParams[] = []
     installStub({ spawnCalls })
@@ -2288,7 +2310,7 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     })
 
     expect(result.perPersona).toEqual([
-      { key: f.a.key, action: 'not-brought-up', failures: [{ step, class: cls, cause: expect.any(String) }] },
+      { key: f.a.key, action: 'not-brought-up', outcome, failures: [{ step, class: cls, cause: expect.any(String) }] },
       { key: f.b.key, action: 'spawned' },
     ])
     expect(result.notBroughtUp).toBe(1)
@@ -2435,9 +2457,89 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     expect(result.perPersona.find((o) => o.key === beta.key)).toEqual({
       key: beta.key,
       action: 'not-brought-up',
+      outcome: 'broken',
       failures: [{ step: 'slack', class: 'persona-credentials-refused', cause: expect.any(String) }],
     })
     expect(launched()).not.toContain(id(beta))
+    assertNoLeak({ lines: f.lines, errLog, result })
+  })
+
+  // b.av2 SR-6.1: retries run outside the pool. A (Slack unreachable at start)
+  // is `retrying` and B (credentials file missing) is `broken`; neither takes a
+  // slot or counts as failed. With the single slot held by C and D queued, A's
+  // manager retry (fake clock) brings it up and the controller launches it at
+  // once, not behind the pool; the pass then returns while A's launch is still
+  // held, and A's later launch never enters the pass's counts.
+  test('concurrency 1, launches held: a retrying persona that comes up later is launched outside the pool — it neither waits for the pass nor blocks it; broken and retrying take no slot and are not failures', async () => {
+    const readLog = captureStartupErrors()
+    const names = ['Alpha Desk', 'Beta Ops', 'Gamma Hub', 'Delta Bay']
+    const f = bringUpFixture({ authTest: [{ kind: 'network' }] }, names)
+    const [alpha, beta, gamma, delta] = f.h.personas as Persona[]
+    rmSync(beta.credentials_file)
+    const held = holdSpawns(installStub({}))
+    const launched = () => held.calls.map((p) => p.claude_instance_id)
+    const id = (p: Persona) => `cscb_${p.key}`
+
+    let result: Awaited<ReturnType<typeof startupSessionManager>> | undefined
+    const errLog = await withCapturedErr(async () => {
+      const start = startupSessionManager(f.cfg, { concurrency: 1, bringUp: f.bringUp })
+      void start.then((r) => { result = r })
+
+      // Gamma holds the only slot; Delta queues; Alpha is retrying, Beta broken.
+      await waitFor(() => launched().length === 1)
+      await waitFor(() => launched().length > 1, 50)
+      expect(launched()).toEqual([id(gamma)])
+      expect(f.h.manager.status(alpha.key)).toMatchObject({ state: 'retrying', phase: 'bring-up' })
+      expect(f.bringUp.state(beta.key)?.outcome).toBe('broken')
+
+      // Alpha's retry succeeds: its launch starts at once, beside the held slot.
+      await f.h.clock.runNext()
+      await waitFor(() => launched().length === 2)
+      expect(f.h.manager.status(alpha.key)?.state).toBe('up')
+      expect(launched()).toEqual([id(gamma), id(alpha)])
+      expect(held.held()).toEqual([id(gamma), id(alpha)])
+      expect(result).toBeUndefined()
+
+      // The pool finishes Gamma then Delta; the pass returns with Alpha's launch still held.
+      held.release(id(gamma))
+      await waitFor(() => launched().length === 3)
+      held.release(id(delta))
+      await waitFor(() => result !== undefined)
+      expect(result).toBeDefined()
+      expect(held.held()).toEqual([id(alpha)])
+      expect(isLaunchInFlight(alpha.key)).toBe(true)
+
+      held.release(id(alpha))
+      await waitFor(() => !isLaunchInFlight(alpha.key))
+    })
+
+    expect(isLaunchInFlight(alpha.key)).toBe(false)
+    expect(launched()).toEqual([id(gamma), id(alpha), id(delta)])
+    const byKey = (x: { key: string }, y: { key: string }) => x.key.localeCompare(y.key)
+    const expected: StartupPersonaOutcome[] = [
+      { key: gamma.key, action: 'spawned' },
+      { key: delta.key, action: 'spawned' },
+      {
+        key: alpha.key,
+        action: 'not-brought-up',
+        outcome: 'retrying',
+        failures: [{ step: 'slack', class: 'persona-slack-unreachable', cause: expect.any(String) }],
+      },
+      {
+        key: beta.key,
+        action: 'not-brought-up',
+        outcome: 'broken',
+        failures: [{ step: 'credentials', class: 'persona-credentials-missing', cause: expect.any(String) }],
+      },
+    ]
+    expect([...result!.perPersona].sort(byKey)).toEqual(expected.sort(byKey))
+    expect(result!.notBroughtUp).toBe(2)
+    expect(result!.failed).toBe(0)
+    expect(result!.succeeded).toBe(2)
+    expect(result!.freshSpawned).toBe(2)
+    expect(readLog()).toBe('')
+    expect(notices).toEqual([])
+    expect(errLog).toContain('0 failed, 2 not brought up')
     assertNoLeak({ lines: f.lines, errLog, result })
   })
 

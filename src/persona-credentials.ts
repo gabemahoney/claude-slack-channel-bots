@@ -41,7 +41,7 @@
  *
  * Pure module (b.av2 SR-13.1): nothing runs at import and no token is read at
  * module scope. The server runs it as step 1 of each persona's start
- * (`bringUpPersona` in `persona-start.ts`).
+ * (`checkPersonaLocalSteps` in `persona-start.ts`).
  *
  * SPDX-License-Identifier: MIT
  */

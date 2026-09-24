@@ -20,7 +20,8 @@
  *
  * The label set grows as later work lands (E2 Task 2 added credentials-refused
  * and Slack-unreachable, E2 Task 3 connection lost/restored, E3 Task 7 the
- * unclaimed channel and the interim DM drop; later Epics theirs).
+ * unclaimed channel and the interim DM drop, E5 Task 1 the per-persona start
+ * line; later Epics theirs).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -83,8 +84,16 @@ export const UNCLAIMED_CHANNEL = 'unclaimed-channel'
  */
 export const PERSONA_DM_DROPPED = 'persona-dm-dropped'
 
+/**
+ * A persona's bring-up is starting (b.av2 SR-10.3): one line per applied
+ * persona at start, naming the persona and its key, before any line about
+ * the persona's bring-up outcome.
+ */
+export const PERSONA_START = 'persona-start'
+
 /** Every persona diagnostic class label, in a fixed order. */
 export const PERSONA_DIAGNOSTIC_CLASSES = [
+  PERSONA_START,
   PERSONA_CREDENTIALS_MISSING,
   PERSONA_CREDENTIALS_UNREADABLE,
   PERSONA_CREDENTIALS_INVALID,

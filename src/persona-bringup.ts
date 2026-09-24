@@ -15,8 +15,9 @@
  * These are pure checks: no Slack call, no agent-director call, no
  * environment access, no writes, no lock, queue, timer or module-scope state.
  * The server runs them as steps 1 and 2 of each persona's start
- * (`bringUpPersona` in `persona-start.ts`); E5 adds the broken/retrying
- * outcome bookkeeping and directory-retry timers.
+ * (`checkPersonaLocalSteps` in `persona-start.ts`); the broken/retrying
+ * outcomes and the directory-retry timers are the bring-up controller's
+ * (`persona-bringup-controller.ts`).
  *
  * Logging contract (same as `persona-credentials.ts`): every failure's
  * formatted line is returned; when a `log` is passed each failure line is

@@ -6,7 +6,9 @@
  * whose text carries the persona reference built from the persona's stored
  * key. `dm` destinations are logged only (server notices by DM are not
  * supported yet), dry run posts nothing, notices raised before the persona's
- * client is validated are held and flushed per persona, and a failed post is
+ * client is validated are held and flushed per persona (at most
+ * `MAX_HELD_NOTICES_PER_PERSONA` per persona: past it the oldest held notice
+ * is dropped with one log line and never posted), and a failed post is
  * logged and handed to the caller's failure callback without ever rejecting.
  *
  * Pure module under test: built from injected fakes only, through the shared
@@ -22,7 +24,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { Persona } from '../src/config.ts'
-import { formatPersonaNotice } from '../src/persona-notifier.ts'
+import { MAX_HELD_NOTICES_PER_PERSONA, formatPersonaNotice } from '../src/persona-notifier.ts'
 import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
@@ -328,6 +330,49 @@ describe('hold and flush per persona (SR-7.2)', () => {
     expect(h.totalPosts()).toBe(0)
     expect(h.logs).toHaveLength(1)
     expect(h.logs[0]).toContain(f.A.key)
+  })
+
+  test('held notices are bounded per persona: the 21st drops only the oldest (one line, its first line), the newest 20 post in order, the other persona\'s queue is untouched', async () => {
+    const bound = MAX_HELD_NOTICES_PER_PERSONA
+    expect(bound).toBe(20)
+    // Multi-line bodies: the drop line must carry the first line only.
+    const noticeA = (i: number) => `A-notice-${String(i).padStart(2, '0')}\n  detail line ${i}`
+    const noticeB = (i: number) => `B-notice-${i}\n  detail`
+
+    // A's bound is its own: B's notices, interleaved, count only against B.
+    for (let i = 1; i <= bound; i++) {
+      await h.notifier.notify(f.A.key, noticeA(i))
+      if (i <= 3) await h.notifier.notify(f.B.key, noticeB(i))
+    }
+    // Exactly at the bound nothing is dropped.
+    expect(h.logs).toEqual([])
+
+    await h.notifier.notify(f.A.key, noticeA(bound + 1))
+
+    expect(h.totalPosts()).toBe(0)
+    expect(h.logs).toEqual([
+      `[slack] persona-notifier: more than ${bound} notices held for ${ref(f.A)} — ` +
+        'oldest held notice dropped, not posted: A-notice-01',
+    ])
+
+    await validateAndFlush(f.A)
+
+    // The newest 20, in raised order, to A's destination through A's client; the dropped one never posts.
+    const expected = Array.from({ length: bound }, (_, i) => formatPersonaNotice(f.A, noticeA(i + 2)))
+    expect(texts(f.A)).toEqual(expected)
+    expect(h.posts(f.A.key).every((c) => c.channel === f.A.permission_prompts)).toBe(true)
+    expect(h.posts(f.B.key)).toEqual([])
+
+    // A second flush posts nothing more: the dropped notice is gone for good.
+    await h.notifier.flush(f.A.key)
+    expect(h.posts(f.A.key)).toHaveLength(bound)
+    expect(h.posts(f.A.key).some((c) => c.text.includes('A-notice-01'))).toBe(false)
+
+    // B's queue kept all three of its notices, in raised order, and dropped none.
+    await validateAndFlush(f.B)
+    expect(texts(f.B)).toEqual([1, 2, 3].map((i) => formatPersonaNotice(f.B, noticeB(i))))
+    expect(h.logs).toHaveLength(1)
+    assertNoLeak({ lines: h.logs, posts: h.allPosts() })
   })
 })
 
