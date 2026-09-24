@@ -50,6 +50,7 @@ import {
   notifyRestartCapReached,
   reconcileOrphans,
   reconnectMcp,
+  setPreLaunchTrustPatcher,
   setSessionNotifier,
   startupSessionManager,
   sweepDeadTmuxChannel,
@@ -63,7 +64,7 @@ import {
   emitBlockActionReceived,
   handlePermissionClick,
 } from './permission-click-handler.ts'
-import { trustBootstrap } from './trust-bootstrap.ts'
+import { trustBootstrap, trustPatchPersona } from './trust-bootstrap.ts'
 import { runJsonlPersistenceSafeguard } from './jsonl-persistence-check.ts'
 import { stopHookBootstrap } from './stop-hook-bootstrap.ts'
 import { startPermissionPoller, stopPermissionPoller } from './permission-poller.ts'
@@ -922,7 +923,8 @@ let routingConfig: RoutingConfig | null = null
  * TRANSITIONAL — removed in E3 Task 9 with the route->persona adapter.
  * Stand-in personas built from `routingConfig` right after `loadConfig()`
  * succeeds; null on the MCP_HOST / MCP_PORT fallback path. Read by the
- * persona-keyed consumers (startup spawns, restart launch, liveness probe).
+ * persona-keyed consumers (template install, start passes, startup spawns,
+ * restart launch, liveness probe).
  */
 let personaConfig: PersonaConfig | null = null
 
@@ -1279,16 +1281,24 @@ export async function main(): Promise<void> {
 
   try {
     routingConfig = loadConfig()
-    personaConfig = routesToPersonaConfig(routingConfig)
+    const appliedPersonas = routesToPersonaConfig(routingConfig)
+    personaConfig = appliedPersonas
+    // b.av2 SR-6.2: the trust patch precedes every launch. Installed as soon as
+    // the persona config is set — before the Slack socket, Bun.serve and
+    // initRestart — so no launch path (start, restart or a human trigger) can
+    // run unpatched.
+    setPreLaunchTrustPatcher(trustPatchPersona)
     mcpHost = routingConfig.bind
     mcpPort = routingConfig.port
     const routeCount = Object.keys(routingConfig.routes).length
     console.error(`[slack] Loaded routing config: ${routeCount} route(s)`)
 
     // SR-3.2: refresh the slack-channel-bot agent-director template on every
-    // boot. Atomic replacement via Client.makeTemplate(..., overwrite: true)
-    // gives us "ensure post-state" semantics. Fatal startup error on failure.
-    await installSlackChannelBotTemplate(routingConfig)
+    // boot, after the persona config is set: its memory-read rules cover the
+    // personas' effective config dirs. Atomic replacement via
+    // Client.makeTemplate(..., overwrite: true) gives us "ensure post-state"
+    // semantics. Fatal startup error on failure.
+    await installSlackChannelBotTemplate(appliedPersonas)
 
     // Initialize message archive if configured
     if (routingConfig.message_archive_db) {
@@ -1645,33 +1655,37 @@ export async function main(): Promise<void> {
     }
   }
 
-  // b.uhv / b.k54: patch .claude.json for every routed cwd so the trust dialog
-  // and project onboarding are pre-accepted before any spawn fires. Runs for
-  // both real and dry-run modes (config-file patch, not a session operation).
-  if (routingConfig) {
-    await trustBootstrap(routingConfig)
+  // b.uhv / b.k54 / b.av2 SR-6.2: patch .claude.json for every applied
+  // persona's working directory so the trust dialog and project onboarding are
+  // pre-accepted before any spawn fires (the pre-launch patcher repeats it per
+  // launch). Runs for both real and dry-run modes (config-file patch, not a
+  // session operation).
+  if (personaConfig) {
+    await trustBootstrap(personaConfig)
   }
 
   // b.zak: preventative JSONL-persistence safeguard. Detect non-persistent
   // storage roots (Layer 1) and personas whose transcript would be treated as
   // missing on resume (Layer 2) and say so LOUDLY, BEFORE startupSessionManager
   // runs the resume path that silently deletes+fresh-spawns on ErrJsonlMissing.
-  // Awaited but wrapped so a rejection can never kill startup. Its notices go
-  // through the per-persona notifier, which only logs them in dry run.
-  if (routingConfig) {
+  // Runs over the applied personas. Awaited but wrapped so a rejection can
+  // never kill startup. Its notices go through the per-persona notifier, which
+  // only logs them in dry run.
+  if (personaConfig) {
     try {
-      await runJsonlPersistenceSafeguard(routingConfig, personaNotifier.notify)
+      await runJsonlPersistenceSafeguard(personaConfig, personaNotifier.notify)
     } catch (err) {
       console.error('[slack] Warning: jsonl-persistence safeguard failed — continuing:', err)
     }
   }
 
-  // b.osj: install (or remove) the CSCB-managed Stop hook in each effective
-  // claude_config_dir's settings.json before any spawn fires. Runs for both
-  // real and dry-run modes (config-file patch, not a session operation).
-  // Never throws — per-dir failures are recorded via recordStartupError.
-  if (routingConfig) {
-    stopHookBootstrap(routingConfig)
+  // b.osj: install (or remove) the CSCB-managed Stop hook in each applied
+  // persona's effective claude_config_dir settings.json before any spawn
+  // fires. Runs for both real and dry-run modes (config-file patch, not a
+  // session operation). Never throws — per-dir failures are recorded via
+  // recordStartupError.
+  if (personaConfig) {
+    stopHookBootstrap(personaConfig)
   }
 
   // Per-persona reconcile via library: spawnForPersona dispatches fresh-spawn or

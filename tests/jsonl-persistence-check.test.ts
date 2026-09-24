@@ -1,6 +1,7 @@
 /**
  * jsonl-persistence-check.test.ts — Branch-matrix tests for the b.zak startup
- * JSONL-persistence safeguard (src/jsonl-persistence-check.ts).
+ * JSONL-persistence safeguard (src/jsonl-persistence-check.ts), run over the
+ * applied personas (b.av2 SR-6.2).
  *
  * Layer 1 (pure): resolveJsonlRoots dedup/precedence, checkMountFstype
  * longest-prefix + malformed/edge parsing, checkJsonlPersistence tmpfs/ramfs
@@ -9,18 +10,25 @@
  * Layer 2 (per-persona via runJsonlPersistenceSafeguard with injected deps):
  * every classification branch — healthy, stale-path-loud, lost-loud (archive
  * evidence), idle-quiet, no-row skip, empty-session skip, AD-error-continue,
- * never-throws. Notices go through the persona-keyed notice seam; one case
- * wires it to the real per-persona notifier (b.av2 SR-7.2).
+ * never-throws — plus the logged skip for a row the collision ladder will
+ * replace (another cwd, or a missing or changed config_dir label). Notices go through the persona-keyed notice seam; some
+ * cases wire it to the real per-persona notifier (b.av2 SR-7.2).
+ *
+ * Archive evidence (b.av2 SR-7.4): personaArchiveEvidenceScope and the real
+ * makeDefaultArchiveCount against temp sqlite archives with several channels —
+ * only a persona's `delivery: all` channels count, and a zero count is
+ * inconclusive when the persona has a `mentions` channel or DMs on.
  *
  * All external effects are dependency-injected — no mock.module, no real /proc
- * reads, no filesystem writes.
+ * reads. Files (archives, symlinks, homes) live only in mkdtempSync dirs
+ * removed after each test.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, afterEach } from 'bun:test'
+import { describe, test, expect, afterEach, beforeEach, spyOn } from 'bun:test'
 import { homedir, tmpdir } from 'node:os'
-import { mkdtempSync, existsSync, chmodSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, symlinkSync, existsSync, chmodSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import type { GetResult } from 'agent-director'
 import {
@@ -28,16 +36,57 @@ import {
   checkMountFstype,
   checkJsonlPersistence,
   runJsonlPersistenceSafeguard,
+  makeDefaultArchiveCount,
+  personaArchiveEvidenceScope,
+  UNATTRIBUTABLE_ZERO_REASON,
   type JsonlPersistenceSafeguardDeps,
 } from '../src/jsonl-persistence-check.ts'
 import { resolveJsonlPath } from '../src/cozempic.ts'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
+import { personaConfigDirLabelValue } from '../src/session-manager.ts'
 import { ErrSpawnNotFound } from '../src/agent-director-errors.ts'
-import { makeRoutingConfig } from './test-helpers/routing-config.ts'
-import type { RoutingConfig } from '../src/config.ts'
+import type { Persona, PersonaConfig } from '../src/config.ts'
 import { buildTempArchiveDb, type ArchiveRow } from './test-helpers/archive-db.ts'
-import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
+import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
+
+// ---------------------------------------------------------------------------
+// Temp dirs, temp home and console capture — all released after each test
+// ---------------------------------------------------------------------------
+
+const cleanups: Array<() => void> = []
+
+/** A fresh mkdtempSync dir, removed after the test. */
+function makeTempDir(prefix = 'jsonl-check-test-'): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix))
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }))
+  return dir
+}
+
+/** Captures console.error lines for the rest of the test (restored after it). */
+function captureErrorLog(): string[] {
+  const lines: string[] = []
+  const spy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+    lines.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(' '))
+  })
+  cleanups.push(() => spy.mockRestore())
+  return lines
+}
+
+/**
+ * Home directory for the test: an unset claude_config_dir resolves under it,
+ * and every row's `config_dir` label and the safeguard's `deps.home` use it.
+ */
+let home = ''
+
+beforeEach(() => {
+  home = makeTempDir('jsonl-check-home-')
+})
+
+afterEach(() => {
+  while (cleanups.length > 0) cleanups.pop()!()
+})
 
 // ---------------------------------------------------------------------------
 // Realistic multi-mount mountinfo fixture
@@ -65,46 +114,44 @@ const fixture = (content: string): (() => string) => () => content
 // ---------------------------------------------------------------------------
 
 describe('resolveJsonlRoots', () => {
-  test('global claude_config_dir only — routes dedup to one root', () => {
-    const config = makeRoutingConfig({
-      routes: { C001: { cwd: '/repo/a' }, C002: { cwd: '/repo/b' } },
-      claude_config_dir: '/home/user/.claude-corp',
-    })
-    expect(resolveJsonlRoots(config)).toEqual(['/home/user/.claude-corp/projects'])
+  test('personas inheriting one top-level claude_config_dir dedup to one root', () => {
+    const config = makeMultiPersonaConfig([{}, {}], makeTempDir(), { claude_config_dir: '/home/user/.claude-corp' })
+    expect(resolveJsonlRoots(config, home)).toEqual(['/home/user/.claude-corp/projects'])
   })
 
-  test('per-route claude_config_dir takes precedence over global', () => {
-    const config = makeRoutingConfig({
-      routes: {
-        C001: { cwd: '/repo/a', claude_config_dir: '/home/user/.claude-a' },
-        C002: { cwd: '/repo/b' }, // falls back to global
-      },
-      claude_config_dir: '/home/user/.claude-global',
-    })
-    const roots = resolveJsonlRoots(config)
+  test('per-persona claude_config_dir takes precedence over the top-level one', () => {
+    const config = makeMultiPersonaConfig(
+      [{ claude_config_dir: '/home/user/.claude-a' }, {}], // second inherits the top level
+      makeTempDir(),
+      { claude_config_dir: '/home/user/.claude-global' },
+    )
+    const roots = resolveJsonlRoots(config, home)
     expect(roots).toHaveLength(2)
     expect(roots).toContain('/home/user/.claude-a/projects')
     expect(roots).toContain('/home/user/.claude-global/projects')
   })
 
-  test('two routes sharing a per-route dir dedup to one root', () => {
-    const config = makeRoutingConfig({
-      routes: {
-        C001: { cwd: '/repo/a', claude_config_dir: '/home/user/.claude-shared' },
-        C002: { cwd: '/repo/b', claude_config_dir: '/home/user/.claude-shared' },
-      },
-    })
-    expect(resolveJsonlRoots(config)).toEqual(['/home/user/.claude-shared/projects'])
+  test('two personas sharing a per-persona dir dedup to one root', () => {
+    const config = makeMultiPersonaConfig(
+      [{ claude_config_dir: '/home/user/.claude-shared' }, { claude_config_dir: '/home/user/.claude-shared' }],
+      makeTempDir(),
+    )
+    expect(resolveJsonlRoots(config, home)).toEqual(['/home/user/.claude-shared/projects'])
   })
 
-  test('no config dir anywhere → homedir default', () => {
-    const config = makeRoutingConfig({ routes: { C001: { cwd: '/repo/a' } }, claude_config_dir: undefined })
-    expect(resolveJsonlRoots(config)).toEqual([`${homedir()}/.claude/projects`])
+  test('no config dir anywhere → <home>/.claude default', () => {
+    const config = makeMultiPersonaConfig([{}], makeTempDir())
+    expect(resolveJsonlRoots(config, home)).toEqual([`${home}/.claude/projects`])
   })
 
-  test('no routes at all → homedir default fallback', () => {
-    const config = makeRoutingConfig({ routes: {}, claude_config_dir: undefined })
-    expect(resolveJsonlRoots(config)).toEqual([`${homedir()}/.claude/projects`])
+  test('zero personas → <home>/.claude default fallback', () => {
+    const config = makeMultiPersonaConfig([], makeTempDir())
+    expect(resolveJsonlRoots(config, home)).toEqual([`${home}/.claude/projects`])
+  })
+
+  test('home omitted → the OS home default', () => {
+    const config = makeMultiPersonaConfig([{}], makeTempDir())
+    expect(resolveJsonlRoots(config)).toEqual([join(homedir(), '.claude', 'projects')])
   })
 })
 
@@ -163,97 +210,106 @@ describe('checkMountFstype', () => {
 // ---------------------------------------------------------------------------
 
 describe('checkJsonlPersistence', () => {
-  const configForDir = (dir: string): RoutingConfig =>
-    makeRoutingConfig({ routes: { C001: { cwd: '/repo', claude_config_dir: dir } }, claude_config_dir: undefined })
+  const configForDir = (dir: string): PersonaConfig =>
+    makeMultiPersonaConfig([{ claude_config_dir: dir }], makeTempDir())
 
   test('tmpfs root → nonPersistent, no warnings', () => {
-    const r = checkJsonlPersistence(configForDir('/tmp/claude'), fixture(REALISTIC_MOUNTINFO))
+    const r = checkJsonlPersistence(configForDir('/tmp/claude'), fixture(REALISTIC_MOUNTINFO), home)
     expect(r.nonPersistent).toEqual(['/tmp/claude/projects'])
     expect(r.warnings).toEqual([])
   })
 
   test('ramfs root → nonPersistent, no warnings', () => {
-    const r = checkJsonlPersistence(configForDir('/mnt/ramfs/claude'), fixture(REALISTIC_MOUNTINFO))
+    const r = checkJsonlPersistence(configForDir('/mnt/ramfs/claude'), fixture(REALISTIC_MOUNTINFO), home)
     expect(r.nonPersistent).toEqual(['/mnt/ramfs/claude/projects'])
     expect(r.warnings).toEqual([])
   })
 
   test('ext4 root → neither nonPersistent nor warnings', () => {
-    const r = checkJsonlPersistence(configForDir('/home/user/.claude'), fixture(REALISTIC_MOUNTINFO))
+    const r = checkJsonlPersistence(configForDir('/home/user/.claude'), fixture(REALISTIC_MOUNTINFO), home)
     expect(r.nonPersistent).toEqual([])
     expect(r.warnings).toEqual([])
   })
 
   test('reader throws → warnings (not nonPersistent), does not throw', () => {
     const throws = (): string => { throw new Error('ENOENT') }
-    const r = checkJsonlPersistence(configForDir('/home/user/.claude'), throws)
+    const r = checkJsonlPersistence(configForDir('/home/user/.claude'), throws, home)
     expect(r.nonPersistent).toEqual([])
     expect(r.warnings).toEqual(['/home/user/.claude/projects'])
   })
 
   test('unresolvable mount (no root line) → warnings', () => {
     const noRoot = '24 23 8:2 / /home rw,relatime shared:2 - ext4 /dev/sda2 rw\n'
-    const r = checkJsonlPersistence(configForDir('/no/matching/mount'), fixture(noRoot))
+    const r = checkJsonlPersistence(configForDir('/no/matching/mount'), fixture(noRoot), home)
     expect(r.nonPersistent).toEqual([])
     expect(r.warnings).toEqual(['/no/matching/mount/projects'])
   })
 
   test('multi-root mixed: tmpfs + ext4 classified independently', () => {
-    const config = makeRoutingConfig({
-      routes: {
-        C001: { cwd: '/a', claude_config_dir: '/tmp/claude-tmp' },
-        C002: { cwd: '/b', claude_config_dir: '/home/user/.claude-ext4' },
-      },
-      claude_config_dir: undefined,
-    })
-    const r = checkJsonlPersistence(config, fixture(REALISTIC_MOUNTINFO))
+    const config = makeMultiPersonaConfig(
+      [{ claude_config_dir: '/tmp/claude-tmp' }, { claude_config_dir: '/home/user/.claude-ext4' }],
+      makeTempDir(),
+    )
+    const r = checkJsonlPersistence(config, fixture(REALISTIC_MOUNTINFO), home)
     expect(r.nonPersistent).toEqual(['/tmp/claude-tmp/projects'])
     expect(r.warnings).toEqual([])
   })
 
-  test('never throws with no routes (homedir fallback path)', () => {
-    const config = makeRoutingConfig({ routes: {}, claude_config_dir: undefined })
-    expect(() => checkJsonlPersistence(config, fixture(REALISTIC_MOUNTINFO))).not.toThrow()
+  test('never throws with zero personas (home default fallback path)', () => {
+    const config = makeMultiPersonaConfig([], makeTempDir())
+    expect(() => checkJsonlPersistence(config, fixture(REALISTIC_MOUNTINFO), home)).not.toThrow()
   })
 })
 
 // ---------------------------------------------------------------------------
 // Layer 2 — runJsonlPersistenceSafeguard per-persona classification
 //
-// A single stand-in persona (key = channel ID under the route->persona
-// adapter) is exercised at a time. Layer 1 is neutered by supplying a
+// A single persona is exercised at a time. Layer 1 is neutered by supplying a
 // readMountinfo fixture whose root is ext4 (never nonPersistent), so recorded
-// errors come only from Layer 2.
+// errors come only from Layer 2. Rows carry the persona's `cwd` and matching
+// `config_dir` label (cannedGetResult's persona form under the test's home),
+// so they reach the transcript check rather than the collision-ladder skip.
 // ---------------------------------------------------------------------------
 
 const CH = 'C_TEST1'
 const CONFIG_DIR = '/home/user/.claude' // ext4 in REALISTIC_MOUNTINFO → no Layer-1 noise
+const STARTED_AT = '2026-09-20T05:00:00Z'
+const STALE_PATH = '/some/other/stale/path.jsonl'
 
-function layer2Config(): RoutingConfig {
-  return makeRoutingConfig({
-    routes: { [CH]: { cwd: '/repo/app', claude_config_dir: CONFIG_DIR } },
-    claude_config_dir: undefined,
-    message_archive_db: '/tmp/archive.db',
-  })
+/** The one Layer-2 persona: its working directory yields the `-repo-app` project dir. */
+const LAYER2_SPEC: PersonaSpec = {
+  name: 'Layer Two Bot',
+  working_directory: '/repo/app',
+  claude_config_dir: CONFIG_DIR,
+  channels: [{ id: CH, delivery: 'all' }],
+  permission_prompts: CH,
 }
 
-/** GetResult fixture with the fields Layer 2 reads; overridable. */
-function makeRow(overrides?: Partial<GetResult>): GetResult {
-  return {
-    claude_instance_id: personaInstanceId(CH),
-    parent_id: '',
-    state: 'live',
-    cwd: '/repo/app',
-    tmux_session_name: 'slack_bot_' + CH,
-    claude_args: [],
-    relay_mode: '',
-    jsonl_path: '/home/user/.claude/projects/-repo-app/sess-abc.jsonl',
-    claude_session_id: 'sess-abc',
-    labels: {},
-    started_at: '2026-09-20T05:00:00Z',
-    last_seen_at: '2026-09-20T05:10:00Z',
-    ...overrides,
-  }
+function layer2Config(overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): PersonaConfig {
+  return makeMultiPersonaConfig([LAYER2_SPEC], makeTempDir(), overrides)
+}
+
+function layer2Persona(): Persona {
+  return layer2Config().personas[0]!
+}
+
+/**
+ * GetResult fixture with the fields Layer 2 reads, as a spawn of `persona`
+ * writes it under the test's home; overridable.
+ */
+function makeRow(overrides: Partial<GetResult> = {}, persona: Persona = layer2Persona()): GetResult {
+  return cannedGetResult(
+    {
+      state: 'live',
+      jsonl_path: `${CONFIG_DIR}/projects/-repo-app/sess-abc.jsonl`,
+      claude_session_id: 'sess-abc',
+      started_at: STARTED_AT,
+      last_seen_at: '2026-09-20T05:10:00Z',
+      ...overrides,
+    },
+    persona,
+    home,
+  )
 }
 
 interface Captured {
@@ -273,7 +329,7 @@ interface Captured {
  */
 async function runLayer2(
   deps: Partial<JsonlPersistenceSafeguardDeps>,
-  config: RoutingConfig = layer2Config(),
+  config: PersonaConfig = layer2Config(),
   withNotify = true,
 ): Promise<Captured> {
   const captured: Captured = { errors: [], notices: [] }
@@ -290,6 +346,7 @@ async function runLayer2(
     recordStartupError: (key: string, message: string) => {
       captured.errors.push({ key, message })
     },
+    home,
     ...deps,
   }
   await runJsonlPersistenceSafeguard(config, notify, fullDeps)
@@ -297,7 +354,8 @@ async function runLayer2(
 }
 
 describe('runJsonlPersistenceSafeguard — Layer 2 classification', () => {
-  test('looks up the row by cscb_<key>, the stand-in key being the channel ID (b.av2 SR-2.2)', async () => {
+  test('looks up the row by cscb_<key>, the persona key (b.av2 SR-2.2)', async () => {
+    const persona = layer2Persona()
     const lookups: Array<[string, string]> = []
     await runLayer2({
       getRow: async (key: string, claudeInstanceId: string) => {
@@ -305,8 +363,8 @@ describe('runJsonlPersistenceSafeguard — Layer 2 classification', () => {
         return makeRow()
       },
     })
-    expect(lookups).toEqual([[CH, personaInstanceId(CH)]])
-    expect(lookups[0][1]).toBe('cscb_C_TEST1')
+    expect(lookups).toEqual([[persona.key, personaInstanceId(persona.key)]])
+    expect(lookups[0][1]).toBe(`cscb_${persona.key}`)
   })
 
   test('healthy: persisted path exists → quiet (no error, no notice)', async () => {
@@ -320,7 +378,7 @@ describe('runJsonlPersistenceSafeguard — Layer 2 classification', () => {
     const row = makeRow()
     const fallback = resolveJsonlPath(row.cwd, row.claude_session_id, CONFIG_DIR)
     // Persisted path differs from fallback so persisted stat is false, fallback true.
-    const staleRow = makeRow({ jsonl_path: '/some/other/stale/path.jsonl' })
+    const staleRow = makeRow({ jsonl_path: STALE_PATH })
     const c = await runLayer2({
       getRow: async () => staleRow,
       statFn: (p) => p === fallback,
@@ -328,7 +386,7 @@ describe('runJsonlPersistenceSafeguard — Layer 2 classification', () => {
     expect(c.errors).toHaveLength(1)
     expect(c.errors[0]!.key).toBe('jsonl-transcript-stale-path')
     expect(c.notices).toHaveLength(1)
-    expect(c.notices[0]!.key).toBe(CH)
+    expect(c.notices[0]!.key).toBe(layer2Persona().key)
     expect(c.notices[0]!.text).toContain(fallback)
     expect(c.notices[0]!.text).not.toContain('this channel')
   })
@@ -342,7 +400,7 @@ describe('runJsonlPersistenceSafeguard — Layer 2 classification', () => {
     expect(c.errors[0]!.key).toBe('jsonl-transcript-lost')
     expect(c.errors[0]!.message).toContain('5 message')
     expect(c.notices).toHaveLength(1)
-    expect(c.notices[0]!.key).toBe(CH)
+    expect(c.notices[0]!.key).toBe(layer2Persona().key)
     expect(c.notices[0]!.text).toContain('5 message(s)')
     expect(c.notices[0]!.text).not.toContain('this channel')
   })
@@ -381,34 +439,58 @@ describe('runJsonlPersistenceSafeguard — Layer 2 classification', () => {
     expect(c.notices).toEqual([])
   })
 
-  test('per-persona error inside classification is isolated — sweep never throws', async () => {
-    // statFn throws for one persona; safeguard must swallow and complete.
-    const config = makeRoutingConfig({
-      routes: {
-        BOOMCH: { cwd: '/repo/boom', claude_config_dir: CONFIG_DIR },
-        SAFECH: { cwd: '/repo/safe', claude_config_dir: CONFIG_DIR },
-      },
-      claude_config_dir: undefined,
-      message_archive_db: '/tmp/archive.db',
-    })
-    let safeRan = false
-    await expect(
-      runLayer2(
-        {
-          getRow: async (key: string) => makeRow({ cwd: key === 'BOOMCH' ? '/repo/boom' : '/repo/safe' }),
-          // statFn throws unexpectedly for BOOMCH's paths; the orchestrator's
-          // per-persona try/catch must swallow it so SAFECH still runs.
-          statFn: (p) => {
-            if (p.includes('-repo-boom')) throw new Error('boom')
-            safeRan = true
-            return false
-          },
-          archiveCountSince: () => 0,
+  test('per-persona error inside classification is isolated — the next persona is still checked, sweep never throws', async () => {
+    // statFn throws for Boom Bot (checked first); the per-persona try/catch
+    // must swallow it so Safe Bot is still checked and still goes loud.
+    const config = makeMultiPersonaConfig(
+      [
+        { name: 'Boom Bot', working_directory: '/repo/boom' },
+        { name: 'Safe Bot', working_directory: '/repo/safe' },
+      ],
+      makeTempDir(),
+      { claude_config_dir: CONFIG_DIR },
+    )
+    const [boom, safe] = config.personas
+    expect([boom!.name, safe!.name]).toEqual(['Boom Bot', 'Safe Bot'])
+    const byKey = new Map(config.personas.map((p) => [p.key, p]))
+    const safePaths: string[] = []
+    const log = captureErrorLog()
+    const c = await runLayer2(
+      {
+        getRow: async (key: string) => makeRow({}, byKey.get(key)!),
+        statFn: (p) => {
+          if (p.includes('-repo-boom')) throw new Error('boom')
+          if (p.includes('-repo-safe')) safePaths.push(p)
+          return false
         },
-        config,
-      ),
-    ).resolves.toBeDefined() // resolves (no throw) despite BOOMCH's internal error
-    expect(safeRan).toBe(true)
+        archiveCountSince: (_ids, _since, ref) => (ref === renderPersonaRef(safe!.name, safe!.key) ? 2 : 0),
+      },
+      config,
+    )
+    // Boom Bot's error was caught and logged against Boom Bot.
+    expect(log.filter((l) => l.includes(`unexpected error checking ${renderPersonaRef(boom!.name, boom!.key)}`))).toHaveLength(1)
+    // Safe Bot's own fallback path was checked and its loss recorded and noticed.
+    expect(safePaths).toHaveLength(1)
+    expect(c.errors.map((e) => e.key)).toEqual(['jsonl-transcript-lost'])
+    expect(c.errors[0]!.message).toContain(renderPersonaRef(safe!.name, safe!.key))
+    expect(c.notices.map((n) => n.key)).toEqual([safe!.key])
+  })
+
+  test('persona with no claude_config_dir: its JSONL root, fallback path and row label resolve under deps.home', async () => {
+    const config = makeMultiPersonaConfig([{ ...LAYER2_SPEC, claude_config_dir: undefined }], makeTempDir())
+    const persona = config.personas[0]!
+    const staleRow = makeRow({ jsonl_path: STALE_PATH }, persona)
+    const fallback = resolveJsonlPath(staleRow.cwd, staleRow.claude_session_id, join(home, '.claude'))
+    // Only the temp home is tmpfs, so Layer 1 flags exactly the root under it.
+    const homeTmpfs = `23 0 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n25 23 0:20 / ${home} rw shared:3 - tmpfs tmpfs rw\n`
+    const c = await runLayer2(
+      { readMountinfo: fixture(homeTmpfs), getRow: async () => staleRow, statFn: (p) => p === fallback },
+      config,
+    )
+    expect(c.errors.map((e) => e.key)).toEqual(['jsonl-non-persistent', 'jsonl-transcript-stale-path'])
+    expect(c.errors[0]!.message).toContain(`root="${home}/.claude/projects"`)
+    expect(c.notices.map((n) => n.key)).toEqual([persona.key, persona.key])
+    expect(c.notices[1]!.text).toContain(fallback)
   })
 
   test('notify undefined (no notice seam): loud error still recorded, no notice', async () => {
@@ -420,19 +502,182 @@ describe('runJsonlPersistenceSafeguard — Layer 2 classification', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Layer 2 iterates personas, not channels (b.av2 SR-6.2, SR-7.4)
+// ---------------------------------------------------------------------------
+
+describe('runJsonlPersistenceSafeguard — one pass per persona', () => {
+  test('a persona in several channels gets one row lookup, one count over its `all` channels, one notice', async () => {
+    const config = makeMultiPersonaConfig(
+      [
+        {
+          ...LAYER2_SPEC,
+          channels: [
+            { id: 'C0ALL0001', delivery: 'all' },
+            { id: 'C0ALL0002', delivery: 'all' },
+            { id: 'C0MENT001', delivery: 'mentions' },
+          ],
+          permission_prompts: 'C0ALL0001',
+        },
+      ],
+      makeTempDir(),
+    )
+    const persona = config.personas[0]!
+    const h = makeNotifierHarness(config)
+    const lookups: Array<[string, string]> = []
+    const counts: Array<[readonly string[], number, string]> = []
+    const errors: string[] = []
+    await runJsonlPersistenceSafeguard(config, h.notifier.notify, {
+      readMountinfo: fixture(REALISTIC_MOUNTINFO),
+      statFn: () => false,
+      getRow: async (key, id) => {
+        lookups.push([key, id])
+        return makeRow({}, persona)
+      },
+      archiveCountSince: (ids, since, ref) => {
+        counts.push([[...ids], since, ref])
+        return 3
+      },
+      recordStartupError: (key) => {
+        errors.push(key)
+      },
+      home,
+    })
+    expect(lookups).toEqual([[persona.key, `cscb_${persona.key}`]])
+    expect(counts).toEqual([
+      [['C0ALL0001', 'C0ALL0002'], Date.parse(STARTED_AT) / 1000, renderPersonaRef(persona.name, persona.key)],
+    ])
+    expect(errors).toEqual(['jsonl-transcript-lost'])
+    const posts = h.posts(persona.key)
+    expect(posts).toHaveLength(1)
+    expect(posts[0]!.channel).toBe('C0ALL0001')
+    expect(posts[0]!.text).toContain('3 message(s)')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Rows the collision ladder will replace rather than resume or reconnect
+// (compareRowToPersona: cwd real path, config_dir label) — logged only. The
+// skip line is found by the persona reference plus the reason text, so the
+// "stays loud" rows' empty-match checks cannot pass on a reworded ending.
+// ---------------------------------------------------------------------------
+
+describe('runJsonlPersistenceSafeguard — rows the collision ladder will replace', () => {
+  type RowKind = 'other-cwd' | 'empty-cwd' | 'absent-cwd' | 'no-label' | 'wrong-label' | 'matching' | 'symlinked-cwd'
+  type Condition = 'fallback exists' | 'archived rows since spawn'
+
+  /** The reason texts of the skip line (rowReplacementReason): one per guard. */
+  const SKIP_REASONS = ['differs from working_directory', 'config_dir label']
+
+  /** A persona whose working directory really exists, plus a sibling dir and a symlink to it. */
+  function ladderFixture(): { config: PersonaConfig; persona: Persona; otherWork: string; link: string } {
+    const dir = makeTempDir()
+    const work = join(dir, 'work')
+    const otherWork = join(dir, 'other-work')
+    const link = join(dir, 'work-link')
+    mkdirSync(work)
+    mkdirSync(otherWork)
+    symlinkSync(work, link)
+    const config = makeMultiPersonaConfig([{ ...LAYER2_SPEC, working_directory: work }], dir)
+    return { config, persona: config.personas[0]!, otherWork, link }
+  }
+
+  function rowFor(kind: RowKind, fx: ReturnType<typeof ladderFixture>): GetResult {
+    const base = makeRow({ jsonl_path: STALE_PATH }, fx.persona)
+    const { config_dir: _label, ...labelsWithout } = base.labels
+    switch (kind) {
+      case 'other-cwd':
+        return { ...base, cwd: fx.otherWork }
+      case 'empty-cwd':
+        return { ...base, cwd: '' }
+      case 'absent-cwd': {
+        const { cwd: _cwd, ...withoutCwd } = base
+        return withoutCwd as GetResult
+      }
+      case 'no-label':
+        return { ...base, labels: labelsWithout }
+      case 'wrong-label':
+        return { ...base, labels: { ...labelsWithout, config_dir: personaConfigDirLabelValue('/home/user/.claude-other', home) } }
+      case 'matching':
+        return base
+      case 'symlinked-cwd':
+        return { ...base, cwd: fx.link }
+    }
+  }
+
+  /** Deps that would make a matching row loud under `condition`. */
+  function loudDeps(condition: Condition): Partial<JsonlPersistenceSafeguardDeps> {
+    return condition === 'fallback exists'
+      ? { statFn: (p) => p !== STALE_PATH, archiveCountSince: () => null }
+      : { statFn: () => false, archiveCountSince: () => 4 }
+  }
+
+  async function run(kind: RowKind, condition: Condition) {
+    const fx = ladderFixture()
+    const h = makeNotifierHarness(fx.config)
+    const errors: string[] = []
+    const log = captureErrorLog()
+    await runJsonlPersistenceSafeguard(fx.config, h.notifier.notify, {
+      readMountinfo: fixture(REALISTIC_MOUNTINFO),
+      getRow: async () => rowFor(kind, fx),
+      recordStartupError: (key) => {
+        errors.push(key)
+      },
+      home,
+      ...loudDeps(condition),
+    })
+    const ref = renderPersonaRef(fx.persona.name, fx.persona.key)
+    const ladderLines = log.filter((l) => l.includes(ref) && SKIP_REASONS.some((r) => l.includes(r)))
+    return { fx, h, errors, log, ladderLines }
+  }
+
+  test.each([
+    ['other-cwd', 'fallback exists', 'differs from working_directory'],
+    ['other-cwd', 'archived rows since spawn', 'differs from working_directory'],
+    // No cwd on the row (empty or absent): printed as `<none>`.
+    ['empty-cwd', 'fallback exists', 'row cwd=<none> differs from working_directory='],
+    ['absent-cwd', 'archived rows since spawn', 'row cwd=<none> differs from working_directory='],
+    ['no-label', 'fallback exists', 'config_dir label missing'],
+    ['no-label', 'archived rows since spawn', 'config_dir label missing'],
+    ['wrong-label', 'fallback exists', 'config_dir label was='],
+    ['wrong-label', 'archived rows since spawn', 'config_dir label was='],
+  ] as Array<[RowKind, Condition, string]>)(
+    '%s row, %s → one log line, no record, no notice',
+    async (kind, condition, reason) => {
+      const { fx, h, errors, log, ladderLines } = await run(kind, condition)
+      expect(errors).toEqual([])
+      expect(h.totalPosts()).toBe(0)
+      expect(ladderLines).toHaveLength(1)
+      expect(ladderLines[0]).toContain(renderPersonaRef(fx.persona.name, fx.persona.key))
+      expect(ladderLines[0]).toContain(reason)
+      // A row with no cwd prints `<none>`, never `undefined`.
+      expect(log.filter((l) => l.includes('cwd=undefined'))).toEqual([])
+      // The transcript was never checked.
+      expect(log.filter((l) => l.includes('no transcript'))).toEqual([])
+    },
+  )
+
+  test.each([
+    ['matching', 'fallback exists', 'jsonl-transcript-stale-path'],
+    ['matching', 'archived rows since spawn', 'jsonl-transcript-lost'],
+    ['symlinked-cwd', 'fallback exists', 'jsonl-transcript-stale-path'],
+    ['symlinked-cwd', 'archived rows since spawn', 'jsonl-transcript-lost'],
+  ] as Array<[RowKind, Condition, string]>)('%s row, %s → stays loud (%s + one notice)', async (kind, condition, key) => {
+    const { fx, h, errors, ladderLines } = await run(kind, condition)
+    expect(errors).toEqual([key])
+    expect(h.posts(fx.persona.key)).toHaveLength(1)
+    expect(ladderLines).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Notice seam wired to the real per-persona notifier (b.av2 SR-7.2)
 // ---------------------------------------------------------------------------
 
 describe('runJsonlPersistenceSafeguard — real per-persona notifier', () => {
-  let dir: string | undefined
-  afterEach(() => {
-    if (dir) rmSync(dir, { recursive: true, force: true })
-    dir = undefined
-  })
-
   test("stale-path notice for A posts once, on A's client, to A's destination, with A's reference; nothing on B's", async () => {
-    dir = mkdtempSync(join(tmpdir(), 'jsonl-notifier-test-'))
-    const personaConfig = makeMultiPersonaConfig([{ name: 'Alpha Bot' }, { name: 'Beta Bot' }], dir)
+    const personaConfig = makeMultiPersonaConfig([{ name: 'Alpha Bot' }, { name: 'Beta Bot' }], makeTempDir(), {
+      claude_config_dir: CONFIG_DIR,
+    })
     const a = personaConfig.personas[0]!
     const b = personaConfig.personas[1]!
     // The persona key is distinct from the destination channel, so a notice
@@ -440,18 +685,9 @@ describe('runJsonlPersistenceSafeguard — real per-persona notifier', () => {
     expect(a.key).not.toBe(a.permission_prompts)
     const h = makeNotifierHarness(personaConfig)
 
-    // Under the adapter the safeguard iterates the routing config's keys: key
-    // each route by its persona key.
-    const config = makeRoutingConfig({
-      routes: {
-        [a.key]: { cwd: '/repo/app', claude_config_dir: CONFIG_DIR },
-        [b.key]: { cwd: '/repo/app', claude_config_dir: CONFIG_DIR },
-      },
-      claude_config_dir: undefined,
-    })
-    const staleRow = makeRow({ jsonl_path: '/some/other/stale/path.jsonl' })
+    const staleRow = makeRow({ jsonl_path: STALE_PATH }, a)
     const fallback = resolveJsonlPath(staleRow.cwd, staleRow.claude_session_id, CONFIG_DIR)
-    await runJsonlPersistenceSafeguard(config, h.notifier.notify, {
+    await runJsonlPersistenceSafeguard(personaConfig, h.notifier.notify, {
       readMountinfo: fixture(REALISTIC_MOUNTINFO),
       statFn: (p) => p === fallback,
       getRow: async (key) => {
@@ -460,6 +696,7 @@ describe('runJsonlPersistenceSafeguard — real per-persona notifier', () => {
       },
       archiveCountSince: () => null,
       recordStartupError: () => {},
+      home,
     })
 
     const aPosts = h.posts(a.key)
@@ -485,47 +722,45 @@ describe('runJsonlPersistenceSafeguard — Layer 1 loud path', () => {
   }
 
   test('tmpfs root → jsonl-non-persistent recorded + one notice per persona on that root', async () => {
-    const config = makeRoutingConfig({
-      routes: {
-        A: { cwd: '/repo/a', claude_config_dir: '/tmp/claude' },
-        B: { cwd: '/repo/b', claude_config_dir: '/tmp/claude' },
-      },
-      claude_config_dir: undefined,
-    })
+    const config = makeMultiPersonaConfig(
+      [
+        { name: 'A', claude_config_dir: '/tmp/claude' },
+        { name: 'B', claude_config_dir: '/tmp/claude' },
+      ],
+      makeTempDir(),
+    )
+    const [a, b] = config.personas
     const c = await runLayer2(quietLayer2, config)
     const nonPersistent = c.errors.filter((e) => e.key === 'jsonl-non-persistent')
     expect(nonPersistent).toHaveLength(1)
     // One notice per persona key whose effective root is flagged (both A and B).
-    expect(c.notices.map((n) => n.key).sort()).toEqual(['A', 'B'])
+    expect(c.notices.map((n) => n.key).sort()).toEqual([a!.key, b!.key].sort())
     for (const n of c.notices) expect(n.text).not.toContain('this channel')
   })
 
   test('mixed roots: notice goes ONLY to personas on the flagged tmpfs root; record fires once', async () => {
-    // Two routes with different effective JSONL roots; only /tmp/claude is tmpfs.
+    // Two personas with different effective JSONL roots; only /tmp/claude is tmpfs.
     // A → /tmp/claude/projects (tmpfs, flagged). B → /home/user/.claude/projects (ext4, clean).
-    const config = makeRoutingConfig({
-      routes: {
-        A: { cwd: '/repo/a', claude_config_dir: '/tmp/claude' },
-        B: { cwd: '/repo/b', claude_config_dir: '/home/user/.claude' },
-      },
-      claude_config_dir: undefined,
-    })
+    const config = makeMultiPersonaConfig(
+      [
+        { name: 'A', claude_config_dir: '/tmp/claude' },
+        { name: 'B', claude_config_dir: '/home/user/.claude' },
+      ],
+      makeTempDir(),
+    )
     const c = await runLayer2(quietLayer2, config)
     const nonPersistent = c.errors.filter((e) => e.key === 'jsonl-non-persistent')
     // recordStartupError fires once per flagged root (one tmpfs root here).
     expect(nonPersistent).toHaveLength(1)
     expect(nonPersistent[0]!.message).toContain('/tmp/claude/projects')
     // The notice targets ONLY the persona whose effective root is the flagged root.
-    expect(c.notices.map((n) => n.key)).toEqual(['A'])
+    expect(c.notices.map((n) => n.key)).toEqual([config.personas[0]!.key])
     expect(c.notices[0]!.text).toContain('/tmp/claude/projects')
     expect(c.notices[0]!.text).not.toContain('this channel')
   })
 
   test('unresolvable root → jsonl-persistence-check-warning recorded, no notice', async () => {
-    const config = makeRoutingConfig({
-      routes: { A: { cwd: '/repo/a', claude_config_dir: '/no/matching/mount' } },
-      claude_config_dir: undefined,
-    })
+    const config = makeMultiPersonaConfig([{ name: 'A', claude_config_dir: '/no/matching/mount' }], makeTempDir())
     const noRoot = '24 23 8:2 / /home rw,relatime shared:2 - ext4 /dev/sda2 rw\n'
     const c = await runLayer2({ ...quietLayer2, readMountinfo: fixture(noRoot) }, config)
     expect(c.errors.map((e) => e.key)).toContain('jsonl-persistence-check-warning')
@@ -537,40 +772,30 @@ describe('runJsonlPersistenceSafeguard — Layer 1 loud path', () => {
 // makeDefaultArchiveCount — real temp-sqlite coverage (exercised through the
 // safeguard's default archiveCountSince, i.e. NO archiveCountSince injected).
 //
-// makeRow().started_at is '2026-09-20T05:00:00Z' → the spawn boundary in epoch
-// seconds. The default counter reads config.message_archive_db read-only and
-// counts messages WHERE channel_id = ? AND timestamp > boundary. A positive
-// count surfaces as a loud jsonl-transcript-lost record whose message embeds the
-// exact count; 0 / null (unconfigured, missing, corrupt) stay quiet. statFn is
-// forced false so Layer 2 always reaches the archive-count branch.
+// STARTED_AT '2026-09-20T05:00:00Z' → the spawn boundary in epoch seconds. The
+// default counter reads config.message_archive_db read-only and counts
+// messages in the persona's `all` channels WHERE timestamp > boundary. A
+// positive count surfaces as a loud jsonl-transcript-lost record whose message
+// embeds the exact count; 0 / null (unconfigured, missing, corrupt) stay
+// quiet. statFn is forced false so Layer 2 always reaches the archive-count
+// branch.
 // ---------------------------------------------------------------------------
 
-const SPAWN_EPOCH = Date.parse(makeRow().started_at) / 1000 // 2026-09-20T05:00:00Z
-
-// Cleanup handles for temp archive dirs built during this suite (drained in afterEach).
-const archiveCleanups: Array<() => void> = []
+const SPAWN_EPOCH = Date.parse(STARTED_AT) / 1000 // 2026-09-20T05:00:00Z
 
 /** Builds a temp archive DB with the given (timestamp, channel) rows; returns its path. */
 function makeArchiveDb(rows: ArchiveRow[]): string {
   const built = buildTempArchiveDb(rows, CH)
-  archiveCleanups.push(built.cleanup)
+  cleanups.push(built.cleanup)
   return built.dbPath
 }
 
 /** Config whose message_archive_db points at dbPath (undefined → unconfigured). */
-function archiveConfig(dbPath: string | undefined): RoutingConfig {
-  return makeRoutingConfig({
-    routes: { [CH]: { cwd: '/repo/app', claude_config_dir: CONFIG_DIR } },
-    claude_config_dir: undefined,
-    message_archive_db: dbPath,
-  })
+function archiveConfig(dbPath: string | undefined): PersonaConfig {
+  return layer2Config({ message_archive_db: dbPath })
 }
 
 describe('makeDefaultArchiveCount (real temp sqlite, via default archiveCountSince)', () => {
-  afterEach(() => {
-    while (archiveCleanups.length > 0) archiveCleanups.pop()!()
-  })
-
   test('unconfigured message_archive_db → null → quiet (no loud lost signal)', async () => {
     const c = await runLayer2({ statFn: () => false, archiveCountSince: undefined }, archiveConfig(undefined))
     expect(c.errors).toEqual([])
@@ -578,8 +803,7 @@ describe('makeDefaultArchiveCount (real temp sqlite, via default archiveCountSin
   })
 
   test('missing DB file → null → quiet AND the file is not created', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'jsonl-archive-test-'))
-    const dbPath = join(dir, 'does-not-exist.db')
+    const dbPath = join(makeTempDir('jsonl-archive-test-'), 'does-not-exist.db')
     const c = await runLayer2({ statFn: () => false, archiveCountSince: undefined }, archiveConfig(dbPath))
     expect(c.errors).toEqual([])
     expect(c.notices).toEqual([])
@@ -603,7 +827,7 @@ describe('makeDefaultArchiveCount (real temp sqlite, via default archiveCountSin
     expect(c.errors[0]!.key).toBe('jsonl-transcript-lost')
     expect(c.errors[0]!.message).toContain('3 message(s)')
     expect(c.notices).toHaveLength(1)
-    expect(c.notices[0]!.key).toBe(CH)
+    expect(c.notices[0]!.key).toBe(layer2Persona().key)
     expect(c.notices[0]!.text).toContain('3 message(s)')
     expect(c.notices[0]!.text).not.toContain('this channel')
   })
@@ -616,13 +840,225 @@ describe('makeDefaultArchiveCount (real temp sqlite, via default archiveCountSin
   })
 
   test('corrupt/unreadable DB file → null → quiet (error swallowed)', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'jsonl-archive-test-'))
-    const dbPath = join(dir, 'corrupt.db')
+    const dbPath = join(makeTempDir('jsonl-archive-test-'), 'corrupt.db')
     // Not a valid sqlite file → new Database(...).query throws → counter returns null.
     writeFileSync(dbPath, 'this is not a sqlite database, it is plain garbage bytes')
     chmodSync(dbPath, 0o644)
     const c = await runLayer2({ statFn: () => false, archiveCountSince: undefined }, archiveConfig(dbPath))
     expect(c.errors).toEqual([])
     expect(c.notices).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-7.4 — which archived messages count as a persona's evidence
+//
+// Channels: two `all` channels, one `mentions` channel and a DM conversation
+// the persona under test may hold, and a channel of another persona.
+// ---------------------------------------------------------------------------
+
+const ALL_1 = 'C0ALL0001'
+const ALL_2 = 'C0ALL0002'
+const MENT = 'C0MENT001'
+const DM_CONV = 'D0DM00001'
+const OTHER = 'C0OTHER01'
+
+/** `n` archive rows in `channel`, all strictly after the spawn boundary. */
+function after(channel: string, n: number): ArchiveRow[] {
+  return Array.from({ length: n }, (_, i) => ({ ts: SPAWN_EPOCH + 1 + i, channel }))
+}
+
+/** Pre-boundary noise in every channel: never counted by any case. */
+const PRE_BOUNDARY: ArchiveRow[] = [ALL_1, ALL_2, MENT, DM_CONV, OTHER].map((channel) => ({
+  ts: SPAWN_EPOCH - 1,
+  channel,
+}))
+
+/** Rows in every channel after the boundary: 1 / 2 / 3 / 4 / 5 per channel. */
+const EVERYWHERE: ArchiveRow[] = [
+  ...after(ALL_1, 1),
+  ...after(ALL_2, 2),
+  ...after(MENT, 3),
+  ...after(DM_CONV, 4),
+  ...after(OTHER, 5),
+]
+
+const all = (id: string) => ({ id, delivery: 'all' as const })
+const mentions = (id: string) => ({ id, delivery: 'mentions' as const })
+
+/**
+ * A config of the persona under test (`spec`) and another persona in OTHER,
+ * both matching the rows makeRow builds.
+ */
+function evidenceConfig(spec: PersonaSpec, dbPath?: string): PersonaConfig {
+  return makeMultiPersonaConfig(
+    [
+      { ...LAYER2_SPEC, ...spec },
+      { name: 'Other Bot', working_directory: '/repo/other', channels: [all(OTHER)] },
+    ],
+    makeTempDir(),
+    { claude_config_dir: CONFIG_DIR, ...(dbPath ? { message_archive_db: dbPath } : {}) },
+  )
+}
+
+describe('personaArchiveEvidenceScope + makeDefaultArchiveCount (real temp sqlite, several channels)', () => {
+  test.each([
+    {
+      name: 'rows in its one `all` channel are counted',
+      spec: { channels: [all(ALL_1)] },
+      rows: after(ALL_1, 2),
+      ids: [ALL_1],
+      attributable: true,
+      count: 2,
+    },
+    {
+      name: 'rows in two `all` channels are summed',
+      spec: { channels: [all(ALL_1), all(ALL_2)] },
+      rows: [...after(ALL_1, 2), ...after(ALL_2, 3)],
+      ids: [ALL_1, ALL_2],
+      attributable: true,
+      count: 5,
+    },
+    {
+      name: 'rows only in its `mentions` channel are not counted',
+      spec: { channels: [all(ALL_1), mentions(MENT)] },
+      rows: after(MENT, 4),
+      ids: [ALL_1],
+      attributable: false,
+      count: 0,
+    },
+    {
+      name: 'rows only in a DM conversation are not counted',
+      spec: { channels: [all(ALL_1)], dm: { enabled: true } },
+      rows: after(DM_CONV, 4),
+      ids: [ALL_1],
+      attributable: false,
+      count: 0,
+    },
+    {
+      name: "rows in another persona's channel are not counted",
+      spec: { channels: [all(ALL_1)] },
+      rows: after(OTHER, 4),
+      ids: [ALL_1],
+      attributable: true,
+      count: 0,
+    },
+    {
+      name: 'rows everywhere: only the `all` channels count (1 + 2)',
+      spec: { channels: [mentions(MENT), all(ALL_1), all(ALL_2)], dm: { enabled: true } },
+      rows: EVERYWHERE,
+      ids: [ALL_1, ALL_2],
+      attributable: false,
+      count: 3,
+    },
+    {
+      name: 'a DM-only persona with no channels counts nothing',
+      spec: { channels: [], dm: { enabled: true }, permission_prompts: 'dm' },
+      rows: EVERYWHERE,
+      ids: [],
+      attributable: false,
+      count: 0,
+    },
+  ] as Array<{ name: string; spec: PersonaSpec; rows: ArchiveRow[]; ids: string[]; attributable: boolean; count: number }>)(
+    '$name',
+    ({ spec, rows, ids, attributable, count }) => {
+      const dbPath = makeArchiveDb([...PRE_BOUNDARY, ...rows])
+      const persona = evidenceConfig(spec).personas[0]!
+      const scope = personaArchiveEvidenceScope(persona)
+      expect(scope).toEqual({ channelIds: ids, zeroIsAttributable: attributable })
+      const countSince = makeDefaultArchiveCount({ message_archive_db: dbPath })
+      expect(countSince(scope.channelIds, SPAWN_EPOCH, renderPersonaRef(persona.name, persona.key))).toBe(count)
+    },
+  )
+
+  test.each([
+    ['unconfigured', (): string | undefined => undefined],
+    ['missing-file', (): string | undefined => join(makeTempDir('jsonl-archive-test-'), 'absent.db')],
+    [
+      'corrupt-file',
+      (): string | undefined => {
+        const p = join(makeTempDir('jsonl-archive-test-'), 'corrupt.db')
+        writeFileSync(p, 'not a sqlite database')
+        return p
+      },
+    ],
+  ])('no `all` channels → 0 without opening the %s archive (an `all` channel gives null)', (label, dbPathFor) => {
+    const dbPath = dbPathFor()
+    const countSince = makeDefaultArchiveCount({ message_archive_db: dbPath })
+    expect(countSince([], SPAWN_EPOCH, 'ref')).toBe(0)
+    expect(countSince([ALL_1], SPAWN_EPOCH, 'ref')).toBeNull()
+    if (label === 'missing-file') expect(existsSync(dbPath!)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-7.4 — zero-count interpretation in the safeguard (real sqlite,
+// default archive count, real per-persona notifier)
+// ---------------------------------------------------------------------------
+
+describe('runJsonlPersistenceSafeguard — zero archive count per SR-7.4', () => {
+  async function runEvidence(spec: PersonaSpec, rows: ArchiveRow[]) {
+    const dbPath = makeArchiveDb([...PRE_BOUNDARY, ...rows])
+    const config = evidenceConfig(spec, dbPath)
+    const [persona, other] = config.personas
+    const h = makeNotifierHarness(config)
+    const errors: Array<{ key: string; message: string }> = []
+    const log = captureErrorLog()
+    await runJsonlPersistenceSafeguard(config, h.notifier.notify, {
+      readMountinfo: fixture(REALISTIC_MOUNTINFO),
+      statFn: () => false,
+      // Only the persona under test has a row.
+      getRow: async (key) => {
+        if (key === persona!.key) return makeRow({}, persona!)
+        throw new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'x')
+      },
+      recordStartupError: (key, message) => {
+        errors.push({ key, message })
+      },
+      home,
+    })
+    const ref = renderPersonaRef(persona!.name, persona!.key)
+    return { persona: persona!, other: other!, h, errors, personaLines: log.filter((l) => l.includes(ref)) }
+  }
+
+  test.each([
+    ['rows only in its `mentions` channel', { channels: [all(ALL_1), mentions(MENT)] }, after(MENT, 3)],
+    ['DMs on and archived rows only in a DM', { channels: [all(ALL_1)], dm: { enabled: true } }, after(DM_CONV, 3)],
+    [
+      'a DM-only persona with no channels',
+      { channels: [], dm: { enabled: true }, permission_prompts: 'dm' },
+      after(DM_CONV, 3),
+    ],
+  ] as Array<[string, PersonaSpec, ArchiveRow[]]>)(
+    '%s → zero is inconclusive: no LOST record, no notice, one quiet line',
+    async (_label, spec, rows) => {
+      const { h, errors, personaLines } = await runEvidence(spec, rows)
+      expect(errors).toEqual([])
+      expect(h.totalPosts()).toBe(0)
+      const inconclusive = personaLines.filter((l) => l.includes('archive evidence is inconclusive'))
+      expect(inconclusive).toHaveLength(1)
+      expect(inconclusive[0]).toContain(UNATTRIBUTABLE_ZERO_REASON)
+    },
+  )
+
+  test('a `mentions` channel plus archived `all`-channel rows → LOST record and one notice counting only `all` rows', async () => {
+    const { persona, other, h, errors } = await runEvidence(
+      { channels: [all(ALL_1), mentions(MENT)] },
+      [...after(ALL_1, 2), ...after(MENT, 3), ...after(OTHER, 4)],
+    )
+    expect(errors.map((e) => e.key)).toEqual(['jsonl-transcript-lost'])
+    expect(errors[0]!.message).toContain('2 message(s)')
+    const posts = h.posts(persona.key)
+    expect(posts).toHaveLength(1)
+    expect(posts[0]!.text).toContain('2 message(s)')
+    expect(h.posts(other.key)).toEqual([])
+  })
+
+  test('an `all`-only persona with DMs off and zero `all` rows → idle-quiet, not inconclusive', async () => {
+    const { h, errors, personaLines } = await runEvidence({ channels: [all(ALL_1)] }, after(OTHER, 3))
+    expect(errors).toEqual([])
+    expect(h.totalPosts()).toBe(0)
+    expect(personaLines.filter((l) => l.includes('no archived activity since spawn'))).toHaveLength(1)
+    expect(personaLines.filter((l) => l.includes('inconclusive'))).toEqual([])
   })
 })

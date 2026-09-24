@@ -112,8 +112,11 @@ async function main(): Promise<void> {
     },
   })
 
-  // Install the CSCB template (carries --dangerously-load-development-channels).
-  await installSlackChannelBotTemplate(cfg)
+  // Install the CSCB template (carries --dangerously-load-development-channels)
+  // from the persona config, as the daemon does. The session manager's
+  // pre-launch trust patcher stays uninstalled (no patch runs): stub-claude
+  // prints only the dev-channels dialog, never the trust dialog.
+  await installSlackChannelBotTemplate(personaCfg)
 
   const instanceId = personaInstanceId(persona.key)
 

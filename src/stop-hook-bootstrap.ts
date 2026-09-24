@@ -1,18 +1,20 @@
 /**
  * stop-hook-bootstrap.ts — Patch <claude_config_dir>/settings.json for every
- * routed dir at startup to install (or remove) a CSCB-managed Stop hook that
- * routes reply-guard events back through slack-reply-guard.sh.
+ * applied persona's dir at startup to install (or remove) a CSCB-managed Stop
+ * hook that routes reply-guard events back through slack-reply-guard.sh.
  *
- * SR-3 of SRD t1.2qu.u6:
- *   - Iterate routes; effective dir = route.claude_config_dir ?? top-level.
- *   - Group by dir. Ensure the managed entry if >=1 resolving route is
- *     enabled (route.stop_hook_bootstrap ?? routingConfig.stop_hook_bootstrap);
- *     remove (and prune emptied groups) only if none of the routes for that
- *     dir are enabled.
+ * SR-3 of SRD t1.2qu.u6, iterated over personas (b.av2 SR-6.2):
+ *   - Iterate the applied personas; the dir is the persona's effective
+ *     claude_config_dir (per-persona, else top-level).
+ *   - Group by dir, keyed on the real path (config.ts's resolveRealPath), so
+ *     personas reaching one dir through a symlink form one group. Ensure the managed entry if >=1 persona for that dir is
+ *     enabled (its effective stop_hook_bootstrap: per-persona, else
+ *     top-level); remove (and prune emptied groups) only if none of the
+ *     personas for that dir are enabled.
  *   - Refuse the operator's personal ~/.claude dir (compared via config.ts's
  *     shared resolveRealPath: realpathSync with a lexical resolve() fallback
  *     for non-existent paths): skip, warn, recordStartupError.
- *   - Skip routes with no effective dir; treat empty/whitespace-only dirs as
+ *   - Skip personas with no effective dir; treat empty/whitespace-only dirs as
  *     absent (guards against resolve("") landing in cwd).
  *   - jq absent at boot: warn + recordStartupError, still install entries
  *     (the hook script uses jq at hook time).
@@ -42,7 +44,8 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
 
-import { type RoutingConfig, resolveRealPath } from './config.ts'
+import { type PersonaConfig, resolveRealPath } from './config.ts'
+import { renderPersonaRef } from './persona-identity.ts'
 import { recordStartupError } from './startup-errors.ts'
 
 // ---------------------------------------------------------------------------
@@ -354,22 +357,24 @@ function jqOnPath(): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Public entry point — route iteration + aggregation (subtask t3.osj.72.xf.57)
+// Public entry point — persona iteration + aggregation (subtask t3.osj.72.xf.57)
 // ---------------------------------------------------------------------------
 
 interface DirAggregate {
-  /** True if at least one resolving route for this dir is enabled. */
+  /** The first contributing persona's configured dir: the path written to and logged. */
+  dir: string
+  /** True if at least one persona for this dir is enabled. */
   anyEnabled: boolean
-  /** Route/channel IDs contributing to this dir (for diagnostics). */
-  channels: string[]
+  /** Rendered references of the personas contributing to this dir (for diagnostics). */
+  personas: string[]
 }
 
 /**
- * Boot-time entry point. Iterates the routing config, groups routes by their
+ * Boot-time entry point. Iterates the applied personas, groups them by their
  * effective claude_config_dir, and applies the ensure/remove patch engine
  * per dir. Never throws.
  */
-export function stopHookBootstrap(routingConfig: RoutingConfig): void {
+export function stopHookBootstrap(personaConfig: PersonaConfig): void {
   try {
     // One-time jq availability check. The hook script needs jq at hook time;
     // if absent we still install so that installing jq later Just Works.
@@ -392,36 +397,39 @@ export function stopHookBootstrap(routingConfig: RoutingConfig): void {
       return
     }
 
-    // Group routes by effective dir.
+    // Group personas by the real path of their effective dir, so two
+    // personas reaching one dir through a symlink form one group rather than
+    // two that install and remove the hook in the same settings file.
     const byDir = new Map<string, DirAggregate>()
-    for (const [channelId, route] of Object.entries(routingConfig.routes)) {
-      const rawDir = route.claude_config_dir ?? routingConfig.claude_config_dir
+    for (const persona of personaConfig.personas) {
+      const ref = renderPersonaRef(persona.name, persona.key)
+      const rawDir = persona.claude_config_dir
       if (rawDir === undefined) {
         console.error(
-          `[slack] stop-hook-bootstrap: channel=${channelId} has no claude_config_dir — skipping`,
+          `[slack] stop-hook-bootstrap: ${ref} has no claude_config_dir — skipping`,
         )
         continue
       }
       if (typeof rawDir !== 'string' || rawDir.trim() === '') {
         console.error(
-          `[slack] stop-hook-bootstrap: channel=${channelId} has empty/whitespace claude_config_dir — skipping (guard against resolve("") landing in cwd)`,
+          `[slack] stop-hook-bootstrap: ${ref} has empty/whitespace claude_config_dir — skipping (guard against resolve("") landing in cwd)`,
         )
         continue
       }
-      const dir = rawDir
-      const enabled = route.stop_hook_bootstrap ?? routingConfig.stop_hook_bootstrap
-      const agg = byDir.get(dir) ?? { anyEnabled: false, channels: [] }
-      agg.channels.push(channelId)
-      if (enabled) agg.anyEnabled = true
-      byDir.set(dir, agg)
+      const realDir = resolveRealPath(rawDir)
+      const agg = byDir.get(realDir) ?? { dir: rawDir, anyEnabled: false, personas: [] }
+      agg.personas.push(ref)
+      if (persona.stop_hook_bootstrap) agg.anyEnabled = true
+      byDir.set(realDir, agg)
     }
 
-    for (const [dir, agg] of byDir) {
+    for (const agg of byDir.values()) {
+      const { dir } = agg
       try {
         // Refuse the operator's own ~/.claude — never install a CSCB hook
         // into the personal default config dir.
         if (isForbiddenHomeClaudeDir(dir)) {
-          const msg = `refusing to touch operator's own ~/.claude (dir=${dir}, channels=${agg.channels.join(',')})`
+          const msg = `refusing to touch operator's own ~/.claude (dir=${dir}, personas=${agg.personas.join(', ')})`
           console.error(`[slack] stop-hook-bootstrap: ${msg}`)
           recordStartupError('stop-hook-bootstrap-refuse-home', msg)
           continue
@@ -435,7 +443,7 @@ export function stopHookBootstrap(routingConfig: RoutingConfig): void {
           if (!st.isDirectory()) {
             recordStartupError(
               'stop-hook-bootstrap-not-a-dir',
-              `claude_config_dir ${dir} is not a directory — skipping (channels=${agg.channels.join(',')})`,
+              `claude_config_dir ${dir} is not a directory — skipping (personas=${agg.personas.join(', ')})`,
             )
             continue
           }
@@ -445,7 +453,7 @@ export function stopHookBootstrap(routingConfig: RoutingConfig): void {
           if (agg.anyEnabled) {
             recordStartupError(
               'stop-hook-bootstrap-dir-missing',
-              `claude_config_dir ${dir} does not exist — skipping ensure (channels=${agg.channels.join(',')})`,
+              `claude_config_dir ${dir} does not exist — skipping ensure (personas=${agg.personas.join(', ')})`,
               err,
             )
           }
@@ -460,7 +468,7 @@ export function stopHookBootstrap(routingConfig: RoutingConfig): void {
       } catch (err) {
         recordStartupError(
           'stop-hook-bootstrap-dir',
-          `unexpected error processing dir=${dir} channels=${agg.channels.join(',')}`,
+          `unexpected error processing dir=${dir} personas=${agg.personas.join(', ')}`,
           err,
         )
       }

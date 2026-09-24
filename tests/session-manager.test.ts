@@ -21,6 +21,14 @@
  *   - b.av2 SR-6.3: the fixed instance ID, one launch in flight per persona,
  *     and the start sweep (`reconcileOrphans`) keyed by the `persona` label
  *     (AC 4).
+ *   - b.av2 SR-6.2 pre-launch trust patch: through the injectable seam
+ *     (`setPreLaunchTrustPatcher`, empty by default and reset in afterEach,
+ *     so no test installs the production patch or writes a `.claude.json`),
+ *     once per ladder, before its first spawn or resume, on every launch path;
+ *     never in dry run or for a joining caller; a throw is only logged.
+ *   - b.av2 SR-7.4 transcript-loss diagnosis: only the persona's
+ *     `delivery: all` channels are counted, and a zero count is inconclusive
+ *     for a persona with a `mentions` channel or DMs on.
  *   - SR-8.6 invariant: every successful spawn call site passes
  *     relay_mode='on'.
  *   - Persona notices (b.av2 SR-7.2): spawn failure (generic, dialog-approval
@@ -40,7 +48,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, readFileSync, existsSync, realpathSync, rmSync, symlinkSync } from 'fs'
+import { mkdirSync, mkdtempSync, readFileSync, existsSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join } from 'path'
 import {
@@ -83,7 +91,11 @@ import {
   setSessionNotifier,
   notifySpawnFailure,
   notifyRestartCapReached,
+  setPreLaunchTrustPatcher,
+  _resetPreLaunchTrustPatcher,
 } from '../src/session-manager.ts'
+import { UNATTRIBUTABLE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
+import { resolveJsonlPath } from '../src/cozempic.ts'
 import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
 import type { WebApiOutcome } from './test-helpers/slack-stub.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
@@ -277,6 +289,7 @@ afterEach(() => {
   _resetOutageState()
   _resetSpawnHomeDir()
   _resetInFlightLaunches()
+  _resetPreLaunchTrustPatcher()
   setSessionNotifier(undefined)
   process.env = savedEnv as NodeJS.ProcessEnv
   rmSync(fixtureDir, { recursive: true, force: true })
@@ -1114,6 +1127,29 @@ describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
     expect(calls.spawnCalls[1].cwd).toBe(work)
   })
 
+  test.each(['empty', 'absent'] as const)('a row with an %s cwd is a mismatch; the log prints cwd=<none>, never cwd=undefined', async (variant) => {
+    const { cfg, work } = guardConfig()
+    const calls = newLadderCalls()
+    const base = personaRow(cfg, 'C', { state: 'ended' })
+    const { cwd: _cwd, ...withoutCwd } = base
+    installCollision(variant === 'empty' ? { ...base, cwd: '' } : (withoutCwd as CannedGetResult), calls)
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(result).toEqual({ key: 'C', action: 'spawned' })
+    expect(calls.killCalls).toHaveLength(1)
+    expect(calls.deleteCalls).toHaveLength(1)
+    expect(calls.resumeCalls).toHaveLength(0)
+    expect(calls.spawnCalls[1].cwd).toBe(work)
+    expect(errLog).toContain(
+      `spawnForPersona: ${renderPersonaRef('C', 'C')} row cwd=<none> differs from working_directory=${work} (state=ended) — replacing the row`,
+    )
+    expect(errLog).not.toContain('cwd=undefined')
+  })
+
   test('a failed delete on the mismatch path → failed, no fresh spawn (never two instances)', async () => {
     const readLog = captureStartupErrors()
     const { cfg } = guardConfig()
@@ -1143,31 +1179,63 @@ describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
 // label means delete + fresh spawn (a resume would keep the old config dir)
 // ---------------------------------------------------------------------------
 
-describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)', () => {
-  /** The four ways the ladder reaches a resume. */
-  const RESUME_ENTRIES = ['ended', 'missing', 'waiting (dead session)', 'working (dead session)'] as const
-  type ResumeEntry = (typeof RESUME_ENTRIES)[number]
+/** The four ways the ladder reaches a resume. */
+const RESUME_ENTRIES = ['ended', 'missing', 'waiting (dead session)', 'working (dead session)'] as const
+type ResumeEntry = (typeof RESUME_ENTRIES)[number]
 
+/**
+ * Persona `C` with a real working directory and a real per-persona
+ * claude_config_dir; `overrides` go to the server-wide settings.
+ */
+function labelConfig(
+  overrides: Partial<Omit<PersonaConfig, 'personas'>> = {},
+): { cfg: PersonaConfig; home: string; configDir: string } {
+  const home = useSpawnHome()
+  const configDir = fixtureSubdir('claude-config')
+  const cfg = makeStandInPersonaConfig(
+    { C: { working_directory: fixtureSubdir('work'), claude_config_dir: configDir } },
+    fixtureDir,
+    { agent_director_poll_interval_ms: 1, ...overrides },
+  )
+  return { cfg, home, configDir }
+}
+
+/**
+ * Drive `entry` to its resume decision. `ended` / `missing` resolve straight
+ * to it; `waiting` meets a dead session through persistent ErrTmuxSendKeys;
+ * `working` through the up-front findMissing sweep reconciling the row to
+ * `missing`. The resumed or fresh session reports `waiting`, so the dialog
+ * approver returns at once. Returns the installed stub.
+ */
+function installResumeEntry(entry: ResumeEntry, row: CannedGetResult, calls: LadderCalls): StubClient {
+  const state = entry.split(' ')[0] as 'ended' | 'missing' | 'waiting' | 'working'
+  if (state === 'waiting' || state === 'working') _setTmuxServerEnsurer(async () => {})
+  if (state === 'working') _setWaitForWaitingTimeoutMs(30)
+  return installStub({
+    ...calls,
+    spawnQueue: [
+      cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+      cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+    ],
+    getResult: { ...row, state },
+    sendKeysError: state === 'waiting' ? errTmuxSendKeys() : undefined,
+    findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
+    statusFn: () =>
+      ({
+        state:
+          calls.resumeCalls.length > 0 || calls.spawnCalls.length > 1
+            ? 'waiting'
+            : state === 'working' && calls.findMissingCalls.length > 0
+              ? 'missing'
+              : state,
+      }) as import('agent-director').StatusResult,
+  })
+}
+
+describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)', () => {
   /** How the row's `config_dir` label relates to the persona's current one. */
   const LABEL_VARIANTS = ['matching', 'changed', 'missing'] as const
   type LabelVariant = (typeof LABEL_VARIANTS)[number]
-
-  /**
-   * Persona `C` with a real working directory and a real per-persona
-   * claude_config_dir; `overrides` go to the server-wide settings.
-   */
-  function labelConfig(
-    overrides: Partial<Omit<PersonaConfig, 'personas'>> = {},
-  ): { cfg: PersonaConfig; home: string; configDir: string } {
-    const home = useSpawnHome()
-    const configDir = fixtureSubdir('claude-config')
-    const cfg = makeStandInPersonaConfig(
-      { C: { working_directory: fixtureSubdir('work'), claude_config_dir: configDir } },
-      fixtureDir,
-      { agent_director_poll_interval_ms: 1, ...overrides },
-    )
-    return { cfg, home, configDir }
-  }
 
   /** The row's labels for `variant`. */
   function labelsFor(variant: LabelVariant, cfg: PersonaConfig, home: string): Record<string, string> {
@@ -1182,38 +1250,6 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
         return base
       }
     }
-  }
-
-  /**
-   * Drive `entry` to its resume decision. `ended` / `missing` resolve straight
-   * to it; `waiting` meets a dead session through persistent ErrTmuxSendKeys;
-   * `working` through the up-front findMissing sweep reconciling the row to
-   * `missing`. The resumed or fresh session reports `waiting`, so the dialog
-   * approver returns at once.
-   */
-  function installResumeEntry(entry: ResumeEntry, row: CannedGetResult, calls: LadderCalls): void {
-    const state = entry.split(' ')[0] as 'ended' | 'missing' | 'waiting' | 'working'
-    if (state === 'waiting' || state === 'working') _setTmuxServerEnsurer(async () => {})
-    if (state === 'working') _setWaitForWaitingTimeoutMs(30)
-    installStub({
-      ...calls,
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
-      ],
-      getResult: { ...row, state },
-      sendKeysError: state === 'waiting' ? errTmuxSendKeys() : undefined,
-      findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
-      statusFn: () =>
-        ({
-          state:
-            calls.resumeCalls.length > 0 || calls.spawnCalls.length > 1
-              ? 'waiting'
-              : state === 'working' && calls.findMissingCalls.length > 0
-                ? 'missing'
-                : state,
-        }) as import('agent-director').StatusResult,
-    })
   }
 
   const CASES = RESUME_ENTRIES.flatMap((entry) => LABEL_VARIANTS.map((variant) => [entry, variant] as const))
@@ -1402,6 +1438,274 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     expect(spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(later)
     expect(spawnCalls[1].label).toContain(configDirLabelFor(later))
     expect(spawnCalls[1].label).not.toContain(configDirLabelFor(earlier))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-6.2 — the pre-launch trust patch precedes every launch
+// ---------------------------------------------------------------------------
+//
+// The seam is empty by default (and reset in afterEach), so no test here
+// installs the production trust patch or writes a `.claude.json`. Order is
+// read from one shared event log: the recording patcher and the stub's
+// `spawn` / `resume` all append to it.
+
+/** One entry of the shared launch-order log. */
+type LaunchEvent = 'patch' | 'spawn' | 'resume'
+
+/**
+ * Append 'spawn' / 'resume' to `events` on each such call through `stub`, then
+ * delegate to the stub's own verb, so its call captures and queues still apply.
+ */
+function recordLaunchCalls(stub: StubClient, events: LaunchEvent[]): StubClient {
+  const spawn = stub.spawn.bind(stub)
+  const resume = stub.resume.bind(stub)
+  stub.spawn = (params) => {
+    events.push('spawn')
+    return spawn(params)
+  }
+  stub.resume = (params) => {
+    events.push('resume')
+    return resume(params)
+  }
+  return stub
+}
+
+/**
+ * Install a recording pre-launch trust patcher: each call appends 'patch' to
+ * `events`. Returns the personas it was called with, in order.
+ */
+function installRecordingPatcher(events: LaunchEvent[]): Persona[] {
+  const patched: Persona[] = []
+  setPreLaunchTrustPatcher((persona) => {
+    events.push('patch')
+    patched.push(persona)
+  })
+  return patched
+}
+
+describe('pre-launch trust patch (b.av2 SR-6.2)', () => {
+  /** One launch path: how to reach it, what it returns and the expected launch-order log. */
+  interface LaunchPath {
+    install: (cfg: PersonaConfig, calls: LadderCalls) => StubClient
+    launch: (cfg: PersonaConfig) => Promise<unknown>
+    expected: unknown
+    events: LaunchEvent[]
+  }
+
+  const spawnC = (cfg: PersonaConfig) => spawnForPersona(personaOf(cfg, 'C'), cfg)
+
+  /**
+   * One row per way a ladder reaches agent-director: a fresh spawn, a resume
+   * (straight, and after a dead session), the restart adapter, and the two
+   * paths that spawn again after a first launch call.
+   */
+  const LAUNCH_PATHS: Array<[string, LaunchPath]> = [
+    ['fresh spawn', {
+      install: (_cfg, calls) => installStub({ ...calls }),
+      launch: spawnC,
+      expected: { key: 'C', action: 'spawned' },
+      events: ['patch', 'spawn'],
+    }],
+    ['resume of an ended row', {
+      install: (cfg, calls) => installResumeEntry('ended', personaRow(cfg, 'C'), calls),
+      launch: spawnC,
+      expected: { key: 'C', action: 'resumed' },
+      events: ['patch', 'spawn', 'resume'],
+    }],
+    ['dead-session recovery from a waiting row that resumes', {
+      install: (cfg, calls) => installResumeEntry('waiting (dead session)', personaRow(cfg, 'C'), calls),
+      launch: spawnC,
+      expected: { key: 'C', action: 'resumed' },
+      events: ['patch', 'spawn', 'resume'],
+    }],
+    ['restart launchSession adapter, resume of an ended row', {
+      install: (cfg, calls) => installResumeEntry('ended', personaRow(cfg, 'C'), calls),
+      launch: (cfg) => launchSession('C', cfg),
+      expected: true,
+      events: ['patch', 'spawn', 'resume'],
+    }],
+    ['delete then fresh spawn after resume ErrJsonlMissing', {
+      install: (cfg, calls) =>
+        installStub({
+          ...calls,
+          spawnQueue: [
+            cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+            cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+          ],
+          getResult: personaRow(cfg, 'C', { state: 'ended' }),
+          resumeError: errJsonlMissing(),
+        }),
+      launch: spawnC,
+      expected: { key: 'C', action: 'fresh-after-inconclusive-amnesia' },
+      events: ['patch', 'spawn', 'resume', 'spawn'],
+    }],
+    ['self-heal after ErrTmuxSessionCreate', {
+      install: (_cfg, calls) => {
+        _setTmuxSessionKiller(async () => {})
+        return installStub({
+          ...calls,
+          spawnQueue: [
+            cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
+            cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+          ],
+        })
+      },
+      launch: spawnC,
+      expected: { key: 'C', action: 'spawned' },
+      events: ['patch', 'spawn', 'spawn'],
+    }],
+  ]
+
+  test.each(LAUNCH_PATHS)('%s: patched once, for the persona, before its first spawn or resume', async (_name, path) => {
+    captureStartupErrors()
+    const { cfg, configDir } = labelConfig()
+    const persona = personaOf(cfg, 'C')
+    const events: LaunchEvent[] = []
+    const patched = installRecordingPatcher(events)
+    recordLaunchCalls(path.install(cfg, newLadderCalls()), events)
+
+    let result: unknown
+    await withCapturedErr(async () => {
+      result = await path.launch(cfg)
+    })
+
+    expect(result).toEqual(path.expected)
+    // Exactly one patch, and it comes before every agent-director launch call.
+    expect(events).toEqual(path.events)
+    expect(patched).toHaveLength(1)
+    // For the persona being launched: its effective config dir and working directory.
+    expect(patched[0]).toBe(persona)
+    expect(patched[0]!.claude_config_dir).toBe(configDir)
+    expect(patched[0]!.working_directory).toBe(persona.working_directory)
+  })
+
+  test('a persona whose claude_config_dir overrides the top-level one is patched for its own directory; one that inherits gets the top-level one', async () => {
+    useSpawnHome()
+    const topLevel = fixtureSubdir('top-level-config')
+    const own = fixtureSubdir('persona-config')
+    const cfg = makeStandInPersonaConfig(
+      {
+        C: { working_directory: fixtureSubdir('work-c'), claude_config_dir: own },
+        D: { working_directory: fixtureSubdir('work-d') },
+      },
+      fixtureDir,
+      { claude_config_dir: topLevel },
+    )
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    const patched = installRecordingPatcher([])
+
+    expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual({ key: 'C', action: 'spawned' })
+    expect(await spawnForPersona(personaOf(cfg, 'D'), cfg)).toEqual({ key: 'D', action: 'spawned' })
+
+    expect(patched.map((p) => [p.key, p.claude_config_dir, p.working_directory])).toEqual([
+      ['C', own, personaOf(cfg, 'C').working_directory],
+      ['D', topLevel, personaOf(cfg, 'D').working_directory],
+    ])
+    // The patched directory is the one the launch runs under.
+    expect(spawnCalls.map((p) => p.extra_env?.['CLAUDE_CONFIG_DIR'])).toEqual([own, topLevel])
+  })
+
+  test('dry run: the patcher is never called and nothing is launched', async () => {
+    process.env['SLACK_DRY_RUN'] = '1'
+    const { cfg } = labelConfig()
+    const calls = newLadderCalls()
+    installStub({ ...calls })
+    const patched = installRecordingPatcher([])
+
+    await withCapturedErr(async () => {
+      expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual({ key: 'C', action: 'no-op' })
+      expect(await launchSession('C', cfg)).toBe(true)
+    })
+
+    expect(patched).toHaveLength(0)
+    expect(calls.spawnCalls).toHaveLength(0)
+    expect(calls.resumeCalls).toHaveLength(0)
+  })
+
+  test('a caller that joins a launch in flight does not patch again; the next ladder patches once more', async () => {
+    const { cfg } = labelConfig()
+    const persona = personaOf(cfg, 'C')
+    let spawnsSeen = 0
+    const stub = installStub({})
+    // Hold only the first spawn open, so the second caller joins that ladder.
+    const held = holdSpawns(stub, () => spawnsSeen++ === 0)
+    const events: LaunchEvent[] = []
+    const patched = installRecordingPatcher(events)
+    recordLaunchCalls(stub, events)
+
+    let results!: Awaited<ReturnType<typeof spawnForPersona>>[]
+    const errLog = await withCapturedErr(async () => {
+      const a = spawnForPersona(persona, cfg)
+      const b = spawnForPersona(persona, cfg)
+      await held.entered('cscb_C')
+      held.release('cscb_C')
+      results = await Promise.all([a, b])
+    })
+
+    expect(results[1]).toBe(results[0])
+    expect(errLog).toContain(`launch already in flight for ${renderPersonaRef('C', 'C')} — joining it`)
+    expect(events).toEqual(['patch', 'spawn'])
+    expect(patched).toEqual([persona])
+
+    // A later call is a new ladder: patched once, before its spawn.
+    expect(await spawnForPersona(persona, cfg)).toEqual({ key: 'C', action: 'spawned' })
+    expect(events).toEqual(['patch', 'spawn', 'patch', 'spawn'])
+  })
+
+  test.each([
+    ['fresh spawn', 'spawned'],
+    ['resume of an ended row', 'resumed'],
+  ] as const)('a patcher that throws is logged and the launch goes on (%s → %s)', async (path, action) => {
+    const readLog = captureStartupErrors()
+    const { cfg } = labelConfig()
+    const calls = newLadderCalls()
+    if (path === 'fresh spawn') installStub({ ...calls })
+    else installResumeEntry('ended', personaRow(cfg, 'C'), calls)
+    let attempts = 0
+    setPreLaunchTrustPatcher(() => {
+      attempts++
+      throw Object.assign(new Error('trust patch exploded'), { code: 'EACCES' })
+    })
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    // The ladder outcome is what it would be with no patcher at all.
+    expect(result).toEqual({ key: 'C', action })
+    expect(attempts).toBe(1)
+    expect(calls.spawnCalls).toHaveLength(1)
+    expect(calls.resumeCalls).toHaveLength(action === 'resumed' ? 1 : 0)
+    expect(errLog).toContain(
+      `spawnForPersona: pre-launch trust patch failed for ${renderPersonaRef('C', 'C')} — launching anyway: `,
+    )
+    // Described the safe-to-log way: its type and code.
+    expect(errLog).toContain('launching anyway: Error code=EACCES')
+    // Logged only: no startup error, no spawn-failure notice.
+    expect(readLog()).toBe('')
+    expect(notices).toHaveLength(0)
+  })
+
+  test("with no patcher installed (the default, and after the test-only reset) no patch runs and the persona's .claude.json is untouched", async () => {
+    const { cfg, configDir } = labelConfig()
+    // A patchable file in the persona's config dir: any trust patch would add
+    // the working directory to `projects`.
+    const claudeJson = join(configDir, '.claude.json')
+    writeFileSync(claudeJson, '{"projects":{}}')
+    const before = readFileSync(claudeJson)
+    const patched = installRecordingPatcher([])
+    _resetPreLaunchTrustPatcher()
+    const calls = newLadderCalls()
+    installStub({ ...calls })
+
+    expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual({ key: 'C', action: 'spawned' })
+
+    expect(patched).toHaveLength(0)
+    expect(calls.spawnCalls).toHaveLength(1)
+    expect(readFileSync(claudeJson).equals(before)).toBe(true)
   })
 })
 
@@ -3973,9 +4277,9 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   // only when isStartup=true, so this drives that.
   test('lost: archived messages since spawn > 0 → startup-error recorded + persona notice to the destination', async () => {
     const readLog = captureStartupErrors()
-    // Four post-spawn messages under the persona key (what the archive count
-    // reads today) and under its destination, its only `delivery: all` channel
-    // (what E3 Task 4 counts), so the count is 4 either way.
+    // Four post-spawn messages under its destination, its only `delivery: all`
+    // channel (what is counted, b.av2 SR-7.4), and four under the persona key,
+    // which is not a channel of the persona and is not counted: the count is 4.
     const startedAt = '2026-09-20T05:00:00Z'
     const boundary = Date.parse(startedAt) / 1000
     const rows = [1, 2, 3, 4].flatMap((i) => [
@@ -4248,6 +4552,193 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     // 'lost'-branch wording absent.
     expect(text).not.toContain('has been lost')
     expect(text).not.toContain('message archive shows')
+  })
+
+  // --- b.av2 SR-7.4: archive evidence follows the persona's channels -------
+  // Only the persona's `delivery: all` channels are counted, and a zero count
+  // proves idleness only when the archive sees all of the persona's traffic:
+  // with a `mentions` channel or DMs on, zero is inconclusive. Each case drives
+  // the real resume → ErrJsonlMissing → diagnosis path over a real temp
+  // archive; the row is the persona's own (`personaRow`), so the ladder
+  // resumes it instead of meeting the cwd / config_dir guard.
+
+  const SR74_STARTED_AT = '2026-09-20T05:00:00Z'
+  const SR74_NAME = 'Archive Bot'
+  const SR74_KEY = personaKey(SR74_NAME)
+  const ALL_1 = 'C0ALL0001'
+  const ALL_2 = 'C0ALL0002'
+  const MENTIONS = 'C0MENT003'
+  /** A channel of no persona: never counted. */
+  const ELSEWHERE = 'C0ELSE004'
+
+  interface Sr74Case {
+    channels: Persona['channels']
+    dmEnabled: boolean
+    /** Post-spawn archived messages by channel ID (the persona key included, to prove it is not counted). */
+    rows: Record<string, number>
+    outcome: 'never-created' | 'inconclusive' | 'lost'
+    /** For 'lost': the count the record and notice name. */
+    lostCount?: number
+  }
+
+  const SR74_CASES: Array<[string, Sr74Case]> = [
+    ['only `all` channels, no rows in them since spawn → never-created', {
+      channels: [{ id: ALL_1, delivery: 'all' }, { id: ALL_2, delivery: 'all' }],
+      dmEnabled: false,
+      rows: { [ELSEWHERE]: 3, [SR74_KEY]: 3 },
+      outcome: 'never-created',
+    }],
+    ['an `all` and a `mentions` channel, rows only in the `mentions` channel → inconclusive', {
+      channels: [{ id: ALL_1, delivery: 'all' }, { id: MENTIONS, delivery: 'mentions' }],
+      dmEnabled: false,
+      rows: { [MENTIONS]: 5 },
+      outcome: 'inconclusive',
+    }],
+    ['DMs on, an `all` channel with no rows since spawn → inconclusive', {
+      channels: [{ id: ALL_1, delivery: 'all' }],
+      dmEnabled: true,
+      rows: { [ELSEWHERE]: 2 },
+      outcome: 'inconclusive',
+    }],
+    ['DMs on and no channels → inconclusive', {
+      channels: [],
+      dmEnabled: true,
+      rows: { [ELSEWHERE]: 2, [SR74_KEY]: 2 },
+      outcome: 'inconclusive',
+    }],
+    ['an `all` and a `mentions` channel, rows in the `all` channel → lost (only the `all` rows counted)', {
+      channels: [{ id: ALL_1, delivery: 'all' }, { id: MENTIONS, delivery: 'mentions' }],
+      dmEnabled: false,
+      rows: { [ALL_1]: 3, [MENTIONS]: 2, [ELSEWHERE]: 7 },
+      outcome: 'lost',
+      lostCount: 3,
+    }],
+    ['rows only in the persona’s second `all` channel → lost', {
+      channels: [{ id: ALL_1, delivery: 'all' }, { id: ALL_2, delivery: 'all' }],
+      dmEnabled: false,
+      rows: { [ALL_2]: 2 },
+      outcome: 'lost',
+      lostCount: 2,
+    }],
+    ['DMs on, rows in the `all` channel → lost', {
+      channels: [{ id: ALL_1, delivery: 'all' }],
+      dmEnabled: true,
+      rows: { [ALL_1]: 4 },
+      outcome: 'lost',
+      lostCount: 4,
+    }],
+  ]
+
+  test.each(SR74_CASES)('SR-7.4: %s', async (_label, c) => {
+    const readLog = captureStartupErrors()
+    const boundary = Date.parse(SR74_STARTED_AT) / 1000
+    // Each channel's rows land strictly after started_at; one row per channel
+    // before it proves the "since spawn" bound still applies.
+    const rows = Object.entries(c.rows).flatMap(([channel, n]) => [
+      { ts: boundary - 10, channel },
+      ...Array.from({ length: n }, (_, i) => ({ ts: boundary + 1 + i, channel })),
+    ])
+    rows.push({ ts: boundary - 10, channel: ALL_1 })
+    const archive = buildTempArchiveDb(rows, ELSEWHERE)
+    archiveCleanups.push(archive.cleanup)
+    const cfg = makeMultiPersonaConfig(
+      [{
+        name: SR74_NAME,
+        channels: c.channels,
+        dm: c.dmEnabled ? { enabled: true, contact: 'U0CONTACT1' } : { enabled: false },
+        permission_prompts: c.channels.find((ch) => ch.delivery === 'all')?.id ?? 'dm',
+      }],
+      fixtureDir,
+      { message_archive_db: archive.dbPath },
+    )
+    installAmnesia({
+      cfg,
+      key: SR74_KEY,
+      getResult: { jsonl_path: '/data/proj/sess-sr74.jsonl', claude_session_id: 'sess-sr74', started_at: SR74_STARTED_AT },
+    })
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, SR74_KEY), cfg, true)
+    })
+    const log = readLog()
+
+    if (c.outcome === 'never-created') {
+      // Conclusive and quiet: no record, no notice.
+      expect(result).toEqual({ key: SR74_KEY, action: 'fresh-after-amnesia' })
+      expect(log).not.toContain('jsonl-transcript-lost-on-resume')
+      expect(log).not.toContain('jsonl-diagnosis-inconclusive')
+      expect(notices).toHaveLength(0)
+      expect(errLog).toContain('transcript never created (archive consulted: 0 archived messages since spawn)')
+      return
+    }
+
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!.key).toBe(SR74_KEY)
+    const text = notices[0]!.text
+
+    if (c.outcome === 'lost') {
+      expect(result).toEqual({ key: SR74_KEY, action: 'fresh-after-amnesia' })
+      expect(countStartupEntries(log, 'jsonl-transcript-lost-on-resume')).toBe(1)
+      expect(log).not.toContain('jsonl-diagnosis-inconclusive')
+      expect(log).toContain(`the message archive holds ${c.lostCount} message(s) since spawn`)
+      expect(text).toContain(`message archive shows ${c.lostCount} message(s) since I started`)
+      expect(text).toContain('my conversation memory has been lost')
+      expect(text).not.toContain('could not determine whether my prior')
+      return
+    }
+
+    // Inconclusive, for the new cause: an unattributable zero.
+    expect(result).toEqual({ key: SR74_KEY, action: 'fresh-after-inconclusive-amnesia' })
+    expect(countStartupEntries(log, 'jsonl-diagnosis-inconclusive')).toBe(1)
+    expect(log).not.toContain('jsonl-transcript-lost-on-resume')
+    expect(errLog).not.toContain('transcript never created')
+    expect(text).toContain('could not determine whether my prior')
+    expect(text).not.toContain('has been lost')
+    expect(text).not.toContain('message archive shows')
+    // The recorded cause is the new one, distinct from the existing reasons.
+    expect(log).toContain(UNATTRIBUTABLE_ZERO_REASON)
+    expect(log).not.toContain('no message archive is configured')
+    expect(log).not.toContain('could not be consulted')
+    expect(log).not.toContain('started_at is absent or unparseable')
+  })
+
+  // Carried from E3 Task 1 review: the locally computed fallback transcript
+  // path is built from the persona's effective claude_config_dir. A persona
+  // that overrides the top-level directory is looked up under its own.
+  test('a persona overriding the top-level claude_config_dir: the fallback transcript candidate is under the persona’s directory', async () => {
+    captureStartupErrors()
+    const topLevel = fixtureSubdir('top-level-config')
+    const own = fixtureSubdir('persona-config')
+    const cfg = makeStandInPersonaConfig(
+      { [CH]: { working_directory: CWD, claude_config_dir: own } },
+      fixtureDir,
+      { claude_config_dir: topLevel },
+    )
+    expect(personaOf(cfg, CH).claude_config_dir).toBe(own)
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installAmnesia({
+      cfg,
+      spawnCalls,
+      // No enumerated AD detail, so the diagnosis computes the candidates itself.
+      jsonlDescription: 'jsonl missing',
+      getResult: { jsonl_path: '/data/proj/sess-own.jsonl', claude_session_id: 'sess-own', cwd: CWD },
+    })
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const log = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
+    })
+
+    // The resume path was reached (the row's label matched the persona's own directory).
+    expect(result.action).toBe('fresh-after-inconclusive-amnesia')
+    const expected = resolveJsonlPath(CWD, 'sess-own', own)
+    expect(expected.startsWith(`${own}/projects/`)).toBe(true)
+    expect(log).toContain(`locally-computed(config-dir fallback) ${expected}`)
+    expect(log).not.toContain(resolveJsonlPath(CWD, 'sess-own', topLevel))
+    expect(log).not.toContain(`${topLevel}/projects`)
+    // The fresh spawn after the delete runs under the persona's directory too.
+    expect(spawnCalls[1]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(own)
   })
 
   // --- ErrNoSessionId sibling still 'spawned' (not amnesia) ---------------

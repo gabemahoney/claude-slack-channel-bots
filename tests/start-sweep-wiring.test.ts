@@ -19,30 +19,17 @@
 
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
+import { indicesOf, stripComments } from './test-helpers/source-audit.ts'
 
 const SERVER_SRC = readFileSync('src/server.ts', 'utf-8')
 
-/**
- * server.ts with every comment removed: block comments (JSDoc included) and
- * line comments, whole-line or trailing. String and template literals are
- * matched first and kept, so a `//` inside a string is not taken for a
- * comment. Prose or commented-out code that names a function (e.g. "BEFORE
- * startupSessionManager", `// await reconcileOrphans(personaConfig)`) can then
- * never satisfy or skew a code-position assertion.
- */
-const SERVER_CODE = SERVER_SRC.replace(
-  /('(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`)|\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,
-  (_match, literal: string | undefined) => literal ?? '',
-)
+/** server.ts with every comment removed (see stripComments). */
+const SERVER_CODE = stripComments(SERVER_SRC)
 
 /** Any call of the sweep in code, awaited or not, whatever its argument. */
 const ANY_SWEEP_CALL = /\breconcileOrphans\s*\(/g
 const SWEEP_CALL = /await\s+reconcileOrphans\s*\(\s*personaConfig\s*\)/g
 const STARTUP_CALL = /await\s+startupSessionManager\s*\(/g
-
-function indicesOf(re: RegExp, text: string): number[] {
-  return [...text.matchAll(re)].map((m) => m.index ?? -1)
-}
 
 describe('server.ts wires the persona start sweep (b.av2 SR-6.3)', () => {
   test('imports reconcileOrphans from the session manager', () => {

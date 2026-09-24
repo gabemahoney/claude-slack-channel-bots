@@ -1,317 +1,341 @@
 /**
- * trust-bootstrap.test.ts — Unit tests for src/trust-bootstrap.ts
+ * trust-bootstrap.test.ts — Unit tests for src/trust-bootstrap.ts (b.av2 SR-6.2).
  *
- * Uses real file I/O with mkdtempSync per-test temp directories.
- * Does NOT mock fs or startup-errors. Instead redirects SLACK_STATE_DIR to a
- * temp dir per test so recordStartupError writes are captured via the log file
- * — same pattern as session-manager.test.ts b.yy6 tests.
+ * Covers both entry points over personas:
+ *   - trustBootstrap(personaConfig): the start pass over every applied persona;
+ *     failures are recorded in startup-errors.log.
+ *   - trustPatchPersona(persona): the per-launch patch; failures are logged
+ *     only, never recorded.
+ *
+ * Uses real file I/O. Every `.claude.json` lives in a mkdtempSync directory
+ * removed in afterEach, and SLACK_STATE_DIR is redirected to a temp dir in
+ * beforeEach so recordStartupError writes land in a log the test reads
+ * (b.av2 SR-13.2). Cases for a persona with no configured claude_config_dir
+ * run in a subprocess with a fake HOME (tests/test-helpers/fake-home-subprocess.ts),
+ * so a regression that falls back to the default dir can only touch that fake
+ * home.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, writeFileSync, readFileSync, statSync, rmSync, existsSync } from 'node:fs'
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+import {
+  mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, rmSync, existsSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { RoutingConfig } from '../src/config.ts'
-import { trustBootstrap } from '../src/trust-bootstrap.ts'
+import { fileURLToPath } from 'node:url'
+import type { PersonaConfig } from '../src/config.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
+import { trustBootstrap, trustPatchPersona } from '../src/trust-bootstrap.ts'
+import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
+import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeTempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'trust-bootstrap-test-'))
-}
-
-function writeClaudeJson(dir: string, data: object): void {
-  writeFileSync(join(dir, '.claude.json'), JSON.stringify(data, null, 2), 'utf-8')
-}
-
-function readClaudeJson(dir: string): Record<string, unknown> {
-  return JSON.parse(readFileSync(join(dir, '.claude.json'), 'utf-8')) as Record<string, unknown>
-}
-
-function makeConfig(overrides: Partial<RoutingConfig> = {}): RoutingConfig {
-  return {
-    routes: {},
-    bind: '127.0.0.1',
-    port: 3100,
-    session_restart_delay: 60,
-    health_check_interval: 120,
-    exit_timeout: 120,
-    stop_timeout: 30,
-    mcp_config_path: '/tmp/test-mcp.json',
-    cron_table_path: '/tmp/test-crontab',
-    cron_log_path: '/tmp/test-cron.log',
-    cozempic_prescription: 'standard',
-    system_prompt_mode: 'append',
-    resume_enabled: true,
-    stop_hook_bootstrap: true,
-    agent_director_poll_interval_ms: 1000,
-    ...overrides,
-  }
-}
-
-/**
- * Redirect startup-errors.log into a fresh temp dir and return a reader.
- * Restore SLACK_STATE_DIR in afterEach via savedEnv.
- */
-function captureStartupErrors(logDir: string): () => string {
-  process.env['SLACK_STATE_DIR'] = logDir
-  const logPath = join(logDir, 'startup-errors.log')
-  return () => (existsSync(logPath) ? readFileSync(logPath, 'utf-8') : '')
-}
-
-// ---------------------------------------------------------------------------
-// Test state
-// ---------------------------------------------------------------------------
+type Projects = Record<string, Record<string, unknown>>
 
 let tempDirs: string[] = []
 let savedEnv: typeof process.env
+/** Base dir for persona fixture paths; fresh per test. */
+let baseDir: string
+/** Where recordStartupError writes during this test. */
+let logPath: string
 
 function newTempDir(): string {
-  const d = makeTempDir()
+  const d = mkdtempSync(join(tmpdir(), 'trust-bootstrap-test-'))
   tempDirs.push(d)
   return d
 }
 
+function claudeJsonPath(dir: string): string {
+  return join(dir, '.claude.json')
+}
+
+function writeClaudeJson(dir: string, data: object): void {
+  writeFileSync(claudeJsonPath(dir), JSON.stringify(data, null, 2), 'utf-8')
+}
+
+function projectsOf(dir: string): Projects {
+  const doc = JSON.parse(readFileSync(claudeJsonPath(dir), 'utf-8')) as { projects?: Projects }
+  return doc.projects ?? {}
+}
+
+function expectPatched(dir: string, cwd: string): void {
+  const entry = projectsOf(dir)[cwd]
+  expect(entry?.hasTrustDialogAccepted).toBe(true)
+  expect(entry?.hasCompletedProjectOnboarding).toBe(true)
+}
+
+function readStartupErrors(): string {
+  return existsSync(logPath) ? readFileSync(logPath, 'utf-8') : ''
+}
+
+/** Personas under this test's baseDir; names with spaces so key differs from name. */
+function personas(specs: PersonaSpec[], overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): PersonaConfig {
+  return makeMultiPersonaConfig(specs, baseDir, overrides)
+}
+
+/** One persona whose effective config dir is `dir`. */
+function onePersona(dir: string, name = 'Solo Bot'): PersonaConfig {
+  return personas([{ name, claude_config_dir: dir }])
+}
+
+beforeEach(() => {
+  savedEnv = { ...process.env }
+  baseDir = newTempDir()
+  const logDir = newTempDir()
+  process.env['SLACK_STATE_DIR'] = logDir
+  logPath = join(logDir, 'startup-errors.log')
+})
+
+afterEach(() => {
+  process.env = savedEnv as NodeJS.ProcessEnv
+  for (const d of tempDirs) {
+    try { rmSync(d, { recursive: true, force: true }) } catch { /* ignore */ }
+  }
+  tempDirs = []
+})
+
 // ---------------------------------------------------------------------------
-// Tests
+// Start pass
 // ---------------------------------------------------------------------------
 
-describe('trustBootstrap', () => {
-  beforeEach(() => {
-    savedEnv = { ...process.env }
+describe('trustBootstrap (start pass over personas)', () => {
+  test('missing project entry is created with both flags true; other entries preserved', async () => {
+    const dir = newTempDir()
+    writeClaudeJson(dir, { projects: { '/other/cwd': { hasTrustDialogAccepted: true } } })
+    const cfg = onePersona(dir)
+    const cwd = cfg.personas[0]!.working_directory
+
+    await trustBootstrap(cfg)
+
+    expectPatched(dir, cwd)
+    expect(projectsOf(dir)['/other/cwd']).toEqual({ hasTrustDialogAccepted: true })
   })
 
-  afterEach(() => {
-    process.env = savedEnv as NodeJS.ProcessEnv
-    for (const d of tempDirs) {
-      try { rmSync(d, { recursive: true }) } catch { /* ignore */ }
-    }
-    tempDirs = []
-  })
-
-  // -------------------------------------------------------------------------
-  // Case 1: Missing project entry → created with both flags true
-  // -------------------------------------------------------------------------
-
-  test('missing project entry is created with hasTrustDialogAccepted=true and hasCompletedProjectOnboarding=true', async () => {
-    const configDir = newTempDir()
-    const cwd = '/tmp/test-cwd-missing-entry'
-
-    // .claude.json exists but has no projects entry for this cwd
-    writeClaudeJson(configDir, { projects: { '/other/cwd': { hasTrustDialogAccepted: true } } })
-
-    const config = makeConfig({
-      claude_config_dir: configDir,
-      routes: { 'C_TEST': { cwd } },
+  test('existing false flags are flipped to true; unrelated keys survive', async () => {
+    const dir = newTempDir()
+    const cfg = onePersona(dir)
+    const cwd = cfg.personas[0]!.working_directory
+    writeClaudeJson(dir, {
+      projects: { [cwd]: { hasTrustDialogAccepted: false, hasCompletedProjectOnboarding: false, someOtherKey: 'preserved' } },
     })
 
-    await trustBootstrap(config)
+    await trustBootstrap(cfg)
 
-    const doc = readClaudeJson(configDir)
-    const projects = doc.projects as Record<string, Record<string, unknown>>
-    expect(projects[cwd]).toBeDefined()
-    expect(projects[cwd]!.hasTrustDialogAccepted).toBe(true)
-    expect(projects[cwd]!.hasCompletedProjectOnboarding).toBe(true)
-    // Existing entries are preserved
-    expect(projects['/other/cwd']).toBeDefined()
+    expectPatched(dir, cwd)
+    expect(projectsOf(dir)[cwd]!.someOtherKey).toBe('preserved')
   })
-
-  // -------------------------------------------------------------------------
-  // Case 2: Existing false → flipped to true
-  // -------------------------------------------------------------------------
-
-  test('existing false flags are flipped to true', async () => {
-    const configDir = newTempDir()
-    const cwd = '/tmp/test-cwd-false-flags'
-
-    writeClaudeJson(configDir, {
-      projects: {
-        [cwd]: {
-          hasTrustDialogAccepted: false,
-          hasCompletedProjectOnboarding: false,
-          someOtherKey: 'preserved',
-        },
-      },
-    })
-
-    const config = makeConfig({
-      claude_config_dir: configDir,
-      routes: { 'C_ALPHA': { cwd } },
-    })
-
-    await trustBootstrap(config)
-
-    const doc = readClaudeJson(configDir)
-    const projects = doc.projects as Record<string, Record<string, unknown>>
-    expect(projects[cwd]!.hasTrustDialogAccepted).toBe(true)
-    expect(projects[cwd]!.hasCompletedProjectOnboarding).toBe(true)
-    // Unrelated keys survive the patch
-    expect(projects[cwd]!.someOtherKey).toBe('preserved')
-  })
-
-  // -------------------------------------------------------------------------
-  // Case 3: Already true → no rewrite (idempotency via mtime)
-  // -------------------------------------------------------------------------
 
   test('file is not rewritten when both flags are already true (mtime unchanged)', async () => {
-    const configDir = newTempDir()
-    const cwd = '/tmp/test-cwd-idempotent'
+    const dir = newTempDir()
+    const cfg = onePersona(dir)
+    const cwd = cfg.personas[0]!.working_directory
+    writeClaudeJson(dir, { projects: { [cwd]: { hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true } } })
+    const mtimeBefore = statSync(claudeJsonPath(dir)).mtimeMs
 
-    writeClaudeJson(configDir, {
-      projects: {
-        [cwd]: {
-          hasTrustDialogAccepted: true,
-          hasCompletedProjectOnboarding: true,
-        },
-      },
-    })
+    await trustBootstrap(cfg)
 
-    const configPath = join(configDir, '.claude.json')
-    const mtimeBefore = statSync(configPath).mtimeMs
-
-    const config = makeConfig({
-      claude_config_dir: configDir,
-      routes: { 'C_IDEM': { cwd } },
-    })
-
-    await trustBootstrap(config)
-
-    const mtimeAfter = statSync(configPath).mtimeMs
-    expect(mtimeAfter).toBe(mtimeBefore)
+    expect(statSync(claudeJsonPath(dir)).mtimeMs).toBe(mtimeBefore)
   })
 
-  // -------------------------------------------------------------------------
-  // Case 4: Missing .claude.json → soft skip + recordStartupError
-  // -------------------------------------------------------------------------
+  test('missing .claude.json records trust-bootstrap-config-missing naming the persona key, no throw, file not created', async () => {
+    const dir = newTempDir()
+    const cfg = onePersona(dir)
+    const { key } = cfg.personas[0]!
 
-  test('missing .claude.json causes recordStartupError and no throw, file not created', async () => {
-    const configDir = newTempDir()
-    const logDir = newTempDir()
-    const cwd = '/tmp/test-cwd-no-file'
-    const configPath = join(configDir, '.claude.json')
+    await expect(trustBootstrap(cfg)).resolves.toBeUndefined()
 
-    const readLog = captureStartupErrors(logDir)
-
-    // Deliberately do NOT write .claude.json
-
-    const config = makeConfig({
-      claude_config_dir: configDir,
-      routes: { 'C_NOJSON': { cwd } },
-    })
-
-    // Must not throw
-    await expect(trustBootstrap(config)).resolves.toBeUndefined()
-
-    // File must NOT have been auto-created
-    expect(existsSync(configPath)).toBe(false)
-
-    // recordStartupError must have been called with the missing-config tag
-    const log = readLog()
+    expect(existsSync(claudeJsonPath(dir))).toBe(false)
+    const log = readStartupErrors()
     expect(log).toContain('[trust-bootstrap-config-missing]')
-    // Message must name the channel and the config path
-    expect(log).toContain('C_NOJSON')
-    expect(log).toContain(configPath)
+    expect(log).toContain(key)
+    expect(log).toContain(claudeJsonPath(dir))
   })
 
-  // -------------------------------------------------------------------------
-  // Case 5: Per-route claude_config_dir overrides top-level
-  // -------------------------------------------------------------------------
+  test('malformed JSON records trust-bootstrap-config-parse naming the persona key, no throw', async () => {
+    const dir = newTempDir()
+    writeFileSync(claudeJsonPath(dir), '{ not valid json }', 'utf-8')
+    const cfg = onePersona(dir)
+    const { key } = cfg.personas[0]!
 
-  test('per-route claude_config_dir overrides top-level claude_config_dir', async () => {
-    const dirA = newTempDir()   // top-level / route A
-    const dirB = newTempDir()   // per-route override for route B
-    const cwdA = '/tmp/test-cwd-route-a'
-    const cwdB = '/tmp/test-cwd-route-b'
+    await expect(trustBootstrap(cfg)).resolves.toBeUndefined()
 
-    writeClaudeJson(dirA, { projects: {} })
-    writeClaudeJson(dirB, { projects: {} })
-
-    const config = makeConfig({
-      claude_config_dir: dirA,
-      routes: {
-        'C_ROUTE_A': { cwd: cwdA },
-        'C_ROUTE_B': { cwd: cwdB, claude_config_dir: dirB },
-      },
-    })
-
-    await trustBootstrap(config)
-
-    // dirA's .claude.json should have cwdA patched (route A uses top-level)
-    const docA = readClaudeJson(dirA)
-    const projectsA = docA.projects as Record<string, Record<string, unknown>>
-    expect(projectsA[cwdA]?.hasTrustDialogAccepted).toBe(true)
-    expect(projectsA[cwdA]?.hasCompletedProjectOnboarding).toBe(true)
-    // dirA must NOT contain cwdB
-    expect(projectsA[cwdB]).toBeUndefined()
-
-    // dirB's .claude.json should have cwdB patched (route B overrides)
-    const docB = readClaudeJson(dirB)
-    const projectsB = docB.projects as Record<string, Record<string, unknown>>
-    expect(projectsB[cwdB]?.hasTrustDialogAccepted).toBe(true)
-    expect(projectsB[cwdB]?.hasCompletedProjectOnboarding).toBe(true)
-    // dirB must NOT contain cwdA
-    expect(projectsB[cwdA]).toBeUndefined()
-  })
-
-  // -------------------------------------------------------------------------
-  // Case 6 (additional): Malformed JSON → recordStartupError, no throw
-  // -------------------------------------------------------------------------
-  // Engineer implemented a dedicated 'trust-bootstrap-config-parse' error tag
-  // for malformed JSON. Covered here since it's a real code path not in the
-  // original five cases.
-
-  test('malformed JSON in .claude.json causes recordStartupError and no throw', async () => {
-    const configDir = newTempDir()
-    const logDir = newTempDir()
-    const cwd = '/tmp/test-cwd-bad-json'
-
-    writeFileSync(join(configDir, '.claude.json'), '{ not valid json }', 'utf-8')
-
-    const readLog = captureStartupErrors(logDir)
-
-    const config = makeConfig({
-      claude_config_dir: configDir,
-      routes: { 'C_BADJSON': { cwd } },
-    })
-
-    await expect(trustBootstrap(config)).resolves.toBeUndefined()
-
-    const log = readLog()
+    const log = readStartupErrors()
     expect(log).toContain('[trust-bootstrap-config-parse]')
-    expect(log).toContain('C_BADJSON')
+    expect(log).toContain(key)
   })
 
-  // -------------------------------------------------------------------------
-  // Case 7: No claude_config_dir anywhere → silent skip, no error logged
-  // -------------------------------------------------------------------------
-  // When neither the route nor the top-level RoutingConfig has a
-  // claude_config_dir, bootstrapRoute logs an info line and returns
-  // silently without calling recordStartupError or touching any file.
+  test('a per-persona claude_config_dir wins over the top-level one; a persona without one inherits it', async () => {
+    const topDir = newTempDir()
+    const ownDir = newTempDir()
+    writeClaudeJson(topDir, { projects: {} })
+    writeClaudeJson(ownDir, { projects: {} })
+    const cfg = personas(
+      [{ name: 'Inherits Bot' }, { name: 'Override Bot', claude_config_dir: ownDir }],
+      { claude_config_dir: topDir },
+    )
+    const [inherits, override] = cfg.personas
 
-  test('no claude_config_dir anywhere causes silent skip with no error logged and no file created', async () => {
-    const logDir = newTempDir()
-    const tempDir = newTempDir()
-    const cwd = '/tmp/test-cwd-no-config-dir'
+    await trustBootstrap(cfg)
 
-    const readLog = captureStartupErrors(logDir)
-
-    // No claude_config_dir at top level or per-route
-    const config = makeConfig({
-      routes: { 'C_NODIR': { cwd } },
-    })
-
-    // Must not throw
-    await expect(trustBootstrap(config)).resolves.toBeUndefined()
-
-    // No startup error must have been recorded
-    const log = readLog()
-    expect(log).not.toContain('trust-bootstrap')
-
-    // No .claude.json created in our temp dir (sanity check)
-    expect(existsSync(join(tempDir, '.claude.json'))).toBe(false)
+    expectPatched(topDir, inherits!.working_directory)
+    expect(projectsOf(topDir)[override!.working_directory]).toBeUndefined()
+    expectPatched(ownDir, override!.working_directory)
+    expect(projectsOf(ownDir)[inherits!.working_directory]).toBeUndefined()
   })
+
+  test('iterates every persona: two sharing one dir both patched there, a third patched in its own file, a malformed file first does not stop them', async () => {
+    const badDir = newTempDir()
+    const sharedDir = newTempDir()
+    const otherDir = newTempDir()
+    writeFileSync(claudeJsonPath(badDir), '{ not valid json }', 'utf-8')
+    writeClaudeJson(sharedDir, { projects: {} })
+    writeClaudeJson(otherDir, { projects: {} })
+    const cfg = personas([
+      { name: 'Broken Bot', claude_config_dir: badDir },
+      { name: 'Shared One', claude_config_dir: sharedDir },
+      { name: 'Shared Two', claude_config_dir: sharedDir },
+      { name: 'Other Bot', claude_config_dir: otherDir },
+    ])
+    const [broken, one, two, other] = cfg.personas
+
+    await expect(trustBootstrap(cfg)).resolves.toBeUndefined()
+
+    expectPatched(sharedDir, one!.working_directory)
+    expectPatched(sharedDir, two!.working_directory)
+    expect(Object.keys(projectsOf(sharedDir)).sort()).toEqual([one!.working_directory, two!.working_directory].sort())
+    expect(Object.keys(projectsOf(otherDir))).toEqual([other!.working_directory])
+    const log = readStartupErrors()
+    expect(log).toContain('[trust-bootstrap-config-parse]')
+    expect(log).toContain(broken!.key)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Per-launch patch
+// ---------------------------------------------------------------------------
+
+describe('trustPatchPersona (per-launch patch)', () => {
+  /** Call the per-launch patch; it must not throw and must never record a startup error. */
+  function launchPatch(cfg: PersonaConfig, index = 0): void {
+    expect(() => trustPatchPersona(cfg.personas[index]!)).not.toThrow()
+    expect(readStartupErrors()).toBe('')
+  }
+
+  test('patches exactly that persona\'s working directory in its effective dir, and a second call is idempotent', () => {
+    const topDir = newTempDir()
+    const ownDir = newTempDir()
+    writeClaudeJson(topDir, { projects: {} })
+    writeClaudeJson(ownDir, { projects: {} })
+    const cfg = personas(
+      [{ name: 'Launching Bot', claude_config_dir: ownDir }, { name: 'Idle Bot' }],
+      { claude_config_dir: topDir },
+    )
+    const topBefore = readFileSync(claudeJsonPath(topDir), 'utf-8')
+
+    launchPatch(cfg, 0)
+
+    expect(Object.keys(projectsOf(ownDir))).toEqual([cfg.personas[0]!.working_directory])
+    expectPatched(ownDir, cfg.personas[0]!.working_directory)
+    // The other persona's dir is untouched.
+    expect(readFileSync(claudeJsonPath(topDir), 'utf-8')).toBe(topBefore)
+
+    const mtimeAfterFirst = statSync(claudeJsonPath(ownDir)).mtimeMs
+    launchPatch(cfg, 0)
+    expect(statSync(claudeJsonPath(ownDir)).mtimeMs).toBe(mtimeAfterFirst)
+  })
+
+  test('two personas sharing one dir, patched one after the other, both end up patched in the shared file', () => {
+    const sharedDir = newTempDir()
+    writeClaudeJson(sharedDir, { projects: {} })
+    const cfg = personas(
+      [{ name: 'First Bot' }, { name: 'Second Bot' }],
+      { claude_config_dir: sharedDir },
+    )
+
+    launchPatch(cfg, 0)
+    launchPatch(cfg, 1)
+
+    expectPatched(sharedDir, cfg.personas[0]!.working_directory)
+    expectPatched(sharedDir, cfg.personas[1]!.working_directory)
+  })
+
+  test.each([
+    ['missing', undefined, 'trust-bootstrap-config-missing'],
+    ['malformed', '{ not valid json }', 'trust-bootstrap-config-parse'],
+  ] as const)('%s .claude.json: no throw, no startup error recorded, failure logged with the persona key', (_label, content, errorClass) => {
+    const dir = newTempDir()
+    if (content !== undefined) writeFileSync(claudeJsonPath(dir), content, 'utf-8')
+    const cfg = onePersona(dir, 'Failing Bot')
+    const lines: string[] = []
+    const spy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')) })
+    try {
+      launchPatch(cfg)
+    } finally {
+      spy.mockRestore()
+    }
+
+    expect(existsSync(logPath)).toBe(false)
+    // The file is left as it was: not created when missing, not rewritten when malformed.
+    if (content === undefined) expect(existsSync(claudeJsonPath(dir))).toBe(false)
+    else expect(readFileSync(claudeJsonPath(dir), 'utf-8')).toBe(content)
+    const failure = lines.find((l) => l.includes(errorClass))
+    expect(failure).toBeDefined()
+    expect(failure).toContain(cfg.personas[0]!.key)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// No configured claude_config_dir — fake-HOME subprocess
+// ---------------------------------------------------------------------------
+
+const TRUST_BOOTSTRAP_SRC = fileURLToPath(new URL('../src/trust-bootstrap.ts', import.meta.url))
+
+/** Call either entry point in the child, per `input.entry`. */
+const TRUST_ENTRY_CALL = `
+  if (input.entry === 'start') await mod.trustBootstrap(input.cfg);
+  else mod.trustPatchPersona(input.cfg.personas[0]);
+`
+
+describe('persona with no configured claude_config_dir (fake HOME)', () => {
+  test.each([['start', 'trustBootstrap'], ['launch', 'trustPatchPersona']] as const)(
+    '%s entry (%s) skips it: nothing written under the fake home, no startup error, skip line names the persona',
+    (entry) => {
+      const fakeHome = newTempDir()
+      const stateDir = newTempDir()
+      // Seed both default locations Claude could use, so a fallback to the
+      // default dir would show up as a rewrite rather than a silent miss.
+      const seeded = JSON.stringify({ projects: {} })
+      mkdirSync(join(fakeHome, '.claude'))
+      writeFileSync(join(fakeHome, '.claude', '.claude.json'), seeded, 'utf-8')
+      writeFileSync(join(fakeHome, '.claude.json'), seeded, 'utf-8')
+      // No persona-level and no top-level claude_config_dir.
+      const cfg = personas([{ name: 'No Dir Bot' }])
+      expect(cfg.personas[0]!.claude_config_dir).toBeUndefined()
+
+      const res = runInFakeHome({
+        modulePath: TRUST_BOOTSTRAP_SRC,
+        call: TRUST_ENTRY_CALL,
+        input: { entry, cfg },
+        home: fakeHome,
+        stateDir,
+      })
+
+      // Control: the child really ran under the fake HOME.
+      expect(res.observedHomedir).toBe(fakeHome)
+      expect(res.status).toBe(0)
+      // `.bun` is the child Bun runtime's own cache dir, not the code under test.
+      expect(readdirSync(fakeHome).filter((e) => e !== '.bun').sort()).toEqual(['.claude', '.claude.json'])
+      expect(readdirSync(join(fakeHome, '.claude'))).toEqual(['.claude.json'])
+      expect(readFileSync(join(fakeHome, '.claude', '.claude.json'), 'utf-8')).toBe(seeded)
+      expect(readFileSync(join(fakeHome, '.claude.json'), 'utf-8')).toBe(seeded)
+      expect(existsSync(join(stateDir, 'startup-errors.log'))).toBe(false)
+      const ref = renderPersonaRef(cfg.personas[0]!.name, cfg.personas[0]!.key)
+      expect(res.stderr).toContain(`${ref} has no claude_config_dir`)
+    },
+  )
 })

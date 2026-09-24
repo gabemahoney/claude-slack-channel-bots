@@ -5,6 +5,9 @@
  *   - buildTemplateParams() produces the SR-3.1 shape (relay_mode='on',
  *     label=['service=cscb'], deny=['AskUserQuestion'], overwrite: true,
  *     claude_args with the four required CLI flags).
+ *   - deriveMemoryReadAllowRules() emits one memory-subdir Read rule per
+ *     distinct effective config dir across the personas (b.fae F5,
+ *     b.av2 SR-6.2), never a config-dir root.
  *   - --append-system-prompt-file is appended when the file is readable,
  *     and omitted (with a stderr warning) when accessSync throws.
  *   - installSlackChannelBotTemplate() calls client.makeTemplate(...) with
@@ -15,9 +18,11 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 
+import { mkdtempSync, rmSync } from 'node:fs'
 import * as os from 'node:os'
+import { join } from 'node:path'
 
 import {
   buildTemplateParams,
@@ -30,7 +35,21 @@ import {
   errTemplateNameUnsafe,
   makeStubClient,
 } from './test-helpers/agent-director-stub.ts'
-import { makeRoutingConfig } from './test-helpers/routing-config.ts'
+import { makeMultiPersonaConfig, makePersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
+
+/**
+ * Fixture base dir for persona paths, fresh per test. Nothing is written into
+ * it (the code under test only builds strings), but paths stay unique to the
+ * test and never point at the real home.
+ */
+let baseDir: string
+beforeEach(() => { baseDir = mkdtempSync(join(os.tmpdir(), 'ad-template-test-')) })
+afterEach(() => { rmSync(baseDir, { recursive: true, force: true }) })
+
+/** The memory-subdir Read rule for an absolute config dir (`//` anchor). */
+function memoryRule(dir: string): string {
+  return `Read(/${dir}/projects/*/memory/**)`
+}
 
 // ---------------------------------------------------------------------------
 // buildTemplateParams — SR-3.1 shape
@@ -38,10 +57,10 @@ import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 
 describe('buildTemplateParams (SR-3.1)', () => {
   test('produces the canonical SR-3.1 shape with overwrite=true', () => {
-    const cfg = makeRoutingConfig({
+    const cfg = makePersonaConfig({
       mcp_config_path: '/abs/mcp.json',
       system_prompt_mode: 'none',
-    })
+    }, baseDir)
     const params = buildTemplateParams(cfg)
     expect(params.name).toBe('slack-channel-bot')
     expect(params.relay_mode).toBe('on')
@@ -60,87 +79,90 @@ describe('buildTemplateParams (SR-3.1)', () => {
   })
 
   // b.fae F5 (code-review follow-up) — the allow array is DERIVED from the
-  // distinct effective Claude config dirs across all routes (per-route ??
-  // top-level ?? Claude's default `~/.claude`), one memory-scoped Read rule
-  // per dir, sorted + deduped. NEVER the config-dir root (holds live creds).
+  // distinct effective Claude config dirs across all personas (per-persona,
+  // else top-level, else Claude's default `~/.claude`), one memory-scoped Read
+  // rule per dir, sorted by dir + deduped. NEVER the config-dir root (holds
+  // live creds). os.homedir() is read only to compute an expected string.
   test('allow: default — no config dirs set → exactly the ~/.claude rule from os.homedir() (b.fae F5)', () => {
-    const cfg = makeRoutingConfig({ mcp_config_path: '/abs/mcp.json', system_prompt_mode: 'none' })
+    const cfg = makePersonaConfig({ mcp_config_path: '/abs/mcp.json', system_prompt_mode: 'none' }, baseDir)
     const params = buildTemplateParams(cfg)
     // Built from os.homedir(), NOT a hardcoded /home/horde.
-    const expected = `Read(//${os.homedir().replace(/^\/+/, '')}/.claude/projects/*/memory/**)`
-    expect(params.allow).toEqual([expected])
+    expect(params.allow).toEqual([memoryRule(join(os.homedir(), '.claude'))])
     // deny surface is unchanged by F5.
     expect(params.deny).toEqual(['AskUserQuestion'])
   })
 
-  test('allow: mixed routes (per-route infhub dir + a route with no dir) → both rules, sorted + deduped (b.fae F5)', () => {
-    const cfg = makeRoutingConfig({
-      mcp_config_path: '/abs/mcp.json',
-      system_prompt_mode: 'none',
-      routes: {
-        // Per-route override → infhub memory dir.
-        C_INFHUB: { cwd: '/tmp/a', claude_config_dir: '/home/horde/.claude-infhub' },
-        // No per-route + no top-level → Claude's default ~/.claude.
-        C_DEFAULT: { cwd: '/tmp/b' },
-        // A second route sharing the same infhub dir must NOT add a 3rd rule.
-        C_INFHUB2: { cwd: '/tmp/c', claude_config_dir: '/home/horde/.claude-infhub' },
-      },
-    })
-    const params = buildTemplateParams(cfg)
-    const defaultRule = `Read(//${os.homedir().replace(/^\/+/, '')}/.claude/projects/*/memory/**)`
-    const infhubRule = 'Read(//home/horde/.claude-infhub/projects/*/memory/**)'
-    // Sort is over the DIR paths, not the emitted rule strings: as dirs,
-    // '/home/horde/.claude' < '/home/horde/.claude-infhub' (shorter prefix
-    // first), so the default rule precedes the infhub rule.
-    expect(params.allow).toEqual([defaultRule, infhubRule])
-    // Deduped: three routes, two distinct dirs → two rules.
-    expect(params.allow?.length).toBe(2)
-  })
-
   test('no allow rule covers a config-dir root (credentials guard, b.fae F5)', () => {
-    const cfg = makeRoutingConfig({
-      mcp_config_path: '/abs/mcp.json',
-      system_prompt_mode: 'none',
-      routes: {
-        C_INFHUB: { cwd: '/tmp/a', claude_config_dir: '/home/horde/.claude-infhub' },
-        C_DEFAULT: { cwd: '/tmp/b' },
-      },
-    })
-    const params = buildTemplateParams(cfg)
-    const allow = params.allow ?? []
+    const infhub = join(baseDir, '.claude-infhub')
+    const cfg = makeMultiPersonaConfig(
+      [{ name: 'Infhub Bot', claude_config_dir: infhub }, { name: 'Default Bot' }],
+      baseDir,
+      { mcp_config_path: '/abs/mcp.json', system_prompt_mode: 'none' },
+    )
+    const allow = buildTemplateParams(cfg).allow ?? []
     // The rejected-in-triage broad glob and any bare-root variant must be absent.
-    expect(allow).not.toContain('Read(//home/horde/.claude-infhub/**)')
-    expect(allow).not.toContain('Read(//home/horde/.claude/**)')
+    expect(allow).not.toContain(`Read(/${infhub}/**)`)
+    expect(allow).not.toContain(`Read(/${join(os.homedir(), '.claude')}/**)`)
     // Belt-and-suspenders: every rule must reach into projects/*/memory, so no
     // rule can resolve to the config-dir root, settings.json, or .claude.json.
-    expect(allow.length).toBeGreaterThan(0)
+    expect(allow.length).toBe(2)
     for (const rule of allow) {
       expect(rule.endsWith('/projects/*/memory/**)')).toBe(true)
     }
   })
+})
 
-  test('deriveMemoryReadAllowRules: top-level dir applies to routes without a per-route override (b.fae F5)', () => {
-    const cfg = makeRoutingConfig({
-      claude_config_dir: '/opt/shared-config',
-      routes: {
-        C_A: { cwd: '/tmp/a' },
-        C_B: { cwd: '/tmp/b', claude_config_dir: '/home/horde/.claude-infhub' },
-      },
-    })
-    // C_A → top-level /opt/shared-config; C_B → per-route infhub. Two rules.
-    expect(deriveMemoryReadAllowRules(cfg)).toEqual(
-      [
-        'Read(//opt/shared-config/projects/*/memory/**)',
-        'Read(//home/horde/.claude-infhub/projects/*/memory/**)',
-      ].sort(),
-    )
+// ---------------------------------------------------------------------------
+// deriveMemoryReadAllowRules — rule derivation over personas (b.fae F5, b.av2 SR-6.2)
+// ---------------------------------------------------------------------------
+
+describe('deriveMemoryReadAllowRules over personas', () => {
+  // Every case passes an explicit home under the test's temp dir, so the
+  // default dir (and the sort order against it) never depends on the real
+  // HOME. Expected rules are listed in dir order, not re-sorted: as dirs,
+  // `<home>/.claude` sorts before `<home>/.claude-infhub` (shorter prefix),
+  // while as rule strings the order would flip ('-' < '/'), so these rows
+  // also pin that the sort is over dirs.
+  interface Dirs { home: string; defaultDir: string; infhub: string; shared: string }
+  type Row = [label: string, config: (d: Dirs) => [PersonaSpec[], topLevel?: string], expectedDirs: (d: Dirs) => string[]]
+  const rows: Row[] = [
+    ['no config dir on any persona → exactly the default rule',
+      () => [[{ name: 'A Bot' }, { name: 'B Bot' }]],
+      (d) => [d.defaultDir]],
+    ['a persona with its own dir + one with none (+ one sharing that dir) → both rules, sorted + deduped (b.fae F5)',
+      (d) => [[{ name: 'Infhub Bot', claude_config_dir: d.infhub }, { name: 'Default Bot' }, { name: 'Infhub Two', claude_config_dir: d.infhub }]],
+      (d) => [d.defaultDir, d.infhub]],
+    ['several personas sharing one top-level dir → one rule',
+      (d) => [[{ name: 'A Bot' }, { name: 'B Bot' }, { name: 'C Bot' }], d.shared],
+      (d) => [d.shared]],
+    ['a top-level dir applies to personas without their own override',
+      (d) => [[{ name: 'Inherits Bot' }, { name: 'Override Bot', claude_config_dir: d.infhub }], d.shared],
+      (d) => [d.infhub, d.shared]],
+    ['zero personas → still the default rule',
+      () => [[]],
+      (d) => [d.defaultDir]],
+  ]
+
+  test.each(rows)('%s', (_label, config, expectedDirs) => {
+    const home = join(baseDir, 'home')
+    const d: Dirs = {
+      home,
+      defaultDir: join(home, '.claude'),
+      infhub: join(home, '.claude-infhub'),
+      shared: join(baseDir, 'shared-config'),
+    }
+    const [specs, topLevel] = config(d)
+    const cfg = makeMultiPersonaConfig(specs, baseDir, topLevel === undefined ? {} : { claude_config_dir: topLevel })
+    expect(deriveMemoryReadAllowRules(cfg, home)).toEqual(expectedDirs(d).map(memoryRule))
   })
+})
 
+describe('buildTemplateParams: --append-system-prompt-file (SR-3.1)', () => {
   test('appends --append-system-prompt-file when readable', () => {
-    const cfg = makeRoutingConfig({
+    const cfg = makePersonaConfig({
       append_system_prompt_file: '/etc/cscb/extra.md',
       system_prompt_mode: 'append',
-    })
+    }, baseDir)
     const params = buildTemplateParams(cfg, {
       accessSync: (_p, _mode) => { /* readable: no throw */ },
       stderrWrite: () => { /* should not be called */ },
@@ -150,10 +172,10 @@ describe('buildTemplateParams (SR-3.1)', () => {
   })
 
   test('omits --append-system-prompt-file when unreadable + emits one stderr warning', () => {
-    const cfg = makeRoutingConfig({
+    const cfg = makePersonaConfig({
       append_system_prompt_file: '/etc/cscb/extra.md',
       system_prompt_mode: 'append',
-    })
+    }, baseDir)
     const warnings: string[] = []
     const params = buildTemplateParams(cfg, {
       accessSync: () => { throw new Error('EACCES') },
@@ -167,10 +189,10 @@ describe('buildTemplateParams (SR-3.1)', () => {
   })
 
   test('does NOT append --append-system-prompt-file when system_prompt_mode=none', () => {
-    const cfg = makeRoutingConfig({
+    const cfg = makePersonaConfig({
       append_system_prompt_file: '/etc/cscb/extra.md',
       system_prompt_mode: 'none',
-    })
+    }, baseDir)
     let accessSyncCalled = false
     const params = buildTemplateParams(cfg, {
       accessSync: () => { accessSyncCalled = true },
@@ -182,7 +204,7 @@ describe('buildTemplateParams (SR-3.1)', () => {
   })
 
   test('does NOT append --append-system-prompt-file when path is absent', () => {
-    const cfg = makeRoutingConfig({ system_prompt_mode: 'append' })
+    const cfg = makePersonaConfig({ system_prompt_mode: 'append' }, baseDir)
     const params = buildTemplateParams(cfg, {
       accessSync: () => { /* not reached */ },
       stderrWrite: () => { /* not reached */ },
@@ -197,17 +219,15 @@ describe('buildTemplateParams (SR-3.1)', () => {
 
 describe('installSlackChannelBotTemplate (SR-3.2)', () => {
   test('calls client.makeTemplate with the SR-3.1 params and returns the result', async () => {
-    const calls: Parameters<typeof buildTemplateParams>[0][] = []
     const makeTemplateCalls: import('agent-director').MakeTemplateParams[] = []
     const stub = makeStubClient({
       makeTemplateResult: cannedMakeTemplate('/home/u/.agent-director/templates/slack-channel-bot.toml'),
       makeTemplateCalls,
     })
-    const cfg = makeRoutingConfig({
+    const cfg = makePersonaConfig({
       mcp_config_path: '/abs/mcp.json',
       system_prompt_mode: 'none',
-    })
-    calls.push(cfg)
+    }, baseDir)
     const result = await installSlackChannelBotTemplate(cfg, {
       getClient: () => stub,
       recordStartupError: () => { throw new Error('should not record on success') },
@@ -233,7 +253,7 @@ describe('installSlackChannelBotTemplate (SR-3.2)', () => {
     const stub = makeStubClient({ makeTemplateError: errTemplateMalformed() })
     const recorded: { classLabel: string; message: string }[] = []
     let exited = false
-    const cfg = makeRoutingConfig({ system_prompt_mode: 'none' })
+    const cfg = makePersonaConfig({ system_prompt_mode: 'none' }, baseDir)
     await expect(
       installSlackChannelBotTemplate(cfg, {
         getClient: () => stub,
@@ -250,7 +270,7 @@ describe('installSlackChannelBotTemplate (SR-3.2)', () => {
   test('ErrTemplateNameUnsafe → records + exits', async () => {
     const stub = makeStubClient({ makeTemplateError: errTemplateNameUnsafe() })
     const recorded: { classLabel: string; message: string }[] = []
-    const cfg = makeRoutingConfig({ system_prompt_mode: 'none' })
+    const cfg = makePersonaConfig({ system_prompt_mode: 'none' }, baseDir)
     await expect(
       installSlackChannelBotTemplate(cfg, {
         getClient: () => stub,
@@ -265,7 +285,7 @@ describe('installSlackChannelBotTemplate (SR-3.2)', () => {
   test('non-typed Error → records + exits', async () => {
     const stub = makeStubClient({ makeTemplateError: new Error('FFI handle invalid') })
     const recorded: { classLabel: string; message: string }[] = []
-    const cfg = makeRoutingConfig({ system_prompt_mode: 'none' })
+    const cfg = makePersonaConfig({ system_prompt_mode: 'none' }, baseDir)
     await expect(
       installSlackChannelBotTemplate(cfg, {
         getClient: () => stub,

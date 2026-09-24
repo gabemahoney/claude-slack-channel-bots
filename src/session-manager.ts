@@ -24,7 +24,9 @@
  *
  * Both row checks go through `compareRowToPersona`. At most one launch per
  * persona is in flight (b.av2 SR-6.3): a concurrent call for the same key
- * joins the running ladder.
+ * joins the running ladder. Every ladder run first calls the installed
+ * pre-launch trust patcher (`setPreLaunchTrustPatcher`, b.av2 SR-6.2), so the
+ * persona's `.claude.json` trust flags are set before any spawn or resume.
  *
  * The start sweep (`reconcileOrphans`, b.av2 SR-6.3) lists every
  * `service=cscb` spawn and kills+deletes any with no `persona` label, a
@@ -82,7 +84,13 @@ import { firstNoticeLine, notifySafely, type PersonaNoticeOptions, type PersonaN
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { RESTART_FAILURE_CAP } from './restart.ts'
 import { isDryRun } from './tokens.ts'
-import { makeDefaultArchiveCount, rfc3339ToEpochSeconds } from './jsonl-persistence-check.ts'
+// Import cycle with jsonl-persistence-check.ts: use these imports only inside functions, never at module top level.
+import {
+  UNATTRIBUTABLE_ZERO_REASON,
+  makeDefaultArchiveCount,
+  personaArchiveEvidenceScope,
+  rfc3339ToEpochSeconds,
+} from './jsonl-persistence-check.ts'
 import { realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 
@@ -1462,11 +1470,13 @@ async function diagnoseJsonlMissing(
   // Reuse b.zak's archive-count helper (message_archive_db, read-only, absent
   // file → null == no evidence). started_at bounds "since spawn".
   const startedAtEpoch = row.started_at ? rfc3339ToEpochSeconds(row.started_at) : null
-  // Counted over the persona key, which is the channel ID under the
-  // route->persona adapter; E3 Task 4 counts the persona's `delivery: all` channels.
+  // b.av2 SR-7.4: count only the persona's `delivery: all` channels; a zero
+  // count is evidence of idleness only when the archive can see all of the
+  // persona's traffic (no `mentions` channel, DMs off).
+  const scope = personaArchiveEvidenceScope(persona)
   const archiveCount = makeDefaultArchiveCount(config)
   const archivedSinceSpawn =
-    startedAtEpoch === null ? null : archiveCount(key, startedAtEpoch)
+    startedAtEpoch === null ? null : archiveCount(scope.channelIds, startedAtEpoch, ref)
 
   if (archivedSinceSpawn !== null && archivedSinceSpawn > 0) {
     // LOST: conversation provably happened since spawn, yet no transcript
@@ -1489,13 +1499,15 @@ async function diagnoseJsonlMissing(
     return 'lost'
   }
 
-  // Below archivedSinceSpawn is 0 or null. Only 0 (archive consulted, no
-  // activity since spawn) is evidence-based never-created. null means we never
-  // got a usable count — that is INCONCLUSIVE, not reassurance.
-  if (archivedSinceSpawn === 0) {
+  // Below archivedSinceSpawn is 0 or null. Only an attributable 0 (archive
+  // consulted, no activity since spawn in channels that carry all of the
+  // persona's traffic) is evidence-based never-created. null means we never got
+  // a usable count, and an unattributable 0 proves nothing — both are
+  // INCONCLUSIVE, not reassurance.
+  if (archivedSinceSpawn === 0 && scope.zeroIsAttributable) {
     // NEVER-CREATED (evidence-based): the archive was consulted and proved zero
     // archived activity since spawn. Claude writes the .jsonl lazily on first
-    // message; an idle-since-spawn channel simply never had one. Expected and
+    // message; a persona idle since spawn simply never had one. Expected and
     // lossless — quiet log, no error, no persona notice, counted as an ordinary
     // fresh-spawn.
     console.error(
@@ -1512,11 +1524,14 @@ async function diagnoseJsonlMissing(
   //   (c-config) no message_archive_db configured → diagnosis is structurally
   //              impossible; actionable "turn on the archive" hint.
   //   (c-other) archive configured but file-missing / unreadable / query threw.
+  //   (d) b.av2 SR-7.4: a 0 count the archive cannot attribute to the persona.
   let reason: string
   if (startedAtEpoch === null) {
     reason =
       `the row's started_at is absent or unparseable (started_at=${row.started_at ?? '(none)'}), ` +
       `so "since spawn" could not be bounded and the archive was not consulted`
+  } else if (archivedSinceSpawn === 0) {
+    reason = UNATTRIBUTABLE_ZERO_REASON
   } else if (!config.message_archive_db) {
     reason =
       `no message archive is configured (message_archive_db unset), so there is no evidence source to ` +
@@ -1796,6 +1811,44 @@ async function resumeOrFreshSpawn(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Pre-launch trust patch (b.av2 SR-6.2)
+// ---------------------------------------------------------------------------
+
+/** Patches the persona's `.claude.json` trust flags before a launch. */
+export type PreLaunchTrustPatcher = (persona: Persona) => void
+
+/**
+ * The one pre-launch trust patcher. Production installs the single-persona
+ * trust patch (`trustPatchPersona` in `src/trust-bootstrap.ts`). With none
+ * installed (unit tests, the integration driver) no patch runs and nothing
+ * is written.
+ */
+let preLaunchTrustPatcher: PreLaunchTrustPatcher | undefined
+
+/** Install the pre-launch trust patcher (production: `server.ts`). */
+export function setPreLaunchTrustPatcher(patcher: PreLaunchTrustPatcher): void {
+  preLaunchTrustPatcher = patcher
+}
+
+/** Test-only seam: remove any installed pre-launch trust patcher. */
+export function _resetPreLaunchTrustPatcher(): void {
+  preLaunchTrustPatcher = undefined
+}
+
+/**
+ * Run the installed pre-launch trust patcher for `persona`. A throw is logged
+ * with the persona reference and never reaches the ladder.
+ */
+function runPreLaunchTrustPatch(persona: Persona, ref: string): void {
+  if (!preLaunchTrustPatcher) return
+  try {
+    preLaunchTrustPatcher(persona)
+  } catch (err) {
+    console.error(`[slack] spawnForPersona: pre-launch trust patch failed for ${ref} — launching anyway: ${describeThrownValue(err)}`)
+  }
+}
+
 /**
  * In-flight launches by persona key (b.av2 SR-6.3): at most one ladder per
  * persona runs at a time. Holds only unsettled launches; an entry is removed
@@ -1826,7 +1879,9 @@ export function isLaunchInFlight(key: string): boolean {
  *    key is in flight, a second call joins it and receives its result instead
  *    of starting a second ladder. The start's worker pool and the restart
  *    module's `launchSession` both come through here. Keys are independent.
- * 3. Attempt `client.spawn(...)`. On success → done.
+ * 3. Run the installed pre-launch trust patcher for the persona (b.av2
+ *    SR-6.2) once, before any spawn or resume the ladder makes.
+ *    Then attempt `client.spawn(...)`. On success → done.
  * 4. `ErrInstanceIdCollision` → `client.get(...)`, then:
  *    - the row's `cwd` differs from the persona's working_directory by real
  *      path (`compareRowToPersona`) → kill + delete + fresh spawn, whatever
@@ -1876,6 +1931,11 @@ async function runPersonaLadder(
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
   const params = buildSpawnParams(persona, config)
+
+  // b.av2 SR-6.2: the trust patch precedes every launch. Running it once here,
+  // before the first agent-director spawn or resume this ladder can make,
+  // covers every path below (the patch is idempotent).
+  runPreLaunchTrustPatch(persona, ref)
 
   // Attempt fresh spawn ---
   try {
@@ -1973,7 +2033,7 @@ async function runPersonaLadder(
   // delete and spawn fresh in the persona's working directory.
   if (!compareRowToPersona(row, persona, spawnHomeDir()).cwdMatches) {
     console.error(
-      `[slack] spawnForPersona: ${ref} row cwd=${row.cwd} differs from working_directory=${persona.working_directory} (state=${state}) — replacing the row: kill+delete+fresh`,
+      `[slack] spawnForPersona: ${ref} row cwd=${row.cwd || '<none>'} differs from working_directory=${persona.working_directory} (state=${state}) — replacing the row: kill+delete+fresh`,
     )
     return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: true })
   }

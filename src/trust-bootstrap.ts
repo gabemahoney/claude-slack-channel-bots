@@ -1,16 +1,31 @@
 /**
- * trust-bootstrap.ts — Patch .claude.json for every routed cwd at startup.
+ * trust-bootstrap.ts — Pre-accept the trust dialog and project onboarding in
+ * each persona's `.claude.json` (b.av2 SR-6.2).
  *
- * For each route in routingConfig, resolves the effective claude_config_dir
- * (per-route overrides top-level), then ensures that
- * `projects[<cwd>].hasTrustDialogAccepted` and
- * `projects[<cwd>].hasCompletedProjectOnboarding` are both `true` in
- * `<claude_config_dir>/.claude.json`. Idempotent: no write if both are already
- * set. Missing .claude.json is a soft failure: log + recordStartupError, do
- * NOT auto-create the file, do NOT throw.
+ * For a persona, ensures that `projects[<working_directory>].hasTrustDialogAccepted`
+ * and `projects[<working_directory>].hasCompletedProjectOnboarding` are both
+ * `true` in `<claude_config_dir>/.claude.json`, where `claude_config_dir` is
+ * the persona's effective directory (per-persona, else top-level). Two entry
+ * points share one patch:
  *
- * Never throws to the caller. Per-route errors are caught and recorded via
- * recordStartupError so one bad route cannot block the rest.
+ *   - `trustBootstrap(personaConfig)` — the start pass: patches once per
+ *     applied persona before anything launches. Failures are recorded with
+ *     `recordStartupError` (classes `trust-bootstrap`,
+ *     `trust-bootstrap-config-missing`, `trust-bootstrap-config-parse`).
+ *   - `trustPatchPersona(persona)` — the per-launch patch: the session manager
+ *     calls it (through its pre-launch patcher seam) before every spawn,
+ *     resume or restart. Failures are only logged, never recorded, so a
+ *     restart adds nothing to `startup-errors.log`.
+ *
+ * The patch is idempotent (no write when both flags are already `true`),
+ * writes atomically (`.tmp` + rename), never creates a missing `.claude.json`
+ * and never throws. A persona with no configured `claude_config_dir` is logged
+ * and skipped: Claude uses its own default and there is nothing to patch.
+ *
+ * The read-modify-write is fully synchronous (no `await` between reading and
+ * writing): the start's worker pool launches several personas at once and two
+ * personas can share one config dir, so an interleaved patch of the same file
+ * could otherwise lose an update.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -18,7 +33,8 @@
 import { readFileSync, writeFileSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { type RoutingConfig } from './config.ts'
+import { type Persona, type PersonaConfig } from './config.ts'
+import { renderPersonaRef } from './persona-identity.ts'
 import { recordStartupError } from './startup-errors.ts'
 
 // ---------------------------------------------------------------------------
@@ -36,27 +52,48 @@ interface ClaudeJson {
   [key: string]: unknown
 }
 
+/** Where a patch failure goes: its startup-error class, detail text and cause. */
+type TrustPatchFailureSink = (errorClass: string, detail: string, cause: unknown) => void
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /**
- * Patch `<claude_config_dir>/.claude.json` for every route in routingConfig
- * so that the trust dialog and project onboarding are pre-accepted. Idempotent.
- * Never throws.
+ * Start pass: patch `<claude_config_dir>/.claude.json` for every applied
+ * persona so that the trust dialog and project onboarding are pre-accepted.
+ * Each persona is patched once, whatever the number of channels it lists.
+ * Idempotent. Never throws; per-persona failures are recorded with
+ * `recordStartupError` so one bad persona cannot block the rest.
  */
-export async function trustBootstrap(routingConfig: RoutingConfig): Promise<void> {
-  for (const [channelId, route] of Object.entries(routingConfig.routes)) {
+export async function trustBootstrap(personaConfig: PersonaConfig): Promise<void> {
+  for (const persona of personaConfig.personas) {
     try {
-      await bootstrapRoute(channelId, route.cwd, route.claude_config_dir ?? routingConfig.claude_config_dir)
+      patchPersonaClaudeJson(persona, recordStartupError)
     } catch (err) {
-      // Catch-all: any per-route failure that slips past inner handlers
+      // Catch-all: any per-persona failure that slips past inner handlers
       recordStartupError(
         'trust-bootstrap',
-        `unexpected error for channel=${channelId} cwd=${route.cwd}`,
+        `unexpected error for ${personaRef(persona)} cwd=${persona.working_directory}`,
         err,
       )
     }
+  }
+}
+
+/**
+ * Per-launch patch for one persona (b.av2 SR-6.2): the same patch as the start
+ * pass, run before every spawn, resume or restart. Failures are logged only —
+ * never recorded with `recordStartupError` — and never thrown.
+ */
+export function trustPatchPersona(persona: Persona): void {
+  const logFailure: TrustPatchFailureSink = (errorClass, detail, cause) => {
+    console.error(`[slack] trust-bootstrap: pre-launch patch failed [${errorClass}] ${detail} — ${describeCause(cause)}`)
+  }
+  try {
+    patchPersonaClaudeJson(persona, logFailure)
+  } catch (err) {
+    logFailure('trust-bootstrap', `unexpected error for ${personaRef(persona)} cwd=${persona.working_directory}`, err)
   }
 }
 
@@ -64,17 +101,28 @@ export async function trustBootstrap(routingConfig: RoutingConfig): Promise<void
 // Private helpers
 // ---------------------------------------------------------------------------
 
-async function bootstrapRoute(
-  channelId: string,
-  cwd: string,
-  claudeConfigDir: string | undefined,
-): Promise<void> {
+function personaRef(persona: Pick<Persona, 'name' | 'key'>): string {
+  return renderPersonaRef(persona.name, persona.key)
+}
+
+function describeCause(cause: unknown): string {
+  if (cause instanceof Error) return `${cause.name}: ${cause.message}`
+  return String(cause)
+}
+
+/**
+ * The patch shared by both entry points. Fully synchronous. Read and parse
+ * failures go to `onFailure`; a write failure throws to the caller's catch-all.
+ */
+function patchPersonaClaudeJson(persona: Persona, onFailure: TrustPatchFailureSink): void {
+  const ref = personaRef(persona)
+  const cwd = persona.working_directory
+  const claudeConfigDir = persona.claude_config_dir
+
   // If no claude_config_dir is configured, Claude uses its own default and
   // there is nothing for us to patch.
   if (claudeConfigDir === undefined) {
-    console.error(
-      `[slack] trust-bootstrap: channel=${channelId} has no claude_config_dir — skipping`,
-    )
+    console.error(`[slack] trust-bootstrap: ${ref} has no claude_config_dir — skipping`)
     return
   }
 
@@ -86,13 +134,9 @@ async function bootstrapRoute(
     raw = readFileSync(configPath, 'utf-8')
   } catch (err) {
     console.error(
-      `[slack] trust-bootstrap: channel=${channelId} .claude.json not found or unreadable at ${configPath} — skipping`,
+      `[slack] trust-bootstrap: ${ref} .claude.json not found or unreadable at ${configPath} — skipping`,
     )
-    recordStartupError(
-      'trust-bootstrap-config-missing',
-      `channel=${channelId}: cannot read ${configPath}`,
-      err,
-    )
+    onFailure('trust-bootstrap-config-missing', `${ref}: cannot read ${configPath}`, err)
     return
   }
 
@@ -101,11 +145,7 @@ async function bootstrapRoute(
   try {
     doc = JSON.parse(raw) as ClaudeJson
   } catch (err) {
-    recordStartupError(
-      'trust-bootstrap-config-parse',
-      `channel=${channelId}: malformed JSON in ${configPath}`,
-      err,
-    )
+    onFailure('trust-bootstrap-config-parse', `${ref}: malformed JSON in ${configPath}`, err)
     return
   }
 
@@ -125,7 +165,7 @@ async function bootstrapRoute(
   project.hasCompletedProjectOnboarding = true
   doc.projects[cwd] = project
 
-  // Write atomically (match saveAccess pattern in server.ts: write to .tmp + rename)
+  // Write atomically: write to .tmp + rename
   const tmp = configPath + '.tmp'
   writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf-8')
   renameSync(tmp, configPath)

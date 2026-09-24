@@ -6,7 +6,9 @@
  * Follows the tests/trust-bootstrap.test.ts pattern:
  *   - mkdtempSync per-test temp directories with afterEach cleanup
  *   - process.env save/restore in beforeEach/afterEach
- *   - SLACK_STATE_DIR redirection to capture startup-errors.log
+ *   - SLACK_STATE_DIR redirected to a per-test temp dir in beforeEach, so no
+ *     recordStartupError write (e.g. jq absent on the host) lands under HOME;
+ *     tests that read the log point it at their own dir
  *   - Real fs; no mocks
  *
  * No hardcoded managed command literals (SR-6.1): expectations either derive
@@ -17,7 +19,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import {
   mkdtempSync,
   mkdirSync,
@@ -29,13 +31,21 @@ import {
   existsSync,
   symlinkSync,
   chmodSync,
+  realpathSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { spawnSync } from 'node:child_process'
+import { type PersonaConfig, resolvePersonaConfig } from '../src/config.ts'
+import { renderPersonaRef } from '../src/persona-identity.ts'
 import { stopHookBootstrap } from '../src/stop-hook-bootstrap.ts'
-import { makeRoutingConfig } from './test-helpers/routing-config.ts'
+import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
+import {
+  makeMultiPersonaConfig,
+  makePersona,
+  makePersonaConfigInput,
+  type PersonaSpec,
+} from './test-helpers/persona-config.ts'
 
 /**
  * Absolute path to src/stop-hook-bootstrap.ts, used by subprocess runners so
@@ -45,51 +55,16 @@ const STOP_HOOK_BOOTSTRAP_SRC = fileURLToPath(
   new URL('../src/stop-hook-bootstrap.ts', import.meta.url),
 )
 
-/**
- * Run stopHookBootstrap in a fresh Bun subprocess with a launch-time HOME so
- * that node:os `homedir()` inside the child resolves to `fakeHome` instead of
- * the operator's real home directory. Bun snapshots HOME at process launch, so
- * mutating process.env in-test is insufficient.
- *
- * The child prints one control line `HOMEDIR::<path>` to stdout so the parent
- * can assert HOME was actually honored before trusting the refusal behavior.
- */
-interface SubprocessResult {
-  status: number | null
-  stdout: string
-  stderr: string
-  observedHomedir: string
-}
+/** Child-side call for runInFakeHome: `input` is the persona config. */
+const STOP_HOOK_CALL = 'mod.stopHookBootstrap(input);'
 
-function runBootstrapInSubprocess(
-  cfg: unknown,
-  env: { HOME: string; SLACK_STATE_DIR: string; extra?: Record<string, string> },
-): SubprocessResult {
-  const script = `
-    const { homedir } = require('node:os');
-    process.stdout.write('HOMEDIR::' + homedir() + '\\n');
-    const cfg = JSON.parse(process.env.STOP_HOOK_CFG_JSON);
-    const mod = await import(${JSON.stringify(STOP_HOOK_BOOTSTRAP_SRC)});
-    mod.stopHookBootstrap(cfg);
-  `
-  const childEnv: Record<string, string> = {
-    // Deliberately do NOT forward parent's HOME. Keep PATH so `bun` and `sh`
-    // (used inside the module for jq detection) resolve.
-    PATH: process.env['PATH'] ?? '/usr/bin:/bin',
-    HOME: env.HOME,
-    SLACK_STATE_DIR: env.SLACK_STATE_DIR,
-    ...(env.extra ?? {}),
-    STOP_HOOK_CFG_JSON: JSON.stringify(cfg),
-  }
-  const res = spawnSync('bun', ['-e', script], {
-    env: childEnv,
-    encoding: 'utf-8',
-  })
-  const stdout = res.stdout ?? ''
-  const stderr = res.stderr ?? ''
-  const m = stdout.match(/^HOMEDIR::(.*)$/m)
-  const observedHomedir = m ? m[1]! : ''
-  return { status: res.status, stdout, stderr, observedHomedir }
+/**
+ * Run stopHookBootstrap in a fresh Bun subprocess whose launch-time HOME is
+ * `home` (see tests/test-helpers/fake-home-subprocess.ts), so the personal
+ * ~/.claude the bootstrap refuses lies inside the fake home.
+ */
+function runBootstrapInFakeHome(cfg: PersonaConfig, home: string, stateDir: string) {
+  return runInFakeHome({ modulePath: STOP_HOOK_BOOTSTRAP_SRC, call: STOP_HOOK_CALL, input: cfg, home, stateDir })
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +133,44 @@ function pathWithoutJq(): string {
   return newTempDir()
 }
 
+/**
+ * A resolved persona configuration whose personas' default paths sit in a
+ * fresh temp dir of their own. `claude_config_dir` / `stop_hook_bootstrap`
+ * in `overrides` are the top-level values each persona inherits unless its
+ * spec sets its own.
+ */
+function personaConfigOf(
+  specs: PersonaSpec[],
+  overrides: Partial<Omit<PersonaConfig, 'personas'>> = {},
+): PersonaConfig {
+  return makeMultiPersonaConfig(specs, newTempDir(), overrides)
+}
+
+/** One persona inheriting the top-level `claude_config_dir` = `dir`. */
+function singlePersonaConfig(dir: string): PersonaConfig {
+  return personaConfigOf([{}], { claude_config_dir: dir })
+}
+
+/** Run `fn` with console.error captured; returns the joined lines. */
+function captureConsoleError(fn: () => void): string {
+  const spy = spyOn(console, 'error').mockImplementation(() => {})
+  try {
+    fn()
+    return spy.mock.calls.map((args) => args.map(String).join(' ')).join('\n')
+  } finally {
+    spy.mockRestore()
+  }
+}
+
+/** A settings.json seed holding one managed-only Stop group. */
+function seedManagedEntry(dir: string): void {
+  writeFileSync(
+    join(dir, 'settings.json'),
+    JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: '/seed/slack-reply-guard.sh' }] }] } }),
+    'utf-8',
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Test state
 // ---------------------------------------------------------------------------
@@ -178,6 +191,9 @@ function newTempDir(): string {
 describe('stopHookBootstrap (SR-6.4)', () => {
   beforeEach(() => {
     savedEnv = { ...process.env }
+    // Every test's startup-errors.log goes to a temp dir, never under HOME:
+    // a host without jq records stop-hook-bootstrap-jq-missing on every run.
+    process.env['SLACK_STATE_DIR'] = newTempDir()
   })
 
   afterEach(() => {
@@ -194,10 +210,7 @@ describe('stopHookBootstrap (SR-6.4)', () => {
 
   test('creates settings.json with canonical managed group when missing', () => {
     const dir = newTempDir()
-    const cfg = makeRoutingConfig({
-      claude_config_dir: dir,
-      routes: { 'C_CREATE': { cwd: '/tmp/x' } },
-    })
+    const cfg = singlePersonaConfig(dir)
 
     expect(() => stopHookBootstrap(cfg)).not.toThrow()
 
@@ -243,10 +256,7 @@ describe('stopHookBootstrap (SR-6.4)', () => {
     // Wait a moment so any write would show up
     await new Promise((r) => setTimeout(r, 15))
 
-    const cfg = makeRoutingConfig({
-      claude_config_dir: dir,
-      routes: { 'C_IDEM': { cwd: '/tmp/x' } },
-    })
+    const cfg = singlePersonaConfig(dir)
     stopHookBootstrap(cfg)
 
     expect(statSync(path).mtimeMs).toBe(mtimeBefore)
@@ -270,10 +280,7 @@ describe('stopHookBootstrap (SR-6.4)', () => {
       'utf-8',
     )
 
-    const cfg = makeRoutingConfig({
-      claude_config_dir: dir,
-      routes: { 'C_STALE': { cwd: '/tmp/x' } },
-    })
+    const cfg = singlePersonaConfig(dir)
     stopHookBootstrap(cfg)
 
     const doc = readSettings(dir)
@@ -310,10 +317,7 @@ describe('stopHookBootstrap (SR-6.4)', () => {
     }
     writeFileSync(join(dir, 'settings.json'), JSON.stringify(seed, null, 2), 'utf-8')
 
-    const cfg = makeRoutingConfig({
-      claude_config_dir: dir,
-      routes: { 'C_PRESERVE': { cwd: '/tmp/x' } },
-    })
+    const cfg = singlePersonaConfig(dir)
     stopHookBootstrap(cfg)
 
     const doc = readSettings(dir)
@@ -352,10 +356,7 @@ describe('stopHookBootstrap (SR-6.4)', () => {
     writeFileSync(path, bad, 'utf-8')
     const before = readFileSync(path, 'utf-8')
 
-    const cfg = makeRoutingConfig({
-      claude_config_dir: dir,
-      routes: { 'C_BADJSON': { cwd: '/tmp/x' } },
-    })
+    const cfg = singlePersonaConfig(dir)
 
     expect(() => stopHookBootstrap(cfg)).not.toThrow()
 
@@ -367,38 +368,55 @@ describe('stopHookBootstrap (SR-6.4)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Skip routes with no effective claude_config_dir
+  // Skip personas with no effective claude_config_dir
   // -------------------------------------------------------------------------
 
-  test('skips a route with no effective claude_config_dir and writes nothing', () => {
-    const cwdTemp = newTempDir()
-    const cfg = makeRoutingConfig({
-      // No top-level claude_config_dir
-      claude_config_dir: undefined,
-      routes: { 'C_NODIR': { cwd: cwdTemp } },
-    })
+  test('skips a persona with no effective claude_config_dir, names it, and writes nothing for it', () => {
+    const workDir = newTempDir()
+    const otherDir = newTempDir()
+    // No top-level claude_config_dir: the first persona has no effective dir;
+    // the second sets its own, so the skip must not stop it being patched.
+    const cfg = personaConfigOf([
+      { name: 'no_dir_bot', working_directory: workDir },
+      { name: 'own_dir_bot', claude_config_dir: otherDir },
+    ])
+    expect(cfg.personas[0]!.claude_config_dir).toBeUndefined()
 
-    expect(() => stopHookBootstrap(cfg)).not.toThrow()
+    let stderr = ''
+    expect(() => { stderr = captureConsoleError(() => stopHookBootstrap(cfg)) }).not.toThrow()
 
-    // Nothing written into cwd (guard against resolve("") land) or into that temp
-    expect(existsSync(join(cwdTemp, 'settings.json'))).toBe(false)
+    // Nothing written into the skipped persona's working directory.
+    expect(readdirSync(workDir)).toEqual([])
+    expect(stderr).toContain(`${renderPersonaRef('no_dir_bot')} has no claude_config_dir — skipping`)
+    // The other persona's dir is still patched.
+    expect(managedEntriesOf(readSettings(otherDir))).toHaveLength(1)
   })
 
   // -------------------------------------------------------------------------
   // Skip empty/whitespace-only dir
   // -------------------------------------------------------------------------
 
-  test('empty/whitespace-only claude_config_dir is skipped; nothing written to cwd', () => {
+  test.each([
+    ['empty', ''],
+    ['whitespace-only', '   '],
+  ])('%s persona claude_config_dir is skipped; nothing written to cwd', (_label, blank) => {
+    // Run from an empty temp cwd so a resolve("") regression would land there,
+    // never in the repo checkout.
+    const cwdTemp = newTempDir()
     const cwdBefore = process.cwd()
-    const cfg = makeRoutingConfig({
-      claude_config_dir: '   ',
-      routes: { 'C_BLANK': { cwd: '/tmp/x' } },
-    })
+    const cfg = personaConfigOf([{ name: 'blank_dir_bot', claude_config_dir: blank }])
 
-    expect(() => stopHookBootstrap(cfg)).not.toThrow()
+    let stderr = ''
+    process.chdir(cwdTemp)
+    try {
+      expect(() => { stderr = captureConsoleError(() => stopHookBootstrap(cfg)) }).not.toThrow()
+    } finally {
+      process.chdir(cwdBefore)
+    }
 
     // Nothing written to cwd
-    expect(existsSync(join(cwdBefore, 'settings.json'))).toBe(false)
+    expect(readdirSync(cwdTemp)).toEqual([])
+    expect(stderr).toContain(`${renderPersonaRef('blank_dir_bot')} has empty/whitespace claude_config_dir — skipping`)
   })
 
   // -------------------------------------------------------------------------
@@ -420,12 +438,13 @@ describe('stopHookBootstrap (SR-6.4)', () => {
     const logDir = newTempDir()
     const logPath = join(logDir, 'startup-errors.log')
 
-    const cfg = makeRoutingConfig({
-      claude_config_dir: personalClaude,
-      routes: { 'C_HOME': { cwd: '/tmp/x' } },
-    })
+    // Two personas share the personal dir: one refusal, naming both.
+    const cfg = personaConfigOf(
+      [{ name: 'home_bot_a' }, { name: 'home_bot_b' }],
+      { claude_config_dir: personalClaude },
+    )
 
-    const res = runBootstrapInSubprocess(cfg, { HOME: fakeHome, SLACK_STATE_DIR: logDir })
+    const res = runBootstrapInFakeHome(cfg, fakeHome, logDir)
 
     // Control: prove the subprocess actually saw the fake HOME.
     expect(res.observedHomedir).toBe(fakeHome)
@@ -440,6 +459,8 @@ describe('stopHookBootstrap (SR-6.4)', () => {
     expect(existsSync(logPath)).toBe(true)
     const log = readFileSync(logPath, 'utf-8')
     expect(log).toContain('stop-hook-bootstrap-refuse-home')
+    expect(log).toContain(`personas=${renderPersonaRef('home_bot_a')}, ${renderPersonaRef('home_bot_b')}`)
+    expect(log.match(/stop-hook-bootstrap-refuse-home/g)).toHaveLength(1)
   })
 
   // -------------------------------------------------------------------------
@@ -463,12 +484,9 @@ describe('stopHookBootstrap (SR-6.4)', () => {
     const logDir = newTempDir()
     const logPath = join(logDir, 'startup-errors.log')
 
-    const cfg = makeRoutingConfig({
-      claude_config_dir: linkPath,
-      routes: { 'C_HOMELINK': { cwd: '/tmp/x' } },
-    })
+    const cfg = personaConfigOf([{ name: 'home_link_bot', claude_config_dir: linkPath }])
 
-    const res = runBootstrapInSubprocess(cfg, { HOME: fakeHome, SLACK_STATE_DIR: logDir })
+    const res = runBootstrapInFakeHome(cfg, fakeHome, logDir)
 
     // Control: subprocess actually saw the fake HOME.
     expect(res.observedHomedir).toBe(fakeHome)
@@ -488,22 +506,110 @@ describe('stopHookBootstrap (SR-6.4)', () => {
   // Shared-dir mixed flags → install
   // -------------------------------------------------------------------------
 
-  test('shared dir with mixed per-route flags → managed entry is installed (any-enabled wins)', () => {
+  // Both orders: the enabled persona wins whether it comes first or last.
+  test.each([
+    ['disabled first', [false, true]],
+    ['enabled first', [true, false]],
+  ] as const)('shared dir with mixed per-persona flags (%s) → managed entry is installed (any-enabled wins)', (_label, flags) => {
     const dir = newTempDir()
-    const cfg = makeRoutingConfig({
-      claude_config_dir: dir,
-      stop_hook_bootstrap: false, // default disabled
-      routes: {
-        'C_OFF': { cwd: '/tmp/a', stop_hook_bootstrap: false },
-        'C_ON': { cwd: '/tmp/b', stop_hook_bootstrap: true },
-      },
-    })
+    const cfg = personaConfigOf(
+      flags.map((flag, i) => ({ name: `mixed_bot_${i}`, stop_hook_bootstrap: flag })),
+      { claude_config_dir: dir, stop_hook_bootstrap: false }, // default disabled
+    )
 
     stopHookBootstrap(cfg)
 
     const doc = readSettings(dir)
     const managed = managedEntriesOf(doc)
     expect(managed).toHaveLength(1)
+    expect(managed[0]!.command).toBe(expectedCanonicalCommand())
+  })
+
+  // -------------------------------------------------------------------------
+  // Grouping is per effective dir: each dir follows only its own personas
+  // -------------------------------------------------------------------------
+
+  test('personas in different dirs are grouped per dir: the enabled dir installs, the disabled dir removes', () => {
+    const onDir = newTempDir()
+    const offDir = newTempDir()
+    seedManagedEntry(offDir)
+    const cfg = personaConfigOf(
+      [
+        { name: 'on_bot', claude_config_dir: onDir, stop_hook_bootstrap: true },
+        { name: 'off_bot', claude_config_dir: offDir, stop_hook_bootstrap: false },
+      ],
+      { stop_hook_bootstrap: false },
+    )
+
+    stopHookBootstrap(cfg)
+
+    expect(managedEntriesOf(readSettings(onDir))).toHaveLength(1)
+    // The disabled dir's managed entry is removed and its emptied group pruned.
+    expect(managedEntriesOf(readSettings(offDir))).toHaveLength(0)
+    expect(stopGroupsOf(readSettings(offDir))).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // Grouping keys on the real path: a symlink to a dir joins that dir's group
+  // -------------------------------------------------------------------------
+
+  /**
+   * A real target under this test's temp dir and a symlink to it, also under
+   * a temp dir. The target is resolved with realpathSync first, since the OS
+   * temp dir may itself be a symlink.
+   */
+  function realAndLink(makeTarget: (path: string) => void): { real: string; link: string } {
+    const real = join(realpathSync(newTempDir()), 'target')
+    makeTarget(real)
+    const link = join(newTempDir(), 'config-link')
+    symlinkSync(real, link)
+    return { real, link }
+  }
+
+  // One persona reaches the dir directly and the other through the symlink;
+  // one is enabled and one is disabled. Grouped by configured path instead,
+  // they would form two groups and the later one would win, so one order
+  // would end with the entry removed.
+  test.each([
+    ['enabled persona first, on the real path', 'real'],
+    ['disabled persona first, on the real path', 'link'],
+  ] as const)('two personas reaching one dir through a symlink form one group (%s): exactly one managed entry', (_label, enabledVia) => {
+    const { real, link } = realAndLink((p) => mkdirSync(p))
+    const enabled = { name: 'enabled_bot', claude_config_dir: enabledVia === 'real' ? real : link, stop_hook_bootstrap: true }
+    const disabled = { name: 'disabled_bot', claude_config_dir: enabledVia === 'real' ? link : real, stop_hook_bootstrap: false }
+    const specs = enabledVia === 'real' ? [enabled, disabled] : [disabled, enabled]
+    const cfg = personaConfigOf(specs, { stop_hook_bootstrap: false })
+
+    stopHookBootstrap(cfg)
+
+    expect(managedEntriesOf(readSettings(real)).map((h) => h.command)).toEqual([expectedCanonicalCommand()])
+    // One settings.json, written once (no leftover .tmp); the link still points at the real dir.
+    expect(readdirSync(real)).toEqual(['settings.json'])
+    expect(realpathSync(link)).toBe(real)
+  })
+
+  // The shared path is a regular file, so the one group is recorded as not a
+  // directory: one record, naming both personas, with the first persona's
+  // configured path as the dir.
+  test.each([
+    ['real path first', 'real'],
+    ['symlink first', 'link'],
+  ] as const)('diagnostics for a dir reached through a symlink name both personas once (%s)', (_label, first) => {
+    const { real, link } = realAndLink((p) => writeFileSync(p, 'not a dir', 'utf-8'))
+    const paths = first === 'real' ? [real, link] : [link, real]
+    const cfg = personaConfigOf([
+      { name: 'first_bot', claude_config_dir: paths[0]!, stop_hook_bootstrap: true },
+      { name: 'second_bot', claude_config_dir: paths[1]!, stop_hook_bootstrap: false },
+    ])
+    const readLog = captureStartupErrors(newTempDir())
+
+    stopHookBootstrap(cfg)
+
+    const records = readLog().split('\n').filter((l) => l.includes('[stop-hook-bootstrap-not-a-dir]'))
+    expect(records).toHaveLength(1)
+    expect(records[0]).toContain(`claude_config_dir ${paths[0]} is not a directory`)
+    expect(records[0]).toContain(`personas=${renderPersonaRef('first_bot')}, ${renderPersonaRef('second_bot')}`)
+    expect(readFileSync(real, 'utf-8')).toBe('not a dir')
   })
 
   // -------------------------------------------------------------------------
@@ -533,14 +639,13 @@ describe('stopHookBootstrap (SR-6.4)', () => {
     }
     writeFileSync(join(dir, 'settings.json'), JSON.stringify(seed, null, 2), 'utf-8')
 
-    const cfg = makeRoutingConfig({
-      claude_config_dir: dir,
-      stop_hook_bootstrap: false,
-      routes: {
-        'C_A': { cwd: '/tmp/a', stop_hook_bootstrap: false },
-        'C_B': { cwd: '/tmp/b', stop_hook_bootstrap: false },
-      },
-    })
+    const cfg = personaConfigOf(
+      [
+        { name: 'off_bot_a', stop_hook_bootstrap: false },
+        { name: 'off_bot_b', stop_hook_bootstrap: false },
+      ],
+      { claude_config_dir: dir, stop_hook_bootstrap: false },
+    )
 
     stopHookBootstrap(cfg)
 
@@ -578,10 +683,7 @@ describe('stopHookBootstrap (SR-6.4)', () => {
     }
     writeFileSync(join(dir, 'settings.json'), JSON.stringify(seed, null, 2), 'utf-8')
 
-    const cfg = makeRoutingConfig({
-      claude_config_dir: dir,
-      routes: { 'C_DUP': { cwd: '/tmp/x' } },
-    })
+    const cfg = singlePersonaConfig(dir)
     stopHookBootstrap(cfg)
 
     const doc = readSettings(dir)
@@ -614,10 +716,7 @@ describe('stopHookBootstrap (SR-6.4)', () => {
 
   test('managed entry shape has NO matcher field, is its own group, and command is an existing absolute path', () => {
     const dir = newTempDir()
-    const cfg = makeRoutingConfig({
-      claude_config_dir: dir,
-      routes: { 'C_SHAPE': { cwd: '/tmp/x' } },
-    })
+    const cfg = singlePersonaConfig(dir)
     stopHookBootstrap(cfg)
 
     const doc = readSettings(dir)
@@ -654,10 +753,7 @@ describe('stopHookBootstrap (SR-6.4)', () => {
     const emptyBin = pathWithoutJq()
     process.env['PATH'] = emptyBin
 
-    const cfg = makeRoutingConfig({
-      claude_config_dir: dir,
-      routes: { 'C_JQ': { cwd: '/tmp/x' } },
-    })
+    const cfg = singlePersonaConfig(dir)
 
     expect(() => stopHookBootstrap(cfg)).not.toThrow()
 
@@ -675,22 +771,73 @@ describe('stopHookBootstrap (SR-6.4)', () => {
   test('one dir failing (malformed JSON) does not prevent the other dir from being patched', () => {
     const goodDir = newTempDir()
     const badDir = newTempDir()
+    const logDir = newTempDir()
+    const readLog = captureStartupErrors(logDir)
     writeFileSync(join(badDir, 'settings.json'), '{not json', 'utf-8')
 
-    const cfg = makeRoutingConfig({
-      claude_config_dir: goodDir, // fallback
-      routes: {
-        'C_GOOD': { cwd: '/tmp/g', claude_config_dir: goodDir },
-        'C_BAD':  { cwd: '/tmp/b', claude_config_dir: badDir },
-      },
-    })
+    // Top-level dir is goodDir; the bad persona overrides it with badDir, so
+    // using the top-level dir instead of the persona's would never reach
+    // badDir. The bad persona comes first, so a failure that aborted the loop
+    // would leave goodDir unpatched.
+    const cfg = personaConfigOf(
+      [
+        { name: 'bad_bot', claude_config_dir: badDir },
+        { name: 'good_bot', claude_config_dir: goodDir },
+      ],
+      { claude_config_dir: goodDir },
+    )
 
     expect(() => stopHookBootstrap(cfg)).not.toThrow()
 
     // Good dir patched
     const doc = readSettings(goodDir)
     expect(managedEntriesOf(doc)).toHaveLength(1)
-    // Bad dir left untouched
+    // Bad dir was attempted (parse failure recorded for its file) and left untouched
+    const log = readLog()
+    expect(log).toContain('stop-hook-bootstrap-settings-parse')
+    expect(log).toContain(join(badDir, 'settings.json'))
     expect(readFileSync(join(badDir, 'settings.json'), 'utf-8')).toBe('{not json')
+  })
+
+  // -------------------------------------------------------------------------
+  // Per-persona stop_hook_bootstrap overrides the top-level default
+  // -------------------------------------------------------------------------
+
+  /**
+   * Resolve a file-form config through the persona loader, so the per-persona
+   * override and the top-level default are applied exactly as at start.
+   */
+  function resolvedFromFile(dir: string, topLevel: boolean, own: boolean | undefined): PersonaConfig {
+    const base = newTempDir()
+    const persona = makePersona({ name: 'override_bot', claude_config_dir: dir }, base)
+    const raw = makePersonaConfigInput(
+      {
+        stop_hook_bootstrap: topLevel,
+        personas: [own === undefined ? persona : { ...persona, stop_hook_bootstrap: own }],
+      },
+      base,
+    )
+    return resolvePersonaConfig(raw, base, base)
+  }
+
+  // The persona's own flag wins over the top-level default; without one it
+  // follows the default. The dir starts with a managed entry, so a removal is
+  // visible, and the expected count is the effective flag.
+  test.each([
+    [true, false, false],
+    [false, true, true],
+    [false, undefined, false],
+    [true, undefined, true],
+  ] as const)('top-level stop_hook_bootstrap=%p, persona=%p → effective %p', (topLevel, own, effective) => {
+    const dir = newTempDir()
+    seedManagedEntry(dir)
+    const cfg = resolvedFromFile(dir, topLevel, own)
+    expect(cfg.personas[0]!.stop_hook_bootstrap).toBe(effective)
+
+    stopHookBootstrap(cfg)
+
+    expect(managedEntriesOf(readSettings(dir)).map((h) => h.command)).toEqual(
+      effective ? [expectedCanonicalCommand()] : [],
+    )
   })
 })
