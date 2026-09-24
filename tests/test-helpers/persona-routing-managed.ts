@@ -5,7 +5,7 @@
  *
  * `makeManagedRouting(h, baseDir, opts?)` takes a connection harness
  * (`makeConnectionHarness`) and builds `createPersonaRouting` with the same
- * seams the server passes: `getBotUserId` from the harness's identity getter
+ * seams the server passes: `getBotIdentity` from the harness's identity getter
  * (`createPersonaIdentityLookup`), `clientFor` from its client lookup
  * (`createPersonaClientLookup`), the user-name lookup on the receiving
  * persona's own client (`users.info`, the ID when it has no client), and the
@@ -55,7 +55,7 @@ export function makeManagedRouting(h: ConnectionHarness, baseDir: string, opts: 
   const logs: string[] = []
   const routing = createPersonaRouting({
     getPersonaConfig: () => h.config,
-    getBotUserId: (key) => h.identityFor(key)?.botUserId,
+    getBotIdentity: (key) => h.identityFor(key),
     clientFor: h.clientFor,
     resolveUserName: async (key, userId) => {
       const client = h.clientFor(key)

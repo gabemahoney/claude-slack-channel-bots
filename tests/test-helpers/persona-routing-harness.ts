@@ -1,7 +1,7 @@
 /**
  * test-helpers/persona-routing-harness.ts — The real inbound routing module
  * over stub Slack clients, the real registry and the real restart state
- * (b.av2 SR-4.1, SR-4.2 core, SR-13.4).
+ * (b.av2 SR-4.1, SR-4.2 as decided by src/delivery-decision.ts, SR-13.4).
  *
  * `makeRoutingHarness(specs, baseDir, opts?)` builds the real
  * `createPersonaRouting` from src/persona-routing.ts over:
@@ -316,9 +316,9 @@ export function makeRoutingHarness(
       h.order.push('config')
       return h.config
     },
-    getBotUserId: (key) => {
+    getBotIdentity: (key) => {
       h.order.push(`identity:${key}`)
-      return byKey(key)?.stub.identity.botUserId
+      return byKey(key)?.stub.identity
     },
     clientFor: (key) => clients.clientFor(key) as unknown as WebClient | undefined,
     resolveUserName: opts.resolveUserName ?? ((key, userId) => resolver(key).resolveUserName(userId)),

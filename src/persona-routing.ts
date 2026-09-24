@@ -1,6 +1,6 @@
 /**
  * persona-routing.ts — Inbound Slack delivery per persona (b.av2 SR-4.1 and
- * SR-4.2 core, SR-10.3 `unclaimed-channel`).
+ * SR-4.2, SR-10.3 `unclaimed-channel`).
  *
  * Every `message` and `app_mention` event a persona's connection receives
  * feeds that persona's single pipeline:
@@ -10,26 +10,28 @@
  *    seam (unconditionally, before any decision) and that persona's pipeline
  *    runs. Each persona's run is isolated: a throw is caught and logged, naming
  *    the persona, and never stops another persona's run.
- * 2. Decision (`decideDelivery`, pure): the core channel rules against the
- *    receiving persona P, in order: today's subtype handling (a subtype other
- *    than `file_share`, or no `user`, is dropped); P's own messages (author
- *    user = P's bot user) are dropped; DMs are dropped; a channel P is not
- *    configured into is dropped; `delivery: all` delivers; `delivery: mentions`
- *    delivers only on P's direct user mention (`<@U…>`).
+ * 2. Decision: one call to `decideDelivery` (`src/delivery-decision.ts`, the
+ *    only module holding channel-delivery rules) with P's key, bot user ID,
+ *    bot ID and channel entries and the applied personas. It returns deliver
+ *    with `via`, or drop with a reason.
  * 3. Drop logging: a channel no applied persona lists logs one
  *    `unclaimed-channel` line naming the channel and P; a channel another
  *    applied persona lists logs nothing; a DM logs one interim
- *    `persona-dm-dropped` line. No drop line carries message text.
+ *    `persona-dm-dropped` line; any other reason logs one plain line naming
+ *    the author ID. No drop line carries message text.
  * 4. Dispatch: P's session is looked up by persona key; the ack reaction is
  *    added through P's client; the message goes as `notifications/claude/channel`
- *    to P's session only, with `chat_id` set to the source conversation.
+ *    to P's session only, with `chat_id` set to the source conversation. The
+ *    meta `user` is the author's display name, or for an author without
+ *    `user` (webhook, `bot_message`) the event's `username`, else its
+ *    `bot_profile.name`, else its bot ID.
  * 5. Lost message: when P has no live session, or its session has lost its GET
  *    stream, the message is dropped, a human-triggered restart of P is
  *    scheduled when the restart guards allow (b.kvq / b.9cj), and one reply
  *    saying so is posted in the source conversation through P's client.
  *
- * Deferred rules and where they are completed: the full subtype list, bot-ID
- * self-exclusion, broadcasts and dedupe (E4); DM delivery (E6, which replaces
+ * Deferred rules and where they are completed: dedupe and the `via`,
+ * `user_id` and `bot_id` meta (E4 Task 2); DM delivery (E6, which replaces
  * the interim DM drop and its line); the lost-message notice to P's
  * destination (E8, which replaces the source-conversation replies below); the
  * ack reaction's source and keying (E9; today it comes from `access.json`).
@@ -46,7 +48,14 @@
  */
 
 import type { WebClient } from '@slack/web-api'
-import type { ChannelEntry, Persona, PersonaConfig } from './config.ts'
+import type { Persona, PersonaConfig } from './config.ts'
+import type { SlackBotIdentity } from './persona-slack-validation.ts'
+import {
+  decideDelivery,
+  stripPersonaMention,
+  type DeliverDecision,
+  type DropDecision,
+} from './delivery-decision.ts'
 import { hasGetStreamKey, sanitizeFilename, type Access } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import {
@@ -64,17 +73,17 @@ import { trackAck } from './ack-tracker.ts'
 // Constants
 // ---------------------------------------------------------------------------
 
-/** The one subtype today's rules deliver (a message with a file attached). */
-const FILE_SHARE_SUBTYPE = 'file_share'
-
-/** `channel_type` of a direct message. */
-const DM_CHANNEL_TYPE = 'im'
-
 /** MCP notification method that carries an inbound message to a session. */
 const CHANNEL_NOTIFICATION_METHOD = 'notifications/claude/channel'
 
 /** Characters of message text the dispatch log line shows. */
 const DISPATCH_LOG_TEXT_LENGTH = 80
+
+/** Meta `user` label when an author carries no name and no bot ID (unreachable after the decision). */
+const UNKNOWN_AUTHOR = 'unknown'
+
+/** Author shown in a drop line for an event with neither `user` nor `bot_id`. */
+const NO_AUTHOR_PLACEHOLDER = '(none)'
 
 // Lost-message replies (b.kvq / b.9cj), posted in the source conversation.
 // Kept byte-identical to the pre-persona replies until E8 replaces them.
@@ -105,33 +114,6 @@ export const LOST_MESSAGE_STARTED_REPLY =
 /** The Slack `ack` handed over with a Socket Mode event. */
 export type SlackAck = () => Promise<void> | void
 
-/** Why a persona does not get a message (`decideDelivery`). */
-export type DeliveryDropReason =
-  | 'non-message'
-  | 'own'
-  | 'dm'
-  | 'channel-not-configured'
-  | 'not-mentioned'
-
-/** Outcome of `decideDelivery` for one receiving persona. */
-export type DeliveryDecision =
-  | { action: 'deliver' }
-  | { action: 'drop'; reason: Exclude<DeliveryDropReason, 'channel-not-configured'> }
-  | {
-      action: 'drop'
-      reason: 'channel-not-configured'
-      /** True when no applied persona lists the channel (an `unclaimed-channel` line is due). */
-      unclaimed: boolean
-    }
-
-/** The receiving persona P as `decideDelivery` sees it. */
-export interface DeliveryPersona {
-  /** P's bot user ID. Empty (or absent) never matches an author or a mention. */
-  botUserId: string | undefined
-  /** P's channel entries. */
-  channels: readonly ChannelEntry[]
-}
-
 /** Which restart-guard outcome a lost message gets (b.kvq / b.9cj). */
 export type LostMessageOutcome = 'restarting' | 'auto-restart-disabled' | 'capped' | 'recover'
 
@@ -142,8 +124,11 @@ export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_res
 export interface PersonaRoutingDeps {
   /** The applied persona config, read at call time; null or undefined when there is none. */
   getPersonaConfig(): PersonaRoutingConfig | null | undefined
-  /** P's bot user ID, or empty / undefined when it is not known. */
-  getBotUserId(key: string): string | undefined
+  /**
+   * P's bot identity (bot user ID and bot ID; the placeholder identity in dry
+   * run), or undefined when it is not known.
+   */
+  getBotIdentity(key: string): SlackBotIdentity | undefined
   /** P's validated Slack Web client, or undefined when it has none (before validation, dry run). */
   clientFor(key: string): WebClient | undefined
   /** A user's display name, looked up through P's client. */
@@ -169,61 +154,6 @@ export interface PersonaRouting {
    * run has settled. Never rejects.
    */
   receive(event: unknown, ack: SlackAck, personaKeys: string | readonly string[]): Promise<void>
-}
-
-// ---------------------------------------------------------------------------
-// Pure core decision (b.av2 SR-4.2 core)
-// ---------------------------------------------------------------------------
-
-/**
- * Decide whether the receiving persona P gets `event`. `applied` is every
- * applied persona's channel entries (P's included), used only to tell an
- * unclaimed channel from one another persona lists. Pure. Rules, in order:
- *
- * 1. Today's subtype handling (E4 completes it): a subtype other than
- *    `file_share`, an event with no `user` and an event with no channel are
- *    `non-message`.
- * 2. The author `user` equals P's bot user ID: `own`.
- * 3. `channel_type` `im`: `dm` (DMs are not delivered yet).
- * 4. The channel is not among P's channel entries: `channel-not-configured`,
- *    with `unclaimed` true when no applied persona lists it.
- * 5. `delivery: all` delivers.
- * 6. `delivery: mentions` delivers only when the text contains `<@P's bot
- *    user ID>`; otherwise `not-mentioned`.
- */
-export function decideDelivery(
-  event: unknown,
-  persona: DeliveryPersona,
-  applied: readonly { channels: readonly ChannelEntry[] }[],
-): DeliveryDecision {
-  if (typeof event !== 'object' || event === null) return { action: 'drop', reason: 'non-message' }
-  const ev = event as Record<string, unknown>
-  if (ev['subtype'] && ev['subtype'] !== FILE_SHARE_SUBTYPE) return { action: 'drop', reason: 'non-message' }
-  if (!ev['user']) return { action: 'drop', reason: 'non-message' }
-  const channel = ev['channel']
-  if (typeof channel !== 'string' || channel === '') return { action: 'drop', reason: 'non-message' }
-
-  const botUserId = persona.botUserId ?? ''
-  if (botUserId !== '' && ev['user'] === botUserId) return { action: 'drop', reason: 'own' }
-
-  if (ev['channel_type'] === DM_CHANNEL_TYPE) return { action: 'drop', reason: 'dm' }
-
-  const entry = persona.channels.find((c) => c.id === channel)
-  if (!entry) {
-    const claimed = applied.some((p) => p.channels.some((c) => c.id === channel))
-    return { action: 'drop', reason: 'channel-not-configured', unclaimed: !claimed }
-  }
-
-  if (entry.delivery === 'all') return { action: 'deliver' }
-  return mentionsPersona(ev['text'], botUserId)
-    ? { action: 'deliver' }
-    : { action: 'drop', reason: 'not-mentioned' }
-}
-
-/** True when `text` contains the direct user mention `<@botUserId>`; never for an empty ID. */
-function mentionsPersona(text: unknown, botUserId: string): boolean {
-  if (botUserId === '' || typeof text !== 'string') return false
-  return text.includes(`<@${botUserId}>`)
 }
 
 // ---------------------------------------------------------------------------
@@ -309,16 +239,20 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       deps.log(`[slack] persona-routing: no applied persona with key=${key} — event not delivered to it`)
       return
     }
-    const botUserId = deps.getBotUserId(key) ?? ''
-    const decision = decideDelivery(ev, { botUserId, channels: persona.channels }, config.personas)
+    const identity = deps.getBotIdentity(key)
+    const decision = decideDelivery(
+      ev,
+      { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels },
+      config.personas,
+    )
     if (decision.action === 'drop') {
       logDrop(persona, ev, decision)
       return
     }
-    await dispatch(persona, botUserId, ev, config)
+    await dispatch(persona, identity?.botUserId, ev, decision, config)
   }
 
-  function logDrop(persona: Persona, ev: Record<string, unknown>, decision: Extract<DeliveryDecision, { action: 'drop' }>): void {
+  function logDrop(persona: Persona, ev: Record<string, unknown>, decision: DropDecision): void {
     const channel = String(ev['channel'])
     switch (decision.reason) {
       case 'channel-not-configured':
@@ -344,15 +278,16 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       default:
         deps.log(
           `[slack] persona ${renderPersonaRef(persona.name, persona.key)} dropped message from ` +
-          `channel=${channel} user=${String(ev['user'])}: ${decision.reason}`,
+          `channel=${channel} ${describeAuthor(ev)}: ${decision.reason}`,
         )
     }
   }
 
   async function dispatch(
     persona: Persona,
-    botUserId: string,
+    botUserId: string | undefined,
     ev: Record<string, unknown>,
+    delivery: DeliverDecision,
     config: PersonaRoutingConfig,
   ): Promise<void> {
     const ref = renderPersonaRef(persona.name, persona.key)
@@ -370,11 +305,11 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       return
     }
 
-    const userName = await deps.resolveUserName(persona.key, ev['user'] as string)
+    const userName = await resolveAuthorLabel(persona.key, ev)
     await addAckReaction(persona.key, chatId, ts)
 
-    const meta = buildMeta(ev, chatId, userName)
-    const text = stripMention((ev['text'] as string | undefined) || '', botUserId)
+    const meta = buildMeta(ev, chatId, userName, delivery)
+    const text = stripPersonaMention((ev['text'] as string | undefined) || '', botUserId)
 
     // Re-read P's session after the awaits above: the session may have been
     // replaced or dropped meanwhile. From here to notification() nothing is
@@ -406,6 +341,17 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       method: CHANNEL_NOTIFICATION_METHOD,
       params: { content: text, meta },
     })
+  }
+
+  /**
+   * The meta `user` label: the author's display name through P's client when
+   * the event has a `user`; otherwise (webhook, `bot_message`) a name the
+   * event carries, with no Slack call (see `botAuthorLabel`).
+   */
+  async function resolveAuthorLabel(key: string, ev: Record<string, unknown>): Promise<string> {
+    const user = ev['user']
+    if (typeof user === 'string' && user !== '') return deps.resolveUserName(key, user)
+    return botAuthorLabel(ev)
   }
 
   /** Today's ack reaction and ack tracking, through P's client; skipped when P has none. */
@@ -474,8 +420,43 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
 // Dispatch helpers
 // ---------------------------------------------------------------------------
 
-/** Today's `<channel>` meta: source conversation, message ID, user, ts, thread and attachments. */
-function buildMeta(ev: Record<string, unknown>, chatId: string, userName: string): Record<string, string> {
+/**
+ * Label for an author without `user`: the event's `username`, else its
+ * `bot_profile.name`, else its bot ID. The decision drops an event with
+ * neither `user` nor `bot_id`, so the bot ID is always there when this runs;
+ * `unknown` only guards the type.
+ */
+function botAuthorLabel(ev: Record<string, unknown>): string {
+  const profile = ev['bot_profile']
+  const profileName = typeof profile === 'object' && profile !== null
+    ? (profile as Record<string, unknown>)['name']
+    : undefined
+  for (const candidate of [ev['username'], profileName, ev['bot_id']]) {
+    if (typeof candidate === 'string' && candidate !== '') return candidate
+  }
+  return UNKNOWN_AUTHOR
+}
+
+/** The author ID for a drop line: `user=<U…>`, else `bot_id=<B…>`, else `user=(none)`. */
+function describeAuthor(ev: Record<string, unknown>): string {
+  const user = ev['user']
+  if (typeof user === 'string' && user !== '') return `user=${user}`
+  const botId = ev['bot_id']
+  if (typeof botId === 'string' && botId !== '') return `bot_id=${botId}`
+  return `user=${NO_AUTHOR_PLACEHOLDER}`
+}
+
+/**
+ * Today's `<channel>` meta: source conversation, message ID, user, ts, thread
+ * and attachments. `delivery` is the decision that let the message through;
+ * E4 Task 2 adds its `via` (and the author IDs) to the meta.
+ */
+function buildMeta(
+  ev: Record<string, unknown>,
+  chatId: string,
+  userName: string,
+  delivery: DeliverDecision,
+): Record<string, string> {
   const meta: Record<string, string> = {
     chat_id: chatId,
     message_id: ev['ts'] as string,
@@ -495,10 +476,4 @@ function buildMeta(ev: Record<string, unknown>, chatId: string, userName: string
       .join('; ')
   }
   return meta
-}
-
-/** Remove P's own mention token (and the whitespace after it) from the text, as today. */
-function stripMention(text: string, botUserId: string): string {
-  if (botUserId === '') return text
-  return text.split(`<@${botUserId}>`).map((part, i) => (i === 0 ? part : part.trimStart())).join('').trim()
 }

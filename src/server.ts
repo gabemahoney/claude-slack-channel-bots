@@ -557,7 +557,7 @@ async function handleInitialized(
 }
 
 // ---------------------------------------------------------------------------
-// Inbound delivery per persona (b.av2 SR-4.1, SR-4.2 core)
+// Inbound delivery per persona (b.av2 SR-4.1, SR-4.2)
 // ---------------------------------------------------------------------------
 
 /**
@@ -567,7 +567,7 @@ async function handleInitialized(
  */
 const personaRouting = createPersonaRouting({
   getPersonaConfig: () => personaConfig,
-  getBotUserId: (key) => identityFor(key)?.botUserId,
+  getBotIdentity: identityFor,
   clientFor,
   resolveUserName: resolvePersonaUserName,
   archive: (key, event) => archiveWrite?.(key, event),

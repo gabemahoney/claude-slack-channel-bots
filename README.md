@@ -179,7 +179,7 @@ Postinstall creates a skeleton with an empty persona list. An empty list is vali
 
 #### Example
 
-Two personas share the channel `C0555555555`. `planner` receives every message in its home channel `C0123456789` and only its @mentions in the shared channel. `reviewer` receives only its @mentions in the shared channel.
+Two personas share the channel `C0555555555`. `planner` receives every message in its home channel `C0123456789` and only its @mentions or `@here` / `@channel` in the shared channel. `reviewer` receives only its @mentions or `@here` / `@channel` in the shared channel.
 
 ```json
 {
@@ -215,7 +215,7 @@ Two personas share the channel `C0555555555`. `planner` receives every message i
 | `name` | yes | The persona's name, used in logs, `/interject` and the crontable. Each persona also has a **key**: the name itself when it is 1–40 characters of `a-z`, `0-9` and `_`, otherwise a derived form. Logs show both, as `"planner" (key=planner)`. |
 | `credentials_file` | yes | Path to the persona's [credentials file](#credentials-files). Absolute, `~` or `~/…`. |
 | `working_directory` | yes | Working directory of the persona's Claude instance. Absolute, `~` or `~/…`. |
-| `channels` | yes, unless `dm.enabled` is `true` | The channels the persona is in. Each entry is `{ "id": "<channel ID>", "delivery": "all" \| "mentions" }`: `all` delivers every message in the channel, `mentions` only messages that @mention the persona. Invite the persona's Slack app to each channel. |
+| `channels` | yes, unless `dm.enabled` is `true` | The channels the persona is in. Each entry is `{ "id": "<channel ID>", "delivery": "all" \| "mentions" }`: `all` delivers every message in the channel, `mentions` only messages that @mention the persona or use `@here` / `@channel`. Invite the persona's Slack app to each channel. |
 | `permission_prompts` | yes | The persona's **destination**: where its permission prompts and server notices are posted. One of the persona's own channel IDs, or `"dm"`. |
 | `claude_config_dir` | no | Claude config directory for this persona. Defaults to the top-level `claude_config_dir`. See [Per-persona `claude_config_dir` override](#per-persona-claude_config_dir-override). |
 | `stop_hook_bootstrap` | no | Slack Reply Guard switch for this persona. Defaults to the top-level `stop_hook_bootstrap`. See [Per-persona `stop_hook_bootstrap` override](#per-persona-stop_hook_bootstrap-override). |
@@ -773,8 +773,8 @@ Every message reaches a bot as its text wrapped in a `<channel source="slack-cha
 | Source | How it gets to the bot | Tag attributes | Reminder? |
 |---|---|---|---|
 | Direct message | Not delivered to any persona in this version. The server drops it and logs a `persona-dm-dropped` line naming the persona whose app received it. | — | — |
-| Channel message that @mentions the bot | Goes to the persona when the channel is one of its `channels`, with either `delivery`. The persona's @mention is removed from the text. A message in a channel no persona is configured into is not delivered. | `chat_id` = the channel ID, `user` = the sender's Slack display name (falling back to real name, then Slack username, then user ID), `message_id` and `ts` = the Slack timestamp (for example `1789936743.069939`). Also `thread_ts` for a thread reply, and `attachment_count` and `attachments` when files are attached. | Yes, channel wording |
-| Channel message in a `delivery: all` channel | The persona receives every message in the channel, from any sender other than itself. In a `delivery: mentions` channel it receives only messages that @mention it. | Same as the @mention row | Yes, channel wording |
+| Channel message that @mentions the bot | Goes to the persona when the channel is one of its `channels`, with either `delivery`. The persona's @mention is removed from the text. A message in a channel no persona is configured into is not delivered. | `chat_id` = the channel ID, `user` = the sender's Slack display name (falling back to real name, then Slack username, then user ID; for a webhook or integration post, the post's username, else its bot profile name, else its bot ID), `message_id` and `ts` = the Slack timestamp (for example `1789936743.069939`). Also `thread_ts` for a thread reply, and `attachment_count` and `attachments` when files are attached. | Yes, channel wording |
+| Channel message in a `delivery: all` channel | The persona receives every message in the channel, from any sender other than itself. In a `delivery: mentions` channel it receives only messages that @mention it or use `@here` / `@channel`. | Same as the @mention row | Yes, channel wording |
 | cscb_cron scheduled prompt | The server's scheduler posts it to `/interject`; it reaches only the target persona's instance. | `user="cscb-cron:<prompt-file-basename>"` and `ts` = the server clock in seconds, with at most three decimal places | No |
 | `/interject` message | A localhost script POSTs it (see [Interject](#interject)); it reaches only the named persona's instance. | `user` = the request's `sender` (default `interject`) and `ts` in the same form as a scheduled prompt | No |
 
@@ -783,7 +783,7 @@ Points to handle in a bot's prompt:
 - **Nothing marks an @mention.** The mention is removed from the text and no attribute records it, so a bot in a receive-everything channel cannot tell an @mention from any other message.
 - **A channel @mention currently arrives twice.** Slack sends both a `message` event and an `app_mention` event for it, and the server delivers both. The two copies have the same `message_id`. Answer it once.
 - **`/interject` sender labels are free-form.** Any localhost caller can set any `user` value, including one that starts with `cscb-cron:`. To tell an injected message from a Slack message, check `ts`: Slack timestamps always have six decimal places, and injected ones have at most three. The guard relies on this check too.
-- **Personas can see each other's Slack posts.** Each persona posts as its own Slack app, and the server drops only a persona's own messages. Another persona's post reaches it like any other message: in a `delivery: all` channel always, in a `delivery: mentions` channel when the post @mentions it.
+- **Personas can see each other's Slack posts.** Each persona posts as its own Slack app, and the server drops only a persona's own messages. Another persona's post reaches it like any other message: in a `delivery: all` channel always, in a `delivery: mentions` channel when the post @mentions it or uses `@here` / `@channel`.
 
 ### What the server writes, and where
 

@@ -294,7 +294,8 @@ describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, 
 
   test('the persona routing reads bot identities through identityFor, clients through clientFor and archives through archiveWrite', () => {
     const props = onlyCallProps('createPersonaRouting')
-    expect(props.get('getBotUserId')).toMatch(/^\((\w+)\) => identityFor\(\1\)\?\.botUserId$/)
+    expect(props.get('getBotIdentity')).toBe('identityFor')
+    expect(props.has('getBotUserId')).toBe(false)
     expect(props.get('clientFor')).toBe('clientFor')
     expect(props.get('archive')).toMatch(/^\((\w+), (\w+)\) => archiveWrite\?\.\(\1, \2\)$/)
   })

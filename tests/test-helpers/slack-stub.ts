@@ -1147,14 +1147,32 @@ function makeEvent(defaults: SlackEvent, overrides: EventOverrides): SlackEvent 
   return mergeDroppingUndefined({ ...defaults, ts, event_ts: ts }, overrides)
 }
 
-/** `<@U…>`: a user mention as it appears in message text. */
-export function mentionText(userId: string): string {
-  return `<@${userId}>`
+/** Default user-group ID for `userGroupMentionText`. User-group IDs start `S`. */
+const DEFAULT_USER_GROUP = 'S0STUBGRP1'
+
+/**
+ * `<@U…>`: a user mention as it appears in message text. With `label`, the
+ * labelled form `<@U…|label>`.
+ */
+export function mentionText(userId: string, label?: string): string {
+  return label === undefined ? `<@${userId}>` : `<@${userId}|${label}>`
 }
 
-/** `<!here>`, `<!channel>` or `<!everyone>`: a broadcast as it appears in message text. */
-export function broadcastText(kind: 'here' | 'channel' | 'everyone' = 'here'): string {
-  return `<!${kind}>`
+/**
+ * `<!here>`, `<!channel>` or `<!everyone>`: a broadcast as it appears in
+ * message text. With `label`, the labelled form, such as `<!here|here>`.
+ */
+export function broadcastText(kind: 'here' | 'channel' | 'everyone' = 'here', label?: string): string {
+  return label === undefined ? `<!${kind}>` : `<!${kind}|${label}>`
+}
+
+/**
+ * `<!subteam^S…>`: a user-group mention as it appears in message text. With
+ * `label`, the labelled form, such as `<!subteam^S…|@group>`. Not a mention of
+ * any persona; tests use it to prove that.
+ */
+export function userGroupMentionText(groupId: string = DEFAULT_USER_GROUP, label?: string): string {
+  return label === undefined ? `<!subteam^${groupId}>` : `<!subteam^${groupId}|${label}>`
 }
 
 /** A human's message in a channel (`channel_type` `channel`). */

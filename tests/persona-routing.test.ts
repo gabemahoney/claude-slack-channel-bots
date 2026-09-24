@@ -1,6 +1,6 @@
 /**
  * persona-routing.test.ts — Inbound channel delivery per persona (b.av2 SR-4.1
- * and SR-4.2 core, SR-10.1 gate removal, SR-10.3 `unclaimed-channel`).
+ * and SR-4.2, SR-10.1 gate removal, SR-10.3 `unclaimed-channel`).
  *
  * Replaces the old DM-routing and default-route fallback suites and the gate
  * and pairing cases of server.test.ts (b.av2 SR-13.5). Drives the real
@@ -25,8 +25,12 @@
  * server wires them (`makeManagedRouting`).
  *
  * Owns AC 1, AC 2 and 12 (persona-routing leg; the tool-level scope stays in
- * registry.test.ts) and AC 52. E4 adds rows to the delivery table (broadcasts,
- * dedupe, `via`, bot-to-bot) and E6 replaces the interim DM drop.
+ * registry.test.ts) and AC 52. The delivery rules themselves (SR-4.2) live in
+ * src/delivery-decision.ts and are covered exhaustively by
+ * tests/delivery-decision.test.ts; this file proves the pipeline is wired to
+ * them (subtypes, bot and webhook authors, bot-ID self-exclusion, broadcasts)
+ * and pins the E3 behaviour the rules keep. E4 Task 2 adds dedupe, `via` and
+ * the author meta, and E6 replaces the interim DM drop.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -36,11 +40,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import {
-  decideDelivery,
-  LOST_MESSAGE_RESTARTING_REPLY,
-  LOST_MESSAGE_STARTED_REPLY,
-} from '../src/persona-routing.ts'
+import { LOST_MESSAGE_RESTARTING_REPLY, LOST_MESSAGE_STARTED_REPLY } from '../src/persona-routing.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { checkPersonaTarget, unregisterSession } from '../src/registry.ts'
 import { initRestart, isRestartPendingOrActive } from '../src/restart.ts'
@@ -49,11 +49,14 @@ import { dryRunPersonaIdentity } from '../src/persona-connections.ts'
 import type { Persona } from '../src/config.ts'
 import type { PersonaSpec } from './test-helpers/persona-config.ts'
 import {
+  broadcastText,
   makeAppMention,
   makeBotMessage,
   makeChannelMessage,
   makeDm,
+  makeWebhookPost,
   mentionText,
+  userGroupMentionText,
   type SlackEvent,
 } from './test-helpers/slack-stub.ts'
 import { posts, slackCalls } from './test-helpers/permission-relay-harness.ts'
@@ -230,7 +233,9 @@ describe('AC 2 / AC 12: a persona in several channels hears all of them in one i
 })
 
 // ---------------------------------------------------------------------------
-// Delivery rules (b.av2 SR-4.2 core), against the receiving persona P
+// Delivery rules (b.av2 SR-4.2), against the receiving persona P, through the
+// pipeline. Each row proves the pipeline is wired to src/delivery-decision.ts;
+// the exhaustive matrix is tests/delivery-decision.test.ts.
 // ---------------------------------------------------------------------------
 
 describe('delivery rules against the receiving persona P', () => {
@@ -242,10 +247,14 @@ describe('delivery rules against the receiving persona P', () => {
     { name: 'Pilot', channels: [{ id: PALL, delivery: 'all' }, { id: PMENT, delivery: 'mentions' }] },
     { name: 'Quill', channels: [{ id: QALL, delivery: 'all' }, { id: PMENT, delivery: 'mentions' }] },
   ]
-  type Ids = { p: string; q: string }
+  /** P's and Q's bot user IDs, and P's bot ID. */
+  type Ids = { p: string; q: string; pBot: string }
 
-  // One row per rule; E4 appends broadcast, dedupe and bot-to-bot rows here.
-  test.each<[string, (ids: Ids) => SlackEvent, boolean]>([
+  // One row per wiring case; E4 Task 2 appends the SR-14 matrix and dedupe rows here.
+  // The optional fourth element is a fragment P's one logged drop line must contain. It is read
+  // through a rest parameter: a fourth named parameter would make Bun pass a `done` callback to
+  // the three-element rows.
+  test.each<[string, (ids: Ids) => SlackEvent, boolean, string?]>([
     ['`all` channel: a plain message is delivered', () => makeChannelMessage({ channel: PALL }), true],
     ['`all` channel: a human with no allowlist or pairing entry is delivered (no sender filter)', () => makeChannelMessage({ channel: PALL, user: 'U0STRANGER' }), true],
     ['`mentions` channel: a message with P\'s user mention is delivered', (ids) => makeChannelMessage({ channel: PMENT, text: `${mentionText(ids.p)} hi` }), true],
@@ -256,23 +265,38 @@ describe('delivery rules against the receiving persona P', () => {
     ['own message (author user = P\'s bot user, no bot_id) in an `all` channel is dropped', (ids) => makeChannelMessage({ channel: PALL, user: ids.p }), false],
     ['own message mentioning itself in a `mentions` channel is dropped', (ids) => makeChannelMessage({ channel: PMENT, user: ids.p, text: `${mentionText(ids.p)} hi` }), false],
     ['own bot post (bot_id and P\'s bot user) is dropped', (ids) => makeBotMessage({ channel: PALL, user: ids.p }), false],
-    ['another app\'s bot message (its own user, no subtype) in an `all` channel is delivered (today; E4 revisits bot-to-bot)', () => makeBotMessage({ channel: PALL }), true],
+    ['SR-4.2 step 2: a post carrying P\'s own bot ID and no user is dropped as P\'s own', (ids) => makeWebhookPost({ channel: PALL, bot_id: ids.pBot }), false],
+    ['SR-4.2 step 2: another app\'s bot message (its own user and bot ID, no subtype) in an `all` channel is delivered (self-exclusion is the only author filter)', () => makeBotMessage({ channel: PALL }), true],
+    ['SR-4.2 steps 1-2: a webhook post (subtype bot_message, bot_id, no user) in an `all` channel is delivered', () => makeWebhookPost({ channel: PALL }), true],
     ['a channel P is not configured into (another persona\'s) is not delivered', () => makeChannelMessage({ channel: QALL }), false],
     ['a channel no persona lists is not delivered', () => makeChannelMessage({ channel: CX }), false],
-    ['subtype message_changed is dropped', () => makeChannelMessage({ channel: PALL, subtype: 'message_changed' }), false],
-    ['subtype message_deleted is dropped', () => makeChannelMessage({ channel: PALL, subtype: 'message_deleted' }), false],
+    ['subtype message_changed (an edit) is dropped', () => makeChannelMessage({ channel: PALL, subtype: 'message_changed' }), false],
+    ['subtype message_deleted (a deletion) is dropped', () => makeChannelMessage({ channel: PALL, subtype: 'message_deleted' }), false],
     ['subtype channel_join is dropped', () => makeChannelMessage({ channel: PALL, subtype: 'channel_join' }), false],
     ['subtype file_share is delivered', () => makeChannelMessage({ channel: PALL, subtype: 'file_share', files: [{ name: 'a.txt' }] }), true],
-    ['a message with no user is dropped (today; E4 revisits authorless posts)', () => makeChannelMessage({ channel: PALL, user: undefined }), false],
-  ])('%s', async (_label, build, delivered) => {
+    [
+      'SR-4.2 step 2: a message with neither user nor bot_id is dropped (no author to self-exclude against), logged as user=(none)',
+      () => makeChannelMessage({ channel: PALL, user: undefined }),
+      false,
+      `channel=${PALL} user=(none): no-author`,
+    ],
+    ['SR-4.2 step 5: `mentions` channel: <!here> is delivered to the mention-only persona', () => makeChannelMessage({ channel: PMENT, text: `${broadcastText('here')} standup` }), true],
+    ['SR-4.2 step 5: `mentions` channel: <!everyone> is not a mention and is dropped', () => makeChannelMessage({ channel: PMENT, text: `${broadcastText('everyone')} standup` }), false],
+    ['SR-4.2 step 5: `mentions` channel: a user-group mention is not a mention and is dropped', () => makeChannelMessage({ channel: PMENT, text: `${userGroupMentionText(undefined, '@team')} standup` }), false],
+  ])('%s', async (_label, build, delivered, ...[dropLine]) => {
     const h = makeHarness(specs())
     const P = h.p('Pilot')
-    const event = build({ p: P.stub.identity.botUserId, q: h.p('Quill').stub.identity.botUserId })
+    const event = build({ p: P.stub.identity.botUserId, q: h.p('Quill').stub.identity.botUserId, pBot: P.stub.identity.botId })
 
     await h.receive(event, ['Pilot'])
 
     expect(P.notifications).toHaveLength(delivered ? 1 : 0)
     if (delivered) expect(P.notifications[0]!.params.meta.chat_id).toBe(event.channel as string)
+    if (dropLine !== undefined) {
+      const dropped = lines(h, `persona ${renderPersonaRef(P.persona.name, P.persona.key)} dropped message`)
+      expect(dropped).toHaveLength(1)
+      expect(dropped[0]).toContain(dropLine)
+    }
     // A decision never replies or restarts on its own.
     expect(posts(P.stub)).toEqual([])
     expect(isRestartPendingOrActive(P.persona.key)).toBe(false)
@@ -326,11 +350,58 @@ describe('delivery rules against the receiving persona P', () => {
     ])
     expect(lines(h, ': own')).toEqual([])
     expect(lines(h, ': not-mentioned')).toHaveLength(2)
-    // The pure decision agrees for an unknown (undefined) bot user ID.
-    const applied = h.config!.personas
-    expect(decideDelivery(makeChannelMessage({ channel: PALL }), { botUserId: undefined, channels: P.persona.channels }, applied)).toEqual({ action: 'deliver' })
-    expect(decideDelivery(makeChannelMessage({ channel: PMENT, text: emptyMention }), { botUserId: undefined, channels: P.persona.channels }, applied))
-      .toEqual({ action: 'drop', reason: 'not-mentioned' })
+  })
+
+  test.each<[string, Record<string, unknown>, string]>([
+    ['its username', {}, 'stub-webhook'],
+    ['its bot_profile name when it has no username', { username: undefined, bot_profile: { id: 'B0STUBHOOK', name: 'stub-integration' } }, 'stub-integration'],
+    ['its bot ID when it carries no name', { username: undefined }, 'B0STUBHOOK'],
+  ])('SR-4.2 step 2: a webhook post (no user) is delivered with no users.info call and no error, labelled with %s', async (_label, overrides, label) => {
+    const h = makeHarness(specs())
+    const P = h.p('Pilot')
+
+    await h.receive(makeWebhookPost({ channel: PALL, ...overrides }), ['Pilot'])
+
+    expect(P.notifications.map((n) => ({ chat_id: n.params.meta.chat_id, user: n.params.meta.user, content: n.params.content }))).toEqual([
+      { chat_id: PALL, user: label, content: 'hello from a webhook' },
+    ])
+    expect(P.stub.calls.usersInfo).toEqual([])
+    expect([...h.logs, ...consoleLines].filter((l) => /error|fail/i.test(l))).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Another persona's post (b.av2 SR-4.2 step 2): self-exclusion is per
+// receiving persona, by its bot user ID or its bot ID, so B's post reaches A
+// on A's connection and is dropped as B's own on B's.
+// ---------------------------------------------------------------------------
+
+describe('SR-4.2 step 2: a post by persona B reaches A and is B\'s own on B\'s connection', () => {
+  test.each<[string, (id: { botUserId: string; botId: string }) => SlackEvent, (id: { botUserId: string; botId: string }) => string]>([
+    ['B\'s bot user and bot ID', (id) => makeBotMessage({ channel: CS, user: id.botUserId, bot_id: id.botId, text: 'reply from beta' }), (id) => `user=${id.botUserId}`],
+    ['B\'s bot ID only (no user)', (id) => makeWebhookPost({ channel: CS, bot_id: id.botId, text: 'reply from beta' }), (id) => `bot_id=${id.botId}`],
+  ])('posted with %s in a channel where both have `delivery: all`: delivered to A, dropped as own for B, and B\'s drop line names the author ID', async (_label, build, author) => {
+    const h = makeHarness([
+      { name: 'Alpha Bot', channels: [{ id: CS, delivery: 'all' }] },
+      { name: 'Beta Bot', channels: [{ id: CS, delivery: 'all' }] },
+    ])
+    const A = h.p('Alpha Bot')
+    const B = h.p('Beta Bot')
+    const event = build(B.stub.identity)
+
+    await h.receive(event, ['Alpha Bot'])
+    await h.receive(event, ['Beta Bot'])
+
+    expect(A.notifications.map((n) => ({ chat_id: n.params.meta.chat_id, content: n.params.content }))).toEqual([
+      { chat_id: CS, content: 'reply from beta' },
+    ])
+    expect(B.notifications).toHaveLength(0)
+    const ref = renderPersonaRef(B.persona.name, B.persona.key)
+    const dropped = lines(h, `persona ${ref} dropped message`)
+    expect(dropped).toHaveLength(1)
+    expect(dropped[0]).toContain(`channel=${CS} ${author(B.stub.identity)}: own`)
+    expect(lines(h, `persona ${renderPersonaRef(A.persona.name, A.persona.key)} dropped message`)).toEqual([])
+    assertNoLeak(captured(h))
   })
 })
 
@@ -631,7 +702,7 @@ describe('dispatch uses P\'s session as registered after the awaited lookup', ()
 // ---------------------------------------------------------------------------
 // Per-persona identities over the real connection manager (E3 Task 9; b.av2
 // SR-3.1, SR-3.4, SR-4.2 step 2). The routing is built as the server builds
-// it (`makeManagedRouting`): `getBotUserId` from the manager-backed identity
+// it (`makeManagedRouting`): `getBotIdentity` from the manager-backed identity
 // getter and `clientFor` from the manager-backed client lookup. Each receive
 // names one persona by its key, as that persona's connection does. The
 // per-persona archive source is covered end to end in
@@ -648,7 +719,7 @@ describe('per-persona identities (connection manager)', () => {
   test.each([
     ['live', false],
     ['dry run (placeholder identities)', true],
-  ])('SR-4.2 step 2 (%s): a post by A\'s bot user is dropped as A\'s own on A\'s connection and delivered to B on B\'s; B\'s own post the other way round', async (_label, dryRun) => {
+  ])('SR-4.2 step 2 (%s): a post by A\'s bot user, and one carrying only A\'s bot ID, are dropped as A\'s own on A\'s connection and delivered to B on B\'s; B\'s own posts the other way round', async (_label, dryRun) => {
     const h = makeConnectionHarness(sharedSpecs(), dir, { dryRun })
     try {
       for (const p of h.personas) expect(await h.bringUp(p)).toMatchObject({ state: 'up' })
@@ -658,22 +729,26 @@ describe('per-persona identities (connection manager)', () => {
       const idA = h.identityFor(A.key)!
       const idB = h.identityFor(B.key)!
       expect(idA.botUserId).not.toBe(idB.botUserId)
+      expect(idA.botId).not.toBe(idB.botId)
+      // Dry run: the placeholder identity (`U000DRY_<key>`, `B000DRY_<key>`) is the one self-exclusion uses.
       if (dryRun) expect(idA).toEqual(dryRunPersonaIdentity(A.key))
-      else expect(idA.botUserId).toBe(h.stub(A).identity.botUserId)
+      else expect(idA).toEqual({ botUserId: h.stub(A).identity.botUserId, botId: h.stub(A).identity.botId })
       const ack = async () => {}
 
-      const byA = makeChannelMessage({ channel: CS, user: idA.botUserId, text: 'posted by alpha' })
-      await m.routing.receive(byA, ack, A.key)
-      await m.routing.receive(byA, ack, B.key)
-      const byB = makeChannelMessage({ channel: CS, user: idB.botUserId, text: 'posted by beta' })
-      await m.routing.receive(byB, ack, B.key)
-      await m.routing.receive(byB, ack, A.key)
+      for (const [id, name, own, other] of [[idA, 'alpha', A, B], [idB, 'beta', B, A]] as const) {
+        const byUser = makeChannelMessage({ channel: CS, user: id.botUserId, text: `posted by ${name}` })
+        const byBotId = makeWebhookPost({ channel: CS, bot_id: id.botId, text: `hooked by ${name}` })
+        for (const event of [byUser, byBotId]) {
+          await m.routing.receive(event, ack, own.key)
+          await m.routing.receive(event, ack, other.key)
+        }
+      }
 
-      expect(m.notifications.get(A.key)!.map((n) => n.params.content)).toEqual(['posted by beta'])
-      expect(m.notifications.get(B.key)!.map((n) => n.params.content)).toEqual(['posted by alpha'])
+      expect(m.notifications.get(A.key)!.map((n) => n.params.content)).toEqual(['posted by beta', 'hooked by beta'])
+      expect(m.notifications.get(B.key)!.map((n) => n.params.content)).toEqual(['posted by alpha', 'hooked by alpha'])
       for (const p of [A, B]) {
         const own = m.logs.filter((l) => l.includes(`persona ${renderPersonaRef(p.name, p.key)} dropped message`) && l.endsWith(': own'))
-        expect(own).toHaveLength(1)
+        expect(own).toHaveLength(2)
       }
       assertNoLeak({ logs: m.logs, lines: h.lines })
     } finally {
