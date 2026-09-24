@@ -88,6 +88,9 @@ import type {
   GetPermissionParams,
   GetPermissionResult,
 } from '../../src/agent-director-client.ts'
+import type { Persona } from '../../src/config.ts'
+import { personaInstanceId, personaTmuxSessionName } from '../../src/persona-identity.ts'
+import { personaConfigDirLabelValue } from '../../src/session-manager.ts'
 
 // ---------------------------------------------------------------------------
 // Canned-result and canned-rejection factories
@@ -306,8 +309,64 @@ export function errPauseTimeout(): ErrPauseTimeout {
 // ListRow + GetResult builders
 // ---------------------------------------------------------------------------
 
-/** Build a canned ListRow with sensible defaults. Override fields as needed. */
-export function cannedListRow(overrides: Partial<ListRow> & { claude_instance_id: string }): ListRow {
+/**
+ * The persona fields a persona-form row is derived from. A resolved `Persona`
+ * (e.g. `makePersonaConfig({}, dir).personas[0]`) satisfies it.
+ */
+export type CannedRowPersona = Pick<Persona, 'key' | 'working_directory' | 'claude_config_dir'>
+
+/**
+ * The fields a spawn of `persona` writes (b.av2 SR-2.2): `cwd` = the working
+ * directory, instance ID `cscb_<key>`, tmux session `slack_bot_<key>`, and the
+ * labels `service=cscb`, `persona=<key>`, `config_dir=<value>` and the interim
+ * `channel=<key>`. The `config_dir` value comes from the production helper
+ * `personaConfigDirLabelValue` (real path, lexical fallback) against the
+ * caller's `home`, never the OS home. No I/O beyond that helper's realpath;
+ * nothing is created or written.
+ */
+function personaRowDefaults(persona: CannedRowPersona, home: string): {
+  cwd: string
+  claude_instance_id: string
+  tmux_session_name: string
+  labels: Record<string, string>
+} {
+  const configDir = personaConfigDirLabelValue(persona.claude_config_dir, home)
+  return {
+    cwd: persona.working_directory,
+    claude_instance_id: personaInstanceId(persona.key),
+    tmux_session_name: personaTmuxSessionName(persona.key),
+    labels: { service: 'cscb', persona: persona.key, config_dir: configDir, channel: persona.key },
+  }
+}
+
+/**
+ * Build a canned ListRow with sensible defaults. Override fields as needed.
+ *
+ * Without `persona` the defaults are the legacy ones (`cwd` `/tmp/cwd`, tmux
+ * `slack_bot_<claude_instance_id>`, labels `service=cscb`, `channel=C_TEST`)
+ * and `claude_instance_id` is required. With `persona` the defaults are what
+ * a spawn of that persona writes (see `personaRowDefaults`) and
+ * `claude_instance_id` defaults to `cscb_<key>`; `home` (required) is the home
+ * directory the `config_dir` label is computed against. Explicit overrides always win,
+ * so a negative case can replace `cwd` or `labels` (e.g. drop `config_dir`).
+ * E3 Task 6 makes the persona form the default.
+ */
+export function cannedListRow(overrides: Partial<ListRow> & { claude_instance_id: string }): ListRow
+export function cannedListRow(overrides: Partial<ListRow>, persona: CannedRowPersona, home: string): ListRow
+export function cannedListRow(overrides: Partial<ListRow>, persona?: CannedRowPersona, home?: string): ListRow {
+  if (persona) {
+    if (home === undefined) throw new Error('cannedListRow: the persona form needs a home')
+    return {
+      parent_id: undefined,
+      state: 'waiting',
+      relay_mode: 'on',
+      started_at: '2026-05-24T12:00:00Z',
+      last_seen_at: '2026-05-24T12:00:00Z',
+      ended_at: null,
+      ...personaRowDefaults(persona, home),
+      ...overrides,
+    }
+  }
   return {
     parent_id: undefined,
     state: 'waiting',
@@ -319,7 +378,7 @@ export function cannedListRow(overrides: Partial<ListRow> & { claude_instance_id
     last_seen_at: '2026-05-24T12:00:00Z',
     ended_at: null,
     ...overrides,
-  }
+  } as ListRow
 }
 
 /**
@@ -353,6 +412,11 @@ export type GetResultOverrides =
   & { claude_instance_id: string }
   & { permission_requests?: PermissionRequestRow[] | null }
 
+/** `GetResultOverrides` for the persona form, where `claude_instance_id` defaults to `cscb_<key>`. */
+export type PersonaGetResultOverrides =
+  & Partial<GetResult>
+  & { permission_requests?: PermissionRequestRow[] | null }
+
 /**
  * `cannedGetResult` may carry a `permission_requests` field for check_permission
  * rows. Production code (`permission-poller.ts`,
@@ -366,8 +430,44 @@ export type CannedGetResult = GetResult & { permission_requests?: PermissionRequ
  * Build a canned `GetResult`. Pass `permission_requests` for check_permission
  * rows under the new plural-projection wire. For the negative-test cases
  * (poller skips when the plural field is absent), pass `null` or omit.
+ *
+ * Without `persona` the defaults are the legacy ones (`cwd` `/tmp/cwd`, tmux
+ * `slack_bot_<claude_instance_id>`, labels `service=cscb`, `channel=C_TEST`)
+ * and `claude_instance_id` is required. With `persona` the `cwd`, instance
+ * ID, tmux name and labels default to what a spawn of that persona writes:
+ * `cwd` = working directory, `cscb_<key>`, `slack_bot_<key>`, and
+ * `service=cscb`, `persona=<key>`, `config_dir=<personaConfigDirLabelValue>`
+ * and the interim `channel=<key>`; `home` (required) is the home directory the
+ * `config_dir` label is computed against. Explicit overrides always win.
+ * E3 Task 6 makes the persona form the default.
  */
-export function cannedGetResult(overrides: GetResultOverrides): CannedGetResult {
+export function cannedGetResult(overrides: GetResultOverrides): CannedGetResult
+export function cannedGetResult(
+  overrides: PersonaGetResultOverrides,
+  persona: CannedRowPersona,
+  home: string,
+): CannedGetResult
+export function cannedGetResult(
+  overrides: PersonaGetResultOverrides,
+  persona?: CannedRowPersona,
+  home?: string,
+): CannedGetResult {
+  if (persona) {
+    if (home === undefined) throw new Error('cannedGetResult: the persona form needs a home')
+    return {
+      parent_id: '',
+      state: 'waiting',
+      claude_args: [],
+      relay_mode: 'on',
+      jsonl_path: '',
+      claude_session_id: '',
+      started_at: '2026-05-24T12:00:00Z',
+      last_seen_at: '2026-05-24T12:00:00Z',
+      ended_at: null,
+      ...personaRowDefaults(persona, home),
+      ...overrides,
+    }
+  }
   return {
     parent_id: '',
     state: 'waiting',
@@ -382,18 +482,30 @@ export function cannedGetResult(overrides: GetResultOverrides): CannedGetResult 
     last_seen_at: '2026-05-24T12:00:00Z',
     ended_at: null,
     ...overrides,
-  }
+  } as CannedGetResult
 }
 
 /**
  * Build a canned `GetResult` carrying a non-empty `permission_requests`
  * array — the typical positive-test shape for poller / click-handler tests
- * under the new wire.
+ * under the new wire. `persona` and `home` pass through to `cannedGetResult`.
  */
 export function cannedGetResultPlural(
   overrides: GetResultOverrides & { permission_requests: PermissionRequestRow[] },
+): CannedGetResult
+export function cannedGetResultPlural(
+  overrides: PersonaGetResultOverrides & { permission_requests: PermissionRequestRow[] },
+  persona: CannedRowPersona,
+  home: string,
+): CannedGetResult
+export function cannedGetResultPlural(
+  overrides: PersonaGetResultOverrides & { permission_requests: PermissionRequestRow[] },
+  persona?: CannedRowPersona,
+  home?: string,
 ): CannedGetResult {
-  return cannedGetResult(overrides)
+  if (!persona) return cannedGetResult(overrides as GetResultOverrides)
+  if (home === undefined) throw new Error('cannedGetResultPlural: the persona form needs a home')
+  return cannedGetResult(overrides, persona, home)
 }
 
 /**
@@ -735,6 +847,71 @@ export function makeStubClient(opts: StubClientOptions = {}): StubClient {
     },
     close(): void { /* no-op */ },
     [Symbol.dispose](): void { /* no-op */ },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Held spawns — keep a launch in flight until the test settles it
+// ---------------------------------------------------------------------------
+
+/** Handle returned by `holdSpawns`. */
+export interface SpawnHold {
+  /** Every `spawn` the stub received, held or not, in call order. */
+  calls: SpawnParams[]
+  /** Instance IDs of the spawns still held open, oldest first. */
+  held(): string[]
+  /** Resolves once a spawn for `id` has been issued (at once if one already was). */
+  entered(id: string): Promise<void>
+  /** Resolve the oldest held spawn for `id` with `{ claude_instance_id: id }`. */
+  release(id: string): void
+  /** Reject the oldest held spawn for `id` with `err`. */
+  fail(id: string, err: Error): void
+  /** Resolve every held spawn (teardown). */
+  releaseAll(): void
+}
+
+/**
+ * Replace `stub.spawn` so each spawn whose instance ID satisfies `shouldHold`
+ * (every spawn by default) stays open until the test releases or fails it;
+ * any other spawn goes to the stub's original `spawn`. Lets a test keep one
+ * persona's launch in flight while it drives a second call.
+ */
+export function holdSpawns(stub: StubClient, shouldHold: (id: string) => boolean = () => true): SpawnHold {
+  const calls: SpawnParams[] = []
+  const held: Array<{ id: string; resolve: (r: SpawnResult) => void; reject: (err: Error) => void }> = []
+  const entries = new Map<string, { promise: Promise<void>; resolve: () => void }>()
+  const entry = (id: string) => {
+    let e = entries.get(id)
+    if (!e) {
+      let resolve!: () => void
+      const promise = new Promise<void>((res) => { resolve = res })
+      e = { promise, resolve }
+      entries.set(id, e)
+    }
+    return e
+  }
+  const take = (id: string) => {
+    const i = held.findIndex((h) => h.id === id)
+    if (i < 0) throw new Error(`holdSpawns: no held spawn for ${id}`)
+    return held.splice(i, 1)[0]!
+  }
+  const original = stub.spawn.bind(stub)
+  stub.spawn = (params: SpawnParams): Promise<SpawnResult> => {
+    calls.push(params)
+    const id = String(params.claude_instance_id)
+    entry(id).resolve()
+    if (!shouldHold(id)) return original(params)
+    return new Promise<SpawnResult>((resolve, reject) => { held.push({ id, resolve, reject }) })
+  }
+  return {
+    calls,
+    held: () => held.map((h) => h.id),
+    entered: (id) => entry(id).promise,
+    release: (id) => take(id).resolve({ claude_instance_id: id }),
+    fail: (id, err) => take(id).reject(err),
+    releaseAll: () => {
+      for (const h of held.splice(0)) h.resolve({ claude_instance_id: h.id })
+    },
   }
 }
 

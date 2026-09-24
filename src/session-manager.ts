@@ -10,16 +10,26 @@
  * reconciliation uses the SR-1.4 collision-then-act dispatch:
  *
  *   1. Try `client.spawn(...)` directly.
- *   2. On `ErrInstanceIdCollision`, call `client.get(...)` and branch on the
- *      observed state (ended/missing → resume or kill+delete+spawn; waiting
- *      → /mcp reconnect via sendKeys; working → wait for waiting then
- *      reconnect; pending/check_permission/ask_user → no-op).
+ *   2. On `ErrInstanceIdCollision`, call `client.get(...)`. A row whose `cwd`
+ *      differs from the persona's working directory by real path is killed,
+ *      deleted and spawned fresh whatever its state (b.av2 SR-6.2). Otherwise
+ *      branch on the observed state (ended/missing → resume or
+ *      kill+delete+spawn; waiting → /mcp reconnect via sendKeys; working →
+ *      wait for waiting then reconnect; pending/check_permission/ask_user →
+ *      no-op). Before any resume, a row whose `config_dir` label is missing
+ *      or differs from the persona's current effective claude_config_dir is
+ *      deleted and spawned fresh instead (a resume keeps the old config dir).
  *   3. Any other error raises a spawn-failure notice for the persona via
  *      `notifySpawnFailure` (through the per-persona notifier) and is logged.
  *
- * Orphan reconciliation (SR-1.6) lists every `service=cscb` spawn and
- * kills+deletes any whose `channel` label is missing or not in
- * `routingConfig.routes`.
+ * Both row checks go through `compareRowToPersona`. At most one launch per
+ * persona is in flight (b.av2 SR-6.3): a concurrent call for the same key
+ * joins the running ladder.
+ *
+ * The start sweep (`reconcileOrphans`, b.av2 SR-6.3) lists every
+ * `service=cscb` spawn and kills+deletes any with no `persona` label, a
+ * persona absent from the applied configuration, an instance ID other than
+ * `cscb_<key>`, or a `cwd` other than its persona's working directory.
  *
  * No tmux process-tree walks, no JSONL existence checks for resume eligibility:
  * the library encapsulates both.
@@ -44,7 +54,6 @@ import { checkCozempicAvailable, resolveJsonlPath } from './cozempic.ts'
 import {
   type Persona,
   type PersonaConfig,
-  type RoutingConfig,
   MCP_SERVER_NAME,
   resolveRealPath,
 } from './config.ts'
@@ -99,8 +108,9 @@ const TEMPLATE_NAME = 'slack-channel-bot'
 
 /**
  * Interim label carrying the persona key under the old `channel` name. The
- * orphan sweep, the permission poller and the CLI's `stop --stop-bots` lookup
- * still read it; removed in E3 Task 6 once they read the `persona` label.
+ * permission poller and the CLI's `stop --stop-bots` lookup still read it
+ * (the start sweep reads the `persona` label); removed in E3 Task 6 once they
+ * read the `persona` label.
  */
 const INTERIM_CHANNEL_LABEL_PREFIX = 'channel='
 
@@ -136,6 +146,62 @@ export function personaConfigDirLabelValue(
   realpath: (path: string) => string = realpathSync,
 ): string {
   return configDirLabelValue(resolveRealPath(resolveClaudeConfigDir(configDir, home), realpath), home)
+}
+
+/** Label-map key of the `persona=<key>` label (`persona`). */
+const PERSONA_LABEL_KEY = PERSONA_LABEL_PREFIX.slice(0, -1)
+
+/** Label-map key of the `config_dir=<hash>` label (`config_dir`). */
+const CONFIG_DIR_LABEL_KEY = CONFIG_DIR_LABEL_PREFIX.slice(0, -1)
+
+/** How an agent-director row compares with a persona (b.av2 SR-6.2, SR-6.3). */
+export interface RowPersonaComparison {
+  /** The row's `cwd` and the persona's working_directory have the same real path. */
+  cwdMatches: boolean
+  /** The row carries a `config_dir` label equal to `expectedConfigDirLabel`. */
+  configDirMatches: boolean
+  /** The row's `config_dir` label value; undefined when the label is absent. */
+  configDirLabel: string | undefined
+  /** The `config_dir` label a spawn of the persona carries now (`personaConfigDirLabelValue`). */
+  expectedConfigDirLabel: string
+}
+
+/**
+ * Compare an agent-director row with a persona (b.av2 SR-6.2, SR-6.3). The
+ * one place a row's `cwd` is compared with a persona's working directory and
+ * a row's `config_dir` label with the persona's current effective
+ * claude_config_dir; the collision ladder's `cwd` guard, its pre-resume
+ * `config_dir` guard and the start sweep's `cwd` condition all use it.
+ * Side-effect free.
+ *
+ * - `cwdMatches`: `resolveRealPath` on both sides (a symlink to the working
+ *   directory matches). A row with no `cwd` never matches.
+ * - `configDirMatches`: the row's `config_dir` label is present and equals
+ *   `personaConfigDirLabelValue(persona.claude_config_dir, home, realpath)`,
+ *   the value the spawn writes.
+ *
+ * @param row       The row's `cwd` and `labels` (from `get` or `list`).
+ * @param persona   The resolved persona.
+ * @param home      Home directory for an unset claude_config_dir; defaults to
+ *   the OS home, read at call time.
+ * @param realpath  Realpath function; defaults to `fs.realpathSync`.
+ */
+export function compareRowToPersona(
+  row: { cwd?: string; labels?: Record<string, string> },
+  persona: Pick<Persona, 'working_directory' | 'claude_config_dir'>,
+  home: string = homedir(),
+  realpath: (path: string) => string = realpathSync,
+): RowPersonaComparison {
+  const cwdMatches =
+    !!row.cwd && resolveRealPath(row.cwd, realpath) === resolveRealPath(persona.working_directory, realpath)
+  const configDirLabel = row.labels?.[CONFIG_DIR_LABEL_KEY]
+  const expectedConfigDirLabel = personaConfigDirLabelValue(persona.claude_config_dir, home, realpath)
+  return {
+    cwdMatches,
+    configDirMatches: configDirLabel !== undefined && configDirLabel === expectedConfigDirLabel,
+    configDirLabel,
+    expectedConfigDirLabel,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,6 +1087,15 @@ export function _resetSpawnHomeDir(): void {
 }
 
 /**
+ * Home directory for `config_dir` label values: the test seam's home when set,
+ * else the OS home, read at call time. Used by the spawn labels and by every
+ * row comparison, so both derive the label from the same home.
+ */
+function spawnHomeDir(): string {
+  return _spawnHomeDir ?? homedir()
+}
+
+/**
  * Build SpawnParams for a persona (SR-1.1, b.av2 SR-2.2): instance ID, tmux
  * session name, labels and env from E1's persona-identity functions, `cwd`
  * set to the persona's working directory.
@@ -1045,7 +1120,7 @@ function buildSpawnParams(persona: Persona, config: PersonaConfig): SpawnParams 
     label: [
       SERVICE_LABEL,
       `${PERSONA_LABEL_PREFIX}${key}`,
-      `${CONFIG_DIR_LABEL_PREFIX}${personaConfigDirLabelValue(persona.claude_config_dir, _spawnHomeDir ?? homedir())}`,
+      `${CONFIG_DIR_LABEL_PREFIX}${personaConfigDirLabelValue(persona.claude_config_dir, spawnHomeDir())}`,
       `${INTERIM_CHANNEL_LABEL_PREFIX}${key}`,
     ],
     extra_env: personaSpawnEnv({
@@ -1155,6 +1230,67 @@ async function tryDelete(
     if (isStartup) recordStartupError('spawn-failed', `delete failed for ${ref}: ${e.errName}`, e)
     notifySpawnFailure(key, e, isStartup)
     return false
+  }
+}
+
+/**
+ * Replace the persona's row with a fresh spawn: kill it (best effort, when
+ * `kill` is set, for a row that may still be live), delete it, spawn fresh
+ * and run dialog approval. The collision ladder's kill+delete+fresh paths go
+ * through here: `resume_enabled: false`, a row whose `cwd` differs from the
+ * working directory (b.av2 SR-6.2), and a row whose `config_dir` label is
+ * missing or differs before a resume.
+ *
+ * - A failed delete returns `failed` (tryDelete records `spawn-failed` at
+ *   startup and raises the spawn-failure notice).
+ * - `ErrTmuxSessionCreate` on the fresh spawn takes the b.vub self-heal
+ *   (kill the orphan tmux session by name, retry the spawn once).
+ * - Outage-class and cwd errors return `failed` quietly; any other error
+ *   records `spawn-failed` at startup and raises the spawn-failure notice.
+ * - Success returns `spawned`.
+ */
+async function replaceWithFreshSpawn(
+  persona: Persona,
+  params: SpawnParams,
+  isStartup: boolean,
+  ref: string,
+  opts: { kill: boolean },
+): Promise<SpawnPersonaResult> {
+  const { key } = persona
+  if (opts.kill) await tryKill(key)
+  if (!(await tryDelete(key, isStartup, ref))) return { key, action: 'failed' }
+
+  const failed = (err: unknown, what: string): SpawnPersonaResult => {
+    if (
+      err instanceof ErrSystemInstallDisappeared ||
+      err instanceof ErrTmuxNotAvailable ||
+      err instanceof ErrCwdNotFound ||
+      err instanceof ErrCwdNotADirectory
+    ) {
+      return { key, action: 'failed' }
+    }
+    const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
+    console.error(`[slack] spawnForPersona: ${what} failed for ${ref}: ${e.errName}`)
+    if (isStartup) recordStartupError('spawn-failed', `${what} failed for ${ref}: ${e.errName}`, e)
+    notifySpawnFailure(key, e, isStartup)
+    return { key, action: 'failed' }
+  }
+
+  try {
+    await withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
+    console.error(`[slack] spawnForPersona: fresh-spawned (after ${opts.kill ? 'kill+delete' : 'delete'}) for ${ref}`)
+    await approvePreSessionDialogs(key, isStartup, ref)
+    return { key, action: 'spawned' }
+  } catch (err) {
+    if (!(err instanceof ErrTmuxSessionCreate)) return failed(err, 'fresh spawn after delete')
+  }
+  try {
+    const r = await selfHealTmuxCollisionAndRespawn(persona, params, ref)
+    console.error(`[slack] spawnForPersona: self-heal spawn succeeded after ErrTmuxSessionCreate for ${ref} instanceId=${r.claude_instance_id}`)
+    await approvePreSessionDialogs(key, isStartup, ref)
+    return { key, action: 'spawned' }
+  } catch (err2) {
+    return failed(err2, 'self-heal spawn after ErrTmuxSessionCreate')
   }
 }
 
@@ -1439,40 +1575,33 @@ function reportInconclusiveDiagnosis(
  * This is the `ended`/`missing` state handling, extracted so the
  * b.3ce dead-session fallback in the `waiting`/`working` branches reuses the
  * exact same decision logic instead of inventing its own.
+ *
+ * b.av2 SR-6.2 `config_dir` guard: before the `resume` call (after the
+ * reconcile-missing-first sweep), the row's `config_dir` label — captured by
+ * the collision `get` when the ladder started — is compared with the
+ * persona's current effective claude_config_dir through
+ * `compareRowToPersona`. A resume keeps the old `CLAUDE_CONFIG_DIR`, so a
+ * missing or different label means no resume: kill (on the dead-session
+ * paths, whose row may still be live), delete and spawn fresh, outcome
+ * `spawned`. No transcript was lost (it stays in the old directory), so no
+ * JSONL diagnosis or amnesia action runs. `resume_enabled: false` never
+ * reaches the guard: it already kills, deletes and spawns fresh.
+ *
+ * @param row  The row returned by the collision `get` (its `labels`).
  */
 async function resumeOrFreshSpawn(
   persona: Persona,
   params: SpawnParams,
   config: PersonaConfig,
   isStartup: boolean,
+  row: Pick<GetResult, 'cwd' | 'labels'>,
   opts?: { reconcileMissingFirst?: boolean },
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
   const ref = personaRef(persona)
   if (config.resume_enabled === false) {
     console.error(`[slack] spawnForPersona: resume_enabled=false — kill+delete+fresh for ${ref}`)
-    await tryKill(key)
-    if (!(await tryDelete(key, isStartup, ref))) return { key, action: 'failed' }
-    try {
-      await withSpawnDetection(key, persona.working_directory, (client) => client.spawn(params))
-      console.error(`[slack] spawnForPersona: fresh-spawned (after kill+delete) for ${ref}`)
-      await approvePreSessionDialogs(key, isStartup, ref)
-      return { key, action: 'spawned' }
-    } catch (err) {
-      if (
-        err instanceof ErrSystemInstallDisappeared ||
-        err instanceof ErrTmuxNotAvailable ||
-        err instanceof ErrCwdNotFound ||
-        err instanceof ErrCwdNotADirectory
-      ) {
-        return { key, action: 'failed' }
-      }
-      const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('spawn', 'UnknownError', String(err))
-      console.error(`[slack] spawnForPersona: fresh spawn after delete failed for ${ref}: ${e.errName}`)
-      if (isStartup) recordStartupError('spawn-failed', `fresh spawn after delete failed for ${ref}: ${e.errName}`, e)
-      notifySpawnFailure(key, e, isStartup)
-      return { key, action: 'failed' }
-    }
+    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: true })
   }
 
   // b.4dk: dead-session callers (state=waiting/working with a verified-dead
@@ -1489,6 +1618,19 @@ async function resumeOrFreshSpawn(
   // probing per docs/engineering-guide.md ("Avoiding Duplicated Effort").
   if (opts?.reconcileMissingFirst) {
     await reconcileMissingSweep(key, 'spawnForPersona: before resume', ref)
+  }
+
+  // b.av2 SR-6.2: a resume keeps the row's old CLAUDE_CONFIG_DIR, so resume
+  // only a row labelled with the persona's current effective config dir.
+  const configDir = compareRowToPersona(row, persona, spawnHomeDir())
+  if (!configDir.configDirMatches) {
+    const was = configDir.configDirLabel === undefined ? 'label absent' : `was=${configDir.configDirLabel}`
+    console.error(
+      `[slack] spawnForPersona: ${ref} config_dir label ${configDir.configDirLabel === undefined ? 'missing' : 'changed'} ` +
+        `(${was}, now=${configDir.expectedConfigDirLabel} for claude_config_dir=${persona.claude_config_dir ?? '<default>'}) — ` +
+        `not resuming; spawning fresh`,
+    )
+    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: opts?.reconcileMissingFirst === true })
   }
 
   // resume_enabled: attempt resume
@@ -1655,18 +1797,49 @@ async function resumeOrFreshSpawn(
 }
 
 /**
+ * In-flight launches by persona key (b.av2 SR-6.3): at most one ladder per
+ * persona runs at a time. Holds only unsettled launches; an entry is removed
+ * when its launch settles, whatever the outcome.
+ */
+const inFlightLaunches = new Map<string, Promise<SpawnPersonaResult>>()
+
+/** Test-only seam: forget every in-flight launch. */
+export function _resetInFlightLaunches(): void {
+  inFlightLaunches.clear()
+}
+
+/**
+ * True while a launch (collision ladder) for persona `key` is in flight
+ * (b.av2 SR-6.6). The restart module's kill adapter consults this so a restart
+ * that is about to join a running launch does not first kill the session that
+ * launch is bringing up.
+ */
+export function isLaunchInFlight(key: string): boolean {
+  return inFlightLaunches.has(key)
+}
+
+/**
  * Core per-persona spawn dispatcher (SR-1.4), addressing `cscb_<key>`:
  *
  * 1. Dry-run: skip entirely, return synthetic success.
- * 2. Attempt `client.spawn(...)`. On success → done.
- * 3. `ErrInstanceIdCollision` → `client.get(...)` then branch on state:
+ * 2. One in-flight launch per persona (b.av2 SR-6.3): while a launch for the
+ *    key is in flight, a second call joins it and receives its result instead
+ *    of starting a second ladder. The start's worker pool and the restart
+ *    module's `launchSession` both come through here. Keys are independent.
+ * 3. Attempt `client.spawn(...)`. On success → done.
+ * 4. `ErrInstanceIdCollision` → `client.get(...)`, then:
+ *    - the row's `cwd` differs from the persona's working_directory by real
+ *      path (`compareRowToPersona`) → kill + delete + fresh spawn, whatever
+ *      the state and resume_enabled (b.av2 SR-6.2). Otherwise branch on state:
  *    - ended/missing + resume_enabled → resume; on ErrNoSessionId/
  *      ErrJsonlMissing/ErrJsonlNeverWritten → delete + fresh spawn.
  *    - ended/missing + !resume_enabled → kill + delete + fresh spawn.
  *    - waiting → reconnectMcp; 'dead-session' → resume/fresh-spawn (b.3ce).
  *    - working → waitForWaitingAndReconnect; 'dead-session' → resume/fresh-spawn (b.3ce).
  *    - pending/check_permission/ask_user → no-op.
- * 4. Other errors → surface to Slack + (when isStartup) startup-errors.log.
+ *    Every resume first checks the row's `config_dir` label; a missing or
+ *    different label means delete + fresh spawn instead (resumeOrFreshSpawn).
+ * 5. Other errors → surface to Slack + (when isStartup) startup-errors.log.
  */
 export async function spawnForPersona(
   persona: Persona,
@@ -1680,6 +1853,28 @@ export async function spawnForPersona(
     return { key, action: 'no-op' }
   }
 
+  const inFlight = inFlightLaunches.get(key)
+  if (inFlight) {
+    console.error(`[slack] spawnForPersona: launch already in flight for ${ref} — joining it`)
+    return inFlight
+  }
+  const launch = runPersonaLadder(persona, config, isStartup, ref)
+  inFlightLaunches.set(key, launch)
+  try {
+    return await launch
+  } finally {
+    if (inFlightLaunches.get(key) === launch) inFlightLaunches.delete(key)
+  }
+}
+
+/** One collision ladder for a persona; `spawnForPersona` single-flights it per key. */
+async function runPersonaLadder(
+  persona: Persona,
+  config: PersonaConfig,
+  isStartup: boolean,
+  ref: string,
+): Promise<SpawnPersonaResult> {
+  const { key } = persona
   const params = buildSpawnParams(persona, config)
 
   // Attempt fresh spawn ---
@@ -1733,10 +1928,9 @@ export async function spawnForPersona(
   }
 
   // Collision-handling: get-then-act ---
-  let state: string
+  let row: GetResult
   try {
-    const r = await withOutageDetection(key, undefined, (client) => client.get({ claude_instance_id: personaInstanceId(key) }))
-    state = r.state
+    row = await withOutageDetection(key, undefined, (client) => client.get({ claude_instance_id: personaInstanceId(key) }))
   } catch (err) {
     if (err instanceof ErrSpawnNotFound) {
       // Race: row deleted between spawn-collision and get. Retry spawn once.
@@ -1771,10 +1965,21 @@ export async function spawnForPersona(
     return { key, action: 'failed' }
   }
 
+  const { state } = row
   console.error(`[slack] spawnForPersona: collision resolved, state=${state} for ${ref}`)
 
+  // b.av2 SR-6.2: a row in another directory (by real path) is never resumed,
+  // reconnected or waited on, whatever its state and resume_enabled: kill,
+  // delete and spawn fresh in the persona's working directory.
+  if (!compareRowToPersona(row, persona, spawnHomeDir()).cwdMatches) {
+    console.error(
+      `[slack] spawnForPersona: ${ref} row cwd=${row.cwd} differs from working_directory=${persona.working_directory} (state=${state}) — replacing the row: kill+delete+fresh`,
+    )
+    return replaceWithFreshSpawn(persona, params, isStartup, ref, { kill: true })
+  }
+
   if (state === 'ended' || state === 'missing') {
-    return resumeOrFreshSpawn(persona, params, config, isStartup)
+    return resumeOrFreshSpawn(persona, params, config, isStartup, row)
   }
 
   if (state === 'waiting') {
@@ -1787,7 +1992,7 @@ export async function spawnForPersona(
     const outcome = await reconnectMcp(key, ref)
     if (outcome === 'dead-session') {
       console.error(`[slack] spawnForPersona: dead tmux session for ${ref} (state=waiting) — recovering via resume/fresh-spawn`)
-      return resumeOrFreshSpawn(persona, params, config, isStartup, { reconcileMissingFirst: true })
+      return resumeOrFreshSpawn(persona, params, config, isStartup, row, { reconcileMissingFirst: true })
     }
     if (outcome !== 'ok') {
       console.error(`[slack] spawnForPersona: reconnect failed for ${ref}`)
@@ -1807,7 +2012,7 @@ export async function spawnForPersona(
     const outcome = await waitForWaitingAndReconnect(key, config, ref)
     if (outcome === 'dead-session') {
       console.error(`[slack] spawnForPersona: dead tmux session for ${ref} (state=working) — recovering via resume/fresh-spawn`)
-      return resumeOrFreshSpawn(persona, params, config, isStartup, { reconcileMissingFirst: true })
+      return resumeOrFreshSpawn(persona, params, config, isStartup, row, { reconcileMissingFirst: true })
     }
     if (outcome !== 'ok') {
       console.error(`[slack] spawnForPersona: reconnect failed for ${ref}`)
@@ -1837,12 +2042,38 @@ export interface OrphanReconcileResult {
 }
 
 /**
- * Enumerate all `service=cscb` spawns and kill+delete any whose `channel`
- * label is missing or not in routingConfig.routes. List-level failure is
- * logged but does not block startup.
+ * Why the start sweep removes a row, or undefined when the row is kept
+ * (b.av2 SR-6.3). A row is kept only when it has a `persona` label naming an
+ * applied persona, its instance ID is that persona's `cscb_<key>`, and its
+ * `cwd` matches the persona's working directory by real path.
+ */
+function sweepReason(
+  row: ListRow,
+  persona: Persona | undefined,
+  personaLabel: string | undefined,
+  home: string,
+): string | undefined {
+  if (!personaLabel) return 'no persona label'
+  if (!persona) return 'absent persona'
+  if (row.claude_instance_id !== personaInstanceId(persona.key)) return 'wrong instance ID'
+  if (!compareRowToPersona(row, persona, home).cwdMatches) return 'wrong cwd'
+  return undefined
+}
+
+/**
+ * Start sweep (b.av2 SR-6.3; formerly SR-1.6): enumerate every `service=cscb`
+ * spawn and kill+delete each one that
+ *   - has no `persona` label,
+ *   - names a persona absent from the applied configuration,
+ *   - has an instance ID other than `cscb_<key>` for its persona, or
+ *   - has a `cwd` other than its persona's working directory, by real path
+ *     (`compareRowToPersona`).
+ * The interim `channel` label plays no part. A failed kill still attempts the
+ * delete; kill and delete failures record `orphan-cleanup`, a list failure
+ * records `orphan-cleanup-list-failed` and does not block startup.
  */
 export async function reconcileOrphans(
-  routingConfig: RoutingConfig,
+  personaConfig: PersonaConfig,
 ): Promise<OrphanReconcileResult> {
   if (isDryRun()) {
     console.error('[slack] dry-run: skipping orphan reconciliation')
@@ -1852,7 +2083,7 @@ export async function reconcileOrphans(
   const client = getClient()
   let rows: ListRow[]
   try {
-    const r = await client.list({ label: ['service=cscb'] })
+    const r = await client.list({ label: [SERVICE_LABEL] })
     rows = r.spawns
   } catch (err) {
     const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('list', 'UnknownError', String(err))
@@ -1864,21 +2095,25 @@ export async function reconcileOrphans(
     return { found: 0, killed: 0, failed: 0 }
   }
 
-  const configuredChannels = new Set(Object.keys(routingConfig.routes))
+  const personasByKey = new Map(personaConfig.personas.map((p) => [p.key, p]))
+  const home = spawnHomeDir()
 
   let found = 0
   let killed = 0
   let failed = 0
 
   for (const row of rows) {
-    const channelLabel = row.labels['channel']
-    const isOrphan = !channelLabel || !configuredChannels.has(channelLabel)
-    if (!isOrphan) continue
+    const personaLabel = row.labels?.[PERSONA_LABEL_KEY]
+    const persona = personaLabel ? personasByKey.get(personaLabel) : undefined
+    const reason = sweepReason(row, persona, personaLabel, home)
+    if (!reason) continue
 
     found++
-    const displayChannel = channelLabel ?? '<no channel label>'
+    // The persona reference when the persona exists, else the raw label value.
+    const displayPersona = persona ? personaRef(persona) : (personaLabel || '<no persona label>')
+    const cwdDetail = reason === 'wrong cwd' ? ` cwd=${row.cwd}` : ''
     console.error(
-      `[slack] reconcileOrphans: orphan found channel=${displayChannel} instanceId=${row.claude_instance_id} state=${row.state} — killing and deleting`,
+      `[slack] reconcileOrphans: sweeping row (${reason}) persona=${displayPersona} instanceId=${row.claude_instance_id} state=${row.state}${cwdDetail} — killing and deleting`,
     )
 
     try {
@@ -1887,7 +2122,7 @@ export async function reconcileOrphans(
       const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('kill', 'UnknownError', String(err))
       recordStartupError(
         'orphan-cleanup',
-        `kill failed for orphan instanceId=${row.claude_instance_id} channel=${displayChannel}: ${e.errName}`,
+        `kill failed for orphan instanceId=${row.claude_instance_id} persona=${displayPersona}: ${e.errName}`,
         e,
       )
       // continue to delete attempt
@@ -1900,7 +2135,7 @@ export async function reconcileOrphans(
       const e = err instanceof AgentDirectorError ? err : new AgentDirectorError('delete', 'UnknownError', String(err))
       recordStartupError(
         'orphan-cleanup',
-        `delete failed for orphan instanceId=${row.claude_instance_id} channel=${displayChannel}: ${e.errName}`,
+        `delete failed for orphan instanceId=${row.claude_instance_id} persona=${displayPersona}: ${e.errName}`,
         e,
       )
       failed++

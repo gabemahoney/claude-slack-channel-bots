@@ -45,6 +45,7 @@ import { personaInstanceId } from './persona-identity.ts'
 import { routesToPersonaConfig } from './route-persona-adapter.ts'
 import {
   AGENT_DIRECTOR_LIVE_STATES,
+  isLaunchInFlight,
   launchSession,
   notifyRestartCapReached,
   reconcileOrphans,
@@ -1123,6 +1124,44 @@ export function _buildStatRouteImpl(deps?: {
 }
 
 // ---------------------------------------------------------------------------
+// _buildKillSessionAdapter
+// ---------------------------------------------------------------------------
+
+/**
+ * _buildKillSessionAdapter — test-only factory for the restart module's
+ * killSession dependency. Production code wires this via main()'s initRestart
+ * call; tests call it directly.
+ *
+ * b.av2 SR-6.6 (per-persona lifecycle ops in sequence): restart.ts kills the
+ * persona's session and then calls launchSession, which joins a launch already
+ * in flight for the key. Mid-ladder (dialog approval on resume, or between
+ * delete and spawn) the row reads dead, so an unguarded kill here would take
+ * down the process the running launch is bringing up. While a launch for the
+ * key is in flight the adapter therefore skips the kill; the in-flight launch
+ * owns the session's lifecycle.
+ *
+ * @internal
+ */
+export function _buildKillSessionAdapter(): (key: string) => Promise<void> {
+  // `key` is the persona key (the channel ID under the route->persona adapter).
+  return async (key: string) => {
+    if (isLaunchInFlight(key)) {
+      console.error(`[slack] killSession (restart adapter): launch already in flight for persona=${key} — not killing`)
+      return
+    }
+    try {
+      await withOutageDetection(key, undefined, (client) =>
+        client.kill({ claude_instance_id: personaInstanceId(key) })
+      )
+    } catch (err) {
+      if (err instanceof ErrSpawnNotFound) return
+      if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) return
+      console.error(`[slack] killSession (restart adapter): error for persona=${key}:`, err)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // _buildReconnectSessionAdapter
 // ---------------------------------------------------------------------------
 
@@ -1578,17 +1617,7 @@ export async function main(): Promise<void> {
     },
     hasSessionStream: hasSessionStreamAdapter,
     reconnectSession: _buildReconnectSessionAdapter(),
-    killSession: async (key) => {
-      try {
-        await withOutageDetection(key, undefined, (client) =>
-          client.kill({ claude_instance_id: personaInstanceId(key) })
-        )
-      } catch (err) {
-        if (err instanceof ErrSpawnNotFound) return
-        if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) return
-        console.error(`[slack] killSession (restart adapter): error for persona=${key}:`, err)
-      }
-    },
+    killSession: _buildKillSessionAdapter(),
     launchSession: async (key) => {
       if (!personaConfig) return false
       // Launches the applied persona with this key; false when there is none.
@@ -1604,11 +1633,13 @@ export async function main(): Promise<void> {
     onCapReached: (key) => notifyRestartCapReached(key),
   })
 
-  // SR-1.6: orphan reconciliation BEFORE per-route reconcile. Spawns whose
-  // `channel` label is not in routingConfig.routes get killed + deleted.
-  if (routingConfig) {
+  // b.av2 SR-6.3: the start sweep, BEFORE the trust patch and any spawn.
+  // `service=cscb` spawns with no `persona` label, a persona absent from the
+  // applied config, an instance ID other than `cscb_<key>` or a `cwd` other
+  // than the persona's working directory get killed + deleted.
+  if (personaConfig) {
     try {
-      await reconcileOrphans(routingConfig)
+      await reconcileOrphans(personaConfig)
     } catch (err) {
       console.error('[slack] Warning: orphan reconciliation failed:', err)
     }

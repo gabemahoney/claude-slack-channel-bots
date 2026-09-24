@@ -22,11 +22,25 @@ import {
   getFailureCount,
   isAtCap,
 } from '../src/backoff.ts'
-import { _buildReconnectSessionAdapter } from '../src/server.ts'
+import { _buildKillSessionAdapter, _buildReconnectSessionAdapter } from '../src/server.ts'
 import {
   _resetFindMissingMemo,
   _setTmuxServerEnsurer,
   _resetTmuxServerEnsurer,
+  _resetInFlightLaunches,
+  _setTmuxCapturePane,
+  _setTmuxSendEnter,
+  _resetTmuxDialogHelpers,
+  _setTmuxSessionProber,
+  _resetTmuxSessionProber,
+  _setDialogPollIntervalMs,
+  _resetDialogPollIntervalMs,
+  _setDialogReadyTimeoutMs,
+  _resetDialogReadyTimeoutMs,
+  _setSpawnHomeDir,
+  _resetSpawnHomeDir,
+  isLaunchInFlight,
+  launchSession as launchPersonaSession,
   notifyRestartCapReached,
   setSessionNotifier,
 } from '../src/session-manager.ts'
@@ -39,13 +53,13 @@ import {
   initOutageState,
 } from '../src/outage-state.ts'
 import { makeStubClient } from './test-helpers/agent-director-stub.ts'
-import { errTmuxSendKeys } from './test-helpers/agent-director-stub.ts'
+import { errGeneric, errTmuxSendKeys, holdSpawns, type SpawnHold } from './test-helpers/agent-director-stub.ts'
 import type { Client } from 'agent-director'
-import type { FindMissingParams, SendKeysParams, StatusParams } from 'agent-director'
+import type { FindMissingParams, KillParams, SendKeysParams, SpawnParams, StatusParams } from 'agent-director'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
-import type { Persona } from '../src/config.ts'
+import type { Persona, PersonaConfig } from '../src/config.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -67,6 +81,7 @@ type DepsOpts = {
   hasSessionStreamResult?: boolean  // default: true (stream present — prior semantics)
   launchSessionResult?: boolean   // default: true (launch succeeds)
   launchSession?: (key: string, cwd: string, sessionId?: string) => Promise<boolean>  // override entire launchSession
+  killSession?: (key: string) => Promise<void>  // runs after the capture (e.g. the real kill adapter)
   restartDelay?: number           // default: FAST_DELAY_S
   isShuttingDown?: boolean        // default: false
   onCapReached?: (key: string) => void  // called after the capture (e.g. the real cap-notice function)
@@ -107,6 +122,7 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     },
     async killSession(key) {
       killSessionCalls.push(key)
+      await opts.killSession?.(key)
     },
     async launchSession(key, cwd, sessionId) {
       launchSessionCalls.push({ key, cwd, sessionId })
@@ -1112,5 +1128,236 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
 
     expect(deps.killSessionCalls).toEqual([KEY])
     expect(deps.launchSessionCalls).toEqual([KEY])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Restart-triggered launches: one in flight per persona (b.av2 SR-6.3, SR-6.6,
+// SR-14 row 4). `RestartDeps.launchSession` is the session manager's REAL
+// launch adapter, so each restart launch goes through `spawnForPersona`'s
+// per-persona single-flight, and `RestartDeps.killSession` is server.ts's REAL
+// kill adapter (`_buildKillSessionAdapter`). restart.ts itself does not stop a
+// second timer for a persona whose launch is still running: the kill adapter
+// must not kill the session that launch is bringing up, and the session
+// manager must join that launch instead of starting a second ladder.
+//
+// `holdSpawns` keeps the stub AD client's `spawn` open per instance ID, so a
+// launch can be kept in flight while a second restart fires. `status` answers
+// `waiting`, so the dialog approver returns at once. Every raw-tmux seam is a
+// no-op, the `config_dir` label derives from a temp home, and every persona
+// path lies under a temp directory removed in afterEach.
+// ---------------------------------------------------------------------------
+
+describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () => {
+  let dir: string
+  let config: PersonaConfig
+  let a: Persona
+  let b: Persona
+  /** Instance IDs whose `spawn` is held open until released. */
+  let holdIds: Set<string>
+  let hold: SpawnHold
+  /** Every `kill` the stub AD client received. */
+  let killCalls: KillParams[]
+  /** Each boolean restart received from `launchSession`, in settle order. */
+  let launchResults: Array<{ key: string; ok: boolean }>
+  /** Session-manager notices (spawn-failure notices land here). */
+  let notices: Array<{ key: string; text: string }>
+  /** console.error lines written during the test. */
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+
+  function spawnsFor(p: Persona): SpawnParams[] {
+    return hold.calls.filter((c) => c.claude_instance_id === personaInstanceId(p.key))
+  }
+
+  function killsFor(p: Persona): number {
+    return killCalls.filter((k) => k.claude_instance_id === personaInstanceId(p.key)).length
+  }
+
+  function skipLine(p: Persona): string {
+    return `[slack] killSession (restart adapter): launch already in flight for persona=${p.key} — not killing`
+  }
+
+  /** Restart deps over the real kill and launch adapters, recording each boolean restart receives. */
+  function makeInFlightDeps(): ReturnType<typeof makeDeps> {
+    return makeDeps({
+      killSession: _buildKillSessionAdapter(),
+      launchSession: async (key) => {
+        const ok = await launchPersonaSession(key, config)
+        launchResults.push({ key, ok })
+        return ok
+      },
+    })
+  }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'restart-inflight-'))
+    config = makeMultiPersonaConfig([{ name: 'alpha_bot' }, { name: 'beta_bot' }], dir)
+    ;[a, b] = config.personas as [Persona, Persona]
+    holdIds = new Set()
+    killCalls = []
+    launchResults = []
+    notices = []
+    errLines = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+
+    const stub = makeStubClient({ statusFn: () => ({ state: 'waiting' }), killCalls })
+    hold = holdSpawns(stub, (id) => holdIds.has(id))
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+    setClientForTests(stub as unknown as Client)
+    setSessionNotifier((key, text) => { notices.push({ key, text }) })
+
+    _resetInFlightLaunches()
+    _setSpawnHomeDir(dir)
+    _setDialogPollIntervalMs(1)
+    _setDialogReadyTimeoutMs(200)
+    _setTmuxCapturePane(async () => '')
+    _setTmuxSendEnter(async () => {})
+    _setTmuxSessionProber(async () => true)
+    _setTmuxServerEnsurer(async () => {})
+  })
+
+  afterEach(async () => {
+    // Let any launch a failed assertion left held settle before tearing down.
+    hold.releaseAll()
+    await Bun.sleep(WAIT_MS)
+    console.error = origConsoleError
+    cancelAllRestartTimers()
+    _resetInFlightLaunches()
+    resetClientForTests()
+    _resetOutageState()
+    setSessionNotifier(undefined)
+    _resetSpawnHomeDir()
+    _resetDialogPollIntervalMs()
+    _resetDialogReadyTimeoutMs()
+    _resetTmuxDialogHelpers()
+    _resetTmuxSessionProber()
+    _resetTmuxServerEnsurer()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('kill adapter: no kill for a persona whose launch is in flight (skip logged); another persona is killed meanwhile; kills once the launch settles', async () => {
+    holdIds.add(personaInstanceId(a.key))
+    const launch = launchPersonaSession(a.key, config)
+    await hold.entered(personaInstanceId(a.key))
+    expect(isLaunchInFlight(a.key)).toBe(true)
+    const killSession = _buildKillSessionAdapter()
+
+    await killSession(a.key)
+    expect(killCalls).toEqual([])
+    expect(errLines).toContain(skipLine(a))
+
+    await killSession(b.key)
+    expect(killCalls.map((k) => k.claude_instance_id)).toEqual([personaInstanceId(b.key)])
+    expect(errLines).not.toContain(skipLine(b))
+
+    hold.release(personaInstanceId(a.key))
+    expect(await launch).toBe(true)
+    expect(isLaunchInFlight(a.key)).toBe(false)
+    await killSession(a.key)
+    expect(killCalls.map((k) => k.claude_instance_id)).toEqual([personaInstanceId(b.key), personaInstanceId(a.key)])
+    expect(errLines.filter((l) => l === skipLine(a))).toHaveLength(1)
+  })
+
+  test('same persona: a second restart while the first launch is held neither kills it nor spawns again — it joins; both launches resolve alike; a later restart kills and spawns again', async () => {
+    const deps = makeInFlightDeps()
+    initRestart(deps)
+    holdIds.add(personaInstanceId(a.key))
+
+    // First restart: nothing in flight, so A is killed; its launch is then held inside `spawn`.
+    scheduleRestart(a.key, a.working_directory)
+    await Bun.sleep(WAIT_MS)
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([a.key])
+    expect(killsFor(a)).toBe(1)
+    expect(spawnsFor(a)).toHaveLength(1)
+    expect(launchResults).toEqual([])
+
+    // Second restart for A fires while the first launch is still in flight:
+    // restart asks for a kill, the adapter skips it, and the launch joins.
+    scheduleRestart(a.key, a.working_directory)
+    await Bun.sleep(WAIT_MS)
+    expect(deps.killSessionCalls).toEqual([a.key, a.key])
+    expect(killsFor(a)).toBe(1)
+    expect(errLines).toContain(skipLine(a))
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([a.key, a.key])
+    expect(spawnsFor(a)).toHaveLength(1)
+    expect(hold.held()).toHaveLength(1)
+    expect(launchResults).toEqual([])
+
+    // Release the one held spawn: both launchSession calls resolve true.
+    hold.release(personaInstanceId(a.key))
+    await Bun.sleep(WAIT_MS)
+    expect(launchResults).toEqual([{ key: a.key, ok: true }, { key: a.key, ok: true }])
+    expect(spawnsFor(a)).toHaveLength(1)
+    expect(getFailureCount(a.key)).toBe(0)
+    expect(isRestartPendingOrActive(a.key)).toBe(false)
+
+    // The launch has settled: a further restart for A kills and starts a new ladder.
+    holdIds.clear()
+    scheduleRestart(a.key, a.working_directory)
+    await Bun.sleep(WAIT_MS)
+    expect(killsFor(a)).toBe(2)
+    expect(spawnsFor(a)).toHaveLength(2)
+    expect(launchResults).toHaveLength(3)
+    expect(launchResults[2]).toEqual({ key: a.key, ok: true })
+    expect(hold.calls.every((c) => c.claude_instance_id === personaInstanceId(a.key))).toBe(true)
+    expect(errLines.filter((l) => l === skipLine(a))).toHaveLength(1)
+  })
+
+  test('same persona: a joined launch that fails counts one failure per launchSession boolean restart receives (single counting site)', async () => {
+    const deps = makeInFlightDeps()
+    initRestart(deps)
+    holdIds.add(personaInstanceId(a.key))
+
+    scheduleRestart(a.key, a.working_directory)
+    await Bun.sleep(WAIT_MS)
+    scheduleRestart(a.key, a.working_directory)
+    await Bun.sleep(WAIT_MS)
+    expect(deps.launchSessionCalls).toHaveLength(2)
+    expect(killsFor(a)).toBe(1)
+    expect(spawnsFor(a)).toHaveLength(1)
+    expect(getFailureCount(a.key)).toBe(0)
+
+    // The one held spawn fails: the one shared ladder returns `failed`, so
+    // each launchSession call hands restart `false`, and each is counted.
+    hold.fail(personaInstanceId(a.key), errGeneric('spawn', 'ErrSomethingElse', 'spawn blew up'))
+    await Bun.sleep(WAIT_MS)
+    expect(launchResults).toEqual([{ key: a.key, ok: false }, { key: a.key, ok: false }])
+    expect(getFailureCount(a.key)).toBe(2)
+    expect(spawnsFor(a)).toHaveLength(1)
+    // One ladder ran, so one spawn-failure notice, for A.
+    expect(notices.map((n) => n.key)).toEqual([a.key])
+    expect(notices[0]!.text).toContain('ErrSomethingElse')
+  })
+
+  test('different persona: while A\'s launch is held, a restart for B kills and spawns B and completes without waiting for A', async () => {
+    const deps = makeInFlightDeps()
+    initRestart(deps)
+    holdIds.add(personaInstanceId(a.key))
+
+    scheduleRestart(a.key, a.working_directory)
+    await Bun.sleep(WAIT_MS)
+    expect(spawnsFor(a)).toHaveLength(1)
+    expect(launchResults).toEqual([])
+
+    scheduleRestart(b.key, b.working_directory)
+    await Bun.sleep(WAIT_MS)
+    // B was killed (no launch of B in flight), its spawn was issued, addressed
+    // to B, and B's launch completed while A's spawn is still held.
+    expect(killsFor(b)).toBe(1)
+    expect(errLines).not.toContain(skipLine(b))
+    expect(spawnsFor(b)).toHaveLength(1)
+    expect(spawnsFor(b)[0]!.cwd).toBe(b.working_directory)
+    expect(launchResults).toEqual([{ key: b.key, ok: true }])
+    expect(hold.held()).toEqual([personaInstanceId(a.key)])
+    expect(getFailureCount(b.key)).toBe(0)
+
+    hold.release(personaInstanceId(a.key))
+    await Bun.sleep(WAIT_MS)
+    expect(launchResults).toEqual([{ key: b.key, ok: true }, { key: a.key, ok: true }])
+    expect(spawnsFor(a)).toHaveLength(1)
+    expect(spawnsFor(b)).toHaveLength(1)
   })
 })

@@ -194,6 +194,9 @@ async function main(): Promise<void> {
   // -------------------------------------------------------------------------
   const r2 = await spawnForPersona(persona, personaCfg, true)
   if (r2.action === 'failed') driverFail(`phase2 spawnForPersona returned failed (resume did not recover)`)
+  // The row carries this persona's cwd and config_dir label, so the ladder
+  // must resume it; any other outcome means a guard replaced it (b.av2 SR-6.2).
+  if (r2.action !== 'resumed') driverFail(`phase2 spawnForPersona returned ${r2.action}, not resumed (the row was not resumed)`)
 
   const s2 = await waitForLive(instanceId, 30_000)
   if (!LIVE_STATES.has(s2)) {

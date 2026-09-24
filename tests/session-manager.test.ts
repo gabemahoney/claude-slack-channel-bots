@@ -12,9 +12,15 @@
  *   - The real-path `config_dir` label (b.av2 SR-1.5, SR-2.2).
  *   - AC 3: one persona listed in two channels is spawned exactly once.
  *   - SR-1.4 idempotency: ErrInstanceIdCollision → client.get(); each state
- *     drives the documented branch.
- *   - SR-1.6 orphan reconciliation: list-then-kill-then-delete for spawns
- *     whose channel label is not in routingConfig.routes.
+ *     drives the documented branch. Collision fixtures build their row for
+ *     the persona under test (`personaRow`), so its `cwd` and `config_dir`
+ *     label match and each case stays on the path it tests.
+ *   - b.av2 SR-6.2 ladder guards: a row in another directory (by real path) is
+ *     killed, deleted and spawned fresh on every path; a missing or changed
+ *     `config_dir` label means a fresh spawn instead of a resume (AC 48).
+ *   - b.av2 SR-6.3: the fixed instance ID, one launch in flight per persona,
+ *     and the start sweep (`reconcileOrphans`) keyed by the `persona` label
+ *     (AC 4).
  *   - SR-8.6 invariant: every successful spawn call site passes
  *     relay_mode='on'.
  *   - Persona notices (b.av2 SR-7.2): spawn failure (generic, dialog-approval
@@ -71,6 +77,9 @@ import {
   _resetDialogDeadGracePolls,
   _setSpawnHomeDir,
   _resetSpawnHomeDir,
+  _resetInFlightLaunches,
+  isLaunchInFlight,
+  compareRowToPersona,
   setSessionNotifier,
   notifySpawnFailure,
   notifyRestartCapReached,
@@ -79,8 +88,8 @@ import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
 import type { WebApiOutcome } from './test-helpers/slack-stub.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
 import { LEAK_SENTINEL, assertNoLeak } from './test-helpers/credentials.ts'
-import { type Persona, type PersonaConfig, resolveRealPath } from '../src/config.ts'
-import { configDirLabelValue, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
+import { MCP_SERVER_NAME, type Persona, type PersonaConfig, resolveRealPath } from '../src/config.ts'
+import { PERSONA_INSTANCE_ID_PREFIX, configDirLabelValue, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { routesToPersonaConfig } from '../src/route-persona-adapter.ts'
 import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
 import {
@@ -99,7 +108,10 @@ import {
   errSpawnNotInteractive,
   errTmuxSendKeys,
   errTmuxSessionCreate,
+  holdSpawns,
   makeStubClient,
+  type CannedGetResult,
+  type PersonaGetResultOverrides,
   type StubClient,
 } from './test-helpers/agent-director-stub.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
@@ -162,7 +174,49 @@ function useSpawnHome(name = 'home'): string {
   const home = fixtureSubdir(name)
   mkdirSync(join(home, '.claude'))
   _setSpawnHomeDir(home)
+  seamHome = home
   return home
+}
+
+/**
+ * Replace `<home>/.claude` with a symlink to a new directory under the fixture
+ * dir and return that directory's real path (what a spawn's `config_dir`
+ * label is computed from).
+ */
+function linkClaudeDir(home: string): string {
+  const target = fixtureSubdir('claude-dir-target')
+  rmSync(join(home, '.claude'), { recursive: true, force: true })
+  symlinkSync(target, join(home, '.claude'))
+  return realpathSync(target)
+}
+
+/** The home the latest `useSpawnHome` of this test installed; cleared in beforeEach. */
+let seamHome: string | undefined
+
+/** This test's seam home, created with `useSpawnHome()` on first use. */
+function ladderHome(): string {
+  return seamHome ?? useSpawnHome()
+}
+
+/**
+ * The row a spawn of persona `key` left behind, for a collision fixture:
+ * `cannedGetResult` in persona form, so its `cwd` is the persona's working
+ * directory, its instance ID `cscb_<key>` and its `config_dir` label the
+ * persona's current one under the seam home (`ladderHome`). A ladder fixture
+ * built from it stays on the state path it tests instead of meeting the `cwd`
+ * or `config_dir` guard (b.av2 SR-6.2). Overrides win, so a guard case can
+ * replace `cwd` or `labels`.
+ */
+function personaRow(cfg: PersonaConfig, key: string, overrides: PersonaGetResultOverrides = {}): CannedGetResult {
+  return cannedGetResult(overrides, personaOf(cfg, key), ladderHome())
+}
+
+/** A stub `get` that answers each `cscb_<key>` with `personaRow(cfg, key, overrides)`. */
+function personaRowsGet(
+  cfg: PersonaConfig,
+  overrides: PersonaGetResultOverrides = {},
+): (params: import('agent-director').GetParams) => Promise<CannedGetResult> {
+  return async (params) => personaRow(cfg, params.claude_instance_id.slice(PERSONA_INSTANCE_ID_PREFIX.length), overrides)
 }
 
 /** Capture of outage-state notices (onsets + all-clears), by persona key, across each test. */
@@ -198,6 +252,7 @@ beforeEach(() => {
   })
   notices = []
   setSessionNotifier((key, text, options) => { notices.push({ key, text, options }) })
+  seamHome = undefined
   // Default the raw-tmux dialog seams to safe no-ops so unit tests never shell
   // out to real tmux (b.vub). Dead-row tests override these to drive behavior.
   _setTmuxCapturePane(async () => '')
@@ -221,6 +276,7 @@ afterEach(() => {
   _resetDialogDeadGracePolls()
   _resetOutageState()
   _resetSpawnHomeDir()
+  _resetInFlightLaunches()
   setSessionNotifier(undefined)
   process.env = savedEnv as NodeJS.ProcessEnv
   rmSync(fixtureDir, { recursive: true, force: true })
@@ -658,13 +714,13 @@ describe('spawnForPersona: persona identity (SR-2.2)', () => {
     const getCalls: import('agent-director').GetParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const key = personaKey('General Chat')
+    const cfg = makeMultiPersonaConfig([{ name: 'General Chat', working_directory: '/x' }], fixtureDir)
     installStub({
       getCalls,
       resumeCalls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: `cscb_${key}`, state: 'ended' }),
+      getResult: personaRow(cfg, key, { state: 'ended' }),
     })
-    const cfg = makeMultiPersonaConfig([{ name: 'General Chat', working_directory: '/x' }], fixtureDir)
 
     const result = await spawnForPersona(personaOf(cfg, key), cfg)
 
@@ -682,13 +738,13 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
   test('ended state + resume_enabled → resume()', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       spawnCalls,
       resumeCalls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('resumed')
     expect(resumeCalls).toHaveLength(1)
@@ -698,6 +754,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
   test('ended state + ErrNoSessionId on resume → delete + fresh spawn', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       spawnCalls,
       deleteCalls,
@@ -706,9 +763,8 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
       ],
       resumeError: errNoSessionId(),
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(spawnCalls).toHaveLength(2)
@@ -721,6 +777,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     const killCalls: import('agent-director').KillParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { resume_enabled: false })
     installStub({
       spawnCalls,
       killCalls,
@@ -730,9 +787,8 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
       ],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'missing' }),
+      getResult: personaRow(cfg, 'C', { state: 'missing' }),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { resume_enabled: false })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(resumeCalls).toHaveLength(0)
@@ -742,12 +798,12 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
 
   test('waiting state → reconnectMcp (sendKeys with /mcp reconnect)', async () => {
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       sendKeysCalls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      getResult: personaRow(cfg, 'C', { state: 'waiting' }),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('reconnected')
     expect(sendKeysCalls).toHaveLength(1)
@@ -756,11 +812,11 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
 
   test('pending/check_permission/ask_user → no-op', async () => {
     for (const state of ['pending', 'check_permission', 'ask_user']) {
+      const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
       installStub({
         spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-        getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state }),
+        getResult: personaRow(cfg, 'C', { state }),
       })
-      const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
       const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
       expect(result.action).toBe('no-op')
       resetClientForTests()
@@ -777,6 +833,8 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
+    const home = useSpawnHome()
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       spawnCalls,
       killCalls,
@@ -786,10 +844,8 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
       ],
       resumeError: errSpawnNotFound(),
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
     })
-    const home = useSpawnHome()
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result).toEqual({ key: 'C', action: 'spawned' })
     // initial collision spawn + the fresh spawn after ErrSpawnNotFound
@@ -812,6 +868,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     const readLog = captureStartupErrors()
+    const cfg = makeNoticeConfig()
     installStub({
       spawnCalls,
       deleteCalls,
@@ -820,9 +877,8 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
         cannedErr<import('agent-director').SpawnResult>(errGeneric('spawn', 'ErrSpawnBroken')),
       ],
       resumeError: errSpawnNotFound(),
-      getResult: cannedGetResult({ claude_instance_id: `cscb_${NOTICE_KEY}`, state: 'ended' }),
+      getResult: personaRow(cfg, NOTICE_KEY, { state: 'ended' }),
     })
-    const cfg = makeNoticeConfig()
     const h = installNoticeNotifier(cfg)
     const result = await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg)
     await settleNotices()
@@ -856,37 +912,799 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-1.6 — orphan reconciliation
+// b.av2 SR-6.2 / SR-6.3 — row-vs-persona comparison (compareRowToPersona)
 // ---------------------------------------------------------------------------
 
-describe('reconcileOrphans (SR-1.6)', () => {
-  test('kills + deletes spawns whose channel label is not in routes', async () => {
+describe('compareRowToPersona (b.av2 SR-6.2, SR-6.3)', () => {
+  /** Paths for one case, all under this test's fixture dir; `home` is real-pathed. */
+  interface CompareFixture {
+    work: string
+    config: string
+    home: string
+  }
+
+  function compareFixture(): CompareFixture {
+    const home = realpathSync(fixtureSubdir('home'))
+    mkdirSync(join(home, '.claude'))
+    return { work: fixtureSubdir('work'), config: fixtureSubdir('claude-config'), home }
+  }
+
+  // agent-director stores the real path a spawn ran in, so in practice the
+  // symlink is on the persona side: its configured working_directory or
+  // claude_config_dir. Row-side links are covered too.
+  test.each<[string, boolean, (f: CompareFixture) => { rowCwd: string | undefined; personaWork: string }]>([
+    ['equal', true, (f) => ({ rowCwd: f.work, personaWork: f.work })],
+    [
+      'the real directory, persona working_directory a symlink to it',
+      true,
+      (f) => {
+        const link = join(fixtureDir, 'work-link')
+        symlinkSync(f.work, link)
+        return { rowCwd: realpathSync(f.work), personaWork: link }
+      },
+    ],
+    [
+      'a symlink to the working directory',
+      true,
+      (f) => {
+        const link = join(fixtureDir, 'work-link')
+        symlinkSync(f.work, link)
+        return { rowCwd: link, personaWork: f.work }
+      },
+    ],
+    ['a different existing directory', false, (f) => ({ rowCwd: fixtureSubdir('elsewhere'), personaWork: f.work })],
+    ['a nonexistent path (lexical fallback, differs)', false, (f) => ({ rowCwd: join(fixtureDir, 'never-created'), personaWork: f.work })],
+    [
+      'a nonexistent path (lexical fallback, same after normalisation)',
+      true,
+      () => ({ rowCwd: join(fixtureDir, 'absent-work') + '/./', personaWork: join(fixtureDir, 'absent-work') }),
+    ],
+    ['absent', false, (f) => ({ rowCwd: undefined, personaWork: f.work })],
+    ['empty', false, (f) => ({ rowCwd: '', personaWork: f.work })],
+  ])('row cwd %s → cwdMatches=%p', (_label, expected, build) => {
+    const f = compareFixture()
+    const { rowCwd, personaWork } = build(f)
+    const persona = { working_directory: personaWork, claude_config_dir: f.config }
+    const row = { cwd: rowCwd, labels: { config_dir: personaConfigDirLabelValue(f.config, f.home) } }
+    expect(compareRowToPersona(row, persona, f.home).cwdMatches).toBe(expected)
+  })
+
+  test.each<[string, boolean, (f: CompareFixture) => { label: string | undefined; configDir: string | undefined }]>([
+    ['equal', true, (f) => ({ label: configDirLabelValue(realpathSync(f.config)), configDir: f.config })],
+    ['missing', false, (f) => ({ label: undefined, configDir: f.config })],
+    ['different', false, (f) => ({ label: configDirLabelValue(realpathSync(fixtureSubdir('other-config'))), configDir: f.config })],
+    [
+      'the one its spawn wrote (the real directory), persona claude_config_dir a symlink to it',
+      true,
+      (f) => {
+        const link = join(fixtureDir, 'config-link')
+        symlinkSync(f.config, link)
+        return { label: configDirLabelValue(realpathSync(f.config)), configDir: link }
+      },
+    ],
+    [
+      'equal, persona with no claude_config_dir (the injected home’s .claude)',
+      true,
+      (f) => ({ label: configDirLabelValue(join(f.home, '.claude')), configDir: undefined }),
+    ],
+    [
+      'the one its spawn wrote (the real directory), no claude_config_dir and the injected home’s .claude a symlink',
+      true,
+      (f) => ({ label: configDirLabelValue(linkClaudeDir(f.home)), configDir: undefined }),
+    ],
+  ])('config_dir label %s → configDirMatches=%p', (_label, expected, build) => {
+    const f = compareFixture()
+    const { label, configDir } = build(f)
+    const labels: Record<string, string> = { service: 'cscb', persona: 'C' }
+    if (label !== undefined) labels['config_dir'] = label
+    const result = compareRowToPersona({ cwd: f.work, labels }, { working_directory: f.work, claude_config_dir: configDir }, f.home)
+    expect(result.configDirMatches).toBe(expected)
+    expect(result.configDirLabel).toBe(label)
+    // The expected label is the one a spawn of the persona writes.
+    expect(result.expectedConfigDirLabel).toBe(personaConfigDirLabelValue(configDir, f.home))
+    expect(result.cwdMatches).toBe(true)
+  })
+})
+
+/** Calls captured by a collision-ladder stub (the cwd and config_dir guard blocks). */
+interface LadderCalls {
+  spawnCalls: import('agent-director').SpawnParams[]
+  killCalls: import('agent-director').KillParams[]
+  deleteCalls: import('agent-director').DeleteParams[]
+  resumeCalls: import('agent-director').ResumeParams[]
+  sendKeysCalls: import('agent-director').SendKeysParams[]
+  findMissingCalls: import('agent-director').FindMissingParams[]
+}
+
+function newLadderCalls(): LadderCalls {
+  return { spawnCalls: [], killCalls: [], deleteCalls: [], resumeCalls: [], sendKeysCalls: [], findMissingCalls: [] }
+}
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-6.2 / AC 4 — a row in another directory is replaced on every
+// ladder path (kill + delete + fresh spawn in the persona's working directory)
+// ---------------------------------------------------------------------------
+
+describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
+  const COLLISION_STATES = ['ended', 'missing', 'waiting', 'working', 'pending', 'check_permission', 'ask_user'] as const
+
+  /** Persona `C` with working_directory `work` (a real temp directory by default), the seam home installed. */
+  function guardConfig(work = fixtureSubdir('work')): { cfg: PersonaConfig; work: string } {
+    useSpawnHome()
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: work } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
+    return { cfg, work }
+  }
+
+  /** A colliding spawn whose `get` returns `row`; a second spawn succeeds. */
+  function installCollision(row: CannedGetResult, calls: LadderCalls, extra: Parameters<typeof makeStubClient>[0] = {}): StubClient {
+    return installStub({
+      ...calls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      ],
+      getResult: row,
+      ...extra,
+    })
+  }
+
+  test.each([...COLLISION_STATES])('state=%s, row cwd another existing directory → kill + delete + one fresh spawn, no resume or reconnect', async (state) => {
+    const { cfg, work } = guardConfig()
+    const elsewhere = fixtureSubdir('elsewhere')
+    const calls = newLadderCalls()
+    installCollision(personaRow(cfg, 'C', { state, cwd: elsewhere }), calls)
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(result).toEqual({ key: 'C', action: 'spawned' })
+    expect(calls.killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_C'])
+    expect(calls.deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_C']])
+    // The colliding spawn plus exactly one fresh spawn, in the persona's directory.
+    expect(calls.spawnCalls).toHaveLength(2)
+    expect(calls.spawnCalls[1].claude_instance_id).toBe('cscb_C')
+    expect(calls.spawnCalls[1].cwd).toBe(work)
+    // Never resumed, reconnected or reconciled-then-resumed.
+    expect(calls.resumeCalls).toHaveLength(0)
+    expect(calls.sendKeysCalls.filter((s) => String(s.text).includes('/mcp reconnect'))).toHaveLength(0)
+    expect(calls.findMissingCalls).toHaveLength(0)
+    expect(errLog).toContain(
+      `spawnForPersona: ${renderPersonaRef('C', 'C')} row cwd=${elsewhere} differs from working_directory=${work} (state=${state}) — replacing the row: kill+delete+fresh`,
+    )
+  })
+
+  test.each([
+    ['ended', 'resumed'],
+    ['waiting', 'reconnected'],
+    ['pending', 'no-op'],
+  ] as const)('control: state=%s, persona working_directory a symlink and the row cwd its real directory → normal path (%s), nothing killed or deleted', async (state, action) => {
+    const real = fixtureSubdir('work-real')
+    const link = join(fixtureDir, 'work-link')
+    symlinkSync(real, link)
+    const { cfg } = guardConfig(link)
+    const calls = newLadderCalls()
+    // agent-director records the real path the spawn ran in.
+    installCollision(personaRow(cfg, 'C', { state, cwd: realpathSync(real) }), calls)
+
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+
+    expect(result).toEqual({ key: 'C', action })
+    expect(calls.killCalls).toHaveLength(0)
+    expect(calls.deleteCalls).toHaveLength(0)
+    expect(calls.spawnCalls).toHaveLength(1)
+    expect(calls.resumeCalls).toHaveLength(state === 'ended' ? 1 : 0)
+    expect(calls.sendKeysCalls.filter((s) => String(s.text).includes('/mcp reconnect'))).toHaveLength(state === 'waiting' ? 1 : 0)
+  })
+
+  test('control: a row cwd that does not exist falls back to lexical comparison and is a mismatch', async () => {
+    const { cfg, work } = guardConfig()
+    const absent = join(fixtureDir, 'never-created')
+    const calls = newLadderCalls()
+    installCollision(personaRow(cfg, 'C', { state: 'ended', cwd: absent }), calls)
+
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+
+    expect(result).toEqual({ key: 'C', action: 'spawned' })
+    expect(calls.killCalls).toHaveLength(1)
+    expect(calls.deleteCalls).toHaveLength(1)
+    expect(calls.resumeCalls).toHaveLength(0)
+    expect(calls.spawnCalls).toHaveLength(2)
+    expect(calls.spawnCalls[1].cwd).toBe(work)
+  })
+
+  test('a failed delete on the mismatch path → failed, no fresh spawn (never two instances)', async () => {
+    const readLog = captureStartupErrors()
+    const { cfg } = guardConfig()
+    const calls = newLadderCalls()
+    installCollision(personaRow(cfg, 'C', { state: 'waiting', cwd: fixtureSubdir('elsewhere') }), calls, {
+      deleteError: errGeneric('delete', 'ErrDeleteBroken'),
+    })
+
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+
+    expect(result).toEqual({ key: 'C', action: 'failed' })
+    expect(calls.killCalls).toHaveLength(1)
+    expect(calls.deleteCalls).toHaveLength(1)
+    expect(calls.spawnCalls).toHaveLength(1) // only the colliding spawn
+    expect(calls.resumeCalls).toHaveLength(0)
+    expect(calls.sendKeysCalls).toHaveLength(0)
+    const log = readLog()
+    expect(log).toContain('[spawn-failed]')
+    expect(log).toContain(`delete failed for ${renderPersonaRef('C', 'C')}: ErrDeleteBroken`)
+    expect(notices).toHaveLength(1)
+    expect(notices[0].key).toBe('C')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-6.2 / AC 48 — before any resume, a missing or changed `config_dir`
+// label means delete + fresh spawn (a resume would keep the old config dir)
+// ---------------------------------------------------------------------------
+
+describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)', () => {
+  /** The four ways the ladder reaches a resume. */
+  const RESUME_ENTRIES = ['ended', 'missing', 'waiting (dead session)', 'working (dead session)'] as const
+  type ResumeEntry = (typeof RESUME_ENTRIES)[number]
+
+  /** How the row's `config_dir` label relates to the persona's current one. */
+  const LABEL_VARIANTS = ['matching', 'changed', 'missing'] as const
+  type LabelVariant = (typeof LABEL_VARIANTS)[number]
+
+  /**
+   * Persona `C` with a real working directory and a real per-persona
+   * claude_config_dir; `overrides` go to the server-wide settings.
+   */
+  function labelConfig(
+    overrides: Partial<Omit<PersonaConfig, 'personas'>> = {},
+  ): { cfg: PersonaConfig; home: string; configDir: string } {
+    const home = useSpawnHome()
+    const configDir = fixtureSubdir('claude-config')
+    const cfg = makeStandInPersonaConfig(
+      { C: { working_directory: fixtureSubdir('work'), claude_config_dir: configDir } },
+      fixtureDir,
+      { agent_director_poll_interval_ms: 1, ...overrides },
+    )
+    return { cfg, home, configDir }
+  }
+
+  /** The row's labels for `variant`. */
+  function labelsFor(variant: LabelVariant, cfg: PersonaConfig, home: string): Record<string, string> {
+    const base = { ...personaRow(cfg, 'C').labels }
+    switch (variant) {
+      case 'matching':
+        return base
+      case 'changed':
+        return { ...base, config_dir: personaConfigDirLabelValue(fixtureSubdir('earlier-config'), home) }
+      case 'missing': {
+        delete base['config_dir']
+        return base
+      }
+    }
+  }
+
+  /**
+   * Drive `entry` to its resume decision. `ended` / `missing` resolve straight
+   * to it; `waiting` meets a dead session through persistent ErrTmuxSendKeys;
+   * `working` through the up-front findMissing sweep reconciling the row to
+   * `missing`. The resumed or fresh session reports `waiting`, so the dialog
+   * approver returns at once.
+   */
+  function installResumeEntry(entry: ResumeEntry, row: CannedGetResult, calls: LadderCalls): void {
+    const state = entry.split(' ')[0] as 'ended' | 'missing' | 'waiting' | 'working'
+    if (state === 'waiting' || state === 'working') _setTmuxServerEnsurer(async () => {})
+    if (state === 'working') _setWaitForWaitingTimeoutMs(30)
+    installStub({
+      ...calls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      ],
+      getResult: { ...row, state },
+      sendKeysError: state === 'waiting' ? errTmuxSendKeys() : undefined,
+      findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
+      statusFn: () =>
+        ({
+          state:
+            calls.resumeCalls.length > 0 || calls.spawnCalls.length > 1
+              ? 'waiting'
+              : state === 'working' && calls.findMissingCalls.length > 0
+                ? 'missing'
+                : state,
+        }) as import('agent-director').StatusResult,
+    })
+  }
+
+  const CASES = RESUME_ENTRIES.flatMap((entry) => LABEL_VARIANTS.map((variant) => [entry, variant] as const))
+
+  test.each(CASES)('%s row, %s config_dir label', async (entry, variant) => {
+    const readLog = captureStartupErrors()
+    const { cfg, home, configDir } = labelConfig()
+    const expectedLabel = personaConfigDirLabelValue(configDir, home)
+    const labels = labelsFor(variant, cfg, home)
+    const calls = newLadderCalls()
+    installResumeEntry(entry, personaRow(cfg, 'C', { labels }), calls)
+    const dead = entry.includes('dead session')
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    if (variant === 'matching') {
+      // Resumed as before the guard existed.
+      expect(result).toEqual({ key: 'C', action: 'resumed' })
+      expect(calls.resumeCalls.map((r) => r.claude_instance_id)).toEqual(['cscb_C'])
+      expect(calls.deleteCalls).toHaveLength(0)
+      expect(calls.spawnCalls).toHaveLength(1)
+      expect(errLog).not.toContain('config_dir label')
+      return
+    }
+
+    // No resume: the row is deleted (and killed first when it may still be
+    // live) and exactly one fresh spawn follows, carrying the current label
+    // and CLAUDE_CONFIG_DIR.
+    expect(result).toEqual({ key: 'C', action: 'spawned' })
+    expect(calls.resumeCalls).toHaveLength(0)
+    expect(calls.killCalls).toHaveLength(dead ? 1 : 0)
+    expect(calls.deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_C']])
+    expect(calls.spawnCalls).toHaveLength(2)
+    expect(calls.spawnCalls[1].label).toContain(`config_dir=${expectedLabel}`)
+    expect(calls.spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configDir)
+    // A fresh spawn, not amnesia: no transcript diagnosis, record or notice.
+    const log = readLog()
+    expect(log).not.toContain('jsonl-transcript-lost-on-resume')
+    expect(log).not.toContain('jsonl-diagnosis-inconclusive')
+    expect(notices).toHaveLength(0)
+    const ref = renderPersonaRef('C', 'C')
+    if (variant === 'missing') {
+      expect(errLog).toContain(
+        `spawnForPersona: ${ref} config_dir label missing (label absent, now=${expectedLabel} for claude_config_dir=${configDir}) — not resuming; spawning fresh`,
+      )
+    } else {
+      expect(errLog).toContain(
+        `spawnForPersona: ${ref} config_dir label changed (was=${labels['config_dir']}, now=${expectedLabel} for claude_config_dir=${configDir}) — not resuming; spawning fresh`,
+      )
+    }
+  })
+
+  // agent-director stores the label a spawn wrote, computed from the REAL
+  // effective directory; the symlink is on the persona side.
+  test.each(['claude_config_dir a symlink', 'no claude_config_dir and the seam home’s .claude a symlink'] as const)(
+    'ended row carrying the label its spawn wrote, persona %s → resumed',
+    async (variant) => {
+      const home = useSpawnHome()
+      let configDir: string | undefined
+      let real: string
+      if (variant === 'claude_config_dir a symlink') {
+        real = realpathSync(fixtureSubdir('claude-config'))
+        configDir = join(fixtureDir, 'config-link')
+        symlinkSync(real, configDir)
+      } else {
+        real = linkClaudeDir(home)
+      }
+      const cfg = makeStandInPersonaConfig(
+        { C: { working_directory: fixtureSubdir('work'), claude_config_dir: configDir } },
+        fixtureDir,
+        { agent_director_poll_interval_ms: 1 },
+      )
+      const labels = { ...personaRow(cfg, 'C').labels, config_dir: configDirLabelValue(real) }
+      const calls = newLadderCalls()
+      installResumeEntry('ended', personaRow(cfg, 'C', { labels }), calls)
+
+      let result!: Awaited<ReturnType<typeof spawnForPersona>>
+      const errLog = await withCapturedErr(async () => {
+        result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+      })
+
+      expect(result).toEqual({ key: 'C', action: 'resumed' })
+      expect(calls.resumeCalls.map((r) => r.claude_instance_id)).toEqual(['cscb_C'])
+      expect(calls.killCalls).toHaveLength(0)
+      expect(calls.deleteCalls).toHaveLength(0)
+      expect(calls.spawnCalls).toHaveLength(1)
+      expect(errLog).not.toContain('config_dir label')
+    },
+  )
+
+  test('a live waiting row with a matching cwd and a stale label still reconnects (the check applies only before a resume)', async () => {
+    const { cfg, home } = labelConfig()
+    const calls = newLadderCalls()
+    installStub({
+      ...calls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: personaRow(cfg, 'C', { state: 'waiting', labels: labelsFor('changed', cfg, home) }),
+    })
+
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+
+    expect(result).toEqual({ key: 'C', action: 'reconnected' })
+    expect(calls.sendKeysCalls.map((s) => s.text)).toEqual([`/mcp reconnect ${MCP_SERVER_NAME}`])
+    expect(calls.killCalls).toHaveLength(0)
+    expect(calls.deleteCalls).toHaveLength(0)
+    expect(calls.spawnCalls).toHaveLength(1)
+  })
+
+  test('resume_enabled: false with a stale label keeps its kill + delete + fresh path', async () => {
+    const { cfg, home } = labelConfig({ resume_enabled: false })
+    const calls = newLadderCalls()
+    installStub({
+      ...calls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      ],
+      getResult: personaRow(cfg, 'C', { state: 'ended', labels: labelsFor('changed', cfg, home) }),
+    })
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    expect(result).toEqual({ key: 'C', action: 'spawned' })
+    expect(calls.resumeCalls).toHaveLength(0)
+    expect(calls.killCalls).toHaveLength(1)
+    expect(calls.deleteCalls).toHaveLength(1)
+    expect(calls.spawnCalls).toHaveLength(2)
+    expect(errLog).toContain(`resume_enabled=false — kill+delete+fresh for ${renderPersonaRef('C', 'C')}`)
+    expect(errLog).not.toContain('config_dir label')
+  })
+
+  // AC 48 (b.av2 SR-14 "session-manager"): a persona inheriting the top-level
+  // claude_config_dir runs; its effective directory then changes through a
+  // per-persona override. The row still carries the earlier label, so the
+  // ladder deletes it and spawns fresh with the new CLAUDE_CONFIG_DIR.
+  test('AC 48: a changed effective claude_config_dir (inherited, then overridden) gives a fresh spawn with the new CLAUDE_CONFIG_DIR', async () => {
+    const home = useSpawnHome()
+    const work = fixtureSubdir('work')
+    const earlier = fixtureSubdir('top-level-config')
+    const later = fixtureSubdir('persona-config')
+    const before = makeStandInPersonaConfig({ C: { working_directory: work } }, fixtureDir, { claude_config_dir: earlier })
+    expect(personaOf(before, 'C').claude_config_dir).toBe(earlier) // inherited
+    const after = makeStandInPersonaConfig({ C: { working_directory: work, claude_config_dir: later } }, fixtureDir, { claude_config_dir: earlier })
+    expect(personaOf(after, 'C').claude_config_dir).toBe(later) // overridden
+    // The row a spawn under the earlier configuration left behind.
+    const row = personaRow(before, 'C', { state: 'ended' })
+    expect(row.labels['config_dir']).toBe(personaConfigDirLabelValue(earlier, home))
+
+    // Control: under the unchanged configuration the same row resumes.
+    const controlResume: import('agent-director').ResumeParams[] = []
+    installStub({
+      resumeCalls: controlResume,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: row,
+    })
+    expect(await spawnForPersona(personaOf(before, 'C'), before)).toEqual({ key: 'C', action: 'resumed' })
+    expect(controlResume).toHaveLength(1)
+    resetClientForTests()
+
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    installStub({
+      spawnCalls,
+      deleteCalls,
+      resumeCalls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      ],
+      getResult: row,
+    })
+
+    const result = await spawnForPersona(personaOf(after, 'C'), after)
+
+    expect(result).toEqual({ key: 'C', action: 'spawned' })
+    expect(resumeCalls).toHaveLength(0)
+    expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_C']])
+    expect(spawnCalls).toHaveLength(2)
+    expect(spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(later)
+    expect(spawnCalls[1].label).toContain(configDirLabelFor(later))
+    expect(spawnCalls[1].label).not.toContain(configDirLabelFor(earlier))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-6.3 / AC 4 — the fixed instance ID and one in-flight launch per persona
+// ---------------------------------------------------------------------------
+
+describe('spawnForPersona: fixed instance ID and one launch in flight per persona (b.av2 SR-6.3, AC 4)', () => {
+  test('the same persona spawned twice in turn: both spawns use cscb_<key>; the second meets ErrInstanceIdCollision and resolves through the ladder', async () => {
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const getCalls: import('agent-director').GetParams[] = []
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    installStub({
+      spawnCalls,
+      getCalls,
+      sendKeysCalls,
+      spawnQueue: [
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+      ],
+      getResult: personaRow(cfg, 'C', { state: 'waiting' }),
+    })
+
+    const first = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    const second = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+
+    expect(first).toEqual({ key: 'C', action: 'spawned' })
+    expect(second).toEqual({ key: 'C', action: 'reconnected' })
+    // No second instance ID is ever requested.
+    expect(spawnCalls.map((p) => p.claude_instance_id)).toEqual(['cscb_C', 'cscb_C'])
+    expect(getCalls.map((g) => g.claude_instance_id)).toEqual(['cscb_C'])
+    expect(sendKeysCalls.map((s) => s.text)).toEqual([`/mcp reconnect ${MCP_SERVER_NAME}`])
+  })
+
+  test('two overlapping calls for one persona make exactly one spawn and both get the same result', async () => {
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const held = holdSpawns(installStub({}))
+    const persona = personaOf(cfg, 'C')
+
+    let results!: Awaited<ReturnType<typeof spawnForPersona>>[]
+    const errLog = await withCapturedErr(async () => {
+      const a = spawnForPersona(persona, cfg)
+      const b = spawnForPersona(persona, cfg)
+      await held.entered('cscb_C')
+      held.release('cscb_C')
+      results = await Promise.all([a, b])
+    })
+
+    expect(held.calls).toHaveLength(1)
+    expect(results[0]).toEqual({ key: 'C', action: 'spawned' })
+    expect(results[1]).toBe(results[0])
+    expect(errLog).toContain(`spawnForPersona: launch already in flight for ${renderPersonaRef('C', 'C')} — joining it`)
+  })
+
+  test('a launchSession for K issued while startupSessionManager is launching K joins that launch: one spawn in total', async () => {
+    captureStartupErrors()
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const held = holdSpawns(installStub({}))
+
+    const start = startupSessionManager(cfg, { concurrency: 1 })
+    await held.entered('cscb_C')
+    const restart = launchSession('C', cfg)
+    held.release('cscb_C')
+    const [startResult, launched] = await Promise.all([start, restart])
+
+    expect(held.calls).toHaveLength(1)
+    expect(launched).toBe(true)
+    expect(startResult.perPersona).toEqual([{ key: 'C', action: 'spawned' }])
+  })
+
+  test('overlapping calls for two personas make one spawn each, and neither waits for the other', async () => {
+    const cfg = makeStandInPersonaConfig({ K: { working_directory: '/x/k' }, L: { working_directory: '/x/l' } }, fixtureDir)
+    const held = holdSpawns(installStub({}))
+
+    const k = spawnForPersona(personaOf(cfg, 'K'), cfg)
+    const l = spawnForPersona(personaOf(cfg, 'L'), cfg)
+    // L's spawn starts while K's is still held open.
+    await held.entered('cscb_K')
+    await held.entered('cscb_L')
+    // L settles while K is still in flight.
+    held.release('cscb_L')
+    expect(await l).toEqual({ key: 'L', action: 'spawned' })
+    let kSettled = false
+    void k.then(() => { kSettled = true })
+    await settleNotices()
+    expect(kSettled).toBe(false)
+    held.release('cscb_K')
+    expect(await k).toEqual({ key: 'K', action: 'spawned' })
+
+    expect(held.calls.map((p) => p.claude_instance_id).sort()).toEqual(['cscb_K', 'cscb_L'])
+  })
+
+  test('isLaunchInFlight is true for a persona only while its launch is unsettled; other keys stay false', async () => {
+    const cfg = makeStandInPersonaConfig({ K: { working_directory: '/x/k' }, L: { working_directory: '/x/l' } }, fixtureDir)
+    const held = holdSpawns(installStub({}))
+    expect(isLaunchInFlight('K')).toBe(false)
+
+    const k = spawnForPersona(personaOf(cfg, 'K'), cfg)
+    await held.entered('cscb_K')
+    expect(isLaunchInFlight('K')).toBe(true)
+    expect(isLaunchInFlight('L')).toBe(false)
+
+    held.release('cscb_K')
+    expect(await k).toEqual({ key: 'K', action: 'spawned' })
+    expect(isLaunchInFlight('K')).toBe(false)
+  })
+
+  test.each(['success', 'failed', 'a throw'] as const)('after a launch settles (%s), the next call for the persona starts a new ladder', async (settlement) => {
+    captureStartupErrors()
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const first =
+      settlement === 'success'
+        ? cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' })
+        : settlement === 'failed'
+          ? cannedErr<import('agent-director').SpawnResult>(errGeneric('spawn', 'ErrSpawnBroken'))
+          : cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())
+    const stub = installStub({
+      spawnCalls,
+      spawnQueue: [first, cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' })],
+    })
+    // 'a throw': the collision get returns no row, so the ladder throws while reading it.
+    stub.get = async () => undefined as unknown as import('agent-director').GetResult
+    const persona = personaOf(cfg, 'C')
+
+    if (settlement === 'a throw') {
+      await expect(spawnForPersona(persona, cfg)).rejects.toThrow()
+    } else {
+      expect((await spawnForPersona(persona, cfg)).action).toBe(settlement === 'success' ? 'spawned' : 'failed')
+    }
+    const again = await spawnForPersona(persona, cfg)
+
+    expect(again).toEqual({ key: 'C', action: 'spawned' })
+    expect(spawnCalls).toHaveLength(2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// E3 Task 3: resume_enabled: false now replaces the row through the shared
+// kill+delete+fresh path, which self-heals ErrTmuxSessionCreate (b.vub)
+// ---------------------------------------------------------------------------
+
+describe('resume_enabled: false fresh spawn self-heals ErrTmuxSessionCreate', () => {
+  test('ErrTmuxSessionCreate on the fresh spawn → kill orphan tmux by name, retry once → spawned, no notice', async () => {
+    const killedSessions: string[] = []
+    _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { resume_enabled: false })
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const killCalls: import('agent-director').KillParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    installStub({
+      spawnCalls,
+      killCalls,
+      deleteCalls,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
+      ],
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
+    })
+
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+
+    expect(result).toEqual({ key: 'C', action: 'spawned' })
+    expect(killCalls).toHaveLength(1)
+    expect(deleteCalls).toHaveLength(1)
+    expect(killedSessions).toEqual(['slack_bot_C'])
+    expect(spawnCalls).toHaveLength(3) // collision + fresh (tmux-create) + self-heal retry
+    expect(notices).toHaveLength(0)
+  })
+
+  test('the self-heal retry also fails → failed, spawn-failed recorded and a spawn-failure notice', async () => {
+    const readLog = captureStartupErrors()
+    _setTmuxSessionKiller(async () => {})
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { resume_enabled: false })
+    installStub({
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
+        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
+      ],
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
+    })
+
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
+
+    expect(result).toEqual({ key: 'C', action: 'failed' })
+    expect(readLog()).toContain(`self-heal spawn after ErrTmuxSessionCreate failed for ${renderPersonaRef('C', 'C')}: ErrTmuxSessionCreate`)
+    expect(notices).toHaveLength(1)
+    expect(notices[0].text).toContain('ErrTmuxSessionCreate')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-6.3 (formerly SR-1.6) — the start sweep
+// ---------------------------------------------------------------------------
+
+describe('reconcileOrphans: the start sweep by persona (b.av2 SR-6.3, AC 4)', () => {
+  /**
+   * Three applied personas in real temp working directories, except that
+   * beta's configured working_directory is a symlink to `betaReal` (the path
+   * agent-director records for beta's spawn).
+   */
+  function sweepConfig(): { cfg: PersonaConfig; home: string; betaReal: string } {
+    const home = useSpawnHome()
+    const betaReal = realpathSync(fixtureSubdir('beta-work'))
+    const betaLink = join(fixtureDir, 'beta-link')
+    symlinkSync(betaReal, betaLink)
+    const cfg = makeMultiPersonaConfig(
+      [
+        { name: 'alpha', working_directory: fixtureSubdir('alpha-work') },
+        { name: 'beta', working_directory: betaLink },
+        { name: 'gamma', working_directory: fixtureSubdir('gamma-work') },
+      ],
+      fixtureDir,
+    )
+    return { cfg, home, betaReal }
+  }
+
+  test('kills and deletes exactly the rows with no persona label, an absent persona, a wrong instance ID or a wrong cwd; keeps correct rows', async () => {
+    const { cfg, home, betaReal } = sweepConfig()
+    const alpha = personaOf(cfg, 'alpha')
+    const beta = personaOf(cfg, 'beta')
+    const gamma = personaOf(cfg, 'gamma')
+    const elsewhere = fixtureSubdir('elsewhere')
+    const killCalls: import('agent-director').KillParams[] = []
+    const deleteCalls: import('agent-director').DeleteParams[] = []
+    const listCalls: import('agent-director').ListParams[] = []
+    installStub({
+      killCalls,
+      deleteCalls,
+      listCalls,
+      listResult: {
+        spawns: [
+          // Kept: correct row for an applied persona.
+          cannedListRow({}, alpha, home),
+          // Kept: the persona's working_directory is a symlink; the row's cwd is its real directory.
+          cannedListRow({ cwd: betaReal }, beta, home),
+          // Swept: only the interim `channel` label, no `persona` label.
+          cannedListRow({ claude_instance_id: 'cscb_legacy', labels: { service: 'cscb', channel: 'alpha' } }, alpha, home),
+          // Swept: names a persona absent from the applied configuration.
+          cannedListRow({ claude_instance_id: 'cscb_departed', labels: { service: 'cscb', persona: 'departed', channel: 'departed' } }, alpha, home),
+          // Swept: right persona label, another instance ID.
+          cannedListRow({ claude_instance_id: 'cscb_alpha_old' }, alpha, home),
+          // Swept: right label and instance ID, another cwd.
+          cannedListRow({ cwd: elsewhere }, gamma, home),
+        ],
+      },
+    })
+
+    let result!: Awaited<ReturnType<typeof reconcileOrphans>>
+    const errLog = await withCapturedErr(async () => {
+      result = await reconcileOrphans(cfg)
+    })
+
+    expect(listCalls).toEqual([{ label: ['service=cscb'] }])
+    expect(result).toEqual({ found: 4, killed: 4, failed: 0 })
+    const swept = ['cscb_alpha_old', 'cscb_departed', 'cscb_gamma', 'cscb_legacy']
+    expect(killCalls.map((k) => k.claude_instance_id).sort()).toEqual(swept)
+    expect(deleteCalls.map((d) => d.claude_instance_id).sort()).toEqual(swept.map((id) => [id]))
+    // Each row is swept for its own reason, named in the log.
+    expect(errLog).toContain('reconcileOrphans: sweeping row (no persona label) persona=<no persona label> instanceId=cscb_legacy state=waiting — killing and deleting')
+    expect(errLog).toContain('reconcileOrphans: sweeping row (absent persona) persona=departed instanceId=cscb_departed state=waiting — killing and deleting')
+    expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong instance ID) persona=${renderPersonaRef('alpha', 'alpha')} instanceId=cscb_alpha_old state=waiting — killing and deleting`)
+    expect(errLog).toContain(`reconcileOrphans: sweeping row (wrong cwd) persona=${renderPersonaRef('gamma', 'gamma')} instanceId=cscb_gamma state=waiting cwd=${elsewhere} — killing and deleting`)
+    expect(errLog).not.toContain('instanceId=cscb_alpha state=')
+    expect(errLog).not.toContain('instanceId=cscb_beta ')
+  })
+
+  test.each([
+    ['kill', 'killed 1, failed 0', { found: 1, killed: 1, failed: 0 }],
+    ['delete', 'killed 0, failed 1', { found: 1, killed: 0, failed: 1 }],
+  ] as const)('a %s failure records orphan-cleanup; the delete is still attempted (%s)', async (verb, _label, expected) => {
+    const readLog = captureStartupErrors()
+    const { cfg, home } = sweepConfig()
     const killCalls: import('agent-director').KillParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     installStub({
       killCalls,
       deleteCalls,
-      listResult: {
-        spawns: [
-          cannedListRow({ claude_instance_id: 'cscb_C_LIVE', labels: { service: 'cscb', channel: 'C_LIVE' } }),
-          cannedListRow({ claude_instance_id: 'cscb_C_ORPH', labels: { service: 'cscb', channel: 'C_ORPH' } }),
-          cannedListRow({ claude_instance_id: 'cscb_C_NOLBL', labels: { service: 'cscb' } }),
-        ],
-      },
+      listResult: { spawns: [cannedListRow({ claude_instance_id: 'cscb_alpha_old' }, personaOf(cfg, 'alpha'), home)] },
+      killError: verb === 'kill' ? errGeneric('kill', 'ErrKillBroken') : undefined,
+      deleteError: verb === 'delete' ? errGeneric('delete', 'ErrDeleteBroken') : undefined,
     })
-    const cfg = makeRoutingConfig({ routes: { C_LIVE: { cwd: '/x' } } })
+
     const result = await reconcileOrphans(cfg)
-    expect(result.found).toBe(2) // C_ORPH + the unlabeled one
-    expect(result.killed).toBe(2)
-    expect(result.failed).toBe(0)
-    expect(killCalls.map((k) => k.claude_instance_id).sort()).toEqual(['cscb_C_NOLBL', 'cscb_C_ORPH'])
-    expect(deleteCalls.map((d) => d.claude_instance_id[0]).sort()).toEqual(['cscb_C_NOLBL', 'cscb_C_ORPH'])
+
+    expect(result).toEqual(expected)
+    expect(killCalls.map((k) => k.claude_instance_id)).toEqual(['cscb_alpha_old'])
+    expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_alpha_old']])
+    const log = readLog()
+    expect(countStartupEntries(log, 'orphan-cleanup')).toBe(1)
+    expect(log).toContain(
+      `${verb} failed for orphan instanceId=cscb_alpha_old persona=${renderPersonaRef('alpha', 'alpha')}: Err${verb === 'kill' ? 'Kill' : 'Delete'}Broken`,
+    )
   })
 
   test('list failure → recorded + zero counts (no crash)', async () => {
     const readLog = captureStartupErrors()
     installStub({ listError: new Error('AD down') })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await reconcileOrphans(cfg)
     expect(result.found).toBe(0)
     expect(result.killed).toBe(0)
@@ -1073,16 +1891,16 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
   test('spawnForPersona waiting branch: self-heal retry succeeds → reconnected', async () => {
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     _setTmuxServerEnsurer(async () => {})
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       sendKeysCalls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      getResult: personaRow(cfg, 'C', { state: 'waiting' }),
       sendKeysQueue: [
         cannedErr<import('agent-director').SendKeysResult>(errTmuxSendKeys()),
         cannedOk<import('agent-director').SendKeysResult>({}),
       ],
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('reconnected')
     expect(sendKeysCalls).toHaveLength(2)
@@ -1092,13 +1910,13 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
     const readLog = captureStartupErrors()
     _setTmuxServerEnsurer(async () => {})
     const resumeCalls: import('agent-director').ResumeParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      getResult: personaRow(cfg, 'C', { state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(), // persistent — self-heal retry fails too (dead session)
       resumeCalls,
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     // b.3ce: pre-fix this reported 'failed' and gave up; now the dead session
     // falls through to the ended/missing recovery logic (resume-first).
@@ -1112,6 +1930,7 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
     const killCalls: import('agent-director').KillParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     const spawnCalls: import('agent-director').SpawnParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       spawnCalls,
       killCalls,
@@ -1120,11 +1939,10 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
       ],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      getResult: personaRow(cfg, 'C', { state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(),
       resumeError: errSpawnNotResumable(), // stale `waiting` row rejects resume
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(killCalls).toHaveLength(1)
@@ -1135,13 +1953,13 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
   test('spawnForPersona waiting branch: dead session and recovery also fails → action=failed', async () => {
     const readLog = captureStartupErrors()
     _setTmuxServerEnsurer(async () => {})
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      getResult: personaRow(cfg, 'C', { state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(),
       resumeError: errGeneric('resume', 'ErrResumeBroken'), // recovery fails too
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(readLog()).toBe('') // resume-failure path raises a spawn-failure notice; no reconnect-failed startup entry
@@ -1153,16 +1971,17 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
     // Both routes collide into `waiting` rows whose reconnect send-keys fails
     // persistently — the 2026-09-18 post-reboot outage shape — AND the b.3ce
     // resume recovery fails, so both must land in the failed bucket.
-    installStub({
+    const cfg = makeStandInPersonaConfig({ C1: { working_directory: '/x1' }, C2: { working_directory: '/x2' } }, fixtureDir)
+    const stub = installStub({
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
       ],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_X', state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(),
       resumeError: errGeneric('resume', 'ErrResumeBroken'),
     })
-    const cfg = makeStandInPersonaConfig({ C1: { working_directory: '/x1' }, C2: { working_directory: '/x2' } }, fixtureDir)
+    // Each persona's collision get returns its own `waiting` row.
+    stub.get = personaRowsGet(cfg, { state: 'waiting' })
     const result = await startupSessionManager(cfg, { concurrency: 1 })
     expect(result.failed).toBe(2)
     expect(result.succeeded).toBe(0)
@@ -1290,9 +2109,10 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     _setTmuxServerEnsurer(async () => {})
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     installStub({
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working' }),
+      getResult: personaRow(cfg, 'C', { state: 'working' }),
       // Up-front sweep reconciles the frozen row; the first poll then sees `missing`,
       // so the loop's ended/missing branch returns dead-session before the deadline.
       findMissingCalls,
@@ -1301,7 +2121,6 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
         ({ state: findMissingCalls.length >= 1 ? 'missing' : 'working' }) as import('agent-director').StatusResult,
       resumeCalls,
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('resumed')
     expect(resumeCalls).toHaveLength(1)
@@ -1316,15 +2135,15 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
     const spawnCalls: import('agent-director').SpawnParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     installStub({
       spawnCalls,
       killCalls,
       resumeCalls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working' }),
+      getResult: personaRow(cfg, 'C', { state: 'working' }),
       statusResult: { state: 'working' } as import('agent-director').StatusResult,
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('reconnected')
     expect(resumeCalls).toHaveLength(0)
@@ -1357,16 +2176,16 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
     const callLog: string[] = []
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       callLog,
       findMissingCalls,
       resumeCalls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      getResult: personaRow(cfg, 'C', { state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(), // persistent → dead session
       findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('resumed')
     expect(findMissingCalls).toHaveLength(1)
@@ -1390,19 +2209,19 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
     const callLog: string[] = []
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     installStub({
       callLog,
       findMissingCalls,
       resumeCalls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working' }),
+      getResult: personaRow(cfg, 'C', { state: 'working' }),
       // Poll loop stays `working`; only after the fresh timeout sweep does the
       // row reconcile to `missing` → dead-session → resume recovery.
       statusFn: () =>
         ({ state: findMissingCalls.length >= 2 ? 'missing' : 'working' }) as import('agent-director').StatusResult,
       findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('resumed')
     // findMissing fires and precedes resume. (With TTL=0 the up-front sweep, the
@@ -1420,13 +2239,13 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
   test('ended/missing path: resume called with NO findMissing call', async () => {
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       findMissingCalls,
       resumeCalls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('resumed')
     expect(findMissingCalls).toHaveLength(0)
@@ -1442,6 +2261,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
     const killCalls: import('agent-director').KillParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     const spawnCalls: import('agent-director').SpawnParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       findMissingCalls,
       resumeCalls,
@@ -1452,12 +2272,11 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
       ],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      getResult: personaRow(cfg, 'C', { state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(),
       findMissingError: errGeneric('find-missing', 'ErrProbeFailed'),
       resumeError: errSpawnNotResumable(), // row still live-state → resume rejects
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(findMissingCalls).toHaveLength(1)
@@ -1475,6 +2294,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { resume_enabled: false })
     installStub({
       findMissingCalls,
       resumeCalls,
@@ -1484,10 +2304,9 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
       ],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      getResult: personaRow(cfg, 'C', { state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { resume_enabled: false })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(findMissingCalls).toHaveLength(0)
@@ -1506,6 +2325,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const spawnCalls: import('agent-director').SpawnParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       findMissingCalls,
       resumeCalls,
@@ -1514,11 +2334,10 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' } as import('agent-director').SpawnResult),
       ],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      getResult: personaRow(cfg, 'C', { state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(),
       resumeError: errTmuxSessionCreate('resume'),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(findMissingCalls).toHaveLength(1) // findMissing still runs once, before resume
@@ -1893,13 +2712,13 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
     _setTmuxSessionProber(async () => false)
     _setTmuxServerEnsurer(async () => {})
     const resumeCalls: import('agent-director').ResumeParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     installStub({
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working' }),
+      getResult: personaRow(cfg, 'C', { state: 'working' }),
       statusResult: { state: 'missing' } as import('agent-director').StatusResult,
       resumeCalls,
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('resumed')
     expect(resumeCalls).toHaveLength(1)
@@ -1923,6 +2742,7 @@ describe('SR-8.6 invariants', () => {
 
   test('every spawn call site emits relay_mode=on', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       spawnCalls,
       spawnQueue: [
@@ -1930,9 +2750,8 @@ describe('SR-8.6 invariants', () => {
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
       ],
       resumeError: errNoSessionId(),
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     await spawnForPersona(personaOf(cfg, 'C'), cfg)
     // Both spawns (initial + retry-after-delete) must carry relay_mode='on'.
     expect(spawnCalls.length).toBeGreaterThanOrEqual(1)
@@ -2014,13 +2833,13 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     // the resumed row is already live (default stub status='waiting'), the
     // approver returns before ever reading the pane.
     const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       readPaneCalls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
       statusResult: { state: 'waiting' },
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     expect(result.action).toBe('resumed')
@@ -2029,12 +2848,12 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
 
   test('skipped on collision-reconnect path (waiting state → no readPane)', async () => {
     const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       readPaneCalls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
+      getResult: personaRow(cfg, 'C', { state: 'waiting' }),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     expect(result.action).toBe('reconnected')
@@ -2043,12 +2862,12 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
 
   test('skipped on collision-noop path (pending state → no readPane)', async () => {
     const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       readPaneCalls,
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'pending' }),
+      getResult: personaRow(cfg, 'C', { state: 'pending' }),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     expect(result.action).toBe('no-op')
@@ -2336,18 +3155,18 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     const rawEntered: string[] = []
     _setTmuxCapturePane(async () => DEV_CHANNELS_PANE)
     _setTmuxSendEnter(async (name) => { rawEntered.push(name) })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       resumeCalls,
       // fresh spawn collides → get=missing → resume succeeds → approver runs
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'missing' }),
+      getResult: personaRow(cfg, 'C', { state: 'missing' }),
       // resumed bot is still `missing` while blocked at the dialog, then waiting
       statusQueue: [
         cannedOk({ state: 'missing' }),
         cannedOk({ state: 'waiting' }),
       ],
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     expect(result.action).toBe('resumed')
@@ -2364,6 +3183,7 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     const killedSessions: string[] = []
     _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
     const spawnCalls: import('agent-director').SpawnParams[] = []
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     installStub({
       spawnCalls,
       // 1st spawn: instance-id collision → get=missing → resume throws tmux-create
@@ -2372,12 +3192,11 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
         // 2nd spawn (the self-heal retry) succeeds
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_C' }),
       ],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'missing' }),
+      getResult: personaRow(cfg, 'C', { state: 'missing' }),
       resumeError: errTmuxSessionCreate('resume'),
       // approver on the retry-spawn: already live → returns immediately
       statusResult: { state: 'waiting' },
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     expect(result.action).toBe('spawned')
@@ -2507,13 +3326,13 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   test('site #9: tryKill kill ErrSystemInstallDisappeared → ad-unreachable, error ignored (no spawn-failure notice)', async () => {
     // collision → get=ended → resume_enabled=false → kill throws (flag set, ignored)
     // delete also throws so flow terminates without a fresh spawn that would clear the flag
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
     installStub({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
       killError: new ErrSystemInstallDisappeared('kill', BIN),
       deleteError: new ErrSystemInstallDisappeared('delete', BIN),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
@@ -2525,13 +3344,13 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   // -------------------------------------------------------------------------
 
   test('site #10: tryDelete delete ErrSystemInstallDisappeared → ad-unreachable, no spawn-failure notice', async () => {
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
     installStub({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
       // kill succeeds; delete fails with typed outage error
       deleteError: new ErrSystemInstallDisappeared('delete', BIN),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
@@ -2603,14 +3422,14 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   // -------------------------------------------------------------------------
 
   test('site #14: fresh-spawn after kill+delete ErrCwdNotFound → cwd-unreachable, no spawn-failure notice', async () => {
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
         cannedErr(new ErrCwdNotFound('spawn', 'ErrCwdNotFound', `cwd ${CWD} does not exist`)),
       ],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
@@ -2622,12 +3441,12 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   // -------------------------------------------------------------------------
 
   test('site #15: resume ErrSystemInstallDisappeared → ad-unreachable, no spawn-failure notice', async () => {
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
     installStub({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
       resumeError: new ErrSystemInstallDisappeared('resume', BIN),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
@@ -2639,15 +3458,15 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   // -------------------------------------------------------------------------
 
   test('site #16: spawn after ErrNoSessionId-delete ErrCwdNotFound → cwd-unreachable, no spawn-failure notice', async () => {
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
         cannedErr(new ErrCwdNotFound('spawn', 'ErrCwdNotFound', `cwd ${CWD} does not exist`)),
       ],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
       resumeError: errNoSessionId(),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
@@ -2659,15 +3478,15 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   // -------------------------------------------------------------------------
 
   test('site #17: spawn after ErrSpawnNotResumable kill+delete ErrSystemInstallDisappeared → ad-unreachable, no spawn-failure notice', async () => {
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
         cannedErr(new ErrSystemInstallDisappeared('spawn', BIN)),
       ],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
+      getResult: personaRow(cfg, 'C', { state: 'ended' }),
       resumeError: errSpawnNotResumable(),
     })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
@@ -2789,14 +3608,14 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
 
   test('site #14: fresh-spawn after kill+delete (resume_enabled=false) clears all three flags', async () => {
     setupFlags()
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
       ],
-      getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
+      getResult: personaRow(cfg, CH, { state: 'ended' }),
     })
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
     const result = await spawnForPersona(personaOf(cfg, CH), cfg, false)
     expect(result.action).toBe('spawned')
     assertAllClear()
@@ -2808,11 +3627,11 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
 
   test('site #15: resume success clears all three flags + emits all-clear', async () => {
     setupFlags()
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     installStub({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
+      getResult: personaRow(cfg, CH, { state: 'ended' }),
     })
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, CH), cfg, false)
     expect(result.action).toBe('resumed')
     assertAllClear()
@@ -2824,15 +3643,15 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
 
   test('site #16: spawn after ErrNoSessionId-delete success clears all three flags', async () => {
     setupFlags()
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
       ],
-      getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
+      getResult: personaRow(cfg, CH, { state: 'ended' }),
       resumeError: errNoSessionId(),
     })
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, CH), cfg, false)
     expect(result.action).toBe('spawned')
     assertAllClear()
@@ -2844,15 +3663,15 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
 
   test('site #17: spawn after ErrSpawnNotResumable kill+delete success clears all three flags', async () => {
     setupFlags()
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     installStub({
       spawnQueue: [
         cannedErr(errInstanceIdCollision()),
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
       ],
-      getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
+      getResult: personaRow(cfg, CH, { state: 'ended' }),
       resumeError: errSpawnNotResumable(),
     })
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, CH), cfg, false)
     expect(result.action).toBe('spawned')
     assertAllClear()
@@ -2894,8 +3713,10 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
    * collision-recovery get and the diagnostic get.
    */
   function installAmnesia(opts: {
+    /** The applied configuration; the row is `personaRow(cfg, key, …)`. */
+    cfg: PersonaConfig
     jsonlDescription?: string
-    getResult?: Omit<Parameters<typeof cannedGetResult>[0], 'claude_instance_id'>
+    getResult?: PersonaGetResultOverrides
     getError?: Error
     spawnCalls?: import('agent-director').SpawnParams[]
     deleteCalls?: import('agent-director').DeleteParams[]
@@ -2913,7 +3734,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       resumeError: errJsonlMissing(opts.jsonlDescription),
       getResult: opts.getError
         ? undefined
-        : cannedGetResult({ claude_instance_id: `cscb_${key}`, state: 'ended', ...opts.getResult }),
+        : personaRow(opts.cfg, key, { state: 'ended', ...opts.getResult }),
       getError: opts.getError,
     })
   }
@@ -2935,10 +3756,11 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   // FAILS; post-fix it PASSES.
   test('REGRESSION: ErrJsonlMissing fresh-spawn with no archive configured is counted as fresh-after-inconclusive-amnesia, not fresh-after-amnesia', async () => {
     captureStartupErrors()
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     installAmnesia({
+      cfg,
       getResult: { jsonl_path: '/data/proj/sess-1.jsonl', claude_session_id: 'sess-1', cwd: CWD },
     })
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
     expect(result.freshAfterInconclusiveAmnesia).toBe(1)
@@ -2973,11 +3795,6 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       if (params.claude_instance_id === 'cscb_C3') throw errJsonlMissing()
       return { claude_instance_id: params.claude_instance_id }
     }
-    // Both collision gets return an `ended` row for their own instance id.
-    stub.get = async (params) => {
-      getIdx++
-      return cannedGetResult({ claude_instance_id: params.claude_instance_id, state: 'ended' })
-    }
     const cfg = makeStandInPersonaConfig(
       {
         C1: { working_directory: '/x1' },
@@ -2987,6 +3804,12 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       },
       fixtureDir,
     )
+    // Both collision gets return an `ended` row for their own persona.
+    const personaGet = personaRowsGet(cfg, { state: 'ended' })
+    stub.get = async (params) => {
+      getIdx++
+      return personaGet(params)
+    }
     let result!: Awaited<ReturnType<typeof startupSessionManager>>
     const errLog = await withCapturedErr(async () => {
       result = await startupSessionManager(cfg, { concurrency: 1 })
@@ -3037,11 +3860,12 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   /** Drive the amnesia diagnostic with `desc` and return the captured log. */
   async function logForDescription(desc: string): Promise<string> {
     return withCapturedErr(async () => {
+      const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
       installAmnesia({
+        cfg,
         jsonlDescription: desc,
         getResult: { jsonl_path: '/data/proj/sess-1.jsonl', claude_session_id: 'sess-1', cwd: CWD },
       })
-      const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
       await spawnForPersona(personaOf(cfg, CH), cfg, true)
     })
   }
@@ -3096,11 +3920,12 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   test('plain non-enumerated ErrJsonlMissing message: degrades to honest locally-computed candidates, no throw', async () => {
     captureStartupErrors()
     const log = await withCapturedErr(async () => {
+      const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
       installAmnesia({
+        cfg,
         jsonlDescription: 'jsonl missing', // no <source> <path> (<err>) enumeration
         getResult: { jsonl_path: '/data/proj/sess-2.jsonl', claude_session_id: 'sess-2', cwd: CWD },
       })
-      const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
       const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
       // Never throws — the fresh-spawn still happens. No message_archive_db is
       // configured here, so the diagnosis is inconclusive (c-config).
@@ -3119,7 +3944,9 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   test('never-created: 0 archived messages since spawn → quiet (no startup-error, no persona notice)', async () => {
     const readLog = captureStartupErrors()
     const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 0)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
     installAmnesia({
+      cfg,
       getResult: {
         jsonl_path: '/data/proj/sess-3.jsonl',
         claude_session_id: 'sess-3',
@@ -3127,7 +3954,6 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         started_at: '2026-09-20T05:00:00Z',
       },
     })
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
     const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
 
     // b.fwu: evidence-based never-created is the DIAGNOSED-lossless case — it
@@ -3158,16 +3984,17 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     ])
     const archive = buildTempArchiveDb(rows, NOTICE_KEY)
     archiveCleanups.push(archive.cleanup)
+    const cfg = makeNoticeConfig({ message_archive_db: archive.dbPath })
     installAmnesia({
+      cfg,
       key: NOTICE_KEY,
       getResult: {
         jsonl_path: '/data/proj/sess-4.jsonl',
         claude_session_id: 'sess-4',
-        cwd: CWD,
+        // cwd: the notice persona's own working directory (personaRow).
         started_at: startedAt,
       },
     })
-    const cfg = makeNoticeConfig({ message_archive_db: archive.dbPath })
     const h = installNoticeNotifier(cfg)
     const result = await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg, true)
     await settleNotices()
@@ -3204,13 +4031,13 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       ],
       resumeError: errJsonlMissing(),
     })
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     let getCalls = 0
     stub.get = async (params) => {
       getCalls++
       if (getCalls >= 2) throw errGeneric('get', 'ErrSpawnGone')
-      return cannedGetResult({ claude_instance_id: params.claude_instance_id, state: 'ended' })
+      return personaRowsGet(cfg, { state: 'ended' })(params)
     }
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
 
     expect(result.action).toBe('fresh-after-inconclusive-amnesia')
@@ -3239,13 +4066,13 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       ],
       resumeError: errJsonlMissing(),
     })
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     let getCalls = 0
     stub.get = async (params) => {
       getCalls++
       if (getCalls >= 2) throw errGeneric('get', 'ErrSpawnGone')
-      return cannedGetResult({ claude_instance_id: params.claude_instance_id, state: 'ended' })
+      return personaRowsGet(cfg, { state: 'ended' })(params)
     }
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
     expect(result.freshAfterInconclusiveAmnesia).toBe(1)
@@ -3261,7 +4088,9 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   test('inconclusive (b) via startup: unparseable started_at → counter + jsonl-diagnosis-inconclusive record', async () => {
     const readLog = captureStartupErrors()
     const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 3)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
     installAmnesia({
+      cfg,
       getResult: {
         jsonl_path: '/data/proj/sess-b.jsonl',
         claude_session_id: 'sess-b',
@@ -3269,7 +4098,6 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         started_at: 'not-a-timestamp',
       },
     })
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
     expect(result.freshAfterInconclusiveAmnesia).toBe(1)
@@ -3286,10 +4114,11 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   // from (c-other) by the actionable "no message archive is configured" hint.
   test('inconclusive (c-config) via startup: no message_archive_db → counter + jsonl-diagnosis-inconclusive record', async () => {
     const readLog = captureStartupErrors()
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir) // no message_archive_db
     installAmnesia({
+      cfg,
       getResult: { jsonl_path: '/data/proj/sess-c1.jsonl', claude_session_id: 'sess-c1', cwd: CWD },
     })
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir) // no message_archive_db
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
     expect(result.freshAfterInconclusiveAmnesia).toBe(1)
@@ -3304,7 +4133,9 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   test('inconclusive (c-other) via startup: configured archive file missing → counter + jsonl-diagnosis-inconclusive record', async () => {
     const readLog = captureStartupErrors()
     const missingDb = join(tmpdir(), `cscb-wrb-missing-${Date.now()}.db`)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: missingDb })
     installAmnesia({
+      cfg,
       getResult: {
         jsonl_path: '/data/proj/sess-c2.jsonl',
         claude_session_id: 'sess-c2',
@@ -3312,7 +4143,6 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         started_at: '2026-09-20T05:00:00Z',
       },
     })
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: missingDb })
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
     expect(result.freshAfterInconclusiveAmnesia).toBe(1)
@@ -3337,7 +4167,9 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   test('conclusive lost via startup: post-spawn archived messages → freshAfterAmnesia counter + diagnosed follow-up line', async () => {
     captureStartupErrors()
     const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 4)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
     installAmnesia({
+      cfg,
       getResult: {
         jsonl_path: '/data/proj/sess-lost.jsonl',
         claude_session_id: 'sess-lost',
@@ -3345,7 +4177,6 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         started_at: '2026-09-20T05:00:00Z',
       },
     })
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
     let result!: Awaited<ReturnType<typeof startupSessionManager>>
     const errLog = await withCapturedErr(async () => {
       result = await startupSessionManager(cfg, { concurrency: 1 })
@@ -3375,7 +4206,9 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   test('conclusive never-created via startup: 0 post-spawn messages → freshAfterAmnesia counter, not inconclusive', async () => {
     captureStartupErrors()
     const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 0)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
     installAmnesia({
+      cfg,
       getResult: {
         jsonl_path: '/data/proj/sess-nc.jsonl',
         claude_session_id: 'sess-nc',
@@ -3383,7 +4216,6 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         started_at: '2026-09-20T05:00:00Z',
       },
     })
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
     expect(result.freshAfterAmnesia).toBe(1)
@@ -3396,11 +4228,13 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   // "your history was destroyed" is its own harm.
   test('inconclusive persona notice is worded as uncertainty, not the lost "destroyed" wording', async () => {
     const readLog = captureStartupErrors()
-    installAmnesia({
-      key: NOTICE_KEY,
-      getResult: { jsonl_path: '/data/proj/sess-u.jsonl', claude_session_id: 'sess-u', cwd: CWD },
-    })
     const cfg = makeNoticeConfig() // no message_archive_db: c-config → inconclusive
+    installAmnesia({
+      cfg,
+      key: NOTICE_KEY,
+      // The row's cwd is the notice persona's own working directory (personaRow).
+      getResult: { jsonl_path: '/data/proj/sess-u.jsonl', claude_session_id: 'sess-u' },
+    })
     const h = installNoticeNotifier(cfg)
     const result = await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg, true)
     await settleNotices()
@@ -3421,15 +4255,15 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   // sibling in the same branch keeps the plain 'spawned' action.
   test('ErrNoSessionId sibling keeps action=spawned (only ErrJsonlMissing is amnesia)', async () => {
     captureStartupErrors()
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     installStub({
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
       ],
-      getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
+      getResult: personaRow(cfg, CH, { state: 'ended' }),
       resumeError: errNoSessionId(),
     })
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
     expect(result.action).toBe('spawned')
   })
@@ -3460,7 +4294,7 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
    * Drive the wedge: colliding spawn resolves to an `ended` row, resume rejects
    * with ErrJsonlNeverWritten, then delete + fresh spawn succeeds.
    */
-  function installNeverWritten(opts?: {
+  function installNeverWritten(cfg: PersonaConfig, opts?: {
     spawnCalls?: import('agent-director').SpawnParams[]
     deleteCalls?: import('agent-director').DeleteParams[]
     getCalls?: import('agent-director').GetParams[]
@@ -3472,8 +4306,7 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
       ],
       resumeError: errJsonlNeverWritten(),
-      getResult: cannedGetResult({
-        claude_instance_id: `cscb_${CH}`,
+      getResult: personaRow(cfg, CH, {
         state: 'ended',
         jsonl_path: '/data/proj/sess-jgf.jsonl',
         claude_session_id: 'sess-jgf',
@@ -3493,8 +4326,8 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
     const getCalls: import('agent-director').GetParams[] = []
-    installNeverWritten({ spawnCalls, deleteCalls, getCalls })
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    installNeverWritten(cfg, { spawnCalls, deleteCalls, getCalls })
 
     const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
 
@@ -3517,8 +4350,8 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
   // launchSession adapter returns false. The wedge was that loop, so assert at
   // the adapter boundary rather than replicating restart.ts's timer.
   test('launchSession adapter returns true → restart.ts records success, schedules no retry', async () => {
-    installNeverWritten()
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    installNeverWritten(cfg)
 
     expect(await launchSession(CH, cfg)).toBe(true)
   })
@@ -3548,8 +4381,8 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
   // AC-3: the startup summary must stay honest — a never-written transcript is
   // an ordinary fresh spawn, not amnesia and not an undiagnosable one.
   test('startup counters: bucketed as freshSpawned, not amnesia and not failed', async () => {
-    installNeverWritten()
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    installNeverWritten(cfg)
 
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
