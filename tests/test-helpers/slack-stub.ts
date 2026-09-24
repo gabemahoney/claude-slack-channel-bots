@@ -14,9 +14,15 @@
  *   consumes, record acks, drop on demand and can be started again;
  * - per-call scripted outcomes for `auth.test`, socket `start()`,
  *   `chat.postMessage`, `chat.update`, `filesUploadV2`, `conversations.history`,
- *   `conversations.replies` and `conversations.info` (`script`), falling back
- *   to success when exhausted; a Web API call scripted with a deferred outcome
- *   (`makeDeferredWebApiCall`) answers only when the test settles it;
+ *   `conversations.replies`, `conversations.info` and `conversations.open`
+ *   (`script`), falling back to success when exhausted; a Web API call
+ *   scripted with a deferred outcome (`makeDeferredWebApiCall`) answers only
+ *   when the test settles it;
+ * - `conversations.open` succeeds by default with a `D…` ID derived from the
+ *   requested users (`stubOpenedDmId`), so two users get two IDs and none
+ *   equals the event factories' default DM; `openedDm(id)` scripts a chosen ID;
+ * - an ordered call log (`callLog`) of every Web API method called, per client
+ *   and per stub, so a test can assert "open, then post" or "no call at all";
  * - a record of the options every client was built with (`options`).
  *
  * `makeStubSlackFactory()` adapts per-persona stubs to the connection
@@ -278,6 +284,12 @@ export interface StubSlackScript {
   replies: WebApiOutcome[]
   /** `conversations.info`; an `ok` `result` can set `channel`. */
   info: WebApiOutcome[]
+  /**
+   * `conversations.open`; an `ok` `result` can set `channel` (see `openedDm`).
+   * Unscripted, a call succeeds with `stubOpenedDmId(users)`. Starts empty
+   * (no `StubSlackOptions` counterpart); push onto `stub.script.open`.
+   */
+  open: WebApiOutcome[]
 }
 
 export interface StubSlackOptions {
@@ -312,9 +324,51 @@ export interface StubSlackOptions {
   teamId?: string
 }
 
+/** An `ok` `conversations.open` outcome returning the DM conversation `id` (a `D…` ID). */
+export function openedDm(id: string): WebApiOutcome {
+  return { kind: 'ok', result: { channel: { id } } }
+}
+
+/**
+ * The `D…` ID an unscripted `conversations.open` returns for `users` (Slack's
+ * comma-separated user list): `D0OPN` followed by the users' IDs without
+ * their `U`/`W` prefix, so each user (or group) gets its own ID. Never equal
+ * to the event factories' default DM (`D0STUB0001`).
+ */
+export function stubOpenedDmId(users: string): string {
+  const tail = users
+    .split(',')
+    .map((user) => user.trim().replace(/^[UW]/, ''))
+    .join('')
+    .replace(/[^0-9A-Za-z]/g, '')
+    .toUpperCase()
+  return `D0OPN${tail}`
+}
+
 // ---------------------------------------------------------------------------
 // Client surfaces
 // ---------------------------------------------------------------------------
+
+/** A Web API method the stub imitates, as it appears in a `callLog`. */
+export type StubWebMethod =
+  | 'auth.test'
+  | 'chat.postMessage'
+  | 'chat.update'
+  | 'reactions.add'
+  | 'reactions.remove'
+  | 'conversations.open'
+  | 'conversations.history'
+  | 'conversations.replies'
+  | 'conversations.info'
+  | 'users.info'
+  | 'filesUploadV2'
+
+/** One Web API call, logged when the call is made (before its outcome, so a failed call is logged too). */
+export interface StubWebCall {
+  readonly method: StubWebMethod
+  /** The arguments exactly as passed (the same object the `calls` capture holds). */
+  readonly args: unknown
+}
 
 /** The Web API surface the stub imitates, typed as the real `WebClient` methods. */
 export interface StubWebClient {
@@ -326,6 +380,12 @@ export interface StubWebClient {
   readonly token?: string
   /** Whether the client carries exactly `expected`; assert on this so a failure prints no token. */
   hasToken(expected: string): boolean
+  /**
+   * Every Web API call made on this client, in call order. Assert the order
+   * with `client.callLog.map((c) => c.method)`, e.g.
+   * `['conversations.open', 'chat.postMessage']`, or no call with `[]`.
+   */
+  readonly callLog: readonly StubWebCall[]
   auth: { test: WebClient['auth']['test'] }
   chat: { postMessage: WebClient['chat']['postMessage']; update: WebClient['chat']['update'] }
   reactions: { add: WebClient['reactions']['add']; remove: WebClient['reactions']['remove'] }
@@ -337,6 +397,17 @@ export interface StubWebClient {
   }
   users: { info: WebClient['users']['info'] }
   filesUploadV2: WebClient['filesUploadV2']
+}
+
+/**
+ * `client` typed as the real `WebClient`, for code that takes one (a
+ * persona's client in the registry's `SessionToolDeps.clientFor`, the
+ * connection manager's factory). `WebClient` is a class with private members,
+ * so no plain object satisfies it structurally; the stub implements the
+ * methods CSCB calls, and this is the one cast, so test files need none.
+ */
+export function asWebClient(client: StubWebClient): WebClient {
+  return client as unknown as WebClient
 }
 
 /** Ack function handed to socket event listeners. Records into `acks`. */
@@ -452,6 +523,12 @@ export interface StubSlack {
   readonly script: StubSlackScript
   /** Captured Web API call arguments, shared by every Web API client of this stub. */
   readonly calls: StubSlackCalls
+  /**
+   * Every Web API call made on any Web API client of this stub (`web` and
+   * each `createWebClient` client), in call order. Each client's own calls
+   * are in its `callLog`.
+   */
+  readonly callLog: readonly StubWebCall[]
   /** Options every client was built with, in build order. */
   readonly options: { web: StubWebClientBuild[]; socket: SocketModeOptions[] }
   /**
@@ -641,6 +718,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
     history: [...(opts.history ?? [])],
     replies: [...(opts.replies ?? [])],
     info: [...(opts.info ?? [])],
+    open: [],
   }
   const calls: StubSlackCalls = {
     authTest: [],
@@ -657,8 +735,8 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
   }
   const options: StubSlack['options'] = { web: [], socket: [] }
   const sockets: StubSocketClient[] = []
+  const stubCallLog: StubWebCall[] = []
   let tsSeq = 0
-  let dmSeq = 0
   let fileSeq = 0
 
   const nextTs = (): string => `1700000000.${String(++tsSeq).padStart(6, '0')}`
@@ -671,6 +749,13 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
       timeoutMs: clientOptions?.timeout,
       marker,
     })
+    const clientCallLog: StubWebCall[] = []
+    /** Log one call on this client and on the stub. */
+    const record = (method: StubWebMethod, args: unknown): void => {
+      const entry: StubWebCall = { method, args }
+      clientCallLog.push(entry)
+      stubCallLog.push(entry)
+    }
     /** A message-list call (`history`, `replies`): default an empty list. */
     const messageList = (outcome: WebApiOutcome | undefined, method: string) =>
       runWebApiCall(outcome, ctx(method), (overrides) =>
@@ -678,8 +763,10 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
       )
     const client: StubWebClient = {
       hasToken: (expected: string) => expected === token,
+      callLog: clientCallLog,
       auth: {
         test: (args) => {
+          record('auth.test', args)
           calls.authTest.push(args)
           const outcome = script.authTest.shift()
           return runWebApiCall(outcome, ctx('auth.test'), (overrides) =>
@@ -701,6 +788,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
       },
       chat: {
         postMessage: (args) => {
+          record('chat.postMessage', args)
           calls.postMessage.push(args)
           const outcome = script.post.shift()
           return runWebApiCall(outcome, ctx('chat.postMessage'), (overrides) => {
@@ -718,6 +806,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
           })
         },
         update: (args) => {
+          record('chat.update', args)
           calls.update.push(args)
           const outcome = script.update.shift()
           return runWebApiCall(outcome, ctx('chat.update'), (overrides) =>
@@ -727,28 +816,40 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
       },
       reactions: {
         add: (args) => {
+          record('reactions.add', args)
           calls.reactionsAdd.push(args)
           return Promise.resolve({ ok: true })
         },
         remove: (args) => {
+          record('reactions.remove', args)
           calls.reactionsRemove.push(args)
           return Promise.resolve({ ok: true })
         },
       },
       conversations: {
         open: (args) => {
+          record('conversations.open', args)
           calls.conversationsOpen.push(args)
-          return Promise.resolve({ ok: true, channel: { id: `D0STUB${String(++dmSeq).padStart(4, '0')}` } })
+          const outcome = script.open.shift()
+          return runWebApiCall(outcome, ctx('conversations.open'), (overrides) => {
+            // CSCB opens a DM only with `{ users }`; Slack answers with that DM.
+            const { users } = args as { users?: unknown }
+            const id = stubOpenedDmId(typeof users === 'string' ? users : '')
+            return mergeDroppingUndefined({ ok: true, channel: { id } }, overrides)
+          })
         },
         history: (args) => {
+          record('conversations.history', args)
           calls.conversationsHistory.push(args)
           return messageList(script.history.shift(), 'conversations.history')
         },
         replies: (args) => {
+          record('conversations.replies', args)
           calls.conversationsReplies.push(args)
           return messageList(script.replies.shift(), 'conversations.replies')
         },
         info: (args) => {
+          record('conversations.info', args)
           calls.conversationsInfo.push(args)
           const outcome = script.info.shift()
           return runWebApiCall(outcome, ctx('conversations.info'), (overrides) =>
@@ -770,6 +871,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
       },
       users: {
         info: (args) => {
+          record('users.info', args)
           calls.usersInfo.push(args)
           return Promise.resolve({
             ok: true,
@@ -785,6 +887,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
         },
       },
       filesUploadV2: (args) => {
+        record('filesUploadV2', args)
         calls.filesUploadV2.push(args)
         const outcome = script.upload.shift()
         return runWebApiCall(outcome, ctx('files.completeUploadExternal'), (overrides) => {
@@ -1015,6 +1118,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
     identity,
     script,
     calls,
+    callLog: stubCallLog,
     options,
     web: buildWebClient(opts.token ?? fakeToken(BOT_TOKEN_PREFIX, `stub-web-${randomIdTail()}`), undefined),
     createWebClient(token = fakeToken(BOT_TOKEN_PREFIX, 'stub'), clientOptions) {
@@ -1142,10 +1246,7 @@ export function makeStubSlackFactory(): StubSlackFactory {
     createValidationClient: (botToken, options) =>
       build('validation', botToken, options, (stub) => stub.createWebClient(botToken, options)),
     createWebClient: (botToken, options) =>
-      // `WebClient` is a class with private members, so no plain object can
-      // satisfy it structurally. The stub implements the methods persona code
-      // calls; this is the one cast, so test files pass `factory` uncast.
-      build('web', botToken, options, (stub) => stub.createWebClient(botToken, options) as unknown as WebClient),
+      build('web', botToken, options, (stub) => asWebClient(stub.createWebClient(botToken, options))),
   }
 
   function buildsOf<K extends StubClientKind>(key: string, kind: K): Extract<StubClientBuild, { kind: K }>[]

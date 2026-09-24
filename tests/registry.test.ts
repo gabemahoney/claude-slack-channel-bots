@@ -21,7 +21,6 @@ import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import type { WebClient } from '@slack/web-api'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import type { Persona } from '../src/config.ts'
@@ -53,13 +52,25 @@ import {
   matchPersonaByRootsPath,
   checkPersonaTarget,
   isSlackHostedFileUrl,
+  type PersonaTargetAction,
+  type PersonaTargetCheck,
   _resetRegistry,
   type SessionEntry,
   type SessionToolDeps,
 } from '../src/registry.ts'
 import { trackAck, consumeAck, _resetAckTracker } from '../src/ack-tracker.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
-import { makeStubSlack, type StubSlack, type StubSlackOptions } from './test-helpers/slack-stub.ts'
+import {
+  asWebClient,
+  makeStubSlack,
+  openedDm,
+  stubOpenedDmId,
+  type StubSlack,
+  type StubSlackOptions,
+  type StubWebCall,
+  type StubWebMethod,
+  type WebApiOutcome,
+} from './test-helpers/slack-stub.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import {
   BOT_TOKEN_PREFIX,
@@ -204,7 +215,10 @@ function makeHarness(): Harness {
     assertSendable: (p) => assertSendable(p, stateDir, inboxDir, [credentialsFile]),
     getAccess: () => ({ dmPolicy: 'pairing' as const, allowFrom: [], channels: {}, pending: {}, ackReaction: 'eyes' }),
     getPersona: (key) => personas.get(key),
-    clientFor: (key) => clients.get(key)?.web as unknown as WebClient | undefined,
+    clientFor: (key) => {
+      const stub = clients.get(key)
+      return stub ? asWebClient(stub.web) : undefined
+    },
     inboxDir,
     resolveUserName: async (_key, userId) => userId,
     consumeAck,
@@ -252,8 +266,35 @@ function totalSlackCalls(): number {
   return [...h.clients.values()].reduce((n, s) => n + slackCallCount(s), 0)
 }
 
-function refusal(p: Persona, target: string): string {
-  return `Persona ${renderPersonaRef(p.name, p.key)} may not target ${JSON.stringify(target)}: it is not one of the persona's configured channels.`
+/** Why `checkPersonaTarget` refuses a target (b.av2 SR-5.1). */
+const WHY = {
+  channel: "it is not one of the persona's configured channels.",
+  dmsOff: 'DMs are off for this persona (dm.enabled is false).',
+  userId: 'this tool needs a conversation ID (a channel ID or a D… DM conversation ID), not a user ID.',
+} as const
+
+function refusal(p: Persona, target: string, why: string = WHY.channel): string {
+  return `Persona ${renderPersonaRef(p.name, p.key)} may not target ${JSON.stringify(target)}: ${why}`
+}
+
+/** Every Web API method called on any persona's stub, in call order per stub. */
+function allCallLogs(): Record<string, StubWebMethod[]> {
+  return Object.fromEntries([...h.clients].map(([key, stub]) => [key, stub.callLog.map((c) => c.method)]))
+}
+
+/** No persona's stub saw any Web API call. */
+function expectNoSlackCall(): void {
+  expect(allCallLogs()).toEqual(Object.fromEntries([...h.clients.keys()].map((key) => [key, []])))
+}
+
+/**
+ * Apply `p` with its DMs switch set to `on` (and any other overrides, `dm`
+ * fields such as `contact` included) as the persona `getPersona` returns now.
+ */
+function applyPersona(p: Persona, on: boolean, overrides: Partial<Persona> = {}): Persona {
+  const applied: Persona = { ...p, ...overrides, dm: { ...p.dm, ...overrides.dm, enabled: on } }
+  h.personas.set(p.key, applied)
+  return applied
 }
 
 beforeEach(() => {
@@ -837,18 +878,48 @@ describe('not-up personas: MCP session admission and drop (b.av2 SR-6.3, SR-6.4)
 // ---------------------------------------------------------------------------
 
 describe('checkPersonaTarget', () => {
-  test.each([
-    ['a configured `all` channel', A_ALL, true],
-    ['a configured `mentions` channel', A_MENTIONS, true],
-    ["another persona's channel", B_CHANNEL, false],
-    ['an unconfigured channel', UNCONFIGURED, false],
-    ['a D… conversation', 'D0DIRECT1', false],
-    ['a U… user ID', 'U0USER001', false],
-    ['an empty value', '', false],
-  ])('%s → allowed=%p', (_label, target, allowed) => {
-    const check = checkPersonaTarget(h.alpha, target)
+  const D = 'D0DIRECT1'
+  const U = 'U0USER001'
+  const W = 'W0USER002'
+  /** An allowed target's kind, or the reason for its refusal. */
+  type Expected = 'channel' | 'dm' | 'user' | { why: string }
 
-    expect(check).toEqual(allowed ? { allowed: true } : { allowed: false, message: refusal(h.alpha, target) })
+  function expectedCheck(persona: Persona, target: string, expected: Expected): PersonaTargetCheck {
+    return typeof expected === 'string'
+      ? { allowed: true, kind: expected }
+      : { allowed: false, message: refusal(persona, target, expected.why) }
+  }
+
+  // Persona A (channels A_ALL and A_MENTIONS) with its DMs switch at `dms`.
+  // A refusal names A and the target (the full message, so the reason is pinned too).
+  test.each<[string, string, boolean, PersonaTargetAction, Expected]>([
+    ['a configured `all` channel, DMs off', A_ALL, false, 'act', 'channel'],
+    ['a configured `mentions` channel, DMs on', A_MENTIONS, true, 'post', 'channel'],
+    ["another persona's channel, DMs on", B_CHANNEL, true, 'post', { why: WHY.channel }],
+    ['an unconfigured channel, DMs off', UNCONFIGURED, false, 'post', { why: WHY.channel }],
+    ['an unconfigured channel, DMs on', UNCONFIGURED, true, 'act', { why: WHY.channel }],
+    ['a D… conversation, DMs on, post', D, true, 'post', 'dm'],
+    ['a D… conversation, DMs on, act', D, true, 'act', 'dm'],
+    ['a D… conversation, DMs off, post', D, false, 'post', { why: WHY.dmsOff }],
+    ['a D… conversation, DMs off, act', D, false, 'act', { why: WHY.dmsOff }],
+    ['a U… user ID, DMs on, post (open the DM first)', U, true, 'post', 'user'],
+    ['a W… user ID, DMs on, post (open the DM first)', W, true, 'post', 'user'],
+    ['a U… user ID, DMs off, post', U, false, 'post', { why: WHY.dmsOff }],
+    ['a U… user ID, DMs on, act', U, true, 'act', { why: WHY.userId }],
+    // DMs off, a user ID gets the DMs-off reason on every tool (never steered to a D… that is refused too).
+    ['a W… user ID, DMs off, act', W, false, 'act', { why: WHY.dmsOff }],
+    // A comma-separated user list would open a group DM; the anchored user-ID pattern refuses it.
+    ['a comma-separated user list, DMs on, post', 'U0USER001,U0USER003', true, 'post', { why: WHY.channel }],
+    ['a D… ID with trailing junk, DMs on', 'D0DIRECT1,C0NOPE001', true, 'act', { why: WHY.channel }],
+    ['a G… group DM, DMs on', 'G0GROUP01', true, 'post', { why: WHY.channel }],
+    ['a lower-case d… ID, DMs on', 'd0direct1', true, 'post', { why: WHY.channel }],
+    ['an empty value, DMs on', '', true, 'post', { why: WHY.channel }],
+  ])('%s', (_label, target, dms, action, expected) => {
+    const persona = applyPersona(h.alpha, dms)
+
+    const check = checkPersonaTarget(persona, target, action)
+
+    expect(check).toEqual(expectedCheck(persona, target, expected))
   })
 })
 
@@ -867,16 +938,22 @@ describe('tool posting scope (through the MCP server)', () => {
     },
   )
 
-  test.each(TOOLS.flatMap((tool) => [B_CHANNEL, UNCONFIGURED, 'D0DIRECT1', 'U0USER001'].map((target) => [tool, target] as const)))(
-    '%s to %s is refused with a tool error naming persona and target, and no Slack call',
-    async (tool, target) => {
+  // DM targets (D…, U…, W…) are in `DM targets` below. The DMs switch does not widen the channel scope.
+  test.each(
+    TOOLS.flatMap((tool) =>
+      [B_CHANNEL, UNCONFIGURED, 'G0GROUP01'].flatMap((target) => (['off', 'on'] as const).map((dms) => [tool, target, dms] as const)),
+    ),
+  )(
+    '%s to %s with DMs %s is refused with a tool error naming persona and target, and no Slack call',
+    async (tool, target, dms) => {
+      applyPersona(h.alpha, dms === 'on')
       const session = await openPersonaSession(h.alpha)
 
       const result = await session.call(tool, TOOL_ARGS[tool](target))
 
       expect(result.isError).toBe(true)
       expect(result.content[0]!.text).toBe(refusal(h.alpha, target))
-      expect(totalSlackCalls()).toBe(0)
+      expectNoSlackCall()
     },
   )
 
@@ -894,6 +971,254 @@ describe('tool posting scope (through the MCP server)', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// DM targets, gated by the persona's DMs switch (b.av2 SR-5.1)
+// ---------------------------------------------------------------------------
+
+describe('DM targets (through the MCP server)', () => {
+  const D = 'D0DIRECT1'
+  const U = 'U0USER001'
+  const W = 'W0USER002'
+  /** The persona's operator contact (`dm.contact`). */
+  const OPERATOR = 'U0OPER001'
+  /** The conversation a scripted `conversations.open` returns. */
+  const OPENED = 'D0OPENED1'
+  const ACT_TOOLS = TOOLS.filter((t) => t !== 'reply')
+  const ref = () => renderPersonaRef(h.alpha.name, h.alpha.key)
+
+  // With DMs off every D…/U…/W… target on every tool gets the DMs-off reason,
+  // the operator's own contact ID included.
+  test.each(TOOLS.flatMap((tool) => [D, OPERATOR, W].map((target) => [tool, target, WHY.dmsOff] as const)))(
+    'AC 36: DMs off, %s to %s is refused with a tool error naming persona and target, and no Slack call on any client',
+    async (tool, target, why) => {
+      const persona = applyPersona(h.alpha, false, { dm: { enabled: false, contact: OPERATOR } })
+      expect(persona.dm).toEqual({ enabled: false, contact: OPERATOR })
+      const session = await openPersonaSession(h.alpha)
+
+      const result = await session.call(tool, TOOL_ARGS[tool](target))
+
+      expect(result.isError).toBe(true)
+      expect(result.content[0]!.text).toBe(refusal(h.alpha, target, why))
+      expectNoSlackCall()
+    },
+  )
+
+  test("AC 37: DMs on, a reply in the delivered DM posts there through the persona's own client and removes its ack there", async () => {
+    applyPersona(h.alpha, true)
+    trackAck(D, MSG_TS)
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', { chat_id: D, text: 'hi', message_id: MSG_TS })
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0]!.text).toStartWith(`Sent 1 message(s) to ${D} [ts: `)
+    expect(stubOf(h.alpha).callLog).toEqual([
+      { method: 'chat.postMessage', args: { channel: D, text: 'hi', thread_ts: undefined, unfurl_links: false, unfurl_media: false } },
+      { method: 'reactions.remove', args: { channel: D, timestamp: MSG_TS, name: 'eyes' } },
+    ])
+    expect(stubOf(h.beta).callLog).toEqual([])
+  })
+
+  // The ack is tracked on the opened conversation in both rows; only the row
+  // that passes message_id removes it, there, after the post.
+  test.each<[string, string, Record<string, unknown>, StubWebCall[]]>([
+    [U, 'no message_id', {}, []],
+    [
+      W,
+      'with message_id, removing the ack in the opened DM',
+      { message_id: MSG_TS },
+      [{ method: 'reactions.remove', args: { channel: OPENED, timestamp: MSG_TS, name: 'eyes' } }],
+    ],
+  ])(
+    "AC 38: DMs on, a reply to user %s (%s) opens the DM on the persona's own client, then posts to the returned conversation",
+    async (user, _label, extraArgs, afterPost) => {
+      applyPersona(h.alpha, true)
+      stubOf(h.alpha).script.open.push(openedDm(OPENED))
+      trackAck(OPENED, MSG_TS)
+      const session = await openPersonaSession(h.alpha)
+
+      const result = await session.call('reply', { chat_id: user, text: 'hello there', ...extraArgs })
+
+      expect(result.isError).toBeUndefined()
+      expect(result.content[0]!.text).toStartWith(`Sent 1 message(s) to ${OPENED} (the DM with ${user}) [ts: `)
+      // The persona's own Web client's log (the one `clientFor` hands the tools).
+      expect(stubOf(h.alpha).web.callLog).toEqual([
+        { method: 'conversations.open', args: { users: user } },
+        {
+          method: 'chat.postMessage',
+          args: { channel: OPENED, text: 'hello there', thread_ts: undefined, unfurl_links: false, unfurl_media: false },
+        },
+        ...afterPost,
+      ])
+      expect(stubOf(h.beta).callLog).toEqual([])
+    },
+  )
+
+  test('AC 38: a multi-chunk reply with a file to a user ID opens the DM once and sends every chunk and the file there', async () => {
+    applyPersona(h.alpha, true)
+    stubOf(h.alpha).script.open.push(openedDm(OPENED))
+    const file = join(h.inboxDir, 'out.txt')
+    writeFileSync(file, 'data')
+    const deps: SessionToolDeps = { ...h.deps, getAccess: () => ({ ...h.deps.getAccess(), textChunkLimit: 5 }) }
+    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), deps)
+
+    const result = await session.call('reply', { chat_id: U, text: 'one\ntwo\nthree', files: [file] })
+
+    expect(result.isError).toBeUndefined()
+    const log = stubOf(h.alpha).callLog
+    expect(log.map((c) => c.method)).toEqual(['conversations.open', 'chat.postMessage', 'chat.postMessage', 'chat.postMessage', 'filesUploadV2'])
+    expect(stubOf(h.alpha).calls.postMessage.map((c) => [c.channel, (c as { text?: string }).text])).toEqual([[OPENED, 'one'], [OPENED, 'two'], [OPENED, 'three']])
+    expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: OPENED, file }] as any)
+    expect(stubOf(h.beta).callLog).toEqual([])
+  })
+
+  test.each(ACT_TOOLS)("DMs on, %s on a D… conversation passes the scope check and acts there through the persona's client", async (tool) => {
+    applyPersona(h.alpha, true)
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call(tool, TOOL_ARGS[tool](D))
+
+    expect(result.isError).toBeUndefined()
+    const captured = stubOf(h.alpha).calls[TOOL_CAPTURE[tool]] as Array<{ channel?: string }>
+    expect(captured.map((c) => c.channel)).toEqual([D])
+    expect(stubOf(h.alpha).callLog.map((c) => c.method)).not.toContain('conversations.open')
+    expect(stubOf(h.beta).callLog).toEqual([])
+  })
+
+  test.each(ACT_TOOLS)(
+    'DMs on, %s given a user ID is refused with a tool error and no Slack call (no conversations.open)',
+    async (tool) => {
+      applyPersona(h.alpha, true)
+      const session = await openPersonaSession(h.alpha)
+
+      const result = await session.call(tool, TOOL_ARGS[tool](U))
+
+      expect(result.isError).toBe(true)
+      expect(result.content[0]!.text).toBe(refusal(h.alpha, U, WHY.userId))
+      expectNoSlackCall()
+    },
+  )
+
+  test.each<[string, WebApiOutcome[], string]>([
+    [
+      'missing_scope (the im:write re-install hint)',
+      [{ kind: 'platform', error: 'missing_scope' }],
+      " (missing_scope). The persona's Slack app lacks the im:write scope; add it and re-install the app.",
+    ],
+    ['user_not_found', [{ kind: 'platform', error: 'user_not_found' }], ' (user_not_found).'],
+    ['an answer with no conversation ID', [{ kind: 'ok', result: { channel: { id: '' } } }], ' (Slack returned no conversation ID).'],
+  ])('DMs on, a reply to a user ID whose conversations.open fails with %s → tool error, nothing posted, token-safe', async (_label, open, tail) => {
+    applyPersona(h.alpha, true)
+    stubOf(h.alpha).script.open.push(...open)
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', { chat_id: U, text: 'hello' })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(`Tool "reply" failed for persona ${ref()}: could not open a DM with "${U}"${tail}`)
+    expect(stubOf(h.alpha).callLog.map((c) => c.method)).toEqual(['conversations.open'])
+    expect(stubOf(h.beta).callLog).toEqual([])
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test('DMs on, a reply to a user ID whose post fails after the open → tool error naming the user and the opened conversation, no retry, token-safe', async () => {
+    applyPersona(h.alpha, true)
+    stubOf(h.alpha).script.open.push(openedDm(OPENED))
+    stubOf(h.alpha).script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', TOOL_ARGS.reply(U))
+
+    const failedFor = `Tool "reply" failed for persona ${ref()} on DM target "${U}" (conversation ${OPENED})`
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(`${failedFor}: the tool call failed (not_in_channel).`)
+    expect(h.lines.filter((l) => l.startsWith(`[slack] ${failedFor}: `))).toHaveLength(1)
+    expect(stubOf(h.alpha).callLog.map((c) => c.method)).toEqual(['conversations.open', 'chat.postMessage'])
+    expect(stubOf(h.beta).callLog).toEqual([])
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test('DMs on, a reply to a user ID with a refused file (state directory, outside the inbox) → tool error before any Slack call (no conversations.open)', async () => {
+    applyPersona(h.alpha, true)
+    const file = join(h.stateDir, 'state.json')
+    writeFileSync(file, '{}')
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', { chat_id: U, text: 'hello', files: [file] })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(
+      `Blocked: cannot send files from state directory (${h.stateDir}). Only files in inbox/ are sendable.`,
+    )
+    expectNoSlackCall()
+  })
+
+  test('DMs on, two replies to the same user open the DM twice (no cache) and post each time to the opened conversation', async () => {
+    applyPersona(h.alpha, true)
+    const session = await openPersonaSession(h.alpha)
+
+    const first = await session.call('reply', TOOL_ARGS.reply(U))
+    const second = await session.call('reply', TOOL_ARGS.reply(U))
+
+    expect([first.isError, second.isError]).toEqual([undefined, undefined])
+    expect(stubOf(h.alpha).callLog.map((c) => [c.method, c.args])).toEqual([
+      ['conversations.open', { users: U }],
+      ['chat.postMessage', expect.objectContaining({ channel: stubOpenedDmId(U) })],
+      ['conversations.open', { users: U }],
+      ['chat.postMessage', expect.objectContaining({ channel: stubOpenedDmId(U) })],
+    ])
+  })
+
+  test('DMs on, a D… conversation Slack refuses (channel_not_found) → tool error naming the DM target, with no open fallback or retry', async () => {
+    applyPersona(h.alpha, true)
+    stubOf(h.alpha).script.post.push({ kind: 'platform', error: 'channel_not_found' })
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', TOOL_ARGS.reply(D))
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(
+      `Tool "reply" failed for persona ${ref()} on DM target "${D}": the tool call failed (channel_not_found).`,
+    )
+    expect(stubOf(h.alpha).callLog.map((c) => c.method)).toEqual(['chat.postMessage'])
+    assertNoLeak({ result, lines: h.lines })
+  })
+
+  test('AC 40 / AC 41 (registry leg): a zero-channel persona with DMs on answers its DM in place and is refused on any channel', async () => {
+    const persona = applyPersona(h.alpha, true, { channels: [], permission_prompts: 'dm', dm: { enabled: true, contact: OPERATOR } })
+    expect(persona.dm).toEqual({ enabled: true, contact: OPERATOR })
+    const session = await openPersonaSession(h.alpha)
+
+    const inDm = await session.call('reply', TOOL_ARGS.reply(D))
+    const refused = await Promise.all([A_ALL, B_CHANNEL].map((c) => session.call('reply', TOOL_ARGS.reply(c))))
+
+    expect(inDm.isError).toBeUndefined()
+    expect(refused.map((r) => [r.isError, r.content[0]!.text])).toEqual([
+      [true, refusal(h.alpha, A_ALL)],
+      [true, refusal(h.alpha, B_CHANNEL)],
+    ])
+    expect(stubOf(h.alpha).callLog.map((c) => [c.method, (c.args as { channel?: string }).channel])).toEqual([['chat.postMessage', D]])
+    expect(stubOf(h.beta).callLog).toEqual([])
+  })
+
+  test("dm.enabled is read at call time: turning A's DMs off between two replies to the same user refuses the second", async () => {
+    applyPersona(h.alpha, true)
+    const session = await openPersonaSession(h.alpha)
+    const first = await session.call('reply', TOOL_ARGS.reply(U))
+
+    applyPersona(h.alpha, false)
+    const second = await session.call('reply', TOOL_ARGS.reply(U))
+
+    expect(first.isError).toBeUndefined()
+    expect(second.isError).toBe(true)
+    expect(second.content[0]!.text).toBe(refusal(h.alpha, U, WHY.dmsOff))
+    expect(stubOf(h.alpha).callLog.map((c) => [c.method, (c.args as { channel?: string }).channel])).toEqual([
+      ['conversations.open', undefined],
+      ['chat.postMessage', stubOpenedDmId(U)],
+    ])
+  })
+})
+
 describe('dry run (SLACK_DRY_RUN=1)', () => {
   beforeEach(() => {
     process.env['SLACK_DRY_RUN'] = '1'
@@ -907,6 +1232,30 @@ describe('dry run (SLACK_DRY_RUN=1)', () => {
     expect(result.isError).toBeUndefined()
     expect(result.content[0]!.text).toStartWith('[dry-run]')
     expect(totalSlackCalls()).toBe(0)
+  })
+
+  test.each(['D0DIRECT1', 'U0USER001'])('DMs off, a reply to %s is still refused (scope runs before dry run)', async (target) => {
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', TOOL_ARGS.reply(target))
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]!.text).toBe(refusal(h.alpha, target, WHY.dmsOff))
+    expectNoSlackCall()
+  })
+
+  test.each([
+    ['D0DIRECT1', '[dry-run] Would send message to D0DIRECT1'],
+    ['U0USER001', '[dry-run] Would open a DM with U0USER001 and send message there'],
+  ])('DMs on, a reply to %s returns the dry-run result and makes no Slack call (no conversations.open)', async (target, text) => {
+    applyPersona(h.alpha, true)
+    const session = await openPersonaSession(h.alpha)
+
+    const result = await session.call('reply', TOOL_ARGS.reply(target))
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0]!.text).toBe(text)
+    expectNoSlackCall()
   })
 
   test.each(TOOLS)('%s to an unconfigured channel is still refused (scope runs before dry run)', async (tool) => {
@@ -1410,6 +1759,17 @@ describe('tool list and instructions', () => {
     // E6: dm (a direct message to the persona) is a via value too.
     expect(viaList).toMatch(/\bdm \(/)
     expect(instructions).toMatch(/<@ID>[^\n]*mentions a Slack user or another persona/)
+  })
+
+  // b.av2 SR-5.1 / SR-12: the reply targets. Key phrases only.
+  test('instructions name a DM conversation and a user ID as reply targets and say a persona with DMs off has no DM target', async () => {
+    const { client } = await openPersonaSession(h.alpha)
+
+    const instructions = client.getInstructions() ?? ''
+
+    expect(instructions).toMatch(/DMs are on[^\n]*reply in a DM conversation[^\n]*\(a D\.\.\. chat_id\)/)
+    expect(instructions).toMatch(/pass a user ID \(U\.\.\. or W\.\.\.\) as reply's chat_id/)
+    expect(instructions).toMatch(/DMs are off, you have no DM target/)
   })
 
   test('instructions say a message without via is an injected prompt needing no reply unless it asks', async () => {

@@ -17,8 +17,9 @@
  * Tool scope (b.av2 SR-5.1, SR-3.1): the tools keep their names and inputs.
  * Each call resolves the calling session's persona and that persona's Slack
  * client at call time, may target only the channels in the persona's current
- * applied configuration (`checkPersonaTarget`), and posts as the persona with
- * no username or icon override.
+ * applied configuration and, while its `dm.enabled` is on, its DM
+ * conversations and (for `reply`) user IDs (`checkPersonaTarget`), and posts
+ * as the persona with no username or icon override.
  *
  * Importing this module has no side effects.
  *
@@ -34,10 +35,10 @@ import {
 import type { WebClient } from '@slack/web-api'
 import { writeFileSync } from 'fs'
 import { join, resolve } from 'path'
-import { MCP_SERVER_NAME, resolveRealPath, type Persona } from './config.ts'
+import { DM_CONTACT_RE, MCP_SERVER_NAME, resolveRealPath, type Persona } from './config.ts'
 import { chunkText, sanitizeFilename } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
-import { describeThrownValue, slackPlatformReason } from './persona-connection-errors.ts'
+import { describeSlackCallFailure, describeThrownValue, slackPlatformReason } from './persona-connection-errors.ts'
 import { isDryRun } from './tokens.ts'
 // Peer-PID + sessions.json registry have been deleted (SR-7.1). The
 // agent-director library owns session state.
@@ -519,37 +520,97 @@ export interface SessionToolDeps {
 // Posting scope (b.av2 SR-5.1)
 // ---------------------------------------------------------------------------
 
-/** Outcome of `checkPersonaTarget`. */
+/** A DM conversation ID. A group DM (`G…`, `mpim`) never matches. */
+const DM_CONVERSATION_ID_RE = /^D[A-Z0-9]+$/
+
+/**
+ * What a tool target is, for one persona (b.av2 SR-5.1):
+ * - `channel`: the `id` of one of the persona's configured channels;
+ * - `dm`: a DM conversation ID (`D…`);
+ * - `user`: a Slack user ID (`U…`/`W…`, the `dm.contact` format);
+ * - `other`: anything else (another channel, a group DM, an empty value …).
+ */
+type PersonaTargetKind = 'channel' | 'dm' | 'user' | 'other'
+
+/**
+ * Classify `target` for `persona`. A configured channel wins over the ID
+ * shapes. Pure: no Slack call, logging or state.
+ */
+function classifyPersonaTarget(persona: Persona, target: string): PersonaTargetKind {
+  if (target !== '' && persona.channels.some((c) => c.id === target)) return 'channel'
+  if (DM_CONVERSATION_ID_RE.test(target)) return 'dm'
+  if (DM_CONTACT_RE.test(target)) return 'user'
+  return 'other'
+}
+
+/**
+ * The kind of action a tool takes on its target: `post` posts a new message
+ * (`reply`, with its file uploads); `act` acts on an existing conversation
+ * (`react`, `edit_message`, `fetch_messages`, `download_attachment`).
+ */
+export type PersonaTargetAction = 'post' | 'act'
+
+/**
+ * Outcome of `checkPersonaTarget`. An allowed `user` target is a user ID that
+ * must first be opened with `conversations.open` on the persona's client; the
+ * tool then acts in the returned conversation, never on the user ID itself.
+ */
 export type PersonaTargetCheck =
-  | { allowed: true }
+  | { allowed: true; kind: 'channel' | 'dm' | 'user' }
   | { allowed: false; message: string }
 
 /**
- * The posting scope of a persona (b.av2 SR-5.1): a tool may target `target`
- * only when it is the `id` of one of the persona's configured channels,
- * whatever that channel's delivery mode. Everything else is refused: another
- * channel, a `D…` conversation, a user ID or an empty value. The refusal
- * message names the persona (`renderPersonaRef` with its stored key) and the
- * target. Pure; DM targets are added by E6.
+ * The posting scope of a persona (b.av2 SR-5.1), decided from the persona as
+ * applied now (callers pass the persona resolved at call time):
+ * - a configured channel is allowed, whatever its delivery mode;
+ * - a `D…` conversation is allowed only while `dm.enabled` is on (Slack itself
+ *   refuses one the persona's app is not in);
+ * - a user ID is allowed only for `post` and only while `dm.enabled` is on,
+ *   as `kind: 'user'` (open the DM first); for `act` it is refused whatever
+ *   the switch, so no read, edit or reaction ever opens a DM;
+ * - everything else is refused.
+ * A refusal message names the persona (`renderPersonaRef` with its stored
+ * key) and the target. While `dm.enabled` is off, every `D…`/`U…`/`W…`
+ * target on any tool gets the DMs-off reason, so the model is never steered
+ * to a DM conversation that would be refused too. Pure.
  */
-export function checkPersonaTarget(persona: Persona, target: string): PersonaTargetCheck {
-  if (target !== '' && persona.channels.some((c) => c.id === target)) return { allowed: true }
-  return {
+export function checkPersonaTarget(
+  persona: Persona,
+  target: string,
+  action: PersonaTargetAction,
+): PersonaTargetCheck {
+  const kind = classifyPersonaTarget(persona, target)
+  const refuse = (why: string): PersonaTargetCheck => ({
     allowed: false,
-    message:
-      `Persona ${renderPersonaRef(persona.name, persona.key)} may not target ${JSON.stringify(target)}: ` +
-      `it is not one of the persona's configured channels.`,
+    message: `Persona ${renderPersonaRef(persona.name, persona.key)} may not target ${JSON.stringify(target)}: ${why}`,
+  })
+  if (kind === 'channel') return { allowed: true, kind }
+  if (kind === 'other') return refuse(`it is not one of the persona's configured channels.`)
+  if (!persona.dm.enabled) return refuse(`DMs are off for this persona (dm.enabled is false).`)
+  if (kind === 'user' && action !== 'post') {
+    return refuse(`this tool needs a conversation ID (a channel ID or a D… DM conversation ID), not a user ID.`)
   }
+  return { allowed: true, kind }
 }
 
-/** The argument naming each tool's Slack target. Tools not listed here are unknown. */
-const TOOL_TARGET_ARG: Readonly<Record<string, string>> = {
-  reply: 'chat_id',
-  react: 'chat_id',
-  edit_message: 'chat_id',
-  fetch_messages: 'channel',
-  download_attachment: 'chat_id',
+/**
+ * Each tool's Slack target: the argument naming it, and the kind of action the
+ * tool takes there (only `reply` posts a new message). Tools not listed here
+ * are unknown.
+ */
+const TOOL_TARGET: Readonly<Record<string, { arg: string; action: PersonaTargetAction }>> = {
+  reply: { arg: 'chat_id', action: 'post' },
+  react: { arg: 'chat_id', action: 'act' },
+  edit_message: { arg: 'chat_id', action: 'act' },
+  fetch_messages: { arg: 'channel', action: 'act' },
+  download_attachment: { arg: 'chat_id', action: 'act' },
 }
+
+/** The bot scope `conversations.open` needs to open a DM with a user. */
+const DM_OPEN_SCOPE = 'im:write'
+
+/** Slack's platform error for a call the app's scopes do not cover. */
+const MISSING_SCOPE_ERROR = 'missing_scope'
 
 /** Reply chunk size when the access config sets none. */
 const DEFAULT_CHUNK_LIMIT = 4000
@@ -647,7 +708,7 @@ async function fetchSlackHostedFile(url: string, token: string): Promise<SlackFi
 const MCP_INSTRUCTIONS = [
   'The sender reads Slack, not this session. Anything you want them to see must go through the reply tool.',
   '',
-  'Messages from Slack arrive as <channel source="slack" chat_id="C..." message_id="1234567890.123456" user="jeremy" user_id="U..." thread_ts="..." ts="..." via="mention">.',
+  'Messages from Slack arrive as <channel source="slack" chat_id="C..." message_id="1234567890.123456" user="display name" user_id="U..." thread_ts="..." ts="..." via="mention">.',
   'user_id is the author\'s Slack user ID. When a bot or integration without a user posted the message, the tag carries bot_id instead of user_id.',
   'via says how the message reached you: dm (a direct message to you), mention (you were @mentioned), broadcast (@here or @channel), ' +
     'receive_all_shared (a channel where you and at least one other persona receive every message), ' +
@@ -656,6 +717,14 @@ const MCP_INSTRUCTIONS = [
   'A message without via is an injected prompt (a scheduled prompt or an /interject message). It needs no reply unless it asks for one.',
   'If the tag has attachment_count, call download_attachment(chat_id, message_id) to fetch them.',
   'Reply with the reply tool — pass chat_id back. Use thread_ts to reply in a thread.',
+  'Where you may act: any channel your persona is configured into, which covers the chat_id of every channel message you receive.',
+  'When your persona\'s DMs are on, you may also reply in a DM conversation you are part of (a D... chat_id), ' +
+    'and use react, edit_message, fetch_messages and download_attachment there. ' +
+    'To start a DM, pass a user ID (U... or W...) as reply\'s chat_id: the server opens the conversation, ' +
+    'and the result names the conversation ID (D...) to use for later edits, reactions, reads and thread replies. ' +
+    'The other tools do not take a user ID.',
+  'When your persona\'s DMs are off, you have no DM target.',
+  'Any other target is refused with an error.',
   'Pass message_id (the triggering message ts) to reply to automatically remove the ack reaction when done.',
   'reply accepts file paths (files: ["/abs/path.png"]) for attachments.',
   'Use react to add emoji reactions, edit_message to update a previously sent message.',
@@ -698,7 +767,11 @@ export function createSessionServer(
         inputSchema: {
           type: 'object' as const,
           properties: {
-            chat_id: { type: 'string', description: 'Slack channel or DM ID' },
+            chat_id: {
+              type: 'string',
+              description:
+                'A channel ID or a DM conversation ID (D...); with DMs on, a user ID (U... or W...) opens a DM with that user',
+            },
             text: { type: 'string', description: 'Message text (mrkdwn supported)' },
             thread_ts: {
               type: 'string',
@@ -723,7 +796,7 @@ export function createSessionServer(
         inputSchema: {
           type: 'object' as const,
           properties: {
-            chat_id: { type: 'string', description: 'Channel ID' },
+            chat_id: { type: 'string', description: 'A channel ID or a DM conversation ID (D...)' },
             message_id: { type: 'string', description: 'Message timestamp (ts)' },
             emoji: {
               type: 'string',
@@ -739,7 +812,7 @@ export function createSessionServer(
         inputSchema: {
           type: 'object' as const,
           properties: {
-            chat_id: { type: 'string', description: 'Channel ID' },
+            chat_id: { type: 'string', description: 'A channel ID or a DM conversation ID (D...)' },
             message_id: { type: 'string', description: 'Message timestamp (ts)' },
             text: { type: 'string', description: 'New message text' },
           },
@@ -749,11 +822,11 @@ export function createSessionServer(
       {
         name: 'fetch_messages',
         description:
-          'Fetch message history from a channel or thread. Returns oldest-first.',
+          'Fetch message history from a channel, DM conversation or thread. Returns oldest-first.',
         inputSchema: {
           type: 'object' as const,
           properties: {
-            channel: { type: 'string', description: 'Channel ID' },
+            channel: { type: 'string', description: 'A channel ID or a DM conversation ID (D...)' },
             limit: {
               type: 'number',
               description: 'Max messages to fetch (default 20, max 100)',
@@ -773,7 +846,7 @@ export function createSessionServer(
         inputSchema: {
           type: 'object' as const,
           properties: {
-            chat_id: { type: 'string', description: 'Channel ID' },
+            chat_id: { type: 'string', description: 'A channel ID or a DM conversation ID (D...)' },
             message_id: {
               type: 'string',
               description: 'Message timestamp (ts) containing the files',
@@ -790,17 +863,27 @@ export function createSessionServer(
   //
   // Every call resolves the session's persona at call time from the entry
   // this server closes over, checks the tool's target against the persona's
-  // current channels (before the dry-run branch), and outside dry run makes
-  // every Slack call on the persona's own client, with no username or icon
-  // override. A refusal is a tool error (`isError: true`), never a protocol
-  // error, and makes no Slack call.
+  // current channels and DM switch (`checkPersonaTarget`, before the dry-run
+  // branch), and outside dry run makes every Slack call on the persona's own
+  // client, with no username or icon override. A refusal is a tool error
+  // (`isError: true`), never a protocol error, and makes no Slack call.
+  //
+  // A user-ID target (`reply` only) is opened with `conversations.open` on the
+  // persona's client on every call (no cache), and the reply goes to the
+  // returned conversation; the user ID itself never reaches a Slack write,
+  // which would open a DM implicitly.
   // -------------------------------------------------------------------------
 
   /** Today's dry-run result for a tool whose target passed the scope check. */
-  function dryRunResult(name: string, args: Record<string, any>) {
+  function dryRunResult(name: string, args: Record<string, any>, kind: PersonaTargetKind) {
     switch (name) {
       case 'reply':
         console.error(`[slack] dry-run: reply to ${args.chat_id} (${args.text.length} chars)`)
+        if (kind === 'user') {
+          return {
+            content: [{ type: 'text', text: `[dry-run] Would open a DM with ${args.chat_id} and send message there` }],
+          }
+        }
         return { content: [{ type: 'text', text: `[dry-run] Would send message to ${args.chat_id}` }] }
       case 'react':
         console.error(`[slack] dry-run: react :${args.emoji}: on ${args.message_id}`)
@@ -811,20 +894,64 @@ export function createSessionServer(
       case 'fetch_messages':
         console.error(`[slack] dry-run: fetch_messages from ${args.channel}`)
         return { content: [{ type: 'text', text: `[dry-run] Would fetch messages from ${args.channel}` }] }
-      default: // download_attachment (runs only for a tool in TOOL_TARGET_ARG)
+      default: // download_attachment (runs only for a tool in TOOL_TARGET)
         console.error(`[slack] dry-run: download_attachment from ${args.chat_id} msg=${args.message_id}`)
         return { content: [{ type: 'text', text: `[dry-run] Would download attachments from ${args.message_id}` }] }
     }
   }
 
-  /** Run one tool on the persona's client. Thrown failures (Slack or otherwise) propagate to the caller. */
-  async function runTool(name: string, args: Record<string, any>, persona: Persona, web: WebClient) {
+  /**
+   * Open (or find) the DM between the persona's app and user `userId` with
+   * `conversations.open` on the persona's client. Returns the conversation
+   * ID, or the tool error to return when Slack refused the open or answered
+   * without an ID; nothing is posted after a failed open.
+   */
+  async function openDmConversation(
+    name: string,
+    persona: Persona,
+    web: WebClient,
+    userId: string,
+  ): Promise<{ ok: true; id: string } | { ok: false; message: string }> {
+    const failed = `Tool "${name}" failed for persona ${renderPersonaRef(persona.name, persona.key)}: ` +
+      `could not open a DM with ${JSON.stringify(userId)}`
+    try {
+      const res = await web.conversations.open({ users: userId })
+      const id = res.channel?.id
+      if (typeof id === 'string' && id !== '') return { ok: true, id }
+      console.error(`[slack] ${failed}: Slack returned no conversation ID`)
+      return { ok: false, message: `${failed} (Slack returned no conversation ID).` }
+    } catch (err) {
+      // Token-safe: a Slack library error's message and headers can hold a token.
+      console.error(`[slack] ${failed}${describeSlackCallFailure(err)}`)
+      const reason = slackPlatformReason(err)
+      const scopeHint = reason === MISSING_SCOPE_ERROR
+        ? ` The persona's Slack app lacks the ${DM_OPEN_SCOPE} scope; add it and re-install the app.`
+        : ''
+      return { ok: false, message: `${failed}${reason ? ` (${reason})` : ''}.${scopeHint}` }
+    }
+  }
+
+  /**
+   * Run one tool on the persona's client. `kind` is the target's kind from
+   * the scope check; a `user` target (reply only) is opened first, and the
+   * opened conversation ID is set on `dm.opened` right away so the caller can
+   * name it when a later call fails. Thrown failures (Slack or otherwise)
+   * propagate to the caller.
+   */
+  async function runTool(
+    name: string,
+    args: Record<string, any>,
+    persona: Persona,
+    web: WebClient,
+    kind: PersonaTargetKind,
+    dm: { opened?: string },
+  ) {
     switch (name) {
       // ---------------------------------------------------------------------
       // reply
       // ---------------------------------------------------------------------
       case 'reply': {
-        const chatId: string = args.chat_id
+        let chatId: string = args.chat_id
         const text: string = args.text
         const threadTs: string | undefined = args.thread_ts
         const files: string[] | undefined = args.files
@@ -837,6 +964,16 @@ export function createSessionServer(
           } catch (err) {
             return toolError(err instanceof Error ? err.message : String(err))
           }
+        }
+
+        // A user ID is never posted to: open the DM, then act only in it.
+        let where = chatId
+        if (kind === 'user') {
+          const opened = await openDmConversation(name, persona, web, chatId)
+          if (!opened.ok) return toolError(opened.message)
+          dm.opened = opened.id
+          where = `${opened.id} (the DM with ${chatId})`
+          chatId = opened.id
         }
 
         const access = getAccess()
@@ -878,7 +1015,7 @@ export function createSessionServer(
           try {
             assertSendable(filePath)
           } catch (err) {
-            const posted = `${chunks.length} message(s) to ${chatId}${lastTs ? ` [ts: ${lastTs}]` : ''}`
+            const posted = `${chunks.length} message(s) to ${where}${lastTs ? ` [ts: ${lastTs}]` : ''}`
             return toolError(
               `${err instanceof Error ? err.message : String(err)} ` +
                 `The reply text was already posted (${posted}); ` +
@@ -898,7 +1035,7 @@ export function createSessionServer(
           content: [
             {
               type: 'text',
-              text: `Sent ${chunks.length} message(s)${files?.length ? ` + ${files.length} file(s)` : ''} to ${chatId}${lastTs ? ` [ts: ${lastTs}]` : ''}`,
+              text: `Sent ${chunks.length} message(s)${files?.length ? ` + ${files.length} file(s)` : ''} to ${where}${lastTs ? ` [ts: ${lastTs}]` : ''}`,
             },
           ],
         }
@@ -1068,7 +1205,8 @@ export function createSessionServer(
     const { name } = request.params
     const args = (request.params.arguments || {}) as Record<string, any>
 
-    if (!Object.hasOwn(TOOL_TARGET_ARG, name)) return toolError(`Unknown tool: ${name}`)
+    const toolTarget = Object.hasOwn(TOOL_TARGET, name) ? TOOL_TARGET[name] : undefined
+    if (!toolTarget) return toolError(`Unknown tool: ${name}`)
 
     // The calling instance's persona, resolved now (not at session creation).
     const key = entry.personaKey
@@ -1077,26 +1215,34 @@ export function createSessionServer(
     if (!persona) return toolError(`Tool "${name}" refused: persona key=${key} is not an applied persona.`)
 
     // Posting scope, before the dry-run branch (b.av2 SR-5.1).
-    const target = args[TOOL_TARGET_ARG[name]]
-    const scope = checkPersonaTarget(persona, typeof target === 'string' ? target : '')
+    const rawTarget = args[toolTarget.arg]
+    const target = typeof rawTarget === 'string' ? rawTarget : ''
+    const scope = checkPersonaTarget(persona, target, toolTarget.action)
     if (!scope.allowed) return toolError(scope.message)
 
-    if (isDryRun()) return dryRunResult(name, args)
+    if (isDryRun()) return dryRunResult(name, args, scope.kind)
 
     const ref = renderPersonaRef(persona.name, persona.key)
     const web = clientFor(key)
     if (!web) return toolError(`Tool "${name}" refused: the Slack client for persona ${ref} is not available.`)
 
+    const dm: { opened?: string } = {}
     try {
-      return await runTool(name, args, persona, web)
+      return await runTool(name, args, persona, web, scope.kind, dm)
     } catch (err) {
+      // A DM target is named, so a refusal of a D… conversation the persona's
+      // app is not in (or of the DM opened for a user) says where it failed;
+      // for a user target, the conversation opened for it is named too.
+      const failedFor = `Tool "${name}" failed for persona ${ref}` +
+        (scope.kind === 'channel' ? '' : ` on DM target ${JSON.stringify(target)}`) +
+        (dm.opened ? ` (conversation ${dm.opened})` : '')
       // Token-safe: a Slack library error's message and headers can hold a token.
-      console.error(`[slack] Tool "${name}" failed for persona ${ref}: ${describeThrownValue(err)}`)
+      console.error(`[slack] ${failedFor}: ${describeThrownValue(err)}`)
       // Not every failure here is a Slack call (a missing argument, a file
       // write, a network error), so the wording is generic; a Slack platform
       // error code is kept when there is one.
       const reason = slackPlatformReason(err)
-      return toolError(`Tool "${name}" failed for persona ${ref}: the tool call failed${reason ? ` (${reason})` : ''}.`)
+      return toolError(`${failedFor}: the tool call failed${reason ? ` (${reason})` : ''}.`)
     }
   })
 

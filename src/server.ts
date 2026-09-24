@@ -32,7 +32,9 @@
  * `delivery: mentions` one) and, with `dm.enabled` on, direct messages to its
  * own app (SR-4.3); group DMs are never delivered. A delivered message reaches
  * that persona's session only. Outbound tool calls post as the session's persona,
- * through its own client, and are scoped to that persona's configured channels.
+ * through its own client, and are scoped to that persona's configured channels
+ * and, while its `dm.enabled` is on, its DM conversations and (for `reply`)
+ * user IDs (`checkPersonaTarget` in `registry.ts`).
  *
  * SPDX-License-Identifier: MIT
  */

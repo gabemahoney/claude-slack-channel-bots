@@ -1,6 +1,6 @@
 # Claude Slack Channel Bots
 
-A single HTTP MCP server that runs several independent Claude Code bots, called personas. Each persona has its own Slack app and identity (name and avatar), one Claude Code instance with its own working directory, and is reachable from the Slack channels it is configured into. The server holds one Slack Socket Mode connection per persona and delivers each message to the persona whose app received it; each persona's tool calls may post only to the channels it is configured into, as that persona.
+A single HTTP MCP server that runs several independent Claude Code bots, called personas. Each persona has its own Slack app and identity (name and avatar), one Claude Code instance with its own working directory, and is reachable from the Slack channels it is configured into. The server holds one Slack Socket Mode connection per persona and delivers each message to the persona whose app received it; each persona's tool calls may post only to the channels it is configured into and, when its `dm.enabled` is `true`, to its direct messages, as that persona.
 
 ---
 
@@ -524,13 +524,13 @@ Each MCP endpoint exposes the following tools to the connected Claude Code sessi
 
 | Tool | Description |
 |---|---|
-| `reply` | Send a message to a Slack channel. Auto-chunks long text according to `textChunkLimit` and `chunkMode` in `access.json`. Supports file attachments. |
-| `react` | Add an emoji reaction to a Slack message. |
-| `edit_message` | Edit a previously sent message (bot's own messages only). |
-| `fetch_messages` | Fetch message history from a channel or thread. Returns oldest-first. |
-| `download_attachment` | Download attachments from a Slack message. Saves files to `STATE_DIR/inbox/`. Returns local file paths. Only files hosted by Slack are downloaded; external files are refused. |
+| `reply` | Send a message to one of the persona's configured channels or, when the persona's `dm.enabled` is `true`, to a DM conversation ID (`D…`) or a Slack user ID (`U…`/`W…`). A user ID opens a DM with that user and posts there as the persona; the result names the DM conversation ID to use for later calls. Auto-chunks long text according to `textChunkLimit` and `chunkMode` in `access.json`. Supports file attachments. |
+| `react` | Add an emoji reaction to a Slack message in a configured channel or, with `dm.enabled` `true`, a DM conversation (`D…`). |
+| `edit_message` | Edit a previously sent message (bot's own messages only) in a configured channel or, with `dm.enabled` `true`, a DM conversation (`D…`). |
+| `fetch_messages` | Fetch message history from a configured channel, a DM conversation (`D…`, with `dm.enabled` `true`) or a thread in either. Returns oldest-first. |
+| `download_attachment` | Download attachments from a Slack message in a configured channel or, with `dm.enabled` `true`, a DM conversation (`D…`). Saves files to `STATE_DIR/inbox/`. Returns local file paths. Only files hosted by Slack are downloaded; external files are refused. |
 
-A tool call that targets a channel the bot is not configured for is refused with a tool error, and nothing is posted.
+Only `reply` takes a user ID; the other tools need a channel or DM conversation ID. When `dm.enabled` ([Persona fields](#persona-fields)) is `false`, the persona has no DM target: no tool can post in, read or open a DM. A tool call with any other target is refused with a tool error naming the persona and the target, and nothing is sent to Slack.
 
 ---
 

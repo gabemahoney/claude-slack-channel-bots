@@ -236,9 +236,9 @@ describe('AC 2 / AC 12: a persona in several channels hears all of them in one i
     const chatIds = P.notifications.map((n) => n.params.meta.chat_id)
     expect(chatIds).toEqual([C1, C2, C3])
     expect(P.notifications.map((n) => n.params.content)).toEqual([C1, C2, C3].map((c) => `message for ${c}`))
-    for (const chatId of chatIds) expect(checkPersonaTarget(P.persona, chatId)).toEqual({ allowed: true })
+    for (const chatId of chatIds) expect(checkPersonaTarget(P.persona, chatId, 'post')).toEqual({ allowed: true, kind: 'channel' })
     // Control: the scope check is not vacuous.
-    expect(checkPersonaTarget(P.persona, CX).allowed).toBe(false)
+    expect(checkPersonaTarget(P.persona, CX, 'post').allowed).toBe(false)
     expect(h.p('Other Bot').notifications).toHaveLength(0)
   })
 })
