@@ -58,6 +58,8 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
 5. **No class line, but the persona still isn't served?** See
    [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running)
    and [Other lines you may see](#other-lines-you-may-see).
+6. **A `reply` to a user ID fails with `missing_scope`?** See
+   [A persona can't open a DM](#a-persona-cant-open-a-dm-re-install-its-app-to-gain-imwrite).
 
 ---
 
@@ -476,6 +478,44 @@ and is `broken`.
 
 **Fix:** put a working bot token in the persona's credentials file (see
 `persona-credentials-refused`), then restart the server.
+
+---
+
+## A persona can't open a DM: re-install its app to gain `im:write`
+
+- **Symptom:** a persona with `dm.enabled` on receives DMs and answers in
+  them, but a `reply` to a Slack user ID fails with this tool error:
+  `Tool "reply" failed for persona <ref>: could not open a DM with "<user>" (missing_scope). The persona's Slack app lacks the im:write scope; add it and re-install the app.`
+  `server.log` has a matching `[slack] Tool "reply" failed for persona <ref>: could not open a DM with "<user>" …`
+  line. Nothing is posted.
+- **Cause:** opening a DM with a user needs the `im:write` bot scope. The
+  persona's Slack app was created, or last installed, from a manifest without
+  it. Receiving DMs and replying in an existing DM (a `D…` ID) use other
+  scopes, so they keep working.
+- **Per app:** each persona is its own Slack app, so the fix is for that
+  persona's app only. Other personas are unaffected; apply the fix to each app
+  that shows the error.
+- **Fix,** in that app's settings at api.slack.com/apps:
+  1. Add the `im:write` bot scope, either as `- im:write` under
+     `oauth_config.scopes.bot` in the app's own manifest, or under OAuth &
+     Permissions → Bot Token Scopes. Do not paste the shipped
+     `slack-app-manifest.yml` over the app's manifest: that resets the app's
+     name and bot display name to the shipped defaults.
+  2. Re-install the app to the workspace (Slack prompts for it after a scope
+     change).
+  3. Try the `reply` to the user ID again. No server restart is needed while
+     the bot token is unchanged.
+- **The bot token after the re-install:** Slack adds the new scope to the
+  app's existing grant, and the shipped manifest has token rotation off, so
+  the Bot User OAuth Token normally stays the same. The operator checks this
+  themselves, outside the chat: compare the Bot User OAuth Token on the app's
+  OAuth & Permissions page with the persona's credentials file. If it changed,
+  the operator writes the new token into the credentials file and restarts the
+  server, as in the Fix of
+  [`persona-credentials-refused`](#persona-credentials-refused);
+  [Checking a credentials file's shape](#checking-a-credentials-files-shape)
+  confirms the file without showing the token. Never ask for, read, print or
+  compare a token value in the chat.
 
 ---
 

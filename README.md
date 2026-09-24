@@ -1,6 +1,6 @@
 # Claude Slack Channel Bots
 
-A single HTTP MCP server that runs several independent Claude Code bots, called personas. Each persona has its own Slack app and identity (name and avatar), one Claude Code instance with its own working directory, and is reachable from the Slack channels it is configured into. The server holds one Slack Socket Mode connection per persona and delivers each message to the persona whose app received it; each persona's tool calls may post only to the channels it is configured into and, when its `dm.enabled` is `true`, to its direct messages, as that persona.
+A single HTTP MCP server that runs several independent Claude Code bots, called personas. Each persona has its own Slack app and identity (name and avatar), one Claude Code instance with its own working directory, and is reachable from the Slack channels it is configured into and, when its `dm.enabled` is `true`, by direct message. The server holds one Slack Socket Mode connection per persona and delivers each message to the persona whose app received it; each persona's tool calls may post only to the channels it is configured into and, when its `dm.enabled` is `true`, to its direct messages, as that persona.
 
 ---
 
@@ -219,7 +219,7 @@ Two personas share the channel `C0555555555`. `planner` receives every message i
 | `permission_prompts` | yes | The persona's **destination**: where its permission prompts and server notices are posted. One of the persona's own channel IDs, or `"dm"`. |
 | `claude_config_dir` | no | Claude config directory for this persona. Defaults to the top-level `claude_config_dir`. See [Per-persona `claude_config_dir` override](#per-persona-claude_config_dir-override). |
 | `stop_hook_bootstrap` | no | Slack Reply Guard switch for this persona. Defaults to the top-level `stop_hook_bootstrap`. See [Per-persona `stop_hook_bootstrap` override](#per-persona-stop_hook_bootstrap-override). |
-| `dm` | no | Direct-message settings: `{ "enabled": <boolean>, "contact": "<user ID>" }`. `enabled` defaults to `false`. `contact` is a Slack user ID such as `U0123456789` (starting with `U` or `W`), the person a `"dm"` destination addresses. With `enabled` `true`, direct messages to the persona's Slack app are delivered to it; with `false` they are dropped with a `persona-dm-dropped` log line. |
+| `dm` | no | Direct-message settings: `{ "enabled": <boolean>, "contact": "<user ID>" }`. `enabled` defaults to `false`. `contact` is a Slack user ID such as `U0123456789` (starting with `U` or `W`), the person a `"dm"` destination addresses. See [Direct messages](#direct-messages-dmenabled). |
 
 A `"dm"` destination is accepted, but in this version its prompts and notices are only written to `server.log`, not sent to Slack.
 
@@ -233,6 +233,45 @@ The rules that most often trip a first config:
 - Unknown fields are rejected, at the top level and inside each persona.
 
 The server checks the whole file at start. Any error stops the start, and the message names the persona (`personas[<i>]`) and the field.
+
+#### Direct messages (`dm.enabled`)
+
+`dm.enabled` is each persona's DMs switch. It is off (`false`) by default.
+
+- **On:** anyone in the workspace can DM the persona's own Slack app, and that persona alone receives the DM and answers in it. The persona can also start a DM with a workspace user by passing the user's ID to `reply`, and posts there as itself.
+- **Off:** DMs to the persona's app are not delivered. The server logs one `persona-dm-dropped` line naming the persona and `dm.enabled`. The persona never opens, reads or posts in a DM.
+- **Group DMs** (DMs with more than one person) are never delivered to any persona, whatever `dm.enabled` says.
+
+The config rules for DMs (a persona with no `channels`, a `"dm"` destination) are in the rules list above.
+
+A channel persona that also takes DMs:
+
+```json
+{
+  "name": "planner",
+  "credentials_file": "~/.config/cscb/planner-credentials.json",
+  "working_directory": "~/projects/alpha",
+  "channels": [
+    { "id": "C0123456789", "delivery": "all" }
+  ],
+  "permission_prompts": "C0123456789",
+  "dm": { "enabled": true }
+}
+```
+
+A DM-only persona:
+
+```json
+{
+  "name": "helpdesk",
+  "credentials_file": "~/.config/cscb/helpdesk-credentials.json",
+  "working_directory": "~/projects/helpdesk",
+  "permission_prompts": "dm",
+  "dm": { "enabled": true, "contact": "U0123456789" }
+}
+```
+
+Starting a DM with a user needs the `im:write` bot scope, which the shipped `slack-app-manifest.yml` grants. An app created from an earlier manifest lacks it: `reply` to a user ID fails with `missing_scope` until the scope is added and the app is re-installed. Receiving DMs and answering in them work without it. The `debug-slack-channel-bots` skill (see [Troubleshooting](#troubleshooting)) has the steps under "A persona can't open a DM".
 
 #### Credentials files
 
@@ -341,7 +380,7 @@ A per-persona opt-out only *fully* disables the guard for that bot when the pers
 
 `access.json` is read from `~/.claude/channels/slack/access.json` by default (same directory as `config.json`). A skeleton file with defaults is created by postinstall. The file is written with `0600` permissions.
 
-`access.json` controls only the acknowledgement reaction and how long replies are chunked. Which messages a bot receives is set by each persona's `channels` in `config.json` (see [Messages a bot receives](#messages-a-bot-receives)).
+`access.json` controls only the acknowledgement reaction and how long replies are chunked. Which messages a bot receives is set by each persona's `channels` and `dm.enabled` in `config.json` (see [Messages a bot receives](#messages-a-bot-receives)).
 
 #### Complete example
 

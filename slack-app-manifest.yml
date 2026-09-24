@@ -1,9 +1,26 @@
 # Slack App Manifest for Claude Slack Channel Bots
 #
-# MANUAL STEP REQUIRED after creating the app from this manifest:
-# In the Slack admin UI, go to Basic Information → App-Level Tokens and generate
-# an App-Level Token with the `connections:write` scope. This token is required
-# for Socket Mode and must be set as the SLACK_APP_TOKEN environment variable.
+# ONE APP PER PERSONA: every persona is its own Slack app. Create one app from
+# this manifest for each persona, and give each app its own name and avatar.
+# You may change `display_information.name` and `features.bot_user.display_name`
+# before creating the app, or change the name and avatar afterwards in the
+# Slack admin UI.
+#
+# MANUAL STEPS REQUIRED after creating each app:
+# 1. Go to Basic Information → App-Level Tokens and generate an app-level token
+#    with the `connections:write` scope. Socket Mode needs it.
+# 2. Install the app to the workspace to get its bot token.
+# 3. Put both tokens in that persona's credentials file, the file named by the
+#    persona's `credentials_file` setting in the server's config.json. The file
+#    is a JSON object with exactly two keys: `bot_token` (the bot token) and
+#    `app_token` (the app-level token).
+#
+# RE-INSTALL EXISTING APPS: this manifest grants the `im:write` bot scope,
+# which a persona needs to open a DM with a workspace user. An app created from
+# an earlier version of this manifest must have `im:write` added and then be
+# re-installed to gain it. Until then, opening a DM fails with `missing_scope`.
+#
+# Group DMs are deliberately not subscribed: do not add a group-DM event.
 
 _metadata:
   major_version: 1
@@ -29,6 +46,7 @@ oauth_config:
       - reactions:write
       - channels:history
       - im:history
+      - im:write
       - files:read
       - files:write
       - users:read

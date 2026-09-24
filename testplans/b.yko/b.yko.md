@@ -204,9 +204,9 @@ env | grep -c -E '^SLACK_(BOT|APP)_TOKEN=' # must print 0
 
 These are expected in this build and are not failures:
 
-- DMs to any persona are dropped until E6.
-- B's `dm` destination only writes its prompts and notices to `server.log` until E7.
-- So B is checked only by its coordination-channel mention, and C only by its `agent-director` row.
+- B's and C's `dm` destination only writes its prompts and notices to `server.log` until E7.
+- So the E3 checks cover B only by its coordination-channel mention, and C only by its `agent-director` row. The DMs section (E6) checks B and C over DMs.
+- A has DMs off in this setup (no `dm` field), so a DM to A is dropped until the DMs section turns A's DMs on.
 
 ---
 
@@ -231,12 +231,11 @@ Expected:
 - `~/.claude/channels/slack/server.log` contains (match literally; `Session connected` lines may interleave with the others):
   - `[slack] Loaded persona config: 3 persona(s)`
   - `[slack] startupSessionManager: 3 persona(s), concurrency=3`
+  - one line per persona: `[slack] persona-start: personas[0] "persona_a" (key=persona_a): bring-up starting`, and the same for `persona_b` (`personas[1]`) and `persona_c` (`personas[2]`)
   - one line per persona: `[slack] spawnForPersona: spawned "persona_a" (key=persona_a) instanceId=cscb_persona_a`, and the same for `persona_b` and `persona_c`
   - `[slack] startupSessionManager: complete — 3 persona(s): 0 resumed, 3 fresh-spawned, 0 fresh-after-amnesia, 0 fresh-after-inconclusive-amnesia, 0 reconnected, 0 no-op, 0 failed, 0 not brought up`
   - one line per persona: `[slack] Session connected: persona "persona_a" (key=persona_a) cwd="<real path of ~/cscb-live/a>"`, and the same for B and C
 - No line of the form `[slack] persona "<name>" (key=<key>) not brought up:` for any persona.
-
-The per-persona `persona-start` line arrives with E5, which updates this check.
 
 Pass: `start` exits 0 with both token variables unset, and every line above is present.
 
@@ -533,7 +532,385 @@ throttle message.
 
 ## DMs (appended by E6)
 
-Placeholder. E6 fills in this section, including B's and C's DM checks.
+These checks verify AC 15, 35, 36 (outbound leg), 37, 38, 40 and 41, and AC 17
+in passing: the DM sender has no allowlist entry and gets no pairing step.
+They cover b.av2 SR-4.3 (a DM is decided only against the persona whose app
+received it, by its DMs switch) and SR-5.1 (a persona's DM posting targets).
+Check 18 also covers the edited-event dedupe: an edit that adds a persona's
+mention wakes it once.
+
+Like the rest of this plan, the section runs only on the test workspace and
+the test host's server, never on the production install. The Safety section
+applies unchanged. Run it after Check 12, on the server that is already
+running. If the server was stopped since, restart it as the E4 section says
+(confirm `hostname` and `whoami`, unset the token variables, `start`; do not
+rerun the check1 pre-flight).
+
+Until E7, a `dm`-destination persona's permission prompts are only written to
+`server.log`. So no step here asks B or C for work that needs a tool
+approval, and nothing here waits for a prompt to reach C's contact.
+
+### Setup for these checks
+
+The DMs switch per persona, as these checks use it:
+
+| Persona | `dm.enabled` in Checks 13–14 | `dm.enabled` in Checks 15–18 |
+|---|---|---|
+| A (`persona_a`) | off (Setup's config has no `dm` field) | on (the restart step below adds it) |
+| B (`persona_b`) | on, `dm` destination | on |
+| C (`persona_c`) | on, `dm` destination, `dm.contact` set | on |
+
+Only A changes, and only through `config.json` and a restart of the test
+server, so the setup stays config-file only (AC 14). B and C cannot be
+switched off: a `dm` destination, or zero channels, needs DMs on (b.av2
+SR-1.5), so the config would be refused.
+
+Every persona app must carry the `im:write` bot scope, which opening a DM
+with a user needs. The shipped `slack-app-manifest.yml` grants it. To check,
+open each app's **OAuth & Permissions** page and confirm `im:write` is listed
+under Bot Token Scopes. An app created from an older manifest gets `im:write`
+added and is then re-installed, as the `debug-slack-channel-bots` skill's
+section "A persona can't open a DM: re-install its app to gain `im:write`"
+says. The bot token normally stays the same; if the OAuth & Permissions page
+shows a different token, re-create that persona's credentials file as in
+Setup step 2, then restart the test server before Check 13 with the guarded
+stop and start of "Turn A's DMs on" (its steps 1, 2 and 4, without the config
+edit). The operator compares the token outside the chat; never print it or
+compare it in a chat.
+
+A **second test user** is needed: a user account in the test workspace, other
+than the operator's, that the operator can sign in as (for example in another
+browser profile). It must never have had a DM with app A: in that account's
+sidebar and **Apps** list, no conversation with "CSCB Test A" exists. Its
+member ID (`U…`, from its profile) replaces `<SECOND_USER_ID>` below. A
+second test user from an earlier run already has a DM with A (Check 17 opened
+it), so a rerun uses a user that A has never messaged.
+
+Note two more values for the restart step below: `<TEST_HOST>`, the test
+host's name exactly as `hostname` prints it (the pre-flight's `TEST_HOST`),
+and `<TEST_USER>`, the test host's user exactly as `whoami` prints it.
+
+Define these shell helpers in the tester's shell, next to `tags`. `LOG` names
+the server log, and `since <mark>` prints only the log lines after line
+`<mark>`. `server.log` is appended across runs and checks, so each check
+records a mark first and reads only the lines after it:
+
+```sh
+LOG=~/.claude/channels/slack/server.log
+since() { tail -n +"$(($1 + 1))" "$LOG"; }   # usage: since <mark>
+```
+
+Define this read-only helper next to `tags` (see "How to observe delivered
+tags"). It prints every `reply` tool call in one persona's current transcript,
+with its target and the tool's result:
+
+```sh
+replies() {  # usage: replies a|b|c
+  local t
+  t="$(ls -t ~/.claude/projects/*-cscb-live-"$1"/*.jsonl | head -1)"
+  jq -rs '
+    [ .[] | select(.type == "assistant") | .message.content | arrays | .[]
+      | select(.type? == "tool_use" and (.name | endswith("__reply"))) ] as $calls
+    | [ .[] | select(.type == "user") | .message.content | arrays | .[]
+        | select(.type? == "tool_result") ] as $results
+    | $calls[] | . as $c
+    | ([ $results[] | select(.tool_use_id == $c.id) ] | first) as $r
+    | "chat_id=\($c.input.chat_id) error=\($r.is_error // false) result=\(
+        $r.content | if type == "string" then .
+                     elif type == "array" then ([ .[] | .text? // empty ] | join(" "))
+                     else "(no result yet)" end)"' "$t"
+}
+```
+
+The last lines of `replies a` are A's most recent calls, so a check picks
+out its call by target, for example
+`replies a | grep -F 'chat_id=<SECOND_USER_ID>' | tail -n 1`. The result text
+is what the server returned to the persona; a refusal is returned to the
+persona only, never logged, so the transcript is where it is read. Claude Code
+may wrap an MCP error's text, so a check matches the expected text with
+"contains", not as the whole result. As with `tags`, a persona's own account
+of a tool result is not evidence.
+
+Check 18 also needs a text-keyed variant of `tags`, for a message whose
+delivered tag may not carry the `<TS>` from its link (an edited message). It
+prints the `<channel …>` tag of every user entry in one persona's current
+transcript whose content contains the given text:
+
+```sh
+tagstext() {  # usage: tagstext a|b|c '<text>'
+  local t
+  t="$(ls -t ~/.claude/projects/*-cscb-live-"$1"/*.jsonl | head -1)"
+  jq -r --arg s "$2" 'select(.type == "user") | .message.content
+         | if type == "string" then . else (.[]? | .text? // empty) end
+         | select(contains($s))' "$t" \
+    | grep -oE '<channel source="slack[^"]*"[^>]*>'
+}
+```
+
+A DM message's `<TS>` comes from its **Copy link** URL, as for channel
+messages. The same URL's path holds the DM conversation ID (`D…`): note the
+one between the operator and A as `<A_DM_ID>`, and likewise `<B_DM_ID>` and
+`<C_DM_ID>`.
+
+### Check 13: a DM to a persona with DMs off is dropped with a log line (AC 35)
+
+A's DMs are off, as Setup configured it.
+
+Steps:
+
+1. Record where the log ends: `MARK=$(wc -l < "$LOG")`.
+2. As the operator, open a DM with app A (its **Messages** tab) and send "Reply with the word dm-off." Work out the message's `<TS>` and note `<A_DM_ID>`.
+3. Wait two minutes.
+4. Run:
+
+   ```sh
+   since "$MARK" | grep -F 'persona-dm-dropped:' | grep -F 'ts=<TS>'
+   since "$MARK" | grep -F 'Dispatching to persona "persona_a"' | grep -F 'chat_id=<A_DM_ID>'
+   tags a <TS>
+   since "$MARK" | grep -E 'persona=persona_(b|c):' | grep -F '<TS>'
+   ```
+
+Expected:
+
+- The first command prints exactly one line: `[slack] persona-dm-dropped: personas[0] "persona_a" (key=persona_a): direct message in conversation <A_DM_ID> ts=<TS> dropped: dm.enabled is off for this persona`.
+- The second and third commands print nothing: A's instance received nothing.
+- The fourth prints nothing: the DM reached only A's app's connection.
+- No reply and no reaction from A appear in the DM.
+
+A silent drop fails this check: no reply and no `persona-dm-dropped` line is a fail.
+
+Pass: exactly one `persona-dm-dropped` line naming `persona_a` and `dm.enabled`, and every other command prints nothing.
+
+### Check 14: a persona with DMs off refuses to message a user (AC 36, outbound leg)
+
+A's DMs are still off. Run this before Check 17, which opens the DM between A
+and the second test user.
+
+Steps:
+
+1. Record where the log ends: `MARK=$(wc -l < "$LOG")`.
+2. In A-home, post: "Call your reply tool once with chat_id `<SECOND_USER_ID>` and the text `DMs-off outbound check`. Call it even if you expect it to fail. Then reply here with the word done."
+3. When A says done, run:
+
+   ```sh
+   replies a | grep -F 'chat_id=<SECOND_USER_ID>' | tail -n 1
+   since "$MARK" | grep -F 'could not open a DM'
+   ```
+
+4. Signed in as the second test user, look for any DM or **Apps** conversation from "CSCB Test A".
+
+Expected:
+
+- The `replies a` line starts `chat_id=<SECOND_USER_ID> error=true` and contains `Persona "persona_a" (key=persona_a) may not target "<SECOND_USER_ID>": DMs are off for this persona (dm.enabled is false).`
+- The `grep` prints no line naming `persona_a` and `<SECOND_USER_ID>`: no failed DM open was logged.
+- The second test user has no conversation with A and no new message from it.
+
+If the `replies a` command prints nothing, A made no call to
+`<SECOND_USER_ID>`: it chose not to call the tool. Ask once more; if there is still no call, record the check as "not run"
+with the reason in Notes. It is not a pass.
+
+Pass: the call to `<SECOND_USER_ID>` returned the refusal naming `persona_a` and `<SECOND_USER_ID>`, and the second test user got nothing from A.
+
+### Turn A's DMs on (operator step on the test host)
+
+This is a config edit and a restart of the test server, not a runtime
+reload. Plain `stop` leaves the persona instances running; `start` brings
+them back to the server.
+
+1. Define the guard. It fails, and says why, unless this is the test host
+   and its user (the pre-flight's hostname comparison, plus the user), and
+   unless `config.json.last-applied` is absent from the test state directory.
+   That file belongs to a later Epic's confirmed reload; if it exists, a
+   restart would leave this edit pending rather than applied, so stop the
+   section and record that in Notes.
+
+   ```sh
+   guard() {
+     [ "$(hostname)" = '<TEST_HOST>' ] && [ "$(whoami)" = '<TEST_USER>' ] \
+       || { echo 'NOT THE TEST HOST - stop'; return 1; }
+     [ ! -e ~/.claude/channels/slack/config.json.last-applied ] \
+       || { echo 'config.json.last-applied exists - stop'; return 1; }
+   }
+   ```
+
+2. Stop the test server only if the guard passes, and note where the log ends:
+
+   ```sh
+   if guard; then
+     claude-slack-channel-bots stop
+     LOG_MARK=$(wc -l < "$LOG"); echo "LOG_MARK=$LOG_MARK"
+   fi
+   ```
+
+   If it prints `NOT THE TEST HOST - stop` or `config.json.last-applied exists - stop`, do nothing more in this section.
+
+3. In `~/.claude/channels/slack/config.json`, add this line to the `persona_a` entry, after its `channels` array (mind the commas):
+
+   ```json
+   "dm": { "enabled": true },
+   ```
+
+   Then check the file still parses: `jq -e '.personas[0].dm.enabled' ~/.claude/channels/slack/config.json` must print `true`.
+4. Start the test server with no token variables, again only if the guard passes:
+
+   ```sh
+   if guard; then
+     unset SLACK_BOT_TOKEN SLACK_APP_TOKEN
+     claude-slack-channel-bots start
+   fi
+   ```
+
+5. Wait until the start's summary line and each persona's `Session connected` line appear. This can take about 3–5 minutes after a restart. Then read this start's lines:
+
+   ```sh
+   since "$LOG_MARK" | grep -E 'persona-start:|Session connected: persona|startupSessionManager: complete|\) not brought up:|persona-(credentials|directory)-|persona-slack-unreachable'
+   ```
+
+Expected:
+
+- `start` exits 0.
+- The last command prints one `[slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting` line for each of `personas[0] "persona_a" (key=persona_a)`, `personas[1] "persona_b" (key=persona_b)` and `personas[2] "persona_c" (key=persona_c)`.
+- It prints at least one `[slack] Session connected: persona "<name>" (key=<key>)` line for each of the three personas.
+- It prints one `[slack] startupSessionManager: complete — 3 persona(s): …` line, ending `0 failed, 0 not brought up`.
+- It prints no `[slack] persona "<name>" (key=<key>) not brought up:` line and no `persona-credentials-…`, `persona-directory-…` or `persona-slack-unreachable` line.
+
+If any of that is missing, or a failure line is present, stop the section and record the failure in Notes.
+
+A's DMs stay on for the rest of this run. Teardown removes the `dm` line
+again, so the next run starts from Setup's config.
+
+### Check 15: each DM is answered by the persona whose app received it (AC 15, AC 37, AC 17)
+
+Steps:
+
+1. Record where the log ends: `MARK=$(wc -l < "$LOG")`.
+2. As the operator, send "Reply with the word dm-a." in the DM with app A. Work out its `<TS>` (call it `<TS_A>`).
+3. Send "Reply with the word dm-b." in a DM with app B. Work out its `<TS>` (`<TS_B>`) and note `<B_DM_ID>`.
+4. Wait for both answers, then run:
+
+   ```sh
+   tags a <TS_A>; tags b <TS_A>; tags c <TS_A>
+   tags b <TS_B>; tags a <TS_B>; tags c <TS_B>
+   since "$MARK" | grep -E 'persona=persona_(b|c):' | grep -F '<TS_A>'
+   since "$MARK" | grep -E 'persona=persona_(a|c):' | grep -F '<TS_B>'
+   replies a; replies b
+   ```
+
+Expected:
+
+- A answers "dm-a" in the DM with A, under A's name and avatar. B answers "dm-b" in the DM with B, under B's name and avatar.
+- `tags a <TS_A>` prints exactly one tag, with `chat_id="<A_DM_ID>"`, `via="dm"` and `user_id="<OPERATOR_USER_ID>"`. `tags b <TS_B>` prints exactly one, with `chat_id="<B_DM_ID>"`, `via="dm"` and `user_id="<OPERATOR_USER_ID>"`.
+- The other four `tags` commands and both `grep` commands print nothing: the other personas received nothing.
+- The last line of `replies a` has `chat_id=<A_DM_ID>`, and the last line of `replies b` has `chat_id=<B_DM_ID>`, each with `error=false` and a result containing `Sent`.
+- Neither DM gets a pairing code, allowlist prompt or any message other than the persona's answer (AC 17: the operator has no allowlist entry).
+
+Pass: each DM is delivered once with `via="dm"` to the persona whose app received it, answered there under that persona's identity, and received by no other persona.
+
+### Check 16: a DM-only persona starts, connects and answers DMs (AC 40, AC 41)
+
+C has zero channels, DMs on, a `dm` destination and `dm.contact` set.
+
+Steps:
+
+1. Confirm C's start in the restart's lines (from "Turn A's DMs on"):
+
+   ```sh
+   since "$LOG_MARK" | grep -F '"persona_c" (key=persona_c)'
+   since "$LOG_MARK" | grep -E 'persona-(credentials|directory)-|persona-slack-unreachable' | grep -F '(key=persona_c)'
+   agent-director list --label service=cscb
+   ```
+
+2. As the operator, send "Reply with the word dm-c." in a DM with app C. Work out its `<TS>` and note `<C_DM_ID>`. Wait for the answer.
+3. Run:
+
+   ```sh
+   tags c <TS>
+   replies c
+   since "$LOG_MARK" | grep -F '(key=persona_c)' \
+     | grep -oE 'chat_id=[A-Z0-9]+|channel=[A-Z0-9]+|in (channel|conversation) [A-Z0-9]+' | sort -u
+   since "$LOG_MARK" | grep -F 'unclaimed-channel: personas[2] "persona_c"'
+   ```
+
+   The third command lists every conversation ID on C's lines since the restart: its `Dispatching to persona "persona_c" (key=persona_c) chat_id=…` lines, any `dropped message from channel=…` line, and any `persona-dm-dropped` or `unclaimed-channel` line (`… in conversation …` / `… in channel …`). The RAW lines are not used: they keep only the first 300 characters of the event, which usually cut off its `"channel"` field.
+
+4. In the test workspace's channel browser, open every channel (A-home, coordination and the workspace's default channels) and look at its member list.
+
+Expected:
+
+- Step 1's first command prints a `[slack] persona-start: personas[2] "persona_c" (key=persona_c): bring-up starting` line and a `[slack] Session connected: persona "persona_c" (key=persona_c)` line, and no `[slack] persona "persona_c" (key=persona_c) not brought up:` line. Its second command prints nothing. The list has C's row, `cscb_persona_c`.
+- C answers "dm-c" in the DM with C, under C's name and avatar.
+- `tags c <TS>` prints exactly one tag, with `chat_id="<C_DM_ID>"`, `via="dm"` and `user_id="<OPERATOR_USER_ID>"`.
+- Every line of `replies c` has a `chat_id` starting with `D`: C has posted only in DMs.
+- The ID extraction prints at least `chat_id=<C_DM_ID>`, and every ID it prints starts with `D`: C's pipeline has handled nothing outside a DM since the restart.
+- The `unclaimed-channel` grep prints nothing.
+- "CSCB Test C" is in no channel's member list.
+
+Pass: C started and connected with no failure line, answered the DM in place with `via="dm"`, and is in no channel and has posted nowhere but DMs.
+
+### Check 17: a persona with DMs on opens a DM with a user and posts as itself (AC 38)
+
+A's DMs are now on. The second test user still has no DM with A (Check 14
+posted nothing).
+
+Steps:
+
+1. Record where the log ends: `MARK=$(wc -l < "$LOG")`.
+2. In A-home, post: "Call your reply tool once with chat_id `<SECOND_USER_ID>` and the text `DMs-on outbound check`. Then reply here with the word done."
+3. When A says done, run:
+
+   ```sh
+   replies a | grep -F 'chat_id=<SECOND_USER_ID>' | tail -n 1
+   since "$MARK" | grep -F 'could not open a DM'
+   ```
+
+4. Signed in as the second test user, open the DM from "CSCB Test A".
+
+Expected:
+
+- The `replies a` line starts `chat_id=<SECOND_USER_ID> error=false` and contains `Sent 1 message(s) to D` followed by the DM's ID and ` (the DM with <SECOND_USER_ID>)`.
+- The `grep` prints nothing. A `missing_scope` failure here means app A lacks `im:write` (see this section's setup).
+- The second test user has a new DM from app A, holding "DMs-on outbound check" under A's name and avatar.
+
+Pass: A's call opened a DM with the second test user and the message appears there under A's identity.
+
+### Check 18: an edit that adds a mention wakes the persona once
+
+This covers the edited-event dedupe: an edit that adds a persona's mention
+reaches it as a new mention, once.
+
+Steps:
+
+An edited message's delivered tag may not carry the `<TS>` from the
+message's link, so this check counts deliveries with `tagstext` (see this
+section's setup), keyed on the text `edit check`. The `Dispatching` lines
+carry no `via`; they only corroborate the count.
+
+Steps:
+
+1. Record where the log ends: `MARK=$(wc -l < "$LOG")`.
+2. In coordination, post "edit check, no reply needed yet" (no mention). Work out its `<TS>`. Wait one minute, then run `tagstext a 'edit check'`.
+3. Edit that message to "@CSCB Test A edit check: reply with the word edited." Wait two minutes, then run:
+
+   ```sh
+   tagstext a 'edit check'
+   tagstext b 'edit check'
+   tags a <TS>
+   since "$MARK" | grep -F 'Dispatching to persona "persona_a"' | grep -F 'edit check'
+   ```
+
+4. Observation only: edit the message again to fix a typo while keeping the mention (for example "@CSCB Test A edit check: reply with the word edited!"). Wait two minutes and run `tagstext a 'edit check'` again.
+
+Expected:
+
+- Step 2: `tagstext a 'edit check'` prints nothing (A is mentions-only in coordination).
+- Step 3: `tagstext a 'edit check'` prints exactly one tag, with `via="mention"` and `user_id="<OPERATOR_USER_ID>"`. `tagstext b 'edit check'` prints nothing. The `grep` prints exactly one line. A replies "edited" in coordination once, under its own name and avatar.
+- Record in Notes whether `tags a <TS>` printed that same tag, or nothing (the tag's `ts` differs from `<TS>`; record the tag's `ts`). Either is acceptable.
+
+Step 4 is not part of the pass. Record in Notes how many tags
+`tagstext a 'edit check'` prints after the typo edit (one, or two if the
+second edit woke A again) and whether A replied again.
+
+Pass: the edit that added the mention woke A exactly once with `via="mention"`, and B received nothing.
 
 ## DM prompts (appended by E7)
 
@@ -566,6 +943,16 @@ claude-slack-channel-bots stop --stop-bots
 agent-director list --label service=cscb        # rows remain, stopped, for resume
 ```
 
+If the DMs section ran, return `config.json` to Setup's config so the next
+run starts from it: once the server is stopped, delete the
+`"dm": { "enabled": true },` line that "Turn A's DMs on" added to the
+`persona_a` entry (mind the commas), then check that A has no `dm` field:
+`jq -e '.personas[0] | has("dm") | not' ~/.claude/channels/slack/config.json`
+must print `true`.
+
+A rerun of the DMs section needs a second test user that A has never
+messaged: the one used here now has a DM with A (Check 17 opened it).
+
 Remove the credentials files when the run is over if the test apps are
 retired: `rm ~/.config/cscb-test/*-credentials.json`.
 
@@ -576,6 +963,6 @@ retired: `rm ~/.config/cscb-test/*-credentials.json`.
 The operator adds one row per run. Record pass or fail only, never a token or
 a log excerpt containing one.
 
-| Date | Build commit | Host / user | Check 1 | Check 2 | Check 3 | Check 4 | Check 5 | Check 6 | Check 7 | Check 8 | Check 9 | Check 10 | Check 11 | Check 12 | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| | | | | | | | | | | | | | | | |
+| Date | Build commit | Host / user | Check 1 | Check 2 | Check 3 | Check 4 | Check 5 | Check 6 | Check 7 | Check 8 | Check 9 | Check 10 | Check 11 | Check 12 | Check 13 | Check 14 | Check 15 | Check 16 | Check 17 | Check 18 | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| | | | | | | | | | | | | | | | | | | | | | |
