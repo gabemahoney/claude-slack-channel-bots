@@ -11,7 +11,7 @@
  *     opaque to CSCB.
  *   - Persona instance ids (b.av2 SR-2.1 / SR-2.2): `cscb_<key>` for keys
  *     from `personaKey` round-trips within Slack's 255-character action_id
- *     limit, and `personaKeyFromActionId` recovers the key.
+ *     limit.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -21,7 +21,6 @@ import {
   encodePermissionActionId,
   parsePermissionActionId,
   PERMISSION_ACTION_ID_RE,
-  personaKeyFromActionId,
 } from '../src/permission-action-id.ts'
 import { personaInstanceId, personaKey } from '../src/persona-identity.ts'
 
@@ -261,26 +260,5 @@ describe('parsePermissionActionId — cscb_<persona key> round-trip', () => {
         })
       }
     }
-  })
-})
-
-describe('personaKeyFromActionId', () => {
-  test.each(PERSONA_NAME_SAMPLES)('$label: returns the key the action_id was built for', ({ name }) => {
-    const key = personaKey(name)
-    for (const decision of ['allow', 'deny'] as const) {
-      const actionId = encodePermissionActionId(decision, personaInstanceId(key), SAMPLE_TOKENS[3]!)
-      expect(personaKeyFromActionId(actionId)).toBe(key)
-    }
-  })
-
-  test.each<[string, string]>([
-    ['a foreign (non-perm_) action_id', 'some_other_bot_action'],
-    ['an empty action_id', ''],
-    ['an instance id without the cscb_ prefix', `perm_allow_other_ops_bot_${SAMPLE_TOKENS[0]}`],
-    ['a numeric (non-UUID) token', `perm_allow_cscb_${personaKey(PERSONA_NAME_SAMPLES[1]!.name)}_42`],
-    ['an unknown decision verb', `perm_maybe_cscb_${personaKey(PERSONA_NAME_SAMPLES[1]!.name)}_${SAMPLE_TOKENS[0]}`],
-    ['no instance id after cscb_', `perm_allow_cscb_${SAMPLE_TOKENS[0]}`],
-  ])('returns undefined for %s', (_label, actionId) => {
-    expect(personaKeyFromActionId(actionId)).toBeUndefined()
   })
 })

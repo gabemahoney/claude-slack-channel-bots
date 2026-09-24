@@ -23,10 +23,11 @@
  * the first persona (beta) got no restart and no post, so recovery or a reply
  * keyed to the wrong persona fails. The streamless branch (b.9cj) is
  * covered by tests/dispatch-get-stream.test.ts; general delivery by
- * tests/persona-routing.test.ts. src/server.ts cannot be imported in a test
- * (module-scope startup code), so describe (7) audits its source to keep one
- * tested copy of the branch: server.ts must hand inbound events to the
- * routing module and hold no copy of its own.
+ * tests/persona-routing.test.ts. main() in src/server.ts cannot run in a
+ * test (startup gate, real port, real Slack connections), so describe (7)
+ * audits the source to keep one tested copy of the branch: server.ts must hand
+ * inbound events to the routing module through the persona event router and
+ * hold no copy of its own.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -499,10 +500,10 @@ describe('b.kvq (6) humanTrigger delay clamp (DOWN only)', () => {
 // Required behavior 7 — one tested copy: server.ts takes the branch from the
 // routing module and holds no copy of its own
 //
-// server.ts cannot be imported in a test, so this audits its comment-stripped
-// source (see tests/start-sweep-wiring.test.ts). If the drop branch were
-// re-inlined in server.ts, the behavioural tests above would keep passing
-// against the module while production ran an untested copy.
+// main() cannot run in a test, so this audits the comment-stripped source
+// (see tests/start-sweep-wiring.test.ts). If the drop branch were re-inlined
+// in server.ts, the behavioural tests above would keep passing against the
+// module while production ran an untested copy.
 // ===========================================================================
 
 describe('b.kvq (7) server.ts holds no copy of the lost-message branch', () => {
@@ -522,18 +523,23 @@ describe('b.kvq (7) server.ts holds no copy of the lost-message branch', () => {
     expect(indicesOf(/\bhumanTrigger\b/g, SERVER_CODE)).toEqual([])
   })
 
-  test('server.ts builds one persona-routing instance and hands both inbound event kinds to it', () => {
+  test('server.ts builds one persona-routing instance and gives it to the persona event router', () => {
     expect(SERVER_SRC).toMatch(
       /import\s*\{[^}]*\bcreatePersonaRouting\b[^}]*\}\s*from\s*['"]\.\/persona-routing\.ts['"]/,
     )
+    const routing = [...SERVER_CODE.matchAll(/\bconst\s+(\w+)\s*=\s*createPersonaRouting\s*\(/g)]
+    expect(routing).toHaveLength(1)
     expect(indicesOf(/\bcreatePersonaRouting\s*\(/g, SERVER_CODE)).toHaveLength(1)
-    for (const kind of ['message', 'app_mention']) {
-      const start = SERVER_CODE.search(new RegExp(`socket\\.on\\(\\s*['"]${kind}['"]`))
-      expect(start).toBeGreaterThanOrEqual(0)
-      const next = SERVER_CODE.indexOf('socket.on(', start + 1)
-      const handler = SERVER_CODE.slice(start, next === -1 ? undefined : next)
-      expect(handler).toMatch(/\bpersonaRouting\.receive\s*\(\s*event\s*,\s*ack\s*,/)
-    }
+    const router = SERVER_CODE.match(/\bcreatePersonaEventRouter\s*\(\s*\{[^}]*\}/)
+    expect(router).not.toBeNull()
+    expect(router![0]).toMatch(new RegExp(`\\brouting\\s*:\\s*${routing[0]![1]}\\b`))
+  })
+
+  test('server.ts never calls receive itself: inbound events reach the routing only through the event router', () => {
+    // What the router hands `receive` (the receiving connection's key as the
+    // only receiver) is driven end to end in
+    // tests/persona-connection-wiring.test.ts.
+    expect(indicesOf(/\.receive\s*\(/g, SERVER_CODE)).toEqual([])
   })
 
   test('the restart guard and the health check take the stream probe from the routing module', () => {

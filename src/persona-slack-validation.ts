@@ -40,9 +40,8 @@
  * built by this module.
  *
  * Pure module (b.av2 SR-13.1): no module-scope state, timers, I/O, logging,
- * network or environment access. The classifier never throws. Nothing in the
- * server calls it yet; the connection manager (E2 Task 3) does, and E3 wires
- * that into the server.
+ * network or environment access. The classifier never throws. The connection
+ * manager (`persona-connections.ts`) calls it for every attempt.
  *
  * SPDX-License-Identifier: MIT
  */

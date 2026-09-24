@@ -68,10 +68,19 @@ export interface HealthCheckDeps {
 /**
  * The health check's work list for a persona config: one entry per persona,
  * mapping its key to its working directory, however many channels it lists.
- * Pure.
+ * With `include`, only the personas it accepts (the server passes the
+ * relaunch gate, so a persona whose Slack connection is not serving is left
+ * out of the tick). Pure apart from what `include` does.
  */
-export function buildPersonaWorkList(config: Pick<PersonaConfig, 'personas'>): Record<string, string> {
-  return Object.fromEntries(config.personas.map((persona) => [persona.key, persona.working_directory]))
+export function buildPersonaWorkList(
+  config: Pick<PersonaConfig, 'personas'>,
+  include?: (key: string) => boolean,
+): Record<string, string> {
+  return Object.fromEntries(
+    config.personas
+      .filter((persona) => include === undefined || include(persona.key))
+      .map((persona) => [persona.key, persona.working_directory]),
+  )
 }
 
 // ---------------------------------------------------------------------------

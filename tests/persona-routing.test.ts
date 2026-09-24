@@ -15,8 +15,14 @@
  * - a line capture for the module's log seam, and a `console.error` spy for
  *   the restart and registry modules' own lines.
  *
- * Until E3 Task 9 the server hands each event to every persona's pipeline, so
- * the tests feed one event to several persona keys in one `receive` call.
+ * Each persona has its own Slack connection (E3 Task 9), so a message in a
+ * channel several personas are in reaches each of them on its own connection.
+ * The tests feed an event to each receiving persona as its connection would:
+ * one `receive` call per persona, with its key alone and its own ack
+ * (`receiveOnEach`). Each persona has its own bot identity (the stub's
+ * `auth.test` identity, distinct per persona). The last block drives the
+ * routing over the real connection manager's per-persona identities, as the
+ * server wires them (`makeManagedRouting`).
  *
  * Owns AC 1, AC 2 and 12 (persona-routing leg; the tool-level scope stays in
  * registry.test.ts) and AC 52. E4 adds rows to the delivery table (broadcasts,
@@ -37,8 +43,10 @@ import {
 } from '../src/persona-routing.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { checkPersonaTarget, unregisterSession } from '../src/registry.ts'
-import { isRestartPendingOrActive } from '../src/restart.ts'
+import { initRestart, isRestartPendingOrActive } from '../src/restart.ts'
 import { openArchiveDatabase } from '../src/message-archive.ts'
+import { dryRunPersonaIdentity } from '../src/persona-connections.ts'
+import type { Persona } from '../src/config.ts'
 import type { PersonaSpec } from './test-helpers/persona-config.ts'
 import {
   makeAppMention,
@@ -52,12 +60,16 @@ import { posts, slackCalls } from './test-helpers/permission-relay-harness.ts'
 import { buildTempArchiveDb } from './test-helpers/archive-db.ts'
 import { LEAK_SENTINEL, assertNoLeak } from './test-helpers/credentials.ts'
 import {
+  NEVER_FIRE_RESTART_DELAY_S,
+  makeRestartDeps,
   makeRoutingHarness,
   resetRoutingState,
   waitFor,
   type RoutingHarness,
   type RoutingHarnessOptions,
 } from './test-helpers/persona-routing-harness.ts'
+import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
+import { makeManagedRouting } from './test-helpers/persona-routing-managed.ts'
 
 // ---------------------------------------------------------------------------
 // Channels
@@ -95,6 +107,14 @@ const lines = (h: Harness, needle: string) => h.logs.filter((l) => l.includes(ne
 
 /** Every captured line (module log seam and console) that contains `text`. */
 const linesWithText = (h: Harness, text: string) => [...h.logs, ...consoleLines].filter((l) => l.includes(text))
+
+/**
+ * Feed `event` to each named persona (default: all), one `receive` per
+ * persona with its own ack, as each persona's own connection delivers it.
+ */
+async function receiveOnEach(h: Harness, event: unknown, names: readonly string[] = h.all.map((x) => x.persona.name)): Promise<void> {
+  for (const name of names) await h.receive(event, [name])
+}
 
 /** A has `all` in CA and `mentions` in CS; B has `all` in CB and `mentions` in CS (the AC 1 setup). */
 function ac1Specs(): PersonaSpec[] {
@@ -137,8 +157,8 @@ describe('AC 1: two personas, home channels and a shared mention-only channel', 
     const home = makeChannelMessage({ channel: CA })
     const mention = makeChannelMessage({ channel: CS, text: `${mentionText(A.stub.identity.botUserId)} can you look?` })
 
-    await h.receive(home)
-    await h.receive(mention)
+    await receiveOnEach(h, home)
+    await receiveOnEach(h, mention)
 
     expect(A.notifications.map((n) => n.params.meta.chat_id)).toEqual([CA, CS])
     expect(B.notifications).toHaveLength(0)
@@ -151,7 +171,7 @@ describe('AC 1: two personas, home channels and a shared mention-only channel', 
   test('AC 1 / AC 52: a home message in B\'s channel reaches only B; A, which does not list it, logs nothing (no unclaimed-channel line)', async () => {
     const h = makeHarness(ac1Specs())
     const A = h.p('Alpha Bot').persona
-    await h.receive(makeChannelMessage({ channel: CB }))
+    await receiveOnEach(h, makeChannelMessage({ channel: CB }))
 
     expect(h.p('Beta Bot').notifications.map((n) => n.params.meta.chat_id)).toEqual([CB])
     expect(h.p('Alpha Bot').notifications).toHaveLength(0)
@@ -165,7 +185,7 @@ describe('AC 1: two personas, home channels and a shared mention-only channel', 
     const h = makeHarness(ac1Specs(), { sessions: ['Alpha Bot'] })
     const A = h.p('Alpha Bot')
     const B = h.p('Beta Bot')
-    await h.receive(makeChannelMessage({ channel: CB }))
+    await receiveOnEach(h, makeChannelMessage({ channel: CB }))
 
     expect(A.notifications).toHaveLength(0)
     expect(slackCalls(A.stub)).toBe(0)
@@ -196,7 +216,7 @@ describe('AC 2 / AC 12: a persona in several channels hears all of them in one i
     const mention = mentionText(P.stub.identity.botUserId)
 
     for (const channel of [C1, C2, C3]) {
-      await h.receive(makeChannelMessage({ channel, text: `${mention} message for ${channel}` }))
+      await receiveOnEach(h, makeChannelMessage({ channel, text: `${mention} message for ${channel}` }))
     }
 
     const chatIds = P.notifications.map((n) => n.params.meta.chat_id)
@@ -270,7 +290,7 @@ describe('delivery rules against the receiving persona P', () => {
       files: [{ name: 'report.pdf', mimetype: 'application/pdf', size: 2048 }],
     })
 
-    await h.receive(event)
+    await receiveOnEach(h, event)
 
     expect(P.notifications).toHaveLength(1)
     const { method, params } = P.notifications[0]!
@@ -323,7 +343,7 @@ describe('AC 52: unclaimed-channel line', () => {
   test('AC 52: a channel no applied persona lists logs one unclaimed-channel line per receiving persona, naming the channel and that persona, without the message text, and reaches no session', async () => {
     const h = makeHarness(ac1Specs())
     const marker = 'ZEBRA7731UNCLAIMED'
-    await h.receive(makeChannelMessage({ channel: CX, text: `${marker} quarterly numbers` }))
+    await receiveOnEach(h, makeChannelMessage({ channel: CX, text: `${marker} quarterly numbers` }))
 
     for (const { persona, notifications } of h.all) {
       const mine = lines(h, `unclaimed-channel: personas[${persona.index}] ${renderPersonaRef(persona.name, persona.key)}`)
@@ -390,7 +410,7 @@ describe('intake', () => {
 
   test('the event is acked exactly once, before the archive write and before any decision', async () => {
     const h = makeHarness(ac1Specs())
-    await h.receive(makeChannelMessage({ channel: CA }))
+    await h.receive(makeChannelMessage({ channel: CA }), ['Alpha Bot'])
 
     expect(h.order.filter((m) => m === 'ack')).toHaveLength(1)
     expect(h.order[0]).toBe('ack')
@@ -400,7 +420,7 @@ describe('intake', () => {
 
   test('the ack happens even when a later step never settles', async () => {
     const h = makeHarness(ac1Specs(), { resolveUserName: () => new Promise<string>(() => {}) })
-    void h.receive(makeChannelMessage({ channel: CA }))
+    void h.receive(makeChannelMessage({ channel: CA }), ['Alpha Bot'])
     await new Promise((r) => setTimeout(r, 5))
 
     expect(h.order.filter((m) => m === 'ack')).toHaveLength(1)
@@ -410,7 +430,7 @@ describe('intake', () => {
 
   test('a failed ack is logged token-safely and delivery still happens', async () => {
     const h = makeHarness(ac1Specs())
-    await h.receive(makeChannelMessage({ channel: CA }), undefined, () => {
+    await h.receive(makeChannelMessage({ channel: CA }), ['Alpha Bot'], () => {
       throw new Error(`ack refused ${LEAK_SENTINEL}`)
     })
 
@@ -448,14 +468,14 @@ describe('intake', () => {
   test('the ack reaction of a delivered message is added on P\'s stub (the second persona) and on no other persona\'s', async () => {
     const h = makeHarness(ac1Specs(), { ackReaction: 'eyes' })
     const event = makeChannelMessage({ channel: CB })
-    await h.receive(event)
+    await receiveOnEach(h, event)
 
     expect(h.p('Beta Bot').notifications).toHaveLength(1)
     expect(h.p('Beta Bot').stub.calls.reactionsAdd).toEqual([{ channel: CB, timestamp: event.ts as string, name: 'eyes' }])
     expect(h.p('Alpha Bot').stub.calls.reactionsAdd).toEqual([])
   })
 
-  test('a throw in A\'s run is logged naming A, token-safely, and B still gets its delivery', async () => {
+  test('a throw in A\'s run is logged naming A, token-safely, and B, receiving the same message on its own connection, still gets its delivery', async () => {
     const h = makeHarness(
       [
         { name: 'Alpha Bot', channels: [{ id: CS, delivery: 'all' }] },
@@ -464,11 +484,12 @@ describe('intake', () => {
       { throwOnNotify: ['Alpha Bot'] },
     )
     const A = h.p('Alpha Bot').persona
-    await h.receive(makeChannelMessage({ channel: CS }))
+    await receiveOnEach(h, makeChannelMessage({ channel: CS }))
 
     expect(lines(h, `error handling event for persona ${renderPersonaRef(A.name, A.key)}`)).toHaveLength(1)
     expect(h.p('Beta Bot').notifications).toHaveLength(1)
-    expect(h.order.filter((m) => m === 'ack')).toHaveLength(1)
+    // One ack per receiving connection.
+    expect(h.order.filter((m) => m === 'ack')).toHaveLength(2)
     assertNoLeak(captured(h))
   })
 
@@ -478,10 +499,13 @@ describe('intake', () => {
   ])('%s: nothing is delivered to it and the event is still acked', async (_label, noConfig) => {
     const h = makeHarness(ac1Specs())
     if (noConfig) h.config = null
-    await h.receiveKeys(makeChannelMessage({ channel: CA }), ['ghost_key', h.p('Alpha Bot').persona.key])
+    const event = makeChannelMessage({ channel: CA })
+    await h.receiveKeys(event, ['ghost_key'])
 
     expect(lines(h, 'no applied persona with key=ghost_key')).toHaveLength(1)
     expect(h.order.filter((m) => m === 'ack')).toHaveLength(1)
+
+    await h.receiveKeys(event, [h.p('Alpha Bot').persona.key])
     expect(h.p('Alpha Bot').notifications).toHaveLength(noConfig ? 0 : 1)
   })
 })
@@ -505,7 +529,7 @@ describe('lost message: reply and recovery keyed to the persona, through its cli
     const lost = h.p('Lost Bot')
     const other = h.p('Other Bot')
 
-    await h.receive(makeChannelMessage({ channel: CA }))
+    await receiveOnEach(h, makeChannelMessage({ channel: CA }))
 
     expect(h.allPosts()).toEqual([{ key: lost.persona.key, channel: CA, text: LOST_MESSAGE_STARTED_REPLY }])
     expect(other.notifications).toHaveLength(0)
@@ -601,5 +625,59 @@ describe('dispatch uses P\'s session as registered after the awaited lookup', ()
     expect(isRestartPendingOrActive(P.persona.key)).toBe(true)
     expect(isRestartPendingOrActive(h.p('Other Bot').persona.key)).toBe(false)
     assertNoLeak(captured(h))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Per-persona identities over the real connection manager (E3 Task 9; b.av2
+// SR-3.1, SR-3.4, SR-4.2 step 2). The routing is built as the server builds
+// it (`makeManagedRouting`): `getBotUserId` from the manager-backed identity
+// getter and `clientFor` from the manager-backed client lookup. Each receive
+// names one persona by its key, as that persona's connection does. The
+// per-persona archive source is covered end to end in
+// tests/persona-connection-wiring.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('per-persona identities (connection manager)', () => {
+  /** A and B both `all` in the shared channel CS. */
+  const sharedSpecs = (): PersonaSpec[] => [
+    { name: 'Alpha Bot', channels: [{ id: CS, delivery: 'all' }] },
+    { name: 'Beta Bot', channels: [{ id: CS, delivery: 'all' }] },
+  ]
+
+  test.each([
+    ['live', false],
+    ['dry run (placeholder identities)', true],
+  ])('SR-4.2 step 2 (%s): a post by A\'s bot user is dropped as A\'s own on A\'s connection and delivered to B on B\'s; B\'s own post the other way round', async (_label, dryRun) => {
+    const h = makeConnectionHarness(sharedSpecs(), dir, { dryRun })
+    try {
+      for (const p of h.personas) expect(await h.bringUp(p)).toMatchObject({ state: 'up' })
+      initRestart(makeRestartDeps({ restartDelayS: NEVER_FIRE_RESTART_DELAY_S }))
+      const m = makeManagedRouting(h, dir)
+      const [A, B] = h.personas as [Persona, Persona]
+      const idA = h.identityFor(A.key)!
+      const idB = h.identityFor(B.key)!
+      expect(idA.botUserId).not.toBe(idB.botUserId)
+      if (dryRun) expect(idA).toEqual(dryRunPersonaIdentity(A.key))
+      else expect(idA.botUserId).toBe(h.stub(A).identity.botUserId)
+      const ack = async () => {}
+
+      const byA = makeChannelMessage({ channel: CS, user: idA.botUserId, text: 'posted by alpha' })
+      await m.routing.receive(byA, ack, A.key)
+      await m.routing.receive(byA, ack, B.key)
+      const byB = makeChannelMessage({ channel: CS, user: idB.botUserId, text: 'posted by beta' })
+      await m.routing.receive(byB, ack, B.key)
+      await m.routing.receive(byB, ack, A.key)
+
+      expect(m.notifications.get(A.key)!.map((n) => n.params.content)).toEqual(['posted by beta'])
+      expect(m.notifications.get(B.key)!.map((n) => n.params.content)).toEqual(['posted by alpha'])
+      for (const p of [A, B]) {
+        const own = m.logs.filter((l) => l.includes(`persona ${renderPersonaRef(p.name, p.key)} dropped message`) && l.endsWith(': own'))
+        expect(own).toHaveLength(1)
+      }
+      assertNoLeak({ logs: m.logs, lines: h.lines })
+    } finally {
+      await h.manager.stopAll()
+    }
   })
 })

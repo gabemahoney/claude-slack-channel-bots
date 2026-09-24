@@ -10,8 +10,8 @@
  * `persona-credentials-missing` / `-unreadable` / `-invalid`.
  *
  * Secrets rules:
- * - Never reads an environment variable (in particular not `SLACK_BOT_TOKEN`
- *   or `SLACK_APP_TOKEN`).
+ * - Never reads an environment variable (in particular no Slack token
+ *   variable).
  * - Never writes, copies, caches or persists the file or any value from it,
  *   and never checks or changes the file mode.
  * - Causes and diagnostic lines name a bad token by its key and the rule it
@@ -28,18 +28,25 @@
  * to `console`, `logging.ts` or `startup-errors.log` itself.
  *
  * File-system seam: every file-system access goes through a `CredentialsFs`
- * (`readFile`, `realpath`); the real file system (`DEFAULT_CREDENTIALS_FS`)
- * is the default and callers may override any subset via `options.fs`. Tests
- * use it to simulate unreadable files even when running as root: make
- * `readFile` throw an error whose `code` is `EACCES`, `EISDIR`, `ENOENT`, ….
+ * (`openFile`, `fstatFile`, `readFileFd`, `closeFile`, `realpath`); the real
+ * file system (`DEFAULT_CREDENTIALS_FS`) is the default and callers may
+ * override any subset via `options.fs`. Tests use it to simulate unreadable
+ * files even when running as root: make `openFile` or `readFileFd` throw an
+ * error whose `code` is `EACCES`, `EISDIR`, `ENOENT`, …, or make `fstatFile`
+ * report a FIFO or a device. The file is opened once, read-only and
+ * non-blocking (following symlinks), and its descriptor is stat'ed, read and
+ * closed, so the file checked is the file read. Anything but a regular file
+ * is refused unread: a FIFO would block the read forever and a device such as
+ * `/dev/zero` would never end.
  *
  * Pure module (b.av2 SR-13.1): nothing runs at import and no token is read at
- * module scope. Nothing in the server calls it yet; E3 wires it.
+ * module scope. The server runs it as step 1 of each persona's start
+ * (`bringUpPersona` in `persona-start.ts`).
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { readFileSync, realpathSync } from 'node:fs'
+import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync, realpathSync } from 'node:fs'
 
 import { resolveRealPath, type Persona } from './config.ts'
 import { renderPersonaRef } from './persona-identity.ts'
@@ -88,17 +95,38 @@ const TOKEN_FORBIDDEN_CHAR_RE = /[\s\p{Cc}]/u
 // File-system seam
 // ---------------------------------------------------------------------------
 
-/** The file-system operations the credentials check performs. */
+/**
+ * The file-system operations the credentials check performs. The file is
+ * opened once and then stat'ed, read and closed through its descriptor, so
+ * the type check and the read see the same file. The names deliberately
+ * differ from the working-directory check's (`stat`, `access`): the combined
+ * bring-up seam (`PersonaBringUpFs`) carries both, and an override of one
+ * must never reach the other. `realpath` is shared.
+ */
 export interface CredentialsFs {
-  /** Read a whole file as UTF-8. Throws an errno-style error (with `code`) on failure. */
-  readFile(path: string): string
+  /**
+   * Open the credentials path read-only and non-blocking (`O_RDONLY |
+   * O_NONBLOCK`, following symlinks), so opening a FIFO never waits for a
+   * writer. Returns the descriptor. Throws an errno-style error (with `code`)
+   * on failure.
+   */
+  openFile(path: string): number
+  /** Stat an open descriptor. Throws an errno-style error (with `code`) on failure. */
+  fstatFile(fd: number): { isFile(): boolean; isDirectory(): boolean }
+  /** Read the whole file behind an open descriptor as UTF-8. Throws an errno-style error (with `code`) on failure. */
+  readFileFd(fd: number): string
+  /** Close a descriptor opened by `openFile`. The check ignores a failure. */
+  closeFile(fd: number): void
   /** Resolve a path's real path. Throws on failure; callers fall back to the lexical form. */
   realpath(path: string): string
 }
 
 /** The real file system, looked up at call time. */
 export const DEFAULT_CREDENTIALS_FS: CredentialsFs = {
-  readFile: path => readFileSync(path, 'utf8'),
+  openFile: path => openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK),
+  fstatFile: fd => fstatSync(fd),
+  readFileFd: fd => readFileSync(fd, 'utf8'),
+  closeFile: fd => closeSync(fd),
   realpath: path => realpathSync(path),
 }
 
@@ -268,8 +296,11 @@ function validateCredentialsContent(content: string): PersonaSlackTokens | strin
  *      naming the other persona. Checked first so another persona's tokens
  *      are never read on this persona's behalf;
  *   2. it exists → else `persona-credentials-missing`;
- *   3. it can be read (not a directory, permitted) → else
- *      `persona-credentials-unreadable`;
+ *   3. it is a regular file (after following symlinks; not a directory, FIFO,
+ *      socket or device) and can be read (permitted) → else
+ *      `persona-credentials-unreadable`. The file is opened non-blocking and
+ *      its type checked through the descriptor before the read, so a FIFO or
+ *      a device is never read and cannot be swapped in after the check;
  *   4. it is a JSON object with exactly `bot_token` (`xoxb-…`) and
  *      `app_token` (`xapp-…`) as strings, each with at least one character
  *      after its prefix and no whitespace or control character anywhere →
@@ -292,10 +323,8 @@ export function checkPersonaCredentials(
   const collision = describeRealPathCollision(path, persona.key, options.others, 'credentials_file', p => fs.realpath(p))
   if (collision !== undefined) return fail(PERSONA_CREDENTIALS_INVALID, collision)
 
-  let content: string
-  try {
-    content = fs.readFile(path)
-  } catch (err) {
+  // A failed open, stat or read: missing, a directory, permission denied, or other.
+  const failAccess = (err: unknown): CredentialsCheckResult => {
     if (isMissingPathError(err)) return fail(PERSONA_CREDENTIALS_MISSING, 'credentials file does not exist')
     const code = errnoCode(err)
     if (code === 'EISDIR') return fail(PERSONA_CREDENTIALS_UNREADABLE, 'credentials file is a directory')
@@ -303,6 +332,39 @@ export function checkPersonaCredentials(
       return fail(PERSONA_CREDENTIALS_UNREADABLE, `credentials file cannot be read: permission denied${errnoSuffix(err)}`)
     }
     return fail(PERSONA_CREDENTIALS_UNREADABLE, `credentials file cannot be read${errnoSuffix(err)}`)
+  }
+
+  // Open once (non-blocking, so a FIFO never waits for a writer), then check
+  // the type and read through the same descriptor: the file cannot be swapped
+  // between the check and the read. Never read anything but a regular file:
+  // a FIFO blocks the read forever and a device such as /dev/zero never ends.
+  let fd: number
+  try {
+    fd = fs.openFile(path)
+  } catch (err) {
+    return failAccess(err)
+  }
+  let content: string
+  try {
+    let stats: { isFile(): boolean; isDirectory(): boolean }
+    try {
+      stats = fs.fstatFile(fd)
+    } catch (err) {
+      return failAccess(err)
+    }
+    if (stats.isDirectory()) return fail(PERSONA_CREDENTIALS_UNREADABLE, 'credentials file is a directory')
+    if (!stats.isFile()) return fail(PERSONA_CREDENTIALS_UNREADABLE, 'credentials file is not a regular file')
+    try {
+      content = fs.readFileFd(fd)
+    } catch (err) {
+      return failAccess(err)
+    }
+  } finally {
+    try {
+      fs.closeFile(fd)
+    } catch {
+      // Nothing to report: the descriptor is gone either way.
+    }
   }
 
   const validated = validateCredentialsContent(content)

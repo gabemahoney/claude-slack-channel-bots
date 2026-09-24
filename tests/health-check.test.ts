@@ -938,6 +938,18 @@ describe('persona-keyed work list and streaks (b.av2 SR-6.3)', () => {
     expect(deps.scheduleRestartCalls.some((c) => channelIds.includes(c.key))).toBe(false)
   })
 
+  test('buildPersonaWorkList with include (the server passes the relaunch gate): only the personas it accepts, each asked once by key, in config order', () => {
+    const config = makeMultiPersonaConfig([{ name: 'alpha' }, { name: 'beta' }, { name: 'gamma' }], baseDir)
+    const [alpha, , gamma] = config.personas
+    const asked: string[] = []
+
+    const personas = buildPersonaWorkList(config, (key) => (asked.push(key), key !== 'beta'))
+
+    expect(personas).toEqual({ alpha: alpha.working_directory, gamma: gamma.working_directory })
+    expect(asked).toEqual(['alpha', 'beta', 'gamma'])
+    expect(buildPersonaWorkList(config, () => false)).toEqual({})
+  })
+
   test('streak isolation: only the alive-but-disconnected persona advances its streak and is scheduled', async () => {
     // Over two ticks A is disconnected both times; B is connected on tick 1 and
     // disconnected on tick 2. Keyed streaks: A reaches 2 and fires, B is at 1.

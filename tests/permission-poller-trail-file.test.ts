@@ -31,8 +31,8 @@ import { _resetOutageState, initOutageState } from '../src/outage-state.ts'
 import {
   encodePermissionActionId,
   parsePermissionActionId,
-  personaKeyFromActionId,
 } from '../src/permission-action-id.ts'
+import { personaKeyFromActionId } from './test-helpers/action-id-key.ts'
 import {
   emitBlockActionReceived,
   handlePermissionClick,

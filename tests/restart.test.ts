@@ -21,6 +21,7 @@ import {
   _resetBackoffState,
   getFailureCount,
   isAtCap,
+  recordFailure,
 } from '../src/backoff.ts'
 import { _buildKillSessionAdapter, _buildReconnectSessionAdapter } from '../src/server.ts'
 import {
@@ -79,8 +80,8 @@ type DepsOpts = {
   isSessionAliveResult?: boolean  // default: false (session is dead)
   isSessionConnectedResult?: boolean  // default: false (not yet reconnected)
   hasSessionStreamResult?: boolean  // default: true (stream present — prior semantics)
-  launchSessionResult?: boolean   // default: true (launch succeeds)
-  launchSession?: (key: string, cwd: string, sessionId?: string) => Promise<boolean>  // override entire launchSession
+  launchSessionResult?: boolean | 'skipped'  // default: true (launch succeeds); 'skipped': the relaunch gate declined
+  launchSession?: (key: string, cwd: string, sessionId?: string) => Promise<boolean | 'skipped'>  // override entire launchSession
   killSession?: (key: string) => Promise<void>  // runs after the capture (e.g. the real kill adapter)
   restartDelay?: number           // default: FAST_DELAY_S
   isShuttingDown?: boolean        // default: false
@@ -880,6 +881,42 @@ describe('backoff integration (SR-29.3)', () => {
     expect(deps.onCapReachedCalls).toEqual([A, B])
   })
 
+  // -------------------------------------------------------------------------
+  // (8) The relaunch gate: launchSession answers 'skipped' when the persona's
+  //     Slack connection is not serving. Nothing was attempted, so the
+  //     counter, backoff and cap latch are left exactly as they were.
+  // -------------------------------------------------------------------------
+
+  const GATED = 'gated_bot'
+  test.each<[string, boolean, number, string[]]>([
+    ['a failed launch counts: the count reaches the cap and the cap notice fires once', false, RESTART_FAILURE_CAP, [GATED]],
+    ['a successful launch resets the count', true, 0, []],
+  ])('(8) launchSession=skipped is neither a success nor a failure (no reset, no count, no cap); the next serving restart counts — %s', async (_label, next, count, capCalls) => {
+    for (let i = 0; i < RESTART_FAILURE_CAP - 1; i++) recordFailure(GATED)
+    let outcome: boolean | 'skipped' = 'skipped'
+    const deps = makeDeps({ restartDelay: CAP_BASE_DELAY_S, launchSession: async () => outcome })
+    initRestart(deps)
+
+    // Two declined restarts: one short of the cap, a counted failure would cap it.
+    await driveFailures(GATED, '/cwd/gated', 2)
+
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([GATED, GATED])
+    // The kill before the launch still runs.
+    expect(deps.killSessionCalls).toEqual([GATED, GATED])
+    expect(getFailureCount(GATED)).toBe(RESTART_FAILURE_CAP - 1)
+    expect(isAtCap(GATED, RESTART_FAILURE_CAP)).toBe(false)
+    expect(deps.onCapReachedCalls).toEqual([])
+    expect(isRestartPendingOrActive(GATED)).toBe(false)
+
+    // Serving again: the next restart's launch counts as usual.
+    outcome = next
+    await driveFailures(GATED, '/cwd/gated', 1)
+
+    expect(deps.launchSessionCalls).toHaveLength(3)
+    expect(getFailureCount(GATED)).toBe(count)
+    expect(deps.onCapReachedCalls).toEqual(capCalls)
+  })
+
   test('(5) SR-25.4 no-stacking: second scheduleRestart cancels first pending timer (cancel-and-replace)', async () => {
     const deps = makeDeps({ restartDelay: SLOW_DELAY_S, launchSessionResult: false })
     initRestart(deps)
@@ -1062,7 +1099,7 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     _setTmuxServerEnsurer(async () => {})
 
     // The adapter resolves the instance ID from the persona key alone
-    // (b.av2 SR-2.2) — the stand-in key is the channel ID, C_DEADTMUX.
+    // (b.av2 SR-2.2) — here the persona key C_DEADTMUX.
     const reconnectSession = _buildReconnectSessionAdapter()
 
     const deps: RestartDeps & { killSessionCalls: string[]; launchSessionCalls: string[] } = {
@@ -1158,8 +1195,8 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
   let hold: SpawnHold
   /** Every `kill` the stub AD client received. */
   let killCalls: KillParams[]
-  /** Each boolean restart received from `launchSession`, in settle order. */
-  let launchResults: Array<{ key: string; ok: boolean }>
+  /** Each result restart received from `launchSession`, in settle order. */
+  let launchResults: Array<{ key: string; ok: boolean | 'skipped' }>
   /** Session-manager notices (spawn-failure notices land here). */
   let notices: Array<{ key: string; text: string }>
   /** console.error lines written during the test. */

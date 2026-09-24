@@ -75,7 +75,8 @@
  * Pure module (b.av2 SR-13.1): nothing is created, read or scheduled at
  * import or at `createPersonaConnectionManager`; no environment access
  * (dry run is passed in). It imports nothing from the agent-director modules.
- * Not yet wired into `server.ts`; E3 does that.
+ * `server.ts` constructs one manager in `main()` and brings each persona up
+ * through `bringUpPersona` (`persona-start.ts`).
  *
  * SPDX-License-Identifier: MIT
  */

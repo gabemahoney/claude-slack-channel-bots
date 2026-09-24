@@ -10,6 +10,7 @@
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'path'
@@ -229,6 +230,22 @@ function readOwnSessionId(): number | null {
   }
 }
 
+/** A spawned child that ran nothing: see the fake `spawn` below. */
+function fakeChild(): EventEmitter & { pid: number; stdout: EventEmitter; stderr: EventEmitter; unref(): void; kill(): boolean } {
+  const child = Object.assign(new EventEmitter(), {
+    pid: 999999,
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    unref: () => { /* no-op */ },
+    kill: () => false,
+  })
+  setImmediate(() => {
+    child.emit('exit', 1, null)
+    child.emit('close', 1, null)
+  })
+  return child
+}
+
 describe('start — daemonize session-leader guard (b.acn)', () => {
   let scratchDir: string
   // Each fake-spawn call records the real detach arguments so tests can assert
@@ -238,10 +255,17 @@ describe('start — daemonize session-leader guard (b.acn)', () => {
   beforeAll(async () => {
     const real = await import('node:child_process')
     // Fake spawn: record (cmd, args, opts), never launch a real process; return
-    // a minimal child with unref() and a pid so the parent path completes.
+    // a child that behaves like a real one that could not run what it was
+    // given. Under Bun 1.4, mock.restore() does not undo mock.module, so this
+    // fake stays installed for every later test file in the same `bun test`
+    // process (the cozempic probe in startupSessionManager awaits its child's
+    // `close`). The child therefore supports what a caller of spawn uses:
+    // `on`/`once` (an EventEmitter), `stdout`/`stderr` streams, `unref`,
+    // `kill` and `pid`; once the caller has attached its listeners it emits
+    // `exit` and then `close` with code 1 (nothing ran), as a failed command does.
     const fakeSpawn = (cmd: string, args: string[], opts: Record<string, unknown>) => {
-      spawnedCalls.push({ cmd, args, opts })
-      return { unref: () => { /* no-op */ }, pid: 999999 }
+      spawnedCalls?.push({ cmd, args, opts })
+      return fakeChild()
     }
     mock.module('node:child_process', () => ({ ...real, spawn: fakeSpawn }))
     mock.module('child_process', () => ({ ...real, spawn: fakeSpawn }))

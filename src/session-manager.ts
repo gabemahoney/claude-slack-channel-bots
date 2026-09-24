@@ -33,6 +33,14 @@
  * persona absent from the applied configuration, an instance ID other than
  * `cscb_<key>`, or a `cwd` other than its persona's working directory.
  *
+ * At start, `startupSessionManager` brings each applied persona up through
+ * the b.av2 SR-6.1 procedure (`persona-start.ts`): the local credentials and
+ * working-directory checks, Slack validation and connection
+ * (`connectPersona`, every persona at once), then the launch through
+ * `spawnForPersona` (at most `concurrency` at a time). A restart
+ * (`launchSession`) runs the launch only, and only while the caller's gate
+ * says the persona's connection is serving.
+ *
  * No tmux process-tree walks, no JSONL existence checks for resume eligibility:
  * the library encapsulates both.
  *
@@ -82,6 +90,7 @@ import {
 } from './agent-director-errors.ts'
 import { recordStartupError } from './startup-errors.ts'
 import { firstNoticeLine, notifySafely, type PersonaNoticeOptions, type PersonaNotify } from './persona-notifier.ts'
+import { connectPersona, type PersonaBringUpFailure, type PersonaConnectDeps } from './persona-start.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import { RESTART_FAILURE_CAP } from './restart.ts'
 import { isDryRun } from './tokens.ts'
@@ -2200,10 +2209,28 @@ export async function reconcileOrphans(
 // startupSessionManager — iterate personas and dispatch per persona
 // ---------------------------------------------------------------------------
 
+/**
+ * What `startupSessionManager` needs to run steps 1–3 of the SR-6.1 bring-up
+ * procedure for each persona (`connectPersona`): the connection manager, the
+ * dry-run flag, the logger and optional check / file-system overrides. The
+ * applied set is supplied here; the launch (step 4) is `spawnForPersona`.
+ */
+export type StartupBringUpDeps = Omit<PersonaConnectDeps, 'applied'>
+
+/** One persona's start outcome: a spawn outcome, or not brought up (steps 1–3) with its failures. */
+export type StartupPersonaOutcome =
+  | { key: string; action: SpawnPersonaResult['action'] }
+  | { key: string; action: 'not-brought-up'; failures: PersonaBringUpFailure[] }
+
 export interface StartupSessionManagerResult {
   /** Any non-failed action (kept for callers that only care about liveness). */
   succeeded: number
   failed: number
+  /**
+   * Personas not brought up: a step 1–3 failure (credentials, working
+   * directory, Slack). Not launched, and not counted as a failed spawn.
+   */
+  notBroughtUp: number
   /** b.wrb: honest per-outcome breakdown of the succeeded personas. */
   resumed: number
   /** Clean fresh spawns (no prior row / no resume attempted). */
@@ -2221,21 +2248,33 @@ export interface StartupSessionManagerResult {
   reconnected: number
   noop: number
   /** One outcome per persona, by key. */
-  perPersona: Array<{ key: string; action: SpawnPersonaResult['action'] }>
+  perPersona: StartupPersonaOutcome[]
 }
 
 /**
- * On server startup, iterate all configured personas and call spawnForPersona
- * once for each — a persona listed in several channels still gets exactly one
- * spawn. Uses a worker-pool pattern to limit concurrency.
+ * On server startup, bring every applied persona up once — a persona listed
+ * in several channels still gets exactly one bring-up and one spawn.
  *
- * Per-persona failures are logged and recorded in startup-errors.log but never
- * crash the server. cozempic availability is probed in the background
- * (non-blocking).
+ * With `options.bringUp` (the server always passes it) each persona goes
+ * through the b.av2 SR-6.1 procedure, in order: the local credentials check
+ * (skipped in dry run), the working-directory check, Slack validation and
+ * connection (`connectPersona`), then the launch (`spawnForPersona`). Steps
+ * 1–3 run for every persona at once, so no persona's Slack connection waits
+ * behind another persona's launch; only the launches share a pool of at most
+ * `concurrency` (default 3), taken in the order the personas become ready. A
+ * step 1–3 failure means the persona is not brought up: it is counted apart
+ * from spawn outcomes, records no startup error, posts no notice and is not a
+ * failed spawn. Without `options.bringUp` each persona is launched directly
+ * (steps 1–3 skipped), in config order through the same pool; only unit
+ * tests of the launch ladder call it that way.
+ *
+ * Per-persona launch failures are logged and recorded in startup-errors.log
+ * but never crash the server. cozempic availability is probed in the
+ * background (non-blocking).
  */
 export async function startupSessionManager(
   config: PersonaConfig,
-  options?: { concurrency?: number },
+  options?: { concurrency?: number; bringUp?: StartupBringUpDeps },
 ): Promise<StartupSessionManagerResult> {
   await checkCozempicAvailable()
 
@@ -2246,16 +2285,18 @@ export async function startupSessionManager(
     `[slack] startupSessionManager: ${personas.length} persona(s), concurrency=${concurrency}`,
   )
 
-  const perPersona: Array<{ key: string; action: SpawnPersonaResult['action'] }> = []
+  const perPersona: StartupPersonaOutcome[] = []
+  const bringUp = options?.bringUp
+  const launchSlot = createLaunchPool(Math.max(1, concurrency))
   let succeeded = 0
   let failed = 0
+  let notBroughtUp = 0
   let resumed = 0
   let freshSpawned = 0
   let freshAfterAmnesia = 0
   let freshAfterInconclusiveAmnesia = 0
   let reconnected = 0
   let noop = 0
-  let nextIdx = 0
 
   function tally(action: SpawnPersonaResult['action']): void {
     switch (action) {
@@ -2290,9 +2331,27 @@ export async function startupSessionManager(
     }
   }
 
+  /**
+   * Steps 1–3 (with `bringUp`, outside the pool), then step 4 through the
+   * launch pool; the launch alone without `bringUp`. Undefined when not
+   * brought up (recorded here).
+   */
+  async function launchPersona(persona: Persona): Promise<SpawnPersonaResult | undefined> {
+    if (bringUp) {
+      const connected = await connectPersona(persona, { ...bringUp, applied: personas })
+      if (connected.outcome !== 'connected') {
+        perPersona.push({ key: persona.key, action: 'not-brought-up', failures: connected.failures })
+        notBroughtUp++
+        return undefined
+      }
+    }
+    return launchSlot(() => spawnForPersona(persona, config))
+  }
+
   async function processPersona(persona: Persona): Promise<void> {
     try {
-      const result = await spawnForPersona(persona, config)
+      const result = await launchPersona(persona)
+      if (result === undefined) return
       perPersona.push({ key: persona.key, action: result.action })
       tally(result.action)
     } catch (err) {
@@ -2308,17 +2367,7 @@ export async function startupSessionManager(
     }
   }
 
-  async function worker(): Promise<void> {
-    while (nextIdx < personas.length) {
-      const idx = nextIdx++
-      if (idx >= personas.length) break
-      await processPersona(personas[idx])
-    }
-  }
-
-  await Promise.all(
-    Array.from({ length: Math.min(concurrency, personas.length || 1) }, () => worker()),
-  )
+  await Promise.all(personas.map((persona) => processPersona(persona)))
 
   // b.wrb/b.fwu: honest breakdown. A fresh-spawn that replaced a resume because
   // the transcript was missing is reported separately and never folded into a
@@ -2329,7 +2378,7 @@ export async function startupSessionManager(
     `[slack] startupSessionManager: complete — ${personas.length} persona(s): ${resumed} resumed, ` +
       `${freshSpawned} fresh-spawned, ${freshAfterAmnesia} fresh-after-amnesia, ` +
       `${freshAfterInconclusiveAmnesia} fresh-after-inconclusive-amnesia, ` +
-      `${reconnected} reconnected, ${noop} no-op, ${failed} failed`,
+      `${reconnected} reconnected, ${noop} no-op, ${failed} failed, ${notBroughtUp} not brought up`,
   )
   if (freshAfterAmnesia > 0) {
     // Loud, grep-friendly signal that some personas lost their resume target.
@@ -2357,6 +2406,7 @@ export async function startupSessionManager(
   return {
     succeeded,
     failed,
+    notBroughtUp,
     resumed,
     freshSpawned,
     freshAfterAmnesia,
@@ -2367,13 +2417,40 @@ export async function startupSessionManager(
   }
 }
 
+/**
+ * A first-in, first-out pool: `run(task)` starts `task` once fewer than
+ * `size` tasks are running, in the order `run` was called, and settles with
+ * its result.
+ */
+function createLaunchPool(size: number): <T>(task: () => Promise<T>) => Promise<T> {
+  let running = 0
+  const waiting: Array<() => void> = []
+  return async <T>(task: () => Promise<T>): Promise<T> => {
+    if (running >= size) await new Promise<void>((resolve) => waiting.push(resolve))
+    else running++
+    try {
+      return await task()
+    } finally {
+      const next = waiting.shift()
+      if (next) next()
+      else running--
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // launchSession — restart.ts adapter
 // ---------------------------------------------------------------------------
 
 /**
  * Restart-adapter shim for restart.ts (`RestartDeps.launchSession`): launch
- * the applied persona with this key.
+ * the applied persona with this key. Runs step 4 of the start procedure only:
+ * a restart never repeats the credentials, working-directory or Slack steps.
+ *
+ * `options.canLaunch` (the server passes `createPersonaRelaunchGate`) is
+ * asked first: when it answers false — the persona's Slack connection is not
+ * serving, so steps 1–3 have not passed — nothing is launched and the result
+ * is `'skipped'`, which restart.ts counts as neither a success nor a failure.
  *
  * Returns true on any non-failed action (spawned / resumed / reconnected /
  * no-op), false on `failed` or when no applied persona has the key. The
@@ -2383,9 +2460,11 @@ export async function startupSessionManager(
 export async function launchSession(
   key: string,
   config: PersonaConfig,
-): Promise<boolean> {
+  options?: { canLaunch?: (key: string) => boolean },
+): Promise<boolean | 'skipped'> {
   const persona = config.personas.find((p) => p.key === key)
   if (!persona) return false
+  if (options?.canLaunch && !options.canLaunch(key)) return 'skipped'
   const result = await spawnForPersona(persona, config, false)
   return result.action !== 'failed'
 }

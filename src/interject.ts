@@ -67,9 +67,9 @@ export type InterjectSession = Pick<SessionEntry, 'connected' | 'server'>
 /** Dependencies of `handleInterject`, injected per call. */
 export interface InterjectDeps {
   /**
-   * The current applied persona config, read once per request. Null when
-   * there is none (the MCP_HOST / MCP_PORT fallback path until E3 Task 9):
-   * every target is then unknown (404).
+   * The current applied persona config, read once per request. Null only
+   * before the server has loaded its configuration: every target is then
+   * unknown (404).
    */
   getPersonaConfig: () => { personas: readonly InterjectPersona[] } | null
   /** The registry lookup by persona key (`getSessionByPersona` in production). */

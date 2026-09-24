@@ -46,7 +46,7 @@ src/server.ts | _buildIsSessionAliveAdapter | const r = await getClient().status
 src/agent-director-template.ts | prodDeps | getClient: () => getClient(),  # production-deps factory wiring: getClient hook returns the singleton getClient()
 src/agent-director-template.ts | installSlackChannelBotTemplate | const client = d.getClient() as {  # startup-fatal makeTemplate install: const client = d.getClient()
 src/session-manager.ts | reconcileOrphans | const client = getClient()  # reconcileOrphans start sweep (its rows have no single-persona attribution)
-src/permission-poller.ts | runTick | const client = deps.getClient()  # list-level client.list at top of runTick (no per-channel context)
+src/permission-poller.ts | runTick | const client = deps.getClient()  # list-level client.list at top of runTick (no single-persona context)
 src/cli.ts | resolveCscbInstanceId | const r = await getClient().list({ label: [SERVICE_LABEL, `${PERSONA_LABEL_PREFIX}${key}`] })  # CLI teardown support: list by persona label (resolveCscbInstanceId)
 src/cli.ts | directorStatus | const r = await getClient().status({ claude_instance_id: id })  # CLI subcommand: status
 src/cli.ts | directorPause | await getClient().pause({ claude_instance_id: id })  # CLI subcommand: pause

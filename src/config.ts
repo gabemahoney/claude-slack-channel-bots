@@ -1,16 +1,18 @@
 /**
  * config.ts — Configuration loaders and validators for the Slack Channel Router.
  *
- * Two loaders live side by side until E3 of b.ob2 switches the server over:
+ * Two loaders live side by side until the CLI switches over (b.ob2 E3 Task 10):
  *
- * - The route loader (`loadConfig` / `resolveConfig`) reads today's
- *   route-keyed shape (`routes`, `default_route`, `default_dm_session`). The
- *   running server and CLI use it.
  * - The persona loader (`loadPersonaConfig` / `resolvePersonaConfig`) reads the
  *   persona shape of b.av2 SR-1: a `personas` array plus the server-wide
  *   settings. It rejects the pre-persona shape before any other check
- *   (b.av2 SR-1.7) and never writes or converts the file. Nothing in the
- *   server calls it yet; E3 wires it in and deletes the route loader.
+ *   (b.av2 SR-1.7) and never writes or converts the file. The server loads
+ *   its configuration through `loadStartPersonaConfig`, at the path
+ *   `resolveServerConfigPath` returns (b.av2 SR-8.7): the file is required and
+ *   there is no fallback.
+ * - The route loader (`loadConfig` / `resolveConfig`) reads the route-keyed
+ *   shape (`routes`, `default_route`, `default_dm_session`). Only `cli.ts`
+ *   still uses it; Task 10 removes it.
  *
  * Both loaders share the server-wide defaults, path resolution and
  * validation rules; only their error prefixes differ, and persona-loader
@@ -18,17 +20,18 @@
  *
  * Pure functions (applyDefaults, validateConfig, expandTilde, resolveConfig)
  * are side-effect-free and importable by tests without performing any I/O
- * (b.av2 SR-13.1); importing this module touches no file. resolvePersonaConfig
- * and resolveRealPath additionally resolve real paths (b.av2 SR-1.5) but never
- * open, read, create or write a file. The I/O wrappers (loadConfig,
- * loadPersonaConfig) read the JSON file once and delegate to them.
+ * (b.av2 SR-13.1); importing this module touches no file and reads no
+ * environment variable. resolvePersonaConfig and resolveRealPath additionally
+ * resolve real paths (b.av2 SR-1.5) but never open, read, create or write a
+ * file. The I/O wrappers (loadConfig, loadPersonaConfig,
+ * loadStartPersonaConfig) read the JSON file once and delegate to them.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { readFileSync, realpathSync } from 'fs'
 import { homedir } from 'os'
-import { dirname, isAbsolute, resolve } from 'path'
+import { dirname, isAbsolute, join, resolve } from 'path'
 
 import { expandTilde as expandTildeWith, personaKey, renderPersonaRef } from './persona-identity.ts'
 
@@ -37,12 +40,19 @@ import { expandTilde as expandTildeWith, personaKey, renderPersonaRef } from './
 // ---------------------------------------------------------------------------
 
 /**
- * Default path to config.json. Also the source of the fallback config
- * directory used by default resolution when no loaded-config path is known
- * (direct pure-function callers): the expanded dirname of this path
- * (`~/.claude/channels/slack`).
+ * The route shape's fallback config directory for direct pure-function
+ * callers with no loaded-config path (`applyDefaults` / `resolveConfig`): the
+ * expanded dirname of this path (`~/.claude/channels/slack`). Not the path
+ * any loader reads by default: that is `resolveServerConfigPath()`. Removed
+ * with the route loader (Task 10).
  */
 export const DEFAULT_CONFIG_PATH = '~/.claude/channels/slack/config.json'
+
+/** The environment variable that overrides the server's state directory. */
+export const STATE_DIR_ENV = 'SLACK_STATE_DIR'
+
+/** The configuration file's name inside the state directory (b.av2 SR-1.1). */
+export const CONFIG_FILE_NAME = 'config.json'
 
 export const MCP_SERVER_NAME = 'slack-channel-router'
 export const ALLOWED_PRESCRIPTIONS = ['gentle', 'standard', 'aggressive']
@@ -1376,18 +1386,65 @@ export function resolvePersonaConfig(raw: unknown, configDir: string, home: stri
 }
 
 // ---------------------------------------------------------------------------
+// Server paths (b.av2 SR-1.1, SR-8.7)
+// ---------------------------------------------------------------------------
+
+/**
+ * The server's state directory: `SLACK_STATE_DIR` (made absolute) when it is
+ * set and non-empty, otherwise `<home>/.claude/channels/slack`. The variable
+ * and the home directory are read at call time, never at import.
+ *
+ * @param home  Home directory; defaults to the OS home, read only when needed.
+ * @param env   Environment to read `SLACK_STATE_DIR` from; defaults to `process.env`.
+ */
+export function resolveServerStateDir(home?: string, env: NodeJS.ProcessEnv = process.env): string {
+  const fromEnv = env[STATE_DIR_ENV]
+  if (fromEnv) return resolve(fromEnv)
+  return join(home ?? homedir(), '.claude', 'channels', 'slack')
+}
+
+/**
+ * The configuration file the server loads (b.av2 SR-1.1): `config.json` in
+ * the state directory (`resolveServerStateDir`). With `SLACK_STATE_DIR` unset
+ * this is `~/.claude/channels/slack/config.json`. The one definition of the
+ * location: the server, the route loader's default and the CLI (Task 10)
+ * all use it. Computed at call time.
+ *
+ * @param home  Home directory; defaults to the OS home, read only when needed.
+ * @param env   Environment to read `SLACK_STATE_DIR` from; defaults to `process.env`.
+ */
+export function resolveServerConfigPath(home?: string, env: NodeJS.ProcessEnv = process.env): string {
+  return join(resolveServerStateDir(home, env), CONFIG_FILE_NAME)
+}
+
+// ---------------------------------------------------------------------------
 // I/O wrappers
 // ---------------------------------------------------------------------------
 
 /**
+ * `loadPersonaConfig` could not read the file (missing, unreadable, a
+ * directory, …). The message names the path; `code` is the errno code when
+ * the read error carried one.
+ */
+export class PersonaConfigReadError extends Error {
+  readonly code: string | undefined
+
+  constructor(message: string, code: string | undefined) {
+    super(message)
+    this.name = 'PersonaConfigReadError'
+    this.code = code
+  }
+}
+
+/**
  * Reads routing configuration from disk, parses it, and returns a validated
  * RoutingConfig. Throws a descriptive error for missing files, malformed JSON,
- * or validation failures.
+ * or validation failures. Used by `cli.ts` only, until Task 10.
  *
- * @param path  Path to config.json. Defaults to ~/.claude/channels/slack/config.json.
+ * @param path  Path to config.json. Defaults to `resolveServerConfigPath()`.
  */
 export function loadConfig(path?: string): RoutingConfig {
-  const configPath = resolve(expandTilde(path ?? DEFAULT_CONFIG_PATH))
+  const configPath = resolve(expandTilde(path ?? resolveServerConfigPath()))
 
   let raw: string
   try {
@@ -1432,12 +1489,14 @@ export function loadConfig(path?: string): RoutingConfig {
 /**
  * Reads a persona configuration file once, parses it and returns the
  * validated PersonaConfig (see `resolvePersonaConfig`). Read, parse and
- * validation failures are rethrown naming the path.
+ * validation failures are rethrown naming the path; a read failure is a
+ * `PersonaConfigReadError`.
  *
  * Read-only (b.av2 SR-1.7, AC 45): the file is opened for reading only and
  * nothing is ever written, renamed, created or converted. A malformed-JSON
  * error omits the parser's detail, which can quote file content such as a
- * pasted token (b.av2 SR-10.3). Not called by the server until E3.
+ * pasted token (b.av2 SR-10.3). The server loads through
+ * `loadStartPersonaConfig`, which calls this.
  *
  * @param path  Path to the configuration file; `~` is expanded under `home`.
  * @param home  Home directory for every `~`; defaults to the OS home, read at call time only.
@@ -1450,7 +1509,10 @@ export function loadPersonaConfig(path: string, home?: string): PersonaConfig {
     text = readFileSync(configPath, 'utf-8')
   } catch (err) {
     const cause = err instanceof Error ? err.message : String(err)
-    throw new Error(`loadPersonaConfig: cannot read persona config at "${configPath}": ${cause}`)
+    throw new PersonaConfigReadError(
+      `loadPersonaConfig: cannot read persona config at "${configPath}": ${cause}`,
+      readErrnoCode(err),
+    )
   }
 
   let parsed: unknown
@@ -1465,5 +1527,53 @@ export function loadPersonaConfig(path: string, home?: string): PersonaConfig {
   } catch (err) {
     const cause = err instanceof Error ? err.message : String(err)
     throw new Error(`loadPersonaConfig: invalid persona config in "${configPath}": ${cause}`)
+  }
+}
+
+/** errno codes meaning the configuration file does not exist (ENOTDIR: an ancestor is not a directory). */
+const MISSING_CONFIG_CODES: ReadonlySet<string> = new Set(['ENOENT', 'ENOTDIR'])
+
+/** An errno code that is safe to echo: `E` plus upper-case letters and digits. */
+const SAFE_ERRNO_CODE_RE = /^E[A-Z0-9]+$/
+
+/** The `code` of an errno-style error when it is a safe errno identifier. */
+function readErrnoCode(err: unknown): string | undefined {
+  if (typeof err !== 'object' || err === null) return undefined
+  const code = (err as { code?: unknown }).code
+  return typeof code === 'string' && SAFE_ERRNO_CODE_RE.test(code) ? code : undefined
+}
+
+/**
+ * Load the configuration at start (b.av2 SR-1.7 live, SR-8.7 no-record part).
+ * Returns the resolved persona config, or throws one `Error` whose message is
+ * ready to log:
+ *
+ * - the file is missing or cannot be read: the message names the path and
+ *   says the server requires the configuration file to start. There is no
+ *   fallback of any kind;
+ * - the file carries a pre-persona key (`routes`, `default_route`,
+ *   `default_dm_session`): `loadPersonaConfig`'s error, carrying E1's
+ *   conversion message, passed through unchanged;
+ * - any other parse or validation failure: `loadPersonaConfig`'s error,
+ *   passed through unchanged.
+ *
+ * Reads the file once and nothing else: no environment variable, no write.
+ *
+ * @param path  Path to the configuration file (`resolveServerConfigPath()` at
+ *   the server); `~` is expanded under `home`.
+ * @param home  Home directory for every `~`; defaults to the OS home, read at call time only.
+ */
+export function loadStartPersonaConfig(path: string, home?: string): PersonaConfig {
+  try {
+    return loadPersonaConfig(path, home)
+  } catch (err) {
+    if (!(err instanceof PersonaConfigReadError)) throw err
+    const configPath = resolve(expandTildeWith(path, home))
+    const what = err.code !== undefined && MISSING_CONFIG_CODES.has(err.code)
+      ? 'does not exist'
+      : `cannot be read${err.code !== undefined ? ` (${err.code})` : ''}`
+    throw new Error(
+      `The configuration file "${configPath}" ${what}. The server requires the configuration file to start.`,
+    )
   }
 }

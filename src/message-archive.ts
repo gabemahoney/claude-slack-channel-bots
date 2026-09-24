@@ -19,6 +19,12 @@
  *     thread_ts TEXT              -- event.thread_ts or null
  *   )
  *
+ * Name lookups for an event run on the client of the persona that received
+ * it (b.av2 SR-4.1): `createPersonaNameResolverSource` keeps one resolver per
+ * persona (rebuilt when the persona's client changes), and `createPersonaArchiveWriter` is the fire-and-forget writer the
+ * persona-routing archive seam calls. A persona with no client (dry run, not
+ * up) still gets its row, with IDs in place of names.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -162,6 +168,82 @@ export function createNameResolver(
   }
 
   return { resolveChannelName, resolveUserName }
+}
+
+/**
+ * The resolver used when the receiving persona has no client (dry run, or not
+ * up): every ID stands in for its name, as an unresolved lookup does. Makes no
+ * Slack call.
+ */
+export const ID_ONLY_NAME_RESOLVER: NameResolver = {
+  resolveChannelName: async (channelId) => channelId,
+  resolveUserName: async (userId) => userId,
+}
+
+/** Per-persona name resolvers for the message archive (b.av2 SR-4.1). */
+export interface PersonaNameResolverSource {
+  /**
+   * The resolver for persona `key`: one `createNameResolver` over that
+   * persona's own client, built the first time the client is available and
+   * reused for the key while `clientFor(key)` returns that same client;
+   * rebuilt (with empty caches) when it returns a different client.
+   * `ID_ONLY_NAME_RESOLVER` while the persona has no client. Never another
+   * persona's client or cache.
+   */
+  resolverFor(key: string): NameResolver
+}
+
+/**
+ * Build the per-persona resolver source over `clientFor(key)`, the persona's
+ * client or undefined when it has none. The client is looked up on every
+ * call, so a persona without a client never reaches Slack; each persona's
+ * resolver (and its caches) is built once per client: a new resolver is built
+ * when the persona's client changes. Creates nothing until
+ * `resolverFor` is called.
+ */
+export function createPersonaNameResolverSource(
+  clientFor: (key: string) => NameResolverWebClient | undefined,
+  opts: { channelTtlMs?: number } = {},
+): PersonaNameResolverSource {
+  const cached = new Map<string, { client: NameResolverWebClient; resolver: NameResolver }>()
+  return {
+    resolverFor(key) {
+      const client = clientFor(key)
+      if (!client) return ID_ONLY_NAME_RESOLVER
+      const entry = cached.get(key)
+      if (entry && entry.client === client) return entry.resolver
+      // First use, or the persona's client changed (e.g. rebuilt after new
+      // credentials): a fresh resolver over the current client.
+      const resolver = createNameResolver(client, opts)
+      cached.set(key, { client, resolver })
+      return resolver
+    },
+  }
+}
+
+/**
+ * Build the archive writer for inbound events received by a persona: the
+ * persona-routing archive seam. Fire-and-forget: the row is written with the
+ * receiving persona's resolver (`source.resolverFor(key)`); a resolver or
+ * write failure goes to `onError` and is never thrown into delivery. The
+ * insert-or-ignore key is unchanged, so one message received by two personas
+ * is stored once.
+ */
+export function createPersonaArchiveWriter(
+  db: Database,
+  source: PersonaNameResolverSource,
+  onError: (err: unknown) => void,
+): (key: string, event: unknown) => void {
+  return (key, event) => {
+    let resolver: NameResolver
+    try {
+      resolver = source.resolverFor(key)
+    } catch (err) {
+      onError(err)
+      return
+    }
+    archiveSlackMessage(db, event as SlackMessageEvent, resolver).catch(onError)
+  }
 }
 
 // ---------------------------------------------------------------------------

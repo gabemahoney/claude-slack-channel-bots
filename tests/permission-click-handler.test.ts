@@ -52,7 +52,8 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { ErrSystemInstallDisappeared, type Client, type DecideParams, type DecideResult } from 'agent-director'
 import { handlePermissionClick, type ClickDeps } from '../src/permission-click-handler.ts'
-import { encodePermissionActionId, personaKeyFromActionId } from '../src/permission-action-id.ts'
+import { encodePermissionActionId } from '../src/permission-action-id.ts'
+import { personaKeyFromActionId } from './test-helpers/action-id-key.ts'
 import {
   _resetPollerState,
   getLivePermission,

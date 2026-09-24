@@ -16,10 +16,10 @@
  * `isHttpVerbose()` is now exported from src/server.ts as an env-parameterized
  * seam (mirroring b.brv's isVerbose in agent-director-logger.ts), so the truthy
  * contract is exercised by importing the helper and injecting `env` objects
- * directly — no source-text audit needed. Importing src/server.ts is safe: its
- * `main()` boot is guarded behind `if (import.meta.main)`, so a plain
- * `import { isHttpVerbose }` runs no side effects (existing tests already import
- * `_buildIsSessionAliveAdapter` / `_buildStatRouteImpl` from the same module).
+ * directly — no source-text audit needed. Importing src/server.ts is safe: it
+ * reads no Slack token, builds no Slack client and creates no directory at
+ * import (b.av2 SR-3.1) — all of that happens in `main()`, which runs only
+ * behind `if (import.meta.main)`.
  *
  * The one remaining static assertion is the guard-adjacency regression pin: it
  * fails on the pre-fix code — where the access line was an unconditional

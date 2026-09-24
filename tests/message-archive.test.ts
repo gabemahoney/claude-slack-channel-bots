@@ -8,6 +8,7 @@ import {
   openArchiveDatabase,
   archiveSlackMessage,
   createNameResolver,
+  createPersonaNameResolverSource,
   resolveSenderIdentity,
   type SlackMessageEvent,
   type NameResolver,
@@ -406,5 +407,33 @@ describe('createNameResolver', () => {
     }
     const resolver = createNameResolver(stub)
     expect(await resolver.resolveUserName('U1')).toBe('Real Name')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// createPersonaNameResolverSource: one resolver per persona per client
+// ---------------------------------------------------------------------------
+
+describe('createPersonaNameResolverSource', () => {
+  test('the same client keeps its resolver (and its cache); a different client gets a new resolver with an empty cache', async () => {
+    const first = makeStubWebClient()
+    const second = makeStubWebClient()
+    let current = first
+    const source = createPersonaNameResolverSource((key) => (key === 'persona_a' ? current : undefined))
+
+    const resolver = source.resolverFor('persona_a')
+    await resolver.resolveUserName('U1')
+    expect(source.resolverFor('persona_a')).toBe(resolver)
+    await source.resolverFor('persona_a').resolveUserName('U1')
+    expect(first.userCalls).toBe(1)
+
+    // The persona's client was replaced (e.g. rebuilt after new credentials).
+    current = second
+    const rebuilt = source.resolverFor('persona_a')
+    expect(rebuilt).not.toBe(resolver)
+    expect(await rebuilt.resolveUserName('U1')).toBe('display-U1')
+    expect(second.userCalls).toBe(1)
+    expect(first.userCalls).toBe(1)
+    expect(source.resolverFor('persona_a')).toBe(rebuilt)
   })
 })

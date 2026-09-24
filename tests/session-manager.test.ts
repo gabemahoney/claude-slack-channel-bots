@@ -21,6 +21,11 @@
  *   - b.av2 SR-6.3: the fixed instance ID, one launch in flight per persona,
  *     and the start sweep (`reconcileOrphans`) keyed by the `persona` label
  *     (AC 4).
+ *   - b.av2 SR-6.1 start: `startupSessionManager` with `bringUp` (a persona
+ *     not brought up is counted apart; every Slack bring-up runs at once and
+ *     only the launches share the pool, in readiness order; a launch that
+ *     throws is one failed persona), and `launchSession`'s relaunch gate
+ *     (`canLaunch` false → `'skipped'`, nothing launched or patched).
  *   - b.av2 SR-6.2 pre-launch trust patch: through the injectable seam
  *     (`setPreLaunchTrustPatcher`, empty by default and reset in afterEach,
  *     so no test installs the production patch or writes a `.claude.json`),
@@ -37,9 +42,9 @@
  *     through the real per-persona notifier installed with
  *     `setSessionNotifier`.
  *
- * Most blocks use a stand-in persona keyed by its channel ID (the shape the
- * E3 route→persona adapter produces), so their `cscb_<channelId>` ids and
- * outage keys are unchanged. Every test gets a bare notice capture
+ * Most blocks use a stand-in persona keyed by its channel ID
+ * (`makeStandInPersonaConfig`), so their `cscb_<channelId>` ids and outage
+ * keys stay short and fixed. Every test gets a bare notice capture
  * (`notices`); the notice-routing cases replace it with the real notifier
  * over a two-persona config whose notice persona's name, key and destination
  * all differ.
@@ -97,12 +102,20 @@ import {
 import { UNATTRIBUTABLE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
 import { resolveJsonlPath } from '../src/cozempic.ts'
 import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
-import type { WebApiOutcome } from './test-helpers/slack-stub.ts'
+import { makeDeferredConnect, type DeferredConnect, type StubSlackOptions, type WebApiOutcome } from './test-helpers/slack-stub.ts'
+import type { PersonaConnectionManager } from '../src/persona-connections.ts'
+import type { PersonaBringUpStep } from '../src/persona-start.ts'
+import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
-import { LEAK_SENTINEL, assertNoLeak } from './test-helpers/credentials.ts'
+import {
+  APP_TOKEN_PREFIX,
+  BOT_TOKEN_PREFIX,
+  LEAK_SENTINEL,
+  assertNoLeak,
+  fakeToken,
+} from './test-helpers/credentials.ts'
 import { MCP_SERVER_NAME, type Persona, type PersonaConfig, resolveRealPath } from '../src/config.ts'
 import { PERSONA_INSTANCE_ID_PREFIX, configDirLabelValue, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
-import { routesToPersonaConfig } from '../src/route-persona-adapter.ts'
 import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
 import {
   cannedGetResult,
@@ -126,7 +139,6 @@ import {
   type PersonaGetResultOverrides,
   type StubClient,
 } from './test-helpers/agent-director-stub.ts'
-import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import { buildTempArchiveDb, messagesSince } from './test-helpers/archive-db.ts'
 import {
@@ -480,7 +492,7 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
       CLAUDE_CONFIG_DIR: configDir,
       CSCB_PERSONA: key,
       CLAUDE_MANAGED_CHANNEL: key,
-      CSCB_CRONTABLE_PATH: cfg.cron_table_path,
+      CSCB_CRONTABLE_PATH: join(fixtureDir, 'crontab'),
     })
     expect(params.claude_args).toBeUndefined()
   })
@@ -694,12 +706,14 @@ describe('spawnForPersona: persona identity (SR-2.2)', () => {
     expect(spawnCalls[0].label).toContain('persona=ops_bot')
   })
 
-  test('a stand-in persona keyed by its channel ID (route→persona adapter) spawns byte-identically as cscb_<channelId>', async () => {
+  test('a persona whose key is set directly (a channel-ID stand-in) spawns byte-identically as cscb_<key>', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     installStub({ spawnCalls })
     const topLevel = fixtureSubdir('top-level')
-    const cfg = routesToPersonaConfig(
-      makeRoutingConfig({ routes: { C0AMDDZEHCY: { cwd: '/repo/general' } }, claude_config_dir: topLevel }),
+    const cfg = makeStandInPersonaConfig(
+      { C0AMDDZEHCY: { working_directory: '/repo/general' } },
+      fixtureDir,
+      { claude_config_dir: topLevel },
     )
 
     const result = await spawnForPersona(personaOf(cfg, 'C0AMDDZEHCY'), cfg)
@@ -719,7 +733,7 @@ describe('spawnForPersona: persona identity (SR-2.2)', () => {
       CLAUDE_CONFIG_DIR: topLevel,
       CSCB_PERSONA: 'C0AMDDZEHCY',
       CLAUDE_MANAGED_CHANNEL: 'C0AMDDZEHCY',
-      CSCB_CRONTABLE_PATH: '/tmp/test-crontab',
+      CSCB_CRONTABLE_PATH: cfg.cron_table_path,
     })
   })
 
@@ -1710,6 +1724,68 @@ describe('pre-launch trust patch (b.av2 SR-6.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// launchSession's relaunch gate (b.av2 SR-6.1: a persona whose Slack
+// connection is not serving is not relaunched). The server passes
+// `createPersonaRelaunchGate` as `canLaunch`; tests/persona-relaunch-gate.test.ts
+// covers the gate itself.
+// ---------------------------------------------------------------------------
+
+describe('launchSession: the relaunch gate (canLaunch)', () => {
+  /** Persona C with a recording trust patcher and a stub whose spawn and resume calls are logged with the patch. */
+  function gateFixture() {
+    const readLog = captureStartupErrors()
+    const { cfg } = labelConfig()
+    const events: LaunchEvent[] = []
+    const patched = installRecordingPatcher(events)
+    const calls = newLadderCalls()
+    recordLaunchCalls(installStub({ ...calls }), events)
+    return { cfg, events, patched, calls, readLog }
+  }
+
+  test('canLaunch false: \'skipped\' — the gate is asked once with the key; no trust patch, no agent-director call, no notice, no startup error', async () => {
+    const f = gateFixture()
+    const asked: string[] = []
+
+    let result: boolean | 'skipped' | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await launchSession('C', f.cfg, { canLaunch: (key) => (asked.push(key), false) })
+    })
+
+    expect(result).toBe('skipped')
+    expect(asked).toEqual(['C'])
+    expect(f.events).toEqual([])
+    expect(f.patched).toEqual([])
+    expect(f.calls).toEqual(newLadderCalls())
+    expect(notices).toEqual([])
+    expect(f.readLog()).toBe('')
+    expect(errLog).toBe('')
+  })
+
+  test('canLaunch true: launched as without a gate — patched once, then spawned; true', async () => {
+    const f = gateFixture()
+
+    let result: boolean | 'skipped' | undefined
+    await withCapturedErr(async () => {
+      result = await launchSession('C', f.cfg, { canLaunch: () => true })
+    })
+
+    expect(result).toBe(true)
+    expect(f.events).toEqual(['patch', 'spawn'])
+    expect(f.calls.spawnCalls.map((p) => p.claude_instance_id)).toEqual(['cscb_C'])
+  })
+
+  test('an unknown key is false before the gate is asked', async () => {
+    const f = gateFixture()
+    const asked: string[] = []
+
+    expect(await launchSession('C_UNKNOWN', f.cfg, { canLaunch: (key) => (asked.push(key), true) })).toBe(false)
+
+    expect(asked).toEqual([])
+    expect(f.events).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // b.av2 SR-6.3 / AC 4 — the fixed instance ID and one in-flight launch per persona
 // ---------------------------------------------------------------------------
 
@@ -2134,6 +2210,263 @@ describe('startupSessionManager', () => {
     expect(log).toContain('[spawn-failed]')
     expect(log).toContain(`spawn failed for ${rendered}: ErrSpawnBroken`)
     expect(lines.some((l) => l.includes(`spawnForPersona: spawn failed for ${rendered}`))).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// startupSessionManager with the SR-6.1 bring-up (b.av2 SR-6.1, SR-11)
+//
+// The server passes `bringUp`: each persona goes through its credentials,
+// working-directory and Slack steps before the launch. The procedure itself is
+// tested in tests/persona-bringup.test.ts; these cases pin the start pool's
+// bookkeeping: a step 1–3 failure is "not brought up", never a failed spawn,
+// a startup error or a notice.
+// ---------------------------------------------------------------------------
+
+describe('startupSessionManager: SR-6.1 bring-up', () => {
+  let managers: PersonaConnectionManager[] = []
+
+  beforeEach(() => {
+    managers = []
+    // This block handles credentials: an accidental environment read gets fakes (restored by the file's afterEach).
+    process.env['SLACK_BOT_TOKEN'] = fakeToken(BOT_TOKEN_PREFIX, 'env')
+    process.env['SLACK_APP_TOKEN'] = fakeToken(APP_TOKEN_PREFIX, 'env')
+    delete process.env['SLACK_DRY_RUN']
+  })
+
+  afterEach(async () => {
+    await Promise.all(managers.map((m) => m.stopAll()))
+  })
+
+  /**
+   * Personas named `names` (A and B by default; names differ from keys), each
+   * with its own working directory and credentials file under fixtureDir, on
+   * the real connection manager over the stub factory and a fake clock
+   * (`makeConnectionHarness` with `files: true`). `slack` scripts each
+   * persona's stub by name. `bringUp` is what the server passes to
+   * `startupSessionManager`; its `connections` records `slack:<key>` in
+   * `order`, and `lines` holds the manager's and the procedure's lines.
+   */
+  function bringUpFixture(slackA: StubSlackOptions = {}, names = ['Alpha Desk', 'Beta Ops'], slack: Record<string, StubSlackOptions> = {}) {
+    const h = makeConnectionHarness(names.map((name) => ({ name })), fixtureDir, {
+      files: true,
+      stubOptions: { [names[0]!]: slackA, ...slack },
+    })
+    managers.push(h.manager)
+    const [a, b] = h.personas as [Persona, Persona]
+    const lines = h.lines
+    return {
+      h,
+      cfg: h.config!,
+      a,
+      b,
+      lines,
+      order: h.order,
+      bringUp: { connections: h.connections, dryRun: false, log: (line: string) => void lines.push(line) },
+    }
+  }
+
+  /** Poll `cond` (real time, 1 ms steps) for at most `ms`; the caller asserts afterwards. */
+  async function waitFor(cond: () => boolean, ms = 500): Promise<void> {
+    for (let waited = 0; !cond() && waited < ms; waited++) await new Promise((r) => setTimeout(r, 1))
+  }
+
+  test.each<[string, (f: ReturnType<typeof bringUpFixture>) => void, StubSlackOptions, PersonaBringUpStep, string]>([
+    ['credentials file missing (step 1)', (f) => rmSync(f.a.credentials_file), {}, 'credentials', 'persona-credentials-missing'],
+    ['working directory missing (step 2)', (f) => rmSync(f.a.working_directory, { recursive: true }), {}, 'working-directory', 'persona-directory-missing'],
+    ['Slack refuses A\'s bot token (step 3)', () => {}, { authTest: [{ kind: 'platform', error: 'invalid_auth' }] }, 'slack', 'persona-credentials-refused'],
+  ])('%s: A is not brought up — no spawn, no failed count, no startup error, no notice; B is launched', async (_label, arrange, slackA, step, cls) => {
+    const readLog = captureStartupErrors()
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    const f = bringUpFixture(slackA)
+    arrange(f)
+
+    let result!: Awaited<ReturnType<typeof startupSessionManager>>
+    const errLog = await withCapturedErr(async () => {
+      result = await startupSessionManager(f.cfg, { concurrency: 1, bringUp: f.bringUp })
+    })
+
+    expect(result.perPersona).toEqual([
+      { key: f.a.key, action: 'not-brought-up', failures: [{ step, class: cls, cause: expect.any(String) }] },
+      { key: f.b.key, action: 'spawned' },
+    ])
+    expect(result.notBroughtUp).toBe(1)
+    expect(result.failed).toBe(0)
+    expect(result.succeeded).toBe(1)
+    expect(result.freshSpawned).toBe(1)
+    expect(spawnCalls.map((p) => p.claude_instance_id)).toEqual([`cscb_${f.b.key}`])
+    expect(readLog()).toBe('')
+    expect(notices).toEqual([])
+    expect(outageEmissions).toEqual([])
+    expect(errLog).toContain(
+      'startupSessionManager: complete — 2 persona(s): 0 resumed, 1 fresh-spawned, 0 fresh-after-amnesia, ' +
+        '0 fresh-after-inconclusive-amnesia, 0 reconnected, 0 no-op, 0 failed, 1 not brought up',
+    )
+    assertNoLeak({ lines: f.lines, errLog, result })
+  })
+
+  test('a persona brought up goes on to the collision ladder after its connection is up: its ended row is resumed', async () => {
+    captureStartupErrors()
+    const f = bringUpFixture()
+    const stub = installStub({
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${f.b.key}` }),
+      ],
+      getResult: personaRow(f.cfg, f.a.key, { state: 'ended' }),
+    })
+    const realSpawn = stub.spawn.bind(stub)
+    stub.spawn = async (params) => {
+      f.order.push(`spawn:${params.claude_instance_id}`)
+      return realSpawn(params)
+    }
+
+    let result!: Awaited<ReturnType<typeof startupSessionManager>>
+    const errLog = await withCapturedErr(async () => {
+      result = await startupSessionManager(f.cfg, { concurrency: 1, bringUp: f.bringUp })
+    })
+
+    // Both Slack bring-ups start at once; only the launches are pooled (here one at a time, in readiness order).
+    expect(f.order).toEqual([`slack:${f.a.key}`, `slack:${f.b.key}`, `spawn:cscb_${f.a.key}`, `spawn:cscb_${f.b.key}`])
+    expect(result.perPersona).toEqual([
+      { key: f.a.key, action: 'resumed' },
+      { key: f.b.key, action: 'spawned' },
+    ])
+    expect(result.notBroughtUp).toBe(0)
+    expect(result.resumed).toBe(1)
+    expect(errLog).toContain('0 failed, 0 not brought up')
+    assertNoLeak({ lines: f.lines, errLog, result })
+  })
+
+  // A launch that throws (not a failed ladder: spawnForPersona itself rejects)
+  // is caught per persona; the next persona in the pool still launches.
+  test('concurrency 1: A\'s launch throws — A is counted failed with a startup error, and B is still spawned', async () => {
+    const readLog = captureStartupErrors()
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    const f = bringUpFixture()
+    // Building A's spawn parameters throws, so A's launch rejects outright.
+    Object.defineProperty(f.a, 'claude_config_dir', {
+      get() {
+        throw new Error('launch exploded for A')
+      },
+    })
+
+    let result!: Awaited<ReturnType<typeof startupSessionManager>>
+    const errLog = await withCapturedErr(async () => {
+      result = await startupSessionManager(f.cfg, { concurrency: 1, bringUp: f.bringUp })
+    })
+
+    expect(result.perPersona).toEqual([
+      { key: f.a.key, action: 'failed' },
+      { key: f.b.key, action: 'spawned' },
+    ])
+    expect(result.failed).toBe(1)
+    expect(result.succeeded).toBe(1)
+    expect(result.notBroughtUp).toBe(0)
+    expect(spawnCalls.map((p) => p.claude_instance_id)).toEqual([`cscb_${f.b.key}`])
+    expect(errLog).toContain(`startupSessionManager: unexpected error for ${renderPersonaRef(f.a.name, f.a.key)}`)
+    expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(1)
+    expect(readLog()).toContain(`unexpected error spawning ${renderPersonaRef(f.a.name, f.a.key)}`)
+    assertNoLeak({ lines: f.lines, errLog, result })
+  })
+
+  // The launch pool: steps 1–3 run for every persona at once; only the
+  // launches share `concurrency` slots, taken in the order personas become
+  // ready. Each persona's socket open is deferred so the test picks the
+  // readiness order, and every spawn is held so no launch settles until the
+  // test releases it.
+  test('pool (5 personas, concurrency 3, launches held): every Slack bring-up finishes before any launch settles; at most 3 launches run, in readiness order; a persona not brought up takes no slot', async () => {
+    captureStartupErrors()
+    const names = ['Alpha Desk', 'Beta Ops', 'Gamma Hub', 'Delta Bay', 'Echo Den']
+    const connects = new Map<string, DeferredConnect>(names.map((name) => [name, makeDeferredConnect()]))
+    const f = bringUpFixture({}, names, Object.fromEntries(names.map((name) => [name, { connect: [connects.get(name)!.outcome] }])))
+    const [alpha, beta, gamma, delta, echo] = f.h.personas as Persona[]
+    const held = holdSpawns(installStub({}))
+    const launched = () => held.calls.map((p) => p.claude_instance_id)
+    const id = (p: Persona) => `cscb_${p.key}`
+    const settle = async (p: Persona, outcome?: Parameters<DeferredConnect['settle']>[0]) => {
+      connects.get(p.name)!.settle(outcome)
+      await waitFor(() => f.h.manager.status(p.key)?.state !== 'connecting')
+    }
+
+    let result!: Awaited<ReturnType<typeof startupSessionManager>>
+    const errLog = await withCapturedErr(async () => {
+      const start = startupSessionManager(f.cfg, { concurrency: 3, bringUp: f.bringUp })
+
+      // Every persona's Slack step starts at once, before any launch.
+      await waitFor(() => f.order.length === names.length)
+      expect(f.order).toEqual(f.h.personas.map((p) => `slack:${p.key}`))
+      expect(launched()).toEqual([])
+
+      // Ready in the order Delta, (Beta refused), Echo, Alpha, Gamma.
+      await settle(delta)
+      await waitFor(() => launched().length === 1)
+      await settle(beta, { kind: 'platform', error: 'invalid_auth' })
+      await settle(echo)
+      await waitFor(() => launched().length === 2)
+      await settle(alpha)
+      await waitFor(() => launched().length === 3)
+      await settle(gamma)
+      await waitFor(() => launched().length > 3, 50)
+
+      // Beta took no slot: the three slots are Delta, Echo and Alpha, all held; Gamma waits.
+      expect(launched()).toEqual([id(delta), id(echo), id(alpha)])
+      expect(held.held()).toEqual([id(delta), id(echo), id(alpha)])
+      // Every Slack bring-up has finished while no launch has settled.
+      expect(f.h.personas.map((p) => [p.key, f.h.manager.status(p.key)?.state])).toEqual([
+        [alpha.key, 'up'], [beta.key, 'broken'], [gamma.key, 'up'], [delta.key, 'up'], [echo.key, 'up'],
+      ])
+
+      // A slot frees: the next ready persona (Gamma) takes it; still at most 3 running.
+      held.release(id(echo))
+      await waitFor(() => launched().length === 4)
+      expect(launched()).toEqual([id(delta), id(echo), id(alpha), id(gamma)])
+      expect(held.held()).toEqual([id(delta), id(alpha), id(gamma)])
+
+      held.releaseAll()
+      result = await start
+    })
+
+    expect(result.notBroughtUp).toBe(1)
+    expect(result.freshSpawned).toBe(4)
+    expect(result.failed).toBe(0)
+    expect(result.perPersona.find((o) => o.key === beta.key)).toEqual({
+      key: beta.key,
+      action: 'not-brought-up',
+      failures: [{ step: 'slack', class: 'persona-credentials-refused', cause: expect.any(String) }],
+    })
+    expect(launched()).not.toContain(id(beta))
+    assertNoLeak({ lines: f.lines, errLog, result })
+  })
+
+  test('without bringUp: launches go through the same pool in config order, at most `concurrency` at once', async () => {
+    const cfg = makeMultiPersonaConfig(
+      ['alpha', 'beta', 'gamma', 'delta'].map((name) => ({ name, working_directory: `/x/${name}` })),
+      fixtureDir,
+    )
+    const held = holdSpawns(installStub({}))
+    const launched = () => held.calls.map((p) => p.claude_instance_id)
+
+    let result!: Awaited<ReturnType<typeof startupSessionManager>>
+    await withCapturedErr(async () => {
+      const start = startupSessionManager(cfg, { concurrency: 3 })
+      await waitFor(() => launched().length === 3)
+      await waitFor(() => launched().length > 3, 50)
+      expect(launched()).toEqual(['cscb_alpha', 'cscb_beta', 'cscb_gamma'])
+
+      held.release('cscb_beta')
+      await waitFor(() => launched().length === 4)
+      expect(launched()).toEqual(['cscb_alpha', 'cscb_beta', 'cscb_gamma', 'cscb_delta'])
+      expect(held.held()).toEqual(['cscb_alpha', 'cscb_gamma', 'cscb_delta'])
+
+      held.releaseAll()
+      result = await start
+    })
+
+    expect(result.freshSpawned).toBe(4)
+    expect(result.notBroughtUp).toBe(0)
   })
 })
 
@@ -4138,7 +4471,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(errLog).toContain(
       'startupSessionManager: complete — 4 persona(s): 1 resumed, 1 fresh-spawned, ' +
         '0 fresh-after-amnesia, 1 fresh-after-inconclusive-amnesia, ' +
-        '0 reconnected, 0 no-op, 1 failed',
+        '0 reconnected, 0 no-op, 1 failed, 0 not brought up',
     )
     // Because freshAfterInconclusiveAmnesia > 0, its loud grep-friendly
     // follow-up line fires (the freshAfterAmnesia line does not — count is 0).
@@ -4493,7 +4826,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(errLog).toContain(
       'startupSessionManager: complete — 1 persona(s): 0 resumed, 0 fresh-spawned, ' +
         '1 fresh-after-amnesia, 0 fresh-after-inconclusive-amnesia, ' +
-        '0 reconnected, 0 no-op, 0 failed',
+        '0 reconnected, 0 no-op, 0 failed, 0 not brought up',
     )
     // The diagnosed follow-up line fires; the inconclusive one does not.
     expect(errLog).toContain(
@@ -5024,7 +5357,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     const cfg = makeNoticeConfig()
     const h = installNoticeNotifier(cfg, { post: [{ kind: 'network' }], leakMarker: LEAK_SENTINEL })
 
-    let launched: boolean | undefined
+    let launched: boolean | 'skipped' | undefined
     const errLog = await withCapturedErr(async () => {
       launched = await launchSession(NOTICE_KEY, cfg)
       await settleNotices()

@@ -14,8 +14,9 @@
  *
  * These are pure checks: no Slack call, no agent-director call, no
  * environment access, no writes, no lock, queue, timer or module-scope state.
- * E3 wires the procedure into the server; E5 adds the broken/retrying outcome
- * bookkeeping and directory-retry timers.
+ * The server runs them as steps 1 and 2 of each persona's start
+ * (`bringUpPersona` in `persona-start.ts`); E5 adds the broken/retrying
+ * outcome bookkeeping and directory-retry timers.
  *
  * Logging contract (same as `persona-credentials.ts`): every failure's
  * formatted line is returned; when a `log` is passed each failure line is
@@ -27,7 +28,9 @@
  * any subset via `options.fs`. Tests use it to simulate unreadable or
  * unsearchable directories even when running as root: make `access` throw an
  * error with `code: 'EACCES'` for `fs.constants.R_OK` or `X_OK`. The combined
- * check takes a `PersonaBringUpFs`, the union of both seams.
+ * check takes a `PersonaBringUpFs`, the union of both seams; the credentials
+ * seam stats through a descriptor (`fstatFile`), so a `stat` override reaches
+ * only this check.
  *
  * Pure module (b.av2 SR-13.1): nothing runs at import.
  *

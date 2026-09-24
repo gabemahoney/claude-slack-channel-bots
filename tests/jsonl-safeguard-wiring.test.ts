@@ -9,16 +9,18 @@
  * exactly the 2026-09-20 incident.
  *
  * b.av2 SR-6.2 widens the audit to every start-time pass: the trust patch, the
- * Stop-hook bootstrap and the JSONL safeguard all run over the applied personas
- * before any launch, the agent-director template install covers the personas'
- * config dirs, and the session manager's pre-launch trust patcher is installed
- * before anything can launch (the Slack socket, Bun.serve, initRestart, the
- * per-persona bring-up).
+ * Stop-hook bootstrap and the JSONL safeguard all run over the persona config
+ * main() loaded (`loadStartPersonaConfig`) before the per-persona bring-up
+ * (`startupSessionManager`, which brings each persona up and launches it; b.av2
+ * SR-6.1), the agent-director template install covers the personas' config
+ * dirs, and the session manager's pre-launch trust patcher is installed before
+ * anything can launch (the persona Slack connections, Bun.serve, initRestart,
+ * the per-persona bring-up).
  *
- * Why a static audit: importing src/server.ts runs module-scope startup code
- * against the real HOME and token environment, which unit tests must not do
- * (b.av2 SR-13.2). Positions and arguments are read from the source with every
- * comment stripped, and anchor on names, never on line numbers or whole lines.
+ * Why a static audit: main() cannot run in a unit test (the agent-director
+ * startup gate, a real port, real Slack connections). Positions and arguments
+ * are read from the source with every comment stripped, and anchor on names,
+ * never on line numbers or whole lines.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -26,7 +28,7 @@
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { indicesOf, stripComments } from './test-helpers/source-audit.ts'
+import { indicesOf, loadedConfigName, stripComments } from './test-helpers/source-audit.ts'
 
 const SERVER_SRC = readFileSync(fileURLToPath(new URL('../src/server.ts', import.meta.url)), 'utf-8')
 
@@ -57,24 +59,6 @@ const START_PASSES = [
   'runJsonlPersistenceSafeguard',
   'stopHookBootstrap',
 ] as const
-
-/**
- * The persona configuration `server.ts` hands to `startupSessionManager`, and
- * every identifier assigned to it (`personaConfig = appliedPersonas`), so a
- * pass may take either name for the same object.
- */
-function personaConfigNames(): Set<string> {
-  const startupArgs = new Set(firstArgsOf('startupSessionManager'))
-  expect(startupArgs.size).toBe(1)
-  const [startupArg] = [...startupArgs]
-  expect(startupArg).toMatch(/^\w+$/)
-  expect(startupArg).not.toBe('routingConfig')
-  const names = new Set([startupArg!])
-  for (const m of SERVER_CODE.matchAll(new RegExp(`\\b${startupArg}\\s*=\\s*(\\w+)\\s*[;\\n]`, 'g'))) {
-    if (m[1] !== 'null') names.add(m[1]!)
-  }
-  return names
-}
 
 describe('server.ts wires the JSONL-persistence safeguard', () => {
   test('imports runJsonlPersistenceSafeguard from the safeguard module', () => {
@@ -107,16 +91,13 @@ describe('server.ts runs every start-time pass over the applied personas (b.av2 
     },
   )
 
-  test.each([...START_PASSES])(
-    '%s is never passed the route config; it takes the persona config startupSessionManager gets',
+  test.each([...START_PASSES, 'startupSessionManager'])(
+    '%s takes exactly the loaded persona config',
     (pass) => {
-      const names = personaConfigNames()
+      const loaded = loadedConfigName(SERVER_CODE)
       const args = firstArgsOf(pass)
       expect(args.length).toBeGreaterThan(0)
-      for (const arg of args) {
-        expect(arg).not.toMatch(/\broutingConfig\b/)
-        expect(names.has(arg)).toBe(true)
-      }
+      for (const arg of args) expect(arg).toBe(loaded)
     },
   )
 })
@@ -144,7 +125,7 @@ describe('server.ts installs the pre-launch trust patcher (b.av2 SR-6.2)', () =>
 
   test.each([
     ['the template install', 'installSlackChannelBotTemplate'],
-    ['the Slack socket start', 'socket\\.start'],
+    ['the persona Slack connections', 'createPersonaConnectionManager'],
     ['Bun.serve', 'Bun\\.serve'],
     ['initRestart', 'initRestart'],
     ['startupSessionManager', 'startupSessionManager'],

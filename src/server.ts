@@ -6,23 +6,35 @@
  * Security: per-persona delivery rules, persona posting scope, file exfiltration
  * guard, bot token sent only to Slack-hosted file URLs.
  *
+ * Configuration: `main()` loads the persona configuration from
+ * `config.json` in the state directory (`resolveServerConfigPath`). The file is
+ * required: a missing, unreadable, pre-persona or invalid file stops the start
+ * with one fatal line (b.av2 SR-1.7, SR-8.7). No Slack client is built and no
+ * token is read at module scope (SR-3.1, SR-10.2).
+ *
+ * Slack: one connection per persona, run by the connection manager
+ * (`persona-connections.ts`) and brought up at start through the SR-6.1
+ * procedure (`startupSessionManager` → `connectPersona`, then the launch).
+ * Only a persona whose connection is serving is relaunched by the health
+ * check or a restart (`createPersonaRelaunchGate`). Each persona's
+ * `message`, `app_mention` and `interactive` events reach the event router
+ * (`persona-event-router.ts`) tagged with that persona's key.
+ *
  * Multi-session routing: each Claude Code session connects to its own MCP Server
  * instance and is matched to a persona by the real path of its roots working
- * directory. Inbound Slack messages go through each receiving persona's
+ * directory. Inbound Slack messages go through the receiving persona's
  * pipeline in `persona-routing.ts`: a persona hears only the channels it is
  * configured into (every message in a `delivery: all` channel, only its direct
  * mentions in a `delivery: mentions` one), and a delivered message reaches that
- * persona's session only. Outbound tool calls post as the session's persona and
- * are scoped to that persona's configured channels.
+ * persona's session only. Outbound tool calls post as the session's persona,
+ * through its own client, and are scoped to that persona's configured channels.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 
-import { SocketModeClient } from '@slack/socket-mode'
-import { WebClient } from '@slack/web-api'
-import { homedir } from 'os'
+import type { WebClient } from '@slack/web-api'
 import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
 import {
@@ -39,18 +51,17 @@ import {
   type Access,
 } from './lib.ts'
 import {
-  loadConfig,
+  loadStartPersonaConfig,
   expandTilde,
   credentialsFilesToProtect,
   resolveRealPath,
-  DEFAULT_CONFIG_PATH,
+  resolveServerConfigPath,
+  resolveServerStateDir,
   type Persona,
   type PersonaConfig,
-  type RoutingConfig,
   MCP_SERVER_NAME,
 } from './config.ts'
 import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
-import { routesToPersonaConfig } from './route-persona-adapter.ts'
 import {
   AGENT_DIRECTOR_LIVE_STATES,
   isLaunchInFlight,
@@ -65,15 +76,19 @@ import {
 } from './session-manager.ts'
 import { createPersonaNotifier } from './persona-notifier.ts'
 import { createPersonaRouting, hasSessionStream } from './persona-routing.ts'
+import { createPersonaConnectionManager, type PersonaConnectionManager } from './persona-connections.ts'
+import { createUnhandledRejectionHandler, describeThrownValue } from './persona-connection-errors.ts'
+import { createPersonaEventRouter } from './persona-event-router.ts'
+import {
+  createPersonaClientLookup,
+  createPersonaIdentityLookup,
+  createPersonaRelaunchGate,
+  createPersonaUpFlushListener,
+} from './persona-start.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { ErrSpawnNotFound } from 'agent-director'
 import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from './agent-director-errors.ts'
 import { getClient, closeClient } from './agent-director-client.ts'
-import {
-  emitBlockActionReceived,
-  handlePermissionClick,
-} from './permission-click-handler.ts'
-import { personaKeyFromActionId } from './permission-action-id.ts'
 import { trustBootstrap, trustPatchPersona } from './trust-bootstrap.ts'
 import { runJsonlPersistenceSafeguard } from './jsonl-persistence-check.ts'
 import { stopHookBootstrap } from './stop-hook-bootstrap.ts'
@@ -87,17 +102,14 @@ import {
 } from './restart.ts'
 import { buildPersonaWorkList, initHealthCheck, startHealthCheck, stopHealthCheck } from './health-check.ts'
 import { isAtCap as backoffIsAtCap } from './backoff.ts'
-import { loadTokens, isDryRun } from './tokens.ts'
+import { isDryRun } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
 import { consumeAck } from './ack-tracker.ts'
 import {
   openArchiveDatabase,
-  createNameResolver,
-  archiveSlackMessage,
-  type SlackMessageEvent,
-  type NameResolver,
+  createPersonaArchiveWriter,
+  createPersonaNameResolverSource,
 } from './message-archive.ts'
-import type { Database as ArchiveDatabase } from 'bun:sqlite'
 import {
   registerSession,
   unregisterByMcpSessionId,
@@ -158,9 +170,9 @@ export function isHttpVerbose(env: NodeJS.ProcessEnv = process.env): boolean {
 // Constants
 // ---------------------------------------------------------------------------
 
-const STATE_DIR = process.env['SLACK_STATE_DIR'] || join(homedir(), '.claude', 'channels', 'slack')
+const STATE_DIR = resolveServerStateDir()
 /** The configuration file main() loads; the file guard also reads it (b.av2 SR-5.2). */
-const CONFIG_PATH = DEFAULT_CONFIG_PATH
+const CONFIG_PATH = resolveServerConfigPath()
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'server.pid')
@@ -203,42 +215,44 @@ export function stopAllKeepAliveTimers(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Bootstrap — tokens & state directory
+// Persona Slack connections (b.av2 SR-3.1)
+//
+// The connection manager is constructed in main(); nothing Slack-related is
+// built or read at import. Until then every lookup below answers "no client".
 // ---------------------------------------------------------------------------
 
-mkdirSync(STATE_DIR, { recursive: true })
-mkdirSync(INBOX_DIR, { recursive: true })
+let connections: PersonaConnectionManager | undefined
 
-const serverTokens = loadTokens()
+/** The manager's per-persona queries, answering nothing before main() builds it. */
+const connectionView: Pick<PersonaConnectionManager, 'status' | 'webClient' | 'identity'> = {
+  status: (key) => connections?.status(key),
+  webClient: (key) => connections?.webClient(key),
+  identity: (key) => connections?.identity(key),
+}
 
-// ---------------------------------------------------------------------------
-// Slack clients
-// ---------------------------------------------------------------------------
+/**
+ * The persona's Web client: its long-lived client from the connection manager
+ * while it is serving (up, lost, or retrying a reopen); undefined otherwise,
+ * for an unknown key and in dry run (see `createPersonaClientLookup`).
+ */
+const clientFor = createPersonaClientLookup(connectionView, () => personaConfig)
 
-const web = new WebClient(serverTokens.botToken)
-const socket = new SocketModeClient({ appToken: serverTokens.appToken })
+/** The persona's bot identity while it is serving; the placeholder identity in dry run. */
+const identityFor = createPersonaIdentityLookup(connectionView, () => personaConfig)
 
-let botUserId = ''
+/** Installed once, in main(), before any persona connects. */
+let unhandledRejectionHandlerInstalled = false
 
 // ---------------------------------------------------------------------------
 // Message archive — write every inbound Slack message to SQLite (feature-gated)
 // ---------------------------------------------------------------------------
 
-let archiveDb: ArchiveDatabase | undefined
-let archiveResolver: NameResolver | undefined
-
 /**
- * Fire-and-forget archive write. Safe to call on every inbound event; a no-op
- * when the feature is disabled. Errors are logged but never thrown so archiving
- * can never interfere with routing/delivery.
+ * The archive writer for the receiving persona (name lookups on its own
+ * client), set in main() when `message_archive_db` is configured. Undefined
+ * when the archive is disabled.
  */
-function archiveInboundMessage(event: unknown): void {
-  if (!archiveDb || !archiveResolver) return
-  const msg = event as SlackMessageEvent
-  archiveSlackMessage(archiveDb, msg, archiveResolver).catch((err) => {
-    console.error('[slack] message-archive write failed:', err)
-  })
-}
+let archiveWrite: ((key: string, event: unknown) => void) | undefined
 
 // Permission relay state lives in src/permission-poller.ts (SR-2.1 polling
 // model). AskUserQuestion is denied at the agent-director template level
@@ -514,17 +528,7 @@ async function handleInitialized(
   const rootsPath = resolve(expandTilde(rawCwd))
   const realCwd = resolveRealPath(rootsPath)
 
-  if (!personaConfig) {
-    console.error(`[slack] No persona config — disconnecting pending session "${pendingId}" (CWD: "${realCwd}")`)
-    const pending = getPendingSession(pendingId)
-    if (pending) {
-      removePendingSession(pendingId)
-      try { await pending.transport.close() } catch { /* ignore */ }
-    }
-    return
-  }
-
-  const persona = matchPersonaByRootsPath(rootsPath, personaConfig.personas)
+  const persona = matchPersonaByRootsPath(rootsPath, personaConfig?.personas ?? [])
 
   if (!persona) {
     console.error(`[slack] Session connected with CWD "${realCwd}" — no matching persona`)
@@ -556,26 +560,17 @@ async function handleInitialized(
 // Inbound delivery per persona (b.av2 SR-4.1, SR-4.2 core)
 // ---------------------------------------------------------------------------
 
-/** Keys of the applied personas; empty when there is no persona config. */
-function appliedPersonaKeys(): string[] {
-  return personaConfig?.personas.map((p) => p.key) ?? []
-}
-
 /**
- * The one persona-routing instance. Each socket event is handed to it with
- * every applied persona as a receiver: until E3 Task 9 there is one Socket
- * Mode connection, which every stand-in persona shares.
+ * The one persona-routing instance. The event router hands each `message`
+ * and `app_mention` event to it with the receiving persona as the only
+ * receiver.
  */
 const personaRouting = createPersonaRouting({
   getPersonaConfig: () => personaConfig,
-  // TRANSITIONAL — re-pointed in E3 Task 9 at each persona's own identity from
-  // the connection manager. Until then every applied persona shares the one
-  // module-scope bot user (`U000DRY` in dry run).
-  getBotUserId: (key) => (getAppliedPersona(key) ? botUserId : undefined),
+  getBotUserId: (key) => identityFor(key)?.botUserId,
   clientFor,
   resolveUserName: resolvePersonaUserName,
-  // Today's archive writer and resolver; the per-persona resolver is E3 Task 9's.
-  archive: (_key, event) => archiveInboundMessage(event),
+  archive: (key, event) => archiveWrite?.(key, event),
   getAccess,
   log: (line) => console.error(line),
 })
@@ -584,75 +579,12 @@ const personaRouting = createPersonaRouting({
 // (SR-2.1/2.2 — owns the message + action_id encoding).
 
 // ---------------------------------------------------------------------------
-// Socket Mode event routing
+// Persona configuration
 // ---------------------------------------------------------------------------
-
-// Both events go to the persona-routing intake, which acks first. With no
-// persona config (the MCP_HOST / MCP_PORT fallback) there is no receiver, so
-// the event is acked and nothing is delivered.
-socket.on('message', async ({ event, ack }) => {
-  console.error('[slack] RAW message event:', JSON.stringify(event)?.slice(0, 300))
-  await personaRouting.receive(event, ack, appliedPersonaKeys())
-})
-
-socket.on('app_mention', async ({ event, ack }) => {
-  console.error('[slack] RAW app_mention event:', JSON.stringify(event)?.slice(0, 300))
-  await personaRouting.receive(event, ack, appliedPersonaKeys())
-})
-
-socket.on('interactive', async (evt) => {
-  const { ack } = evt as { ack: () => Promise<void> }
-  const p = ((evt as any).body ?? (evt as any).payload ?? evt) as Record<string, unknown>
-  const actions = (Array.isArray(p['actions']) ? p['actions'] : []) as Array<{ action_id: string }>
-  // SR-V-2.6 / SR-V-2.9 envelope: pull the inbound channel / message ts /
-  // clicking user once per payload — all actions in this payload share them.
-  const channelId = ((p['channel'] as { id?: string } | undefined)?.id) ?? undefined
-  const messageTs = ((p['message'] as { ts?: string } | undefined)?.ts) ?? undefined
-  const userId = ((p['user'] as { id?: string } | undefined)?.id) ?? undefined
-
-  for (const action of actions) {
-    const actionId = action.action_id
-    // SR-V-2.9: emit cscb.block_action.received for every action regardless
-    // of whether handlePermissionClick decides to engage. Decode-failure
-    // cases are diagnostically critical for "I clicked and nothing happened".
-    emitBlockActionReceived(actionId, {
-      channel: channelId,
-      messageTs,
-      user: userId,
-    })
-
-    // TRANSITIONAL — until E3 Task 9 there is one Socket Mode connection, so
-    // the receiving persona is taken from the action ID. Task 9 replaces it
-    // with the receiving connection's persona key.
-    const handled = await handlePermissionClick(
-      actionId,
-      {
-        receivingPersonaKey: personaKeyFromActionId(actionId),
-        clientFor,
-        getPersona: getAppliedPersona,
-      },
-      { channel: channelId, messageTs, user: userId },
-    )
-    if (handled) {
-      await ack()
-      return
-    }
-  }
-  await ack()
-})
-
-// ---------------------------------------------------------------------------
-// Routing config
-// ---------------------------------------------------------------------------
-
-let routingConfig: RoutingConfig | null = null
 
 /**
- * TRANSITIONAL — removed in E3 Task 9 with the route->persona adapter.
- * Stand-in personas built from `routingConfig` right after `loadConfig()`
- * succeeds; null on the MCP_HOST / MCP_PORT fallback path. Read by the
- * persona-keyed consumers (template install, start passes, startup spawns,
- * restart launch, liveness probe).
+ * The applied persona configuration, as loaded by main() (b.av2 SR-1). Null
+ * only before main() loads it; every getter reads it at call time.
  */
 let personaConfig: PersonaConfig | null = null
 
@@ -670,28 +602,10 @@ function getAppliedPersona(key: string): Persona | undefined {
 // ---------------------------------------------------------------------------
 
 /**
- * True once Slack is validated: set right after Socket Mode connects, where
- * held persona notices are flushed. Never set in dry run.
- */
-let slackValidated = false
-
-/**
- * The validated Web client for persona `key`: the module-scope client once
- * Slack is validated and `key` is an applied persona; undefined before that,
- * in dry run and for any other key.
- *
- * TRANSITIONAL — re-pointed in E3 Task 9 at the persona's own client from the
- * connection manager (validated per persona).
- */
-function clientFor(key: string): WebClient | undefined {
-  if (!slackValidated || isDryRun()) return undefined
-  if (!personaConfig?.personas.some((p) => p.key === key)) return undefined
-  return web
-}
-
-/**
  * The one per-persona notifier. Outage state, the session manager and the
  * JSONL safeguard send every persona notice through it (installed in main()).
+ * A notice raised while its persona has no client is held, and flushed when
+ * that persona reports up (the manager's status listener).
  */
 const personaNotifier = createPersonaNotifier({
   getPersona: getAppliedPersona,
@@ -748,9 +662,9 @@ async function shutdown(signal: string): Promise<void> {
     }
   }
 
-  console.error('[slack] Disconnecting Socket Mode')
+  console.error('[slack] Disconnecting persona Slack connections')
   try {
-    await socket.disconnect()
+    await connections?.stopAll()
   } catch { /* ignore */ }
 
   // SR-11 Event 11: release the agent-director Client handle. close() is
@@ -785,7 +699,7 @@ process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
 export function _buildIsSessionAliveAdapter(
   getPersonaConfig: () => PersonaConfig | null | undefined,
 ): (key: string) => Promise<boolean> {
-  // `key` is the persona key (the channel ID under the route->persona adapter).
+  // `key` is the persona key.
   return async (key: string) => {
     const config = getPersonaConfig()
     if (!config?.personas.some((p) => p.key === key)) return false
@@ -882,7 +796,7 @@ export function _buildStatRouteImpl(deps?: {
  * @internal
  */
 export function _buildKillSessionAdapter(): (key: string) => Promise<void> {
-  // `key` is the persona key (the channel ID under the route->persona adapter).
+  // `key` is the persona key.
   return async (key: string) => {
     if (isLaunchInFlight(key)) {
       console.error(`[slack] killSession (restart adapter): launch already in flight for persona=${key} — not killing`)
@@ -927,7 +841,7 @@ export function _buildKillSessionAdapter(): (key: string) => Promise<void> {
  * @internal
  */
 export function _buildReconnectSessionAdapter(): (key: string) => Promise<'success' | 'escalate-dead' | 'transient'> {
-  // `key` is the persona key (the channel ID under the route->persona adapter).
+  // `key` is the persona key.
   return async (key: string) => {
     try {
       const claude_instance_id = personaInstanceId(key)
@@ -997,6 +911,18 @@ export function _buildReconnectSessionAdapter(): (key: string) => Promise<'succe
 // ---------------------------------------------------------------------------
 
 export async function main(): Promise<void> {
+  // The state and inbox directories, before any file in the state directory
+  // is read or written (nothing is created at import).
+  mkdirSync(STATE_DIR, { recursive: true })
+  mkdirSync(INBOX_DIR, { recursive: true })
+
+  // b.av2 SR-3.3: one persona's stray rejection must not take the process
+  // down. Installed once, before any persona connects; never at import.
+  if (!unhandledRejectionHandlerInstalled) {
+    process.on('unhandledRejection', createUnhandledRejectionHandler((line) => console.error(line)))
+    unhandledRejectionHandlerInstalled = true
+  }
+
   // SR-5.1: agent-director startup gate.
   // Runs before any other CSCB work — imports the library, constructs the
   // singleton Client, performs the version probe, and verifies that the
@@ -1006,71 +932,64 @@ export async function main(): Promise<void> {
 
   // Check for an existing server BEFORE any side-effectful startup work —
   // before writePidFile (which would clobber the live server's PID file),
-  // and before the template overwrite and Socket Mode connect below (crontable
-  // bootstrap now happens later, inside the scheduler started after Bun.serve).
-  // A duplicate start must fail fast without mutating shared state.
+  // and before the template overwrite and the persona Slack connections below
+  // (crontable bootstrap now happens later, inside the scheduler started after
+  // Bun.serve). A duplicate start must fail fast without mutating shared state.
   checkPidConflict(PID_FILE)
 
   // The agent-director store owns session-id state; CSCB's own sessions.json
   // registry was deleted (SR-7.1, Epic 2).
 
-  let mcpHost: string
-  let mcpPort: number
-
+  // b.av2 SR-1.7 / SR-8.7: the configuration file is required. A missing or
+  // unreadable file, a pre-persona file (the conversion error) or any invalid
+  // file stops the start here, before any port, PID file, Slack connection or
+  // spawn. There is no fallback.
   try {
-    routingConfig = loadConfig(CONFIG_PATH)
-    const appliedPersonas = routesToPersonaConfig(routingConfig)
-    personaConfig = appliedPersonas
-    // b.av2 SR-6.2: the trust patch precedes every launch. Installed as soon as
-    // the persona config is set — before the Slack socket, Bun.serve and
-    // initRestart — so no launch path (start, restart or a human trigger) can
-    // run unpatched.
-    setPreLaunchTrustPatcher(trustPatchPersona)
-    mcpHost = routingConfig.bind
-    mcpPort = routingConfig.port
-    const routeCount = Object.keys(routingConfig.routes).length
-    console.error(`[slack] Loaded routing config: ${routeCount} route(s)`)
-
-    // SR-3.2: refresh the slack-channel-bot agent-director template on every
-    // boot, after the persona config is set: its memory-read rules cover the
-    // personas' effective config dirs. Atomic replacement via
-    // Client.makeTemplate(..., overwrite: true) gives us "ensure post-state"
-    // semantics. Fatal startup error on failure.
-    await installSlackChannelBotTemplate(appliedPersonas)
-
-    // Initialize message archive if configured
-    if (routingConfig.message_archive_db) {
-      try {
-        archiveDb = openArchiveDatabase(routingConfig.message_archive_db)
-        archiveResolver = createNameResolver(web)
-        console.error(`[slack] Message archive enabled: ${routingConfig.message_archive_db}`)
-      } catch (err) {
-        const cause = err instanceof Error ? err.message : String(err)
-        console.error(`[slack] Warning: failed to initialize message archive: ${cause}`)
-        archiveDb = undefined
-        archiveResolver = undefined
-      }
-    }
-
-    // NOTE: crontable bootstrap (ensureCrontableExists) is NO LONGER called
-    // here. Per PM review it moved into cron-scheduler.start() — the scheduler
-    // is now the ONLY caller of ensure-exists, wired after Bun.serve() below.
+    personaConfig = loadStartPersonaConfig(CONFIG_PATH)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    if (msg.includes('cannot read routing config')) {
-      console.error(
-        `[slack] Warning: no routing config found — falling back to env vars (MCP_HOST/MCP_PORT)`,
-      )
-      mcpHost = process.env['MCP_HOST'] ?? '127.0.0.1'
-      mcpPort = Number(process.env['MCP_PORT'] ?? 3100)
-    } else {
-      console.error(`[slack] Fatal: routing config error — ${msg}`)
-      process.exit(1)
+    console.error(`[slack] Fatal: configuration error — ${msg}`)
+    process.exit(1)
+  }
+  // b.av2 SR-6.2: the trust patch precedes every launch. Installed as soon as
+  // the persona config is set — before the Slack connections, Bun.serve and
+  // initRestart — so no launch path (start, restart or a human trigger) can
+  // run unpatched.
+  setPreLaunchTrustPatcher(trustPatchPersona)
+  console.error(`[slack] Loaded persona config: ${personaConfig.personas.length} persona(s)`)
+  // The loaded config, for closures below (it is never replaced after this).
+  const appliedConfig: PersonaConfig = personaConfig
+
+  // SR-3.2: refresh the slack-channel-bot agent-director template on every
+  // boot, after the persona config is set: its memory-read rules cover the
+  // personas' effective config dirs. Atomic replacement via
+  // Client.makeTemplate(..., overwrite: true) gives us "ensure post-state"
+  // semantics. Fatal startup error on failure.
+  await installSlackChannelBotTemplate(personaConfig)
+
+  // Initialize message archive if configured. Name lookups run on the
+  // receiving persona's own client (b.av2 SR-4.1).
+  if (personaConfig.message_archive_db) {
+    try {
+      const archiveDb = openArchiveDatabase(personaConfig.message_archive_db)
+      archiveWrite = createPersonaArchiveWriter(archiveDb, createPersonaNameResolverSource(clientFor), (err) => {
+        console.error(`[slack] message-archive write failed: ${describeThrownValue(err)}`)
+      })
+      console.error(`[slack] Message archive enabled: ${personaConfig.message_archive_db}`)
+    } catch (err) {
+      const cause = err instanceof Error ? err.message : String(err)
+      console.error(`[slack] Warning: failed to initialize message archive: ${cause}`)
+      archiveWrite = undefined
     }
   }
 
+  // NOTE: crontable bootstrap (ensureCrontableExists) is NOT called here. The
+  // cron scheduler's start() is the ONLY caller of ensure-exists, wired after
+  // Bun.serve() below.
+
   // Every persona notice goes through the one per-persona notifier: it holds
-  // a notice until Slack is validated and logs instead of posting in dry run.
+  // a notice until the persona's client is available and logs instead of
+  // posting in dry run.
   initOutageState({
     notify: (key, text) => {
       void personaNotifier.notify(key, text)
@@ -1079,45 +998,50 @@ export async function main(): Promise<void> {
   })
   setSessionNotifier(personaNotifier.notify)
 
+  // b.av2 SR-3.1: one Slack connection per persona. Each connection's
+  // `message`, `app_mention` and `interactive` events reach the event router
+  // with that persona's key; each time a persona reports up its held notices
+  // are flushed (SR-7.2). Nothing connects until the bring-up pass below.
+  const manager = createPersonaConnectionManager({
+    onEvent: createPersonaEventRouter({
+      routing: personaRouting,
+      clientFor,
+      getPersona: getAppliedPersona,
+      log: (line) => console.error(line),
+    }),
+    log: (line) => console.error(line),
+    dryRun: isDryRun(),
+    onStatus: createPersonaUpFlushListener(personaNotifier),
+  })
+  connections = manager
+
+  // Only a persona whose connection is serving may be relaunched: the health
+  // check's work list and the restart launch both ask this gate, so a persona
+  // that was not brought up is never launched past its failed steps. It logs
+  // once per persona per non-serving state.
+  const canRelaunch = createPersonaRelaunchGate(manager, (line) => console.error(line))
+
   if (isDryRun()) {
     console.error('[slack] Running in dry-run mode — Slack disabled')
-    botUserId = 'U000DRY'
   } else {
-    // Resolve bot user ID
-    try {
-      const auth = await web.auth.test()
-      botUserId = (auth.user_id as string) || ''
-    } catch (err) {
-      console.error('[slack] Failed to resolve bot user ID:', err)
-    }
-
-    // Connect Socket Mode
-    await socket.start()
-    console.error('[slack] Socket Mode connected')
-
-    if (personaConfig) {
-      resetAllToHealthy(personaConfig.personas.map((p) => p.key))
-    }
+    // A clean outage slate for every applied persona before any of them is
+    // brought up (Epic 2 boundary for pre-start observations).
+    resetAllToHealthy(personaConfig.personas.map((p) => p.key))
 
     // SR-2.1 permission poller — single-threaded interval loop monitors AD
     // state for spawns in check_permission and posts Block Kit prompts to
-    // each persona's destination through its client (b.av2 SR-7.1).
-    if (personaConfig) {
-      startPermissionPoller({
-        getClient,
-        clientFor,
-        getPersona: getAppliedPersona,
-        intervalMs: personaConfig.agent_director_poll_interval_ms,
-      })
-    }
-
-    // Slack is validated: post each applied persona's held notices, one
-    // persona at a time, through that persona's client (b.av2 SR-7.2).
-    slackValidated = true
-    for (const persona of personaConfig?.personas ?? []) {
-      void personaNotifier.flush(persona.key)
-    }
+    // each persona's destination through its client (b.av2 SR-7.1). It does
+    // not wait for any persona: one with no client yet is skipped.
+    startPermissionPoller({
+      getClient,
+      clientFor,
+      getPersona: getAppliedPersona,
+      intervalMs: personaConfig.agent_director_poll_interval_ms,
+    })
   }
+
+  const mcpHost = personaConfig.bind
+  const mcpPort = personaConfig.port
 
   // Propagate resolved port to tool deps for peer PID discovery
   sessionToolDeps.serverPort = mcpPort
@@ -1226,37 +1150,34 @@ export async function main(): Promise<void> {
   // Cron scheduler — the once-per-minute dispatch tick (b.he5 E2). It is its
   // own /interject client, so it MUST start only AFTER Bun.serve() is listening
   // (unlike startPermissionPoller, which starts before Bun.serve — do not copy
-  // that placement). Guarded on routingConfig: the env-var fallback path
-  // constructs and starts NOTHING cron-related. Uses the ACTUAL bound port
-  // (httpServer.port) so port-0 configs still reach the right listener. Any
-  // construction/start failure is non-fatal — the server keeps serving without
-  // a scheduler. scheduler.start() also owns the crontable bootstrap (the sole
-  // ensure-exists caller) and is failure-isolated internally.
-  if (routingConfig) {
-    try {
-      const cronLog = createCronLog(routingConfig.cron_log_path)
-      // Prefer the ACTUAL bound port (covers port-0 configs); fall back to the
-      // requested port only if Bun leaves it undefined (never expected once the
-      // server is listening).
-      const boundPort = httpServer.port ?? mcpPort
-      const dispatcher = createCronDispatcher({
-        port: boundPort,
-        cronLog,
-        cronTablePath: routingConfig.cron_table_path,
-        // Resolved against the applied persona config at each fire.
-        resolveTarget: (target) => resolvePersonaTarget(personaConfig, target)?.key,
-      })
-      cronScheduler = createCronScheduler({
-        dispatcher,
-        cronLog,
-        cronTablePath: routingConfig.cron_table_path,
-      })
-      cronScheduler.start()
-    } catch (err) {
-      const cause = err instanceof Error ? err.message : String(err)
-      console.error(`[slack] Warning: cron scheduler failed to start — ${cause}`)
-      cronScheduler = null
-    }
+  // that placement). Uses the ACTUAL bound port (httpServer.port) so port-0
+  // configs still reach the right listener. Any construction/start failure is
+  // non-fatal — the server keeps serving without a scheduler.
+  // scheduler.start() also owns the crontable bootstrap (the sole ensure-exists
+  // caller) and is failure-isolated internally.
+  try {
+    const cronLog = createCronLog(personaConfig.cron_log_path)
+    // Prefer the ACTUAL bound port (covers port-0 configs); fall back to the
+    // requested port only if Bun leaves it undefined (never expected once the
+    // server is listening).
+    const boundPort = httpServer.port ?? mcpPort
+    const dispatcher = createCronDispatcher({
+      port: boundPort,
+      cronLog,
+      cronTablePath: personaConfig.cron_table_path,
+      // Resolved against the applied persona config at each fire.
+      resolveTarget: (target) => resolvePersonaTarget(personaConfig, target)?.key,
+    })
+    cronScheduler = createCronScheduler({
+      dispatcher,
+      cronLog,
+      cronTablePath: personaConfig.cron_table_path,
+    })
+    cronScheduler.start()
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err)
+    console.error(`[slack] Warning: cron scheduler failed to start — ${cause}`)
+    cronScheduler = null
   }
 
   // Shared adapter: probes agent-director for the spawn's current state per
@@ -1288,10 +1209,11 @@ export async function main(): Promise<void> {
       // resume vs fresh is handled inside spawnForPersona (SR-1.4
       // collision-then-act). The cwd and session-id arguments from the legacy
       // restart deps are ignored — the persona carries its working directory
-      // and AD owns the resume state, not CSCB.
-      return await launchSession(key, personaConfig)
+      // and AD owns the resume state, not CSCB. A persona whose connection is
+      // not serving is skipped (neither success nor failure).
+      return await launchSession(key, personaConfig, { canLaunch: canRelaunch })
     },
-    getRestartDelay: () => routingConfig?.session_restart_delay ?? 60,
+    getRestartDelay: () => appliedConfig.session_restart_delay,
     isShuttingDown: () => shuttingDown,
     // The persona's restart-cap notice (SR-25.3), built in the session manager.
     onCapReached: (key) => notifyRestartCapReached(key),
@@ -1301,12 +1223,10 @@ export async function main(): Promise<void> {
   // `service=cscb` spawns with no `persona` label, a persona absent from the
   // applied config, an instance ID other than `cscb_<key>` or a `cwd` other
   // than the persona's working directory get killed + deleted.
-  if (personaConfig) {
-    try {
-      await reconcileOrphans(personaConfig)
-    } catch (err) {
-      console.error('[slack] Warning: orphan reconciliation failed:', err)
-    }
+  try {
+    await reconcileOrphans(personaConfig)
+  } catch (err) {
+    console.error('[slack] Warning: orphan reconciliation failed:', err)
   }
 
   // b.uhv / b.k54 / b.av2 SR-6.2: patch .claude.json for every applied
@@ -1314,9 +1234,7 @@ export async function main(): Promise<void> {
   // pre-accepted before any spawn fires (the pre-launch patcher repeats it per
   // launch). Runs for both real and dry-run modes (config-file patch, not a
   // session operation).
-  if (personaConfig) {
-    await trustBootstrap(personaConfig)
-  }
+  await trustBootstrap(personaConfig)
 
   // b.zak: preventative JSONL-persistence safeguard. Detect non-persistent
   // storage roots (Layer 1) and personas whose transcript would be treated as
@@ -1325,12 +1243,10 @@ export async function main(): Promise<void> {
   // Runs over the applied personas. Awaited but wrapped so a rejection can
   // never kill startup. Its notices go through the per-persona notifier, which
   // only logs them in dry run.
-  if (personaConfig) {
-    try {
-      await runJsonlPersistenceSafeguard(personaConfig, personaNotifier.notify)
-    } catch (err) {
-      console.error('[slack] Warning: jsonl-persistence safeguard failed — continuing:', err)
-    }
+  try {
+    await runJsonlPersistenceSafeguard(personaConfig, personaNotifier.notify)
+  } catch (err) {
+    console.error('[slack] Warning: jsonl-persistence safeguard failed — continuing:', err)
   }
 
   // b.osj: install (or remove) the CSCB-managed Stop hook in each applied
@@ -1338,19 +1254,24 @@ export async function main(): Promise<void> {
   // fires. Runs for both real and dry-run modes (config-file patch, not a
   // session operation). Never throws — per-dir failures are recorded via
   // recordStartupError.
-  if (personaConfig) {
-    stopHookBootstrap(personaConfig)
-  }
+  stopHookBootstrap(personaConfig)
 
-  // Per-persona reconcile via library: spawnForPersona dispatches fresh-spawn or
-  // collision-handling per SR-1.4, once per persona. Failures raise a notice to
-  // the persona's destination; the server stays up.
-  if (personaConfig) {
-    try {
-      await startupSessionManager(personaConfig)
-    } catch (err) {
-      console.error('[slack] Warning: session startup failed — continuing:', err)
-    }
+  // b.av2 SR-6.1: bring each applied persona up — the local credentials check
+  // (skipped in dry run), the working-directory check, Slack validation and
+  // connection through the manager, then the launch (spawnForPersona: fresh
+  // spawn or collision handling per SR-1.4). A persona failing a step before
+  // the launch is not brought up (its checks or the manager log why); a launch
+  // failure raises a notice to the persona's destination. The server stays up.
+  try {
+    await startupSessionManager(personaConfig, {
+      bringUp: {
+        connections: manager,
+        dryRun: isDryRun(),
+        log: (line) => console.error(line),
+      },
+    })
+  } catch (err) {
+    console.error('[slack] Warning: session startup failed — continuing:', err)
   }
 
   // Initialize and start the health-check poller.
@@ -1371,16 +1292,16 @@ export async function main(): Promise<void> {
     statRoute: _buildStatRouteImpl(),
     scheduleRestart,
     isShuttingDown: () => shuttingDown,
-    // One entry per applied persona: key → working directory.
-    getPersonas: () => (personaConfig ? buildPersonaWorkList(personaConfig) : {}),
+    // One entry per applied persona whose connection is serving: key →
+    // working directory. A persona not brought up (or not serving) is left
+    // out, so the tick never relaunches it; it joins once it reports up.
+    getPersonas: () => (personaConfig ? buildPersonaWorkList(personaConfig, canRelaunch) : {}),
   })
 
-  if (routingConfig) {
-    // INVARIANT: Health check starts only after startupSessionManager() returns.
-    // Promise.allSettled ensures all launches have settled before this point.
-    // Do not move this call earlier in the startup sequence.
-    startHealthCheck(routingConfig.health_check_interval)
-  }
+  // INVARIANT: Health check starts only after startupSessionManager() returns.
+  // Promise.allSettled ensures all launches have settled before this point.
+  // Do not move this call earlier in the startup sequence.
+  startHealthCheck(personaConfig.health_check_interval)
 }
 
 if (import.meta.main) {

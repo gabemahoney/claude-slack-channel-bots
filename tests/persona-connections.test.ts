@@ -36,6 +36,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   chmodSync,
@@ -55,7 +56,12 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
-import { checkPersonaCredentials, type CredentialsFs, type PersonaSlackTokens } from '../src/persona-credentials.ts'
+import {
+  DEFAULT_CREDENTIALS_FS,
+  checkPersonaCredentials,
+  type CredentialsFs,
+  type PersonaSlackTokens,
+} from '../src/persona-credentials.ts'
 import {
   createPersonaConnectionManager,
   dryRunPersonaIdentity,
@@ -333,21 +339,7 @@ describe('checkPersonaCredentials: valid, missing and unreadable', () => {
     expect(expectFailure(result, PERSONA_CREDENTIALS_MISSING, lines).cause).toContain('does not exist')
   })
 
-  test.each<[string, (persona: BringUpPersona) => Partial<CredentialsFs> | undefined, string]>([
-    ['the path is a directory', persona => void mkdirSync(persona.credentials_file, { recursive: true }), 'is a directory'],
-    ['reading is denied with EACCES (injected fs)', () => ({ readFile: failsWith('EACCES') }), 'permission denied'],
-    ['reading is denied with EPERM (injected fs)', () => ({ readFile: failsWith('EPERM') }), 'permission denied'],
-    ['reading fails with another error, EIO (injected fs)', () => ({ readFile: failsWith('EIO') }), 'cannot be read (EIO)'],
-  ])('persona-credentials-unreadable when %s', (_label, arrange, causeFragment) => {
-    const persona = makePersona()
-    const fs = arrange(persona)
-    if (fs !== undefined) writeCreds(persona)
-    const { lines, log } = capture()
-
-    const result = checkPersonaCredentials(persona, { others: [], fs, log })
-
-    expect(expectFailure(result, PERSONA_CREDENTIALS_UNREADABLE, lines).cause).toContain(causeFragment)
-  })
+  // A directory, a device, a FIFO and injected open, fstat and read failures: see the descriptor block below.
 
   test.skipIf(isRoot)(`persona-credentials-unreadable for a file without read permission (real fs; ${ROOT_SKIP})`, () => {
     const persona = makePersona()
@@ -359,6 +351,143 @@ describe('checkPersonaCredentials: valid, missing and unreadable', () => {
     const result = checkPersonaCredentials(persona, { others: [], log })
 
     expect(expectFailure(result, PERSONA_CREDENTIALS_UNREADABLE, lines).cause).toContain('permission denied')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// One descriptor: open once (non-blocking), fstat, read, always close
+// ---------------------------------------------------------------------------
+
+describe('checkPersonaCredentials: the file is opened once and checked, read and closed through its descriptor', () => {
+  /** A file-system op the check made, with the descriptor it got (none for `open`). */
+  type FdCall = { op: 'open' | 'fstat' | 'read' | 'close'; fd?: number }
+
+  /**
+   * The real credentials seam with every call recorded; `overrides` replace
+   * an op (a replaced `closeFile` still closes the real descriptor first, so
+   * nothing leaks). Returns the seam, the calls and the descriptor opened.
+   */
+  function recordingFs(overrides: Partial<CredentialsFs> = {}) {
+    const calls: FdCall[] = []
+    let opened: number | undefined
+    const fs: Partial<CredentialsFs> = {
+      openFile: (path) => {
+        calls.push({ op: 'open' })
+        opened = (overrides.openFile ?? DEFAULT_CREDENTIALS_FS.openFile)(path)
+        return opened
+      },
+      fstatFile: (fd) => {
+        calls.push({ op: 'fstat', fd })
+        return (overrides.fstatFile ?? DEFAULT_CREDENTIALS_FS.fstatFile)(fd)
+      },
+      readFileFd: (fd) => {
+        calls.push({ op: 'read', fd })
+        return (overrides.readFileFd ?? DEFAULT_CREDENTIALS_FS.readFileFd)(fd)
+      },
+      closeFile: (fd) => {
+        calls.push({ op: 'close', fd })
+        DEFAULT_CREDENTIALS_FS.closeFile(fd)
+        overrides.closeFile?.(fd)
+      },
+    }
+    return { fs, calls, opened: () => opened }
+  }
+
+  const hasMkfifo = spawnSync('mkfifo', ['--version']).status === 0
+
+  // Rows: label, arrange (real path or injected ops), expected class and cause, ops made after the open.
+  test.each<[string, (persona: BringUpPersona) => Partial<CredentialsFs>, PersonaDiagnosticClass | 'ok', string, FdCall['op'][]]>([
+    ['a valid regular file', (persona) => (writeCreds(persona), {}), 'ok', '', ['fstat', 'read', 'close']],
+    ['a directory (real)', (persona) => (mkdirSync(persona.credentials_file, { recursive: true }), {}),
+      PERSONA_CREDENTIALS_UNREADABLE, 'credentials file is a directory', ['fstat', 'close']],
+    ['a symlink to /dev/zero (real character device)', (persona) => {
+      mkdirSync(join(dir, persona.key), { recursive: true })
+      symlinkSync('/dev/zero', persona.credentials_file)
+      return {}
+    }, PERSONA_CREDENTIALS_UNREADABLE, 'credentials file is not a regular file', ['fstat', 'close']],
+    ['a FIFO, as the injected fstatFile reports it', (persona) => (writeCreds(persona), { fstatFile: () => ({ isFile: () => false, isDirectory: () => false }) }),
+      PERSONA_CREDENTIALS_UNREADABLE, 'credentials file is not a regular file', ['fstat', 'close']],
+    ['fstat fails with EIO (injected)', (persona) => (writeCreds(persona), { fstatFile: failsWith('EIO') }),
+      PERSONA_CREDENTIALS_UNREADABLE, 'credentials file cannot be read (EIO)', ['fstat', 'close']],
+    ['the read fails with EIO (injected)', (persona) => (writeCreds(persona), { readFileFd: failsWith('EIO') }),
+      PERSONA_CREDENTIALS_UNREADABLE, 'credentials file cannot be read (EIO)', ['fstat', 'read', 'close']],
+    ['the read is denied with EACCES (injected)', (persona) => (writeCreds(persona), { readFileFd: failsWith('EACCES') }),
+      PERSONA_CREDENTIALS_UNREADABLE, 'credentials file cannot be read: permission denied (EACCES)', ['fstat', 'read', 'close']],
+    ['invalid content', (persona) => (writeCreds(persona, 'null'), {}),
+      PERSONA_CREDENTIALS_INVALID, 'credentials file is invalid: not a JSON object', ['fstat', 'read', 'close']],
+    ['closing throws (injected): ignored, the result stands', (persona) => (writeCreds(persona), { closeFile: failsWith('EIO') }),
+      'ok', '', ['fstat', 'read', 'close']],
+    ['closing throws after a refused non-regular file (injected): ignored', (persona) => (writeCreds(persona), {
+      fstatFile: () => ({ isFile: () => false, isDirectory: () => false }),
+      closeFile: failsWith('EBADF'),
+    }), PERSONA_CREDENTIALS_UNREADABLE, 'credentials file is not a regular file', ['fstat', 'close']],
+  ])('%s', (_label, arrange, expected, cause, afterOpen) => {
+    const persona = makePersona()
+    const { fs, calls, opened } = recordingFs(arrange(persona))
+    const { lines, log } = capture()
+
+    const result = checkPersonaCredentials(persona, { others: [], fs, log })
+
+    if (expected === 'ok') {
+      assertNoLeak({ result, lines })
+      if (!result.ok) throw new Error(`expected ok, got ${result.class}`)
+      expect(result.tokens.botToken).toBe(FILE_BOT_TOKEN)
+      expect(lines).toEqual([])
+    } else {
+      expect(expectFailure(result, expected, lines).cause).toBe(cause)
+    }
+    // Opened once; every later op used that descriptor; closed exactly once, last.
+    expect(calls.map((c) => c.op)).toEqual(['open', ...afterOpen])
+    expect(calls.slice(1).every((c) => c.fd === opened())).toBe(true)
+  })
+
+  // In a child process with a 10 s bound: a blocking open of a FIFO with no
+  // writer never returns, so in-process it would hang the whole suite instead
+  // of failing this test.
+  test.skipIf(!hasMkfifo)('a real FIFO: the open does not wait for a writer; refused unread and closed (child process, 10 s bound; skipped where mkfifo is unavailable)', () => {
+    const persona = makePersona()
+    mkdirSync(join(dir, persona.key), { recursive: true })
+    expect(spawnSync('mkfifo', [persona.credentials_file]).status).toBe(0)
+    const modulePath = join(import.meta.dir, '..', 'src', 'persona-credentials.ts')
+    const script = `
+      const { checkPersonaCredentials, DEFAULT_CREDENTIALS_FS: d } = await import(${JSON.stringify(modulePath)})
+      const ops = []
+      const fs = {
+        openFile: (p) => (ops.push('open'), d.openFile(p)),
+        fstatFile: (fd) => (ops.push('fstat'), d.fstatFile(fd)),
+        readFileFd: (fd) => (ops.push('read'), d.readFileFd(fd)),
+        closeFile: (fd) => (ops.push('close'), d.closeFile(fd)),
+      }
+      const r = checkPersonaCredentials(${JSON.stringify(persona)}, { others: [], fs })
+      console.log(JSON.stringify({ ok: r.ok, class: r.class, cause: r.cause, ops }))
+    `
+
+    const child = spawnSync(process.execPath, ['-e', script], { timeout: 10_000, encoding: 'utf-8', env: { PATH: process.env['PATH'] } })
+
+    expect(child.signal).toBeNull()
+    expect(JSON.parse(child.stdout.trim())).toEqual({
+      ok: false,
+      class: PERSONA_CREDENTIALS_UNREADABLE,
+      cause: 'credentials file is not a regular file',
+      ops: ['open', 'fstat', 'close'],
+    })
+  }, 15_000)
+
+  test.each<[string, string, PersonaDiagnosticClass, string]>([
+    ['missing (real)', 'ENOENT', PERSONA_CREDENTIALS_MISSING, 'credentials file does not exist'],
+    ['open denied with EACCES (injected)', 'EACCES', PERSONA_CREDENTIALS_UNREADABLE, 'credentials file cannot be read: permission denied (EACCES)'],
+    ['open denied with EPERM (injected)', 'EPERM', PERSONA_CREDENTIALS_UNREADABLE, 'credentials file cannot be read: permission denied (EPERM)'],
+    ['open fails with EIO (injected)', 'EIO', PERSONA_CREDENTIALS_UNREADABLE, 'credentials file cannot be read (EIO)'],
+  ])('a failed open (%s): nothing to stat, read or close', (_label, code, cls, cause) => {
+    const persona = makePersona()
+    if (code !== 'ENOENT') writeCreds(persona)
+    const { fs, calls } = recordingFs(code === 'ENOENT' ? {} : { openFile: failsWith(code) })
+    const { lines, log } = capture()
+
+    const result = checkPersonaCredentials(persona, { others: [], fs, log })
+
+    expect(expectFailure(result, cls, lines).cause).toBe(cause)
+    expect(calls).toEqual([{ op: 'open' }])
   })
 })
 
@@ -622,7 +751,7 @@ describe('checkPersonaLocalBringUp', () => {
 
     const result = checkPersonaLocalBringUp(persona, {
       others: [],
-      fs: { readFile: failsWith('EACCES'), access: accessDenying(fsConstants.X_OK) },
+      fs: { openFile: failsWith('EACCES'), access: accessDenying(fsConstants.X_OK) },
       log,
     })
 
@@ -774,7 +903,8 @@ describe('diagnostic lines', () => {
     ['credentials missing', persona => checkPersonaCredentials(persona, { others: [] }), persona => persona.credentials_file],
     [
       'credentials unreadable',
-      persona => checkPersonaCredentials(persona, { others: [], fs: { readFile: failsWith('EACCES') } }),
+      // The file exists; the injected open is what fails.
+      persona => (writeCreds(persona), checkPersonaCredentials(persona, { others: [], fs: { openFile: failsWith('EACCES') } })),
       persona => persona.credentials_file,
     ],
     [

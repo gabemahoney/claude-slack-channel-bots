@@ -272,7 +272,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     baseDir = mkdtempSync(join(tmpdir(), 'cscb-server-'))
   })
 
-  /** One stand-in persona per key (the channel ID under the route->persona adapter), in order. */
+  /** One stand-in persona per key (keyed and named by its one channel's ID), in order. */
   function standIns(...keys: string[]): PersonaConfig {
     return makeStandInPersonaConfig(Object.fromEntries(keys.map((k) => [k, {}])), baseDir)
   }
@@ -298,7 +298,7 @@ describe('_buildIsSessionAliveAdapter', () => {
       ? { statusError, statusCalls }
       : { statusResult: { state: statusState ?? 'waiting' }, statusCalls }
     setClientForTests(makeStubClient(stubOpts) as unknown as Client)
-    // Default persona config: one stand-in persona keyed C1 (the channel ID).
+    // Default persona config: one stand-in persona keyed C1.
     return {
       emissions,
       statusCalls,

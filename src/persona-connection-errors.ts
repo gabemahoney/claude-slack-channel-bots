@@ -26,7 +26,7 @@
  * `unhandledRejection` event that logs one `[slack]` line built with the
  * describer and returns: it never throws, rethrows or exits, so one persona's
  * stray rejection cannot take the process down. This module never installs
- * it (no `process.on`); E3 does.
+ * it (no `process.on`); `server.ts` installs it once, in `main()`.
  *
  * Pure module (b.av2 SR-13.1): no module-scope state, no environment access,
  * no file writes, nothing runs at import.

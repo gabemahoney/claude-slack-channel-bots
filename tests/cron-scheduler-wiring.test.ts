@@ -1,25 +1,33 @@
 /**
- * cron-scheduler-wiring.test.ts — Static audit (b.he5 E2 wiring guard).
+ * cron-scheduler-wiring.test.ts — Static audit (b.he5 E2 wiring guard;
+ * b.av2 SR-11 cron semantics).
  *
- * server.ts cannot be imported in tests (module-scope side effects), so the
- * SRD invariant "the cron scheduler starts only AFTER the HTTP server is
- * listening, from main(), and is stopped on shutdown" cannot be exercised
- * behaviorally. This follows the repo precedent for exactly that situation:
- * tests/jsonl-safeguard-wiring.test.ts — a content-anchored static audit of
- * src/server.ts source text (import shape + relative call-site ordering via
- * indexOf; never line numbers).
+ * main() cannot run in a unit test (the agent-director startup gate, a real
+ * port, real Slack connections), so the SRD invariant "the cron scheduler
+ * starts only AFTER the HTTP server is listening, from main(), and is stopped
+ * on shutdown" cannot be exercised behaviorally. This follows the repo
+ * precedent for exactly that situation: tests/jsonl-safeguard-wiring.test.ts —
+ * a content-anchored static audit of src/server.ts source text (import shape +
+ * relative call-site ordering via indexOf; never line numbers).
  *
  * These assertions FAIL if the scheduler start call is dropped or reordered
- * before Bun.serve(), or if the shutdown-path stop call disappears; they PASS
- * with Task 3's wiring in place.
+ * before Bun.serve(), if the shutdown-path stop call disappears, or if the
+ * cron wiring stops reading the persona config main() loaded (its log and
+ * table paths, and the dispatcher's target resolution). There is no longer a
+ * no-config start: main() requires the config file (b.av2 SR-8.7), so the
+ * scheduler is always built.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
+import { callArguments, indicesOf, loadedConfigName, stripComments } from './test-helpers/source-audit.ts'
 
 const SERVER_SRC = readFileSync('src/server.ts', 'utf-8')
+
+/** server.ts with every comment removed (see stripComments). */
+const SERVER_CODE = stripComments(SERVER_SRC)
 
 describe('server.ts wires the cron scheduler', () => {
   test('imports createCronScheduler from the cron-scheduler module', () => {
@@ -33,44 +41,28 @@ describe('server.ts wires the cron scheduler', () => {
     // Anchor on `Bun.serve({` (the actual server construction) — NOT a bare
     // `Bun.serve(`, which would first match the `ReturnType<typeof Bun.serve>`
     // type annotation near the top of the file and defeat the ordering check.
-    const serveIdx = SERVER_SRC.indexOf('Bun.serve({')
-    const startIdx = SERVER_SRC.indexOf('cronScheduler.start(')
-    // serveIdx > -1 anchors the ordering; startIdx > -1 proves the start call
-    // exists (subsumes a separate "is called" test); start must follow serve.
+    // Read the comment-stripped code, and check EVERY start call (`?.` and `!.`
+    // included), so an extra early start cannot hide behind a later one.
+    const serveIdx = SERVER_CODE.indexOf('Bun.serve({')
+    const starts = indicesOf(/\bcronScheduler[?!]?\.start\s*\(/g, SERVER_CODE)
     expect(serveIdx).toBeGreaterThan(-1)
-    expect(startIdx).toBeGreaterThan(-1)
-    expect(startIdx).toBeGreaterThan(serveIdx)
+    expect(starts.length).toBeGreaterThan(0)
+    for (const startIdx of starts) expect(startIdx).toBeGreaterThan(serveIdx)
   })
 
-  test('constructs the cron scheduler+log INSIDE the `if (routingConfig)` guard block (env-var fallback path builds nothing cron-related)', () => {
-    // AC (subtask t3.he5.eu.4q.ti): on the env-var fallback path (no routing
-    // config) nothing cron-related is constructed or started. Enforced by
-    // requiring the createCronLog/createCronScheduler/start() calls to live
-    // inside the routingConfig guard block, so dropping the guard fails here.
-    const schedIdx = SERVER_SRC.indexOf('createCronScheduler(')
-    const logIdx = SERVER_SRC.indexOf('createCronLog(')
-    const startIdx = SERVER_SRC.indexOf('cronScheduler.start(')
-    expect(schedIdx).toBeGreaterThan(-1)
-    expect(logIdx).toBeGreaterThan(-1)
-    expect(startIdx).toBeGreaterThan(-1)
-
-    // The enclosing guard is the LAST `if (routingConfig) {` before the cron
-    // construction; its try/catch closes at the first `catch (err)` after it.
-    // Bounding the region by content (never line numbers) keeps this robust to
-    // edits elsewhere in main() — the same indexOf technique the shutdown-region
-    // and Bun.serve-ordering tests use.
-    const guardIdx = SERVER_SRC.lastIndexOf('if (routingConfig) {', schedIdx)
-    expect(guardIdx).toBeGreaterThan(-1)
-    const guardEnd = SERVER_SRC.indexOf('catch (err)', guardIdx)
-    expect(guardEnd).toBeGreaterThan(guardIdx)
-
-    // All three cron wiring calls must fall strictly within [guard, catch): if
-    // the guard were removed the lastIndexOf would land on a DIFFERENT, earlier
-    // `if (routingConfig)` and one of these bounds would fail.
-    for (const idx of [logIdx, schedIdx, startIdx]) {
-      expect(idx).toBeGreaterThan(guardIdx)
-      expect(idx).toBeLessThan(guardEnd)
+  test('builds the cron log, dispatcher and scheduler from the loaded persona config', () => {
+    // The config main() loaded through the persona loader (b.av2 SR-1.7). The
+    // dispatcher resolves each fire's target against it (b.av2 SR-11).
+    const config = loadedConfigName(SERVER_CODE)
+    for (const call of ['createCronLog', 'createCronDispatcher', 'createCronScheduler']) {
+      const at = SERVER_CODE.search(new RegExp(`\\b${call}\\s*\\(`))
+      expect(at).toBeGreaterThan(-1)
+      const args = callArguments(SERVER_CODE, at)
+      expect(args).toMatch(new RegExp(`\\b${config}\\.cron_(?:log|table)_path\\b`))
     }
+    expect(callArguments(SERVER_CODE, SERVER_CODE.search(/\bcreateCronDispatcher\s*\(/))).toMatch(
+      new RegExp(`\\bresolveTarget\\s*:[^,]*\\bresolvePersonaTarget\\s*\\(\\s*${config}\\s*,`),
+    )
   })
 
   test('stops the scheduler inside the shutdown() function body', () => {

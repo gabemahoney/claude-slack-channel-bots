@@ -24,6 +24,9 @@ import {
   resolvePersonaConfig,
   resolveRealPath,
   credentialsFilesToProtect,
+  loadStartPersonaConfig,
+  resolveServerConfigPath,
+  resolveServerStateDir,
   type RouteEntry,
   type RoutingConfigInput,
   type RoutingConfig,
@@ -32,6 +35,7 @@ import {
 } from '../src/config.ts'
 import { personaKey } from '../src/persona-identity.ts'
 import {
+  makeMultiPersonaConfig,
   makePersona,
   makePersonaConfig,
   makePersonaConfigInput,
@@ -2211,5 +2215,200 @@ describe('credentialsFilesToProtect (b.av2 SR-5.2)', () => {
   ])('%s yields only the applied personas\' paths, without throwing', (_label, setup) => {
     const applied = appliedPersonas()
     expect(build(applied, setup())).toEqual([applied[0].credentials_file])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Server config path (b.av2 SR-1.1, SR-8.7)
+// ---------------------------------------------------------------------------
+
+/** Environment variables these blocks change; restored after every test. */
+const START_ENV_KEYS = ['SLACK_STATE_DIR', 'MCP_HOST', 'MCP_PORT'] as const
+
+/** Save the variables in `START_ENV_KEYS` and return a restore function. */
+function saveStartEnv(): () => void {
+  const saved = START_ENV_KEYS.map((key) => [key, process.env[key]] as const)
+  return () => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
+describe('resolveServerConfigPath / resolveServerStateDir (b.av2 SR-1.1)', () => {
+  let dir: string
+  let home: string
+  let restoreEnv: () => void
+
+  beforeEach(() => {
+    restoreEnv = saveStartEnv()
+    dir = mkdtempSync(join(tmpdir(), 'server-path-'))
+    home = mkdtempSync(join(tmpdir(), 'server-path-home-'))
+  })
+
+  afterEach(() => {
+    restoreEnv()
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  test('SLACK_STATE_DIR set to a directory gives <that dir>/config.json, whatever the home', () => {
+    const env = { SLACK_STATE_DIR: dir }
+    expect(resolveServerStateDir(home, env)).toBe(dir)
+    expect(resolveServerConfigPath(home, env)).toBe(join(dir, 'config.json'))
+  })
+
+  test('a relative SLACK_STATE_DIR is made absolute against the working directory', () => {
+    const path = resolveServerConfigPath(home, { SLACK_STATE_DIR: join('rel', 'state') })
+    expect(path).toBe(join(process.cwd(), 'rel', 'state', 'config.json'))
+  })
+
+  test.each([
+    ['unset', {}],
+    ['empty', { SLACK_STATE_DIR: '' }],
+  ])('SLACK_STATE_DIR %s gives <home>/.claude/channels/slack/config.json under the injected home', (_label, env) => {
+    expect(resolveServerStateDir(home, env)).toBe(join(home, '.claude', 'channels', 'slack'))
+    expect(resolveServerConfigPath(home, env)).toBe(join(home, '.claude', 'channels', 'slack', 'config.json'))
+  })
+
+  test('process.env is read at call time: changing SLACK_STATE_DIR between calls changes the result', () => {
+    const first = join(dir, 'first')
+    const second = join(dir, 'second')
+    process.env['SLACK_STATE_DIR'] = first
+    expect(resolveServerConfigPath(home)).toBe(join(first, 'config.json'))
+    process.env['SLACK_STATE_DIR'] = second
+    expect(resolveServerConfigPath(home)).toBe(join(second, 'config.json'))
+    delete process.env['SLACK_STATE_DIR']
+    expect(resolveServerConfigPath(home)).toBe(join(home, '.claude', 'channels', 'slack', 'config.json'))
+  })
+
+  test('the route loader\'s default path is the resolver\'s path: it loads the file there and names it when missing', () => {
+    process.env['SLACK_STATE_DIR'] = dir
+    const path = resolveServerConfigPath()
+    expect(path).toBe(join(dir, 'config.json'))
+    expect(() => loadConfig()).toThrow(`"${path}"`)
+
+    writeFileSync(path, JSON.stringify(makeRoutingConfig({ routes: { C_GENERAL: makeRoute({ cwd: dir }) } })), 'utf-8')
+    expect(loadConfig().routes['C_GENERAL'].cwd).toBe(dir)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// loadStartPersonaConfig (b.av2 SR-1.7 live part, SR-8.7 no-record part)
+// ---------------------------------------------------------------------------
+
+describe('loadStartPersonaConfig (b.av2 SR-1.7, SR-8.7)', () => {
+  let dir: string
+  let home: string
+  let restoreEnv: () => void
+
+  beforeEach(() => {
+    restoreEnv = saveStartEnv()
+    dir = mkdtempSync(join(tmpdir(), 'start-config-'))
+    home = mkdtempSync(join(tmpdir(), 'start-config-home-'))
+  })
+
+  afterEach(() => {
+    restoreEnv()
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  /** Call `fn`, expecting a throw; returns the error after `assertNoLeak`. */
+  function thrown(fn: () => unknown): Error {
+    try {
+      fn()
+    } catch (err) {
+      assertNoLeak(err, 'rejection')
+      return err as Error
+    }
+    throw new Error('expected a throw')
+  }
+
+  const requiredMessage = (path: string, what: string) =>
+    `The configuration file "${path}" ${what}. The server requires the configuration file to start.`
+
+  test('a valid two-persona file returns the resolved persona config', () => {
+    const channels = [{ id: 'C0TEST001', delivery: 'all' as const }]
+    const path = writeConfigFile(dir, makePersonaConfigInput({
+      personas: [makePersona({ name: 'Ops Bot' }, dir), makePersona({ name: 'review_bot' }, dir)],
+    }, dir))
+
+    const config = loadStartPersonaConfig(path, home)
+
+    // The loader defaults mcp_config_path under the home it was given (see the testing guide).
+    expect(config).toEqual(makeMultiPersonaConfig(
+      [{ name: 'Ops Bot', channels }, { name: 'review_bot', channels }],
+      dir,
+      { mcp_config_path: join(home, '.claude', 'slack-mcp.json') },
+    ))
+  })
+
+  test.each([
+    ['a missing file', () => join(dir, 'config.json'), 'does not exist'],
+    ['a path under a regular file (ENOTDIR)', () => {
+      writeFileSync(join(dir, 'not-a-dir'), '', 'utf-8')
+      return join(dir, 'not-a-dir', 'config.json')
+    }, 'does not exist'],
+    // A directory fails to read on every platform and as root.
+    ['a directory', () => {
+      mkdirSync(join(dir, 'config.json'))
+      return join(dir, 'config.json')
+    }, 'cannot be read (EISDIR)'],
+  ])('%s throws naming the path and that the server requires the file; nothing is returned', (_label, setup, what) => {
+    const path = setup()
+    let returned: unknown
+    const err = thrown(() => { returned = loadStartPersonaConfig(path, home) })
+    expect(returned).toBeUndefined()
+    expect(err.message).toBe(requiredMessage(path, what))
+  })
+
+  test('a missing file throws even with MCP_HOST and MCP_PORT set: there is no fallback config', () => {
+    process.env['MCP_HOST'] = '127.0.0.1'
+    process.env['MCP_PORT'] = '3999'
+    const path = join(dir, 'config.json')
+    let returned: unknown
+    const err = thrown(() => { returned = loadStartPersonaConfig(path, home) })
+    expect(returned).toBeUndefined()
+    expect(err.message).toBe(requiredMessage(path, 'does not exist'))
+  })
+
+  test('a ~ path is expanded under the injected home, and the message names the expanded path', () => {
+    const err = thrown(() => loadStartPersonaConfig('~/config.json', home))
+    expect(err.message).toBe(requiredMessage(join(home, 'config.json'), 'does not exist'))
+  })
+
+  test.each([
+    ['routes', { C0TEST001: { cwd: '/tmp/ops' } }],
+    ['default_route', '/tmp/ops'],
+    ['default_dm_session', '/tmp/ops'],
+  ])('a pre-persona file with %s passes E1\'s conversion error through unchanged; the file is unchanged', (key, value) => {
+    const path = writeConfigFile(dir, { ...makePersonaConfigInput({}, dir), [key]: value })
+    const bytes = readFileSync(path)
+
+    const err = thrown(() => loadStartPersonaConfig(path, home))
+
+    expect(err.message).toBe(thrown(() => loadPersonaConfig(path, home)).message)
+    expect(err.message).toContain(prePersonaConversionMessage(key))
+    expect(readFileSync(path).equals(bytes)).toBe(true)
+  })
+
+  test.each([
+    ['an invalid persona', () => writeConfigFile(dir, makePersonaConfigInput({
+      personas: [makePersona({ permission_prompts: undefined }, dir)],
+    }, dir))],
+    ['an unknown top-level key', () => writeConfigFile(dir, { ...makePersonaConfigInput({}, dir), extra_setting: 1 })],
+    ['malformed JSON', () => {
+      const path = join(dir, 'config.json')
+      writeFileSync(path, '{ "personas": [', 'utf-8')
+      return path
+    }],
+  ])('%s throws E1\'s error unchanged', (_label, setup) => {
+    const path = setup()
+    const err = thrown(() => loadStartPersonaConfig(path, home))
+    expect(err.message).toBe(thrown(() => loadPersonaConfig(path, home)).message)
+    expect(err.message).toContain(path)
+    expect(err.message).not.toContain('The server requires the configuration file')
   })
 })

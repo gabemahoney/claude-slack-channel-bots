@@ -70,8 +70,12 @@ export interface RestartDeps {
    */
   reconnectSession(key: string): Promise<'success' | 'escalate-dead' | 'transient' | void>
   killSession(key: string): Promise<void>
-  /** `cwd` is the persona's working directory. */
-  launchSession(key: string, cwd: string, sessionId?: string): Promise<boolean>
+  /**
+   * `cwd` is the persona's working directory. `'skipped'`: the launch was
+   * declined (the persona's Slack connection is not serving), which counts as
+   * neither a success nor a failure.
+   */
+  launchSession(key: string, cwd: string, sessionId?: string): Promise<boolean | 'skipped'>
   getRestartDelay(): number
   isShuttingDown(): boolean
   /**
@@ -219,12 +223,18 @@ export function scheduleRestart(
 
       console.error(`[slack] Relaunching session for persona=${key} cwd="${cwd}"`)
 
-      let ok: boolean
+      let ok: boolean | 'skipped'
       try {
         ok = await deps.launchSession(key, cwd, sessionId)
       } catch (err) {
         console.error(`[slack] restart: launchSession threw for persona=${key}:`, err)
         ok = false
+      }
+
+      if (ok === 'skipped') {
+        // Declined, not attempted (the gate logged why): the failure counter,
+        // backoff and cap latch are left exactly as they were.
+        return
       }
 
       if (ok) {

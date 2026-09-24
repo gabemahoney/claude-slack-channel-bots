@@ -83,7 +83,8 @@ import {
   type PollerDeps,
 } from '../src/permission-poller.ts'
 import { _resetTrailFdForTests } from '../src/permission-trail.ts'
-import { parsePermissionActionId, personaKeyFromActionId } from '../src/permission-action-id.ts'
+import { parsePermissionActionId } from '../src/permission-action-id.ts'
+import { personaKeyFromActionId } from './test-helpers/action-id-key.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import {
   cannedGetPermissionResponse,

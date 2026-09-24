@@ -4,10 +4,9 @@
  * The keep-alive mechanism sends `:ping\n\n` SSE comments every ~30s on the
  * GET SSE stream to prevent idle-connection disconnects.
  *
- * server.ts cannot be imported without live Slack credentials, so we set fake
- * tokens at module scope before the dynamic import. The values satisfy prefix
- * checks (xoxb-*, xapp-*) but are otherwise inert — no network calls happen
- * at import time.
+ * The keep-alive functions are imported straight from src/server.ts: importing
+ * it reads no Slack token, builds no Slack client and creates no directory
+ * (b.av2 SR-3.1); `main()` runs only behind `if (import.meta.main)`.
  *
  * Since Bun's fake-timer support does not intercept setInterval callbacks
  * reliably, we monkey-patch globalThis.setInterval within each test to capture
@@ -18,15 +17,7 @@
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import type { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
-
-// ---------------------------------------------------------------------------
-// Bootstrap — fake tokens so loadTokens() passes without calling process.exit
-// ---------------------------------------------------------------------------
-
-process.env['SLACK_BOT_TOKEN'] ||= 'xoxb-test-keepalive'
-process.env['SLACK_APP_TOKEN'] ||= 'xapp-test-keepalive'
-
-const { startSseKeepAlive, stopSseKeepAlive, stopAllKeepAliveTimers } = await import('../src/server.ts')
+import { startSseKeepAlive, stopSseKeepAlive, stopAllKeepAliveTimers } from '../src/server.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers

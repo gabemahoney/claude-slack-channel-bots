@@ -17,8 +17,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { PERSONA_INSTANCE_ID_PREFIX } from './persona-identity.ts'
-
 export type PermissionDecision = 'allow' | 'deny'
 
 export interface ParsedPermissionActionId {
@@ -70,15 +68,4 @@ export function parsePermissionActionId(actionId: string): ParsedPermissionActio
   const claudeInstanceId = match[2]
   const requestToken = match[3]
   return { decision, claudeInstanceId, requestToken }
-}
-
-/**
- * The persona key a permission action ID was built for: its instance ID with
- * `PERSONA_INSTANCE_ID_PREFIX` removed (the inverse of `personaInstanceId`).
- * Undefined for a foreign or malformed action ID.
- */
-export function personaKeyFromActionId(actionId: string): string | undefined {
-  const parsed = parsePermissionActionId(actionId)
-  if (parsed === null || !parsed.claudeInstanceId.startsWith(PERSONA_INSTANCE_ID_PREFIX)) return undefined
-  return parsed.claudeInstanceId.slice(PERSONA_INSTANCE_ID_PREFIX.length)
 }

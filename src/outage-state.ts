@@ -203,8 +203,8 @@ export function clearOutageFlag(key: string, cls: OutageClass): void {
 /**
  * resetAllToHealthy — silently wipes each given persona's flag set and
  * bad-stretch history to a clean slate. No `notify` calls. Called at boot by
- * server.ts with the applied persona keys immediately after `socket.start()`
- * as a defensive boundary for pre-auth observations (added in Epic 2).
+ * server.ts with the applied persona keys, before any persona is brought up,
+ * as a defensive boundary for pre-start observations (added in Epic 2).
  */
 export function resetAllToHealthy(keys: string[]): void {
   for (const key of keys) {
