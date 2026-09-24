@@ -13,11 +13,12 @@ Each source module has a corresponding test file in the project root:
 | Source | Test File | What It Tests |
 |--------|-----------|---------------|
 | lib.ts | server.test.ts | gate(), assertSendable, assertOutboundAllowed, chunkText, sanitizeFilename |
-| config.ts | config.test.ts | applyDefaults, validateConfig, expandTilde, resolveConfig, loadConfig; resolveRealPath (real path, lexical fallback, injected realpath); persona loader (resolvePersonaConfig, loadPersonaConfig), cross-persona rejections (duplicate name or key, shared working_directory or credentials_file), non-collision controls, SR-14 rejection table |
+| config.ts | config.test.ts | applyDefaults, validateConfig, expandTilde, resolveConfig, loadConfig; resolveRealPath (real path, lexical fallback, injected realpath); persona loader (resolvePersonaConfig, loadPersonaConfig), cross-persona rejections (duplicate name or key, shared working_directory or credentials_file), non-collision controls, SR-14 rejection table; every persona rejection passes `assertNoLeak` |
 | registry.ts | registry.test.ts | Session registry CRUD, routing, pending sessions |
 | server.ts (DM routing) | dm-routing.test.ts | DM routing via gate() + registry |
 | server.ts (permission relay) | permission-poller.test.ts, permission-click-handler.test.ts | SR-2.1 poller loop and Block Kit click handler |
 | persona-identity.ts | persona-identity.test.ts | persona key rule, derived identifiers, persona-name rendering |
+| persona-credentials.ts, persona-bringup.ts, persona-diagnostics.ts | persona-connections.test.ts | checkPersonaCredentials (valid, missing, unreadable and each invalid shape), checkPersonaWorkingDirectory (missing, not a directory, unreadable, unsearchable), checkPersonaLocalBringUp (both causes reported), real-path collisions with another applied persona, no environment token read, no file written, diagnostic class labels and line format (causes escaped to one line), success values that never print a token |
 
 New features that add significant logic should get their own test file (e.g., `session-manager.test.ts`).
 
@@ -50,6 +51,35 @@ writeConfigFile(dir, input) — writes input as JSON to <dir>/config.json and re
 `baseDir` defaults to the OS temp directory; pass the test's own `mkdtempSync` directory when paths must exist or be unique to the test. `writeConfigFile` writes only into the caller-supplied temp directory and has no default location. Pass `loadPersonaConfig` a temp home as well, so `~` never expands to the real home. Remove both the temp directory and the temp home in `afterEach`.
 
 `makePersonaConfig` puts `mcp_config_path` under `baseDir`, but the loader defaults it to `~/.claude/slack-mcp.json` under the home you pass. When comparing against loader output, override `mcp_config_path` with the loader's value (e.g. `join(home, '.claude', 'slack-mcp.json')`).
+
+### Credentials Fixtures and Leak Checks
+
+Any test that touches Slack tokens or a persona credentials file uses the shared helper `tests/test-helpers/credentials.ts`. It builds fake tokens that all carry one marker, `LEAK_SENTINEL`, and checks captured output for that marker or any token-like value. A leak then fails a test instead of reaching a log.
+
+| Export | Use it for |
+|--------|------------|
+| `LEAK_SENTINEL` | The marker every fake token embeds. It uses identifier characters only, so an error that quotes an identifier quotes the whole sentinel. Refer to the constant; never copy its value into a test. |
+| `BOT_TOKEN_PREFIX`, `APP_TOKEN_PREFIX` | The Slack token prefixes, for building fakes and for asserting on rule text. A bare prefix is not a token. |
+| `fakeToken(prefix, suffix?)` | One fake token built at runtime: the prefix, then the sentinel, then an optional suffix. Use distinct suffixes to tell two fakes apart; pass a wrong prefix or none for bad-prefix cases. |
+| `makeCredentials(overrides?)` | A credentials object. By default it is valid (exactly `bot_token` and `app_token`, distinct fakes); an override set to `undefined` removes that key, and any other override adds or replaces one. |
+| `writeCredentialsFile(dir, name?, overrides?)` | Writes a credentials file with mode 0600 inside `dir` and returns its path. An object override merges over the valid defaults; a string override is the whole file content, for non-JSON or non-object cases. `dir` is required and `name` must stay inside it. |
+| `writtenFile(path)` | Marks a file or directory the code under test wrote, so `assertNoLeak` checks its content. This is the only way to check a file: a plain string is always checked as text, never read as a path. |
+| `assertNoLeak(captured, label?)` | Fails if the sentinel (any case) or a token-like value appears anywhere in `captured`. Strings, errors (message, stack, properties, `cause`, aggregated errors), arrays, objects, maps, sets, buffers and `writtenFile` marks are all checked, recursively. |
+
+Rules:
+
+- **Fakes only.** Tests use only tokens from `fakeToken`, `makeCredentials` or `writeCredentialsFile`, so every token embeds `LEAK_SENTINEL`. No test file contains a token literal, not even a fake one; build it at runtime from the prefix constants.
+- **Check everything captured.** Every test that handles credentials runs `assertNoLeak` over its captured log lines, errors and results, including rejected calls and failure paths. Pass them together as one object so a failure names the leaking item (for example `captured.lines[2]`). Wrap any file the code wrote in `writtenFile`.
+- **Override the token environment.** A suite that touches `SLACK_BOT_TOKEN` or `SLACK_APP_TOKEN` sets both to fakes for its whole run and restores the previous values afterwards, so an ambient real token can never reach a failure message.
+- **Why the failure is safe.** `assertNoLeak` reports which item leaked and whether it held the sentinel or a token-like value, never the leaked text. Rule text such as "must start with" a bare prefix passes.
+
+Isolation (SR-13.2) applies to credentials files and working-directory fixtures exactly as it does to config files:
+
+- Create them only under the test's own `mkdtempSync` directory, pass every path explicitly, and remove the directory in `afterEach`. `writeCredentialsFile` has no default location and refuses a name that escapes `dir`.
+- Never read or write `~/.claude/channels/slack` or `~/.agent-director`, and never point a credentials path at the real home.
+- When a test compares real paths (for example a symlinked credentials file shared with another persona), resolve the temp directory with `realpathSync` first; the OS temp directory may itself be a symlink.
+
+Permission cases (an unreadable credentials file, an unreadable or unsearchable working directory) inject a failing operation through the check's file-system seam, so they pass under root in docker CI. A variant that uses real permission bits is marked `test.skipIf(isRoot)`, with the reason in the test name. Restore any mode a test changed before `afterEach` removes the directory.
 
 ### Parametrization
 

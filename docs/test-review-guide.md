@@ -33,6 +33,13 @@ When reviewing tests, check for:
 - [ ] No `sleep` or timing-dependent assertions longer than 100ms
 - [ ] Capture arrays used to verify side effects (API calls, messages sent)
 
+### Credentials and Leak Checks
+- [ ] Every test that handles tokens or a credentials file runs `assertNoLeak` over all its captured log lines, errors and results, failure paths included; a missing call is a defect
+- [ ] Files the code under test wrote are passed to `assertNoLeak` wrapped in `writtenFile`, not as a bare path string (which is checked only as text)
+- [ ] No token literal anywhere in the test file, fake or not; every token comes from `fakeToken`, `makeCredentials` or `writeCredentialsFile` and so embeds `LEAK_SENTINEL`, and the sentinel's value is never copied in
+- [ ] Credentials files and working-directory fixtures are created only under the test's `mkdtempSync` directory, never under `~/.claude/channels/slack`, `~/.agent-director` or any other real-home path
+- [ ] Permission cases use the injected file-system seam so they pass as root; real-permission variants are `test.skipIf(isRoot)` with the reason in the test name
+
 ### Conciseness
 - [ ] 3+ tests with the same structure and different inputs use `test.each`
 - [ ] No meta-tests — tests of factories, stubs, or other test infrastructure add no value; real tests validate them

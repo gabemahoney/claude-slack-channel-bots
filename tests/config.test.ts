@@ -37,6 +37,13 @@ import {
   makePersonaConfigInput,
   writeConfigFile,
 } from './test-helpers/persona-config.ts'
+import {
+  APP_TOKEN_PREFIX,
+  BOT_TOKEN_PREFIX,
+  assertNoLeak,
+  fakeToken,
+  writeCredentialsFile,
+} from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1420,17 +1427,22 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
 
   const load = (input: unknown) => loadPersonaConfig(writeConfigFile(dir, input), home)
 
-  /** Load `input`, expecting rejection; returns the message after checking it leaks no placeholder. */
+  /**
+   * Load `input`, expecting rejection; returns the message after checking it
+   * leaks no placeholder and that the whole error passes `assertNoLeak` (the
+   * config leg of AC 20), so every rejection case built on it is leak-checked.
+   */
   function loadError(input: unknown): string {
-    let message: string | undefined
+    let error: Error | undefined
     try {
       load(input)
     } catch (err) {
-      message = (err as Error).message
+      error = err as Error
     }
-    if (message === undefined) throw new Error('expected loadPersonaConfig to reject the configuration')
-    expect(message).not.toContain(PLACEHOLDER)
-    return message
+    if (error === undefined) throw new Error('expected loadPersonaConfig to reject the configuration')
+    assertNoLeak(error, 'rejection')
+    expect(error.message).not.toContain(PLACEHOLDER)
+    return error.message
   }
 
   /** The b.av2 SR-2.2 persona reference: JSON-quoted name with its key. */
@@ -1551,7 +1563,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       ['working_directory', '~other/work'],
       ['claude_config_dir', './claude'],
     ])('%s rejects %s, naming the persona and the key', (setting, value) => {
-      const message = loadError(withPersonas(makePersona({ name: 'Ops Bot', [setting]: value })))
+      const message = loadError(withPersonas(makePersona({ name: 'Ops Bot', [setting]: value }, dir)))
       expectNamesPersona(message, 'Ops Bot')
       expect(message).toContain(setting)
       expect(message).not.toContain(value)
@@ -1559,13 +1571,19 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
   })
 
   describe('unknown keys (SR-1.1, SR-1.2; AC 20 config leg)', () => {
+    // Table inputs are built at registration, before `dir` exists, so these
+    // personas keep the helper's default base dir; each case is rejected per
+    // entry, before any path is resolved.
     const persona = (overrides: Record<string, unknown>) =>
       withPersonas(makePersona({ name: 'Ops Bot', ...overrides } as Partial<PersonaInput>))
 
+    // The token-like keys hold sentinel-bearing fake tokens: loadError's
+    // assertNoLeak proves the error names the key but never echoes the value.
     test.each([
       ['top-level', { ...makePersonaConfigInput(), extra_setting: 1 }, 'extra_setting', false],
       ['persona entry', persona({ nickname: 'ops' }), 'nickname', true],
-      ['persona entry bot_token', persona({ bot_token: PLACEHOLDER }), 'bot_token', true],
+      ['persona entry bot_token', persona({ bot_token: fakeToken(BOT_TOKEN_PREFIX, 'entry') }), 'bot_token', true],
+      ['persona entry app_token', persona({ app_token: fakeToken(APP_TOKEN_PREFIX, 'entry') }), 'app_token', true],
       ['persona entry route-era cwd (SR-10.2)', persona({ cwd: '/tmp/somewhere' }), 'cwd', true],
       ['dm object', persona({ dm: { enabled: false, relay: true } }), 'relay', true],
       ['channel entry', persona({ channels: [{ id: 'C0TEST001', delivery: 'all', label: 'ops' }] }), 'label', true],
@@ -1592,7 +1610,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         'C0TEST001',
       ],
     ])('%s is rejected, naming the persona and the key or channel', (_label, overrides, named) => {
-      const message = loadError(withPersonas(makePersona({ name: 'Ops Bot', ...overrides } as Partial<PersonaInput>)))
+      const message = loadError(withPersonas(makePersona({ name: 'Ops Bot', ...overrides } as Partial<PersonaInput>, dir)))
       expectNamesPersona(message, 'Ops Bot')
       expect(message).toContain(named)
     })
@@ -1604,7 +1622,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       ['a whitespace-only name', { name: '   ' }, 'name'],
       ['a non-string name', { name: 42 }, 'name'],
     ])('%s is rejected, naming personas[i] and the setting', (_label, overrides, setting) => {
-      const message = loadError(withPersonas(makePersona(overrides as Partial<PersonaInput>)))
+      const message = loadError(withPersonas(makePersona(overrides as Partial<PersonaInput>, dir)))
       expect(message).toContain(`personas[0]: ${setting}`)
     })
 
@@ -1616,7 +1634,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       ['an empty claude_config_dir', { claude_config_dir: '' }, 'claude_config_dir'],
       ['a permission_prompts that is neither dm nor a channel ID', { permission_prompts: PLACEHOLDER }, 'permission_prompts'],
     ])('%s is rejected, naming the persona and the setting', (_label, overrides, setting) => {
-      const message = loadError(withPersonas(makePersona({ name: 'Ops Bot', ...overrides } as Partial<PersonaInput>)))
+      const message = loadError(withPersonas(makePersona({ name: 'Ops Bot', ...overrides } as Partial<PersonaInput>, dir)))
       expectNamesPersona(message, 'Ops Bot')
       expect(message).toContain(setting)
     })
@@ -1628,7 +1646,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     const LONG_KEY = personaKey(LONG_NAME)
     /** An in-form name that is its own key and equals the derived key of 'Ops Bot'. */
     const OPS_KEY = personaKey('Ops Bot')
-    /** Slack token prefixes; no error may contain one (`assertNoLeak` arrives in E2). */
+    /** Slack token prefixes; no error may contain one (loadError's `assertNoLeak` checks the whole error too). */
     const TOKEN_LIKE = /\bx(?:ox[a-z]|app)-/
 
     const inDir = (rel: string) => join(dir, rel)
@@ -1636,11 +1654,8 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       mkdirSync(inDir(rel), { recursive: true })
       return inDir(rel)
     }
-    /** A real credentials file holding placeholder, non-token content, which no error may echo. */
-    const makeCredentials = (rel: string) => {
-      writeFileSync(inDir(rel), PLACEHOLDER)
-      return inDir(rel)
-    }
+    /** A real 0600 credentials file holding sentinel-bearing fake tokens, which no error may echo. */
+    const makeCredentials = (rel: string) => writeCredentialsFile(dir, rel)
     const makeLink = (target: string, rel: string) => {
       symlinkSync(target, inDir(rel))
       return inDir(rel)
@@ -1680,7 +1695,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         label: 'missing permission_prompts',
         offenders: [[0, 'Ops Bot']],
         settings: ['permission_prompts'],
-        build: () => ({ personas: [makePersona({ name: 'Ops Bot', permission_prompts: undefined })] }),
+        build: () => ({ personas: [makePersona({ name: 'Ops Bot', permission_prompts: undefined }, dir)] }),
       },
       {
         ac: '30',
@@ -1688,7 +1703,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         offenders: [[0, 'Say "hi" Bot']],
         settings: ['permission_prompts', 'dm.contact'],
         build: () => ({
-          personas: [makePersona({ name: 'Say "hi" Bot', dm: { enabled: true }, permission_prompts: 'dm' })],
+          personas: [makePersona({ name: 'Say "hi" Bot', dm: { enabled: true }, permission_prompts: 'dm' }, dir)],
         }),
       },
       {
@@ -1696,21 +1711,21 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         label: 'destination channel not in the persona channels',
         offenders: [[0, 'Ops Bot']],
         settings: ['permission_prompts', 'C0TEST999'],
-        build: () => ({ personas: [makePersona({ name: 'Ops Bot', permission_prompts: 'C0TEST999' })] }),
+        build: () => ({ personas: [makePersona({ name: 'Ops Bot', permission_prompts: 'C0TEST999' }, dir)] }),
       },
       {
         ac: '42',
         label: 'zero channels with dm.enabled false',
         offenders: [[0, 'ops_bot']],
         settings: ['dm.enabled'],
-        build: () => ({ personas: [makePersona({ name: 'ops_bot', channels: [], dm: { enabled: false } })] }),
+        build: () => ({ personas: [makePersona({ name: 'ops_bot', channels: [], dm: { enabled: false } }, dir)] }),
       },
       {
         ac: '42',
         label: 'zero channels with dm absent',
         offenders: [[0, 'Ops Bot']],
         settings: ['dm.enabled'],
-        build: () => ({ personas: [makePersona({ name: 'Ops Bot', channels: undefined, dm: undefined })] }),
+        build: () => ({ personas: [makePersona({ name: 'Ops Bot', channels: undefined, dm: undefined }, dir)] }),
       },
       {
         ac: '43',
@@ -1718,7 +1733,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         offenders: [[0, 'Ops Bot']],
         settings: ['permission_prompts', 'dm.enabled'],
         build: () => ({
-          personas: [makePersona({ name: 'Ops Bot', dm: { enabled: false, contact: 'U0TEST001' }, permission_prompts: 'dm' })],
+          personas: [makePersona({ name: 'Ops Bot', dm: { enabled: false, contact: 'U0TEST001' }, permission_prompts: 'dm' }, dir)],
         }),
       },
       {
@@ -1726,7 +1741,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         label: 'dm destination with neither dm.enabled nor dm.contact',
         offenders: [[0, 'Ops Bot']],
         settings: ['permission_prompts', 'dm.contact', 'dm.enabled'],
-        build: () => ({ personas: [makePersona({ name: 'Ops Bot', permission_prompts: 'dm' })] }),
+        build: () => ({ personas: [makePersona({ name: 'Ops Bot', permission_prompts: 'dm' }, dir)] }),
       },
       // Cross-persona rows: name and key
       {
@@ -1960,15 +1975,17 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       ],
     ])('non-collision control loads: %s', (_label, build) => {
       const personas = build()
-      expect(load(withPersonas(...personas)).personas.map((p) => p.name)).toEqual(personas.map((p) => p.name))
+      const config = load(withPersonas(...personas))
+      assertNoLeak(config, 'config')
+      expect(config.personas.map((p) => p.name)).toEqual(personas.map((p) => p.name))
     })
 
     test.each([
       {
         label: 'of two per-entry violations, the first persona',
         build: () => [
-          makePersona({ name: 'first_bot', permission_prompts: undefined }),
-          makePersona({ name: 'second_bot', channels: [] }),
+          makePersona({ name: 'first_bot', permission_prompts: undefined }, dir),
+          makePersona({ name: 'second_bot', channels: [] }, dir),
         ],
         reported: [[0, 'first_bot']] as [number, string][],
         named: 'permission_prompts',
@@ -2022,6 +2039,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       try {
         resolvePersonaConfig(input, dir, home)
       } catch (err) {
+        assertNoLeak(err, 'rejection')
         pure = (err as Error).message
       }
       expect(pure).toContain(`${indexedRef(1, 'review_bot')}: working_directory`)
@@ -2085,26 +2103,30 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       ['reply_chunk_limit', 2.5, 'reply_chunk_limit'],
       ['reply_chunk_mode', PLACEHOLDER, 'reply_chunk_mode'],
     ])('%s = %p is rejected, naming %s', (key, value, named) => {
-      expect(loadError({ ...makePersonaConfigInput(), [key]: value })).toContain(named)
+      expect(loadError({ ...makePersonaConfigInput({}, dir), [key]: value })).toContain(named)
     })
   })
 
   describe('pre-persona rejection (SR-1.7 loader part; AC 45)', () => {
-    /** Load `input`, returning the error plus proof that the file and directory are untouched. */
+    /**
+     * Load `input`, returning the error message plus proof that the file and
+     * directory are untouched and that the error passes `assertNoLeak`.
+     */
     function rejectUntouched(input: unknown): string {
       const path = writeConfigFile(dir, input)
       const bytes = readFileSync(path)
       const listing = readdirSync(dir)
-      let message: string | undefined
+      let error: Error | undefined
       try {
         loadPersonaConfig(path, home)
       } catch (err) {
-        message = (err as Error).message
+        error = err as Error
       }
       expect(readFileSync(path).equals(bytes)).toBe(true)
       expect(readdirSync(dir)).toEqual(listing)
-      if (message === undefined) throw new Error('expected loadPersonaConfig to reject the configuration')
-      return message
+      if (error === undefined) throw new Error('expected loadPersonaConfig to reject the configuration')
+      assertNoLeak(error, 'rejection')
+      return error.message
     }
 
     test.each([
@@ -2116,7 +2138,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       ['default_route', 'default_route', '/tmp/ops'],
       ['default_dm_session', 'default_dm_session', '/tmp/ops'],
     ])('%s is rejected with the conversion message; the file is unchanged', (_label, key, value) => {
-      const message = rejectUntouched({ ...makePersonaConfigInput(), [key]: value })
+      const message = rejectUntouched({ ...makePersonaConfigInput({}, dir), [key]: value })
       expect(message).toContain(prePersonaConversionMessage(key))
       expect(message).toContain(JSON.stringify(key))
       expect(message).toContain('must be converted to personas')
@@ -2146,6 +2168,15 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         },
         'malformed JSON',
       ],
+      [
+        'malformed JSON holding a pasted token',
+        (d: string) => {
+          const path = join(d, 'config.json')
+          writeFileSync(path, `{ "personas": [], "bot_token": "${fakeToken(BOT_TOKEN_PREFIX)}" ${PLACEHOLDER}`, 'utf-8')
+          return path
+        },
+        'malformed JSON',
+      ],
       ['a JSON array', (d: string) => writeConfigFile(d, []), 'must be a JSON object'],
     ])('%s is rejected, naming the file path', (_label, setup, fragment) => {
       const path = setup(dir)
@@ -2153,6 +2184,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       try {
         loadPersonaConfig(path, home)
       } catch (err) {
+        assertNoLeak(err, 'rejection')
         message = (err as Error).message
       }
       expect(message).toContain(fragment)
