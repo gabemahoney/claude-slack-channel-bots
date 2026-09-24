@@ -5,7 +5,9 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { homedir } from 'os'
+import { homedir, tmpdir } from 'os'
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'fs'
+import { join } from 'path'
 import type { RouteEntry, RoutingConfig } from '../src/config.ts'
 import {
   registerSession,
@@ -19,6 +21,7 @@ import {
   removePendingSession,
   getAllPendingSessions,
   createSessionServer,
+  isSlackHostedFileUrl,
   _resetRegistry,
   type SessionEntry,
   type PendingSessionEntry,
@@ -159,12 +162,39 @@ async function withClient(server: any, fn: (client: Client) => Promise<void>): P
   }
 }
 
+/** One stubbed `fetch` call: its URL, `Authorization` header and `redirect` mode. */
+interface FetchCall {
+  url: string
+  auth: string | null
+  redirect: RequestRedirect | undefined
+}
+
+const realFetch = globalThis.fetch
+
+/** Every `fetch` call made during the test (the global `fetch` is stubbed for every test). */
+let fetches: FetchCall[] = []
+/** Answers each stubbed `fetch`; throws by default, so no test can reach the network. */
+let fetchHandler: (url: string) => Response | Promise<Response>
+
 // ---------------------------------------------------------------------------
-// Reset registry state before each test
+// Reset registry state and stub the global fetch before each test
 // ---------------------------------------------------------------------------
 
 beforeEach(() => {
   _resetRegistry()
+  fetches = []
+  fetchHandler = () => {
+    throw new Error('unexpected fetch in registry.test.ts')
+  }
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input instanceof Request ? input.url : input)
+    fetches.push({ url, auth: new Headers(init?.headers).get('Authorization'), redirect: init?.redirect })
+    return fetchHandler(url)
+  }) as typeof fetch
+})
+
+afterEach(() => {
+  globalThis.fetch = realFetch
 })
 
 // ---------------------------------------------------------------------------
@@ -869,6 +899,227 @@ describe('dry-run mode', () => {
     expect(apiCalls).toHaveLength(0)
     expect(result.content[0].text).toContain('[dry-run]')
     expect(result.isError).toBeFalsy()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// download_attachment: the bearer token goes only to https://files.slack.com (b.2u6)
+// ---------------------------------------------------------------------------
+
+describe('isSlackHostedFileUrl', () => {
+  test.each<[string, unknown, boolean]>([
+    ['an https files.slack.com URL', 'https://files.slack.com/files-pri/T0-F0/a.txt', true],
+    ['one with a query string', 'https://files.slack.com/files-pri/T0-F0/a.txt?pub_secret=x', true],
+    ['an upper-case host', 'https://FILES.SLACK.COM/a.txt', true],
+    ['the explicit default port', 'https://files.slack.com:443/a.txt', true],
+    ['http:', 'http://files.slack.com/a.txt', false],
+    ['a lookalike host (suffix)', 'https://files.slack.com.evil.example/a.txt', false],
+    ['a lookalike host (prefix)', 'https://evilfiles.slack.com/a.txt', false],
+    ['another Slack host', 'https://slack.com/a.txt', false],
+    ['a third-party host naming files.slack.com in its path', 'https://evil.example/files.slack.com/a.txt', false],
+    ['a non-default port', 'https://files.slack.com:8443/a.txt', false],
+    ['userinfo (user and password)', 'https://u:p@files.slack.com/a.txt', false],
+    ['userinfo (user only)', 'https://u@files.slack.com/a.txt', false],
+    ['no scheme (unparseable)', 'files.slack.com/a.txt', false],
+    ['free text (unparseable)', 'not a url', false],
+    ['an empty string', '', false],
+    ['undefined', undefined, false],
+    ['null', null, false],
+    ['a number', 42, false],
+    ['a URL object', new URL('https://files.slack.com/a.txt'), false],
+  ])('%s → %p', (_label, url, expected) => {
+    expect(isSlackHostedFileUrl(url)).toBe(expected)
+  })
+})
+
+describe('download_attachment', () => {
+  const FILES = 'https://files.slack.com'
+  const BOT_TOKEN = 'xoxb-test-token'
+  const DL_CHANNEL = 'C_DL'
+  const MSG_TS = '1700000000.000100'
+  /** A query string on every fixture URL; a refusal must never echo it. */
+  const QUERY = '?pub_secret=fake-secret'
+  const OFFSITE = 'redirected away from https://files.slack.com, so it is not hosted by Slack'
+
+  let inboxDir: string
+
+  beforeEach(() => {
+    inboxDir = mkdtempSync(join(tmpdir(), 'registry-download-'))
+  })
+
+  afterEach(() => {
+    rmSync(inboxDir, { recursive: true, force: true })
+  })
+
+  const outPath = (name: string) => join(inboxDir, `1700000000_000100_${name}`)
+  const slackFile = (id: string, name: string) => ({ id, name, url_private_download: `${FILES}/files-pri/T0-${id}/${name}${QUERY}` })
+  const redirect = (location?: string) => new Response(null, { status: 302, headers: location ? { Location: location } : {} })
+  const notHosted = (label: string) =>
+    `Tool "download_attachment" refused: file ${label} is not hosted by Slack, so the bot token is not sent for it (only https://files.slack.com is trusted).`
+  const redirectRefusal = (label: string, why: string) =>
+    `Tool "download_attachment" refused: file ${label} ${why}; the bot token is only sent to https://files.slack.com.`
+
+  /** Serve `files` on the message and call download_attachment on a fresh session. */
+  async function download(files: Array<Record<string, unknown>>): Promise<any> {
+    const entry = registerSession('/tmp/download-test', DL_CHANNEL, makeTransport(), makeServer())
+    const { web } = makeWebClient()
+    web.conversations.replies = async () => ({ messages: [{ ts: MSG_TS, files }] })
+    const server = createSessionServer(entry, makeDeps(web, { botToken: BOT_TOKEN, inboxDir }))
+    let result: any
+    await withClient(server, async (client) => {
+      result = await client.callTool({ name: 'download_attachment', arguments: { chat_id: DL_CHANNEL, message_id: MSG_TS } })
+    })
+    return result
+  }
+
+  /** Every fetch went to https://files.slack.com with the bearer token and manual redirects. */
+  function expectTokenOnlySentToSlackFiles() {
+    for (const f of fetches) {
+      expect(new URL(f.url).origin).toBe(FILES)
+      expect(f.auth).toBe(`Bearer ${BOT_TOKEN}`)
+      expect(f.redirect).toBe('manual')
+    }
+  }
+
+  test('sends the bot token as the bearer to files.slack.com with manual redirects and writes into the inbox', async () => {
+    fetchHandler = () => new Response('file-body')
+
+    const result = await download([slackFile('F0FILE001', 'report.txt')])
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0].text).toBe(`Downloaded 1 file(s):\n${outPath('report.txt')}`)
+    expect(fetches.map((f) => f.url)).toEqual([`${FILES}/files-pri/T0-F0FILE001/report.txt${QUERY}`])
+    expectTokenOnlySentToSlackFiles()
+    expect(readFileSync(outPath('report.txt'), 'utf-8')).toBe('file-body')
+    expect(readdirSync(inboxDir)).toEqual(['1700000000_000100_report.txt'])
+  })
+
+  test.each<[string, Array<Record<string, unknown>>, string]>([
+    ['an is_external file on a files.slack.com URL', [{ ...slackFile('F0EXT0001', 'e.txt'), is_external: true }], 'F0EXT0001'],
+    ["a mode: 'external' file on a files.slack.com URL", [{ ...slackFile('F0EXT0002', 'e.txt'), mode: 'external' }], 'F0EXT0002'],
+    ['an external file with no URL', [{ id: 'F0EXT0003', name: 'e.txt', is_external: true }], 'F0EXT0003'],
+    ['a third-party url_private', [{ id: 'F0EXT0004', name: 'x.txt', url_private: `https://example.com/x.txt${QUERY}` }], 'F0EXT0004'],
+    [
+      'a third-party URL (malformed file ID → labelled by position)',
+      [{ id: 'not/an id', name: 'x.txt', url_private_download: `https://example.com/x.txt${QUERY}` }],
+      '#1',
+    ],
+    [
+      'a Slack-hosted file followed by a lookalike-host url_private',
+      [slackFile('F0FILE001', 'a.txt'), { name: 'b.txt', url_private: `https://files.slack.com.evil.example/b.txt${QUERY}` }],
+      '#2',
+    ],
+  ])('%s → the whole call is refused before any fetch', async (_label, files, label) => {
+    fetchHandler = () => new Response('file-body')
+
+    const result = await download(files)
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0].text).toBe(notHosted(label))
+    expect(fetches).toEqual([])
+    expect(readdirSync(inboxDir)).toEqual([])
+  })
+
+  test('a same-origin redirect is followed with the token and the file is downloaded', async () => {
+    fetchHandler = (url) =>
+      url.includes('/download/') ? new Response('file-body') : redirect('/files-pri/T0-F0FILE001/download/report.txt')
+
+    const result = await download([slackFile('F0FILE001', 'report.txt')])
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0].text).toBe(`Downloaded 1 file(s):\n${outPath('report.txt')}`)
+    expect(fetches.map((f) => f.url)).toEqual([
+      `${FILES}/files-pri/T0-F0FILE001/report.txt${QUERY}`,
+      `${FILES}/files-pri/T0-F0FILE001/download/report.txt`,
+    ])
+    expectTokenOnlySentToSlackFiles()
+    expect(readFileSync(outPath('report.txt'), 'utf-8')).toBe('file-body')
+  })
+
+  test.each([
+    ['another host', 'https://evil.example/report.txt'],
+    ['a lookalike host', 'https://files.slack.com.evil.example/report.txt'],
+    ['http: on the Slack host', 'http://files.slack.com/report.txt'],
+    ['a non-default port on the Slack host', 'https://files.slack.com:8443/report.txt'],
+    ['a protocol-relative URL on another host', '//evil.example/x'],
+  ])('a redirect to %s is refused and never fetched', async (_label, location) => {
+    fetchHandler = () => redirect(location)
+
+    const result = await download([slackFile('F0FILE001', 'report.txt')])
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0].text).toBe(redirectRefusal('F0FILE001', OFFSITE))
+    expect(fetches.map((f) => f.url)).toEqual([`${FILES}/files-pri/T0-F0FILE001/report.txt${QUERY}`])
+    expectTokenOnlySentToSlackFiles()
+    expect(readdirSync(inboxDir)).toEqual([])
+  })
+
+  test.each([
+    [3, true],
+    [4, false],
+  ])('%p same-origin redirects → downloaded=%p, after exactly 4 fetches', async (hops, downloaded) => {
+    fetchHandler = (url) => {
+      const n = Number(new URL(url).pathname.split('/').pop())
+      return n < hops ? redirect(`/hop/${n + 1}`) : new Response('file-body')
+    }
+
+    const result = await download([{ id: 'F0FILE001', name: 'report.txt', url_private_download: `${FILES}/hop/0${QUERY}` }])
+
+    expect(fetches).toHaveLength(4)
+    expectTokenOnlySentToSlackFiles()
+    if (downloaded) {
+      expect(result.isError).toBeUndefined()
+      expect(result.content[0].text).toBe(`Downloaded 1 file(s):\n${outPath('report.txt')}`)
+    } else {
+      expect(result.isError).toBe(true)
+      expect(result.content[0].text).toBe(redirectRefusal('F0FILE001', 'redirected more than 3 times'))
+      expect(readdirSync(inboxDir)).toEqual([])
+    }
+  })
+
+  test.each<[string, (url: string) => Response, string[]]>([
+    ['a 302 with no Location', () => redirect(), [`${FILES}/files-pri/T0-F0FILE001/report.txt${QUERY}`]],
+    [
+      'a 404 on the first request',
+      () => new Response('not found', { status: 404 }),
+      [`${FILES}/files-pri/T0-F0FILE001/report.txt${QUERY}`],
+    ],
+    [
+      'a same-origin 302 that then returns 404',
+      (url) =>
+        url.includes('/download/')
+          ? new Response('not found', { status: 404 })
+          : redirect('/files-pri/T0-F0FILE001/download/report.txt'),
+      [`${FILES}/files-pri/T0-F0FILE001/report.txt${QUERY}`, `${FILES}/files-pri/T0-F0FILE001/download/report.txt`],
+    ],
+  ])('%s skips the file → "Failed to download any files."', async (_label, handler, fetched) => {
+    fetchHandler = handler
+
+    const result = await download([slackFile('F0FILE001', 'report.txt')])
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0].text).toBe('Failed to download any files.')
+    expect(fetches.map((f) => f.url)).toEqual(fetched)
+    expectTokenOnlySentToSlackFiles()
+    expect(readdirSync(inboxDir)).toEqual([])
+  })
+
+  test('a redirect refusal after an earlier file was written lists the already-downloaded path', async () => {
+    fetchHandler = (url) => (url.includes('/b.txt') ? redirect('https://evil.example/b.txt') : new Response('a-body'))
+
+    const result = await download([slackFile('F0FILE001', 'a.txt'), slackFile('F0FILE002', 'b.txt')])
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0].text).toBe(
+      `${redirectRefusal('F0FILE002', OFFSITE)} Already downloaded before this refusal:\n${outPath('a.txt')}`,
+    )
+    expect(fetches.map((f) => f.url)).toEqual([
+      `${FILES}/files-pri/T0-F0FILE001/a.txt${QUERY}`,
+      `${FILES}/files-pri/T0-F0FILE002/b.txt${QUERY}`,
+    ])
+    expectTokenOnlySentToSlackFiles()
+    expect(readFileSync(outPath('a.txt'), 'utf-8')).toBe('a-body')
+    expect(readdirSync(inboxDir)).toEqual(['1700000000_000100_a.txt'])
   })
 })
 

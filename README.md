@@ -431,7 +431,7 @@ Each MCP endpoint exposes the following tools to the connected Claude Code sessi
 | `react` | Add an emoji reaction to a Slack message. |
 | `edit_message` | Edit a previously sent message (bot's own messages only). |
 | `fetch_messages` | Fetch message history from a channel or thread. Returns oldest-first. |
-| `download_attachment` | Download attachments from a Slack message. Saves files to `STATE_DIR/inbox/`. Returns local file paths. |
+| `download_attachment` | Download attachments from a Slack message. Saves files to `STATE_DIR/inbox/`. Returns local file paths. Only files hosted by Slack are downloaded; external files are refused. |
 
 ---
 

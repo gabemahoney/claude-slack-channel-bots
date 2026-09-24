@@ -65,7 +65,7 @@ The deleted files from the pre-Epic-2 architecture (`src/tmux.ts`, `src/peer-pid
 
 1. Claude Code calls MCP tools (`reply`, `react`, `edit_message`, etc.)
 2. Tool handler checks `assertOutboundAllowed()` — session can only send to channels it has received messages from
-3. Tool calls the Slack Web API (`web.chat.postMessage`, `web.reactions.add`, etc.)
+3. Tool calls the Slack Web API (`web.chat.postMessage`, `web.reactions.add`, etc.). `download_attachment` authorises file fetches with the bot token, sent only to `https://files.slack.com` URLs. It refuses external (non-Slack-hosted) files and never follows a redirect off that origin with the header.
 4. After the first chunk posts, if `message_id` was provided and `consumeAck(channelId, messageTs)` finds a tracked entry, the ack reaction is removed via `reactions.remove`
 
 ### Slack Reply Guard (Stop hook)
@@ -816,5 +816,6 @@ Injects a message directly into an active Claude session without going through S
 - **Gate layer**: All inbound messages pass through `gate()` — drops bot messages, enforces DM policy, validates allowlist
 - **Outbound scoping**: Each session can only send to channels it has received messages from (per-session `deliveredChannels` Set)
 - **File exfiltration guard**: `assertSendable()` blocks uploading files from the state directory
+- **Attachment download token scope**: `download_attachment` sends the bot token only to `https://files.slack.com` URLs. External (non-Slack-hosted) files are refused, and a redirect off that origin is never followed with the Authorization header, so the token cannot reach a third-party host
 - **Localhost restriction**: `/permission`, `/ask`, and `/interject` endpoints only accept requests from 127.0.0.1/::1/::ffff:127.*
 - **Session scope guard**: agent-director enforces session scope via `relay_mode='on'` at spawn time. Permission requests are routed through agent-director's internal relay machinery (SR-2.1 poller), which is scoped to the spawned session. Sessions not spawned by CSCB have no relay route and no `PermissionRequest` or `PreToolUse` hook entries in `settings.json` — the `.sh` hook files are not shipped.

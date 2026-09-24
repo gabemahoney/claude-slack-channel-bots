@@ -55,6 +55,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 - Gate all inbound Slack messages through the `gate()` function before processing
 - Validate all external input at system boundaries (HTTP endpoints, Slack payloads, config files) before acting on it
 - Error responses to external callers must not expose stack traces, internal paths, or sensitive data — log detail to stderr, return a generic message
+- Send the bot token only to `https://files.slack.com`. A URL taken from a Slack payload (such as a file's `url_private`) gets the Authorization header only if `isSlackHostedFileUrl` accepts it; fetch it with manual redirects and check each redirect target the same way before resending the header
 
 ## Naming Conventions
 
