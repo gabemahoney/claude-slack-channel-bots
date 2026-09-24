@@ -14,6 +14,7 @@ import {
   recordSuccess,
   getFailureCount,
   nextBackoffDelay,
+  doublingBackoffDelay,
   isAtCap,
   shouldNotifyCap,
   _resetBackoffState,
@@ -122,6 +123,46 @@ describe('nextBackoffDelay — exponential ladder (base from makeRoutingConfig)'
   ])('base=%p, preCount=%p → %p', (base, preCount, expected) => {
     for (let i = 0; i < preCount; i++) recordFailure('C1')
     expect(nextBackoffDelay('C1', base)).toBe(expected)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// doublingBackoffDelay — pure, stateless arithmetic
+//
+// Formula: min(base * 2^priorAttempts, ceiling). The ceiling is a parameter,
+// not the restart ladder's fixed 900. Slack retry-schedule rows (SR-3.2) are
+// covered by the retry-schedule tests, not here.
+// ---------------------------------------------------------------------------
+
+describe('doublingBackoffDelay — doubling per prior attempt, clamped to ceiling', () => {
+  // Table columns: [base, priorAttempts, ceiling, expected]. Two ceilings
+  // (900 and 300) prove the clamp is the argument, not a hard-coded constant.
+  test.each([
+    // ceiling 900, base BASE_S (60): same ladder as nextBackoffDelay
+    [BASE_S, 0, 900, BASE_S],        // 60
+    [BASE_S, 3, 900, BASE_S * 8],    // 480
+    [BASE_S, 4, 900, 900],           // 960 → clamped
+    // ceiling 300, base 7: 7·2^n, clamped at 300
+    [7, 0, 300, 7],
+    [7, 1, 300, 14],
+    [7, 5, 300, 224],
+    [7, 6, 300, 300],                // 448 → clamped
+    // exactly at the ceiling is returned as-is
+    [75, 2, 300, 300],               // 300
+    // very large count: 2^10000 overflows, result is still the ceiling
+    [BASE_S, 10_000, 900, 900],
+    [7, 10_000, 300, 300],
+  ])('base=%p, priorAttempts=%p, ceiling=%p → %p', (base, priorAttempts, ceiling, expected) => {
+    const delay = doublingBackoffDelay(base, priorAttempts, ceiling)
+    expect(delay).toBe(expected)
+    expect(Number.isFinite(delay)).toBe(true)
+  })
+
+  test('does not read or change the per-channel counters', () => {
+    recordFailure('C1')
+    expect(doublingBackoffDelay(BASE_S, 0, 900)).toBe(BASE_S)
+    expect(getFailureCount('C1')).toBe(1)
+    expect(nextBackoffDelay('C1', BASE_S)).toBe(BASE_S * 2)
   })
 })
 

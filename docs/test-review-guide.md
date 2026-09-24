@@ -32,6 +32,10 @@ When reviewing tests, check for:
 - [ ] No real network calls; file I/O only inside a `mkdtempSync` directory (see Isolation)
 - [ ] No `sleep` or timing-dependent assertions longer than 100ms
 - [ ] Capture arrays used to verify side effects (API calls, messages sent)
+- [ ] Persona and connection suites fake Slack with `makeStubSlack` from `tests/test-helpers/slack-stub.ts` and its event factories; a hand-rolled WebClient or SocketModeClient stub in such a suite is a defect
+- [ ] Slack failure cases use the stub's scripted outcomes with `leakMarker` set to `LEAK_SENTINEL`, and assert on the classification, not on the error text
+- [ ] Backoff, retry and timeout tests never wait in real time: pure schedules are called directly, timers and clocks are injected fakes, and a never-settling call is ended through the stub or the injected clock
+- [ ] `retryAfter` cases assert the wait is never shorter than `retryAfter`, converting seconds to milliseconds
 
 ### Credentials and Leak Checks
 - [ ] Every test that handles tokens or a credentials file runs `assertNoLeak` over all its captured log lines, errors and results, failure paths included; a missing call is a defect

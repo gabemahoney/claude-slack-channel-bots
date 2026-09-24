@@ -19,6 +19,8 @@ Each source module has a corresponding test file in the project root:
 | server.ts (permission relay) | permission-poller.test.ts, permission-click-handler.test.ts | SR-2.1 poller loop and Block Kit click handler |
 | persona-identity.ts | persona-identity.test.ts | persona key rule, derived identifiers, persona-name rendering |
 | persona-credentials.ts, persona-bringup.ts, persona-diagnostics.ts | persona-connections.test.ts | checkPersonaCredentials (valid, missing, unreadable and each invalid shape), checkPersonaWorkingDirectory (missing, not a directory, unreadable, unsearchable), checkPersonaLocalBringUp (both causes reported), real-path collisions with another applied persona, no environment token read, no file written, diagnostic class labels and line format (causes escaped to one line), success values that never print a token |
+| persona-slack-validation.ts, persona-retry-schedule.ts, persona-slack-episodes.ts | persona-connections.test.ts | classifySlackValidationError on each leg an outcome applies to (`auth.test`, `socket-mode` or both) and botIdentityFromAuthTest on the `auth.test` leg: up, Slack-unreachable (with reason) or credentials-refused for every scripted Slack outcome; createPersonaRetrySchedule (5 s doubling to 300 s, no cap, reset, per-persona isolation, `retryAfter` honoured); createSlackEpisodeTracker (one start line and one cleared line per episode, class changes, per-persona isolation) |
+| backoff.ts | backoff.test.ts | Per-channel failure counts, nextBackoffDelay, doublingBackoffDelay (doubling per prior attempt, clamped to the ceiling), isAtCap, shouldNotifyCap, per-channel isolation |
 
 New features that add significant logic should get their own test file (e.g., `session-manager.test.ts`).
 
@@ -81,6 +83,59 @@ Isolation (SR-13.2) applies to credentials files and working-directory fixtures 
 
 Permission cases (an unreadable credentials file, an unreadable or unsearchable working directory) inject a failing operation through the check's file-system seam, so they pass under root in docker CI. A variant that uses real permission bits is marked `test.skipIf(isRoot)`, with the reason in the test name. Restore any mode a test changed before `afterEach` removes the directory.
 
+### Slack Stub
+
+New persona and connection suites fake Slack with the shared helper `tests/test-helpers/slack-stub.ts`, not with hand-rolled WebClient or SocketModeClient stubs. `makeStubSlack(opts?)` builds one independent fake Slack for one persona. It has no module-scope state, network, file system, environment access or timers, and its error shapes follow the installed `@slack/web-api` and `@slack/socket-mode` libraries.
+
+| Member | What it gives a test |
+|--------|----------------------|
+| `identity` | The bot user ID, bot ID and team ID a successful `auth.test` returns. The bot user ID and bot ID default to random values, distinct per stub; the team ID defaults to a fixed value. Override them through `botUserId`, `botId` and `teamId`. |
+| `script` | Outcome queues `authTest`, `connect` (socket `start()`) and `post` (`chat.postMessage`). Seed them through the options of the same names, or push onto them at any time. Each call takes the next outcome; an empty queue means success. |
+| `calls` | Capture arrays of call arguments: `authTest`, `postMessage`, `update`, `reactionsAdd`, `reactionsRemove`, `conversationsOpen`, `usersInfo`. Every Web API client of the stub shares them. |
+| `web` | A ready Web API client with default options, for direct calls. |
+| `createWebClient(token?, options?)` | Builds a Web API client as the real constructor would; recorded in `options.web`. |
+| `createSocketClient(options?)` | Builds a socket client; recorded in `options.socket` and `sockets`. Throws on an empty app token, as the real constructor does. |
+| `options` | The options every client was built with, in build order (`web`, `socket`). |
+| `sockets`, `socket` | Every socket client built, and the latest one (`socket` throws if none was built). |
+
+The socket stub behaves like `SocketModeClient` with auto-reconnect off:
+
+- `start()` takes the next `connect` outcome and first runs the connect leg (`apps.connections.open`). A failure there (the Web API kinds, `no-url` or `reject`) rejects `start()` with no lifecycle event.
+- Otherwise `start()` emits `authenticated` and `connecting`, and the WebSocket phase settles on a later microtask according to the outcome. `startCalls` counts calls, and `start()` can be called again after a drop, so a test can drive a reopen.
+- `drop()` is Slack closing the connection, the case the connection manager reopens: it emits `close` and `disconnected`, and a `start()` still waiting for `hello` rejects with no value. `disconnect()` is the client's own close, which is not reopened: it is counted in `disconnectCalls` and emits `disconnecting`, then `close` (if a WebSocket phase ever began) and `disconnected`.
+- `deliver(event)` sends an Events API event and `deliverInteractive(payload)` an interactive payload, in the shape `server.ts` consumes. Both need a connected socket and resolve once every listener settles.
+- `acks` records each ack in order; `lifecycle` records every lifecycle event emitted, in order.
+
+**Scripted outcomes.** Each queue entry is one outcome kind:
+
+| Kind | Result |
+|------|--------|
+| `ok` | Success. On `auth.test` and `post`, an optional `result` is merged over the default response; a key set to `undefined` is removed. |
+| `platform` | A named Slack error (an `ok: false` answer) with that `error`, and an optional `retryAfter` in the response metadata. |
+| `network`, `dns`, `timeout`, `http`, `rate-limited` | Slack unreachable: a request error, an HTTP error with a status, or a rate-limited error with `retryAfter` in seconds. |
+| `no-url` | Connect only: `apps.connections.open` answered without a URL. `start()` rejects with a plain error on the connect leg, with no lifecycle event. |
+| `closed-before-hello`, `websocket-error` | Connect only: the WebSocket closes before `hello`. `start()` rejects with no value after `close` and `disconnected`; `websocket-error` emits `error` first. |
+| `never` | The call never settles. A pending `start()` ends only on `drop()` or `disconnect()`. |
+| `reject` | The call rejects with the given value exactly as given (a plain error, a string, `undefined` and so on). |
+
+Set `leakMarker` to `LEAK_SENTINEL` and every error the stub builds carries the marker wherever a real error can hold secrets: the message, the wrapped `original` error and its headers, HTTP headers and body, fields of `data`, and the error the socket's `error` event carries. `data.error` stays exactly as scripted, so classification still sees the real Slack error code.
+
+Not every failure carries the marker. A rejection with no value carries nothing: `closed-before-hello`, and the `start()` rejection after `websocket-error`. `reject` passes its value unchanged, so plant the sentinel in the value if the row needs it. Run `assertNoLeak` over what the code under test produced (see Credentials Fixtures and Leak Checks).
+
+**Event factories.** `makeChannelMessage`, `makeDm`, `makeBotMessage`, `makeWebhookPost` and `makeAppMention` build Slack events with defaults and overrides (a key set to `undefined` is removed). `mentionText(userId)` and `broadcastText(kind?)` build mention and broadcast text for message bodies; pass the stub's `identity.botUserId` to mention that stub's bot.
+
+**Reference example.** The `Slack validation classification (both legs, sentinel-bearing errors)` describe block in `tests/persona-connections.test.ts` is a table test. Each row scripts one outcome and runs it against a fresh sentinel-bearing stub on each leg it applies to: `auth.test`, `socket-mode` or both. It checks the class, the reason fields and `assertNoLeak` on everything captured.
+
+### Backoff and Retry Tests
+
+Backoff, retry and timeout tests never wait in real time.
+
+- **Pure schedules are called, not timed.** `createPersonaRetrySchedule` holds no timer and reads no clock: it returns the next wait. Tests drive it by calling `nextDelayMs` and asserting on the returned sequence, as the `backoff schedule` describe block does.
+- **Timers and clocks are injected.** Code that schedules a wait, or abandons a call that never settles, takes its clock and timers as parameters. Tests pass fakes and advance them; they never sleep past a real delay.
+- **Never-settling cases.** A `never` outcome stays pending for good, so the test ends it through the stub (`drop()`, `disconnect()`) or through the injected clock, never by waiting for it.
+- **`retryAfter` rows.** Script `retryAfter` values above and below the current step, and assert that the wait is never shorter than `retryAfter`. The outcome carries `retryAfter` in seconds and the schedule returns milliseconds, so convert before comparing. The `retryAfter` describe block is the reference.
+- **Leak checks still apply.** Every captured log line and error passes through `assertNoLeak`.
+
 ### Parametrization
 
 When 3+ tests follow the same structure with different inputs, collapse them with `test.each`:
@@ -105,8 +160,8 @@ Use `beforeEach` to reset module-scoped state between tests:
 
 ### Stubbing External Dependencies
 
-- **WebClient**: Create stub functions (e.g., `stubPostMessage`, `stubChatUpdate`) that record calls to a capture array and return mock responses
-- **SocketModeClient**: Simulate events by directly calling the handler logic with mock payloads
+- **WebClient**: Persona code uses the Slack stub's Web API clients and `calls` capture arrays (see Slack Stub). Pre-persona suites keep their local stub functions (e.g., `stubPostMessage`, `stubChatUpdate`) that record calls to a capture array and return mock responses, until E3 moves them over
+- **SocketModeClient**: Persona code uses the Slack stub's socket clients and event factories (see Slack Stub). Pre-persona suites keep simulating events by directly calling the handler logic with mock payloads, until E3
 - **server.ts side effects**: Cannot import server.ts in tests (module-scope side effects). Instead, replicate the relevant logic in a self-contained test server or test the extracted pure functions
 
 ### Module Mocks (mock.module)
@@ -200,7 +255,7 @@ When testing HTTP endpoints that live in server.ts, create a minimal Bun.serve()
 
 - Internal implementation details (private helper functions)
 - Exact log output (test behavior, not logging)
-- Timing-dependent behavior with real delays — use short configurable timeouts in tests
+- Timing-dependent behavior with real delays — inject the clock and timers (see Backoff and Retry Tests); older suites use short configurable timeouts
 - Test infrastructure itself (factories, stubs, reset helpers) — if a fixture breaks, the real tests that use it will fail anyway
 
 ## Keeping the Suite Lean

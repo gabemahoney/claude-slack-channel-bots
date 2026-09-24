@@ -99,6 +99,10 @@ Each successive failure doubles the restart delay, starting from `session_restar
 
 Formula: `min(base * 2^preFailureCount, 900)`. `nextBackoffDelay(channelId, baseDelaySeconds)` returns this value using the count recorded before the current failure attempt.
 
+The arithmetic is also exported statelessly as `doublingBackoffDelay(base, priorAttempts, ceiling)` for callers that keep their own attempt count; `nextBackoffDelay` delegates to it with the 900 s ceiling. The session-restart ladder above, its 5-failure cap and its per-channel counters are unchanged.
+
+Persona Slack-unreachable retries (b.av2 SR-3.2) use a separate schedule in `src/persona-retry-schedule.ts`: 5 s doubling to 300 s, no attempt cap, and never shorter than Slack's `retryAfter`. Create one schedule per persona and retry purpose with `createPersonaRetrySchedule`; don't use the per-channel counters for personas.
+
 #### Cap at 5 consecutive failures
 
 After 5 consecutive failures, `isAtCap(channelId, RESTART_FAILURE_CAP)` returns `true` (`RESTART_FAILURE_CAP = 5` is exported from `restart.ts` and referenced by `server.ts` and the health-check wiring — no hardcoded literal). Capped channels are skipped by the health-check tick — the poller calls `isAtCap` before `scheduleRestart` and skips the channel when it is true.

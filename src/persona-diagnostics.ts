@@ -18,8 +18,8 @@
  * emitting is the caller's job, through an injected `PersonaDiagnosticLogger`.
  * These lines never go to `startup-errors.log`, and no log file is added.
  *
- * The label set grows as later work lands (E2 Task 2: credentials-refused and
- * Slack-unreachable; E2 Task 3: connection lost/restored; later Epics theirs).
+ * The label set grows as later work lands (E2 Task 2 added credentials-refused
+ * and Slack-unreachable; E2 Task 3: connection lost/restored; later Epics theirs).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -39,6 +39,19 @@ export const PERSONA_CREDENTIALS_UNREADABLE = 'persona-credentials-unreadable'
 /** The credentials file was read but is not valid, or is another applied persona's file. */
 export const PERSONA_CREDENTIALS_INVALID = 'persona-credentials-invalid'
 
+/**
+ * Slack refused a token: a Web API platform error (`ok: false`) other than the
+ * transient ones, from `auth.test` (bot token) or the Socket Mode open (app
+ * token). The persona is credentials-broken.
+ */
+export const PERSONA_CREDENTIALS_REFUSED = 'persona-credentials-refused'
+
+/**
+ * Slack could not be reached while validating a token; retried with backoff
+ * (b.av2 SR-3.2). Logged when the cause starts and when it clears.
+ */
+export const PERSONA_SLACK_UNREACHABLE = 'persona-slack-unreachable'
+
 /** The working directory does not exist. */
 export const PERSONA_DIRECTORY_MISSING = 'persona-directory-missing'
 
@@ -50,6 +63,8 @@ export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_CREDENTIALS_MISSING,
   PERSONA_CREDENTIALS_UNREADABLE,
   PERSONA_CREDENTIALS_INVALID,
+  PERSONA_CREDENTIALS_REFUSED,
+  PERSONA_SLACK_UNREACHABLE,
   PERSONA_DIRECTORY_MISSING,
   PERSONA_DIRECTORY_UNUSABLE,
 ] as const

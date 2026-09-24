@@ -6,6 +6,9 @@
  * State is in-process only — lost on server restart by design (restart
  * re-runs startup reconcile, which gives each channel a fresh attempt).
  *
+ * The delay arithmetic itself is exported statelessly as
+ * `doublingBackoffDelay`, for callers that hold their own attempt count.
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -82,9 +85,36 @@ export function getFailureCount(channelId: string): number {
  *   5 → 900s  (1920 clamped)
  */
 export function nextBackoffDelay(channelId: string, baseDelaySeconds: number): number {
-  const preCount = getFailureCount(channelId)
-  const raw = baseDelaySeconds * Math.pow(2, preCount)
-  return Math.min(raw, 900)
+  return doublingBackoffDelay(baseDelaySeconds, getFailureCount(channelId), RESTART_BACKOFF_CEILING_S)
+}
+
+/** Ceiling of the restart backoff ladder (`nextBackoffDelay`), in seconds. */
+const RESTART_BACKOFF_CEILING_S = 900
+
+// ---------------------------------------------------------------------------
+// doublingBackoffDelay — pure delay arithmetic
+// ---------------------------------------------------------------------------
+
+/**
+ * Pure delay arithmetic: `base` doubled once per prior attempt, clamped to
+ * `ceiling`, i.e. `min(base * 2^priorAttempts, ceiling)`. Unit-agnostic: the
+ * result is in whatever unit `base` and `ceiling` are given in.
+ *
+ * Holds no state, so a caller that keeps its own attempt count (for example
+ * a per-persona retry schedule, b.av2 SR-3.2) can reuse it without touching
+ * this module's per-channel counters.
+ *
+ * Overflow-safe for a positive `base` and a finite `ceiling`: once
+ * `2^priorAttempts` overflows to `Infinity` the product is `Infinity` and
+ * the clamp returns `ceiling`, so any non-negative count (10 000 included)
+ * yields a finite value.
+ *
+ * Ladder for base=5, ceiling=300, priorAttempts 0..7:
+ *   5, 10, 20, 40, 80, 160, 300, 300
+ */
+export function doublingBackoffDelay(base: number, priorAttempts: number, ceiling: number): number {
+  const raw = base * Math.pow(2, priorAttempts)
+  return Math.min(raw, ceiling)
 }
 
 // ---------------------------------------------------------------------------
