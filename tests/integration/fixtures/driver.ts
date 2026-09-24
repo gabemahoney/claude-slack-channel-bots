@@ -4,7 +4,7 @@
  *
  * WHY A DRIVER INSTEAD OF THE FULL DAEMON
  * ---------------------------------------
- * The b.vub bug lives entirely in spawnForRoute / approvePreSessionDialogs.
+ * The b.vub bug lives entirely in spawnForPersona / approvePreSessionDialogs.
  * Launching the whole daemon non-dry-run requires real Slack credentials
  * (web.auth.test + Socket Mode) which CI does not have. But the exact code path
  * that shipped the bug — real agent-director + real tmux, a real
@@ -18,7 +18,7 @@
  * SCENARIO
  * --------
  *   Phase 1 (fresh spawn past the dialog):
- *     spawnForRoute() -> real AD spawns a tmux pane running stub-claude, which
+ *     spawnForPersona() -> real AD spawns a tmux pane running stub-claude, which
  *     prints the dev-channels dialog and blocks. approvePreSessionDialogs sees
  *     the needle, sends Enter, stub fires SessionStart -> AD row goes `waiting`.
  *     ASSERT: action != 'failed' AND AD status is a live state.
@@ -29,7 +29,7 @@
  *     ASSERT: state == 'missing' AND session_id present (resume is possible).
  *
  *   Phase 2 (resume past the dialog AGAIN — the regression):
- *     spawnForRoute() again -> collision -> get=missing -> resume -> stub-claude
+ *     spawnForPersona() again -> collision -> get=missing -> resume -> stub-claude
  *     re-prints the dialog. PRE-FIX: the resume path never called the approver,
  *     so the dialog stuck forever and the row stayed `missing`, producing the
  *     ErrTmuxSessionCreate respawn loop. POST-FIX: approvePreSessionDialogs runs
@@ -50,7 +50,9 @@ const PKG = process.env['CSCB_PKG_DIR'] ?? '/test-repo/node_modules/claude-slack
 const { runAgentDirectorStartupGate } = await import(`${PKG}/src/agent-director-startup.ts`)
 const { initOutageState } = await import(`${PKG}/src/outage-state.ts`)
 const { installSlackChannelBotTemplate } = await import(`${PKG}/src/agent-director-template.ts`)
-const { spawnForRoute, instanceIdFor } = await import(`${PKG}/src/session-manager.ts`)
+const { spawnForPersona } = await import(`${PKG}/src/session-manager.ts`)
+const { personaInstanceId } = await import(`${PKG}/src/persona-identity.ts`)
+const { routesToPersonaConfig } = await import(`${PKG}/src/route-persona-adapter.ts`)
 const { applyDefaults } = await import(`${PKG}/src/config.ts`)
 const { getClient } = await import(`${PKG}/src/agent-director-client.ts`)
 
@@ -91,11 +93,16 @@ async function main(): Promise<void> {
     bind: '127.0.0.1',
     port: 3100,
   })
+  // The spawn entry point is persona-keyed: run the route config through the
+  // route->persona adapter, whose stand-in key is the channel ID, so the
+  // instance ID stays cscb_<CHANNEL>.
+  const personaCfg = routesToPersonaConfig(cfg)
+  const persona = personaCfg.personas[0]
 
   // Real AD Client via the production startup gate (installs the singleton).
   await runAgentDirectorStartupGate()
 
-  // spawnForRoute goes through withSpawnDetection/withOutageDetection, which
+  // spawnForPersona goes through withSpawnDetection/withOutageDetection, which
   // need outage-state wired. Post-to-channel is log-only (no Slack in CI).
   initOutageState({
     getClient,
@@ -107,7 +114,7 @@ async function main(): Promise<void> {
   // Install the CSCB template (carries --dangerously-load-development-channels).
   await installSlackChannelBotTemplate(cfg)
 
-  const instanceId = instanceIdFor(CHANNEL)
+  const instanceId = personaInstanceId(persona.key)
 
   // Clean slate: remove any stale row/session from a prior run.
   try { await getClient().kill({ claude_instance_id: instanceId }) } catch { /* ignore */ }
@@ -116,8 +123,8 @@ async function main(): Promise<void> {
   // -------------------------------------------------------------------------
   // Phase 1 — fresh spawn must get PAST the dev-channels dialog.
   // -------------------------------------------------------------------------
-  const r1 = await spawnForRoute(CHANNEL, { cwd: CWD }, cfg, undefined, true)
-  if (r1.action === 'failed') driverFail(`phase1 spawnForRoute returned failed`)
+  const r1 = await spawnForPersona(persona, personaCfg, undefined, true)
+  if (r1.action === 'failed') driverFail(`phase1 spawnForPersona returned failed`)
 
   const s1 = await waitForLive(instanceId, 30_000)
   if (!LIVE_STATES.has(s1)) {
@@ -184,8 +191,8 @@ async function main(): Promise<void> {
   // -------------------------------------------------------------------------
   // Phase 2 — the regression: resume must drive PAST the dialog again.
   // -------------------------------------------------------------------------
-  const r2 = await spawnForRoute(CHANNEL, { cwd: CWD }, cfg, undefined, true)
-  if (r2.action === 'failed') driverFail(`phase2 spawnForRoute returned failed (resume did not recover)`)
+  const r2 = await spawnForPersona(persona, personaCfg, undefined, true)
+  if (r2.action === 'failed') driverFail(`phase2 spawnForPersona returned failed (resume did not recover)`)
 
   const s2 = await waitForLive(instanceId, 30_000)
   if (!LIVE_STATES.has(s2)) {

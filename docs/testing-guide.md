@@ -42,16 +42,27 @@ makeServer() — minimal MCP server stub
 
 Always use factory functions instead of hardcoding fixture values in individual tests. When a new field is added to a type, update the factory function — all tests automatically pick up the default.
 
-New persona-loader tests use the shared persona-config helper, `tests/test-helpers/persona-config.ts`, instead of local route factories. Route-loader tests keep using the route helpers until E3 removes the route loader:
+New persona-loader tests, and new tests of persona-keyed code such as `spawnForPersona`, `startupSessionManager` and `launchSession` in `src/session-manager.ts`, use the shared persona-config helper, `tests/test-helpers/persona-config.ts`, instead of local route factories. Route-loader tests and tests of code still keyed by route keep using the route helpers until E3 removes the route loader:
 
 ```
 makePersona(overrides?, baseDir?) — one PersonaInput entry in file form; default paths sit under baseDir
 makePersonaConfigInput(overrides?, baseDir?) — a PersonaConfigInput file-form config with one default persona
 makePersonaConfig(overrides?, baseDir?) — a resolved PersonaConfig, as loadPersonaConfig returns it, except mcp_config_path (see below)
+makeMultiPersonaConfig(specs, baseDir, overrides?) — a resolved PersonaConfig with one persona per PersonaSpec, in order
+makeStandInPersonaConfig(personas, baseDir, overrides?) — makeMultiPersonaConfig for stand-in personas keyed by channel ID, as the route→persona adapter builds them
 writeConfigFile(dir, input) — writes input as JSON to <dir>/config.json and returns the path
 ```
 
-`baseDir` defaults to the OS temp directory; pass the test's own `mkdtempSync` directory when paths must exist or be unique to the test. `writeConfigFile` writes only into the caller-supplied temp directory and has no default location. Pass `loadPersonaConfig` a temp home as well, so `~` never expands to the real home. Remove both the temp directory and the temp home in `afterEach`.
+Use `makeMultiPersonaConfig` when a test needs several personas. Each `PersonaSpec` is any resolved `Persona` field except `index`; `overrides` sets the server-wide fields as for `makePersonaConfig`.
+
+- It runs no validation, so a stand-in persona can set `key` to a channel ID directly.
+- Each persona defaults to its own `all` channel, with prompts to that channel and DMs off. A spec with no channels gets `permission_prompts: 'dm'` but DMs still off, a pair the loader rejects; set `dm` in that spec yourself.
+- It throws when two personas share a name or a key.
+- `baseDir` is required; pass the test's `mkdtempSync` directory.
+
+Use `makeStandInPersonaConfig` for code fed by the interim route→persona adapter. Each record key is a channel ID that becomes the persona's `name` and `key`, its one `all` channel and its `permission_prompts` target; the record value sets further fields such as `working_directory`. Personas keep record order, and everything else, including the required `baseDir`, is as for `makeMultiPersonaConfig`.
+
+For the other helpers, `baseDir` defaults to the OS temp directory; pass the test's own `mkdtempSync` directory when paths must exist or be unique to the test. `writeConfigFile` writes only into the caller-supplied temp directory and has no default location. Pass `loadPersonaConfig` a temp home as well, so `~` never expands to the real home. Remove both the temp directory and the temp home in `afterEach`.
 
 `makePersonaConfig` puts `mcp_config_path` under `baseDir`, but the loader defaults it to `~/.claude/slack-mcp.json` under the home you pass. When comparing against loader output, override `mcp_config_path` with the loader's value (e.g. `join(home, '.claude', 'slack-mcp.json')`).
 

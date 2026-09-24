@@ -3,8 +3,13 @@
  * approvePreSessionDialogs exercising the TRUST needle specifically (b.4ie).
  *
  * The session-manager.test.ts block covers the dev-channels needle via
- * spawnForRoute. This file calls approvePreSessionDialogs directly to give
+ * spawnForPersona. This file calls approvePreSessionDialogs directly to give
  * focused coverage of the trust-folder path.
+ *
+ * approvePreSessionDialogs takes a persona key (b.av2 SR-2.2): every AD call
+ * addresses `cscb_<key>` and the raw-tmux fallback targets `slack_bot_<key>`.
+ * A plain key like `C` keeps the `cscb_C` expectations; `ops_bot` shows the
+ * key passed, not a channel, selects the instance.
  *
  * Same mocked getClient() via setClientForTests / makeStubClient.
  * Same captureStartupErrors / SLACK_STATE_DIR pattern for recordStartupError assertions.
@@ -32,6 +37,7 @@ import {
   _resetDialogDeadGracePolls,
 } from '../src/session-manager.ts'
 import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
+import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
 import { initOutageState, _resetOutageState } from '../src/outage-state.ts'
 import {
   cannedOk,
@@ -109,12 +115,18 @@ describe('approvePreSessionDialogs (trust needle, b.4ie)', () => {
   // Case 1: Trust needle present while pending → Enter sent, then session live
   // -------------------------------------------------------------------------
 
-  test('trust needle present while pending → Enter sent (allow_pending true, id cscb_C); statusQueue reaches waiting → returns; no startup error', async () => {
+  // Run for a stand-in persona keyed by its channel ID and for a named persona
+  // key (b.av2 SR-2.2): every verb addresses cscb_<key> either way.
+  test.each(['C', 'ops_bot'])('trust needle present while pending → Enter sent (allow_pending true, id cscb_%s); statusQueue reaches waiting → returns; no startup error', async (key) => {
+    const id = personaInstanceId(key)
+    expect(id).toBe(`cscb_${key}`)
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+    const statusCalls: import('agent-director').StatusParams[] = []
     installStub({
       sendKeysCalls,
       readPaneCalls,
+      statusCalls,
       // pending first → Enter gets pressed; then waiting → function returns
       statusQueue: [
         cannedOk({ state: 'pending' }),
@@ -127,21 +139,23 @@ describe('approvePreSessionDialogs (trust needle, b.4ie)', () => {
     })
     const readLog = captureStartupErrors()
 
-    await approvePreSessionDialogs('C', undefined, true)
+    await approvePreSessionDialogs(key, undefined, true)
 
     // Enter sent once with allow_pending:true and correct instance id
     expect(sendKeysCalls).toHaveLength(1)
     expect(sendKeysCalls[0].text).toBe('')
     expect(sendKeysCalls[0].allow_pending).toBe(true)
-    expect(sendKeysCalls[0].claude_instance_id).toBe('cscb_C')
+    expect(sendKeysCalls[0].claude_instance_id).toBe(id)
 
-    // readPane called with n_lines 40, allow_pending true, correct instance id
-    expect(readPaneCalls.length).toBeGreaterThanOrEqual(1)
+    // One readPane (the needle), with n_lines 40, allow_pending true, correct instance id
+    expect(readPaneCalls.map((c) => c.claude_instance_id)).toEqual([id])
     for (const r of readPaneCalls) {
-      expect(r.claude_instance_id).toBe('cscb_C')
       expect(r.n_lines).toBe(40)
       expect(r.allow_pending).toBe(true)
     }
+
+    // Every status poll addresses the persona's cscb_<key> instance
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([id, id])
 
     // No startup error recorded
     expect(readLog()).toBe('')
@@ -188,7 +202,22 @@ describe('approvePreSessionDialogs (trust needle, b.4ie)', () => {
     expect(sendKeysCalls).toHaveLength(0)
     const log = readLog()
     expect(log).toContain('[dev-channels-approve-not-ready]')
-    expect(log).toContain('channel=C')
+    // Default persona reference in the message (the log names the persona key)
+    expect(log).toContain('persona=C')
+  })
+
+  test('cap hit with an explicit persona reference → the recorded message names that reference', async () => {
+    installStub({
+      statusResult: { state: 'pending' },
+      readPaneResults: [{ pane: 'unrelated pane text' }],
+    })
+    const readLog = captureStartupErrors()
+
+    await approvePreSessionDialogs('ops_bot', undefined, true, '"Ops Bot" (key=ops_bot)')
+
+    const log = readLog()
+    expect(log).toContain('[dev-channels-approve-not-ready]')
+    expect(log).toContain('"Ops Bot" (key=ops_bot)')
   })
 
   // -------------------------------------------------------------------------
@@ -199,7 +228,8 @@ describe('approvePreSessionDialogs (trust needle, b.4ie)', () => {
     // b.vub: dead rows are driven via raw tmux; with no needle in the raw pane
     // and grace=1, the ended poll exhausts the grace and records the death.
     _setDialogDeadGracePolls(1)
-    _setTmuxCapturePane(async () => 'no trust needle here')
+    const capturedSessions: string[] = []
+    _setTmuxCapturePane(async (session) => { capturedSessions.push(session); return 'no trust needle here' })
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     installStub({
       sendKeysCalls,
@@ -214,8 +244,44 @@ describe('approvePreSessionDialogs (trust needle, b.4ie)', () => {
     await approvePreSessionDialogs('C', undefined, true)
 
     expect(sendKeysCalls).toHaveLength(0)
+    // The raw-tmux fallback read the persona's slack_bot_<key> session
+    expect(capturedSessions).toEqual(['slack_bot_C'])
     const log = readLog()
     expect(log).toContain('[dev-channels-approve-spawn-died]')
+  })
+
+  // -------------------------------------------------------------------------
+  // Persona key selects the instance (b.av2 SR-2.2)
+  // -------------------------------------------------------------------------
+
+  test('raw-tmux fallback (dead row + trust needle): Enter goes to slack_bot_<key>, never through AD send-keys', async () => {
+    const capturedSessions: string[] = []
+    const enterSessions: string[] = []
+    _setTmuxCapturePane(async (session) => { capturedSessions.push(session); return TRUST_PANE })
+    _setTmuxSendEnter(async (session) => { enterSessions.push(session) })
+    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
+    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
+    installStub({
+      sendKeysCalls,
+      readPaneCalls,
+      // resumed row: missing while the dialog blocks SessionStart, then live
+      statusQueue: [
+        cannedOk({ state: 'missing' }),
+        cannedOk({ state: 'waiting' }),
+      ],
+    })
+    const readLog = captureStartupErrors()
+
+    await approvePreSessionDialogs('ops_bot', undefined, true)
+
+    const session = personaTmuxSessionName('ops_bot')
+    expect(session).toBe('slack_bot_ops_bot')
+    expect(capturedSessions).toEqual([session])
+    expect(enterSessions).toEqual([session])
+    // AD refuses a dead row, so the fallback never used AD read-pane/send-keys
+    expect(readPaneCalls).toHaveLength(0)
+    expect(sendKeysCalls).toHaveLength(0)
+    expect(readLog()).toBe('')
   })
 
   // -------------------------------------------------------------------------

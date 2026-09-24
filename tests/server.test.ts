@@ -1,4 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   gate,
   assertSendable,
@@ -39,6 +42,9 @@ import {
 } from '../src/session-manager.ts'
 import type { WebClient } from '@slack/web-api'
 import type { FindMissingParams, SendKeysParams, StatusParams } from 'agent-director'
+import type { PersonaConfig } from '../src/config.ts'
+import { personaInstanceId } from '../src/persona-identity.ts'
+import { makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -615,36 +621,55 @@ describe('defaultAccess', () => {
 describe('_buildIsSessionAliveAdapter', () => {
   type Emission = { channelId: string; text: string }
 
+  /** Per-test temp dir: `baseDir` for the stand-in persona fixtures. */
+  let baseDir: string
+
+  beforeEach(() => {
+    baseDir = mkdtempSync(join(tmpdir(), 'cscb-server-'))
+  })
+
+  /** One stand-in persona per key (the channel ID under the route->persona adapter), in order. */
+  function standIns(...keys: string[]): PersonaConfig {
+    return makeStandInPersonaConfig(Object.fromEntries(keys.map((k) => [k, {}])), baseDir)
+  }
+
   /** Build per-test emission capture + stub client + outage-state harness. */
-  function makeHarness(statusError?: Error, statusState?: string): {
+  function makeHarness(
+    statusError?: Error,
+    statusState?: string,
+    config: PersonaConfig | null = standIns('C1'),
+  ): {
     emissions: Emission[]
+    statusCalls: StatusParams[]
     adapter: (channelId: string) => Promise<boolean>
   } {
     const emissions: Emission[] = []
+    const statusCalls: StatusParams[] = []
     _resetOutageState()
     initOutageState({
       postToChannel: (channelId, text) => { emissions.push({ channelId, text }) },
       getClient: () => makeStubClient() as unknown as Client,
     })
     const stubOpts = statusError
-      ? { statusError }
-      : { statusResult: { state: statusState ?? 'waiting' } }
+      ? { statusError, statusCalls }
+      : { statusResult: { state: statusState ?? 'waiting' }, statusCalls }
     setClientForTests(makeStubClient(stubOpts) as unknown as Client)
-    // Minimal routing config: channel C1 is routed
-    const fakeConfig = { routes: { C1: { normalizedName: 'test-channel' } } }
+    // Default persona config: one stand-in persona keyed C1 (the channel ID).
     return {
       emissions,
-      adapter: _buildIsSessionAliveAdapter(() => fakeConfig as any),
+      statusCalls,
+      adapter: _buildIsSessionAliveAdapter(() => config),
     }
   }
 
   afterEach(() => {
     resetClientForTests()
     _resetOutageState()
+    rmSync(baseDir, { recursive: true, force: true })
   })
 
   test('1. alive: status returns live state → clears ad-unreachable + tmux-unavailable; returns true', async () => {
-    const { emissions, adapter } = makeHarness(undefined, 'waiting')
+    const { emissions, statusCalls, adapter } = makeHarness(undefined, 'waiting')
     // Pre-raise both flags so the clears are observable
     setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
     setOutageFlag('C1', 'tmux-unavailable')
@@ -653,6 +678,10 @@ describe('_buildIsSessionAliveAdapter', () => {
     const result = await adapter('C1')
 
     expect(result).toBe(true)
+    // b.av2 SR-2.2: the probe addresses the persona's cscb_<key> instance.
+    expect(statusCalls).toHaveLength(1)
+    expect(statusCalls[0].claude_instance_id).toBe(personaInstanceId('C1'))
+    expect(statusCalls[0].claude_instance_id).toBe('cscb_C1')
     expect(getOutageFlags('C1').size).toBe(0)
     const newEmissions = emissions.slice(before)
     expect(newEmissions).toHaveLength(1)
@@ -663,7 +692,7 @@ describe('_buildIsSessionAliveAdapter', () => {
   })
 
   test('2. ErrSpawnNotFound: status throws → clears ad-unreachable + tmux-unavailable; returns false', async () => {
-    const { emissions, adapter } = makeHarness(
+    const { emissions, statusCalls, adapter } = makeHarness(
       new ErrSpawnNotFound('status', 'ErrSpawnNotFound', 'spawn not found'),
     )
     setOutageFlag('C1', 'ad-unreachable', '/bin/ad')
@@ -673,6 +702,7 @@ describe('_buildIsSessionAliveAdapter', () => {
     const result = await adapter('C1')
 
     expect(result).toBe(false)
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
     expect(getOutageFlags('C1').size).toBe(0)
     const newEmissions = emissions.slice(before)
     expect(newEmissions).toHaveLength(1)
@@ -683,13 +713,14 @@ describe('_buildIsSessionAliveAdapter', () => {
 
   test('3. ErrSystemInstallDisappeared: status throws → sets ad-unreachable with binaryPath as detail; returns false', async () => {
     const binaryPath = '/home/horde/.agent-director/bin/agent-director'
-    const { emissions, adapter } = makeHarness(
+    const { emissions, statusCalls, adapter } = makeHarness(
       new ErrSystemInstallDisappeared('status', binaryPath),
     )
 
     const result = await adapter('C1')
 
     expect(result).toBe(false)
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
     expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
     expect(getOutageFlags('C1').has('tmux-unavailable')).toBe(false)
     expect(emissions).toHaveLength(1)
@@ -699,13 +730,14 @@ describe('_buildIsSessionAliveAdapter', () => {
   })
 
   test('4. ErrTmuxNotAvailable: status throws → sets tmux-unavailable (no detail); returns false', async () => {
-    const { emissions, adapter } = makeHarness(
+    const { emissions, statusCalls, adapter } = makeHarness(
       new ErrTmuxNotAvailable('status', 'ErrTmuxNotAvailable', 'tmux not found'),
     )
 
     const result = await adapter('C1')
 
     expect(result).toBe(false)
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1'])
     expect(getOutageFlags('C1').has('tmux-unavailable')).toBe(true)
     expect(getOutageFlags('C1').has('ad-unreachable')).toBe(false)
     expect(emissions).toHaveLength(1)
@@ -713,6 +745,39 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(emissions[0].text).toMatch(/tmux unavailable/)
     // ONSET_TEMPLATES['tmux-unavailable'] ignores the detail arg — nothing extra
     expect(emissions[0].text).not.toContain('undefined')
+  })
+
+  test('5. each persona is probed by its own key: cscb_<key> for the key passed (b.av2 SR-2.2)', async () => {
+    const { statusCalls, adapter } = makeHarness(undefined, 'waiting', standIns('C1', 'C2'))
+
+    expect(await adapter('C2')).toBe(true)
+    expect(await adapter('C1')).toBe(true)
+
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([
+      personaInstanceId('C2'),
+      personaInstanceId('C1'),
+    ])
+  })
+
+  test('6. unknown key: returns false without a status call and without touching outage flags', async () => {
+    const { emissions, statusCalls, adapter } = makeHarness(undefined, 'waiting')
+    setOutageFlag('C9', 'ad-unreachable', '/bin/ad')
+    const before = emissions.length
+
+    const result = await adapter('C9')
+
+    expect(result).toBe(false)
+    expect(statusCalls).toHaveLength(0)
+    // No probe ran, so nothing was cleared and no all-clear was posted.
+    expect(getOutageFlags('C9').has('ad-unreachable')).toBe(true)
+    expect(emissions.slice(before)).toHaveLength(0)
+  })
+
+  test('7. no persona config (MCP_HOST/MCP_PORT fallback): returns false without a status call', async () => {
+    const { statusCalls, adapter } = makeHarness(undefined, 'waiting', null)
+
+    expect(await adapter('C1')).toBe(false)
+    expect(statusCalls).toHaveLength(0)
   })
 })
 
@@ -773,9 +838,10 @@ describe('_buildReconnectSessionAdapter', () => {
     // between the two send-keys attempts. Stub it so the dead-session path
     // (double ErrTmuxSendKeys) never touches a live tmux server.
     _setTmuxServerEnsurer(async () => {})
-    const fakeConfig = { routes: { C1: { normalizedName: 'test-channel' } } }
     return {
-      adapter: _buildReconnectSessionAdapter(() => fakeConfig as any, {} as unknown as WebClient),
+      // The builder resolves the instance ID from the persona key alone
+      // (b.av2 SR-2.2); it takes no config getter.
+      adapter: _buildReconnectSessionAdapter({} as unknown as WebClient),
       statusCalls,
       sendKeysCalls,
       findMissingCalls,
@@ -802,8 +868,10 @@ describe('_buildReconnectSessionAdapter', () => {
     const result = await adapter('C1')
 
     expect(result).toBe('transient')
-    // The probe ran...
+    // The probe ran against the persona's cscb_<key> instance...
     expect(statusCalls).toHaveLength(1)
+    expect(statusCalls[0].claude_instance_id).toBe(personaInstanceId('C1'))
+    expect(statusCalls[0].claude_instance_id).toBe('cscb_C1')
     // ...but the working-state defer short-circuited before reconnectMcp — no
     // `/mcp reconnect` was typed into the pane.
     expect(sendKeysCalls).toHaveLength(0)
@@ -821,6 +889,9 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(statusCalls).toHaveLength(1)
     expect(sendKeysCalls).toHaveLength(1)
     expect(sendKeysCalls[0].text).toContain('/mcp reconnect')
+    // Both the probe and the reconnect address cscb_<key>.
+    expect(statusCalls[0].claude_instance_id).toBe('cscb_C1')
+    expect(sendKeysCalls[0].claude_instance_id).toBe('cscb_C1')
     // b.9a7: the success path never escalates, so no sweep fires.
     expect(findMissingCalls).toHaveLength(0)
   })
@@ -856,9 +927,20 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(statusCalls).toHaveLength(1)
     // Two send-keys attempts (original + one self-heal retry) both threw.
     expect(sendKeysCalls).toHaveLength(2)
+    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C1', 'cscb_C1'])
     // The escalate-dead branch fires sweepDeadTmuxChannel → the memoized
     // reconcileMissingSweep → exactly ONE client.findMissing({}). No direct new
     // findMissing call site; the memoized helper is the only sweep mechanism.
     expect(findMissingCalls).toHaveLength(1)
+  })
+
+  test('(v) the key passed selects the instance: a non-channel-form key probes and reconnects cscb_<key> (b.av2 SR-2.2)', async () => {
+    const { adapter, statusCalls, sendKeysCalls } = makeHarness({ statusState: 'waiting' })
+
+    const result = await adapter('ops_bot')
+
+    expect(result).toBe('success')
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId('ops_bot')])
+    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_ops_bot'])
   })
 })

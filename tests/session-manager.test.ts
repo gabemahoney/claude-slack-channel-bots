@@ -1,12 +1,16 @@
 /**
  * session-manager.test.ts — Library-backed session-manager tests.
  *
- * Replaces the deleted tmux-direct test suite. Drives spawnForRoute via the
+ * Replaces the deleted tmux-direct test suite. Drives spawnForPersona via the
  * agent-director-stub (no real FFI). Coverage:
  *
- *   - Fresh-spawn happy path: emits SpawnParams matching SR-1.1
- *     (relay_mode='on', service=cscb + channel labels, template name,
- *     correct claude_instance_id and tmux_session_name).
+ *   - Fresh-spawn happy path: emits SpawnParams matching SR-1.1 and the
+ *     persona identity of b.av2 SR-2.2 (relay_mode='on', template name,
+ *     `cscb_<key>` / `slack_bot_<key>`, the `service` / `persona` /
+ *     `config_dir` labels plus the interim `channel` label, and the persona
+ *     spawn environment).
+ *   - The real-path `config_dir` label (b.av2 SR-1.5, SR-2.2).
+ *   - AC 3: one persona listed in two channels is spawned exactly once.
  *   - SR-1.4 idempotency: ErrInstanceIdCollision → client.get(); each state
  *     drives the documented branch.
  *   - SR-1.6 orphan reconciliation: list-then-kill-then-delete for spawns
@@ -14,26 +18,26 @@
  *   - SR-8.6 invariant: every successful spawn call site passes
  *     relay_mode='on'.
  *
+ * Most blocks use a stand-in persona keyed by its channel ID (the shape the
+ * E3 route→persona adapter produces), so their `cscb_<channelId>` ids, outage
+ * keys and notice channels are unchanged.
+ *
  * SPDX-License-Identifier: MIT
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, existsSync } from 'fs'
-import { tmpdir } from 'os'
+import { mkdirSync, mkdtempSync, readFileSync, existsSync, realpathSync, rmSync, symlinkSync } from 'fs'
+import { homedir, tmpdir } from 'os'
 import { join } from 'path'
 import {
-  reconcileInstanceIds,
   reconcileOrphans,
-  refreshRouteNameFromEvent,
-  resolveChannelNames,
   reconnectMcp,
   waitForWaitingAndReconnect,
   approvePreSessionDialogs,
-  spawnForRoute,
+  spawnForPersona,
   startupSessionManager,
   launchSession,
-  instanceIdFor,
-  tmuxSessionNameFor,
+  personaConfigDirLabelValue,
   AGENT_DIRECTOR_LIVE_STATES,
   DEV_CHANNELS_DIALOG_NEEDLE,
   TRUST_DIALOG_NEEDLE,
@@ -57,7 +61,12 @@ import {
   _resetTmuxDialogHelpers,
   _setDialogDeadGracePolls,
   _resetDialogDeadGracePolls,
+  _setSpawnHomeDir,
+  _resetSpawnHomeDir,
 } from '../src/session-manager.ts'
+import { type Persona, type PersonaConfig, resolveRealPath } from '../src/config.ts'
+import { configDirLabelValue, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
+import { routesToPersonaConfig } from '../src/route-persona-adapter.ts'
 import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
 import {
   cannedGetResult,
@@ -79,6 +88,7 @@ import {
   type StubClient,
 } from './test-helpers/agent-director-stub.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
+import { makeMultiPersonaConfig, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
 import { messagesSince } from './test-helpers/archive-db.ts'
 import {
   initOutageState,
@@ -102,6 +112,43 @@ function installStub(opts?: Parameters<typeof makeStubClient>[0]): StubClient {
   return stub
 }
 
+/**
+ * Per-test temp directory: `baseDir` for the persona fixtures and the parent
+ * of any working, config or home directory a test creates. Removed in afterEach.
+ */
+let fixtureDir: string
+
+/** The applied persona with `key`; fails the test when there is none. */
+function personaOf(config: PersonaConfig, key: string): Persona {
+  const persona = config.personas.find((p) => p.key === key)
+  if (!persona) throw new Error(`test fixture has no persona with key ${key}`)
+  return persona
+}
+
+/**
+ * Point SLACK_STATE_DIR at `<fixtureDir>/state` for this test and return a
+ * reader for the startup-errors.log recorded there. The directory goes with
+ * fixtureDir in afterEach, which also restores the environment.
+ */
+function captureStartupErrors(): () => string {
+  const dir = join(fixtureDir, 'state')
+  process.env['SLACK_STATE_DIR'] = dir
+  const logPath = join(dir, 'startup-errors.log')
+  return () => (existsSync(logPath) ? readFileSync(logPath, 'utf-8') : '')
+}
+
+/**
+ * Create a temp home `<fixtureDir>/<name>` holding `.claude` and make the spawn
+ * path resolve an unset claude_config_dir against it (`_setSpawnHomeDir`,
+ * reset in afterEach), so no label depends on the process home. Returns it.
+ */
+function useSpawnHome(name = 'home'): string {
+  const home = fixtureSubdir(name)
+  mkdirSync(join(home, '.claude'))
+  _setSpawnHomeDir(home)
+  return home
+}
+
 /** Capture of outage-state Slack emissions (onsets + all-clears) across each test. */
 let outageEmissions: Array<{ channelId: string; text: string }> = []
 
@@ -109,6 +156,7 @@ let savedEnv: NodeJS.ProcessEnv
 
 beforeEach(() => {
   savedEnv = { ...process.env }
+  fixtureDir = mkdtempSync(join(tmpdir(), 'cscb-sm-'))
   // Keep dialog approval polling tight so the merged approvePreSessionDialogs
   // running on every fresh-spawn doesn't add seconds to the suite. Individual
   // tests can override these as needed.
@@ -146,7 +194,9 @@ afterEach(() => {
   _resetTmuxDialogHelpers()
   _resetDialogDeadGracePolls()
   _resetOutageState()
+  _resetSpawnHomeDir()
   process.env = savedEnv as NodeJS.ProcessEnv
+  rmSync(fixtureDir, { recursive: true, force: true })
 })
 
 // ---------------------------------------------------------------------------
@@ -171,86 +221,331 @@ function preSetAllFlags(channelId: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// SR-1.1 — fresh spawn shape
+// SR-1.1 / b.av2 SR-2.2 — fresh spawn parameters
 // ---------------------------------------------------------------------------
 //
+// Spawns are keyed by persona: `cscb_<key>`, `slack_bot_<key>`, the labels
+// `service=cscb`, `persona=<key>`, `config_dir=<12 hex of the REAL effective
+// claude_config_dir>` and the interim `channel=<key>` (removed in E3 Task 6),
+// and the env `CSCB_PERSONA` / `CLAUDE_MANAGED_CHANNEL` (the key),
+// `CSCB_CRONTABLE_PATH`, and `CLAUDE_CONFIG_DIR` only when a directory is
+// configured.
+//
 // extra_env always carries CSCB_CRONTABLE_PATH — the resolved, absolute
-// cron_table_path from the RoutingConfig — for every route, whether or not a
-// (per-route or top-level) claude_config_dir is present. buildSpawnParams
+// cron_table_path from the config — for every persona, whether or not a
+// (per-persona or top-level) claude_config_dir is present. buildSpawnParams
 // copies the field verbatim; it never recomputes or re-resolves the path, so a
 // distinctive absolute override on the config must appear untouched in
 // extra_env (see the pass-through test below).
 //
 // There is deliberately no "cron_table_path missing" case here: cron_table_path
-// is a required field on the resolved RoutingConfig type, and the env-var
-// fallback server mode has no RoutingConfig at all — server.ts guards every
-// spawn on `if (routingConfig)`, so buildSpawnParams is never reached without
-// one. A missing-field case is therefore unrepresentable, not merely untested.
-describe('spawnForRoute: SR-1.1 fresh spawn', () => {
-  test('emits SpawnParams with the SR-1.1 shape', async () => {
+// is a required field on the resolved config type, and the env-var fallback
+// server mode has no config at all — server.ts guards every spawn on a loaded
+// config, so buildSpawnParams is never reached without one. A missing-field
+// case is therefore unrepresentable, not merely untested.
+
+/** Create `name` under the per-test fixture dir and return its path. */
+function fixtureSubdir(name: string): string {
+  const dir = join(fixtureDir, name)
+  mkdirSync(dir, { recursive: true })
+  return dir
+}
+
+/** Expected `config_dir=` label for a configured directory that exists. */
+function configDirLabelFor(dir: string): string {
+  return `config_dir=${configDirLabelValue(realpathSync(dir))}`
+}
+
+describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
+  test('emits SpawnParams with the persona instance id, tmux name, exact labels and env', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     installStub({ spawnCalls })
-    const cfg = makeRoutingConfig({
-      routes: {
-        C012345: { cwd: '/repo/x' },
-      },
-      claude_config_dir: '/home/u/.claude-corp',
-    })
-    const result = await spawnForRoute('C012345', { cwd: '/repo/x' }, cfg)
-    expect(result.action).toBe('spawned')
+    const configDir = fixtureSubdir('claude-corp')
+    const workDir = fixtureSubdir('work')
+    const cfg = makeMultiPersonaConfig(
+      [{ name: 'Ops Bot', working_directory: workDir, claude_config_dir: configDir }],
+      fixtureDir,
+    )
+    const key = personaKey('Ops Bot')
+    expect(key).not.toBe('Ops Bot') // the name needs normalisation, so name and key differ
+
+    const result = await spawnForPersona(personaOf(cfg, key), cfg)
+
+    expect(result).toEqual({ key, action: 'spawned' })
     expect(spawnCalls).toHaveLength(1)
     const params = spawnCalls[0]
     expect(params.template).toBe('slack-channel-bot')
-    expect(params.cwd).toBe('/repo/x')
-    expect(params.claude_instance_id).toBe('cscb_C012345')
-    expect(params.tmux_session_name).toBe('slack_bot_C012345')
+    expect(params.cwd).toBe(workDir)
+    expect(params.claude_instance_id).toBe(`cscb_${key}`)
+    expect(params.tmux_session_name).toBe(`slack_bot_${key}`)
     expect(params.relay_mode).toBe('on')
-    expect(params.label).toEqual(['service=cscb', 'channel=C012345'])
-    expect(params.extra_env).toEqual({ CLAUDE_CONFIG_DIR: '/home/u/.claude-corp', CLAUDE_MANAGED_CHANNEL: 'C012345', CSCB_CRONTABLE_PATH: '/tmp/test-crontab' })
+    expect(params.label).toEqual(['service=cscb', `persona=${key}`, configDirLabelFor(configDir), `channel=${key}`])
+    expect(params.extra_env).toEqual({
+      CLAUDE_CONFIG_DIR: configDir,
+      CSCB_PERSONA: key,
+      CLAUDE_MANAGED_CHANNEL: key,
+      CSCB_CRONTABLE_PATH: cfg.cron_table_path,
+    })
     expect(params.claude_args).toBeUndefined()
   })
 
-  test('per-route claude_config_dir wins over top-level', async () => {
+  test('no claude_config_dir configured → CLAUDE_CONFIG_DIR absent (not empty), label is that of <home>/.claude', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     installStub({ spawnCalls })
-    const cfg = makeRoutingConfig({
-      routes: {
-        C: { cwd: '/repo', claude_config_dir: '/per-route' },
-      },
-      claude_config_dir: '/top-level',
-    })
-    await spawnForRoute('C', { cwd: '/repo' }, cfg)
-    expect(spawnCalls[0].extra_env).toEqual({ CLAUDE_CONFIG_DIR: '/per-route', CLAUDE_MANAGED_CHANNEL: 'C', CSCB_CRONTABLE_PATH: '/tmp/test-crontab' })
+    const home = useSpawnHome()
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    expect(cfg.claude_config_dir).toBeUndefined()
+
+    await spawnForPersona(personaOf(cfg, 'C'), cfg)
+
+    const env = spawnCalls[0].extra_env!
+    expect(env).toEqual({ CSCB_PERSONA: 'C', CLAUDE_MANAGED_CHANNEL: 'C', CSCB_CRONTABLE_PATH: cfg.cron_table_path })
+    expect('CLAUDE_CONFIG_DIR' in env).toBe(false)
+    expect(spawnCalls[0].label).toEqual([
+      'service=cscb',
+      'persona=C',
+      `config_dir=${personaConfigDirLabelValue(undefined, home)}`,
+      'channel=C',
+    ])
+    // Independent of the helper: the hash of the real <home>/.claude.
+    expect(spawnCalls[0].label).toContain(`config_dir=${configDirLabelValue(join(realpathSync(home), '.claude'))}`)
   })
 
-  test('extra_env carries only channel + crontable path when no claude_config_dir', async () => {
+  test('the seam home is followed through a symlink: a linked home gives the label of its target', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     installStub({ spawnCalls })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    await spawnForRoute('C', { cwd: '/x' }, cfg)
-    expect(spawnCalls[0].extra_env).toEqual({ CLAUDE_MANAGED_CHANNEL: 'C', CSCB_CRONTABLE_PATH: '/tmp/test-crontab' })
+    const target = fixtureSubdir('real-home')
+    mkdirSync(join(target, '.claude'))
+    const linkedHome = join(fixtureDir, 'linked-home')
+    symlinkSync(target, linkedHome)
+    _setSpawnHomeDir(linkedHome)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+
+    await spawnForPersona(personaOf(cfg, 'C'), cfg)
+
+    const label = spawnCalls[0].label!.find((l) => l.startsWith('config_dir='))
+    expect(label).toBe(`config_dir=${personaConfigDirLabelValue(undefined, target)}`)
+    expect(label).toBe(`config_dir=${configDirLabelValue(join(realpathSync(target), '.claude'))}`)
+    // The lexical hash under the link differs, so equality proves the real path was hashed.
+    expect(label).not.toBe(`config_dir=${configDirLabelValue(join(linkedHome, '.claude'))}`)
+    expect('CLAUDE_CONFIG_DIR' in spawnCalls[0].extra_env!).toBe(false)
+  })
+
+  test('a configured absolute claude_config_dir ignores the seam home', async () => {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    const home = useSpawnHome()
+    const configured = fixtureSubdir('absolute-config')
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x', claude_config_dir: configured } }, fixtureDir)
+
+    await spawnForPersona(personaOf(cfg, 'C'), cfg)
+
+    expect(spawnCalls[0].label).toContain(configDirLabelFor(configured))
+    expect(spawnCalls[0].label).not.toContain(`config_dir=${personaConfigDirLabelValue(undefined, home)}`)
+    expect(spawnCalls[0].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configured)
+  })
+
+  test('a ~-prefixed claude_config_dir expands against the seam home for the label; env keeps it as configured', async () => {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    const home = useSpawnHome()
+    const expanded = join(home, 'tilde-config')
+    mkdirSync(expanded)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x', claude_config_dir: '~/tilde-config' } }, fixtureDir)
+
+    await spawnForPersona(personaOf(cfg, 'C'), cfg)
+
+    expect(spawnCalls[0].label).toContain(configDirLabelFor(expanded))
+    // Not expanded against the process home.
+    expect(spawnCalls[0].label).not.toContain(`config_dir=${configDirLabelValue(join(homedir(), 'tilde-config'))}`)
+    expect(spawnCalls[0].extra_env?.['CLAUDE_CONFIG_DIR']).toBe('~/tilde-config')
   })
 
   test('extra_env passes the already-resolved cron_table_path through untouched (no recomputation)', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     installStub({ spawnCalls })
-    const cfg = makeRoutingConfig({
-      routes: { C: { cwd: '/x' } },
-      cron_table_path: '/srv/resolved/absolute/crontable.md',
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { cron_table_path: '/srv/resolved/absolute/crontable.md' })
+    await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    expect(spawnCalls[0].extra_env).toEqual({
+      CSCB_PERSONA: 'C',
+      CLAUDE_MANAGED_CHANNEL: 'C',
+      CSCB_CRONTABLE_PATH: '/srv/resolved/absolute/crontable.md',
     })
-    await spawnForRoute('C', { cwd: '/x' }, cfg)
-    expect(spawnCalls[0].extra_env).toEqual({ CLAUDE_MANAGED_CHANNEL: 'C', CSCB_CRONTABLE_PATH: '/srv/resolved/absolute/crontable.md' })
   })
 
-  test('extra_env carries the crontable path alongside a per-route claude_config_dir', async () => {
+  test('extra_env carries the crontable path alongside a per-persona claude_config_dir', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     installStub({ spawnCalls })
-    const cfg = makeRoutingConfig({
-      routes: { C: { cwd: '/x', claude_config_dir: '/per-route' } },
-      cron_table_path: '/srv/resolved/absolute/crontable.md',
+    const perPersona = fixtureSubdir('per-persona')
+    const cfg = makeStandInPersonaConfig(
+      { C: { working_directory: '/x', claude_config_dir: perPersona } },
+      fixtureDir,
+      { cron_table_path: '/srv/resolved/absolute/crontable.md' },
+    )
+    await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    expect(spawnCalls[0].extra_env).toEqual({
+      CLAUDE_CONFIG_DIR: perPersona,
+      CSCB_PERSONA: 'C',
+      CLAUDE_MANAGED_CHANNEL: 'C',
+      CSCB_CRONTABLE_PATH: '/srv/resolved/absolute/crontable.md',
     })
-    await spawnForRoute('C', { cwd: '/x' }, cfg)
-    expect(spawnCalls[0].extra_env).toEqual({ CLAUDE_CONFIG_DIR: '/per-route', CLAUDE_MANAGED_CHANNEL: 'C', CSCB_CRONTABLE_PATH: '/srv/resolved/absolute/crontable.md' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-2.2, SR-1.5 — the `config_dir` label hashes the REAL path of the
+// effective claude_config_dir, falling back to the lexical path when it cannot
+// be resolved.
+// ---------------------------------------------------------------------------
+
+describe('spawnForPersona: config_dir label (SR-2.2, SR-1.5)', () => {
+  /** Spawn every persona of `cfg` once and return the spawn params by key. */
+  async function spawnAll(cfg: PersonaConfig): Promise<Map<string, import('agent-director').SpawnParams>> {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    for (const persona of cfg.personas) await spawnForPersona(persona, cfg)
+    return new Map(spawnCalls.map((p) => [String(p.claude_instance_id).slice('cscb_'.length), p]))
+  }
+
+  test('a per-persona directory overrides the top-level one in the label and the env', async () => {
+    const top = fixtureSubdir('top-level')
+    const per = fixtureSubdir('per-persona')
+    const cfg = makeMultiPersonaConfig(
+      [{ name: 'ops_bot', working_directory: '/x', claude_config_dir: per }],
+      fixtureDir,
+      { claude_config_dir: top },
+    )
+    const params = (await spawnAll(cfg)).get('ops_bot')!
+    expect(params.label).toContain(configDirLabelFor(per))
+    expect(params.label).not.toContain(configDirLabelFor(top))
+    expect(params.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(per)
+  })
+
+  test('two different directories give different labels', async () => {
+    const one = fixtureSubdir('dir-one')
+    const two = fixtureSubdir('dir-two')
+    const cfg = makeMultiPersonaConfig(
+      [
+        { name: 'alpha', working_directory: '/x/a', claude_config_dir: one },
+        { name: 'beta', working_directory: '/x/b', claude_config_dir: two },
+      ],
+      fixtureDir,
+    )
+    const byKey = await spawnAll(cfg)
+    const alpha = byKey.get('alpha')!.label!.find((l) => l.startsWith('config_dir='))
+    const beta = byKey.get('beta')!.label!.find((l) => l.startsWith('config_dir='))
+    expect(alpha).toBe(configDirLabelFor(one))
+    expect(beta).toBe(configDirLabelFor(two))
+    expect(alpha).not.toBe(beta)
+  })
+
+  test('a symlink to a directory gives the same label as the directory (env keeps the path as configured)', async () => {
+    const target = fixtureSubdir('real-config')
+    const link = join(fixtureDir, 'config-link')
+    symlinkSync(target, link)
+    const cfg = makeMultiPersonaConfig(
+      [
+        { name: 'direct', working_directory: '/x/d', claude_config_dir: target },
+        { name: 'via_link', working_directory: '/x/l', claude_config_dir: link },
+      ],
+      fixtureDir,
+    )
+    const byKey = await spawnAll(cfg)
+    const direct = byKey.get('direct')!.label!.find((l) => l.startsWith('config_dir='))
+    const viaLink = byKey.get('via_link')!.label!.find((l) => l.startsWith('config_dir='))
+    expect(viaLink).toBe(direct)
+    expect(viaLink).toBe(configDirLabelFor(target))
+    // The lexical hash of the link path differs, so equality proves the real path was hashed.
+    expect(viaLink).not.toBe(`config_dir=${configDirLabelValue(link)}`)
+    expect(byKey.get('via_link')!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(link)
+  })
+
+  test('a configured path that does not exist falls back to its lexical form', async () => {
+    const missing = join(fixtureDir, 'not-created', 'claude')
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x', claude_config_dir: missing } }, fixtureDir)
+    const params = (await spawnAll(cfg)).get('C')!
+    expect(params.label).toContain(`config_dir=${configDirLabelValue(missing)}`)
+  })
+
+  test('no directory configured: the label is that of .claude under an injected temp home', () => {
+    const home = fixtureSubdir('home')
+    mkdirSync(join(home, '.claude'))
+    const expected = configDirLabelValue(resolveRealPath(join(realpathSync(home), '.claude')), home)
+    expect(personaConfigDirLabelValue(undefined, home)).toBe(expected)
+    // Unset equals an explicit <home>/.claude, in absolute and tilde form.
+    expect(personaConfigDirLabelValue(join(home, '.claude'), home)).toBe(expected)
+    expect(personaConfigDirLabelValue('~/.claude', home)).toBe(expected)
+    // A symlinked home resolves to the same real directory.
+    const linkedHome = join(fixtureDir, 'home-link')
+    symlinkSync(home, linkedHome)
+    expect(personaConfigDirLabelValue(undefined, linkedHome)).toBe(expected)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-2.2 — spawn identity is the persona key, never the name
+// ---------------------------------------------------------------------------
+
+describe('spawnForPersona: persona identity (SR-2.2)', () => {
+  test('an in-form name is its own key', async () => {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    const cfg = makeMultiPersonaConfig([{ name: 'ops_bot', working_directory: '/repo/ops' }], fixtureDir)
+
+    await spawnForPersona(personaOf(cfg, 'ops_bot'), cfg)
+
+    expect(spawnCalls[0].claude_instance_id).toBe('cscb_ops_bot')
+    expect(spawnCalls[0].tmux_session_name).toBe('slack_bot_ops_bot')
+    expect(spawnCalls[0].label).toContain('persona=ops_bot')
+  })
+
+  test('a stand-in persona keyed by its channel ID (route→persona adapter) spawns byte-identically as cscb_<channelId>', async () => {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    const topLevel = fixtureSubdir('top-level')
+    const cfg = routesToPersonaConfig(
+      makeRoutingConfig({ routes: { C0AMDDZEHCY: { cwd: '/repo/general' } }, claude_config_dir: topLevel }),
+    )
+
+    const result = await spawnForPersona(personaOf(cfg, 'C0AMDDZEHCY'), cfg)
+
+    expect(result).toEqual({ key: 'C0AMDDZEHCY', action: 'spawned' })
+    const params = spawnCalls[0]
+    expect(params.claude_instance_id).toBe('cscb_C0AMDDZEHCY')
+    expect(params.tmux_session_name).toBe('slack_bot_C0AMDDZEHCY')
+    expect(params.cwd).toBe('/repo/general')
+    expect(params.label).toEqual([
+      'service=cscb',
+      'persona=C0AMDDZEHCY',
+      configDirLabelFor(topLevel),
+      'channel=C0AMDDZEHCY',
+    ])
+    // The top-level claude_config_dir reaches the env of a stand-in with none of its own.
+    expect(params.extra_env).toEqual({
+      CLAUDE_CONFIG_DIR: topLevel,
+      CSCB_PERSONA: 'C0AMDDZEHCY',
+      CLAUDE_MANAGED_CHANNEL: 'C0AMDDZEHCY',
+      CSCB_CRONTABLE_PATH: '/tmp/test-crontab',
+    })
+  })
+
+  test('collision handling addresses the same cscb_<key> for get and resume', async () => {
+    const getCalls: import('agent-director').GetParams[] = []
+    const resumeCalls: import('agent-director').ResumeParams[] = []
+    const key = personaKey('General Chat')
+    installStub({
+      getCalls,
+      resumeCalls,
+      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
+      getResult: cannedGetResult({ claude_instance_id: `cscb_${key}`, state: 'ended' }),
+    })
+    const cfg = makeMultiPersonaConfig([{ name: 'General Chat', working_directory: '/x' }], fixtureDir)
+
+    const result = await spawnForPersona(personaOf(cfg, key), cfg)
+
+    expect(result.action).toBe('resumed')
+    expect(getCalls[0].claude_instance_id).toBe(`cscb_${key}`)
+    expect(resumeCalls[0].claude_instance_id).toBe(`cscb_${key}`)
   })
 })
 
@@ -258,19 +553,7 @@ describe('spawnForRoute: SR-1.1 fresh spawn', () => {
 // SR-1.4 — idempotency dispatch on ErrInstanceIdCollision
 // ---------------------------------------------------------------------------
 
-describe('spawnForRoute: SR-1.4 collision-then-act', () => {
-  /**
-   * Redirect startup-errors.log into a temp dir for this test and return a
-   * helper that reads back recorded entries. Restores the previous
-   * SLACK_STATE_DIR via the file-level afterEach.
-   */
-  function captureStartupErrors(): () => string {
-    const dir = mkdtempSync(join(tmpdir(), 'cscb-2oy-'))
-    process.env['SLACK_STATE_DIR'] = dir
-    const logPath = join(dir, 'startup-errors.log')
-    return () => (existsSync(logPath) ? readFileSync(logPath, 'utf-8') : '')
-  }
-
+describe('spawnForPersona: SR-1.4 collision-then-act', () => {
   test('ended state + resume_enabled → resume()', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
@@ -280,8 +563,8 @@ describe('spawnForRoute: SR-1.4 collision-then-act', () => {
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('resumed')
     expect(resumeCalls).toHaveLength(1)
     expect(resumeCalls[0].claude_instance_id).toBe('cscb_C')
@@ -300,8 +583,8 @@ describe('spawnForRoute: SR-1.4 collision-then-act', () => {
       resumeError: errNoSessionId(),
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(spawnCalls).toHaveLength(2)
     expect(deleteCalls).toHaveLength(1)
@@ -324,8 +607,8 @@ describe('spawnForRoute: SR-1.4 collision-then-act', () => {
       ],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'missing' }),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, resume_enabled: false })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { resume_enabled: false })
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(resumeCalls).toHaveLength(0)
     expect(killCalls).toHaveLength(1)
@@ -339,8 +622,8 @@ describe('spawnForRoute: SR-1.4 collision-then-act', () => {
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('reconnected')
     expect(sendKeysCalls).toHaveLength(1)
     expect(sendKeysCalls[0].text).toContain('/mcp reconnect')
@@ -352,8 +635,8 @@ describe('spawnForRoute: SR-1.4 collision-then-act', () => {
         spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
         getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state }),
       })
-      const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-      const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+      const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+      const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
       expect(result.action).toBe('no-op')
       resetClientForTests()
     }
@@ -381,14 +664,15 @@ describe('spawnForRoute: SR-1.4 collision-then-act', () => {
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
     })
     const { web, calls } = makeMockWeb()
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, web as never)
-    expect(result).toEqual({ channelId: 'C', action: 'spawned' })
+    const home = useSpawnHome()
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
+    expect(result).toEqual({ key: 'C', action: 'spawned' })
     // initial collision spawn + the fresh spawn after ErrSpawnNotFound
     expect(spawnCalls).toHaveLength(2)
-    // fresh spawn carries the original params (same channel labels / id)
+    // fresh spawn carries the original params (same persona labels / id)
     expect(spawnCalls[1].claude_instance_id).toBe('cscb_C')
-    expect(spawnCalls[1].label).toEqual(['service=cscb', 'channel=C'])
+    expect(spawnCalls[1].label).toEqual(['service=cscb', 'persona=C', `config_dir=${personaConfigDirLabelValue(undefined, home)}`, 'channel=C'])
     // row was already gone — no kill and no delete of a missing row
     expect(killCalls).toHaveLength(0)
     expect(deleteCalls).toHaveLength(0)
@@ -414,8 +698,8 @@ describe('spawnForRoute: SR-1.4 collision-then-act', () => {
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
     })
     const { web, calls } = makeMockWeb()
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, web as never)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
     expect(result.action).toBe('failed')
     expect(spawnCalls).toHaveLength(2)
     expect(deleteCalls).toHaveLength(0)
@@ -435,8 +719,8 @@ describe('spawnForRoute: SR-1.4 collision-then-act', () => {
       ],
       getError: errSpawnNotFound(),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(spawnCalls).toHaveLength(2)
   })
@@ -471,20 +755,23 @@ describe('reconcileOrphans (SR-1.6)', () => {
   })
 
   test('list failure → recorded + zero counts (no crash)', async () => {
+    const readLog = captureStartupErrors()
     installStub({ listError: new Error('AD down') })
     const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
     const result = await reconcileOrphans(cfg)
     expect(result.found).toBe(0)
     expect(result.killed).toBe(0)
+    expect(readLog()).toContain('[orphan-cleanup-list-failed]')
   })
 })
 
 // ---------------------------------------------------------------------------
-// startupSessionManager — iterate routes
+// startupSessionManager — iterate personas (b.av2 SR-6.3)
 // ---------------------------------------------------------------------------
 
 describe('startupSessionManager', () => {
-  test('counts succeeded/failed per route', async () => {
+  test('counts succeeded/failed per persona', async () => {
+    captureStartupErrors()
     let callIdx = 0
     const stub = installStub({})
     const realSpawn = stub.spawn.bind(stub)
@@ -493,17 +780,109 @@ describe('startupSessionManager', () => {
       if (callIdx === 2) throw new Error('boom')
       return realSpawn(params)
     }
-    const cfg = makeRoutingConfig({
-      routes: {
-        C1: { cwd: '/x1' },
-        C2: { cwd: '/x2' },
-        C3: { cwd: '/x3' },
-      },
-    })
+    const cfg = makeMultiPersonaConfig(
+      [
+        // alpha is listed in two channels and still counts once.
+        {
+          name: 'alpha',
+          working_directory: '/x1',
+          channels: [
+            { id: 'C0HOME01', delivery: 'all' },
+            { id: 'C0SHARED1', delivery: 'mentions' },
+          ],
+        },
+        { name: 'beta', working_directory: '/x2' },
+        { name: 'gamma', working_directory: '/x3' },
+      ],
+      fixtureDir,
+    )
     const result = await startupSessionManager(cfg, { concurrency: 1 })
     expect(result.succeeded + result.failed).toBe(3)
     expect(result.failed).toBe(1)
     expect(result.succeeded).toBe(2)
+    // One outcome per persona, keyed by persona; concurrency 1 makes the second (beta) the failure.
+    expect(result.perPersona).toEqual([
+      { key: 'alpha', action: 'spawned' },
+      { key: 'beta', action: 'failed' },
+      { key: 'gamma', action: 'spawned' },
+    ])
+  })
+
+  // AC 3 (b.av2 SR-14 "session-manager: one spawn"): a persona listed in two
+  // channels is ONE instance — exactly one spawn, never one per channel.
+  test('AC 3: one persona listed in two channels produces exactly one spawn', async () => {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    installStub({ spawnCalls })
+    const cfg = makeMultiPersonaConfig(
+      [
+        {
+          name: 'alpha',
+          working_directory: '/x/alpha',
+          channels: [
+            { id: 'C0HOME01', delivery: 'all' },
+            { id: 'C0SHARED1', delivery: 'mentions' },
+          ],
+          permission_prompts: 'C0HOME01',
+        },
+        {
+          name: 'beta',
+          working_directory: '/x/beta',
+          channels: [{ id: 'C0SHARED1', delivery: 'mentions' }],
+          permission_prompts: 'C0SHARED1',
+        },
+      ],
+      fixtureDir,
+    )
+
+    const result = await startupSessionManager(cfg)
+
+    const ids = spawnCalls.map((p) => p.claude_instance_id)
+    expect(spawnCalls).toHaveLength(2)
+    expect(ids.filter((id) => id === 'cscb_alpha')).toHaveLength(1)
+    expect(ids.filter((id) => id === 'cscb_beta')).toHaveLength(1)
+    // No spawn is keyed by a channel.
+    expect(ids.some((id) => String(id).includes('C0HOME01') || String(id).includes('C0SHARED1'))).toBe(false)
+    // Each spawn carries its own persona's working directory and persona label.
+    const byId = new Map(spawnCalls.map((p) => [p.claude_instance_id, p]))
+    expect(byId.get('cscb_alpha')!.cwd).toBe('/x/alpha')
+    expect(byId.get('cscb_alpha')!.label).toContain('persona=alpha')
+    expect(byId.get('cscb_beta')!.cwd).toBe('/x/beta')
+    expect(byId.get('cscb_beta')!.label).toContain('persona=beta')
+    // Result counts are per persona.
+    expect(result.succeeded).toBe(2)
+    expect(result.freshSpawned).toBe(2)
+    expect(result.failed).toBe(0)
+    expect([...result.perPersona].sort((a, b) => a.key.localeCompare(b.key))).toEqual([
+      { key: 'alpha', action: 'spawned' },
+      { key: 'beta', action: 'spawned' },
+    ])
+  })
+
+  // b.av2 SR-2.2: logs and errors name the persona in rendered form — the name
+  // JSON-quoted with the key beside it.
+  test('a startup spawn failure names the persona in rendered form (JSON-quoted name plus key)', async () => {
+    const readLog = captureStartupErrors()
+    installStub({ spawnError: errGeneric('spawn', 'ErrSpawnBroken') })
+    const name = 'Ops "Prod" Bot'
+    const key = personaKey(name)
+    const cfg = makeMultiPersonaConfig([{ name, working_directory: '/x/ops' }], fixtureDir)
+    const lines: string[] = []
+    const realError = console.error
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+    let result!: Awaited<ReturnType<typeof startupSessionManager>>
+    try {
+      result = await startupSessionManager(cfg, { concurrency: 1 })
+    } finally {
+      console.error = realError
+    }
+
+    expect(result.failed).toBe(1)
+    const rendered = `"Ops \\"Prod\\" Bot" (key=${key})`
+    expect(rendered).toBe(renderPersonaRef(name, key))
+    const log = readLog()
+    expect(log).toContain('[spawn-failed]')
+    expect(log).toContain(`spawn failed for ${rendered}: ErrSpawnBroken`)
+    expect(lines.some((l) => l.includes(`spawnForPersona: spawn failed for ${rendered}`))).toBe(true)
   })
 })
 
@@ -512,18 +891,6 @@ describe('startupSessionManager', () => {
 // ---------------------------------------------------------------------------
 
 describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
-  /**
-   * Redirect startup-errors.log into a temp dir for this test and return a
-   * helper that reads back recorded entries. Restores the previous
-   * SLACK_STATE_DIR via the file-level afterEach.
-   */
-  function captureStartupErrors(): () => string {
-    const dir = mkdtempSync(join(tmpdir(), 'cscb-rmy-'))
-    process.env['SLACK_STATE_DIR'] = dir
-    const logPath = join(dir, 'startup-errors.log')
-    return () => (existsSync(logPath) ? readFileSync(logPath, 'utf-8') : '')
-  }
-
   test('reconnectMcp: ErrTmuxSendKeys → ensure tmux server + retry once → success', async () => {
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     let ensureCalls = 0
@@ -536,8 +903,7 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
       ],
     })
     const { web, calls } = makeMockWeb()
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await reconnectMcp('C', web as never, cfg)
+    const result = await reconnectMcp('C', web as never)
     expect(result).toBe('ok')
     expect(ensureCalls).toBe(1)
     expect(sendKeysCalls).toHaveLength(2)
@@ -555,8 +921,7 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
       sendKeysError: errTmuxSendKeys(), // persistent — first attempt AND retry fail
     })
     const { web, calls } = makeMockWeb()
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await reconnectMcp('C', web as never, cfg)
+    const result = await reconnectMcp('C', web as never)
     expect(result).toBe('dead-session')
     expect(ensureCalls).toBe(1) // self-heal attempted exactly once (single retry)
     expect(sendKeysCalls).toHaveLength(2)
@@ -572,14 +937,13 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
       sendKeysCalls,
       sendKeysError: errGeneric('send-keys', 'ErrSomethingElse'),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await reconnectMcp('C', undefined, cfg)
+    const result = await reconnectMcp('C', undefined)
     expect(result).toBe('failed')
     expect(ensureCalls).toBe(0)
     expect(sendKeysCalls).toHaveLength(1)
   })
 
-  test('spawnForRoute waiting branch: self-heal retry succeeds → reconnected', async () => {
+  test('spawnForPersona waiting branch: self-heal retry succeeds → reconnected', async () => {
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     _setTmuxServerEnsurer(async () => {})
     installStub({
@@ -591,13 +955,13 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
         cannedOk<import('agent-director').SendKeysResult>({}),
       ],
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('reconnected')
     expect(sendKeysCalls).toHaveLength(2)
   })
 
-  test('spawnForRoute waiting branch (b.3ce): persistent ErrTmuxSendKeys → resume recovery, not failed', async () => {
+  test('spawnForPersona waiting branch (b.3ce): persistent ErrTmuxSendKeys → resume recovery, not failed', async () => {
     const readLog = captureStartupErrors()
     _setTmuxServerEnsurer(async () => {})
     const resumeCalls: import('agent-director').ResumeParams[] = []
@@ -607,8 +971,8 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
       sendKeysError: errTmuxSendKeys(), // persistent — self-heal retry fails too (dead session)
       resumeCalls,
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     // b.3ce: pre-fix this reported 'failed' and gave up; now the dead session
     // falls through to the ended/missing recovery logic (resume-first).
     expect(result.action).toBe('resumed')
@@ -616,7 +980,7 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
     expect(readLog()).toBe('')
   })
 
-  test('spawnForRoute waiting branch (b.3ce): dead session + resume not resumable → kill+delete+fresh spawn', async () => {
+  test('spawnForPersona waiting branch (b.3ce): dead session + resume not resumable → kill+delete+fresh spawn', async () => {
     _setTmuxServerEnsurer(async () => {})
     const killCalls: import('agent-director').KillParams[] = []
     const deleteCalls: import('agent-director').DeleteParams[] = []
@@ -633,15 +997,15 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
       sendKeysError: errTmuxSendKeys(),
       resumeError: errSpawnNotResumable(), // stale `waiting` row rejects resume
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(killCalls).toHaveLength(1)
     expect(deleteCalls).toHaveLength(1)
     expect(spawnCalls).toHaveLength(2) // initial collision + fresh spawn
   })
 
-  test('spawnForRoute waiting branch: dead session and recovery also fails → action=failed', async () => {
+  test('spawnForPersona waiting branch: dead session and recovery also fails → action=failed', async () => {
     const readLog = captureStartupErrors()
     _setTmuxServerEnsurer(async () => {})
     installStub({
@@ -650,8 +1014,8 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
       sendKeysError: errTmuxSendKeys(),
       resumeError: errGeneric('resume', 'ErrResumeBroken'), // recovery fails too
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('failed')
     expect(readLog()).toBe('') // resume-failure path posts to Slack; no reconnect-failed startup entry
   })
@@ -671,11 +1035,11 @@ describe('b.rmy: ErrTmuxSendKeys self-heal + reconnect outcome', () => {
       sendKeysError: errTmuxSendKeys(),
       resumeError: errGeneric('resume', 'ErrResumeBroken'),
     })
-    const cfg = makeRoutingConfig({ routes: { C1: { cwd: '/x1' }, C2: { cwd: '/x2' } } })
+    const cfg = makeStandInPersonaConfig({ C1: { working_directory: '/x1' }, C2: { working_directory: '/x2' } }, fixtureDir)
     const result = await startupSessionManager(cfg, { concurrency: 1 })
     expect(result.failed).toBe(2)
     expect(result.succeeded).toBe(0)
-    expect(result.perChannel.every((p) => p.action === 'failed')).toBe(true)
+    expect(result.perPersona.every((p) => p.action === 'failed')).toBe(true)
   })
 })
 
@@ -699,7 +1063,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
       findMissingResult: cannedFindMissing(), // b.m4r: empty sweep — a genuinely-alive long-turn row is untouched
       statusResult: { state: 'working' } as import('agent-director').StatusResult, // process mid-long-turn
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
     expect(result).toBe('ok')
     // b.ecw: the live-status verdict is authoritative — the raw tmux probe is
@@ -721,7 +1085,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
       findMissingResult: cannedFindMissing(),
       statusResult: { state: 'working' } as import('agent-director').StatusResult, // stays live → up-front sweep does not short-circuit the loop
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
     expect(result).toBe('ok') // status live at timeout → ok
     // Up-front sweep + fresh timeout sweep = 2 (TTL=0 defeats memo reuse).
@@ -747,7 +1111,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
       statusFn: () =>
         ({ state: findMissingCalls.length >= 2 ? 'missing' : 'working' }) as import('agent-director').StatusResult,
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
     expect(result).toBe('dead-session')
     expect(probed).toEqual([]) // process verdict is authoritative; tmux never consulted
@@ -781,19 +1145,20 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
             ? errorFactory()
             : ({ state: 'working' } as import('agent-director').StatusResult),
       })
-      const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+      const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
       const result = await waitForWaitingAndReconnect('C', cfg)
       expect(result).toBe(expected)
-      expect(probed).toEqual([tmuxSessionNameFor('C', undefined)]) // fell back to tmux
+      expect(probed).toEqual(['slack_bot_C']) // fell back to tmux
     },
   )
 
   // b.ecw: the poll loop's ended/missing branch aborts early. `statusFn` flips to
   // `missing` on the FIRST poll after the up-front sweep (findMissingCalls >= 1),
   // so waitForWaitingAndReconnect returns dead-session from the loop branch WITHOUT
-  // ever reaching the deadline — the timeout branch never runs. spawnForRoute then
+  // ever reaching the deadline — the timeout branch never runs. spawnForPersona then
   // drives the dead-session recovery (findMissing-before-resume → resume).
-  test('spawnForRoute working branch: loop ended/missing early-abort → dead-session → resume recovery', async () => {
+  test('spawnForPersona working branch: loop ended/missing early-abort → dead-session → resume recovery', async () => {
+    captureStartupErrors() // the dialog approver records dev-channels-approve-spawn-died here
     _setWaitForWaitingTimeoutMs(30)
     _setTmuxServerEnsurer(async () => {})
     const resumeCalls: import('agent-director').ResumeParams[] = []
@@ -809,13 +1174,13 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
         ({ state: findMissingCalls.length >= 1 ? 'missing' : 'working' }) as import('agent-director').StatusResult,
       resumeCalls,
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('resumed')
     expect(resumeCalls).toHaveLength(1)
   })
 
-  test('spawnForRoute working branch: timeout + session alive → reconnected (no kill/resume/spawn)', async () => {
+  test('spawnForPersona working branch: timeout + session alive → reconnected (no kill/resume/spawn)', async () => {
     _setWaitForWaitingTimeoutMs(30)
     // The timeout live path decides on the fresh status call alone and never
     // consults tmux; capture the prober to prove it is not called.
@@ -832,8 +1197,8 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'working' }),
       statusResult: { state: 'working' } as import('agent-director').StatusResult,
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('reconnected')
     expect(resumeCalls).toHaveLength(0)
     expect(killCalls).toHaveLength(0)
@@ -874,8 +1239,8 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
       sendKeysError: errTmuxSendKeys(), // persistent → dead session
       findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('resumed')
     expect(findMissingCalls).toHaveLength(1)
     expect(findMissingCalls[0]).toEqual({})
@@ -891,6 +1256,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
   // status, not the raw tmux probe). TTL=0 makes the timeout sweep observable
   // and lets the reconciled `missing` verdict flip in.
   test('working dead-session: findMissing runs (sweep + reconcile) BEFORE resume → resumed', async () => {
+    captureStartupErrors() // the dialog approver records dev-channels-approve-spawn-died here
     _setWaitForWaitingTimeoutMs(30)
     _setFindMissingMemoTtlMs(0)
     _setTmuxServerEnsurer(async () => {})
@@ -909,8 +1275,8 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
         ({ state: findMissingCalls.length >= 2 ? 'missing' : 'working' }) as import('agent-director').StatusResult,
       findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('resumed')
     // findMissing fires and precedes resume. (With TTL=0 the up-front sweep, the
     // timeout sweep, and resumeOrFreshSpawn's reconcileMissingFirst each sweep,
@@ -933,8 +1299,8 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('resumed')
     expect(findMissingCalls).toHaveLength(0)
     expect(resumeCalls).toHaveLength(1)
@@ -964,8 +1330,8 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
       findMissingError: errGeneric('find-missing', 'ErrProbeFailed'),
       resumeError: errSpawnNotResumable(), // row still live-state → resume rejects
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(findMissingCalls).toHaveLength(1)
     expect(resumeCalls).toHaveLength(1) // resume still attempted despite findMissing failure
@@ -994,8 +1360,8 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
       sendKeysError: errTmuxSendKeys(),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, resume_enabled: false })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { resume_enabled: false })
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(findMissingCalls).toHaveLength(0)
     expect(resumeCalls).toHaveLength(0)
@@ -1025,8 +1391,8 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
       sendKeysError: errTmuxSendKeys(),
       resumeError: errTmuxSessionCreate('resume'),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('spawned')
     expect(findMissingCalls).toHaveLength(1) // findMissing still runs once, before resume
     expect(resumeCalls).toHaveLength(1) // resume attempted once, threw ErrTmuxSessionCreate
@@ -1077,7 +1443,7 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
       findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
       statusFn: () => ({ state: findMissingCalls.length > 0 ? 'missing' : 'working' }) as import('agent-director').StatusResult,
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
 
     const result = await waitForWaitingAndReconnect('C', cfg)
 
@@ -1110,7 +1476,7 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
         cannedOk<import('agent-director').StatusResult>({ state: 'waiting' }),
       ],
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
 
     expect(findMissingCalls).toHaveLength(1) // attempted once, rejected
@@ -1135,7 +1501,7 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
       findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
       statusFn: () => ({ state: findMissingCalls.length > 0 ? 'missing' : 'working' }) as import('agent-director').StatusResult,
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
 
     const first = await waitForWaitingAndReconnect('C', cfg)
     const second = await waitForWaitingAndReconnect('C', cfg)
@@ -1156,7 +1522,7 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
       findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }),
       statusFn: () => ({ state: findMissingCalls.length > 0 ? 'missing' : 'working' }) as import('agent-director').StatusResult,
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
 
     await waitForWaitingAndReconnect('C', cfg)
     await waitForWaitingAndReconnect('C', cfg)
@@ -1177,7 +1543,7 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
         cannedOk<import('agent-director').StatusResult>({ state: 'waiting' }),
       ],
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
 
     await waitForWaitingAndReconnect('C', cfg)
     await waitForWaitingAndReconnect('C', cfg)
@@ -1230,9 +1596,9 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
 
     await sweepDeadTmuxChannel('C', 'dead-session')
 
-    const line = errLog.find((l) => l.includes('escalate-dead: channel=C'))
+    const line = errLog.find((l) => l.includes('escalate-dead: persona=C'))
     expect(line).toBeDefined()
-    expect(line).toContain('channel=C')
+    expect(line).toContain('persona=C')
     expect(line).toContain('verdict=dead-session')
     expect(line!.toLowerCase()).toContain('reconciliation')
   })
@@ -1255,7 +1621,7 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
     await sweepDeadTmuxChannel('D', 'dead-session')
 
     expect(findMissingCalls).toHaveLength(1) // memo hit → NO second sweep
-    const line = errLog.find((l) => l.includes('escalate-dead: channel=D'))
+    const line = errLog.find((l) => l.includes('escalate-dead: persona=D'))
     expect(line).toBeDefined()
     expect(line).toContain('verdict=dead-session')
     expect(line!.toLowerCase()).toContain('reconciliation')
@@ -1286,7 +1652,7 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
     expect(findMissingCalls[0]).toEqual({})
     // Every escalating channel got its own unconditional operator line.
     for (const c of ['A', 'B', 'C', 'D']) {
-      expect(errLog.some((l) => l.includes(`escalate-dead: channel=${c}`))).toBe(true)
+      expect(errLog.some((l) => l.includes(`escalate-dead: persona=${c}`))).toBe(true)
     }
   })
 
@@ -1334,7 +1700,7 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
     installStub({
       statusResult: { state } as import('agent-director').StatusResult,
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
     expect(result).toBe('dead-session')
     expect(probed).toEqual([]) // process verdict is authoritative — no tmux probe
@@ -1351,7 +1717,7 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
     installStub({
       statusResult: { state: 'missing' } as import('agent-director').StatusResult,
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
     expect(result).toBe('dead-session')
     expect(probed).toEqual([]) // the ended/missing branch no longer probes tmux
@@ -1363,7 +1729,7 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
     installStub({
       statusResult: { state: 'ask_user' } as import('agent-director').StatusResult,
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
     expect(result).toBe('ok')
     expect(probed).toEqual([]) // live transient states never reach the prober
@@ -1374,7 +1740,7 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
     installStub({
       statusResult: { state: 'check_permission' } as import('agent-director').StatusResult,
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
     expect(result).toBe('ok')
   })
@@ -1382,7 +1748,7 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
   test('ErrSpawnNotFound + tmux gone → dead-session', async () => {
     _setTmuxSessionProber(async () => false)
     installStub({ statusError: errSpawnNotFound() })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
     expect(result).toBe('dead-session')
   })
@@ -1390,12 +1756,13 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
   test('ErrSpawnNotFound + tmux alive → ok', async () => {
     _setTmuxSessionProber(async () => true)
     installStub({ statusError: errSpawnNotFound() })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
     expect(result).toBe('ok')
   })
 
-  test('spawnForRoute working branch: transition to missing + dead tmux → resume recovery instead of misreported ok', async () => {
+  test('spawnForPersona working branch: transition to missing + dead tmux → resume recovery instead of misreported ok', async () => {
+    captureStartupErrors() // the dialog approver records dev-channels-approve-spawn-died here
     _setTmuxSessionProber(async () => false)
     _setTmuxServerEnsurer(async () => {})
     const resumeCalls: import('agent-director').ResumeParams[] = []
@@ -1405,8 +1772,8 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
       statusResult: { state: 'missing' } as import('agent-director').StatusResult,
       resumeCalls,
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } }, agent_director_poll_interval_ms: 1 })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(result.action).toBe('resumed')
     expect(resumeCalls).toHaveLength(1)
   })
@@ -1427,20 +1794,6 @@ describe('SR-8.6 invariants', () => {
     expect(AGENT_DIRECTOR_LIVE_STATES.has('missing')).toBe(false)
   })
 
-  test('instanceIdFor produces deterministic cscb_<channelId> (no name)', () => {
-    expect(instanceIdFor('C012345')).toBe('cscb_C012345')
-  })
-
-  test('instanceIdFor composes cscb_<name>_<channelId> when name is provided', () => {
-    expect(instanceIdFor('C012345', 'general')).toBe('cscb_general_C012345')
-    expect(instanceIdFor('C0B3X876XSB', 'horde_agent_director')).toBe('cscb_horde_agent_director_C0B3X876XSB')
-  })
-
-  test('instanceIdFor falls back to bare-ID for empty/undefined name', () => {
-    expect(instanceIdFor('C012345', '')).toBe('cscb_C012345')
-    expect(instanceIdFor('C012345', undefined)).toBe('cscb_C012345')
-  })
-
   test('every spawn call site emits relay_mode=on', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     installStub({
@@ -1452,8 +1805,8 @@ describe('SR-8.6 invariants', () => {
       resumeError: errNoSessionId(),
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    await spawnForPersona(personaOf(cfg, 'C'), cfg)
     // Both spawns (initial + retry-after-delete) must carry relay_mode='on'.
     expect(spawnCalls.length).toBeGreaterThanOrEqual(1)
     for (const p of spawnCalls) {
@@ -1473,20 +1826,8 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
   )
   const WELCOME_PANE = 'Listening for channel messages from: server:slack-channel-router'
 
-  /**
-   * Redirect startup-errors.log into a temp dir for this test and return a
-   * helper that reads back recorded entries. Restores the previous
-   * SLACK_STATE_DIR via the file-level afterEach.
-   */
-  function captureStartupErrors(): () => string {
-    const dir = mkdtempSync(join(tmpdir(), 'cscb-4ie-'))
-    process.env['SLACK_STATE_DIR'] = dir
-    const logPath = join(dir, 'startup-errors.log')
-    return () => (existsSync(logPath) ? readFileSync(logPath, 'utf-8') : '')
-  }
-
   // -------------------------------------------------------------------------
-  // Happy path: dialog detected → Enter sent (via spawnForRoute, the SR-1.1
+  // Happy path: dialog detected → Enter sent (via spawnForPersona, the SR-1.1
   // fresh-spawn path that calls approvePreSessionDialogs).
   // statusQueue drives pending→waiting so the approver presses Enter then exits.
   // -------------------------------------------------------------------------
@@ -1507,8 +1848,8 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
         { pane: WELCOME_PANE },
       ],
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     expect(result.action).toBe('spawned')
     expect(sendKeysCalls).toHaveLength(1)
@@ -1552,8 +1893,8 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
       statusResult: { state: 'waiting' },
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     expect(result.action).toBe('resumed')
     expect(readPaneCalls).toHaveLength(0)
@@ -1566,8 +1907,8 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'waiting' }),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     expect(result.action).toBe('reconnected')
     expect(readPaneCalls).toHaveLength(0)
@@ -1580,8 +1921,8 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'pending' }),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     expect(result.action).toBe('no-op')
     expect(readPaneCalls).toHaveLength(0)
@@ -1599,8 +1940,8 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       readPaneResults: [{ pane: 'unrelated' }],
     })
     const readLog = captureStartupErrors()
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, undefined, false)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, undefined, false)
 
     expect(result.action).toBe('spawned')
     expect(readLog()).toBe('')
@@ -1643,8 +1984,8 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       return { state: enterCount >= 1 ? 'waiting' : 'pending' }
     }
 
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     // If allow_pending is present everywhere the spawn must complete cleanly.
     expect(result.action).toBe('spawned')
@@ -1656,10 +1997,11 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // b.ben regression: composed instance id used when route has normalizedName
+  // b.ben regression: the approver addresses the persona's cscb_<key>, derived
+  // from the key and never from the name (the two differ here).
   // -------------------------------------------------------------------------
 
-  test('b.ben: uses composed instance id when route has normalizedName', async () => {
+  test('b.ben: dialog approval addresses cscb_<key> for a persona whose key differs from its name', async () => {
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     const readPaneCalls: import('agent-director').ReadPaneParams[] = []
     installStub({
@@ -1674,19 +2016,19 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
         { pane: WELCOME_PANE },
       ],
     })
-    const cfg = makeRoutingConfig({
-      routes: { C_TEST1: { cwd: '/x', name: 'my_chan', normalizedName: 'my_chan' } },
-    })
-    const result = await spawnForRoute('C_TEST1', { cwd: '/x' }, cfg)
+    const key = personaKey('My Chan')
+    expect(key).not.toBe('My Chan')
+    const cfg = makeMultiPersonaConfig([{ name: 'My Chan', working_directory: '/x' }], fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, key), cfg)
 
     expect(result.action).toBe('spawned')
-    // Approver must address the composed id, not the bare cscb_<id>.
+    // Approver must address the persona's cscb_<key>.
     expect(readPaneCalls.length).toBeGreaterThanOrEqual(1)
     for (const r of readPaneCalls) {
-      expect(r.claude_instance_id).toBe('cscb_my_chan_C_TEST1')
+      expect(r.claude_instance_id).toBe(`cscb_${key}`)
     }
     expect(sendKeysCalls).toHaveLength(1)
-    expect(sendKeysCalls[0].claude_instance_id).toBe('cscb_my_chan_C_TEST1')
+    expect(sendKeysCalls[0].claude_instance_id).toBe(`cscb_${key}`)
     expect(sendKeysCalls[0].text).toBe('')
   })
 
@@ -1705,13 +2047,13 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     })
     const readLog = captureStartupErrors()
     const { web, calls } = makeMockWeb()
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    await spawnForRoute('C', { cwd: '/x' }, cfg, web as never)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
 
     expect(sendKeysCalls).toHaveLength(0)
     const log = readLog()
     expect(log).toContain('[dev-channels-approve-not-ready]')
-    expect(log).toContain('channel=C')
+    expect(log).toContain(`for ${renderPersonaRef('C', 'C')} —`)
     // cap path must also fire postSpawnFailureToChannel (core requirement of b.4ie)
     expect(calls.length).toBeGreaterThanOrEqual(1)
   })
@@ -1734,8 +2076,8 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       readPaneResults: [{ pane: 'no needle here' }],
     })
     const readLog = captureStartupErrors()
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     const log = readLog()
     expect(log).toContain('[dev-channels-approve-spawn-died]')
@@ -1753,8 +2095,8 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       statusQueue: [cannedOk({ state: 'waiting' })],
     })
     const readLog = captureStartupErrors()
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     expect(readPaneCalls).toHaveLength(0)
     expect(sendKeysCalls).toHaveLength(0)
@@ -1773,8 +2115,8 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       // sticky: every readPane returns the dialog needle
       readPaneResults: [{ pane: DEV_CHANNELS_PANE }],
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     // Enter pressed each time the pane shows the needle while pending
     expect(sendKeysCalls.length).toBeGreaterThanOrEqual(2)
@@ -1875,8 +2217,8 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
         cannedOk({ state: 'waiting' }),
       ],
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     expect(result.action).toBe('resumed')
     expect(resumeCalls).toHaveLength(1)
@@ -1905,8 +2247,8 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       // approver on the retry-spawn: already live → returns immediately
       statusResult: { state: 'waiting' },
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     expect(result.action).toBe('spawned')
     // Orphan tmux killed by its deterministic per-channel name.
@@ -1928,31 +2270,31 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
       ],
       statusResult: { state: 'waiting' },
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
 
     expect(result.action).toBe('spawned')
     expect(killedSessions).toEqual(['slack_bot_C'])
     expect(spawnCalls).toHaveLength(2)
   })
 
-  test('b.vub: ErrTmuxSessionCreate self-heal uses composed tmux name when route has normalizedName', async () => {
+  test('b.vub: ErrTmuxSessionCreate self-heal kills slack_bot_<key> for a persona whose key differs from its name', async () => {
     const killedSessions: string[] = []
     _setTmuxSessionKiller(async (name) => { killedSessions.push(name) })
+    const key = personaKey('my chan')
+    expect(key).not.toBe('my chan')
     installStub({
       spawnQueue: [
         cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
-        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: 'cscb_my_chan_C_T1' }),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${key}` }),
       ],
       statusResult: { state: 'waiting' },
     })
-    const cfg = makeRoutingConfig({
-      routes: { C_T1: { cwd: '/x', name: 'my chan', normalizedName: 'my_chan' } },
-    })
-    const result = await spawnForRoute('C_T1', { cwd: '/x' }, cfg)
+    const cfg = makeMultiPersonaConfig([{ name: 'my chan', working_directory: '/x' }], fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, key), cfg)
 
     expect(result.action).toBe('spawned')
-    expect(killedSessions).toEqual(['slack_bot_my_chan_C_T1'])
+    expect(killedSessions).toEqual([`slack_bot_${key}`])
   })
 
   test('b.vub: ErrTmuxSessionCreate self-heal that fails on retry → posts Slack failure', async () => {
@@ -1966,428 +2308,12 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
         cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
       ],
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg, web as never)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
 
     expect(result.action).toBe('failed')
     expect(calls.length).toBeGreaterThanOrEqual(1)
     expect(readLog()).toContain('[spawn-failed]')
-  })
-})
-
-// b.1m9 — tmuxSessionNameFor naming layer
-// ---------------------------------------------------------------------------
-
-describe('tmuxSessionNameFor (b.1m9)', () => {
-  test('falls back to slack_bot_<id> when no normalized name', () => {
-    expect(tmuxSessionNameFor('C0AMDDZEHCY')).toBe('slack_bot_C0AMDDZEHCY')
-    expect(tmuxSessionNameFor('C0AMDDZEHCY', undefined)).toBe('slack_bot_C0AMDDZEHCY')
-    expect(tmuxSessionNameFor('C0AMDDZEHCY', '')).toBe('slack_bot_C0AMDDZEHCY')
-  })
-
-  test('composes slack_bot_<name>_<id> when name is provided', () => {
-    expect(tmuxSessionNameFor('C0AMDDZEHCY', 'general')).toBe('slack_bot_general_C0AMDDZEHCY')
-    expect(tmuxSessionNameFor('C0B3X876XSB', 'horde_agent_director'))
-      .toBe('slack_bot_horde_agent_director_C0B3X876XSB')
-  })
-
-  test('does not normalize internally — caller must pre-normalize', () => {
-    // Whatever string the caller passes is concatenated verbatim. (Production
-    // callers go through normalizeChannelName before this; the function trusts
-    // its argument.)
-    expect(tmuxSessionNameFor('C', 'has space')).toBe('slack_bot_has space_C')
-  })
-
-  test('output is glanceable for realistic channel names', () => {
-    // Mirrors the acceptance examples from b.1m9 body.
-    const cases: [string, string, string][] = [
-      ['C0AMDDZEHCY', 'general', 'slack_bot_general_C0AMDDZEHCY'],
-      ['C0B2A9D2THT', 'horde', 'slack_bot_horde_C0B2A9D2THT'],
-      ['C0B3X876XSB', 'horde_agent_director', 'slack_bot_horde_agent_director_C0B3X876XSB'],
-      ['C0B2UB0LR9A', 'horde_apiary', 'slack_bot_horde_apiary_C0B2UB0LR9A'],
-    ]
-    for (const [id, name, expected] of cases) {
-      expect(tmuxSessionNameFor(id, name)).toBe(expected)
-    }
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.1m9 — spawn-params composition uses normalizedName from the route
-// ---------------------------------------------------------------------------
-
-describe('spawnForRoute: name-aware composition (b.1m9)', () => {
-  test('uses cscb_<name>_<id> and slack_bot_<name>_<id> when route has normalizedName', async () => {
-    const spawnCalls: import('agent-director').SpawnParams[] = []
-    installStub({ spawnCalls })
-    const cfg = makeRoutingConfig({
-      routes: {
-        C0AMDDZEHCY: { cwd: '/repo/general', name: 'general', normalizedName: 'general' },
-      },
-    })
-    await spawnForRoute('C0AMDDZEHCY', { cwd: '/repo/general' }, cfg)
-    expect(spawnCalls).toHaveLength(1)
-    expect(spawnCalls[0].claude_instance_id).toBe('cscb_general_C0AMDDZEHCY')
-    expect(spawnCalls[0].tmux_session_name).toBe('slack_bot_general_C0AMDDZEHCY')
-  })
-
-  test('falls back to bare-ID when route has no normalizedName', async () => {
-    const spawnCalls: import('agent-director').SpawnParams[] = []
-    installStub({ spawnCalls })
-    const cfg = makeRoutingConfig({
-      routes: { C_BARE: { cwd: '/repo' } },
-    })
-    await spawnForRoute('C_BARE', { cwd: '/repo' }, cfg)
-    expect(spawnCalls[0].claude_instance_id).toBe('cscb_C_BARE')
-    expect(spawnCalls[0].tmux_session_name).toBe('slack_bot_C_BARE')
-  })
-
-  test('collision-handling uses the same composed id for get/resume/delete', async () => {
-    const getCalls: import('agent-director').GetParams[] = []
-    const resumeCalls: import('agent-director').ResumeParams[] = []
-    installStub({
-      getCalls,
-      resumeCalls,
-      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: cannedGetResult({ claude_instance_id: 'cscb_general_C', state: 'ended' }),
-    })
-    const cfg = makeRoutingConfig({
-      routes: { C: { cwd: '/x', name: 'general', normalizedName: 'general' } },
-    })
-    const result = await spawnForRoute('C', { cwd: '/x' }, cfg)
-    expect(result.action).toBe('resumed')
-    expect(getCalls[0].claude_instance_id).toBe('cscb_general_C')
-    expect(resumeCalls[0].claude_instance_id).toBe('cscb_general_C')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.1m9 — resolveChannelNames flow
-// ---------------------------------------------------------------------------
-
-describe('resolveChannelNames (b.1m9)', () => {
-  test('populates route.name + route.normalizedName from conversations.info', async () => {
-    const infoCalls: Array<{ channel: string }> = []
-    const fakeWeb = {
-      conversations: {
-        info: async ({ channel }: { channel: string }) => {
-          infoCalls.push({ channel })
-          const nameMap: Record<string, string> = {
-            C0AMDDZEHCY: 'general',
-            C0B3X876XSB: 'horde-agent-director',
-          }
-          const name = nameMap[channel]
-          return name ? { channel: { name } } : {}
-        },
-      },
-    }
-    const cfg = makeRoutingConfig({
-      routes: {
-        C0AMDDZEHCY: { cwd: '/repo/general' },
-        C0B3X876XSB: { cwd: '/repo/agent-director' },
-      },
-    })
-    const results = await resolveChannelNames(cfg, fakeWeb)
-    expect(infoCalls.map((c) => c.channel).sort()).toEqual(['C0AMDDZEHCY', 'C0B3X876XSB'])
-    expect(cfg.routes['C0AMDDZEHCY'].name).toBe('general')
-    expect(cfg.routes['C0AMDDZEHCY'].normalizedName).toBe('general')
-    expect(cfg.routes['C0B3X876XSB'].name).toBe('horde-agent-director')
-    expect(cfg.routes['C0B3X876XSB'].normalizedName).toBe('horde_agent_director')
-    expect(results).toHaveLength(2)
-    for (const r of results) expect(r.error).toBeUndefined()
-  })
-
-  test('graceful fallback: conversations.info rejection leaves the route nameless', async () => {
-    const fakeWeb = {
-      conversations: {
-        info: async ({ channel }: { channel: string }) => {
-          if (channel === 'C_OK') return { channel: { name: 'okchan' } }
-          throw new Error('not_authorized')
-        },
-      },
-    }
-    const cfg = makeRoutingConfig({
-      routes: {
-        C_OK: { cwd: '/a' },
-        C_FAIL: { cwd: '/b' },
-      },
-    })
-    const results = await resolveChannelNames(cfg, fakeWeb)
-    expect(cfg.routes['C_OK'].normalizedName).toBe('okchan')
-    expect(cfg.routes['C_FAIL'].name).toBeUndefined()
-    expect(cfg.routes['C_FAIL'].normalizedName).toBeUndefined()
-    const failResult = results.find((r) => r.channelId === 'C_FAIL')!
-    expect(failResult.error).toContain('not_authorized')
-  })
-
-  test('graceful fallback: response without a channel.name leaves the route nameless', async () => {
-    const fakeWeb = {
-      conversations: {
-        info: async () => ({}), // no channel field
-      },
-    }
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const results = await resolveChannelNames(cfg, fakeWeb)
-    expect(cfg.routes['C'].normalizedName).toBeUndefined()
-    expect(results[0].error).toContain('no name')
-  })
-
-  test('subsequent spawn for a name-fallback route uses bare-ID naming', async () => {
-    // Composite: resolve fails → spawn falls back to cscb_<id>.
-    const fakeWeb = {
-      conversations: { info: async () => { throw new Error('boom') } },
-    }
-    const cfg = makeRoutingConfig({ routes: { C_X: { cwd: '/x' } } })
-    await resolveChannelNames(cfg, fakeWeb)
-
-    const spawnCalls: import('agent-director').SpawnParams[] = []
-    installStub({ spawnCalls })
-    await spawnForRoute('C_X', { cwd: '/x' }, cfg)
-    expect(spawnCalls[0].claude_instance_id).toBe('cscb_C_X')
-    expect(spawnCalls[0].tmux_session_name).toBe('slack_bot_C_X')
-  })
-
-  test('undefined web → no-op (no rejections)', async () => {
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    const results = await resolveChannelNames(cfg, undefined)
-    expect(results).toEqual([])
-    expect(cfg.routes['C'].name).toBeUndefined()
-  })
-
-  test('normalizes empty-string normalize result back to undefined', async () => {
-    // Channel name with no alnum chars → normalize returns '', which would
-    // produce ugly "slack_bot__C…" suffixes. The resolver should leave
-    // normalizedName undefined in that case so the bare-ID fallback kicks in.
-    const fakeWeb = {
-      conversations: { info: async () => ({ channel: { name: '🎉' } }) },
-    }
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    await resolveChannelNames(cfg, fakeWeb)
-    expect(cfg.routes['C'].name).toBe('🎉')
-    expect(cfg.routes['C'].normalizedName).toBeUndefined()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.1m9 — refreshRouteNameFromEvent
-// ---------------------------------------------------------------------------
-
-describe('refreshRouteNameFromEvent (b.1m9)', () => {
-  test('updates route on channel_rename-shape event (channel + channel_name fields)', () => {
-    const cfg = makeRoutingConfig({
-      routes: { C0AMDDZEHCY: { cwd: '/x', name: 'oldname', normalizedName: 'oldname' } },
-    })
-    refreshRouteNameFromEvent(cfg, { channel: 'C0AMDDZEHCY', channel_name: 'new-name' })
-    expect(cfg.routes['C0AMDDZEHCY'].name).toBe('new-name')
-    expect(cfg.routes['C0AMDDZEHCY'].normalizedName).toBe('new_name')
-  })
-
-  test('updates route on nested-channel-object event shape', () => {
-    const cfg = makeRoutingConfig({ routes: { C0AMDDZEHCY: { cwd: '/x' } } })
-    refreshRouteNameFromEvent(cfg, { channel: { id: 'C0AMDDZEHCY', name: 'general' } })
-    expect(cfg.routes['C0AMDDZEHCY'].name).toBe('general')
-    expect(cfg.routes['C0AMDDZEHCY'].normalizedName).toBe('general')
-  })
-
-  test('no-ops when event has no channel name', () => {
-    const cfg = makeRoutingConfig({
-      routes: { C: { cwd: '/x', name: 'unchanged', normalizedName: 'unchanged' } },
-    })
-    refreshRouteNameFromEvent(cfg, { channel: 'C', type: 'message', text: 'hi' })
-    expect(cfg.routes['C'].name).toBe('unchanged')
-  })
-
-  test('no-ops when channel is not in routes', () => {
-    const cfg = makeRoutingConfig({ routes: { C_OTHER: { cwd: '/x' } } })
-    refreshRouteNameFromEvent(cfg, { channel: 'C_NOT_ROUTED', channel_name: 'foo' })
-    expect(cfg.routes['C_OTHER'].name).toBeUndefined()
-  })
-
-  test('no-ops when cached name already matches', () => {
-    const cfg = makeRoutingConfig({
-      routes: { C: { cwd: '/x', name: 'general', normalizedName: 'general' } },
-    })
-    refreshRouteNameFromEvent(cfg, { channel: 'C', channel_name: 'general' })
-    expect(cfg.routes['C'].name).toBe('general')
-    expect(cfg.routes['C'].normalizedName).toBe('general')
-  })
-
-  test('handles malformed event input safely', () => {
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: '/x' } } })
-    refreshRouteNameFromEvent(cfg, null)
-    refreshRouteNameFromEvent(cfg, undefined)
-    refreshRouteNameFromEvent(cfg, 'not-an-object')
-    refreshRouteNameFromEvent(cfg, 42)
-    expect(cfg.routes['C'].name).toBeUndefined()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.1m9 — reconcileInstanceIds migration warner / auto-delete
-// ---------------------------------------------------------------------------
-
-describe('reconcileInstanceIds (b.1m9)', () => {
-  test('warns about stale bare-ID rows when new naming differs (no delete by default)', async () => {
-    const deleteCalls: import('agent-director').DeleteParams[] = []
-    const warnings: string[] = []
-    const originalErr = console.error
-    console.error = ((...args: unknown[]) => {
-      warnings.push(args.map(String).join(' '))
-    }) as typeof console.error
-    try {
-      installStub({
-        deleteCalls,
-        listResult: {
-          spawns: [
-            // Stale: cscb_C0AMDDZEHCY but route now expects cscb_general_C0AMDDZEHCY
-            cannedListRow({
-              claude_instance_id: 'cscb_C0AMDDZEHCY',
-              labels: { service: 'cscb', channel: 'C0AMDDZEHCY' },
-            }),
-            // Already new-style: cscb_horde_C0B2A9D2THT — should not flag.
-            cannedListRow({
-              claude_instance_id: 'cscb_horde_C0B2A9D2THT',
-              labels: { service: 'cscb', channel: 'C0B2A9D2THT' },
-            }),
-          ],
-        },
-      })
-      const cfg = makeRoutingConfig({
-        routes: {
-          C0AMDDZEHCY: { cwd: '/a', name: 'general', normalizedName: 'general' },
-          C0B2A9D2THT: { cwd: '/b', name: 'horde', normalizedName: 'horde' },
-        },
-      })
-      const r = await reconcileInstanceIds(cfg, false)
-      expect(r.orphans).toHaveLength(1)
-      expect(r.orphans[0]).toEqual({
-        channelId: 'C0AMDDZEHCY',
-        oldInstanceId: 'cscb_C0AMDDZEHCY',
-        expectedInstanceId: 'cscb_general_C0AMDDZEHCY',
-      })
-      expect(r.deleted).toBe(0)
-      expect(deleteCalls).toHaveLength(0)
-      // The operator-facing one-liner with the exact delete command must be present.
-      const combined = warnings.join('\n')
-      expect(combined).toContain('agent-director delete --claude-instance-id cscb_C0AMDDZEHCY')
-    } finally {
-      console.error = originalErr
-    }
-  })
-
-  test('autoDelete=true issues delete for each orphan', async () => {
-    const deleteCalls: import('agent-director').DeleteParams[] = []
-    installStub({
-      deleteCalls,
-      listResult: {
-        spawns: [
-          cannedListRow({
-            claude_instance_id: 'cscb_C0AMDDZEHCY',
-            labels: { service: 'cscb', channel: 'C0AMDDZEHCY' },
-          }),
-          cannedListRow({
-            claude_instance_id: 'cscb_C0B2A9D2THT',
-            labels: { service: 'cscb', channel: 'C0B2A9D2THT' },
-          }),
-        ],
-      },
-    })
-    const cfg = makeRoutingConfig({
-      routes: {
-        C0AMDDZEHCY: { cwd: '/a', name: 'general', normalizedName: 'general' },
-        C0B2A9D2THT: { cwd: '/b', name: 'horde', normalizedName: 'horde' },
-      },
-    })
-    const r = await reconcileInstanceIds(cfg, true)
-    expect(r.orphans).toHaveLength(2)
-    expect(r.deleted).toBe(2)
-    expect(r.failed).toBe(0)
-    const deletedIds = deleteCalls.flatMap((d) => d.claude_instance_id).sort()
-    expect(deletedIds).toEqual(['cscb_C0AMDDZEHCY', 'cscb_C0B2A9D2THT'])
-  })
-
-  test('no orphans when every row matches the expected new naming', async () => {
-    const deleteCalls: import('agent-director').DeleteParams[] = []
-    installStub({
-      deleteCalls,
-      listResult: {
-        spawns: [
-          cannedListRow({
-            claude_instance_id: 'cscb_general_C0AMDDZEHCY',
-            labels: { service: 'cscb', channel: 'C0AMDDZEHCY' },
-          }),
-        ],
-      },
-    })
-    const cfg = makeRoutingConfig({
-      routes: { C0AMDDZEHCY: { cwd: '/a', name: 'general', normalizedName: 'general' } },
-    })
-    const r = await reconcileInstanceIds(cfg, true)
-    expect(r.orphans).toEqual([])
-    expect(r.deleted).toBe(0)
-    expect(deleteCalls).toHaveLength(0)
-  })
-
-  test('rows without a route entry are skipped (handled by reconcileOrphans)', async () => {
-    const deleteCalls: import('agent-director').DeleteParams[] = []
-    installStub({
-      deleteCalls,
-      listResult: {
-        spawns: [
-          cannedListRow({
-            claude_instance_id: 'cscb_C_NOT_CONFIGURED',
-            labels: { service: 'cscb', channel: 'C_NOT_CONFIGURED' },
-          }),
-        ],
-      },
-    })
-    const cfg = makeRoutingConfig({ routes: { C_OTHER: { cwd: '/x' } } })
-    const r = await reconcileInstanceIds(cfg, true)
-    expect(r.orphans).toEqual([])
-    expect(deleteCalls).toHaveLength(0)
-  })
-
-  test('list failure → empty result, no crash', async () => {
-    installStub({ listError: new Error('AD down') })
-    const cfg = makeRoutingConfig({
-      routes: { C: { cwd: '/x', name: 'g', normalizedName: 'g' } },
-    })
-    const r = await reconcileInstanceIds(cfg, true)
-    expect(r.orphans).toEqual([])
-    expect(r.deleted).toBe(0)
-  })
-
-  test('mixed routes: some new, some bare — only the bare get flagged', async () => {
-    installStub({
-      listResult: {
-        spawns: [
-          cannedListRow({
-            claude_instance_id: 'cscb_general_C1',
-            labels: { service: 'cscb', channel: 'C1' },
-          }),
-          cannedListRow({
-            claude_instance_id: 'cscb_C2',
-            labels: { service: 'cscb', channel: 'C2' },
-          }),
-          cannedListRow({
-            claude_instance_id: 'cscb_horde_C3',
-            labels: { service: 'cscb', channel: 'C3' },
-          }),
-        ],
-      },
-    })
-    const cfg = makeRoutingConfig({
-      routes: {
-        C1: { cwd: '/1', name: 'general', normalizedName: 'general' },
-        C2: { cwd: '/2', name: 'horde', normalizedName: 'horde' },
-        C3: { cwd: '/3', name: 'horde', normalizedName: 'horde' },
-      },
-    })
-    const r = await reconcileInstanceIds(cfg, false)
-    expect(r.orphans).toHaveLength(1)
-    expect(r.orphans[0].channelId).toBe('C2')
-    expect(r.orphans[0].oldInstanceId).toBe('cscb_C2')
-    expect(r.orphans[0].expectedInstanceId).toBe('cscb_horde_C2')
   })
 })
 
@@ -2413,8 +2339,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   test('site #1: reconnectMcp ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
     const { web, calls } = makeMockWeb()
     installStub({ sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN) })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
-    const result = await reconnectMcp('C', web as never, cfg)
+    const result = await reconnectMcp('C', web as never)
     expect(result).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(calls).toHaveLength(0)
@@ -2423,8 +2348,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   test('site #1b: reconnectMcp ErrTmuxNotAvailable → tmux-unavailable, no postSpawnFailureToChannel', async () => {
     const { web, calls } = makeMockWeb()
     installStub({ sendKeysError: new ErrTmuxNotAvailable('send-keys', 'ErrTmuxNotAvailable', 'tmux not available') })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
-    const result = await reconnectMcp('C', web as never, cfg)
+    const result = await reconnectMcp('C', web as never)
     expect(result).toBe('failed')
     expect(getOutageFlags('C').has('tmux-unavailable')).toBe(true)
     expect(calls).toHaveLength(0)
@@ -2438,7 +2362,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     const { web, calls } = makeMockWeb()
     _setWaitForWaitingTimeoutMs(50)
     installStub({ statusError: new ErrSystemInstallDisappeared('status', BIN) })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
     const result = await waitForWaitingAndReconnect('C', cfg, web as never)
     expect(result).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
@@ -2446,7 +2370,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Site #9 — tryKill → kill (tested via spawnForRoute collision path)
+  // Site #9 — tryKill → kill (tested via spawnForPersona collision path)
   // kill errors are silently ignored by tryKill, but the outage flag IS raised.
   // -------------------------------------------------------------------------
 
@@ -2460,8 +2384,8 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       killError: new ErrSystemInstallDisappeared('kill', BIN),
       deleteError: new ErrSystemInstallDisappeared('delete', BIN),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } }, resume_enabled: false })
-    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(calls).toHaveLength(0)
@@ -2479,22 +2403,22 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       // kill succeeds; delete fails with typed outage error
       deleteError: new ErrSystemInstallDisappeared('delete', BIN),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } }, resume_enabled: false })
-    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(calls).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
-  // Site #11 — spawnForRoute initial spawn (withSpawnDetection)
+  // Site #11 — spawnForPersona initial spawn (withSpawnDetection)
   // -------------------------------------------------------------------------
 
   test('site #11: initial spawn ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
     const { web, calls } = makeMockWeb()
     installStub({ spawnError: new ErrSystemInstallDisappeared('spawn', BIN) })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
-    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(calls).toHaveLength(0)
@@ -2503,8 +2427,8 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   test('site #11b: initial spawn ErrCwdNotFound → cwd-unreachable with route.cwd as detail, no postSpawnFailureToChannel', async () => {
     const { web, calls } = makeMockWeb()
     installStub({ spawnError: new ErrCwdNotFound('spawn', 'ErrCwdNotFound', `cwd ${CWD} does not exist`) })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
-    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
     // The detail should be route.cwd (from withSpawnDetection's routeCwd arg)
@@ -2513,7 +2437,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Site #12 — spawnForRoute collision-get (withOutageDetection)
+  // Site #12 — spawnForPersona collision-get (withOutageDetection)
   // -------------------------------------------------------------------------
 
   test('site #12: collision-get ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
@@ -2522,15 +2446,15 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getError: new ErrSystemInstallDisappeared('get', BIN),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
-    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(calls).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
-  // Site #13 — spawnForRoute retry-spawn after ErrSpawnNotFound
+  // Site #13 — spawnForPersona retry-spawn after ErrSpawnNotFound
   // -------------------------------------------------------------------------
 
   test('site #13: retry-spawn after ErrSpawnNotFound ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
@@ -2542,15 +2466,15 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       ],
       getError: errSpawnNotFound(),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
-    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(calls).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
-  // Site #14 — spawnForRoute fresh-spawn after kill+delete (resume_enabled=false)
+  // Site #14 — spawnForPersona fresh-spawn after kill+delete (resume_enabled=false)
   // -------------------------------------------------------------------------
 
   test('site #14: fresh-spawn after kill+delete ErrCwdNotFound → cwd-unreachable, no postSpawnFailureToChannel', async () => {
@@ -2562,15 +2486,15 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       ],
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } }, resume_enabled: false })
-    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
     expect(calls).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
-  // Site #15 — spawnForRoute resume (withSpawnDetection)
+  // Site #15 — spawnForPersona resume (withSpawnDetection)
   // -------------------------------------------------------------------------
 
   test('site #15: resume ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
@@ -2580,15 +2504,15 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
       resumeError: new ErrSystemInstallDisappeared('resume', BIN),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
-    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(calls).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
-  // Site #16 — spawnForRoute spawn after ErrNoSessionId → delete → spawn
+  // Site #16 — spawnForPersona spawn after ErrNoSessionId → delete → spawn
   // -------------------------------------------------------------------------
 
   test('site #16: spawn after ErrNoSessionId-delete ErrCwdNotFound → cwd-unreachable, no postSpawnFailureToChannel', async () => {
@@ -2601,15 +2525,15 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
       resumeError: errNoSessionId(),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
-    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('cwd-unreachable')).toBe(true)
     expect(calls).toHaveLength(0)
   })
 
   // -------------------------------------------------------------------------
-  // Site #17 — spawnForRoute spawn after ErrSpawnNotResumable → kill+delete → spawn
+  // Site #17 — spawnForPersona spawn after ErrSpawnNotResumable → kill+delete → spawn
   // -------------------------------------------------------------------------
 
   test('site #17: spawn after ErrSpawnNotResumable kill+delete ErrSystemInstallDisappeared → ad-unreachable, no postSpawnFailureToChannel', async () => {
@@ -2622,37 +2546,13 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
       getResult: cannedGetResult({ claude_instance_id: 'cscb_C', state: 'ended' }),
       resumeError: errSpawnNotResumable(),
     })
-    const cfg = makeRoutingConfig({ routes: { C: { cwd: CWD } } })
-    const result = await spawnForRoute('C', { cwd: CWD }, cfg, web as never)
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg, web as never)
     expect(result.action).toBe('failed')
     expect(getOutageFlags('C').has('ad-unreachable')).toBe(true)
     expect(calls).toHaveLength(0)
   })
 
-  // -------------------------------------------------------------------------
-  // Site #18 — reconcileInstanceIds per-orphan delete (withOutageDetection)
-  // -------------------------------------------------------------------------
-
-  test('site #18: reconcileInstanceIds per-orphan delete ErrSystemInstallDisappeared → ad-unreachable, counted as failed', async () => {
-    installStub({
-      listResult: {
-        spawns: [
-          cannedListRow({
-            claude_instance_id: 'cscb_C_OLD',
-            labels: { service: 'cscb', channel: 'C_REC' },
-          }),
-        ],
-      },
-      deleteError: new ErrSystemInstallDisappeared('delete', BIN),
-    })
-    const cfg = makeRoutingConfig({
-      routes: { C_REC: { cwd: CWD, name: 'new_name', normalizedName: 'new_name' } },
-    })
-    const result = await reconcileInstanceIds(cfg, true)
-    expect(result.deleted).toBe(0)
-    expect(result.failed).toBe(1)
-    expect(getOutageFlags('C_REC').has('ad-unreachable')).toBe(true)
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -2737,8 +2637,8 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
   test('site #11: initial spawn success clears all three flags + emits all-clear', async () => {
     setupFlags()
     installStub({})
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
-    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, false)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, false)
     expect(result.action).toBe('spawned')
     assertAllClear()
   })
@@ -2756,8 +2656,8 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
       ],
       getError: errSpawnNotFound(),
     })
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
-    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, false)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, false)
     expect(result.action).toBe('spawned')
     assertAllClear()
   })
@@ -2775,8 +2675,8 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
       ],
       getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
     })
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } }, resume_enabled: false })
-    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, false)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, false)
     expect(result.action).toBe('spawned')
     assertAllClear()
   })
@@ -2791,8 +2691,8 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
     })
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
-    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, false)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, false)
     expect(result.action).toBe('resumed')
     assertAllClear()
   })
@@ -2811,8 +2711,8 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
       getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
       resumeError: errNoSessionId(),
     })
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
-    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, false)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, false)
     expect(result.action).toBe('spawned')
     assertAllClear()
   })
@@ -2831,8 +2731,8 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
       getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
       resumeError: errSpawnNotResumable(),
     })
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
-    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, false)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, false)
     expect(result.action).toBe('spawned')
     assertAllClear()
   })
@@ -2858,18 +2758,6 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   afterEach(() => {
     while (archiveCleanups.length > 0) archiveCleanups.pop()!()
   })
-
-  /**
-   * Redirect startup-errors.log into a temp dir and return a reader. The
-   * 'lost' classification records to startup-errors ONLY when isStartup=true,
-   * so the lost test drives spawnForRoute(..., isStartup=true).
-   */
-  function captureStartupErrors(): () => string {
-    const dir = mkdtempSync(join(tmpdir(), 'cscb-wrb-'))
-    process.env['SLACK_STATE_DIR'] = dir
-    const logPath = join(dir, 'startup-errors.log')
-    return () => (existsSync(logPath) ? readFileSync(logPath, 'utf-8') : '')
-  }
 
   /** Capture console.error output for the duration of `fn`, then restore. */
   async function withCapturedErr(fn: () => Promise<void>): Promise<string> {
@@ -2939,7 +2827,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     installAmnesia({
       getResult: { jsonl_path: '/data/proj/sess-1.jsonl', claude_session_id: 'sess-1', cwd: CWD },
     })
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
     expect(result.freshAfterInconclusiveAmnesia).toBe(1)
@@ -2949,8 +2837,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(result.failed).toBe(0)
     // Still counted toward liveness, but distinctly bucketed.
     expect(result.succeeded).toBe(1)
-    expect(result.perChannel).toEqual([
-      { channelId: CH, action: 'fresh-after-inconclusive-amnesia' },
+    expect(result.perPersona).toEqual([
+      { key: CH, action: 'fresh-after-inconclusive-amnesia' },
     ])
   })
 
@@ -2979,9 +2867,15 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       getIdx++
       return cannedGetResult({ claude_instance_id: params.claude_instance_id, state: 'ended' })
     }
-    const cfg = makeRoutingConfig({
-      routes: { C1: { cwd: '/x1' }, C2: { cwd: '/x2' }, C3: { cwd: '/x3' }, C4: { cwd: '/x4' } },
-    })
+    const cfg = makeStandInPersonaConfig(
+      {
+        C1: { working_directory: '/x1' },
+        C2: { working_directory: '/x2' },
+        C3: { working_directory: '/x3' },
+        C4: { working_directory: '/x4' },
+      },
+      fixtureDir,
+    )
     let result!: Awaited<ReturnType<typeof startupSessionManager>>
     const errLog = await withCapturedErr(async () => {
       result = await startupSessionManager(cfg, { concurrency: 1 })
@@ -3004,17 +2898,17 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     // folding amnesia into a generic "ok"), splitting diagnosed
     // (fresh-after-amnesia) from undiagnosable (fresh-after-inconclusive-amnesia).
     expect(errLog).toContain(
-      'startupSessionManager: complete — 1 resumed, 1 fresh-spawned, ' +
+      'startupSessionManager: complete — 4 persona(s): 1 resumed, 1 fresh-spawned, ' +
         '0 fresh-after-amnesia, 1 fresh-after-inconclusive-amnesia, ' +
         '0 reconnected, 0 no-op, 1 failed',
     )
     // Because freshAfterInconclusiveAmnesia > 0, its loud grep-friendly
     // follow-up line fires (the freshAfterAmnesia line does not — count is 0).
     expect(errLog).toContain(
-      '1 channel(s) were fresh-spawned after ErrJsonlMissing WITHOUT a conclusive diagnosis',
+      '1 persona(s) were fresh-spawned after ErrJsonlMissing WITHOUT a conclusive diagnosis',
     )
     expect(errLog).not.toContain(
-      '1 channel(s) were fresh-spawned after ErrJsonlMissing (transcript could not be resumed)',
+      '1 persona(s) were fresh-spawned after ErrJsonlMissing (transcript could not be resumed)',
     )
   })
 
@@ -3036,8 +2930,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         jsonlDescription: desc,
         getResult: { jsonl_path: '/data/proj/sess-1.jsonl', claude_session_id: 'sess-1', cwd: CWD },
       })
-      const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
-      await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, true)
+      const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+      await spawnForPersona(personaOf(cfg, CH), cfg, undefined, true)
     })
   }
 
@@ -3086,7 +2980,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   // --- Message-shape coverage: plain non-enumerated format ----------------
   // A pre-b.1ba AD's ErrJsonlMissing carries no per-candidate enumeration. The
   // diagnostic must degrade to locally-computed candidates, label them
-  // honestly, and never throw (spawnForRoute still completes the amnesia
+  // honestly, and never throw (spawnForPersona still completes the amnesia
   // fresh-spawn).
   test('plain non-enumerated ErrJsonlMissing message: degrades to honest locally-computed candidates, no throw', async () => {
     captureStartupErrors()
@@ -3095,8 +2989,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         jsonlDescription: 'jsonl missing', // no <source> <path> (<err>) enumeration
         getResult: { jsonl_path: '/data/proj/sess-2.jsonl', claude_session_id: 'sess-2', cwd: CWD },
       })
-      const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
-      const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, true)
+      const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+      const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, true)
       // Never throws — the fresh-spawn still happens. No message_archive_db is
       // configured here, so the diagnosis is inconclusive (c-config).
       expect(result.action).toBe('fresh-after-inconclusive-amnesia')
@@ -3123,8 +3017,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         started_at: '2026-09-20T05:00:00Z',
       },
     })
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } }, message_archive_db: dbPath })
-    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, web as never, true)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, web as never, true)
 
     // b.fwu: evidence-based never-created is the DIAGNOSED-lossless case — it
     // stays quiet and is bucketed as the ordinary fresh-after-amnesia action,
@@ -3138,7 +3032,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
 
   // --- Classification triad: lost (loud) ----------------------------------
   // Archived messages > 0 since spawn → real context destroyed. Loud:
-  // recordStartupError('jsonl-transcript-lost-on-resume') + channel post.
+  // recordStartupError('jsonl-transcript-lost-on-resume') + channel post. The
+  // startup error is recorded only when isStartup=true, so this drives that.
   test('lost: archived messages since spawn > 0 → startup-error recorded + channel post', async () => {
     const readLog = captureStartupErrors()
     const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 4)
@@ -3151,8 +3046,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         started_at: '2026-09-20T05:00:00Z',
       },
     })
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } }, message_archive_db: dbPath })
-    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, web as never, true)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, web as never, true)
 
     expect(result.action).toBe('fresh-after-amnesia')
     // Operator-visible: startup-error entry embedding the archived count.
@@ -3190,8 +3085,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       if (getCalls >= 2) throw errGeneric('get', 'ErrSpawnGone')
       return cannedGetResult({ claude_instance_id: params.claude_instance_id, state: 'ended' })
     }
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
-    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, true)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, true)
 
     expect(result.action).toBe('fresh-after-inconclusive-amnesia')
     expect(deleteCalls).toHaveLength(1) // delete+fresh policy unchanged
@@ -3225,7 +3120,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       if (getCalls >= 2) throw errGeneric('get', 'ErrSpawnGone')
       return cannedGetResult({ claude_instance_id: params.claude_instance_id, state: 'ended' })
     }
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
     expect(result.freshAfterInconclusiveAmnesia).toBe(1)
@@ -3249,7 +3144,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         started_at: 'not-a-timestamp',
       },
     })
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } }, message_archive_db: dbPath })
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
     expect(result.freshAfterInconclusiveAmnesia).toBe(1)
@@ -3269,7 +3164,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     installAmnesia({
       getResult: { jsonl_path: '/data/proj/sess-c1.jsonl', claude_session_id: 'sess-c1', cwd: CWD },
     })
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } }) // no message_archive_db
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir) // no message_archive_db
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
     expect(result.freshAfterInconclusiveAmnesia).toBe(1)
@@ -3292,10 +3187,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         started_at: '2026-09-20T05:00:00Z',
       },
     })
-    const cfg = makeRoutingConfig({
-      routes: { [CH]: { cwd: CWD } },
-      message_archive_db: missingDb,
-    })
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: missingDb })
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
     expect(result.freshAfterInconclusiveAmnesia).toBe(1)
@@ -3328,7 +3220,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         started_at: '2026-09-20T05:00:00Z',
       },
     })
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } }, message_archive_db: dbPath })
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
     let result!: Awaited<ReturnType<typeof startupSessionManager>>
     const errLog = await withCapturedErr(async () => {
       result = await startupSessionManager(cfg, { concurrency: 1 })
@@ -3339,13 +3231,13 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(result.succeeded).toBe(1)
     // Summary line reports the conclusive bucket, not the inconclusive one.
     expect(errLog).toContain(
-      'startupSessionManager: complete — 0 resumed, 0 fresh-spawned, ' +
+      'startupSessionManager: complete — 1 persona(s): 0 resumed, 0 fresh-spawned, ' +
         '1 fresh-after-amnesia, 0 fresh-after-inconclusive-amnesia, ' +
         '0 reconnected, 0 no-op, 0 failed',
     )
     // The diagnosed follow-up line fires; the inconclusive one does not.
     expect(errLog).toContain(
-      '1 channel(s) were fresh-spawned after ErrJsonlMissing (transcript could not be resumed)',
+      '1 persona(s) were fresh-spawned after ErrJsonlMissing (transcript could not be resumed)',
     )
     expect(errLog).not.toContain(
       'fresh-spawned after ErrJsonlMissing WITHOUT a conclusive diagnosis',
@@ -3366,7 +3258,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         started_at: '2026-09-20T05:00:00Z',
       },
     })
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } }, message_archive_db: dbPath })
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
     expect(result.freshAfterAmnesia).toBe(1)
@@ -3383,8 +3275,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     installAmnesia({
       getResult: { jsonl_path: '/data/proj/sess-u.jsonl', claude_session_id: 'sess-u', cwd: CWD },
     })
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } }) // c-config → inconclusive
-    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, web as never, true)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir) // c-config → inconclusive
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, web as never, true)
 
     expect(result.action).toBe('fresh-after-inconclusive-amnesia')
     expect(calls).toHaveLength(1)
@@ -3410,8 +3302,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
       getResult: cannedGetResult({ claude_instance_id: `cscb_${CH}`, state: 'ended' }),
       resumeError: errNoSessionId(),
     })
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
-    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, undefined, true)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, undefined, true)
     expect(result.action).toBe('spawned')
   })
 })
@@ -3433,8 +3325,8 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
   const CWD = '/repo/jgf'
 
   beforeEach(() => {
-    // startupSessionManager writes startup-errors.log; keep it out of the repo.
-    process.env['SLACK_STATE_DIR'] = mkdtempSync(join(tmpdir(), 'cscb-jgf-'))
+    // startupSessionManager writes startup-errors.log; keep it in the per-test dir.
+    captureStartupErrors()
   })
 
   /**
@@ -3476,13 +3368,13 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
     const getCalls: import('agent-director').GetParams[] = []
     installNeverWritten({ spawnCalls, deleteCalls, getCalls })
     const { web, calls } = makeMockWeb()
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
 
-    const result = await spawnForRoute(CH, { cwd: CWD }, cfg, web as never, true)
+    const result = await spawnForPersona(personaOf(cfg, CH), cfg, web as never, true)
 
     // AC-2/AC-3: plain success action — not 'failed', and not borrowed from the
     // amnesia vocabulary, because nothing was lost.
-    expect(result).toEqual({ channelId: CH, action: 'spawned' })
+    expect(result).toEqual({ key: CH, action: 'spawned' })
     // Row deleted, then re-spawned with the original params.
     expect(deleteCalls).toHaveLength(1)
     expect(deleteCalls[0].claude_instance_id).toEqual([`cscb_${CH}`])
@@ -3501,16 +3393,39 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
   test('launchSession adapter returns true → restart.ts records success, schedules no retry', async () => {
     installNeverWritten()
     const { web } = makeMockWeb()
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
 
-    expect(await launchSession(CH, CWD, cfg, web as never)).toBe(true)
+    expect(await launchSession(CH, cfg, web as never)).toBe(true)
+  })
+
+  // The restart path's adapter looks the key up among the applied personas; an
+  // unknown key reports failure and never reaches agent-director.
+  test('launchSession: unknown key → false, no agent-director call', async () => {
+    const spawnCalls: import('agent-director').SpawnParams[] = []
+    const stub = installStub({ spawnCalls })
+    // Record every client verb, not just the ones the stub captures.
+    const verbs: string[] = []
+    const record = stub as unknown as Record<string, unknown>
+    for (const name of Object.keys(record)) {
+      const fn = record[name]
+      if (typeof fn !== 'function') continue
+      record[name] = (...args: unknown[]) => { verbs.push(name); return (fn as (...a: unknown[]) => unknown)(...args) }
+    }
+    const { web, calls } = makeMockWeb()
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+
+    expect(await launchSession('C_UNKNOWN', cfg, web as never)).toBe(false)
+
+    expect(spawnCalls).toHaveLength(0)
+    expect(verbs).toEqual([])
+    expect(calls).toHaveLength(0)
   })
 
   // AC-3: the startup summary must stay honest — a never-written transcript is
   // an ordinary fresh spawn, not amnesia and not an undiagnosable one.
   test('startup counters: bucketed as freshSpawned, not amnesia and not failed', async () => {
     installNeverWritten()
-    const cfg = makeRoutingConfig({ routes: { [CH]: { cwd: CWD } } })
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
 
     const result = await startupSessionManager(cfg, { concurrency: 1 })
 
@@ -3518,6 +3433,6 @@ describe('b.jgf: ErrJsonlNeverWritten → lossless delete + fresh spawn', () => 
     expect(result.freshAfterAmnesia).toBe(0)
     expect(result.freshAfterInconclusiveAmnesia).toBe(0)
     expect(result.failed).toBe(0)
-    expect(result.perChannel).toEqual([{ channelId: CH, action: 'spawned' }])
+    expect(result.perPersona).toEqual([{ key: CH, action: 'spawned' }])
   })
 })

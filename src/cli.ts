@@ -19,7 +19,7 @@ import { initLogging } from './logging.ts'
 import { isDryRun } from './tokens.ts'
 import { ErrSpawnNotFound } from './agent-director-errors.ts'
 import { getClient } from './agent-director-client.ts'
-import { instanceIdFor } from './session-manager.ts'
+import { personaInstanceId } from './persona-identity.ts'
 import { runStartupGate } from './agent-director-startup.ts'
 
 // ---------------------------------------------------------------------------
@@ -275,11 +275,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       const { spawn } = await import('child_process')
       const logPath = join(stateDir, 'server.log')
       const logFd = openSync(logPath, 'a')
-      // b.1m9: propagate --reconcile-instance-ids to the daemon child via env.
       const childEnv: NodeJS.ProcessEnv = { ...process.env, _CLI_DAEMON_CHILD: '1' }
-      if (process.argv.includes('--reconcile-instance-ids')) {
-        childEnv['CSCB_RECONCILE_INSTANCE_IDS'] = '1'
-      }
       const child = spawn(process.execPath, [import.meta.filename, 'start'], {
         detached: true,
         stdio: ['ignore', logFd, logFd],
@@ -506,15 +502,12 @@ if (import.meta.main) {
     console.error('')
     console.error('stop flags:')
     console.error('  --stop-bots    Gracefully exit all managed bots before stopping the server')
-    console.error('')
-    console.error('Flags (b.1m9):')
-    console.error('  --reconcile-instance-ids   Auto-delete stale pre-rename cscb_<id> AD rows on startup')
     process.exit(1)
   }
 
   // Resolve a channel's actual claude_instance_id by querying agent-director's
-  // label index. Survives the b.1m9 naming change (cscb_<name>_<id>) without
-  // requiring the CLI to know the route's normalizedName.
+  // label index (the interim `channel` label). Spawns are named `cscb_<key>`
+  // and, until the persona loader switch, the key is the channel ID.
   //
   // b.qwo: returns null ONLY when no cscb row exists for the channel (empty
   // list). All other errors (AD connection refused, uninitialized client,
@@ -526,9 +519,11 @@ if (import.meta.main) {
   async function resolveCscbInstanceId(channelId: string): Promise<string | null> {
     const r = await getClient().list({ label: ['service=cscb', `channel=${channelId}`] })
     if (r.spawns.length === 0) return null
-    // Prefer the new-naming row if both old and new exist mid-migration.
-    const newStyle = r.spawns.find((s) => s.claude_instance_id !== `cscb_${channelId}`)
-    return (newStyle ?? r.spawns[0]).claude_instance_id
+    // Prefer the row named exactly `cscb_<channel>` (the current naming) when
+    // more than one carries the label; any other row is a leftover from the
+    // retired channel-name naming. Fall back to the first row otherwise.
+    const current = r.spawns.find((s) => s.claude_instance_id === personaInstanceId(channelId))
+    return (current ?? r.spawns[0]).claude_instance_id
   }
 
   const realDeps: CliDeps = {
@@ -556,9 +551,8 @@ if (import.meta.main) {
       }
     },
     directorStatus: async (channelId) => {
-      // Resolve the actual claude_instance_id by label (cscb_<name>_<id> after b.1m9,
-      // or cscb_<id> on pre-rename installs). Falls back to bare-ID lookup if
-      // listing isn't possible, preserving compatibility with single-row stubs.
+      // Resolve the actual claude_instance_id by label; null when no cscb row
+      // carries this channel's label.
       const id = await resolveCscbInstanceId(channelId)
       if (id === null) return null
       try {
@@ -570,12 +564,12 @@ if (import.meta.main) {
       }
     },
     directorPause: async (channelId) => {
-      const id = (await resolveCscbInstanceId(channelId)) ?? instanceIdFor(channelId)
+      const id = (await resolveCscbInstanceId(channelId)) ?? personaInstanceId(channelId)
       await getClient().pause({ claude_instance_id: id })
     },
     directorKill: async (channelId) => {
       try {
-        const id = (await resolveCscbInstanceId(channelId)) ?? instanceIdFor(channelId)
+        const id = (await resolveCscbInstanceId(channelId)) ?? personaInstanceId(channelId)
         await getClient().kill({ claude_instance_id: id })
       } catch (err) {
         if (err instanceof ErrSpawnNotFound) return

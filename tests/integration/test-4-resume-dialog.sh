@@ -8,7 +8,7 @@
 # fell into an ErrTmuxSessionCreate respawn loop.
 #
 # This test exercises the REAL agent-director + REAL tmux spawn/resume path (no
-# SLACK_DRY_RUN) via a small driver that calls the shipped spawnForRoute /
+# SLACK_DRY_RUN) via a small driver that calls the shipped spawnForPersona /
 # approvePreSessionDialogs directly (the full daemon needs Slack creds CI lacks).
 # A stub `claude` on PATH stands in for the model: it prints the exact
 # dev-channels dialog and fires SessionStart on Enter, so the test is

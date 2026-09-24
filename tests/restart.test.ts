@@ -37,7 +37,8 @@ import { makeStubClient } from './test-helpers/agent-director-stub.ts'
 import { errTmuxSendKeys } from './test-helpers/agent-director-stub.ts'
 import type { Client } from 'agent-director'
 import type { WebClient } from '@slack/web-api'
-import type { FindMissingParams } from 'agent-director'
+import type { FindMissingParams, SendKeysParams, StatusParams } from 'agent-director'
+import { personaInstanceId } from '../src/persona-identity.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -844,19 +845,25 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
       launchSessionCalls: string[]
     }
     findMissingCalls: FindMissingParams[]
+    statusCalls: StatusParams[]
+    sendKeysCalls: SendKeysParams[]
     setAlive: (v: boolean) => void
   } {
     let alive = true
     const killSessionCalls: string[] = []
     const launchSessionCalls: string[] = []
     const findMissingCalls: FindMissingParams[] = []
+    const statusCalls: StatusParams[] = []
+    const sendKeysCalls: SendKeysParams[] = []
 
     // Non-working status → adapter falls through to reconnectMcp; persistent
     // ErrTmuxSendKeys on send-keys (ensurer stubbed no-op) → 'dead-session'
     // → adapter maps to 'escalate-dead' and fires the internal sweep.
     const stub = makeStubClient({
       statusFn: () => ({ state: 'waiting' }),
+      statusCalls,
       sendKeysError: errTmuxSendKeys(),
+      sendKeysCalls,
       findMissingCalls,
     })
     _resetOutageState()
@@ -867,11 +874,9 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     setClientForTests(stub as unknown as Client)
     _setTmuxServerEnsurer(async () => {})
 
-    const fakeConfig = { routes: { C_DEADTMUX: { normalizedName: 'dead-tmux' } } }
-    const reconnectSession = _buildReconnectSessionAdapter(
-      () => fakeConfig as never,
-      {} as unknown as WebClient,
-    )
+    // The adapter resolves the instance ID from the persona key alone
+    // (b.av2 SR-2.2) — the stand-in key is the channel ID, C_DEADTMUX.
+    const reconnectSession = _buildReconnectSessionAdapter({} as unknown as WebClient)
 
     const deps: RestartDeps & { killSessionCalls: string[]; launchSessionCalls: string[] } = {
       killSessionCalls,
@@ -886,7 +891,7 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
       isShuttingDown: () => false,
       onCapReached: () => {},
     }
-    return { deps, findMissingCalls, setAlive: (v: boolean) => { alive = v } }
+    return { deps, findMissingCalls, statusCalls, sendKeysCalls, setAlive: (v: boolean) => { alive = v } }
   }
 
   beforeEach(() => {
@@ -902,7 +907,7 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
 
   test('tick 1: alive+dead-tmux verdict fires exactly one internal findMissing sweep (no kill/relaunch); tick 2: session dead → kill+relaunch', async () => {
     const CHANNEL = 'C_DEADTMUX'
-    const { deps, findMissingCalls, setAlive } = makeRealAdapterDeps()
+    const { deps, findMissingCalls, statusCalls, sendKeysCalls, setAlive } = makeRealAdapterDeps()
     initRestart(deps)
 
     // --- Tick 1: row still looks alive; the real adapter runs reconnectMcp,
@@ -920,6 +925,10 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
     // Single counting site: escalate-dead never records a failure.
     expect(getFailureCount(CHANNEL)).toBe(0)
     expect(isAtCap(CHANNEL, RESTART_FAILURE_CAP)).toBe(false)
+    // The adapter's AD calls address the persona's cscb_<key> instance: one
+    // status probe, then the send-keys reconnect and its one self-heal retry.
+    expect(statusCalls.map((c) => c.claude_instance_id)).toEqual([personaInstanceId(CHANNEL)])
+    expect(sendKeysCalls.map((c) => c.claude_instance_id)).toEqual(['cscb_C_DEADTMUX', 'cscb_C_DEADTMUX'])
 
     // --- Tick 2: the sweep has (in production) reconciled the row to `missing`,
     // so the next tick observes the session dead. The normal kill+relaunch

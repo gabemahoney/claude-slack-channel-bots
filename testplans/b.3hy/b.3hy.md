@@ -28,17 +28,19 @@ If not running, fail this test.
 ### Verify dry-run spawn-skip
 Per-channel session state is now owned by agent-director (SR-7.1) — CSCB no
 longer maintains its own `sessions.json` registry, and in dry-run mode
-`spawnForRoute` is a no-op (the WebClient is not authenticated). Instead of
+`spawnForPersona` is a no-op (the WebClient is not authenticated). Instead of
 inspecting a sessions file, verify directly from the server log that the
 startup session manager ran and that the spawn was skipped for the configured
-route:
+route. The server turns each route into a stand-in persona whose name and key
+are the channel ID, so the log names the persona as `"C_TEST1" (key=C_TEST1)`.
+Match the strings literally (`grep -F`):
 ```bash
-grep "startupSessionManager: 1 route" ~/.claude/channels/slack/server.log
-grep "dry-run: skipping spawn for channel=C_TEST1" ~/.claude/channels/slack/server.log
-grep "startupSessionManager: complete" ~/.claude/channels/slack/server.log
+grep -F 'startupSessionManager: 1 persona(s)' ~/.claude/channels/slack/server.log
+grep -F '[slack] dry-run: skipping spawn for "C_TEST1" (key=C_TEST1)' ~/.claude/channels/slack/server.log
+grep -F 'startupSessionManager: complete' ~/.claude/channels/slack/server.log
 ```
 
 ### Pass criteria
-- `~/.claude/channels/slack/server.log` contains "startupSessionManager: 1 route(s)"
-- `~/.claude/channels/slack/server.log` contains "[slack] dry-run: skipping spawn for channel=C_TEST1"
-- `~/.claude/channels/slack/server.log` contains "startupSessionManager: complete"
+- `~/.claude/channels/slack/server.log` contains `startupSessionManager: 1 persona(s)`
+- `~/.claude/channels/slack/server.log` contains `[slack] dry-run: skipping spawn for "C_TEST1" (key=C_TEST1)`
+- `~/.claude/channels/slack/server.log` contains `startupSessionManager: complete`

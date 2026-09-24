@@ -40,18 +40,16 @@ import {
   type Access,
   type GateResult,
 } from './lib.ts'
-import { loadConfig, expandTilde, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
+import { loadConfig, expandTilde, type PersonaConfig, type RoutingConfig, MCP_SERVER_NAME } from './config.ts'
+import { personaInstanceId } from './persona-identity.ts'
+import { routesToPersonaConfig } from './route-persona-adapter.ts'
 import {
   AGENT_DIRECTOR_LIVE_STATES,
   flushSpawnFailureQueue,
-  instanceIdFor,
   launchSession,
   postSpawnFailureToChannel,
-  reconcileInstanceIds,
   reconcileOrphans,
   reconnectMcp,
-  refreshRouteNameFromEvent,
-  resolveChannelNames,
   startupSessionManager,
   sweepDeadTmuxChannel,
 } from './session-manager.ts'
@@ -644,15 +642,16 @@ async function handleMessage(event: unknown): Promise<void> {
           // above when resolving targetSession).
           //
           // Recovery must be keyed to the OWNING channel, not the inbound one:
-          // buildSpawnParams/instanceIdFor derive the instance id + tmux name
-          // from the channelId, and the restart guards/backoff are keyed by
-          // channelId. For a direct route the owning channel IS the inbound
-          // channel. For default_route the session is owned by the direct route
-          // whose cwd === default_route (config.ts guarantees such a route
-          // exists — default_route must match a defined route CWD, and CWDs are
-          // unique per channel). Keying to the inbound channel there would spawn
-          // a SECOND instance on the shared cwd and its guards could not see the
-          // owning session's in-flight restart or cap state.
+          // the spawn's instance id + tmux name derive from the persona key
+          // (the channelId under the route->persona adapter), and the restart
+          // guards/backoff are keyed by channelId. For a direct route the
+          // owning channel IS the inbound channel. For default_route the
+          // session is owned by the direct route whose cwd === default_route
+          // (config.ts guarantees such a route exists — default_route must
+          // match a defined route CWD, and CWDs are unique per channel).
+          // Keying to the inbound channel there would spawn a SECOND instance
+          // on the shared cwd and its guards could not see the owning
+          // session's in-flight restart or cap state.
           const directRoute = routingConfig?.routes[channelId]
           let cwd: string | undefined
           let ownerChannelId: string | undefined
@@ -796,11 +795,12 @@ async function handleMessage(event: unknown): Promise<void> {
         // Recovery is keyed to the OWNING channel of the session, not the
         // inbound channel. targetSession may have been resolved via
         // default_route (getSessionByCwd) or the DM default_dm_session path, in
-        // which case channelId is not the owner. instanceIdFor, tmux naming,
+        // which case channelId is not the owner. The instance id, tmux naming,
         // backoff, and the pending/cap guards are all keyed by the owning
-        // channelId, so scheduling under the inbound channel could spawn a
-        // duplicate instance on a shared cwd and miss the owner's in-flight
-        // restart/cap state. The reply below stays on the inbound channelId.
+        // channelId (the persona key under the route->persona adapter), so
+        // scheduling under the inbound channel could spawn a duplicate
+        // instance on a shared cwd and miss the owner's in-flight restart/cap
+        // state. The reply below stays on the inbound channelId.
         const ownerChannelId = targetSession.channelId
         const alreadyRestarting = isRestartPendingOrActive(ownerChannelId)
         const autoRestartDisabled = (routingConfig?.session_restart_delay ?? 60) === 0
@@ -857,7 +857,6 @@ socket.on('message', async ({ event, ack }) => {
   await ack()
   if (!event) return
   archiveInboundMessage(event)
-  if (routingConfig) refreshRouteNameFromEvent(routingConfig, event)
   try {
     await handleMessage(event)
   } catch (err) {
@@ -870,21 +869,11 @@ socket.on('app_mention', async ({ event, ack }) => {
   await ack()
   if (!event) return
   archiveInboundMessage(event)
-  if (routingConfig) refreshRouteNameFromEvent(routingConfig, event)
   try {
     await handleMessage(event)
   } catch (err) {
     console.error('[slack] Error handling mention:', err)
   }
-})
-
-// Capture channel renames as a separate event — Slack delivers a channel_name
-// field here that lets us refresh the cached name without waiting for the next
-// message on the channel.
-socket.on('channel_rename', async ({ event, ack }) => {
-  await ack()
-  if (!event) return
-  if (routingConfig) refreshRouteNameFromEvent(routingConfig, event)
 })
 
 socket.on('interactive', async (evt) => {
@@ -926,6 +915,14 @@ socket.on('interactive', async (evt) => {
 // ---------------------------------------------------------------------------
 
 let routingConfig: RoutingConfig | null = null
+
+/**
+ * TRANSITIONAL — removed in E3 Task 9 with the route->persona adapter.
+ * Stand-in personas built from `routingConfig` right after `loadConfig()`
+ * succeeds; null on the MCP_HOST / MCP_PORT fallback path. Read by the
+ * persona-keyed consumers (startup spawns, restart launch, liveness probe).
+ */
+let personaConfig: PersonaConfig | null = null
 
 // ---------------------------------------------------------------------------
 // Graceful shutdown
@@ -1010,12 +1007,14 @@ process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)) })
  * @internal
  */
 export function _buildIsSessionAliveAdapter(
-  getRoutingConfig: () => RoutingConfig | null | undefined,
+  getPersonaConfig: () => PersonaConfig | null | undefined,
 ): (channelId: string) => Promise<boolean> {
+  // `channelId` is the persona key (the channel ID under the route->persona
+  // adapter); restart and health-check still name it by channel.
   return async (channelId: string) => {
-    const routingConfig = getRoutingConfig()
-    if (!routingConfig?.routes[channelId]) return false
-    const claude_instance_id = instanceIdFor(channelId, routingConfig.routes[channelId]?.normalizedName)
+    const config = getPersonaConfig()
+    if (!config?.personas.some((p) => p.key === channelId)) return false
+    const claude_instance_id = personaInstanceId(channelId)
     try {
       const r = await getClient().status({ claude_instance_id })
       clearOutageFlag(channelId, 'ad-unreachable')
@@ -1115,13 +1114,12 @@ export function _buildStatRouteImpl(deps?: {
  * @internal
  */
 export function _buildReconnectSessionAdapter(
-  getRoutingConfig: () => RoutingConfig | null | undefined,
   web: WebClient,
 ): (channelId: string) => Promise<'success' | 'escalate-dead' | 'transient'> {
+  // `channelId` is the persona key (the channel ID under the route->persona adapter).
   return async (channelId: string) => {
-    const routingConfig = getRoutingConfig()
     try {
-      const claude_instance_id = instanceIdFor(channelId, routingConfig?.routes[channelId]?.normalizedName)
+      const claude_instance_id = personaInstanceId(channelId)
       const st = await withOutageDetection(channelId, undefined, (client) =>
         client.status({ claude_instance_id }),
       )
@@ -1150,7 +1148,7 @@ export function _buildReconnectSessionAdapter(
     // removing it is a separate operator decision). Not counting here keeps
     // failures attributed to the launchSession site, which owns the single
     // counting site (SR-25.1).
-    const result = await reconnectMcp(channelId, isDryRun() ? undefined : web, routingConfig ?? undefined)
+    const result = await reconnectMcp(channelId, isDryRun() ? undefined : web)
     if (result === 'ok') return 'success'
     if (result === 'dead-session') {
       // b.sv7: trigger the internal memoized findMissing sweep (b.m4r) before
@@ -1209,6 +1207,7 @@ export async function main(): Promise<void> {
 
   try {
     routingConfig = loadConfig()
+    personaConfig = routesToPersonaConfig(routingConfig)
     mcpHost = routingConfig.bind
     mcpPort = routingConfig.port
     const routeCount = Object.keys(routingConfig.routes).length
@@ -1516,7 +1515,7 @@ export async function main(): Promise<void> {
   // SR-11 Event 6a. Any AGENT_DIRECTOR_LIVE_STATES value → alive; terminal
   // states (ended, missing) and ErrSpawnNotFound → dead. Other errors fall
   // back to "dead" defensively — health-check will retry.
-  const isSessionAliveAdapter = _buildIsSessionAliveAdapter(() => routingConfig)
+  const isSessionAliveAdapter = _buildIsSessionAliveAdapter(() => personaConfig)
 
   // b.9cj: shared stream-presence probe. A session can be `connected === true`
   // in the registry while the SDK has silently deleted its `_GET_stream` map
@@ -1537,12 +1536,13 @@ export async function main(): Promise<void> {
       return session?.connected === true
     },
     hasSessionStream: hasSessionStreamAdapter,
-    reconnectSession: _buildReconnectSessionAdapter(() => routingConfig, web),
+    reconnectSession: _buildReconnectSessionAdapter(web),
+    // restart.ts names the persona key `channelId` (the channel ID under the
+    // route->persona adapter).
     killSession: async (channelId) => {
       try {
-        const normalizedName = routingConfig?.routes[channelId]?.normalizedName
         await withOutageDetection(channelId, undefined, (client) =>
-          client.kill({ claude_instance_id: instanceIdFor(channelId, normalizedName) })
+          client.kill({ claude_instance_id: personaInstanceId(channelId) })
         )
       } catch (err) {
         if (err instanceof ErrSpawnNotFound) return
@@ -1550,12 +1550,14 @@ export async function main(): Promise<void> {
         console.error(`[slack] killSession (restart adapter): error for channel=${channelId}:`, err)
       }
     },
-    launchSession: async (channelId, cwd) => {
-      if (!routingConfig) return false
-      // resume vs fresh is handled inside spawnForRoute (SR-1.4 collision-then-act).
-      // The session-id argument from the legacy restart deps is now ignored — AD
-      // owns the resume state, not CSCB.
-      return await launchSession(channelId, cwd, routingConfig, isDryRun() ? undefined : web)
+    launchSession: async (channelId) => {
+      if (!personaConfig) return false
+      // Launches the applied persona with this key; false when there is none.
+      // resume vs fresh is handled inside spawnForPersona (SR-1.4
+      // collision-then-act). The cwd and session-id arguments from the legacy
+      // restart deps are ignored — the persona carries its working directory
+      // and AD owns the resume state, not CSCB.
+      return await launchSession(channelId, personaConfig, isDryRun() ? undefined : web)
     },
     getRestartDelay: () => routingConfig?.session_restart_delay ?? 60,
     isShuttingDown: () => shuttingDown,
@@ -1578,17 +1580,6 @@ export async function main(): Promise<void> {
       await reconcileOrphans(routingConfig)
     } catch (err) {
       console.error('[slack] Warning: orphan reconciliation failed:', err)
-    }
-  }
-
-  // b.1m9: resolve channel names from Slack so per-route spawns get the
-  // glanceable `cscb_<name>_<id>` / `slack_bot_<name>_<id>` naming. Failures
-  // are non-fatal: nameless routes fall back to the legacy bare-ID form.
-  if (routingConfig) {
-    try {
-      await resolveChannelNames(routingConfig, isDryRun() ? undefined : web)
-    } catch (err) {
-      console.error('[slack] Warning: channel-name resolution failed:', err)
     }
   }
 
@@ -1621,25 +1612,12 @@ export async function main(): Promise<void> {
     stopHookBootstrap(routingConfig)
   }
 
-  // b.1m9: warn about (or, with --reconcile-instance-ids, delete) stale
-  // pre-rename rows whose claude_instance_id doesn't match the new naming.
-  // Must run AFTER name resolution so the expected ids are right.
-  if (routingConfig) {
-    const autoDelete = process.argv.includes('--reconcile-instance-ids') ||
-      process.env['CSCB_RECONCILE_INSTANCE_IDS'] === '1'
+  // Per-persona reconcile via library: spawnForPersona dispatches fresh-spawn or
+  // collision-handling per SR-1.4, once per persona. Failures are surfaced to
+  // the persona's Slack channel; the server stays up.
+  if (personaConfig) {
     try {
-      await reconcileInstanceIds(routingConfig, autoDelete)
-    } catch (err) {
-      console.error('[slack] Warning: instance-id reconcile failed:', err)
-    }
-  }
-
-  // Per-route reconcile via library: spawnForRoute dispatches fresh-spawn or
-  // collision-handling per SR-1.4. Failures are surfaced to the affected Slack
-  // channel; the server stays up.
-  if (routingConfig) {
-    try {
-      await startupSessionManager(routingConfig, undefined, isDryRun() ? undefined : web)
+      await startupSessionManager(personaConfig, undefined, isDryRun() ? undefined : web)
     } catch (err) {
       console.error('[slack] Warning: session startup failed — continuing:', err)
     }

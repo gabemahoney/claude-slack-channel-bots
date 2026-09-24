@@ -18,13 +18,13 @@ kill -0 "$(cat "${PID_FILE}")" 2>/dev/null \
 
 test -f "${LOG}" || fail "server log ${LOG} not present"
 
-grep -q "startupSessionManager: 1 route" "${LOG}" \
-    || fail "server.log missing 'startupSessionManager: 1 route(s)'"
+grep -qF 'startupSessionManager: 1 persona(s)' "${LOG}" \
+    || fail "server.log missing 'startupSessionManager: 1 persona(s)'"
 
-grep -q "dry-run: skipping spawn for channel=C_TEST1" "${LOG}" \
-    || fail "server.log missing '[slack] dry-run: skipping spawn for channel=C_TEST1'"
+grep -qF '[slack] dry-run: skipping spawn for "C_TEST1" (key=C_TEST1)' "${LOG}" \
+    || fail "server.log missing '[slack] dry-run: skipping spawn for \"C_TEST1\" (key=C_TEST1)'"
 
-grep -q "startupSessionManager: complete" "${LOG}" \
+grep -qF 'startupSessionManager: complete' "${LOG}" \
     || fail "server.log missing 'startupSessionManager: complete'"
 
 echo "PASS: ${TEST_NAME}"

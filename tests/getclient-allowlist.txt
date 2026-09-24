@@ -46,7 +46,6 @@ src/server.ts | _buildIsSessionAliveAdapter | const r = await getClient().status
 src/agent-director-template.ts | prodDeps | getClient: () => getClient(),  # production-deps factory wiring: getClient hook returns the singleton getClient()
 src/agent-director-template.ts | installSlackChannelBotTemplate | const client = d.getClient() as {  # startup-fatal makeTemplate install: const client = d.getClient()
 src/session-manager.ts | reconcileOrphans | const client = getClient()  # reconcileOrphans (orphans have no routed-channel attribution)
-src/session-manager.ts | reconcileInstanceIds | const client = getClient()  # reconcileInstanceIds (binding used for client.list)
 src/permission-poller.ts | runTick | const client = deps.getClient()  # list-level client.list at top of runTick (no per-channel context)
 src/cli.ts | resolveCscbInstanceId | const r = await getClient().list({ label: ['service=cscb', `channel=${channelId}`] })  # CLI subcommand support: list (resolveCscbInstanceId)
 src/cli.ts | directorStatus | const r = await getClient().status({ claude_instance_id: id })  # CLI subcommand: status

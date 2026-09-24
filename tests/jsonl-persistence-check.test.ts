@@ -31,7 +31,7 @@ import {
   type JsonlPersistenceSafeguardDeps,
 } from '../src/jsonl-persistence-check.ts'
 import { resolveJsonlPath } from '../src/cozempic.ts'
-import { instanceIdFor } from '../src/session-manager.ts'
+import { personaInstanceId } from '../src/persona-identity.ts'
 import { ErrSpawnNotFound } from '../src/agent-director-errors.ts'
 import { makeRoutingConfig } from './test-helpers/routing-config.ts'
 import type { RoutingConfig } from '../src/config.ts'
@@ -237,7 +237,7 @@ function layer2Config(): RoutingConfig {
 /** GetResult fixture with the fields Layer 2 reads; overridable. */
 function makeRow(overrides?: Partial<GetResult>): GetResult {
   return {
-    claude_instance_id: instanceIdFor(CH),
+    claude_instance_id: personaInstanceId(CH),
     parent_id: '',
     state: 'live',
     cwd: '/repo/app',
@@ -292,6 +292,18 @@ async function runLayer2(
 }
 
 describe('runJsonlPersistenceSafeguard — Layer 2 classification', () => {
+  test('looks up the row by cscb_<key>, the stand-in key being the channel ID (b.av2 SR-2.2)', async () => {
+    const lookups: Array<[string, string]> = []
+    await runLayer2({
+      getRow: async (channelId: string, claudeInstanceId: string) => {
+        lookups.push([channelId, claudeInstanceId])
+        return makeRow()
+      },
+    })
+    expect(lookups).toEqual([[CH, personaInstanceId(CH)]])
+    expect(lookups[0][1]).toBe('cscb_C_TEST1')
+  })
+
   test('healthy: persisted path exists → quiet (no error, no post)', async () => {
     const persisted = makeRow().jsonl_path
     const c = await runLayer2({ statFn: (p) => p === persisted })

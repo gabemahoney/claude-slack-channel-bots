@@ -324,6 +324,29 @@ describe('start — daemonize session-leader guard (b.acn)', () => {
     expect(bundle.exitCodes).toContain(0)
     expect(bundle.startServerCalled).toBe(false)
   })
+
+  // b.av2 SR-10.2: `--reconcile-instance-ids` is retired, so `start` no longer
+  // turns it into CSCB_RECONCILE_INSTANCE_IDS for the daemon child.
+  test('--reconcile-instance-ids on argv is not forwarded to the daemon child as CSCB_RECONCILE_INSTANCE_IDS (SR-10.2)', async () => {
+    const savedArgv = process.argv
+    const savedEnv = process.env['CSCB_RECONCILE_INSTANCE_IDS']
+    // The child env copies process.env, so the runner's own value must not mask a forward.
+    delete process.env['CSCB_RECONCILE_INSTANCE_IDS']
+    process.argv = [...savedArgv, '--reconcile-instance-ids']
+    try {
+      const bundle = makeDeps({ existsAll: true, resolveStateDir: () => scratchDir })
+      await expect(createCli(bundle.deps).start()).rejects.toBeInstanceOf(ExitError)
+
+      expect(spawnedCalls).toHaveLength(1)
+      expectRealDetach(spawnedCalls[0]!)
+      const childEnv = spawnedCalls[0]!.opts['env'] as NodeJS.ProcessEnv
+      expect('CSCB_RECONCILE_INSTANCE_IDS' in childEnv).toBe(false)
+    } finally {
+      process.argv = savedArgv
+      if (savedEnv === undefined) delete process.env['CSCB_RECONCILE_INSTANCE_IDS']
+      else process.env['CSCB_RECONCILE_INSTANCE_IDS'] = savedEnv
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -719,17 +742,36 @@ describe('b.qwo — initClient startup gate', () => {
 
 describe('unknown subcommand', () => {
   const CLI_SCRIPT = resolve(import.meta.dir, '..', 'src', 'cli.ts')
+  let tempHome: string
 
-  test('`trail` subcommand hits the unknown-subcommand error path (non-zero exit, no "trail" in usage)', () => {
+  beforeEach(() => {
+    tempHome = mkdtempSync(join(tmpdir(), 'cscb-cli-usage-'))
+  })
+
+  afterEach(() => {
+    rmSync(tempHome, { recursive: true, force: true })
+  })
+
+  test('`trail` subcommand hits the unknown-subcommand error path (non-zero exit, no "trail" or retired reconcile flag in usage)', () => {
     const result = spawnSync('bun', [CLI_SCRIPT, 'trail'], {
       encoding: 'utf-8',
-      env: { ...process.env, SLACK_BOT_TOKEN: 'xoxb-test', SLACK_APP_TOKEN: 'xapp-test' },
+      // Temp HOME and state dir so the spawned CLI never sees the real home (b.av2 SR-13.2).
+      env: {
+        ...process.env,
+        HOME: tempHome,
+        SLACK_STATE_DIR: join(tempHome, 'state'),
+        SLACK_BOT_TOKEN: 'xoxb-test',
+        SLACK_APP_TOKEN: 'xapp-test',
+      },
     })
     // Must exit non-zero
     expect(result.status).not.toBe(0)
     // Usage text must not list `trail` as a valid subcommand
     const output = (result.stderr ?? '') + (result.stdout ?? '')
     expect(output).not.toMatch(/\btrail\b/)
+    // b.av2 SR-10.2: the retired reconcile flag and its env variable are not advertised.
+    expect(output).not.toContain('--reconcile-instance-ids')
+    expect(output).not.toContain('CSCB_RECONCILE_INSTANCE_IDS')
     // Usage text should mention the valid subcommands
     expect(output).toContain('start')
   })

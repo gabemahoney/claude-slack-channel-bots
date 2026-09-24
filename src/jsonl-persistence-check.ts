@@ -27,14 +27,11 @@ import { homedir } from 'node:os'
 import { Database } from 'bun:sqlite'
 import type { WebClient } from '@slack/web-api'
 import type { GetResult } from 'agent-director'
-import type { RoutingConfig } from './config.ts'
+import type { RoutingConfig, ServerSettings } from './config.ts'
 import { recordStartupError as defaultRecordStartupError } from './startup-errors.ts'
 import { withOutageDetection } from './outage-state.ts'
 import { ErrSpawnNotFound } from './agent-director-errors.ts'
-import {
-  instanceIdFor,
-  getNormalizedNameForChannel,
-} from './session-manager.ts'
+import { personaInstanceId } from './persona-identity.ts'
 import { resolveJsonlPath } from './cozempic.ts'
 
 // ---------------------------------------------------------------------------
@@ -286,6 +283,8 @@ function defaultGetRow(channelId: string, claudeInstanceId: string): Promise<Get
 
 /**
  * Builds a default archive-count function bound to config.message_archive_db.
+ * Reads only that setting, so both the route config and the persona config
+ * satisfy the parameter.
  * Opens the existing DB read-only per query (never creates, migrates, or writes
  * it) and counts messages for the channel with timestamp strictly after
  * `sinceEpochSeconds`. Returns null when the archive is unconfigured, the DB
@@ -296,7 +295,7 @@ function defaultGetRow(channelId: string, claudeInstanceId: string): Promise<Get
  * Slack ts); `started_at` is RFC3339, converted to epoch seconds by the caller.
  */
 export function makeDefaultArchiveCount(
-  config: RoutingConfig,
+  config: Pick<ServerSettings, 'message_archive_db'>,
 ): (channelId: string, sinceEpochSeconds: number) => number | null {
   return (channelId: string, sinceEpochSeconds: number): number | null => {
     const dbPath = config.message_archive_db
@@ -358,8 +357,8 @@ async function checkChannelTranscript(
   recordError: typeof defaultRecordStartupError,
   postFn: (web: WebClient, channelId: string, text: string) => Promise<void>,
 ): Promise<void> {
-  const normalizedName = getNormalizedNameForChannel(channelId, config)
-  const claudeInstanceId = instanceIdFor(channelId, normalizedName)
+  // Under the route->persona adapter the persona key is the channel ID.
+  const claudeInstanceId = personaInstanceId(channelId)
 
   let row: GetResult
   try {

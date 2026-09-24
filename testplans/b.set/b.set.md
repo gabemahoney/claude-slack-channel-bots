@@ -46,7 +46,7 @@ sleep 15
 
 ### Verify cozempic was probed during startup
 `checkCozempicAvailable` runs at the top of `startupSessionManager` on every
-boot. In dry-run mode `spawnForRoute` is a no-op so no JSONL files are produced
+boot. In dry-run mode `spawnForPersona` is a no-op so no JSONL files are produced
 or cleaned, but the availability probe still logs:
 ```bash
 grep -i cozempic ~/.claude/channels/slack/server.log | tail -5

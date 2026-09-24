@@ -29,7 +29,7 @@ CSCB's resume-success path (`action: 'resumed'`, `src/session-manager.ts:1104-11
 
 ## Simulated-reboot scenario (from b.nk5's acceptance criteria, carried from b.m6u)
 
-Runnable without rebooting production: kill all `slack_bot_*` tmux sessions leaving AD rows `waiting`/`working` → plain `start` brings every previously-active channel back **with context via resume** — verify `spawnForRoute: resumed` appears in server.log — on a machine with no per-host hygiene script. Also assert no `ErrSpawnNotResumable` at startup recovery (the findMissing-first path holds).
+Runnable without rebooting production: kill all `slack_bot_*` tmux sessions leaving AD rows `waiting`/`working` → plain `start` brings every previously-active channel back **with context via resume** — verify `spawnForPersona: resumed` appears in server.log — on a machine with no per-host hygiene script. Also assert no `ErrSpawnNotResumable` at startup recovery (the findMissing-first path holds).
 
 ## Notes
 
