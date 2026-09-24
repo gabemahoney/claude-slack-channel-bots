@@ -47,8 +47,9 @@
  * persona's record, update its launched-with dir, run the launch pass. The
  * session manager calls it (through its pre-launch seam) immediately before
  * each agent-director spawn or resume. Its undo (for an optimistic spawn that
- * met a live instance) restores each part only while it is still what the
- * step set, and re-runs the launch pass against the applied set read afresh.
+ * met a live instance) restores the record and launched-with dir, each only
+ * while it is still what the step set, then re-runs the launch pass against
+ * the applied set read afresh, re-evaluating the hook rather than restoring it.
  *
  * Idempotent: a file already holding exactly one canonical managed group and
  * no other managed entry is not written. Otherwise it is rewritten atomically

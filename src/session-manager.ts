@@ -2000,7 +2000,8 @@ export function isLaunchInFlight(key: string): boolean {
  *    Then attempt `client.spawn(...)`. On success → done. Every spawn and
  *    resume below is immediately preceded by the installed pre-launch reply
  *    guard (b.av2 SR-9.4); the optimistic spawn undoes its reply-guard steps
- *    on `ErrInstanceIdCollision`, so a reconnect or no-op changes nothing.
+ *    on `ErrInstanceIdCollision`: the record and launched-with dir are
+ *    restored while still its own, and the hook is re-evaluated.
  * 4. `ErrInstanceIdCollision` → `client.get(...)`, then:
  *    - the row's `cwd` differs from the persona's working_directory by real
  *      path (`compareRowToPersona`) → kill + delete + fresh spawn, whatever
@@ -2064,9 +2065,10 @@ async function runPersonaLadder(
   // b.av2 SR-9.4: the reply-guard steps run immediately before every spawn or
   // resume, never on a path that only reconnects to a live instance or does
   // nothing. This optimistic spawn is a launch only when no row exists; a
-  // collision means an instance already exists, so its steps are undone
-  // (record, launched-with dir and hook install restored) and any later spawn
-  // or resume below runs them again.
+  // collision means an instance already exists, so its steps are undone (the
+  // record and launched-with dir restored while still this step's own, and
+  // the hook re-evaluated against the persona's current config) and any later
+  // spawn or resume below runs them again.
   let replyGuardUndo: ReplyGuardUndo | undefined
   try {
     replyGuardUndo = runPreLaunchReplyGuard(persona, ref)

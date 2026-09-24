@@ -380,7 +380,7 @@ The value applies to that persona alone, even when it shares its `claude_config_
 
 `access.json` is read from `~/.claude/channels/slack/access.json` by default (same directory as `config.json`). A skeleton file with defaults is created by postinstall. The file is written with `0600` permissions.
 
-`access.json` controls only the acknowledgement reaction and how long replies are chunked. Which messages a bot receives is set by each persona's `channels` and `dm.enabled` in `config.json` (see [Messages a bot receives](#messages-a-bot-receives)).
+`access.json` controls only the acknowledgement reaction and how long replies are chunked. Which messages a bot receives is set by each persona's `channels` and `dm.enabled` in `config.json` (see [How a persona receives messages](#how-a-persona-receives-messages)).
 
 #### Complete example
 
@@ -575,7 +575,7 @@ Only `reply` takes a user ID; the other tools need a channel or DM conversation 
 
 ## Interject
 
-POST to `/interject` to inject a message into a persona's running Claude instance from localhost. The message reaches only the named persona's instance, never any other persona. Only requests from `127.0.0.1` or `::1` are accepted — external callers are rejected with 403. The bot sees it as described in [Messages a bot receives](#messages-a-bot-receives); the Slack Reply Guard does not remind it to reply.
+POST to `/interject` to inject a message into a persona's running Claude instance from localhost. The message reaches only the named persona's instance, never any other persona. Only requests from `127.0.0.1` or `::1` are accepted — external callers are rejected with 403. The bot sees it as described in [How a persona receives messages](#how-a-persona-receives-messages); the Slack Reply Guard does not remind it to reply.
 
 An injected message carries no Slack conversation. If you want the bot to post a reply in Slack, say in the message text where to post it.
 
@@ -718,7 +718,7 @@ The prompt-file path resolves as follows:
 
 ### How fires appear
 
-A scheduled fire reaches only the target persona's instance, as an `/interject` message with no Slack conversation attached. Its `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. The [Slack Reply Guard](#slack-reply-guard-stop-hook) never reminds a bot to reply to a scheduled prompt. Because a fire carries no channel, a prompt file that wants a Slack reply must say where to post it. Each schedule delivers its own message independently, so when several schedules match the same minute for the same persona each one arrives as its own `/interject` message.
+A scheduled fire reaches only the target persona's instance, as an `/interject` message with no Slack conversation attached. Its `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. The [Slack Reply Guard](#slack-reply-guard-stop-hook) never reminds a bot to reply to a scheduled prompt: like every injected message, a fire carries no `via`. Because a fire carries no channel, a prompt file that wants a Slack reply must say where to post it. Each schedule delivers its own message independently, so when several schedules match the same minute for the same persona each one arrives as its own `/interject` message.
 
 ### The cron log
 
@@ -796,89 +796,153 @@ The template also pre-allows each bot to read its own persistent-memory director
 
 ---
 
+## How a persona receives messages
+
+Every message reaches a persona's Claude instance as its text wrapped in a `<channel source="slack-channel-router" …>` tag. A message from Slack carries a `via` attribute that says how it reached the persona. An injected message (a scheduled prompt or an `/interject` message) carries no `via`.
+
+A message from Slack carries these tag attributes:
+
+| Attribute | Value |
+|---|---|
+| `chat_id` | The channel ID, or the DM conversation ID (`D…`) for a direct message. |
+| `message_id`, `ts` | The message's Slack timestamp, for example `1789936743.069939`. |
+| `user` | The author's Slack display name, falling back to real name, then Slack username, then user ID. For a post by a bot or integration without a user: the post's username, else its bot profile name, else its bot ID. |
+| `user_id` | The author's Slack user ID. |
+| `bot_id` | The author's bot ID, in place of `user_id`, for a post without a user. |
+| `via` | How the message reached the persona (see the next table). |
+| `thread_ts` | The thread's timestamp, for a thread reply. |
+| `attachment_count`, `attachments` | The number of attached files and each file's name, type and size, when files are attached. |
+
+Each way a message reaches a persona:
+
+| Kind | How it reaches the persona | Tag attributes | `via` | Reminder |
+|---|---|---|---|---|
+| Direct message | A DM to the persona's own Slack app, when its `dm.enabled` is `true`, whatever the text mentions. With `dm.enabled` `false` the server drops it and logs one `persona-dm-dropped` line. A group DM is never delivered. | Slack attributes; `chat_id` is the DM conversation ID | `dm` | Yes, direct-message wording |
+| Direct @mention | A message that @mentions the persona in a channel listed in its `channels`, with `delivery: mentions` or `delivery: all`. | Slack attributes | `mention` | Yes, direct-mention wording |
+| `@here` / `@channel` broadcast | A message that uses `@here` or `@channel` in a channel listed in the persona's `channels`, with either `delivery`. `@everyone` and user-group mentions are not broadcasts. | Slack attributes | `broadcast` | Yes, broadcast wording |
+| Every message, shared channel | A message that neither @mentions the persona nor broadcasts, in a channel listed in its `channels` with `delivery: all`, when at least one other persona in the applied configuration also has `delivery: all` for that channel, whether or not that persona is up. | Slack attributes | `receive_all_shared` | Yes, shared-channel wording |
+| Every message, this persona alone | A message that neither @mentions the persona nor broadcasts, in a channel listed in its `channels` with `delivery: all`, when no other persona in the applied configuration has `delivery: all` for that channel. | Slack attributes | `receive_all` | Yes, only-you wording |
+| Scheduled prompt | A crontable line naming the persona fires, and the scheduler posts it to `/interject` for that persona only (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)). | Only `user` = `cscb-cron:<prompt file name without its extension>` (`cscb-cron:standup` for `standup.md`) and `ts` = the server clock in seconds. No `chat_id`, `message_id` or `via`. | none | Never |
+| `/interject` message | A localhost POST to `/interject` addressed by `persona` (see [Interject](#interject)); it reaches only that persona. | Only `user` = the request's `sender` (default `interject`) and `ts`, as for a scheduled prompt. No `chat_id`, `message_id` or `via`. | none | Never |
+
+A "Yes" in the Reminder column means the [Slack Reply Guard](#slack-reply-guard-stop-hook) reminds the persona once if it ends its turn without replying, wherever the reminder is on for that persona. Each `via` has its own reminder wording, stating how the message arrived; that section lists them.
+
+- **The first applicable `via` wins,** in the order `dm`, `mention`, `broadcast`, `receive_all_shared`, `receive_all`. A message that @mentions the persona in a channel it receives in full arrives as `mention`.
+- **The persona's own @mention is removed from the text.** Mentions of other personas and `@here` / `@channel` stay.
+- **Every author counts.** Posts by people, bots, integrations and other personas all arrive by these rules. Each persona posts as its own Slack app, so another persona's post reaches it like anyone else's.
+- **A persona never receives its own posts.**
+- **Each message arrives at most once per persona,** even though Slack sends a channel @mention twice. A Slack redelivery more than 10 minutes after the first, or after a server restart, arrives again.
+- **A message without `via` is an injected prompt.** Its `user` label is free-form, so an `/interject` sender label, even one starting with `cscb-cron:`, cannot make it look like a Slack message.
+- **When the reminder is off.** A persona gets no reminder when its effective `stop_hook_bootstrap` was `false` at its last launch, when it has no `claude_config_dir` (its own or the top-level one), when that directory resolves to `~/.claude`, or when `jq` is not installed. See [Slack Reply Guard](#slack-reply-guard-stop-hook).
+
+---
+
 ## Slack Reply Guard (Stop hook)
 
-CSCB ships a Claude Code Stop hook that gives every bot session it manages a **one-time, declinable reminder** to answer in Slack. When the messages that started the turn include a real Slack message and the bot ends its turn without calling the `mcp__slack-channel-router__reply` tool, the hook exits `2` and Claude Code shows the bot one of these reminders:
+CSCB ships a Claude Code Stop hook that gives a persona a **one-time, declinable reminder** to answer in Slack. It is on for every persona whose effective `stop_hook_bootstrap` is `true` (the default), except a persona with no `claude_config_dir`, one whose directory resolves to `~/.claude`, or any persona when `jq` is missing (see [When the guard stays silent](#when-the-guard-stays-silent)). When the messages that started the turn include a message from Slack and the persona ends its turn without calling the `mcp__slack-channel-router__reply` tool, the hook exits `2` and Claude Code shows the persona a reminder. The message's `via` picks the wording:
 
-| Message came from | Reminder |
+| `via` | Reminder |
 |---|---|
-| A direct message | `This turn started from a Slack direct message (conversation <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
-| A channel | `This turn started from a Slack channel message (channel <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
+| `dm` | `This turn started from a Slack direct message (conversation <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
+| `mention` | `This turn started from a Slack message that @mentioned you directly (channel <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
+| `broadcast` | `This turn started from an @here or @channel broadcast in a Slack channel (channel <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
+| `receive_all_shared` | `This turn started from a message in a Slack channel where you and other personas receive every message (channel <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
+| `receive_all` | `This turn started from a message in a Slack channel where only you receive every message (channel <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
+| any other value, empty included | `This turn started from a Slack channel message (channel <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
 
-The bot then continues once. It can reply, or end the turn without replying. That continuation carries `stop_hook_active=true`, which the guard always lets through, so the reminder appears at most once per turn and never loops.
+`<chat_id>` is the message's `chat_id`. When `chat_id` is absent or is not a Slack ID (capital letters and digits only), the reminder omits the parenthesis, for example:
 
-Injected messages — cscb_cron scheduled prompts and `/interject` messages — never trigger the reminder, because no Slack conversation is waiting on them. An injected message that arrives right after a human's Slack message does not cancel the reminder for the human's message.
+```text
+This turn started from a Slack direct message and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.
+```
 
-### Messages a bot receives
+When several Slack messages started the turn, the last one picks the wording. A `reply` call after the earliest of them counts as a reply. The persona then continues once: it can reply, or end the turn without replying. That continuation carries `stop_hook_active=true`, which the guard always lets through, so the reminder appears at most once per turn and never loops.
 
-Every message reaches a bot as its text wrapped in a `<channel source="slack-channel-router" …>` tag. This table covers every source and whether the guard reminds the bot to reply to it.
+**Only messages from Slack trigger it.** The guard recognises a message from Slack by its `via` attribute; any `via` value counts. Injected prompts (scheduled prompts and `/interject` messages) carry no `via`, so they never trigger the reminder: no Slack conversation is waiting on them. An injected message that arrives right after a Slack message does not cancel the reminder for the Slack message. [How a persona receives messages](#how-a-persona-receives-messages) lists every kind of message and its `via`.
 
-| Source | How it gets to the bot | Tag attributes | Reminder? |
-|---|---|---|---|
-| Direct message | Goes to the persona whose Slack app received it when that persona's `dm.enabled` is `true`, whatever the text mentions. When `dm.enabled` is `false`, the server drops it and logs one `persona-dm-dropped` line naming the persona and `dm.enabled`. A group DM is never delivered. | Same as the @mention row, with `chat_id` = the DM conversation ID and `via` = `dm` | Yes, DM wording |
-| Channel message that @mentions the bot | Goes to the persona when the channel is one of its `channels`, with either `delivery`. The persona's @mention is removed from the text. A message in a channel no persona is configured into is not delivered. | `chat_id` = the channel ID, `user` = the sender's Slack display name (falling back to real name, then Slack username, then user ID; for a webhook or integration post, the post's username, else its bot profile name, else its bot ID), `message_id` and `ts` = the Slack timestamp (for example `1789936743.069939`). Also `user_id` = the author's Slack user ID (or `bot_id` for a post without a user) and `via` = how the message arrived (for example `mention` or `broadcast`); `thread_ts` for a thread reply, and `attachment_count` and `attachments` when files are attached. | Yes, channel wording |
-| Channel message in a `delivery: all` channel | The persona receives every message in the channel, from any sender other than itself. In a `delivery: mentions` channel it receives only messages that @mention it or use `@here` / `@channel`. | Same as the @mention row | Yes, channel wording |
-| cscb_cron scheduled prompt | The server's scheduler posts it to `/interject`; it reaches only the target persona's instance. | `user="cscb-cron:<prompt-file-basename>"` and `ts` = the server clock in seconds, with at most three decimal places | No |
-| `/interject` message | A localhost script POSTs it (see [Interject](#interject)); it reaches only the named persona's instance. | `user` = the request's `sender` (default `interject`) and `ts` in the same form as a scheduled prompt | No |
+### Turning it on or off
 
-Points to handle in a bot's prompt:
+Set `stop_hook_bootstrap` in `config.json`: at the top level for every persona, or on a persona to override the top-level value for that persona alone. It defaults to `true`. Setting `stop_hook_bootstrap: false` on the persona, or inheriting `false` from the top level, is all an opt-out needs, even when the persona shares its `claude_config_dir` with other personas. See [Server-wide settings](#server-wide-settings) and [Per-persona `stop_hook_bootstrap` override](#per-persona-stop_hook_bootstrap-override).
 
-- **`/interject` sender labels are free-form.** Any localhost caller can set any `user` value, including one that starts with `cscb-cron:`. To tell an injected message from a Slack message, check `ts`: Slack timestamps always have six decimal places, and injected ones have at most three. The guard relies on this check too.
-- **Personas can see each other's Slack posts.** Each persona posts as its own Slack app, and the server drops only a persona's own messages. Another persona's post reaches it like any other message: in a `delivery: all` channel always, in a `delivery: mentions` channel when the post @mentions it or uses `@here` / `@channel`.
+A change reaches a persona at its first launch after the server loads it; see [Timing](#timing-when-the-hook-is-patched-and-the-record-written).
+
+### Personas that answer without `reply` — opt them out
+
+The guard only recognises a reply made with `mcp__slack-channel-router__reply`. A persona whose only Slack surface is `edit_message` or `react` ends its turn without that call, so the guard reminds it after every Slack message, costing one useless continuation each time. Set `stop_hook_bootstrap: false` on that persona.
 
 ### What the server writes, and where
 
-CSCB owns installing the hook on your behalf. On every server boot, alongside the trust-folder bootstrap, the server walks every persona, groups them by effective `claude_config_dir` (a persona's own value falls back to the top-level value), and patches `<claude_config_dir>/settings.json` in place. For each dir it ensures **exactly one** managed Stop-hook group of the shape:
+**The hook.** The server patches `<claude_config_dir>/settings.json` in each applied persona's effective `claude_config_dir` (the persona's own value, else the top-level value). Where the hook is installed, the file holds **exactly one** managed Stop-hook group of this shape:
 
 ```jsonc
 {
   "hooks": {
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "<absolute path>/stop-hooks/slack-reply-guard.sh" } ] }
+      { "hooks": [ { "type": "command", "command": "'<absolute path>/stop-hooks/slack-reply-guard.sh' '<state dir>/reply-guard'" } ] }
     ]
   }
 }
 ```
 
-The command is an absolute path to the script inside CSCB's installed package tree. There is no `matcher` field — Stop is not a tool-scoped event. Any other Stop hooks you have configured, and every other key in `settings.json`, are preserved. Writes are atomic (`.tmp` + `rename`). A missing `settings.json` is created with just this group; a malformed `settings.json` is left untouched and a startup error is recorded.
+The command is the absolute path of the script inside CSCB's installed package, then the record directory, each in single quotes. There is no `matcher` field, because Stop is not a tool-scoped event. Your other Stop hooks, and every other key in `settings.json`, are preserved. Writes are atomic (`.tmp` + `rename`). A missing `settings.json` is created with just this group. A malformed `settings.json` is left untouched and an error is recorded.
 
-**Recognition rule.** The server treats *any* Stop-hook `command` string containing the substring `slack-reply-guard.sh` as CSCB-managed. Duplicates from prior boots are collapsed to one canonical entry; stale entries (from an older install path) are rewritten to the current absolute path — this is the self-heal path across upgrades.
+**Recognition rule.** The server treats *any* Stop-hook `command` containing `slack-reply-guard.sh` as CSCB-managed. Only the exact current command is kept: duplicates collapse to one group, and an entry with an older script path, no record directory or another record directory is replaced. This is how the hook heals itself across upgrades.
 
-### Timing: on-disk at every boot, effective at next Claude process start
+**The record.** Each persona has a record file, `reply-guard/<persona key>` in the state directory (`~/.claude/channels/slack/`, or `SLACK_STATE_DIR` when set). It holds `true` or `false`: the persona's effective `stop_hook_bootstrap`. The server writes it atomically immediately before it spawns or resumes the persona's instance. Reconnecting to an instance that is still running leaves the record as it was.
 
-The bootstrap rewrites `settings.json` on **every** CSCB boot, so the on-disk entry always reflects the currently-installed release's absolute path. Claude Code, however, only reads hook configuration when a Claude process starts. On a CSCB restart, live sessions are reconnected and keep their already-running Claude processes — they will not pick up an updated hook path until the next fresh spawn or the next resume of a dead/missing session for that persona.
+**What the guard reads.** Every persona's instance runs with its key in `CSCB_PERSONA`. The guard reads the record `<record directory>/<CSCB_PERSONA>` and reminds only when it reads exactly `true`. A missing argument, an unset `CSCB_PERSONA`, or a missing record means no reminder.
 
-### Shared-dir aggregation
+### Personas sharing a config directory
 
-The install/remove decision is per **directory**, not per persona. If two personas resolve to the same `claude_config_dir`, the managed entry is installed when at least one of them has the guard enabled, and removed only when all of them have it disabled. Consequence: a per-persona opt-out fully disables the guard for a bot only when that persona has a *dedicated* `claude_config_dir`. A persona that shares a dir with any enabled persona still gets the guard on that shared dir.
+Personas that share one `claude_config_dir` each follow their own `stop_hook_bootstrap`, through their own record. The managed hook stays installed in a directory while any persona counting toward it has an effective `stop_hook_bootstrap` of `true` or a record reading `true`. A persona counts toward its effective directory and toward the directory its running instance launched with. When no such persona is left, the server removes the hook from that directory.
+
+### Timing: when the hook is patched and the record written
+
+- **Server start.** The server patches the hook for every applied persona before any launch.
+- **Each launch.** Immediately before each spawn or resume (including a restart), the server writes the persona's record and patches the hook in the persona's new effective directory and, if it differs, the directory it last launched with.
+
+A running instance keeps the value it launched with, because the guard reads that instance's own record, written only at its launch. The hook itself may appear in or vanish from a shared directory while an instance runs, for example when a neighbour launches; Claude Code normally picks up such edits without a restart, but the instance's own record still decides. On a plain server restart, live instances are reconnected rather than relaunched, so a changed value reaches them at their next launch.
 
 ### Personal-dir refusal
 
-The bootstrap refuses to touch the operator's own `~/.claude` directory. If a persona's effective `claude_config_dir` resolves (via `realpathSync`, with a lexical fallback for paths that do not exist on disk) to your home `.claude` dir, nothing is written and a startup error is recorded. This prevents CSCB from ever installing a bot-oriented Stop hook into your interactive Claude Code config.
+The server never installs the hook in your own `~/.claude` (it never edits `~/.claude/settings.json`). A persona whose effective `claude_config_dir` resolves to `~/.claude` (symlinks followed) gets no reminder. At server start the refusal is recorded once as the startup error `stop-hook-bootstrap-refuse-home` (see [Startup errors](#startup-errors)). At a later launch it is a server-log line only.
 
-### Bots without a `claude_config_dir`
+### Personas without a `claude_config_dir`
 
-Personas with no effective `claude_config_dir` — neither their own nor top-level — are skipped. Empty or whitespace-only values are treated as absent (so `resolve("")` never lands in the process cwd). If you want the guard on a bot, give its persona a real `claude_config_dir`.
+A persona with no effective `claude_config_dir` (neither its own nor the top-level one; an empty or whitespace-only value counts as none) gets no reminder. The server logs this as a server-log line only; no startup error is recorded. To give a persona the reminder, give it a real `claude_config_dir`.
 
-### v1 limitations — opt these bots out
+### When the guard stays silent
 
-The v1 guard only recognises a reply via `mcp__slack-channel-router__reply`. Bots whose only Slack surface is `edit_message` or `react` end their turn without producing a matching `tool_use`, so the guard reminds them after every Slack message and costs them one extra, useless continuation each time. **Opt these bots out** by setting `stop_hook_bootstrap: false` on the persona (see [Per-persona `stop_hook_bootstrap` override](#per-persona-stop_hook_bootstrap-override)), and give the persona a dedicated `claude_config_dir` — see [Shared-dir aggregation](#shared-dir-aggregation).
+The guard is **fail-open by design**: when anything is missing or goes wrong, it exits `0` and the turn ends normally. Besides the cases above, it stays silent when:
 
-### Opting out
-
-The `stop_hook_bootstrap` boolean lives on the top level of `config.json` and on individual personas. It defaults to `true`. Set it to `false` at the top level to disable the bootstrap for every persona; set it on an individual persona to override the top-level default for one bot. See [Server-wide settings](#server-wide-settings) and [Per-persona `stop_hook_bootstrap` override](#per-persona-stop_hook_bootstrap-override) above for the field details and the per-persona-vs-shared-dir interaction.
+- `jq` is not installed. The server records `stop-hook-bootstrap-jq-missing` at start and installs the hook anyway, so installing `jq` later is enough.
+- The record could not be written before a launch. The server removes any stale record, logs one line and launches anyway.
+- The transcript is missing or unreadable, or the message's opening `<channel>` tag is not in the shape the guard expects (see below).
 
 ### Tag drift — fail-open, verify after upgrades
 
-The guard reads the `<channel …>` tag at the very start of each message that started the turn, treats it as a Slack message when its `source` starts with `slack`, and uses its `chat_id`, `user`, and `ts` attributes. A tag quoted later in a message's text is ignored. CSCB only sends `{content, meta}` over MCP; the `<channel source="…">` wrapper is rendered by the **Claude Code harness itself** when it serialises the MCP tool result into the transcript, and the `source` attribute is the MCP server name (e.g. `slack-channel-router`). That tag is therefore an **external, harness-owned contract** — a future Claude Code release can rename it or restructure the wrapper without touching CSCB, and the guard would silently stop matching. Because the contract sits outside CSCB, the guard is designed to fail open on drift, and a post-upgrade verification recipe (below) exists so operators catch a silent-dark guard the next time the harness changes the tag.
+The guard reads the `<channel …>` tag at the very start of each message that started the turn. It treats the tag as Slack's when its `source` starts with `slack`, and reads its `via` and `chat_id`. A tag quoted later in a message's text is ignored.
 
-The guard is **fail-open by design**: any error, missing transcript, missing `jq`, or absence of the tag results in `exit 0` (turn allowed). This means a future rename of the `<channel>` tag will silently disable the guard rather than break the bot. After every CSCB or Claude Code upgrade, verify the guard end-to-end:
+CSCB sends only the message content and its attributes over MCP. The **Claude Code harness itself** renders the `<channel source="…">` tag when it writes the message into the transcript; `source` is the MCP server name (`slack-channel-router`). The tag is therefore an **external, harness-owned contract**. A future Claude Code release can rename or restructure it, and the guard would silently stop reminding.
 
-1. Send the bot a Slack message that requires a reply.
+The guard also relies on the harness escaping attribute values. `via` comes after the free-form `user` attribute, so if the harness stopped escaping `>` in attribute values, a display name containing `>` would cut the tag short before `via`, and the reminder would be silently skipped.
+
+After every CSCB or Claude Code upgrade, verify the guard end to end:
+
+1. Send a persona that has the reminder on a Slack message that needs a reply.
 2. Confirm the reply lands in Slack.
-3. In the bot's transcript file (`<claude_config_dir>/projects/<slug>/*.jsonl` — guard-covered bots always run with a dedicated `claude_config_dir`, since the bootstrap refuses the operator's personal `~/.claude`), grep for `<channel source="slack` at the start of the triggering message's text, confirm that tag still carries `chat_id`, `user`, and `ts` attributes, and look for a subsequent assistant entry containing `"name":"mcp__slack-channel-router__reply"` in a `tool_use` block.
+3. Inspect the persona's most recently modified transcript. It lives in `<claude_config_dir>/projects/<folder named after the persona's working_directory>/`, where `<claude_config_dir>` is the persona's effective `claude_config_dir` (a persona the guard covers always has one, and never `~/.claude`). Claude Code names that folder (`<project_folder>` below) after the absolute `working_directory`, with every character other than a letter, a digit or `-` replaced by `-`: `/home/me/projects/alpha` becomes `-home-me-projects-alpha`. Other personas sharing the config dir have their own folders, so use this one, not `projects/*`. Replace both placeholders:
 
-If the tag or any of those attributes no longer appears, the guard is dark or misclassifying messages — file an issue.
+   ```sh
+   f=$(ls -t <claude_config_dir>/projects/<project_folder>/*.jsonl | head -n 1)
+   grep -o '<channel source=\\"slack[^>]*>' "$f" | tail -n 1
+   grep -n '<channel source=\\"slack' "$f" | tail -n 1 | cut -d: -f1
+   grep -n '"name":"mcp__slack-channel-router__reply"' "$f" | tail -n 1 | cut -d: -f1
+   ```
+
+   The transcript stores the tag's quotes escaped (`\"`), which is why the patterns contain `\\"`. The first `grep` prints the last Slack tag, which must carry both `via` and `chat_id`. The next two print the line numbers of the last Slack tag and of the last `mcp__slack-channel-router__reply` `tool_use`. The reply's line number must be greater than the tag's; no reply line, or a smaller number, means the reply was not recorded after the message.
+
+If the tag, `via` or `chat_id` no longer appears, the guard is dark or misreading messages — file an issue.
 
 ---
 
