@@ -41,9 +41,9 @@ import {
   type Persona,
   type PersonaConfig,
 } from './config.ts'
-import type { PersonaBringUpState } from './persona-bringup-controller.ts'
+import { isCredentialsBroken, type PersonaBringUpState } from './persona-bringup-controller.ts'
 import type { CredentialsDigest } from './persona-credentials.ts'
-import { PERSONA_CREDENTIALS_REFUSED, escapeCause } from './persona-diagnostics.ts'
+import { escapeCause } from './persona-diagnostics.ts'
 import { effectiveClaudeConfigDirs, renderPersonaRef } from './persona-identity.ts'
 
 // ---------------------------------------------------------------------------
@@ -223,9 +223,10 @@ export interface CredentialsPersonaChange extends ChangePlanPersonaRef {
   credentialsBroken: boolean | undefined
   /**
    * The persona is retrying its bring-up (Slack-unreachable or
-   * directory-broken): it has no connection yet and retries with the new
-   * content (b.av2 SR-8.6). Undefined when its bring-up state could not be
-   * queried.
+   * directory-broken), or its first Slack attempt is in flight: it has no
+   * connection yet and retries with the new content (b.av2 SR-8.6), or, when
+   * the new content is not locally valid, with its current content.
+   * Undefined when its bring-up state could not be queried.
    */
   retrying?: boolean
   /**
@@ -415,18 +416,11 @@ function credentialsChanged(key: string, path: string, facts: ChangePlanFacts): 
 
 /**
  * Whether a persona's current bring-up state is credentials-broken (b.av2
- * SR-6.4): its outcome is `broken` and either its local credentials check
- * failed (missing, unreadable or locally invalid) or Slack refused a token
- * (`persona-credentials-refused`: `invalid_auth`, `token_revoked`,
- * `account_inactive` and every other non-transient Slack error). A persona
- * retrying because Slack is unreachable or its directory is unusable, or
- * broken for another reason, is not. Such a persona is brought up at apply
- * rather than reconnected (SR-8.6 step 6).
+ * SR-6.4); the bring-up controller's rule, which the apply's step bodies and
+ * operations use too. Such a persona is brought up at apply rather than
+ * reconnected (SR-8.6 step 6).
  */
-export function isCredentialsBroken(state: Pick<PersonaBringUpState, 'outcome' | 'causes'> | undefined): boolean {
-  if (state?.outcome !== 'broken') return false
-  return state.causes.credentials !== undefined || state.causes.slack?.class === PERSONA_CREDENTIALS_REFUSED
-}
+export { isCredentialsBroken }
 
 /**
  * Whether the set of effective config directories of `candidate`'s personas
@@ -531,7 +525,8 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
       const state = facts.bringUpState?.(persona.key)
       const known = state !== FACT_UNKNOWN
       const credentialsBroken = known ? isCredentialsBroken(state) : undefined
-      const retrying = known ? state?.outcome === 'retrying' : undefined
+      // An undefined outcome: its first Slack attempt is in flight, so it has no connection yet.
+      const retrying = known ? state !== undefined && (state.outcome === 'retrying' || state.outcome === undefined) : undefined
       const problem = facts.credentialsProblem?.(persona.credentials_file)
       plan.credentials.push({ ...ref, path: persona.credentials_file, credentialsBroken, retrying, problem })
       changed = true
@@ -688,7 +683,9 @@ function credentialsEffect(c: CredentialsPersonaChange): string {
       : `${unusable}: it stays broken by its credentials`
   }
   if (c.retrying) {
-    return `${unusable ?? changed}: it has no connection yet, so it retries with the new content, instance kept`
+    return unusable === undefined
+      ? `${changed}: it has no connection yet, so it retries with the new content, instance kept`
+      : `${unusable}: it keeps retrying with its current content, instance kept`
   }
   return unusable === undefined
     ? `${changed}: a new connection opens, then the old one closes, instance kept`

@@ -3,8 +3,9 @@
  * apply runs (b.av2 SR-6.1, SR-6.2, SR-6.5, SR-6.6, SR-8.6).
  *
  * `createPersonaLifecycle(deps)` composes, over injected dependencies, the
- * three operations the reload controller's apply steps fan out to
- * (`ReloadLifecycleOps.teardown`, `.bringUp` and `.updateInPlace`, `reload.ts`):
+ * four operations the reload controller's apply steps fan out to
+ * (`ReloadLifecycleOps.teardown`, `.bringUp`, `.reconnectCredentials` and
+ * `.updateInPlace`, `reload.ts`):
  *
  * - **persona teardown** (SR-6.5, apply step 2): everything the server holds
  *   for one persona key goes, with no graceful wind-down. In order:
@@ -56,6 +57,35 @@
  *   line is logged. Shutdown has already cancelled every bring-up and
  *   stopped every connection, so nothing started here would be released.
  *
+ *   With `{ recovery: true }` it is the recovery bring-up of a persona
+ *   broken by its credentials whose credentials file changed (SR-6.4, SR-8.6
+ *   step 6, with or without an instance): decided when it runs, a persona
+ *   still broken by its credentials first has its bring-up state cancelled,
+ *   its connection stopped (a fresh connection and episode latch follow) and
+ *   its cached DM conversation forgotten, then goes through the same
+ *   procedure; its instance and row are kept, so the launch reaches them
+ *   through the collision ladder. Shutdown is checked again once that
+ *   clearing is done, before anything new connects. One that is not broken
+ *   by its credentials by then (step 4 left it here because it was, and a
+ *   pending reconnect of an earlier change brought it up since) gets the
+ *   confirmed change as step 4 would have applied it, the credentials change
+ *   below run directly in the same serializer turn, so the confirmed content
+ *   is applied rather than skipped.
+ *
+ * - **credentials change** (SR-8.6 step 4, credentials row): the bring-up
+ *   controller's `changeCredentials` over the connection manager, for a
+ *   persona that is up (reconnected: the new connection opens, then the old
+ *   one closes; its instance and MCP session are kept) or retrying (it
+ *   retries with the new content). Its cached DM conversation is forgotten
+ *   right before the new connection comes into use (the controller's
+ *   `beforeSwap`, ahead of the notifier's flush at up), whether that swap
+ *   happens at once or later; a later swap logs the reconnected line too.
+ *   Each line is worded from the persona's state after the attempt (a
+ *   persona whose current connection was refused meanwhile is not said to
+ *   keep it). A persona broken by its credentials by then is left to step
+ *   6's recovery bring-up. Nothing touches another persona; no
+ *   agent-director call.
+ *
  * - **in-place update** (SR-8.6, AC 58, apply step 3): a persona whose
  *   `channels`, `delivery`, `permission_prompts` or `dm.*` changed keeps its
  *   instance, Slack connection, Web API client, MCP session, restart,
@@ -70,7 +100,7 @@
  *   longer applied when the operation runs gets nothing. Makes no Slack or
  *   agent-director call; never rejects. Dry run: the same.
  *
- * All three run through the per-persona lifecycle serializer (SR-6.6), so
+ * All four run through the per-persona lifecycle serializer (SR-6.6), so
  * each starts only after every operation already submitted for the persona
  * (a restart timer's work, a bring-up retry) has settled. None submits to the
  * serializer again from inside its own operation (the re-entrancy rule in
@@ -90,6 +120,20 @@
  *   [slack] persona "<name>" (key=<key>): not brought up — the server is shutting down
  *   [slack] persona "<name>" (key=<key>): updated in place (<settings>); its instance, Slack connection and MCP session are kept[; its cached DM conversation is forgotten | ; forgetting its cached DM conversation failed: <thrown value>]
  *   [slack] persona "<name>" (key=<key>): in-place update failed: <thrown value>
+ *   [slack] persona "<name>" (key=<key>): broken by its credentials and its credentials file changed — bringing it up again
+ *   [slack] persona "<name>" (key=<key>): not brought up again — it is not broken by its credentials now, so its changed credentials are applied as a credentials change
+ *   [slack] persona "<name>" (key=<key>): <step> before bringing it up again failed: <thrown value>
+ *   [slack] persona "<name>" (key=<key>): reconnected with its changed credentials; its instance and MCP session are kept
+ *   [slack] persona "<name>" (key=<key>): reconnected with its changed credentials and up again; its instance is kept
+ *   [slack] persona "<name>" (key=<key>): its changed credentials cannot reach Slack yet; the new connection retries and the current one stays in use
+ *   [slack] persona "<name>" (key=<key>): its changed credentials cannot reach Slack yet; the new connection retries, and it stays broken by its credentials until that connection is in use
+ *   [slack] persona "<name>" (key=<key>): it retries its bring-up with its changed credentials
+ *   [slack] persona "<name>" (key=<key>): broken by its credentials now, so it is brought up again rather than reconnected
+ *   [slack] persona "<name>" (key=<key>): credentials change not applied — the server is shutting down
+ *   [slack] persona "<name>" (key=<key>): forgetting its cached DM conversation failed: <thrown value>
+ *
+ * A credentials change that cannot be used is logged by the bring-up
+ * controller (`persona-credentials-change-failed`).
  *
  * `<settings>` lists the changed setting groups, comma-separated, in the
  * change plan's order (`channels`, `delivery`, `permission_prompts`,
@@ -103,7 +147,13 @@
  */
 
 import type { Persona, PersonaConfig } from './config.ts'
-import type { PersonaBringUpController, PersonaBringUpResultSummary } from './persona-bringup-controller.ts'
+import {
+  isCredentialsBroken,
+  type CredentialsChangeHooks,
+  type PersonaBringUpController,
+  type PersonaBringUpResultSummary,
+  type PersonaCredentialsChangeResult,
+} from './persona-bringup-controller.ts'
 import type { PersonaConnectionManager } from './persona-connections.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import type { PersonaDestinations } from './persona-destination.ts'
@@ -112,7 +162,7 @@ import { personaInstanceId, renderPersonaRef } from './persona-identity.ts'
 import type { PersonaNotifier } from './persona-notifier.ts'
 import type { PersonaRouting } from './persona-routing.ts'
 import type { PersonaSerialize } from './persona-serializer.ts'
-import type { InPlaceApplyInput } from './reload-apply.ts'
+import type { ApplyBringUpOptions, InPlaceApplyInput } from './reload-apply.ts'
 import type { InPlaceSetting } from './reload-plan.ts'
 
 // ---------------------------------------------------------------------------
@@ -133,16 +183,26 @@ export interface PersonaTeardownReplyGuard {
 export interface PersonaLifecycleDeps {
   /** The per-persona lifecycle serializer's `run` (the server's one shared instance). */
   serialize: PersonaSerialize
-  /** The bring-up controller: an added persona's bring-up; a removed persona's cancel. */
-  bringUps: Pick<PersonaBringUpController, 'bringUp' | 'cancel'>
-  /** The connection manager: a removed persona's connection is stopped and forgotten. */
-  connections: Pick<PersonaConnectionManager, 'stop'>
+  /**
+   * The bring-up controller: an added persona's bring-up; a removed
+   * persona's cancel; a credentials change (`changeCredentials`); and, for a
+   * recovery, the persona's state now and its cancel.
+   */
+  bringUps: Pick<PersonaBringUpController, 'bringUp' | 'cancel' | 'state' | 'changeCredentials'>
+  /**
+   * The connection manager: a removed or recovered persona's connection is
+   * stopped and forgotten; a credentials change reconnects an up persona
+   * (`reconnectCredentials`) or hands a Slack-retrying one its new tokens
+   * (`replaceRetryTokens`).
+   */
+  connections: Pick<PersonaConnectionManager, 'stop' | 'reconnectCredentials' | 'replaceRetryTokens'>
   /** The inbound routing: a removed persona's dedupe store is dropped. */
   routing: Pick<PersonaRouting, 'forget'>
   /**
    * The shared destination resolver: a removed persona's cached DM is
-   * forgotten, and an in-place updated one's when its DM destination settings
-   * changed.
+   * forgotten, an in-place updated one's when its DM destination settings
+   * changed, and one whose credentials changed when its new connection comes
+   * into use or it is brought up again (the new app may have another DM).
    */
   destinations: Pick<PersonaDestinations, 'forget'>
   /** The shared destination hold: a removed persona's held notices and retry are cancelled. */
@@ -212,9 +272,24 @@ export interface PersonaLifecycle {
   /**
    * Apply bring-up of one added persona (apply step 6), with `applied` the
    * configuration apply step 1 made current. Resolves with the bring-up
-   * outcome once an `up` persona's launch settled.
+   * outcome once an `up` persona's launch settled. With `options.recovery`,
+   * the recovery bring-up of a persona broken by its credentials whose
+   * credentials file changed (b.av2 SR-6.4): when it is still broken by its
+   * credentials, its leftover state is cleared first; otherwise its changed
+   * credentials are applied as `reconnectCredentials` would, in the same
+   * serializer turn.
    */
-  bringUp(persona: Persona, applied: PersonaConfig): Promise<PersonaBringUpResultSummary>
+  bringUp(persona: Persona, applied: PersonaConfig, options?: ApplyBringUpOptions): Promise<PersonaBringUpResultSummary>
+  /**
+   * Credentials change of one persona whose credentials file changed (apply
+   * step 4), declared as in `applied`: the bring-up controller's
+   * `changeCredentials` over the connection manager, its cached DM
+   * conversation forgotten right before the new connection comes into use.
+   * Resolves once
+   * its first attempt settled, with `{ kind: 'credentials-broken' }` when it
+   * is broken by its credentials by then (step 6 brings it up instead).
+   */
+  reconnectCredentials(persona: Persona, applied: PersonaConfig): Promise<PersonaCredentialsChangeResult>
   /**
    * In-place update of one persona modified in place (apply step 3):
    * `change.persona` is its entry in the configuration step 1 made current,
@@ -239,7 +314,7 @@ const DM_DESTINATION_SETTINGS: ReadonlySet<InPlaceSetting> = new Set<InPlaceSett
 // Factory
 // ---------------------------------------------------------------------------
 
-/** Compose the persona teardown, the apply bring-up and the in-place update. Creates, reads and schedules nothing. */
+/** Compose the persona teardown, the apply bring-up (and recovery), the credentials change and the in-place update. Creates, reads and schedules nothing. */
 export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifecycle {
   function log(line: string): void {
     try {
@@ -319,7 +394,11 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
   // Apply bring-up (b.av2 SR-6.1, SR-6.2)
   // -------------------------------------------------------------------------
 
-  async function runBringUp(persona: Persona, applied: PersonaConfig): Promise<PersonaBringUpResultSummary> {
+  async function runBringUp(
+    persona: Persona,
+    applied: PersonaConfig,
+    options: ApplyBringUpOptions = {},
+  ): Promise<PersonaBringUpResultSummary> {
     const ref = renderPersonaRef(persona.name, persona.key)
     const skipLine = `[slack] persona ${ref}: not brought up — the server is shutting down`
     // Shutdown has cancelled every bring-up and stopped every connection:
@@ -327,6 +406,16 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     if (deps.isShuttingDown()) {
       log(skipLine)
       return { outcome: 'broken', failures: [] }
+    }
+    if (options.recovery === true) {
+      const notNeeded = await prepareRecovery(persona, applied)
+      if (notNeeded !== undefined) return notNeeded
+      // Shutdown may have begun while its connection was being stopped:
+      // nothing new is connected or launched.
+      if (deps.isShuttingDown()) {
+        log(skipLine)
+        return { outcome: 'broken', failures: [] }
+      }
     }
     try {
       deps.storageCheck(persona)
@@ -345,6 +434,108 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
       await deps.launch(persona)
     } catch (err) {
       log(`[slack] persona ${ref}: launch at apply failed: ${describeThrownValue(err)}`)
+    }
+    return result
+  }
+
+  /**
+   * The recovery-specific preparation (b.av2 SR-6.4): decided when the
+   * operation runs, not at the preview. A persona still broken by its
+   * credentials has its bring-up state and timers cancelled, its connection
+   * stopped (a fresh connection gets a fresh episode latch, so a new refusal
+   * is logged) and its cached DM conversation forgotten; its instance and
+   * agent-director row are kept, for the launch's collision ladder. Resolves
+   * undefined then, so the bring-up runs. A persona that is not broken by
+   * its credentials any more (step 4 left it to this step because it was,
+   * and a pending reconnect of an earlier change has brought it up since)
+   * gets the confirmed change as step 4 would have applied it, through the
+   * credentials change body called directly (this already runs in its
+   * serializer turn), so the confirmed content is never left unapplied; it
+   * resolves the persona's outcome after that, unless the change found it
+   * broken by its credentials again, when the preparation goes ahead. A
+   * failed step is logged and the rest still run.
+   */
+  async function prepareRecovery(persona: Persona, applied: PersonaConfig): Promise<PersonaBringUpResultSummary | undefined> {
+    const { key } = persona
+    const prefix = `[slack] persona ${renderPersonaRef(persona.name, key)}`
+    if (!isCredentialsBroken(deps.bringUps.state(key))) {
+      log(`${prefix}: not brought up again — it is not broken by its credentials now, so its changed credentials are applied as a credentials change`)
+      const change = await runReconnectCredentials(persona, applied)
+      if (change.kind !== 'credentials-broken') {
+        return { outcome: deps.bringUps.state(key)?.outcome ?? 'broken', failures: [] }
+      }
+    }
+    log(`${prefix}: broken by its credentials and its credentials file changed — bringing it up again`)
+    const step = async (what: string, body: () => unknown): Promise<void> => {
+      try {
+        await body()
+      } catch (err) {
+        log(`${prefix}: ${what} before bringing it up again failed: ${describeThrownValue(err)}`)
+      }
+    }
+    await step('cancelling its bring-up state', () => deps.bringUps.cancel(key))
+    await step('stopping its Slack connection', () => deps.connections.stop(key))
+    await step('forgetting its DM destination', () => deps.destinations.forget(key))
+    return undefined
+  }
+
+  // -------------------------------------------------------------------------
+  // Credentials change (b.av2 SR-8.6 step 4, credentials row)
+  // -------------------------------------------------------------------------
+
+  /**
+   * The credentials change body. Runs inside the persona's serializer turn:
+   * submitted by `reconnectCredentials`, or called directly by a recovery
+   * bring-up that found the persona no longer broken by its credentials
+   * (never through the serializer again: the re-entrancy rule).
+   */
+  async function runReconnectCredentials(persona: Persona, applied: PersonaConfig): Promise<PersonaCredentialsChangeResult> {
+    const { key } = persona
+    const prefix = `[slack] persona ${renderPersonaRef(persona.name, key)}`
+    if (deps.isShuttingDown()) {
+      log(`${prefix}: credentials change not applied — the server is shutting down`)
+      return { kind: 'skipped' }
+    }
+    const reconnectedLine = (wasUp: boolean): string =>
+      wasUp
+        ? `${prefix}: reconnected with its changed credentials; its instance and MCP session are kept`
+        : `${prefix}: reconnected with its changed credentials and up again; its instance is kept`
+    const hooks: CredentialsChangeHooks = {
+      // Before the swap, so the notifier's flush at up never posts held
+      // notices to the old app's DM (the new app may have another DM).
+      beforeSwap: () => {
+        try {
+          deps.destinations.forget(key)
+        } catch (err) {
+          log(`${prefix}: forgetting its cached DM conversation failed: ${describeThrownValue(err)}`)
+        }
+      },
+      // A reconnect left retrying took over after this operation resolved.
+      onSwapped: (swap) => {
+        if (swap.late) log(reconnectedLine(swap.wasUp))
+      },
+    }
+    const result = await deps.bringUps.changeCredentials(persona, applied.personas, deps.connections, hooks)
+    switch (result.kind) {
+      case 'swapped':
+        log(reconnectedLine(result.cameBackUp !== true))
+        break
+      case 'retrying':
+        log(
+          result.connection === 'kept'
+            ? `${prefix}: its changed credentials cannot reach Slack yet; the new connection retries and the current one stays in use`
+            : result.connection === 'broken'
+              ? `${prefix}: its changed credentials cannot reach Slack yet; the new connection retries, and it stays broken by its credentials until that connection is in use`
+              : `${prefix}: it retries its bring-up with its changed credentials`,
+        )
+        break
+      case 'credentials-broken':
+        log(`${prefix}: broken by its credentials now, so it is brought up again rather than reconnected`)
+        break
+      case 'failed':
+      case 'skipped':
+        // A failed change logged its persona-credentials-change-failed line.
+        break
     }
     return result
   }
@@ -380,7 +571,8 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
 
   return {
     teardown: (persona) => deps.serialize(persona.key, () => runTeardown(persona)),
-    bringUp: (persona, applied) => deps.serialize(persona.key, () => runBringUp(persona, applied)),
+    bringUp: (persona, applied, options) => deps.serialize(persona.key, () => runBringUp(persona, applied, options)),
+    reconnectCredentials: (persona, applied) => deps.serialize(persona.key, () => runReconnectCredentials(persona, applied)),
     updateInPlace: (change) => deps.serialize(change.persona.key, () => runUpdateInPlace(change)),
   }
 }

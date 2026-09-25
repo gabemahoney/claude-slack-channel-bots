@@ -231,7 +231,10 @@ file, and never delete `config.json.last-applied` while the server runs.
 
 Per-persona changes take effect at the apply: an added persona is brought up,
 a removed one is torn down, and `channels`, `delivery`, `permission_prompts`,
-`dm.enabled` and `dm.contact` are updated in place. A server-wide setting such
+`dm.enabled` and `dm.contact` are updated in place, and a persona whose
+credentials file changed at the same path is reconnected with it (or brought
+up again, when it was down because of its credentials). No check here
+rotates a token: that path has unit coverage only. A server-wide setting such
 as `session_restart_delay` is only recorded at the apply; its preview line
 says it `takes effect at the next server start after that`. For such an edit,
 confirm it, then restart the test server with the "Guarded restart" in the

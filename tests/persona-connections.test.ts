@@ -52,6 +52,19 @@
  * included), close the socket with no reopen and no lost or restored line,
  * and forget its state, digest and identity; `cancelAll` covers a persona
  * added after the start; a `start()` settling after `stop` is no connection.
+ * E13 Task 1 adds the manager's credentials reconnect (b.av2 SR-8.6
+ * credentials row, SR-3.1 overlap, SR-3.3 reconnect part): the new
+ * connection opens (SR-3.3 option sets, new tokens) before the old one
+ * closes, a refusal or Slack-unreachable keeps the old connection, a
+ * never-settling `start()` is abandoned at 10 s, retries follow the backoff,
+ * a later reconnect, `stop` and shutdown cancel a pending one, a retrying
+ * persona takes new tokens (`replaceRetryTokens`), and the
+ * `persona-credentials-change-failed` line per cause; and bug b.ujn: the
+ * first `invalid_auth`, `token_revoked`, `account_inactive` or `not_authed`
+ * from a Web API call on a persona's current client marks it
+ * credentials-broken at once (one line, no delivery, later calls refused
+ * locally), whatever the serializer holds, while other errors, stale
+ * clients and B change nothing.
  * Time is a fake clock throughout;
  * nothing sleeps (the start-pass cases poll in 1 ms real-time steps only for
  * the real spawn path).
@@ -111,6 +124,8 @@ import {
   type PersonaConnectionManager,
   type PersonaConnectionStatus,
   type PersonaEventHandler,
+  type PersonaReconnectLaterOutcome,
+  type PersonaReconnectOutcome,
   type PersonaSocketEventName,
   type PersonaSocketEventPayload,
 } from '../src/persona-connections.ts'
@@ -133,6 +148,7 @@ import {
 import {
   PERSONA_CONNECTION_LOST,
   PERSONA_CONNECTION_RESTORED,
+  PERSONA_CREDENTIALS_CHANGE_FAILED,
   PERSONA_CREDENTIALS_INVALID,
   PERSONA_CREDENTIALS_MISSING,
   PERSONA_CREDENTIALS_REFUSED,
@@ -142,8 +158,10 @@ import {
   PERSONA_START,
   PERSONA_DIRECTORY_MISSING,
   PERSONA_DIRECTORY_UNUSABLE,
+  formatCredentialsChangeFailed,
   formatPersonaDiagnostic,
   personaCheckFailure,
+  type CredentialsChangeKept,
   type PersonaCheckFailure,
   type PersonaDiagnosticClass,
 } from '../src/persona-diagnostics.ts'
@@ -153,11 +171,13 @@ import {
   SlackStartTimeoutError,
   botIdentityFromAuthTest,
   classifySlackValidationError,
+  type SlackCredentialsRefusedOutcome,
   type SlackValidationCheck,
   type SlackValidationFailure,
   type SlackValidationOutcome,
 } from '../src/persona-slack-validation.ts'
 import { MAX_TIMER_DELAY_MS, createPersonaRetrySchedule } from '../src/persona-retry-schedule.ts'
+import { WEB_API_CALL_REFUSED_LOCALLY, WebApiCallRefusedLocallyError } from '../src/persona-web-api-watch.ts'
 import { createSlackEpisodeTracker, type SlackEpisodeTracker } from '../src/persona-slack-episodes.ts'
 import {
   APP_TOKEN_PREFIX,
@@ -170,6 +190,7 @@ import {
   type CredentialsOverrides,
 } from './test-helpers/credentials.ts'
 import {
+  INITIAL_CREDENTIALS,
   makeAppMention,
   makeChannelMessage,
   makeDeferredConnect,
@@ -183,6 +204,7 @@ import {
   type StubSlack,
   type StubSlackFactory,
   type StubSlackOptions,
+  type StubSlackScript,
   type WebApiOutcome,
 } from './test-helpers/slack-stub.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
@@ -201,15 +223,17 @@ import {
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import type { PersonaSpec } from './test-helpers/persona-config.ts'
 import { resolveRealPath, type Persona } from '../src/config.ts'
-import { createPersonaSerializer, type PersonaSerializer } from '../src/persona-serializer.ts'
+import { createPersonaSerializer, type PersonaSerialize, type PersonaSerializer } from '../src/persona-serializer.ts'
 import {
   createNotUpSessionDropper,
   createPersonaBringUpController,
   describePersonaNotUp,
+  type CredentialsSwap,
   type PersonaBringUpController,
   type PersonaBringUpControllerDeps,
   type PersonaBringUpResultSummary,
   type PersonaBringUpState,
+  type PersonaCredentialsChangeResult,
 } from '../src/persona-bringup-controller.ts'
 import {
   composePersonaStatusListeners,
@@ -1237,10 +1261,11 @@ describe('no writes', () => {
 // ---------------------------------------------------------------------------
 
 describe('diagnostic lines', () => {
-  test('the label set is exactly the start, credentials, Slack-validation, connection, directory, unclaimed-channel, DM-drop and destination-failed classes', () => {
+  test('the label set is exactly the start, credentials, Slack-validation, connection, directory, unclaimed-channel, DM-drop, destination-failed and credentials-change-failed classes', () => {
     expect([...PERSONA_DIAGNOSTIC_CLASSES].sort()).toEqual([
       'persona-connection-lost',
       'persona-connection-restored',
+      'persona-credentials-change-failed',
       'persona-credentials-invalid',
       'persona-credentials-missing',
       'persona-credentials-refused',
@@ -1404,8 +1429,12 @@ describe('success value secrecy', () => {
 // Slack validation legs, driven through the Slack stub (SR-3.2)
 // ---------------------------------------------------------------------------
 
-/** One validation leg: `auth.test` checks the bot token, the Socket Mode open the app token. */
-type Leg = SlackValidationCheck
+/**
+ * One validation leg: `auth.test` checks the bot token, the Socket Mode open
+ * the app token. The `web-api` check (bug b.ujn) is a running persona's call,
+ * not a validation leg; it has its own block below.
+ */
+type Leg = Exclude<SlackValidationCheck, 'web-api'>
 
 /** The credentials-file key each leg validates. */
 const LEG_KEY = { 'auth.test': 'bot_token', 'socket-mode': 'app_token' } as const
@@ -1866,6 +1895,51 @@ describe('Slack episode lines', () => {
     expect([a.tracker.open, b.tracker.open]).toEqual([null, R])
     expect(b.lines[0]).toContain('personas[1]')
   })
+
+  // Rows: the open episode's class and how it is opened.
+  test.each<[PersonaDiagnosticClass, (tracker: SlackEpisodeTracker) => Promise<void>]>([
+    [U, async tracker => void tracker.record(await failureVia('auth.test', DNS))],
+    [R, async tracker => void tracker.record(await failureVia('socket-mode', refused('invalid_auth')))],
+    [PERSONA_CONNECTION_LOST, async tracker => void tracker.record({ kind: 'connection-lost' })],
+  ])('end(reason) closes an open %s episode with exactly one line, its class and `cleared: <reason>`; then nothing is open and neither end() nor up logs again', async (cls, open) => {
+    const name = 'Night "Ops" Desk'
+    const { tracker, lines, path } = makeTracker(name, 2)
+    await open(tracker)
+    expect(lines).toHaveLength(1)
+
+    const ended = tracker.end('the attempts it covered were abandoned')
+
+    const expected = formatPersonaDiagnostic({
+      class: cls,
+      name,
+      key: personaKey(name),
+      index: 2,
+      path,
+      cause: 'cleared: the attempts it covered were abandoned',
+    })
+    expect(ended).toEqual([expected])
+    expect(lines.slice(1)).toEqual([expected])
+    expect(tracker.open).toBeNull()
+    expect(tracker.end('again')).toEqual([])
+    expect(tracker.record({ kind: 'up' })).toEqual([])
+    expect(lines).toHaveLength(2)
+    // The latch is reset: the next failure opens a new episode with its start line.
+    expect(tracker.record(await failureVia('auth.test', DNS)).map(classOf)).toEqual([U])
+    assertNoLeak({ lines, ended })
+  })
+
+  test('end(reason) with no episode open logs and returns nothing: a fresh tracker, and one whose episode already cleared', async () => {
+    const { tracker, lines } = makeTracker()
+
+    expect(tracker.end('nothing to end')).toEqual([])
+    tracker.record(await failureVia('auth.test', DNS))
+    tracker.record({ kind: 'up' })
+    expect(lines.map(classOf)).toEqual([U, U])
+
+    expect(tracker.end('nothing to end')).toEqual([])
+    expect(lines).toHaveLength(2)
+    expect(tracker.open).toBeNull()
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1909,6 +1983,10 @@ interface HarnessOptions {
   names?: [string, string]
   /** Called after each event is recorded. */
   onEvent?: PersonaEventHandler
+  /** Called after each status report is recorded (a status listener beside the recorder). */
+  onStatus?: (key: string, status: PersonaConnectionStatus) => void
+  /** The per-persona serializer's `run`, passed to the manager as `serialize` (bug b.ujn). Default: none, so the close runs at once. */
+  serialize?: PersonaSerialize
 }
 
 /** Harnesses built in the running test; stopped and leak-checked after it. */
@@ -1967,11 +2045,15 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
     factory: slack.factory,
     clock,
     log: line => void lines.push(line),
-    onStatus: (key, status) => void statuses.push([key, status]),
+    onStatus: (key, status) => {
+      statuses.push([key, status])
+      opts.onStatus?.(key, status)
+    },
     onEvent: (key, eventName, payload) => {
       events.push({ key, eventName, payload })
       return opts.onEvent?.(key, eventName, payload)
     },
+    serialize: opts.serialize,
   })
   const h: Harness = { manager, clock, slack, a, b, lines, events, statuses, agentDirector: makeAgentDirectorRecorder() }
   harnesses.push(h)
@@ -2010,10 +2092,14 @@ function pendingDelays(h: Harness): number[] {
 
 let deliverySeq = 0
 
-/** Deliver a uniquely-texted message on the persona's latest socket; it must reach the handler exactly once, tagged with that persona. */
-async function expectDelivers(h: Harness, p: ManagedPersona): Promise<void> {
+/**
+ * Deliver a uniquely-texted message on the persona's latest socket (of `stub`,
+ * default its initial credential set's); it must reach the handler exactly
+ * once, tagged with that persona.
+ */
+async function expectDelivers(h: Harness, p: ManagedPersona, stub: StubSlack = stubOf(h, p)): Promise<void> {
   const text = `delivery ${++deliverySeq} on ${p.key}`
-  await stubOf(h, p).socket.deliver(makeChannelMessage({ text }))
+  await stub.socket.deliver(makeChannelMessage({ text }))
   expect(h.events.filter(e => e.payload.event?.text === text).map(e => e.key)).toEqual([p.key])
 }
 
@@ -3235,6 +3321,1455 @@ describe('rejected Web API calls (AC 20)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Credentials reconnect (E13 Task 1: b.av2 SR-8.6 credentials row, SR-3.1
+// overlap, SR-3.3 reconnect part, SR-10.3 persona-credentials-change-failed)
+//
+// `reconnectCredentials` and `replaceRetryTokens` at module level, on the
+// file harness (A and B, stub Slack, fake clock), independent of the reload
+// controller; `tests/reload-apply.test.ts` covers them end to end. Each
+// rotated token pair is registered with the stub factory as its own
+// credential set (`addCredentials`), so the old and new tokens are scripted
+// apart and the factory's activity record shows the open-before-close order.
+// ---------------------------------------------------------------------------
+
+/** The label of the first rotated credential set a case registers. */
+const ROTATED = 'rotated'
+
+/** A long-lived persona Web API client as the manager hands it out. */
+type ManagedWebClient = NonNullable<ReturnType<PersonaConnectionManager['webClient']>>
+
+/** A persona's rotated credential set: its tokens, the stub its clients go to and the identity its `auth.test` returns. */
+interface RotatedCredentials {
+  tokens: PersonaSlackTokens
+  stub: StubSlack
+  identity: { botUserId: string; botId: string }
+}
+
+/**
+ * Register a rotated credential set `label` for `p`: new sentinel-bearing
+ * fake tokens and their own stub (leak marker on, `opts` seeding its script),
+ * whose bot user ID and bot ID differ from the old ones and whose team
+ * differs too: another app, which the manager never compares.
+ */
+function rotateCredentials(h: Harness, p: ManagedPersona, label = ROTATED, opts: StubSlackOptions = {}): RotatedCredentials {
+  const tokens = new PersonaSlackTokens(
+    fakeToken(BOT_TOKEN_PREFIX, `${p.key}-${label}-bot`),
+    fakeToken(APP_TOKEN_PREFIX, `${p.key}-${label}-app`),
+  )
+  const stub = h.slack.addCredentials(p.key, label, tokens, { leakMarker: LEAK_SENTINEL, teamId: 'T0ROTATED', ...opts })
+  return { tokens, stub, identity: { botUserId: stub.identity.botUserId, botId: stub.identity.botId } }
+}
+
+/** The identity the persona's initial credential set's `auth.test` returns. */
+function initialIdentityOf(h: Harness, p: ManagedPersona): { botUserId: string; botId: string } {
+  const { botUserId, botId } = stubOf(h, p).identity
+  return { botUserId, botId }
+}
+
+/** The persona's clients built from credential set `label`, by kind, in build order. */
+function builtFrom(h: Harness, p: ManagedPersona, label: string): StubClientKind[] {
+  return h.slack.buildsOf(p.key).filter(build => build.credentials === label).map(build => build.kind)
+}
+
+/** `start()` calls over every socket client of one credential set's stub. */
+function stubStarts(stub: StubSlack): number {
+  return stub.sockets.reduce((sum, socket) => sum + socket.startCalls, 0)
+}
+
+/**
+ * The old connection is intact and in use: `p` is up with its initial
+ * identity and Web API client, its one initial socket is open (never closed)
+ * and delivers, tagged with `p`.
+ */
+async function expectOldConnectionKept(h: Harness, p: ManagedPersona, oldWeb: ManagedWebClient | undefined): Promise<void> {
+  expect(oldWeb).toBeDefined()
+  expect(h.manager.status(p.key)).toEqual({ state: 'up', identity: initialIdentityOf(h, p) })
+  expect(h.manager.identity(p.key)).toEqual(initialIdentityOf(h, p))
+  expect(h.manager.webClient(p.key)).toBe(oldWeb!)
+  expect(stubOf(h, p).sockets.map(socket => [socket.connected, socket.disconnectCalls])).toEqual([[true, 0]])
+  await expectDelivers(h, p)
+}
+
+/**
+ * B was never touched: up with its identity since its bring-up, its three
+ * clients only, its one socket started once and never closed, no line naming
+ * it, and it still delivers. No agent-director call was made for anyone.
+ */
+async function expectBUndisturbed(h: Harness): Promise<void> {
+  const b = stubOf(h, h.b)
+  expect(h.manager.status(h.b.key)).toEqual({ state: 'up', identity: initialIdentityOf(h, h.b) })
+  expect(statesOf(h, h.b)).toEqual(['connecting', 'up'])
+  expect(h.slack.buildsOf(h.b.key).map(build => build.kind)).toEqual(['validation', 'web', 'socket'])
+  expect(b.sockets.map(socket => [socket.startCalls, socket.disconnectCalls, socket.connected])).toEqual([[1, 0, true]])
+  expect(h.lines.filter(line => line.includes(renderPersonaRef(h.b.name, h.b.key)))).toEqual([])
+  expect(h.agentDirector.callCount()).toBe(0)
+  await expectDelivers(h, h.b)
+}
+
+/** The diagnostic line the manager logs for `p` with class `cls` and `cause` (personas[i], name and key, credentials path). */
+function personaLine(p: BringUpPersona, cls: PersonaDiagnosticClass, cause: string): string {
+  return formatPersonaDiagnostic({ class: cls, name: p.name, key: p.key, index: p.index, path: p.credentials_file, cause })
+}
+
+/** The Slack-unreachable cause of a reconnect's first attempt left retrying; throws (naming only the kind) otherwise. */
+function retryingCause(outcome: PersonaReconnectOutcome): string {
+  if (outcome.kind !== 'retrying') throw new Error(`expected a reconnect left retrying, got ${outcome.kind}`)
+  return outcome.outcome.cause
+}
+
+/** A listener for a reconnect's later outcome, recording what it is told. */
+function laterOutcomes(): { later: PersonaReconnectLaterOutcome[]; listener: (outcome: PersonaReconnectLaterOutcome) => void } {
+  const later: PersonaReconnectLaterOutcome[] = []
+  return { later, listener: outcome => void later.push(outcome) }
+}
+
+describe('connection manager: credentials reconnect (b.av2 SR-8.6 credentials row, SR-3.1, SR-3.3)', () => {
+  test('success: the new validation client, Web API client and socket are built and the socket reaches hello before the old socket is let go and closed; identity is the new auth.test result; A stays up; B undisturbed', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const old = stubOf(h, h.a)
+    const oldWeb = h.manager.webClient(h.a.key)
+    const rotated = rotateCredentials(h, h.a)
+    const since = h.slack.activityOf(h.a.key).length
+    const { later, listener } = laterOutcomes()
+
+    const outcome = await h.manager.reconnectCredentials(h.a.key, rotated.tokens, listener)
+
+    assertNoLeak({ outcome, later })
+    expect(outcome).toEqual({ kind: 'swapped', identity: rotated.identity })
+    // Open before close: the new socket is connected before the old one is discarded and disconnected.
+    expect(h.slack.activityOf(h.a.key).slice(since).map(e => [e.event, e.kind, e.credentials])).toEqual([
+      ['built', 'validation', ROTATED],
+      ['built', 'web', ROTATED],
+      ['built', 'socket', ROTATED],
+      ['started', 'socket', ROTATED],
+      ['connected', 'socket', ROTATED],
+      ['discarded', 'socket', INITIAL_CREDENTIALS],
+      ['disconnected', 'socket', INITIAL_CREDENTIALS],
+    ])
+    // A different bot user ID, bot ID and team: no same-app check.
+    expect(rotated.identity.botUserId).not.toBe(initialIdentityOf(h, h.a).botUserId)
+    expect(rotated.identity.botId).not.toBe(initialIdentityOf(h, h.a).botId)
+    expect(h.manager.identity(h.a.key)).toEqual(rotated.identity)
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+    expect(statesOf(h, h.a)).toEqual(['connecting', 'up', 'up'])
+    expect(later).toEqual([])
+
+    // The old socket's close is the manager's own: no reopen, no persona-connection-lost line.
+    expect(old.socket.lifecycle).toContain('disconnecting')
+    await h.clock.advance(HOUR_MS)
+    expect(stubStarts(old)).toBe(1)
+    expect(rotated.stub.sockets.map(socket => [socket.startCalls, socket.connected])).toEqual([[1, true]])
+    expect(h.lines).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
+
+    // Events on the new connection are tagged with A; A's Web API calls go through the new client.
+    await expectDelivers(h, h.a, rotated.stub)
+    const web = h.manager.webClient(h.a.key)
+    expect(web).toBeDefined()
+    expect(web).not.toBe(oldWeb!)
+    await web!.chat.postMessage({ channel: 'C0STUB0001', text: 'after the swap' })
+    expect(rotated.stub.calls.postMessage).toHaveLength(1)
+    expect(old.calls.postMessage).toEqual([])
+    await expectBUndisturbed(h)
+  })
+
+  test('AC 20 connection leg: the reconnect’s validation, Web API and socket clients get exactly the SR-3.3 options and the new tokens, never the old', async () => {
+    const noRetry = { retryConfig: { retries: 0 }, timeout: 10_000, rejectRateLimitedCalls: true, attachOriginalToWebAPIRequestError: false }
+    const expected: Record<StubClientKind, Record<string, unknown>> = {
+      validation: noRetry,
+      web: { timeout: 30_000, attachOriginalToWebAPIRequestError: false },
+      socket: { autoReconnectEnabled: false, clientOptions: noRetry },
+    }
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const rotated = rotateCredentials(h, h.a)
+
+    expect(await h.manager.reconnectCredentials(h.a.key, rotated.tokens)).toMatchObject({ kind: 'swapped' })
+
+    const builds = h.slack.buildsOf(h.a.key).filter(build => build.credentials === ROTATED)
+    expect(builds.map(build => build.kind)).toEqual(['validation', 'web', 'socket'])
+    const oldTokens = fileTokensOf(h.a)
+    for (const build of builds) {
+      const options: Record<string, unknown> = { ...build.options }
+      delete options.appToken
+      expect(options).toStrictEqual(expected[build.kind])
+      const [fresh, stale] = build.kind === 'socket'
+        ? [rotated.tokens.appToken, oldTokens.appToken]
+        : [rotated.tokens.botToken, oldTokens.botToken]
+      expect(build.hasToken(fresh)).toBe(true)
+      expect(build.hasToken(stale)).toBe(false)
+    }
+    await expectBUndisturbed(h)
+  })
+
+  // Rows: label, how the new credentials are refused, the check and cause the E2 classifier gives, and the clients built from them.
+  test.each<[string, StubSlackOptions, 'auth.test' | 'socket-mode', string, StubClientKind[]]>([
+    [
+      'the bot token refused by auth.test',
+      { authTest: [{ kind: 'platform', error: 'invalid_auth' }] },
+      'auth.test',
+      'bot_token refused by auth.test: Slack error invalid_auth',
+      ['validation'],
+    ],
+    [
+      'the app token refused at the Socket Mode open',
+      { connect: [{ kind: 'platform', error: 'invalid_auth' }] },
+      'socket-mode',
+      'app_token refused by the Socket Mode open: Slack error invalid_auth',
+      ['validation', 'web', 'socket'],
+    ],
+  ])('refused (%s): the old connection stays open and in use, identity unchanged; the call reports refused with the classifier cause; no new client is left open, nothing is retried or logged; B undisturbed', async (_label, script, check, cause, built) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const oldWeb = h.manager.webClient(h.a.key)
+    const rotated = rotateCredentials(h, h.a, ROTATED, script)
+    const { later, listener } = laterOutcomes()
+
+    const outcome = await h.manager.reconnectCredentials(h.a.key, rotated.tokens, listener)
+
+    assertNoLeak({ outcome, later })
+    expect(outcome).toEqual({
+      kind: 'refused',
+      outcome: {
+        kind: 'credentials-refused',
+        class: PERSONA_CREDENTIALS_REFUSED,
+        check,
+        key: check === 'auth.test' ? 'bot_token' : 'app_token',
+        slackError: 'invalid_auth',
+        cause,
+      },
+    })
+    expect(builtFrom(h, h.a, ROTATED)).toEqual(built)
+    // The refused socket, if one was built, was let go without ever connecting.
+    expect(h.slack.activityOf(h.a.key).filter(a => a.credentials === ROTATED && a.kind === 'socket').map(a => a.event))
+      .toEqual(built.includes('socket') ? ['built', 'started', 'discarded'] : [])
+    expect(rotated.stub.sockets.filter(socket => socket.connected)).toEqual([])
+    expect(h.lines).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.clock.advance(HOUR_MS)
+    expect(rotated.stub.calls.authTest).toHaveLength(1)
+    expect(stubStarts(rotated.stub)).toBe(built.includes('socket') ? 1 : 0)
+    expect(later).toEqual([])
+    expect(statesOf(h, h.a)).toEqual(['connecting', 'up'])
+    await expectOldConnectionKept(h, h.a, oldWeb)
+    await expectBUndisturbed(h)
+  })
+
+  test('Slack unreachable for the new credentials: the call returns retrying at once; the old connection stays in use while the new one retries at 5 s, then 10 s; when Slack answers the swap completes and the listener is told', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const oldWeb = h.manager.webClient(h.a.key)
+    const rotated = rotateCredentials(h, h.a, ROTATED, { authTest: [{ kind: 'network' }, { kind: 'network' }] })
+    const { later, listener } = laterOutcomes()
+
+    const outcome = await h.manager.reconnectCredentials(h.a.key, rotated.tokens, listener)
+
+    // Returned without waiting for any retry.
+    expect(h.clock.now()).toBe(0)
+    expect(outcome).toEqual({
+      kind: 'retrying',
+      retryInMs: 5_000,
+      outcome: expect.objectContaining({ kind: 'slack-unreachable', check: 'auth.test', key: 'bot_token', reason: 'network' }),
+    })
+    expect(pendingDelays(h)).toEqual([5_000])
+    await expectOldConnectionKept(h, h.a, oldWeb)
+
+    await h.clock.advance(4_999)
+    expect(rotated.stub.calls.authTest).toHaveLength(1)
+    await h.clock.advance(1)
+    expect(rotated.stub.calls.authTest).toHaveLength(2)
+    expect(pendingDelays(h)).toEqual([10_000])
+    expect(later).toEqual([])
+    await expectOldConnectionKept(h, h.a, oldWeb)
+    await expectBUndisturbed(h)
+
+    await h.clock.advance(10_000)
+    expect(rotated.stub.calls.authTest).toHaveLength(3)
+    expect(later).toEqual([{ kind: 'swapped', identity: rotated.identity }])
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+    expect(statesOf(h, h.a)).toEqual(['connecting', 'up', 'up'])
+    expect(stubOf(h, h.a).socket.disconnectCalls).toBe(1)
+    expect(h.clock.pendingCount()).toBe(0)
+    // The new connection's own Slack-unreachable episode: one start line, one cleared line, naming A.
+    expect(h.lines.map(classOf)).toEqual([PERSONA_SLACK_UNREACHABLE, PERSONA_SLACK_UNREACHABLE])
+    for (const line of h.lines) expect(line).toContain(renderPersonaRef(h.a.name, h.a.key))
+    await expectDelivers(h, h.a, rotated.stub)
+    await expectBUndisturbed(h)
+    assertNoLeak({ outcome, later })
+  })
+
+  // Rows: label and how the new socket's start() hangs.
+  test.each<[string, SettledConnectOutcome]>([
+    ['the WebSocket phase never reaches hello', { kind: 'never' }],
+    ['apps.connections.open never answers', { kind: 'open-never-answers' }],
+  ])('a new start() that never settles (%s) is abandoned at exactly 10 s on the fake clock: its socket is disconnected, it counts as Slack-unreachable, the old connection stays, and the retry 5 s later swaps', async (_label, hang) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const oldWeb = h.manager.webClient(h.a.key)
+    const rotated = rotateCredentials(h, h.a, ROTATED, { connect: [hang] })
+    const { later, listener } = laterOutcomes()
+    let resolved: PersonaReconnectOutcome | undefined
+    const reconnect = h.manager.reconnectCredentials(h.a.key, rotated.tokens, listener).then(outcome => (resolved = outcome))
+
+    await h.clock.advanceTo(9_999)
+    const hung = rotated.stub.socket
+    expect(hung.startCalls).toBe(1)
+    expect(resolved).toBeUndefined()
+    expect(hung.disconnectCalls).toBe(0)
+    await expectOldConnectionKept(h, h.a, oldWeb)
+    await h.clock.advance(1)
+
+    const outcome = await reconnect
+    expect(outcome).toEqual({
+      kind: 'retrying',
+      retryInMs: 5_000,
+      outcome: expect.objectContaining({ kind: 'slack-unreachable', check: 'socket-mode', key: 'app_token', reason: 'timeout' }),
+    })
+    expect(h.clock.now()).toBe(10_000)
+    expect(hung.disconnectCalls).toBe(1)
+    expect(pendingDelays(h)).toEqual([5_000])
+    await expectOldConnectionKept(h, h.a, oldWeb)
+    await expectBUndisturbed(h)
+
+    await h.clock.advance(5_000)
+    expect(later).toEqual([{ kind: 'swapped', identity: rotated.identity }])
+    expect(rotated.stub.sockets.map(socket => socket.connected)).toEqual([false, true])
+    expect(stubOf(h, h.a).socket.connected).toBe(false)
+    expect(h.clock.pendingCount()).toBe(0)
+    await expectDelivers(h, h.a, rotated.stub)
+    await expectBUndisturbed(h)
+    assertNoLeak({ outcome, later })
+  })
+
+  test('the swap cancels a reopen of the old connection in progress and closes its episode: one lost line, one restored line, no further start() of the old tokens', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const old = stubOf(h, h.a)
+    old.script.connect.push({ kind: 'network' })
+    old.socket.drop()
+    await h.clock.flush()
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'retrying', phase: 'reopen' })
+    const rotated = rotateCredentials(h, h.a)
+
+    expect(await h.manager.reconnectCredentials(h.a.key, rotated.tokens)).toEqual({ kind: 'swapped', identity: rotated.identity })
+
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.clock.advance(HOUR_MS)
+    expect(stubStarts(old)).toBe(2)
+    expect(h.lines.map(classOf)).toEqual([PERSONA_CONNECTION_LOST, PERSONA_CONNECTION_RESTORED])
+    expect(statesOf(h, h.a)).toEqual(['connecting', 'up', 'lost', 'retrying', 'up'])
+    await expectDelivers(h, h.a, rotated.stub)
+    await expectBUndisturbed(h)
+  })
+
+  test('the swap cancels a reopen of the old connection whose start() is in flight: its socket is closed, its 10 s bound goes with it, and A stays up on the new connection however far the clock runs', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const old = stubOf(h, h.a)
+    old.script.connect.push({ kind: 'never' })
+    old.socket.drop()
+    await h.clock.flush()
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'lost' })
+    const reopening = old.socket
+    expect(reopening.startCalls).toBe(1)
+    const rotated = rotateCredentials(h, h.a)
+
+    expect(await h.manager.reconnectCredentials(h.a.key, rotated.tokens)).toEqual({ kind: 'swapped', identity: rotated.identity })
+    await h.clock.flush()
+
+    expect(reopening.disconnectCalls).toBe(1)
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.clock.advance(HOUR_MS)
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+    expect(stubStarts(old)).toBe(2)
+    expect(h.lines.map(classOf)).toEqual([PERSONA_CONNECTION_LOST, PERSONA_CONNECTION_RESTORED])
+    expect(statesOf(h, h.a)).toEqual(['connecting', 'up', 'lost', 'up'])
+    await expectDelivers(h, h.a, rotated.stub)
+    await expectBUndisturbed(h)
+  })
+
+  test('unreachable, then refused: a later backoff attempt refused reaches the listener, the retries stop, the new connection’s unreachable episode gets its one cleared line and the old connection is intact', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const oldWeb = h.manager.webClient(h.a.key)
+    const rotated = rotateCredentials(h, h.a, ROTATED, {
+      authTest: [{ kind: 'network' }, { kind: 'platform', error: 'token_revoked' }],
+    })
+    const { later, listener } = laterOutcomes()
+    const first = await h.manager.reconnectCredentials(h.a.key, rotated.tokens, listener)
+    expect(first).toMatchObject({ kind: 'retrying', retryInMs: 5_000 })
+
+    await h.clock.advance(5_000)
+
+    expect(later).toEqual([{
+      kind: 'refused',
+      outcome: expect.objectContaining({ check: 'auth.test', key: 'bot_token', slackError: 'token_revoked' }),
+    }])
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.clock.advance(HOUR_MS)
+    expect(rotated.stub.calls.authTest).toHaveLength(2)
+    expect(builtFrom(h, h.a, ROTATED)).toEqual(['validation', 'validation'])
+    expect(later).toHaveLength(1)
+    // The new connection's unreachable episode: its start line, then its cleared line once Slack
+    // answered (with the refusal). The refusal itself is its caller's to log.
+    expect(h.lines).toEqual([
+      personaLine(h.a, PERSONA_SLACK_UNREACHABLE, retryingCause(first)),
+      personaLine(h.a, PERSONA_SLACK_UNREACHABLE, 'cleared: Slack answered after being unreachable checking bot_token via auth.test'),
+    ])
+    // The reconnect is over: stopping A later ends no episode a second time.
+    await expectOldConnectionKept(h, h.a, oldWeb)
+    await expectBUndisturbed(h)
+    await h.manager.stop(h.a.key)
+    expect(h.lines).toHaveLength(2)
+    assertNoLeak({ first, later })
+  })
+
+  test('a second reconnect while the first is retrying cancels the first: only the latest tokens are tried on the fake clock, one timer at a time, and no client or timer of the first remains', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const first = rotateCredentials(h, h.a, 'first', { authTest: [{ kind: 'network' }] })
+    const second = rotateCredentials(h, h.a, 'second', { authTest: [{ kind: 'network' }] })
+    const firstLater = laterOutcomes()
+    const secondLater = laterOutcomes()
+    expect(await h.manager.reconnectCredentials(h.a.key, first.tokens, firstLater.listener)).toMatchObject({ kind: 'retrying' })
+    await h.clock.advance(2_000)
+
+    expect(await h.manager.reconnectCredentials(h.a.key, second.tokens, secondLater.listener)).toMatchObject({ kind: 'retrying', retryInMs: 5_000 })
+
+    // The first's timer (due at 5 s) is gone; the second's (due at 7 s) is the only one.
+    expect(h.clock.pending().map(timer => timer.dueAt)).toEqual([7_000])
+    await h.clock.advance(5_000)
+    expect(secondLater.later).toEqual([{ kind: 'swapped', identity: second.identity }])
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: second.identity })
+    await h.clock.advance(HOUR_MS)
+    expect(first.stub.calls.authTest).toHaveLength(1)
+    expect(builtFrom(h, h.a, 'first')).toEqual(['validation'])
+    expect(second.stub.calls.authTest).toHaveLength(2)
+    expect(firstLater.later).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
+    await expectDelivers(h, h.a, second.stub)
+    await expectBUndisturbed(h)
+    assertNoLeak({ first: firstLater.later, second: secondLater.later })
+  })
+
+  test('a second reconnect while the first’s start() is in flight cancels it: the first resolves cancelled, its socket is closed and never counts, and the second swaps', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const first = rotateCredentials(h, h.a, 'first', { connect: [{ kind: 'never' }] })
+    const second = rotateCredentials(h, h.a, 'second')
+    const firstCall = h.manager.reconnectCredentials(h.a.key, first.tokens)
+    await h.clock.flush()
+    const firstSocket = first.stub.socket
+    expect(firstSocket.startCalls).toBe(1)
+
+    const secondOutcome = await h.manager.reconnectCredentials(h.a.key, second.tokens)
+
+    expect(await firstCall).toEqual({ kind: 'cancelled' })
+    expect(secondOutcome).toEqual({ kind: 'swapped', identity: second.identity })
+    expect(firstSocket.disconnectCalls).toBe(1)
+    expect(h.manager.identity(h.a.key)).toEqual(second.identity)
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.clock.advance(HOUR_MS)
+    expect(stubStarts(first.stub)).toBe(1)
+    expect(second.stub.sockets.map(socket => socket.connected)).toEqual([true])
+    await expectDelivers(h, h.a, second.stub)
+    await expectBUndisturbed(h)
+  })
+
+  test('the teardown path: stopping A cancels a reconnect left retrying: no timer is left, no further auth.test or start() on the fake clock, and the listener is never told; B undisturbed', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const rotated = rotateCredentials(h, h.a, ROTATED, { authTest: [{ kind: 'network' }] })
+    const { later, listener } = laterOutcomes()
+    expect(await h.manager.reconnectCredentials(h.a.key, rotated.tokens, listener)).toMatchObject({ kind: 'retrying' })
+
+    await h.manager.stop(h.a.key)
+
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.clock.advance(HOUR_MS)
+    expect(rotated.stub.calls.authTest).toHaveLength(1)
+    expect(builtFrom(h, h.a, ROTATED)).toEqual(['validation'])
+    expect(later).toEqual([])
+    expect(h.manager.status(h.a.key)).toBeUndefined()
+    await expectBUndisturbed(h)
+  })
+
+  // Rows: label and the new credentials' script that leaves the reconnect pending.
+  test.each<[string, StubSlackOptions]>([
+    ['left retrying', { authTest: [{ kind: 'network' }] }],
+    ['with its start() in flight', { connect: [{ kind: 'never' }] }],
+  ])('shutdown during a reconnect %s leaves no pending timer and no open new client', async (_label, script) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const rotated = rotateCredentials(h, h.a, ROTATED, script)
+    const { later, listener } = laterOutcomes()
+    let resolved: PersonaReconnectOutcome | undefined
+    void h.manager.reconnectCredentials(h.a.key, rotated.tokens, listener).then(outcome => (resolved = outcome))
+    await h.clock.flush()
+    await expectBUndisturbed(h)
+    const authTests = rotated.stub.calls.authTest.length
+    const starts = stubStarts(rotated.stub)
+
+    await h.manager.stopAll()
+    await h.clock.flush()
+
+    expect(resolved).toEqual(script.connect === undefined ? expect.objectContaining({ kind: 'retrying' }) : { kind: 'cancelled' })
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(rotated.stub.sockets.filter(socket => socket.connected)).toEqual([])
+    expect(rotated.stub.sockets.map(socket => socket.disconnectCalls)).toEqual(script.connect === undefined ? [] : [1])
+    await h.clock.advance(HOUR_MS)
+    expect(rotated.stub.calls.authTest).toHaveLength(authTests)
+    expect(stubStarts(rotated.stub)).toBe(starts)
+    expect(later).toEqual([])
+  })
+
+  test('overlap: events emitted on the old and the new socket before the swap are both tagged with A; a duplicate (channel, ts) on both reaches the handler once per socket, for the routing dedupe to collapse', async () => {
+    // The manager does not dedupe: the per-persona dedupe in the routing does.
+    // tests/persona-routing.test.ts, "SR-4.1 per-persona dedupe through the
+    // pipeline" (`the same \`message\` redelivered on A's one connection` and
+    // `dedupe is per persona key …`), shows a redelivered (channel, ts) for
+    // one key collapses to one notification, whichever connection brought it.
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const hello = makeDeferredConnect()
+    const rotated = rotateCredentials(h, h.a, ROTATED, { connect: [hello.outcome] })
+    const reconnect = h.manager.reconnectCredentials(h.a.key, rotated.tokens)
+    await h.clock.flush()
+    const oldSocket = stubOf(h, h.a).socket
+    const newSocket = rotated.stub.socket
+    const duplicate = makeChannelMessage({ text: 'seen on both sockets' })
+    const deliveries: Promise<void>[] = []
+    // Both sockets are open during the new one's `connected` emit, before the swap.
+    newSocket.once('connected', () => {
+      expect(oldSocket.connected).toBe(true)
+      deliveries.push(newSocket.deliver(duplicate), oldSocket.deliver(duplicate))
+    })
+
+    hello.settle()
+    expect(await reconnect).toMatchObject({ kind: 'swapped' })
+    await Promise.all(deliveries)
+
+    expect(deliveries).toHaveLength(2)
+    expect(h.events.filter(e => e.payload.event === duplicate).map(e => e.key)).toEqual([h.a.key, h.a.key])
+    expect(oldSocket.connected).toBe(false)
+    await expectDelivers(h, h.a, rotated.stub)
+    await expectBUndisturbed(h)
+  })
+
+  test('nothing to reconnect: an unknown or stopped persona, or dry run, resolves cancelled and builds nothing', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const rotated = rotateCredentials(h, h.a)
+    const dry = makeHarness({ dryRun: true })
+    await dry.manager.bringUp(dry.a)
+
+    expect(await h.manager.reconnectCredentials('no_such_persona', rotated.tokens)).toEqual({ kind: 'cancelled' })
+    expect(await dry.manager.reconnectCredentials(dry.a.key, rotated.tokens)).toEqual({ kind: 'cancelled' })
+    expect(dry.manager.replaceRetryTokens(dry.a.key, rotated.tokens)).toBe(false)
+    await h.manager.stop(h.a.key)
+    expect(await h.manager.reconnectCredentials(h.a.key, rotated.tokens)).toEqual({ kind: 'cancelled' })
+
+    expect(builtFrom(h, h.a, ROTATED)).toEqual([])
+    expect(dry.slack.builds).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
+    await expectBUndisturbed(h)
+  })
+})
+
+/** Cause of the cleared line of a pending reconnect's unreachable episode when a later reconnect replaced it. */
+const RECONNECT_SUPERSEDED_CLEARED =
+  'cleared: the new connection of its confirmed credentials change is no longer retried: a later confirmed credentials change replaced it'
+
+/** Cause of the cleared line of a pending reconnect's unreachable episode when the persona's connection was stopped. */
+const RECONNECT_STOPPED_CLEARED =
+  'cleared: the new connection of its confirmed credentials change is no longer retried: the persona\'s connection was stopped'
+
+describe('connection manager: a credentials reconnect’s beforeSwap hook (b.av2 SR-8.6 credentials row)', () => {
+  /** What beforeSwap saw of A when it ran: its reported status, identity, client and both sockets. */
+  interface SwapView {
+    status: PersonaConnectionStatus | undefined
+    identity: { botUserId: string; botId: string } | undefined
+    oldClient: boolean
+    oldSocketConnected: boolean
+    newSocketConnected: boolean
+  }
+
+  /**
+   * A harness whose second status listener appends `status:<state>` for A to
+   * `order`, and a beforeSwap that appends `beforeSwap` and records what it saw.
+   */
+  async function makeOrderedHarness(script: StubSlackOptions = {}) {
+    const order: string[] = []
+    const alphaKey = personaKey('Alpha')
+    const h = makeHarness({
+      onStatus: (key, status) => {
+        if (key === alphaKey) order.push(`status:${status.state}`)
+      },
+    })
+    await bringUpBoth(h)
+    order.length = 0
+    const oldWeb = h.manager.webClient(h.a.key)
+    const old = stubOf(h, h.a)
+    const rotated = rotateCredentials(h, h.a, ROTATED, script)
+    const seen: SwapView[] = []
+    const beforeSwap = (): void => {
+      order.push('beforeSwap')
+      seen.push({
+        status: h.manager.status(h.a.key),
+        identity: h.manager.identity(h.a.key),
+        oldClient: h.manager.webClient(h.a.key) === oldWeb,
+        oldSocketConnected: old.socket.connected,
+        newSocketConnected: rotated.stub.socket.connected,
+      })
+    }
+    return { h, order, rotated, seen, beforeSwap }
+  }
+
+  /** A as beforeSwap must see it: still up on its old connection, the new socket already past hello. */
+  function oldConnectionView(h: Harness): SwapView {
+    const identity = initialIdentityOf(h, h.a)
+    return { status: { state: 'up', identity }, identity, oldClient: true, oldSocketConnected: true, newSocketConnected: true }
+  }
+
+  test('a first-attempt swap: beforeSwap runs once, while A still reports its old status, identity and client with its old socket open, and before any status listener hears A up on the new connection', async () => {
+    const { h, order, rotated, seen, beforeSwap } = await makeOrderedHarness()
+
+    const outcome = await h.manager.reconnectCredentials(h.a.key, rotated.tokens, undefined, beforeSwap)
+
+    expect(outcome).toEqual({ kind: 'swapped', identity: rotated.identity })
+    expect(order).toEqual(['beforeSwap', 'status:up'])
+    expect(seen).toEqual([oldConnectionView(h)])
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+    expect(h.lines).toEqual([])
+    await expectDelivers(h, h.a, rotated.stub)
+    await expectBUndisturbed(h)
+    assertNoLeak({ outcome, seen })
+  })
+
+  test('a later swap of a reconnect left retrying: beforeSwap is not run at the unreachable first attempt, then runs once right before the swap, before the status listener hears A up and before the reconnect’s listener is told', async () => {
+    const { h, order, rotated, seen, beforeSwap } = await makeOrderedHarness({ authTest: [{ kind: 'network' }] })
+    const later: PersonaReconnectLaterOutcome[] = []
+    const listener = (outcome: PersonaReconnectLaterOutcome): void => {
+      order.push(`later:${outcome.kind}`)
+      later.push(outcome)
+    }
+
+    const first = await h.manager.reconnectCredentials(h.a.key, rotated.tokens, listener, beforeSwap)
+    expect(first).toMatchObject({ kind: 'retrying', retryInMs: 5_000 })
+    expect(order).toEqual([])
+
+    await h.clock.advance(5_000)
+
+    expect(order).toEqual(['beforeSwap', 'status:up', 'later:swapped'])
+    expect(seen).toEqual([oldConnectionView(h)])
+    expect(later).toEqual([{ kind: 'swapped', identity: rotated.identity }])
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+    await expectDelivers(h, h.a, rotated.stub)
+    await expectBUndisturbed(h)
+    assertNoLeak({ first, later, seen })
+  })
+
+  // Rows: label and a beforeSwap that fails that way with a sentinel-bearing error.
+  test.each<[string, (err: Error) => unknown]>([
+    ['throws', err => {
+      throw err
+    }],
+    ['returns a rejected promise', err => Promise.reject(err)],
+  ])('a beforeSwap that %s is logged once, token-free, naming A, and the swap still happens', async (_label, fail) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const old = stubOf(h, h.a)
+    const rotated = rotateCredentials(h, h.a)
+    const err = new Error(`before-swap failed with ${fakeToken(BOT_TOKEN_PREFIX, 'in-hook')}`)
+    let calls = 0
+
+    const outcome = await h.manager.reconnectCredentials(h.a.key, rotated.tokens, undefined, () => {
+      calls++
+      return fail(err)
+    })
+    await h.clock.flush()
+
+    expect(calls).toBe(1)
+    expect(outcome).toEqual({ kind: 'swapped', identity: rotated.identity })
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+    expect(statesOf(h, h.a)).toEqual(['connecting', 'up', 'up'])
+    expect(h.lines).toEqual([
+      `[slack] persona credentials reconnect before-swap hook failed: personas[0] ${renderPersonaRef(h.a.name, h.a.key)}: ${describeThrownValue(err)}`,
+    ])
+    expect(old.socket.connected).toBe(false)
+    expect(h.clock.pendingCount()).toBe(0)
+    await expectDelivers(h, h.a, rotated.stub)
+    await expectBUndisturbed(h)
+    assertNoLeak({ outcome, lines: h.lines })
+  })
+
+  // Rows: label, the new credentials' script, and what ends the reconnect without a swap (its outcome
+  // or later outcome given back for the leak check). No beforeSwap runs in any of them.
+  test.each<[string, StubSlackOptions, (h: Harness, first: Promise<PersonaReconnectOutcome>) => Promise<unknown>]>([
+    ['refused at its first attempt', { authTest: [{ kind: 'platform', error: 'invalid_auth' }] }, async (_h, first) => {
+      const outcome = await first
+      expect(outcome).toMatchObject({ kind: 'refused' })
+      return outcome
+    }],
+    ['refused at a later attempt', { authTest: [{ kind: 'network' }, { kind: 'platform', error: 'token_revoked' }] }, async (h, first) => {
+      const outcome = await first
+      expect(outcome).toMatchObject({ kind: 'retrying' })
+      await h.clock.advance(5_000)
+      return outcome
+    }],
+    ['superseded by a later reconnect while its start() is in flight', { connect: [{ kind: 'never' }] }, async (h, first) => {
+      const second = rotateCredentials(h, h.a, 'second')
+      const outcome = await h.manager.reconnectCredentials(h.a.key, second.tokens)
+      expect(await first).toEqual({ kind: 'cancelled' })
+      expect(outcome).toEqual({ kind: 'swapped', identity: second.identity })
+      return outcome
+    }],
+    ['cancelled by stopping A while it retries', { authTest: [{ kind: 'network' }] }, async (h, first) => {
+      const outcome = await first
+      expect(outcome).toMatchObject({ kind: 'retrying' })
+      await h.manager.stop(h.a.key)
+      return outcome
+    }],
+  ])('%s: beforeSwap is never run', async (_label, script, end) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const rotated = rotateCredentials(h, h.a, ROTATED, script)
+    let calls = 0
+
+    const first = h.manager.reconnectCredentials(h.a.key, rotated.tokens, undefined, () => void calls++)
+    await h.clock.flush()
+    const ended = await end(h, first)
+    await h.clock.advance(HOUR_MS)
+
+    expect(calls).toBe(0)
+    expect(rotated.stub.sockets.filter(socket => socket.connected)).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
+    await expectBUndisturbed(h)
+    assertNoLeak({ ended })
+  })
+})
+
+describe('connection manager: a pending credentials reconnect’s unreachable episode always ends (SR-10.3)', () => {
+  // Rows: label, the first reconnect's script, what ends it, and the cause of the one cleared line
+  // (null: its first attempt was still in flight, so no episode was open and nothing is logged).
+  test.each<[string, StubSlackOptions, 'supersede' | 'stop' | 'stopAll', string | null]>([
+    ['left retrying, then a later reconnect supersedes it', { authTest: [{ kind: 'network' }] }, 'supersede', RECONNECT_SUPERSEDED_CLEARED],
+    ['left retrying, then A is stopped (the teardown)', { authTest: [{ kind: 'network' }] }, 'stop', RECONNECT_STOPPED_CLEARED],
+    ['left retrying, then every persona is stopped (shutdown)', { authTest: [{ kind: 'network' }] }, 'stopAll', RECONNECT_STOPPED_CLEARED],
+    ['its first attempt in flight, then a later reconnect supersedes it', { connect: [{ kind: 'never' }] }, 'supersede', null],
+    ['its first attempt in flight, then A is stopped', { connect: [{ kind: 'never' }] }, 'stop', null],
+  ])('%s: exactly the lines it opened and closed, none more', async (_label, script, how, cleared) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const rotated = rotateCredentials(h, h.a, ROTATED, script)
+    const second = rotateCredentials(h, h.a, 'second')
+    const firstCall = h.manager.reconnectCredentials(h.a.key, rotated.tokens)
+    await h.clock.flush()
+
+    let secondOutcome: PersonaReconnectOutcome | undefined
+    if (how === 'supersede') secondOutcome = await h.manager.reconnectCredentials(h.a.key, second.tokens)
+    else if (how === 'stop') await h.manager.stop(h.a.key)
+    else await h.manager.stopAll()
+    const first = await firstCall
+    await h.clock.advance(HOUR_MS)
+
+    expect(h.lines).toEqual(
+      cleared === null
+        ? []
+        : [personaLine(h.a, PERSONA_SLACK_UNREACHABLE, retryingCause(first)), personaLine(h.a, PERSONA_SLACK_UNREACHABLE, cleared)],
+    )
+    expect(first).toMatchObject({ kind: cleared === null ? 'cancelled' : 'retrying' })
+    expect(rotated.stub.sockets.filter(socket => socket.connected)).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
+    if (how === 'supersede') {
+      expect(secondOutcome).toEqual({ kind: 'swapped', identity: second.identity })
+      await expectDelivers(h, h.a, second.stub)
+    } else {
+      expect(h.manager.status(h.a.key)).toBeUndefined()
+    }
+    if (how !== 'stopAll') await expectBUndisturbed(h)
+    // Stopping everything afterwards ends nothing a second time.
+    await h.manager.stopAll()
+    expect(h.lines).toHaveLength(cleared === null ? 0 : 2)
+    assertNoLeak({ first, secondOutcome, lines: h.lines })
+  })
+})
+
+describe('connection manager: a retrying persona takes the new credentials (replaceRetryTokens, b.av2 SR-8.6)', () => {
+  test('A Slack-unreachable at bring-up keeps its pending retry; the retry uses only the new tokens and comes up with their identity; B undisturbed', async () => {
+    const h = makeHarness()
+    stubOf(h, h.a).script.authTest.push({ kind: 'network' })
+    expect(await h.manager.bringUp(h.a, h.a.tokens)).toMatchObject({ state: 'retrying', phase: 'bring-up', retryInMs: 5_000 })
+    expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
+    const rotated = rotateCredentials(h, h.a)
+
+    expect(h.manager.replaceRetryTokens(h.a.key, rotated.tokens)).toBe(true)
+
+    // Nothing starts at once: the pending retry is kept.
+    expect(builtFrom(h, h.a, ROTATED)).toEqual([])
+    expect(pendingDelays(h)).toEqual([5_000])
+    await h.clock.advance(5_000)
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+    expect(builtFrom(h, h.a, ROTATED)).toEqual(['validation', 'web', 'socket'])
+    expect(builtFrom(h, h.a, INITIAL_CREDENTIALS)).toEqual(['validation'])
+    expect(stubOf(h, h.a).calls.authTest).toHaveLength(1)
+    await h.manager.webClient(h.a.key)!.chat.postMessage({ channel: 'C0STUB0001', text: 'with the new token' })
+    expect(rotated.stub.calls.postMessage).toHaveLength(1)
+    await expectDelivers(h, h.a, rotated.stub)
+    expect(h.clock.pendingCount()).toBe(0)
+    await expectBUndisturbed(h)
+  })
+
+  test('an attempt in flight with the old tokens is cancelled and one with the new tokens starts at once: never two attempts, one live socket, no timer left', async () => {
+    const h = makeHarness()
+    stubOf(h, h.a).script.authTest.push({ kind: 'never' })
+    const bringUpA = h.manager.bringUp(h.a, h.a.tokens)
+    expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
+    await h.clock.flush()
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'connecting' })
+    const rotated = rotateCredentials(h, h.a)
+
+    expect(h.manager.replaceRetryTokens(h.a.key, rotated.tokens)).toBe(true)
+    await bringUpA
+    await h.clock.flush()
+
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+    // The old attempt's 10 s bound went with it: no timer, no abandonment, no retry.
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.clock.advance(HOUR_MS)
+    expect(builtFrom(h, h.a, INITIAL_CREDENTIALS)).toEqual(['validation'])
+    expect(builtFrom(h, h.a, ROTATED)).toEqual(['validation', 'web', 'socket'])
+    expect(rotated.stub.sockets.map(socket => socket.connected)).toEqual([true])
+    expect(h.lines).toEqual([])
+    await expectDelivers(h, h.a, rotated.stub)
+    await expectBUndisturbed(h)
+  })
+
+  test('a bring-up whose socket failed after auth.test built a Web API client from the old bot token: the retry builds one from the new token, and A’s posts land on the new credentials only', async () => {
+    const h = makeHarness()
+    stubOf(h, h.a).script.connect.push({ kind: 'network' })
+    expect(await h.manager.bringUp(h.a, h.a.tokens)).toMatchObject({ state: 'retrying', phase: 'bring-up', retryInMs: 5_000 })
+    expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
+    expect(builtFrom(h, h.a, INITIAL_CREDENTIALS)).toEqual(['validation', 'web', 'socket'])
+    const rotated = rotateCredentials(h, h.a)
+
+    expect(h.manager.replaceRetryTokens(h.a.key, rotated.tokens)).toBe(true)
+    await h.clock.advance(5_000)
+
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+    expect(builtFrom(h, h.a, ROTATED)).toEqual(['validation', 'web', 'socket'])
+    await h.manager.webClient(h.a.key)!.chat.postMessage({ channel: 'C0STUB0001', text: 'with the new token' })
+    expect(rotated.stub.calls.postMessage).toHaveLength(1)
+    expect(stubOf(h, h.a).calls.postMessage).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
+    await expectDelivers(h, h.a, rotated.stub)
+    await expectBUndisturbed(h)
+  })
+
+  // Rows: label and how A is left; in each, A is not retrying its bring-up.
+  test.each<[string, (h: Harness) => Promise<void>]>([
+    ['up (it is reconnected instead)', async () => {}],
+    [
+      'retrying a reopen',
+      async h => {
+        stubOf(h, h.a).script.connect.push({ kind: 'network' })
+        stubOf(h, h.a).socket.drop()
+        await h.clock.flush()
+      },
+    ],
+    ['stopped', async h => h.manager.stop(h.a.key)],
+  ])('a persona that is %s does not take new tokens: false, and no client is ever built from them', async (_label, arrange) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    await arrange(h)
+    const rotated = rotateCredentials(h, h.a)
+
+    expect(h.manager.replaceRetryTokens(h.a.key, rotated.tokens)).toBe(false)
+    expect(h.manager.replaceRetryTokens('no_such_persona', rotated.tokens)).toBe(false)
+
+    await h.clock.advance(HOUR_MS)
+    expect(builtFrom(h, h.a, ROTATED)).toEqual([])
+    await expectBUndisturbed(h)
+  })
+})
+
+describe('persona-credentials-change-failed lines (SR-10.3)', () => {
+  // Rows: label, the cause as the failing check words it, what the persona keeps, and fragments the cause must hold.
+  test.each<[string, (persona: BringUpPersona, other: OtherBringUpPersona) => Promise<string>, CredentialsChangeKept, string[]]>([
+    ['missing', async persona => checkCause(checkPersonaCredentials(persona, { others: [] })), 'connection', ['does not exist']],
+    [
+      'unreadable',
+      async persona => (writeCreds(persona), checkCause(checkPersonaCredentials(persona, { others: [], fs: { openFile: failsWith('EACCES') } }))),
+      'content',
+      [],
+    ],
+    [
+      'invalid (key and rule, no value)',
+      async persona => (writeCreds(persona, { bot_token: fakeToken('xoxp-') }), checkCause(checkPersonaCredentials(persona, { others: [] }))),
+      'connection',
+      ['bot_token must start with xoxb-'],
+    ],
+    [
+      'a real path shared with another applied persona',
+      async (persona, other) => (
+        writeCreds(other),
+        checkCause(checkPersonaCredentials({ ...persona, credentials_file: other.credentials_file }, { others: [other] }))
+      ),
+      'connection',
+      ['credentials_file'],
+    ],
+    [
+      'refused: the bot token via auth.test',
+      async () => (await failureVia('auth.test', { kind: 'platform', error: 'invalid_auth' })).cause,
+      'connection',
+      ['bot_token', 'auth.test', 'invalid_auth'],
+    ],
+    [
+      'refused: the app token via the Socket Mode open',
+      async () => (await failureVia('socket-mode', { kind: 'platform', error: 'token_revoked' })).cause,
+      'connection',
+      ['app_token', 'Socket Mode open', 'token_revoked'],
+    ],
+  ])('%s: one line naming the persona (JSON-quoted, key beside it), personas[i], the path, the cause, what is kept and that the change stays pending', async (label, causeOf, kept, fragments) => {
+    const persona = makePersona('Night "Ops" Desk', { index: 3 })
+    const other = makeOther()
+    const cause = await causeOf(persona, other)
+
+    const line = formatCredentialsChangeFailed({
+      name: persona.name,
+      key: persona.key,
+      index: persona.index,
+      path: persona.credentials_file,
+      cause,
+      kept,
+    })
+
+    assertNoLeak({ cause, line }, label)
+    const keptText = kept === 'connection' ? 'the current connection stays in use' : 'it keeps retrying with its current credentials'
+    expect(line).toBe(
+      `[slack] ${PERSONA_CREDENTIALS_CHANGE_FAILED}: personas[3] ${renderPersonaRef(persona.name, persona.key)} ` +
+      `path=${JSON.stringify(persona.credentials_file)}: the confirmed credentials change cannot be used: ${cause}; ` +
+      `${keptText}, and the change stays pending`,
+    )
+    expect(classOf(line)).toBe(PERSONA_CREDENTIALS_CHANGE_FAILED)
+    expect(line).toContain(`${JSON.stringify(persona.name)} (key=${persona.key})`)
+    expect(line).not.toMatch(/[\r\n]/)
+    for (const fragment of fragments) expect(cause).toContain(fragment)
+    if (label.startsWith('a real path shared')) expect(cause).toContain(renderPersonaRef(other.name, other.key))
+  })
+})
+
+/** The cause of a failed credentials check; throws (naming only the outcome) if the check passed. */
+function checkCause(result: ReturnType<typeof checkPersonaCredentials>): string {
+  if (result.ok) throw new Error('expected a credentials check failure, got ok')
+  return result.cause
+}
+
+// ---------------------------------------------------------------------------
+// Revoked bot token while running: the Web API auth-error watch (bug b.ujn)
+//
+// The manager wraps every long-lived Web API client it hands out; the first
+// `invalid_auth`, `token_revoked`, `account_inactive` or `not_authed` from a
+// call on a persona's current client marks the persona credentials-broken
+// at once. Failures are scripted on the stub (leak marker on), each on the
+// first call it applies to.
+// ---------------------------------------------------------------------------
+
+/** The Slack errors that mean the bot token no longer works. */
+const WEB_API_AUTH_CODES = ['token_revoked', 'invalid_auth', 'account_inactive', 'not_authed'] as const
+
+/** A Web API call through a persona's client, and the stub script queue that answers it. */
+type WatchedCall = [method: string, queue: keyof StubSlackScript, call: (web: ManagedWebClient) => Promise<unknown>]
+
+const WATCH_CHANNEL = 'C0STUB0001'
+const WATCHED_CALLS: WatchedCall[] = [
+  ['chat.postMessage', 'post', web => web.chat.postMessage({ channel: WATCH_CHANNEL, text: 'hello' })],
+  ['reactions.add', 'reactionsAdd', web => web.reactions.add({ channel: WATCH_CHANNEL, timestamp: '1700000000.000100', name: 'eyes' })],
+  ['reactions.remove', 'reactionsRemove', web => web.reactions.remove({ channel: WATCH_CHANNEL, timestamp: '1700000000.000100', name: 'eyes' })],
+  ['conversations.open', 'open', web => web.conversations.open({ users: 'U0BOB' })],
+  ['conversations.history', 'history', web => web.conversations.history({ channel: WATCH_CHANNEL })],
+  ['users.info', 'usersInfo', web => web.users.info({ user: 'U0BOB' })],
+  ['filesUploadV2', 'upload', web => web.filesUploadV2({ channel_id: WATCH_CHANNEL, file: Buffer.from('report'), filename: 'report.txt' })],
+  // apiCall is named by the method it calls.
+  ['conversations.mark', 'apiCall', web => web.apiCall('conversations.mark', { channel: WATCH_CHANNEL, ts: '1700000000.000100' })],
+]
+
+/** Settle a call and return what it rejected with (or `undefined` if it resolved). */
+async function rejectionOf(call: Promise<unknown>): Promise<unknown> {
+  return call.then(() => undefined, (err: unknown) => err)
+}
+
+/** The outcome a refused call of `method` with `code` marks A with. */
+function webApiRefusal(method: string, code: string): SlackCredentialsRefusedOutcome {
+  return {
+    kind: 'credentials-refused',
+    class: PERSONA_CREDENTIALS_REFUSED,
+    check: 'web-api',
+    key: 'bot_token',
+    slackError: code,
+    method,
+    cause: `bot_token refused by a Web API call (${method}): Slack error ${code}`,
+  }
+}
+
+/** The one line a refused call of `method` with `code` logs for A: personas[i], A and its credentials path. */
+function webApiRefusalLine(h: Harness, method: string, code: string): string {
+  return formatPersonaDiagnostic({
+    class: PERSONA_CREDENTIALS_REFUSED,
+    name: h.a.name,
+    key: h.a.key,
+    index: h.a.index,
+    path: h.a.credentials_file,
+    cause: `bot_token refused by a Web API call (${method}): Slack error ${code}`,
+  })
+}
+
+/** How many times A was reported broken. */
+function brokenReportsOf(h: Harness, p: ManagedPersona): number {
+  return h.statuses.filter(([key, status]) => key === p.key && status.state === 'broken').length
+}
+
+describe('connection manager: a revoked bot token while running (the Web API auth-error watch, bug b.ujn)', () => {
+  test.each([...WEB_API_AUTH_CODES])('%s from a call on A’s client marks A broken at once: the caller gets the original rejection, the listener hears broken once, one line names A and its credentials path, A’s socket is closed as the manager’s own close with no reopen, a later call never reaches Slack; B is untouched', async code => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a)
+    const web = h.manager.webClient(h.a.key)!
+    const webB = h.manager.webClient(h.b.key)
+    a.script.post.push({ kind: 'platform', error: code })
+
+    const thrown = await rejectionOf(web.chat.postMessage({ channel: WATCH_CHANNEL, text: 'hello' }))
+
+    // The caller's own rejection is Slack's error, unchanged (the stub planted the sentinel in it).
+    expect(thrown).toMatchObject({ code: 'slack_webapi_platform_error', data: { error: code } })
+    expect(thrown).not.toBeInstanceOf(WebApiCallRefusedLocallyError)
+    expect(() => assertNoLeak(thrown)).toThrow()
+    // Marked before the caller saw the rejection: status, listener and line.
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'broken', phase: 'running', outcome: webApiRefusal('chat.postMessage', code) })
+    expect(brokenReportsOf(h, h.a)).toBe(1)
+    expect(h.lines).toEqual([webApiRefusalLine(h, 'chat.postMessage', code)])
+    expect(h.lines[0]).toContain('personas[0]')
+    expect(h.lines[0]).toContain(`path=${JSON.stringify(h.a.credentials_file)}`)
+
+    await h.clock.flush()
+    // The manager's own close: disconnect() called once, the socket let go first.
+    expect(a.sockets.map(socket => [socket.disconnectCalls, socket.connected])).toEqual([[1, false]])
+    expect(h.slack.activityOf(h.a.key).filter(e => e.kind === 'socket').map(e => e.event).slice(-2)).toEqual(['discarded', 'disconnected'])
+    await h.clock.advance(HOUR_MS)
+    expect(startsOf(h, h.a)).toBe(1)
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(h.lines.map(classOf)).toEqual([PERSONA_CREDENTIALS_REFUSED])
+    expect(statesOf(h, h.a)).toEqual(['connecting', 'up', 'broken'])
+
+    // A later call on the captured client is refused locally and never reaches the stub.
+    const calls = a.callLog.length
+    const local = await rejectionOf(web.reactions.add({ channel: WATCH_CHANNEL, timestamp: '1700000000.000100', name: 'eyes' }))
+    expect(local).toBeInstanceOf(WebApiCallRefusedLocallyError)
+    expect(local).toMatchObject({ code: WEB_API_CALL_REFUSED_LOCALLY, data: { ok: false, error: code }, method: 'reactions.add' })
+    expect(a.callLog).toHaveLength(calls)
+    expect(brokenReportsOf(h, h.a)).toBe(1)
+    expect(h.lines).toHaveLength(1)
+
+    expect(h.manager.webClient(h.b.key)).toBe(webB!)
+    await expectBUndisturbed(h)
+    assertNoLeak({ status: h.manager.status(h.a.key), lines: h.lines, local })
+  })
+
+  test.each(WATCHED_CALLS)('the watch sees %s: its token_revoked marks A with the method named, and the next such call is refused locally', async (method, queue, call) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a)
+    const web = h.manager.webClient(h.a.key)!
+    a.script[queue].push({ kind: 'platform', error: 'token_revoked' })
+    const since = a.callLog.length
+
+    const thrown = await rejectionOf(call(web))
+
+    expect(thrown).toMatchObject({ data: { error: 'token_revoked' } })
+    expect(a.callLog.slice(since).map((c): string => c.method)).toEqual([queue === 'apiCall' ? 'apiCall' : method])
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'broken', phase: 'running', outcome: webApiRefusal(method, 'token_revoked') })
+    expect(h.lines).toEqual([webApiRefusalLine(h, method, 'token_revoked')])
+    const local = await rejectionOf(call(web))
+    expect(local).toMatchObject({ code: WEB_API_CALL_REFUSED_LOCALLY, method })
+    expect(a.callLog).toHaveLength(since + 1)
+    await expectBUndisturbed(h)
+    assertNoLeak({ lines: h.lines, local })
+  })
+
+  test('two calls rejecting at once with auth errors log one line and report broken once; each caller gets its own rejection', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a)
+    const web = h.manager.webClient(h.a.key)!
+    const first = makeDeferredWebApiCall()
+    const second = makeDeferredWebApiCall()
+    a.script.post.push(first.outcome, second.outcome)
+    const calls = [
+      rejectionOf(web.chat.postMessage({ channel: WATCH_CHANNEL, text: 'one' })),
+      rejectionOf(web.chat.postMessage({ channel: WATCH_CHANNEL, text: 'two' })),
+    ]
+    await h.clock.flush()
+    expect(a.calls.postMessage).toHaveLength(2)
+
+    first.settle({ kind: 'platform', error: 'token_revoked' })
+    second.settle({ kind: 'platform', error: 'invalid_auth' })
+    const [one, two] = await Promise.all(calls)
+
+    expect(one).toMatchObject({ code: 'slack_webapi_platform_error', data: { error: 'token_revoked' } })
+    expect(two).toMatchObject({ code: 'slack_webapi_platform_error', data: { error: 'invalid_auth' } })
+    expect(h.lines).toEqual([webApiRefusalLine(h, 'chat.postMessage', 'token_revoked')])
+    expect(brokenReportsOf(h, h.a)).toBe(1)
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'broken', outcome: { slackError: 'token_revoked' } })
+    await expectBUndisturbed(h)
+  })
+
+  // Rows: label, the scripted failure, and what the caller's rejection carries.
+  test.each<[string, WebApiOutcome, Record<string, unknown>]>([
+    ['missing_scope', { kind: 'platform', error: 'missing_scope' }, { code: 'slack_webapi_platform_error', data: { error: 'missing_scope' } }],
+    ['channel_not_found', { kind: 'platform', error: 'channel_not_found' }, { code: 'slack_webapi_platform_error', data: { error: 'channel_not_found' } }],
+    ['a network error', { kind: 'network' }, { code: 'slack_webapi_request_error' }],
+    ['an HTTP 500', { kind: 'http', status: 500 }, { code: 'slack_webapi_http_error' }],
+  ])('%s from a call on A’s client changes nothing: A stays up and delivering, nothing is logged, the caller gets the rejection and A’s next call reaches Slack', async (_label, failure, rejection) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a)
+    const web = h.manager.webClient(h.a.key)!
+    const reported = h.statuses.length
+    a.script.post.push(failure)
+
+    const thrown = await rejectionOf(web.chat.postMessage({ channel: WATCH_CHANNEL, text: 'hello' }))
+    await h.clock.flush()
+
+    expect(thrown).toMatchObject(rejection)
+    expect(thrown).not.toBeInstanceOf(WebApiCallRefusedLocallyError)
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: initialIdentityOf(h, h.a) })
+    expect(h.statuses).toHaveLength(reported)
+    expect(h.lines).toEqual([])
+    await web.chat.postMessage({ channel: WATCH_CHANNEL, text: 'again' })
+    expect(a.calls.postMessage).toHaveLength(2)
+    expect(a.socket.disconnectCalls).toBe(0)
+    await expectDelivers(h, h.a)
+    await expectBUndisturbed(h)
+  })
+
+  test('the mark happens while A’s serializer slot is held: A is broken and its detached socket delivers nothing at once; only the network close waits for A’s turn; B’s turn is free', async () => {
+    const serializer = createPersonaSerializer()
+    const h = makeHarness({ serialize: serializer.run })
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a)
+    const web = h.manager.webClient(h.a.key)!
+    a.script.post.push({ kind: 'platform', error: 'token_revoked' })
+    const turn = Promise.withResolvers<void>()
+    let stateInside: string | undefined
+    // A lifecycle operation holds A's turn, and the refused call is made from inside it.
+    const held = serializer.run(h.a.key, async () => {
+      await rejectionOf(web.chat.postMessage({ channel: WATCH_CHANNEL, text: 'inside the held turn' }))
+      stateInside = h.manager.status(h.a.key)?.state
+      await turn.promise
+    })
+    await h.clock.flush()
+
+    expect(stateInside).toBe('broken')
+    expect(h.lines).toEqual([webApiRefusalLine(h, 'chat.postMessage', 'token_revoked')])
+    // The socket is still open on the network, but detached: A's next inbound event is not delivered.
+    expect(a.socket.connected).toBe(true)
+    expect(a.socket.disconnectCalls).toBe(0)
+    const text = 'after the refusal'
+    await a.socket.deliver(makeChannelMessage({ text }))
+    expect(h.events.filter(e => e.payload.event?.text === text)).toEqual([])
+    expect(await serializer.run(h.b.key, () => 'B ran')).toBe('B ran')
+    await expectBUndisturbed(h)
+
+    turn.resolve()
+    await held
+    await h.clock.flush()
+
+    expect(a.socket.disconnectCalls).toBe(1)
+    expect(a.socket.connected).toBe(false)
+    await h.clock.advance(HOUR_MS)
+    expect(startsOf(h, h.a)).toBe(1)
+    expect(h.lines).toHaveLength(1)
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+
+  test('stopping A while the close of its detached socket waits for A’s turn closes it at once', async () => {
+    const serializer = createPersonaSerializer()
+    const h = makeHarness({ serialize: serializer.run })
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a)
+    a.script.post.push({ kind: 'platform', error: 'token_revoked' })
+    const turn = Promise.withResolvers<void>()
+    const held = serializer.run(h.a.key, () => turn.promise)
+    await rejectionOf(h.manager.webClient(h.a.key)!.chat.postMessage({ channel: WATCH_CHANNEL, text: 'hello' }))
+    expect(a.socket.connected).toBe(true)
+
+    await h.manager.stop(h.a.key)
+
+    expect(a.socket.connected).toBe(false)
+    expect(a.socket.disconnectCalls).toBeGreaterThanOrEqual(1)
+    turn.resolve()
+    await held
+    await h.clock.flush()
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(startsOf(h, h.a)).toBe(1)
+    await expectBUndisturbed(h)
+  })
+
+  test('a stale client after a credentials reconnect’s swap: an auth error from the old client changes nothing; the new client serves', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const oldWeb = h.manager.webClient(h.a.key)!
+    const rotated = rotateCredentials(h, h.a)
+    expect(await h.manager.reconnectCredentials(h.a.key, rotated.tokens)).toEqual({ kind: 'swapped', identity: rotated.identity })
+    const reported = h.statuses.length
+    stubOf(h, h.a).script.post.push({ kind: 'platform', error: 'token_revoked' })
+
+    const thrown = await rejectionOf(oldWeb.chat.postMessage({ channel: WATCH_CHANNEL, text: 'on the old client' }))
+    await h.clock.flush()
+
+    expect(thrown).toMatchObject({ data: { error: 'token_revoked' } })
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+    expect(h.statuses).toHaveLength(reported)
+    expect(h.lines).toEqual([])
+    expect(rotated.stub.sockets.map(socket => [socket.connected, socket.disconnectCalls])).toEqual([[true, 0]])
+    await h.manager.webClient(h.a.key)!.chat.postMessage({ channel: WATCH_CHANNEL, text: 'on the new client' })
+    expect(rotated.stub.calls.postMessage).toHaveLength(1)
+    await expectDelivers(h, h.a, rotated.stub)
+    await expectBUndisturbed(h)
+  })
+
+  test('a stale client after stop(A): an auth error from its former client changes nothing and logs nothing', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const former = h.manager.webClient(h.a.key)!
+    await h.manager.stop(h.a.key)
+    const reported = h.statuses.length
+    stubOf(h, h.a).script.post.push({ kind: 'platform', error: 'invalid_auth' })
+
+    const thrown = await rejectionOf(former.chat.postMessage({ channel: WATCH_CHANNEL, text: 'after the stop' }))
+    await h.clock.flush()
+
+    expect(thrown).toMatchObject({ data: { error: 'invalid_auth' } })
+    expect(h.manager.status(h.a.key)).toBeUndefined()
+    expect(h.statuses).toHaveLength(reported)
+    expect(h.lines).toEqual([])
+    expect(h.clock.pendingCount()).toBe(0)
+    await expectBUndisturbed(h)
+  })
+
+  test('a reconnect left retrying when A is marked broken still completes: its swap brings A back up on the new client and socket', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const oldWeb = h.manager.webClient(h.a.key)!
+    const rotated = rotateCredentials(h, h.a, ROTATED, { authTest: [{ kind: 'network' }] })
+    const { later, listener } = laterOutcomes()
+    expect(await h.manager.reconnectCredentials(h.a.key, rotated.tokens, listener)).toMatchObject({ kind: 'retrying' })
+    stubOf(h, h.a).script.post.push({ kind: 'platform', error: 'token_revoked' })
+    await rejectionOf(oldWeb.chat.postMessage({ channel: WATCH_CHANNEL, text: 'revoked' }))
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'broken', phase: 'running' })
+    expect(pendingDelays(h)).toEqual([5_000])
+
+    await h.clock.advance(5_000)
+
+    expect(later).toEqual([{ kind: 'swapped', identity: rotated.identity }])
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+    expect(statesOf(h, h.a)).toEqual(['connecting', 'up', 'broken', 'up'])
+    // The reconnect's unreachable episode and the refusal each open once and clear at the swap.
+    expect(h.lines.map(classOf)).toEqual([
+      PERSONA_SLACK_UNREACHABLE,
+      PERSONA_CREDENTIALS_REFUSED,
+      PERSONA_SLACK_UNREACHABLE,
+      PERSONA_CREDENTIALS_REFUSED,
+    ])
+    expect(h.lines[1]).toBe(webApiRefusalLine(h, 'chat.postMessage', 'token_revoked'))
+    expect(h.lines[3]).toContain(': cleared: ')
+    await h.manager.webClient(h.a.key)!.chat.postMessage({ channel: WATCH_CHANNEL, text: 'on the new client' })
+    expect(rotated.stub.calls.postMessage).toHaveLength(1)
+    await expectDelivers(h, h.a, rotated.stub)
+    expect(h.clock.pendingCount()).toBe(0)
+    await expectBUndisturbed(h)
+    assertNoLeak({ later })
+  })
+
+  test('a pending reconnect’s new socket forwards nothing for A while A is marked broken; after its swap A delivers again', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const hello = makeDeferredConnect()
+    const rotated = rotateCredentials(h, h.a, ROTATED, { connect: [hello.outcome] })
+    const reconnect = h.manager.reconnectCredentials(h.a.key, rotated.tokens)
+    await h.clock.flush()
+    stubOf(h, h.a).script.post.push({ kind: 'platform', error: 'account_inactive' })
+    await rejectionOf(h.manager.webClient(h.a.key)!.chat.postMessage({ channel: WATCH_CHANNEL, text: 'revoked' }))
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'broken', phase: 'running' })
+    const newSocket = rotated.stub.socket
+    const early = makeChannelMessage({ text: 'on the new socket before its swap' })
+    const deliveries: Promise<void>[] = []
+    // The new socket is open during its `connected` emit, before the swap; A is still broken then.
+    newSocket.once('connected', () => void deliveries.push(newSocket.deliver(early)))
+
+    hello.settle()
+    expect(await reconnect).toEqual({ kind: 'swapped', identity: rotated.identity })
+    await Promise.all(deliveries)
+
+    expect(deliveries).toHaveLength(1)
+    expect(h.events.filter(e => e.payload.event === early)).toEqual([])
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+    await expectDelivers(h, h.a, rotated.stub)
+    await expectBUndisturbed(h)
+  })
+
+  // Rows: label, A's reopen outcome, A's reported states before the refusal, and the closes of the reopen's socket.
+  test.each<[string, SettledConnectOutcome, string[], number]>([
+    ['waiting on its retry timer (connect: network)', { kind: 'network' }, ['connecting', 'up', 'lost', 'retrying'], 0],
+    ['with its start() in flight (connect: never)', { kind: 'never' }, ['connecting', 'up', 'lost'], 1],
+  ])('a reopen of A %s when a Web API call refuses A’s bot token is cancelled: A stays broken, no timer is left and no further start() is made however far the clock runs', async (_label, reopen, before, reopenCloses) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a)
+    const web = h.manager.webClient(h.a.key)!
+    a.script.connect.push(reopen)
+    a.socket.drop()
+    await h.clock.flush()
+    expect(statesOf(h, h.a)).toEqual(before)
+    // The reopen's 5 s retry timer, or the 10 s bound on its start() in flight.
+    expect(h.clock.pendingCount()).toBe(1)
+    a.script.post.push({ kind: 'platform', error: 'token_revoked' })
+
+    await rejectionOf(web.chat.postMessage({ channel: WATCH_CHANNEL, text: 'while reopening' }))
+    await h.clock.flush()
+
+    const broken: PersonaConnectionStatus = { state: 'broken', phase: 'running', outcome: webApiRefusal('chat.postMessage', 'token_revoked') }
+    expect(h.manager.status(h.a.key)).toEqual(broken)
+    expect(h.clock.pendingCount()).toBe(0)
+    await h.clock.advance(HOUR_MS)
+    expect(h.manager.status(h.a.key)).toEqual(broken)
+    expect(statesOf(h, h.a)).toEqual([...before, 'broken'])
+    expect(startsOf(h, h.a)).toBe(2)
+    expect(a.sockets.map(socket => [socket.disconnectCalls, socket.connected])).toEqual([[0, false], [reopenCloses, false]])
+    expect(h.lines).toEqual([h.lines[0], webApiRefusalLine(h, 'chat.postMessage', 'token_revoked')])
+    expect(classOf(h.lines[0])).toBe(PERSONA_CONNECTION_LOST)
+    await expectBUndisturbed(h)
+  })
+
+  test('A already broken by a refused reopen: an auth error from its client reports nothing more, logs no second line and leaves the reopen’s refusal as A’s status', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a)
+    a.script.connect.push({ kind: 'platform', error: 'invalid_auth' })
+    a.socket.drop()
+    await h.clock.flush()
+    const refusedReopen = h.manager.status(h.a.key)
+    expect(refusedReopen).toMatchObject({ state: 'broken', phase: 'reopen', outcome: { check: 'socket-mode', slackError: 'invalid_auth' } })
+    const lines = [...h.lines]
+    const reported = h.statuses.length
+    const web = h.manager.webClient(h.a.key)
+    expect(web).toBeDefined()
+    a.script.post.push({ kind: 'platform', error: 'token_revoked' })
+
+    const thrown = await rejectionOf(web!.chat.postMessage({ channel: WATCH_CHANNEL, text: 'after the refused reopen' }))
+    await h.clock.flush()
+
+    expect(thrown).toMatchObject({ code: 'slack_webapi_platform_error', data: { error: 'token_revoked' } })
+    expect(h.manager.status(h.a.key)).toEqual(refusedReopen!)
+    expect(h.statuses).toHaveLength(reported)
+    expect(brokenReportsOf(h, h.a)).toBe(1)
+    expect(h.lines).toEqual(lines)
+    expect(h.clock.pendingCount()).toBe(0)
+    await expectBUndisturbed(h)
+  })
+
+  test('the client a credentials reconnect installs is watched: token_revoked from a call on it marks A broken at once with one line, and its next call is refused locally', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const rotated = rotateCredentials(h, h.a)
+    expect(await h.manager.reconnectCredentials(h.a.key, rotated.tokens)).toEqual({ kind: 'swapped', identity: rotated.identity })
+    const web = h.manager.webClient(h.a.key)!
+    rotated.stub.script.post.push({ kind: 'platform', error: 'token_revoked' })
+    const since = rotated.stub.callLog.length
+
+    const thrown = await rejectionOf(web.chat.postMessage({ channel: WATCH_CHANNEL, text: 'on the rotated client' }))
+    await h.clock.flush()
+
+    expect(thrown).toMatchObject({ code: 'slack_webapi_platform_error', data: { error: 'token_revoked' } })
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'broken', phase: 'running', outcome: webApiRefusal('chat.postMessage', 'token_revoked') })
+    expect(brokenReportsOf(h, h.a)).toBe(1)
+    expect(h.lines).toEqual([webApiRefusalLine(h, 'chat.postMessage', 'token_revoked')])
+    expect(rotated.stub.sockets.map(socket => [socket.disconnectCalls, socket.connected])).toEqual([[1, false]])
+    const local = await rejectionOf(web.chat.postMessage({ channel: WATCH_CHANNEL, text: 'again' }))
+    expect(local).toBeInstanceOf(WebApiCallRefusedLocallyError)
+    expect(rotated.stub.callLog).toHaveLength(since + 1)
+    await h.clock.advance(HOUR_MS)
+    expect(h.clock.pendingCount()).toBe(0)
+    expect(stubStarts(rotated.stub)).toBe(1)
+    expect(stubStarts(stubOf(h, h.a))).toBe(1)
+    await expectBUndisturbed(h)
+    assertNoLeak({ local })
+  })
+
+  // `apiCall` and `filesUploadV2` are prototype methods on the real WebClient and need the client as
+  // `this`; the stub's do too, so these rows fail if the watch calls them detached.
+  test.each(WATCHED_CALLS.filter(([, queue]) => queue === 'upload' || queue === 'apiCall'))('%s through A’s watched client, called with the client as this, reaches Slack once and resolves with Slack’s answer; A stays up', async (method, queue, call) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a)
+    const since = a.callLog.length
+
+    const result = await call(h.manager.webClient(h.a.key)!)
+
+    expect(result).toMatchObject({ ok: true })
+    expect(a.callLog.slice(since).map((c): string => c.method)).toEqual([queue === 'apiCall' ? 'apiCall' : method])
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: initialIdentityOf(h, h.a) })
+    expect(h.lines).toEqual([])
+    await expectBUndisturbed(h)
+  })
+
+  test('an apiCall whose method name carries a token: A is marked broken with no method named, and neither the line, the status nor the local refusal of the next such call carries it', async () => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const a = stubOf(h, h.a)
+    const web = h.manager.webClient(h.a.key)!
+    const method = `conversations.${fakeToken(BOT_TOKEN_PREFIX, 'method')}`
+    a.script.apiCall.push({ kind: 'platform', error: 'token_revoked' })
+
+    await rejectionOf(web.apiCall(method, { channel: WATCH_CHANNEL }))
+    const local = await rejectionOf(web.apiCall(method, { channel: WATCH_CHANNEL }))
+
+    const status = h.manager.status(h.a.key)
+    expect(status).toEqual({
+      state: 'broken',
+      phase: 'running',
+      outcome: {
+        kind: 'credentials-refused',
+        class: PERSONA_CREDENTIALS_REFUSED,
+        check: 'web-api',
+        key: 'bot_token',
+        slackError: 'token_revoked',
+        cause: 'bot_token refused by a Web API call: Slack error token_revoked',
+      },
+    })
+    expect(h.lines).toHaveLength(1)
+    expect(classOf(h.lines[0])).toBe(PERSONA_CREDENTIALS_REFUSED)
+    expect(local).toBeInstanceOf(WebApiCallRefusedLocallyError)
+    expect(local).toMatchObject({ code: WEB_API_CALL_REFUSED_LOCALLY, method: undefined, data: { ok: false, error: 'token_revoked' } })
+    expect(a.calls.apiCall).toHaveLength(1)
+    assertNoLeak({ line: h.lines[0], status, local }, 'token-bearing method name')
+    await expectBUndisturbed(h)
+  })
+
+  test('dry run: there is no Web API client to watch and nothing is built', async () => {
+    const h = makeHarness({ dryRun: true })
+
+    for (const p of [h.a, h.b]) expect(await h.manager.bringUp(p)).toMatchObject({ state: 'up' })
+
+    expect(h.manager.webClient(h.a.key)).toBeUndefined()
+    expect(h.manager.webClient(h.b.key)).toBeUndefined()
+    expect(h.slack.builds).toEqual([])
+    expect(h.lines).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Bring-up outcomes, the start pass and per-persona retry timers (E5 Task 1:
 // b.av2 SR-6.1 outcomes, SR-6.4, SR-7.2 part, SR-10.3 part; AC 23, 24, 66)
 //
@@ -4363,7 +5898,7 @@ describe('bring-up outcomes (E5)', () => {
         key: a.key,
         index: a.index,
         path: a.working_directory,
-        cause: 'cleared: working directory is usable again; the persona stays broken until its credentials are fixed and the server is restarted',
+        cause: 'cleared: working directory is usable again; the persona stays broken until its credentials file is fixed and the change confirmed',
       }))
       // Nothing is re-checked once the directory cleared; nothing moves on to Slack.
       expect(f.h.clock.pendingCount()).toBe(0)
@@ -5232,6 +6767,77 @@ describe('bring-up outcomes (E5)', () => {
       expect(f.credentialOpens.filter(path => path === a.credentials_file)).toHaveLength(2)
       await expectServes(f, a)
       expectDigestsLeakNothing(f)
+    })
+  })
+
+  describe('a confirmed credentials change while a Web API call refuses the running persona (changeCredentials, bug b.ujn)', () => {
+    // Rows: label, whether a Web API call refuses A's current connection while the reconnect's first
+    // attempt waits at its Socket Mode open, how that open then settles, and what changeCredentials
+    // resolves with. The controls show `cameBackUp` and `connection: 'broken'` only follow the refusal.
+    test.each<[string, boolean, SettledConnectOutcome, PersonaCredentialsChangeResult]>([
+      ['refused meanwhile, then the new connection opens: swapped, cameBackUp', true, { kind: 'ok' }, { kind: 'swapped', cameBackUp: true }],
+      ['refused meanwhile, then the new connection is unreachable: retrying, connection broken', true, { kind: 'network' }, { kind: 'retrying', connection: 'broken' }],
+      ['still up, then the new connection opens (control): swapped', false, { kind: 'ok' }, { kind: 'swapped' }],
+      ['still up, then the new connection is unreachable (control): retrying, connection kept', false, { kind: 'network' }, { kind: 'retrying', connection: 'kept' }],
+    ])('%s; the swap (at once or on the 5 s retry) reports wasUp, and only a persona that came back up is launched', async (_label, refuse, settleWith, expected) => {
+      const f = makeBringUpFixture()
+      const [a, b] = f.personas as [Persona, Persona]
+      await bringUpEach(f)
+      const edited = editCredentials(a)
+      const hello = makeDeferredConnect()
+      const fresh = f.h.slack.addCredentials(a.key, 'edited', edited, { leakMarker: LEAK_SENTINEL, connect: [hello.outcome] })
+      const hookCalls: string[] = []
+      const swaps: CredentialsSwap[] = []
+      const change = f.controller.changeCredentials(a, f.personas, f.h.manager, {
+        beforeSwap: () => void hookCalls.push(`beforeSwap while ${f.controller.state(a.key)?.outcome}`),
+        onSwapped: swap => void swaps.push(swap),
+      })
+      await f.h.clock.flush()
+      expect(fresh.socket.startCalls).toBe(1)
+      if (refuse) {
+        f.h.stub(a).script.post.push({ kind: 'platform', error: 'token_revoked' })
+        await rejectionOf(f.h.manager.webClient(a.key)!.chat.postMessage({ channel: WATCH_CHANNEL, text: 'revoked' }))
+        expect(f.controller.state(a.key)?.outcome).toBe('broken')
+      }
+
+      hello.settle(settleWith)
+      const result = await change
+      await f.h.clock.flush()
+
+      expect(result).toStrictEqual(expected)
+      const wasUp = !refuse
+      const swapHook = `beforeSwap while ${refuse ? 'broken' : 'up'}`
+      if (expected.kind === 'retrying') {
+        // A keeps its state (up on its old connection, or broken) while the new one retries.
+        expect(swaps).toEqual([])
+        expect(hookCalls).toEqual([])
+        expect(f.controller.state(a.key)?.outcome).toBe(refuse ? 'broken' : 'up')
+        await f.h.clock.advance(5_000)
+      }
+      expect(hookCalls).toEqual([swapHook])
+      expect(swaps).toEqual([{ late: expected.kind === 'retrying', wasUp }])
+      expect(f.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+      expect(f.h.manager.identity(a.key)).toEqual({ botUserId: fresh.identity.botUserId, botId: fresh.identity.botId })
+      expect(f.controller.credentialsDigest(a.key)).toBe(fileDigest(a.credentials_file))
+      await f.h.clock.flush()
+      expect(f.launches).toEqual(refuse ? [a.key] : [])
+      // A's lines: the refusal opens and the swap clears its episode; the new connection's unreachable
+      // episode opens and clears; no change-failed line; the launch line only when A came back up.
+      const unreachable = expected.kind === 'retrying' ? [PERSONA_SLACK_UNREACHABLE, PERSONA_SLACK_UNREACHABLE] : []
+      expect(linesOf(f, a).map(classOf)).toEqual(
+        refuse
+          ? [PERSONA_START, PERSONA_CREDENTIALS_REFUSED, ...unreachable, PERSONA_CREDENTIALS_REFUSED, undefined]
+          : [PERSONA_START, ...unreachable],
+      )
+      if (refuse) {
+        expect(linesOf(f, a).at(-1)).toBe(`[slack] persona ${renderPersonaRef(a.name, a.key)}: up after its confirmed credentials change — launching`)
+      }
+      const text = `on the new connection of ${a.key}`
+      await fresh.socket.deliver(makeChannelMessage({ text }))
+      expect(f.events.filter(e => e.text === text).map(e => e.key)).toEqual([a.key])
+      await expectServes(f, b)
+      expect(f.h.clock.pendingCount()).toBe(0)
+      assertNoLeak(f.captured({ result, swaps, hookCalls }))
     })
   })
 })

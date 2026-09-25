@@ -1,14 +1,18 @@
 /**
  * reload-apply.test.ts — What a confirmed change does to the personas (b.av2
- * SR-6.1 at apply, SR-6.5, SR-6.6, SR-8.6 steps 2, 3 and 6, the removal,
- * `name` and in-place rows; AC 19, 22, 57, 58, 64).
+ * SR-6.1 at apply, SR-6.4, SR-6.5, SR-6.6, SR-8.6 steps 2, 3, 4 and 6, the
+ * removal, `name`, in-place and credentials rows, SR-1.4 at apply; AC 19,
+ * 22, 57, 58, 64, 68).
  *
  * Every case drives the real reload controller through `makeReloadHarness`:
- * start from a record, edit `config.json`, tick to write the pending file,
- * rename it with `h.confirm()`, tick again. The controller's default step
- * bodies then fan out to the harness's lifecycle recorder: step 2 tears down
- * each removed persona, step 3 updates each persona modified in place and
- * step 6 brings up each added one. Cases marked "real composition" bind
+ * start from a record, edit `config.json` (or a credentials file), tick to
+ * write the pending file, rename it with `h.confirm()`, tick again. The
+ * controller's default step bodies then fan out to the harness's lifecycle
+ * recorder: step 2 tears down each removed persona, step 3 updates each
+ * persona modified in place, step 4 reconnects each persona whose
+ * credentials changed and that is not broken by its credentials then, and
+ * step 6 brings up each added one and, as a recovery, each persona broken by
+ * its credentials whose credentials changed. Cases marked "real composition" bind
  * `createPersonaLifecycle` (`opts.realLifecycle`), so the teardown, in-place
  * update and bring-up are the production code over the run's real bring-up
  * controller and connection manager, stub Slack and a stub agent-director
@@ -17,19 +21,29 @@
  * notifier and destination resolver, the MCP tools over a registered
  * session), which read the applied configuration at each use.
  *
+ * The credentials cases (AC 68; b.av2 SR-8.6 step 4, step 6's extra case
+ * and the credentials row, SR-3.3's reconnect bound, SR-6.4 recovery, SR-1.4
+ * at apply) rotate a file with `h.rotateCredentials`, whose new token pair
+ * has its own stub (`run.credentialsStub`), so the old and new connections
+ * are told apart (`run.socketActivity`, `run.currentStub`); the 10 s start
+ * bound and the SR-3.2 retries run on `run.clock`.
+ *
  * Confirmation processing, invalid, stale and no-op candidates and step 1
- * are pinned in `tests/reload.test.ts`. Credentials reconnects, destructive
- * modifies, next-launch settings and the template refresh are left to the
- * work that binds them: nothing here asserts their presence or absence.
+ * are pinned in `tests/reload.test.ts`. Destructive modifies, next-launch
+ * settings and the template refresh (step 5) are left to the work that binds
+ * them: nothing here asserts their presence or absence.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { rmSync, symlinkSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 
 import type { PersonaInput } from '../src/config.ts'
-import type { PersonaBringUpOutcome } from '../src/persona-bringup-controller.ts'
+import { isCredentialsBroken, type PersonaBringUpOutcome } from '../src/persona-bringup-controller.ts'
 import {
+  PERSONA_CREDENTIALS_CHANGE_FAILED,
   PERSONA_CREDENTIALS_INVALID,
   PERSONA_CREDENTIALS_MISSING,
   PERSONA_CREDENTIALS_REFUSED,
@@ -44,7 +58,15 @@ import type { InPlaceSetting } from '../src/reload-plan.ts'
 import { RELOAD_APPLIED } from '../src/reload.ts'
 import { stubCallCount } from './test-helpers/agent-director-stub.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
-import { makeChannelMessage, makeDm, mentionText, stubOpenedDmId, type StubWebCall } from './test-helpers/slack-stub.ts'
+import {
+  makeChannelMessage,
+  makeDm,
+  mentionText,
+  stubOpenedDmId,
+  type StubSlackOptions,
+  type StubWebCall,
+  type WebApiOutcome,
+} from './test-helpers/slack-stub.ts'
 import {
   makeReloadHarness,
   NO_RUN_ACTIVITY,
@@ -167,6 +189,19 @@ function slackSideOf(run: ReloadRun, name: string) {
     authTests: stub.calls.authTest.length,
     webCalls: stub.callLog.length,
     builds: run.slack.buildsOf(h.key(name)).length,
+  }
+}
+
+/**
+ * Watch a persona the change leaves alone: the returned check asserts it got
+ * no lifecycle record from here on and that its Slack side is as it is now.
+ */
+function watchUntouched(run: ReloadRun, name: string): () => void {
+  const cp = run.checkpoint()
+  const before = slackSideOf(run, name)
+  return () => {
+    expect(run.since(cp).lifecycle.filter((r) => r.key === h.key(name))).toEqual([])
+    expect(slackSideOf(run, name)).toEqual(before)
   }
 }
 
@@ -509,18 +544,19 @@ describe('a name change is a removal of the old key and an addition of the new o
 // ---------------------------------------------------------------------------
 
 describe('step order: every teardown settles before any bring-up starts (b.av2 SR-8.6, SR-6.6)', () => {
-  /** alpha, bravo and delta running; the change removes bravo and delta and adds echo and foxtrot. */
+  /** alpha, bravo and delta running; the change removes bravo and delta, rotates alpha's token and adds echo and foxtrot. */
   async function removeTwoAddTwo() {
     const { run, personas } = await running(['alpha', 'bravo', 'delta'])
+    h.rotateCredentials(personas[0]!)
     const echo = h.persona('echo')
     const foxtrot = h.persona('foxtrot')
     h.materialize(echo, foxtrot)
     return { run, next: [personas[0]!, echo, foxtrot] }
   }
 
-  test("with bravo's teardown held, delta's still runs and settles while no bring-up starts; once bravo's is released both bring-ups run, and reload-applied comes last", async () => {
+  test("with bravo's teardown held, delta's still runs and settles while no reconnect or bring-up starts; once bravo's is released alpha's reconnect runs and settles, then both bring-ups run, and reload-applied comes last", async () => {
     const { run, next } = await removeTwoAddTwo()
-    const [bravoKey, deltaKey, echoKey, foxtrotKey] = keysOf('bravo', 'delta', 'echo', 'foxtrot')
+    const [alphaKey, bravoKey, deltaKey, echoKey, foxtrotKey] = keysOf('alpha', 'bravo', 'delta', 'echo', 'foxtrot')
     const gate = run.lifecycle.hold('teardown', bravoKey)
 
     const { applying } = await confirmConfig(run, next)
@@ -535,6 +571,7 @@ describe('step order: every teardown settles before any bring-up starts (b.av2 S
       { op: 'teardown', key: deltaKey, phase: 'settled' },
     ])
     expect(run.lifecycle.keys('bring-up').filter((k) => k === echoKey || k === foxtrotKey)).toEqual([])
+    expect(run.lifecycle.keys('reconnect')).toEqual([])
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
 
     gate.release()
@@ -542,7 +579,13 @@ describe('step order: every teardown settles before any bring-up starts (b.av2 S
 
     const timeline = run.lifecycle.timeline
     const firstBringUp = indexOf(timeline, { op: 'bring-up', phase: 'start' })
-    expect(indexOf(timeline, { key: bravoKey, phase: 'settled' })).toBe(firstBringUp - 1)
+    // Step 4 between them: alpha's reconnect starts right after the last teardown settled and settles before any bring-up.
+    expect(indexOf(timeline, { key: bravoKey, phase: 'settled' })).toBe(firstBringUp - 3)
+    expect(timeline.slice(firstBringUp - 2, firstBringUp)).toEqual([
+      { op: 'reconnect', key: alphaKey, phase: 'start' },
+      { op: 'reconnect', key: alphaKey, phase: 'settled' },
+    ])
+    expect(run.lifecycle.of('reconnect')).toEqual([{ op: 'reconnect', key: alphaKey, via: 'apply', change: { kind: 'swapped' } }])
     expect(timeline.slice(firstBringUp).map((e) => [e.op, e.key, e.phase]).sort()).toEqual(
       [
         ['bring-up', echoKey, 'settled'],
@@ -1000,24 +1043,68 @@ describe('step order with teardowns, in-place updates and bring-ups (b.av2 SR-8.
     expectNoPostNoLeak(run)
   })
 
+  test("AC 68: a removal, an in-place change, a credentials rotation and an addition in one apply run as teardown, then in-place update, then reconnect, then bring-up; with alpha's reconnect held, delta's bring-up does not start", async () => {
+    const { run, next } = await removeModifyAdd()
+    const [alphaKey, bravoKey, charlieKey, deltaKey] = keysOf('alpha', 'bravo', 'charlie', 'delta')
+    h.rotateCredentials(next[0]!)
+    const reconnect = run.lifecycle.hold('reconnect', alphaKey)
+
+    const { applying } = await confirmConfig(run, next)
+    await reconnect.entered
+    await settle()
+    expect(run.lifecycle.timeline).toEqual([
+      { op: 'teardown', key: charlieKey, phase: 'start' },
+      { op: 'teardown', key: charlieKey, phase: 'settled' },
+      { op: 'update-in-place', key: bravoKey, phase: 'start' },
+      { op: 'update-in-place', key: bravoKey, phase: 'settled' },
+      { op: 'reconnect', key: alphaKey, phase: 'start' },
+    ])
+    expect(run.lifecycle.keys('bring-up').filter((k) => k === deltaKey)).toEqual([])
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
+
+    reconnect.release()
+    await applying
+
+    expect(run.lifecycle.timeline).toEqual([
+      { op: 'teardown', key: charlieKey, phase: 'start' },
+      { op: 'teardown', key: charlieKey, phase: 'settled' },
+      { op: 'update-in-place', key: bravoKey, phase: 'start' },
+      { op: 'update-in-place', key: bravoKey, phase: 'settled' },
+      { op: 'reconnect', key: alphaKey, phase: 'start' },
+      { op: 'reconnect', key: alphaKey, phase: 'settled' },
+      { op: 'bring-up', key: deltaKey, phase: 'start' },
+      { op: 'bring-up', key: deltaKey, phase: 'settled' },
+    ])
+    expect(run.lifecycle.of('reconnect')).toEqual([{ op: 'reconnect', key: alphaKey, via: 'apply', change: { kind: 'swapped' } }])
+    expect(run.lifecycle.outcome(deltaKey)).toBe('up')
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    expect(run.logs.at(-1)).toStartWith(`[slack] ${RELOAD_APPLIED}: `)
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
   /**
-   * alpha, bravo, charlie and delta running; the change removes bravo and
-   * delta (step 2), adds a channel to alpha and to charlie (step 3), and adds
-   * echo and foxtrot (step 6): two personas in each step.
+   * alpha, bravo, charlie, delta, golf and hotel running; the change removes
+   * bravo and delta (step 2), adds a channel to alpha and to charlie (step
+   * 3), rotates golf's and hotel's tokens (step 4), and adds echo and foxtrot
+   * (step 6): two personas in each step.
    */
   async function twoOfEach() {
-    const { run, personas } = await running(['alpha', 'bravo', 'charlie', 'delta'])
+    const { run, personas } = await running(['alpha', 'bravo', 'charlie', 'delta', 'golf', 'hotel'])
     const withExtra = (name: string, extra: string) =>
       h.persona(name, { channels: [{ id: ownChannel(name), delivery: 'all' }, { id: extra, delivery: 'all' }] })
+    const [, , , , golf, hotel] = personas
+    h.rotateCredentials(golf!)
+    h.rotateCredentials(hotel!)
     const echo = h.persona('echo')
     const foxtrot = h.persona('foxtrot')
     h.materialize(echo, foxtrot)
-    expect(personas.map((p) => p.name)).toEqual(['alpha', 'bravo', 'charlie', 'delta'])
-    return { run, next: [withExtra('alpha', EXTRA_CHANNEL), withExtra('charlie', OTHER_CHANNEL), echo, foxtrot] }
+    expect(personas.map((p) => p.name)).toEqual(['alpha', 'bravo', 'charlie', 'delta', 'golf', 'hotel'])
+    return { run, next: [withExtra('alpha', EXTRA_CHANNEL), withExtra('charlie', OTHER_CHANNEL), golf!, hotel!, echo, foxtrot] }
   }
 
   /** The apply step each timeline op belongs to, in step order. */
-  const STEP_OF: Record<LifecycleTimelineEntry['op'], number> = { teardown: 2, 'update-in-place': 3, 'bring-up': 6 }
+  const STEP_OF: Record<LifecycleTimelineEntry['op'], number> = { teardown: 2, 'update-in-place': 3, reconnect: 4, 'bring-up': 6 }
 
   // Each row fails the step's second persona, so the line must name the one that failed.
   // Either way the failure is one controller line with no message, the step's other
@@ -1025,10 +1112,13 @@ describe('step order with teardowns, in-place updates and bring-ups (b.av2 SR-8.
   test.each<{ label: string; op: LifecycleTimelineEntry['op']; failing: string; step: string }>([
     { label: 'step 2', op: 'teardown', failing: 'delta', step: '2 (teardowns)' },
     { label: 'AC 58: step 3', op: 'update-in-place', failing: 'charlie', step: '3 (in-place-updates)' },
+    { label: 'AC 68: step 4', op: 'reconnect', failing: 'hotel', step: '4 (credentials-reconnects)' },
     { label: 'step 6', op: 'bring-up', failing: 'foxtrot', step: '6 (bring-ups)' },
   ])("$label: when one $op rejects, it is logged once by the controller without its message, the step's other persona still settles, the later steps still run, and the apply finishes", async ({ op, failing, step }) => {
     const { run, next } = await twoOfEach()
-    const [alphaKey, bravoKey, charlieKey, deltaKey, echoKey, foxtrotKey] = keysOf('alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot')
+    const [alphaKey, bravoKey, charlieKey, deltaKey, echoKey, foxtrotKey, golfKey, hotelKey] = keysOf(
+      'alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel',
+    )
     const failingKey = h.key(failing)
     // A failure whose message holds a fake token: only its class may be logged.
     run.lifecycle.hold(op, failingKey).fail(new Error(`lifecycle op exploded ${fakeToken(APP_TOKEN_PREFIX, 'failure')}`))
@@ -1050,6 +1140,8 @@ describe('step order with teardowns, in-place updates and bring-ups (b.av2 SR-8.
         ...call('teardown', deltaKey),
         ...call('update-in-place', alphaKey),
         ...call('update-in-place', charlieKey),
+        ...call('reconnect', golfKey),
+        ...call('reconnect', hotelKey),
         ...call('bring-up', echoKey),
         ...call('bring-up', foxtrotKey),
       ].sort(),
@@ -1063,8 +1155,14 @@ describe('step order with teardowns, in-place updates and bring-ups (b.av2 SR-8.
     )
     expect(failed[0]).not.toContain('exploded')
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
-    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'charlie', 'echo', 'foxtrot'))
-    await expectNothingPendingAfter(run)
+    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'charlie', 'golf', 'hotel', 'echo', 'foxtrot'))
+    expect(run.lifecycle.of('reconnect').find((r) => r.key === golfKey)!.change).toEqual({ kind: 'swapped' })
+    if (op === 'reconnect') {
+      // The rejected reconnect never ran, so hotel's change is pending again.
+      await expectCredentialsPending(run, next[3]!)
+    } else {
+      await expectNothingPendingAfter(run)
+    }
     expectNoPostNoLeak(run)
   })
 })
@@ -1139,5 +1237,827 @@ describe('AC 58: a persona that is not up is still updated in place, and nothing
     // On bravo's own client.
     expect(run.stub('bravo').callLog.filter((c) => c.method === 'chat.postMessage')).toEqual(posts)
     assertNoLeak(run.captured())
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Credentials changes (AC 68; b.av2 SR-8.6 step 4, step 6's extra case and the
+// credentials row, SR-3.3 reconnect part, SR-6.4 recovery, SR-1.4 apply part)
+// ---------------------------------------------------------------------------
+
+/** A persona's bot identity as the manager and a stub name it. */
+function identityOf(stub: { identity: { botUserId: string; botId: string } }) {
+  return { botUserId: stub.identity.botUserId, botId: stub.identity.botId }
+}
+
+/** The start of a preview's credentials line for `persona` (its wording is `tests/reload-preview.test.ts`'s). */
+function credentialsLineStart(persona: PersonaInput): string {
+  return `persona ${renderPersonaRef(persona.name, h.key(persona.name))}: credentials file ${JSON.stringify(persona.credentials_file)} changed`
+}
+
+/** The `persona-credentials-change-failed` lines naming `persona` at entry `index`, with its credentials path. */
+function changeFailedLines(run: ReloadRun, persona: PersonaInput, index: number): string[] {
+  const start = `[slack] ${PERSONA_CREDENTIALS_CHANGE_FAILED}: personas[${index}] ${renderPersonaRef(persona.name, h.key(persona.name))} path=${JSON.stringify(persona.credentials_file)}: `
+  return run.logsOf(PERSONA_CREDENTIALS_CHANGE_FAILED).filter((l) => l.startsWith(start))
+}
+
+/**
+ * The change is pending again: the next check writes `config.json.pending`
+ * with `persona`'s credentials line (checked for leaks while it exists).
+ */
+async function expectCredentialsPending(run: ReloadRun, persona: PersonaInput): Promise<void> {
+  await run.ticks.tick()
+  expect(h.pendingExists()).toBe(true)
+  expect(h.pendingLines()!.filter((l) => l.startsWith(credentialsLineStart(persona)))).toHaveLength(1)
+  assertNoLeak(run.captured())
+}
+
+/** The persona's socket activity from `from` (a `socketActivity` length taken earlier) on. */
+function socketActivitySince(run: ReloadRun, name: string, from: number): string[] {
+  return run.socketActivity(name).slice(from)
+}
+
+describe('AC 68: a confirmed token rotation reconnects only that persona (b.av2 SR-8.6 step 4, the credentials row)', () => {
+  test("AC 68: bravo's token rotated in the same file and confirmed records exactly one reconnect for bravo: the new connection opens before the old closes, its identity comes from the new auth.test (another bot and app), its instance and MCP session are kept, and alpha gets no lifecycle call and no auth.test (real composition)", async () => {
+    const { run, personas } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
+    const [, bravo] = personas
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    const oldLabel = h.credentialsLabel('bravo')
+    const oldStub = run.stub('bravo')
+    const oldIdentity = identityOf(oldStub)
+    const sessions = { alpha: run.session('alpha'), bravo: run.session('bravo') }
+    const alphaBefore = slackSideOf(run, 'alpha')
+    const activityFrom = run.socketActivity('bravo').length
+    const oldAuthTests = oldStub.calls.authTest.length
+
+    const { tokens, label } = h.rotateCredentials(bravo!)
+    const cp = run.checkpoint()
+    await (await run.confirmPending()).applying
+
+    // Only a reconnect, for bravo, and it swapped: no teardown, bring-up or launch.
+    expect(run.since(cp).lifecycle).toEqual([{ op: 'reconnect', key: bravoKey, via: 'apply', change: { kind: 'swapped' } }])
+    expect(run.lifecycle.timeline).toEqual([
+      { op: 'reconnect', key: bravoKey, phase: 'start' },
+      { op: 'reconnect', key: bravoKey, phase: 'settled' },
+    ])
+    expect(run.composition!.calls).toEqual([
+      ['bringUps.changeCredentials', bravoKey],
+      ['connections.reconnectCredentials', bravoKey],
+      ['destinations.forget', bravoKey],
+    ])
+    expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
+    // The new connection opened, then the old one closed.
+    expect(socketActivitySince(run, 'bravo', activityFrom)).toEqual([
+      `built ${label}`,
+      `started ${label}`,
+      `connected ${label}`,
+      `discarded ${oldLabel}`,
+      `disconnected ${oldLabel}`,
+    ])
+    expect(run.currentStub('bravo')).toBe(run.credentialsStub('bravo', label))
+    // Every client built for the change took the new file's tokens; the identity is the new auth.test's.
+    const newBuilds = run.slack.buildsOf(bravoKey).filter((b) => b.credentials === label)
+    expect(newBuilds.map((b) => b.kind).sort()).toEqual(['socket', 'validation', 'web'])
+    for (const build of newBuilds) expect(build.hasToken(build.kind === 'socket' ? tokens.appToken : tokens.botToken)).toBe(true)
+    expect(run.credentialsStub('bravo', label).calls.authTest).toHaveLength(1)
+    expect(oldStub.calls.authTest).toHaveLength(oldAuthTests)
+    const newIdentity = identityOf(run.credentialsStub('bravo', label))
+    expect(newIdentity.botUserId).not.toBe(oldIdentity.botUserId)
+    expect(newIdentity.botId).not.toBe(oldIdentity.botId)
+    expect(run.connections.manager.identity(bravoKey)).toEqual(newIdentity)
+    // Instance and conversation kept: the same MCP session, still up and admitted.
+    expect(run.session('bravo')).toBe(sessions.bravo!)
+    expect(run.session('alpha')).toBe(sessions.alpha!)
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+    expect(run.isUp('bravo')).toBe(true)
+    // Its next event arrives on the new connection, and the new client names the author.
+    const own = ownChannel('bravo')
+    const usersInfoFrom = run.credentialsStub('bravo', label).calls.usersInfo.length
+    await run.credentialsStub('bravo', label).socket.deliver(makeChannelMessage({ channel: own }))
+    expect(deliveredSince(run, 'bravo', 0)).toEqual([{ chat_id: own, via: 'receive_all' }])
+    expect(run.credentialsStub('bravo', label).calls.usersInfo).toHaveLength(usersInfoFrom + 1)
+    // alpha: nothing at all.
+    expect(run.composition!.calls.filter(([, key]) => key === alphaKey)).toEqual([])
+    expect(slackSideOf(run, 'alpha')).toEqual(alphaBefore)
+    expect(run.since(cp).logs.filter((l) => l.includes(renderPersonaRef('alpha', alphaKey)))).toEqual([])
+    // The held content is the new file's, so nothing is left pending.
+    expect(run.bringUps.credentialsDigest(bravoKey)).toBe(h.credentialsDigestOf(bravo!))
+    expect(run.logsOf(PERSONA_CREDENTIALS_CHANGE_FAILED)).toEqual([])
+    expect(run.logsOf('reload')).toEqual([])
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test.each<{ label: string; slack?: StubSlackOptions; swapped: boolean }>([
+    { label: 'succeeds', swapped: true },
+    { label: 'is refused by Slack', slack: SLACK_AUTH_REJECTED, swapped: false },
+  ])("the DM-destination cache: after bravo's credentials change $label, its next notice to its dm destination opens the conversation again through the new client, or reuses the cached one on the old client when the change failed (real composition)", async ({ slack, swapped }) => {
+    const dmTo: Partial<PersonaInput> = { dm: { enabled: true, contact: CONTACT }, permission_prompts: 'dm' }
+    const { run, personas } = await running(['alpha', ['bravo', dmTo]], { realLifecycle: true })
+    const bravoKey = h.key('bravo')
+    const dm = stubOpenedDmId(CONTACT)
+    // Before: the first notice opens the DM on the old client, which caches it.
+    expect(await noticeCalls(run, 'bravo')).toEqual([`conversations.open ${CONTACT}`, `chat.postMessage ${dm}`])
+    const oldFrom = run.stub('bravo').callLog.length
+    const { label } = h.rotateCredentials(personas[1]!, { slack })
+
+    await (await run.confirmPending()).applying
+    expect(run.lifecycle.of('reconnect')).toEqual([
+      { op: 'reconnect', key: bravoKey, via: 'apply', change: swapped ? { kind: 'swapped' } : { kind: 'failed', cause: expect.any(String) } },
+    ])
+    expect(run.composition!.calls.filter(([member]) => member === 'destinations.forget')).toEqual(
+      swapped ? [['destinations.forget', bravoKey]] : [],
+    )
+    await run.notice('bravo', 'after the change')
+
+    const newCalls = callTargets(run.credentialsStub('bravo', label).callLog.filter((c) => c.method !== 'auth.test'))
+    if (swapped) {
+      expect(newCalls).toEqual([`conversations.open ${CONTACT}`, `chat.postMessage ${dm}`])
+      expect(callsSince(run, 'bravo', oldFrom)).toEqual([])
+    } else {
+      expect(newCalls).toEqual([])
+      expect(callsSince(run, 'bravo', oldFrom)).toEqual([`chat.postMessage ${dm}`])
+    }
+    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test'])
+    assertNoLeak(run.captured())
+  })
+
+  test("AC 68: a reconnect whose start() never settles holds the apply at step 4 until 10 s on the fake clock, while alpha keeps delivering its events; then it is abandoned, the old connection stays open and in use, the reconnect retries (complete for step order), step 6 brings up the persona added in the same apply, alpha gets no lifecycle call and its Slack side is untouched, and a later tick detects and previews a further edit", async () => {
+    const { run, personas } = await running(['alpha', 'bravo'])
+    const [alpha, bravo] = personas
+    const [bravoKey, deltaKey] = keysOf('bravo', 'delta')
+    run.registerSession('alpha')
+    const oldLabel = h.credentialsLabel('bravo')
+    const oldIdentity = identityOf(run.stub('bravo'))
+    const { label } = h.rotateCredentials(bravo!, { slack: { connect: [{ kind: 'open-never-answers' }] } })
+    const delta = h.persona('delta')
+    h.materialize(delta)
+    h.writeConfig(configOf(alpha!, bravo!, delta))
+    const activityFrom = run.socketActivity('bravo').length
+    const t0 = run.clock.now()
+    const alphaUntouched = watchUntouched(run, 'alpha')
+
+    const { applying } = await run.confirmPending()
+    await until(() => run.socketActivity('bravo').includes(`started ${label}`))
+    // Just short of the bound: still at step 4, so step 6 has not started.
+    await run.clock.advanceTo(t0 + 9_999)
+    for (let i = 0; i < 20; i++) await new Promise((done) => setImmediate(done))
+    expect(run.lifecycle.timeline).toEqual([{ op: 'reconnect', key: bravoKey, phase: 'start' }])
+    expect(run.lifecycle.keys('bring-up').filter((k) => k === deltaKey)).toEqual([])
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
+    // Nothing of bravo's hang reaches alpha: untouched so far, and its next event is delivered while step 4 still holds.
+    alphaUntouched()
+    expect(await deliverTo(run, 'alpha', makeChannelMessage({ channel: ownChannel('alpha') }))).toEqual([
+      { chat_id: ownChannel('alpha'), via: 'receive_all' },
+    ])
+    expect(run.lifecycle.timeline).toEqual([{ op: 'reconnect', key: bravoKey, phase: 'start' }])
+    // The delivery's one users.info call is alpha's only Slack call; watch again from here.
+    const alphaStillUntouched = watchUntouched(run, 'alpha')
+
+    // At 10 s the attempt is abandoned; the reconnect is left retrying, and the apply moves on.
+    await run.clock.advanceTo(t0 + 10_000)
+    await applying
+
+    expect(run.lifecycle.timeline).toEqual([
+      { op: 'reconnect', key: bravoKey, phase: 'start' },
+      { op: 'reconnect', key: bravoKey, phase: 'settled' },
+      { op: 'bring-up', key: deltaKey, phase: 'start' },
+      { op: 'bring-up', key: deltaKey, phase: 'settled' },
+    ])
+    expect(run.lifecycle.of('reconnect')).toEqual([
+      { op: 'reconnect', key: bravoKey, via: 'apply', change: { kind: 'retrying', connection: 'kept' } },
+    ])
+    expect(run.lifecycle.outcome(deltaKey)).toBe('up')
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    // The old connection stays open and in use: never closed, same identity, its client posts.
+    const activity = socketActivitySince(run, 'bravo', activityFrom)
+    expect(activity).not.toContain(`connected ${label}`)
+    expect(activity.filter((a) => a.endsWith(` ${oldLabel}`))).toEqual([])
+    expect(run.stub('bravo').socket.disconnectCalls).toBe(0)
+    expect(run.connections.manager.status(bravoKey)?.state).toBe('up')
+    expect(run.connections.manager.identity(bravoKey)).toEqual(oldIdentity)
+    expect(run.currentStub('bravo')).toBe(run.stub('bravo'))
+    expect(await noticeCalls(run, 'bravo')).toEqual([`chat.postMessage ${ownChannel('bravo')}`])
+    // Its next attempt is due on the SR-3.2 backoff's first step.
+    expect(run.clock.pending().map((t) => t.dueAt)).toContain(t0 + 15_000)
+    alphaStillUntouched()
+
+    // Later ticks run: nothing is pending (the confirmed content is held), and a further edit is previewed.
+    await run.ticks.tick()
+    expect(h.pendingExists()).toBe(false)
+    h.writeConfig(configOf(h.persona('alpha', { channels: [{ id: ownChannel('alpha'), delivery: 'mentions' }] }), bravo!, delta))
+    await run.ticks.tick()
+    expect(h.pendingHeader()).toStartWith('A configuration change is pending; nothing has been applied. ')
+    expect(h.pendingHeader()).toContain('1 modified in place')
+    assertNoLeak(run.captured())
+  })
+
+  test.each<{ label: string; spoil: (bravo: PersonaInput) => void }>([
+    { label: 'missing', spoil: (bravo) => h.deleteCredentials(bravo) },
+    { label: 'unreadable (a directory at its path)', spoil: (bravo) => h.makeCredentialsUnreadable(bravo) },
+    { label: 'locally invalid (no bot_token)', spoil: (bravo) => void h.writeCredentialsContent(bravo, { bot_token: undefined }) },
+    { label: 'refused by Slack', spoil: (bravo) => void h.rotateCredentials(bravo, { slack: SLACK_AUTH_REJECTED }) },
+  ])("a confirmed credentials file that is $label keeps bravo's old connection, logs one persona-credentials-change-failed line naming bravo, its entry and path, and stays pending, while alpha's in-place change in the same apply is applied", async ({ spoil }) => {
+    const { run, personas } = await running(['alpha', 'bravo'])
+    const [, bravo] = personas
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    const oldIdentity = identityOf(run.stub('bravo'))
+    const alphaEdited = h.persona('alpha', { channels: [{ id: ownChannel('alpha'), delivery: 'all' }, { id: EXTRA_CHANNEL, delivery: 'all' }] })
+    spoil(bravo!)
+    h.writeConfig(configOf(alphaEdited, bravo!))
+    const cp = run.checkpoint()
+
+    await (await run.confirmPending()).applying
+
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'update-in-place', key: alphaKey, via: 'apply', settings: ['channels'] },
+      { op: 'reconnect', key: bravoKey, via: 'apply', change: { kind: 'failed', cause: expect.any(String) } },
+    ])
+    // The old connection stays: never closed, same identity, still up.
+    expect(run.stub('bravo').socket.disconnectCalls).toBe(0)
+    expect(run.currentStub('bravo')).toBe(run.stub('bravo'))
+    expect(run.connections.manager.identity(bravoKey)).toEqual(oldIdentity)
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+    // One failed-change line, for bravo, naming its entry and credentials path.
+    expect(run.logsOf(PERSONA_CREDENTIALS_CHANGE_FAILED)).toHaveLength(1)
+    expect(changeFailedLines(run, bravo!, 1)).toHaveLength(1)
+    // alpha's change was applied.
+    expect(run.appliedConfigs.at(-1)!.personas.find((p) => p.key === alphaKey)!.channels.map((c) => c.id)).toEqual([
+      ownChannel('alpha'),
+      EXTRA_CHANNEL,
+    ])
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    // The credentials change is pending again.
+    await expectCredentialsPending(run, bravo!)
+    expect(run.slackPosts()).toEqual([])
+  })
+
+  test.each<{ label: string; later: WebApiOutcome; swaps: boolean }>([
+    { label: 'answers', later: { kind: 'ok' }, swaps: true },
+    { label: 'refuses the new token', later: { kind: 'platform', error: 'invalid_auth' }, swaps: false },
+  ])("Slack unreachable for bravo's new file: the old connection stays while the new one retries on the SR-3.2 backoff and nothing is pending; when a later attempt $label, the swap completes or the change fails and is pending again, and alpha gets no lifecycle call and its Slack side is untouched", async ({ later, swaps }) => {
+    const { run, personas } = await running(['alpha', 'bravo'])
+    const [, bravo] = personas
+    const bravoKey = h.key('bravo')
+    const oldIdentity = identityOf(run.stub('bravo'))
+    const oldDigest = run.bringUps.credentialsDigest(bravoKey)
+    const { label } = h.rotateCredentials(bravo!, { slack: { authTest: [{ kind: 'network' }, later] } })
+    const newStub = run.credentialsStub('bravo', label)
+    const t0 = run.clock.now()
+    const alphaUntouched = watchUntouched(run, 'alpha')
+
+    await (await run.confirmPending()).applying
+
+    expect(run.lifecycle.of('reconnect')).toEqual([
+      { op: 'reconnect', key: bravoKey, via: 'apply', change: { kind: 'retrying', connection: 'kept' } },
+    ])
+    expect(run.currentStub('bravo')).toBe(run.stub('bravo'))
+    expect(run.connections.manager.identity(bravoKey)).toEqual(oldIdentity)
+    expect(run.clock.pending().map((t) => t.dueAt)).toEqual([t0 + 5_000])
+    // The confirmed content is held while it retries, so the change is not left pending.
+    await run.ticks.tick()
+    expect(h.pendingExists()).toBe(false)
+    expect(run.bringUps.credentialsDigest(bravoKey)).toBe(h.credentialsDigestOf(bravo!))
+
+    await run.clock.advanceTo(t0 + 5_000)
+    expect(newStub.calls.authTest).toHaveLength(2)
+
+    if (swaps) {
+      expect(run.currentStub('bravo')).toBe(newStub)
+      expect(run.connections.manager.identity(bravoKey)).toEqual(identityOf(newStub))
+      expect(run.stub('bravo').socket.disconnectCalls).toBe(1)
+      expect(run.logsOf(PERSONA_CREDENTIALS_CHANGE_FAILED)).toEqual([])
+      await run.ticks.tick()
+      expect(h.pendingExists()).toBe(false)
+    } else {
+      expect(run.currentStub('bravo')).toBe(run.stub('bravo'))
+      expect(run.connections.manager.identity(bravoKey)).toEqual(oldIdentity)
+      expect(run.stub('bravo').socket.disconnectCalls).toBe(0)
+      expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+      expect(changeFailedLines(run, bravo!, 1)).toHaveLength(1)
+      expect(run.logsOf(PERSONA_CREDENTIALS_CHANGE_FAILED)).toHaveLength(1)
+      expect(run.bringUps.credentialsDigest(bravoKey)).toBe(oldDigest)
+      await expectCredentialsPending(run, bravo!)
+    }
+    expect(run.lifecycle.of('bring-up').filter((r) => r.via === 'apply')).toEqual([])
+    alphaUntouched()
+    expectNoPostNoLeak(run)
+  })
+
+  test.each<{ label: string; opts: RunningOptions; prepare: (personas: PersonaInput[]) => void; bringBack: (run: ReloadRun, bravo: PersonaInput) => Promise<unknown> }>([
+    {
+      label: 'Slack-unreachable',
+      opts: { slack: { bravo: SLACK_UNREACHABLE } },
+      prepare: () => undefined,
+      bringBack: (run) => run.clock.runNext(),
+    },
+    {
+      label: 'directory-broken',
+      opts: {},
+      prepare: ([, bravo]) => h.deleteWorkingDirectory(bravo!),
+      bringBack: (run, bravo) => {
+        h.makeWorkingDirectory(bravo)
+        return run.clock.runNext()
+      },
+    },
+  ])('bravo retrying ($label) whose credentials change is confirmed retries with the new content: once it comes up, every client it builds has the new tokens, and alpha gets no lifecycle call and its Slack side is untouched', async ({ opts, prepare, bringBack }) => {
+    const { run, personas } = await running(['alpha', 'bravo'], opts, prepare)
+    const [, bravo] = personas
+    const bravoKey = h.key('bravo')
+    expect(run.lifecycle.outcome(bravoKey)).toBe('retrying')
+    const oldTokens = h.tokens('bravo')
+    const oldAuthTests = run.stub('bravo').calls.authTest.length
+    const buildsFrom = run.slack.buildsOf(bravoKey).length
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const { tokens, label } = h.rotateCredentials(bravo!)
+
+    await (await run.confirmPending()).applying
+
+    expect(run.lifecycle.of('reconnect')).toEqual([
+      { op: 'reconnect', key: bravoKey, via: 'apply', change: { kind: 'retrying', connection: 'none' } },
+    ])
+    expect(run.bringUps.credentialsDigest(bravoKey)).toBe(h.credentialsDigestOf(bravo!))
+    const cp = run.checkpoint()
+    await bringBack(run, bravo!)
+
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+    expect(run.since(cp).lifecycle).toEqual([{ op: 'launch', key: bravoKey, via: 'retry' }])
+    expect(run.connections.manager.identity(bravoKey)).toEqual(identityOf(run.credentialsStub('bravo', label)))
+    const builds = run.slack.buildsOf(bravoKey).slice(buildsFrom)
+    expect(builds.map((b) => b.kind).sort()).toEqual(['socket', 'validation', 'web'])
+    for (const build of builds) {
+      expect(build.hasToken(build.kind === 'socket' ? tokens.appToken : tokens.botToken)).toBe(true)
+      expect(build.hasToken(oldTokens.appToken) || build.hasToken(oldTokens.botToken)).toBe(false)
+    }
+    expect(run.stub('bravo').calls.authTest).toHaveLength(oldAuthTests)
+    alphaUntouched()
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test('a later confirmed removal of bravo, whose reconnect is still retrying, cancels the reconnect: no further auth.test or start() for it on the fake clock, and alpha gets no lifecycle call from either apply and its Slack side is untouched', async () => {
+    const { run, personas } = await running(['alpha', 'bravo'])
+    const [alpha, bravo] = personas
+    const bravoKey = h.key('bravo')
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const { label } = h.rotateCredentials(bravo!, { slack: { connect: Array.from({ length: 50 }, () => ({ kind: 'network' as const })) } })
+    const newStub = run.credentialsStub('bravo', label)
+    await (await run.confirmPending()).applying
+    expect(run.lifecycle.of('reconnect')).toEqual([
+      { op: 'reconnect', key: bravoKey, via: 'apply', change: { kind: 'retrying', connection: 'kept' } },
+    ])
+    await run.clock.runNext()
+    expect(newStub.calls.authTest).toHaveLength(2)
+
+    await applyConfig(run, [alpha!])
+    expect(run.lifecycle.keys('teardown')).toEqual([bravoKey])
+    // Its next attempt's timer went with it.
+    expect(run.clock.pendingCount()).toBe(0)
+    const authTests = newStub.calls.authTest.length
+    const starts = newStub.sockets.map((s) => s.startCalls)
+    const cp = run.checkpoint()
+    await run.clock.advance(3_600_000)
+
+    expect(newStub.calls.authTest).toHaveLength(authTests)
+    expect(newStub.sockets.map((s) => s.startCalls)).toEqual(starts)
+    expect(run.since(cp).slackBuilds).toBe(0)
+    expect(run.since(cp).lifecycle).toEqual([])
+    expect(run.clock.pendingCount()).toBe(0)
+    alphaUntouched()
+    expectNoPostNoLeak(run)
+  })
+
+  test("bravo's old connection's reopen is refused while its confirmed reconnect retries: it stops being up, its MCP session dropped and its instance kept; when the reconnect later succeeds it comes up with no second confirmation and is launched again, while alpha gets no lifecycle or dependency call, keeps its session and its Slack side is untouched (real composition)", async () => {
+    const { run, personas } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
+    const [, bravo] = personas
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    const alphaSession = run.session('alpha')
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const { label } = h.rotateCredentials(bravo!, { slack: { authTest: [{ kind: 'network' }] } })
+    await (await run.confirmPending()).applying
+    expect(run.lifecycle.of('reconnect')).toEqual([
+      { op: 'reconnect', key: bravoKey, via: 'apply', change: { kind: 'retrying', connection: 'kept' } },
+    ])
+    const ticksRun = run.ticks.ticksRun
+
+    await run.refuseReopen('bravo')
+
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('broken')
+    expect(run.isUp('bravo')).toBe(false)
+    expect(run.session('bravo')).toBeUndefined()
+    expect(run.admitSession('bravo').kind).toBe('not-up')
+    expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
+    const cp = run.checkpoint()
+
+    // The pending reconnect's next attempt succeeds.
+    await run.clock.runNext()
+
+    expect(run.currentStub('bravo')).toBe(run.credentialsStub('bravo', label))
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+    expect(run.isUp('bravo')).toBe(true)
+    expect(run.since(cp).lifecycle).toEqual([{ op: 'launch', key: bravoKey, via: 'retry' }])
+    // No kill, delete or fresh start of its instance: the launch reaches it.
+    expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
+    expect(run.admitSession('bravo').kind).toBe('admitted')
+    // No second confirmation: no tick ran, nothing is pending.
+    expect(run.ticks.ticksRun).toBe(ticksRun)
+    await run.ticks.tick()
+    expect(h.pendingExists()).toBe(false)
+    // alpha: nothing.
+    alphaUntouched()
+    expect(run.composition!.calls.filter(([, key]) => key === alphaKey)).toEqual([])
+    expect(run.session('alpha')).toBe(alphaSession!)
+    expect(run.isUp('alpha')).toBe(true)
+    expectNoPostNoLeak(run)
+  })
+})
+
+describe('step 6 brings up a credentials-broken persona whose credentials changed (b.av2 SR-8.6 step 6, SR-6.4 recovery)', () => {
+  interface RecoveryRow {
+    label: string
+    opts: RunningOptions
+    prepare: (personas: PersonaInput[]) => void
+    /** Break bravo after the start (before the change), if the row does. */
+    breakRunning?: (run: ReloadRun) => Promise<void>
+  }
+
+  const RECOVERY_ROWS: RecoveryRow[] = [
+    {
+      label: 'broken at start by a missing credentials file, then created',
+      opts: REAL_WITH_SESSIONS,
+      prepare: ([, bravo]) => h.deleteCredentials(bravo!),
+    },
+    {
+      label: 'broken at start by locally invalid content, then fixed',
+      opts: REAL_WITH_SESSIONS,
+      prepare: ([, bravo]) => void h.writeCredentialsContent(bravo!, { bot_token: undefined }),
+    },
+    {
+      label: 'broken at start by Slack refusing its token',
+      opts: { ...REAL_WITH_SESSIONS, slack: { bravo: SLACK_AUTH_REJECTED } },
+      prepare: () => undefined,
+    },
+    {
+      label: 'revoked while running (a refused reopen)',
+      opts: REAL_WITH_SESSIONS,
+      prepare: () => undefined,
+      breakRunning: (run) => run.refuseReopen('bravo'),
+    },
+  ]
+
+  // The agent-director stub holds no row for bravo, and the harness only
+  // records a launch: these rows show the recovery makes no agent-director
+  // call (no kill or delete) and asks for a launch, not what the launch does
+  // with an existing row.
+  test.each(RECOVERY_ROWS)('bravo $label: a confirmed good file brings it up at step 6 as a recovery (no reconnect), with the new tokens, no agent-director call and a launch recorded, its MCP registration accepted again, and alpha untouched (real composition)', async ({ opts, prepare, breakRunning }) => {
+    const { run, personas } = await running(['alpha', 'bravo'], opts, prepare)
+    const [, bravo] = personas
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    if (breakRunning !== undefined) await breakRunning(run)
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('broken')
+    const alphaBefore = slackSideOf(run, 'alpha')
+    const { tokens, label } = h.rotateCredentials(bravo!)
+    const cp = run.checkpoint()
+
+    await (await run.confirmPending()).applying
+
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'bring-up', key: bravoKey, via: 'apply', recovery: true, result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: bravoKey, via: 'apply' },
+    ])
+    expect(run.lifecycle.timeline).toEqual([
+      { op: 'bring-up', key: bravoKey, phase: 'start' },
+      { op: 'bring-up', key: bravoKey, phase: 'settled' },
+    ])
+    // Its leftover state is cleared first, then the same bring-up and a recorded launch; no agent-director call (no kill or delete).
+    expect(run.composition!.calls).toEqual([
+      ['bringUps.cancel', bravoKey],
+      ['connections.stop', bravoKey],
+      ['destinations.forget', bravoKey],
+      ['storageCheck', bravoKey],
+      ['bringUps.bringUp', bravoKey],
+      ['launch', bravoKey],
+    ])
+    expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
+    // Up with the new file's tokens, on the new set's clients.
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+    expect(run.currentStub('bravo')).toBe(run.credentialsStub('bravo', label))
+    const builds = run.slack.buildsOf(bravoKey).filter((b) => b.credentials === label)
+    expect(builds.map((b) => b.kind).sort()).toEqual(['socket', 'validation', 'web'])
+    for (const build of builds) expect(build.hasToken(build.kind === 'socket' ? tokens.appToken : tokens.botToken)).toBe(true)
+    expect(run.isUp('bravo')).toBe(true)
+    expect(run.admitSession('bravo').kind).toBe('admitted')
+    // alpha: nothing.
+    expect(run.composition!.calls.filter(([, key]) => key === alphaKey)).toEqual([])
+    expect(slackSideOf(run, 'alpha')).toEqual(alphaBefore)
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test("Director decision 4: bravo, up when the apply's plan was built (a reconnect), is revoked while step 2 runs; step 4 re-checks it at step time and leaves it, and step 6 brings it up as a recovery with the new tokens (real composition)", async () => {
+    const { run, personas } = await running(['alpha', 'bravo', 'charlie'], REAL_WITH_SESSIONS)
+    const [alpha, bravo] = personas
+    const [bravoKey, charlieKey] = keysOf('bravo', 'charlie')
+    const { tokens, label } = h.rotateCredentials(bravo!)
+    const teardown = run.lifecycle.hold('teardown', charlieKey)
+    const cp = run.checkpoint()
+
+    // Up when the applying check builds its plan, so the plan lists bravo for a reconnect.
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+    const { applying } = await confirmConfig(run, [alpha!, bravo!])
+    await teardown.entered
+    await run.refuseReopen('bravo')
+    teardown.release()
+    await applying
+
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: charlieKey, via: 'apply' },
+      { op: 'bring-up', key: bravoKey, via: 'apply', recovery: true, result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: bravoKey, via: 'apply' },
+    ])
+    expect(run.lifecycle.keys('reconnect')).toEqual([])
+    expect(run.currentStub('bravo')).toBe(run.credentialsStub('bravo', label))
+    for (const build of run.slack.buildsOf(bravoKey).filter((b) => b.credentials === label)) {
+      expect(build.hasToken(build.kind === 'socket' ? tokens.appToken : tokens.botToken)).toBe(true)
+    }
+    expect(run.isUp('bravo')).toBe(true)
+    expect(run.admitSession('bravo').kind).toBe('admitted')
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test("Director decision 4, at the reconnect itself: bravo, up when step 4 chose it for a reconnect, is revoked by a Web API call while that reconnect waits to start; the reconnect finds it credentials-broken and leaves it, and step 6 brings it up as a recovery with the new tokens (real composition)", async () => {
+    const { run, personas } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    const { tokens, label } = h.rotateCredentials(personas[1]!)
+    const reconnect = run.lifecycle.hold('reconnect', bravoKey)
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const cp = run.checkpoint()
+
+    const { applying } = await run.confirmPending()
+    // Step 4 chose bravo (up at its filter) and its reconnect is recorded, its body not yet run.
+    await reconnect.entered
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+    // Now bravo's bot token is revoked, and its next Web API call (a tool call) finds it so: credentials-broken.
+    run.revokeBotToken('bravo')
+    // The tool handler's failure line goes to console.error: captured for the leak check, not printed.
+    const consoleLines: string[] = []
+    const consoleSpy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => void consoleLines.push(args.map(String).join(' ')))
+    let refused: { isError: boolean; text: string }
+    try {
+      refused = await run.callTool('bravo', 'react', { chat_id: ownChannel('bravo'), message_id: '1700000000.000100', emoji: 'eyes' })
+    } finally {
+      consoleSpy.mockRestore()
+    }
+    expect(refused.isError).toBe(true)
+    expect(consoleLines).toHaveLength(1)
+    expect(isCredentialsBroken(run.bringUps.state(bravoKey))).toBe(true)
+    reconnect.release()
+    await applying
+
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'reconnect', key: bravoKey, via: 'apply', change: { kind: 'credentials-broken' } },
+      { op: 'bring-up', key: bravoKey, via: 'apply', recovery: true, result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: bravoKey, via: 'apply' },
+    ])
+    expect(run.lifecycle.timeline).toEqual([
+      { op: 'reconnect', key: bravoKey, phase: 'start' },
+      { op: 'reconnect', key: bravoKey, phase: 'settled' },
+      { op: 'bring-up', key: bravoKey, phase: 'start' },
+      { op: 'bring-up', key: bravoKey, phase: 'settled' },
+    ])
+    // The reconnect built nothing; the recovery cleared bravo's state and brought it up on the new set's clients.
+    expect(run.composition!.calls).toEqual([
+      ['bringUps.changeCredentials', bravoKey],
+      ['bringUps.cancel', bravoKey],
+      ['connections.stop', bravoKey],
+      ['destinations.forget', bravoKey],
+      ['storageCheck', bravoKey],
+      ['bringUps.bringUp', bravoKey],
+      ['launch', bravoKey],
+    ])
+    expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
+    expect(run.currentStub('bravo')).toBe(run.credentialsStub('bravo', label))
+    const builds = run.slack.buildsOf(bravoKey).filter((b) => b.credentials === label)
+    expect(builds.map((b) => b.kind).sort()).toEqual(['socket', 'validation', 'web'])
+    for (const build of builds) expect(build.hasToken(build.kind === 'socket' ? tokens.appToken : tokens.botToken)).toBe(true)
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+    expect(run.isUp('bravo')).toBe(true)
+    expect(run.admitSession('bravo').kind).toBe('admitted')
+    // alpha: nothing.
+    alphaUntouched()
+    expect(run.composition!.calls.filter(([, key]) => key === alphaKey)).toEqual([])
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run, { refused, console: consoleLines })
+  })
+
+  test('a credentials-broken persona whose file did not change gets no bring-up and no auth.test from an apply that changes something else (real composition)', async () => {
+    const { run } = await running(['alpha', 'bravo'], { realLifecycle: true, slack: { bravo: SLACK_AUTH_REJECTED } })
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('broken')
+    const bravoBefore = slackSideOf(run, 'bravo')
+    const cp = run.checkpoint()
+
+    await applyConfig(run, [
+      h.persona('alpha', { channels: [{ id: ownChannel('alpha'), delivery: 'all' }, { id: EXTRA_CHANNEL, delivery: 'all' }] }),
+      h.persona('bravo'),
+    ])
+
+    expect(run.since(cp).lifecycle).toEqual([{ op: 'update-in-place', key: alphaKey, via: 'apply', settings: ['channels'] }])
+    expect(run.composition!.calls.filter(([, key]) => key === bravoKey)).toEqual([])
+    expect(slackSideOf(run, 'bravo')).toEqual(bravoBefore)
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('broken')
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+})
+
+describe('b.av2 SR-1.4 at apply: a credentials file whose real path is another applied persona\'s', () => {
+  test('recovery after a record-start collision: alpha and bravo share a credentials file, so both are broken; a confirmed removal of alpha leaves bravo broken and untouched, and a byte change to the file, confirmed, brings bravo up at step 6 (real composition)', async () => {
+    const [alpha, charlie] = [h.persona('alpha'), h.persona('charlie')]
+    h.materialize(alpha, charlie)
+    const bravo = h.persona('bravo', { credentials_file: alpha.credentials_file })
+    h.makeWorkingDirectory(bravo)
+    h.writeRecord(configOf(alpha, bravo, charlie))
+    h.writeConfig(configOf(alpha, bravo, charlie))
+    const run = await h.startDetecting({ realLifecycle: true })
+    await run.ticks.tick()
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    for (const key of [alphaKey, bravoKey]) {
+      expect(run.lifecycle.outcome(key)).toBe('broken')
+      expect(run.lifecycle.classes(key)).toEqual([PERSONA_CREDENTIALS_INVALID])
+    }
+
+    // The removal of alpha: bravo stays broken and gets nothing.
+    const removal = run.checkpoint()
+    await applyConfig(run, [bravo, charlie])
+    expect(run.since(removal).lifecycle).toEqual([{ op: 'teardown', key: alphaKey, via: 'apply' }])
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('broken')
+    expect(run.slack.buildsOf(bravoKey)).toEqual([])
+    await expectNothingPendingAfter(run)
+
+    // A re-save with a byte change, confirmed: bravo comes up at step 6.
+    const { tokens } = h.rotateCredentials(bravo)
+    const cp = run.checkpoint()
+    await (await run.confirmPending()).applying
+
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'bring-up', key: bravoKey, via: 'apply', recovery: true, result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: bravoKey, via: 'apply' },
+    ])
+    for (const build of run.slack.buildsOf(bravoKey)) {
+      expect(build.hasToken(build.kind === 'socket' ? tokens.appToken : tokens.botToken)).toBe(true)
+    }
+    expect(run.lifecycle.of('bring-up').filter((r) => r.key === h.key('charlie') && r.via === 'apply')).toEqual([])
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  /**
+   * alpha up with its own file; bravo's credentials_file is a symlink
+   * (`link`) to its own file (`target`), created by `prepare` or left
+   * dangling. Detection started and its first check run.
+   */
+  async function linkedBravo(opts: RunningOptions, writeTarget: boolean) {
+    const alpha = h.persona('alpha')
+    h.materialize(alpha)
+    const own = h.persona('bravo')
+    const link = join(dirname(own.credentials_file), 'credentials-link.json')
+    const bravo = h.persona('bravo', { credentials_file: link })
+    h.makeWorkingDirectory(bravo)
+    h.makeWorkingDirectory({ working_directory: dirname(link) })
+    if (writeTarget) h.writeCredentials(own)
+    symlinkSync(own.credentials_file, link)
+    h.writeRecord(configOf(alpha, bravo))
+    h.writeConfig(configOf(alpha, bravo))
+    const run = await h.startDetecting(opts)
+    await run.ticks.tick()
+    expect(h.pendingExists()).toBe(false)
+    /** Point the symlink at alpha's credentials file. */
+    const retarget = () => {
+      rmSync(link)
+      symlinkSync(alpha.credentials_file, link)
+    }
+    return { run, alpha, bravo, own, retarget }
+  }
+
+  test("a collision created after validation (the symlink retargeted at step 1): the step-6 recovery bring-up of credentials-broken bravo ends credentials-broken with persona-credentials-invalid naming alpha (real composition)", async () => {
+    const { run, bravo, own, retarget } = await linkedBravo({ realLifecycle: true }, false)
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    expect(run.lifecycle.outcome(bravoKey)).toBe('broken')
+    h.writeCredentials(own)
+    run.beforeApplySteps(retarget)
+    const cp = run.checkpoint()
+
+    await (await run.confirmPending()).applying
+
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'bring-up', key: bravoKey, via: 'apply', recovery: true, result: expect.objectContaining({ outcome: 'broken' }) },
+    ])
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('broken')
+    const invalid = run.since(cp).logs.filter((l) => l.startsWith(`[slack] ${PERSONA_CREDENTIALS_INVALID}: `))
+    expect(invalid).toHaveLength(1)
+    expect(invalid[0]).toContain(renderPersonaRef('bravo', bravoKey))
+    expect(invalid[0]).toContain(`of ${renderPersonaRef('alpha', alphaKey)}`)
+    expect(invalid[0]).toContain(JSON.stringify(bravo.credentials_file))
+    expect(run.slack.buildsOf(bravoKey)).toEqual([])
+    expect(run.composition!.calls.filter(([, key]) => key === alphaKey)).toEqual([])
+    expect(run.bringUps.state(alphaKey)?.outcome).toBe('up')
+    expectNoPostNoLeak(run)
+  })
+
+  test("a collision created after validation (the symlink retargeted at step 1): up bravo's confirmed credentials change logs persona-credentials-change-failed naming alpha, keeps its old connection and stays pending", async () => {
+    const { run, bravo, own, retarget } = await linkedBravo({}, true)
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    expect(run.lifecycle.outcome(bravoKey)).toBe('up')
+    const oldIdentity = identityOf(run.stub('bravo'))
+    h.rotateCredentials(own)
+    run.beforeApplySteps(retarget)
+
+    await (await run.confirmPending()).applying
+
+    expect(run.lifecycle.of('reconnect')).toEqual([
+      { op: 'reconnect', key: bravoKey, via: 'apply', change: { kind: 'failed', cause: expect.stringContaining(`of ${renderPersonaRef('alpha', alphaKey)}`) } },
+    ])
+    const failed = changeFailedLines(run, bravo, 1)
+    expect(failed).toHaveLength(1)
+    expect(failed[0]).toContain(`of ${renderPersonaRef('alpha', alphaKey)}`)
+    expect(run.stub('bravo').socket.disconnectCalls).toBe(0)
+    expect(run.currentStub('bravo')).toBe(run.stub('bravo'))
+    expect(run.connections.manager.identity(bravoKey)).toEqual(oldIdentity)
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+    await expectCredentialsPending(run, bravo)
+    expectNoPostNoLeak(run)
+  })
+
+  test("the reconnect's re-check uses the applied set after step 1's swap: alpha removed in the same apply frees its credentials file, and up bravo's symlink retargeted to it at step 1 is no collision, so the reconnect swaps to the tokens read there (real composition)", async () => {
+    const { run, alpha, bravo, own, retarget } = await linkedBravo({ realLifecycle: true }, true)
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    expect(run.lifecycle.outcome(bravoKey)).toBe('up')
+    const oldLabel = h.credentialsLabel('bravo')
+    const { tokens, label } = h.rotateCredentials(own)
+    h.writeConfig(configOf(bravo))
+    // At step 1, after the swap (alpha no longer applied): alpha's file gets bravo's new bytes and bravo's symlink points at it.
+    run.beforeApplySteps(() => {
+      h.writeCredentialsContent(alpha, h.readCredentialsBytes(own)!.toString('utf-8'))
+      retarget()
+    })
+    const activityFrom = run.socketActivity('bravo').length
+    const cp = run.checkpoint()
+
+    await (await run.confirmPending()).applying
+
+    expect(run.appliedKeys()).toEqual([bravoKey])
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: alphaKey, via: 'apply' },
+      { op: 'reconnect', key: bravoKey, via: 'apply', change: { kind: 'swapped' } },
+    ])
+    // No collision was found: no change-failed or invalid line.
+    expect(run.logsOf(PERSONA_CREDENTIALS_CHANGE_FAILED)).toEqual([])
+    expect(run.logsOf(PERSONA_CREDENTIALS_INVALID)).toEqual([])
+    // The new connection, on the tokens read through the retargeted symlink, opened before the old one closed.
+    expect(socketActivitySince(run, 'bravo', activityFrom)).toEqual([
+      `built ${label}`,
+      `started ${label}`,
+      `connected ${label}`,
+      `discarded ${oldLabel}`,
+      `disconnected ${oldLabel}`,
+    ])
+    expect(run.currentStub('bravo')).toBe(run.credentialsStub('bravo', label))
+    const builds = run.slack.buildsOf(bravoKey).filter((b) => b.credentials === label)
+    expect(builds.map((b) => b.kind).sort()).toEqual(['socket', 'validation', 'web'])
+    for (const build of builds) expect(build.hasToken(build.kind === 'socket' ? tokens.appToken : tokens.botToken)).toBe(true)
+    expect(run.connections.manager.identity(bravoKey)).toEqual(identityOf(run.credentialsStub('bravo', label)))
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+    // What it holds is what its path now reads, so nothing is left pending.
+    expect(run.bringUps.credentialsDigest(bravoKey)).toBe(h.credentialsDigestOf(bravo))
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test('control: a credentials file freed by a persona removed in the same apply is used by a persona added in it, because the check runs against the new applied set (real composition)', async () => {
+    const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
+    const [alpha, bravo] = personas
+    const [bravoKey, charlieKey] = keysOf('bravo', 'charlie')
+    const charlie = h.persona('charlie', { credentials_file: bravo!.credentials_file })
+    h.makeWorkingDirectory(charlie)
+    const { tokens } = h.rotateCredentials(charlie)
+    const cp = run.checkpoint()
+
+    await applyConfig(run, [alpha!, charlie])
+
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: bravoKey, via: 'apply' },
+      { op: 'bring-up', key: charlieKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: charlieKey, via: 'apply' },
+    ])
+    for (const build of run.slack.buildsOf(charlieKey)) {
+      expect(build.hasToken(build.kind === 'socket' ? tokens.appToken : tokens.botToken)).toBe(true)
+    }
+    expect(run.logsOf(PERSONA_CREDENTIALS_INVALID)).toEqual([])
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
   })
 })

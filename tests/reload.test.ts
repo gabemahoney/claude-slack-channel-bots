@@ -22,7 +22,11 @@
  * rename that applies (AC 73), invalid (AC 63), stale (AC 69), malformed,
  * unreadable and undeletable confirmations, step 1's record write and its
  * failures, the pending file rewritten after a consumed confirmation (AC 56),
- * `reload-noop`, and the order of the step 2–6 slots; the 64 KiB read cap on
+ * `reload-noop`, and the order of the step 2–6 slots. Confirmed credentials
+ * changes end to end (SR-6.4, SR-8.3, SR-8.6): a persona credentials-broken
+ * at start comes up once its file is fixed and the change confirmed, and
+ * only then (AC 65); a failed change stays pending; the held content follows
+ * the outcome. The 64 KiB read cap on
  * the start, tick and confirmation paths. Every test runs `assertNoLeak` over
  * what each run captured and checks no Slack post, except the one pure case
  * of the default step 3 body (`lifecycleApplySlots` gives each persona one
@@ -43,8 +47,16 @@ import {
   type PersonaConfigFs,
   type PersonaInput,
 } from '../src/config.ts'
-import type { PersonaBringUpOutcome } from '../src/persona-bringup-controller.ts'
+import type { PersonaBringUpOutcome, PersonaCredentialsChangeResult } from '../src/persona-bringup-controller.ts'
 import { CREDENTIALS_UNREADABLE_MARKER } from '../src/persona-credentials.ts'
+import {
+  formatCredentialsChangeFailed,
+  type CredentialsChangeKept,
+  PERSONA_CREDENTIALS_CHANGE_FAILED,
+  PERSONA_CREDENTIALS_INVALID,
+  PERSONA_CREDENTIALS_MISSING,
+  PERSONA_CREDENTIALS_REFUSED,
+} from '../src/persona-diagnostics.ts'
 import {
   RELOAD_APPLIED,
   RELOAD_INVALID,
@@ -66,6 +78,7 @@ import {
 import { composePendingFile, PENDING_FILE_HEADER, reloadFingerprint } from '../src/reload-fingerprint.ts'
 import { createReloadTickDriver } from '../src/reload-timer.ts'
 import { assertNoLeak, fakeToken, LEAK_SENTINEL, makeCredentials, writtenFile } from './test-helpers/credentials.ts'
+import { stubCallCount } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import {
   makeReloadHarness,
@@ -309,7 +322,9 @@ function runHarnessInChild<T>(body: string): { result: T; stderr: string } {
  * the persona's bring-up state and whether the new content can be used:
  * - `reconnect`: up, content valid (a new connection, then the old one closes);
  * - `kept`: up, content unusable (the current connection is kept);
- * - `retry`: retrying, with no connection yet (valid or unusable content);
+ * - `retry`: retrying, with no connection yet: it retries with valid new
+ *   content, and keeps retrying with its current content when the new one is
+ *   unusable;
  * - `bring-up`: broken by its credentials, content valid;
  * - `stays-broken`: broken by its credentials, content still unusable;
  * - `unchecked`: its bring-up state could not be checked (valid or unusable content).
@@ -338,7 +353,10 @@ function credentialsChangedLine(persona: PersonaInput, effect: CredentialsEffect
     case 'kept':
       return `${head}: the current connection is kept, instance kept.`
     case 'retry':
-      return `${head}: it has no connection yet, so it retries with the new content, instance kept.`
+      // Unusable content is not taken: the persona keeps retrying with what it holds.
+      return cause === undefined
+        ? `${changed}: it has no connection yet, so it retries with the new content, instance kept.`
+        : `${head}: it keeps retrying with its current content, instance kept.`
     case 'bring-up':
       return `${changed}: it is broken by its credentials now, so it will be brought up.`
     case 'stays-broken':
@@ -1477,7 +1495,8 @@ describe('detection compares each referenced credentials file with what its pers
   const badPrefix: Edit = (p) => void h.writeCredentialsContent(p, { bot_token: fakeToken('xoxp-') })
 
   // The preview's effect is decided by the persona's bring-up state and whether the new content can be used (b.av2
-  // SR-8.6): up is reconnected when it can, else keeps its current connection; retrying retries with the new content;
+  // SR-8.6): up is reconnected when it can, else keeps its current connection; retrying retries with the new content
+  // when it can, else keeps retrying with its current content;
   // broken by its credentials (a local credentials failure, or Slack refusing a token) is brought up when it can,
   // else stays broken. The cause is the credentials check's own wording over the bytes the tick read. A persona
   // broken by a missing file that is then created, or by invalid content that is then fixed, is the AC 65 (preview
@@ -2479,6 +2498,7 @@ describe('the default step 3 body updates each persona once (lifecycleApplySlots
     const members: ApplyLifecycleMembers = {
       teardown: async (persona) => void calls.push(`teardown ${persona.key}`),
       bringUp: async (persona) => void calls.push(`bringUp ${persona.key}`),
+      reconnectCredentials: async (persona) => void calls.push(`reconnectCredentials ${persona.key}`),
       updateInPlace: async (change) => {
         calls.push(`updateInPlace ${change.persona.key}`)
         updates.push(change)
@@ -3314,6 +3334,421 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expect(run.logsOf(RELOAD_NOOP)).toEqual([noopLogged()])
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
     expect(h.readRecord()).toEqual(candidate)
+    expectNoPostNoLeak(run)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Confirmed credentials changes end to end (b.av2 SR-6.4, SR-8.3, SR-8.4, SR-8.6; AC 65)
+// ---------------------------------------------------------------------------
+
+describe('confirmed credentials changes: recovery of a credentials-broken persona (AC 65) and the pending state end to end', () => {
+  /** How the persona starts credentials-broken, and the class of its start-time line. */
+  interface StartCause {
+    label: string
+    prepare: (alpha: PersonaInput) => void
+    slack?: StubSlackOptions
+    cls: string
+  }
+  const MISSING_AT_START: StartCause = {
+    label: 'a missing credentials file',
+    prepare: () => undefined,
+    cls: PERSONA_CREDENTIALS_MISSING,
+  }
+  const INVALID_AT_START: StartCause = {
+    label: 'a locally invalid credentials file',
+    // Malformed content holding the sentinel: no cause or preview may echo it.
+    prepare: (p) => void h.writeCredentialsContent(p, `{${LEAK_SENTINEL}`),
+    cls: PERSONA_CREDENTIALS_INVALID,
+  }
+  const REFUSED_AT_START: StartCause = {
+    label: 'a token Slack refused',
+    prepare: (p) => void h.writeCredentials(p),
+    slack: SLACK_AUTH_REJECTED,
+    cls: PERSONA_CREDENTIALS_REFUSED,
+  }
+
+  /**
+   * A running server whose record and config file (byte-equal) hold alpha,
+   * credentials-broken at start by `cause`, and bravo, healthy; detection
+   * started and its first check run (nothing pending).
+   */
+  async function brokenBesideHealthy(
+    cause: StartCause,
+    opts: ReloadRunOptions = {},
+  ): Promise<{ run: ReloadRun; alpha: PersonaInput }> {
+    const [bravo] = materialized('bravo')
+    const alpha = h.persona('alpha')
+    h.makeWorkingDirectory(alpha)
+    cause.prepare(alpha)
+    h.writeRecord(configOf(alpha, bravo!))
+    h.writeConfig(configOf(alpha, bravo!))
+    const run = await h.startDetecting({ ...opts, slack: cause.slack === undefined ? undefined : { alpha: cause.slack } })
+    await run.ticks.tick()
+    expect(run.bringUps.state(h.key('alpha'))?.outcome).toBe('broken')
+    expect(run.lifecycle.classes(h.key('alpha'))).toEqual([cause.cls])
+    expect(run.isUp('alpha')).toBe(false)
+    expect(run.isUp('bravo')).toBe(true)
+    expect(h.pendingExists()).toBe(false)
+    return { run, alpha }
+  }
+
+  /** The start-rules line of class `cls` for `persona` (declared first), by its persona and path. */
+  function brokenLinePrefix(cls: string, persona: PersonaInput): string {
+    return `[slack] ${cls}: personas[0] ${JSON.stringify(persona.name)} (key=${h.key(persona.name)}) path=${JSON.stringify(persona.credentials_file)}: `
+  }
+
+  /**
+   * Matches alpha's one `persona-credentials-change-failed` line by its
+   * persona and path, for a Slack refusal whose cause is the classifier's;
+   * the rest of its wording is pinned with the diagnostics.
+   */
+  function changeFailedLine(persona: PersonaInput): string {
+    const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return expect.stringMatching(new RegExp(`^${escape(brokenLinePrefix(PERSONA_CREDENTIALS_CHANGE_FAILED, persona))}`))
+  }
+
+  /** personas[0]'s whole `persona-credentials-change-failed` line: its cause and what it keeps (its connection, or with none yet its content). */
+  function changeFailedExact(persona: PersonaInput, cause: string, kept: CredentialsChangeKept): string {
+    const path = persona.credentials_file!
+    return formatCredentialsChangeFailed({ name: persona.name, key: h.key(persona.name), index: 0, path, cause, kept })
+  }
+
+  /** The `[slack] reload…` lines of a stretch (the reload controller's own classes). */
+  function reloadLines(activity: ReloadRunActivity): string[] {
+    return activity.logs.filter((line) => line.startsWith('[slack] reload'))
+  }
+
+  /** The bravo-side view an apply must leave alone: its lifecycle records, Slack clients and Web API calls. */
+  function bravoSide(run: ReloadRun) {
+    const key = h.key('bravo')
+    return {
+      records: run.lifecycle.records.filter((r) => r.key === key).length,
+      builds: run.slack.buildsOf(key).length,
+      calls: run.slackCalls()[key]?.length,
+      up: run.isUp('bravo'),
+    }
+  }
+
+  const notJson = (p: PersonaInput) => void h.writeCredentialsContent(p, `{${LEAK_SENTINEL}`)
+
+  // Over the recorder's stand-in and over the real lifecycle composition (persona-lifecycle.ts's recovery).
+  const AC65_ROWS = [MISSING_AT_START, INVALID_AT_START, REFUSED_AT_START].flatMap((cause) => [
+    { cause, label: cause.label, realLifecycle: false, over: "the recorder's stand-in lifecycle" },
+    { cause, label: cause.label, realLifecycle: true, over: 'the real lifecycle composition' },
+  ])
+
+  test.each(AC65_ROWS)(
+    'AC 65: a persona credentials-broken at start by $label ($over) is previewed as brought up once a good file is placed, stays broken over many ticks and a long clock advance, and after one rename comes up with the new tokens, with no restart and nothing done to the healthy persona',
+    async ({ cause, realLifecycle }) => {
+      const { run, alpha } = await brokenBesideHealthy(cause, { realLifecycle })
+      const key = h.key('alpha')
+      const bravoBefore = bravoSide(run)
+      const cp = run.checkpoint()
+
+      const { tokens } = h.rotateCredentials(alpha)
+      await run.ticks.tick()
+      expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'bring-up')])
+      // Checked while the pending file exists: the new token set is in neither it nor the log.
+      assertNoLeak(run.captured())
+
+      // Neither detection nor time brings it up: it is not retried, and ticks apply nothing.
+      await run.ticks.ticks(50)
+      await run.clock.advance(3_600_000)
+      await run.ticks.ticks(50)
+      expect(run.since(cp)).toEqual(pendingWritten())
+      expect(run.bringUps.state(key)?.outcome).toBe('broken')
+      expect(run.isUp('alpha')).toBe(false)
+      const applyCp = run.checkpoint()
+
+      h.confirm()
+      await run.ticks.tick()
+
+      // Step 6's recovery bring-up, then its launch: no reconnect, and nothing for bravo.
+      expect(run.since(applyCp).lifecycle).toEqual([
+        { op: 'bring-up', key, via: 'apply', recovery: true, result: { outcome: 'up', failures: [] } },
+        { op: 'launch', key, via: 'apply' },
+      ])
+      expect(run.bringUps.state(key)?.outcome).toBe('up')
+      expect(run.isUp('alpha')).toBe(true)
+      expect(run.slack.buildsOf(key, 'validation').at(-1)!.hasToken(tokens.botToken)).toBe(true)
+      expect(run.slack.buildsOf(key, 'socket').at(-1)!.hasToken(tokens.appToken)).toBe(true)
+      expect(run.bringUps.credentialsDigest(key)).toBe(h.credentialsDigestOf(alpha))
+      // No restart: the one start pass, the same run.
+      expect(run.lifecycle.startPasses).toHaveLength(1)
+      expect(bravoSide(run)).toEqual(bravoBefore)
+      if (realLifecycle) {
+        // Its leftover state is cleared before the fresh bring-up; its instance is kept (no agent-director call).
+        expect(run.composition!.calls).toEqual([
+          ['bringUps.cancel', key],
+          ['connections.stop', key],
+          ['destinations.forget', key],
+          ['storageCheck', key],
+          ['bringUps.bringUp', key],
+          ['launch', key],
+        ])
+        expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
+      }
+      expect(reloadLines(run.since(applyCp))).toEqual([appliedLogged({ credentials: 1 })])
+      expect(h.pendingExists()).toBe(false)
+
+      const later = run.checkpoint()
+      await run.ticks.ticks(5)
+      expect(run.since(later)).toEqual(NO_RUN_ACTIVITY)
+      expectNoPostNoLeak(run)
+    },
+  )
+
+  test("SR-6.4: a persona Slack refused at start, whose app is then fixed on Slack's side, stays broken with no auth.test retry over ticks and backoff periods; a byte-only re-save of its file, confirmed, brings it up", async () => {
+    const { run, alpha } = await brokenBesideHealthy(REFUSED_AT_START)
+    const key = h.key('alpha')
+    const stub = run.stub('alpha')
+    // The scripted refusal is used up: Slack now accepts the same token.
+    expect(stub.script.authTest).toEqual([])
+    expect(stub.calls.authTest).toHaveLength(1)
+    const cp = run.checkpoint()
+
+    // Well past the SR-3.2 schedule's steps (5 s doubling to 300 s), with checks in between.
+    for (let i = 0; i < 12; i++) {
+      await run.clock.advance(300_000)
+      await run.ticks.ticks(5)
+    }
+    expect(run.since(cp)).toEqual(NO_RUN_ACTIVITY)
+    expect(stub.calls.authTest).toHaveLength(1)
+    expect(run.clock.pendingCount()).toBe(0)
+    expect(run.bringUps.state(key)?.outcome).toBe('broken')
+    expect(run.isUp('alpha')).toBe(false)
+
+    // Same tokens, one more byte: a credentials change, previewed as a bring-up.
+    h.writeCredentialsContent(alpha, withNewline(h.readCredentialsBytes(alpha)!).toString('utf-8'))
+    await run.ticks.tick()
+    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'bring-up')])
+    assertNoLeak(run.captured())
+    expect(stub.calls.authTest).toHaveLength(1)
+    const applyCp = run.checkpoint()
+
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(run.since(applyCp).lifecycle).toEqual([
+      { op: 'bring-up', key, via: 'apply', recovery: true, result: { outcome: 'up', failures: [] } },
+      { op: 'launch', key, via: 'apply' },
+    ])
+    expect(stub.calls.authTest).toHaveLength(2)
+    expect(run.isUp('alpha')).toBe(true)
+    expect(run.bringUps.credentialsDigest(key)).toBe(h.credentialsDigestOf(alpha))
+    expect(h.pendingExists()).toBe(false)
+    expectNoPostNoLeak(run)
+  })
+
+  test.each<{ label: string; edit: (alpha: PersonaInput) => void; effect: CredentialsEffect; cause?: string }>([
+    { label: 'rewritten as malformed JSON holding a token', edit: notJson, effect: 'kept', cause: CREDENTIALS_NOT_JSON },
+    { label: 'deleted', edit: (p) => h.deleteCredentials(p), effect: 'kept', cause: CREDENTIALS_MISSING },
+    {
+      label: 'rotated to tokens Slack refuses',
+      edit: (p) => void h.rotateCredentials(p, { slack: SLACK_AUTH_REJECTED }),
+      effect: 'reconnect',
+    },
+  ])('SR-8.3: a confirmed credentials change of an up persona whose new file is $label is not used: one persona-credentials-change-failed line, the old connection keeps serving, the change stays pending with its credentials line, and a good file confirmed afresh reconnects', async ({ edit, effect, cause }) => {
+    const { run, personas } = await running(['alpha', 'bravo'])
+    const alpha = personas[0]!
+    const key = h.key('alpha')
+    const held = run.bringUps.credentialsDigest(key)
+    const sockets = run.socketActivity('alpha')
+    const identity = run.connections.manager.identity(key)
+    const bravoBefore = bravoSide(run)
+
+    edit(alpha)
+    await run.ticks.tick()
+    const preview = [previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, effect, cause)]
+    expect(h.pendingLines()).toEqual(preview)
+    const fingerprint = h.pendingFingerprint()
+    assertNoLeak(run.captured())
+    const cp = run.checkpoint()
+
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'reconnect', key, via: 'apply', change: { kind: 'failed', cause: expect.any(String) } },
+    ])
+    // A local cause is pinned whole, with what an up persona keeps: its connection.
+    expect(run.logsOf(PERSONA_CREDENTIALS_CHANGE_FAILED)).toEqual([
+      cause === undefined ? changeFailedLine(alpha) : changeFailedExact(alpha, cause, 'connection'),
+    ])
+    // Still pending, in the same state: the pending file is written again with the credentials line.
+    expect(h.pendingLines()).toEqual(preview)
+    expect(h.pendingFingerprint()).toBe(fingerprint)
+    expect(run.bringUps.credentialsDigest(key)).toBe(held)
+    // The old connection keeps serving: no socket opened or closed, the same identity, still up.
+    expect(run.socketActivity('alpha')).toEqual(sockets)
+    expect(run.connections.manager.identity(key)).toEqual(identity)
+    expect(run.connections.manager.status(key)?.state).toBe('up')
+    expect(run.isUp('alpha')).toBe(true)
+    // Checked while the pending file exists.
+    assertNoLeak(run.captured())
+
+    // Later checks leave it pending and apply nothing.
+    const quiet = run.checkpoint()
+    await run.ticks.ticks(10)
+    expect(run.since(quiet)).toEqual(NO_RUN_ACTIVITY)
+
+    const { label } = h.rotateCredentials(alpha)
+    await run.ticks.tick()
+    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'reconnect')])
+    assertNoLeak(run.captured())
+    const fix = run.checkpoint()
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(run.since(fix).lifecycle).toEqual([{ op: 'reconnect', key, via: 'apply', change: { kind: 'swapped' } }])
+    expect(run.currentStub('alpha')).toBe(run.credentialsStub('alpha', label))
+    expect(run.bringUps.credentialsDigest(key)).toBe(h.credentialsDigestOf(alpha))
+    expect(run.logsOf(PERSONA_CREDENTIALS_CHANGE_FAILED)).toHaveLength(1)
+    expect(h.pendingExists()).toBe(false)
+    expect(bravoSide(run)).toEqual(bravoBefore)
+    expectNoPostNoLeak(run)
+  })
+
+  test('SR-8.3: a retrying persona (Slack unreachable) whose confirmed new file is unusable keeps retrying with its current content and the change stays pending; a good file confirmed then is what its next retry comes up with', async () => {
+    const { run, personas } = await running(['alpha', 'bravo'], { slack: { alpha: SLACK_UNREACHABLE } })
+    const alpha = personas[0]!
+    const key = h.key('alpha')
+    const firstSet = run.stub('alpha')
+    expect(run.bringUps.state(key)?.outcome).toBe('retrying')
+    const held = run.bringUps.credentialsDigest(key)
+    const bravoBefore = bravoSide(run)
+
+    notJson(alpha)
+    await run.ticks.tick()
+    const preview = [previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'retry', CREDENTIALS_NOT_JSON)]
+    expect(h.pendingLines()).toEqual(preview)
+    assertNoLeak(run.captured())
+    const cp = run.checkpoint()
+
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'reconnect', key, via: 'apply', change: { kind: 'failed', cause: CREDENTIALS_NOT_JSON } },
+    ])
+    // The whole line: with no connection yet, what it keeps is its current content.
+    expect(run.logsOf(PERSONA_CREDENTIALS_CHANGE_FAILED)).toEqual([changeFailedExact(alpha, CREDENTIALS_NOT_JSON, 'content')])
+    expect(h.pendingLines()).toEqual(preview)
+    expect(run.bringUps.credentialsDigest(key)).toBe(held)
+    assertNoLeak(run.captured())
+    // Its next retry still uses the content it holds: another auth.test on the first set's stub.
+    const attempts = firstSet.calls.authTest.length
+    await run.clock.advance(300_000)
+    expect(firstSet.calls.authTest.length).toBeGreaterThan(attempts)
+    expect(run.bringUps.state(key)?.outcome).toBe('retrying')
+
+    const { tokens, label } = h.rotateCredentials(alpha)
+    await run.ticks.tick()
+    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'retry')])
+    assertNoLeak(run.captured())
+    const fix = run.checkpoint()
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(run.since(fix).lifecycle).toEqual([
+      { op: 'reconnect', key, via: 'apply', change: { kind: 'retrying', connection: 'none' } },
+    ])
+    // Nothing is pending: it holds the new file's content, which its retries now use.
+    expect(run.bringUps.credentialsDigest(key)).toBe(h.credentialsDigestOf(alpha))
+    expect(h.pendingExists()).toBe(false)
+    await run.clock.advance(300_000)
+    expect(run.bringUps.state(key)?.outcome).toBe('up')
+    expect(run.isUp('alpha')).toBe(true)
+    expect(run.currentStub('alpha')).toBe(run.credentialsStub('alpha', label))
+    expect(run.slack.buildsOf(key, 'validation').at(-1)!.hasToken(tokens.botToken)).toBe(true)
+    expect(run.lifecycle.of('launch').filter((r) => r.key === key)).toEqual([{ op: 'launch', key, via: 'retry' }])
+    expect(bravoSide(run)).toEqual(bravoBefore)
+    expectNoPostNoLeak(run)
+  })
+
+  test.each<{ label: string; slack?: StubSlackOptions; change: PersonaCredentialsChangeResult }>([
+    { label: 'the new connection swapped in', change: { kind: 'swapped' } },
+    {
+      label: 'the new connection left retrying (Slack unreachable)',
+      slack: SLACK_UNREACHABLE,
+      change: { kind: 'retrying', connection: 'kept' },
+    },
+  ])('SR-8.3: after a confirmed rotation of an up persona with $label, it holds the new file’s content, so nothing is pending and later checks do nothing', async ({ slack, change }) => {
+    const { run, personas } = await running(['alpha', 'bravo'])
+    const alpha = personas[0]!
+    const key = h.key('alpha')
+    const bravoBefore = bravoSide(run)
+    h.rotateCredentials(alpha, { slack })
+    await run.ticks.tick()
+    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, 'reconnect')])
+    assertNoLeak(run.captured())
+    const cp = run.checkpoint()
+
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(run.since(cp).lifecycle).toEqual([{ op: 'reconnect', key, via: 'apply', change }])
+    expect(run.bringUps.credentialsDigest(key)).toBe(h.credentialsDigestOf(alpha))
+    expect(run.isUp('alpha')).toBe(true)
+    // The apply's own line says what happened; no preview and no failure line.
+    expect(reloadLines(run.since(cp))).toEqual([appliedLogged({ credentials: 1 })])
+    expect(run.logsOf(PERSONA_CREDENTIALS_CHANGE_FAILED)).toEqual([])
+    expect(h.pendingExists()).toBe(false)
+
+    const later = run.checkpoint()
+    await run.ticks.ticks(10)
+    expect(run.since(later)).toEqual(NO_RUN_ACTIVITY)
+    expect(bravoSide(run)).toEqual(bravoBefore)
+    expectNoPostNoLeak(run)
+  })
+
+  test.each<{ label: string; start: StartCause; edit: (alpha: PersonaInput) => void; preview: (alpha: PersonaInput) => string; cls: string }>([
+    {
+      label: 'broken by a missing file, given malformed JSON holding a token',
+      start: MISSING_AT_START,
+      edit: notJson,
+      preview: (p) => credentialsChangedLine(p, 'stays-broken', CREDENTIALS_NOT_JSON),
+      cls: PERSONA_CREDENTIALS_INVALID,
+    },
+    {
+      label: 'refused by Slack, given tokens Slack refuses too',
+      start: REFUSED_AT_START,
+      edit: (p) => void h.rotateCredentials(p, { slack: SLACK_AUTH_REJECTED }),
+      preview: (p) => credentialsChangedLine(p, 'bring-up'),
+      cls: PERSONA_CREDENTIALS_REFUSED,
+    },
+  ])('SR-8.3: a credentials-broken persona ($label) whose confirmed new file is still bad stays credentials-broken with its start-rules line, not persona-credentials-change-failed, and holds the new file’s content, so nothing is pending', async ({ start, edit, preview, cls }) => {
+    const { run, alpha } = await brokenBesideHealthy(start)
+    const key = h.key('alpha')
+    const bravoBefore = bravoSide(run)
+    edit(alpha)
+    await run.ticks.tick()
+    expect(h.pendingLines()).toEqual([previewHeader({ credentials: 1 }), preview(alpha)])
+    assertNoLeak(run.captured())
+    const cp = run.checkpoint()
+
+    h.confirm()
+    await run.ticks.tick()
+
+    const since = run.since(cp)
+    expect(since.lifecycle.map((r) => [r.op, r.key, r.via, r.recovery, r.result?.outcome])).toEqual([
+      ['bring-up', key, 'apply', true, 'broken'],
+    ])
+    expect(run.lifecycle.classes(key)).toEqual([cls])
+    expect(run.bringUps.state(key)?.outcome).toBe('broken')
+    expect(run.isUp('alpha')).toBe(false)
+    expect(since.logs.filter((line) => line.startsWith(brokenLinePrefix(cls, alpha)))).toHaveLength(1)
+    expect(run.logsOf(PERSONA_CREDENTIALS_CHANGE_FAILED)).toEqual([])
+    // The held digest is the content that broke it (b.av2 SR-8.3): nothing is pending.
+    expect(run.bringUps.credentialsDigest(key)).toBe(h.credentialsDigestOf(alpha))
+    expect(reloadLines(since)).toEqual([appliedLogged({ credentials: 1 })])
+    expect(h.pendingExists()).toBe(false)
+
+    const later = run.checkpoint()
+    await run.ticks.ticks(10)
+    expect(run.since(later)).toEqual(NO_RUN_ACTIVITY)
+    expect(bravoSide(run)).toEqual(bravoBefore)
     expectNoPostNoLeak(run)
   })
 })

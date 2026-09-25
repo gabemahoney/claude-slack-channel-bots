@@ -14,7 +14,8 @@
  *   consumes, record acks, drop on demand and can be started again;
  * - per-call scripted outcomes for `auth.test`, socket `start()`,
  *   `chat.postMessage`, `chat.update`, `filesUploadV2`, `conversations.history`,
- *   `conversations.replies`, `conversations.info` and `conversations.open`
+ *   `conversations.replies`, `conversations.info`, `conversations.open`,
+ *   `reactions.add`, `reactions.remove`, `users.info` and `apiCall`
  *   (`script`), falling back to success when exhausted; a Web API call
  *   scripted with a deferred outcome (`makeDeferredWebApiCall`) answers only
  *   when the test settles it;
@@ -29,7 +30,11 @@
  * manager's injected `PersonaSlackClientFactory`: one factory serves every
  * persona, routing each build to the persona whose token it received (the app
  * token for a socket client, the bot token for a Web API client), and records
- * every client it built with its kind, persona, options and token.
+ * every client it built with its kind, persona, credential set, options and
+ * token. A persona can hold several credential sets (`addCredentials`, for a
+ * rotated pair), each with its own stub, so its old and new tokens are
+ * scripted apart; `activity` records, in order, each client built, started,
+ * connected, disconnected and discarded.
  *
  * Failure shapes follow the installed libraries, `@slack/web-api` 7.15.0 and
  * `@slack/socket-mode` 2.0.6, whose `ErrorCode` values the stub uses directly:
@@ -290,6 +295,14 @@ export interface StubSlackScript {
    * (no `StubSlackOptions` counterpart); push onto `stub.script.open`.
    */
   open: WebApiOutcome[]
+  /** `reactions.add`. */
+  reactionsAdd: WebApiOutcome[]
+  /** `reactions.remove`. */
+  reactionsRemove: WebApiOutcome[]
+  /** `users.info`; an `ok` `result` can set `user`. */
+  usersInfo: WebApiOutcome[]
+  /** `apiCall(method, options)`, whatever the method; an unscripted call answers `{ ok: true }`. */
+  apiCall: WebApiOutcome[]
 }
 
 export interface StubSlackOptions {
@@ -309,6 +322,14 @@ export interface StubSlackOptions {
   replies?: readonly WebApiOutcome[]
   /** Initial `conversations.info` outcomes. */
   info?: readonly WebApiOutcome[]
+  /** Initial `reactions.add` outcomes. */
+  reactionsAdd?: readonly WebApiOutcome[]
+  /** Initial `reactions.remove` outcomes. */
+  reactionsRemove?: readonly WebApiOutcome[]
+  /** Initial `users.info` outcomes. */
+  usersInfo?: readonly WebApiOutcome[]
+  /** Initial `apiCall` outcomes. */
+  apiCall?: readonly WebApiOutcome[]
   /**
    * Bot token of the ready `web` client. Default: a sentinel-bearing
    * `fakeToken(BOT_TOKEN_PREFIX, …)` with a random suffix, distinct per stub.
@@ -362,6 +383,8 @@ export type StubWebMethod =
   | 'conversations.info'
   | 'users.info'
   | 'filesUploadV2'
+  /** `apiCall(method, options)`: logged with `args` `{ method, options }`. */
+  | 'apiCall'
 
 /** One Web API call, logged when the call is made (before its outcome, so a failed call is logged too). */
 export interface StubWebCall {
@@ -396,7 +419,13 @@ export interface StubWebClient {
     info: WebClient['conversations']['info']
   }
   users: { info: WebClient['users']['info'] }
+  /** As on the real `WebClient`, a prototype method that needs the client as `this` (a detached call throws). */
   filesUploadV2: WebClient['filesUploadV2']
+  /**
+   * The generic call, as `WebClient.apiCall`; scripted through `script.apiCall` whatever `method` names.
+   * As on the real `WebClient`, a prototype method that needs the client as `this` (a detached call throws).
+   */
+  apiCall: WebClient['apiCall']
 }
 
 /**
@@ -514,6 +543,14 @@ export interface StubSlackCalls {
   conversationsHistory: Parameters<WebClient['conversations']['history']>[0][]
   conversationsReplies: Parameters<WebClient['conversations']['replies']>[0][]
   conversationsInfo: Parameters<WebClient['conversations']['info']>[0][]
+  /** `apiCall` calls: the method named and the options passed. */
+  apiCall: StubApiCall[]
+}
+
+/** One captured `apiCall(method, options)`. */
+export interface StubApiCall {
+  readonly method: string
+  readonly options: Record<string, unknown> | undefined
 }
 
 export interface StubSlack {
@@ -697,12 +734,53 @@ function randomIdTail(): string {
   return crypto.randomUUID().replace(/-/g, '').slice(0, 9).toUpperCase()
 }
 
+/** Where a stub Web API client keeps what its prototype methods read through `this`. */
+const STUB_WEB_CLIENT_STATE = Symbol('stub web client state')
+
+/** The per-client implementations `apiCall` and `filesUploadV2` reach through `this`. */
+interface StubWebClientState {
+  apiCall: WebClient['apiCall']
+  filesUploadV2: WebClient['filesUploadV2']
+}
+
+/** The client state `self` (a method's `this`) reaches, own or inherited; throws as a real client's method does without its `this`. */
+function stubWebClientState(self: unknown, method: string): StubWebClientState {
+  const state = (self as { [STUB_WEB_CLIENT_STATE]?: StubWebClientState } | null | undefined)?.[STUB_WEB_CLIENT_STATE]
+  if (state === undefined) throw new TypeError(`stub WebClient.${method} called without its client as this`)
+  return state
+}
+
+/**
+ * The prototype of every stub Web API client. As on the real `WebClient`,
+ * `apiCall` and `filesUploadV2` are prototype methods that need the client
+ * as `this` (the real ones read the client's token, options and queue), while
+ * the namespace methods (`chat.postMessage`, …) are bound per client and work
+ * detached. A wrapper whose prototype is the client (the Web API watch's)
+ * reaches the state through its prototype chain. Holds no state of its own.
+ */
+const STUB_WEB_CLIENT_PROTOTYPE: Pick<StubWebClient, 'apiCall' | 'filesUploadV2'> = {
+  apiCall(this: unknown, method, apiOptions) {
+    return stubWebClientState(this, 'apiCall').apiCall(method, apiOptions)
+  },
+  filesUploadV2(this: unknown, args) {
+    return stubWebClientState(this, 'filesUploadV2').filesUploadV2(args)
+  },
+}
+
 // ---------------------------------------------------------------------------
 // makeStubSlack
 // ---------------------------------------------------------------------------
 
 /** Build one independent fake Slack. See the module comment for behaviour. */
 export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
+  return buildStubSlack(opts, undefined)
+}
+
+/** What a socket client did, as the factory's activity record reports it (see `StubClientEvent`). */
+type SocketEventObserver = (socket: StubSocketClient, event: Exclude<StubClientEvent, 'built'>) => void
+
+/** `makeStubSlack`, telling `observe` (if given) what each socket client does. */
+function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | undefined): StubSlack {
   const marker = opts.leakMarker
   const identity = {
     botUserId: opts.botUserId ?? `U${randomIdTail()}`,
@@ -719,6 +797,10 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
     replies: [...(opts.replies ?? [])],
     info: [...(opts.info ?? [])],
     open: [],
+    reactionsAdd: [...(opts.reactionsAdd ?? [])],
+    reactionsRemove: [...(opts.reactionsRemove ?? [])],
+    usersInfo: [...(opts.usersInfo ?? [])],
+    apiCall: [...(opts.apiCall ?? [])],
   }
   const calls: StubSlackCalls = {
     authTest: [],
@@ -732,6 +814,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
     conversationsHistory: [],
     conversationsReplies: [],
     conversationsInfo: [],
+    apiCall: [],
   }
   const options: StubSlack['options'] = { web: [], socket: [] }
   const sockets: StubSocketClient[] = []
@@ -761,7 +844,24 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
       runWebApiCall(outcome, ctx(method), (overrides) =>
         mergeDroppingUndefined({ ok: true, messages: [], has_more: false }, overrides),
       )
-    const client: StubWebClient = {
+    const state: StubWebClientState = {
+      filesUploadV2: (args) => {
+        record('filesUploadV2', args)
+        calls.filesUploadV2.push(args)
+        const outcome = script.upload.shift()
+        return runWebApiCall(outcome, ctx('files.completeUploadExternal'), (overrides) => {
+          const id = `F0STUB${String(++fileSeq).padStart(4, '0')}`
+          return mergeDroppingUndefined({ ok: true, files: [{ ok: true, files: [{ id }] }] }, overrides)
+        })
+      },
+      apiCall: (method, apiOptions) => {
+        const captured: StubApiCall = { method, options: apiOptions }
+        record('apiCall', captured)
+        calls.apiCall.push(captured)
+        return runWebApiCall(script.apiCall.shift(), ctx(method), (overrides) => mergeDroppingUndefined({ ok: true }, overrides))
+      },
+    }
+    const own: Omit<StubWebClient, 'apiCall' | 'filesUploadV2' | 'token'> = {
       hasToken: (expected: string) => expected === token,
       callLog: clientCallLog,
       auth: {
@@ -818,12 +918,16 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
         add: (args) => {
           record('reactions.add', args)
           calls.reactionsAdd.push(args)
-          return Promise.resolve({ ok: true })
+          return runWebApiCall(script.reactionsAdd.shift(), ctx('reactions.add'), (overrides) =>
+            mergeDroppingUndefined({ ok: true }, overrides),
+          )
         },
         remove: (args) => {
           record('reactions.remove', args)
           calls.reactionsRemove.push(args)
-          return Promise.resolve({ ok: true })
+          return runWebApiCall(script.reactionsRemove.shift(), ctx('reactions.remove'), (overrides) =>
+            mergeDroppingUndefined({ ok: true }, overrides),
+          )
         },
       },
       conversations: {
@@ -873,29 +977,28 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
         info: (args) => {
           record('users.info', args)
           calls.usersInfo.push(args)
-          return Promise.resolve({
-            ok: true,
-            user: {
-              id: args.user,
-              team_id: identity.teamId,
-              name: 'stub-user',
-              real_name: 'Stub User',
-              is_bot: false,
-              profile: { display_name: 'stub-user', real_name: 'Stub User' },
-            },
-          })
+          return runWebApiCall(script.usersInfo.shift(), ctx('users.info'), (overrides) =>
+            mergeDroppingUndefined(
+              {
+                ok: true,
+                user: {
+                  id: args.user,
+                  team_id: identity.teamId,
+                  name: 'stub-user',
+                  real_name: 'Stub User',
+                  is_bot: false,
+                  profile: { display_name: 'stub-user', real_name: 'Stub User' },
+                },
+              },
+              overrides,
+            ),
+          )
         },
       },
-      filesUploadV2: (args) => {
-        record('filesUploadV2', args)
-        calls.filesUploadV2.push(args)
-        const outcome = script.upload.shift()
-        return runWebApiCall(outcome, ctx('files.completeUploadExternal'), (overrides) => {
-          const id = `F0STUB${String(++fileSeq).padStart(4, '0')}`
-          return mergeDroppingUndefined({ ok: true, files: [{ ok: true, files: [{ id }] }] }, overrides)
-        })
-      },
     }
+    // `apiCall` and `filesUploadV2` come from the prototype and reach `state` through `this`.
+    const client: StubWebClient = Object.assign(Object.create(STUB_WEB_CLIENT_PROTOTYPE) as typeof STUB_WEB_CLIENT_PROTOTYPE, own)
+    Object.defineProperty(client, STUB_WEB_CLIENT_STATE, { value: state, enumerable: false })
     // Not enumerable, as E2's build records keep `token`: a printed or compared client never shows it.
     Object.defineProperty(client, 'token', { value: token, enumerable: false })
     return client
@@ -974,6 +1077,17 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
       await Promise.all(results)
     }
 
+    function totalListeners(): number {
+      let total = 0
+      for (const list of listeners.values()) total += list.length
+      return total
+    }
+
+    /** A removal that took the last listener away: the client was discarded. */
+    function noteIfDiscarded(before: number): void {
+      if (before > 0 && totalListeners() === 0) observe?.(client, 'discarded')
+    }
+
     const client: StubSocketClient = {
       options: socketOptions,
       on(event, listener) {
@@ -988,14 +1102,18 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
         return this.removeListener(event, listener)
       },
       removeListener(event, listener) {
+        const before = totalListeners()
         const list = listeners.get(event) ?? []
         const i = list.findIndex((entry) => entry.fn === listener)
         if (i !== -1) list.splice(i, 1)
+        noteIfDiscarded(before)
         return this
       },
       removeAllListeners(event) {
+        const before = totalListeners()
         if (event === undefined) listeners.clear()
         else listeners.delete(event)
+        noteIfDiscarded(before)
         return this
       },
       listenerCount(event) {
@@ -1004,6 +1122,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
 
       async start() {
         startCalls++
+        observe?.(client, 'started')
         const scripted: ConnectOutcome = script.connect.shift() ?? { kind: 'ok' }
         // The apps.connections.open leg: a failure here rejects start() with no event.
         await Promise.resolve()
@@ -1027,6 +1146,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
             if (!wsOpen || pendingStart === null) return
             if (outcome.kind === 'ok') {
               connected = true
+              observe?.(client, 'connected')
               const pending = pendingStart
               pendingStart = null
               try {
@@ -1053,6 +1173,7 @@ export function makeStubSlack(opts: StubSlackOptions = {}): StubSlack {
 
       async disconnect() {
         disconnectCalls++
+        observe?.(client, 'disconnected')
         emitLifecycle('disconnecting')
         if (wsCreated) closeSocket()
         else emitLifecycle('disconnected')
@@ -1156,9 +1277,18 @@ export interface StubPersonaTokens {
   readonly appToken: string
 }
 
+/** The label `addPersona` gives a persona's first credential set. */
+export const INITIAL_CREDENTIALS = 'initial'
+
 interface StubClientBuildCommon {
   /** Key of the persona that registered the token, or `undefined` if none did (the build then threw). */
   readonly persona: string | undefined
+  /**
+   * Label of the persona's credential set the token belongs to:
+   * `INITIAL_CREDENTIALS` for the set `addPersona` registered, else the label
+   * given to `addCredentials`; `undefined` when no persona registered it.
+   */
+  readonly credentials: string | undefined
   /**
    * The token the client received (the app token for a socket client). Not
    * enumerable, so printing a record or comparing records never shows it.
@@ -1178,71 +1308,156 @@ export type StubClientBuild =
   | (StubClientBuildCommon & { readonly kind: 'validation'; readonly options: WebClientOptions })
   | (StubClientBuildCommon & { readonly kind: 'web'; readonly options: WebClientOptions })
 
+/**
+ * What happened to a client the factory built, in `activity` order:
+ * - `built`: the factory built it (every kind; recorded with its build record);
+ * - `started`: `start()` was called on the socket client;
+ * - `connected`: its `start()` reached `hello` (the socket is open);
+ * - `disconnected`: `disconnect()` was called, the client's (CSCB's) own close;
+ * - `discarded`: the last listener was removed from the socket client
+ *   (`removeListener`, `off` or `removeAllListeners`), as the manager does when
+ *   it lets a socket go, with or without `disconnect()`.
+ * A drop by Slack (`drop()`) is the test's own act and is not recorded.
+ */
+export type StubClientEvent = 'built' | 'started' | 'connected' | 'disconnected' | 'discarded'
+
+/**
+ * One entry of the factory's activity record. `event`, `kind`, `persona` and
+ * `credentials` are enumerable, so `toEqual` compares just those; `build` (the
+ * client's record in `builds`, to tell two clients of one kind and credential
+ * set apart) is not.
+ */
+export interface StubClientActivity {
+  readonly event: StubClientEvent
+  readonly kind: StubClientKind
+  readonly persona: string | undefined
+  readonly credentials: string | undefined
+  readonly build: StubClientBuild
+}
+
 export interface StubSlackFactory {
   /** Pass to `createPersonaConnectionManager({ factory })`; no cast needed. */
   readonly factory: PersonaSlackClientFactory
   /**
    * Register persona `key` with its tokens and give it its own stub
    * (`makeStubSlack(opts)`): its own identity, script queues, captures and
-   * socket clients, shared with no other persona. Throws if the key or
-   * either token is already registered.
+   * socket clients, shared with no other persona. These tokens are the
+   * persona's `INITIAL_CREDENTIALS` set. Throws if the key or either token is
+   * already registered.
    */
   addPersona(key: string, tokens: StubPersonaTokens, opts?: StubSlackOptions): StubSlack
   /**
-   * Persona `key`'s stub. `socket` is its latest (live) socket client,
-   * `sockets` every one built, abandoned ones included. Throws if unknown.
+   * Register another credential set for persona `key` (a rotated pair) under
+   * `label`, with its own stub (`makeStubSlack(opts)`): its own identity
+   * (`botUserId`, `botId`), script queues, captures and socket clients. Every
+   * build that receives one of these tokens is routed to this stub and
+   * recorded with `persona: key` and `credentials: label`, so the old and new
+   * credentials of one persona can be scripted apart. Both tokens must be new
+   * to the factory. Throws if `key` is not registered, `label` is already one
+   * of its sets, or either token is already registered.
+   */
+  addCredentials(key: string, label: string, tokens: StubPersonaTokens, opts?: StubSlackOptions): StubSlack
+  /**
+   * Persona `key`'s `INITIAL_CREDENTIALS` stub. `socket` is its latest socket
+   * client, `sockets` every one built, abandoned ones included; clients built
+   * from a set added with `addCredentials` are on that set's stub
+   * (`credentials(key, label)`). Throws if unknown.
    */
   persona(key: string): StubSlack
+  /** The stub of persona `key`'s credential set `label`. Throws if unknown. */
+  credentials(key: string, label: string): StubSlack
   /** Every client built, all personas, in build order. */
   readonly builds: readonly StubClientBuild[]
   /** The clients built for persona `key`, optionally of one kind, in build order. */
   buildsOf<K extends StubClientKind>(key: string, kind: K): Extract<StubClientBuild, { kind: K }>[]
   buildsOf(key: string): StubClientBuild[]
+  /**
+   * What happened to every client built, all personas, in order (see
+   * `StubClientEvent`). Only clients built through `factory` are recorded.
+   */
+  readonly activity: readonly StubClientActivity[]
+  /**
+   * Persona `key`'s activity, in order. For example, a reconnect that opens
+   * the new connection before closing the old one reads, as
+   * `activityOf(key).filter((a) => a.kind === 'socket')`,
+   * `[built new, started new, connected new, discarded initial, disconnected initial]`.
+   */
+  activityOf(key: string): StubClientActivity[]
 }
 
 /**
  * A `PersonaSlackClientFactory` over per-persona stubs. Each build is routed
  * by the token it received: `createSocketClient` by `options.appToken`,
  * `createValidationClient` and `createWebClient` by the bot token (an app
- * token passed as a bot token matches no persona). The build goes to that
- * persona's stub with the options unchanged, so the stub honours them
+ * token passed as a bot token matches no persona). The build goes to the stub
+ * of the persona and credential set that registered the token, with the
+ * options unchanged, so the stub honours them
  * (`attachOriginalToWebAPIRequestError: false` drops `original`), and is
- * recorded in `builds`. A token no persona registered is recorded with
- * `persona: undefined` and the build throws an error naming no token.
+ * recorded in `builds` and `activity`. A token no persona registered is
+ * recorded with `persona: undefined` and the build throws an error naming no
+ * token.
  *
- * Every socket client the manager builds for a persona comes from that
- * persona's stub, so its `script.connect` queue applies across them all.
+ * Every socket client the manager builds from one credential set comes from
+ * that set's stub, so its `script.connect` queue applies across them all.
  */
 export function makeStubSlackFactory(): StubSlackFactory {
-  const stubs = new Map<string, StubSlack>()
-  const byBotToken = new Map<string, string>()
-  const byAppToken = new Map<string, string>()
+  /** Per persona: its credential sets' stubs, by label. */
+  const stubs = new Map<string, Map<string, StubSlack>>()
+  const byBotToken = new Map<string, { persona: string; credentials: string }>()
+  const byAppToken = new Map<string, { persona: string; credentials: string }>()
   const builds: StubClientBuild[] = []
+  const activity: StubClientActivity[] = []
+  const socketBuilds = new Map<StubSocketClient, StubClientBuild>()
+
+  function note(event: StubClientEvent, build: StubClientBuild): void {
+    const entry = { event, kind: build.kind, persona: build.persona, credentials: build.credentials }
+    Object.defineProperty(entry, 'build', { value: build, enumerable: false })
+    activity.push(entry as StubClientActivity)
+  }
+
+  const observeSocket: SocketEventObserver = (socket, event) => {
+    const build = socketBuilds.get(socket)
+    if (build !== undefined) note(event, build)
+  }
 
   /**
-   * Record one build and hand it to the persona the token routes to (the app
-   * token for a socket client, the bot token otherwise); throw if none.
+   * Record one build and hand it to the persona credential set the token
+   * routes to (the app token for a socket client, the bot token otherwise);
+   * throw if none.
    */
   function build<T>(
     kind: StubClientKind,
     token: string,
     options: SocketModeOptions | WebClientOptions,
-    make: (stub: StubSlack) => T,
+    make: (stub: StubSlack, record: StubClientBuild) => T,
   ): T {
-    const persona = (kind === 'socket' ? byAppToken : byBotToken).get(token)
-    const entry = { kind, persona, options, hasToken: (expected: string) => expected === token }
+    const route = (kind === 'socket' ? byAppToken : byBotToken).get(token)
+    const entry = {
+      kind,
+      persona: route?.persona,
+      credentials: route?.credentials,
+      options,
+      hasToken: (expected: string) => expected === token,
+    }
     Object.defineProperty(entry, 'token', { value: token, enumerable: false })
     // `kind` and `options` always arrive paired by the factory methods below.
-    builds.push(entry as StubClientBuild)
-    const stub = persona === undefined ? undefined : stubs.get(persona)
+    const record = entry as StubClientBuild
+    builds.push(record)
+    note('built', record)
+    const stub = route === undefined ? undefined : stubs.get(route.persona)?.get(route.credentials)
     if (stub === undefined) {
       throw new Error(`slack-stub factory: no persona registered this ${kind === 'socket' ? 'app' : 'bot'} token`)
     }
-    return make(stub)
+    return make(stub, record)
   }
 
   const factory: PersonaSlackClientFactory = {
-    createSocketClient: (options) => build('socket', options.appToken, options, (stub) => stub.createSocketClient(options)),
+    createSocketClient: (options) =>
+      build('socket', options.appToken, options, (stub, record) => {
+        const socket = stub.createSocketClient(options)
+        socketBuilds.set(socket, record)
+        return socket
+      }),
     createValidationClient: (botToken, options) =>
       build('validation', botToken, options, (stub) => stub.createWebClient(botToken, options)),
     createWebClient: (botToken, options) =>
@@ -1255,26 +1470,53 @@ export function makeStubSlackFactory(): StubSlackFactory {
     return builds.filter((entry) => entry.persona === key && (kind === undefined || entry.kind === kind))
   }
 
+  /** Register one credential set; the caller has checked the persona and label. */
+  function register(key: string, label: string, tokens: StubPersonaTokens, opts: StubSlackOptions): StubSlack {
+    if (byBotToken.has(tokens.botToken) || byAppToken.has(tokens.appToken)) {
+      throw new Error(`slack-stub factory: persona ${JSON.stringify(key)} reuses a token already registered`)
+    }
+    const stub = buildStubSlack(opts, observeSocket)
+    let sets = stubs.get(key)
+    if (sets === undefined) {
+      sets = new Map()
+      stubs.set(key, sets)
+    }
+    sets.set(label, stub)
+    byBotToken.set(tokens.botToken, { persona: key, credentials: label })
+    byAppToken.set(tokens.appToken, { persona: key, credentials: label })
+    return stub
+  }
+
+  function credentials(key: string, label: string): StubSlack {
+    const sets = stubs.get(key)
+    if (sets === undefined) throw new Error(`slack-stub factory: no persona ${JSON.stringify(key)} registered`)
+    const stub = sets.get(label)
+    if (stub === undefined) {
+      throw new Error(`slack-stub factory: persona ${JSON.stringify(key)} has no credential set ${JSON.stringify(label)}`)
+    }
+    return stub
+  }
+
   return {
     factory,
     addPersona(key, tokens, opts = {}) {
       if (stubs.has(key)) throw new Error(`slack-stub factory: persona ${JSON.stringify(key)} is already registered`)
-      if (byBotToken.has(tokens.botToken) || byAppToken.has(tokens.appToken)) {
-        throw new Error(`slack-stub factory: persona ${JSON.stringify(key)} reuses a token another persona registered`)
+      return register(key, INITIAL_CREDENTIALS, tokens, opts)
+    },
+    addCredentials(key, label, tokens, opts = {}) {
+      const sets = stubs.get(key)
+      if (sets === undefined) throw new Error(`slack-stub factory: no persona ${JSON.stringify(key)} registered`)
+      if (sets.has(label)) {
+        throw new Error(`slack-stub factory: persona ${JSON.stringify(key)} already has credential set ${JSON.stringify(label)}`)
       }
-      const stub = makeStubSlack(opts)
-      stubs.set(key, stub)
-      byBotToken.set(tokens.botToken, key)
-      byAppToken.set(tokens.appToken, key)
-      return stub
+      return register(key, label, tokens, opts)
     },
-    persona(key) {
-      const stub = stubs.get(key)
-      if (stub === undefined) throw new Error(`slack-stub factory: no persona ${JSON.stringify(key)} registered`)
-      return stub
-    },
+    persona: (key) => credentials(key, INITIAL_CREDENTIALS),
+    credentials,
     builds,
     buildsOf,
+    activity,
+    activityOf: (key) => activity.filter((entry) => entry.persona === key),
   }
 }
 

@@ -90,7 +90,7 @@ import {
   type PersonaConfigFs,
 } from './config.ts'
 import { checkPersonaWorkingDirectory, type WorkingDirectoryFs } from './persona-bringup.ts'
-import type { PersonaBringUpState } from './persona-bringup-controller.ts'
+import { isCredentialsBroken, type PersonaBringUpState } from './persona-bringup-controller.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import {
   credentialsDigest,
@@ -116,6 +116,7 @@ import {
   renderNoopLogLine,
   renderStaleConfirmationLogLine,
   runApplySteps,
+  type ApplyBringUpOptions,
   type ApplyStepSlots,
   type InPlaceApplyInput,
   type StaleConfirmationReason,
@@ -252,9 +253,11 @@ export interface ReloadTickDriver {
  * is the start pass. A confirmed apply's default step bodies
  * (`lifecycleApplySlots`, `reload-apply.ts`) fan out to `teardown` (step 2,
  * each removed persona), `updateInPlace` (step 3, each persona modified in
- * place) and `bringUp` (step 6, each added persona); production binds all
- * three through `persona-lifecycle.ts`. `reconnectCredentials` is bound by
- * the work that implements step 4, and nothing calls it yet.
+ * place), `reconnectCredentials` (step 4, each persona whose credentials
+ * changed and that is not broken by its credentials) and `bringUp` (step 6,
+ * each added persona, and as a recovery each persona broken by its
+ * credentials whose credentials changed); production binds all four through
+ * `persona-lifecycle.ts`.
  */
 export interface ReloadLifecycleOps {
   /**
@@ -267,13 +270,25 @@ export interface ReloadLifecycleOps {
   /**
    * Bring up one persona a confirmed change added, `applied` being the
    * configuration step 1 made current. Resolves once it has an outcome and,
-   * when up, its launch settled.
+   * when up, its launch settled. With `options.recovery` the persona is not
+   * new: it is broken by its credentials and its credentials file changed
+   * (b.av2 SR-8.6 step 6, SR-6.4), and it is brought up afresh the same way;
+   * one that is not broken by its credentials any more when the operation
+   * runs gets its changed credentials applied as `reconnectCredentials`
+   * would, so step 4 and step 6 never both skip a confirmed change.
    */
-  bringUp(persona: Persona, applied: PersonaConfig): Promise<unknown>
+  bringUp(persona: Persona, applied: PersonaConfig, options?: ApplyBringUpOptions): Promise<unknown>
   /** Tear down one persona a confirmed change removed (and, from E13, the old half of a destructive modify). */
   teardown(persona: Persona): Promise<unknown>
-  /** Reconnect one persona with its changed credentials file. */
-  reconnectCredentials?(persona: Persona, applied: PersonaConfig): Promise<unknown>
+  /**
+   * Apply one persona's changed credentials file (b.av2 SR-8.6 step 4,
+   * credentials row), `applied` being the configuration step 1 made current:
+   * reconnect it (up) or hand its retries the new content (retrying).
+   * Resolves once its first attempt settled; resolves with
+   * `CredentialsBrokenAtReconnect` when it is broken by its credentials by
+   * the time it runs, and step 6 then brings it up instead.
+   */
+  reconnectCredentials(persona: Persona, applied: PersonaConfig): Promise<unknown>
   /**
    * Apply the in-place settings of one persona a confirmed change modified in
    * place, without tearing it down (its instance is kept): `change.persona`
@@ -314,7 +329,7 @@ export type BringUpStateQuery = (key: string) => PersonaBringUpState | undefined
 export interface ReloadControllerDeps {
   /** The configuration file and its reload files (`reloadFilePaths`). */
   paths: ReloadFilePaths
-  /** The lifecycle operations; all but `reconnectCredentials` are required. */
+  /** The lifecycle operations. */
   lifecycle: ReloadLifecycleOps
   /** Receives each `[slack]` line the controller logs (the server log). */
   log: (line: string) => void
@@ -338,10 +353,11 @@ export interface ReloadControllerDeps {
   heldCredentialsDigest?: HeldCredentialsDigestQuery
   /**
    * An applied persona's current bring-up state (production: the bring-up
-   * controller's `state`), for the preview of a credentials change: a
-   * persona broken by its credentials is brought up at apply rather than
-   * reconnected (b.av2 SR-8.6). Without it no persona counts as broken by its
-   * credentials.
+   * controller's `state`), for the preview of a credentials change and again
+   * when apply steps 4 and 6 run (E13 Director decision 4): a persona broken
+   * by its credentials is brought up at apply rather than reconnected (b.av2
+   * SR-8.6). Without it no persona counts as broken by its credentials in the
+   * preview, and the steps follow the plan's split.
    */
   bringUpState?: BringUpStateQuery
   /**
@@ -372,7 +388,9 @@ export interface ReloadControllerDeps {
    * instead of the default ones; an unbound step then does nothing. Without
    * it the controller runs `lifecycleApplySlots` over `lifecycle` (step 2
    * tears down each removed persona, step 3 updates each persona modified in
-   * place, step 6 brings up each added one).
+   * place, step 4 reconnects each persona whose credentials changed, step 6
+   * brings up each added one and each credentials-broken one whose
+   * credentials changed).
    * Production never sets it.
    */
   applySteps?: ApplyStepSlots
@@ -1107,14 +1125,31 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
   // members, which log each persona's rejected operation.
   const applySlots =
     deps.applySteps ??
-    lifecycleApplySlots(lifecycle, (step, persona, err) =>
-      deps.log(
-        `[slack] reload: apply step ${applyStepNumber(step)} (${step}) failed for persona ` +
-          `${renderPersonaRef(persona.name, persona.key)}: ${describeThrownValue(err)}`,
-      ),
+    lifecycleApplySlots(
+      lifecycle,
+      (step, persona, err) =>
+        deps.log(
+          `[slack] reload: apply step ${applyStepNumber(step)} (${step}) failed for persona ` +
+            `${renderPersonaRef(persona.name, persona.key)}: ${describeThrownValue(err)}`,
+        ),
+      credentialsBrokenNow,
     )
   let phase: StartPhase = 'unresolved'
   let appliedState: AppliedConfiguration | undefined
+
+  /**
+   * Whether a persona is broken by its credentials now, for apply steps 4 and
+   * 6 (E13 Director decision 4): from the bring-up state when it can be
+   * queried, else undefined (the plan's split decides).
+   */
+  function credentialsBrokenNow(key: string): boolean | undefined {
+    if (deps.bringUpState === undefined) return undefined
+    try {
+      return isCredentialsBroken(deps.bringUpState(key))
+    } catch {
+      return undefined
+    }
+  }
   let detection: PendingDetection | undefined
   let detectionStopped = false
 

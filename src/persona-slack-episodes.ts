@@ -25,6 +25,10 @@
  *   `persona-connection-restored` line; any other with one cleared line
  *   carrying that episode's class label and cause text starting `cleared:`;
  *   nothing if none is open.
+ * - Ended (`end(reason)`: the attempts the episode covered were abandoned,
+ *   for example a credentials reconnect that was cancelled): close an open
+ *   episode with one line carrying its class label and the cause
+ *   `cleared: <reason>`; nothing if none is open.
  *
  * Lines are built with `formatPersonaDiagnostic` (the persona's JSON-quoted
  * name with its key, `personas[i]`, the credentials file path, the cause) from
@@ -110,6 +114,13 @@ type OpenEpisode =
 export interface SlackEpisodeTracker {
   /** Record an outcome; return the lines it produced, in order (zero to two). */
   record(outcome: SlackEpisodeInput): string[]
+  /**
+   * End the open episode without an outcome (the attempts it covered were
+   * abandoned): one line with its class label and the cause
+   * `cleared: <reason>`, so its start line always gets an end. Nothing when
+   * no episode is open. Returns the lines produced (zero or one).
+   */
+  end(reason: string): string[]
   /** The open episode's class label, or `null`. */
   readonly open: SlackEpisodeState
 }
@@ -166,6 +177,12 @@ export function createSlackEpisodeTracker(options: SlackEpisodeTrackerOptions): 
         : { kind: outcome.kind, class: outcome.class, key: outcome.key, check: outcome.check, slackError: outcome.slackError }
       lines.push(line(outcome.class, outcome.cause))
       return lines
+    },
+    end(reason: string): string[] {
+      if (open === null) return []
+      const text = line(open.class, `cleared: ${reason}`)
+      open = null
+      return [text]
     },
     get open(): SlackEpisodeState {
       return open === null ? null : open.class

@@ -21,7 +21,8 @@
  * The label set grows as later work lands (E2 Task 2 added credentials-refused
  * and Slack-unreachable, E2 Task 3 connection lost/restored, E3 Task 7 the
  * unclaimed channel and the DM drop, E5 Task 1 the per-persona start
- * line, E7 Task 2 the destination failure; later Epics theirs).
+ * line, E7 Task 2 the destination failure, E13 Task 1 the failed credentials
+ * change; later Epics theirs).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -102,6 +103,16 @@ export const PERSONA_START = 'persona-start'
  */
 export const PERSONA_DESTINATION_FAILED = 'persona-destination-failed'
 
+/**
+ * A confirmed change to a persona's credentials file cannot be used (b.av2
+ * SR-8.6 credentials row, SR-10.3): the new file is missing, unreadable,
+ * locally invalid or another applied persona's credentials file, or Slack
+ * refused a token in it. The old connection (or the held content of a
+ * persona that is retrying) stays in use and the change stays pending
+ * (SR-8.3). Built with `formatCredentialsChangeFailed`.
+ */
+export const PERSONA_CREDENTIALS_CHANGE_FAILED = 'persona-credentials-change-failed'
+
 /** Every persona diagnostic class label, in a fixed order. */
 export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_START,
@@ -117,6 +128,7 @@ export const PERSONA_DIAGNOSTIC_CLASSES = [
   UNCLAIMED_CHANNEL,
   PERSONA_DM_DROPPED,
   PERSONA_DESTINATION_FAILED,
+  PERSONA_CREDENTIALS_CHANGE_FAILED,
 ] as const
 
 /** A persona diagnostic class label (closed set). */
@@ -163,6 +175,64 @@ export function formatPersonaDiagnostic(diagnostic: PersonaDiagnostic): string {
   const ref = renderPersonaRef(diagnostic.name, diagnostic.key)
   const path = diagnostic.path === undefined ? '' : ` path=${JSON.stringify(diagnostic.path)}`
   return `${SERVER_LOG_PREFIX} ${diagnostic.class}: personas[${diagnostic.index}] ${ref}${path}: ${escapeCause(diagnostic.cause)}`
+}
+
+/**
+ * What a persona keeps when a confirmed credentials change cannot be used:
+ * its current connection (a persona that is up), the credentials content it
+ * holds and retries with (a persona that is retrying), or its
+ * credentials-broken state (a persona whose current connection Slack refused
+ * while the change was being tried).
+ */
+export type CredentialsChangeKept = 'connection' | 'content' | 'broken'
+
+/** A confirmed credentials change that cannot be used: the persona, its credentials path, the cause and what it keeps. */
+export interface CredentialsChangeFailure {
+  name: string
+  key: string
+  index: number
+  /** The persona's credentials file. */
+  path: string
+  /**
+   * Why the new file cannot be used, as the check that failed words it: the
+   * credentials check's cause (missing, unreadable, invalid, or the real-path
+   * collision naming the other persona) or the Slack classifier's refused
+   * cause (which token, which check, the Slack error code). Never a token
+   * value, file contents or a digest.
+   */
+  cause: string
+  kept: CredentialsChangeKept
+}
+
+/** How each kind of kept state reads in a `persona-credentials-change-failed` line. */
+const CREDENTIALS_CHANGE_KEPT_TEXT: Readonly<Record<CredentialsChangeKept, string>> = {
+  connection: 'the current connection stays in use',
+  content: 'it keeps retrying with its current credentials',
+  broken: 'it stays broken by its credentials',
+}
+
+/**
+ * Format the `persona-credentials-change-failed` line (b.av2 SR-8.6, SR-10.3)
+ * through `formatPersonaDiagnostic`:
+ *
+ *   `[slack] persona-credentials-change-failed: personas[<i>] "<name>" (key=<key>) path="<path>": the confirmed credentials change cannot be used: <cause>; <kept>, and the change stays pending`
+ *
+ * `<kept>` is `the current connection stays in use`, `it keeps retrying
+ * with its current credentials` or `it stays broken by its credentials`.
+ * Pure: returns the line, emits nothing.
+ */
+export function formatCredentialsChangeFailed(failure: CredentialsChangeFailure): string {
+  const { name, key, index, path, cause, kept } = failure
+  return formatPersonaDiagnostic({
+    class: PERSONA_CREDENTIALS_CHANGE_FAILED,
+    name,
+    key,
+    index,
+    path,
+    cause:
+      `the confirmed credentials change cannot be used: ${cause}; ` +
+      `${CREDENTIALS_CHANGE_KEPT_TEXT[kept]}, and the change stays pending`,
+  })
 }
 
 /** Control characters (C0, DEL, C1) and the Unicode line/paragraph separators. */

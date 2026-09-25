@@ -14,9 +14,11 @@
  *   launch already in flight for the persona (`spawnForPersona`). A launch
  *   failure is not a new outcome: it takes today's spawn-failure path.
  * - `broken` (credentials-broken): the credentials file is missing,
- *   unreadable or locally invalid, or Slack refused a token (at bring-up, or
- *   on a reopen of a running persona, whose instance is left running). Not
- *   retried: recovery through a confirmed change is E13's.
+ *   unreadable or locally invalid, or Slack refused a token (at bring-up, on
+ *   a reopen of a running persona, or in a Web API call of a running persona,
+ *   bug b.ujn; its instance is left running). Not retried: it recovers only
+ *   through a confirmed change to its credentials file (b.av2 SR-6.4), which
+ *   the apply brings up afresh (`persona-lifecycle.ts`, step 6).
  * - `retrying`: Slack-unreachable (retried by the connection manager on its
  *   own per-persona timer, the SR-3.2 schedule) or directory-broken.
  *
@@ -34,28 +36,56 @@
  * retrying.
  *
  * Held credentials (SR-6.1): the tokens read at the persona's first bring-up
- * are kept in the persona's entry and handed to the manager when a directory
- * retry reaches Slack; the credentials file is never read again by a retry,
- * so an edit made meanwhile is not used (it is E11's pending change). The
- * manager itself keeps the same tokens for its own retries and reopens. The
- * tokens are never logged, returned or written, and no query exposes them.
- * Beside them the entry holds the digest of the bytes that first read
- * produced, or a missing/unreadable marker (b.av2 SR-8.3); the read-only
- * `credentialsDigest(key)` query exposes only that, for the reload
- * detection tick. A persona broken by a shared credentials file holds the
- * digest of its own file too (read only to be hashed, never parsed), so once
- * the collision is gone a re-save of that file makes a change pending.
+ * (or at its last confirmed credentials change) are kept in the persona's
+ * entry and handed to the manager when a directory retry reaches Slack; the
+ * credentials file is never read again by a retry, so an edit made meanwhile
+ * is not used (it is E11's pending change). The manager itself keeps the same
+ * tokens for its own retries and reopens. The tokens are never logged,
+ * returned or written, and no query exposes them. Beside them the entry holds
+ * the digest of the bytes that read produced, or a missing/unreadable marker
+ * (b.av2 SR-8.3); the read-only `credentialsDigest(key)` query exposes only
+ * that, for the reload detection tick. A persona broken by a shared
+ * credentials file holds the digest of its own file too (read only to be
+ * hashed, never parsed), so once the collision is gone a re-save of that
+ * file makes a change pending.
+ *
+ * Confirmed credentials change (b.av2 SR-8.6 credentials row, SR-8.3;
+ * `changeCredentials`, apply step 4): for a persona that is up or retrying,
+ * the file is read once through the local check, against the applied set
+ * now. A locally bad file changes nothing and logs one
+ * `persona-credentials-change-failed` line, so the change stays pending. An
+ * up persona is reconnected by the manager (new connection first, then the
+ * old one closes). Beside the held content the entry keeps the content its
+ * own connection uses (`live`): set at bring-up and at every swap, a late
+ * one included. Right before the swap (the manager's `beforeSwap`, before
+ * any status listener sees the persona up on the new connection) the held
+ * and live content become the new file's and the caller's `beforeSwap` runs
+ * (the lifecycle forgets the cached DM conversation there). While the new
+ * connection retries the held content is the new file's (nothing pending)
+ * and the live one stays. A refusal, at once or later, holds the live
+ * content again, so the change is pending again (and so is an earlier change
+ * whose retrying reconnect this one replaced) — unless the persona stopped
+ * being up meanwhile, which then stays credentials-broken with the confirmed
+ * content held. The failed line's "kept" wording and the result are chosen
+ * from the persona's state after the attempt. A retrying persona takes the
+ * new tokens and digest at once (held and live), and so does the manager's
+ * own Slack retry. A credentials-broken persona is not changed here: the
+ * apply brings it up afresh.
  *
  * Launch on recovery: a persona launches from its own retry path, never
  * waiting for the health check: after a directory retry whose Slack step
  * reports `up`, or when the manager reports `up` right after `retrying` a
  * bring-up (`onConnectionStatus`, the manager's status listener). An `up`
  * after `lost` or after `retrying` a reopen launches nothing: the instance is
- * already running. At most one such launch per persona.
+ * already running. At most one such launch per persona. A persona whose
+ * connection Slack had refused (`broken`) and that the manager reports `up`
+ * again (a confirmed credentials reconnect left retrying succeeded) is
+ * launched the same way, through its launch path's collision ladder.
  *
  * Leaving up (SR-6.3, SR-6.4): each time a persona's outcome changes from
- * `up` to `broken` or `retrying` (today only a refused reopen of a running
- * persona), the injected `onLeftUp` is told once. A lost connection being
+ * `up` to `broken` or `retrying` (a refused reopen of a running persona, or a
+ * Web API call refused for its bot token), the injected `onLeftUp` is told
+ * once. A lost connection being
  * reopened (`lost`, `retrying` a reopen) stays `up`. Production wires
  * `createNotUpSessionDropper`, which drops the persona's registered MCP
  * session; its instance and agent-director row are kept.
@@ -74,7 +104,7 @@
  *
  *   [slack] persona-directory-missing: personas[<i>] "<name>" (key=<key>) path="<dir>": cleared: working directory is usable again; continuing the bring-up
  *
- * (`…; the persona stays broken until its credentials are fixed and the server is restarted` while a
+ * (`…; the persona stays broken until its credentials file is fixed and the change confirmed` while a
  * credentials cause holds). A change of class between attempts is the same
  * episode and logs nothing. Slack-unreachable start and clear lines come from
  * the connection manager only. A launch after a retry logs:
@@ -125,14 +155,18 @@ import {
 } from './persona-connections.ts'
 import type { CredentialsDigest, PersonaSlackTokens } from './persona-credentials.ts'
 import {
+  PERSONA_CREDENTIALS_REFUSED,
   PERSONA_START,
+  formatCredentialsChangeFailed,
   formatPersonaDiagnostic,
+  type CredentialsChangeKept,
   type PersonaCheckFailure,
   type PersonaDiagnosticLogger,
 } from './persona-diagnostics.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { createPersonaRetrySchedule, type PersonaRetrySchedule } from './persona-retry-schedule.ts'
 import type { PersonaSerialize } from './persona-serializer.ts'
+import type { SlackCredentialsRefusedOutcome } from './persona-slack-validation.ts'
 import {
   checkPersonaLocalSteps,
   connectPersonaSlack,
@@ -166,6 +200,90 @@ export interface PersonaBringUpState {
 export interface PersonaBringUpResultSummary {
   outcome: PersonaBringUpOutcome
   failures: PersonaBringUpFailure[]
+}
+
+/** The connection manager operations a confirmed credentials change uses (`changeCredentials`). */
+export type CredentialsChangeConnections = Pick<PersonaConnectionManager, 'reconnectCredentials' | 'replaceRetryTokens'>
+
+/** One swap of a persona's connection to the new file's (`CredentialsChangeHooks.onSwapped`). */
+export interface CredentialsSwap {
+  /** True when a reconnect left retrying swapped later, after the operation had resolved. */
+  late: boolean
+  /**
+   * Whether the persona was up right before the swap. False when its current
+   * connection had been refused meanwhile (a refused reopen, or a Web API
+   * call refused for its bot token): it comes up again through the swap and
+   * its MCP session, dropped then, registers again.
+   */
+  wasUp: boolean
+}
+
+/** Told when a confirmed credentials change takes effect on the persona's connection. */
+export interface CredentialsChangeHooks {
+  /**
+   * Right before the persona switches to the new file's connection (the
+   * manager's `beforeSwap`), synchronously, before any status listener sees
+   * it up on the new connection (the notifier's flush of held notices). For
+   * what depends on the old app, such as the cached DM conversation. A throw
+   * is logged and the swap still happens.
+   */
+  beforeSwap?: () => void
+  /**
+   * The persona now uses the new file's connection: right away (`late:
+   * false`, before the operation resolves `swapped`), or later, when a
+   * reconnect left retrying swaps (`late: true`). A throw is logged.
+   */
+  onSwapped?: (swap: CredentialsSwap) => void
+}
+
+/** How a confirmed credentials change of one persona settled (its first attempt, for an up persona). */
+export type PersonaCredentialsChangeResult =
+  /**
+   * Up persona: the new connection is in use, the old one closed; the new
+   * file's content is held. `cameBackUp` when the persona was not up right
+   * before the swap (its current connection was refused while the attempt
+   * ran): it is up again, and its MCP session registers again.
+   */
+  | { kind: 'swapped'; cameBackUp?: true }
+  /**
+   * The new file's content is held and retried with: an up persona whose new
+   * connection is retrying while its old one stays in use (`connection:
+   * 'kept'`), one whose current connection was refused while the attempt ran
+   * and that stays broken by its credentials until the new connection is in
+   * use (`'broken'`), or a retrying persona that has no connection yet
+   * (`'none'`).
+   */
+  | { kind: 'retrying'; connection: 'kept' | 'broken' | 'none' }
+  /**
+   * The new file cannot be used: locally (missing, unreadable, invalid,
+   * another applied persona's file) or refused by Slack. Nothing changed and
+   * one `persona-credentials-change-failed` line was logged; `cause` is its
+   * cause. The change stays pending.
+   */
+  | { kind: 'failed'; cause: string }
+  /** Broken by its credentials now: not changed here; the apply brings it up afresh (step 6). */
+  | { kind: 'credentials-broken' }
+  /**
+   * Nothing done: dry run, a persona unknown, cancelled or no longer applied,
+   * one neither up nor retrying (for example broken by a failed Slack
+   * bring-up), or its connection stopped or superseded meanwhile.
+   */
+  | { kind: 'skipped' }
+
+/**
+ * Whether a bring-up state is credentials-broken (b.av2 SR-6.4): its outcome
+ * is `broken` and either its local credentials check failed (missing,
+ * unreadable or locally invalid, or another applied persona's file) or Slack
+ * refused a token (`persona-credentials-refused`: at bring-up, on a reopen,
+ * or in a Web API call of the running persona). A persona retrying because
+ * Slack is unreachable or its directory is unusable, or broken for another
+ * reason, is not. Such a persona recovers only through a confirmed change to
+ * its credentials file, which the apply brings up rather than reconnects
+ * (SR-8.6 step 6). Pure.
+ */
+export function isCredentialsBroken(state: Pick<PersonaBringUpState, 'outcome' | 'causes'> | undefined): boolean {
+  if (state?.outcome !== 'broken') return false
+  return state.causes.credentials !== undefined || state.causes.slack?.class === PERSONA_CREDENTIALS_REFUSED
 }
 
 /** Dependencies of `createPersonaBringUpController`. */
@@ -238,9 +356,31 @@ export interface PersonaBringUpController {
    * another applied persona shares holds the digest of its own file (hashed,
    * never parsed). Undefined when nothing is held: dry run (no file is read)
    * and an unknown or cancelled persona. Retries never re-read the file, so
-   * it never changes. Read-only; never logged.
+   * it changes only at a confirmed credentials change (`changeCredentials`).
+   * Read-only; never logged.
    */
   credentialsDigest(key: string): CredentialsDigest | undefined
+  /**
+   * Apply a confirmed change of the persona's credentials file (b.av2 SR-8.6
+   * credentials row, SR-8.3), for a persona that is up or retrying, as it is
+   * declared in the applied set now; see the module comment. Re-checks the
+   * persona's state when it runs: a persona credentials-broken now is left
+   * alone (`credentials-broken`). Reads the file once, through the local
+   * check against the applied set now (the `appliedPersonas` getter; without
+   * it `applied`, the set the confirmed apply made current, never the set the
+   * persona was first brought up with); reconnects an up persona through
+   * `connections.reconnectCredentials` and hands a Slack-retrying one's new
+   * tokens to `connections.replaceRetryTokens`. Resolves once an up
+   * persona's first attempt settled. Touches no other persona. Run it
+   * through the persona's serializer turn (the lifecycle does). Never
+   * rejects except through a throwing injected dependency.
+   */
+  changeCredentials(
+    persona: Persona,
+    applied: readonly Persona[],
+    connections: CredentialsChangeConnections,
+    hooks?: CredentialsChangeHooks,
+  ): Promise<PersonaCredentialsChangeResult>
   /** Stop one persona's retries and forget it; a retry already running does nothing more. Idempotent. */
   cancel(key: string): void
   /** Cancel every persona. */
@@ -262,6 +402,12 @@ interface DirectoryEpisode {
   latest: PersonaCheckFailure
 }
 
+/** Credentials content held in memory: tokens and the digest of the bytes they came from. Never logged. */
+interface HeldCredentials {
+  readonly tokens: PersonaSlackTokens | undefined
+  readonly digest: CredentialsDigest | undefined
+}
+
 /** Everything the controller holds for one persona. Nothing here is shared with another persona. */
 interface BringUpEntry {
   readonly persona: Persona
@@ -270,12 +416,30 @@ interface BringUpEntry {
    * re-checks when no `appliedPersonas` getter is injected.
    */
   readonly applied: readonly Persona[]
-  /** Step 1's tokens from the first read; undefined in dry run or when step 1 failed. Never logged. */
-  readonly tokens: PersonaSlackTokens | undefined
-  /** Step 1's failure; cleared only by E13's confirmed change. */
+  /**
+   * Step 1's tokens from the first read, or from the last confirmed
+   * credentials change; undefined in dry run or when step 1 failed. Never
+   * logged.
+   */
+  tokens: PersonaSlackTokens | undefined
+  /** Step 1's failure. A credentials-broken persona recovers only through a fresh bring-up (a new entry). */
   readonly credentials: PersonaCheckFailure | undefined
-  /** The digest or marker of the bytes step 1 read (a collision included); undefined in dry run, where none are read. Never logged. */
-  readonly credentialsDigest: CredentialsDigest | undefined
+  /**
+   * The digest or marker of the bytes step 1 read (a collision included), or
+   * of the last confirmed credentials change's; undefined in dry run, where
+   * none are read. Never logged.
+   */
+  credentialsDigest: CredentialsDigest | undefined
+  /**
+   * The content the persona's own connection uses (the manager entry's
+   * tokens): set at bring-up, on every swap to a confirmed change's new
+   * connection (a late one included) and when a retrying persona takes a
+   * change. It differs from `tokens`/`credentialsDigest` only while an up
+   * persona's reconnect is retrying with newer content, and is what they go
+   * back to when that reconnect ends without a swap (refused, or cancelled
+   * by a later change that was refused). Never logged.
+   */
+  live: HeldCredentials
   directory: DirectoryEpisode | undefined
   readonly directorySchedule: PersonaRetrySchedule
   directoryTimer: TimerBox | undefined
@@ -302,7 +466,7 @@ const PERSONA_START_CAUSE = 'bring-up starting'
 /** Cause of a directory cleared line, by whether the credentials cause still holds. */
 const DIRECTORY_CLEARED_CONTINUING = 'cleared: working directory is usable again; continuing the bring-up'
 const DIRECTORY_CLEARED_STILL_BROKEN =
-  'cleared: working directory is usable again; the persona stays broken until its credentials are fixed and the server is restarted'
+  'cleared: working directory is usable again; the persona stays broken until its credentials file is fixed and the change confirmed'
 
 // ---------------------------------------------------------------------------
 // Factory
@@ -451,17 +615,40 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
    */
   async function launchAfterRetry(entry: BringUpEntry, via: 'directory' | 'Slack'): Promise<void> {
     if (entry.cancelled || entry.retryLaunched) return
+    await launchUp(entry, `its bring-up retry (${via})`, 'its bring-up retry', () => {
+      entry.retryLaunched = true
+    })
+  }
+
+  /**
+   * Launch after a pending credentials reconnect brought back a persona whose
+   * connection Slack had refused (b.av2 SR-6.4): its instance was kept, so
+   * the launch path's collision ladder reaches it. Runs inside the persona's
+   * serialized turn, like `launchAfterRetry`.
+   */
+  async function launchAfterCredentialsChange(entry: BringUpEntry): Promise<void> {
+    if (entry.cancelled || outcomeOf(entry) !== 'up') return
+    await launchUp(entry, 'its confirmed credentials change', 'its confirmed credentials change')
+  }
+
+  /**
+   * Launch the persona's current applied declaration, logging the up line
+   * (`up after <after> — launching`); nothing but a line for a persona no
+   * longer applied. `onLaunching` runs right before the launch. A throw is
+   * logged (`launch after <failedAfter> failed: …`), never posted.
+   */
+  async function launchUp(entry: BringUpEntry, after: string, failedAfter: string, onLaunching?: () => void): Promise<void> {
     const persona = appliedPersona(entry.persona.key, entry.persona)
     if (persona === undefined) {
-      log(`[slack] persona ${ref(entry)}: up after its bring-up retry (${via}) but no longer applied — not launching`)
+      log(`[slack] persona ${ref(entry)}: up after ${after} but no longer applied — not launching`)
       return
     }
-    entry.retryLaunched = true
-    log(`[slack] persona ${ref(entry)}: up after its bring-up retry (${via}) — launching`)
+    onLaunching?.()
+    log(`[slack] persona ${ref(entry)}: up after ${after} — launching`)
     try {
       await deps.launch(persona)
     } catch (err) {
-      log(`[slack] persona ${ref(entry)}: launch after its bring-up retry failed: ${describeThrownValue(err)}`)
+      log(`[slack] persona ${ref(entry)}: launch after ${failedAfter} failed: ${describeThrownValue(err)}`)
     }
   }
 
@@ -561,6 +748,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
       tokens: local.tokens,
       credentials: local.credentials,
       credentialsDigest: local.credentialsDigest,
+      live: { tokens: local.tokens, digest: local.credentialsDigest },
       directory: local.directory ? { opened: local.directory, latest: local.directory } : undefined,
       directorySchedule: createPersonaRetrySchedule(),
       directoryTimer: undefined,
@@ -595,8 +783,171 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
       serialize(key, () => launchAfterRetry(entry, 'Slack')).catch((err) =>
         log(`[slack] persona ${ref(entry)}: launch after its bring-up retry failed: ${describeThrownValue(err)}`),
       )
+    } else if (status.state === 'up' && previous?.state === 'broken') {
+      // Only a pending credentials reconnect's swap takes a refused
+      // connection back to up: the persona comes up again, and its kept
+      // instance is launched (reached through the collision ladder).
+      serialize(key, () => launchAfterCredentialsChange(entry)).catch((err) =>
+        log(`[slack] persona ${ref(entry)}: launch after its confirmed credentials change failed: ${describeThrownValue(err)}`),
+      )
     }
     observeOutcome(entry)
+  }
+
+  // -------------------------------------------------------------------------
+  // Confirmed credentials change (b.av2 SR-8.6 credentials row, SR-8.3)
+  // -------------------------------------------------------------------------
+
+  function logChangeFailed(persona: Persona, cause: string, kept: CredentialsChangeKept): void {
+    log(formatCredentialsChangeFailed({
+      name: persona.name,
+      key: persona.key,
+      index: persona.index,
+      path: persona.credentials_file,
+      cause,
+      kept,
+    }))
+  }
+
+  function runHook(entry: BringUpEntry, hook: () => void): void {
+    try {
+      hook()
+    } catch (err) {
+      log(`[slack] persona ${ref(entry)}: handling its confirmed credentials change failed: ${describeThrownValue(err)}`)
+    }
+  }
+
+  /** Hold `content` as what the persona is connected with or retrying with (the pending-change digest). */
+  function hold(entry: BringUpEntry, content: HeldCredentials): void {
+    entry.tokens = content.tokens
+    entry.credentialsDigest = content.digest
+  }
+
+  /** What an up persona keeps when its change failed, by its state now (after the attempt). */
+  function keptNow(entry: BringUpEntry): CredentialsChangeKept {
+    return isCredentialsBroken({ outcome: outcomeOf(entry), causes: causesOf(entry) }) ? 'broken' : 'connection'
+  }
+
+  async function changeCredentials(
+    persona: Persona,
+    applied: readonly Persona[],
+    connections: CredentialsChangeConnections,
+    hooks: CredentialsChangeHooks = {},
+  ): Promise<PersonaCredentialsChangeResult> {
+    const entry = entries.get(persona.key)
+    if (deps.dryRun || entry === undefined) return { kind: 'skipped' }
+    // The declaration step 1 made current, and the persona set it is checked against.
+    const current = appliedPersona(persona.key, persona)
+    if (current === undefined) return { kind: 'skipped' }
+    // Decided now, not at the preview: a Web API call may have broken it since.
+    if (isCredentialsBroken({ outcome: outcomeOf(entry), causes: causesOf(entry) })) return { kind: 'credentials-broken' }
+    const outcome = outcomeOf(entry)
+    const up = outcome === 'up'
+    // An undefined outcome with Slack started: its first attempt is in flight.
+    const retrying = outcome === 'retrying' || (outcome === undefined && entry.slackStarted)
+    if (!up && !retrying) return { kind: 'skipped' }
+
+    const local = checkPersonaLocalSteps(current, {
+      // SR-1.4 at apply: another applied persona's file, after step 1's swap.
+      applied: deps.appliedPersonas?.() ?? applied,
+      dryRun: false,
+      checkLocal: deps.checkLocal,
+      checkDirectory: deps.checkDirectory,
+      fs: deps.fs,
+    })
+    if (local.credentials !== undefined || local.tokens === undefined) {
+      const cause = local.credentials?.cause ?? 'the credentials file could not be checked'
+      logChangeFailed(current, cause, up ? 'connection' : 'content')
+      return { kind: 'failed', cause }
+    }
+    const next: HeldCredentials = { tokens: local.tokens, digest: local.credentialsDigest }
+
+    if (retrying) {
+      // A Slack retry runs on the manager's timer with the manager's tokens.
+      if (entry.slackStarted && !connections.replaceRetryTokens(current.key, local.tokens)) return { kind: 'skipped' }
+      // No connection yet: every later attempt uses the new content.
+      hold(entry, next)
+      entry.live = next
+      return { kind: 'retrying', connection: 'none' }
+    }
+
+    // Whether the persona was up right before the swap, taken in the swap hook.
+    let wasUp = true
+    const result = await connections.reconnectCredentials(
+      current.key,
+      local.tokens,
+      (later) => {
+        if (entry.cancelled) return
+        if (later.kind === 'swapped') {
+          hold(entry, next)
+          entry.live = next
+          runHook(entry, () => hooks.onSwapped?.({ late: true, wasUp }))
+          return
+        }
+        onLateRefusal(entry, later.outcome)
+      },
+      () => {
+        // Right before the swap (first attempt or later), while the persona
+        // still reports its old connection: from here on its own connection
+        // uses the new content, so that is both held and live.
+        if (entry.cancelled) return
+        wasUp = outcomeOf(entry) === 'up'
+        hold(entry, next)
+        entry.live = next
+        if (hooks.beforeSwap !== undefined) runHook(entry, hooks.beforeSwap)
+      },
+    )
+    if (entry.cancelled) return { kind: 'skipped' }
+    switch (result.kind) {
+      case 'swapped':
+        // What it connected with (the swap hook already held it; again here
+        // for a manager that did not call the hook).
+        hold(entry, next)
+        entry.live = next
+        runHook(entry, () => hooks.onSwapped?.({ late: false, wasUp }))
+        return wasUp ? { kind: 'swapped' } : { kind: 'swapped', cameBackUp: true }
+      case 'retrying':
+        // What it is retrying with: nothing is pending. Its own connection
+        // still uses the live content. Worded by its state now: a refusal of
+        // its current connection may have landed during the attempt.
+        hold(entry, next)
+        return { kind: 'retrying', connection: keptNow(entry) === 'broken' ? 'broken' : 'kept' }
+      case 'refused':
+        // This reconnect cancelled any earlier one still retrying, so nothing
+        // retries newer content now: hold what the persona's own connection
+        // uses, and the change (and any earlier one it replaced) is pending.
+        hold(entry, entry.live)
+        logChangeFailed(current, result.outcome.cause, keptNow(entry))
+        return { kind: 'failed', cause: result.outcome.cause }
+      case 'cancelled':
+        return { kind: 'skipped' }
+    }
+  }
+
+  /**
+   * A reconnect left retrying was refused later. Still up on its own
+   * connection: log the failed change and hold the content that connection
+   * uses (`live`, which a later swap may have changed since the change was
+   * confirmed), so the change is pending again. No longer up (its own
+   * connection was refused meanwhile): it stays credentials-broken with the
+   * confirmed content held, so nothing is pending, and the refusal is logged
+   * as its cause.
+   */
+  function onLateRefusal(entry: BringUpEntry, refusal: SlackCredentialsRefusedOutcome): void {
+    const persona = appliedPersona(entry.persona.key, entry.persona) ?? entry.persona
+    if (outcomeOf(entry) === 'up') {
+      hold(entry, entry.live)
+      logChangeFailed(persona, refusal.cause, 'connection')
+      return
+    }
+    log(formatPersonaDiagnostic({
+      class: PERSONA_CREDENTIALS_REFUSED,
+      name: persona.name,
+      key: persona.key,
+      index: persona.index,
+      path: persona.credentials_file,
+      cause: refusal.cause,
+    }))
   }
 
   function cancel(key: string): void {
@@ -620,6 +971,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
       return entry === undefined ? undefined : { outcome: outcomeOf(entry), causes: causesOf(entry) }
     },
     credentialsDigest: (key) => entries.get(key)?.credentialsDigest,
+    changeCredentials,
     cancel,
     cancelAll: () => {
       for (const key of [...entries.keys()]) cancel(key)

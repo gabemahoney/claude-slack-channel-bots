@@ -500,7 +500,7 @@ Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In 
 | `DESTRUCTIVE: …` | Applying it destroys that persona's live session: its instance and its conversation. A removed persona is torn down. A persona whose `name`, `credentials_file` or `working_directory` changed is torn down and brought up fresh. |
 | `… is added but cannot come up: …` | The new persona would fail to come up, for the reasons given. |
 | `credentials file "<path>" changed: …` | The persona's credentials file changed at the same path. The line names the persona and the path, never a token, and says what applying it does: a persona that is up opens a new connection, then closes the old one; a persona still retrying retries with the new content; a persona down because of its credentials `will be brought up`. |
-| `credentials file "<path>" changed, but it cannot be used (<cause>): …` | The new content is missing, unreadable or invalid, for example `credentials file does not exist`. A persona that is up keeps its current connection, and a persona down because of its credentials stays down. Every start reads the file as it stands, so after a restart the persona stays down until the file is fixed. |
+| `credentials file "<path>" changed, but it cannot be used (<cause>): …` | The new content is missing, unreadable or invalid, for example `credentials file does not exist`. A persona that is up keeps its current connection, and a persona still retrying keeps retrying with its current content; confirming logs `persona-credentials-change-failed` in `server.log`, and the change stays pending. A persona down because of its credentials stays down, and confirming logs its usual credentials line and leaves nothing pending. Every start reads the file as it stands, so after a restart the persona stays down until the file is fixed. |
 | `claude_config_dir changed: …, which starts fresh (the conversation is not resumed)` | The persona's next launch uses the new config directory and starts a new conversation. The running instance is kept until then. |
 | `… could not be checked.` | The server couldn't check whether an added persona can come up, or whether a persona is down because of its credentials. `server.log` has a `reload: cannot check …` line; report it as a bug. |
 | `server-wide setting … inherited by …` | A changed top-level default. The line lists the personas that inherit it. If none does, it says `no persona inherits it, so no instance is affected`. |
@@ -542,6 +542,7 @@ grep -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed)' "
 | A persona is removed | It is torn down. Its instance, its agent-director row and its conversation are destroyed. Its posted permission prompts stay in Slack, and clicking one has no effect. |
 | A persona's `name` changes | A removal plus an addition. The old session is destroyed, and a fresh one starts with no history. |
 | `channels`, `delivery`, `permission_prompts`, `dm.enabled` or `dm.contact` changes | Applied in place, from the next event or post. The instance and its conversation are kept. A changed DM contact is used for the next prompt. |
+| A credentials file's content changes (same path), such as a rotated token | Only that persona is reconnected: the new connection opens, then the old one closes, and its instance and conversation are kept. A persona down because of its credentials comes up with the fixed file, with no restart. For a running persona, if the new file can't be used, the old connection keeps running, `server.log` shows `persona-credentials-change-failed`, and the change stays pending. A persona down because of its credentials whose new file can't be used stays down with its usual line, such as `persona-credentials-invalid`. |
 | A persona's declaration and credentials are unchanged | It is not touched. |
 
 ### What takes effect at the next start
@@ -551,8 +552,6 @@ A confirmation records these changes, but the running server doesn't act on them
 - **`credentials_file` or `working_directory`.** The persona's instance and connection keep running as they are. After a confirmed `working_directory` change, though, the server admits the persona's MCP session only from the new directory: if the running bot's session reconnects from the old one, it is refused and the bot goes silent in Slack, and if its session drops, the server relaunches it fresh in the new directory, without its conversation. So restart promptly.
 - **`claude_config_dir` or `stop_hook_bootstrap`.** They take effect at the persona's next launch.
 - **Server-wide settings** such as `port` or `bind`. The server keeps the values it started with.
-
-A change to a credentials file's content is never recorded. The persona keeps its current connection, or stays down if its credentials were bad, and the change stays pending. Every start reads credentials files as they stand, so it needs only a restart, not a confirmation.
 
 To make them take effect, wait for the `reload-applied` line, then run `claude-slack-channel-bots clean_restart`. It reads the bot list from the record before it stops the server, so run earlier it can work from the old record. The server comes back on the record, and every bot is relaunched. Conversations resume, except that a changed `working_directory` or `claude_config_dir` starts that persona fresh. A changed `credentials_file` only reconnects the persona to Slack with the new app, and its conversation is kept.
 
@@ -1136,7 +1135,8 @@ grep -E '\(key=<key>\)|persona=<key>\b' ~/.claude/channels/slack/server.log
 
 | Class | Persona | What to do |
 |---|---|---|
-| `persona-credentials-*` | Stays down | Fix the credentials file, then restart the server |
+| `persona-credentials-missing`, `-unreadable`, `-invalid`, `-refused` | Stays down | Fix the credentials file, then confirm the pending change; the persona comes up with no restart |
+| `persona-credentials-change-failed` | Keeps running on its old credentials | Fix the credentials file, then confirm the new pending change |
 | `persona-slack-unreachable` | Retries on its own | Nothing; it comes up once Slack answers |
 | `persona-directory-*` | Retries on its own | Create or fix the working directory; the persona comes up with no restart |
 

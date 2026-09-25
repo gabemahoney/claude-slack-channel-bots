@@ -30,20 +30,27 @@
  * The controller's default bodies are `lifecycleApplySlots`: per-step
  * fan-outs (`fanOutPersonas`) over the lifecycle members, step 2 to
  * `teardown` for each removed persona, step 3 to `updateInPlace` for each
- * persona modified in place (once per persona) and step 6 to `bringUp` for
- * each added one. Within a step every persona's operation runs at once and
- * the step settles once all of them settled; one persona's rejection is
- * reported and never stops the others.
+ * persona modified in place (once per persona), step 4 to
+ * `reconnectCredentials` for each persona whose credentials changed and that
+ * is not broken by its credentials when step 4 runs, and step 6 to `bringUp`
+ * for each added one and, as a recovery (`{ recovery: true }`), for each
+ * persona whose credentials changed and that step 4 did not reconnect
+ * because it was broken by its credentials (the recovery re-checks inside
+ * the persona's serializer turn and, for a persona not broken any more,
+ * applies the change as step 4 would). Within a step every
+ * persona's operation runs at once and the step settles once all of them
+ * settled; one persona's rejection is reported and never stops the others.
  *
  * The line renderers here give the apply-time reload classes their text:
  * `reload-applied`, `reload-noop`, `reload-stale-confirmation`, and the
  * `reload-invalid` line of a confirmed candidate.
  *
  * Pure (b.av2 SR-13.1): nothing here reads or writes a file, calls Slack or
- * agent-director, arms a timer, logs or holds state, and nothing runs at
- * import; `runApplySteps` and the fan-outs only call and await the injected
- * bodies and members. No output holds a token, credentials content, a digest
- * or a fingerprint.
+ * agent-director, arms a timer or logs, and nothing runs at import;
+ * `runApplySteps` and the fan-outs only call and await the injected bodies,
+ * members and queries. The only state is the default bodies' per-apply set
+ * of the personas step 4 reconnected, which step 6 reads. No output holds a
+ * token, credentials content, a digest or a fingerprint.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -111,9 +118,10 @@ export interface CredentialsApplyInput {
  * plan's classes, each taken from the configuration that declares it. A step
  * binds to the classes it acts on: step 2 tears down `removed` (and, from
  * E13, `destructiveOld`), step 3 updates `inPlace`, step 4 reconnects
- * `credentials`, step 5 reads `configDirsChanged`, step 6 brings up `added`
- * (and, from E13, `destructiveNew` and `credentialsBroken`). Holds no token
- * or digest.
+ * `credentials` and step 6 brings up `credentialsBroken` (each re-checked
+ * when the step runs, so a persona can move from one to the other), step 5
+ * reads `configDirsChanged`, step 6 brings up `added` (and, from E13,
+ * `destructiveNew`). Holds no token or digest.
  */
 export interface ApplyStepInputs {
   /** The applied configuration before step 1. */
@@ -157,7 +165,38 @@ export type ApplyStepBody = (inputs: ApplyStepInputs) => Promise<unknown>
 export type ApplyStepSlots = Partial<Record<ApplyStepName, ApplyStepBody>>
 
 /** The per-persona lifecycle members the default step bodies fan out to (`ReloadLifecycleOps` in `reload.ts`). */
-export type ApplyLifecycleMembers = Pick<ReloadLifecycleOps, 'teardown' | 'updateInPlace' | 'bringUp'>
+export type ApplyLifecycleMembers = Pick<ReloadLifecycleOps, 'teardown' | 'updateInPlace' | 'bringUp' | 'reconnectCredentials'>
+
+/** Options of an apply bring-up (`ReloadLifecycleOps.bringUp`). */
+export interface ApplyBringUpOptions {
+  /**
+   * The persona is not new: it is broken by its credentials and its
+   * credentials file changed (b.av2 SR-8.6 step 6, SR-6.4 recovery). Its
+   * leftover state is cleared before the same bring-up runs; if it is not
+   * broken by its credentials any more when the operation runs, its changed
+   * credentials are applied as step 4's reconnect would apply them. Absent
+   * for an added persona.
+   */
+  recovery?: boolean
+}
+
+/**
+ * What `reconnectCredentials` resolves with when the persona is broken by its
+ * credentials by the time the operation runs: it was not reconnected, and
+ * step 6 brings it up instead (E13 Director decision 4). Anything else counts
+ * as reconnected.
+ */
+export interface CredentialsBrokenAtReconnect {
+  kind: 'credentials-broken'
+}
+
+/**
+ * Whether persona `key` is broken by its credentials now (b.av2 SR-6.4),
+ * asked by steps 4 and 6 when they run, not at the preview (E13 Director
+ * decision 4); undefined when it cannot be told, and the plan's
+ * `credentialsBroken` decides.
+ */
+export type CredentialsBrokenNowQuery = (key: string) => boolean | undefined
 
 /** Told of one persona's rejected lifecycle operation in a step. */
 export type ApplyPersonaFailure = (step: ApplyStepName, persona: Persona, err: unknown) => void
@@ -227,18 +266,55 @@ function onePerPersona(inPlace: readonly InPlaceApplyInput[]): InPlaceApplyInput
   })
 }
 
+/** Whether a `reconnectCredentials` result says the persona was broken by its credentials when it ran. */
+function isCredentialsBrokenAtReconnect(result: unknown): result is CredentialsBrokenAtReconnect {
+  return (
+    typeof result === 'object' &&
+    result !== null &&
+    (result as { kind?: unknown }).kind === 'credentials-broken'
+  )
+}
+
 /**
  * The controller's default step bodies (b.av2 SR-8.6): pure fan-outs over the
  * lifecycle members. Step 2 tears down every removed persona, step 3 updates
  * every persona modified in place (`inputs.inPlace`, one update per persona),
- * step 6 brings up every added one with the applied configuration; each
- * settles once every persona's operation settled, a rejection going to
- * `onFailure`. Step 3 comes before step 4, so a persona modified in place
- * whose credentials also changed is updated before it is reconnected. Steps
- * 4–5, the next-launch changes and the destructive-modify halves are bound by
- * later work. Pure: builds the bodies only.
+ * step 4 reconnects every persona whose credentials changed and that is not
+ * broken by its credentials, step 6 brings up every added one, and every
+ * persona whose credentials changed and that step 4 did not reconnect (a
+ * recovery bring-up), with the applied configuration. Whether a persona is
+ * broken by its credentials is asked when step 4 runs
+ * (`credentialsBrokenNow`; without an answer the plan's split into
+ * `credentials` and `credentialsBroken` decides), because a Web API call can
+ * break a persona between the preview and the apply (E13 Director decision
+ * 4); a persona the reconnect found broken by its credentials when it ran
+ * (`CredentialsBrokenAtReconnect`) is left to step 6 too. The recovery
+ * re-checks inside the persona's serializer turn: a persona that is not
+ * broken any more by then (a pending reconnect of an earlier change brought
+ * it up) gets the change as step 4 would have applied it. When step 4 did
+ * not run in the apply, step 6 asks `credentialsBrokenNow` itself.
+ * Each step settles once every persona's operation settled, a rejection going
+ * to `onFailure`; step 4 settles once every persona's first attempt settled.
+ * Step 3 comes before step 4, so a persona modified in place whose
+ * credentials also changed is updated before it is reconnected. Step 5, the
+ * next-launch changes and the destructive-modify halves are bound by later
+ * work. Builds the bodies only; the one state they keep is the set of
+ * personas step 4 reconnected, per apply (its inputs), for step 6.
  */
-export function lifecycleApplySlots(members: ApplyLifecycleMembers, onFailure: ApplyPersonaFailure): ApplyStepSlots {
+export function lifecycleApplySlots(
+  members: ApplyLifecycleMembers,
+  onFailure: ApplyPersonaFailure,
+  credentialsBrokenNow: CredentialsBrokenNowQuery = () => undefined,
+): ApplyStepSlots {
+  /** Per apply, the keys step 4 reconnected (or tried to): step 6 does not bring them up. */
+  const reconnectedAt = new WeakMap<ApplyStepInputs, Set<string>>()
+  const brokenNow = (change: CredentialsApplyInput): boolean =>
+    credentialsBrokenNow(change.persona.key) ?? change.change.credentialsBroken === true
+  const credentialsChanges = (inputs: ApplyStepInputs): CredentialsApplyInput[] => [
+    ...inputs.credentials,
+    ...inputs.credentialsBroken,
+  ]
+
   return {
     teardowns: (inputs) =>
       fanOutPersonas(inputs.removed, (persona) => members.teardown(persona), (persona, err) =>
@@ -253,10 +329,37 @@ export function lifecycleApplySlots(members: ApplyLifecycleMembers, onFailure: A
         (persona, err) => onFailure('in-place-updates', persona, err),
       )
     },
-    'bring-ups': (inputs) =>
-      fanOutPersonas(inputs.added, (persona) => members.bringUp(persona, inputs.applied), (persona, err) =>
-        onFailure('bring-ups', persona, err),
-      ),
+    'credentials-reconnects': async (inputs) => {
+      const reconnected = new Set<string>()
+      reconnectedAt.set(inputs, reconnected)
+      const targets = credentialsChanges(inputs).filter((change) => !brokenNow(change))
+      await fanOutPersonas(
+        targets.map((change) => change.persona),
+        async (persona) => {
+          reconnected.add(persona.key)
+          const result = await members.reconnectCredentials(persona, inputs.applied)
+          if (isCredentialsBrokenAtReconnect(result)) reconnected.delete(persona.key)
+        },
+        (persona, err) => onFailure('credentials-reconnects', persona, err),
+      )
+    },
+    'bring-ups': async (inputs) => {
+      const reconnected = reconnectedAt.get(inputs)
+      // Every change step 4 left because the persona was broken by its
+      // credentials: the recovery decides inside the persona's serializer
+      // turn, and applies the change as step 4 would for a persona that is
+      // not broken any more (a pending reconnect brought it up since), so no
+      // confirmed change is skipped by both steps. Without step 4 this apply,
+      // the persona's state now decides.
+      const recoveries = credentialsChanges(inputs)
+        .filter((change) => (reconnected === undefined ? brokenNow(change) : !reconnected.has(change.persona.key)))
+        .map((change) => change.persona)
+      const onBringUpFailure = (persona: Persona, err: unknown) => onFailure('bring-ups', persona, err)
+      await Promise.all([
+        fanOutPersonas(inputs.added, (persona) => members.bringUp(persona, inputs.applied), onBringUpFailure),
+        fanOutPersonas(recoveries, (persona) => members.bringUp(persona, inputs.applied, { recovery: true }), onBringUpFailure),
+      ])
+    },
   }
 }
 

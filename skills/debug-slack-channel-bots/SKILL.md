@@ -91,6 +91,9 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change).
    Its channels, destination or DM settings were changed? See
    [A persona's routing settings were changed by a confirmed change](#a-personas-routing-settings-were-changed-by-a-confirmed-change).
+   A confirmed change to its credentials file didn't take? Look for a
+   [`persona-credentials-change-failed`](#persona-credentials-change-failed)
+   line.
 
 ---
 
@@ -192,8 +195,11 @@ running are not affected. See
 
 - **Line:** `[slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting`
 - **Meaning:** One line per configured persona each time the server starts,
-  and one for each persona a confirmed change adds, before any other line
-  about that persona's bring-up. It's the name-to-key map.
+  and one for each persona a confirmed change adds or brings up again after
+  a credentials change (a persona broken by its credentials, after
+  `broken by its credentials and its credentials file changed — bringing it
+  up again`), before any other line about that bring-up. It's the
+  name-to-key map.
 - **Fix:** None. If a persona has no `persona-start` line in the latest start,
   it isn't in the configuration the server applied at that start, or the
   server didn't start at all (see [Configuration rejections](#configuration-rejections)
@@ -277,13 +283,18 @@ running are not affected. See
 
 - **State:** `broken`. Doesn't recover on its own. Logged by the connection
   manager, with the credentials file as `path`.
-- **Meaning:** Slack answered and refused a token. Two checks can refuse:
-  - `bot_token refused by auth.test: Slack error <code>`
-  - `app_token refused by the Socket Mode open: Slack error <code>`
-- **Codes:** any Slack error except the five transient ones listed under
-  `persona-slack-unreachable`. The expected ones are `not_authed`,
-  `invalid_auth`, `account_inactive`, `token_revoked`, `token_expired` and
-  `not_allowed_token_type`.
+- **Meaning:** Slack answered and refused a token. Three checks can refuse:
+  - `bot_token refused by auth.test: Slack error <code>` (at bring-up)
+  - `app_token refused by the Socket Mode open: Slack error <code>` (at
+    bring-up, or when a running persona's connection is reopened)
+  - `bot_token refused by a Web API call (<method>): Slack error <code>` (a
+    running persona's call, such as `chat.postMessage`, was refused)
+- **Codes:** for `auth.test` and the Socket Mode open, any Slack error except
+  the five transient ones listed under `persona-slack-unreachable`. The
+  expected ones are `not_authed`, `invalid_auth`, `account_inactive`,
+  `token_revoked`, `token_expired` and `not_allowed_token_type`. For a Web API
+  call, only `invalid_auth`, `token_revoked`, `account_inactive` and
+  `not_authed`.
 - **Fix:** Get a working token from the persona's Slack app and have the
   operator write it into the credentials file: for `bot_token`, the app's Bot
   User OAuth Token (re-install the app to the workspace if it was uninstalled
@@ -373,7 +384,7 @@ running are not affected. See
   persona; it comes up on its own once the directory is usable. Other
   personas are not affected.
 - If the persona also has a credentials cause, the cleared line ends
-  `the persona stays broken until its credentials are fixed and the server is restarted`
+  `the persona stays broken until its credentials file is fixed and the change confirmed`
   instead. See [Both causes at once](#both-causes-at-once).
 
 ### `persona-directory-unusable`
@@ -526,6 +537,90 @@ running are not affected. See
   `[slack] persona-notifier: failed to post notice for <ref> to <id> …` once
   for a notice, which is dropped. Report it as a bug, with the line.
 
+### `persona-credentials-change-failed`
+
+- **State:** unchanged. A persona that was `up` stays `up`; one that was
+  `retrying` keeps retrying. One whose own connection Slack refused while the
+  change was being tried (for example, its bot token was revoked meanwhile)
+  stays `broken`.
+- **Line:**
+  `[slack] persona-credentials-change-failed: personas[<i>] "<name>" (key=<key>) path="<path>": the confirmed credentials change cannot be used: <cause>; the current connection stays in use, and the change stays pending`.
+  For a persona that is retrying its bring-up, the end reads
+  `it keeps retrying with its current credentials, and the change stays pending`.
+  For a persona whose own connection was refused meanwhile, it reads
+  `it stays broken by its credentials, and the change stays pending`.
+- **Meaning:** The operator confirmed a change to the persona's credentials
+  file (same path, new content), and the server couldn't use the new file.
+  `<cause>` says why:
+  - the file is missing, unreadable or invalid: the cause texts of
+    [`persona-credentials-missing`](#persona-credentials-missing),
+    [`persona-credentials-unreadable`](#persona-credentials-unreadable) and
+    [`persona-credentials-invalid`](#persona-credentials-invalid);
+  - its real path is another persona's credentials file:
+    `real path is also the credentials_file of "<name>" (key=<key>)`;
+  - Slack refused a new token: `bot_token refused by auth.test: Slack error <code>`
+    or `app_token refused by the Socket Mode open: Slack error <code>` (see
+    [`persona-credentials-refused`](#persona-credentials-refused) for the
+    codes).
+- **Effect:** Nothing about the persona changed. It keeps running on its old
+  connection and old tokens (or stays `broken`, for the `stays broken`
+  ending), and its instance and conversation are untouched.
+  Other personas are not affected. The change stays pending, so
+  `config.json.pending` is written again with the same
+  `credentials file "<path>" changed …` line (see
+  [Pending changes](#pending-changes)).
+- **Also logged later:** when a confirmed change first found Slack
+  unreachable and Slack then refuses the new token while the persona is still
+  up on its old connection, this line is logged at that point, and the change
+  is pending again. If the old connection was refused meanwhile, the later
+  refusal is logged as [`persona-credentials-refused`](#persona-credentials-refused)
+  instead, and the persona stays `broken`: fix the file and confirm again.
+- **Fix:** Have the operator correct the credentials file: the shape under
+  [`persona-credentials-invalid`](#persona-credentials-invalid) (check it with
+  [Checking a credentials file's shape](#checking-a-credentials-files-shape)),
+  or a working token as described under
+  [`persona-credentials-refused`](#persona-credentials-refused). Each save
+  regenerates `config.json.pending` within about 5 s. Wait for it, then
+  confirm again (see [Confirming a pending change](#confirming-a-pending-change)).
+  No restart is needed.
+- **Not this class: Slack unreachable.** A confirmed change that can't reach
+  Slack isn't a failure. The persona keeps its current connection while the
+  new one retries on its own (5 s doubling to 300 s), and `server.log` has
+  `[slack] persona "<name>" (key=<key>): its changed credentials cannot reach Slack yet; the new connection retries and the current one stays in use`
+  plus a [`persona-slack-unreachable`](#persona-slack-unreachable) line for
+  the new connection. Once Slack answers, the persona switches to the new
+  connection with no further action, and the `reconnected …` line below is
+  logged then. A persona whose own connection Slack refused meanwhile logs
+  `[slack] persona "<name>" (key=<key>): its changed credentials cannot reach Slack yet; the new connection retries, and it stays broken by its credentials until that connection is in use`
+  instead; it comes up again once the new connection is in use. If a later
+  confirmed change replaces the retrying one, or the persona's connection is
+  stopped, the new connection's `persona-slack-unreachable` line is closed by
+  one ending `cleared: the new connection of its confirmed credentials change is no longer retried: …`
+  with the reason.
+- **When it works:** an up persona logs
+  `[slack] persona "<name>" (key=<key>): reconnected with its changed credentials; its instance and MCP session are kept`;
+  one whose own connection Slack had refused meanwhile logs
+  `[slack] persona "<name>" (key=<key>): reconnected with its changed credentials and up again; its instance is kept`,
+  then `up after its confirmed credentials change — launching`, and its kept
+  instance registers again;
+  a retrying one logs
+  `[slack] persona "<name>" (key=<key>): it retries its bring-up with its changed credentials`.
+- **When its state changed since the preview:** a persona the preview said
+  would be reconnected, but that is broken by its credentials when the
+  change is applied, logs
+  `[slack] persona "<name>" (key=<key>): broken by its credentials now, so it is brought up again rather than reconnected`
+  and is then brought up again (`broken by its credentials and its
+  credentials file changed — bringing it up again`, a new `persona-start`
+  line). A persona the preview said would be brought up, but that a pending
+  reconnect of an earlier change has brought up since, logs
+  `[slack] persona "<name>" (key=<key>): not brought up again — it is not broken by its credentials now, so its changed credentials are applied as a credentials change`,
+  then the lines above for an up persona.
+- **Not this class: a persona already broken by its credentials when the
+  change is applied.** Its bad new file doesn't log this line. It is brought up again and logs its usual class
+  line (`persona-credentials-invalid`, `-missing`, `-unreadable` or
+  `-refused`), stays `broken`, and nothing is pending until the file
+  changes again.
+
 ---
 
 ## Combined and related cases
@@ -534,9 +629,11 @@ running are not affected. See
 
 A persona with a credentials cause and a directory cause is `broken`. Both
 lines are logged at bring-up. The directory is still re-checked, and its
-cleared line says the persona stays broken until its credentials are fixed and
-the server is restarted. Fix both: the directory, and the credentials file,
-then restart the server.
+cleared line says the persona stays broken until its credentials file is fixed
+and the change confirmed. Fix both: the directory, and the credentials file,
+then confirm the pending change (see
+[Confirming a pending change](#confirming-a-pending-change)); no restart is
+needed.
 
 ### A running persona's directory disappears later
 
@@ -706,9 +803,12 @@ once it is up.
 
 ## A token was revoked while the persona was running
 
-Which token was revoked decides what the log shows. A running persona's
-Socket Mode reopen uses only the app token; `auth.test` (the bot token check)
-runs only at bring-up, when the server starts.
+Which token was revoked decides what the log shows. The Socket Mode
+connection uses only the app token, so a revoked app token shows up when that
+connection is reopened. Every Web API call (posts, reactions, history,
+downloads) uses the bot token, so a revoked bot token shows up at the first
+such call Slack refuses. Either way the persona becomes `broken` with one
+`persona-credentials-refused` line.
 
 ### The app token
 
@@ -723,31 +823,62 @@ There is no `persona-connection-restored` line. Then:
 - nothing is posted to Slack about it.
 
 **Fix:** a working token in the persona's credentials file (see
-`persona-credentials-refused`), then restart the server. The instance
-re-registers once the persona is up.
+`persona-credentials-refused`), then confirm the pending change (see
+[Confirming a pending change](#confirming-a-pending-change)); no restart is
+needed. The persona is brought up again as under the bot token below, and the
+instance re-registers once it is up.
 
 ### The bot token
 
-A bot token revoked while the persona runs may never be detected. Even if the
-connection drops, the reopen doesn't check the bot token, so no
-`persona-credentials-refused` line is logged. The persona stays `up` and keeps
-its MCP session, but everything it sends to Slack fails:
+**Symptom:** the persona stops answering in Slack, and its instance's MCP
+session is dropped and then refused. The Socket Mode connection stays up on
+the app token, so nothing looks wrong on the connection itself.
 
-- its tool calls (`reply`, `react`, `edit_message`, `fetch_messages`,
-  `download_attachment`) return a tool error to the instance:
-  `Tool "<tool>" failed for persona "<name>" (key=<key>): the tool call failed (<Slack error code>).`
-- `server.log` has the matching line:
-  `[slack] Tool "<tool>" failed for persona "<name>" (key=<key>): …`;
-- its permission prompts and notices are held, with one
-  [`persona-destination-failed`](#persona-destination-failed) line naming the
-  Slack error (for example `token_revoked` or `invalid_auth`).
+**When it's noticed:** at the first Web API call on the persona's client that
+Slack refuses with `invalid_auth`, `token_revoked`, `account_inactive` or
+`not_authed`: a tool call from its instance, or a permission prompt or notice
+the server posts for it. A persona that makes no call isn't noticed until it
+does. Any other Slack error, or a network failure, doesn't mark it.
 
-The next server start runs `auth.test`, which refuses the token: the persona
-then logs `persona-credentials-refused` with `bot_token refused by auth.test`
-and is `broken`.
+**What the log shows:** one line, logged at once:
 
-**Fix:** put a working bot token in the persona's credentials file (see
-`persona-credentials-refused`), then restart the server.
+```
+[slack] persona-credentials-refused: personas[<i>] "<name>" (key=<key>) path="<credentials file>": bot_token refused by a Web API call (<method>): Slack error <code>
+```
+
+`<method>` is the Slack method that was refused, such as `chat.postMessage`.
+The call that hit the error fails as it would anyway (a tool error to the
+instance, with its `[slack] Tool "<tool>" failed for persona …` line; a
+refused prompt or notice may also log
+[`persona-destination-failed`](#persona-destination-failed)). Then comes
+`MCP session dropped — the persona is not up (broken: …)` if a session was
+registered.
+
+**What the server did:**
+
+- the persona is `broken`, with no further attempts; its Socket Mode
+  connection is closed, and messages sent to it are no longer delivered;
+- its client makes no more calls: any later call on it is refused without
+  reaching Slack, so nothing is posted under the persona's or any other
+  identity;
+- its MCP session is dropped, and the instance's reconnects are refused, as
+  under [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running);
+- its instance and agent-director row are kept, so its conversation survives;
+- other personas are not affected, and nothing is posted to Slack about it.
+
+**Fix:** get a working Bot User OAuth Token from the persona's Slack app
+(re-install the app to the workspace if it was uninstalled or the token
+revoked), have the operator write it into the persona's credentials file, then
+confirm the pending change (see
+[Confirming a pending change](#confirming-a-pending-change)). The preview
+reads `…: credentials file "<path>" changed: it is broken by its credentials
+now, so it will be brought up.` No restart is needed. Once applied, the log
+shows `[slack] persona "<name>" (key=<key>): broken by its credentials and its
+credentials file changed — bringing it up again`, a new `persona-start` line
+and `up at apply — launching`. The launch reaches the kept instance, which
+registers again with its history. If the new token is refused too, a new
+`persona-credentials-refused` line names the cause and the persona stays
+`broken`.
 
 ---
 
@@ -1119,8 +1250,8 @@ settings.
 | `…: credentials file "<path>" changed: a new connection opens, then the old one closes, instance kept.` | The credentials file's content changed at the same path, and the persona is up. The line names the persona and the path, never a token. |
 | `…: credentials file "<path>" changed: it has no connection yet, so it retries with the new content, instance kept.` | The same, for a persona still retrying its bring-up (Slack unreachable, or its working directory unusable). |
 | `…: credentials file "<path>" changed: it is broken by its credentials now, so it will be brought up.` | The same, for a persona that is broken by its credentials: its credentials file is missing, unreadable or invalid, or Slack refused its tokens ([`persona-credentials-refused`](#persona-credentials-refused)). |
-| `…: credentials file "<path>" changed, but it cannot be used (<cause>): the current connection is kept, instance kept.` | The new content is missing, unreadable or invalid; `<cause>` is the credentials cause text, for example `credentials file does not exist` (never file content). The persona is up and keeps its current connection. A restart reads the file as it stands, so the persona would then be `broken`: fix the file. |
-| `…: credentials file "<path>" changed, but it cannot be used (<cause>): it has no connection yet, so it retries with the new content, instance kept.` | The same bad content, for a retrying persona. |
+| `…: credentials file "<path>" changed, but it cannot be used (<cause>): the current connection is kept, instance kept.` | The new content is missing, unreadable or invalid; `<cause>` is the credentials cause text, for example `credentials file does not exist` (never file content). The persona is up and keeps its current connection. Confirming it changes nothing and logs [`persona-credentials-change-failed`](#persona-credentials-change-failed). A restart reads the file as it stands, so the persona would then be `broken`: fix the file. |
+| `…: credentials file "<path>" changed, but it cannot be used (<cause>): it keeps retrying with its current content, instance kept.` | The same bad content, for a persona still retrying its bring-up. |
 | `…: credentials file "<path>" changed, but it cannot be used (<cause>): it stays broken by its credentials.` | The same bad content, for a persona broken by its credentials. It stays broken until the file is fixed. |
 | `persona "<name>" (key=<key>) is added; whether it can come up could not be checked.` | A new persona whose credentials and working directory the check couldn't examine (see the `cannot check` line below). It isn't counted differently in the header. |
 | `…: credentials file "<path>" changed; whether it is broken by its credentials now could not be checked.` | A credentials change whose persona's bring-up state couldn't be read (see the `cannot check` line below). With bad content it starts `credentials file "<path>" changed, but it cannot be used (<cause>);`. |
@@ -1206,7 +1337,9 @@ design; saving, restarting and rebooting apply nothing.
    it is used once. If its fingerprint still describes `config.json` and the
    credentials files, the change is applied: the record is rewritten with
    `config.json`'s bytes first, then removed personas are torn down, changed
-   routing settings are updated in place and added personas are brought up.
+   routing settings are updated in place, personas whose credentials file
+   changed are reconnected, and added personas, and personas broken by their
+   credentials whose credentials file changed, are brought up.
    Otherwise nothing is applied and
    [`reload-stale-confirmation`](#reload-stale-confirmation) is logged.
 5. Watch `server.log` for the outcome:
@@ -1216,8 +1349,8 @@ design; saving, restarting and rebooting apply nothing.
    ```
 
    [`reload-applied`](#reload-applied) (or [`reload-noop`](#reload-noop))
-   is logged once every teardown and bring-up has settled, possibly minutes
-   later; a persona that is `retrying` at that point isn't up yet. See
+   is logged once every teardown, reconnect attempt and bring-up has
+   settled, possibly minutes later; a persona that is `retrying` at that point isn't up yet. See
    [I confirmed but nothing happened](#i-confirmed-but-nothing-happened) for
    every other outcome.
 
@@ -1230,6 +1363,20 @@ What changes at once, with no restart:
   place immediately, instance kept` lines: `channels`, a channel's
   `delivery`, `permission_prompts` and `dm.*`. See
   [A persona's routing settings were changed by a confirmed change](#a-personas-routing-settings-were-changed-by-a-confirmed-change).
+- **A kept persona's credentials file content** (same path), the preview's
+  `credentials file "<path>" changed …` lines. A persona that is up is
+  reconnected: the new connection opens, then the old one closes, and its
+  instance, MCP session and conversation are kept. A persona still retrying
+  its bring-up retries with the new content. A persona broken by its
+  credentials is brought up again, and its launch reaches its kept
+  instance, so its conversation is kept. For a persona that is up or
+  retrying, a new file that can't be used changes nothing and logs
+  [`persona-credentials-change-failed`](#persona-credentials-change-failed);
+  the change stays pending. A persona broken by its credentials whose new
+  file can't be used is still brought up again: it logs its `persona-start`
+  line and its usual class line (`persona-credentials-invalid`,
+  `-missing`, `-unreadable` or `-refused`), stays broken, and nothing is
+  pending until the file changes again.
 
 Everything else in the change is recorded, and a later start carries it out
 (see [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)).
@@ -1252,7 +1399,6 @@ conversation. So restart promptly after `reload-applied`.
 | Preview line | After the confirmation | To carry it out |
 |---|---|---|
 | `DESTRUCTIVE: … changed to "<path>" …` or `… name changed …` (a kept persona's `credentials_file`, `working_directory` or `name`) | Recorded. The persona isn't torn down or brought up again. | Restart: at the start, a persona whose `working_directory` changed has its instance killed by the start sweep and comes up fresh in the new directory, without its session history; a changed `credentials_file` only reconnects the persona to Slack with the new app, and its instance keeps running. |
-| `credentials file "<path>" changed …` | Not applied: the persona keeps its current connection, and the credentials change stays pending in `config.json.pending`. | Restart: every start reads credentials files as they stand. No confirmation is needed for it. |
 | `stop_hook_bootstrap changed` or `claude_config_dir changed` (`takes effect at its next launch`, or a top-level setting `inherited by …`) | Recorded. It reaches each persona at its next launch. | Relaunch the bots: `claude-slack-channel-bots clean_restart`, or `stop --stop-bots` then `start`. Both cut off the bots' current turns. A plain restart reconnects running bots, which is not a launch. |
 | `server-wide setting <name> changed: once applied, it is recorded and takes effect at the next server start after that.` | Recorded. | Restart. |
 
@@ -1280,7 +1426,7 @@ Look in `server.log` for the lines logged after the rename (the `grep` in
 
 | Line | Meaning |
 |---|---|
-| [`reload-applied`](#reload-applied) | The change was applied. Personas added, removed or changed in place are handled; the rest is recorded (see [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)). A persona that isn't up has its own class line. |
+| [`reload-applied`](#reload-applied) | The change was applied. Personas added, removed, changed in place or with a changed credentials file are handled (a credentials file that can't be used logs [`persona-credentials-change-failed`](#persona-credentials-change-failed) and stays pending); the rest is recorded (see [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)). A persona that isn't up has its own class line. |
 | [`reload-noop`](#reload-noop) | The change had no effect (whitespace, key order, a default written out); the record now matches `config.json`. Nothing else happens. |
 | [`reload-invalid`](#reload-invalid), `the confirmed configuration is invalid, so nothing is applied` | `config.json` was invalid. Nothing is applied and the confirmation is used up. Fix the file, then confirm the new preview. |
 | [`reload-stale-confirmation`](#reload-stale-confirmation) | The confirmation didn't match the files as they stand, or couldn't be read. Nothing is applied. |
@@ -1580,9 +1726,16 @@ or a filesystem that doesn't support syncing a directory).
     `persona-start` line, then `up at apply — launching` or a class line);
   - a kept persona's `credentials_file` path change is only recorded: its
     connection keeps running as it is until a restart reconnects it;
-  - a persona with changed credentials keeps its current connection, and the
-    credentials change stays pending (see
-    [Pending changes](#pending-changes)).
+  - a persona with a changed credentials file (same path) is reconnected
+    with it when up (`reconnected with its changed credentials; its
+    instance and MCP session are kept`), retries with it when retrying, and
+    is brought up again when broken by its credentials. For a persona that
+    is up or retrying, a new file that can't be used leaves it as it was and
+    logs [`persona-credentials-change-failed`](#persona-credentials-change-failed),
+    and that change stays pending (see [Pending changes](#pending-changes)).
+    A persona broken by its credentials whose new file can't be used is
+    brought up again anyway, logs its usual class line (for example
+    `persona-credentials-invalid`) and stays broken; nothing is pending.
 
   The next start runs the new record and carries out what the
   confirmation left to it (see

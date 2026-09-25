@@ -509,6 +509,8 @@ describe('credentials changed', () => {
       causes: { directory: failure('working-directory', PERSONA_DIRECTORY_MISSING) },
     },
     up: { outcome: 'up', causes: {} },
+    /** Its first Slack attempt is in flight: no outcome yet, so no connection yet. */
+    firstAttempt: { outcome: undefined, causes: {} },
   } satisfies Record<string, PersonaBringUpState>
 
   test.each<[string, PersonaBringUpState | undefined, boolean, boolean]>([
@@ -518,6 +520,7 @@ describe('credentials changed', () => {
     ['retrying: Slack unreachable', STATES.retryingSlack, false, true],
     ['retrying: working directory missing', STATES.retryingDirectory, false, true],
     ['up', STATES.up, false, false],
+    ['in its first Slack attempt (no outcome yet)', STATES.firstAttempt, false, true],
     ['the controller does not know', undefined, false, false],
   ])('a persona %s is credentials-broken and retrying exactly as its state says', (_label, state, broken, retrying) => {
     const { plan } = preview(applied(), { ...bravoRotated(), bringUpState: () => state })
@@ -593,13 +596,25 @@ describe('credentials changed', () => {
       'retrying (Slack unreachable), file missing',
       STATES.retryingSlack,
       () => MISSING,
-      (c) => `, but it cannot be used (${c}): it has no connection yet, so it retries with the new content, instance kept.`,
+      (c) => `, but it cannot be used (${c}): it keeps retrying with its current content, instance kept.`,
     ],
     [
       'retrying (working directory missing), malformed JSON holding a token',
       STATES.retryingDirectory,
       NOT_JSON,
-      (c) => `, but it cannot be used (${c}): it has no connection yet, so it retries with the new content, instance kept.`,
+      (c) => `, but it cannot be used (${c}): it keeps retrying with its current content, instance kept.`,
+    ],
+    [
+      'in its first Slack attempt (no outcome yet), content valid',
+      STATES.firstAttempt,
+      undefined,
+      () => ': it has no connection yet, so it retries with the new content, instance kept.',
+    ],
+    [
+      'in its first Slack attempt (no outcome yet), file missing',
+      STATES.firstAttempt,
+      () => MISSING,
+      (c) => `, but it cannot be used (${c}): it keeps retrying with its current content, instance kept.`,
     ],
     [
       'broken by its local credentials check, content valid',

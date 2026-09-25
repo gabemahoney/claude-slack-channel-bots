@@ -21,13 +21,17 @@
  * SR-6.5 / SR-6.1 / SR-6.6 (E12 Task 2): a confirmed apply's teardowns (step
  * 2) and bring-ups (step 6) are the controller's default fan-out over its
  * lifecycle members `teardown` and `bringUp`; its in-place updates (step 3,
- * E12 Task 3) over `updateInPlace`. The audit pins that production binds all
- * three to the one `PersonaLifecycle` main() composes with
+ * E12 Task 3) over `updateInPlace`; its credentials reconnects (step 4, E13
+ * Task 1) over `reconnectCredentials`, and the recovery of a
+ * credentials-broken persona (step 6, SR-6.4) over `bringUp` with its
+ * `recovery` option. The audit pins that production binds all four, every
+ * argument forwarded, to the one `PersonaLifecycle` main() composes with
  * `createPersonaLifecycle` (declared before the controller, assigned once
  * after the bring-up controller exists and before detection is armed), passes
  * no `applySteps` override (which would replace that fan-out), and that the
- * restart timers, the bring-up retries and the lifecycle share one
- * per-persona serializer. What the default step bodies do with those members
+ * restart timers, the connection manager (the deferred socket close after a
+ * Web API auth error, b.ujn), the bring-up retries and the lifecycle share
+ * one per-persona serializer. What the default step bodies do with those members
  * is tested in tests/reload-apply.test.ts; what the teardown, the apply
  * bring-up and the in-place update do is tested behaviourally against
  * `createPersonaLifecycle`.
@@ -293,40 +297,54 @@ function constOf(factory: string): string {
   return decls[0]![1]!
 }
 
-/** The lifecycle holder the controller's `teardown`, `updateInPlace` and `bringUp` members forward to (see the first test below). */
-function lifecycleHolder(): string {
-  const lifecycle = objectProperties(controllerProps().get('lifecycle') ?? '')
-  const teardown = (lifecycle.get('teardown') ?? '').match(/^\(?\s*(\w+)\s*\)?\s*=>\s*(\w+)\s*\.\s*teardown\s*\(\s*(\w+)\s*\)$/)
-  const updateInPlace = (lifecycle.get('updateInPlace') ?? '').match(
-    /^\(?\s*(\w+)\s*\)?\s*=>\s*(\w+)\s*\.\s*updateInPlace\s*\(\s*(\w+)\s*\)$/,
+/**
+ * The controller's lifecycle member `member`, which must be exactly
+ * `(<p1>, …, <pn>) => <holder>.<member>(<p1>, …, <pn>)` with `arity`
+ * parameters, each passed through unchanged and in order (none dropped,
+ * reordered or replaced); fails the test otherwise. Returns the holder.
+ */
+function forwardingHolder(lifecycle: Map<string, string>, member: string, arity: number): string {
+  const params = Array.from({ length: arity }, () => '\\s*(\\w+)\\s*').join(',')
+  const paramList = arity === 1 ? `\\(?${params}\\)?` : `\\(${params}\\)`
+  const arrow = (lifecycle.get(member) ?? '').match(
+    new RegExp(`^${paramList}\\s*=>\\s*(\\w+)\\s*\\.\\s*${member}\\s*\\(${params}\\)$`),
   )
-  const bringUp = (lifecycle.get('bringUp') ?? '').match(
-    /^\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>\s*(\w+)\s*\.\s*bringUp\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)$/,
-  )
-  expect(teardown).not.toBeNull()
-  expect(updateInPlace).not.toBeNull()
-  expect(bringUp).not.toBeNull()
-  // Each passes its own parameters through, unchanged and in order.
-  expect(teardown![3]).toBe(teardown![1])
-  expect(updateInPlace![3]).toBe(updateInPlace![1])
-  expect([bringUp![4], bringUp![5]]).toEqual([bringUp![1], bringUp![2]])
-  // All three on the same holder.
-  expect(updateInPlace![2]).toBe(teardown![2])
-  expect(bringUp![3]).toBe(teardown![2])
-  return teardown![2]!
+  expect([member, arrow]).not.toEqual([member, null])
+  expect([member, arrow!.slice(arity + 2)]).toEqual([member, arrow!.slice(1, arity + 1)])
+  return arrow![arity + 1]!
 }
 
-describe('server.ts binds the confirmed apply\'s teardown, in-place update and bring-up (b.av2 SR-6.1, SR-6.5, SR-6.6, SR-8.6 step 3)', () => {
-  // ReloadLifecycleOps.teardown, .updateInPlace and .bringUp are required, so
-  // the typecheck catches a missing member; it cannot catch one bound to
-  // something that does nothing, or to another member. Without these
-  // bindings a confirmed removal would leave the persona's connection,
-  // session and instance running, a confirmed addition would never come up,
-  // and a confirmed routing change would be recorded as applied while the
-  // persona's cached DM conversation stayed and no line was logged.
-  test('the controller\'s lifecycle members teardown, updateInPlace and bringUp forward their arguments to one lifecycle holder, beside the start bring-up', () => {
+/**
+ * The lifecycle holder the controller's `teardown`, `updateInPlace`,
+ * `reconnectCredentials` and `bringUp` members forward to (see the first test
+ * below).
+ */
+function lifecycleHolder(): string {
+  const lifecycle = objectProperties(controllerProps().get('lifecycle') ?? '')
+  const teardown = forwardingHolder(lifecycle, 'teardown', 1)
+  // All four on the same holder. bringUp forwards its third parameter, the
+  // options carrying `recovery` (SR-8.6 step 6, SR-6.4): a binding that drops
+  // it typechecks, but would bring a credentials-broken persona up as new.
+  expect(forwardingHolder(lifecycle, 'updateInPlace', 1)).toBe(teardown)
+  expect(forwardingHolder(lifecycle, 'reconnectCredentials', 2)).toBe(teardown)
+  expect(forwardingHolder(lifecycle, 'bringUp', 3)).toBe(teardown)
+  return teardown
+}
+
+describe('server.ts binds the confirmed apply\'s teardown, in-place update, credentials change and bring-up (b.av2 SR-6.1, SR-6.4, SR-6.5, SR-6.6, SR-8.6 steps 3, 4 and 6)', () => {
+  // ReloadLifecycleOps.teardown, .updateInPlace, .reconnectCredentials and
+  // .bringUp are required, so the typecheck catches a missing member; it
+  // cannot catch one bound to something that does nothing, to another
+  // member, or one that drops an optional argument. Without these bindings a
+  // confirmed removal would leave the persona's connection, session and
+  // instance running, a confirmed addition would never come up, a confirmed
+  // routing change would be recorded as applied while the persona's cached
+  // DM conversation stayed and no line was logged, a rotated token would
+  // never reach the persona's connection, and a credentials-broken persona
+  // would never recover.
+  test('the controller\'s lifecycle members teardown, updateInPlace, reconnectCredentials and bringUp (with its options) forward their arguments to one lifecycle holder, beside the start bring-up', () => {
     const lifecycle = objectProperties(controllerProps().get('lifecycle') ?? '')
-    expect([...lifecycle.keys()].sort()).toEqual(['bringUp', 'startBringUp', 'teardown', 'updateInPlace'])
+    expect([...lifecycle.keys()].sort()).toEqual(['bringUp', 'reconnectCredentials', 'startBringUp', 'teardown', 'updateInPlace'])
     expect(lifecycleHolder()).toMatch(/^\w+$/)
   })
 
@@ -367,15 +385,23 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update and b
     expect(indicesOf(/\bapplySteps\b/g, SERVER_CODE)).toEqual([])
   })
 
-  test('one per-persona serializer, built once at module scope: its run is the serialize of initRestart, the bring-up controller and the lifecycle', () => {
+  // The connection manager's serialize (b.ujn) is optional in its deps and
+  // defaults to running the close at once, so only this audit makes sure
+  // production passes it: without it, the deferred close of a socket whose
+  // Web API call was refused for its token would not wait behind a lifecycle
+  // operation holding the persona.
+  test('one per-persona serializer, built once at module scope: its run is the serialize of initRestart, the connection manager, the bring-up controller and the lifecycle, and is used nowhere else', () => {
     const serializer = constOf('createPersonaSerializer')
     expect(callsOf(SERVER_CODE, 'createPersonaSerializer')).toHaveLength(1)
     const decl = SERVER_CODE.search(new RegExp(`^const\\s+${serializer}\\s*=\\s*createPersonaSerializer\\s*\\(\\s*\\)\\s*$`, 'm'))
     expect(decl).toBeGreaterThanOrEqual(0)
     expect(insideMain(SERVER_CODE, decl)).toBe(false)
-    for (const factory of ['initRestart', 'createPersonaBringUpController', 'createPersonaLifecycle']) {
+    const factories = ['initRestart', 'createPersonaConnectionManager', 'createPersonaBringUpController', 'createPersonaLifecycle']
+    for (const factory of factories) {
       expect([factory, onlyCallProps(factory).get('serialize')]).toEqual([factory, `${serializer}.run`])
     }
+    // Beyond its declaration, the serializer is named only in those values.
+    expect(indicesOf(new RegExp(`(?<![\\w.$])${serializer}\\b`, 'g'), SERVER_CODE)).toHaveLength(1 + factories.length)
   })
 
   // Every dependency is required, so the typecheck catches a missing one; it
@@ -390,6 +416,11 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update and b
     // The same per-persona queue as restarts and bring-up retries (test above).
     const expected = new Map<string, string>([
       ['serialize', `${constOf('createPersonaSerializer')}.run`],
+      // The server's own instances, whose states, held tokens and live
+      // connections the credentials change and the recovery act on
+      // (`state`, `changeCredentials`; `reconnectCredentials`,
+      // `replaceRetryTokens`): a separate instance would type-check but
+      // change nothing the server serves.
       ['bringUps', constOf('createPersonaBringUpController')],
       ['connections', constOf('createPersonaConnectionManager')],
       ['routing', constOf('createPersonaRouting')],

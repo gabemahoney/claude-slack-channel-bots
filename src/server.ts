@@ -1123,9 +1123,10 @@ export async function main(): Promise<void> {
   // Declared here, before the controller whose onApplied reads it, so that
   // closure never depends on declaration order (no temporal dead zone).
   let appliedConfig!: PersonaConfig
-  // A confirmed apply's teardowns (step 2), in-place updates (step 3) and
-  // bring-ups (step 6), composed in persona-lifecycle.ts once the bring-up
-  // controller exists (below).
+  // A confirmed apply's teardowns (step 2), in-place updates (step 3),
+  // credentials changes (step 4) and bring-ups (step 6, recoveries
+  // included), composed in persona-lifecycle.ts once the bring-up controller
+  // exists (below).
   // Declared here for the same reason as appliedConfig; an apply runs only
   // after the start bring-up pass, long after it is set.
   let personaLifecycleOps!: PersonaLifecycle
@@ -1135,7 +1136,8 @@ export async function main(): Promise<void> {
       startBringUp: (applied) => startupSessionManager(applied, { bringUp: personaBringUps }),
       teardown: (persona) => personaLifecycleOps.teardown(persona),
       updateInPlace: (change) => personaLifecycleOps.updateInPlace(change),
-      bringUp: (persona, applied) => personaLifecycleOps.bringUp(persona, applied),
+      bringUp: (persona, applied, options) => personaLifecycleOps.bringUp(persona, applied, options),
+      reconnectCredentials: (persona, applied) => personaLifecycleOps.reconnectCredentials(persona, applied),
     },
     log: (line) => console.error(line),
     tickDriver: createReloadTickDriver({ log: (line) => console.error(line) }),
@@ -1235,6 +1237,10 @@ export async function main(): Promise<void> {
     }),
     log: (line) => console.error(line),
     dryRun: isDryRun(),
+    // b.ujn: a running persona whose Web API call is refused for its bot
+    // token is marked credentials-broken at once; only the network close of
+    // its detached socket goes through the per-persona serializer.
+    serialize: personaLifecycle.run,
     onStatus: composePersonaStatusListeners(
       createPersonaUpFlushListener(personaNotifier),
       (key, status) => bringUps?.onConnectionStatus(key, status),
@@ -1266,9 +1272,10 @@ export async function main(): Promise<void> {
   })
   bringUps = personaBringUps
 
-  // b.av2 SR-6.5 / SR-6.1 / SR-8.6 / SR-6.6: the apply's persona teardown,
-  // in-place update and bring-up, each through the per-persona serializer. This supplies only the
-  // production dependencies; the operations live in persona-lifecycle.ts.
+  // b.av2 SR-6.5 / SR-6.1 / SR-8.6 / SR-6.6 / SR-6.4: the apply's persona
+  // teardown, in-place update, credentials change and bring-up (recovery
+  // included), each through the per-persona serializer. This supplies only
+  // the production dependencies; the operations live in persona-lifecycle.ts.
   personaLifecycleOps = createPersonaLifecycle({
     serialize: personaLifecycle.run,
     bringUps: personaBringUps,

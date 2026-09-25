@@ -219,7 +219,8 @@ export function personaSlackStatusFailure(status: Exclude<PersonaConnectionStatu
 /**
  * Whether a persona in this connection status serves Web API calls: `up`,
  * `lost`, or `retrying` a reopen (a dropped socket does not stop the Web API).
- * Not while connecting, retrying its bring-up, broken (either phase), stopped,
+ * Not while connecting, retrying its bring-up, broken (at bring-up, on a
+ * reopen, or by a Web API call refused for its bot token), stopped,
  * or unmanaged. Whether a persona may be relaunched also needs its bring-up
  * outcome to be `up` (b.av2 SR-6.4; `createPersonaRelaunchGate`).
  */

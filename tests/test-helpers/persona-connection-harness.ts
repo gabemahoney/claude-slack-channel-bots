@@ -9,7 +9,8 @@
  * - the real `createPersonaConnectionManager` over the shared stub factory
  *   (`makeStubSlackFactory`, one stub per persona with the leak marker on) and
  *   a fake clock. Each persona's tokens are distinct sentinel-bearing fakes;
- *   in dry run no stub or token is registered;
+ *   in dry run no stub or token is registered. `opts.serialize` is handed to
+ *   the manager as its `serialize`, as `server.ts` wires it (none by default);
  * - `clientFor` = `createPersonaClientLookup(manager, () => h.config)` and
  *   `identityFor` = `createPersonaIdentityLookup(manager, () => h.config)`,
  *   the lookups `server.ts` builds;
@@ -52,6 +53,7 @@ import {
   type PersonaStatusListener,
 } from '../../src/persona-connections.ts'
 import { PersonaSlackTokens } from '../../src/persona-credentials.ts'
+import type { PersonaSerialize } from '../../src/persona-serializer.ts'
 import type { SlackBotIdentity } from '../../src/persona-slack-validation.ts'
 import { createPersonaClientLookup, createPersonaIdentityLookup } from '../../src/persona-start.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './persona-config.ts'
@@ -74,6 +76,14 @@ export interface ConnectionHarnessOptions {
    * be sentinel-bearing (`fakeToken`) and distinct from every other persona's.
    */
   tokens?: Readonly<Record<string, PersonaSlackTokens>>
+  /**
+   * The per-persona serializer's `run` handed to the manager as its
+   * `serialize` (bug b.ujn: the network close of a socket detached by a
+   * refused Web API call waits for the persona's turn), so the manager is
+   * wired as `server.ts` wires it (`serialize: personaLifecycle.run`). Omitted:
+   * the manager gets none and that close runs at once.
+   */
+  serialize?: PersonaSerialize
 }
 
 /** One call of `h.connections.bringUp`. A boolean, so a failure never prints a token. */
@@ -167,6 +177,7 @@ export function makeConnectionHarness(
       return h.onStatus?.(key, status)
     },
     onEvent: (key, eventName, payload) => h.onEvent(key, eventName, payload),
+    ...(opts.serialize === undefined ? {} : { serialize: opts.serialize }),
   })
 
   const h: ConnectionHarness = {

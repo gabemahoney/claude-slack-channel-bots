@@ -25,8 +25,23 @@
  *   first credentials are written after a run was built (a brand-new file
  *   created while the server runs, AC 22) is registered with that run's stub
  *   factory then, so its tokens route to its own stub (`run.stub(name)`,
- *   scripted by the run's `opts.slack[name]`); a later rotation of a persona
- *   the run already routes is not re-registered;
+ *   scripted by the run's `opts.slack[name]`);
+ * - credentials rotations (b.av2 SR-8.6 credentials row): every set written
+ *   has a harness label, `credentials-<n>` (`h.credentialsLabel(name)` is
+ *   the latest). `h.rotateCredentials(persona, { slack? })` is
+ *   `h.writeCredentials` returning `{ tokens, label }`, with `slack`
+ *   scripting the new set: a live run that already routes the persona
+ *   registers the new pair as another credential set of it
+ *   (`addCredentials`), with its own stub, identity and script, so a
+ *   reconnect builds its clients there while the old set keeps serving
+ *   (`h.writeCredentials` does the same, unscripted). `run.credentialsStub(
+ *   name, label?)` is a set's stub in that run, `run.currentStub(name)` the
+ *   one whose socket connected last (the set serving it now), and
+ *   `run.socketActivity(name)` the persona's socket clients' events in
+ *   order, labelled by set (`'connected credentials-2'`, `'discarded
+ *   credentials-1'`, …), which tells "new opened, then old closed" apart.
+ *   Its current identity is `run.connections.manager.identity(key)`; a
+ *   set's scripted one is `run.credentialsStub(name, label).identity`;
  * - configuration and record files: `h.writeConfig(input)` and
  *   `h.writeRecord(input)` write `input` as JSON in the same format (so the
  *   same input gives byte-identical files) and return the bytes;
@@ -87,7 +102,12 @@
  *   File permissions are never the seam: the suite may run as root;
  * - confirmations (b.av2 SR-8.5): `h.confirm()` is the operator's gesture
  *   exactly, one rename of `paths.pending` to `paths.apply` with no content
- *   change (AC 73); `h.writeApplyBytes(b)` places any bytes at the apply
+ *   change (AC 73); `run.confirmPending()` is a tick that must write the
+ *   pending file, that rename, then the applying tick, returned unawaited as
+ *   `{ applying }`; `run.beforeApplySteps(hook)` runs `hook` once at the
+ *   next apply's step 1, after the applied set was swapped and before step 2
+ *   (to change the file system between the candidate's validation and steps
+ *   4 and 6, b.av2 SR-1.4 apply part); `h.writeApplyBytes(b)` places any bytes at the apply
  *   path (an older copy of the pending file kept with `h.readPending()`, for
  *   the stale gesture, or garbage for a malformed one); `h.applyExists()` and
  *   `h.readApply()` show what is there. A confirmation that cannot be deleted
@@ -133,8 +153,20 @@
  *   that ends `up`; a launch is only recorded (nothing is spawned).
  *   `bringUp` does the same for one persona; `teardown` cancels the persona's
  *   bring-up and stops its connection; `updateInPlace` is recorded (with the
- *   changed `settings`) and does nothing else; `reconnectCredentials` is
- *   recorded only. With `opts.realLifecycle`, `bringUp`, `teardown` and
+ *   changed `settings`) and does nothing else; `reconnectCredentials` (step
+ *   4) runs the real controller's `changeCredentials` over the manager (the
+ *   real reconnect: new connection first, the 10 s `start()` bound and the
+ *   SR-3.2 retries on `run.clock`) and records how it settled (`change`); a
+ *   recovery bring-up (`{ recovery: true }`, step 6) is recorded with
+ *   `recovery: true`, cancels its bring-up, stops its connection and
+ *   brings it up afresh. These two stand-ins cover only what they do as the
+ *   lifecycle does: they never forget a cached DM conversation (the
+ *   lifecycle's forget), so a reconnect or recovery of a persona that has had
+ *   a `dm` destination in this run, and a recovery of a persona no longer
+ *   credentials-broken when it runs (the lifecycle applies the change as a
+ *   reconnect then), need `opts.realLifecycle`: the stand-in rejects the
+ *   call and `h.cleanup()` throws, naming it. With `opts.realLifecycle`, `bringUp` (a recovery
+ *   included), `teardown`, `reconnectCredentials` and
  *   `updateInPlace` run the real composition instead (`run.composition`, see
  *   `RealLifecycleComposition`: `createPersonaLifecycle` over the run's
  *   controller and manager, a real serializer, the run's destination
@@ -149,11 +181,21 @@
  *   returned release is called, or makes it reject once `release.fail(err)`
  *   is called (a start pass that throws after its bring-ups and launches).
  *   Apply-time calls: `hold(op, key)` holds the next `teardown`,
- *   `update-in-place` or `bring-up` of one persona before its body runs
+ *   `update-in-place`, `reconnect` or `bring-up` of one persona before its body runs
  *   until `release()`, or makes it reject with `fail(err)`; `timeline` lists
- *   every apply-time teardown, in-place update and bring-up as it started and
+ *   every apply-time teardown, in-place update, reconnect and bring-up as it started and
  *   settled or rejected, across personas and steps (b.av2 SR-8.6 step order
- *   without timing);
+ *   without timing). The bring-up controller's `onLeftUp` is server.ts's
+ *   `createNotUpSessionDropper` over the real `dropPersonaSession`, so a
+ *   persona that stops being up has its registered session dropped (one
+ *   line). With `opts.realLifecycle` the manager gets the composition's
+ *   serializer (`makeConnectionHarness`'s `serialize`, as `server.ts` passes
+ *   `personaLifecycle.run`), so a b.ujn mark's network close of its detached
+ *   socket waits for the persona's serializer turn (behind a lifecycle
+ *   operation of that persona in flight; a `hold` gate is outside the
+ *   serializer and holds no turn). Without it the manager
+ *   gets no serializer, like the recorder's stand-ins (which take none), and
+ *   that close runs at once;
  * - the real consumers of the applied settings (b.av2 SR-13.1), wired as
  *   `server.ts` wires them and reading the controller's applied
  *   configuration at each use: the routing (`createPersonaRouting`) behind
@@ -173,7 +215,18 @@
  *   Deliver only to a persona with a registered session (a lost message
  *   would reach the restart module, which the harness does not set up).
  *   A delivery makes a `users.info` call (the author's name), and no ack
- *   reaction;
+ *   reaction. `run.noticeClock` is the destination hold's clock.
+ *   Not-up personas (b.av2 SR-6.3, SR-6.4): `run.isUp(name)` is server.ts's
+ *   up check (`createPersonaUpPredicate`), `run.admitSession(name)` its MCP
+ *   admission (`decideSessionAdmission`: registers when admitted, else one
+ *   refusal line), and `run.bringUps.state(key)` the up/broken/retrying
+ *   state. Breaking a running persona: `run.revokeBotToken(name, opts?)`
+ *   scripts `token_revoked` (or `opts.error`) at the front of every Web API
+ *   queue of its current stub, so the first call a consumer makes (a notice,
+ *   a tool call, a delivery's `users.info`) marks it broken (bug b.ujn);
+ *   `run.refuseReopen(name, error?)` drops its socket with a refused reopen
+ *   queued and resolves once it is broken. `run.linesOf(name)` is every log
+ *   line naming the persona (lifecycle, bring-up, manager, diagnostics);
  * - `run.ticks`: a manual `ReloadTickDriver`. Nothing runs until the test
  *   calls `tick()` or `ticks(n)` (each awaited until the pass settles; `tick`
  *   rejects when nothing is armed); no real timer is ever armed. `armed`,
@@ -248,7 +301,8 @@
  *   test advances `run.clock`, so they never mix into a stretch of ticks.
  *
  * Call `await h.cleanup()` in `afterEach`: it stops every run (detection,
- * bring-up retries, connections) and removes the root. A test that must show
+ * bring-up retries, connections) and removes the root, then throws if a
+ * stand-in refused a call that needs `opts.realLifecycle`. A test that must show
  * no timer is left calls `await run.stop()` and checks
  * `run.clock.pendingCount()`.
  *
@@ -299,18 +353,22 @@ import {
   durableWriteFileSync,
   type DurableWriteFs,
 } from '../../src/atomic-write.ts'
-import { MAX_RELOAD_FILE_BYTES, type Persona, type PersonaConfig, type PersonaConfigFs, type PersonaInput } from '../../src/config.ts'
+import { DM_DESTINATION, MAX_RELOAD_FILE_BYTES, type Persona, type PersonaConfig, type PersonaConfigFs, type PersonaInput } from '../../src/config.ts'
 import {
   DEFAULT_WORKING_DIRECTORY_FS,
   type PersonaBringUpFs,
   type WorkingDirectoryFs,
 } from '../../src/persona-bringup.ts'
 import {
+  createNotUpSessionDropper,
   createPersonaBringUpController,
+  describePersonaNotUp,
+  isCredentialsBroken,
   type PersonaBringUpController,
   type PersonaBringUpOutcome,
   type PersonaBringUpResultSummary,
   type PersonaBringUpState,
+  type PersonaCredentialsChangeResult,
 } from '../../src/persona-bringup-controller.ts'
 import {
   credentialsDigest,
@@ -325,7 +383,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 
 import { _resetAckTracker, consumeAck } from '../../src/ack-tracker.ts'
 import { defaultAccess } from '../../src/lib.ts'
-import { personaInstanceId, personaKey } from '../../src/persona-identity.ts'
+import { personaKey, renderPersonaRef } from '../../src/persona-identity.ts'
 import { createPersonaEventRouter } from '../../src/persona-event-router.ts'
 import { createPersonaLifecycle, type PersonaLifecycle } from '../../src/persona-lifecycle.ts'
 import { createPersonaRouting } from '../../src/persona-routing.ts'
@@ -335,18 +393,21 @@ import {
   createPersonaClientLookup,
   createPersonaIdentityLookup,
   createPersonaUpFlushListener,
+  createPersonaUpPredicate,
 } from '../../src/persona-start.ts'
 import { _resetOutageState, initOutageState } from '../../src/outage-state.ts'
 import {
   _resetRegistry,
   createSessionServer,
+  decideSessionAdmission,
+  dropPersonaSession,
   getSessionByPersona,
   registerSession,
   type SessionEntry,
   type SessionToolDeps,
 } from '../../src/registry.ts'
 import { deletePersonaInstance, killPersonaInstance } from '../../src/session-manager.ts'
-import type { ApplyStepSlots, InPlaceApplyInput } from '../../src/reload-apply.ts'
+import type { ApplyBringUpOptions, ApplyStepSlots, InPlaceApplyInput } from '../../src/reload-apply.ts'
 import { composePendingFile, parsePendingFingerprint } from '../../src/reload-fingerprint.ts'
 import { DESTRUCTIVE_PREFIX, PENDING_PREVIEW_TITLE, type InPlaceSetting } from '../../src/reload-plan.ts'
 import {
@@ -376,7 +437,16 @@ import { makePersona } from './persona-config.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './persona-connection-harness.ts'
 import { makeNotifierStack } from './persona-notifier.ts'
 import { makeSessionServer, makeTransport, type ChannelNotification } from './persona-routing-harness.ts'
-import type { SlackEvent, StubSlack, StubSlackFactory, StubSlackOptions, StubWebCall } from './slack-stub.ts'
+import {
+  INITIAL_CREDENTIALS,
+  type SlackEvent,
+  type StubSlack,
+  type StubSlackFactory,
+  type StubSlackOptions,
+  type StubSlackScript,
+  type StubWebCall,
+  type WebApiOutcome,
+} from './slack-stub.ts'
 
 // ---------------------------------------------------------------------------
 // Scripted Slack outcomes for a start
@@ -511,6 +581,15 @@ export interface ReloadLifecycleRecord {
   result?: PersonaBringUpResultSummary
   /** In-place update only: the changed settings the controller passed (`InPlaceApplyInput.settings`), in its order. */
   readonly settings?: readonly InPlaceSetting[]
+  /**
+   * Apply bring-up only, and only when set: the step-6 recovery bring-up of a
+   * persona broken by its credentials whose credentials file changed (the
+   * controller passed `{ recovery: true }`, b.av2 SR-6.4). Absent for an
+   * added persona's bring-up, so its record compares as before.
+   */
+  readonly recovery?: true
+  /** Reconnect only: how the credentials change settled (its first attempt), set once it resolved. */
+  change?: PersonaCredentialsChangeResult
 }
 
 export interface ReloadLifecycleRecorder {
@@ -535,8 +614,8 @@ export interface ReloadLifecycleRecorder {
    */
   holdStartPass(): StartPassHold
   /**
-   * Gate the next apply-time call of `op` (`teardown`, `update-in-place` or
-   * `bring-up`) for the persona `key`: the call is recorded and its `start`
+   * Gate the next apply-time call of `op` (`teardown`, `update-in-place`,
+   * `reconnect` or `bring-up`) for the persona `key`: the call is recorded and its `start`
    * timeline entry made when it arrives, then it waits, its body not yet run,
    * until `gate.release()` (the body runs) or `gate.fail(err)` (the call
    * rejects with `err` and its body never runs). Call `fail` before the call
@@ -544,7 +623,8 @@ export interface ReloadLifecycleRecorder {
    */
   hold(op: LifecycleGateOp, key: string): LifecycleGate
   /**
-   * The apply-time `teardown`, `update-in-place` and `bring-up` calls in the
+   * The apply-time `teardown`, `update-in-place`, `reconnect` and `bring-up`
+   * calls (a recovery bring-up included) in the
    * order they started and settled (`start`, then `settled` or `rejected`),
    * across personas and steps, so step order is asserted without timing
    * (b.av2 SR-8.6). A held call's `start` comes when it arrives, its
@@ -554,7 +634,7 @@ export interface ReloadLifecycleRecorder {
 }
 
 /** An apply-time lifecycle call a test can hold (`run.lifecycle.hold`). */
-export type LifecycleGateOp = 'teardown' | 'update-in-place' | 'bring-up'
+export type LifecycleGateOp = 'teardown' | 'update-in-place' | 'reconnect' | 'bring-up'
 
 /** `run.lifecycle.hold(op, key)`'s handle. */
 export interface LifecycleGate {
@@ -577,12 +657,12 @@ export interface LifecycleTimelineEntry {
  * The real lifecycle composition a run binds with `opts.realLifecycle`
  * (`run.composition`): `createPersonaLifecycle` (`persona-lifecycle.ts`) over
  * the run's real bring-up controller and connection manager, a real
- * per-persona serializer, the real `killPersonaInstance` and
+ * per-persona serializer (shared with that controller and manager), the real `killPersonaInstance` and
  * `deletePersonaInstance` over a `makeStubClient` agent-director stub, and a
  * recording stand-in for every other dependency.
  */
 export interface RealLifecycleComposition {
-  /** The composition the recorder's `teardown`, `updateInPlace` and `bringUp` call. */
+  /** The composition the recorder's `teardown`, `updateInPlace`, `reconnectCredentials` and `bringUp` call. */
   readonly lifecycle: PersonaLifecycle
   /** Every agent-director verb call, by verb (`killCalls`, `deleteCalls`, …). */
   readonly agentDirector: StubCallLog
@@ -598,10 +678,70 @@ export interface RealLifecycleComposition {
    * `'deleteInstance'`, `'forgetFailures'`, `'forgetDisconnectedStreak'`,
    * `'replyGuard.launchedWithDir'`, `'replyGuard.teardown'`,
    * `'replyGuard.launchPass'`, `'storageCheck'`, `'bringUps.bringUp'`,
-   * `'launch'`) plus `'outage-notice'` for a notice the outage state raised.
+   * `'bringUps.changeCredentials'`, `'connections.reconnectCredentials'`,
+   * `'connections.replaceRetryTokens'`, `'launch'`) plus `'outage-notice'`
+   * for a notice the outage state raised. The one query, `bringUps.state`
+   * (a recovery's re-check), is not recorded.
    */
   readonly calls: ReadonlyArray<readonly [string, string]>
 }
+
+/** `h.rotateCredentials`'s options. */
+export interface CredentialsRotationOptions {
+  /**
+   * Scripts the new credential set's stub in every live run (see
+   * `h.rotateCredentials`); the leak marker is always on. Unscripted, the new
+   * tokens are accepted: `auth.test` answers with the new stub's own
+   * identity (a different bot user ID and bot ID from the old set's) and its
+   * socket connects.
+   */
+  slack?: StubSlackOptions
+}
+
+/** A credential set `h.rotateCredentials` wrote. */
+export interface RotatedCredentials {
+  /** The new token pair (sentinel-bearing fakes; never print them). */
+  readonly tokens: PersonaSlackTokens
+  /**
+   * The set's harness label, `credentials-<n>` (n counts the persona's
+   * writes): the label `run.credentialsStub(name, label)` and
+   * `run.socketActivity(name)` use for it in every run.
+   */
+  readonly label: string
+}
+
+/** The Web API script queues of a stub (every queue but `authTest` and `connect`). */
+export type StubWebApiQueue = Exclude<keyof StubSlackScript, 'authTest' | 'connect'>
+
+/** Every `StubWebApiQueue`, so `run.revokeBotToken` reaches whichever call a consumer makes first. */
+const WEB_API_QUEUES: readonly StubWebApiQueue[] = [
+  'post',
+  'update',
+  'upload',
+  'history',
+  'replies',
+  'info',
+  'open',
+  'reactionsAdd',
+  'reactionsRemove',
+  'usersInfo',
+  'apiCall',
+]
+
+/** `run.revokeBotToken`'s options. */
+export interface BotTokenRevocation {
+  /** The Slack error the next Web API call answers (default `token_revoked`; also `invalid_auth`, `account_inactive`, `not_authed`, or any other to show it is ignored). */
+  error?: string
+  /** The credential set whose stub answers it (harness label); default the one whose socket connected last (`run.currentStub`). */
+  credentials?: string
+  /** The queues scripted; default every Web API queue, so whichever call comes first answers it. */
+  queues?: readonly StubWebApiQueue[]
+}
+
+/** `run.admitSession`'s answer: the registered session when the persona was admitted. */
+export type ReloadSessionAdmission =
+  | { readonly kind: 'admitted'; readonly session: SessionEntry }
+  | { readonly kind: 'not-up' | 'unmatched' }
 
 /** One message the routing delivered to a persona's registered session (`run.deliveries`). Holds no token. */
 export interface ReloadDelivery {
@@ -859,10 +999,11 @@ export interface ReloadRunOptions {
   /**
    * Bind the real lifecycle composition (`run.composition`, see
    * `RealLifecycleComposition`) behind the recorder's `teardown`,
-   * `updateInPlace` and `bringUp`, instead of the stand-ins; the bring-up
-   * controller then also
-   * gets the composition's serializer and the controller's live applied set,
-   * as `server.ts` wires it.
+   * `updateInPlace`, `reconnectCredentials` and `bringUp` (a recovery
+   * included), instead of the stand-ins; the bring-up
+   * controller then also gets the composition's serializer and the
+   * controller's live applied set, and the connection manager that
+   * serializer, as `server.ts` wires them.
    */
   realLifecycle?: boolean
   /** With `realLifecycle`: options for the agent-director stub (e.g. `killError`). Its call captures are the harness's own. */
@@ -915,6 +1056,13 @@ export interface ReloadRun {
   deliver(name: string, event: SlackEvent): Promise<void>
   /** Raise a notice for the persona through the real notifier, as a notice site does; read the Slack calls on `run.stub(name).callLog`. */
   notice(name: string, text: string): Promise<void>
+  /**
+   * The destination hold's own fake clock (never `run.clock`): advance it to
+   * drive the retries of a notice held after a failed post (for example one
+   * refused with `token_revoked`, which the hold keeps and retries once the
+   * persona has a client again).
+   */
+  readonly noticeClock: FakeClock
   /**
    * Call MCP tool `tool` with `args` as the persona's instance: an in-memory
    * MCP client over `createSessionServer` for its registered session (the
@@ -981,6 +1129,86 @@ export interface ReloadRun {
   slackPosts(): StubWebCall[]
   /** Everything captured, plus `extra`, for `assertNoLeak`; written files as `writtenFile`. */
   captured(extra?: Record<string, unknown>): Record<string, unknown>
+  /**
+   * The operator's whole confirmation, for a change already on disk (a
+   * rotated credentials file, an edited `config.json`): one tick (which must
+   * write the pending file; throws otherwise), the rename (`h.confirm()`),
+   * then the tick that applies it, started and returned unawaited as
+   * `applying`, so a test can hold a lifecycle call or advance `run.clock`
+   * while it runs (`await (await run.confirmPending()).applying`).
+   */
+  confirmPending(): Promise<{ applying: Promise<void> }>
+  /**
+   * Run `hook` once, at the next confirmed apply's step 1: after the record
+   * was rewritten and the applied set swapped, before step 2 starts (the
+   * moment `opts.onApplied` is called, with the same configuration). E.g. to
+   * retarget a symlink so a credentials real path collides with another
+   * applied persona's after the candidate was validated (b.av2 SR-1.4, apply
+   * part). A throw is logged by the controller as a failed `onApplied`.
+   */
+  beforeApplySteps(hook: (applied: PersonaConfig) => void): void
+  /**
+   * The stub of the persona's credential set `label` (a harness label, see
+   * `RotatedCredentials`; default the persona's latest, `h.credentialsLabel`)
+   * in this run: its script queues, captures, sockets and `identity`. The
+   * set the run was built with is also `run.stub(name)`. Throws for a set this
+   * run does not route (written before it was built and replaced since).
+   */
+  credentialsStub(name: string, label?: string): StubSlack
+  /**
+   * The stub of the credential set whose socket most recently connected for
+   * the persona (after a reconnect's swap, the new set's; before any
+   * connection, `run.stub(name)`): the one serving it now.
+   */
+  currentStub(name: string): StubSlack
+  /**
+   * The persona's socket clients in the order things happened to them, as
+   * `<event> <harness label>` (`built`, `started`, `connected`, `discarded`,
+   * `disconnected`; see `StubClientEvent`), over the factory's activity
+   * record: a credentials reconnect that opens the new connection before
+   * closing the old reads `…, 'built credentials-2', 'started credentials-2',
+   * 'connected credentials-2', 'discarded credentials-1', 'disconnected
+   * credentials-1'`. Every kind with its build record: `run.slack.activityOf(key)`.
+   */
+  socketActivity(name: string): string[]
+  /**
+   * Make the persona's bot token look revoked to Slack (bug b.ujn): the next
+   * call on each Web API queue of its current stub (`currentStub`, or
+   * `opts.credentials`) answers the platform error `opts.error` (default
+   * `token_revoked`), put at the front of each queue. Whichever call a
+   * consumer makes first (a notice, a tool call, a delivery's `users.info`)
+   * trips the watch and marks the persona broken; every later call through
+   * that client is refused locally and never reaches the stub, so the other
+   * scripted entries stay queued. The returned function removes the entries
+   * still queued (e.g. before the same tokens are used again). Scripts only;
+   * makes no call itself.
+   */
+  revokeBotToken(name: string, opts?: BotTokenRevocation): () => void
+  /**
+   * Make a running persona credentials-broken by a refused reopen (b.av2
+   * SR-3.3): Slack drops its live socket and the reopen's `start()` is
+   * refused with `error` (default `invalid_auth`). Resolves once the manager
+   * reports it `broken` (phase `reopen`); throws if it never does. Its
+   * instance is kept and its MCP session dropped (`onLeftUp`, as server.ts
+   * wires it).
+   */
+  refuseReopen(name: string, error?: string): Promise<void>
+  /**
+   * The real up check (`createPersonaUpPredicate` over the manager and the
+   * bring-up controller's `isUp` and `isApplied`, as server.ts builds it):
+   * whether the persona's instance may register, be served and be launched.
+   */
+  isUp(name: string): boolean
+  /**
+   * The MCP admission of the persona's instance, as server.ts decides it
+   * (`decideSessionAdmission` over its applied working directory, the
+   * applied set and `isUp`, with `describePersonaNotUp` for the one refusal
+   * line in `run.logs`): registers the session when admitted, else leaves
+   * any registered session as it is.
+   */
+  admitSession(name: string): ReloadSessionAdmission
+  /** Every `run.logs` line naming the persona (its rendered name and key: lifecycle, bring-up, manager and diagnostic lines), in order. */
+  linesOf(name: string): string[]
   /** Stop detection (`controller.stopDetection()`, which stops `run.ticks`), cancel every bring-up retry and stop every connection. Idempotent. */
   stop(): Promise<void>
 }
@@ -1033,8 +1261,28 @@ export interface ReloadHarness {
   replaceWithDirectory(path: string): void
   /** The names in the configuration directory, sorted. */
   configDirEntries(): string[]
-  /** Write a valid credentials file for `persona` with a fresh token set; returns the set (never print it). */
+  /**
+   * Write a valid credentials file for `persona` with a fresh token set;
+   * returns the set (never print it). `h.rotateCredentials` without options.
+   */
   writeCredentials(persona: Pick<ReloadPersonaFiles, 'name' | 'credentials_file'>): PersonaSlackTokens
+  /**
+   * Write a valid credentials file for `persona` with a fresh token set (a
+   * rotation when it had one) and register the pair with every live run: a
+   * run that already routes the persona gets it as a new credential set
+   * (`addCredentials`, under the returned `label`, scripted by `opts.slack`),
+   * so its old and new tokens answer apart; a run that does not route the
+   * persona yet (its first file, created while the run is live) gets it as
+   * the persona's set (`run.stub(name)`, scripted by `opts.slack` over the
+   * run's `opts.slack[name]`). A run built afterwards routes only the latest
+   * set, as `run.stub(name)`.
+   */
+  rotateCredentials(
+    persona: Pick<ReloadPersonaFiles, 'name' | 'credentials_file'>,
+    opts?: CredentialsRotationOptions,
+  ): RotatedCredentials
+  /** The harness label of the latest set `writeCredentials` / `rotateCredentials` wrote for `name`. Throws if none. */
+  credentialsLabel(name: string): string
   /** Write `content` (see `CredentialsOverrides`) as `persona`'s credentials file; returns its path. */
   writeCredentialsContent(persona: Pick<ReloadPersonaFiles, 'credentials_file'>, content: CredentialsOverrides): string
   /** The latest token set `writeCredentials` wrote for the persona named `name`. Throws if none. */
@@ -1153,7 +1401,7 @@ export interface ReloadHarness {
   startDetecting(opts?: ReloadRunOptions): Promise<StartedReloadRun>
   /** Every run built, in order. */
   readonly runs: readonly ReloadRun[]
-  /** Stop every run and remove the root. */
+  /** Stop every run and remove the root; then throw if a stand-in refused a call that needs `opts.realLifecycle`. */
   cleanup(): Promise<void>
 }
 
@@ -1221,14 +1469,24 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
 
   const channels = new Map<string, string>()
   const tokensByName = new Map<string, PersonaSlackTokens>()
+  /** The harness label (`credentials-<n>`) of each persona's latest token set, by name. */
+  const labelsByName = new Map<string, string>()
   const credentialWrites = new Map<string, number>()
   const runs: ReloadRun[] = []
-  /** Per run: register a persona whose credentials were written after the run was built with its stub factory. */
-  const lateRegistrations: Array<(name: string, tokens: PersonaSlackTokens) => void> = []
+  /** Per run: register a token set written after the run was built with its stub factory. */
+  const lateRegistrations: Array<
+    (name: string, tokens: PersonaSlackTokens, label: string, slack: StubSlackOptions | undefined) => void
+  > = []
   let outageStateInstalled = false
   /** A run registered an MCP session (or delivered through the routing): reset the registry and ack tracker at cleanup. */
   let registryTouched = false
   let tokenWatch: TokenEnvironmentWatch | undefined
+  /**
+   * Every stand-in call refused because it needs `opts.realLifecycle`. The
+   * controller logs a rejected lifecycle call without its message, so
+   * `h.cleanup()` throws these.
+   */
+  const standInRefusals: string[] = []
 
   /** `path`, resolved, if it is strictly under the root; throws otherwise. */
   function inside(path: string): string {
@@ -1269,10 +1527,18 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
 
   function build(runOpts: ReloadRunOptions = {}): ReloadRun {
     const dryRun = runOpts.dryRun ?? false
+    // With the real composition, one serializer shared by the manager, the
+    // bring-up controller and the lifecycle, as server.ts shares its one.
+    const serializer = runOpts.realLifecycle ? createPersonaSerializer() : undefined
     const connections = makeConnectionHarness(
       [...tokensByName.keys()].map((name) => ({ name })),
       root,
-      { dryRun, stubOptions: runOpts.slack, tokens: Object.fromEntries(tokensByName) },
+      {
+        dryRun,
+        stubOptions: runOpts.slack,
+        tokens: Object.fromEntries(tokensByName),
+        ...(serializer === undefined ? {} : { serialize: serializer.run }),
+      },
     )
     const logs = connections.lines
     const log = (line: string) => void logs.push(line)
@@ -1284,15 +1550,19 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     let startHold: Promise<void> | undefined
     let outcome: ReloadStartOutcome | undefined
 
-    function record(op: ReloadLifecycleOp, key: string, via: ReloadLifecycleVia): ReloadLifecycleRecord {
-      const entry: ReloadLifecycleRecord = { op, key, via }
+    function record(
+      op: ReloadLifecycleOp,
+      key: string,
+      via: ReloadLifecycleVia,
+      extra: Pick<ReloadLifecycleRecord, 'recovery'> = {},
+    ): ReloadLifecycleRecord {
+      const entry: ReloadLifecycleRecord = { op, key, via, ...extra }
       records.push(entry)
       return entry
     }
 
     // Declared before the bring-up controller, whose applied-set getter reads it (late).
     let controller!: ReloadController
-    const serializer = runOpts.realLifecycle ? createPersonaSerializer() : undefined
     const bringUps = createPersonaBringUpController({
       connections: {
         bringUp: (persona, tokens) => connections.connections.bringUp(persona, tokens),
@@ -1303,6 +1573,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       log,
       fs: runOpts.bringUpFs,
       launch: async (persona) => void record('launch', persona.key, 'retry'),
+      // As server.ts wires it: a persona that stops being up (a refused
+      // reopen, a Web API call refused for its bot token) has its registered
+      // MCP session dropped; its instance is kept.
+      onLeftUp: createNotUpSessionDropper({ drop: dropPersonaSession, log }),
       // As server.ts wires it, with the real composition only.
       ...(serializer === undefined
         ? {}
@@ -1316,6 +1590,11 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const getAppliedPersona = (key: string): Persona | undefined => appliedConfig()?.personas.find((p) => p.key === key)
     const clientFor = createPersonaClientLookup(connections.manager, appliedConfig)
     const identityFor = createPersonaIdentityLookup(connections.manager, appliedConfig)
+    // server.ts's one up check (MCP admission, the poller's skip, /interject).
+    const isPersonaUp = createPersonaUpPredicate(connections.manager, {
+      isUp: (key) => bringUps.isUp(key),
+      isApplied: (key) => bringUps.isApplied(key),
+    })
     const resolveUserName = async (key: string, userId: string): Promise<string> => {
       const client = clientFor(key)
       if (!client) return userId
@@ -1383,8 +1662,25 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
             return bringUps.bringUp(persona, applied)
           },
           cancel: rec('bringUps.cancel', (key) => bringUps.cancel(key)),
+          // A query (a recovery's re-check): not recorded.
+          state: (key) => bringUps.state(key),
+          changeCredentials: (persona, applied, changeConnections, hooks) => {
+            calls.push(['bringUps.changeCredentials', persona.key])
+            return bringUps.changeCredentials(persona, applied, changeConnections, hooks)
+          },
         },
-        connections: { stop: rec('connections.stop', (key) => connections.manager.stop(key)) },
+        connections: {
+          stop: rec('connections.stop', (key) => connections.manager.stop(key)),
+          // Every argument forwarded: the lifecycle's DM forget runs in `beforeSwap`.
+          reconnectCredentials: (key, tokens, onLaterOutcome, beforeSwap) => {
+            calls.push(['connections.reconnectCredentials', key])
+            return connections.manager.reconnectCredentials(key, tokens, onLaterOutcome, beforeSwap)
+          },
+          replaceRetryTokens: (key, tokens) => {
+            calls.push(['connections.replaceRetryTokens', key])
+            return connections.manager.replaceRetryTokens(key, tokens)
+          },
+        },
         routing: { forget: rec('routing.forget') },
         // The run's one destination resolver, which the notices post through.
         destinations: { forget: rec('destinations.forget', (key) => noticeStack.destinations.forget(key)) },
@@ -1434,8 +1730,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
      * test's gate (if one was set with `hold`), then `body`, then `settled`
      * or `rejected`.
      */
-    async function gated(op: LifecycleGateOp, key: string, body: () => Promise<void>): Promise<void> {
+    async function gated<T>(op: LifecycleGateOp, key: string, body: () => Promise<T>): Promise<T> {
       timeline.push({ op, key, phase: 'start' })
+      let result: T
       try {
         const gate = gates.get(`${op} ${key}`)
         if (gate !== undefined) {
@@ -1443,19 +1740,64 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           gate.enter()
           await gate.wait
         }
-        await body()
+        result = await body()
       } catch (err) {
         timeline.push({ op, key, phase: 'rejected' })
         throw err
       }
       timeline.push({ op, key, phase: 'settled' })
+      return result
     }
 
     /** One persona's bring-up through the real controller, then its recorded launch when up. */
-    async function bringUpAndLaunch(persona: Persona, applied: PersonaConfig, via: ReloadLifecycleVia): Promise<void> {
-      const entry = record('bring-up', persona.key, via)
+    async function bringUpAndLaunch(
+      persona: Persona,
+      applied: PersonaConfig,
+      via: ReloadLifecycleVia,
+      entry: ReloadLifecycleRecord = record('bring-up', persona.key, via),
+    ): Promise<void> {
       entry.result = await bringUps.bringUp(persona, applied.personas)
       if (entry.result.outcome === 'up') record('launch', persona.key, via)
+    }
+
+    /**
+     * Refuse a stand-in call that would diverge from the lifecycle
+     * (`createPersonaLifecycle`): recorded for `h.cleanup()`, then thrown.
+     */
+    function needsRealLifecycle(what: string, persona: Persona, reason: string): never {
+      const message = `reload-harness: the stand-in ${what} of ${JSON.stringify(persona.name)} would diverge from the lifecycle (${reason}): pass opts.realLifecycle`
+      standInRefusals.push(message)
+      throw new Error(message)
+    }
+
+    /**
+     * Whether the persona has had a `dm` destination in this run (the start
+     * configuration, any applied one or the entry the call got): the run's
+     * destination resolver may then hold a cached DM conversation for it,
+     * which the lifecycle forgets and the stand-ins do not. A channel
+     * destination never caches one.
+     */
+    function mayHaveCachedDm(persona: Persona): boolean {
+      const entries = [...startPasses, ...appliedConfigs].flatMap((c) => c.personas.filter((p) => p.key === persona.key))
+      return [persona, ...entries].some((p) => p.permission_prompts === DM_DESTINATION)
+    }
+
+    /**
+     * The stand-in recovery bring-up (no composition), for a persona still
+     * broken by its credentials when it runs: its bring-up state cancelled
+     * and its connection stopped, then brought up afresh, as the lifecycle
+     * does. A persona no longer broken by its credentials (the lifecycle
+     * applies the change as a reconnect), or one that may hold a cached DM
+     * conversation (the lifecycle forgets it), needs the real composition.
+     */
+    async function standInRecovery(persona: Persona, applied: PersonaConfig, entry: ReloadLifecycleRecord): Promise<void> {
+      if (!isCredentialsBroken(bringUps.state(persona.key))) {
+        needsRealLifecycle('recovery bring-up', persona, 'it is no longer broken by its credentials')
+      }
+      if (mayHaveCachedDm(persona)) needsRealLifecycle('recovery bring-up', persona, 'it has had a dm destination')
+      bringUps.cancel(persona.key)
+      await connections.manager.stop(persona.key)
+      await bringUpAndLaunch(persona, applied, 'apply', entry)
     }
 
     const ops: Required<ReloadLifecycleOps> = {
@@ -1465,15 +1807,17 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         await Promise.all(applied.personas.map((persona) => bringUpAndLaunch(persona, applied, 'start')))
         if (startHold !== undefined) await startHold
       },
-      async bringUp(persona, applied) {
+      async bringUp(persona, applied, options?: ApplyBringUpOptions) {
         connections.config = applied
-        if (composition === undefined) {
+        const recovery = options?.recovery === true
+        if (composition === undefined && !recovery) {
           await gated('bring-up', persona.key, () => bringUpAndLaunch(persona, applied, 'apply'))
           return
         }
-        const entry = record('bring-up', persona.key, 'apply')
+        const entry = record('bring-up', persona.key, 'apply', recovery ? { recovery: true } : {})
         await gated('bring-up', persona.key, async () => {
-          entry.result = await composition.lifecycle.bringUp(persona, applied)
+          if (composition === undefined) await standInRecovery(persona, applied, entry)
+          else entry.result = await composition.lifecycle.bringUp(persona, applied, options)
         })
       },
       async teardown(persona) {
@@ -1487,8 +1831,23 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           await connections.manager.stop(persona.key)
         })
       },
-      async reconnectCredentials(persona) {
-        record('reconnect', persona.key, 'apply')
+      async reconnectCredentials(persona, applied) {
+        connections.config = applied
+        const entry = record('reconnect', persona.key, 'apply')
+        // The result goes back to the step bodies: a `credentials-broken` one
+        // leaves the persona to step 6's recovery bring-up.
+        return gated('reconnect', persona.key, async () => {
+          if (composition !== undefined) {
+            entry.change = await composition.lifecycle.reconnectCredentials(persona, applied)
+            return entry.change
+          }
+          // The stand-in: the real controller's change over the manager. The
+          // lifecycle also forgets the cached DM conversation right before the
+          // swap; a persona that may hold one needs the real composition.
+          if (mayHaveCachedDm(persona)) needsRealLifecycle('credentials reconnect', persona, 'it has had a dm destination')
+          entry.change = await bringUps.changeCredentials(persona, applied.personas, connections.manager)
+          return entry.change
+        })
       },
       async updateInPlace(change: InPlaceApplyInput) {
         const { key } = change.persona
@@ -1600,17 +1959,41 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       onApplied: (config) => {
         appliedConfigs.push(config)
         runOpts.onApplied?.(config)
+        const hook = applyHook
+        applyHook = undefined
+        hook?.(config)
       },
     })
 
     /** Every persona key with a stub: those registered at build, then those whose credentials were written later. */
     const stubKeys = dryRun ? [] : connections.personas.map((p) => p.key)
-    lateRegistrations.push((name, tokens) => {
+    /** Per key: the harness label of the set registered as the persona's `INITIAL_CREDENTIALS` set in this run. */
+    const initialLabels = new Map<string, string>(
+      dryRun ? [] : connections.personas.map((p) => [p.key, labelsByName.get(p.name)!] as const),
+    )
+    lateRegistrations.push((name, tokens, label, slack) => {
       const key = personaKey(name)
-      if (dryRun || stopped || stubKeys.includes(key)) return
-      connections.slack.addPersona(key, tokens, { leakMarker: LEAK_SENTINEL, ...runOpts.slack?.[name] })
+      if (dryRun || stopped) return
+      if (stubKeys.includes(key)) {
+        connections.slack.addCredentials(key, label, tokens, { leakMarker: LEAK_SENTINEL, ...slack })
+        return
+      }
+      connections.slack.addPersona(key, tokens, { leakMarker: LEAK_SENTINEL, ...runOpts.slack?.[name], ...slack })
       stubKeys.push(key)
+      initialLabels.set(key, label)
     })
+
+    /** The factory's label of a harness label in this run. */
+    function factoryLabel(key: string, label: string): string {
+      return initialLabels.get(key) === label ? INITIAL_CREDENTIALS : label
+    }
+
+    /** The harness label of a factory label in this run. */
+    function harnessLabel(key: string, label: string | undefined): string {
+      return label === INITIAL_CREDENTIALS ? (initialLabels.get(key) ?? label) : String(label)
+    }
+
+    let applyHook: ((applied: PersonaConfig) => void) | undefined
 
     function slackCalls(): Record<string, StubWebCall[]> {
       return Object.fromEntries(stubKeys.map((key) => [key, [...connections.slack.persona(key).callLog]]))
@@ -1711,6 +2094,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         await run.stub(name).socket.deliver(event)
       },
       notice: (name, text) => Promise.resolve(noticeStack.notifier.notify(personaKey(name), text)),
+      noticeClock: noticeStack.clock,
       async callTool(name, tool, args) {
         const client = await toolClientFor(name)
         const result = (await client.callTool({ name: tool, arguments: args })) as {
@@ -1757,6 +2141,74 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           .map((path) => writtenFile(path)),
         ...extra,
       }),
+      async confirmPending() {
+        await ticks.tick()
+        if (!existsSync(paths.pending)) throw new Error('reload-harness: confirmPending(): the tick wrote no pending file')
+        renameSync(paths.pending, paths.apply)
+        return { applying: ticks.tick() }
+      },
+      beforeApplySteps(hook) {
+        applyHook = hook
+      },
+      credentialsStub(name, label = h.credentialsLabel(name)) {
+        const key = personaKey(name)
+        return connections.slack.credentials(key, factoryLabel(key, label))
+      },
+      currentStub(name) {
+        const key = personaKey(name)
+        const connected = connections.slack
+          .activityOf(key)
+          .filter((a) => a.kind === 'socket' && a.event === 'connected')
+          .at(-1)
+        return connected === undefined ? run.stub(name) : connections.slack.credentials(key, connected.credentials!)
+      },
+      socketActivity(name) {
+        const key = personaKey(name)
+        return connections.slack
+          .activityOf(key)
+          .filter((a) => a.kind === 'socket')
+          .map((a) => `${a.event} ${harnessLabel(key, a.credentials)}`)
+      },
+      revokeBotToken(name, opts = {}) {
+        const stub = opts.credentials === undefined ? run.currentStub(name) : run.credentialsStub(name, opts.credentials)
+        const outcome: WebApiOutcome = { kind: 'platform', error: opts.error ?? 'token_revoked' }
+        const queues = opts.queues ?? WEB_API_QUEUES
+        for (const queue of queues) stub.script[queue].unshift(outcome)
+        return () => {
+          for (const queue of queues) {
+            const list = stub.script[queue]
+            for (let i = list.indexOf(outcome); i !== -1; i = list.indexOf(outcome)) list.splice(i, 1)
+          }
+        }
+      },
+      async refuseReopen(name, error = 'invalid_auth') {
+        const key = personaKey(name)
+        const stub = run.currentStub(name)
+        stub.script.connect.unshift({ kind: 'platform', error })
+        stub.socket.drop()
+        const broken = () => connections.manager.status(key)?.state === 'broken'
+        // Event-loop turns only, no timer: the reopen starts on the drop itself.
+        for (let i = 0; i < 1_000 && !broken(); i++) await new Promise((done) => setImmediate(done))
+        if (!broken()) throw new Error(`reload-harness: refuseReopen(${JSON.stringify(name)}): the persona did not end broken`)
+      },
+      isUp: (name) => isPersonaUp(personaKey(name)),
+      admitSession(name) {
+        const key = personaKey(name)
+        const persona = getAppliedPersona(key)
+        if (persona === undefined) throw new Error(`reload-harness: admitSession(${JSON.stringify(name)}): not applied`)
+        registryTouched = true
+        const admission = decideSessionAdmission(persona.working_directory, appliedConfig()?.personas ?? [], {
+          isPersonaUp,
+          describeNotUp: (k) => describePersonaNotUp(bringUps.state(k)),
+          log,
+        })
+        if (admission.kind !== 'admitted') return { kind: admission.kind }
+        return { kind: 'admitted', session: registerRunSession(admission.persona.name) }
+      },
+      linesOf(name) {
+        const ref = renderPersonaRef(name, personaKey(name))
+        return logs.filter((line) => line.includes(ref))
+      },
       async stop() {
         if (stopped) return
         stopped = true
@@ -1798,7 +2250,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       mkdirSync(full, { recursive: true })
     },
     configDirEntries: () => readdirSync(dir).sort(),
-    writeCredentials(persona) {
+    writeCredentials: (persona) => h.rotateCredentials(persona).tokens,
+    rotateCredentials(persona, rotation = {}) {
       const key = personaKey(persona.name)
       const n = (credentialWrites.get(key) ?? 0) + 1
       credentialWrites.set(key, n)
@@ -1806,13 +2259,20 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         fakeToken(BOT_TOKEN_PREFIX, `${key}-bot-${n}`),
         fakeToken(APP_TOKEN_PREFIX, `${key}-app-${n}`),
       )
+      const label = `credentials-${n}`
       writeCredentialsFile(root, relative(root, inside(persona.credentials_file)), {
         bot_token: tokens.botToken,
         app_token: tokens.appToken,
       })
       tokensByName.set(persona.name, tokens)
-      for (const register of lateRegistrations) register(persona.name, tokens)
-      return tokens
+      labelsByName.set(persona.name, label)
+      for (const register of lateRegistrations) register(persona.name, tokens, label, rotation.slack)
+      return { tokens, label }
+    },
+    credentialsLabel(name) {
+      const label = labelsByName.get(name)
+      if (label === undefined) throw new Error(`reload-harness: no credentials written for ${JSON.stringify(name)}`)
+      return label
     },
     writeCredentialsContent: (persona, content) =>
       writeCredentialsFile(root, relative(root, inside(persona.credentials_file)), content),
@@ -1837,6 +2297,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       const bytes = readFileIfPresent(path)
       const wasDirectory = bytes === undefined && existsSync(path) && statSync(path).isDirectory()
       const tokens = tokensByName.get(persona.name)
+      const label = labelsByName.get(persona.name)
       return () => {
         rmSync(path, { recursive: true, force: true })
         if (wasDirectory) mkdirSync(path, { recursive: true })
@@ -1847,6 +2308,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         }
         if (tokens === undefined) tokensByName.delete(persona.name)
         else tokensByName.set(persona.name, tokens)
+        if (label === undefined) labelsByName.delete(persona.name)
+        else labelsByName.set(persona.name, label)
       }
     },
     deleteCredentials: (persona) => h.remove(persona.credentials_file),
@@ -2003,6 +2466,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         }
         rmSync(root, { recursive: true, force: true })
       }
+      if (standInRefusals.length > 0) throw new Error(standInRefusals.join('\n'))
     },
   }
   return h

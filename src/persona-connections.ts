@@ -6,8 +6,9 @@
  * `createPersonaConnectionManager(deps)` returns a handle that brings each
  * persona up, keeps its connection open and answers queries about it. Per
  * persona that is up it holds exactly one long-lived Socket Mode client and
- * one long-lived Web API client; a short-lived validation client exists only
- * during `auth.test`. All clients are built through the injected
+ * one long-lived Web API client (two of each only while a credentials
+ * reconnect overlaps); a short-lived validation client exists only during
+ * `auth.test`. All clients are built through the injected
  * `PersonaSlackClientFactory` with the SR-3.3 option sets
  * (`persona-slack-clients.ts`).
  *
@@ -58,6 +59,53 @@
  * - Log lines go through each persona's `createSlackEpisodeTracker`, so they
  *   are written when a cause starts and when it clears, never per attempt.
  *
+ * Credentials reconnect (b.av2 SR-8.6 credentials row; `reconnectCredentials`):
+ * a confirmed change of an up persona's credentials content opens a second
+ * connection with the new tokens through the same attempt code (validation
+ * client and `auth.test`, a new long-lived Web API client, a new socket under
+ * the 10 s bound). Only once it reached `hello` does the persona switch to
+ * the new tokens, identity, client and socket together; the old socket is
+ * then closed as the manager's own close and any reopen of it cancelled.
+ * SR-3.1 allows the two sockets and two Web API clients only during this
+ * overlap. A refusal discards the new clients and leaves the old connection
+ * untouched; Slack-unreachable keeps the old connection while the new one
+ * retries on its own SR-3.2 schedule and its own episode latch, and a later
+ * swap or refusal is reported to the reconnect's listener. The reconnect's
+ * `beforeSwap` hook runs right before every swap (first attempt or later),
+ * before any status listener sees the persona up on the new connection. A
+ * new reconnect, `stop` and `stopAll` cancel a pending one; the reconnect's
+ * Slack-unreachable episode then ends with a cleared line saying so (and
+ * with the usual cleared line when Slack answers, by a swap or a refusal),
+ * so its start line always gets an end. A persona whose bring-up is
+ * Slack-unreachable and retrying takes a new token pair instead
+ * (`replaceRetryTokens`): every later attempt uses it.
+ *
+ * Revoked bot token while running (bug b.ujn): every long-lived Web API
+ * client the manager hands out is wrapped by `watchWebClientAuth`
+ * (`persona-web-api-watch.ts`). The first call refused with `invalid_auth`,
+ * `token_revoked`, `account_inactive` or `not_authed` on a client latches
+ * that client (every later Web API call through it is refused locally, never
+ * sent) and, when it is still the persona's current client (`entry.web`, the
+ * client's identity is its generation) of a persona neither stopped nor
+ * already broken, marks the persona at once, in the rejection's handler:
+ * its attempt in flight and retry timer are cancelled, its live socket is
+ * detached (it forwards nothing more and its `disconnected` is not seen), one
+ * `persona-credentials-refused` line is logged (`bot_token refused by a Web
+ * API call (<method>): Slack error <code>`) and it is reported `broken`
+ * (phase `running`), which the status listeners (the bring-up controller's
+ * outcome, `onLeftUp`) see before the next event or call. Nothing of that
+ * waits for the per-persona serializer, so a lifecycle operation holding the
+ * persona's turn (a launch) cannot delay it. Only the detached socket's
+ * network close, the manager's own close (no reopen, no lost line), is
+ * submitted through the injected serializer, never awaited (the refusal may
+ * come from inside an operation holding the persona's turn); `stop` closes it
+ * at once if its turn has not come. A refusal from a replaced client (after a
+ * credentials reconnect's swap, a `replaceRetryTokens` or a fresh bring-up),
+ * from a stopped persona or from one already broken marks nothing. A
+ * persona's events are forwarded only while it is not `broken`, so a pending
+ * reconnect's socket forwards nothing for a persona marked meanwhile until
+ * its swap.
+ *
  * Events: `message`, `app_mention` and `interactive` from a persona's socket
  * reach `onEvent(key, eventName, payload)` with the library's listener
  * argument unchanged (`{ event, body, ack, … }`). The handler is awaited in
@@ -66,16 +114,18 @@
  *
  * Isolation: every piece of state lives in one entry per persona. No lock,
  * queue, promise chain or timer is shared between personas; at most one
- * attempt per persona is in flight and at most one live Socket Mode client
- * exists per persona.
+ * attempt of the persona's own connection is in flight and at most one live
+ * Socket Mode client exists per persona, plus, during a credentials
+ * reconnect, the reconnect's one attempt and socket.
  *
  * Dry run (SR-3.4): bring-up calls no factory method, needs no credentials
  * value and reports up at once with a placeholder identity derived from the
  * key (`dryRunPersonaIdentity`); there is no Web API client.
  *
  * Secrets: the persona's `PersonaSlackTokens` is held in memory for later
- * attempts and read only to hand a token to the factory; it is never logged,
- * serialised or re-read. Log lines carry only sanitized outcome fields or
+ * attempts (replaced only by a reconnect's swap or `replaceRetryTokens`) and
+ * read only to hand a token to the factory; it is never logged, serialised
+ * or re-read. Log lines carry only sanitized outcome fields or
  * `describeThrownValue` output.
  *
  * Pure module (b.av2 SR-13.1): nothing is created, read or scheduled at
@@ -95,6 +145,7 @@ import type { PersonaSlackTokens } from './persona-credentials.ts'
 import type { PersonaDiagnosticLogger } from './persona-diagnostics.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { createPersonaRetrySchedule, type PersonaRetrySchedule } from './persona-retry-schedule.ts'
+import type { PersonaSerialize } from './persona-serializer.ts'
 import {
   PERSONA_START_TIMEOUT_MS,
   PRODUCTION_SLACK_CLIENT_FACTORY,
@@ -118,6 +169,7 @@ import {
   type SlackUpOutcome,
   type SlackValidationFailure,
 } from './persona-slack-validation.ts'
+import { watchWebClientAuth } from './persona-web-api-watch.ts'
 
 // ---------------------------------------------------------------------------
 // Clock seam
@@ -176,6 +228,13 @@ export type PersonaEventHandler = (
 /** Which kind of attempt produced a status: first bring-up (with `auth.test`) or a Socket Mode reopen. */
 export type PersonaAttemptPhase = 'bring-up' | 'reopen'
 
+/**
+ * Where a refusal that made a persona broken was found: an attempt
+ * (`PersonaAttemptPhase`), or `running`: a Web API call of the running
+ * persona was refused for its bot token (bug b.ujn), with no attempt.
+ */
+export type PersonaBrokenPhase = PersonaAttemptPhase | 'running'
+
 /** A persona's connection status. */
 export type PersonaConnectionStatus =
   /** The first bring-up attempt is in flight. */
@@ -193,12 +252,51 @@ export type PersonaConnectionStatus =
     nextAttemptAt: number
   }
   /** Slack refused a token: credentials-broken, disconnected, not retried. */
-  | { state: 'broken'; phase: PersonaAttemptPhase; outcome: SlackCredentialsRefusedOutcome }
+  | { state: 'broken'; phase: PersonaBrokenPhase; outcome: SlackCredentialsRefusedOutcome }
   /** Stopped by the caller; the persona's clients were dropped. */
   | { state: 'stopped' }
 
 /** Receives every status change, with the persona's key. */
 export type PersonaStatusListener = (key: string, status: PersonaConnectionStatus) => void
+
+/** How the first attempt of a credentials reconnect ended (b.av2 SR-8.6 credentials row). */
+export type PersonaReconnectOutcome =
+  /**
+   * The new connection reached `hello`: the persona now uses the new tokens,
+   * Web API client, identity (from the new `auth.test`) and socket, and its
+   * old socket was closed as the manager's own close.
+   */
+  | { kind: 'swapped'; identity: SlackBotIdentity }
+  /** Slack refused a new token: the new clients were discarded and the old connection is untouched. */
+  | { kind: 'refused'; outcome: SlackCredentialsRefusedOutcome }
+  /**
+   * Slack could not be reached with the new tokens (a `start()` abandoned at
+   * its 10 s bound included): the old connection stays, and the new one is
+   * retried after `retryInMs` on its own SR-3.2 schedule.
+   */
+  | { kind: 'retrying'; outcome: SlackUnreachableOutcome; retryInMs: number }
+  /**
+   * Nothing was attempted, or the attempt was cancelled: dry run, an unknown
+   * or stopped persona, or a later reconnect, a stop or shutdown superseded it.
+   */
+  | { kind: 'cancelled' }
+
+/** How a reconnect left retrying ended later: swapped, or refused (its retries then end). */
+export type PersonaReconnectLaterOutcome = Extract<PersonaReconnectOutcome, { kind: 'swapped' | 'refused' }>
+
+/** Told how a reconnect left retrying ended; the per-persona outcome listener of one reconnect. */
+export type PersonaReconnectListener = (outcome: PersonaReconnectLaterOutcome) => unknown
+
+/**
+ * Told, synchronously, right before one reconnect's swap: the persona still
+ * reports its old status, identity and Web API client, and nothing has been
+ * switched yet. It runs before the status listeners see the persona `up` on
+ * the new connection (for example the notifier's up-flush), so whatever
+ * depends on the old app (the cached DM conversation) can be forgotten
+ * first. At the first attempt's swap and at a later one alike. A throw is
+ * logged and the swap still happens.
+ */
+export type PersonaReconnectBeforeSwap = () => unknown
 
 // ---------------------------------------------------------------------------
 // Surface
@@ -221,6 +319,16 @@ export interface PersonaConnectionManagerDeps {
   factory?: PersonaSlackClientFactory
   /** Clock and timers; default `SYSTEM_PERSONA_CONNECTION_CLOCK`. */
   clock?: PersonaConnectionClock
+  /**
+   * The per-persona lifecycle serializer's `run` (b.av2 SR-6.6,
+   * `persona-serializer.ts`): after a running persona is marked
+   * credentials-broken by a refused Web API call (bug b.ujn), the network
+   * close of its detached socket is submitted through it, never awaited (the
+   * call may come from inside an operation already holding the persona's
+   * turn). The mark itself never waits for it. Without it the close runs at
+   * once. Production passes the server's one shared serializer.
+   */
+  serialize?: PersonaSerialize
 }
 
 /** The connection manager handle. */
@@ -239,6 +347,49 @@ export interface PersonaConnectionManager {
   identity(key: string): SlackBotIdentity | undefined
   /** The persona's long-lived Web API client once it has been up; always `undefined` in dry run. */
   webClient(key: string): WebClient | undefined
+  /**
+   * Reconnect a managed persona with a new, locally valid token pair (b.av2
+   * SR-8.6 credentials row, SR-3.1, SR-3.3): a new validation client
+   * (`auth.test`), a new long-lived Web API client and a new Socket Mode
+   * client, through the factory with the SR-3.3 option sets, the socket
+   * `start()` under the 10 s bound. Only once the new socket reached `hello`
+   * are the persona's tokens, identity, Web API client and socket switched to
+   * the new ones together, any reopen of the old connection cancelled and the
+   * old socket closed as the manager's own close (no reopen, no lost line).
+   * There is no same-app check. Until then the old connection keeps its
+   * normal supervision and both sockets forward events (the routing's dedupe
+   * delivers a message once).
+   *
+   * Resolves with the first attempt's outcome. `refused` discards the new
+   * clients. `retrying` keeps retrying the new tokens on their own SR-3.2
+   * schedule (its Slack-unreachable episode logged through its own tracker);
+   * a later swap or refusal is reported to `onLaterOutcome`, and a refusal
+   * ends the retries. A new reconnect, `stop` and `stopAll` cancel a pending
+   * one (timer and attempt; its clients discarded), and end its
+   * Slack-unreachable episode with a cleared line. `beforeSwap` is called
+   * right before the swap, whether at the first attempt or later, before any
+   * status listener sees the persona up on the new connection. Dry run, or an
+   * unknown or stopped persona: `cancelled`, with no Slack call. No
+   * agent-director call, no instance action. Never rejects.
+   */
+  reconnectCredentials(
+    key: string,
+    tokens: PersonaSlackTokens,
+    onLaterOutcome?: PersonaReconnectListener,
+    beforeSwap?: PersonaReconnectBeforeSwap,
+  ): Promise<PersonaReconnectOutcome>
+  /**
+   * Hand a persona whose bring-up is Slack-unreachable and retrying (or whose
+   * first attempt is in flight) a new, locally valid token pair (b.av2
+   * SR-8.6: a retrying persona retries with the new content). Every later
+   * attempt uses only the new pair: an attempt in flight with the old one is
+   * cancelled and a new one starts at once; a pending retry timer is kept.
+   * Two attempts never run at once, and the SR-3.2 schedule and episode
+   * logging carry on. Returns whether the pair was taken: false in dry run,
+   * for an unknown or stopped persona, and for a persona in any other state
+   * (one that has been up is reconnected instead).
+   */
+  replaceRetryTokens(key: string, tokens: PersonaSlackTokens): boolean
   /**
    * Stop a persona: cancel its timers and any attempt in flight (its result
    * is discarded), disconnect its socket as the manager's own close, drop its
@@ -266,6 +417,14 @@ interface TimerBox {
   handle: unknown
 }
 
+/** Why a pending reconnect's Slack-unreachable episode ended: a later reconnect replaced it. */
+const RECONNECT_SUPERSEDED =
+  'the new connection of its confirmed credentials change is no longer retried: a later confirmed credentials change replaced it'
+
+/** Why a pending reconnect's Slack-unreachable episode ended: the persona's connection was stopped. */
+const RECONNECT_STOPPED =
+  'the new connection of its confirmed credentials change is no longer retried: the persona\'s connection was stopped'
+
 /** One Socket Mode client and the listeners the manager subscribed on it. */
 interface SocketBinding {
   readonly client: PersonaSocketClient
@@ -276,11 +435,23 @@ interface SocketBinding {
   readonly listeners: Array<[string, PersonaSocketListener]>
 }
 
-/** How an attempt ended. */
+/** An attempt's kind: a bring-up or reopen of the persona's own connection, or a credentials reconnect's new one. */
+type AttemptPhase = PersonaAttemptPhase | 'reconnect'
+
+/**
+ * How an attempt ended. `up` carries the socket it opened and, for a
+ * reconnect, the new long-lived Web API client (a bring-up keeps its client
+ * on the entry).
+ */
 type AttemptResult =
-  | { kind: 'up'; identity: SlackBotIdentity }
+  | { kind: 'up'; identity: SlackBotIdentity; binding: SocketBinding; web: WebClient | undefined }
   | { kind: 'failed'; outcome: SlackValidationFailure }
   | { kind: 'cancelled' }
+
+/** Where an in-flight attempt is kept: the persona's entry, or its pending reconnect. */
+interface AttemptSlot {
+  attempt: Attempt | undefined
+}
 
 /** One in-flight attempt. */
 interface Attempt {
@@ -293,20 +464,45 @@ interface Attempt {
   finish(result: AttemptResult): void
 }
 
+/** A credentials reconnect whose new connection is not in use yet. Nothing here is shared with another persona. */
+interface PendingReconnect extends AttemptSlot {
+  /** The new token pair. Never logged. */
+  readonly tokens: PersonaSlackTokens
+  /** Its own SR-3.2 schedule. */
+  readonly schedule: PersonaRetrySchedule
+  /** Its own episode latch, for its Slack-unreachable start and cleared lines. */
+  readonly tracker: SlackEpisodeTracker
+  readonly onLater: PersonaReconnectListener | undefined
+  readonly beforeSwap: PersonaReconnectBeforeSwap | undefined
+  timer: TimerBox | undefined
+  cancelled: boolean
+}
+
 /** Everything the manager holds for one persona. Nothing here is shared with another persona. */
-interface PersonaEntry {
+interface PersonaEntry extends AttemptSlot {
   readonly persona: ConnectionPersona
-  /** Held for later attempts; `undefined` in dry run. */
-  readonly tokens: PersonaSlackTokens | undefined
+  /**
+   * Held for later attempts; `undefined` in dry run. Replaced only by a
+   * credentials reconnect's swap or `replaceRetryTokens`.
+   */
+  tokens: PersonaSlackTokens | undefined
   readonly schedule: PersonaRetrySchedule
   readonly tracker: SlackEpisodeTracker
   status: PersonaConnectionStatus
   identity: SlackBotIdentity | undefined
+  /** The long-lived Web API client, wrapped by the auth-failure watch (`watchWebClientAuth`). */
   web: WebClient | undefined
   /** The live Socket Mode connection, while up. */
   socket: SocketBinding | undefined
-  attempt: Attempt | undefined
   retryTimer: TimerBox | undefined
+  /** A credentials reconnect whose new connection is not in use yet. */
+  reconnect: PendingReconnect | undefined
+  /**
+   * The socket detached when a refused Web API call marked the persona
+   * broken (bug b.ujn), until its network close, submitted through the
+   * serializer, runs; `stop` closes it at once.
+   */
+  refusedSocket: SocketBinding | undefined
   stopped: boolean
 }
 
@@ -319,6 +515,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   const { onEvent, dryRun } = deps
   const factory = deps.factory ?? PRODUCTION_SLACK_CLIENT_FACTORY
   const clock = deps.clock ?? SYSTEM_PERSONA_CONNECTION_CLOCK
+  const serialize: PersonaSerialize = deps.serialize ?? (async (_key, operation) => operation())
   const entries = new Map<string, PersonaEntry>()
 
   // -------------------------------------------------------------------------
@@ -403,7 +600,9 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     eventName: PersonaSocketEventName,
     payload: PersonaSocketEventPayload,
   ): Promise<void> {
-    if (binding.retired || entry.stopped) return
+    // A persona marked broken (a refused Web API call, bug b.ujn) gets no
+    // delivery, even from a pending reconnect's socket, until a swap.
+    if (binding.retired || entry.stopped || entry.status.state === 'broken') return
     try {
       await onEvent(entry.persona.key, eventName, payload)
     } catch (err) {
@@ -426,8 +625,17 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   // One attempt
   // -------------------------------------------------------------------------
 
-  /** Run one attempt for a persona; resolves exactly once with its result. */
-  function runAttempt(entry: PersonaEntry, phase: PersonaAttemptPhase): Promise<AttemptResult> {
+  /**
+   * Run one attempt for a persona with `tokens`, kept in `slot` while in
+   * flight (the entry's own, or a pending reconnect's); resolves exactly once
+   * with its result.
+   */
+  function runAttempt(
+    entry: PersonaEntry,
+    phase: AttemptPhase,
+    slot: AttemptSlot,
+    tokens: PersonaSlackTokens | undefined,
+  ): Promise<AttemptResult> {
     return new Promise<AttemptResult>(resolve => {
       const attempt: Attempt = {
         settled: false,
@@ -437,26 +645,31 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
           if (attempt.settled) return
           attempt.settled = true
           clearStartTimer(attempt)
-          if (entry.attempt === attempt) entry.attempt = undefined
+          if (slot.attempt === attempt) slot.attempt = undefined
           resolve(result)
         },
       }
-      entry.attempt = attempt
-      performAttempt(entry, attempt, phase).catch(err => {
+      slot.attempt = attempt
+      performAttempt(entry, attempt, phase, tokens).catch(err => {
         // performAttempt catches every Slack failure itself; this is a backstop.
         attempt.finish({ kind: 'failed', outcome: classifySlackValidationError(err, 'socket-mode') })
       })
     })
   }
 
-  async function performAttempt(entry: PersonaEntry, attempt: Attempt, phase: PersonaAttemptPhase): Promise<void> {
-    const tokens = entry.tokens
+  async function performAttempt(
+    entry: PersonaEntry,
+    attempt: Attempt,
+    phase: AttemptPhase,
+    tokens: PersonaSlackTokens | undefined,
+  ): Promise<void> {
     if (tokens === undefined || entry.stopped) {
       attempt.finish({ kind: 'cancelled' })
       return
     }
     let identity = entry.identity
-    if (phase === 'bring-up') {
+    let web: WebClient | undefined
+    if (phase !== 'reopen') {
       const validated = await validate(attempt, tokens)
       if (attempt.settled) return // abandoned at the 10 s bound, or cancelled
       clearStartTimer(attempt)
@@ -465,13 +678,14 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
         return
       }
       identity = validated.identity
-      if (entry.web === undefined) {
-        try {
-          entry.web = factory.createWebClient(tokens.botToken, longLivedWebClientOptions())
-        } catch (err) {
-          attempt.finish({ kind: 'failed', outcome: classifySlackValidationError(err, 'auth.test') })
-          return
-        }
+      try {
+        // A reconnect's client is the persona's only from the swap on; a
+        // bring-up builds the persona's once.
+        if (phase === 'reconnect') web = createWatchedWebClient(entry, tokens)
+        else if (entry.web === undefined) entry.web = createWatchedWebClient(entry, tokens)
+      } catch (err) {
+        attempt.finish({ kind: 'failed', outcome: classifySlackValidationError(err, 'auth.test') })
+        return
       }
     }
     if (identity === undefined) {
@@ -479,7 +693,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
       attempt.finish({ kind: 'failed', outcome: classifySlackValidationError(undefined, 'auth.test') })
       return
     }
-    await openSocket(entry, attempt, tokens, identity)
+    await openSocket(entry, attempt, phase, tokens, identity, web)
   }
 
   /**
@@ -501,12 +715,18 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     }
   }
 
-  /** Build a fresh Socket Mode client and `start()` it under the 10 s bound (app token). */
+  /**
+   * Build a fresh Socket Mode client and `start()` it under the 10 s bound
+   * (app token). A bring-up or reopen makes it the persona's live socket at
+   * once; a reconnect's becomes it only at the swap.
+   */
   async function openSocket(
     entry: PersonaEntry,
     attempt: Attempt,
+    phase: AttemptPhase,
     tokens: PersonaSlackTokens,
     identity: SlackBotIdentity,
+    web: WebClient | undefined,
   ): Promise<void> {
     let binding: SocketBinding
     try {
@@ -543,8 +763,8 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
       attempt.finish({ kind: 'failed', outcome: classifySlackValidationError(undefined, 'socket-mode') })
       return
     }
-    entry.socket = binding
-    attempt.finish({ kind: 'up', identity })
+    if (phase !== 'reconnect') entry.socket = binding
+    attempt.finish({ kind: 'up', identity, binding, web })
   }
 
   function armStartTimer(attempt: Attempt, binding: SocketBinding): void {
@@ -584,9 +804,17 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
 
   /** Start an attempt in the background and act on its result. */
   function startAttempt(entry: PersonaEntry, phase: PersonaAttemptPhase): void {
-    runAttempt(entry, phase)
+    runAttempt(entry, phase, entry, entry.tokens)
       .then(result => handleResult(entry, phase, result))
       .catch(err => logFailure('connection supervision', entry, err))
+  }
+
+  /** Settle the entry's own attempt in flight as cancelled and close the socket it was opening. */
+  function cancelOwnAttempt(entry: PersonaEntry): Promise<void> {
+    const attempt = entry.attempt
+    if (attempt === undefined) return Promise.resolve()
+    attempt.finish({ kind: 'cancelled' })
+    return attempt.binding === undefined ? Promise.resolve() : retire(attempt.binding, true)
   }
 
   function handleResult(entry: PersonaEntry, phase: PersonaAttemptPhase, result: AttemptResult): void {
@@ -629,6 +857,272 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     clock.clearTimeout(timer.handle)
   }
 
+  function trackerFor(persona: ConnectionPersona): SlackEpisodeTracker {
+    return createSlackEpisodeTracker({
+      name: persona.name,
+      key: persona.key,
+      index: persona.index,
+      path: persona.credentials_file,
+      log,
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // Credentials reconnect (b.av2 SR-8.6 credentials row, SR-3.1, SR-3.3)
+  // -------------------------------------------------------------------------
+
+  async function reconnectCredentials(
+    key: string,
+    tokens: PersonaSlackTokens,
+    onLaterOutcome?: PersonaReconnectListener,
+    beforeSwap?: PersonaReconnectBeforeSwap,
+  ): Promise<PersonaReconnectOutcome> {
+    const entry = entries.get(key)
+    if (dryRun || entry === undefined || entry.stopped) return { kind: 'cancelled' }
+    // A new reconnect supersedes a pending one: its timer, attempt and clients go.
+    void cancelReconnect(entry, RECONNECT_SUPERSEDED)
+    const reconnect: PendingReconnect = {
+      tokens,
+      schedule: createPersonaRetrySchedule(),
+      tracker: trackerFor(entry.persona),
+      onLater: onLaterOutcome,
+      beforeSwap,
+      attempt: undefined,
+      timer: undefined,
+      cancelled: false,
+    }
+    entry.reconnect = reconnect
+    const result = await runAttempt(entry, 'reconnect', reconnect, tokens)
+    return settleReconnectAttempt(entry, reconnect, result)
+  }
+
+  /** A later attempt of a reconnect left retrying; its swap or refusal goes to the reconnect's listener. */
+  function startReconnectAttempt(entry: PersonaEntry, reconnect: PendingReconnect): void {
+    runAttempt(entry, 'reconnect', reconnect, reconnect.tokens)
+      .then(result => {
+        const outcome = settleReconnectAttempt(entry, reconnect, result)
+        if (outcome.kind === 'swapped' || outcome.kind === 'refused') notifyReconnectLater(entry, reconnect, outcome)
+      })
+      .catch(err => logFailure('credentials reconnect', entry, err))
+  }
+
+  /**
+   * Act on one reconnect attempt's result: swap on `up`, end the reconnect on
+   * a refusal (nothing logged here: the caller reports it), schedule the
+   * next attempt when Slack was unreachable. A result for a reconnect that
+   * was cancelled meanwhile is discarded with its socket.
+   */
+  function settleReconnectAttempt(
+    entry: PersonaEntry,
+    reconnect: PendingReconnect,
+    result: AttemptResult,
+  ): PersonaReconnectOutcome {
+    if (reconnect.cancelled || entry.stopped || entry.reconnect !== reconnect || result.kind === 'cancelled') {
+      if (result.kind === 'up') void retire(result.binding, true)
+      return { kind: 'cancelled' }
+    }
+    let outcome: SlackValidationFailure
+    if (result.kind === 'up') {
+      if (!result.binding.disconnected) {
+        swapToReconnect(entry, reconnect, result)
+        return { kind: 'swapped', identity: result.identity }
+      }
+      // Closed between `hello` and here: as a socket closed before `hello`.
+      void retire(result.binding, false)
+      outcome = classifySlackValidationError(undefined, 'socket-mode')
+    } else {
+      outcome = result.outcome
+    }
+    if (outcome.kind === 'credentials-refused') {
+      entry.reconnect = undefined
+      reconnect.cancelled = true
+      // Slack answered: an unreachable episode of this reconnect gets its
+      // cleared line. The refusal itself is the caller's to log.
+      reconnect.tracker.record({ kind: 'up' })
+      return { kind: 'refused', outcome }
+    }
+    reconnect.tracker.record(outcome)
+    const retryInMs = reconnect.schedule.nextDelayMs(outcome.retryAfter)
+    scheduleReconnectRetry(entry, reconnect, retryInMs)
+    return { kind: 'retrying', outcome, retryInMs }
+  }
+
+  /**
+   * The swap: the persona now uses the reconnect's tokens, identity, Web API
+   * client and socket; any reopen of the old connection is cancelled and the
+   * old socket closed as the manager's own close (no reopen, no lost line).
+   * Any episode open on the old connection (lost, refused) and on the
+   * reconnect (unreachable) closes, so a later refusal of the new tokens is
+   * logged afresh. The reconnect's `beforeSwap` runs first, while the
+   * persona still reports its old status, so nothing a status listener does
+   * at `up` (the notifier's flush) uses state tied to the old app.
+   */
+  function swapToReconnect(
+    entry: PersonaEntry,
+    reconnect: PendingReconnect,
+    result: Extract<AttemptResult, { kind: 'up' }>,
+  ): void {
+    if (reconnect.beforeSwap !== undefined) {
+      try {
+        const hook: unknown = reconnect.beforeSwap()
+        if (isThenable(hook)) hook.then(undefined, err => logFailure('credentials reconnect before-swap hook', entry, err))
+      } catch (err) {
+        logFailure('credentials reconnect before-swap hook', entry, err)
+      }
+    }
+    entry.reconnect = undefined
+    clearRetryTimer(entry)
+    void cancelOwnAttempt(entry)
+    const previous = entry.socket
+    entry.tokens = reconnect.tokens
+    entry.identity = result.identity
+    if (result.web !== undefined) entry.web = result.web
+    entry.socket = result.binding
+    entry.schedule.reset()
+    if (previous !== undefined && previous !== result.binding) void retire(previous, true)
+    reconnect.tracker.record({ kind: 'up' })
+    entry.tracker.record({ kind: 'up' })
+    setStatus(entry, { state: 'up', identity: result.identity })
+  }
+
+  function scheduleReconnectRetry(entry: PersonaEntry, reconnect: PendingReconnect, delayMs: number): void {
+    clearReconnectTimer(reconnect)
+    const timer: TimerBox = { handle: undefined }
+    reconnect.timer = timer
+    timer.handle = clock.setTimeout(() => {
+      if (reconnect.timer !== timer) return
+      reconnect.timer = undefined
+      if (reconnect.cancelled || entry.stopped || entry.reconnect !== reconnect || reconnect.attempt !== undefined) return
+      startReconnectAttempt(entry, reconnect)
+    }, delayMs)
+  }
+
+  function clearReconnectTimer(reconnect: PendingReconnect): void {
+    const timer = reconnect.timer
+    if (timer === undefined) return
+    reconnect.timer = undefined
+    clock.clearTimeout(timer.handle)
+  }
+
+  /**
+   * Cancel the persona's pending reconnect, if any: its timer, its attempt
+   * and the socket that attempt was opening. Its open Slack-unreachable
+   * episode ends with one cleared line giving `reason`, so its start line
+   * always gets an end.
+   */
+  function cancelReconnect(entry: PersonaEntry, reason: string): Promise<void> {
+    const reconnect = entry.reconnect
+    if (reconnect === undefined) return Promise.resolve()
+    entry.reconnect = undefined
+    reconnect.cancelled = true
+    reconnect.tracker.end(reason)
+    clearReconnectTimer(reconnect)
+    const attempt = reconnect.attempt
+    if (attempt === undefined) return Promise.resolve()
+    attempt.finish({ kind: 'cancelled' })
+    return attempt.binding === undefined ? Promise.resolve() : retire(attempt.binding, true)
+  }
+
+  function notifyReconnectLater(entry: PersonaEntry, reconnect: PendingReconnect, outcome: PersonaReconnectLaterOutcome): void {
+    const listener = reconnect.onLater
+    if (listener === undefined) return
+    try {
+      const result: unknown = listener(outcome)
+      if (isThenable(result)) result.then(undefined, err => logFailure('credentials reconnect listener', entry, err))
+    } catch (err) {
+      logFailure('credentials reconnect listener', entry, err)
+    }
+  }
+
+  function replaceRetryTokens(key: string, tokens: PersonaSlackTokens): boolean {
+    const entry = entries.get(key)
+    if (dryRun || entry === undefined || entry.stopped) return false
+    const { status } = entry
+    if (!(status.state === 'connecting' || (status.state === 'retrying' && status.phase === 'bring-up'))) return false
+    entry.tokens = tokens
+    // A client an earlier attempt built from the old bot token (its socket
+    // then failed) was never handed out; the next attempt builds one anew.
+    entry.web = undefined
+    if (entry.attempt !== undefined) {
+      // Superseded: the old pair's attempt is cancelled, the new pair's starts.
+      void cancelOwnAttempt(entry)
+      startAttempt(entry, 'bring-up')
+    }
+    return true
+  }
+
+  // -------------------------------------------------------------------------
+  // Revoked bot token while running (bug b.ujn)
+  // -------------------------------------------------------------------------
+
+  /** The persona's long-lived Web API client for `tokens`, wrapped by the auth-failure watch. */
+  function createWatchedWebClient(entry: PersonaEntry, tokens: PersonaSlackTokens): WebClient {
+    const raw = factory.createWebClient(tokens.botToken, longLivedWebClientOptions())
+    const watched: WebClient = watchWebClientAuth(raw, outcome => onWebApiRefused(entry, watched, outcome))
+    return watched
+  }
+
+  /**
+   * Whether a refusal of `client`'s call still concerns the persona: its
+   * current client (a replaced one is another object), not stopped and not
+   * already broken.
+   */
+  function webApiRefusalApplies(entry: PersonaEntry, client: WebClient): boolean {
+    return (
+      !entry.stopped &&
+      entries.get(entry.persona.key) === entry &&
+      entry.web === client &&
+      entry.status.state !== 'broken'
+    )
+  }
+
+  /**
+   * A Web API call on `client` was refused for its bot token (the watch tells
+   * this once per client). When `client` is still the persona's current
+   * client, mark the persona at once; see `markRefusedWhileRunning`.
+   */
+  function onWebApiRefused(entry: PersonaEntry, client: WebClient, outcome: SlackCredentialsRefusedOutcome): void {
+    if (!webApiRefusalApplies(entry, client)) return
+    markRefusedWhileRunning(entry, outcome)
+  }
+
+  /**
+   * Mark a running persona credentials-broken (bug b.ujn), synchronously:
+   * cancel its attempt in flight and retry timer (a reopen cannot bring it
+   * back up), detach its live socket (it forwards nothing more), log one
+   * `persona-credentials-refused` line and report `broken`, so every gate
+   * that reads the status (the client lookup, the up predicate, the relaunch
+   * gate, the bring-up controller) refuses from now on. Only the detached
+   * socket's network close is submitted through the serializer, never
+   * awaited. A pending credentials reconnect is left to finish: its swap
+   * brings the persona back up.
+   */
+  function markRefusedWhileRunning(entry: PersonaEntry, outcome: SlackCredentialsRefusedOutcome): void {
+    clearRetryTimer(entry)
+    void cancelOwnAttempt(entry)
+    const socket = entry.socket
+    if (socket !== undefined) {
+      entry.socket = undefined
+      void retire(socket, false)
+      entry.refusedSocket = socket
+      serialize(entry.persona.key, () => closeRefusedSocket(entry, socket)).catch(err =>
+        logFailure('closing the connection of a persona whose bot token was refused', entry, err),
+      )
+    }
+    entry.tracker.record(outcome)
+    setStatus(entry, { state: 'broken', phase: 'running', outcome })
+  }
+
+  /**
+   * Close a socket detached by `markRefusedWhileRunning` as the manager's own
+   * close. Not awaited: its turn never holds the persona's serializer slot
+   * for the close itself. Idempotent.
+   */
+  function closeRefusedSocket(entry: PersonaEntry, socket: SocketBinding): void {
+    if (entry.refusedSocket === socket) entry.refusedSocket = undefined
+    void disconnectQuietly(socket.client)
+  }
+
   // -------------------------------------------------------------------------
   // Public surface
   // -------------------------------------------------------------------------
@@ -643,19 +1137,15 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
       persona,
       tokens: dryRun ? undefined : tokens,
       schedule: createPersonaRetrySchedule(),
-      tracker: createSlackEpisodeTracker({
-        name: persona.name,
-        key: persona.key,
-        index: persona.index,
-        path: persona.credentials_file,
-        log,
-      }),
+      tracker: trackerFor(persona),
       status: { state: 'connecting' },
       identity: undefined,
       web: undefined,
       socket: undefined,
       attempt: undefined,
       retryTimer: undefined,
+      reconnect: undefined,
+      refusedSocket: undefined,
       stopped: false,
     }
     entries.set(persona.key, entry)
@@ -669,7 +1159,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
 
     setStatus(entry, { state: 'connecting' })
     if (entry.stopped) return entry.status
-    const result = await runAttempt(entry, 'bring-up')
+    const result = await runAttempt(entry, 'bring-up', entry, entry.tokens)
     handleResult(entry, 'bring-up', result)
     return entry.status
   }
@@ -680,15 +1170,15 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
     entries.delete(key)
     entry.stopped = true
     clearRetryTimer(entry)
-    const closing: Promise<void>[] = []
-    const attempt = entry.attempt
-    if (attempt !== undefined) {
-      attempt.finish({ kind: 'cancelled' })
-      if (attempt.binding !== undefined) closing.push(retire(attempt.binding, true))
-    }
+    const closing: Promise<void>[] = [cancelOwnAttempt(entry), cancelReconnect(entry, RECONNECT_STOPPED)]
     if (entry.socket !== undefined) {
       closing.push(retire(entry.socket, true))
       entry.socket = undefined
+    }
+    if (entry.refusedSocket !== undefined) {
+      // Its serialized close has not run yet: close it now.
+      closing.push(disconnectQuietly(entry.refusedSocket.client))
+      entry.refusedSocket = undefined
     }
     entry.web = undefined
     entry.identity = undefined
@@ -708,6 +1198,8 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
       const entry = entries.get(key)
       return entry?.identity === undefined ? undefined : entry.web
     },
+    reconnectCredentials,
+    replaceRetryTokens,
     stop,
     stopAll,
   }

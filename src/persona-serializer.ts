@@ -19,8 +19,23 @@
  *   (`persona-bringup-controller.ts`, through its `serialize` dependency): a
  *   directory re-check with its Slack step and launch, and the launch after a
  *   Slack retry reached `up`;
- * - the apply's lifecycle operations: teardown and bring-up now, and later
- *   in-place updates and credentials reconnects once they are wired.
+ * - the apply's lifecycle operations (`persona-lifecycle.ts`): teardown,
+ *   in-place update, credentials change (step 4's reconnect, which awaits
+ *   the new connection's first attempt) and bring-up (step 6, the recovery
+ *   bring-up of a credentials-broken persona included; a recovery that
+ *   finds the persona no longer broken runs the credentials change body
+ *   directly in the same turn, never through `run` again);
+ * - the connection manager's network close of the socket it detached when
+ *   a running persona's Web API call was refused for its bot token
+ *   (`persona-connections.ts`, bug b.ujn). It is submitted, never awaited,
+ *   because the refusal can arrive inside an operation already holding the
+ *   persona's turn; the credentials-broken mark itself is synchronous and
+ *   never waits for the serializer.
+ * A credentials reconnect's later attempts (retries on its own timer) and
+ * its swap or refusal do not go through it: they touch only the
+ * connection, and whatever they trigger that launches (the launch after a
+ * late swap brought a refused persona back up) is submitted by the bring-up
+ * controller.
  * The start's bring-up pass does not: the reload detection tick, the only
  * source of applies, is armed only after that pass returns. The launch
  * single-flight (`spawnForPersona`'s in-flight launches) stays inside the

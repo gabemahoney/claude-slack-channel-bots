@@ -22,6 +22,12 @@
  *   `invalid_auth`, `token_revoked`, `missing_scope`, …). The persona is
  *   credentials-broken.
  *
+ * A running persona's Web API calls are classified too, but only for a
+ * revoked bot token (bug b.ujn): `classifyWebApiAuthFailure` maps a platform
+ * error whose Slack error is `invalid_auth`, `token_revoked`,
+ * `account_inactive` or `not_authed` to credentials refused (the `web-api`
+ * check, `bot_token`, naming the method), and everything else to nothing.
+ *
  * A connection counts as up only once `auth.test` has returned both the bot
  * user ID and the bot ID (b.av2 SR-3.1); `botIdentityFromAuthTest` maps a
  * result lacking either to Slack-unreachable, never up.
@@ -55,9 +61,12 @@ import { PERSONA_CREDENTIALS_REFUSED, PERSONA_SLACK_UNREACHABLE } from './person
 /**
  * Which validation a failure came from: `auth.test` checks the bot token,
  * `socket-mode` (opening Socket Mode: `apps.connections.open`, then the
- * WebSocket up to `hello`) checks the app token.
+ * WebSocket up to `hello`) checks the app token. `web-api` is a Web API call
+ * a running persona's long-lived client made (bug b.ujn): it checks the bot
+ * token too, and only its auth errors are classified
+ * (`classifyWebApiAuthFailure`).
  */
-export type SlackValidationCheck = 'auth.test' | 'socket-mode'
+export type SlackValidationCheck = 'auth.test' | 'socket-mode' | 'web-api'
 
 /** A credentials-file key naming one of the persona's two tokens. */
 export type PersonaTokenKey = 'bot_token' | 'app_token'
@@ -66,12 +75,14 @@ export type PersonaTokenKey = 'bot_token' | 'app_token'
 export const SLACK_CHECK_TOKEN_KEY: Readonly<Record<SlackValidationCheck, PersonaTokenKey>> = {
   'auth.test': 'bot_token',
   'socket-mode': 'app_token',
+  'web-api': 'bot_token',
 }
 
 /** How each check is named in a cause (e.g. `the Socket Mode open`). */
 export const SLACK_CHECK_DESCRIPTION: Readonly<Record<SlackValidationCheck, string>> = {
   'auth.test': 'auth.test',
   'socket-mode': 'the Socket Mode open',
+  'web-api': 'a Web API call',
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +121,26 @@ export const SLACK_ERROR_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/
 
 /** Placeholder for an absent Slack error code in a cause text. */
 export const UNKNOWN_SLACK_ERROR = 'unknown'
+
+/**
+ * The Slack errors of a Web API call that mean the bot token no longer works
+ * (bug b.ujn): the persona is marked credentials-broken at the first one. Any
+ * other Slack error (`missing_scope`, `channel_not_found`, `ratelimited`, …)
+ * is the call's own failure and changes nothing.
+ */
+export const WEB_API_AUTH_FAILURE_ERRORS: ReadonlySet<string> = new Set([
+  'invalid_auth',
+  'token_revoked',
+  'account_inactive',
+  'not_authed',
+])
+
+/**
+ * A Web API method name safe to copy into a cause: a letter, then letters,
+ * digits, `_` and `.` (`chat.postMessage`, `filesUploadV2`), up to 64
+ * characters.
+ */
+export const SLACK_METHOD_NAME_RE = /^[A-Za-z][A-Za-z0-9_.]{0,63}$/
 
 // ---------------------------------------------------------------------------
 // Start timeout marker (b.av2 SR-3.3)
@@ -221,7 +252,12 @@ export interface SlackCredentialsRefusedOutcome {
   key: PersonaTokenKey
   /** Slack error code (`invalid_auth`, …); always matches `SLACK_ERROR_CODE_RE`. */
   slackError: string
-  /** Single-line cause for the diagnostic line: key, check and Slack error code. */
+  /**
+   * The Web API method whose call was refused, for the `web-api` check only
+   * when it matches `SLACK_METHOD_NAME_RE` (e.g. `chat.postMessage`).
+   */
+  method?: string
+  /** Single-line cause for the diagnostic line: key, check (and method) and Slack error code. */
   cause: string
 }
 
@@ -294,6 +330,24 @@ export function classifySlackValidationError(error: unknown, check: SlackValidat
 }
 
 /**
+ * Classify a value a running persona's Web API call rejected with (bug
+ * b.ujn): a refused outcome of the `web-api` check (`bot_token`) when it is a
+ * Web API platform error whose Slack error is exactly one of
+ * `WEB_API_AUTH_FAILURE_ERRORS`; undefined for anything else (another Slack
+ * error, a network, HTTP or rate-limited error, any other value). Recognised
+ * structurally, like `classifySlackValidationError`. `method` names the call
+ * in the cause when it matches `SLACK_METHOD_NAME_RE`, e.g.
+ * `bot_token refused by a Web API call (chat.postMessage): Slack error token_revoked`.
+ * Copies nothing from the error but the Slack error code. Never throws.
+ */
+export function classifyWebApiAuthFailure(error: unknown, method: string | undefined): SlackCredentialsRefusedOutcome | undefined {
+  if (readProp(error, 'code') !== WEB_API_PLATFORM_ERROR) return undefined
+  const slackError = readProp(readProp(error, 'data'), 'error')
+  if (typeof slackError !== 'string' || !WEB_API_AUTH_FAILURE_ERRORS.has(slackError)) return undefined
+  return refused('web-api', slackError, method !== undefined && SLACK_METHOD_NAME_RE.test(method) ? method : undefined)
+}
+
+/**
  * Turn a successful `auth.test` result into the persona's bot identity
  * (b.av2 SR-3.1): `user_id` and `bot_id`, each a non-empty string. A result
  * lacking either is a failed check; not being a platform error, it is
@@ -356,16 +410,19 @@ function unreachable(
   return outcome
 }
 
-function refused(check: SlackValidationCheck, slackError: string): SlackCredentialsRefusedOutcome {
+function refused(check: SlackValidationCheck, slackError: string, method?: string): SlackCredentialsRefusedOutcome {
   const key = SLACK_CHECK_TOKEN_KEY[check]
-  return {
+  const via = method === undefined ? '' : ` (${method})`
+  const outcome: SlackCredentialsRefusedOutcome = {
     kind: 'credentials-refused',
     class: PERSONA_CREDENTIALS_REFUSED,
     check,
     key,
     slackError,
-    cause: `${key} refused by ${SLACK_CHECK_DESCRIPTION[check]}: Slack error ${slackError}`,
+    cause: `${key} refused by ${SLACK_CHECK_DESCRIPTION[check]}${via}: Slack error ${slackError}`,
   }
+  if (method !== undefined) outcome.method = method
+  return outcome
 }
 
 // ---------------------------------------------------------------------------

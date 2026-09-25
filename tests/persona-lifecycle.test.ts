@@ -1,7 +1,9 @@
 /**
- * persona-lifecycle.test.ts — The persona teardown, the apply bring-up and
- * the in-place update (`createPersonaLifecycle`, src/persona-lifecycle.ts;
- * b.av2 SR-6.1, SR-6.2, SR-6.5, SR-6.6, SR-8.6).
+ * persona-lifecycle.test.ts — The persona teardown, the apply bring-up (and
+ * the recovery bring-up of a credentials-broken persona), the credentials
+ * change and the in-place update (`createPersonaLifecycle`,
+ * src/persona-lifecycle.ts; b.av2 SR-6.1, SR-6.2, SR-6.4, SR-6.5, SR-6.6,
+ * SR-8.6).
  *
  * Every lifecycle here runs through a real `createPersonaSerializer`. The
  * dependencies are recorders by default (each call appends `<dep>:<arg>` to
@@ -15,8 +17,12 @@
  *   (`initRestart` with `serialize`, real `cancelRestartTimer`). Its timer is
  *   a real `setTimeout` (1 ms here; it takes no fake clock), waited for by a
  *   1 ms-step poll;
- * - serialization behind a bring-up retry: the real bring-up controller over
- *   the real connection manager (`makeConnectionHarness`, fake clock).
+ * - serialization behind a bring-up retry, the recovery bring-up of a
+ *   persona broken by its credentials, and confirmed credentials changes
+ *   (the controller's `changeCredentials` called directly, and through the
+ *   lifecycle): the real bring-up controller over the real connection manager
+ *   (`makeControllerStack` over `makeConnectionHarness`, fake clock), each
+ *   rewritten credentials file registered as its own stub credential set.
  *
  * Isolation (b.av2 SR-13.2): persona paths under a per-test `mkdtempSync`
  * directory, fake tokens only, no real agent-director, no Slack post.
@@ -25,16 +31,34 @@
  */
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 
 import type { Persona, PersonaConfig } from '../src/config.ts'
 import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
 import { ErrSystemInstallDisappeared } from '../src/agent-director-errors.ts'
 import { _resetBackoffState } from '../src/backoff.ts'
 import { _resetOutageState, getOutageFlags, initOutageState, resetAllToHealthy, setOutageFlag } from '../src/outage-state.ts'
-import { createPersonaBringUpController, type PersonaBringUpController, type PersonaBringUpResultSummary } from '../src/persona-bringup-controller.ts'
+import {
+  createPersonaBringUpController,
+  type CredentialsChangeConnections,
+  type CredentialsChangeHooks,
+  type CredentialsSwap,
+  type PersonaBringUpController,
+  type PersonaBringUpResultSummary,
+  type PersonaBringUpState,
+  type PersonaCredentialsChangeResult,
+} from '../src/persona-bringup-controller.ts'
+import { credentialsDigest, readCredentialsFile } from '../src/persona-credentials.ts'
+import {
+  PERSONA_CREDENTIALS_CHANGE_FAILED,
+  PERSONA_CREDENTIALS_INVALID,
+  PERSONA_CREDENTIALS_MISSING,
+  PERSONA_CREDENTIALS_REFUSED,
+  PERSONA_DIRECTORY_MISSING,
+  PERSONA_SLACK_UNREACHABLE,
+} from '../src/persona-diagnostics.ts'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { createPersonaLifecycle, type PersonaLifecycle, type PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
 import { createPersonaSerializer, type PersonaSerializer } from '../src/persona-serializer.ts'
@@ -43,11 +67,11 @@ import type { InPlaceSetting } from '../src/reload-plan.ts'
 import { _resetRestartState, cancelAllRestartTimers, cancelRestartTimer, initRestart, isRestartPendingOrActive, scheduleRestart } from '../src/restart.ts'
 import { deletePersonaInstance, killPersonaInstance } from '../src/session-manager.ts'
 import { errGeneric, errSpawnNotFound, makeStubCallLog, makeStubClient, stubCallCount } from './test-helpers/agent-director-stub.ts'
-import { BOT_TOKEN_PREFIX, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
-import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
+import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken, writeCredentialsFile } from './test-helpers/credentials.ts'
+import { makeConnectionHarness, type ConnectionHarness, type ConnectionHarnessOptions } from './test-helpers/persona-connection-harness.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
-import type { WebApiOutcome } from './test-helpers/slack-stub.ts'
+import { INITIAL_CREDENTIALS, makeDeferredWebApiCall, type WebApiOutcome } from './test-helpers/slack-stub.ts'
 
 // ---------------------------------------------------------------------------
 // Temp directory, console capture and module state
@@ -113,14 +137,17 @@ function makeConfig(): PersonaConfig {
 
 /** Dependency names the recorder fixture can make fail. */
 type DepName =
-  | 'bringUps.cancel' | 'bringUps.bringUp' | 'cancelRestartTimer' | 'whenLaunchSettled' | 'connections.stop'
+  | 'bringUps.cancel' | 'bringUps.bringUp' | 'bringUps.state' | 'bringUps.changeCredentials' | 'cancelRestartTimer' | 'whenLaunchSettled' | 'connections.stop'
   | 'routing.forget' | 'destinations.forget' | 'destinationHold.cancel' | 'notifier.forget' | 'forgetPersonaPrompts'
   | 'dropSession' | 'resetOutageState' | 'killInstance' | 'deleteInstance' | 'forgetFailures'
   | 'forgetDisconnectedStreak' | 'replyGuard.launchedWithDir' | 'replyGuard.teardown' | 'replyGuard.launchPass'
-  | 'storageCheck' | 'launch'
+  | 'storageCheck' | 'launch' | 'connections.reconnectCredentials' | 'connections.replaceRetryTokens'
 
 /** Dependencies whose production form returns a promise: their failure is a rejection, the others' a throw. */
-const ASYNC_DEPS = new Set<DepName>(['bringUps.bringUp', 'whenLaunchSettled', 'connections.stop', 'dropSession', 'killInstance', 'deleteInstance', 'launch'])
+const ASYNC_DEPS = new Set<DepName>([
+  'bringUps.bringUp', 'bringUps.changeCredentials', 'whenLaunchSettled', 'connections.stop', 'connections.reconnectCredentials',
+  'dropSession', 'killInstance', 'deleteInstance', 'launch',
+])
 
 /** A thrown value whose message carries a fake token: the log line must not show it. */
 function failure(): Error {
@@ -137,6 +164,10 @@ interface FixtureOptions {
   launchInFlight?: (key: string) => Promise<void>
   /** What the recording `bringUps.bringUp` resolves with. */
   bringUpResult?: PersonaBringUpResultSummary
+  /** What the recording `bringUps.state` returns, read at each call (default: undefined, an unknown persona). */
+  state?: () => PersonaBringUpState | undefined
+  /** What the recording `bringUps.changeCredentials` resolves with (default: `swapped`). It never calls the hook itself. */
+  changeResult?: PersonaCredentialsChangeResult
   /** Replace any dependency (real modules); the trail then records only the recorders left. */
   overrides?: Partial<PersonaLifecycleDeps>
 }
@@ -155,6 +186,10 @@ interface Fixture {
   lines: string[]
   /** Keys submitted to the serializer through the lifecycle. */
   submitted: string[]
+  /** The connections the lifecycle was given (its `deps.connections`). */
+  connections: PersonaLifecycleDeps['connections']
+  /** Every recording `bringUps.changeCredentials` call's connections and hooks, in order. */
+  changeCalls: Array<{ connections: CredentialsChangeConnections; hooks: CredentialsChangeHooks | undefined }>
 }
 
 function makeFixture(opts: FixtureOptions = {}): Fixture {
@@ -163,6 +198,7 @@ function makeFixture(opts: FixtureOptions = {}): Fixture {
   const trail: string[] = []
   const lines: string[] = []
   const submitted: string[] = []
+  const changeCalls: Fixture['changeCalls'] = []
   const applied: Persona[] = [a]
   const serializer = createPersonaSerializer()
   const fails = new Set(opts.fail ?? [])
@@ -193,8 +229,23 @@ function makeFixture(opts: FixtureOptions = {}): Fixture {
         (p: Persona, set: readonly Persona[]) => `${p.key}:[${set.map((x) => x.key).join(',')}]`,
         async () => opts.bringUpResult ?? { outcome: 'up' as const, failures: [] },
       ),
+      state: rec('bringUps.state', byKey, () => opts.state?.()),
+      changeCredentials: rec(
+        'bringUps.changeCredentials',
+        (p: Persona, set: readonly Persona[], _connections: CredentialsChangeConnections, _hooks?: CredentialsChangeHooks) =>
+          `${p.key}:[${set.map((x) => x.key).join(',')}]`,
+        async (_p: Persona, _set: readonly Persona[], connections: CredentialsChangeConnections, hooks?: CredentialsChangeHooks) => {
+          changeCalls.push({ connections, hooks })
+          return opts.changeResult ?? { kind: 'swapped' as const }
+        },
+      ),
     },
-    connections: { stop: rec('connections.stop', byKey, async () => undefined) },
+    connections: {
+      stop: rec('connections.stop', byKey, async () => undefined),
+      // Handed to the controller's changeCredentials only: the lifecycle never calls them itself.
+      reconnectCredentials: rec('connections.reconnectCredentials', byKey, async () => ({ kind: 'cancelled' as const })),
+      replaceRetryTokens: rec('connections.replaceRetryTokens', byKey, () => false),
+    },
     routing: { forget: rec('routing.forget', byKey, () => undefined) },
     destinations: { forget: rec('destinations.forget', byKey, () => undefined) },
     destinationHold: { cancel: rec('destinationHold.cancel', byKey, () => undefined) },
@@ -226,7 +277,10 @@ function makeFixture(opts: FixtureOptions = {}): Fixture {
     launch: rec('launch', byPersona, async () => ({ key: 'x', action: 'spawned' })),
     ...opts.overrides,
   }
-  return { lifecycle: createPersonaLifecycle(deps), serializer, config, a, b, applied, trail, lines, submitted }
+  return {
+    lifecycle: createPersonaLifecycle(deps), serializer, config, a, b, applied, trail, lines, submitted,
+    connections: deps.connections, changeCalls,
+  }
 }
 
 /** The teardown line prefix for `p`. */
@@ -250,6 +304,68 @@ function fullTeardownTrail(p: Persona, launchPass: string): string[] {
 /** The launch-pass record for B's config dir and `launchedWith`, against the applied set [A]. */
 function launchPassOf(f: Fixture, launchedWith: string | undefined): string {
   return `${JSON.stringify([f.b.claude_config_dir, launchedWith])}:[${f.a.key}]`
+}
+
+/** The real bring-up controller over the real connection manager, and a lifecycle over them. */
+interface ControllerStack {
+  h: ConnectionHarness
+  controller: PersonaBringUpController
+  /** The lifecycle fixture: its `bringUps` is the controller, its `connections` the manager; the rest are recorders. */
+  f: Fixture
+  a: Persona
+  b: Persona
+  /** Keys the controller launched itself (after a retry, or once a credentials swap brought a refused persona back up). */
+  launches: string[]
+}
+
+/**
+ * A and B on the connection harness with their files (not brought up yet).
+ * The controller reads the harness's applied set, runs its retry work
+ * through `f`'s serializer and logs into `h.lines`; teardown cancels it,
+ * stops the manager and asserts no fake-clock timer is left.
+ */
+function makeControllerStack(opts: {
+  stubOptions?: ConnectionHarnessOptions['stubOptions']
+  /** What the controller's launch does after recording the key. */
+  launch?: (p: Persona) => Promise<unknown>
+  /** Further lifecycle dependency overrides. */
+  overrides?: Partial<PersonaLifecycleDeps>
+} = {}): ControllerStack {
+  const h = makeConnectionHarness([{ name: NAME_A }, { name: NAME_B }], dir, { files: true, stubOptions: opts.stubOptions })
+  const [a, b] = h.personas as [Persona, Persona]
+  const launches: string[] = []
+  let controller!: PersonaBringUpController
+  const f = makeFixture({
+    overrides: {
+      bringUps: {
+        bringUp: (p, set) => controller.bringUp(p, set),
+        cancel: (k) => controller.cancel(k),
+        state: (k) => controller.state(k),
+        changeCredentials: (...args) => controller.changeCredentials(...args),
+      },
+      connections: h.manager,
+      ...opts.overrides,
+    },
+  })
+  controller = createPersonaBringUpController({
+    connections: { bringUp: h.connections.bringUp, status: (key) => h.manager.status(key) },
+    clock: h.clock,
+    dryRun: false,
+    log: (line) => void h.lines.push(line),
+    appliedPersonas: () => h.config?.personas ?? [],
+    serialize: f.serializer.run,
+    launch: async (p) => {
+      launches.push(p.key)
+      return opts.launch?.(p)
+    },
+  })
+  h.onStatus = (key, status) => controller.onConnectionStatus(key, status)
+  cleanups.push(async () => {
+    controller.cancelAll()
+    await h.manager.stopAll()
+    expect(h.clock.pendingCount()).toBe(0)
+  })
+  return { h, controller, f, a, b, launches }
 }
 
 // ---------------------------------------------------------------------------
@@ -624,7 +740,12 @@ describe('apply bring-up (SR-6.1, SR-6.2): storage check, bring-up, then a launc
     const f = makeFixture({
       overrides: {
         isShuttingDown: () => shuttingDown,
-        bringUps: { cancel: () => undefined, bringUp: (p) => { bringUpCalls.push(p.key); return gate.promise } },
+        bringUps: {
+          cancel: () => undefined,
+          bringUp: (p) => { bringUpCalls.push(p.key); return gate.promise },
+          state: () => undefined,
+          changeCredentials: async () => ({ kind: 'skipped' }),
+        },
       },
     })
 
@@ -653,6 +774,671 @@ describe('apply bring-up (SR-6.1, SR-6.2): storage check, bring-up, then a launc
     await held
     await forB
     expect(f.trail.filter((c) => c.startsWith('launch:'))).toEqual([`launch:${f.a.key}`, `launch:${f.b.key}`])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Recovery bring-up (SR-6.4, SR-8.6 step 6): a persona broken by its
+// credentials whose credentials file changed. Decided when it runs.
+// ---------------------------------------------------------------------------
+
+/** An applied config holding A and B. */
+function appliedAB(f: Fixture): PersonaConfig {
+  return { ...f.config, personas: [f.a, f.b] }
+}
+
+/** One cause of `step` and `cls` (the cause text is not read by the lifecycle). */
+const causeOf = (step: 'credentials' | 'working-directory' | 'slack', cls: string) => ({ step, class: cls, cause: 'x' })
+
+/** Bring-up states B can be in when its recovery runs. */
+const STATES = {
+  brokenMissing: { outcome: 'broken', causes: { credentials: causeOf('credentials', PERSONA_CREDENTIALS_MISSING) } },
+  brokenInvalid: { outcome: 'broken', causes: { credentials: causeOf('credentials', PERSONA_CREDENTIALS_INVALID) } },
+  brokenRefused: { outcome: 'broken', causes: { slack: causeOf('slack', PERSONA_CREDENTIALS_REFUSED) } },
+  brokenOther: { outcome: 'broken', causes: { slack: causeOf('slack', 'error') } },
+  retryingSlack: { outcome: 'retrying', causes: { slack: causeOf('slack', PERSONA_SLACK_UNREACHABLE) } },
+  retryingDirectory: { outcome: 'retrying', causes: { directory: causeOf('working-directory', PERSONA_DIRECTORY_MISSING) } },
+  firstAttempt: { outcome: undefined, causes: {} },
+  up: { outcome: 'up', causes: {} },
+} satisfies Record<string, PersonaBringUpState>
+
+describe('recovery bring-up (SR-6.4, SR-8.6 step 6): a credentials-broken persona is cleared, then brought up afresh', () => {
+  const recovery = { recovery: true } as const
+
+  /** B's recovery-specific steps, then the apply bring-up's, for an `up` result. */
+  const recoveredTrail = (f: Fixture) => {
+    const k = f.b.key
+    return [
+      `bringUps.state:${k}`, `bringUps.cancel:${k}`, `connections.stop:${k}`, `destinations.forget:${k}`,
+      `storageCheck:${k}`, `bringUps.bringUp:${k}:[${f.a.key},${k}]`, `launch:${k}`,
+    ]
+  }
+
+  test.each<[string, PersonaBringUpState]>([
+    ['its credentials file missing', STATES.brokenMissing],
+    ['its credentials file locally invalid', STATES.brokenInvalid],
+    ['Slack refusing its token', STATES.brokenRefused],
+  ])('B broken by %s: its bring-up state cancelled, its connection stopped and its cached DM forgotten, in that order, then storage check, bring-up and launch; B alone, through the serializer', async (_label, state) => {
+    const result: PersonaBringUpResultSummary = { outcome: 'up', failures: [] }
+    const f = makeFixture({ state: () => state, bringUpResult: result })
+
+    expect(await f.lifecycle.bringUp(f.b, appliedAB(f), recovery)).toBe(result)
+
+    expect(f.trail).toEqual(recoveredTrail(f))
+    const ref = renderPersonaRef(f.b.name, f.b.key)
+    expect(f.lines).toEqual([
+      `[slack] persona ${ref}: broken by its credentials and its credentials file changed — bringing it up again`,
+      `[slack] persona ${ref}: up at apply — launching`,
+    ])
+    expect(f.submitted).toEqual([f.b.key])
+  })
+
+  /** The recovery's line for a persona no longer broken by its credentials (finding 4's fallback). */
+  const notBrokenLine = (f: Fixture) =>
+    `[slack] persona ${renderPersonaRef(f.b.name, f.b.key)}: not brought up again — it is not broken by its credentials now, so its changed credentials are applied as a credentials change`
+  /** The recovery's trail when it applies the change instead: the state read, the change, then the state read for its result. */
+  const appliedAsChangeTrail = (f: Fixture) => [
+    `bringUps.state:${f.b.key}`, `bringUps.changeCredentials:${f.b.key}:[${f.a.key},${f.b.key}]`, `bringUps.state:${f.b.key}`,
+  ]
+
+  // Rows: B's state when the recovery runs, what the controller's change resolves, and the change's own line after the prefix.
+  test.each<[string, PersonaBringUpState | undefined, PersonaCredentialsChangeResult, string | undefined]>([
+    ['up', STATES.up, { kind: 'swapped' }, 'reconnected with its changed credentials; its instance and MCP session are kept'],
+    ['retrying: Slack unreachable', STATES.retryingSlack, { kind: 'retrying', connection: 'none' }, 'it retries its bring-up with its changed credentials'],
+    ['retrying: working directory missing', STATES.retryingDirectory, { kind: 'retrying', connection: 'none' }, 'it retries its bring-up with its changed credentials'],
+    ['in its first Slack attempt (no outcome yet)', STATES.firstAttempt, { kind: 'retrying', connection: 'none' }, 'it retries its bring-up with its changed credentials'],
+    ['broken by another Slack error', STATES.brokenOther, { kind: 'skipped' }, undefined],
+    ['unknown to the controller', undefined, { kind: 'skipped' }, undefined],
+  ])('B %s when the recovery runs: not cleared or brought up; its changed credentials are applied as a credentials change in the same serializer turn, and it resolves with its outcome then and no failures', async (_label, state, changeResult, changeLine) => {
+    const f = makeFixture({ state: () => state, changeResult })
+
+    expect(await f.lifecycle.bringUp(f.b, appliedAB(f), recovery)).toEqual({ outcome: state?.outcome ?? 'broken', failures: [] })
+
+    // No cancel, stop, forget, storage check, bring-up or launch.
+    expect(f.trail).toEqual(appliedAsChangeTrail(f))
+    expect(f.changeCalls).toHaveLength(1)
+    expect(f.changeCalls[0]!.connections).toBe(f.connections)
+    const ref = renderPersonaRef(f.b.name, f.b.key)
+    expect(f.lines).toEqual([notBrokenLine(f), ...(changeLine === undefined ? [] : [`[slack] persona ${ref}: ${changeLine}`])])
+    // Called directly inside the recovery's turn, never submitted again (which would wait for itself).
+    expect(f.submitted).toEqual([f.b.key])
+  })
+
+  test('the state is read when the recovery runs, not when it was submitted: B coming up while it waits for B\'s turn gets its change applied, not a fresh bring-up', async () => {
+    let state: PersonaBringUpState = STATES.brokenRefused
+    const f = makeFixture({ state: () => state })
+    const blocker = Promise.withResolvers<void>()
+    const held = f.serializer.run(f.b.key, () => blocker.promise)
+
+    const done = f.lifecycle.bringUp(f.b, appliedAB(f), recovery)
+    expect(await settled(done)).toBe(false)
+    expect(f.trail).toEqual([])
+    state = STATES.up
+    blocker.resolve()
+    await held
+
+    expect(await done).toEqual({ outcome: 'up', failures: [] })
+    expect(f.trail).toEqual(appliedAsChangeTrail(f))
+  })
+
+  test('the change finds B broken by its credentials again: the recovery goes ahead (cleared, then brought up and launched)', async () => {
+    const f = makeFixture({ state: () => STATES.up, changeResult: { kind: 'credentials-broken' } })
+
+    expect(await f.lifecycle.bringUp(f.b, appliedAB(f), recovery)).toEqual({ outcome: 'up', failures: [] })
+
+    const k = f.b.key
+    expect(f.trail).toEqual([
+      `bringUps.state:${k}`, `bringUps.changeCredentials:${k}:[${f.a.key},${k}]`,
+      `bringUps.cancel:${k}`, `connections.stop:${k}`, `destinations.forget:${k}`,
+      `storageCheck:${k}`, `bringUps.bringUp:${k}:[${f.a.key},${k}]`, `launch:${k}`,
+    ])
+    const ref = renderPersonaRef(f.b.name, k)
+    expect(f.lines).toEqual([
+      notBrokenLine(f),
+      `[slack] persona ${ref}: broken by its credentials now, so it is brought up again rather than reconnected`,
+      `[slack] persona ${ref}: broken by its credentials and its credentials file changed — bringing it up again`,
+      `[slack] persona ${ref}: up at apply — launching`,
+    ])
+    expect(f.submitted).toEqual([k])
+  })
+
+  test('shutdown beginning while B\'s leftover state is cleared: nothing new is connected or launched (no storage check, bring-up or launch); the shutdown line; it resolves broken with no failures', async () => {
+    let f!: Fixture
+    // Shutdown begins while B's connection is being stopped.
+    f = makeFixture({
+      state: () => STATES.brokenRefused,
+      overrides: { isShuttingDown: () => f.trail.includes(`connections.stop:${f.b.key}`) },
+    })
+
+    expect(await f.lifecycle.bringUp(f.b, appliedAB(f), recovery)).toEqual({ outcome: 'broken', failures: [] })
+
+    const k = f.b.key
+    expect(f.trail).toEqual([`bringUps.state:${k}`, `bringUps.cancel:${k}`, `connections.stop:${k}`, `destinations.forget:${k}`])
+    const ref = renderPersonaRef(f.b.name, k)
+    expect(f.lines).toEqual([
+      `[slack] persona ${ref}: broken by its credentials and its credentials file changed — bringing it up again`,
+      `[slack] persona ${ref}: not brought up — the server is shutting down`,
+    ])
+  })
+
+  test.each<[DepName, string]>([
+    ['bringUps.cancel', 'cancelling its bring-up state'],
+    ['connections.stop', 'stopping its Slack connection'],
+    ['destinations.forget', 'forgetting its DM destination'],
+  ])('%s failing: logged token-safely, the other clearing steps and the bring-up still run', async (dep, phrase) => {
+    const f = makeFixture({ state: () => STATES.brokenMissing, fail: [dep] })
+
+    expect(await f.lifecycle.bringUp(f.b, appliedAB(f), recovery)).toEqual({ outcome: 'up', failures: [] })
+
+    expect(f.trail).toEqual(recoveredTrail(f))
+    const ref = renderPersonaRef(f.b.name, f.b.key)
+    expect(f.lines).toHaveLength(3)
+    expect(f.lines[1]).toMatch(new RegExp(`^${RegExp.escape(`[slack] persona ${ref}: ${phrase} before bringing it up again failed: Error`)}( |$)`))
+    expect(f.lines[2]).toBe(`[slack] persona ${ref}: up at apply — launching`)
+    assertNoLeak({ lines: f.lines })
+  })
+
+  test('shutting down when the recovery starts: no state read, nothing cleared or brought up; the shutdown line; it resolves broken with no failures', async () => {
+    const f = makeFixture({ state: () => STATES.brokenMissing, overrides: { isShuttingDown: () => true } })
+
+    expect(await f.lifecycle.bringUp(f.b, appliedAB(f), recovery)).toEqual({ outcome: 'broken', failures: [] })
+
+    expect(f.trail).toEqual([])
+    expect(f.lines).toEqual([`[slack] persona ${renderPersonaRef(f.b.name, f.b.key)}: not brought up — the server is shutting down`])
+  })
+
+  test('without the recovery option a credentials-broken persona is not cleared: no state read, no cancel, stop or forget', async () => {
+    const f = makeFixture({ state: () => STATES.brokenMissing })
+
+    await f.lifecycle.bringUp(f.b, appliedAB(f))
+
+    expect(f.trail).toEqual([`storageCheck:${f.b.key}`, `bringUps.bringUp:${f.b.key}:[${f.a.key},${f.b.key}]`, `launch:${f.b.key}`])
+  })
+
+  // Rows: how B is broken by its credentials at start, and its credentials cause class.
+  test.each<[string, boolean, string]>([
+    ['its credentials file missing (then written)', true, PERSONA_CREDENTIALS_MISSING],
+    ['Slack refusing its token at auth.test (then accepted)', false, PERSONA_CREDENTIALS_REFUSED],
+  ])('over the real bring-up controller and connection manager: B broken by %s comes up at its recovery with its file\'s tokens and is launched; A is untouched', async (_label, missing, cls) => {
+    const { h, controller, f, a, b } = makeControllerStack({
+      stubOptions: missing ? {} : { [NAME_B]: { authTest: [{ kind: 'platform', error: 'invalid_auth' }] } },
+    })
+    if (missing) unlinkSync(b.credentials_file)
+    for (const p of [a, b]) await controller.bringUp(p, h.personas)
+    const brokenBy = missing ? { credentials: { class: cls } } : { slack: { class: cls } }
+    expect(controller.state(b.key)).toMatchObject({ outcome: 'broken', causes: brokenBy })
+    const aSockets = h.stub(a).sockets.length
+
+    writeCredentialsFile(dir, relative(dir, b.credentials_file), { bot_token: h.tokens(b).botToken, app_token: h.tokens(b).appToken })
+    const got = await f.lifecycle.bringUp(b, { ...h.config!, personas: [a, b] }, recovery)
+
+    expect(got).toEqual({ outcome: 'up', failures: [] })
+    expect(controller.state(b.key)?.outcome).toBe('up')
+    expect(h.manager.status(b.key)).toMatchObject({ state: 'up' })
+    expect(f.trail.filter((c) => c.startsWith('launch:'))).toEqual([`launch:${b.key}`])
+    const ownCall = { key: b.key, gotTokens: true, ownTokens: true }
+    expect(h.bringUpCalls.filter((c) => c.key === b.key)).toEqual(missing ? [ownCall] : [ownCall, ownCall])
+    expect(h.stub(a).sockets).toHaveLength(aSockets)
+    expect(h.manager.status(a.key)).toMatchObject({ state: 'up' })
+    assertNoLeak({ lines: h.lines, lifecycle: f.lines })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Credentials change (SR-8.6 step 4, credentials row): the controller's
+// changeCredentials over the lifecycle's connections, under the serializer.
+// ---------------------------------------------------------------------------
+
+describe('credentials change (SR-8.6 step 4): the controller\'s change over the connection manager, one line per outcome', () => {
+  const lineOf = (f: Fixture, rest: string) => `[slack] persona ${renderPersonaRef(f.b.name, f.b.key)}: ${rest}`
+
+  // Rows: the controller's result, and the lifecycle's line after the persona prefix (none for failed and skipped).
+  test.each<[string, PersonaCredentialsChangeResult, string | undefined]>([
+    ['swapped', { kind: 'swapped' }, 'reconnected with its changed credentials; its instance and MCP session are kept'],
+    [
+      'swapped, up again (its current connection was refused during the attempt)',
+      { kind: 'swapped', cameBackUp: true },
+      'reconnected with its changed credentials and up again; its instance is kept',
+    ],
+    [
+      'retrying, the current connection kept',
+      { kind: 'retrying', connection: 'kept' },
+      'its changed credentials cannot reach Slack yet; the new connection retries and the current one stays in use',
+    ],
+    [
+      'retrying, its current connection refused during the attempt',
+      { kind: 'retrying', connection: 'broken' },
+      'its changed credentials cannot reach Slack yet; the new connection retries, and it stays broken by its credentials until that connection is in use',
+    ],
+    ['retrying with no connection yet', { kind: 'retrying', connection: 'none' }, 'it retries its bring-up with its changed credentials'],
+    ['credentials-broken now', { kind: 'credentials-broken' }, 'broken by its credentials now, so it is brought up again rather than reconnected'],
+    ['failed (the controller logged it)', { kind: 'failed', cause: 'credentials file does not exist' }, undefined],
+    ['skipped', { kind: 'skipped' }, undefined],
+  ])('%s: B\'s change against the applied set over the lifecycle\'s own connections, its result returned as is, and its line; nothing else done by the lifecycle', async (_label, result, rest) => {
+    const f = makeFixture({ changeResult: result })
+
+    expect(await f.lifecycle.reconnectCredentials(f.b, appliedAB(f))).toBe(result)
+
+    // The DM cache is forgotten only through the swap hook, never by the lifecycle itself.
+    expect(f.trail).toEqual([`bringUps.changeCredentials:${f.b.key}:[${f.a.key},${f.b.key}]`])
+    expect(f.changeCalls).toHaveLength(1)
+    expect(f.changeCalls[0]!.connections).toBe(f.connections)
+    expect(f.lines).toEqual(rest === undefined ? [] : [lineOf(f, rest)])
+    expect(f.submitted).toEqual([f.b.key])
+  })
+
+  test('its before-swap hook forgets B\'s cached DM conversation (only B\'s) when the controller calls it, and not before; the swapped hook forgets nothing', async () => {
+    const f = makeFixture({ changeResult: { kind: 'retrying', connection: 'kept' } })
+
+    await f.lifecycle.reconnectCredentials(f.b, appliedAB(f))
+    const hooks = f.changeCalls[0]!.hooks!
+    expect(f.trail.filter((c) => c.startsWith('destinations.'))).toEqual([])
+
+    hooks.onSwapped!({ late: true, wasUp: true })
+    expect(f.trail.filter((c) => c.startsWith('destinations.'))).toEqual([])
+
+    hooks.beforeSwap!() // the new connection is about to come into use
+    expect(f.trail.filter((c) => c.startsWith('destinations.'))).toEqual([`destinations.forget:${f.b.key}`])
+  })
+
+  // Rows: the swap the controller reports, and the line it logs after the persona prefix (none for the operation's own swap).
+  test.each<[string, CredentialsSwap, string | undefined]>([
+    ['at once, up before it', { late: false, wasUp: true }, undefined],
+    ['at once, refused before it', { late: false, wasUp: false }, undefined],
+    ['later, up before it', { late: true, wasUp: true }, 'reconnected with its changed credentials; its instance and MCP session are kept'],
+    ['later, refused before it', { late: true, wasUp: false }, 'reconnected with its changed credentials and up again; its instance is kept'],
+  ])('a swap %s: the swapped hook logs the reconnected line only for a late swap, worded by whether B was up before it', async (_label, swap, rest) => {
+    const f = makeFixture({ changeResult: { kind: 'retrying', connection: 'kept' } })
+    await f.lifecycle.reconnectCredentials(f.b, appliedAB(f))
+    const before = f.lines.length
+
+    f.changeCalls[0]!.hooks!.onSwapped!(swap)
+
+    expect(f.lines.slice(before)).toEqual(rest === undefined ? [] : [lineOf(f, rest)])
+  })
+
+  test('forgetting the cached DM throws in the before-swap hook: one token-safe line, and the hook does not throw', async () => {
+    const f = makeFixture({ fail: ['destinations.forget'] })
+
+    await f.lifecycle.reconnectCredentials(f.b, appliedAB(f))
+    expect(() => f.changeCalls[0]!.hooks!.beforeSwap!()).not.toThrow()
+
+    expect(f.trail.at(-1)).toBe(`destinations.forget:${f.b.key}`)
+    expect(f.lines.at(-1)).toMatch(
+      new RegExp(`^${RegExp.escape(lineOf(f, 'forgetting its cached DM conversation failed: Error'))}( |$)`),
+    )
+    assertNoLeak({ lines: f.lines })
+  })
+
+  test('shutting down when the change starts (the flag set while it waited for B\'s turn): no change asked for; one line; it resolves skipped', async () => {
+    let shuttingDown = false
+    const f = makeFixture({ overrides: { isShuttingDown: () => shuttingDown } })
+    const blocker = Promise.withResolvers<void>()
+    const held = f.serializer.run(f.b.key, () => blocker.promise)
+
+    const done = f.lifecycle.reconnectCredentials(f.b, appliedAB(f))
+    shuttingDown = true
+    blocker.resolve()
+    await held
+
+    expect(await done).toEqual({ kind: 'skipped' })
+    expect(f.trail).toEqual([])
+    expect(f.lines).toEqual([lineOf(f, 'credentials change not applied — the server is shutting down')])
+  })
+
+  test('serialized per key: B\'s change waits behind an operation running for B; A\'s change does not', async () => {
+    const f = makeFixture()
+    const blocker = Promise.withResolvers<void>()
+    const held = f.serializer.run(f.b.key, () => blocker.promise)
+
+    const forB = f.lifecycle.reconnectCredentials(f.b, appliedAB(f))
+    await f.lifecycle.reconnectCredentials(f.a, appliedAB(f))
+    expect(await settled(forB)).toBe(false)
+    expect(f.trail).toEqual([`bringUps.changeCredentials:${f.a.key}:[${f.a.key},${f.b.key}]`])
+
+    blocker.resolve()
+    await held
+    expect(await forB).toEqual({ kind: 'swapped' })
+    expect(f.trail).toEqual([
+      `bringUps.changeCredentials:${f.a.key}:[${f.a.key},${f.b.key}]`,
+      `bringUps.changeCredentials:${f.b.key}:[${f.a.key},${f.b.key}]`,
+    ])
+    expect(f.submitted).toEqual([f.b.key, f.a.key])
+  })
+
+  test('a rejecting change rejects the operation (the apply\'s fan-out reports it) with no line of the lifecycle\'s own', async () => {
+    const f = makeFixture({ fail: ['bringUps.changeCredentials'] })
+
+    await expect(f.lifecycle.reconnectCredentials(f.b, appliedAB(f))).rejects.toThrow(/^step exploded with /)
+    expect(f.lines).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Confirmed credentials changes over the real bring-up controller and
+// connection manager (b.av2 SR-8.3, SR-8.6 step 4): the content held after
+// superseded and late reconnects, the failed line's "kept" wording, and the
+// results worded from B's state after the attempt. B is up on its original
+// file (O); each rotation writes B's file with a new token pair registered
+// as its own credential set, so each set's auth.test is scripted apart.
+// ---------------------------------------------------------------------------
+
+const HOUR_MS = 3_600_000
+/** A reconnect left retrying tries again after 5 s (the SR-3.2 schedule's first step). */
+const FIRST_RETRY_MS = 5_000
+
+interface CredentialsStack extends ControllerStack {
+  /** Every hook call of the changes made through `change`, in order. */
+  hookCalls: Array<'beforeSwap' | CredentialsSwap>
+  /**
+   * Write B's credentials file with a new token pair, registered as the
+   * credential set `label` whose auth.test answers `authTest` in turn (then
+   * ok); returns the digest of the file as written.
+   */
+  rotate(label: string, authTest?: WebApiOutcome[]): string
+  /** The digest the controller holds for B (what detection compares the file with). */
+  held(): string | undefined
+  /** The controller's change of B, against the applied set, over the manager, with recording hooks. */
+  change(): Promise<PersonaCredentialsChangeResult>
+  /** A Web API call on B's current client refused with token_revoked: the manager marks B broken at once. */
+  revokeCurrent(): Promise<void>
+  /** The credential set B's own connection uses now (`INITIAL_CREDENTIALS` for O). */
+  connectedWith(): string | undefined
+  /** The controller's persona-credentials-change-failed lines. */
+  changeFailedLines(): string[]
+}
+
+/**
+ * `makeControllerStack` with A and B brought up on their original files: up,
+ * unless `stubOptions` script B's original set otherwise.
+ */
+async function makeCredentialsStack(stubOptions?: ConnectionHarnessOptions['stubOptions']): Promise<CredentialsStack> {
+  const stack = makeControllerStack({ stubOptions })
+  const { h, controller, b } = stack
+  for (const p of [stack.a, b]) await controller.bringUp(p, h.personas)
+  expect(controller.state(b.key)?.outcome).toBe(stubOptions === undefined ? 'up' : 'retrying')
+  const labels = [INITIAL_CREDENTIALS]
+  const hookCalls: CredentialsStack['hookCalls'] = []
+  const connectedWith = () =>
+    labels.find((l) => h.slack.credentials(b.key, l).identity.botUserId === h.manager.identity(b.key)?.botUserId)
+  return {
+    ...stack,
+    hookCalls,
+    rotate(label, authTest = []) {
+      const botToken = fakeToken(BOT_TOKEN_PREFIX, `${b.key}-${label}-bot`)
+      const appToken = fakeToken(APP_TOKEN_PREFIX, `${b.key}-${label}-app`)
+      h.slack.addCredentials(b.key, label, { botToken, appToken }, { leakMarker: LEAK_SENTINEL, authTest })
+      writeCredentialsFile(dir, relative(dir, b.credentials_file), { bot_token: botToken, app_token: appToken })
+      labels.push(label)
+      return credentialsDigest(readCredentialsFile(b.credentials_file))
+    },
+    held: () => controller.credentialsDigest(b.key),
+    change: () =>
+      controller.changeCredentials(b, h.personas, h.manager, {
+        beforeSwap: () => void hookCalls.push('beforeSwap'),
+        onSwapped: (swap) => void hookCalls.push(swap),
+      }),
+    async revokeCurrent() {
+      h.slack.credentials(b.key, connectedWith()!).script.reactionsAdd.push({ kind: 'platform', error: 'token_revoked' })
+      await h.manager.webClient(b.key)!.reactions.add({ channel: b.channels[0]!.id, timestamp: '1700000000.000100', name: 'eyes' })
+        .catch(() => undefined)
+      expect(h.manager.status(b.key)).toMatchObject({ state: 'broken', phase: 'running' })
+    },
+    connectedWith,
+    changeFailedLines: () => h.lines.filter((l) => l.includes(`${PERSONA_CREDENTIALS_CHANGE_FAILED}:`)),
+  }
+}
+
+describe('the controller\'s credentials change (SR-8.3, SR-8.6 step 4): any refusal holds the content B\'s own connection uses', () => {
+  const KEPT_CONNECTION = '; the current connection stays in use, and the change stays pending'
+  const KEPT_BROKEN = '; it stays broken by its credentials, and the change stays pending'
+
+  test('change A left retrying, then change B refused at once: B holds O again (not A), A\'s superseded reconnect never swaps, and one failed line says the current connection stays in use', async () => {
+    const s = await makeCredentialsStack()
+    const o = s.held()
+    const a = s.rotate('A', [{ kind: 'network' }])
+    expect(await s.change()).toEqual({ kind: 'retrying', connection: 'kept' })
+    expect(s.held()).toBe(a)
+
+    s.rotate('B', [{ kind: 'platform', error: 'invalid_auth' }])
+    const got = await s.change()
+
+    expect(got).toMatchObject({ kind: 'failed' })
+    expect(s.held()).toBe(o)
+    await s.h.clock.advance(HOUR_MS)
+    expect(s.held()).toBe(o)
+    expect(s.connectedWith()).toBe(INITIAL_CREDENTIALS)
+    expect(s.h.slack.credentials(s.b.key, 'A').calls.authTest).toHaveLength(1)
+    expect(s.hookCalls).toEqual([])
+    expect(s.changeFailedLines()).toEqual([expect.stringContaining(KEPT_CONNECTION)])
+    expect(s.controller.state(s.b.key)?.outcome).toBe('up')
+    assertNoLeak({ lines: s.h.lines, got })
+  })
+
+  test('change A left retrying, then change B left retrying and refused later: B holds B while it retries, then O again, with one failed line; A never swaps', async () => {
+    const s = await makeCredentialsStack()
+    const o = s.held()
+    s.rotate('A', [{ kind: 'network' }])
+    await s.change()
+    const b = s.rotate('B', [{ kind: 'network' }, { kind: 'platform', error: 'invalid_auth' }])
+    expect(await s.change()).toEqual({ kind: 'retrying', connection: 'kept' })
+    expect(s.held()).toBe(b)
+    expect(s.changeFailedLines()).toEqual([])
+
+    await s.h.clock.advance(FIRST_RETRY_MS)
+
+    expect(s.held()).toBe(o)
+    expect(s.changeFailedLines()).toEqual([expect.stringContaining(KEPT_CONNECTION)])
+    await s.h.clock.advance(HOUR_MS)
+    expect(s.held()).toBe(o)
+    expect(s.connectedWith()).toBe(INITIAL_CREDENTIALS)
+    expect(s.hookCalls).toEqual([])
+    assertNoLeak({ lines: s.h.lines })
+  })
+
+  test('change A left retrying swaps later, then change C refused at once: B holds A (what its connection now uses), not O', async () => {
+    const s = await makeCredentialsStack()
+    const a = s.rotate('A', [{ kind: 'network' }])
+    await s.change()
+    await s.h.clock.advance(FIRST_RETRY_MS)
+    expect(s.connectedWith()).toBe('A')
+    expect(s.hookCalls).toEqual(['beforeSwap', { late: true, wasUp: true }])
+
+    s.rotate('C', [{ kind: 'platform', error: 'invalid_auth' }])
+    expect(await s.change()).toMatchObject({ kind: 'failed' })
+
+    expect(s.held()).toBe(a)
+    expect(s.connectedWith()).toBe('A')
+    expect(s.changeFailedLines()).toEqual([expect.stringContaining(KEPT_CONNECTION)])
+    assertNoLeak({ lines: s.h.lines })
+  })
+
+  test('B retrying its bring-up takes change A, comes up on it, then change C is refused at once: B holds A (what its connection uses), not O', async () => {
+    const s = await makeCredentialsStack({ [NAME_B]: { authTest: [{ kind: 'network' }] } })
+    const a = s.rotate('A')
+    expect(await s.change()).toEqual({ kind: 'retrying', connection: 'none' })
+    expect(s.held()).toBe(a)
+    await s.h.clock.advance(FIRST_RETRY_MS)
+    await flush()
+    expect(s.controller.state(s.b.key)?.outcome).toBe('up')
+    expect(s.connectedWith()).toBe('A')
+
+    s.rotate('C', [{ kind: 'platform', error: 'invalid_auth' }])
+    expect(await s.change()).toMatchObject({ kind: 'failed' })
+
+    expect(s.held()).toBe(a)
+    expect(s.changeFailedLines()).toEqual([expect.stringContaining(KEPT_CONNECTION)])
+    assertNoLeak({ lines: s.h.lines })
+  })
+
+  test('B\'s current connection refused while change A\'s first attempt runs, then A refused: the failed line says B stays broken by its credentials (not that its connection stays in use), and B holds O', async () => {
+    const s = await makeCredentialsStack()
+    const o = s.held()
+    const deferred = makeDeferredWebApiCall()
+    s.rotate('A', [deferred.outcome])
+    const pending = s.change()
+    await flush()
+    await s.revokeCurrent()
+
+    deferred.settle({ kind: 'platform', error: 'invalid_auth' })
+    const got = await pending
+
+    expect(got).toMatchObject({ kind: 'failed' })
+    expect(s.changeFailedLines()).toEqual([expect.stringContaining(KEPT_BROKEN)])
+    expect(s.changeFailedLines()[0]).not.toContain('the current connection stays in use')
+    expect(s.held()).toBe(o)
+    expect(s.controller.state(s.b.key)).toMatchObject({ outcome: 'broken', causes: { slack: { class: PERSONA_CREDENTIALS_REFUSED } } })
+    assertNoLeak({ lines: s.h.lines, got })
+  })
+
+  test('B\'s current connection refused while change A\'s first attempt runs, then A unreachable: retrying with connection \'broken\' and A held; A\'s later swap brings B up again (a late swap, not up before it) and the controller launches it', async () => {
+    const s = await makeCredentialsStack()
+    const deferred = makeDeferredWebApiCall()
+    const a = s.rotate('A', [deferred.outcome])
+    const pending = s.change()
+    await flush()
+    await s.revokeCurrent()
+
+    deferred.settle({ kind: 'network' })
+    expect(await pending).toEqual({ kind: 'retrying', connection: 'broken' })
+    expect(s.held()).toBe(a)
+    expect(s.controller.state(s.b.key)?.outcome).toBe('broken')
+    expect(s.launches).toEqual([])
+
+    await s.h.clock.advance(FIRST_RETRY_MS)
+
+    expect(s.hookCalls).toEqual(['beforeSwap', { late: true, wasUp: false }])
+    expect(s.controller.state(s.b.key)?.outcome).toBe('up')
+    expect(s.connectedWith()).toBe('A')
+    expect(s.held()).toBe(a)
+    expect(s.launches).toEqual([s.b.key])
+    expect(s.changeFailedLines()).toEqual([])
+    assertNoLeak({ lines: s.h.lines })
+  })
+
+  test('B\'s current connection refused while change A\'s first attempt runs, then A swaps: swapped with cameBackUp, the swap reported as not up before it, A held, and the controller launches B', async () => {
+    const s = await makeCredentialsStack()
+    const deferred = makeDeferredWebApiCall()
+    const a = s.rotate('A', [deferred.outcome])
+    const pending = s.change()
+    await flush()
+    await s.revokeCurrent()
+
+    deferred.settle()
+    expect(await pending).toEqual({ kind: 'swapped', cameBackUp: true })
+    await flush()
+
+    expect(s.hookCalls).toEqual(['beforeSwap', { late: false, wasUp: false }])
+    expect(s.controller.state(s.b.key)?.outcome).toBe('up')
+    expect(s.connectedWith()).toBe('A')
+    expect(s.held()).toBe(a)
+    expect(s.launches).toEqual([s.b.key])
+    assertNoLeak({ lines: s.h.lines })
+  })
+
+  test('a plain swap reports up before it and no cameBackUp: swapped, and nothing launched', async () => {
+    const s = await makeCredentialsStack()
+    const a = s.rotate('A')
+
+    expect(await s.change()).toEqual({ kind: 'swapped' })
+    await flush()
+
+    expect(s.hookCalls).toEqual(['beforeSwap', { late: false, wasUp: true }])
+    expect(s.held()).toBe(a)
+    expect(s.launches).toEqual([])
+    assertNoLeak({ lines: s.h.lines })
+  })
+
+  test('change A left retrying, B\'s current connection then refused, and A refused later: B stays broken by its credentials with A held (nothing pending), logged as its refusal, not as a failed change', async () => {
+    const s = await makeCredentialsStack()
+    const a = s.rotate('A', [{ kind: 'network' }, { kind: 'platform', error: 'invalid_auth' }])
+    expect(await s.change()).toEqual({ kind: 'retrying', connection: 'kept' })
+    await s.revokeCurrent()
+    const refusedBefore = s.h.lines.filter((l) => l.includes(`${PERSONA_CREDENTIALS_REFUSED}:`)).length
+
+    await s.h.clock.advance(FIRST_RETRY_MS)
+
+    expect(s.held()).toBe(a)
+    expect(s.changeFailedLines()).toEqual([])
+    expect(s.h.lines.filter((l) => l.includes(`${PERSONA_CREDENTIALS_REFUSED}:`))).toHaveLength(refusedBefore + 1)
+    expect(s.controller.state(s.b.key)?.outcome).toBe('broken')
+    assertNoLeak({ lines: s.h.lines })
+  })
+})
+
+describe('credentials change over the real controller and manager: the DM forget before the swap, and the lines worded after the attempt', () => {
+  /**
+   * B up on O, with the manager's status reports for B recorded on the
+   * lifecycle trail (`status:<state>`) beside the recorders, so the DM
+   * forget's order against the swap's `up` report shows.
+   */
+  async function makeStatusStack(): Promise<CredentialsStack> {
+    const s = await makeCredentialsStack()
+    s.h.onStatus = (key, status) => {
+      if (key === s.b.key) s.f.trail.push(`status:${status.state}`)
+      s.controller.onConnectionStatus(key, status)
+    }
+    return s
+  }
+  const lineOf = (s: ControllerStack, rest: string) => `[slack] persona ${renderPersonaRef(s.b.name, s.b.key)}: ${rest}`
+
+  // Rows: A's auth.test script, whether B's current connection is refused before A's retry, the lifecycle's line for the
+  // operation's result and for a late swap (fragments after the persona prefix), and whether the controller launches B.
+  test.each<[string, WebApiOutcome[], boolean, string, string | undefined, boolean]>([
+    ['A swaps at once', [], false, 'reconnected with its changed credentials; its instance and MCP session are kept', undefined, false],
+    ['A swaps later, B up meanwhile', [{ kind: 'network' }], false, 'the current one stays in use', 'reconnected with its changed credentials; its instance and MCP session are kept', false],
+    ['A swaps later, B refused meanwhile', [{ kind: 'network' }], true, 'the current one stays in use', 'reconnected with its changed credentials and up again; its instance is kept', true],
+  ])('%s: B\'s cached DM is forgotten right before the swap\'s up report (never at the operation\'s result), and the lines are worded by B\'s state then', async (_label, authTest, revoke, resultLine, lateLine, launched) => {
+    const s = await makeStatusStack()
+    s.rotate('A', authTest)
+
+    await s.f.lifecycle.reconnectCredentials(s.b, { ...s.h.config!, personas: [s.a, s.b] })
+    if (revoke) await s.revokeCurrent()
+    await s.h.clock.advance(FIRST_RETRY_MS)
+    await flush()
+
+    const k = s.b.key
+    // The forget comes right before the up report of the swap, and only once.
+    expect(s.f.trail.filter((c) => c.startsWith('destinations.') || c === 'status:up')).toEqual([`destinations.forget:${k}`, 'status:up'])
+    expect(s.connectedWith()).toBe('A')
+    expect(s.f.lines).toHaveLength(lateLine === undefined ? 1 : 2)
+    expect(s.f.lines[0]!.startsWith(lineOf(s, ''))).toBe(true)
+    expect(s.f.lines[0]).toContain(resultLine)
+    if (lateLine !== undefined) expect(s.f.lines[1]).toBe(lineOf(s, lateLine))
+    expect(s.launches).toEqual(launched ? [k] : [])
+    assertNoLeak({ lines: s.h.lines, lifecycle: s.f.lines })
+  })
+
+  test('step 6\'s recovery of B, broken by its credentials when step 4 ran, finds it up again (an earlier change\'s pending reconnect swapped meanwhile): the confirmed change C is applied as a credentials change, so B ends on C with no fresh bring-up', async () => {
+    const s = await makeStatusStack()
+    const applied = { ...s.h.config!, personas: [s.a, s.b] }
+    // An earlier confirmed change A is left retrying; then B's own connection is refused.
+    s.rotate('A', [{ kind: 'network' }])
+    await s.f.lifecycle.reconnectCredentials(s.b, applied)
+    await s.revokeCurrent()
+
+    // A later confirmed change C: step 4 leaves B to step 6 ...
+    const c = s.rotate('C')
+    expect(await s.f.lifecycle.reconnectCredentials(s.b, applied)).toEqual({ kind: 'credentials-broken' })
+    // ... and A's reconnect swaps before step 6 runs.
+    await s.h.clock.advance(FIRST_RETRY_MS)
+    expect(s.connectedWith()).toBe('A')
+    await flush()
+    const linesBefore = s.f.lines.length
+
+    expect(await s.f.lifecycle.bringUp(s.b, applied, { recovery: true })).toEqual({ outcome: 'up', failures: [] })
+
+    expect(s.connectedWith()).toBe('C')
+    expect(s.held()).toBe(c)
+    expect(s.f.lines.slice(linesBefore)).toEqual([
+      expect.stringContaining('not brought up again — it is not broken by its credentials now, so its changed credentials are applied as a credentials change'),
+      lineOf(s, 'reconnected with its changed credentials; its instance and MCP session are kept'),
+    ])
+    // Not cleared or brought up afresh: no storage check or apply launch, and no second Slack bring-up of B.
+    expect(s.f.trail.filter((entry) => /^(storageCheck|launch):/.test(entry))).toEqual([])
+    expect(s.h.bringUpCalls.filter((call) => call.key === s.b.key)).toHaveLength(1)
+    expect(s.controller.state(s.b.key)?.outcome).toBe('up')
+    assertNoLeak({ lines: s.h.lines, lifecycle: s.f.lines })
   })
 })
 
@@ -926,57 +1712,19 @@ describe('persona teardown serialization (SR-6.6)', () => {
   })
 
   describe('behind a bring-up retry (real bring-up controller over the real connection manager)', () => {
-    interface RetryFixture {
-      h: ConnectionHarness
-      controller: PersonaBringUpController
-      f: Fixture
-      a: Persona
-      b: Persona
-      /** Keys the controller launched after a retry. */
-      launches: string[]
-    }
-
     /**
-     * A and B on the connection harness with their files; B's first auth.test
-     * fails (network), so B is retrying its Slack bring-up. The controller
-     * runs its retry launches through `f`'s serializer; the lifecycle's
-     * `bringUps` and `connections` are the controller and the manager.
+     * `makeControllerStack` with both brought up; B's first auth.test fails
+     * (network), so B is retrying its Slack bring-up.
      */
-    async function makeRetry(opts: { launch?: (p: Persona) => Promise<unknown>; whenLaunchSettled?: PersonaLifecycleDeps['whenLaunchSettled'] } = {}): Promise<RetryFixture> {
-      const h = makeConnectionHarness([{ name: NAME_A }, { name: NAME_B }], dir, {
-        files: true,
+    async function makeRetry(opts: { launch?: (p: Persona) => Promise<unknown>; whenLaunchSettled?: PersonaLifecycleDeps['whenLaunchSettled'] } = {}): Promise<ControllerStack> {
+      const stack = makeControllerStack({
         stubOptions: { [NAME_B]: { authTest: [{ kind: 'network' }] } },
+        launch: opts.launch,
+        overrides: opts.whenLaunchSettled ? { whenLaunchSettled: opts.whenLaunchSettled } : {},
       })
-      const [a, b] = h.personas as [Persona, Persona]
-      const launches: string[] = []
-      let controller!: PersonaBringUpController
-      const f = makeFixture({
-        overrides: {
-          bringUps: { bringUp: (p, set) => controller.bringUp(p, set), cancel: (k) => controller.cancel(k) },
-          connections: h.manager,
-          ...(opts.whenLaunchSettled ? { whenLaunchSettled: opts.whenLaunchSettled } : {}),
-        },
-      })
-      controller = createPersonaBringUpController({
-        connections: { bringUp: h.connections.bringUp, status: (key) => h.manager.status(key) },
-        clock: h.clock,
-        dryRun: false,
-        log: (line) => void h.lines.push(line),
-        appliedPersonas: () => h.config?.personas ?? [],
-        serialize: f.serializer.run,
-        launch: async (p) => {
-          launches.push(p.key)
-          return opts.launch?.(p)
-        },
-      })
-      h.onStatus = (key, status) => controller.onConnectionStatus(key, status)
-      cleanups.push(async () => {
-        controller.cancelAll()
-        await h.manager.stopAll()
-      })
-      for (const p of [a, b]) await controller.bringUp(p, h.personas)
-      expect(controller.state(b.key)?.outcome).toBe('retrying')
-      return { h, controller, f, a, b, launches }
+      for (const p of [stack.a, stack.b]) await stack.controller.bringUp(p, stack.h.personas)
+      expect(stack.controller.state(stack.b.key)?.outcome).toBe('retrying')
+      return stack
     }
 
     test('a teardown for B submitted while B\'s launch after its Slack retry is running waits for it; then B has no bring-up state, no connection and no pending timer', async () => {
