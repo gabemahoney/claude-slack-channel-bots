@@ -278,12 +278,16 @@ const clientFor = createPersonaClientLookup(connectionView, () => personaConfig)
 const identityFor = createPersonaIdentityLookup(connectionView, () => personaConfig)
 
 /**
- * Whether a persona is up (b.av2 SR-6.4): its connection is serving and its
- * bring-up outcome is `up`. False for every persona before main() builds the
- * controller. The one check behind MCP session admission, the permission
- * poller's skip and `/interject`'s 503 (see `createPersonaUpPredicate`).
+ * Whether a persona is up (b.av2 SR-6.4): its connection is serving, its
+ * bring-up outcome is `up` and its key is applied (b.av2 SR-8.6). False for
+ * every persona before main() builds the controller. The one check behind
+ * MCP session admission, the permission poller's skip and `/interject`'s 503
+ * (see `createPersonaUpPredicate`).
  */
-const isPersonaUp = createPersonaUpPredicate(connectionView, { isUp: (key) => bringUps?.isUp(key) ?? false })
+const isPersonaUp = createPersonaUpPredicate(connectionView, {
+  isUp: (key) => bringUps?.isUp(key) ?? false,
+  isApplied: (key) => bringUps?.isApplied(key) ?? false,
+})
 
 /** A not-up persona's outcome and cause, for the refusal and session-drop lines. */
 function describePersonaNotUpByKey(key: string): string {
@@ -666,8 +670,10 @@ const personaRouting = createPersonaRouting({
 /**
  * The applied persona configuration, as main()'s start resolution chose it
  * (b.av2 SR-1, SR-8.7): the last-applied record when there is one, never the
- * edited config file. Null only before main() resolves the start; every
- * getter reads it at call time.
+ * edited config file. A confirmed apply's step 1 reassigns it (b.av2 SR-8.6,
+ * the reload controller's `onApplied`) to the confirmed persona set with the
+ * start-time server-wide values, which apply only at the next start. Null
+ * only before main() resolves the start; every getter reads it at call time.
  */
 let personaConfig: PersonaConfig | null = null
 
@@ -1081,6 +1087,14 @@ export async function main(): Promise<void> {
   // startDetection() after the start bring-up pass below; it reads the held
   // credentials digests and bring-up states from the bring-up controller
   // built further down.
+  //
+  // The applied config at the start (the record's at a start from the
+  // record): the server-wide values that hold until the next start, e.g. the
+  // restart delay. Set once, below, right after the start resolves, and never
+  // replaced; a confirmed apply replaces only `personaConfig`'s persona set.
+  // Declared here, before the controller whose onApplied reads it, so that
+  // closure never depends on declaration order (no temporal dead zone).
+  let appliedConfig!: PersonaConfig
   const reload = createReloadController({
     paths: reloadFilePaths(CONFIG_PATH),
     lifecycle: {
@@ -1094,6 +1108,19 @@ export async function main(): Promise<void> {
     // apply rather than reconnected (b.av2 SR-8.6).
     bringUpState: (key) => bringUps?.state(key),
     slackClientFactory: PRODUCTION_SLACK_CLIENT_FACTORY,
+    // b.av2 SR-8.6 step 1: once the record holds a confirmed change, the
+    // server runs its persona set. Server-wide settings keep their start-time
+    // values (the next start applies them). Everything that reads the applied
+    // set reads `personaConfig` at call time: the bring-up controller's
+    // applied set, the reply-guard step, routing, the notifier, /interject,
+    // cron, the health work list and MCP admission.
+    // An apply before the start resolved is never expected (detection is
+    // armed only after the start bring-up); it throws rather than build a
+    // config without the start-time values, and the controller logs it.
+    onApplied: (config) => {
+      if (appliedConfig === undefined) throw new Error('a confirmed apply ran before the start resolved its configuration')
+      personaConfig = { ...appliedConfig, personas: config.personas }
+    },
   })
   reloadController = reload
   const start = reload.resolveStart()
@@ -1113,10 +1140,8 @@ export async function main(): Promise<void> {
     personaConfig === null ? undefined : preLaunchReplyGuard(persona, () => personaConfig?.personas, STATE_DIR),
   )
   console.error(`[slack] Loaded persona config: ${personaConfig.personas.length} persona(s)`)
-  // The applied config (the record's at a start from the record), for
-  // closures below: the launch after a bring-up retry and the restart delay.
-  // It is never replaced after this.
-  const appliedConfig: PersonaConfig = personaConfig
+  // The start-time applied config (declared before the reload controller).
+  appliedConfig = personaConfig
 
   // SR-3.2: refresh the slack-channel-bot agent-director template on every
   // boot, after the persona config is set: its memory-read rules cover the
@@ -1188,7 +1213,10 @@ export async function main(): Promise<void> {
     connections: manager,
     dryRun: isDryRun(),
     log: (line) => console.error(line),
-    launch: (persona) => spawnForPersona(persona, appliedConfig, false),
+    // The persona set applied now (b.av2 SR-8.6): a retry re-checks against
+    // it, and a persona no longer in it is neither re-checked nor launched.
+    appliedPersonas: () => personaConfig?.personas ?? [],
+    launch: (persona) => spawnForPersona(persona, personaConfig ?? appliedConfig, false),
     // b.av2 SR-6.3: a session is registered only while its persona is up. A
     // persona that stops being up (a refused reopen) has its session dropped;
     // its instance and row are kept, nothing is restarted or posted, and the

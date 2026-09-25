@@ -1258,6 +1258,10 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
   let statuses: Map<string, PersonaConnectionStatus>
   /** Keys whose bring-up outcome is `up` (the bring-up controller's query). */
   let outcomesUp: Set<string>
+  /** Keys in the applied persona set (the bring-up controller's live `isApplied`). */
+  let applied: Set<string>
+  /** Keys `onCapReached` was called for. */
+  let capCalls: string[]
   let gateLines: string[]
   let statusCalls: StatusParams[]
   let sendKeysCalls: SendKeysParams[]
@@ -1277,6 +1281,8 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
     ;[a, b] = config.personas as [Persona, Persona]
     statuses = new Map([[a.key, UP], [b.key, UP]])
     outcomesUp = new Set([a.key, b.key])
+    applied = new Set([a.key, b.key])
+    capCalls = []
     gateLines = []
     statusCalls = []
     sendKeysCalls = []
@@ -1322,7 +1328,7 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
     const gate = createPersonaRelaunchGate(
       { status: (key) => statuses.get(key) },
       (line) => { gateLines.push(line) },
-      { isUp: (key) => outcomesUp.has(key) },
+      { isUp: (key) => outcomesUp.has(key), isApplied: (key) => applied.has(key) },
     )
     return {
       canRestart: gate,
@@ -1334,7 +1340,7 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
       launchSession: (key) => launchPersonaSession(key, config, { canLaunch: gate }),
       getRestartDelay: () => CAP_BASE_DELAY_S,
       isShuttingDown: () => false,
-      onCapReached: () => {},
+      onCapReached: (key) => { capCalls.push(key) },
     }
   }
 
@@ -1371,6 +1377,88 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
 
     // B: the liveness probe and the reconnect adapter's probe, then one
     // `/mcp reconnect`; never killed or respawned.
+    expect(callsFor(statusCalls, b)).toHaveLength(2)
+    expect(callsFor(sendKeysCalls, b)).toHaveLength(1)
+    expect(getFailureCount(b.key)).toBe(0)
+  })
+
+  // b.av2 SR-8.6: from a confirmed apply's step 1 on, a key outside the
+  // applied set is never restarted, even while its connection still serves and
+  // its bring-up outcome is still `up` (until its teardown). The applied check
+  // lives in the relaunch gate (`canRestart`), so RestartDeps is unchanged.
+  // A refused request logs the gate's removal line (once per persona) and
+  // restart.ts's own "Not scheduling restart" line (per request; accepted
+  // deviation: that line's wording is the not-up one).
+  const removedLine = (key: string) => `[slack] persona=${key}: not relaunched — it is no longer in the applied configuration`
+  const refuseLine = (key: string) =>
+    `[slack] Not scheduling restart for persona=${key} — the persona is not up (its bring-up has not succeeded, or its Slack connection is not serving)`
+
+  test.each<[string, { humanTrigger?: boolean } | undefined]>([
+    ['a disconnect or health-check restart', undefined],
+    ['the human trigger', { humanTrigger: true }],
+  ])('SR-8.6: scheduleRestart for a key outside the applied set, still up and serving, arms no timer and makes no agent-director call; the gate logs the removal once; B, still applied, restarts as before — %s', async (_label, opts) => {
+    recordFailure(a.key)
+    applied.delete(a.key)
+    initRestart(makeRealDeps())
+
+    scheduleRestart(a.key, a.working_directory, undefined, opts)
+    expect(isRestartPendingOrActive(a.key)).toBe(false)
+    scheduleRestart(a.key, a.working_directory, undefined, opts)
+    expect(isRestartPendingOrActive(a.key)).toBe(false)
+    scheduleRestart(b.key, b.working_directory, undefined, opts)
+    expect(isRestartPendingOrActive(b.key)).toBe(true)
+    await Bun.sleep(WAIT_MS)
+
+    expect(callsFor(statusCalls, a)).toEqual([])
+    expect(callsFor(sendKeysCalls, a)).toEqual([])
+    expect(killCalls).toEqual([])
+    expect(deleteCalls).toEqual([])
+    expect(spawnCalls).toEqual([])
+    expect(findMissingCalls).toEqual([])
+    expect(getFailureCount(a.key)).toBe(1)
+    expect(capCalls).toEqual([])
+    expect(gateLines).toEqual([removedLine(a.key)])
+    expect(errLines.filter((l) => l === refuseLine(a.key))).toHaveLength(2)
+    expect(errLines.filter((l) => l.startsWith('[slack] Scheduling restart'))).toEqual([
+      expect.stringContaining(`persona=${b.key} `),
+    ])
+
+    // Control: B is probed and reconnected exactly as today.
+    expect(callsFor(statusCalls, b)).toHaveLength(2)
+    expect(callsFor(sendKeysCalls, b)).toHaveLength(1)
+    expect(getFailureCount(b.key)).toBe(0)
+    expect(isRestartPendingOrActive(b.key)).toBe(false)
+  })
+
+  test('SR-8.6: a restart armed while A is applied, whose key then leaves the applied set (still up and serving), fires with no probe, reconnect, kill or launch; its count and cap latch are unchanged and no cap notice is raised; B, still applied, restarts as before', async () => {
+    // One failure short of the cap: a counted failure would cap and notify.
+    for (let i = 0; i < RESTART_FAILURE_CAP - 1; i++) recordFailure(a.key)
+    initRestart(makeRealDeps())
+
+    scheduleRestart(a.key, a.working_directory)
+    scheduleRestart(b.key, b.working_directory)
+    expect(isRestartPendingOrActive(a.key)).toBe(true)
+    expect(gateLines).toEqual([])
+
+    // Step 1 of a confirmed apply removes A; its connection and outcome stay up.
+    applied.delete(a.key)
+    await Bun.sleep(WAIT_MS)
+
+    expect(callsFor(statusCalls, a)).toEqual([])
+    expect(callsFor(sendKeysCalls, a)).toEqual([])
+    expect(killCalls).toEqual([])
+    expect(deleteCalls).toEqual([])
+    expect(spawnCalls).toEqual([])
+    expect(findMissingCalls).toEqual([])
+    expect(getFailureCount(a.key)).toBe(RESTART_FAILURE_CAP - 1)
+    expect(isAtCap(a.key, RESTART_FAILURE_CAP)).toBe(false)
+    expect(capCalls).toEqual([])
+    expect(isRestartPendingOrActive(a.key)).toBe(false)
+    expect(gateLines).toEqual([removedLine(a.key)])
+    expect(errLines.filter((l) => l === `[slack] Skipping restart for persona=${a.key} — the persona is no longer up; its instance is left as it is`)).toHaveLength(1)
+    expect(errLines.filter((l) => l.startsWith('[slack] Relaunching session'))).toEqual([])
+
+    // Control: B is probed and reconnected exactly as today.
     expect(callsFor(statusCalls, b)).toHaveLength(2)
     expect(callsFor(sendKeysCalls, b)).toHaveLength(1)
     expect(getFailureCount(b.key)).toBe(0)

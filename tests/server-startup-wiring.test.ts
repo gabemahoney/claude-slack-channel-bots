@@ -26,12 +26,14 @@
  * - The bring-up controller (SR-6.1, SR-6.4): the start's bring-up, told
  *   every connection status, stored for shutdown and cancelled there before
  *   the connections stop; the health check started only after the start
- *   bring-up returns.
+ *   bring-up returns. Its launch and its live applied set (`appliedPersonas`)
+ *   read the applied config at call time (SR-8.6).
  * - The relaunch gate (SR-6.1, SR-6.4): built over the manager and the
  *   bring-up controller and passed to the restart module (`canRestart`), the
  *   restart launch and the health-check work list; the restart delay read
  *   from the applied config; the permission poller not started in dry run.
- * - Not-up personas (SR-6.3, SR-6.4): the one `isPersonaUp` predicate handed
+ * - Not-up personas (SR-6.3, SR-6.4, SR-8.6): the one `isPersonaUp`
+ *   predicate (the controller's `isUp` and `isApplied`) handed
  *   to the permission poller, `/interject` and the MCP admission decision;
  *   a refused session disconnected and never registered; the controller's
  *   `onLeftUp` dropping the persona's registered session.
@@ -337,11 +339,27 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
     const props = onlyCallProps('createPersonaBringUpController')
     expect(props.get('connections')).toBe(constOf('createPersonaConnectionManager'))
     expect(props.get('dryRun')).toBe('isDryRun()')
+    // b.av2 SR-8.6: the launch reads the applied config at call time (a
+    // confirmed apply's step 1 swaps it), falling back to the start-time one.
+    const loaded = loadedConfigName(SERVER_CODE)
     const launch = props.get('launch')
-    expect(launch).toMatch(/^\((\w+)\) => spawnForPersona\(\1, (\w+), false\)$/)
-    // The launch's config is the applied config getRestartDelay reads.
-    const appliedName = launch!.match(/spawnForPersona\(\w+, (\w+),/)![1]
+    expect(launch).toMatch(new RegExp(`^\\((\\w+)\\) => spawnForPersona\\(\\1, ${loaded} \\?\\? (\\w+), false\\)$`))
+    // The fallback is the start-time applied config getRestartDelay reads.
+    const appliedName = launch!.match(/\?\? (\w+), false\)$/)![1]
+    expect(appliedName).not.toBe(loaded)
     expect(onlyCallProps('initRestart').get('getRestartDelay')).toBe(`() => ${appliedName}.session_restart_delay`)
+  })
+
+  // b.av2 SR-8.6: optional in the controller's type, so only this audit makes
+  // sure production binds it. Without it every known persona counts as
+  // applied: a removed persona's retry would still launch it, and a re-check
+  // would use the set it was brought up with (the E11 stale-set carry).
+  test('the bring-up controller reads the live applied persona set: appliedPersonas is () => <applied config>?.personas ?? []', () => {
+    const props = onlyCallProps('createPersonaBringUpController')
+    const loaded = loadedConfigName(SERVER_CODE)
+    expect(props.get('appliedPersonas')).toBe(`() => ${loaded}?.personas ?? []`)
+    // The same module-level holder the start sets and the reload controller's onApplied swaps.
+    expect(SERVER_CODE).toMatch(new RegExp(`^let\\s+${loaded}\\s*:\\s*PersonaConfig\\s*\\|\\s*null\\s*=\\s*null\\s*$`, 'm'))
   })
 
   test('main() stores the controller for the manager\'s status listener and for shutdown: `bringUps = <controller>` once, inside main(), right after it is built and before anything connects', () => {
@@ -509,12 +527,21 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
   })
 
   test('getRestartDelay reads session_restart_delay from the config main() loaded', () => {
-    const { loaded, assignAt } = startResolution(SERVER_CODE)
-    const applied = [...SERVER_CODE.matchAll(new RegExp(`\\bconst\\s+(\\w+)(?:\\s*:\\s*\\w+)?\\s*=\\s*${loaded}\\s*(?:;|\\n)`, 'g'))]
-    expect(applied).toHaveLength(1)
-    expect(insideMain(applied[0]!.index!)).toBe(true)
-    expect(applied[0]!.index!).toBeGreaterThan(assignAt)
-    expect(onlyCallProps('initRestart').get('getRestartDelay')).toBe(`() => ${applied[0]![1]}.session_restart_delay`)
+    const { loaded, assignAt, createAt } = startResolution(SERVER_CODE)
+    const delay = onlyCallProps('initRestart').get('getRestartDelay')?.match(/^\(\) => (\w+)\.session_restart_delay$/)
+    expect(delay).not.toBeNull()
+    // The start-time config: declared once, inside main(), before the reload
+    // controller (whose onApplied also reads it), and assigned exactly once,
+    // from the loaded config, after the start resolution set it.
+    const startTime = delay![1]!
+    const decls = [...SERVER_CODE.matchAll(new RegExp(`\\b(?:let|const|var)\\s+${startTime}\\b[^\\n]*`, 'g'))]
+    expect(decls.map((d) => d[0].trim())).toEqual([`let ${startTime}!: PersonaConfig`])
+    expect(insideMain(decls[0]!.index!)).toBe(true)
+    expect(decls[0]!.index!).toBeLessThan(createAt)
+    const assignments = assignmentsTo(startTime)
+    expect(assignments.map((a) => a.value)).toEqual([loaded])
+    expect(insideMain(assignments[0]!.at)).toBe(true)
+    expect(assignments[0]!.at).toBeGreaterThan(assignAt)
   })
 })
 
@@ -536,15 +563,20 @@ describe('server.ts refuses service to a persona that is not up (b.av2 SR-6.3, S
     return balancedAfter(SERVER_CODE, paramsEnd + 1, '{', '}')
   }
 
-  test('isPersonaUp is built once, at module scope, from createPersonaUpPredicate over the connection view and the controller\'s isUp (false before main() builds it); server.ts has no up check of its own', () => {
+  // b.av2 SR-8.6: `isApplied` is optional in PersonaUpQuery (a query without it
+  // counts every key as applied), so this audit is what makes sure production
+  // binds it: a removed persona must stop being up for MCP admission, the
+  // permission poller and /interject from a confirmed apply's step 1 on.
+  test('isPersonaUp is built once, at module scope, from createPersonaUpPredicate over the connection view and the controller\'s isUp and isApplied (both false before main() builds it); server.ts has no up check of its own', () => {
     expect(constOf('createPersonaUpPredicate')).toBe('isPersonaUp')
     expect(insideMain(onlyCallOf('createPersonaUpPredicate'))).toBe(false)
     const args = onlyCallArgs('createPersonaUpPredicate')
     expect(args).toHaveLength(2)
     expect(args[0]).toBe('connectionView')
     const outcomes = objectProperties(args[1]!)
-    expect([...outcomes.keys()]).toEqual(['isUp'])
+    expect([...outcomes.keys()]).toEqual(['isUp', 'isApplied'])
     expect(outcomes.get('isUp')).toMatch(/^\((\w+)\) => bringUps\?\.isUp\(\1\) \?\? false$/)
+    expect(outcomes.get('isApplied')).toMatch(/^\((\w+)\) => bringUps\?\.isApplied\(\1\) \?\? false$/)
     // Never called directly, and no serving check copied in.
     expect(callsOf('isPersonaUp')).toEqual([])
     expect(indicesOf(/\bisPersonaClientServing\b/g, SERVER_CODE)).toEqual([])
@@ -781,6 +813,29 @@ describe('server.ts\'s file guard refuses every persona credentials file (b.av2 
     const props = objectProperties(SERVER_CODE.slice(SERVER_CODE.indexOf('=', deps)))
     expect(props.get('assertSendable')).toBe('assertSendable')
     expect(props.get('clientFor')).toBe('clientFor')
+  })
+
+  // The 64 KiB cap exempts one read: the file guard's read of the config file,
+  // so an oversized config still protects the credentials files it names
+  // (behaviour in tests/config.test.ts). Every other reader (the start, the
+  // record, the pending and apply files, the reload tick) must stay capped;
+  // this audit fails if any other call site passes the option.
+  test('readPersonaConfigBytes is called uncapped only by credentialsFilesToProtect, and nothing outside config.ts names the option', () => {
+    const files = srcFiles().map(([path, source]) => [path, stripComments(source)] as const)
+    expect(files.filter(([path, code]) => path !== 'src/config.ts' && /\buncapped\b/.test(code)).map(([path]) => path)).toEqual([])
+
+    const withOptions = files.flatMap(([path, code]) =>
+      indicesOf(/(?<![\w.$]|function\s+)readPersonaConfigBytes\s*\(/g, code)
+        .map((at) => ({ path, code, at, args: splitTopLevel(callArguments(code, at)) }))
+        .filter((call) => call.args.length > 2),
+    )
+    expect(withOptions.map((c) => [c.path, c.args[2]])).toEqual([['src/config.ts', '{ uncapped: true }']])
+    const { code, at } = withOptions[0]!
+    const guard = code.search(/\bexport\s+function\s+credentialsFilesToProtect\s*\(/)
+    expect(guard).toBeGreaterThan(-1)
+    const [bodyStart, bodyEnd] = balancedAfter(code, balancedAfter(code, guard, '(', ')')[1], '{', '}')
+    expect(at).toBeGreaterThan(bodyStart)
+    expect(at).toBeLessThan(bodyEnd)
   })
 })
 

@@ -728,8 +728,11 @@ const NOTHING_TO_UNDO: ReplyGuardUndo = () => {}
  * `personas` is the applied persona set (a snapshot or a getter; see
  * `AppliedPersonaSource`) and `stateDir` the server's state directory;
  * nothing here resolves either itself. A getter returning undefined makes
- * this a no-op. Never throws and never blocks the launch. Returns the undo
- * for a launch that did not happen.
+ * this a no-op, and so does a persona whose key is not in the applied set
+ * (b.av2 SR-8.6): a late launch of a removed persona must not re-create the
+ * record its teardown deleted, nor run a launch pass that strips a hook.
+ * Never throws and never blocks the launch. Returns the undo for a launch
+ * that did not happen.
  */
 export function preLaunchReplyGuard(
   persona: Persona,
@@ -746,7 +749,7 @@ export function preLaunchReplyGuard(
   let writtenRecord: string | undefined
   try {
     const applied = readAppliedPersonas(personas)
-    if (applied === undefined) return NOTHING_TO_UNDO
+    if (applied === undefined || !applied.some((p) => p.key === key)) return NOTHING_TO_UNDO
     writtenRecord = writeLaunchRecord(persona, stateDir, ref)
     launchedWithDirs.set(key, entry)
     if (effectiveDir === undefined) logNoConfiguredDir(persona, ref)

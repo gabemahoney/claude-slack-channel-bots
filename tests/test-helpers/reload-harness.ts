@@ -79,7 +79,18 @@
  *   do the same for the controller's durable delete (`durableUnlinkSync`
  *   over its own seam, default `unlinkSync`; `{ step: 'fsyncSync' }` fails
  *   the directory fsync after the unlink). The two seams count calls apart.
- *   File permissions are never the seam: the suite may run as root.
+ *   File permissions are never the seam: the suite may run as root;
+ * - confirmations (b.av2 SR-8.5): `h.confirm()` is the operator's gesture
+ *   exactly, one rename of `paths.pending` to `paths.apply` with no content
+ *   change (AC 73); `h.writeApplyBytes(b)` places any bytes at the apply
+ *   path (an older copy of the pending file kept with `h.readPending()`, for
+ *   the stale gesture, or garbage for a malformed one); `h.applyExists()` and
+ *   `h.readApply()` show what is there. A confirmation that cannot be deleted
+ *   is `h.failRemoves()` (its own unlink seam, never permissions);
+ * - `h.writeOversized(path, { prefix?, size? })` writes a file larger than
+ *   the 64 KiB read cap (`MAX_RELOAD_FILE_BYTES + 1` bytes by default):
+ *   `prefix`, then sentinel-bearing fake-token text, so a leak of its
+ *   content shows in `assertNoLeak`.
  *
  * A run (`h.build(opts?)`, or `h.start(opts?)` = build, `resolveStart`, then
  * `runStartBringUp` when the start resolved `applied`) is one server start.
@@ -150,7 +161,14 @@
  *   `run.tickDirectoryChecks` (every working directory it stat'd). Neither
  *   is part of `since`; slice them by length around a stretch of ticks.
  *   `run.resolveStart()` calls its `resolveStart` and keeps the outcome as
- *   `run.outcome`; `run.startDetection()` calls its `startDetection`;
+ *   `run.outcome`; `run.startDetection()` calls its `startDetection`.
+ *   A confirmed apply (b.av2 SR-8.6): `opts.applySteps` is handed to the
+ *   controller as its step 2–6 slots (none bound by default);
+ *   `run.appliedConfigs` holds every configuration its `onApplied` was told
+ *   (`opts.onApplied` is called too), and `run.appliedKeys()` is the
+ *   controller's applied persona keys now (`controller.applied()`).
+ *   `opts.beforeWrite(path)` runs before every writer call, e.g. to see
+ *   whether `paths.apply` still exists when the record is written;
  * - captures: `run.logs` is the one `[slack]` stream (reload controller,
  *   bring-up controller and connection manager lines, in order), and
  *   `run.logsOf(label)` its lines starting `[slack] <label>: ` (a class such
@@ -233,7 +251,7 @@ import {
   durableWriteFileSync,
   type DurableWriteFs,
 } from '../../src/atomic-write.ts'
-import type { Persona, PersonaConfig, PersonaConfigFs, PersonaInput } from '../../src/config.ts'
+import { MAX_RELOAD_FILE_BYTES, type Persona, type PersonaConfig, type PersonaConfigFs, type PersonaInput } from '../../src/config.ts'
 import {
   DEFAULT_WORKING_DIRECTORY_FS,
   type PersonaBringUpFs,
@@ -256,6 +274,7 @@ import {
 } from '../../src/persona-credentials.ts'
 import { personaKey } from '../../src/persona-identity.ts'
 import { composePersonaStatusListeners } from '../../src/persona-start.ts'
+import type { ApplyStepSlots } from '../../src/reload-apply.ts'
 import { composePendingFile, parsePendingFingerprint } from '../../src/reload-fingerprint.ts'
 import { DESTRUCTIVE_PREFIX, PENDING_PREVIEW_TITLE } from '../../src/reload-plan.ts'
 import {
@@ -656,6 +675,16 @@ export interface ReloadRunOptions {
     key: string,
     state: (key: string) => PersonaBringUpState | undefined,
   ) => PersonaBringUpState | undefined
+  /** The controller's apply step 2–6 bodies (`ApplyStepSlots`); unbound by default, so a step does nothing. */
+  applySteps?: ApplyStepSlots
+  /** Also called with every configuration the controller's `onApplied` is told (after `run.appliedConfigs` records it). */
+  onApplied?: (config: PersonaConfig) => void
+  /**
+   * Called with the path before every call of the controller's writer (the
+   * record, the pending file), e.g. to observe what exists when the record
+   * is written.
+   */
+  beforeWrite?: (path: string) => void
 }
 
 /** One server start over the harness's files; see the file comment. */
@@ -680,6 +709,10 @@ export interface ReloadRun {
   readonly removes: readonly ReloadRemoveRecord[]
   /** The latest `run.resolveStart()` outcome (also set by `h.start`). */
   readonly outcome: ReloadStartOutcome | undefined
+  /** Every configuration the controller's `onApplied` was told, in order (one per confirmed apply's step 1). */
+  readonly appliedConfigs: readonly PersonaConfig[]
+  /** The persona keys of the controller's applied configuration now, in order; undefined before the start applied. */
+  appliedKeys(): string[] | undefined
   /** `controller.resolveStart()`, keeping the outcome as `outcome`. */
   resolveStart(): ReloadStartOutcome
   /** `controller.startDetection()`: whether it armed the tick on `run.ticks`. */
@@ -829,6 +862,24 @@ export interface ReloadHarness {
   pendingFingerprint(): string | undefined
   /** Write raw bytes to `paths.pending` (a leftover or hand-placed file); returns them. */
   writePendingBytes(bytes: string | Uint8Array): Buffer
+  /**
+   * The operator's confirmation gesture (b.av2 SR-8.5, AC 73): rename
+   * `paths.pending` to `paths.apply`, content unchanged. Throws when there is
+   * no pending file.
+   */
+  confirm(): void
+  /** Write raw bytes to `paths.apply` (an older pending copy, a malformed confirmation); returns them. */
+  writeApplyBytes(bytes: string | Uint8Array): Buffer
+  /** Whether `paths.apply` exists (as anything). */
+  applyExists(): boolean
+  /** `paths.apply`'s bytes, or undefined when it is not a readable file. */
+  readApply(): Buffer | undefined
+  /**
+   * Write a file larger than the 64 KiB read cap at `path` (under the root):
+   * `prefix` (none by default), then sentinel-bearing fake-token text, `size`
+   * bytes in all (`MAX_RELOAD_FILE_BYTES + 1` by default). Returns the bytes.
+   */
+  writeOversized(path: string, opts?: { prefix?: string | Uint8Array; size?: number }): Buffer
   /**
    * The preview body of `paths.pending`: the text after its two fingerprint
    * lines and the blank line (found through `parsePendingFingerprint` and
@@ -1002,6 +1053,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const startPasses: PersonaConfig[] = []
     const writes: ReloadWriteRecord[] = []
     const removes: ReloadRemoveRecord[] = []
+    const appliedConfigs: PersonaConfig[] = []
     let startHold: Promise<void> | undefined
     let outcome: ReloadStartOutcome | undefined
 
@@ -1101,6 +1153,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       lifecycle: ops,
       log,
       write: (path, bytes) => {
+        runOpts.beforeWrite?.(path)
         try {
           durableWriteFileSync(path, bytes, writeSeam.fs)
         } catch (err) {
@@ -1136,6 +1189,11 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       slackClientFactory: connections.slack.factory,
       home,
       configFs: runOpts.configFs,
+      applySteps: runOpts.applySteps,
+      onApplied: (config) => {
+        appliedConfigs.push(config)
+        runOpts.onApplied?.(config)
+      },
     })
 
     function slackCalls(): Record<string, StubWebCall[]> {
@@ -1180,6 +1238,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       get outcome() {
         return outcome
       },
+      appliedConfigs,
+      appliedKeys: () => controller.applied()?.config.personas.map((p) => p.key),
       resolveStart() {
         outcome = controller.resolveStart()
         return outcome
@@ -1325,6 +1385,22 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       return text === undefined ? undefined : parsePendingFingerprint(text)
     },
     writePendingBytes: (bytes) => writeBytes(paths.pending, bytes),
+    confirm() {
+      if (!existsSync(paths.pending)) throw new Error('reload-harness: confirm() needs a pending file to rename')
+      renameSync(paths.pending, paths.apply)
+    },
+    writeApplyBytes: (bytes) => writeBytes(paths.apply, bytes),
+    applyExists: () => existsSync(paths.apply),
+    readApply: () => readFileIfPresent(paths.apply),
+    writeOversized(path, { prefix = '', size = MAX_RELOAD_FILE_BYTES + 1 } = {}) {
+      const head = typeof prefix === 'string' ? Buffer.from(prefix, 'utf-8') : Buffer.from(prefix)
+      const filler = Buffer.from(`${fakeToken(BOT_TOKEN_PREFIX, 'oversized')}\n`, 'utf-8')
+      const bytes = Buffer.alloc(size)
+      head.copy(bytes, 0, 0, Math.min(head.length, size))
+      for (let at = head.length; at < size; at += filler.length) filler.copy(bytes, at, 0, Math.min(filler.length, size - at))
+      mkdirSync(dirname(inside(path)), { recursive: true })
+      return writeBytes(path, bytes)
+    },
     pendingBody() {
       const text = h.readPendingText()
       const fingerprint = text === undefined ? undefined : parsePendingFingerprint(text)

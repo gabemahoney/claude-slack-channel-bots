@@ -25,7 +25,12 @@
  *     not brought up is counted apart; every Slack bring-up runs at once and
  *     only the launches share the pool, in readiness order; a launch that
  *     throws is one failed persona), and `launchSession`'s relaunch gate
- *     (`canLaunch` false → `'skipped'`, nothing launched or patched).
+ *     (`canLaunch` false → `'skipped'`, nothing launched or patched), asked
+ *     before the key is looked up.
+ *   - b.av2 SR-8.6: a key outside the applied set, refused by the real
+ *     relaunch gate over a live applied set, is `'skipped'` with no
+ *     agent-director call, trust patch or reply-guard record, whether or not
+ *     the config passed still holds it; an applied key launches as before.
  *   - b.av2 SR-6.2 pre-launch trust patch: through the injectable seam
  *     (`setPreLaunchTrustPatcher`, empty by default and reset in afterEach,
  *     so no test installs the production patch or writes a `.claude.json`),
@@ -138,8 +143,8 @@ import {
   type StubSlackOptions,
   type WebApiOutcome,
 } from './test-helpers/slack-stub.ts'
-import type { PersonaConnectionManager } from '../src/persona-connections.ts'
-import type { PersonaBringUpStep } from '../src/persona-start.ts'
+import type { PersonaConnectionManager, PersonaConnectionStatus } from '../src/persona-connections.ts'
+import { createPersonaRelaunchGate, type PersonaBringUpStep } from '../src/persona-start.ts'
 import {
   createPersonaBringUpController,
   type PersonaBringUpController,
@@ -174,7 +179,9 @@ import {
   errTmuxSendKeys,
   errTmuxSessionCreate,
   holdSpawns,
+  makeStubCallLog,
   makeStubClient,
+  stubCallCount,
   type CannedGetResult,
   type CannedResponse,
   type PersonaGetResultOverrides,
@@ -2237,14 +2244,108 @@ describe('launchSession: the relaunch gate (canLaunch)', () => {
     expect(f.calls.spawnCalls.map((p) => p.claude_instance_id)).toEqual(['cscb_C'])
   })
 
-  test('an unknown key is false before the gate is asked', async () => {
+  // The gate is asked first (b.av2 SR-8.6: a key a confirmed apply removed is
+  // 'skipped', not a failure); a key the gate lets through that no applied
+  // persona has is still a failure that launches nothing.
+  test('an unknown key the gate lets through is false: the gate is asked once, then nothing is patched or launched', async () => {
     const f = gateFixture()
     const asked: string[] = []
 
     expect(await launchSession('C_UNKNOWN', f.cfg, { canLaunch: (key) => (asked.push(key), true) })).toBe(false)
 
-    expect(asked).toEqual([])
+    expect(asked).toEqual(['C_UNKNOWN'])
     expect(f.events).toEqual([])
+    expect(f.patched).toEqual([])
+    expect(f.calls).toEqual(newLadderCalls())
+    expect(notices).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-8.6 — a key outside the applied set is never launched. From a
+// confirmed apply's step 1 on, the server's relaunch gate (the real
+// `createPersonaRelaunchGate`, with the bring-up controller's `isApplied`)
+// refuses a removed key, whether or not the config the restart path passes
+// still holds it; `launchSession` asks the gate before it looks the key up.
+// ---------------------------------------------------------------------------
+
+describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
+  const SERVING: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0APPLIED', botId: 'B0APPLIED' } }
+
+  /**
+   * The reply-guard persona (its connection serving, its bring-up `up`) with
+   * a real working directory and claude_config_dir, a recording trust
+   * patcher, the real reply guard over a temp record dir and a stub recording
+   * every verb. The applied set, read live by the gate and the reply guard,
+   * starts as the persona's config; `applied` replaces it.
+   */
+  function appliedFixture() {
+    const readLog = captureStartupErrors()
+    useSpawnHome()
+    const configDir = fixtureSubdir('claude-config')
+    const cfg = makeMultiPersonaConfig(
+      [{ name: GUARD_NAME, working_directory: fixtureSubdir('work'), claude_config_dir: configDir }],
+      fixtureDir,
+      { agent_director_poll_interval_ms: 1 },
+    )
+    let appliedSet: readonly Persona[] = cfg.personas
+    const events: Array<LaunchEvent | 'guard' | 'undo'> = []
+    setPreLaunchTrustPatcher(() => void events.push('patch'))
+    const rg = makeReplyGuardRecordDir({ parentDir: fixtureDir })
+    installRecordingReplyGuard(() => appliedSet, rg.stateDir, events)
+    const calls = makeStubCallLog()
+    observeLaunchCalls(installStub(calls), (call) => events.push(call))
+    const gateLines: string[] = []
+    const canLaunch = createPersonaRelaunchGate({ status: () => SERVING }, (line) => gateLines.push(line), {
+      isUp: () => true,
+      isApplied: (key) => appliedSet.some((p) => p.key === key),
+    })
+    const applied = (personas: readonly Persona[]): void => {
+      appliedSet = personas
+    }
+    return { cfg, configDir, events, calls, rg, gateLines, canLaunch, applied, readLog }
+  }
+
+  test.each([
+    ['the config passed still holds it (a stale snapshot)', true],
+    ['the config passed no longer holds it', false],
+  ] as const)('removed from the applied set, %s: \'skipped\', one gate line, no agent-director call, no trust patch, no reply-guard record or hook', async (_label, passStale) => {
+    const f = appliedFixture()
+    // Step 1 of an apply that removes the persona: the applied set no longer holds it.
+    f.applied([])
+    const passed = passStale ? f.cfg : { ...f.cfg, personas: [] }
+
+    let result: boolean | 'skipped' | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await launchSession(GUARD_KEY, passed, { canLaunch: f.canLaunch })
+    })
+
+    expect(result).toBe('skipped')
+    expect(f.gateLines).toEqual([`[slack] persona=${GUARD_KEY}: not relaunched — it is no longer in the applied configuration`])
+    expect(stubCallCount(f.calls)).toBe(0)
+    expect(f.events).toEqual([])
+    expect(f.rg.readRecord(GUARD_KEY)).toBeNull()
+    expect(getLaunchedWithDir(GUARD_KEY)).toBeUndefined()
+    expect(existsSync(join(f.configDir, 'settings.json'))).toBe(false)
+    expect(notices).toEqual([])
+    expect(f.readLog()).toBe('')
+    expect(errLog).toBe('')
+  })
+
+  test('control: an applied key through the same gate is patched, guarded and spawned as before; true', async () => {
+    const f = appliedFixture()
+
+    let result: boolean | 'skipped' | undefined
+    await withCapturedErr(async () => {
+      result = await launchSession(GUARD_KEY, f.cfg, { canLaunch: f.canLaunch })
+    })
+
+    expect(result).toBe(true)
+    expect(f.gateLines).toEqual([])
+    expect(f.events).toEqual(['patch', 'guard', 'spawn'])
+    expect(f.calls.spawnCalls.map((p) => p.claude_instance_id)).toEqual([GUARD_INSTANCE])
+    expect(f.rg.readRecord(GUARD_KEY)).toBe('true')
+    expect(getLaunchedWithDir(GUARD_KEY)).toBe(f.configDir)
   })
 })
 

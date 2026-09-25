@@ -310,17 +310,25 @@ export function composePersonaStatusListeners(...listeners: PersonaStatusListene
   }
 }
 
-/** Whether a persona's bring-up outcome is `up` (the bring-up controller's query). */
+/** Whether a persona's bring-up outcome is `up`, and whether it is applied (the bring-up controller's queries). */
 export interface PersonaUpQuery {
   isUp(key: string): boolean
+  /**
+   * Whether the key is in the applied persona set now (b.av2 SR-8.6: from a
+   * confirmed apply's step 1 on, a key outside it is never launched or
+   * restarted). Read live, never a snapshot. Production binds the bring-up
+   * controller's `isApplied`; a query without it counts every key as applied.
+   */
+  isApplied?(key: string): boolean
 }
 
 /**
  * Build the "is this persona up" predicate (b.av2 SR-6.4): true while the
  * persona's connection is serving (`isPersonaClientServing`: `up`, `lost`, or
- * `retrying` a reopen; every brought-up persona is `up` in dry run) and its
- * bring-up outcome is `up`; false otherwise, including for a persona the
- * manager or the controller does not know. The single source for every
+ * `retrying` a reopen; every brought-up persona is `up` in dry run), its
+ * bring-up outcome is `up` and its key is applied (b.av2 SR-8.6); false
+ * otherwise, including for a persona the manager or the controller does not
+ * know. The single source for every
  * refusal of a persona that is not up: the relaunch gate, MCP session
  * admission (`decideSessionAdmission`), the permission poller's skip and
  * `/interject`'s 503. Logs nothing.
@@ -334,26 +342,39 @@ export function createPersonaUpPredicate(
 
 /**
  * The up check itself, over a status already read: serving and, when
- * `outcomes` is given, bring-up outcome `up`. `createPersonaUpPredicate` and
+ * `outcomes` is given, bring-up outcome `up` and the key applied
+ * (`isPersonaApplied`). `createPersonaUpPredicate` and
  * `createPersonaRelaunchGate` both decide through it, so the two cannot
  * drift; the gate reads the status once and reuses it to word its line.
- * The outcome is asked only when the connection is serving.
+ * The outcome and the applied set are asked only when the connection is
+ * serving.
  */
 function isPersonaUpGiven(
   key: string,
   status: PersonaConnectionStatus | undefined,
   outcomes: PersonaUpQuery | undefined,
 ): boolean {
-  return isPersonaClientServing(status) && (outcomes === undefined || outcomes.isUp(key))
+  return (
+    isPersonaClientServing(status) &&
+    (outcomes === undefined || (outcomes.isUp(key) && isPersonaApplied(key, outcomes)))
+  )
+}
+
+/** Whether `key` is in the applied set per `outcomes.isApplied`; every key is, without the query. */
+function isPersonaApplied(key: string, outcomes: PersonaUpQuery | undefined): boolean {
+  return outcomes?.isApplied === undefined || outcomes.isApplied(key)
 }
 
 /**
  * Build the relaunch gate: `canRelaunch(key)` is true while the persona's
  * connection is serving (`isPersonaClientServing`: `up`, `lost`, or
  * `retrying` a reopen; every brought-up persona is `up` in dry run) and, when
- * `outcomes` is given, its bring-up outcome is `up` (b.av2 SR-6.1, SR-6.4);
- * false otherwise, including for a persona the manager does not know (one
- * that failed its credentials or working-directory check). The health
+ * `outcomes` is given, its bring-up outcome is `up` (b.av2 SR-6.1, SR-6.4)
+ * and its key is in the applied set (b.av2 SR-8.6: from a confirmed apply's
+ * step 1 on, a removed persona is never launched or restarted, even while its
+ * connection still serves until its teardown); false otherwise, including for
+ * a persona the manager does not know (one that failed its credentials or
+ * working-directory check). The health
  * check's work list, the restart module (`RestartDeps.canRestart`, before any
  * kill, reconnect or launch) and the restart launch (`launchSession`) all ask
  * it, so a persona that is broken or retrying, or whose connection is not
@@ -372,6 +393,10 @@ function isPersonaUpGiven(
  *
  *   [slack] persona=<key>: not relaunched — its bring-up has not succeeded; eligible again once it is up
  *
+ * A key outside the applied set is refused first, whatever its status:
+ *
+ *   [slack] persona=<key>: not relaunched — it is no longer in the applied configuration
+ *
  * The line carries only the key and the reason.
  */
 export function createPersonaRelaunchGate(
@@ -387,6 +412,15 @@ export function createPersonaRelaunchGate(
     if (isPersonaUpGiven(key, status, outcomes)) {
       lastLogged.delete(key)
       return true
+    }
+    // A removed persona: nothing more to wait for, so the line says so.
+    if (!isPersonaApplied(key, outcomes)) {
+      const reason = 'it is no longer in the applied configuration'
+      if (lastLogged.get(key) !== reason) {
+        lastLogged.set(key, reason)
+        log(`[slack] persona=${key}: not relaunched — ${reason}`)
+      }
+      return false
     }
     // Serving, but the bring-up outcome is not `up` (unknown to the
     // controller, cancelled, broken or retrying there): the connection is

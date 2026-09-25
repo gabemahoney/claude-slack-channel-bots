@@ -9,7 +9,9 @@
  * only against the digest a persona connected, retried or broke with, which
  * the bring-up controller holds; SR-8.6 step 6: the preview reads the
  * bring-up controller's state to tell a persona broken by its credentials
- * from one to reconnect. These assertions fail if main() arms the timer
+ * from one to reconnect; SR-8.6 step 1: `onApplied` swaps the server's
+ * applied config to the confirmed persona set over the start-time
+ * server-wide values. These assertions fail if main() arms the timer
  * before the start bring-up returns (or before the refused-start exit), from
  * more than one call site or not at all; if shutdown() stops calling it off;
  * or if the controller is built with anything but the production tick driver,
@@ -176,6 +178,43 @@ describe('server.ts wires the reload detection tick (b.av2 SR-8.2)', () => {
     const receiver = bringUpLookup(props, 'bringUpState', 'state')
     expectBringUpControllerHandle(receiver)
     expect(receiver).toBe(bringUpLookup(props, 'heldCredentialsDigest', 'credentialsDigest'))
+  })
+
+  // SR-8.6 step 1: once the record holds a confirmed change, the server runs
+  // its persona set, with the server-wide values it started with (they apply
+  // at the next start). `onApplied` is optional in the controller's deps, so
+  // only this audit makes sure production binds it; every consumer of the
+  // applied set (the bring-up controller's appliedPersonas, routing, the
+  // reply guard, the health work list) reads the holder it reassigns.
+  test('the controller\'s onApplied swaps the applied config holder to the confirmed persona set over the start-time server-wide values', () => {
+    const { loaded, assignAt, createAt } = startResolution(SERVER_CODE)
+    const onApplied = (controllerProps().get('onApplied') ?? '').replace(/\s+/g, ' ')
+    // The body is exactly: a guard that throws while the start-time config is
+    // still unset, then the swap spreading that same config.
+    const swap = onApplied.match(
+      new RegExp(
+        `^\\(?\\s*(\\w+)\\s*\\)?\\s*=>\\s*\\{\\s*` +
+          `if\\s*\\(\\s*(\\w+)\\s*===\\s*undefined\\s*\\)\\s*throw\\s+new\\s+Error\\s*\\(\\s*'[^']*'\\s*\\)\\s*;?\\s*` +
+          `${loaded}\\s*=\\s*\\{\\s*\\.\\.\\.\\2\\s*,\\s*personas\\s*:\\s*\\1\\s*\\.\\s*personas\\s*,?\\s*\\}\\s*;?\\s*\\}$`,
+      ),
+    )
+    expect(swap).not.toBeNull()
+    // The spread is the start-time config: declared once, inside main(),
+    // before the controller whose onApplied closes over it (no temporal dead
+    // zone), and assigned once, from the holder, after the start resolution
+    // set it and before detection is armed (the only point after which
+    // onApplied can run).
+    const startTime = swap![2]!
+    const decls = [...SERVER_CODE.matchAll(new RegExp(`\\b(?:let|const|var)\\s+${startTime}\\b[^\\n]*`, 'g'))]
+    expect(decls.map((d) => d[0].trim())).toEqual([`let ${startTime}!: PersonaConfig`])
+    expect(insideMain(SERVER_CODE, decls[0]!.index!)).toBe(true)
+    expect(decls[0]!.index!).toBeLessThan(createAt)
+    const assignments = [...SERVER_CODE.matchAll(new RegExp(`(?<![\\w.$])${startTime}\\s*=(?![=>])\\s*([^\\n;]*)`, 'g'))]
+    expect(assignments.map((a) => a[1]!.trim())).toEqual([loaded])
+    const at = assignments[0]!.index!
+    expect(insideMain(SERVER_CODE, at)).toBe(true)
+    expect(at).toBeGreaterThan(assignAt)
+    expect(at).toBeLessThan(onlyMethodCall('startDetection').at)
   })
 
   // SR-8.2: no file watcher. Only the controller's own options are audited, so

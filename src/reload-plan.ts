@@ -7,8 +7,9 @@
  * table: added, removed, destructively modified, modified in place, changed
  * credentials, next-launch changes (own or inherited) and unchanged, plus the
  * changed server-wide settings. The reload detection tick builds it every
- * pass, and the confirmed apply (E12) builds the same plan from its own
- * inputs, so what is applied is what was previewed.
+ * pass, and a confirmed apply (`reload-apply.ts`) acts on the plan that pass
+ * built from the confirmed bytes, never a second diff, so what is applied is
+ * what was previewed.
  *
  * The preview is rendered from the plan, never from a second diff:
  * - `renderPreview` / `renderPreviewLines`: the body of `config.json.pending`
@@ -33,7 +34,13 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { PERSONA_TOP_LEVEL_KEYS, SERVER_PATH_SETTINGS, type Persona, type PersonaConfig } from './config.ts'
+import {
+  configReadFailurePredicate,
+  PERSONA_TOP_LEVEL_KEYS,
+  SERVER_PATH_SETTINGS,
+  type Persona,
+  type PersonaConfig,
+} from './config.ts'
 import type { PersonaBringUpState } from './persona-bringup-controller.ts'
 import type { CredentialsDigest } from './persona-credentials.ts'
 import { PERSONA_CREDENTIALS_REFUSED, escapeCause } from './persona-diagnostics.ts'
@@ -330,9 +337,8 @@ export function addedPersonas(applied: PersonaConfig, candidate: PersonaConfig):
 /** The sentence an invalid candidate reports. */
 function invalidCandidateError(candidate: Exclude<ChangePlanCandidate, { kind: 'valid' }>): string {
   if (candidate.kind === 'invalid') return candidate.error
-  const what = candidate.missing
-    ? 'does not exist'
-    : `cannot be read${candidate.code !== undefined ? ` (${candidate.code})` : ''}`
+  // `missing` decides "does not exist" even when the code alone would not.
+  const what = candidate.missing ? 'does not exist' : configReadFailurePredicate(candidate.code)
   return `the configuration file ${JSON.stringify(candidate.path)} ${what}.`
 }
 

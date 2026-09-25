@@ -151,6 +151,7 @@ import {
   LEAK_SENTINEL,
   assertNoLeak,
   fakeToken,
+  makeCredentials,
   writeCredentialsFile,
   type CredentialsOverrides,
 } from './test-helpers/credentials.ts'
@@ -184,6 +185,7 @@ import {
   type StubSpawnPath,
 } from './test-helpers/agent-director-stub.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
+import type { PersonaSpec } from './test-helpers/persona-config.ts'
 import { resolveRealPath, type Persona } from '../src/config.ts'
 import {
   createNotUpSessionDropper,
@@ -197,6 +199,7 @@ import {
 import {
   composePersonaStatusListeners,
   createPersonaUpFlushListener,
+  createPersonaRelaunchGate,
   createPersonaUpPredicate,
 } from '../src/persona-start.ts'
 import { createPersonaNotifier, type PersonaNotifier } from '../src/persona-notifier.ts'
@@ -778,6 +781,99 @@ describe('readCredentialsFile and credentialsDigest (SR-8.3)', () => {
     expect(credentialsDigest({ ok: true, bytes: Buffer.alloc(0) })).toBe(empty)
     expect(new Set([CREDENTIALS_MISSING_MARKER, CREDENTIALS_UNREADABLE_MARKER, empty]).size).toBe(3)
     for (const marker of [CREDENTIALS_MISSING_MARKER, CREDENTIALS_UNREADABLE_MARKER]) expect(marker).not.toMatch(/^sha256:/)
+  })
+
+  // The 64 KiB cap (65,536 bytes): a larger file is unreadable, worded with the
+  // limit and none of its content, never read past 65,537 bytes, and held as the
+  // unreadable marker. Each file is valid credentials (the file's fake tokens)
+  // padded with trailing whitespace, so only its size can refuse it, and a leak
+  // of its content fails assertNoLeak.
+  const TOO_LARGE = { ok: false, missing: false, cause: 'credentials file is larger than the 64 KiB limit' } as const
+
+  /** `persona`'s credentials file: valid credentials padded with spaces to exactly `size` bytes; the path. */
+  function writePaddedCreds(persona: BringUpPersona, size: number): string {
+    const json = JSON.stringify(makeCredentials())
+    return writeRaw(persona, json + ' '.repeat(size - json.length))
+  }
+
+  /** A credentials seam over the real one that records each op, and for a read the bytes asked for and returned. */
+  function recordingReads(injected: Partial<CredentialsFs> = {}) {
+    const ops: string[] = []
+    const reads: { maxBytes?: number; returned: number }[] = []
+    const fs: Partial<CredentialsFs> = {
+      fstatFile: fd => (ops.push('fstat'), (injected.fstatFile ?? DEFAULT_CREDENTIALS_FS.fstatFile)(fd)),
+      readFileFd: (fd, maxBytes) => {
+        ops.push('read')
+        const bytes = (injected.readFileFd ?? DEFAULT_CREDENTIALS_FS.readFileFd)(fd, maxBytes)
+        reads.push({ maxBytes, returned: bytes.length })
+        return bytes
+      },
+      closeFile: fd => (ops.push('close'), DEFAULT_CREDENTIALS_FS.closeFile(fd)),
+    }
+    return { fs, ops, reads }
+  }
+
+  test.each([
+    { label: '65,536 bytes (the limit) is read in full, asking for at most 65,537, and hashed', size: 65_536, afterOpen: ['fstat', 'read', 'close'] },
+    { label: '65,537 bytes is refused on its stat, unread, and held as the unreadable marker', size: 65_537, afterOpen: ['fstat', 'close'] },
+  ])('a credentials file of $label, by readCredentialsFile and checkPersonaCredentialsAndDigest alike', ({ size, afterOpen }) => {
+    const persona = makePersona()
+    const path = writePaddedCreds(persona, size)
+    const { fs, ops, reads } = recordingReads()
+    const { lines, log } = capture()
+
+    const read = readCredentialsFile(path, fs)
+    const digest = credentialsDigest(read)
+    const both = checkPersonaCredentialsAndDigest(persona, { others: [], log })
+
+    if (size <= 65_536) {
+      if (!read.ok) throw new Error(`expected a read, got ${read.cause}`)
+      expect(read.bytes.length).toBe(size)
+      expect(Buffer.compare(read.bytes, readFileSync(path))).toBe(0)
+      expect(digest).toBe(fileDigest(path))
+      expect(reads).toEqual([{ maxBytes: 65_537, returned: size }])
+      if (!both.result.ok) throw new Error(`expected ok, got ${both.result.class}`)
+      expect(both.result.tokens.botToken).toBe(FILE_BOT_TOKEN)
+      expect(lines).toEqual([])
+    } else {
+      expect(read).toEqual(TOO_LARGE)
+      expect(digest).toBe(CREDENTIALS_UNREADABLE_MARKER)
+      expect(expectFailure(both.result, PERSONA_CREDENTIALS_UNREADABLE, lines).cause).toBe(TOO_LARGE.cause)
+    }
+    expect(ops).toEqual([...afterOpen])
+    expect(both.digest).toBe(digest)
+    // The bytes of a good read are the file's own (its tokens); everything else is checked.
+    assertNoLeak({ refused: read.ok ? undefined : read, digest, both, lines, json: JSON.stringify({ digest, both: both.digest }) })
+  })
+
+  // A stat that under-reports (as for a file that grows after it) or omits the
+  // size: the bounded read still refuses the file, asking for no more than
+  // 65,537 bytes; a read double that returns more than it was asked for is refused too.
+  const regularStats = (size?: number) => () => ({ isFile: () => true, isDirectory: () => false, ...(size === undefined ? {} : { size }) })
+  test.each<{ label: string; injected: Partial<CredentialsFs>; returned: number }>([
+    { label: 'fstat reports 10 bytes; the real bounded read', injected: { fstatFile: regularStats(10) }, returned: 65_537 },
+    { label: 'fstat reports no size; the real bounded read', injected: { fstatFile: regularStats() }, returned: 65_537 },
+    {
+      label: 'fstat reports 10 bytes; a read double returning the whole file whatever it is asked for',
+      injected: { fstatFile: regularStats(10), readFileFd: fd => readFileSync(fd) },
+      returned: 3 * 65_536,
+    },
+  ])('a 192 KiB credentials file where $label: unreadable as too large, the unreadable marker, the read asked for at most 65,537 bytes', ({ injected, returned }) => {
+    const persona = makePersona()
+    const path = writePaddedCreds(persona, 3 * 65_536)
+    const { fs, ops, reads } = recordingReads(injected)
+    const { lines, log } = capture()
+
+    const read = readCredentialsFile(path, fs)
+    const both = checkPersonaCredentialsAndDigest(persona, { others: [], fs: recordingReads(injected).fs, log })
+
+    expect(read).toEqual(TOO_LARGE)
+    expect(credentialsDigest(read)).toBe(CREDENTIALS_UNREADABLE_MARKER)
+    expect(ops).toEqual(['fstat', 'read', 'close'])
+    expect(reads).toEqual([{ maxBytes: 65_537, returned }])
+    expect(both.digest).toBe(CREDENTIALS_UNREADABLE_MARKER)
+    expect(expectFailure(both.result, PERSONA_CREDENTIALS_UNREADABLE, lines).cause).toBe(TOO_LARGE.cause)
+    assertNoLeak({ read, both, lines })
   })
 
   /** `persona`'s credentials path made a symlink to `other`'s (valid) file: a real-path collision; the others list. */
@@ -3124,6 +3220,11 @@ interface BringUpFixture {
   directoryStats: [string, number][]
   /** Overrides consulted at call time by the controller's file-system seam. */
   fsOverride: Partial<PersonaBringUpFs>
+  /**
+   * Replace the applied persona set the controller reads live (`appliedPersonas`,
+   * as server.ts binds it to `personaConfig`); it starts as `personas`.
+   */
+  setApplied(personas: readonly Persona[]): void
   /** Everything the fixture captured, for assertNoLeak. */
   captured(extra?: Record<string, unknown>): Record<string, unknown>
 }
@@ -3135,6 +3236,8 @@ const bringUpFixtures: BringUpFixture[] = []
 interface BringUpFixtureOptions {
   /** Persona names, in config order; default A and B. */
   names?: string[]
+  /** Further fields of a persona's spec, by name (e.g. a shared `working_directory`). */
+  specs?: Record<string, Omit<PersonaSpec, 'name'>>
   dryRun?: boolean
   /** A persona's stub script, by name. */
   slack?: Record<string, StubSlackOptions>
@@ -3162,7 +3265,8 @@ interface BringUpFixtureOptions {
 function makeBringUpFixture(opts: BringUpFixtureOptions = {}): BringUpFixture {
   const dryRun = opts.dryRun ?? false
   const names = opts.names ?? [OUTCOME_A, OUTCOME_B]
-  const h = makeConnectionHarness(names.map(name => ({ name })), dir, { files: true, dryRun, stubOptions: opts.slack })
+  const h = makeConnectionHarness(names.map(name => ({ ...opts.specs?.[name], name })), dir, { files: true, dryRun, stubOptions: opts.slack })
+  let applied: readonly Persona[] = h.personas
   const launches: string[] = []
   const events: { key: string; text: unknown }[] = []
   const credentialOpens: string[] = []
@@ -3187,6 +3291,7 @@ function makeBringUpFixture(opts: BringUpFixtureOptions = {}): BringUpFixture {
     clock: h.clock,
     dryRun,
     log: line => void h.lines.push(line),
+    appliedPersonas: () => applied,
     fs: {
       openFile: path => {
         credentialOpens.push(path)
@@ -3224,6 +3329,9 @@ function makeBringUpFixture(opts: BringUpFixtureOptions = {}): BringUpFixture {
     credentialOpens,
     directoryStats,
     fsOverride,
+    setApplied: personas => {
+      applied = personas
+    },
     captured: (extra = {}) => ({ lines: h.lines, statuses: h.statuses, notifierLines, events, launches, ...extra }),
   }
   bringUpFixtures.push(f)
@@ -4365,6 +4473,161 @@ describe('bring-up outcomes (E5)', () => {
       await expectServes(f, b)
       assertNoLeak(f.captured())
     })
+  })
+
+  // -------------------------------------------------------------------------
+  // The live applied set (b.av2 SR-8.6). From a confirmed apply's step 1 on,
+  // a retry for a key outside the applied set brings nothing up and launches
+  // nothing, even before its teardown cancels it; a directory re-check checks
+  // against the applied set as it is now (the E11 stale-set carry), and a
+  // launch after a retry launches the current declaration. Only launches are
+  // guarded: stopping the connection manager's own Slack retry is the apply's
+  // step 2 (teardown), so a removed persona may still be validated here.
+  // -------------------------------------------------------------------------
+
+  describe('bring-up retries and the live applied set (b.av2 SR-8.6)', () => {
+    const refOf = (persona: Persona) => renderPersonaRef(persona.name, persona.key)
+
+    // server.ts binds the controller's `isApplied` into `isPersonaUp` and the
+    // relaunch gate; A stays up and serving here, so only the applied set can
+    // refuse it.
+    test('isApplied reads the live applied set: once A is removed, the real up predicate and relaunch gate refuse A while its connection and outcome are still up, and allow B', async () => {
+      const f = makeBringUpFixture()
+      const [a, b] = f.personas as [Persona, Persona]
+      const summaries = await bringUpEach(f)
+      const isPersonaUp = createPersonaUpPredicate(f.h.manager, f.controller)
+      const canRelaunch = createPersonaRelaunchGate(f.h.manager, line => void f.h.lines.push(line), f.controller)
+      for (const persona of [a, b]) {
+        expect(f.controller.isApplied(persona.key)).toBe(true)
+        expect(isPersonaUp(persona.key)).toBe(true)
+        expect(canRelaunch(persona.key)).toBe(true)
+      }
+      const linesBefore = f.h.lines.length
+
+      f.setApplied([b])
+
+      expect(f.controller.isApplied(a.key)).toBe(false)
+      expect(f.controller.isApplied(b.key)).toBe(true)
+      expect(f.h.manager.status(a.key)).toMatchObject({ state: 'up' })
+      expect(f.controller.isUp(a.key)).toBe(true)
+      expect(isPersonaUp(a.key)).toBe(false)
+      expect(isPersonaUp(b.key)).toBe(true)
+      expect(canRelaunch(a.key)).toBe(false)
+      expect(canRelaunch(b.key)).toBe(true)
+      expect(f.h.lines.slice(linesBefore)).toEqual([
+        `[slack] persona=${a.key}: not relaunched — it is no longer in the applied configuration`,
+      ])
+      expect(f.launches).toEqual([])
+      await expectServes(f, b)
+      assertNoLeak(f.captured({ summaries: [...summaries.values()] }))
+    })
+
+    test('a directory-broken persona removed from the applied set: its next re-check stats nothing, builds no Slack client, launches nothing and ends its retries with one line; the healthy persona keeps serving', async () => {
+      const f = makeBringUpFixture()
+      const [a, b] = f.personas as [Persona, Persona]
+      breakDirectory(a.working_directory, 'missing')
+      expect((await bringUpEach(f)).get(a.key)?.outcome).toBe('retrying')
+      const statsBefore = f.directoryStats.length
+      const linesBefore = linesOf(f, a).length
+
+      f.setApplied([b])
+      repairDirectory(a.working_directory)
+      await f.h.clock.advance(5_000)
+
+      expect(f.directoryStats.slice(statsBefore)).toEqual([])
+      expect(f.h.slack.buildsOf(a.key)).toEqual([])
+      expect(f.h.bringUpCalls.map(call => call.key)).toEqual([b.key])
+      expect(f.launches).toEqual([])
+      expect(f.h.clock.pendingCount()).toBe(0)
+      expect(linesOf(f, a).slice(linesBefore)).toEqual([`[slack] persona ${refOf(a)}: no longer applied — its working-directory retry stops`])
+      await f.h.clock.advance(HOUR_MS)
+      expect(f.directoryStats.slice(statsBefore)).toEqual([])
+      expect(f.launches).toEqual([])
+      await expectServes(f, b)
+      assertNoLeak(f.captured())
+    })
+
+    // E11 carry: a re-check used the set the persona was brought up with, so
+    // a persona colliding with one an apply removed or moved never came up.
+    test.each<['removed' | 'moved to its own directory']>([['removed'], ['moved to its own directory']])(
+      'two personas sharing a working directory both retry; once B is %s by an apply, A\'s next re-check reads the live applied set and A comes up and is launched once',
+      async (how) => {
+        const shared = join(dir, 'shared-work')
+        const f = makeBringUpFixture({
+          names: [OUTCOME_A, OUTCOME_B, OUTCOME_C],
+          specs: { [OUTCOME_A]: { working_directory: shared }, [OUTCOME_B]: { working_directory: shared } },
+        })
+        const [a, b, c] = f.personas as [Persona, Persona, Persona]
+        const summaries = await bringUpEach(f)
+        for (const persona of [a, b]) {
+          expect(summaries.get(persona.key)).toEqual({
+            outcome: 'retrying',
+            failures: [{ step: 'working-directory', class: PERSONA_DIRECTORY_UNUSABLE, cause: expect.any(String) }],
+          })
+        }
+        expect(summaries.get(c.key)?.outcome).toBe('up')
+
+        const own = join(dir, 'b-own-work')
+        mkdirSync(own)
+        f.setApplied(how === 'removed' ? [a, c] : [a, { ...b, working_directory: own }, c])
+        await f.h.clock.advance(5_000)
+
+        expect(f.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+        expect(f.launches).toEqual([a.key])
+        expect(linesOf(f, a).filter(line => line.includes('up after its bring-up retry (directory) — launching'))).toHaveLength(1)
+        await expectServes(f, a)
+        await expectServes(f, c)
+        assertNoLeak(f.captured({ summaries: [...summaries.values()] }))
+      },
+    )
+
+    test('a Slack-unreachable persona removed from the applied set: when the manager\'s retry brings it up, nothing is launched, with one line; the healthy persona keeps serving', async () => {
+      const f = makeBringUpFixture({ slack: { [OUTCOME_A]: { authTest: [{ kind: 'network' }] } } })
+      const [a, b] = f.personas as [Persona, Persona]
+      expect((await bringUpEach(f)).get(a.key)?.outcome).toBe('retrying')
+
+      f.setApplied([b])
+      await f.h.clock.advance(5_000)
+
+      expect(f.h.manager.status(a.key)).toMatchObject({ state: 'up' })
+      expect(f.launches).toEqual([])
+      expect(linesOf(f, a).filter(line => line.includes('after its bring-up retry'))).toEqual([
+        `[slack] persona ${refOf(a)}: up after its bring-up retry (Slack) but no longer applied — not launching`,
+      ])
+      await f.h.clock.advance(HOUR_MS)
+      expect(f.launches).toEqual([])
+      await expectServes(f, b)
+      assertNoLeak(f.captured())
+    })
+
+    test.each<['directory' | 'Slack']>([['directory'], ['Slack']])(
+      'control: an applied persona\'s %s retry brings it up and launches its current applied declaration, once',
+      async (via) => {
+        const launched: Persona[] = []
+        const f = makeBringUpFixture({
+          launch: async persona => void launched.push(persona),
+          ...(via === 'Slack' ? { slack: { [OUTCOME_A]: { authTest: [{ kind: 'network' }] } } } : {}),
+        })
+        const [a, b] = f.personas as [Persona, Persona]
+        if (via === 'directory') breakDirectory(a.working_directory, 'missing')
+        expect((await bringUpEach(f)).get(a.key)?.outcome).toBe('retrying')
+        if (via === 'directory') repairDirectory(a.working_directory)
+
+        // A confirmed apply's step 1 swaps in a new declaration object for the same key.
+        const current: Persona = { ...a }
+        f.setApplied([current, b])
+        await f.h.clock.advance(5_000)
+
+        expect(f.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+        expect(f.launches).toEqual([a.key])
+        expect(launched).toHaveLength(1)
+        expect(launched[0]).toBe(current)
+        expect(f.h.clock.pendingCount()).toBe(0)
+        await expectServes(f, a)
+        await expectServes(f, b)
+        assertNoLeak(f.captured())
+      },
+    )
   })
 
   // -------------------------------------------------------------------------

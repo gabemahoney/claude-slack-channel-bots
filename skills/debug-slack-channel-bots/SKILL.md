@@ -204,8 +204,11 @@ running, is kept but not served. Healthy personas are unaffected.
 - **State:** `broken`. Doesn't recover on its own.
 - **Cause text:** one of `credentials file is a directory`,
   `credentials file is not a regular file` (a FIFO, socket or device),
-  `credentials file cannot be read: permission denied (<errno>)` (`EACCES` or `EPERM`), or
-  `credentials file cannot be read (<errno>)`.
+  `credentials file cannot be read: permission denied (<errno>)` (`EACCES` or `EPERM`),
+  `credentials file cannot be read (<errno>)`, or
+  `credentials file is larger than the 64 KiB limit` (the server never reads
+  a file over 64 KiB; a real credentials file is far smaller, so the path
+  names the wrong file).
 - **Fix:** Make the path a regular file readable by the user the server runs
   as (the file should be mode 0600, owned by that user). Then restart the
   server.
@@ -776,6 +779,7 @@ as `channels2`, is therefore not shown. After a fix, start the server again.
 |---|---|---|
 | `missing prerequisite: config.json not found at <path>, and no config.json.last-applied at <path>` (from `start`), or `The configuration file "<path>" does not exist. The server requires the configuration file to start.` | No `config.json` and no last-applied record in the state directory. | Create `config.json`; `{"personas": []}` is the smallest valid file. Check `SLACK_STATE_DIR`. |
 | `The configuration file "<path>" cannot be read (<errno>). …` | Permissions, or the path is a directory (`EISDIR`). `(not a regular file)` in place of the errno: the path is a FIFO, socket or device, which is never read. | Make it a readable regular file. |
+| `The configuration file "<path>" is larger than the 64 KiB limit. …` | The file is over 64 KiB. Start and the reload check never read past that; a real configuration is far smaller, so the file is damaged or the wrong file. | Replace it with the intended configuration. |
 | `loadPersonaConfig: malformed JSON in "<path>" at line <L>, column <C>.` | Not valid JSON. The line and column (from 1) point at the first character that breaks it; the file's content is never echoed. | Fix the syntax at that position. |
 | `the configuration must be a JSON object, got <type>.` | Top level isn't an object. | Wrap it in `{ … }`. |
 | A key belonging to the pre-persona shape | See [Pre-persona configuration](#pre-persona-configuration). | |
@@ -989,8 +993,9 @@ INVALID: <error> Nothing will be applied.
 ```
 
 The error is a message from [Configuration rejections](#configuration-rejections),
-or `the configuration file "<path>" does not exist.` or
-`the configuration file "<path>" cannot be read (<errno>).`
+or `the configuration file "<path>" does not exist.`,
+`the configuration file "<path>" cannot be read (<errno>).` or
+`the configuration file "<path>" is larger than the 64 KiB limit.`
 
 **No effective change.** The bytes differ but nothing would change, for
 example a whitespace or key-order edit, or a setting written out with its
@@ -1118,26 +1123,56 @@ record was deleted, failing on the listening address:
 
 ### `reload-record-write-failed`
 
-- **Line:** one of (the `(<errno>)` part appears only when the error has a
-  code):
+The server couldn't write `config.json.last-applied` durably. It happens in
+two places: at a start without a record, and when a running server applies a
+confirmed change. The `(<errno>)` part appears only when the error has a
+code.
+
+**At a start without a record.**
+
+- **Line:** one of:
   - `[slack] reload-record-write-failed: cannot write the last-applied record "<record path>" (<errno>); the server does not start and nothing is applied`:
     the record wasn't written, and there is still no record.
   - `[slack] reload-record-write-failed: the last-applied record "<record path>" was written but its directory could not be synced (<errno>), so it may not survive a crash, and the next start will run it; the server does not start`:
     the record is in place, but the state directory couldn't be synced, so it
     may be lost in a crash or power loss.
-- **When:** A start without a record. `config.json` was valid, but the server
-  couldn't write `config.json.last-applied` beside it durably.
+- **When:** `config.json` was valid, but the server couldn't write the record
+  beside it durably.
 - **Effect:** The server exits 1. No persona is brought up and nothing is
   applied. `start` shows the line in its `Server failed to start` block. After
   the second line, the next start runs the record that was written (a copy of
   `config.json` at that start), unless a crash lost it.
-- **Cause:** Usually the state directory: the server's user can't create or
-  rename files in it (`EACCES`, `EPERM`), the disk or quota is full
-  (`ENOSPC`, `EDQUOT`), or the filesystem is read-only (`EROFS`). A
-  directory that can't be synced usually points at the filesystem (an I/O
-  error, `EIO`, or a filesystem that doesn't support syncing a directory).
-- **Fix:** Fix the directory's permissions, free space or filesystem, then
-  start the server again.
+- **Fix:** Fix the cause below, then start the server again.
+
+**At a confirmed apply.** A running server acting on a confirmation
+(`config.json.apply`) writes the record first, before it changes anything
+else.
+
+- **Line:** one of:
+  - `[slack] reload-record-write-failed: cannot write the last-applied record "<record path>" (<errno>); the confirmed change is not applied and stays pending`:
+    the old record is unchanged.
+  - `[slack] reload-record-write-failed: wrote the last-applied record "<record path>" but could not sync its directory (<errno>); the previous record was written back; the confirmed change is not applied and stays pending`:
+    the new record was put back to the old one. Instead of
+    `the previous record was written back`, the middle part can read
+    `the previous record was written back, though its directory could not be synced either`,
+    or
+    `writing the previous record back failed too (<errno>), so the next start may run the unapplied change`:
+    then the record may hold the unapplied change, and the next start would
+    run it.
+- **Effect:** Nothing is applied. The server keeps running what it ran, the
+  change stays pending, and within about 5 s `config.json.pending` is written
+  again. The confirmation was used up: it isn't acted on again.
+- **Fix:** Fix the cause below. Then read the new `config.json.pending`
+  (see [Pending changes](#pending-changes)) and apply the change again (see
+  [Applying a `config.json` edit](#applying-a-configjson-edit)). If the line
+  says writing the previous record back failed too, compare the record with
+  `config.json` before any restart: the next start runs the record.
+
+**Cause (both).** Usually the state directory: the server's user can't create
+or rename files in it (`EACCES`, `EPERM`), the disk or quota is full
+(`ENOSPC`, `EDQUOT`), or the filesystem is read-only (`EROFS`). A directory
+that can't be synced usually points at the filesystem (an I/O error, `EIO`,
+or a filesystem that doesn't support syncing a directory).
 
 ### `reload-nothing-pending`
 
@@ -1214,19 +1249,161 @@ record was deleted, failing on the listening address:
   differs from the one last logged, and once at the first check after each
   start while it is still pending. An invalid candidate logs only this line,
   never `reload-preview`.
+- **Confirmed variant:** when a confirmation (`config.json.apply`) matched an
+  invalid candidate, the line is instead:
+
+  ```text
+  [slack] reload-invalid: the confirmed configuration is invalid, so nothing is applied: <error>
+  ```
+
+  For example
+  `… so nothing is applied: loadPersonaConfig: malformed JSON in "<config path>" at line 3, column 5.`
+  Normally a candidate gets two lines: the pending-time line when its
+  `INVALID` preview is written, then this one when the confirmation is
+  processed. When the confirmation is already there on the pass that first
+  sees the candidate (for example the first check after a start), only this
+  line is logged.
 - **Cause:** the edited `config.json` fails to parse or validate (the
   `<error>` is a message from
   [Configuration rejections](#configuration-rejections); an unknown key whose
   name could be a pasted token is counted, not shown), or `config.json` is
-  missing or can't be read while a record exists:
-  `the configuration file "<config path>" does not exist.` or
-  `the configuration file "<config path>" cannot be read (<errno>).`
+  missing, can't be read or is too large while a record exists:
+  `the configuration file "<config path>" does not exist.`,
+  `the configuration file "<config path>" cannot be read (<errno>).` or
+  `the configuration file "<config path>" is larger than the 64 KiB limit.`
+  To the reload check, a file over 64 KiB counts as unreadable and is never
+  read in full. (Only the file-send guard reads `config.json` whole, so a
+  credentials path named in an oversized file stays protected.)
 - **Effect:** Nothing is applied. The server keeps running the last-applied
-  record.
+  record. A confirmation of an invalid candidate is used up: it applies
+  nothing, and it isn't acted on again.
 - **Fix:** Correct `config.json` at the position or rule the error names, or
   restore it (see withdrawing under [Pending changes](#pending-changes)).
   Within about 5 s the check writes the new preview, or removes the pending
   file and logs `reload-nothing-pending` if the file matches what is applied.
+  After the confirmed variant, the old confirmation can't be reused: read the
+  new `config.json.pending` once the fix is in, then apply it (see
+  [Applying a `config.json` edit](#applying-a-configjson-edit)).
+
+### `reload-applied`
+
+- **Line:**
+
+  ```text
+  [slack] reload-applied: applied the confirmed configuration change without a restart (personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed); the last-applied record "<record path>" now holds it
+  ```
+
+  The counts are the ones in the preview's header.
+- **When:** a running server's check found a confirmation
+  (`config.json.apply`) whose fingerprint matched the pending change, and the
+  change was valid and had an effect. The confirmation is deleted first, so
+  it is used once.
+- **Meaning:** `config.json.last-applied` now holds the confirmed
+  `config.json`, byte for byte, and the server runs its persona set. Every
+  later start runs it too. A changed server-wide setting is recorded and takes
+  effect at the next start, as its preview line says.
+- **What happens to personas now:** the apply switches the persona set the
+  server runs at once. Message routing, the up check, the notifier and the
+  permission poller read that set at each use. The apply doesn't yet stop or
+  start any instance or Slack connection:
+  - a removed persona (or the old key of a renamed one) keeps its instance
+    running and its Slack connection open until the next start, but it is
+    out of service now:
+    - each event it receives is dropped, with
+      `[slack] persona-routing: no applied persona with key=<key> — event not delivered to it`;
+    - `/interject` for it returns 404 (`Persona not found in the applied config`);
+    - a new MCP session from its working directory matches no persona and
+      is disconnected (`Session connected with CWD "<path>" — no matching persona`);
+    - an MCP session of it that is still registered stays connected, but
+      each tool call it makes fails with
+      `Tool "<name>" refused: persona key=<key> is not an applied persona.`;
+    - the permission poller skips its spawn
+      (`spawn <id> names no applied persona (persona=<key>) — skipping`), and
+      a notice for it is dropped
+      (`persona-notifier: no applied persona with key=<key> — notice dropped`);
+    - it is never restarted or relaunched again;
+  - a kept persona's `channels` (each entry's `delivery` included), `dm.*`
+    and `permission_prompts`
+    take effect at once, for the next message, notice or prompt;
+  - a kept persona's `working_directory`, `stop_hook_bootstrap` or
+    `claude_config_dir` change takes effect at its next relaunch (a restart
+    after its session ends), which launches the new declaration; until then
+    its instance runs as launched;
+  - an added persona isn't brought up until the next start;
+  - a persona with changed credentials keeps its current connection, and the
+    credentials change stays pending (see
+    [Pending changes](#pending-changes)).
+
+  The next start runs the new record, and it treats each persona as
+  [Applying a `config.json` edit](#applying-a-configjson-edit) describes
+  (the record no longer needs deleting: it already holds the change).
+- **Fix:** None. If `config.json.pending` is written again after this line,
+  something is still pending: see [Pending changes](#pending-changes). With
+  nothing left pending, no `reload-nothing-pending` line follows; this line
+  says what happened.
+
+### `reload-noop`
+
+- **Line:**
+
+  ```text
+  [slack] reload-noop: the confirmed configuration has no effective change, so no persona and no server-wide setting changed; the last-applied record "<record path>" was rewritten with it
+  ```
+
+- **When:** a confirmation (`config.json.apply`) matched a pending change
+  whose preview said `no effective change`: `config.json`'s bytes differ from
+  the record's, but nothing they configure does. A whitespace or key-order
+  edit, or a setting written out with its default value, does this.
+- **Meaning:** The record was rewritten with `config.json`'s bytes, so the two
+  match again and nothing is pending. No persona, instance or setting changed.
+- **Fix:** None.
+
+### `reload-stale-confirmation`
+
+- **Line:**
+  `[slack] reload-stale-confirmation: the confirmation "<apply path>" <reason>; nothing is applied`,
+  where `<reason>` is one of:
+  - `does not match the configuration as it stands (the configuration file or a credentials file it references changed after that preview was written)`;
+  - `cannot be read (<errno>)` (for example `EISDIR`, a directory),
+    `cannot be read (not a regular file)` (a FIFO, socket or device, never
+    read), or `is larger than the 64 KiB limit`;
+  - `holds no well-formed fingerprint (it is not a pending-change file as the server writes it)`.
+- **When:** a running server's check found `config.json.apply` beside
+  `config.json`, including one left there while the server was stopped (the
+  first check after the start processes it). The line never shows the file's
+  content.
+- **Cause:** A confirmation carries the fingerprint line of the
+  `config.json.pending` it was made from, and it applies only while that
+  still describes the files. It doesn't match when `config.json` or a
+  credentials file it references changed after that preview was written
+  (an old copy of `config.json.pending` included). A copy whose change was
+  already applied still matches while those files are unchanged: it logs
+  `reload-noop`, not this line. It holds no well-formed fingerprint when it was written
+  by hand or is damaged, and can't be read when it is a directory or not a
+  regular file. A copy of the current `config.json.pending` matches and
+  applies.
+- **Effect:** Nothing is applied. The confirmation is deleted and isn't
+  acted on again. A change that is still pending keeps its current preview in
+  `config.json.pending`, which the check writes again if it is missing.
+- **Fix:** Read the current `config.json.pending` (see
+  [Pending changes](#pending-changes)): it describes what would be applied
+  now. To apply it, see
+  [Applying a `config.json` edit](#applying-a-configjson-edit). Never write
+  a confirmation yourself or reuse an old one.
+- **`is larger than the 64 KiB limit` on a fresh rename:** the server's own
+  `config.json.pending` can exceed the cap for a very large single change
+  (hundreds of personas renamed or credentials files changed at once), even
+  while `config.json` is under it. The check then rewrites the pending file
+  at every tick and can never apply it. Split the change into smaller
+  `config.json` edits and confirm each one in turn.
+- **A confirmation that can't be removed:** any confirmation, matched or not,
+  is deleted before it is acted on. If that fails, the plain line
+  `[slack] reload: cannot remove the confirmation "<apply path>" (<errno>); it was acted on once and is ignored until its content changes`
+  follows. The server retries the delete silently at each check and ignores
+  the file while its content stays the same. Remove it by hand once its
+  directory is fixed (permissions, or a read-only filesystem). If it was
+  removed but its directory couldn't be synced, the line is
+  `[slack] reload: removed the confirmation "<apply path>" but could not sync its directory (<errno>); it may reappear after a crash`.
 
 ### The last-applied record can't be read or is invalid
 
@@ -1237,6 +1414,8 @@ record was deleted, failing on the listening address:
     record exists but the server's user can't read it (permissions, or the path
     is a directory, `EISDIR`); `(not a regular file)` means the path is a FIFO,
     socket or device, which is never read;
+  - `The last-applied record "<record path>" is larger than the 64 KiB limit.`:
+    the record is over 64 KiB, so it was damaged or replaced;
   - `loadPersonaConfig: malformed JSON in "<record path>" at line <L>, column <C>.`:
     the record isn't valid JSON (it was edited or damaged);
   - `loadPersonaConfig: invalid persona config in "<record path>": <message>`:

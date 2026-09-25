@@ -2644,11 +2644,14 @@ function createLaunchPool(size: number): <T>(task: () => Promise<T>) => Promise<
  * a restart never repeats the credentials, working-directory or Slack steps.
  *
  * `options.canLaunch` (the server passes `createPersonaRelaunchGate`) is
- * asked first: when it answers false — the persona is not up (its Slack
- * connection is not serving, or its bring-up is broken or retrying) —
+ * asked first, before the persona is looked up: when it answers false — the
+ * persona is not up (its Slack connection is not serving, or its bring-up is
+ * broken or retrying) or its key is no longer applied (b.av2 SR-8.6) —
  * nothing is launched and the result is `'skipped'`, which restart.ts counts
- * as neither a success nor a failure. restart.ts asks the same gate before
- * any kill or reconnect; this check covers a flip in between.
+ * as neither a success nor a failure. Asking it first keeps a key a
+ * confirmed apply removed from counting as a failure. restart.ts asks the
+ * same gate before any kill or reconnect; this check covers a flip in
+ * between.
  *
  * Returns true on any non-failed action (spawned / resumed / reconnected /
  * no-op), false on `failed` or when no applied persona has the key. The
@@ -2660,9 +2663,9 @@ export async function launchSession(
   config: PersonaConfig,
   options?: { canLaunch?: (key: string) => boolean },
 ): Promise<boolean | 'skipped'> {
+  if (options?.canLaunch && !options.canLaunch(key)) return 'skipped'
   const persona = config.personas.find((p) => p.key === key)
   if (!persona) return false
-  if (options?.canLaunch && !options.canLaunch(key)) return 'skipped'
   const result = await spawnForPersona(persona, config, false)
   return result.action !== 'failed'
 }

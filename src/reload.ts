@@ -33,8 +33,19 @@
  * the change plan of `reload-plan.ts`, behind a fingerprint,
  * `reload-fingerprint.ts`) in step: written while a change is pending,
  * deleted when nothing is. Its first pass after a start from the record is
- * the SR-8.7 comparison, so an unconfirmed edit stays pending. Nothing is
- * applied: no pass calls a lifecycle operation.
+ * the SR-8.7 comparison, so an unconfirmed edit stays pending.
+ *
+ * Confirmation and apply (b.av2 SR-8.5, SR-8.6): each pass first processes
+ * `config.json.apply` (the operator's rename of the pending file), deleting it
+ * before anything is applied. A confirmation whose fingerprint matches the
+ * pass's applies the bytes and the change plan that pass derived: an invalid
+ * candidate logs `reload-invalid` and changes nothing; a valid one runs step
+ * 1 (rewrite the record, then swap the applied state and tell `onApplied`),
+ * then the bound steps 2–6 of `reload-apply.ts` in order, and logs
+ * `reload-applied`, or `reload-noop` when nothing effective changed. A
+ * mismatched, unreadable or malformed confirmation applies nothing and logs
+ * `reload-stale-confirmation`. The pending state is then refreshed against
+ * what is applied.
  *
  * The controller (`createReloadController`) is built with every dependency
  * injected, as `createCronScheduler` is: the SR-8.1 paths, the durable
@@ -53,6 +64,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { createHash } from 'node:crypto'
 import { dirname, resolve } from 'node:path'
 
 import {
@@ -63,6 +75,7 @@ import {
 } from './atomic-write.ts'
 import {
   configFileReadFailureMessage,
+  configReadFailurePredicate,
   credentialsFilesToProtect,
   isMissingConfigCode,
   parsePersonaConfigBytes,
@@ -89,9 +102,25 @@ import {
 import { expandTilde, renderPersonaRef } from './persona-identity.ts'
 import type { PersonaSlackClientFactory } from './persona-slack-clients.ts'
 import {
+  applyStepInputs,
+  applyStepNumber,
+  applyStepsFor,
+  RELOAD_APPLIED,
+  RELOAD_NOOP,
+  RELOAD_STALE_CONFIRMATION,
+  renderAppliedLogLine,
+  renderConfirmedInvalidLogLine,
+  renderNoopLogLine,
+  renderStaleConfirmationLogLine,
+  runApplySteps,
+  type ApplyStepSlots,
+  type StaleConfirmationReason,
+} from './reload-apply.ts'
+import {
   composePendingFile,
   FINGERPRINT_MISSING,
   FINGERPRINT_UNREADABLE,
+  parsePendingFingerprint,
   reloadFingerprint,
   type FingerprintContent,
   type FingerprintCredentialsEntry,
@@ -113,6 +142,7 @@ import {
 } from './reload-plan.ts'
 
 export { RELOAD_INVALID, RELOAD_PREVIEW } from './reload-plan.ts'
+export { RELOAD_APPLIED, RELOAD_NOOP, RELOAD_STALE_CONFIRMATION } from './reload-apply.ts'
 
 // ---------------------------------------------------------------------------
 // Diagnostic classes (b.av2 SR-10.3)
@@ -120,7 +150,8 @@ export { RELOAD_INVALID, RELOAD_PREVIEW } from './reload-plan.ts'
 
 /**
  * The last-applied record could not be written. At a start without a record,
- * the server does not start and nothing is applied.
+ * the server does not start and nothing is applied; at a confirmed apply,
+ * nothing is applied and the change stays pending.
  */
 export const RELOAD_RECORD_WRITE_FAILED = 'reload-record-write-failed'
 
@@ -137,13 +168,18 @@ export const RELOAD_NOTHING_PENDING = 'reload-nothing-pending'
  * Every reload diagnostic class label, in a fixed order. Kept apart from the
  * persona classes (`PERSONA_DIAGNOSTIC_CLASSES`): a reload line is about the
  * configuration, not one persona. `reload-preview` and `reload-invalid` are
- * defined beside the preview they log (`reload-plan.ts`).
+ * defined beside the preview they log (`reload-plan.ts`); `reload-applied`,
+ * `reload-noop` and `reload-stale-confirmation` beside the apply
+ * (`reload-apply.ts`).
  */
 export const RELOAD_DIAGNOSTIC_CLASSES = [
   RELOAD_RECORD_WRITE_FAILED,
   RELOAD_NOTHING_PENDING,
   RELOAD_PREVIEW,
   RELOAD_INVALID,
+  RELOAD_APPLIED,
+  RELOAD_NOOP,
+  RELOAD_STALE_CONFIRMATION,
 ] as const
 
 /** A reload diagnostic class label (closed set). */
@@ -209,8 +245,8 @@ export interface ReloadTickDriver {
 
 /**
  * The per-persona lifecycle operations the controller drives. `startBringUp`
- * is the start pass; the others are bound by the work that first applies a
- * confirmed change, and nothing calls them yet.
+ * is the start pass; the others are bound by the work that implements the
+ * apply step calling them (steps 2, 3, 4 and 6), and nothing calls them yet.
  */
 export interface ReloadLifecycleOps {
   /**
@@ -268,7 +304,7 @@ export interface ReloadControllerDeps {
   log: (line: string) => void
   /** The durable writer; `durableWriteFileSync` by default. */
   write?: ReloadFileWriter
-  /** The durable delete (of `config.json.pending`); `durableUnlinkSync` by default. */
+  /** The durable delete (of `config.json.pending` and `config.json.apply`); `durableUnlinkSync` by default. */
   remove?: ReloadFileRemover
   /** The detection tick's driver; without one, `startDetection` arms nothing. */
   tickDriver?: ReloadTickDriver
@@ -306,6 +342,20 @@ export interface ReloadControllerDeps {
   workingDirectoryFs?: Partial<WorkingDirectoryFs>
   /** The Slack client factory; bound by the work that applies a confirmed change. */
   slackClientFactory?: PersonaSlackClientFactory
+  /**
+   * Told the configuration a confirmed apply's step 1 made the applied one,
+   * right after the record was rewritten and in the same synchronous step as
+   * the controller's own swap (b.av2 SR-8.6). Production reassigns the
+   * server's `personaConfig` to the new persona set with the start-time
+   * server-wide values; the bring-up controller's applied set and the
+   * reply-guard step read it from there. A throw is logged; the apply goes on.
+   */
+  onApplied?: (config: PersonaConfig) => void
+  /**
+   * The bodies of apply steps 2–6 (`reload-apply.ts`); an unbound step does
+   * nothing. Bound by the work that implements each step.
+   */
+  applySteps?: ApplyStepSlots
   /** Home directory for every `~` in the configuration; the OS home by default. */
   home?: string
   /**
@@ -392,7 +442,7 @@ function selectConfiguration(
   } catch (err) {
     const code = err instanceof PersonaConfigReadError ? err.code : undefined
     if (!isMissingConfigCode(code)) {
-      const cause = `The last-applied record "${paths.lastApplied}" cannot be read${code !== undefined ? ` (${code})` : ''}.`
+      const cause = `The last-applied record "${paths.lastApplied}" ${configReadFailurePredicate(code)}.`
       return { ok: false, source: 'record', message: recordFailureMessage(paths, cause) }
     }
   }
@@ -431,6 +481,13 @@ type ConfigFileRead =
 
 /** The pending state one detection pass derived. Holds no credentials content. */
 interface PendingState {
+  /**
+   * The configuration file's bytes this pass read and fingerprinted, or
+   * undefined when it could not be read: what a matching confirmation applies.
+   */
+  bytes: Buffer | undefined
+  /** The candidate the plan was built from (parsed from `bytes`). */
+  candidate: ChangePlanCandidate
   /** The configuration file's bytes differ from the applied bytes (or it cannot be read). */
   configChanged: boolean
   /**
@@ -477,9 +534,36 @@ interface PendingDetection {
   stop(): void
 }
 
+/** What the detection tick asks of the controller that owns the applied state. */
+interface PendingDetectionHost {
+  /** The applied configuration now; read at the start of every derivation, so a swap is seen at once. */
+  applied(): AppliedConfiguration
+  /**
+   * Apply the pass's state after a matching confirmation (b.av2 SR-8.6).
+   * Resolves true when the applied state changed (step 1 succeeded), false
+   * when nothing was applied. Rejects only on a programming error, before
+   * anything is written.
+   */
+  applyConfirmed(state: PendingState): Promise<boolean>
+}
+
+/** The confirmation as the tick found it. */
+type ConfirmationRead =
+  | { kind: 'absent' }
+  | { kind: 'bytes'; bytes: Buffer }
+  | { kind: 'unreadable'; code: string | undefined }
+
 /**
- * Build the detection tick (b.av2 SR-8.2, SR-8.3) over the applied
- * configuration. One pass reads the configuration file once and, unless in
+ * The in-memory identity of a confirmation that could not be read: every
+ * unreadable confirmation has this one, so it is ignored until it can be read.
+ */
+const UNREADABLE_CONFIRMATION_IDENTITY = 'unreadable'
+
+/**
+ * Build the detection tick (b.av2 SR-8.2, SR-8.3, SR-8.5) over the applied
+ * configuration, which it reads from `host` at the start of every derivation
+ * (so a confirmed apply's swap is seen at once, with the logged state kept).
+ * One pass reads the configuration file once and, unless in
  * dry run, each credentials file it references once (stat-first, so a FIFO
  * or a device reads as unreadable and never blocks), derives the pending
  * state through the change plan (`buildChangePlan` in `reload-plan.ts`),
@@ -495,6 +579,24 @@ interface PendingDetection {
  * over the bytes already read (none in dry run) and the working-directory
  * check. An unchanged persona is not probed. The bring-up state is asked
  * only for a persona whose credentials changed.
+ *
+ * Confirmation (b.av2 SR-8.5): each pass first derives the state, then
+ * processes `config.json.apply` before refreshing the pending state. The
+ * confirmation is read once (stat-first) and deleted durably before anything
+ * is decided; its fingerprint (`parsePendingFingerprint`) is compared with
+ * this pass's. On a match the pass's own bytes and plan go to
+ * `host.applyConfirmed`, and the state is derived again against the new
+ * applied state; a mismatch, an unreadable file or one with no fingerprint
+ * applies nothing and logs one `reload-stale-confirmation` line. A deleted
+ * confirmation is used once. One that cannot be deleted is acted on once, and
+ * a SHA-256 of its bytes (or one fixed identity for an unreadable file) is
+ * kept in memory: the same content is then ignored, silently, with its delete
+ * retried, until it changes or is gone. The pending file is then kept in step
+ * as usual, so a change still pending after a consumed confirmation has its
+ * pending file written again on the same pass. A consumed confirmation of an
+ * invalid candidate logs its `reload-invalid` line once, in the apply, and
+ * counts as the logged pending state, so the same candidate never gets a
+ * second, pending-time `reload-invalid` line.
  *
  * Logging, through `deps.log` only (the server log, never Slack):
  * - when the pending state (nothing, or pending with fingerprint F) changes
@@ -514,12 +616,15 @@ interface PendingDetection {
  *   at the next success or when the derived state changes), retried at the
  *   next pass; a delete whose directory sync failed is not retried (the file
  *   is gone) and is logged once, saying so;
- * - an unexpected failure of a pass, once per episode.
+ * - an unexpected failure of a pass, once per episode;
+ * - after an apply that leaves nothing pending, no `reload-nothing-pending`
+ *   line: the apply's own line says what happened;
+ * - a confirmation that cannot be deleted, once, as a plain line naming it.
  *
- * Never reads, writes, renames or deletes `config.json.apply` or the record,
- * calls no lifecycle operation and creates no Slack client. Never throws.
+ * Writes the record, and calls a lifecycle operation, only through
+ * `host.applyConfirmed`. Creates no Slack client. Never throws.
  */
-function createPendingDetection(deps: ReloadControllerDeps, applied: AppliedConfiguration): PendingDetection {
+function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetectionHost): PendingDetection {
   const { paths } = deps
   const write = deps.write ?? durableWriteFileSync
   const remove = deps.remove ?? durableUnlinkSync
@@ -537,6 +642,10 @@ function createPendingDetection(deps: ReloadControllerDeps, applied: AppliedConf
   let rewriteDue = false
   let running = false
   let stopped = false
+  /** The applied configuration of the current derivation (`host.applied()`). */
+  let applied = host.applied()
+  /** The identity of a confirmation acted on once that could not be deleted. */
+  let ignoredConfirmation: string | undefined
 
   let factFailureLatched = false
   /** A fact the preview needs could not be gathered in this pass. */
@@ -612,6 +721,7 @@ function createPendingDetection(deps: ReloadControllerDeps, applied: AppliedConf
    * reads and the held ones; the bytes are dropped when the pass returns.
    */
   function derive(): PendingState {
+    applied = host.applied()
     const read = readConfigFile(paths.config, deps.configFs)
     const configChanged = !read.ok || !read.bytes.equals(applied.bytes)
     const candidate = candidateOf(read, configChanged)
@@ -677,7 +787,14 @@ function createPendingDetection(deps: ReloadControllerDeps, applied: AppliedConf
 
     const fingerprint = reloadFingerprint(fingerprintContentOf(read), entries)
     const credentialsChanged = plan.valid && plan.credentials.length > 0
-    return { configChanged, plan, fingerprint, pending: configChanged || credentialsChanged }
+    return {
+      bytes: read.ok ? read.bytes : undefined,
+      candidate,
+      configChanged,
+      plan,
+      fingerprint,
+      pending: configChanged || credentialsChanged,
+    }
   }
 
   function readPendingFile(): PendingFileRead {
@@ -734,9 +851,10 @@ function createPendingDetection(deps: ReloadControllerDeps, applied: AppliedConf
   /**
    * Delete the pending file when present; once it is gone, log
    * `reload-nothing-pending` if the state changed to nothing pending (or the
-   * first check removed a leftover file).
+   * first check removed a leftover file), unless `quiet` (an apply on this
+   * pass already said what happened).
    */
-  function keepNothingPending(file: PendingFileRead): void {
+  function keepNothingPending(file: PendingFileRead, quiet: boolean): void {
     rewriteDue = false
     let removed = false
     let gone = file.kind === 'absent'
@@ -768,7 +886,7 @@ function createPendingDetection(deps: ReloadControllerDeps, applied: AppliedConf
     // A file that could not be removed keeps the logged state as it is, so the
     // line below follows the removal that succeeds at a later check.
     if (!gone) return
-    if (logged.kind === 'pending' || (logged.kind === 'initial' && removed)) {
+    if (!quiet && (logged.kind === 'pending' || (logged.kind === 'initial' && removed))) {
       deps.log(
         `[slack] ${RELOAD_NOTHING_PENDING}: the configuration file and the credentials files it references match ` +
           `what is applied; no change is pending` +
@@ -778,11 +896,99 @@ function createPendingDetection(deps: ReloadControllerDeps, applied: AppliedConf
     logged = { kind: 'nothing' }
   }
 
+  /** The confirmation, read once and stat-first, or why there is none. Never throws. */
+  function readConfirmation(): ConfirmationRead {
+    try {
+      return { kind: 'bytes', bytes: readPersonaConfigBytes(paths.apply, deps.configFs) }
+    } catch (err) {
+      const code = err instanceof PersonaConfigReadError ? err.code : undefined
+      return isMissingConfigCode(code) ? { kind: 'absent' } : { kind: 'unreadable', code }
+    }
+  }
+
+  /**
+   * Delete the confirmation durably. True when it is gone (removed, already
+   * absent, or removed with a directory sync that failed); false when it is
+   * still there. Logs a failure only when `quietly` is false.
+   */
+  function removeConfirmation(quietly: boolean): boolean {
+    try {
+      remove(paths.apply)
+      return true
+    } catch (err) {
+      if (err instanceof DurableUnlinkUnsyncedError) {
+        if (!quietly) {
+          deps.log(
+            `[slack] reload: removed the confirmation "${paths.apply}" but could not sync its directory` +
+              `${errnoSuffix(err)}; it may reappear after a crash`,
+          )
+        }
+        return true
+      }
+      if (!quietly) {
+        deps.log(
+          `[slack] reload: cannot remove the confirmation "${paths.apply}"${errnoSuffix(err)}; it was acted on ` +
+            'once and is ignored until its content changes',
+        )
+      }
+      return false
+    }
+  }
+
+  /**
+   * Process `config.json.apply` (b.av2 SR-8.5) against this pass's `state`:
+   * read it, delete it, then apply on a fingerprint match or log one
+   * `reload-stale-confirmation` line. Resolves whether the applied state
+   * changed.
+   */
+  async function processConfirmation(state: PendingState): Promise<boolean> {
+    const confirmation = readConfirmation()
+    if (confirmation.kind === 'absent') {
+      ignoredConfirmation = undefined
+      return false
+    }
+    const identity =
+      confirmation.kind === 'bytes'
+        ? createHash('sha256').update(confirmation.bytes).digest('hex')
+        : UNREADABLE_CONFIRMATION_IDENTITY
+    if (identity === ignoredConfirmation) {
+      // Acted on once already: only retry the delete, silently.
+      if (removeConfirmation(true)) ignoredConfirmation = undefined
+      return false
+    }
+    ignoredConfirmation = removeConfirmation(false) ? undefined : identity
+
+    let stale: StaleConfirmationReason | undefined
+    if (confirmation.kind === 'unreadable') {
+      stale = { kind: 'unreadable', code: confirmation.code }
+    } else {
+      const fingerprint = parsePendingFingerprint(confirmation.bytes.toString('utf-8'))
+      if (fingerprint === undefined) stale = { kind: 'malformed' }
+      else if (fingerprint !== state.fingerprint) stale = { kind: 'mismatch' }
+    }
+    if (stale !== undefined) {
+      deps.log(renderStaleConfirmationLogLine(paths.apply, stale))
+      return false
+    }
+    const changed = await host.applyConfirmed(state)
+    // A confirmed invalid candidate has had its one `reload-invalid` line:
+    // count it as logged, so this pass's pending refresh does not log the
+    // pending-time line for the same candidate (the first pass after a start
+    // with the confirmation already present).
+    if (!state.plan.valid && state.pending) logged = { kind: 'pending', fingerprint: state.fingerprint }
+    return changed
+  }
+
   async function tick(): Promise<void> {
     if (stopped || running) return
     running = true
     try {
-      const state = derive()
+      let state = derive()
+      const appliedNow = await processConfirmation(state)
+      // Stopped at shutdown while an apply step ran: the pass ends there.
+      if (stopped) return
+      // The refresh after an apply: derived again against the swapped applied state.
+      if (appliedNow) state = derive()
       const stateId = state.pending ? state.fingerprint : 'nothing'
       if (stateId !== derivedState) {
         // A new pending state, or nothing pending: its first file failure is logged again.
@@ -791,7 +997,7 @@ function createPendingDetection(deps: ReloadControllerDeps, applied: AppliedConf
       }
       const file = readPendingFile()
       if (state.pending) keepPending(state, file)
-      else keepNothingPending(file)
+      else keepNothingPending(file, appliedNow)
       tickFailureLatched = false
     } catch (err) {
       if (!tickFailureLatched) {
@@ -832,7 +1038,11 @@ export interface ReloadController {
    * Resolves when the pass returns.
    */
   runStartBringUp(): Promise<void>
-  /** The applied configuration and its bytes, once the start resolved `applied`. */
+  /**
+   * The applied configuration and its bytes, once the start resolved
+   * `applied`; after a confirmed apply's step 1, the confirmed candidate
+   * (source `config`).
+   */
   applied(): AppliedConfiguration | undefined
   /**
    * Start the detection tick (b.av2 SR-8.2): hand it to the injected tick
@@ -935,10 +1145,97 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     }
   }
 
+  /**
+   * Step 1's record write (b.av2 SR-8.6): the candidate bytes, byte for byte,
+   * through the durable writer. True when it succeeded. On a failure before
+   * the rename the old record is intact; on a directory-sync failure after it
+   * the previous bytes are written back (best effort). Either way one
+   * `reload-record-write-failed` line is logged and false returned, and the
+   * caller leaves the applied state as it was, so the change stays pending.
+   */
+  function writeRecord(bytes: Uint8Array, previous: Uint8Array): boolean {
+    const record = JSON.stringify(paths.lastApplied)
+    const notApplied = 'the confirmed change is not applied and stays pending'
+    try {
+      write(paths.lastApplied, bytes)
+      return true
+    } catch (err) {
+      if (!(err instanceof DurableWriteUnsyncedError)) {
+        deps.log(
+          `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the last-applied record ${record}${errnoSuffix(err)}; ${notApplied}`,
+        )
+        return false
+      }
+      let restored: string
+      try {
+        write(paths.lastApplied, previous)
+        restored = 'the previous record was written back'
+      } catch (restoreErr) {
+        restored =
+          restoreErr instanceof DurableWriteUnsyncedError
+            ? 'the previous record was written back, though its directory could not be synced either'
+            : `writing the previous record back failed too${errnoSuffix(restoreErr)}, so the next start may run the unapplied change`
+      }
+      deps.log(
+        `[slack] ${RELOAD_RECORD_WRITE_FAILED}: wrote the last-applied record ${record} but could not sync its ` +
+          `directory${errnoSuffix(err)}; ${restored}; ${notApplied}`,
+      )
+      return false
+    }
+  }
+
+  /** Tell the server the new applied configuration; a throw is logged, never raised. */
+  function notifyApplied(config: PersonaConfig): void {
+    try {
+      deps.onApplied?.(config)
+    } catch (err) {
+      deps.log(`[slack] reload: updating the server's applied configuration failed: ${describeThrownValue(err)}`)
+    }
+  }
+
+  /**
+   * Apply a confirmed candidate (b.av2 SR-8.6): the exact bytes and the plan
+   * the tick derived from them, never a second read or diff. An invalid
+   * candidate logs one `reload-invalid` line and changes nothing. A valid one
+   * runs step 1 (record rewrite, then the applied-state swap and `onApplied`
+   * in the same synchronous step), then the bound steps 2–6 in order
+   * (`applyStepsFor`: none but the template refresh for a no-op, and that
+   * only when the config directories changed), then logs `reload-applied`
+   * or `reload-noop`. Resolves whether the applied state changed. Rejects
+   * only on a programming error (a plan naming a key its configuration
+   * lacks), before anything is written; the tick logs it as a failed pass.
+   */
+  async function applyConfirmed(state: PendingState): Promise<boolean> {
+    const current = appliedState
+    const { plan, candidate, bytes } = state
+    if (current === undefined) return false
+    if (!plan.valid) {
+      deps.log(renderConfirmedInvalidLogLine(plan))
+      return false
+    }
+    // A valid plan always comes from bytes that were read and parsed.
+    if (candidate.kind !== 'valid' || bytes === undefined) return false
+    const inputs = applyStepInputs(plan, current.config, candidate.config)
+
+    if (!writeRecord(bytes, current.bytes)) return false
+    appliedState = { config: candidate.config, bytes, source: 'config' }
+    notifyApplied(candidate.config)
+
+    await runApplySteps(deps.applySteps ?? {}, inputs, applyStepsFor(plan), (step, err) =>
+      deps.log(`[slack] reload: apply step ${applyStepNumber(step)} (${step}) failed: ${describeThrownValue(err)}`),
+    )
+    deps.log(plan.noEffectiveChange ? renderNoopLogLine(paths.lastApplied) : renderAppliedLogLine(plan, paths.lastApplied))
+    return true
+  }
+
   function startDetection(): boolean {
     if (phase !== 'brought-up' || appliedState === undefined) return false
     if (detection !== undefined || detectionStopped || deps.tickDriver === undefined) return false
-    detection = createPendingDetection(deps, appliedState)
+    const initial = appliedState
+    detection = createPendingDetection(deps, {
+      applied: () => appliedState ?? initial,
+      applyConfirmed,
+    })
     deps.tickDriver.start(detection.tick)
     return true
   }

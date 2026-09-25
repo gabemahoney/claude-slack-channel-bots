@@ -88,6 +88,15 @@
  * (the manager reports every persona up); the directory check and its retry
  * run as in a real start.
  *
+ * Applied set (b.av2 SR-8.6): the injected `appliedPersonas` getter is the
+ * live applied persona set, read at each use, never a snapshot. A directory
+ * re-check or a launch after a retry for a key outside it does nothing (no
+ * Slack step, no launch): from a confirmed apply's step 1 on, a removed
+ * persona is never brought up or launched, even before its teardown cancels
+ * it. A re-check checks the directory against the current set, and a launch
+ * after a retry launches the current declaration. `isApplied(key)` answers
+ * from the same getter, for the up predicate and the relaunch gate.
+ *
  * Isolation (SR-3.3, SR-6.6): each persona's state, timer and in-flight flag
  * live in its own entry; nothing spans two personas, and a directory retry is
  * scheduled only once the previous one has finished, so attempts never
@@ -176,6 +185,13 @@ export interface PersonaBringUpControllerDeps
   onLeftUp?: (persona: Persona, state: PersonaBringUpState) => unknown
   /** Clock and timers for the directory re-checks; default the real clock. */
   clock?: PersonaConnectionClock
+  /**
+   * The applied persona set now (b.av2 SR-8.6), read at each use: production
+   * reads the server's `personaConfig`, which a confirmed apply's step 1
+   * swaps. Without it every known persona counts as applied and a re-check
+   * uses the set the persona was brought up with.
+   */
+  appliedPersonas?: () => readonly Persona[]
 }
 
 /** The controller handle. */
@@ -192,6 +208,11 @@ export interface PersonaBringUpController {
   onConnectionStatus(key: string, status: PersonaConnectionStatus): void
   /** Whether the persona's outcome is `up`. False for an unknown or cancelled persona. */
   isUp(key: string): boolean
+  /**
+   * Whether the key is in the applied persona set now (`appliedPersonas`),
+   * known to the controller or not; true for every key without the getter.
+   */
+  isApplied(key: string): boolean
   /** The persona's outcome and causes, or undefined for an unknown or cancelled persona. */
   state(key: string): PersonaBringUpState | undefined
   /**
@@ -229,7 +250,10 @@ interface DirectoryEpisode {
 /** Everything the controller holds for one persona. Nothing here is shared with another persona. */
 interface BringUpEntry {
   readonly persona: Persona
-  /** The applied personas at bring-up, for the directory collision rule on re-checks. */
+  /**
+   * The applied personas at bring-up, for the directory collision rule on
+   * re-checks when no `appliedPersonas` getter is injected.
+   */
   readonly applied: readonly Persona[]
   /** Step 1's tokens from the first read; undefined in dry run or when step 1 failed. Never logged. */
   readonly tokens: PersonaSlackTokens | undefined
@@ -286,6 +310,16 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
 
   function ref(entry: BringUpEntry): string {
     return renderPersonaRef(entry.persona.name, entry.persona.key)
+  }
+
+  /** The persona with `key` in the applied set now; undefined when it is not applied. */
+  function appliedPersona(key: string, fallback: Persona): Persona | undefined {
+    if (deps.appliedPersonas === undefined) return fallback
+    return deps.appliedPersonas().find((p) => p.key === key)
+  }
+
+  function isApplied(key: string): boolean {
+    return deps.appliedPersonas === undefined || deps.appliedPersonas().some((p) => p.key === key)
   }
 
   // -------------------------------------------------------------------------
@@ -391,14 +425,23 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     }
   }
 
-  /** Launch after a retry, at most once per persona; a throw is logged, never posted. */
+  /**
+   * Launch after a retry, at most once per persona, with its current applied
+   * declaration; nothing for a persona no longer applied. A throw is logged,
+   * never posted.
+   */
   function launchAfterRetry(entry: BringUpEntry, via: 'directory' | 'Slack'): void {
     if (entry.cancelled || entry.retryLaunched) return
+    const persona = appliedPersona(entry.persona.key, entry.persona)
+    if (persona === undefined) {
+      log(`[slack] persona ${ref(entry)}: up after its bring-up retry (${via}) but no longer applied — not launching`)
+      return
+    }
     entry.retryLaunched = true
     log(`[slack] persona ${ref(entry)}: up after its bring-up retry (${via}) — launching`)
     void (async () => {
       try {
-        await deps.launch(entry.persona)
+        await deps.launch(persona)
       } catch (err) {
         log(`[slack] persona ${ref(entry)}: launch after its bring-up retry failed: ${describeThrownValue(err)}`)
       }
@@ -430,11 +473,21 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     clock.clearTimeout(timer.handle)
   }
 
-  /** One re-check: still broken → the next one on the schedule; usable → cleared line, then Slack and the launch. */
+  /**
+   * One re-check: still broken → the next one on the schedule; usable →
+   * cleared line, then Slack and the launch. The directory is checked against
+   * the applied set now; a persona no longer applied is not re-checked and
+   * its re-checks end.
+   */
   async function recheckDirectory(entry: BringUpEntry): Promise<void> {
     const episode = entry.directory
     if (entry.cancelled || episode === undefined) return
-    const result = checkDirectory(entry.persona, { others: entry.applied, fs: deps.fs })
+    if (!isApplied(entry.persona.key)) {
+      log(`[slack] persona ${ref(entry)}: no longer applied — its working-directory retry stops`)
+      return
+    }
+    const others = deps.appliedPersonas?.() ?? entry.applied
+    const result = checkDirectory(entry.persona, { others, fs: deps.fs })
     if (!result.ok) {
       episode.latest = result
       scheduleDirectoryRecheck(entry)
@@ -539,6 +592,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
       const entry = entries.get(key)
       return entry !== undefined && outcomeOf(entry) === 'up'
     },
+    isApplied,
     state: (key) => {
       const entry = entries.get(key)
       return entry === undefined ? undefined : { outcome: outcomeOf(entry), causes: causesOf(entry) }

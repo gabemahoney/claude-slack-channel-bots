@@ -8,6 +8,10 @@
  *     manager does not know (its credentials or directory check failed), and
  *     with the bring-up outcomes (`isUp`) the server passes: a serving
  *     connection whose outcome is not up is refused;
+ *   - the applied-set guard (b.av2 SR-8.6, `isApplied`): a key outside the
+ *     applied set is refused whatever its connection status or outcome, with
+ *     `it is no longer in the applied configuration`; a query without
+ *     `isApplied` counts every key as applied;
  *   - its two lines: `its Slack connection is <state>` while the connection
  *     is not serving, `its bring-up has not succeeded` while it serves but the
  *     outcome is not `up`; each once per persona per reason (a change of
@@ -23,8 +27,9 @@
  * Also covers `createPersonaUpPredicate` (src/persona-start.ts), the "is this
  * persona up" query the permission poller, `/interject` and the MCP admission
  * decision get: its truth table over every connection status crossed with the
- * bring-up outcome, and, row by row, the same answer as the gate over the same
- * status and outcome, so the two cannot drift.
+ * bring-up outcome and the applied set (applied, not applied, no `isApplied`),
+ * and, row by row, the same answer as the gate over the same status, outcome
+ * and applied set, so the two cannot drift.
  *
  * Also covers `composePersonaStatusListeners` (src/persona-start.ts): every
  * listener runs even when an earlier one throws or rejects, the result waits
@@ -94,6 +99,10 @@ const gateLine = (key: string, state: string) =>
 /** The gate's line for a persona whose connection serves but whose bring-up outcome is not `up`. */
 const bringUpLine = (key: string) =>
   `[slack] persona=${key}: not relaunched — its bring-up has not succeeded; eligible again once it is up`
+
+/** The gate's line for a persona outside the applied set (b.av2 SR-8.6). */
+const notAppliedLine = (key: string) =>
+  `[slack] persona=${key}: not relaunched — it is no longer in the applied configuration`
 
 // Status fixtures: only `state` and `phase` matter to the gate.
 const UNREACHABLE = { kind: 'slack-unreachable' } as never
@@ -205,13 +214,57 @@ describe('createPersonaRelaunchGate: true only while the persona\'s connection i
     ])
     assertNoLeak({ lines })
   })
+
+  // The applied-set guard's single answers (refused with the applied-set line whatever the status or outcome;
+  // allowed and silent when applied or without the query) are rows of the predicate/gate table below.
+  test('the applied set is read live per key: the applied-set line logs once per refusal episode, a change of reason logs again, being eligible re-arms it; personas are independent', () => {
+    const statuses = new Map<string, PersonaConnectionStatus>([['persona_a', UP], ['persona_b', UP]])
+    const applied = new Set(['persona_a', 'persona_b'])
+    const lines: string[] = []
+    const canRelaunch = createPersonaRelaunchGate(
+      { status: (key) => statuses.get(key) },
+      (line) => void lines.push(line),
+      { isUp: () => true, isApplied: (key) => applied.has(key) },
+    )
+    const ask = (key: string, times = 2) => Array.from({ length: times }, () => canRelaunch(key))
+
+    expect(ask('persona_a')).toEqual([true, true])
+    // A is removed (its connection still serves until teardown): refused, one line.
+    applied.delete('persona_a')
+    expect(ask('persona_a')).toEqual([false, false])
+    // B is still applied: unaffected.
+    expect(ask('persona_b')).toEqual([true, true])
+    // A's connection stops while it is still not applied: still the applied-set reason, silent.
+    statuses.set('persona_a', { state: 'stopped' })
+    expect(ask('persona_a')).toEqual([false, false])
+    // A is applied again but not serving: the connection reason, logged.
+    applied.add('persona_a')
+    expect(ask('persona_a')).toEqual([false, false])
+    // Removed again: the applied-set reason logs again.
+    applied.delete('persona_a')
+    expect(ask('persona_a')).toEqual([false, false])
+    // Applied and serving: eligible, re-armed; removed once more: logged again.
+    applied.add('persona_a')
+    statuses.set('persona_a', UP)
+    expect(ask('persona_a')).toEqual([true, true])
+    applied.delete('persona_a')
+    expect(ask('persona_a')).toEqual([false, false])
+
+    expect(lines).toEqual([
+      notAppliedLine('persona_a'),
+      gateLine('persona_a', 'stopped'),
+      notAppliedLine('persona_a'),
+      notAppliedLine('persona_a'),
+    ])
+    assertNoLeak({ lines })
+  })
 })
 
 // ---------------------------------------------------------------------------
 // The up predicate: its truth table, and the gate's answer on every row
 // ---------------------------------------------------------------------------
 
-describe('createPersonaUpPredicate: up while the connection is serving and the bring-up outcome is up, the same answer as the gate', () => {
+describe('createPersonaUpPredicate: up while the connection is serving, the bring-up outcome is up and the key is applied, the same answer as the gate', () => {
   // Every connection status, with whether it is serving (up, lost, or retrying a reopen).
   const STATUSES: Array<[string, PersonaConnectionStatus | undefined, boolean]> = [
     ['up', UP, true],
@@ -224,17 +277,26 @@ describe('createPersonaUpPredicate: up while the connection is serving and the b
     ['stopped', { state: 'stopped' }, false],
     ['unknown to the manager', undefined, false],
   ]
+  // The applied set: `isApplied` true, false, or absent (the query without it counts every key as applied).
+  // Not applied wins over serving and up: MCP admission, the permission poller and /interject refuse a removed key.
+  const APPLIED: Array<boolean | undefined> = [true, false, undefined]
   const ROWS = STATUSES.flatMap(([label, status, serving]) =>
-    [true, false].map((outcomeUp) => [label, outcomeUp, serving && outcomeUp, status] as const),
+    [true, false].flatMap((outcomeUp) =>
+      APPLIED.map((applied) => [label, outcomeUp, applied, serving && outcomeUp && applied !== false, status] as const),
+    ),
   )
 
-  test.each(ROWS)('connection %s, bring-up outcome up=%p → up: %p; the gate allows exactly when the predicate says up', (_label, outcomeUp, expected, status) => {
+  test.each(ROWS)('connection %s, bring-up outcome up=%p, applied=%p → up: %p; the gate allows exactly when the predicate says up', (_label, outcomeUp, applied, expected, status) => {
     const statusReads: string[] = []
-    const outcomeAsks: string[] = []
+    const asks: string[] = []
+    const lines: string[] = []
     const connections = { status: (key: string) => (statusReads.push(key), status) }
-    const outcomes = { isUp: (key: string) => (outcomeAsks.push(key), outcomeUp) }
+    const outcomes = {
+      isUp: (key: string) => (asks.push(key), outcomeUp),
+      ...(applied === undefined ? {} : { isApplied: (key: string) => (asks.push(key), applied) }),
+    }
     const isPersonaUp = createPersonaUpPredicate(connections, outcomes)
-    const canRelaunch = createPersonaRelaunchGate(connections, () => {}, outcomes)
+    const canRelaunch = createPersonaRelaunchGate(connections, (l) => void lines.push(l), outcomes)
 
     const up = isPersonaUp('persona_a')
     expect(up).toBe(expected)
@@ -243,7 +305,10 @@ describe('createPersonaUpPredicate: up while the connection is serving and the b
     statusReads.length = 0
     expect(canRelaunch('persona_a')).toBe(up)
     expect(statusReads).toEqual(['persona_a'])
-    expect(outcomeAsks.every((key) => key === 'persona_a')).toBe(true)
+    expect(asks.every((key) => key === 'persona_a')).toBe(true)
+    // A refusal logs one line; a key outside the applied set is named as such, whatever the status or outcome.
+    expect(lines.length).toBe(up ? 0 : 1)
+    if (applied === false) expect(lines).toEqual([notAppliedLine('persona_a')])
   })
 })
 

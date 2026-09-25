@@ -29,7 +29,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync, realpathSync } from 'fs'
+import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync, readSync, realpathSync } from 'fs'
 import { homedir } from 'os'
 import { dirname, isAbsolute, join, resolve } from 'path'
 
@@ -504,8 +504,12 @@ export function tryResolveRealPath(
  * The current file is read tolerantly and not validated, so a file with an
  * invalid edit still protects the paths it names. It is read through
  * `readPersonaConfigBytes`, so a path that is not a regular file (a FIFO or a
- * device) is never read. An unreadable or non-regular file, unparseable JSON,
- * or a file without a `personas` array contributes nothing; this never throws. The file's contents never appear in the result beyond
+ * device) is never read. It is the one read of that reader without the 64 KiB
+ * cap (`uncapped`): a configuration file larger than `MAX_RELOAD_FILE_BYTES`
+ * still protects the paths it names, so the cap never shrinks what the guard
+ * refuses. An unreadable or non-regular file, unparseable JSON, or a file
+ * without a `personas` array contributes nothing; this never throws. The
+ * file's contents never appear in the result beyond
  * the paths themselves. Callers compare the returned paths by
  * `resolveRealPath`.
  *
@@ -526,7 +530,7 @@ export function credentialsFilesToProtect(
   const paths = appliedPersonas.map((p) => p.credentials_file)
   let bytes: Buffer
   try {
-    bytes = readPersonaConfigBytes(resolve(expandTildeWith(configPath, home)), fs)
+    bytes = readPersonaConfigBytes(resolve(expandTildeWith(configPath, home)), fs, { uncapped: true })
   } catch {
     return paths
   }
@@ -1286,10 +1290,60 @@ export function resolveServerConfigPath(home?: string, env: NodeJS.ProcessEnv = 
 export const CONFIG_NOT_REGULAR_FILE_CODE = 'not a regular file'
 
 /**
+ * The largest file the shared readers read, in bytes (64 KiB): the persona
+ * configuration file, the last-applied record, `config.json.pending` and
+ * `config.json.apply` (`readPersonaConfigBytes`), and a credentials file
+ * (`readCredentialsFile` in `persona-credentials.ts`). A larger file is
+ * refused as unreadable and never read past `MAX_RELOAD_FILE_BYTES + 1`
+ * bytes. No legitimate file comes near it; the cap bounds the memory and
+ * hashing work a file grown by mistake could cost. Applied in the readers
+ * rather than by one caller, so the start, the bring-up and the reload tick
+ * see the same outcome (and the same credentials digest marker) for one file.
+ * One read is exempt: the SR-5.2 file guard's read of the configuration file
+ * (`credentialsFilesToProtect`, `readPersonaConfigBytes` with `uncapped`).
+ */
+export const MAX_RELOAD_FILE_BYTES = 64 * 1024
+
+/** `MAX_RELOAD_FILE_BYTES` as worded in messages: `64 KiB`. */
+export const MAX_RELOAD_FILE_SIZE_TEXT = `${MAX_RELOAD_FILE_BYTES / 1024} KiB`
+
+/**
+ * The code of a read refused because the file is larger than
+ * `MAX_RELOAD_FILE_BYTES` (`PersonaConfigReadError.code`). An errno name, so
+ * it passes the safe-code check wherever a code is echoed; messages word it
+ * as "larger than the 64 KiB limit" rather than echoing the bare code.
+ */
+export const FILE_TOO_LARGE_CODE = 'EFBIG'
+
+/**
+ * Read at most `maxBytes` bytes from the start of the file behind an open
+ * descriptor, stopping at end of file. Never reads more than `maxBytes`, so a
+ * file that is larger (or grows while it is read) costs at most that much.
+ * Returns a buffer of exactly the bytes read. Throws an errno-style error
+ * (with `code`) on failure. The real-fs bounded read of both shared readers;
+ * `maxBytes` defaults to one byte more than the readers' limit. A `maxBytes`
+ * of `Infinity` is the one unbounded read: the whole file, to end of file
+ * (`readPersonaConfigBytes` with `uncapped`).
+ */
+export function readFdAtMost(fd: number, maxBytes: number = MAX_RELOAD_FILE_BYTES + 1): Buffer {
+  if (maxBytes === Infinity) return readFileSync(fd)
+  const scratch = Buffer.alloc(maxBytes)
+  let filled = 0
+  while (filled < maxBytes) {
+    const n = readSync(fd, scratch, filled, maxBytes - filled, filled)
+    if (n === 0) break
+    filled += n
+  }
+  return Buffer.from(scratch.subarray(0, filled))
+}
+
+/**
  * `readPersonaConfigBytes` could not read the file (missing, unreadable, a
- * directory, not a regular file, …). The message names the path; `code` is
- * the errno code when the read error carried a safe one (`EISDIR` for a
- * directory), or `CONFIG_NOT_REGULAR_FILE_CODE` for a FIFO, socket or device.
+ * directory, not a regular file, larger than the limit, …). The message names
+ * the path; `code` is the errno code when the read error carried a safe one
+ * (`EISDIR` for a directory), `FILE_TOO_LARGE_CODE` for a file larger than
+ * `MAX_RELOAD_FILE_BYTES`, or `CONFIG_NOT_REGULAR_FILE_CODE` for a FIFO,
+ * socket or device.
  */
 export class PersonaConfigReadError extends Error {
   readonly code: string | undefined
@@ -1315,19 +1369,45 @@ export interface PersonaConfigFs {
    * the descriptor. Throws an errno-style error (with `code`) on failure.
    */
   openFile(path: string): number
-  /** Stat an open descriptor. Throws an errno-style error (with `code`) on failure. */
-  fstatFile(fd: number): { isFile(): boolean; isDirectory(): boolean }
-  /** Read the whole file behind an open descriptor as bytes. Throws an errno-style error (with `code`) on failure. */
-  readFileFd(fd: number): Buffer
+  /**
+   * Stat an open descriptor. `size` is the file's size in bytes; the reader
+   * refuses a file larger than `MAX_RELOAD_FILE_BYTES` before reading it. An
+   * override may omit `size`: the bounded read (`readFileFd`) enforces the
+   * limit either way. Throws an errno-style error (with `code`) on failure.
+   */
+  fstatFile(fd: number): { isFile(): boolean; isDirectory(): boolean; size?: number }
+  /**
+   * Read at most `maxBytes` bytes from the start of the file behind an open
+   * descriptor (`readFdAtMost`). The reader asks for one byte more than the
+   * limit, so it can tell a file over the limit (even one that grew after the
+   * stat) and never reads the rest. An override that returns more than
+   * `maxBytes` bytes is still refused as over the limit. `maxBytes` defaults
+   * to `MAX_RELOAD_FILE_BYTES + 1`, so a caller that omits it still gets a
+   * bounded read. An uncapped read (`ReadPersonaConfigBytesOptions.uncapped`)
+   * passes `Infinity`: read the whole file. Throws an errno-style error (with
+   * `code`) on failure.
+   */
+  readFileFd(fd: number, maxBytes?: number): Buffer
   /** Close a descriptor opened by `openFile`. A failure is ignored. */
   closeFile(fd: number): void
+}
+
+/** How `readPersonaConfigBytes` reads. */
+export interface ReadPersonaConfigBytesOptions {
+  /**
+   * Read the whole file, with no `MAX_RELOAD_FILE_BYTES` cap. Only the SR-5.2
+   * file guard's read (`credentialsFilesToProtect`) sets it; every other
+   * caller stays capped. Stat-first is unchanged: a directory or a
+   * non-regular file is still refused and never read.
+   */
+  uncapped?: boolean
 }
 
 /** The real file system for `readPersonaConfigBytes`, looked up at call time. */
 export const DEFAULT_PERSONA_CONFIG_FS: PersonaConfigFs = {
   openFile: (path) => openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK),
   fstatFile: (fd) => fstatSync(fd),
-  readFileFd: (fd) => readFileSync(fd),
+  readFileFd: (fd, maxBytes) => readFdAtMost(fd, maxBytes),
   closeFile: (fd) => closeSync(fd),
 }
 
@@ -1410,17 +1490,36 @@ export function parsePersonaConfigBytes(
  * checked is the file read). A directory fails with `EISDIR`; any other
  * non-regular file (a FIFO, socket or device, after following symlinks) fails
  * with `CONFIG_NOT_REGULAR_FILE_CODE` and is never read: a FIFO would block
- * the read forever and a device such as `/dev/zero` would never end. There is
- * no size cap.
+ * the read forever and a device such as `/dev/zero` would never end.
+ *
+ * Size cap: a regular file larger than `MAX_RELOAD_FILE_BYTES` (64 KiB) fails
+ * with `FILE_TOO_LARGE_CODE`, worded "larger than the 64 KiB limit" and
+ * carrying no file content. It is refused on the stat's size before any read,
+ * and the read itself is bounded (at most `MAX_RELOAD_FILE_BYTES + 1` bytes),
+ * so a file that grows after the stat, or a stat that under-reports, is still
+ * refused and never read in full.
+ *
+ * The one exception is `options.uncapped`, set only by the SR-5.2 file guard
+ * (`credentialsFilesToProtect`): the file guard must never protect fewer
+ * credentials files because the configuration file grew past the cap, so
+ * that read has no size limit and reads the whole file (stat-first still
+ * applies). Every other caller (the start, the record, the pending and apply
+ * files, the reload tick) is capped.
  *
  * @param configPath  Absolute path of the file.
  * @param fs          File-system overrides; unset operations use `DEFAULT_PERSONA_CONFIG_FS`.
+ * @param options     `uncapped` for the file guard's read only.
  */
-export function readPersonaConfigBytes(configPath: string, fs?: Partial<PersonaConfigFs>): Buffer {
+export function readPersonaConfigBytes(
+  configPath: string,
+  fs?: Partial<PersonaConfigFs>,
+  options: ReadPersonaConfigBytesOptions = {},
+): Buffer {
   const io: PersonaConfigFs = { ...DEFAULT_PERSONA_CONFIG_FS, ...fs }
   const failure = (cause: string, code: string | undefined) =>
     new PersonaConfigReadError(`loadPersonaConfig: cannot read persona config at "${configPath}": ${cause}`, code)
   const errnoFailure = (err: unknown) => failure(err instanceof Error ? err.message : String(err), readErrnoCode(err))
+  const tooLarge = () => failure(`it is larger than the ${MAX_RELOAD_FILE_SIZE_TEXT} limit`, FILE_TOO_LARGE_CODE)
 
   let fd: number
   try {
@@ -1429,7 +1528,7 @@ export function readPersonaConfigBytes(configPath: string, fs?: Partial<PersonaC
     throw errnoFailure(err)
   }
   try {
-    let stats: { isFile(): boolean; isDirectory(): boolean }
+    let stats: ReturnType<PersonaConfigFs['fstatFile']>
     try {
       stats = io.fstatFile(fd)
     } catch (err) {
@@ -1437,11 +1536,16 @@ export function readPersonaConfigBytes(configPath: string, fs?: Partial<PersonaC
     }
     if (stats.isDirectory()) throw failure('it is a directory', 'EISDIR')
     if (!stats.isFile()) throw failure(`it is ${CONFIG_NOT_REGULAR_FILE_CODE}`, CONFIG_NOT_REGULAR_FILE_CODE)
+    const uncapped = options.uncapped === true
+    if (!uncapped && typeof stats.size === 'number' && stats.size > MAX_RELOAD_FILE_BYTES) throw tooLarge()
+    let bytes: Buffer
     try {
-      return io.readFileFd(fd)
+      bytes = io.readFileFd(fd, uncapped ? Infinity : MAX_RELOAD_FILE_BYTES + 1)
     } catch (err) {
       throw errnoFailure(err)
     }
+    if (!uncapped && bytes.length > MAX_RELOAD_FILE_BYTES) throw tooLarge()
+    return bytes
   } finally {
     try {
       io.closeFile(fd)
@@ -1479,15 +1583,27 @@ export function isMissingConfigCode(code: string | undefined): boolean {
 }
 
 /**
+ * What is wrong with a file `readPersonaConfigBytes` could not read, as the
+ * predicate after the file's name: `does not exist`, `is larger than the 64
+ * KiB limit` (`FILE_TOO_LARGE_CODE`), or `cannot be read` with the code in
+ * parentheses when there is one. Carries no file content. The one wording of
+ * a read failure for the start, the reload tick's invalid candidate and any
+ * other message that names a configuration, record, pending or apply file.
+ */
+export function configReadFailurePredicate(code: string | undefined): string {
+  if (isMissingConfigCode(code)) return 'does not exist'
+  if (code === FILE_TOO_LARGE_CODE) return `is larger than the ${MAX_RELOAD_FILE_SIZE_TEXT} limit`
+  return `cannot be read${code !== undefined ? ` (${code})` : ''}`
+}
+
+/**
  * The start's message for a configuration file it cannot read (b.av2 SR-8.7):
- * names the path, says whether it does not exist or cannot be read (with the
- * errno code), and that the server requires the configuration file to start.
+ * names the path, says whether it does not exist, is larger than the 64 KiB
+ * limit or cannot be read (with the errno code), and that the server requires
+ * the configuration file to start.
  */
 export function configFileReadFailureMessage(configPath: string, code: string | undefined): string {
-  const what = isMissingConfigCode(code)
-    ? 'does not exist'
-    : `cannot be read${code !== undefined ? ` (${code})` : ''}`
-  return `The configuration file "${configPath}" ${what}. The server requires the configuration file to start.`
+  return `The configuration file "${configPath}" ${configReadFailurePredicate(code)}. The server requires the configuration file to start.`
 }
 
 /** An errno code that is safe to echo: `E` plus upper-case letters and digits. */

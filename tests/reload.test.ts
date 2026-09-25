@@ -18,15 +18,20 @@
  * `reload-preview`, once per pending-state change), the INVALID form
  * (`reload-invalid`), an added persona that cannot come up and a fact the
  * tick could not gather. The plan and renderer on their own are
- * `reload-preview.test.ts`'s. Every test runs `assertNoLeak` over what each
- * run captured and checks no Slack post.
+ * `reload-preview.test.ts`'s. Confirmation and apply (SR-8.5, SR-8.6): the
+ * rename that applies (AC 73), invalid (AC 63), stale (AC 69), malformed,
+ * unreadable and undeletable confirmations, step 1's record write and its
+ * failures, the pending file rewritten after a consumed confirmation (AC 56),
+ * `reload-noop`, and the order of the step 2–6 slots; the 64 KiB read cap on
+ * the start, tick and confirmation paths. Every test runs `assertNoLeak` over
+ * what each run captured and checks no Slack post.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync, readdirSync, statSync, symlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, symlinkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 import {
@@ -36,10 +41,20 @@ import {
   type PersonaInput,
 } from '../src/config.ts'
 import type { PersonaBringUpOutcome } from '../src/persona-bringup-controller.ts'
-import { RELOAD_INVALID, RELOAD_NOTHING_PENDING, RELOAD_PREVIEW, RELOAD_RECORD_WRITE_FAILED } from '../src/reload.ts'
+import { CREDENTIALS_UNREADABLE_MARKER } from '../src/persona-credentials.ts'
+import {
+  RELOAD_APPLIED,
+  RELOAD_INVALID,
+  RELOAD_NOOP,
+  RELOAD_NOTHING_PENDING,
+  RELOAD_PREVIEW,
+  RELOAD_RECORD_WRITE_FAILED,
+  RELOAD_STALE_CONFIRMATION,
+} from '../src/reload.ts'
+import { APPLY_STEPS, type ApplyStepInputs, type ApplyStepName, type ApplyStepSlots } from '../src/reload-apply.ts'
 import { composePendingFile, PENDING_FILE_HEADER, reloadFingerprint } from '../src/reload-fingerprint.ts'
 import { createReloadTickDriver } from '../src/reload-timer.ts'
-import { assertNoLeak, fakeToken, LEAK_SENTINEL, writtenFile } from './test-helpers/credentials.ts'
+import { assertNoLeak, fakeToken, LEAK_SENTINEL, makeCredentials, writtenFile } from './test-helpers/credentials.ts'
 import {
   makeReloadHarness,
   mkfifoAvailable,
@@ -172,13 +187,18 @@ interface PreviewCounts {
   settings?: number
 }
 
+/** The counts as the preview header and the `reload-applied` line word them. */
+function countsText(c: PreviewCounts): string {
+  return (
+    `personas: ${c.added ?? 0} added, ${c.removed ?? 0} removed, ${c.destructive ?? 0} destructively modified, ` +
+    `${c.inPlace ?? 0} modified in place, ${c.credentials ?? 0} with changed credentials; ` +
+    `server-wide settings: ${c.settings ?? 0} changed`
+  )
+}
+
 /** A valid candidate's preview header (b.av2 SR-8.4) with these counts. */
 function previewHeader(c: PreviewCounts = {}): string {
-  return (
-    `A configuration change is pending; nothing has been applied. personas: ${c.added ?? 0} added, ` +
-    `${c.removed ?? 0} removed, ${c.destructive ?? 0} destructively modified, ${c.inPlace ?? 0} modified in place, ` +
-    `${c.credentials ?? 0} with changed credentials; server-wide settings: ${c.settings ?? 0} changed.`
-  )
+  return `A configuration change is pending; nothing has been applied. ${countsText(c)}.`
 }
 
 /** The whole preview of a candidate with no effect. */
@@ -233,10 +253,15 @@ function pendingRemoved(logs: string[] = [nothingPendingRemoved()]): ReloadRunAc
   return { ...NO_RUN_ACTIVITY, logs, removes: [{ path: h.paths.pending, ok: true, removed: true, unsynced: false }] }
 }
 
+/** Matches a failure line by its opening words, the quoted `path` and the errno code (not the rest of its wording). */
+function failureLine(opening: string, path: string, code: string): string {
+  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return expect.stringMatching(new RegExp(`^${escape(opening)}.*"${escape(path)}".*\\(${code}\\)`))
+}
+
 /** Matches a pending-file write or delete failure line: the `[slack] reload:` prefix, the pending path and the errno code (not its wording). */
 function fileFailureLine(code: string): string {
-  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return expect.stringMatching(new RegExp(`^\\[slack\\] reload: .*"${escape(h.paths.pending)}".*\\(${code}\\)`))
+  return failureLine('[slack] reload: ', h.paths.pending, code)
 }
 
 /**
@@ -421,6 +446,11 @@ describe('a start without a record applies the configuration file or refuses', (
   test.each([
     { label: 'missing', setUp: () => h.remove(h.paths.config), expected: 'does not exist' },
     { label: 'a directory', setUp: () => h.replaceWithDirectory(h.paths.config), expected: 'cannot be read (EISDIR)' },
+    {
+      label: 'larger than the 64 KiB read cap',
+      setUp: () => void h.writeOversized(h.paths.config, { prefix: JSON.stringify(configOf(h.persona('alpha'))) }),
+      expected: 'is larger than the 64 KiB limit',
+    },
   ])('AC 71: a configuration file that is $label refuses the start and names the file', async ({ setUp, expected }) => {
     setUp()
 
@@ -592,6 +622,11 @@ describe('a start with a record runs the record', () => {
       label: 'cannot be read (a directory at its path)',
       setUp: () => h.replaceWithDirectory(h.paths.lastApplied),
       expected: () => `The last-applied record "${h.paths.lastApplied}" cannot be read (EISDIR).`,
+    },
+    {
+      label: 'is larger than the 64 KiB read cap',
+      setUp: () => void h.writeOversized(h.paths.lastApplied, { prefix: JSON.stringify(configOf(h.persona('alpha'))) }),
+      expected: () => `The last-applied record "${h.paths.lastApplied}" is larger than the 64 KiB limit.`,
     },
     {
       label: 'has a JSON syntax error (line and column, no content)',
@@ -2273,6 +2308,896 @@ describe('a pending-file write or delete that fails is logged once per episode a
     const good = run.checkpoint()
     await run.ticks.ticks(3)
     expect(run.since(good)).toEqual(pendingWritten())
+    expectNoPostNoLeak(run)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Confirmation and apply (b.av2 SR-8.5, SR-8.6; AC 63, AC 69, AC 73, AC 56 last clause)
+// ---------------------------------------------------------------------------
+
+/** The `reload-applied` line of a confirmed change with these counts (the preview header's terms). */
+function appliedLogged(c: PreviewCounts = {}): string {
+  return (
+    `[slack] ${RELOAD_APPLIED}: applied the confirmed configuration change without a restart (${countsText(c)}); ` +
+    `the last-applied record ${JSON.stringify(h.paths.lastApplied)} now holds it`
+  )
+}
+
+/** The `reload-noop` line. */
+function noopLogged(): string {
+  return (
+    `[slack] ${RELOAD_NOOP}: the confirmed configuration has no effective change, so no persona and no server-wide ` +
+    `setting changed; the last-applied record ${JSON.stringify(h.paths.lastApplied)} was rewritten with it`
+  )
+}
+
+/** The `reload-invalid` line of a confirmed invalid candidate, carrying the loader's full error. */
+function confirmedInvalidLogged(error: string): string {
+  return `[slack] ${RELOAD_INVALID}: the confirmed configuration is invalid, so nothing is applied: ${error}`
+}
+
+/** Why a confirmation is stale, as its `reload-stale-confirmation` line says it. */
+const STALE_MISMATCH =
+  'does not match the configuration as it stands (the configuration file or a credentials file it references ' +
+  'changed after that preview was written)'
+const STALE_MALFORMED = 'holds no well-formed fingerprint (it is not a pending-change file as the server writes it)'
+const STALE_TOO_LARGE = 'is larger than the 64 KiB limit'
+
+/** The one `reload-stale-confirmation` line. */
+function staleLogged(what: string): string {
+  return `[slack] ${RELOAD_STALE_CONFIRMATION}: the confirmation ${JSON.stringify(h.paths.apply)} ${what}; nothing is applied`
+}
+
+/** Matches the line of a confirmation whose delete failed with `code` (its opening words, the apply path and the code). */
+function undeletableLogged(code: string): string {
+  return failureLine('[slack] reload: cannot remove the confirmation ', h.paths.apply, code)
+}
+
+/** Matches the line of a confirmation removed although its directory sync failed with `code`. */
+function removedUnsyncedLogged(code: string): string {
+  return failureLine('[slack] reload: removed the confirmation ', h.paths.apply, code)
+}
+
+/** A durable delete that removed the confirmation, and one that failed. */
+function applyRemoved(): ReloadRunActivity['removes'][number] {
+  return { path: h.paths.apply, ok: true, removed: true, unsynced: false }
+}
+function applyNotRemoved(): ReloadRunActivity['removes'][number] {
+  return { path: h.paths.apply, ok: false, removed: undefined, unsynced: false }
+}
+
+/**
+ * `activity` with its lifecycle records left out: a confirmed change's
+ * teardowns and bring-ups are bound by later work, so these cases neither
+ * assert them nor their absence for a changed persona.
+ */
+function outsideLifecycle(activity: ReloadRunActivity): ReloadRunActivity {
+  return { ...activity, lifecycle: [] }
+}
+
+/** One call of a recording apply-step slot: its step, what it acted on, and what step 1 had done by then. */
+interface SlotCall {
+  step: ApplyStepName
+  keys: string[] | boolean
+  recordIsCandidate: boolean
+  applied: string[] | undefined
+}
+
+/**
+ * Apply-step slots that record each call, in order, with the keys their step
+ * acts on (the config-directories flag for the template refresh), whether
+ * the record already held `candidate()` and the applied keys at that moment.
+ * `failing` names a step whose body rejects after recording.
+ */
+function recordingSlots(run: () => ReloadRun, candidate: () => Buffer | undefined, failing?: ApplyStepName) {
+  const calls: SlotCall[] = []
+  const events: string[] = []
+  const actedOn = (inputs: ApplyStepInputs, step: ApplyStepName): string[] | boolean => {
+    switch (step) {
+      case 'teardowns':
+        return inputs.teardowns.map((p) => p.key)
+      case 'in-place-updates':
+        return inputs.inPlaceUpdates.map((u) => u.persona.key)
+      case 'credentials-reconnects':
+        return inputs.credentialsReconnects.map((c) => c.persona.key)
+      case 'template-refresh':
+        return inputs.configDirsChanged
+      case 'bring-ups':
+        return inputs.bringUps.map((p) => p.key)
+    }
+  }
+  const slot = (step: ApplyStepName) => async (inputs: ApplyStepInputs) => {
+    events.push(`start ${step}`)
+    const record = h.readRecord()
+    calls.push({
+      step,
+      keys: actedOn(inputs, step),
+      recordIsCandidate: record !== undefined && record.equals(candidate() ?? Buffer.alloc(0)),
+      applied: run().appliedKeys(),
+    })
+    // A later step must not start before this one settles.
+    await new Promise((done) => setImmediate(done))
+    events.push(`end ${step}`)
+    if (step === failing) throw new Error(`slot ${step} failed`)
+  }
+  const slots: ApplyStepSlots = Object.fromEntries(APPLY_STEPS.map((step) => [step, slot(step)]))
+  return { slots, calls, events }
+}
+
+/**
+ * A running server over `names` (see `running`) whose config file then drops
+ * the last of them, checked once so the pending file holds the removal.
+ */
+async function pendingRemoval(names: string[], opts?: ReloadRunOptions) {
+  const started = await running(names, opts)
+  const configBytes = h.writeConfig(configOf(...started.personas.slice(0, -1)))
+  await started.run.ticks.tick()
+  expect(h.pendingHeader()).toBe(previewHeader({ removed: 1 }))
+  return { ...started, configBytes, fingerprint: h.pendingFingerprint()! }
+}
+
+describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
+  test('AC 73: one rename of the pending file applies a removal: the record becomes the config bytes, the applied set shrinks, the confirmation is gone, nothing is pending and one reload-applied line is logged', async () => {
+    const { run, configBytes } = await pendingRemoval(['alpha', 'bravo'])
+    const cp = run.checkpoint()
+
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(h.readRecord()).toEqual(configBytes)
+    expect(run.appliedKeys()).toEqual(keysOf('alpha'))
+    expect(run.appliedConfigs.map((c) => c.personas.map((p) => p.key))).toEqual([keysOf('alpha')])
+    expect(run.controller.applied()?.bytes).toEqual(new Uint8Array(configBytes))
+    expect(h.configDirEntries()).toEqual(['config.json', 'config.json.last-applied'])
+    // No reload-nothing-pending line: the apply's own line says what happened.
+    expect(outsideLifecycle(run.since(cp))).toEqual({
+      ...NO_RUN_ACTIVITY,
+      logs: [appliedLogged({ removed: 1 })],
+      writes: [{ path: h.paths.lastApplied, ok: true }],
+      removes: [applyRemoved()],
+    })
+
+    // Used once: later ticks apply nothing further.
+    const after = run.checkpoint()
+    await run.ticks.ticks(10)
+    expect(run.since(after)).toEqual(NO_RUN_ACTIVITY)
+    expectNoPostNoLeak(run)
+  })
+
+  test('AC 73: a confirmed addition rewrites the record and puts the new key in the applied set, with one reload-applied line', async () => {
+    const [charlie] = materialized('charlie')
+    const { run, personas } = await running(['alpha'])
+    const configBytes = h.writeConfig(configOf(personas[0]!, charlie!))
+    await run.ticks.tick()
+
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(h.readRecord()).toEqual(configBytes)
+    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'charlie'))
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ added: 1 })])
+    expect(h.applyExists()).toBe(false)
+    expectNoPostNoLeak(run)
+  })
+
+  test('after an apply, detection compares with the new applied set: the old config back is previewed as an addition', async () => {
+    const { run, recordBytes } = await pendingRemoval(['alpha', 'bravo'])
+    h.confirm()
+    await run.ticks.tick()
+    const cp = run.checkpoint()
+
+    h.writeConfigBytes(recordBytes)
+    await run.ticks.ticks(3)
+
+    expect(h.pendingHeader()).toBe(previewHeader({ added: 1 }))
+    expect(h.pendingLines()).toContain(addedLine('bravo'))
+    expect(run.since(cp)).toEqual(pendingWritten())
+    expectNoPostNoLeak(run)
+  })
+
+  test('a confirmation made while the server was down is applied by the first check after a start from the record', async () => {
+    const { run, recordBytes, configBytes } = await pendingRemoval(['alpha', 'bravo'])
+    await run.stop()
+    h.confirm()
+
+    const next = await h.startDetecting()
+    expect(next.outcome.kind === 'applied' && next.outcome.source).toBe('record')
+    expect(broughtUp(next)).toEqual(keysOf('alpha', 'bravo'))
+    expect(h.readRecord()).toEqual(recordBytes)
+    await next.ticks.tick()
+
+    expect(h.readRecord()).toEqual(configBytes)
+    expect(next.appliedKeys()).toEqual(keysOf('alpha'))
+    expect(next.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1 })])
+    expect(h.applyExists()).toBe(false)
+    expect(h.pendingExists()).toBe(false)
+    expectNoPostNoLeak(run, next)
+  })
+
+  test('the confirmation is deleted before anything is applied: it is gone when the record is written and when the server is told the new set', async () => {
+    const seen: Array<[string, boolean]> = []
+    const { run } = await pendingRemoval(['alpha', 'bravo'], {
+      beforeWrite: (path) => void (path === h.paths.lastApplied && seen.push(['record write', h.applyExists()])),
+      onApplied: () => void seen.push(['onApplied', h.applyExists()]),
+    })
+
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(seen).toEqual([
+      ['record write', false],
+      ['onApplied', false],
+    ])
+    expectNoPostNoLeak(run)
+  })
+
+  // AC 63: an invalid candidate, confirmed, changes nothing and logs the loader's full error.
+  test.each<{ label: string; edit: (alpha: PersonaInput) => void; error: () => string }>([
+    {
+      label: 'a JSON syntax error',
+      edit: () => void h.writeConfigBytes(malformedWithSentinel()),
+      error: () => `loadPersonaConfig: malformed JSON in "${h.paths.config}" at line 3, column 5.`,
+    },
+    {
+      label: 'a schema violation',
+      edit: (alpha) => void h.writeConfig(configOf({ ...alpha, channels: [{ id: alpha.channels![0]!.id, delivery: 'sometimes' as 'all' }] })),
+      error: () =>
+        `loadPersonaConfig: invalid persona config in "${h.paths.config}": Persona config validation error: ` +
+        `personas[0] "alpha" (key=${h.key('alpha')}): channels[0].delivery is invalid. Allowed values are: all, mentions.`,
+    },
+    {
+      label: 'the pre-persona shape',
+      edit: () => void h.writeConfig({ routes: {}, default_route: 'C0OLD' }),
+      error: () =>
+        `loadPersonaConfig: invalid persona config in "${h.paths.config}": Persona config validation error: ` +
+        prePersonaConversionMessage('routes'),
+    },
+    { label: 'the config file missing', edit: () => h.deleteConfig(), error: () => `the configuration file "${h.paths.config}" does not exist.` },
+  ])('AC 63: a confirmed INVALID candidate ($label) applies nothing, deletes the confirmation, logs one reload-invalid line with the full error and rewrites the INVALID preview', async ({ edit, error }) => {
+    let run!: ReloadRun
+    const slots = recordingSlots(() => run, () => h.readConfig())
+    const started = await running(['alpha'], { applySteps: slots.slots })
+    run = started.run
+    edit(started.personas[0]!)
+    await run.ticks.tick()
+    expect(h.pendingLines()).toEqual(invalidPreview(error()))
+    const pendingBytes = h.readPending()
+    const applied = run.controller.applied()
+    const cp = run.checkpoint()
+
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(run.since(cp)).toEqual({
+      ...NO_RUN_ACTIVITY,
+      logs: [confirmedInvalidLogged(error())],
+      writes: [{ path: h.paths.pending, ok: true }],
+      removes: [applyRemoved()],
+    })
+    expect(h.readPending()).toEqual(pendingBytes)
+    expect(h.readRecord()).toEqual(started.recordBytes)
+    expect(run.controller.applied()).toBe(applied)
+    expect(run.appliedConfigs).toEqual([])
+    expect(slots.calls).toEqual([])
+    expect(h.applyExists()).toBe(false)
+    // Checked while the rewritten pending file exists.
+    expectNoPostNoLeak(run)
+
+    const later = run.checkpoint()
+    await run.ticks.ticks(5)
+    expect(run.since(later)).toEqual(NO_RUN_ACTIVITY)
+  })
+
+  test('AC 63: a confirmation of an INVALID candidate present at a start is logged as exactly one reload-invalid line on the first check', async () => {
+    const { run, recordBytes } = await running(['alpha'])
+    h.writeConfigBytes(malformedWithSentinel())
+    await run.ticks.tick()
+    await run.stop()
+    h.confirm()
+
+    const next = await h.startDetecting()
+    await next.ticks.ticks(5)
+
+    const error = `loadPersonaConfig: malformed JSON in "${h.paths.config}" at line 3, column 5.`
+    expect(next.invalidLines()).toEqual([confirmedInvalidLogged(error)])
+    expect(h.pendingLines()).toEqual(invalidPreview(error))
+    expect(h.readRecord()).toEqual(recordBytes)
+    expect(next.appliedConfigs).toEqual([])
+    expect(next.lifecycle.records.filter((r) => r.via !== 'start')).toEqual([])
+    expect(h.applyExists()).toBe(false)
+    expectNoPostNoLeak(run, next)
+  })
+
+  test('AC 69: a confirmation made stale by an edit before the next check applies nothing and is logged once, and (AC 56) the pending file is rewritten on that check; a revert to its content needs a fresh rename, which then applies', async () => {
+    const { run, personas, recordBytes, configBytes, fingerprint } = await pendingRemoval(['alpha', 'bravo'])
+    const [alpha, bravo] = personas
+    const applied = run.controller.applied()
+
+    h.confirm()
+    h.writeConfig({ ...configOf(alpha!, bravo!), stop_timeout: 45 })
+    const cp = run.checkpoint()
+    await run.ticks.tick()
+
+    // AC 56 (last clause): the pending file is written again on the same check, with the current fingerprint and preview.
+    expect(h.pendingHeader()).toBe(previewHeader({ settings: 1 }))
+    expect(h.pendingFingerprint()).not.toBe(fingerprint)
+    expect(run.since(cp)).toEqual({ ...pendingWritten([staleLogged(STALE_MISMATCH), ...loggedPreview()]), removes: [applyRemoved()] })
+    expect(h.applyExists()).toBe(false)
+
+    const later = run.checkpoint()
+    await run.ticks.ticks(5)
+    expect(run.since(later)).toEqual(NO_RUN_ACTIVITY)
+
+    // Back to the confirmed content: pending again, but nothing applies without a fresh rename.
+    h.writeConfigBytes(configBytes)
+    const reverted = run.checkpoint()
+    await run.ticks.ticks(5)
+    expect(h.pendingFingerprint()).toBe(fingerprint)
+    expect(run.since(reverted)).toEqual(pendingWritten())
+    expect(h.readRecord()).toEqual(recordBytes)
+    expect(run.controller.applied()).toBe(applied)
+    expect(run.appliedConfigs).toEqual([])
+    expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toEqual([staleLogged(STALE_MISMATCH)])
+
+    h.confirm()
+    await run.ticks.tick()
+    expect(h.readRecord()).toEqual(configBytes)
+    expect(run.appliedKeys()).toEqual(keysOf('alpha'))
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1 })])
+    expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toHaveLength(1)
+    expectNoPostNoLeak(run)
+  })
+
+  test.each([
+    { label: 'makes the confirmation stale', dryRun: false },
+    { label: 'is not compared in dry run, so the confirmation applies', dryRun: true },
+  ])('a referenced credentials file rewritten after the pending file was written $label', async ({ dryRun }) => {
+    const { run, personas, recordBytes, configBytes } = await pendingRemoval(['alpha', 'bravo'], { dryRun })
+
+    h.confirm()
+    h.writeCredentials(personas[0]!)
+    await run.ticks.tick()
+
+    if (dryRun) {
+      expect(h.readRecord()).toEqual(configBytes)
+      expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1 })])
+      expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toEqual([])
+    } else {
+      expect(h.readRecord()).toEqual(recordBytes)
+      expect(run.appliedConfigs).toEqual([])
+      expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toEqual([staleLogged(STALE_MISMATCH)])
+      expect(h.pendingHeader()).toBe(previewHeader({ removed: 1, credentials: 1 }))
+    }
+    expect(h.applyExists()).toBe(false)
+    expectNoPostNoLeak(run)
+  })
+
+  test.each<{ label: string; place: () => void; what: string; opts?: () => ReloadRunOptions }>([
+    {
+      // Not a pending-change file at all, and token-bearing: none of its content reaches the log.
+      label: 'a credentials file placed at the apply path',
+      place: () => void h.writeApplyBytes(JSON.stringify(makeCredentials())),
+      what: STALE_MALFORMED,
+    },
+    {
+      label: 'the pending layout with no fingerprint line',
+      place: () => void h.writeApplyBytes(`${PENDING_FILE_HEADER}\n\n${h.pendingBody()}\n`),
+      what: STALE_MALFORMED,
+    },
+    {
+      label: 'a well-formed but wrong fingerprint',
+      place: () => void h.writeApplyBytes(composePendingFile('0'.repeat(64), h.pendingBody()!)),
+      what: STALE_MISMATCH,
+    },
+    {
+      label: 'a matching copy whose read fails (injected EIO)',
+      place: () => void h.writeApplyBytes(h.readPending()!),
+      what: 'cannot be read (EIO)',
+      opts: () => ({
+        configFs: {
+          openFile: (path) => {
+            if (path === h.paths.apply && h.applyExists()) throw Object.assign(new Error('EIO: injected'), { code: 'EIO' })
+            return DEFAULT_PERSONA_CONFIG_FS.openFile(path)
+          },
+        },
+      }),
+    },
+    {
+      label: 'a matching copy larger than the 64 KiB read cap',
+      place: () => void h.writeOversized(h.paths.apply, { prefix: h.readPending()! }),
+      what: STALE_TOO_LARGE,
+    },
+  ])('a malformed or unreadable confirmation ($label) applies nothing and logs one reload-stale-confirmation line', async ({ place, what, opts }) => {
+    const { run, recordBytes } = await pendingRemoval(['alpha', 'bravo'], opts?.())
+    const applied = run.controller.applied()
+    place()
+    const cp = run.checkpoint()
+
+    await run.ticks.ticks(5)
+
+    // The pending file (still current) is left as it is.
+    expect(run.since(cp)).toEqual({ ...NO_RUN_ACTIVITY, logs: [staleLogged(what)], removes: [applyRemoved()] })
+    expect(h.readRecord()).toEqual(recordBytes)
+    expect(run.controller.applied()).toBe(applied)
+    expect(run.appliedConfigs).toEqual([])
+    expect(h.applyExists()).toBe(false)
+    expectNoPostNoLeak(run)
+  })
+
+  test('a directory at the apply path is unreadable and undeletable: over many checks one reload-stale-confirmation line, one delete-failure line, nothing applied', async () => {
+    const { run, recordBytes } = await pendingRemoval(['alpha', 'bravo'])
+    const applied = run.controller.applied()
+    h.replaceWithDirectory(h.paths.apply)
+    const cp = run.checkpoint()
+
+    await run.ticks.ticks(10)
+
+    expect(run.since(cp)).toEqual({
+      ...NO_RUN_ACTIVITY,
+      logs: [undeletableLogged('EISDIR'), staleLogged('cannot be read (EISDIR)')],
+      removes: Array.from({ length: 10 }, applyNotRemoved),
+    })
+    expect(h.readRecord()).toEqual(recordBytes)
+    expect(run.controller.applied()).toBe(applied)
+    expect(h.pendingExists()).toBe(true)
+    expectNoPostNoLeak(run)
+  })
+
+  test('a confirmation that cannot be deleted is applied once, then ignored with its delete retried silently, and processed again once its content changes', async () => {
+    const { run, configBytes } = await pendingRemoval(['alpha', 'bravo'])
+    h.confirm()
+    h.failRemoves()
+    const cp = run.checkpoint()
+
+    await run.ticks.tick()
+
+    expect(outsideLifecycle(run.since(cp))).toEqual({
+      ...NO_RUN_ACTIVITY,
+      logs: [undeletableLogged('EIO'), appliedLogged({ removed: 1 })],
+      writes: [{ path: h.paths.lastApplied, ok: true }],
+      removes: [applyNotRemoved()],
+    })
+    expect(h.readRecord()).toEqual(configBytes)
+    expect(h.applyExists()).toBe(true)
+
+    const ignored = run.checkpoint()
+    await run.ticks.ticks(5)
+    expect(run.since(ignored)).toEqual({ ...NO_RUN_ACTIVITY, removes: Array.from({ length: 5 }, applyNotRemoved) })
+    expect(run.appliedConfigs).toHaveLength(1)
+
+    // New content: processed again (here stale), once.
+    h.writeApplyBytes('not a pending-change file')
+    const changed = run.checkpoint()
+    await run.ticks.ticks(3)
+    expect(run.since(changed)).toEqual({
+      ...NO_RUN_ACTIVITY,
+      logs: [undeletableLogged('EIO'), staleLogged(STALE_MALFORMED)],
+      removes: Array.from({ length: 3 }, applyNotRemoved),
+    })
+
+    // Deletable again: the retry removes it, silently.
+    h.clearRemoveFailure()
+    const cleared = run.checkpoint()
+    await run.ticks.ticks(3)
+    expect(run.since(cleared)).toEqual({ ...NO_RUN_ACTIVITY, removes: [applyRemoved()] })
+    expect(h.applyExists()).toBe(false)
+    expectNoPostNoLeak(run)
+  })
+
+  test('an undeletable stale confirmation still applies nothing once the config is edited back to match it, until its content changes', async () => {
+    const { run, personas, recordBytes, configBytes } = await pendingRemoval(['alpha', 'bravo'])
+    const [alpha, bravo] = personas
+    h.confirm()
+    h.writeConfig({ ...configOf(alpha!, bravo!), stop_timeout: 45 })
+    h.failRemoves()
+    await run.ticks.tick()
+    expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toEqual([staleLogged(STALE_MISMATCH)])
+    expect(run.logsOf('reload')).toEqual([undeletableLogged('EIO')])
+
+    // Edited back: the current fingerprint (and the whole pending file) now matches the confirmation.
+    h.writeConfigBytes(configBytes)
+    await run.ticks.ticks(5)
+    expect(h.readPending()).toEqual(h.readApply())
+    expect(h.readRecord()).toEqual(recordBytes)
+    expect(run.appliedConfigs).toEqual([])
+    expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toHaveLength(1)
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
+
+    // Its content changes (the preview edited, the fingerprint kept): processed again, and it matches.
+    h.writeApplyBytes(Buffer.concat([h.readApply()!, Buffer.from('an edit to the preview\n')]))
+    await run.ticks.tick()
+    expect(h.readRecord()).toEqual(configBytes)
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1 })])
+    // The delete seam fails the pending file's removal too, after the apply.
+    expect(run.logsOf('reload')).toEqual([undeletableLogged('EIO'), undeletableLogged('EIO'), fileFailureLine('EIO')])
+    expectNoPostNoLeak(run)
+  })
+
+  test('an undeletable confirmation that is then removed by hand is forgotten: the same bytes placed again are acted on again', async () => {
+    const { run, configBytes } = await pendingRemoval(['alpha', 'bravo'])
+    h.confirm()
+    const confirmation = h.readApply()!
+    h.failRemoves()
+    await run.ticks.tick()
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1 })])
+    expect(h.applyExists()).toBe(true)
+
+    // Gone by hand (the delete seam still failing): a check that finds no confirmation does nothing.
+    rmSync(h.paths.apply)
+    const gone = run.checkpoint()
+    await run.ticks.tick()
+    expect(run.since(gone)).toEqual(NO_RUN_ACTIVITY)
+
+    // The same bytes again: not the ignored confirmation any more, so processed (it matches, and is a no-op now).
+    h.writeApplyBytes(confirmation)
+    const again = run.checkpoint()
+    await run.ticks.tick()
+    expect(outsideLifecycle(run.since(again))).toEqual({
+      ...NO_RUN_ACTIVITY,
+      logs: [undeletableLogged('EIO'), noopLogged()],
+      writes: [{ path: h.paths.lastApplied, ok: true }],
+      removes: [applyNotRemoved()],
+    })
+    expect(h.readRecord()).toEqual(configBytes)
+    expect(run.appliedConfigs).toHaveLength(2)
+    expectNoPostNoLeak(run)
+  })
+
+  test('a confirmation removed although its directory sync fails is logged once and still applied, and nothing retries the delete', async () => {
+    const { run, configBytes } = await pendingRemoval(['alpha', 'bravo'])
+    h.confirm()
+    h.failRemoves({ step: 'fsyncSync' })
+    const cp = run.checkpoint()
+
+    await run.ticks.tick()
+
+    expect(outsideLifecycle(run.since(cp))).toEqual({
+      ...NO_RUN_ACTIVITY,
+      logs: [removedUnsyncedLogged('EIO'), appliedLogged({ removed: 1 })],
+      writes: [{ path: h.paths.lastApplied, ok: true }],
+      removes: [{ path: h.paths.apply, ok: true, removed: true, unsynced: true }],
+    })
+    expect(h.readRecord()).toEqual(configBytes)
+    expect(run.appliedKeys()).toEqual(keysOf('alpha'))
+    expect(h.applyExists()).toBe(false)
+
+    const later = run.checkpoint()
+    await run.ticks.ticks(3)
+    expect(run.since(later)).toEqual(NO_RUN_ACTIVITY)
+    expectNoPostNoLeak(run)
+  })
+
+  test('AC 56: after a consumed confirmation whose change stays pending in the same state (its fingerprint line damaged after the rename), the pending file is rewritten on the same check with no second preview', async () => {
+    const { run } = await pendingRemoval(['alpha', 'bravo'])
+    const pendingBytes = h.readPending()!
+    h.confirm()
+    h.writeApplyBytes(pendingBytes.toString('utf-8').replace('fingerprint: sha256:', 'fingerprint: '))
+    const cp = run.checkpoint()
+
+    await run.ticks.tick()
+
+    expect(run.since(cp)).toEqual({
+      ...NO_RUN_ACTIVITY,
+      logs: [staleLogged(STALE_MALFORMED)],
+      writes: [{ path: h.paths.pending, ok: true }],
+      removes: [applyRemoved()],
+    })
+    expect(h.readPending()).toEqual(pendingBytes)
+    expect(run.previewEmissionCount()).toBe(1)
+    expectNoPostNoLeak(run)
+  })
+
+  test.each([
+    {
+      label: 'before the rename (openSync)',
+      failure: { step: 'openSync', call: 1 },
+      line: () => failureLine(`[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write `, h.paths.lastApplied, 'EIO'),
+      recordWrites: [false],
+    },
+    {
+      label: 'at the directory fsync after the rename, the previous record written back',
+      failure: { step: 'fsyncSync', call: 2 },
+      // The restore is shown by the second record write and the record's bytes below.
+      line: () => failureLine(`[slack] ${RELOAD_RECORD_WRITE_FAILED}: wrote `, h.paths.lastApplied, 'EIO'),
+      recordWrites: [false, true],
+    },
+  ] as const)('AC 56: a record write failing $label applies nothing, logs one reload-record-write-failed line and rewrites the pending file on the same check', async ({ failure, line, recordWrites }) => {
+    let run!: ReloadRun
+    const slots = recordingSlots(() => run, () => h.readConfig())
+    const started = await pendingRemoval(['alpha', 'bravo'], { applySteps: slots.slots })
+    run = started.run
+    const pendingBytes = h.readPending()
+    const applied = run.controller.applied()
+    h.confirm()
+    h.failWrites(failure)
+    const cp = run.checkpoint()
+
+    await run.ticks.tick()
+
+    expect(run.since(cp)).toEqual({
+      ...NO_RUN_ACTIVITY,
+      logs: [line()],
+      writes: [...recordWrites.map((ok) => ({ path: h.paths.lastApplied, ok })), { path: h.paths.pending, ok: true }],
+      removes: [applyRemoved()],
+    })
+    expect(h.readRecord()).toEqual(started.recordBytes)
+    expect(run.controller.applied()).toBe(applied)
+    expect(run.appliedConfigs).toEqual([])
+    expect(slots.calls).toEqual([])
+    expect(h.readPending()).toEqual(pendingBytes)
+    expect(run.previewEmissionCount()).toBe(1)
+    assertNoLeak(run.captured({ record: writtenFile(h.paths.lastApplied) }))
+
+    // Used once; a fresh rename, with the writer working, applies.
+    h.clearWriteFailure()
+    const later = run.checkpoint()
+    await run.ticks.ticks(3)
+    expect(run.since(later)).toEqual(NO_RUN_ACTIVITY)
+    h.confirm()
+    await run.ticks.tick()
+    expect(h.readRecord()).toEqual(started.configBytes)
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1 })])
+    expectNoPostNoLeak(run)
+  })
+
+  test.each([
+    { label: 'reformatted whitespace', edit: (bytes: Buffer) => withNewline(bytes) },
+    {
+      label: 'reordered keys',
+      edit: (bytes: Buffer) => {
+        const parsed = JSON.parse(bytes.toString('utf-8')) as { personas: Record<string, unknown>[] }
+        const reordered = { personas: parsed.personas.map((p) => Object.fromEntries(Object.entries(p).reverse())) }
+        return Buffer.from(JSON.stringify(reordered))
+      },
+    },
+  ])('a confirmed candidate with no effective change ($label) logs reload-noop only, rewrites the record, runs no step and leaves nothing pending', async ({ edit }) => {
+    let run!: ReloadRun
+    const slots = recordingSlots(() => run, () => h.readConfig())
+    const started = await running(['alpha'], { applySteps: slots.slots })
+    run = started.run
+    const configBytes = h.writeConfigBytes(edit(started.recordBytes))
+    await run.ticks.tick()
+    expect(h.pendingLines()).toEqual([NO_EFFECTIVE_CHANGE_PREVIEW])
+    const cp = run.checkpoint()
+
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(run.since(cp)).toEqual({
+      ...NO_RUN_ACTIVITY,
+      logs: [noopLogged()],
+      writes: [{ path: h.paths.lastApplied, ok: true }],
+      removes: [applyRemoved()],
+    })
+    expect(h.readRecord()).toEqual(configBytes)
+    expect(run.appliedConfigs).toHaveLength(1)
+    expect(slots.calls).toEqual([])
+    expect(h.pendingExists()).toBe(false)
+    const later = run.checkpoint()
+    await run.ticks.ticks(3)
+    expect(run.since(later)).toEqual(NO_RUN_ACTIVITY)
+    expectNoPostNoLeak(run)
+  })
+
+  test('a confirmed server-wide-only change rewrites the record and logs reload-applied (not reload-noop), with no lifecycle call and nothing left pending', async () => {
+    const { run, personas } = await running(['alpha'])
+    const configBytes = h.writeConfig({ ...configOf(personas[0]!), stop_timeout: 45 })
+    await run.ticks.tick()
+    const cp = run.checkpoint()
+
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(run.since(cp)).toEqual({
+      ...NO_RUN_ACTIVITY,
+      logs: [appliedLogged({ settings: 1 })],
+      writes: [{ path: h.paths.lastApplied, ok: true }],
+      removes: [applyRemoved()],
+    })
+    expect(h.readRecord()).toEqual(configBytes)
+    expect(h.pendingExists()).toBe(false)
+    expectNoPostNoLeak(run)
+  })
+
+  test('an untouched persona gets no lifecycle call, Slack client or auth.test from a confirmed apply of another change', async () => {
+    const { run, personas } = await running(['alpha', 'bravo'])
+    const alphaKey = h.key('alpha')
+    h.writeConfig({ ...configOf(personas[0]!), stop_timeout: 45 })
+    await run.ticks.tick()
+    const buildsBefore = run.slack.buildsOf(alphaKey).length
+    const cp = run.checkpoint()
+
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1, settings: 1 })])
+    expect(run.since(cp).lifecycle.filter((r) => r.key === alphaKey)).toEqual([])
+    expect(run.slack.buildsOf(alphaKey)).toHaveLength(buildsBefore)
+    expect(run.since(cp).slackCalls).toEqual([])
+    expect(run.bringUps.credentialsDigest(alphaKey)).toBe(h.credentialsDigestOf(personas[0]!))
+    expectNoPostNoLeak(run)
+  })
+
+  test('the apply runs steps 2–6 after step 1, in order, each settled before the next; a failing step is logged and the later ones still run', async () => {
+    const charlie = h.persona('charlie', { claude_config_dir: join(h.root, 'charlie-claude') })
+    h.materialize(charlie)
+    let run!: ReloadRun
+    let candidate: Buffer | undefined
+    const slots = recordingSlots(() => run, () => candidate, 'in-place-updates')
+    const started = await running(['alpha', 'bravo'], { applySteps: slots.slots })
+    run = started.run
+    const [alpha] = started.personas
+    // alpha changed in place and its token rotated, bravo removed, charlie added under a new config directory.
+    h.writeCredentials(alpha!)
+    candidate = h.writeConfig(configOf({ ...alpha!, channels: [{ id: alpha!.channels![0]!.id, delivery: 'mentions' }] }, charlie))
+    await run.ticks.tick()
+
+    h.confirm()
+    await run.ticks.tick()
+
+    const after = { recordIsCandidate: true, applied: keysOf('alpha', 'charlie') }
+    expect(slots.calls).toEqual([
+      { step: 'teardowns', keys: [h.key('bravo')], ...after },
+      { step: 'in-place-updates', keys: [h.key('alpha')], ...after },
+      { step: 'credentials-reconnects', keys: [h.key('alpha')], ...after },
+      { step: 'template-refresh', keys: true, ...after },
+      { step: 'bring-ups', keys: [h.key('charlie')], ...after },
+    ])
+    expect(slots.events).toEqual(APPLY_STEPS.flatMap((step) => [`start ${step}`, `end ${step}`]))
+    expect(run.logsOf('reload')).toEqual([expect.stringMatching(/^\[slack\] reload: apply step 3 \(in-place-updates\) failed: /)])
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ added: 1, removed: 1, inPlace: 1, credentials: 1 })])
+    expect(run.logs.at(-1)).toBe(appliedLogged({ added: 1, removed: 1, inPlace: 1, credentials: 1 }))
+    expectNoPostNoLeak(run)
+  })
+
+  test("a throw from the server's onApplied is logged and the apply goes on: steps 2–6 run and reload-applied is logged", async () => {
+    let run!: ReloadRun
+    const slots = recordingSlots(() => run, () => h.readConfig())
+    const started = await pendingRemoval(['alpha', 'bravo'], {
+      applySteps: slots.slots,
+      onApplied: () => {
+        throw new Error(`onApplied failed ${LEAK_SENTINEL}`)
+      },
+    })
+    run = started.run
+    h.confirm()
+    const cp = run.checkpoint()
+
+    await run.ticks.tick()
+
+    expect(outsideLifecycle(run.since(cp))).toEqual({
+      ...NO_RUN_ACTIVITY,
+      logs: [
+        expect.stringMatching(/^\[slack\] reload: updating the server's applied configuration failed: Error\b/),
+        appliedLogged({ removed: 1 }),
+      ],
+      writes: [{ path: h.paths.lastApplied, ok: true }],
+      removes: [applyRemoved()],
+    })
+    // Every step this removal runs (no config directory changed, so no template refresh), after step 1.
+    expect(slots.calls.map((c) => c.step)).toEqual(['teardowns', 'in-place-updates', 'credentials-reconnects', 'bring-ups'])
+    expect(slots.calls[0]).toEqual({ step: 'teardowns', keys: [h.key('bravo')], recordIsCandidate: true, applied: keysOf('alpha') })
+    expect(h.readRecord()).toEqual(started.configBytes)
+    expect(run.appliedKeys()).toEqual(keysOf('alpha'))
+    expect(run.appliedConfigs).toHaveLength(1)
+    expect(h.pendingExists()).toBe(false)
+    // The thrown message (sentinel-bearing) is never logged.
+    expectNoPostNoLeak(run)
+  })
+
+  test('a shutdown while an apply step runs ends the pass there: once the step settles, no pending-file write or delete follows', async () => {
+    let entered!: () => void
+    let release!: () => void
+    const inStep = new Promise<void>((done) => (entered = done))
+    const held = new Promise<void>((done) => (release = done))
+    const { run, personas } = await pendingRemoval(['alpha', 'bravo'], {
+      applySteps: {
+        teardowns: async () => {
+          entered()
+          await held
+        },
+      },
+    })
+    h.confirm()
+    const tick = run.ticks.tick()
+    await inStep
+
+    // An edit while the step runs: a pass that went on would write the pending file for it.
+    h.writeConfig({ ...configOf(personas[0]!), stop_timeout: 45 })
+    const cp = run.checkpoint()
+    await run.stop()
+    release()
+    await tick
+
+    const since = run.since(cp)
+    expect(since.writes).toEqual([])
+    expect(since.removes).toEqual([])
+    expect(since.logs.filter((l) => l.startsWith('[slack] reload'))).toEqual([appliedLogged({ removed: 1 })])
+    expect(h.pendingExists()).toBe(false)
+    expect(run.previewEmissionCount()).toBe(1)
+    expectNoPostNoLeak(run)
+  })
+
+  test('a confirmed no-op whose effective config directories changed lexically (a symlink to the same directory) runs only the template refresh and logs reload-noop', async () => {
+    const configDir = join(h.home, '.claude')
+    mkdirSync(configDir)
+    const link = join(h.root, 'claude-link')
+    symlinkSync(configDir, link)
+    const alpha = h.persona('alpha', { claude_config_dir: configDir })
+    h.materialize(alpha)
+    h.writeRecord(configOf(alpha))
+    h.writeConfig(configOf(alpha))
+    let run!: ReloadRun
+    let candidate: Buffer | undefined
+    const slots = recordingSlots(() => run, () => candidate)
+    run = await h.startDetecting({ applySteps: slots.slots })
+    await run.ticks.tick()
+    candidate = h.writeConfig(configOf({ ...alpha, claude_config_dir: link }))
+    await run.ticks.tick()
+    expect(h.pendingLines()).toEqual([NO_EFFECTIVE_CHANGE_PREVIEW])
+
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(slots.calls).toEqual([{ step: 'template-refresh', keys: true, recordIsCandidate: true, applied: keysOf('alpha') }])
+    expect(run.logsOf(RELOAD_NOOP)).toEqual([noopLogged()])
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
+    expect(h.readRecord()).toEqual(candidate)
+    expectNoPostNoLeak(run)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The 64 KiB read cap on the tick and confirmation paths (b.av2 SR-8.1)
+// ---------------------------------------------------------------------------
+
+describe('a file larger than the 64 KiB read cap is unreadable to the tick', () => {
+  test('an oversized config.json on a running server logs one reload-invalid line and previews INVALID naming the limit', async () => {
+    const { run, recordBytes } = await running(['alpha'])
+    const cp = run.checkpoint()
+
+    h.writeOversized(h.paths.config, { prefix: '{"personas": [], "padding": "' })
+    await run.ticks.ticks(5)
+
+    const error = `the configuration file "${h.paths.config}" is larger than the 64 KiB limit.`
+    assertNoLeak(run.captured())
+    expect(h.pendingLines()).toEqual(invalidPreview(error))
+    expect(run.since(cp)).toEqual(pendingWritten([invalidLogged(error)]))
+    expect(h.readRecord()).toEqual(recordBytes)
+    expectNoPostNoLeak(run)
+  })
+
+  test("an oversized referenced credentials file is previewed as an unusable credentials change and never leaks", async () => {
+    const { run, personas } = await running(['alpha'])
+    const cp = run.checkpoint()
+
+    h.writeOversized(personas[0]!.credentials_file)
+    await run.ticks.ticks(5)
+
+    assertNoLeak(run.captured())
+    expect(credentialsChangeLines()).toEqual([
+      credentialsChangedLine(personas[0]!, 'kept', 'credentials file is larger than the 64 KiB limit'),
+    ])
+    expect(run.since(cp)).toEqual(pendingWritten())
+    expectNoPostNoLeak(run)
+  })
+
+  test('a persona whose credentials file is oversized at the start is broken and holds the unreadable marker, so later checks find nothing pending', async () => {
+    const [alpha] = materialized('alpha')
+    h.writeOversized(alpha!.credentials_file)
+    h.writeRecord(configOf(alpha!))
+    h.writeConfig(configOf(alpha!))
+    const run = await h.startDetecting()
+    expect(run.lifecycle.outcome(h.key('alpha'))).toBe('broken')
+    expect(run.bringUps.credentialsDigest(h.key('alpha'))).toBe(CREDENTIALS_UNREADABLE_MARKER)
+    expect(h.credentialsDigestOf(alpha!)).toBe(CREDENTIALS_UNREADABLE_MARKER)
+    const cp = run.checkpoint()
+
+    await run.ticks.ticks(10)
+
+    expect(run.since(cp)).toEqual(NO_RUN_ACTIVITY)
+    expect(h.pendingExists()).toBe(false)
     expectNoPostNoLeak(run)
   })
 })

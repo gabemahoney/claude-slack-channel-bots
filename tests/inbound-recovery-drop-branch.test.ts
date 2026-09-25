@@ -54,6 +54,8 @@ import { recordFailure, isAtCap } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
 import type { LostMessageState } from '../src/lost-message.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
+import { createPersonaRelaunchGate } from '../src/persona-start.ts'
+import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
 import {
   makeAppMention,
   makeChannelMessage,
@@ -763,6 +765,46 @@ describe('b.kvq (5) auto-restart disabled (delay 0) path', () => {
 
     expect(isRestartPendingOrActive('kvq_disabled')).toBe(false)
     expect(deps.launches).toHaveLength(0)
+  })
+})
+
+// ===========================================================================
+// b.av2 SR-8.6 — a key outside the applied set is never restarted. The drop
+// branch reaches the guard through `scheduleRestart`, whose `canRestart` is
+// the real relaunch gate; the gate's applied check (`isApplied`) refuses a
+// removed key even while its connection serves and its bring-up outcome is
+// `up`. RestartDeps is unchanged. The notice is E8's and not asserted here.
+// ===========================================================================
+
+describe('SR-8.6: a message dropped for a key outside the applied set arms no restart timer', () => {
+  test('alpha removed from the applied set (still up and serving): a lost message schedules nothing and launches nothing; once applied again, a lost message arms the timer and launches', async () => {
+    const h = makeHarness()
+    const UP: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0APPLIED', botId: 'B0APPLIED' } }
+    const applied = new Set([h.beta.key])
+    const gateLines: string[] = []
+    const gate = createPersonaRelaunchGate(
+      { status: () => UP },
+      (line) => { gateLines.push(line) },
+      { isUp: () => true, isApplied: (key) => applied.has(key) },
+    )
+    const deps = makeRestartDeps({ restartDelayS: FAST_DELAY_S })
+    deps.canRestart = gate
+    initRestart(deps)
+
+    await h.deliver(messageIn(ALPHA_SECOND), h.alpha.key)
+
+    expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
+    expect(gateLines).toEqual([`[slack] persona=${h.alpha.key}: not relaunched — it is no longer in the applied configuration`])
+    await Bun.sleep(WAIT_MS)
+    expect(deps.launches).toEqual([])
+    expect(isRestartPendingOrActive(h.beta.key)).toBe(false)
+
+    // Control: the same branch arms the timer once the key is applied.
+    applied.add(h.alpha.key)
+    await h.deliver(messageIn(SHARED), h.alpha.key)
+    expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
+    await Bun.sleep(WAIT_MS)
+    expect(deps.launches).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
   })
 })
 

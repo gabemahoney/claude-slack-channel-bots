@@ -38,7 +38,8 @@
  * non-blocking (following symlinks), and its descriptor is stat'ed, read and
  * closed, so the file checked is the file read. Anything but a regular file
  * is refused unread: a FIFO would block the read forever and a device such as
- * `/dev/zero` would never end.
+ * `/dev/zero` would never end. A file larger than `MAX_RELOAD_FILE_BYTES`
+ * (64 KiB) is unreadable too, and never read in full (a bounded read).
  *
  * Reader and digest (b.av2 SR-8.3): the stat-first read is its own export,
  * `readCredentialsFile`, and `credentialsDigest` turns a read into what is
@@ -58,9 +59,15 @@
  */
 
 import { createHash } from 'node:crypto'
-import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync, realpathSync } from 'node:fs'
+import { closeSync, constants as fsConstants, fstatSync, openSync, realpathSync } from 'node:fs'
 
-import { resolveRealPath, type Persona } from './config.ts'
+import {
+  MAX_RELOAD_FILE_BYTES,
+  MAX_RELOAD_FILE_SIZE_TEXT,
+  readFdAtMost,
+  resolveRealPath,
+  type Persona,
+} from './config.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import {
   PERSONA_CREDENTIALS_INVALID,
@@ -123,14 +130,25 @@ export interface CredentialsFs {
    * on failure.
    */
   openFile(path: string): number
-  /** Stat an open descriptor. Throws an errno-style error (with `code`) on failure. */
-  fstatFile(fd: number): { isFile(): boolean; isDirectory(): boolean }
   /**
-   * Read the whole file behind an open descriptor as bytes (decoded as UTF-8
-   * only for validation, so the digest covers exactly the bytes read). Throws
-   * an errno-style error (with `code`) on failure.
+   * Stat an open descriptor. `size` is the file's size in bytes; the reader
+   * refuses a file larger than `MAX_RELOAD_FILE_BYTES` before reading it. An
+   * override may omit `size`: the bounded read (`readFileFd`) enforces the
+   * limit either way. Throws an errno-style error (with `code`) on failure.
    */
-  readFileFd(fd: number): Buffer
+  fstatFile(fd: number): { isFile(): boolean; isDirectory(): boolean; size?: number }
+  /**
+   * Read at most `maxBytes` bytes from the start of the file behind an open
+   * descriptor (`readFdAtMost`), as bytes (decoded as UTF-8 only for
+   * validation, so the digest covers exactly the bytes read). The reader asks
+   * for one byte more than the limit, so it can tell a file over the limit
+   * (even one that grew after the stat) and never reads the rest; an override
+   * that returns more than `maxBytes` bytes is still refused as over the
+   * limit. `maxBytes` defaults to `MAX_RELOAD_FILE_BYTES + 1`, so a caller
+   * that omits it still gets a bounded read. Throws an errno-style error
+   * (with `code`) on failure.
+   */
+  readFileFd(fd: number, maxBytes?: number): Buffer
   /** Close a descriptor opened by `openFile`. The check ignores a failure. */
   closeFile(fd: number): void
   /** Resolve a path's real path. Throws on failure; callers fall back to the lexical form. */
@@ -141,7 +159,7 @@ export interface CredentialsFs {
 export const DEFAULT_CREDENTIALS_FS: CredentialsFs = {
   openFile: path => openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK),
   fstatFile: fd => fstatSync(fd),
-  readFileFd: fd => readFileSync(fd),
+  readFileFd: (fd, maxBytes) => readFdAtMost(fd, maxBytes),
   closeFile: fd => closeSync(fd),
   realpath: path => realpathSync(path),
 }
@@ -337,7 +355,15 @@ export type CredentialsFileRead =
  * read only a regular file, through that same descriptor, so the file cannot
  * be swapped between the check and the read. Anything but a regular file (a
  * directory, FIFO, socket or device) is refused unread: a FIFO blocks a read
- * forever and a device such as `/dev/zero` never ends. There is no size cap.
+ * forever and a device such as `/dev/zero` never ends.
+ *
+ * Size cap: a regular file larger than `MAX_RELOAD_FILE_BYTES` (64 KiB) is
+ * unreadable (`credentials file is larger than the 64 KiB limit`, no file
+ * content), so `credentialsDigest` gives the unreadable marker for it at
+ * bring-up and in the reload tick alike. It is refused on the stat's size
+ * before any read, and the read itself is bounded (at most
+ * `MAX_RELOAD_FILE_BYTES + 1` bytes), so a file that grows after the stat, or
+ * a stat that under-reports, is still refused and never read in full.
  *
  * The one reader of a credentials file: the bring-up's credentials check and
  * the reload detection tick both use it. Never throws for a string path; the
@@ -349,6 +375,7 @@ export type CredentialsFileRead =
 export function readCredentialsFile(path: string, fs?: Partial<CredentialsFs>): CredentialsFileRead {
   const io: CredentialsFs = { ...DEFAULT_CREDENTIALS_FS, ...fs }
   const unreadable = (cause: string): CredentialsFileRead => ({ ok: false, missing: false, cause })
+  const tooLarge = () => unreadable(`credentials file is larger than the ${MAX_RELOAD_FILE_SIZE_TEXT} limit`)
 
   // A failed open, stat or read: missing, a directory, permission denied, or other.
   const failAccess = (err: unknown): CredentialsFileRead => {
@@ -368,7 +395,7 @@ export function readCredentialsFile(path: string, fs?: Partial<CredentialsFs>): 
     return failAccess(err)
   }
   try {
-    let stats: { isFile(): boolean; isDirectory(): boolean }
+    let stats: ReturnType<CredentialsFs['fstatFile']>
     try {
       stats = io.fstatFile(fd)
     } catch (err) {
@@ -376,11 +403,14 @@ export function readCredentialsFile(path: string, fs?: Partial<CredentialsFs>): 
     }
     if (stats.isDirectory()) return unreadable('credentials file is a directory')
     if (!stats.isFile()) return unreadable('credentials file is not a regular file')
+    if (typeof stats.size === 'number' && stats.size > MAX_RELOAD_FILE_BYTES) return tooLarge()
+    let bytes: Buffer
     try {
-      return { ok: true, bytes: io.readFileFd(fd) }
+      bytes = io.readFileFd(fd, MAX_RELOAD_FILE_BYTES + 1)
     } catch (err) {
       return failAccess(err)
     }
+    return bytes.length > MAX_RELOAD_FILE_BYTES ? tooLarge() : { ok: true, bytes }
   } finally {
     try {
       io.closeFile(fd)

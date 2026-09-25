@@ -10,6 +10,7 @@ import {
   rmSync,
   symlinkSync,
   fstatSync,
+  statSync,
 } from 'fs'
 import { spawnSync } from 'child_process'
 import { tmpdir } from 'os'
@@ -27,6 +28,7 @@ import {
   DEFAULT_PERSONA_CONFIG_FS,
   describeUnknownKeys,
   isMissingConfigCode,
+  MAX_RELOAD_FILE_BYTES,
   parsePersonaConfigBytes,
   PersonaConfigReadError,
   readPersonaConfigBytes,
@@ -38,6 +40,7 @@ import {
   type PersonaInput,
 } from '../src/config.ts'
 import { personaKey } from '../src/persona-identity.ts'
+import { assertSendable } from '../src/lib.ts'
 import {
   makePersona,
   makePersonaConfig,
@@ -1006,7 +1009,13 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
 // ---------------------------------------------------------------------------
 
 /** A `PersonaConfigFs` op the reader made, with the descriptor it used (none for `open`). */
-type ConfigFdCall = { op: 'open' | 'fstat' | 'read' | 'close'; fd?: number }
+type ConfigFdCall = {
+  op: 'open' | 'fstat' | 'read' | 'close'
+  fd?: number
+  /** For `read`: the most bytes the reader asked for, and how many the read returned. */
+  maxBytes?: number
+  returned?: number
+}
 
 /**
  * The real configuration-read seam with every call recorded; `overrides`
@@ -1027,9 +1036,12 @@ function recordingConfigFs(overrides: Partial<PersonaConfigFs> = {}) {
       calls.push({ op: 'fstat', fd })
       return (overrides.fstatFile ?? DEFAULT_PERSONA_CONFIG_FS.fstatFile)(fd)
     },
-    readFileFd: (fd) => {
-      calls.push({ op: 'read', fd })
-      return (overrides.readFileFd ?? DEFAULT_PERSONA_CONFIG_FS.readFileFd)(fd)
+    readFileFd: (fd, maxBytes) => {
+      const call: ConfigFdCall = { op: 'read', fd, maxBytes }
+      calls.push(call)
+      const bytes = (overrides.readFileFd ?? DEFAULT_PERSONA_CONFIG_FS.readFileFd)(fd, maxBytes)
+      call.returned = bytes.length
+      return bytes
     },
     closeFile: (fd) => {
       calls.push({ op: 'close', fd })
@@ -1078,7 +1090,7 @@ const CHILD_RECORDING_FS = `
   const fs = {
     openFile: (p) => (ops.push('open'), d.openFile(p)),
     fstatFile: (fd) => (ops.push('fstat'), d.fstatFile(fd)),
-    readFileFd: (fd) => (ops.push('read'), d.readFileFd(fd)),
+    readFileFd: (fd, maxBytes) => (ops.push('read'), d.readFileFd(fd, maxBytes)),
     closeFile: (fd) => (ops.push('close'), d.closeFile(fd)),
   }
 `
@@ -1250,6 +1262,81 @@ describe('credentialsFilesToProtect (b.av2 SR-5.2)', () => {
       : [applied[0].credentials_file])
     expect(calls.map((c) => c.op)).toEqual(['open', ...afterOpen])
     expect(calls.slice(1).every((c) => c.fd === opened())).toBe(true)
+    expect(() => fstatSync(opened()!)).toThrow()
+    expect(lines).toEqual([])
+  })
+
+  // The 64 KiB cap exempts this one read: a config.json grown past the cap
+  // still protects every credentials file it names, even one named only after
+  // the first 65,537 bytes. The padding is sentinel-bearing fake token text,
+  // so a leak of the file's content fails assertNoLeak.
+  /** A config.json over 3 × 64 KiB whose one persona names `credentialsFile` after the padding. */
+  function writeOversizedCurrent(credentialsFile: string): string {
+    const unit = `${fakeToken(BOT_TOKEN_PREFIX, 'padding')} `
+    const padding = unit.repeat(Math.ceil((3 * MAX_RELOAD_FILE_BYTES) / unit.length) + 1)
+    const path = writeConfigFile(dir, {
+      notes: padding,
+      ...makePersonaConfigInput({ personas: [makePersona({ name: 'current_bot', credentials_file: credentialsFile }, dir)] }, dir),
+    })
+    expect(statSync(path).size).toBeGreaterThan(3 * MAX_RELOAD_FILE_BYTES)
+    expect(readFileSync(path, 'utf-8').indexOf(credentialsFile)).toBeGreaterThan(MAX_RELOAD_FILE_BYTES + 1)
+    return path
+  }
+
+  test('a config.json over the 64 KiB cap is read whole and uncapped: the path it names is listed and refused by assertSendable, while the capped reader refuses the same file with EFBIG', () => {
+    const applied = appliedPersonas()
+    // Outside the state directory, so only the list can refuse it.
+    const named = writeCredentialsFile(dir, 'outside/credentials.json')
+    const path = writeOversizedCurrent(named)
+    const { fs, calls, opened } = recordingConfigFs()
+
+    const list = credentialsFilesToProtect(applied, path, home, fs)
+
+    assertNoLeak({ list, lines }, 'protect')
+    expect(list).toEqual([applied[0].credentials_file, named])
+    expect(calls.map((c) => c.op)).toEqual(['open', 'fstat', 'read', 'close'])
+    expect(calls.find((c) => c.op === 'read')).toMatchObject({ maxBytes: Infinity, returned: statSync(path).size })
+    expect(() => fstatSync(opened()!)).toThrow()
+    expect(lines).toEqual([])
+
+    const stateDir = join(dir, 'state')
+    const inboxDir = join(stateDir, 'inbox')
+    expect(() => assertSendable(named, stateDir, inboxDir, list)).toThrow(`Blocked: cannot send ${named} — it is a persona credentials file.`)
+    expect(() => assertSendable(named, stateDir, inboxDir, [applied[0].credentials_file])).not.toThrow()
+
+    // Every other read of the same file is capped.
+    let refused: unknown
+    try {
+      readPersonaConfigBytes(path)
+    } catch (err) {
+      refused = err
+    }
+    assertNoLeak(refused, 'capped read')
+    expect(refused).toBeInstanceOf(PersonaConfigReadError)
+    expect((refused as PersonaConfigReadError).code).toBe('EFBIG')
+  })
+
+  // Uncapped is not unchecked: stat-first still refuses a config.json that is
+  // not a regular file before any read, so it contributes nothing and nothing throws.
+  test.each<[string, () => { path: string; overrides: Partial<PersonaConfigFs> }]>([
+    ['an oversized file reported as a FIFO by the injected fstatFile', () => ({
+      path: writeOversizedCurrent(join(dir, 'current', 'credentials.json')),
+      overrides: { fstatFile: NOT_REGULAR_STATS },
+    })],
+    ['a real directory', () => {
+      mkdirSync(join(dir, 'config.json'))
+      return { path: join(dir, 'config.json'), overrides: {} }
+    }],
+  ])('%s at the config path: never read, only the applied paths, no throw', (_label, arrange) => {
+    const applied = appliedPersonas()
+    const { path, overrides } = arrange()
+    const { fs, calls, opened } = recordingConfigFs(overrides)
+
+    const list = credentialsFilesToProtect(applied, path, home, fs)
+
+    assertNoLeak({ list, lines }, 'protect')
+    expect(list).toEqual([applied[0].credentials_file])
+    expect(calls.map((c) => c.op)).toEqual(['open', 'fstat', 'close'])
     expect(() => fstatSync(opened()!)).toThrow()
     expect(lines).toEqual([])
   })
@@ -1624,6 +1711,80 @@ describe('start-path primitives (b.av2 SR-8.7, SR-1.5, SR-10.3)', () => {
       const refused = { name: 'PersonaConfigReadError', code: CONFIG_NOT_REGULAR_FILE_CODE, message: exactMessage(path, 'it is not a regular file') }
       expect(out).toEqual({ reader: refused, loader: refused, ops: ['open', 'fstat', 'close'] })
     }, 15_000)
+
+    // The 64 KiB cap (65,536 bytes): a larger file is refused with EFBIG, named
+    // by path and limit, carrying none of its content, and never read past
+    // 65,537 bytes. The files hold sentinel-bearing fake token text, so a leak
+    // of their content fails assertNoLeak.
+    const tooLargeMessage = (path: string) => exactMessage(path, 'it is larger than the 64 KiB limit')
+    const tooLargeStartMessage = (path: string) =>
+      `The configuration file "${path}" is larger than the 64 KiB limit. The server requires the configuration file to start.`
+
+    /** Write `size` bytes of fake token text (ASCII: one byte per character) at `path`; the bytes. */
+    function writeTokenText(path: string, size: number): Buffer {
+      const line = `${fakeToken(BOT_TOKEN_PREFIX, 'oversized')}\n`
+      const bytes = Buffer.from(line.repeat(Math.ceil(size / line.length)).slice(0, size))
+      writeFileSync(path, bytes)
+      return bytes
+    }
+
+    /** Call `fn`, expecting a too-large refusal of `path`; checks the error and its start message. */
+    function expectTooLarge(path: string, fn: () => unknown): void {
+      const err = thrown(fn)
+      const startMessage = configFileReadFailureMessage(path, (err as PersonaConfigReadError).code)
+      assertNoLeak({ err, startMessage }, 'too large')
+      expect(err).toBeInstanceOf(PersonaConfigReadError)
+      expect((err as PersonaConfigReadError).code).toBe('EFBIG')
+      expect(err.message).toBe(tooLargeMessage(path))
+      expect(isMissingConfigCode('EFBIG')).toBe(false)
+      expect(startMessage).toBe(tooLargeStartMessage(path))
+    }
+
+    test.each([
+      { label: '65,536 bytes (the limit) is read in full, asking for at most 65,537', size: 65_536, afterOpen: ['fstat', 'read', 'close'] },
+      { label: '65,537 bytes is refused on its stat, unread, and the path loader fails the same way', size: 65_537, afterOpen: ['fstat', 'close'] },
+    ])('a file of $label', ({ size, afterOpen }) => {
+      const path = join(dir, 'config.json')
+      const content = writeTokenText(path, size)
+      const { fs, calls, opened } = recordingConfigFs()
+
+      if (size <= 65_536) {
+        const bytes = readPersonaConfigBytes(path, fs)
+        expect(bytes.length).toBe(size)
+        expect(bytes.equals(content)).toBe(true)
+        expect(calls.find((c) => c.op === 'read')).toMatchObject({ maxBytes: 65_537, returned: size })
+      } else {
+        expectTooLarge(path, () => readPersonaConfigBytes(path, fs))
+        expectTooLarge(path, () => loadPersonaConfig(path, home))
+      }
+      expect(calls.map((c) => c.op)).toEqual(['open', ...afterOpen])
+      expect(() => fstatSync(opened()!)).toThrow()
+    })
+
+    // A stat that under-reports (as for a file that grows after it) or omits
+    // the size: the bounded read still refuses the file, asking for no more
+    // than 65,537 bytes; a read double that returns more than it was asked
+    // for is refused too.
+    const regularStats = (size?: number) => () => ({ isFile: () => true, isDirectory: () => false, ...(size === undefined ? {} : { size }) })
+    test.each<{ label: string; overrides: Partial<PersonaConfigFs>; returned: number }>([
+      { label: 'fstat reports 10 bytes; the real bounded read', overrides: { fstatFile: regularStats(10) }, returned: 65_537 },
+      { label: 'fstat reports no size; the real bounded read', overrides: { fstatFile: regularStats() }, returned: 65_537 },
+      {
+        label: 'fstat reports 10 bytes; a read double returning the whole file whatever it is asked for',
+        overrides: { fstatFile: regularStats(10), readFileFd: (fd) => readFileSync(fd) },
+        returned: 3 * 65_536,
+      },
+    ])('a 192 KiB file where $label: refused as too large, the read asked for at most 65,537 bytes', ({ overrides, returned }) => {
+      const path = join(dir, 'config.json')
+      writeTokenText(path, 3 * 65_536)
+      const { fs, calls, opened } = recordingConfigFs(overrides)
+
+      expectTooLarge(path, () => readPersonaConfigBytes(path, fs))
+
+      expect(calls.map((c) => c.op)).toEqual(['open', 'fstat', 'read', 'close'])
+      expect(calls.find((c) => c.op === 'read')).toMatchObject({ maxBytes: 65_537, returned })
+      expect(() => fstatSync(opened()!)).toThrow()
+    })
   })
 
   describe('parsePersonaConfigBytes', () => {

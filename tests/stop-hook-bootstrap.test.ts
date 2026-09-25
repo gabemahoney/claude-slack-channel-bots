@@ -5,7 +5,9 @@
  *
  * Covers the managed Stop hook's command shape and patch engine, the
  * record-aware install rule (effective flag, record, launched-with dir), the
- * start pass and the launch-time pass, the record written before each launch,
+ * start pass and the launch-time pass, the record written before each launch
+ * (nothing written or patched for a persona outside the applied set, b.av2
+ * SR-8.6),
  * the two-persona shared-dir case end to end through the installed command,
  * the undo of an optimistic launch, the teardown helper and the record
  * helpers.
@@ -983,6 +985,32 @@ describe('stop-hook-bootstrap and the reply-guard record', () => {
     undo()
     expect(snapshot()).toEqual(before)
     expect(getLaunchedWithDir(persona.key)).toBeUndefined()
+  })
+
+  // b.av2 SR-8.6: a late launch of a persona a confirmed apply removed (its
+  // teardown deleted its record) must neither re-create the record nor run a
+  // launch pass, which here would strip the managed hook from its dir since no
+  // applied persona there has the flag on.
+  test('for a persona outside the applied set the step writes no record, patches nothing, and its undo does nothing', () => {
+    const dir = newTempDir()
+    seedManagedEntry(dir)
+    const cfg = personaConfigOf([
+      { name: 'removed_bot', claude_config_dir: dir },
+      { name: 'kept_bot', claude_config_dir: newTempDir() },
+    ])
+    const removed = personaNamed(cfg, 'removed_bot')
+    const applied = [personaNamed(cfg, 'kept_bot')]
+    const snapshot = (): unknown => [snapshotTree(dir), snapshotTree(rec.stateDir)]
+    const before = snapshot()
+
+    const undo = preLaunchReplyGuard(removed, () => applied, rec.stateDir)
+    expect(snapshot()).toEqual(before)
+    expect(rec.readRecord(removed.key)).toBeNull()
+    expect(getLaunchedWithDir(removed.key)).toBeUndefined()
+
+    undo()
+    expect(snapshot()).toEqual(before)
+    expect(getLaunchedWithDir(removed.key)).toBeUndefined()
   })
 
   // -------------------------------------------------------------------------
