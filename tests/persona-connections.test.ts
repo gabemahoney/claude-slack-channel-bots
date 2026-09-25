@@ -92,6 +92,16 @@
  * `checkConfigDir` resolving against the test's own home. `stop(key,
  * endReason)` ends the persona's open lost, unreachable or refused episode
  * with one cleared line; a `stop` without a reason (a teardown) logs nothing.
+ * E14 Task 4 adds the integration suite's Slack API base URL override
+ * (`CSCB_SLACK_API_URL`, director decisions 1 and 14): it is honoured only
+ * for an `http:` URL on the literal loopback address `127.0.0.1` or `[::1]`
+ * (never `localhost`) with no user info, query or fragment, as its
+ * normalized href; `resolveSlackApiUrlOverride` logs one line naming only
+ * the URL's origin when honoured (a token in the path never reaches the
+ * log), and otherwise one warning that never echoes the value, and
+ * sets nothing (a bad value never stops the start); each option builder adds
+ * `slackApiUrl` only when given one (a socket's in its `clientOptions`), and
+ * the manager passes it to every client it builds.
  * Time is a fake clock throughout;
  * nothing sleeps (the start-pass cases poll in 1 ms real-time steps only for
  * the real spawn path).
@@ -214,6 +224,7 @@ import {
   longLivedWebClientOptions,
   redactSlackLogText,
   redactingSlackLogger,
+  resolveSlackApiUrlOverride,
   socketModeClientOptions,
   socketModeSlackLogger,
   validationWebClientOptions,
@@ -2061,6 +2072,8 @@ interface HarnessOptions {
   onStatus?: (key: string, status: PersonaConnectionStatus) => void
   /** The per-persona serializer's `run`, passed to the manager as `serialize` (bug b.ujn). Default: none, so the close runs at once. */
   serialize?: PersonaSerialize
+  /** The integration suite's Slack API base URL, passed to the manager as `slackApiUrl` when the key is given (even as `undefined`). Default: the key left out. */
+  slackApiUrl?: string
 }
 
 /** Harnesses built in the running test; stopped and leak-checked after it. */
@@ -2128,6 +2141,8 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
       return opts.onEvent?.(key, eventName, payload)
     },
     serialize: opts.serialize,
+    // Only when the option is given, so an explicit `undefined` reaches the manager as server.ts passes it.
+    ...('slackApiUrl' in opts ? { slackApiUrl: opts.slackApiUrl } : {}),
   })
   const h: Harness = { manager, clock, slack, a, b, lines, events, statuses, agentDirector: makeAgentDirectorRecorder() }
   harnesses.push(h)
@@ -2766,6 +2781,246 @@ describe('connection manager: client options (SR-3.3, AC 20 connection leg) and 
       setEnvTokens(saved)
     }
     expect(envTokensEqual(saved)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The integration suite's Slack API base URL override (E14 Task 4, director decision 1)
+// ---------------------------------------------------------------------------
+
+/** The Slack stub's base URL, as the docker suite sets it. */
+const STUB_API_URL = 'http://127.0.0.1:3999/api/'
+
+/** The one line an honoured override logs: the URL's origin only (never its path) and the variable. */
+function overrideInUseLine(origin: string): string {
+  return `[slack] Slack API base URL override in use: ${origin} (CSCB_SLACK_API_URL)`
+}
+
+/** The one warning any other value logs: the variable named, the value never echoed. */
+const OVERRIDE_IGNORED_LINE =
+  '[slack] Warning: CSCB_SLACK_API_URL ignored: not a loopback http URL ' +
+  '(http://127.0.0.1 or http://[::1]); Slack calls use the default Slack API'
+
+/** `options` with `slackApiUrl: url` added: a socket's inside its `clientOptions`, never beside them. */
+function withApiUrl(kind: StubClientKind, options: Record<string, unknown>, url: string): Record<string, unknown> {
+  if (kind !== 'socket') return { ...options, slackApiUrl: url }
+  return { ...options, clientOptions: { ...(options.clientOptions as Record<string, unknown>), slackApiUrl: url } }
+}
+
+// Rows: what the value shows, the value, the href it is honoured as, and the origin its line logs.
+const ACCEPTED_API_URLS: [string, string, string, string][] = [
+  ['the stub’s URL (127.0.0.1, a port and a path)', STUB_API_URL, STUB_API_URL, 'http://127.0.0.1:3999'],
+  ['[::1] with a port and no path', 'http://[::1]:1', 'http://[::1]:1/', 'http://[::1]:1'],
+  ['[::1] with a port and a path', 'http://[::1]:2/x', 'http://[::1]:2/x', 'http://[::1]:2'],
+  ['an upper-case scheme (lower-cased, the path kept)', 'HTTP://127.0.0.1:3999/API', 'http://127.0.0.1:3999/API', 'http://127.0.0.1:3999'],
+  ['no port and no path', 'http://127.0.0.1', 'http://127.0.0.1/', 'http://127.0.0.1'],
+  ['the default port (dropped)', 'http://127.0.0.1:80/api/', 'http://127.0.0.1/api/', 'http://127.0.0.1'],
+  ['a short IPv4 form of 127.0.0.1', 'http://127.1:5/', 'http://127.0.0.1:5/', 'http://127.0.0.1:5'],
+  ['the long form of ::1', 'http://[0:0:0:0:0:0:0:1]:6/', 'http://[::1]:6/', 'http://[::1]:6'],
+  ['a dot segment in the path (resolved)', 'http://127.0.0.1:7/a/../b', 'http://127.0.0.1:7/b', 'http://127.0.0.1:7'],
+]
+
+// Rows: why the value is refused, and the value.
+const REJECTED_API_URLS: [string, string][] = [
+  ['https:', 'https://127.0.0.1/'],
+  ['ws:', 'ws://127.0.0.1/'],
+  ['file:', 'file:///tmp/api'],
+  ['a non-loopback host', 'http://example.com/'],
+  ['localhost (a name, resolved by name)', 'http://localhost/'],
+  ['localhost with a port and a path', 'http://localhost:3999/api/'],
+  ['an upper-case LOCALHOST', 'HTTP://LOCALHOST:3999/API'],
+  ['a loopback address inside another host name', 'http://127.0.0.1.nip.io/'],
+  ['a localhost subdomain', 'http://api.localhost/'],
+  ['localhost with a trailing dot', 'http://localhost./'],
+  ['another loopback-range address', 'http://127.0.0.2/'],
+  ['the unspecified address', 'http://0.0.0.0/'],
+  ['an IPv4-mapped IPv6 loopback address', 'http://[::ffff:127.0.0.1]/'],
+  ['user info', 'http://u:p@127.0.0.1/'],
+  ['a user name only', 'http://u@127.0.0.1/'],
+  ['a password only', 'http://:p@127.0.0.1/'],
+  ['a loopback address as the user info of another host', 'http://127.0.0.1@example.com/'],
+  ['a query', 'http://127.0.0.1/?a'],
+  ['an empty query', 'http://127.0.0.1/?'],
+  ['a fragment', 'http://127.0.0.1/#f'],
+  ['an empty fragment', 'http://[::1]/#'],
+  ['not a URL', 'garbage'],
+  ['a path only', '/api/'],
+  ['a scheme-relative URL', '//127.0.0.1/'],
+  ['blank', ' '],
+]
+
+// Rows: where the refused value carries a secret, and the value. The sentinel (inside a fake
+// token where the row says so) must reach no log line.
+const SECRET_BEARING_API_URLS: [string, string][] = [
+  ['a bot token as the user name of a loopback URL', `http://${fakeToken(BOT_TOKEN_PREFIX, 'userinfo')}@127.0.0.1:3999/api/`],
+  ['an app token as the password of a loopback URL', `http://stub:${fakeToken(APP_TOKEN_PREFIX, 'password')}@[::1]:3999/api/`],
+  ['a bot token in the path of an https loopback URL', `https://127.0.0.1/api/${fakeToken(BOT_TOKEN_PREFIX, 'path')}/`],
+  ['a bot token in the path of a localhost URL', `http://localhost:3999/api/${fakeToken(BOT_TOKEN_PREFIX, 'localhost')}/`],
+  ['a bot token in the query of a loopback URL', `http://127.0.0.1:3999/api/?token=${fakeToken(BOT_TOKEN_PREFIX, 'query')}`],
+  ['an app token in the fragment of a loopback URL', `http://[::1]:3999/api/#${fakeToken(APP_TOKEN_PREFIX, 'fragment')}`],
+  ['the sentinel as a non-loopback host', `http://${LEAK_SENTINEL}.example.com/api/`],
+  ['the sentinel in the path of a non-loopback URL', `http://example.com/${LEAK_SENTINEL}/`],
+  ['the sentinel in text that is no URL', `not a url ${LEAK_SENTINEL}`],
+]
+
+/** Resolve `env` the way server.ts does, with the lines it logs. */
+function resolveOverride(env: NodeJS.ProcessEnv): { url: string | undefined; lines: string[] } {
+  const { lines, log } = capture()
+  const url = resolveSlackApiUrlOverride(env, log)
+  return { url, lines }
+}
+
+describe('Slack API base URL override: resolveSlackApiUrlOverride (E14 Task 4, director decisions 1 and 14)', () => {
+  test.each<[string, NodeJS.ProcessEnv]>([
+    ['unset', {}],
+    ['empty', { CSCB_SLACK_API_URL: '' }],
+  ])('%s: no override and nothing logged', (_label, env) => {
+    expect(resolveOverride(env)).toEqual({ url: undefined, lines: [] })
+  })
+
+  test.each(ACCEPTED_API_URLS)('honoured, %s: the parsed href, and one [slack] line naming only its origin and the variable', (_label, value, href, origin) => {
+    expect(resolveOverride({ CSCB_SLACK_API_URL: value })).toEqual({ url: href, lines: [overrideInUseLine(origin)] })
+  })
+
+  test.each([...REJECTED_API_URLS, ...SECRET_BEARING_API_URLS])(
+    'ignored, %s: no override (the start goes on), and one warning naming the variable that never echoes the value',
+    (_label, value) => {
+      const result = resolveOverride({ CSCB_SLACK_API_URL: value })
+
+      assertNoLeak(result, 'rejected override')
+      expect(result).toEqual({ url: undefined, lines: [OVERRIDE_IGNORED_LINE] })
+    },
+  )
+
+  test('reads only CSCB_SLACK_API_URL, and only from the env it is given (never process.env), once per call', () => {
+    const saved = process.env.CSCB_SLACK_API_URL
+    process.env.CSCB_SLACK_API_URL = STUB_API_URL
+    try {
+      const reads: PropertyKey[] = []
+      const env = new Proxy({} as NodeJS.ProcessEnv, {
+        get(target, key) {
+          reads.push(key)
+          return Reflect.get(target, key)
+        },
+      })
+
+      expect(resolveOverride(env)).toEqual({ url: undefined, lines: [] })
+      expect(reads).toEqual(['CSCB_SLACK_API_URL'])
+    } finally {
+      if (saved === undefined) delete process.env.CSCB_SLACK_API_URL
+      else process.env.CSCB_SLACK_API_URL = saved
+    }
+    expect(process.env.CSCB_SLACK_API_URL).toBe(saved)
+  })
+})
+
+describe('Slack API base URL override: the option builders (E14 Task 4)', () => {
+  // Rows: the builder and its exact SR-3.3 options, the logger aside.
+  test.each<[string, (slackApiUrl?: string) => WebClientOptions, Record<string, unknown>]>([
+    ['validationWebClientOptions', validationWebClientOptions, NO_RETRY_OPTIONS],
+    ['longLivedWebClientOptions', longLivedWebClientOptions, SR33_OPTIONS.web],
+  ])('%s: with a URL, exactly its SR-3.3 options plus slackApiUrl and its redacting logger; with undefined, exactly its SR-3.3 options and no slackApiUrl key', (_name, build, expected) => {
+    const withUrl = build(STUB_API_URL)
+    const without = build(undefined)
+
+    const { logger, ...rest } = withUrl
+    expect(rest).toStrictEqual({ ...expected, slackApiUrl: STUB_API_URL })
+    expectRedactingLogger(logger)
+    const { logger: plainLogger, ...plain } = without
+    expect(plain).toStrictEqual(expected)
+    expect('slackApiUrl' in without).toBe(false)
+    expectRedactingLogger(plainLogger)
+    expect(build(STUB_API_URL)).not.toBe(withUrl)
+  })
+
+  test('socketModeClientOptions: with a URL, slackApiUrl inside clientOptions only (so apps.connections.open goes there), every other option unchanged; with undefined, exactly the SR-3.3 options and no slackApiUrl key anywhere', () => {
+    const appToken = fakeToken(APP_TOKEN_PREFIX, 'override')
+    const { lines, log } = capture()
+    const withUrl = socketModeClientOptions(appToken, LOG_PERSONA, log, STUB_API_URL)
+    const again = socketModeClientOptions(appToken, LOG_PERSONA, log, STUB_API_URL)
+    const without = socketModeClientOptions(appToken, LOG_PERSONA, log, undefined)
+
+    expect(withUrl.appToken === appToken).toBe(true)
+    const { appToken: _token, logger, ...rest } = withUrl
+    expect(rest).toStrictEqual(withApiUrl('socket', SR33_OPTIONS.socket, STUB_API_URL))
+    expect('slackApiUrl' in withUrl).toBe(false)
+    expectSocketLogger(logger, LOG_PERSONA, lines)
+    expect(again.clientOptions).not.toBe(withUrl.clientOptions)
+
+    const { appToken: _plainToken, logger: _plainLogger, ...plain } = without
+    expect(plain).toStrictEqual(SR33_OPTIONS.socket)
+    expect('slackApiUrl' in without.clientOptions!).toBe(false)
+    assertNoLeak(lines)
+  })
+})
+
+describe('Slack API base URL override: the connection manager passes it to every client it builds (E14 Task 4)', () => {
+  // Rows: the occasion, what A does up to and through it (B is up first), and the kinds of every
+  // client built for A, in order. Together they build each client kind on first bring-up and again later.
+  test.each<[string, (h: Harness) => Promise<void>, StubClientKind[]]>([
+    ['bring-up', async h => {
+      expect(await h.manager.bringUp(h.a, h.a.tokens)).toMatchObject({ state: 'up' })
+    }, ['validation', 'web', 'socket']],
+    ['a bring-up retry (auth.test unreachable, answered 5 s later)', async h => {
+      stubOf(h, h.a).script.authTest.push({ kind: 'network' })
+      expect(await h.manager.bringUp(h.a, h.a.tokens)).toMatchObject({ state: 'retrying', phase: 'bring-up' })
+      await h.clock.advance(5_000)
+    }, ['validation', 'validation', 'web', 'socket']],
+    ['a reopen after Slack drops the socket', async h => {
+      await h.manager.bringUp(h.a, h.a.tokens)
+      stubOf(h, h.a).socket.drop()
+      await h.clock.flush()
+    }, ['validation', 'web', 'socket', 'socket']],
+    ['a credentials reconnect', async h => {
+      await h.manager.bringUp(h.a, h.a.tokens)
+      const rotated = rotateCredentials(h, h.a)
+      expect(await h.manager.reconnectCredentials(h.a.key, rotated.tokens)).toMatchObject({ kind: 'swapped' })
+    }, ['validation', 'web', 'socket', 'validation', 'web', 'socket']],
+  ])('%s: every client built (validation, long-lived, and the socket’s clientOptions) carries slackApiUrl, every other SR-3.3 option unchanged', async (_occasion, occasion, kinds) => {
+    const h = makeHarness({ slackApiUrl: STUB_API_URL })
+    expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
+
+    await occasion(h)
+
+    expect(h.slack.buildsOf(h.a.key).map(build => build.kind)).toEqual(kinds)
+    expect(h.slack.buildsOf(h.b.key).map(build => build.kind)).toEqual(['validation', 'web', 'socket'])
+    for (const build of h.slack.builds) expectBuiltWith(h, build, withApiUrl(build.kind, SR33_OPTIONS[build.kind], STUB_API_URL))
+    expectNothingShared(h.slack.builds)
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+    assertNoLeak(h.lines)
+    expect(h.lines.filter(line => line.includes(STUB_API_URL))).toEqual([])
+  })
+
+  test('an honoured value with a token in its path, resolved and passed as server.ts does: every client gets the full href, and no logged line carries the path', async () => {
+    const href = `http://127.0.0.1:3999/api/${fakeToken(BOT_TOKEN_PREFIX, 'honoured-path')}/`
+    expect(() => assertNoLeak(href)).toThrow()
+
+    const resolved = resolveOverride({ CSCB_SLACK_API_URL: href })
+    expect(resolved).toEqual({ url: href, lines: [overrideInUseLine('http://127.0.0.1:3999')] })
+    assertNoLeak(resolved.lines, 'honoured override line')
+    const h = makeHarness({ slackApiUrl: resolved.url })
+
+    await bringUpBoth(h)
+
+    expect(h.slack.builds.map(build => build.kind).sort()).toEqual(['socket', 'socket', 'validation', 'validation', 'web', 'web'])
+    for (const build of h.slack.builds) expectBuiltWith(h, build, withApiUrl(build.kind, SR33_OPTIONS[build.kind], href))
+    assertNoLeak(h.lines)
+  })
+
+  test('a rejected value, resolved and passed as server.ts does (slackApiUrl: undefined): every client gets exactly its SR-3.3 options, no slackApiUrl key anywhere', async () => {
+    const resolved = resolveOverride({ CSCB_SLACK_API_URL: SECRET_BEARING_API_URLS[0]![1] })
+    expect(resolved).toEqual({ url: undefined, lines: [OVERRIDE_IGNORED_LINE] })
+    const h = makeHarness({ slackApiUrl: resolved.url })
+
+    await bringUpBoth(h)
+
+    expect(h.slack.builds.map(build => build.kind).sort()).toEqual(['socket', 'socket', 'validation', 'validation', 'web', 'web'])
+    for (const build of h.slack.builds) {
+      expectBuiltWith(h, build, SR33_OPTIONS[build.kind])
+      expect('slackApiUrl' in build.options).toBe(false)
+      if (build.kind === 'socket') expect('slackApiUrl' in build.options.clientOptions!).toBe(false)
+    }
+    assertNoLeak(resolved)
   })
 })
 

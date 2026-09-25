@@ -21,6 +21,10 @@
  *   `identityFor` over the connection view, the routing's identity, client,
  *   archive and notice (`notify`, the persona notifier's, SR-7.3) seams, and
  *   the archive writer's per-persona resolver source.
+ * - The integration suite's Slack API base URL override (E14 Task 4):
+ *   `CSCB_SLACK_API_URL` resolved once in main(), before the manager is
+ *   built, from `process.env`, and passed to it as `slackApiUrl`; no other
+ *   src file names the variable.
  * - The one destination resolver (SR-7.1): built at module scope and shared
  *   by the persona notifier and the permission poller.
  * - The bring-up controller (SR-6.1, SR-6.4): the start's bring-up, told
@@ -490,6 +494,25 @@ describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, 
     // would be in its temporal dead zone when the manager is built).
     expect(listeners[1]).toMatch(/^\((\w+), (\w+)\) => bringUps\?\.onConnectionStatus\(\1, \2\)$/)
     expect(listeners[1]).not.toContain(constOf('createPersonaBringUpController'))
+  })
+
+  test('the Slack API base URL override (E14 Task 4): resolved once, inside main(), from process.env with the manager’s log, before the manager is built, and passed to it as slackApiUrl', () => {
+    expect(importSource(SERVER_CODE, 'resolveSlackApiUrlOverride')).toBe('./persona-slack-clients.ts')
+    const resolveAt = onlyCallOf('resolveSlackApiUrlOverride')
+    expect(insideMain(resolveAt)).toBe(true)
+    expect(resolveAt).toBeLessThan(onlyCallOf('createPersonaConnectionManager'))
+    const managerProps = onlyCallProps('createPersonaConnectionManager')
+    expect(onlyCallArgs('resolveSlackApiUrlOverride')).toEqual(['process.env', managerProps.get('log')!])
+    expect(managerProps.get('log')).toBe('(line) => console.error(line)')
+    expect(managerProps.get('slackApiUrl')).toBe(constOf('resolveSlackApiUrlOverride'))
+  })
+
+  test('only persona-slack-clients.ts names CSCB_SLACK_API_URL or its constant; no other src file reads the variable', () => {
+    const offenders = srcFiles()
+      .filter(([path]) => path !== 'src/persona-slack-clients.ts')
+      .filter(([, source]) => /\bCSCB_SLACK_API_URL\b|\bSLACK_API_URL_OVERRIDE_ENV\b/.test(stripComments(source)))
+      .map(([path]) => path)
+    expect(offenders).toEqual([])
   })
 
   test('the notifier and the permission poller share one destination resolver: createPersonaDestinations built once, at module scope, and passed as `destinations` to both (b.av2 SR-7.1)', () => {

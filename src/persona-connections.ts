@@ -10,7 +10,8 @@
  * reconnect overlaps); a short-lived validation client exists only during
  * `auth.test`. All clients are built through the injected
  * `PersonaSlackClientFactory` with the SR-3.3 option sets
- * (`persona-slack-clients.ts`).
+ * (`persona-slack-clients.ts`), each with the integration suite's
+ * `slackApiUrl` added only when the server passes one (`deps.slackApiUrl`).
  *
  * One attempt:
  *   1. bring-up only: build a validation client, `auth.test` (bot token),
@@ -321,6 +322,14 @@ export interface PersonaConnectionManagerDeps {
   onStatus?: PersonaStatusListener
   /** Slack client factory; defaults to `PRODUCTION_SLACK_CLIENT_FACTORY`. */
   factory?: PersonaSlackClientFactory
+  /**
+   * The integration suite's Slack API base URL override, already checked by
+   * `resolveSlackApiUrlOverride` (`persona-slack-clients.ts`). When given,
+   * every client the manager builds (validation, long-lived Web API, and the
+   * Socket Mode client's own `clientOptions`) gets it as `slackApiUrl`;
+   * absent, the option sets are unchanged. Never set on an operator's host.
+   */
+  slackApiUrl?: string
   /** Clock and timers; default `SYSTEM_PERSONA_CONNECTION_CLOCK`. */
   clock?: PersonaConnectionClock
   /**
@@ -522,7 +531,7 @@ interface PersonaEntry extends AttemptSlot {
 
 /** Create the connection manager. Creates, reads and schedules nothing until `bringUp`. */
 export function createPersonaConnectionManager(deps: PersonaConnectionManagerDeps): PersonaConnectionManager {
-  const { onEvent, dryRun } = deps
+  const { onEvent, dryRun, slackApiUrl } = deps
   const factory = deps.factory ?? PRODUCTION_SLACK_CLIENT_FACTORY
   const clock = deps.clock ?? SYSTEM_PERSONA_CONNECTION_CLOCK
   const serialize: PersonaSerialize = deps.serialize ?? (async (_key, operation) => operation())
@@ -718,7 +727,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
       attempt.finish({ kind: 'failed', outcome: classifySlackValidationError(new SlackAuthTestTimeoutError(), 'auth.test') })
     })
     try {
-      const client = factory.createValidationClient(tokens.botToken, validationWebClientOptions())
+      const client = factory.createValidationClient(tokens.botToken, validationWebClientOptions(slackApiUrl))
       return botIdentityFromAuthTest(await client.auth.test())
     } catch (err) {
       return classifySlackValidationError(err, 'auth.test')
@@ -740,7 +749,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   ): Promise<void> {
     let binding: SocketBinding
     try {
-      binding = bindSocket(entry, factory.createSocketClient(socketModeClientOptions(tokens.appToken, entry.persona, log)))
+      binding = bindSocket(entry, factory.createSocketClient(socketModeClientOptions(tokens.appToken, entry.persona, log, slackApiUrl)))
     } catch (err) {
       attempt.finish({ kind: 'failed', outcome: classifySlackValidationError(err, 'socket-mode') })
       return
@@ -1067,7 +1076,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
 
   /** The persona's long-lived Web API client for `tokens`, wrapped by the auth-failure watch. */
   function createWatchedWebClient(entry: PersonaEntry, tokens: PersonaSlackTokens): WebClient {
-    const raw = factory.createWebClient(tokens.botToken, longLivedWebClientOptions())
+    const raw = factory.createWebClient(tokens.botToken, longLivedWebClientOptions(slackApiUrl))
     const watched: WebClient = watchWebClientAuth(raw, outcome => onWebApiRefused(entry, watched, outcome))
     return watched
   }

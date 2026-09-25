@@ -91,8 +91,9 @@ Extra live evidence (unit-verified in SR-14, checked here too):
 Not checked live: the E13 dry-run leg (a `working_directory` change giving one
 `DESTRUCTIVE:` line with one teardown and one bring-up; a `port` change giving
 a preview line while the listener stays on the old port). It needs no live
-Slack, so the docker reload scenario (Task 4 of E14, `tests/integration/`)
-checks it.
+Slack, so the docker scenario
+`tests/integration/test-9-reload-destructive-and-server-wide.sh` (Task 4 of
+E14) checks it.
 
 ---
 
@@ -2317,8 +2318,9 @@ and needs no `sudo`.
 The optional Check 29b is the second half of the E13 leak check: a real
 Socket Mode handshake failure logs no WebSocket `ticket=` URL, and the
 `[slack] persona Socket Mode: …` connection-health lines appear. It needs
-`sudo`, `iptables` and `systemd-run`. A docker scenario (Task 4 of E14,
-`tests/integration/`) also covers the handshake failure: it produces a real
+`sudo`, `iptables` and `systemd-run`. The docker scenario
+`tests/integration/test-10-credentials-change.sh` (Task 4 of E14) also covers
+the handshake failure: it produces a real
 one against a loopback Slack stub and checks `server.log` for `wss://`,
 `ticket=` and a sentinel. So Check 29b is extra evidence, not the only proof.
 

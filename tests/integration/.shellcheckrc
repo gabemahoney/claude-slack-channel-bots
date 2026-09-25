@@ -1,0 +1,4 @@
+# ShellCheck settings for the integration scripts: follow the shared helper
+# (`# shellcheck source=lib/scenario.sh` in each scenario script) without -x.
+external-sources=true
+source-path=SCRIPTDIR

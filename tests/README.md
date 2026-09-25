@@ -30,10 +30,13 @@ directory lands in `$S` and never in the real `~/.claude/channels/slack/`.
 
 ## Docker integration suite
 
-Bash scripts that install the packed package, write a dry-run persona config
-and start the server. `/ci` packs the package, builds the image from
-`docker/Dockerfile.test` (on the base in `docker/Dockerfile.test.base`, see
-`docker/README.md`) and runs `tests/runner.sh` inside it. The verdict is
+Bash scripts that install the packed package, write a persona config and
+start the server in dry run. Two scripts leave dry run: Test 4 runs its
+driver, which spawns under a stub `claude` and starts no server, and Test 10
+is the one script that starts a live server, against the loopback Slack stub.
+`/ci` packs
+the package, builds the image from `docker/Dockerfile.test` (on the base in
+`docker/Dockerfile.test.base`, see `docker/README.md`) and runs `tests/runner.sh` inside it. The verdict is
 `PASS` or `FAIL`.
 
 The scripts run only in that container, never on a dev box or a host with a
@@ -50,11 +53,22 @@ tests/
     test-2-dryrun-spawn-skip.sh    # b.3hy: persona load line, per-persona dry-run spawn skip, /interject 404 and 503
     test-3-cozempic-restart.sh     # b.set: cozempic probe, stop --stop-bots per persona, clean restart
     test-4-resume-dialog.sh        # no ticket: non-dry-run spawn, then resume past the dev-channels dialog (b.vub)
+    test-5-two-personas.sh         # E3/E4, dry run: two personas (one with a derived key) each log their own persona-start and cwd; /interject by name and key
+    test-6-missing-working-dir.sh  # E5 (SR-6.4), dry run: a missing working dir, and a dangling claude_config_dir symlink, hold a persona down with no repeated line; each comes up once its dir exists
+    test-7-dm-settings.sh          # E6/E7 (SR-1.2, SR-1.5), dry run: DMs switch and `dm` prompt destinations load; six invalid DM settings refuse the start
+    test-8-reload-confirm.sh       # E11/E12 (SR-8.3 to SR-8.5), dry run: an edit is previewed, applied only on confirmation; a stale confirmation applies nothing
+    test-9-reload-destructive-and-server-wide.sh
+                                   # E13 dry-run leg (SR-8.6): a working_directory change gives one DESTRUCTIVE: line and touches one persona; a port change waits for the restart
+    test-10-credentials-change.sh  # E13 (SR-8.3, SR-8.6), live against the Slack stub: a credentials change reconnects one persona on confirmation; handshake failure and refused change; leak counts
+    lib/
+      scenario.sh                  # shared helper sourced by Tests 5 onwards (see Scenario helper below)
     fixtures/
       driver.ts                    # Test 4 driver: builds a one-persona config, calls spawnForPersona directly
-      stub-claude.sh               # Test 4 fake `claude`: prints the dev-channels dialog, fires SessionStart
+      stub-claude.sh               # fake `claude` (Tests 4 and 10): prints the dev-channels dialog, fires SessionStart
+      slack-stub-server.ts         # Test 10 loopback Slack stub: Web API, apps.connections.open, Socket Mode WebSocket, JSONL record
+    .shellcheckrc                  # lets shellcheck follow `source lib/scenario.sh` without -x
     session-leader.test.ts         # bun test, not run by runner.sh
-  runner.sh                        # sequential runner, writes /test-results/verdict.txt
+  runner.sh                        # sequential runner (Tests 1-4, then discovery), writes /test-results/verdict.txt
   README.md
 docker/
   Dockerfile.test.base             # source-independent base image (see docker/README.md)
@@ -62,9 +76,10 @@ docker/
   entrypoint.sh                    # sets up testuser's Claude config, then runs tests/runner.sh
 ```
 
-The `TESTS=(...)` array in `tests/runner.sh` is the list of scripts the suite
-runs, in order. New scenario scripts are added there; this layout shows the
-suite's shape, not a fixed list.
+`tests/runner.sh` runs Tests 1 to 4 first, in that order, then every other
+`tests/integration/test-*.sh` it finds, in version order (`sort -V`, so
+`test-5` runs before `test-10`). A new scenario script needs no runner edit;
+this layout shows the suite's shape, not a fixed list.
 
 ### Testplan tickets
 
@@ -76,7 +91,11 @@ you change the script, update the testplan. Today that is Tests 1 to 3
 (`testplans/b.j9i`, `b.3hy`, `b.set`).
 
 A script with no ticket is specified by its header comment, and by its
-driver's where it has one (Test 4 and `fixtures/driver.ts`).
+driver's where it has one (Test 4 and `fixtures/driver.ts`). Tests 5 to 10
+have no testplan ticket: each header comment lists what it checks, and the
+log fragments it expects are taken from `src/` (the function that writes
+each is named in the header or in a constants block near the top), so the
+transcription rule does not apply to them.
 `testplans/b.efu` is a separate resume scenario for `/release-test`, not one of
 these scripts. `testplans/b.yko` is the manual live acceptance plan and has no
 script (see Live acceptance plan below).
@@ -86,10 +105,11 @@ script (see Live acceptance plan below).
 Every script runs against a persona config written inside the container, never
 a config or credentials file from the host:
 
-- Every `start` runs with `SLACK_DRY_RUN=1` and with the token environment
-  variables unset. Dry run reads no credentials file, so the credentials files
-  the config names are never created, and it skips each persona's spawn with a
-  persona-keyed log line (`dry-run: skipping spawn for "<name>" (key=<key>)`).
+- Every `start` but Test 10's runs with `SLACK_DRY_RUN=1`, and every `start`
+  runs with the token environment variables unset. Dry run reads no
+  credentials file, so a dry-run script never creates the credentials files
+  its config names, and it skips each persona's spawn with a persona-keyed
+  log line (`dry-run: skipping spawn for "<name>" (key=<key>)`).
 - Instances are persona-keyed (`cscb_<key>`); `stop --stop-bots` names each
   persona it tears down.
 - Tests 1 to 3 share one config, written by Test 1 to
@@ -103,15 +123,138 @@ a config or credentials file from the host:
   conversion error.
 - Test 4 runs without dry run but opens no Slack connection: its driver builds
   a one-persona config in memory and spawns under a stub `claude`.
+- Tests 5 to 10 each write their own config into their own scratch state dir
+  (see Scenario helper), never the shared one. Test 10 is the one scenario
+  outside dry run (see Slack stub).
 
 ### Execution model
 
 `docker/entrypoint.sh` runs `tests/runner.sh` as `testuser`. The runner runs
-the scripts in array order in one container, so state one script leaves (the
-installed package, the running daemon, its PID file and server log) is
-consumed by the scripts after it: Test 1 installs the package and starts the
+the scripts in its order (see Layout) in one container, so state one script
+leaves (the installed package, the running daemon, its PID file and server
+log) is consumed by the scripts after it: Test 1 installs the package and starts the
 daemon, Tests 2 and 3 use that daemon, Test 4 uses the installed package. The
 runner stops at the first failure and runs nothing after it.
+
+Tests 5 onwards depend only on Test 1's install. Each runs its own server in
+its own state dir on its own port, and stops it before it exits, so their
+order among themselves does not matter. They still share the container's one
+HOME and one agent-director store, which is why their persona names are
+unique per script.
+
+Test 10's live start runs the server's start sweep (`reconcileOrphans`,
+`src/session-manager.ts`), which kills and deletes every `service=cscb`
+agent-director row whose persona is not in Test 10's own config (and any row
+with no persona label, a foreign instance ID or another working directory).
+Every row an earlier script left behind is gone after Test 10's start; that is
+acceptable only because the container is ephemeral and the scripts run one at
+a time.
+
+### Scenario helper
+
+`tests/integration/lib/scenario.sh` is sourced by Tests 5 onwards; its header
+comment is the full function list. Sourcing it:
+
+- makes a scratch root (`SCENARIO_ROOT`, `mktemp -d` under `/tmp`) and a
+  first state dir under it, exported as `SLACK_STATE_DIR`, so a scenario never
+  touches `~/.claude/channels/slack/` or another script's state, and its first
+  `start` finds no `config.json.last-applied`;
+- picks a free loopback port (`SCENARIO_PORT`, 20000 to 29999, never 3100,
+  which Tests 1 to 3's server keeps) for the scenario's config to name;
+- sets `SCENARIO_TAG` (`t<N>` from the script name). Build persona names from
+  it (`${SCENARIO_TAG}_alpha`), so no two scripts share a persona key in the
+  one agent-director store;
+- installs an EXIT trap that stops every server the scenario started (with
+  `--stop-bots` after a live start), kills every process registered with
+  `track_pid`, runs the `on_exit` hooks, prints the tail of each `server.log`
+  when the script failed, and removes the scratch root.
+
+Matchers (E14 director decision 14). A matcher is one or more fixed-string
+fragments that must appear on one line in the given order, with anything
+between them; there is no regex. A plain string is a one-fragment matcher, so
+`count_log`, `expect_count`, `wait_for_log`, `wait_for_count`, `count_in`,
+`first_log_line`, `last_log_line` and `pending_has_line` take either. Build a
+multi-fragment matcher with `matcher <fragment>...`. A scenario asserts a
+line's class prefix, persona ref and one distinguishing fragment, never a
+whole sentence: the full wording is owned by the unit tests, and a script that
+quotes it breaks on every rewording.
+
+The line builders return such matchers, each fragment taken from `src/` (the
+helper's header names the function behind each):
+
+| Builder | Matches |
+|---|---|
+| `persona_ref <name>` | the text `"<name>" (key=<key>)` (not a matcher) |
+| `persona_start_match <index> <name>` | the `persona-start` line for that entry |
+| `skip_match <name> [<cwd>]` | the dry-run spawn skip, optionally with its `cwd=` |
+| `completion_match <n>` | the start pass's completion line for `<n>` personas |
+| `counts [<field>=<n>]...` | the reload counts text (not a matcher); unnamed fields are 0 |
+| `preview_header_match [<field>=<n>]...` | the `reload-preview` header with those counts |
+| `applied_match [<field>=<n>]...` | the `reload-applied` line with those counts and the record path |
+| `destructive_match <name> <setting>` | the `DESTRUCTIVE:` line for that persona and setting |
+
+`expect_completion <n> <step> <part>...` checks the last completion line holds
+each `<n> <what>` part. `check_pending_layout` checks the pending file's
+header (`PENDING_HEADER`), fingerprint line and counts.
+`hold_not_applied <hold-s> <step> [<command>...]` proves a change is held:
+for `<hold-s>` seconds the last-applied record keeps its inode and bytes, no
+new `reload-applied` line appears and `<command>` stays true, and the pending
+file still exists afterwards.
+
+Processes. `stop_server` forgets its daemon's PID once the daemon is gone,
+and `stop_tracked_pid <pid> [<timeout-s>] [<step>]` stops a tracked process,
+fails unless it is gone in time, and forgets it. Before the trap signals any
+PID it checks the process is still the scenario's (a child of the script's
+shell, or a process whose environment holds this `SCENARIO_ROOT`), so a PID
+the system reused is left alone; `start_server` fails if its daemon does not
+carry `SCENARIO_ROOT`. `on_exit <function>` registers extra cleanup: the trap
+runs the hooks in registration order, each in a subshell, after every process
+is stopped and before the scratch root is removed, on success and failure
+alike. A failing hook turns a pass into a FAIL.
+
+The contract for a scenario:
+
+- Start and stop only through `start_server` / `stop_server` (or `run_start`
+  for a start expected to fail). `start` runs with the token environment
+  variables and `CSCB_PERSONA` unset, and with `SLACK_DRY_RUN=1` unless
+  `--live` is passed.
+- Wait with `wait_for_log`, `wait_for_count`, `wait_for_file` or
+  `wait_until`, each with a stated bound, never a fixed `sleep`. The reload
+  tick runs 5 s after the previous pass and cannot be shortened.
+- Write config and credentials with `write_config` / `write_file`, which
+  write atomically so a reload tick never reads a half-written file.
+- Build fake tokens only with `fake_token`, and check for leaks with
+  `count_token_like`, which prints a count and never the matched text. No
+  token literal may appear under `tests/` (`tests/secrecy-audit.test.ts`).
+- Assert with matchers built from fragments (see above), never a whole
+  sentence copied from `src/`.
+- Never replace the EXIT trap. Register a background process with
+  `track_pid` and extra cleanup with `on_exit` instead.
+
+### Slack stub
+
+`tests/integration/fixtures/slack-stub-server.ts` is a Bun HTTP and WebSocket
+server on 127.0.0.1 that stands in for Slack, because real Slack is not
+reachable in the container. Test 10 starts it in the background and points
+the server at it through the Slack API base URL override, an environment
+variable for the integration suite only (see Environment Variables in
+`docs/architecture.md`). The server honours it only for an
+`http://127.0.0.1…` or `http://[::1]…` URL, and the stub listens on
+127.0.0.1.
+
+- It answers `auth.test` with an identity per token, `apps.connections.open`
+  with a WebSocket URL on itself that sends `hello`, and every other Web API
+  method with an `ok: true` shape CSCB reads.
+- A control file (or `POST /_control`) sets each token's answers by token
+  suffix: refused auth, a handshake to a closed port, and so on. The scenario
+  rewrites it to switch answers mid-run.
+- Every request is one JSONL line in a record file, labelled with the persona
+  the scenario assigned to the token and a token hash, never the token.
+- It has no `bun test` suite of its own; Test 10 exercises it end to end.
+
+Test 10's live start also launches each persona through the real
+agent-director, so it puts `fixtures/stub-claude.sh` first on `PATH` as
+`claude` (as Test 4 does) and stops with `--stop-bots`.
 
 ### Verdict file format
 
@@ -128,21 +271,29 @@ stdout/stderr where `docker logs` can capture them — never into `verdict.txt`.
 
 1. Write the testplan ticket in `testplans/` (the source of truth — describes
    what is being tested and why, in human prose).
-2. Add `tests/integration/test-N-<short-name>.sh`. Required shape:
+   A self-describing scenario with no ticket (as Tests 5 to 10) skips this
+   step: its header comment lists what it checks, and its expected log
+   fragments are taken from `src/` in the header or a constants block.
+2. Add `tests/integration/test-N-<short-name>.sh`, with `N` the next unused
+   number. Required shape:
    ```bash
    #!/usr/bin/env bash
    set -euo pipefail
    TEST_NAME="test-N-<short-name>"
-   fail() { echo "FAIL: ${TEST_NAME}: $1" >&2; exit 1; }
-   # ... setup + assertions ...
+   # shellcheck source=lib/scenario.sh
+   source "$(dirname "$0")/lib/scenario.sh"
+   # ... write_config, start_server, wait_for_* assertions, stop_server ...
    echo "PASS: ${TEST_NAME}"
    ```
-   Every pass criterion must be an explicit bash assertion that exits non-zero
-   on failure with a `FAIL: <test-name>: <step>` line to stderr.
-3. Append the script filename to the `TESTS=(...)` array in `tests/runner.sh`,
-   in the dependency order it expects.
-4. Run `shellcheck tests/integration/*.sh tests/runner.sh`. The suite must
-   stay warning-free.
+   Every pass criterion must be an explicit bash assertion that calls
+   `fail <step>`, which prints `FAIL: <test-name>: <step>` to stderr and exits
+   non-zero. Follow the helper's contract (see Scenario helper).
+3. Make it executable. The runner picks it up by name and runs every
+   `test-*.sh` through `bash`, so the mode bit is not what makes it run;
+   don't edit `tests/runner.sh`.
+4. Run `shellcheck tests/integration/*.sh tests/integration/lib/*.sh tests/runner.sh`
+   from the repo root. `tests/integration/.shellcheckrc` lets shellcheck follow
+   the helper without `-x`. The suite must stay warning-free.
 
 ### What does NOT belong in a test script
 

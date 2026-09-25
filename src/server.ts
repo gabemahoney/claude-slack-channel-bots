@@ -94,6 +94,7 @@ import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaDestinationHold } from './persona-destination-hold.ts'
 import { createPersonaRouting, hasSessionStream } from './persona-routing.ts'
 import { createPersonaConnectionManager, type PersonaConnectionManager } from './persona-connections.ts'
+import { resolveSlackApiUrlOverride } from './persona-slack-clients.ts'
 import { createUnhandledRejectionHandler, describeThrownValue } from './persona-connection-errors.ts'
 import { createPersonaEventRouter } from './persona-event-router.ts'
 import {
@@ -1226,6 +1227,12 @@ export async function main(): Promise<void> {
   // connects until the bring-up pass below. The controller is built over this
   // manager, so the listener reaches it through the module-scope `bringUps`,
   // assigned right after it is built and before anything connects.
+  //
+  // The integration suite's Slack API base URL override: read once here, at
+  // start, honoured only for an http URL on 127.0.0.1 or [::1] (its origin
+  // logged once), any other value ignored with one warning. Unset, the clients use the library
+  // default. Never set on an operator's host.
+  const slackApiUrl = resolveSlackApiUrlOverride(process.env, (line) => console.error(line))
   const manager = createPersonaConnectionManager({
     onEvent: createPersonaEventRouter({
       routing: personaRouting,
@@ -1235,6 +1242,7 @@ export async function main(): Promise<void> {
     }),
     log: (line) => console.error(line),
     dryRun: isDryRun(),
+    slackApiUrl,
     // b.ujn: a running persona whose Web API call is refused for its bot
     // token is marked credentials-broken at once; only the network close of
     // its detached socket goes through the per-persona serializer.

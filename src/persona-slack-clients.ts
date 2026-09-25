@@ -55,9 +55,24 @@
  * receives to `SocketModeClient` / `WebClient` exactly as given: no option is
  * added, dropped or changed.
  *
+ * Slack API base URL override (integration suite only): when
+ * `CSCB_SLACK_API_URL` holds an `http:` URL on the literal loopback address
+ * `127.0.0.1` or `[::1]` (`loopbackSlackApiUrl`), the server passes it to the
+ * connection manager, and every builder above adds it as `slackApiUrl`: the
+ * validation client, the long-lived Web API client and the Socket Mode
+ * client's own `clientOptions` (so `apps.connections.open` goes there, and
+ * the WebSocket URL it returns is used as given). It exists so the docker
+ * suite can point the server at its Slack stub. It must never be set on an
+ * operator's host, and shipped docs do not describe it. The persona tokens
+ * go only to whatever listens on that loopback port, which is trusted with
+ * them. Any other value is ignored with one warning. The start line names
+ * only the URL's origin. Unset (the builders get no URL), every option set
+ * is exactly as above.
+ *
  * Pure module (b.av2 SR-13.1): nothing is constructed, read or scheduled at
- * import; no environment access, no file access. Nothing logs at import: the
- * library loggers built here write only when a client calls them.
+ * import; no file access, and the environment is read only through the `env`
+ * passed to `resolveSlackApiUrlOverride` when it is called. Nothing logs at
+ * import: the library loggers built here write only when a client calls them.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -89,31 +104,99 @@ export const PERSONA_VALIDATION_REQUEST_TIMEOUT_MS = 10_000
 export const PERSONA_WEB_API_REQUEST_TIMEOUT_MS = 30_000
 
 // ---------------------------------------------------------------------------
+// Slack API base URL override (integration suite only)
+// ---------------------------------------------------------------------------
+
+/** The environment variable holding the integration suite's Slack API base URL. */
+export const SLACK_API_URL_OVERRIDE_ENV = 'CSCB_SLACK_API_URL'
+
+/**
+ * The hostnames (as `URL.hostname` renders them) an override may name: the
+ * literal loopback addresses only. No name (`localhost` included) is accepted,
+ * so nothing is resolved by name.
+ */
+const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(['127.0.0.1', '[::1]'])
+
+/**
+ * `value` as a Slack API base URL override, or `undefined` when it is not
+ * one. Accepted: an `http:` URL whose host is `127.0.0.1` or `[::1]` (or a
+ * form the URL parser normalises to one of them), any port, any path, with no
+ * user info, query or fragment. `localhost` is not accepted. The result is
+ * the parsed URL's `href`.
+ */
+export function loopbackSlackApiUrl(value: string): string | undefined {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    return undefined
+  }
+  if (url.protocol !== 'http:' || !LOOPBACK_HOSTNAMES.has(url.hostname)) return undefined
+  if (url.username !== '' || url.password !== '') return undefined
+  if (url.href.includes('?') || url.href.includes('#')) return undefined
+  return url.href
+}
+
+/**
+ * Read `CSCB_SLACK_API_URL` from `env` and return the base URL every
+ * persona's Slack clients use, or `undefined` for the library default. Unset
+ * or empty: `undefined`, nothing logged. A loopback URL
+ * (`loopbackSlackApiUrl`): that URL, with only its origin logged once
+ * through `log`. Any other value: `undefined`, with one warning through `log`
+ * that never echoes the value. Call it once per server start.
+ */
+export function resolveSlackApiUrlOverride(
+  env: NodeJS.ProcessEnv,
+  log: (line: string) => void,
+): string | undefined {
+  const value = env[SLACK_API_URL_OVERRIDE_ENV]
+  if (value === undefined || value === '') return undefined
+  const url = loopbackSlackApiUrl(value)
+  if (url === undefined) {
+    log(
+      `[slack] Warning: ${SLACK_API_URL_OVERRIDE_ENV} ignored: not a loopback http URL ` +
+        `(http://127.0.0.1 or http://[::1]); Slack calls use the default Slack API`,
+    )
+    return undefined
+  }
+  log(`[slack] Slack API base URL override in use: ${new URL(url).origin} (${SLACK_API_URL_OVERRIDE_ENV})`)
+  return url
+}
+
+/** `{ slackApiUrl }` when an override is given, else an empty object (no key). */
+function slackApiUrlOption(slackApiUrl: string | undefined): WebClientOptions {
+  return slackApiUrl === undefined ? {} : { slackApiUrl }
+}
+
+// ---------------------------------------------------------------------------
 // Option sets (b.av2 SR-3.3)
 // ---------------------------------------------------------------------------
 
 /**
  * The request limits of the Socket Mode client's own HTTP client and of the
  * validation client: no retries, a 10 s timeout, rate limits rejected, no
- * `original` on errors. A fresh object per call.
+ * `original` on errors, and `slackApiUrl` only when an override is given. A
+ * fresh object per call.
  */
-function validationRequestLimits(): WebClientOptions {
+function validationRequestLimits(slackApiUrl?: string): WebClientOptions {
   return {
     retryConfig: { retries: 0 },
     timeout: PERSONA_VALIDATION_REQUEST_TIMEOUT_MS,
     rejectRateLimitedCalls: true,
     attachOriginalToWebAPIRequestError: false,
+    ...slackApiUrlOption(slackApiUrl),
   }
 }
 
 /**
  * The options of the validation client: the validation request limits and a
- * redacting logger (`redactingSlackLogger`). The Socket Mode client's own
- * HTTP client takes the limits without this logger: it gets the socket's
- * logger from the library. A fresh object per call.
+ * redacting logger (`redactingSlackLogger`), plus `slackApiUrl` only when an
+ * override is given. The Socket Mode client's own HTTP client takes the
+ * limits without this logger: it gets the socket's logger from the library.
+ * A fresh object per call.
  */
-export function validationWebClientOptions(): WebClientOptions {
-  return { ...validationRequestLimits(), logger: redactingSlackLogger() }
+export function validationWebClientOptions(slackApiUrl?: string): WebClientOptions {
+  return { ...validationRequestLimits(slackApiUrl), logger: redactingSlackLogger() }
 }
 
 // ---------------------------------------------------------------------------
@@ -284,17 +367,20 @@ export function redactingSlackLogger(): Logger {
  * The options of a persona's Socket Mode client: library auto-reconnect off,
  * the validation request limits for its `apps.connections.open` calls, and a
  * logger of its own, `socketModeSlackLogger(persona, log)`, in place of the
- * library's console logger. A fresh object per call.
+ * library's console logger. With an override given, `clientOptions` also
+ * carries `slackApiUrl`, so `apps.connections.open` goes there. A fresh
+ * object per call.
  */
 export function socketModeClientOptions(
   appToken: string,
   persona: SlackLogPersona,
   log: SlackLibraryLineSink,
+  slackApiUrl?: string,
 ): SocketModeOptions {
   return {
     appToken,
     autoReconnectEnabled: false,
-    clientOptions: validationRequestLimits(),
+    clientOptions: validationRequestLimits(slackApiUrl),
     logger: socketModeSlackLogger(persona, log),
   }
 }
@@ -302,15 +388,17 @@ export function socketModeClientOptions(
 /**
  * The options of a persona's long-lived Web API client: a 30 s per-attempt
  * timeout, no `original` on errors and a redacting logger
- * (`redactingSlackLogger`). `retryConfig` and `rejectRateLimitedCalls` are
- * deliberately unset (the library's default retry policy and rate-limit
- * handling apply). A fresh object per call.
+ * (`redactingSlackLogger`), plus `slackApiUrl` only when an override is
+ * given. `retryConfig` and `rejectRateLimitedCalls` are deliberately unset
+ * (the library's default retry policy and rate-limit handling apply). A fresh
+ * object per call.
  */
-export function longLivedWebClientOptions(): WebClientOptions {
+export function longLivedWebClientOptions(slackApiUrl?: string): WebClientOptions {
   return {
     timeout: PERSONA_WEB_API_REQUEST_TIMEOUT_MS,
     attachOriginalToWebAPIRequestError: false,
     logger: redactingSlackLogger(),
+    ...slackApiUrlOption(slackApiUrl),
   }
 }
 

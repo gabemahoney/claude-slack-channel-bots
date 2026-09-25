@@ -2,7 +2,7 @@ FROM cscb-ci-base:v3
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
-# Bash integration tests — runner.sh + the three test scripts.
+# Bash integration tests — runner.sh, the test scripts and their fixtures.
 COPY tests /tests
 
 # Testplans hive — human-prose source of truth for what gets tested.

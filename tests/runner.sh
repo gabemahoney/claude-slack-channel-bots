@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Sequential integration-test runner. Executes tests 1 → 2 → 3 → 4 in order,
-# short-circuits on first FAIL, writes a single-line verdict to
+# Sequential integration-test runner. Runs tests 1 → 2 → 3 → 4 in that order
+# (they share state: Test 1 installs the package and starts the daemon that
+# Tests 2 and 3 use), then every other integration/test-*.sh in version order
+# (`sort -V`: test-5 before test-10), so a new scenario script runs without a
+# runner edit. Short-circuits on first FAIL, writes a single-line verdict to
 # /test-results/verdict.txt: either "PASS" or "FAIL: <test>: <step>".
 # Exits 0 on PASS, 1 on FAIL.
 set -uo pipefail
@@ -17,11 +20,24 @@ write_verdict() {
     printf '\n' >> "${VERDICT_FILE}"
 }
 
-TESTS=(
+# Run first, in this order, whether or not discovery finds them.
+FIRST_TESTS=(
     "test-1-install-startup.sh"
     "test-2-dryrun-spawn-skip.sh"
     "test-3-cozempic-restart.sh"
     "test-4-resume-dialog.sh"
+)
+
+TESTS=("${FIRST_TESTS[@]}")
+while IFS= read -r name; do
+    for first in "${FIRST_TESTS[@]}"; do
+        [[ "${name}" == "${first}" ]] && continue 2
+    done
+    TESTS+=("${name}")
+done < <(
+    for path in "${TESTS_DIR}"/integration/test-*.sh; do
+        [[ -f "${path}" ]] && printf '%s\n' "${path##*/}"
+    done | sort -V
 )
 
 for test_script in "${TESTS[@]}"; do
