@@ -22,7 +22,7 @@
  * and Slack-unreachable, E2 Task 3 connection lost/restored, E3 Task 7 the
  * unclaimed channel and the DM drop, E5 Task 1 the per-persona start
  * line, E7 Task 2 the destination failure, E13 Task 1 the failed credentials
- * change; later Epics theirs).
+ * change, E13 Task 2 the unresolvable claude_config_dir; later Epics theirs).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -113,6 +113,16 @@ export const PERSONA_DESTINATION_FAILED = 'persona-destination-failed'
  */
 export const PERSONA_CREDENTIALS_CHANGE_FAILED = 'persona-credentials-change-failed'
 
+/**
+ * A persona's effective `claude_config_dir` cannot be resolved to a real path
+ * (bug b.g57): a symlink on its path points to nothing, or resolving it failed
+ * (an unmounted drive, a dropped network mount). The persona is not up
+ * (retrying) and is not launched; its agent-director row is kept, and its
+ * launch waits until the directory resolves. Logged once when the cause
+ * starts and once when it clears (`cleared: …`).
+ */
+export const PERSONA_CONFIG_DIR_UNRESOLVABLE = 'persona-config-dir-unresolvable'
+
 /** Every persona diagnostic class label, in a fixed order. */
 export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_START,
@@ -129,6 +139,7 @@ export const PERSONA_DIAGNOSTIC_CLASSES = [
   PERSONA_DM_DROPPED,
   PERSONA_DESTINATION_FAILED,
   PERSONA_CREDENTIALS_CHANGE_FAILED,
+  PERSONA_CONFIG_DIR_UNRESOLVABLE,
 ] as const
 
 /** A persona diagnostic class label (closed set). */

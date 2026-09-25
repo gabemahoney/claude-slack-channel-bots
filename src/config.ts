@@ -19,19 +19,19 @@
  * real-path collision is left to the bring-up (b.av2 SR-1.5).
  *
  * Pure functions (expandTilde, resolvePersonaConfig, parsePersonaConfigBytes,
- * resolveRealPath) are side-effect-free and importable by tests without
- * performing any I/O (b.av2 SR-13.1); importing this module touches no file
- * and reads no environment variable. resolvePersonaConfig and resolveRealPath
- * resolve real paths (b.av2 SR-1.5) but never open, read, create or write a
- * file. The I/O wrapper (loadPersonaConfig) reads the JSON file once and
+ * resolveRealPath, resolveRealPathStrict) are side-effect-free and importable
+ * by tests without performing any I/O (b.av2 SR-13.1); importing this module
+ * touches no file and reads no environment variable. resolvePersonaConfig,
+ * resolveRealPath and resolveRealPathStrict resolve real paths (b.av2 SR-1.5,
+ * bug b.g57) but never open, read, create or write a file. The I/O wrapper (loadPersonaConfig) reads the JSON file once and
  * delegates to them.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync, readSync, realpathSync } from 'fs'
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from 'fs'
 import { homedir } from 'os'
-import { dirname, isAbsolute, join, resolve } from 'path'
+import { basename, dirname, isAbsolute, join, resolve } from 'path'
 
 import { jsonSyntaxErrorOffset, positionAt } from './json-position.ts'
 import { expandTilde as expandTildeWith, personaKey, renderPersonaRef } from './persona-identity.ts'
@@ -488,6 +488,104 @@ export function tryResolveRealPath(
     return realpath(path)
   } catch {
     return undefined
+  }
+}
+
+/** The file-system operations `resolveRealPathStrict` performs; tests inject them. */
+export interface StrictRealPathFs {
+  /** Resolve a path's real path. Throws an errno-style error (with `code`) on failure. */
+  realpath(path: string): string
+  /** Stat a path without following a final symlink. Throws an errno-style error on failure. */
+  lstat(path: string): { isSymbolicLink(): boolean }
+}
+
+/** The real file system, looked up at call time. */
+const DEFAULT_STRICT_REAL_PATH_FS: StrictRealPathFs = {
+  realpath: (path) => realpathSync(path),
+  lstat: (path) => lstatSync(path),
+}
+
+/**
+ * What `resolveRealPathStrict` found: a real path, or none, with the errno
+ * code of the failure (`unknown` when the failure carried no echo-safe code)
+ * and whether the path's first missing component is a symlink that points to
+ * nothing.
+ */
+export type StrictRealPathResult =
+  | { resolved: true; path: string }
+  | { resolved: false; code: string; danglingSymlink: boolean }
+
+/** An echo-safe errno code (`EIO`, `ENOTCONN`, …). */
+const STRICT_ERRNO_CODE_RE = /^E[A-Z0-9]+$/
+
+/** The errno code of a thrown value, or undefined when it has none. */
+function thrownErrnoCode(err: unknown): string | undefined {
+  if (typeof err !== 'object' || err === null) return undefined
+  const code = (err as { code?: unknown }).code
+  return typeof code === 'string' ? code : undefined
+}
+
+/** The unresolvable result for a thrown value; its code only when echo-safe. */
+function unresolvableFrom(err: unknown): StrictRealPathResult {
+  const code = thrownErrnoCode(err)
+  return { resolved: false, code: code !== undefined && STRICT_ERRNO_CODE_RE.test(code) ? code : 'unknown', danglingSymlink: false }
+}
+
+/**
+ * The real path of `path` with no lexical fallback (bug b.g57), for a
+ * directory that exists or is still to be created, such as a persona's
+ * effective claude_config_dir:
+ *
+ * - it resolves: its real path;
+ * - it does not exist yet: realpath fails with `ENOENT` for it and each
+ *   ancestor up to the nearest one that resolves, and the first missing
+ *   component under that ancestor does not exist either (`lstat` fails with
+ *   `ENOENT`). The result is that ancestor's real path joined with the
+ *   remaining components: the path the directory will have once created
+ *   (Claude Code creates its config directory at first launch). With no
+ *   symlink on the path it equals the lexical `path.resolve` form;
+ * - otherwise it is unresolvable: the first missing component exists (a
+ *   symlink that points to nothing, `danglingSymlink`), or realpath or
+ *   `lstat` failed with any code other than `ENOENT` (`EIO`, `ENOTCONN`,
+ *   `ESTALE`, `EACCES`, `ELOOP`, `ENOTDIR`, …), or no ancestor resolves.
+ *
+ * Never returns the lexical form of a path that failed for another reason,
+ * and never throws for a string path. Resolves only: opens, reads and creates
+ * nothing. A dropped mount that leaves an empty mount point is
+ * indistinguishable from a directory not created yet. The input must already
+ * be tilde-expanded; a relative path is made absolute with `path.resolve`.
+ *
+ * @param path  The path to resolve, already tilde-expanded.
+ * @param fs    File-system overrides; unset operations use the real file
+ *   system, looked up at call time.
+ */
+export function resolveRealPathStrict(path: string, fs?: Partial<StrictRealPathFs>): StrictRealPathResult {
+  const { realpath, lstat } = { ...DEFAULT_STRICT_REAL_PATH_FS, ...fs }
+  let ancestor = resolve(path)
+  const missing: string[] = []
+  for (;;) {
+    let real: string
+    try {
+      real = realpath(ancestor)
+    } catch (err) {
+      const parent = dirname(ancestor)
+      if (thrownErrnoCode(err) !== 'ENOENT' || parent === ancestor) return unresolvableFrom(err)
+      missing.unshift(basename(ancestor))
+      ancestor = parent
+      continue
+    }
+    if (missing.length === 0) return { resolved: true, path: real }
+    let isSymlink: boolean
+    try {
+      isSymlink = lstat(join(real, missing[0]!)).isSymbolicLink()
+    } catch (err) {
+      if (thrownErrnoCode(err) === 'ENOENT') return { resolved: true, path: join(real, ...missing) }
+      return unresolvableFrom(err)
+    }
+    // The component exists but has no real path: a symlink that points to
+    // nothing (or, in a race, something created since realpath failed; the
+    // caller's next attempt resolves it).
+    return { resolved: false, code: 'ENOENT', danglingSymlink: isSymlink }
   }
 }
 

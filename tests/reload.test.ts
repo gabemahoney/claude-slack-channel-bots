@@ -2503,6 +2503,7 @@ describe('the default step 3 body updates each persona once (lifecycleApplySlots
         calls.push(`updateInPlace ${change.persona.key}`)
         updates.push(change)
       },
+      refreshTemplate: async () => void calls.push('refreshTemplate'),
     }
     const slots = lifecycleApplySlots(members, (step, persona) => failures.push(`${step} ${persona.key}`))
     const inputs: ApplyStepInputs = {

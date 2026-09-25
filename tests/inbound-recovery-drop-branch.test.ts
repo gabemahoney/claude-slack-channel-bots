@@ -5,10 +5,13 @@
  *
  * A Slack message that qualifies for persona P but finds no live,
  * stream-bearing session (no session, a disconnected one, or one that has lost
- * its GET stream) is lost. The branch in src/persona-routing.ts applies P's
- * restart guards (a restart already pending or running, auto-restart
- * disabled, P at the restart-failure cap), schedules a human-triggered restart
- * of P only when none applies ("starting now"), and raises one lost-message
+ * its GET stream) is lost. The branch in src/persona-routing.ts asks whether P
+ * is up (bug b.g57: a persona that is not up, such as one held for an
+ * unresolvable claude_config_dir while its Slack connection serves, is never
+ * restarted from here) and applies P's restart guards (a restart already
+ * pending or running, auto-restart disabled, P at the restart-failure cap),
+ * schedules a human-triggered restart of P only when none applies ("starting
+ * now"), and raises one lost-message
  * notice at P's permission-prompt destination (a channel, or the DM with
  * `dm.contact`), through P's own client and under P's identity. The notice
  * names P, the sender and the recovery state, and never carries the message
@@ -54,7 +57,7 @@ import { recordFailure, isAtCap } from '../src/backoff.ts'
 import type { Persona } from '../src/config.ts'
 import type { LostMessageState } from '../src/lost-message.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
-import { createPersonaRelaunchGate } from '../src/persona-start.ts'
+import { createPersonaRelaunchGate, createPersonaUpPredicate } from '../src/persona-start.ts'
 import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
 import {
   makeAppMention,
@@ -131,6 +134,12 @@ type Harness = RoutingHarness & {
   beta: Persona
   /** Deliver `event` to the receiving persona key(s), as the socket handler does. */
   deliver(event: unknown, keys: string | readonly string[]): Promise<void>
+  /** Keys whose bring-up outcome is not `up`, read by the up check at call time (with `upCheck` or `notUp`). */
+  notUp: Set<string>
+  /** Every key the routing asked the up check about, in order. */
+  upAsks: string[]
+  /** The bring-up outcomes the up check reads (`isUp`), for a relaunch gate over the same state. */
+  outcomes: { isUp(key: string): boolean }
 }
 
 interface HarnessOptions {
@@ -142,15 +151,33 @@ interface HarnessOptions {
   alphaStub?: StubSlackOptions
   resolveUserName?: RoutingHarnessOptions['resolveUserName']
   notify?: RoutingHarnessOptions['notify']
+  /**
+   * Give the routing the up check (bug b.g57): the real
+   * `createPersonaUpPredicate` over a connection that serves for every
+   * persona and a bring-up outcome that is `up` except for the keys in
+   * `h.notUp`. Without it (and without `notUp`) the routing has no up check.
+   */
+  upCheck?: boolean
+  /** Names whose bring-up is not `up` (held, as for an unresolvable claude_config_dir); implies `upCheck`. */
+  notUp?: readonly string[]
 }
 
+/** A connection that serves: a persona held by its bring-up keeps it (b.g57). */
+const SERVING: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0SERVING', botId: 'B0SERVING' } }
+
 let dir: string
-let harnesses: Harness[] = []
+/** Every harness a case built (cleaned up and leak-checked in teardown). */
+let harnesses: RoutingHarness[] = []
 /** Launches held open by a case; released in teardown. */
 let heldLaunches: Array<(ok: boolean) => void> = []
 
 function makeHarness(opts: HarnessOptions = {}): Harness {
   const streamless = opts.branch === 'streamless'
+  const notUp = new Set<string>()
+  const upAsks: string[] = []
+  const outcomes = { isUp: (key: string) => !notUp.has(key) }
+  const isUp = createPersonaUpPredicate({ status: () => SERVING }, outcomes)
+  const withUpCheck = opts.upCheck === true || opts.notUp !== undefined
   const h = makeRoutingHarness(
     [
       { name: 'beta', channels: [{ id: BETA_MENTIONS, delivery: 'mentions' }, { id: SHARED, delivery: 'mentions' }] },
@@ -176,14 +203,24 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
       stubOptions: opts.alphaStub ? { alpha: opts.alphaStub } : undefined,
       resolveUserName: opts.resolveUserName,
       notify: opts.notify,
+      isPersonaUp: withUpCheck
+        ? (key) => {
+          upAsks.push(key)
+          return isUp(key)
+        }
+        : undefined,
     },
   )
   const [beta, alpha] = h.config!.personas as [Persona, Persona]
+  for (const key of h.keys(opts.notUp ?? [])) notUp.add(key)
   const harness = Object.assign(h, {
     alpha,
     beta,
     deliver: (event: unknown, keys: string | readonly string[]) =>
       h.receiveKeys(event, typeof keys === 'string' ? [keys] : keys),
+    notUp,
+    upAsks,
+    outcomes,
   })
   harnesses.push(harness)
   return harness
@@ -361,40 +398,49 @@ describe('AC 26: a lost message is reported once, at the persona\'s destination,
 })
 
 // ===========================================================================
-// AC 26 x SR-7.3 — the recovery state. Four states × a channel or `dm`
-// destination, on the no-session branch. Each notice identifies its state and
-// no other (so the four texts are pairwise distinct); only "starting now"
-// schedules a launch.
+// AC 26 x SR-7.3 — the recovery state. Five states (not up, from bug b.g57,
+// and the four restart-guard states) × a channel or `dm` destination, on the
+// no-session branch. Each notice identifies its state and no other (so the
+// five texts are pairwise distinct); only "starting now" schedules a launch.
+// The four restart-guard rows run with no up check, so a routing without
+// `isPersonaUp` counts every persona as up.
 // ===========================================================================
 
-describe('AC 26: the notice reports the recovery state', () => {
-  const setups: Record<LostMessageState, { opts: HarnessOptions; arrange(h: Harness): Promise<void> | void; launches: number }> = {
-    // A launch of alpha is already in flight; a stacked one would make two.
-    'restarting': {
-      opts: { launchSession: holdLaunchOpen },
-      arrange: async (h) => {
-        scheduleRestart(h.alpha.key, h.alpha.working_directory, undefined, { humanTrigger: true })
-        await waitFor(() => h.launches.length === 1)
-        expect(h.launches).toHaveLength(1)
-      },
-      launches: 1,
+/**
+ * How each recovery state is arranged for the next lost message on the
+ * no-session branch, and the launches there are once it is handled.
+ */
+const STATE_SETUPS: Record<LostMessageState, { opts: HarnessOptions; arrange(h: Harness): Promise<void> | void; launches: number }> = {
+  // Bug b.g57: alpha's bring-up is held while its connection serves;
+  // restart.ts itself would launch (fast delay) if it were asked.
+  'not-up': { opts: { notUp: ['alpha'] }, arrange: () => {}, launches: 0 },
+  // A launch of alpha is already in flight; a stacked one would make two.
+  'restarting': {
+    opts: { launchSession: holdLaunchOpen },
+    arrange: async (h) => {
+      scheduleRestart(h.alpha.key, h.alpha.working_directory, undefined, { humanTrigger: true })
+      await waitFor(() => h.launches.length === 1)
+      expect(h.launches).toHaveLength(1)
     },
-    'starting-now': { opts: {}, arrange: () => {}, launches: 1 },
-    // restart.ts itself would launch (nonzero restart delay) if it were asked.
-    'auto-restart-disabled': { opts: { sessionRestartDelay: 0 }, arrange: () => {}, launches: 0 },
-    'restart-limit-reached': {
-      opts: {},
-      arrange: (h) => { for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(h.alpha.key) },
-      launches: 0,
-    },
-  }
+    launches: 1,
+  },
+  'starting-now': { opts: {}, arrange: () => {}, launches: 1 },
+  // restart.ts itself would launch (nonzero restart delay) if it were asked.
+  'auto-restart-disabled': { opts: { sessionRestartDelay: 0 }, arrange: () => {}, launches: 0 },
+  'restart-limit-reached': {
+    opts: {},
+    arrange: (h) => { for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(h.alpha.key) },
+    launches: 0,
+  },
+}
 
+describe('AC 26: the notice reports the recovery state', () => {
   const table: [LostMessageState, Destination][] = LOST_MESSAGE_STATES.flatMap((s) => (['channel', 'dm'] as const).map((d): [LostMessageState, Destination] => [s, d]))
 
   test.each(table)(
     'AC 26: state %s, a %s destination: one notice at the destination naming the sender and that state only, nothing in the source',
     async (state, destination) => {
-      const setup = setups[state]
+      const setup = STATE_SETUPS[state]
       const h = makeHarness({ destination, ...setup.opts })
       await setup.arrange(h)
 
@@ -406,6 +452,112 @@ describe('AC 26: the notice reports the recovery state', () => {
       for (const launch of h.launches) expect(launch).toEqual({ key: h.alpha.key, cwd: h.alpha.working_directory })
     },
   )
+})
+
+// ===========================================================================
+// Bug b.g57 — a persona that is not up (its bring-up held, as for an
+// unresolvable claude_config_dir) keeps its Slack connection, so its messages
+// still arrive and are lost. Each one used to report "starting now" and ask
+// for a restart the relaunch gate refused. Now the notice says "not up" and
+// nothing is scheduled: its own recovery launches it. The up check is the
+// real `createPersonaUpPredicate` over a serving connection; the production
+// wiring (the routing gets the server's one `isPersonaUp`) is pinned in
+// tests/server-startup-wiring.test.ts.
+// ===========================================================================
+
+describe('b.g57: a lost message for a persona that is not up starts no restart', () => {
+  test.each(['no session', 'streamless'] as const)(
+    'b.g57 REGRESSION: %s, alpha held with its connection serving: three messages each get exactly the not-up notice at the destination, no restart is asked for, scheduled or launched and nothing is delivered; once alpha is up, the next lost message starts now',
+    async (branch) => {
+      const h = makeHarness({ branch, notUp: ['alpha'] })
+      // The relaunch gate over the same bring-up state: before the fix every
+      // message asked it for a restart, and it refused with a line.
+      const gateLines: string[] = []
+      const deps = makeRestartDeps({ restartDelayS: FAST_DELAY_S })
+      deps.canRestart = createPersonaRelaunchGate({ status: () => SERVING }, (line) => { gateLines.push(line) }, h.outcomes)
+      initRestart(deps)
+
+      for (let i = 0; i < 3; i++) await h.deliver(messageIn(SHARED, `message ${i} ${MESSAGE_MARKER}`), h.alpha.key)
+
+      expect(lostNotices(h)).toEqual(Array.from({ length: 3 }, () => ({ key: h.alpha.key, channel: ALPHA_HOME, state: 'not-up' })))
+      for (const post of h.allPosts()) expectNoticeText(h, post.text, STUB_USER_NAME, 'not-up')
+      expect(h.postsTo(SHARED)).toEqual([])
+      expect(h.upAsks).toEqual([h.alpha.key, h.alpha.key, h.alpha.key])
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
+      expect(gateLines).toEqual([])
+      expect(h.p('alpha').notifications).toEqual([])
+      expectBetaUntouched(h)
+      await Bun.sleep(WAIT_MS) // a restart scheduled anyway would have launched by now
+      expect(deps.launches).toEqual([])
+
+      // Control: the same persona, up again, is restarted by its next lost message.
+      h.notUp.delete(h.alpha.key)
+      await h.deliver(messageIn(SHARED), h.alpha.key)
+      expect(lostNotices(h).map((n) => n.state)).toEqual(['not-up', 'not-up', 'not-up', 'starting-now'])
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
+      await waitFor(() => deps.launches.length > 0)
+      expect(deps.launches).toEqual([{ key: h.alpha.key, cwd: expectedLaunchCwd(h, branch) }])
+      expect(gateLines).toEqual([])
+    },
+  )
+
+  test('b.g57: one message lost on both connections, beta up and alpha not up: beta reports starting now and is restarted, alpha reports not up and is not, each at its own destination', async () => {
+    const h = makeHarness({ notUp: ['alpha'] })
+    // Beta is `mentions` in the shared channel, so it gets the message by mention.
+    const event = messageIn(SHARED, `${mentionText(h.p('beta').stub.identity.botUserId)} ${MESSAGE_MARKER}`)
+
+    await h.deliver(event, [h.beta.key, h.alpha.key])
+
+    expect(lostNotices(h)).toEqual([
+      { key: h.beta.key, channel: BETA_MENTIONS, state: 'starting-now' },
+      { key: h.alpha.key, channel: ALPHA_HOME, state: 'not-up' },
+    ])
+    expect(h.postsTo(SHARED)).toEqual([])
+    expect(h.upAsks).toEqual([h.beta.key, h.alpha.key])
+    expect(isRestartPendingOrActive(h.beta.key)).toBe(true)
+    expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
+    await waitFor(() => h.launches.length > 0)
+    await Bun.sleep(WAIT_MS)
+    expect(h.launches).toEqual([{ key: h.beta.key, cwd: h.beta.working_directory }])
+  })
+
+  test('b.g57: the up check is asked with the persona\'s key, not its name', async () => {
+    const asked: string[] = []
+    const h = makeRoutingHarness([{ name: 'Held Persona', channels: [{ id: SHARED, delivery: 'all' }] }], dir, {
+      sessions: [],
+      restartDelayS: FAST_DELAY_S,
+      isPersonaUp: (key) => {
+        asked.push(key)
+        return false
+      },
+    })
+    harnesses.push(h)
+    const held = h.config!.personas[0]!
+    expect(held.key).not.toBe(held.name)
+
+    await h.receiveKeys(messageIn(SHARED), [held.key])
+
+    expect(asked).toEqual([held.key])
+    expect(h.allPosts().map((p) => stateOf(p.text))).toEqual(['not-up'])
+    expect(isRestartPendingOrActive(held.key)).toBe(false)
+  })
+
+  // An up persona passing the check to "starting now" is the beta side of the
+  // two-persona case above; the AC 26 state table (no up check at all) fails
+  // if an absent check counted as not up. This one row shows an up persona
+  // still falls through to a later restart-guard state.
+  test('b.g57: alpha up through the up check and at the restart-failure cap: the notice says restart limit reached and nothing launches', async () => {
+    const setup = STATE_SETUPS['restart-limit-reached']
+    const h = makeHarness({ ...setup.opts, upCheck: true })
+    await setup.arrange(h)
+
+    await h.deliver(messageIn(SHARED), h.alpha.key)
+
+    expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'restart-limit-reached' })
+    expect(h.upAsks).toEqual([h.alpha.key])
+    await Bun.sleep(WAIT_MS)
+    expect(h.launches).toEqual([])
+  })
 })
 
 // ===========================================================================

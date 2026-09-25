@@ -24,9 +24,15 @@
  *
  * Both row checks go through `compareRowToPersona`. At most one launch per
  * persona is in flight (b.av2 SR-6.3): a concurrent call for the same key
- * joins the running ladder. Every ladder run first calls the installed
- * pre-launch trust patcher (`setPreLaunchTrustPatcher`, b.av2 SR-6.2), so the
- * persona's `.claude.json` trust flags are set before any spawn or resume.
+ * joins the running ladder. Every launch first resolves the persona's
+ * claude_config_dir to a real path with no lexical fallback (bug b.g57,
+ * `checkLaunchConfigDir`); when it cannot be resolved the launch makes no
+ * agent-director call, keeps the row, hands the persona to the installed
+ * hook (`setConfigDirUnresolvableHook`: the bring-up controller holds it
+ * `retrying` and re-checks) and returns `deferred`. Every ladder run first
+ * calls the installed pre-launch trust patcher (`setPreLaunchTrustPatcher`,
+ * b.av2 SR-6.2), so the persona's `.claude.json` trust flags are set before
+ * any spawn or resume.
  * Immediately before each `client.spawn` / `client.resume` it calls the
  * installed pre-launch reply guard (`setPreLaunchReplyGuard`, b.av2 SR-9.4):
  * the persona's reply-guard record, launched-with dir and managed Stop hook.
@@ -74,10 +80,13 @@ import { checkCozempicAvailable, resolveJsonlPath } from './cozempic.ts'
 import {
   type Persona,
   type PersonaConfig,
+  type StrictRealPathFs,
   MCP_SERVER_NAME,
-  resolveRealPath,
+  resolveRealPathStrict,
   tryResolveRealPath,
 } from './config.ts'
+import { checkPersonaConfigDir, type ConfigDirCheckResult } from './persona-bringup.ts'
+import type { PersonaCheckFailure } from './persona-diagnostics.ts'
 import {
   CONFIG_DIR_LABEL_PREFIX,
   PERSONA_LABEL_KEY,
@@ -153,24 +162,62 @@ function keyRef(key: string): string {
 }
 
 /**
+ * Thrown by `personaConfigDirLabelValue` for a claude_config_dir that cannot
+ * be resolved to a real path (bug b.g57): there is no lexical fallback, so
+ * such a directory has no `config_dir` label. Carries the configured
+ * directory (tilde-expanded, absolute) and the errno code; never a token.
+ */
+export class ConfigDirUnresolvableError extends Error {
+  constructor(
+    readonly path: string,
+    readonly code: string,
+  ) {
+    super(`claude_config_dir ${JSON.stringify(path)} cannot be resolved to a real path (${code})`)
+    this.name = 'ConfigDirUnresolvableError'
+  }
+}
+
+/**
+ * A persona's `config_dir` label value, or why there is none: the configured
+ * directory and the errno code when it cannot be resolved to a real path.
+ */
+function strictConfigDirLabel(
+  configDir: string | undefined,
+  home: string,
+  fs: Partial<StrictRealPathFs> | undefined,
+): { label: string } | { path: string; code: string } {
+  const path = resolveClaudeConfigDir(configDir, home)
+  const resolution = resolveRealPathStrict(path, fs)
+  return resolution.resolved ? { label: configDirLabelValue(resolution.path, home) } : { path, code: resolution.code }
+}
+
+/**
  * Value of a persona's `config_dir` label: the 12-hex hash of the REAL path
  * of its effective claude_config_dir (b.av2 SR-1.5, SR-2.2). An absent
  * directory means `<home>/.claude`. The directory is tilde-expanded and
- * resolved against `home`, then real-pathed with `resolveRealPath` (lexical
- * `path.resolve` when realpath fails), so a symlink and its target give the
- * same label. E1's `configDirLabelValue` alone hashes lexically; this is the
- * one derivation spawns and later label comparisons use.
+ * resolved against `home`, then real-pathed with `resolveRealPathStrict`, so
+ * a symlink and its target give the same label, and a directory not created
+ * yet gives the label of the real path it will have (its nearest existing
+ * ancestor's real path plus the rest). There is no lexical fallback (bug
+ * b.g57): a directory that cannot be resolved (a symlink on its path pointing
+ * to nothing, an unmounted drive, a dropped mount) throws
+ * `ConfigDirUnresolvableError`. E1's `configDirLabelValue` alone hashes
+ * lexically; this is the one derivation spawns and later label comparisons
+ * use (the launch checks the directory first, `checkLaunchConfigDir`, and
+ * `compareRowToPersona` reports it as unresolved rather than throwing).
  *
  * @param configDir  The persona's effective claude_config_dir, as configured.
  * @param home       Home directory; defaults to the OS home, read at call time.
- * @param realpath   Realpath function; defaults to `fs.realpathSync`.
+ * @param fs         Realpath and lstat overrides; default the real file system.
  */
 export function personaConfigDirLabelValue(
   configDir?: string,
   home: string = homedir(),
-  realpath: (path: string) => string = realpathSync,
+  fs?: Partial<StrictRealPathFs>,
 ): string {
-  return configDirLabelValue(resolveRealPath(resolveClaudeConfigDir(configDir, home), realpath), home)
+  const result = strictConfigDirLabel(configDir, home, fs)
+  if ('label' in result) return result.label
+  throw new ConfigDirUnresolvableError(result.path, result.code)
 }
 
 /** Label-map key of the `config_dir=<hash>` label (`config_dir`). */
@@ -197,12 +244,28 @@ export interface RowPersonaComparison {
    * never adopts a directory another persona may now own.
    */
   cwdCheckDeferred: boolean
-  /** The row carries a `config_dir` label equal to `expectedConfigDirLabel`. */
-  configDirMatches: boolean
+  /**
+   * The persona's effective claude_config_dir resolved to a real path (or to
+   * the one it will have once created; `resolveRealPathStrict`). When it did
+   * not (bug b.g57), there is no `config_dir` verdict: `configDirMatches` and
+   * `expectedConfigDirLabel` are undefined, and a caller keeps the row rather
+   * than treat it as a mismatch.
+   */
+  configDirResolved: boolean
+  /**
+   * The row carries a `config_dir` label equal to `expectedConfigDirLabel`;
+   * undefined (no verdict) when the directory is unresolvable. Check
+   * `configDirResolved` before acting on it.
+   */
+  configDirMatches: boolean | undefined
   /** The row's `config_dir` label value; undefined when the label is absent. */
   configDirLabel: string | undefined
-  /** The `config_dir` label a spawn of the persona carries now (`personaConfigDirLabelValue`). */
-  expectedConfigDirLabel: string
+  /**
+   * The `config_dir` label a spawn of the persona carries now
+   * (`personaConfigDirLabelValue`); undefined when the directory is
+   * unresolvable, since no label is ever derived from its lexical path.
+   */
+  expectedConfigDirLabel: string | undefined
 }
 
 /**
@@ -222,21 +285,26 @@ export interface RowPersonaComparison {
  *   skip the `cwd` condition for such a row rather than act on the lexical
  *   comparison (b.av2 SR-6.4); a row whose `cwd` resolves to an existing
  *   directory is compared as usual and so mismatches.
+ * - `configDirResolved`: the persona's effective claude_config_dir has a real
+ *   path (`resolveRealPathStrict`, no lexical fallback; bug b.g57).
  * - `configDirMatches`: the row's `config_dir` label is present and equals
- *   `personaConfigDirLabelValue(persona.claude_config_dir, home, realpath)`,
- *   the value the spawn writes.
+ *   `personaConfigDirLabelValue(persona.claude_config_dir, home, configDirFs)`,
+ *   the value the spawn writes; undefined when the directory is unresolvable.
  *
- * @param row       The row's `cwd` and `labels` (from `get` or `list`).
- * @param persona   The resolved persona.
- * @param home      Home directory for an unset claude_config_dir; defaults to
- *   the OS home, read at call time.
- * @param realpath  Realpath function; defaults to `fs.realpathSync`.
+ * @param row          The row's `cwd` and `labels` (from `get` or `list`).
+ * @param persona      The resolved persona.
+ * @param home         Home directory for an unset claude_config_dir; defaults
+ *   to the OS home, read at call time.
+ * @param realpath     Realpath function; defaults to `fs.realpathSync`.
+ * @param configDirFs  Realpath and lstat for the claude_config_dir; default
+ *   `realpath` and the real `lstat`.
  */
 export function compareRowToPersona(
   row: { cwd?: string; labels?: Record<string, string> },
   persona: Pick<Persona, 'working_directory' | 'claude_config_dir'>,
   home: string = homedir(),
   realpath: (path: string) => string = realpathSync,
+  configDirFs: Partial<StrictRealPathFs> = { realpath },
 ): RowPersonaComparison {
   const workingDirectory = tryResolveRealPath(persona.working_directory, realpath)
   const configuredLexical = resolvePath(persona.working_directory)
@@ -246,12 +314,15 @@ export function compareRowToPersona(
     workingDirectory === undefined &&
     (rowCwdReal === undefined || resolvePath(row.cwd!) === configuredLexical)
   const configDirLabel = row.labels?.[CONFIG_DIR_LABEL_KEY]
-  const expectedConfigDirLabel = personaConfigDirLabelValue(persona.claude_config_dir, home, realpath)
+  const expected = strictConfigDirLabel(persona.claude_config_dir, home, configDirFs)
+  const expectedConfigDirLabel = 'label' in expected ? expected.label : undefined
   return {
     cwdMatches,
     workingDirectoryResolved: workingDirectory !== undefined,
     cwdCheckDeferred,
-    configDirMatches: configDirLabel !== undefined && configDirLabel === expectedConfigDirLabel,
+    configDirResolved: expectedConfigDirLabel !== undefined,
+    configDirMatches:
+      expectedConfigDirLabel === undefined ? undefined : configDirLabel !== undefined && configDirLabel === expectedConfigDirLabel,
     configDirLabel,
     expectedConfigDirLabel,
   }
@@ -1122,6 +1193,112 @@ export interface SpawnPersonaResult {
     | 'failed'
     | 'fresh-after-amnesia'
     | 'fresh-after-inconclusive-amnesia'
+    /**
+     * Not launched: the persona's claude_config_dir cannot be resolved to a
+     * real path (bug b.g57). No agent-director call was made and its row is
+     * untouched; the bring-up controller holds the persona `retrying` until
+     * the directory resolves. Not a failure: `launchSession` maps it to
+     * `'skipped'`, so it counts toward no restart failure or cap.
+     */
+    | 'deferred'
+  /** For `deferred`: the claude_config_dir cause (`claude-config-dir` step). */
+  deferredBy?: PersonaBringUpFailure
+}
+
+// ---------------------------------------------------------------------------
+// Pre-launch claude_config_dir check (bug b.g57)
+// ---------------------------------------------------------------------------
+
+/**
+ * Realpath and lstat overrides for resolving a persona's claude_config_dir on
+ * the launch path: the pre-launch check, the spawn label and the ladder's
+ * `config_dir` comparison. `undefined` means the real file system.
+ */
+let _configDirFs: Partial<StrictRealPathFs> | undefined
+
+/** Test-only seam: resolve every persona's claude_config_dir on the launch path through `fs`. */
+export function _setConfigDirFs(fs: Partial<StrictRealPathFs>): void {
+  _configDirFs = fs
+}
+
+/** Test-only seam: restore the real file system for the claude_config_dir resolution. */
+export function _resetConfigDirFs(): void {
+  _configDirFs = undefined
+}
+
+/**
+ * The launch path's check of a persona's claude_config_dir (bug b.g57):
+ * `checkPersonaConfigDir` against the spawn home and the file-system seam, so
+ * the check, the spawn label and the ladder's comparison resolve the
+ * directory the same way. Production also injects it into the bring-up
+ * controller as its re-check. Never throws.
+ */
+export function checkLaunchConfigDir(persona: Persona): ConfigDirCheckResult {
+  return checkPersonaConfigDir(persona, { home: spawnHomeDir(), fs: _configDirFs })
+}
+
+/**
+ * Told when a launch finds a persona's claude_config_dir unresolvable; returns
+ * whether it holds the persona (production: the bring-up controller's
+ * `holdForConfigDir`, which logs the failure line once per episode and
+ * re-checks on the persona's own timer).
+ */
+export type ConfigDirUnresolvableHook = (persona: Persona, failure: PersonaCheckFailure) => boolean
+
+/**
+ * The one hook, installed like the pre-launch reply guard. With none installed
+ * (unit tests, the integration driver), or when it does not hold the persona,
+ * the failure line is logged here, on every attempt.
+ */
+let configDirUnresolvableHook: ConfigDirUnresolvableHook | undefined
+
+/** Install (or, with undefined, remove) the unresolvable-claude_config_dir hook (production: `server.ts`). */
+export function setConfigDirUnresolvableHook(hook: ConfigDirUnresolvableHook | undefined): void {
+  configDirUnresolvableHook = hook
+}
+
+/** Hand an unresolvable claude_config_dir to the hook; log its line when nothing holds the persona. Never throws. */
+function deferLaunchForConfigDir(persona: Persona, failure: PersonaCheckFailure): void {
+  let held = false
+  if (configDirUnresolvableHook) {
+    try {
+      held = configDirUnresolvableHook(persona, failure)
+    } catch (err) {
+      console.error(
+        `[slack] spawnForPersona: holding ${personaRef(persona)} for its claude_config_dir failed: ${describeThrownValue(err)}`,
+      )
+    }
+  }
+  if (!held) console.error(failure.line)
+}
+
+/** The `deferred` result for a persona whose claude_config_dir cannot be resolved. */
+function deferredResult(persona: Persona, failure: PersonaCheckFailure): SpawnPersonaResult {
+  return { key: persona.key, action: 'deferred', deferredBy: { step: 'claude-config-dir', class: failure.class, cause: failure.cause } }
+}
+
+/**
+ * Before a path that would touch the persona's instance ahead of its launch
+ * (the restart module's kill adapter): check its claude_config_dir and, when
+ * it cannot be resolved, hand it to the hook as a launch would and return
+ * true, so the caller leaves the instance and its row alone. False when the
+ * directory resolves. Makes no agent-director call.
+ */
+export function holdLaunchIfConfigDirUnresolvable(persona: Persona): boolean {
+  return deferIfConfigDirUnresolvable(persona) !== undefined
+}
+
+/**
+ * Check the persona's claude_config_dir; when it cannot be resolved, hand it
+ * to the hook as a launch would and return the `deferred` result with its
+ * cause (`deferredBy`), as the pre-launch check does. Undefined when the
+ * directory resolves.
+ */
+function deferIfConfigDirUnresolvable(persona: Persona): SpawnPersonaResult | undefined {
+  const check = checkLaunchConfigDir(persona)
+  if (check.ok) return undefined
+  deferLaunchForConfigDir(persona, check)
+  return deferredResult(persona, check)
 }
 
 /**
@@ -1156,15 +1333,16 @@ function spawnHomeDir(): string {
  * set to the persona's working directory.
  *
  * `CLAUDE_CONFIG_DIR` carries the persona's effective claude_config_dir exactly
- * as configured and is absent when none is; the `config_dir` label hashes its
- * real path (`personaConfigDirLabelValue`).
+ * as configured and is absent when none is; the `config_dir` label is
+ * `configDirLabel`, the hash of its real path from the launch's pre-launch
+ * check (`checkLaunchConfigDir`), never of its lexical path (bug b.g57).
  *
  * extra_env unconditionally carries CSCB_CRONTABLE_PATH (the resolved,
  * tilde-expanded, absolute cron_table_path from the config) so bots can
  * locate the self-documenting crontable from the env var alone — no config
  * file lookup needed (D-Q2, b.grx decision 3).
  */
-function buildSpawnParams(persona: Persona, config: PersonaConfig): SpawnParams {
+function buildSpawnParams(persona: Persona, config: PersonaConfig, configDirLabel: string): SpawnParams {
   const { key } = persona
   return {
     template: TEMPLATE_NAME,
@@ -1175,7 +1353,7 @@ function buildSpawnParams(persona: Persona, config: PersonaConfig): SpawnParams 
     label: [
       SERVICE_LABEL,
       `${PERSONA_LABEL_PREFIX}${key}`,
-      `${CONFIG_DIR_LABEL_PREFIX}${personaConfigDirLabelValue(persona.claude_config_dir, spawnHomeDir())}`,
+      `${CONFIG_DIR_LABEL_PREFIX}${configDirLabel}`,
     ],
     extra_env: personaSpawnEnv({
       key,
@@ -1724,7 +1902,20 @@ async function resumeOrFreshSpawn(
 
   // b.av2 SR-6.2: a resume keeps the row's old CLAUDE_CONFIG_DIR, so resume
   // only a row labelled with the persona's current effective config dir.
-  const configDir = compareRowToPersona(row, persona, spawnHomeDir())
+  const configDir = compareRowToPersona(row, persona, spawnHomeDir(), undefined, _configDirFs)
+  if (!configDir.configDirResolved) {
+    // Bug b.g57: the directory stopped resolving since this ladder's
+    // pre-launch check. No verdict, so no replacement: keep the row and
+    // launch nothing; the hold re-checks and launches once it resolves.
+    const deferred = deferIfConfigDirUnresolvable(persona)
+    if (deferred !== undefined) return deferred
+    // It resolved again between the comparison and the re-check: nothing
+    // holds it, and its next restart or health tick launches it.
+    console.error(
+      `[slack] spawnForPersona: ${ref} claude_config_dir could not be resolved during the launch — keeping its row; not launching`,
+    )
+    return { key, action: 'deferred' }
+  }
   if (!configDir.configDirMatches) {
     const was = configDir.configDirLabel === undefined ? 'label absent' : `was=${configDir.configDirLabel}`
     console.error(
@@ -2048,19 +2239,26 @@ export async function whenLaunchSettled(key: string): Promise<void> {
 /**
  * Core per-persona spawn dispatcher (SR-1.4), addressing `cscb_<key>`:
  *
- * 1. Dry-run: skip entirely, return synthetic success.
- * 2. One in-flight launch per persona (b.av2 SR-6.3): while a launch for the
+ * 1. One in-flight launch per persona (b.av2 SR-6.3): while a launch for the
  *    key is in flight, a second call joins it and receives its result instead
  *    of starting a second ladder. The start's worker pool and the restart
  *    module's `launchSession` both come through here. Keys are independent.
- * 3. Run the installed pre-launch trust patcher for the persona (b.av2
+ * 2. Pre-launch claude_config_dir check (bug b.g57, `checkLaunchConfigDir`),
+ *    dry run included: when the directory cannot be resolved to a real path,
+ *    nothing else runs (no trust patch, no reply-guard step, no
+ *    agent-director call, no record written); the failure goes to the
+ *    installed hook (the bring-up controller holds the persona `retrying`)
+ *    and the result is `deferred`. Otherwise its real path gives the spawn's
+ *    `config_dir` label.
+ * 3. Dry-run: skip the rest, return synthetic success.
+ * 4. Run the installed pre-launch trust patcher for the persona (b.av2
  *    SR-6.2) once, before any spawn or resume the ladder makes.
  *    Then attempt `client.spawn(...)`. On success → done. Every spawn and
  *    resume below is immediately preceded by the installed pre-launch reply
  *    guard (b.av2 SR-9.4); the optimistic spawn undoes its reply-guard steps
  *    on `ErrInstanceIdCollision`: the record and launched-with dir are
  *    restored while still its own, and the hook is re-evaluated.
- * 4. `ErrInstanceIdCollision` → `client.get(...)`, then:
+ * 5. `ErrInstanceIdCollision` → `client.get(...)`, then:
  *    - the row's `cwd` differs from the persona's working_directory by real
  *      path (`compareRowToPersona`) → kill + delete + fresh spawn, whatever
  *      the state and resume_enabled (b.av2 SR-6.2). When the working directory
@@ -2076,7 +2274,9 @@ export async function whenLaunchSettled(key: string): Promise<void> {
  *    - pending/check_permission/ask_user → no-op.
  *    Every resume first checks the row's `config_dir` label; a missing or
  *    different label means delete + fresh spawn instead (resumeOrFreshSpawn).
- * 5. Other errors → surface to Slack + (when isStartup) startup-errors.log.
+ *    A directory that stopped resolving since step 2 keeps the row and
+ *    returns `deferred` instead.
+ * 6. Other errors → surface to Slack + (when isStartup) startup-errors.log.
  */
 export async function spawnForPersona(
   persona: Persona,
@@ -2085,17 +2285,25 @@ export async function spawnForPersona(
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
   const ref = personaRef(persona)
-  if (isDryRun()) {
-    console.error(`[slack] dry-run: skipping spawn for ${ref} cwd=${persona.working_directory}`)
-    return { key, action: 'no-op' }
-  }
-
   const inFlight = inFlightLaunches.get(key)
   if (inFlight) {
     console.error(`[slack] spawnForPersona: launch already in flight for ${ref} — joining it`)
     return inFlight
   }
-  const launch = runPersonaLadder(persona, config, isStartup, ref)
+
+  const configDir = checkLaunchConfigDir(persona)
+  if (!configDir.ok) {
+    deferLaunchForConfigDir(persona, configDir)
+    return deferredResult(persona, configDir)
+  }
+
+  if (isDryRun()) {
+    console.error(`[slack] dry-run: skipping spawn for ${ref} cwd=${persona.working_directory}`)
+    return { key, action: 'no-op' }
+  }
+
+  const configDirLabel = configDirLabelValue(configDir.realPath, spawnHomeDir())
+  const launch = runPersonaLadder(persona, config, isStartup, ref, configDirLabel)
   inFlightLaunches.set(key, launch)
   try {
     return await launch
@@ -2110,9 +2318,10 @@ async function runPersonaLadder(
   config: PersonaConfig,
   isStartup: boolean,
   ref: string,
+  configDirLabel: string,
 ): Promise<SpawnPersonaResult> {
   const { key } = persona
-  const params = buildSpawnParams(persona, config)
+  const params = buildSpawnParams(persona, config, configDirLabel)
 
   // b.av2 SR-6.2: the trust patch precedes every launch. Running it once here,
   // before the first agent-director spawn or resume this ladder can make,
@@ -2606,6 +2815,14 @@ export async function startupSessionManager(
     try {
       const result = await launchPersona(persona)
       if (result === undefined) return
+      if (result.action === 'deferred') {
+        // Bug b.g57: its claude_config_dir cannot be resolved; the bring-up
+        // controller holds it retrying and launches it once it resolves.
+        const failures = result.deferredBy === undefined ? [] : [result.deferredBy]
+        perPersona.push({ key: persona.key, action: 'not-brought-up', outcome: 'retrying', failures })
+        notBroughtUp++
+        return
+      }
       perPersona.push({ key: persona.key, action: result.action })
       tally(result.action)
     } catch (err) {
@@ -2712,9 +2929,11 @@ function createLaunchPool(size: number): <T>(task: () => Promise<T>) => Promise<
  * between.
  *
  * Returns true on any non-failed action (spawned / resumed / reconnected /
- * no-op), false on `failed` or when no applied persona has the key. The
- * richer `SpawnPersonaResult` is collapsed here because the restart subsystem
- * only cares about did-it-relaunch.
+ * no-op), false on `failed` or when no applied persona has the key, and
+ * `'skipped'` for `deferred` (bug b.g57: its claude_config_dir cannot be
+ * resolved; nothing was launched and its row is kept), which counts toward
+ * no failure or cap. The richer `SpawnPersonaResult` is collapsed here
+ * because the restart subsystem only cares about did-it-relaunch.
  */
 export async function launchSession(
   key: string,
@@ -2725,5 +2944,6 @@ export async function launchSession(
   const persona = config.personas.find((p) => p.key === key)
   if (!persona) return false
   const result = await spawnForPersona(persona, config, false)
+  if (result.action === 'deferred') return 'skipped'
   return result.action !== 'failed'
 }

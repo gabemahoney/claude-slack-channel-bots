@@ -3,12 +3,14 @@
  * apply runs (b.av2 SR-6.1, SR-6.2, SR-6.5, SR-6.6, SR-8.6).
  *
  * `createPersonaLifecycle(deps)` composes, over injected dependencies, the
- * four operations the reload controller's apply steps fan out to
- * (`ReloadLifecycleOps.teardown`, `.bringUp`, `.reconnectCredentials` and
- * `.updateInPlace`, `reload.ts`):
+ * operations the reload controller's apply steps fan out to
+ * (`ReloadLifecycleOps.teardown`, `.bringUp`, `.reconnectCredentials`,
+ * `.updateInPlace` and `.refreshTemplate`, `reload.ts`):
  *
  * - **persona teardown** (SR-6.5, apply step 2): everything the server holds
- *   for one persona key goes, with no graceful wind-down. In order:
+ *   for one persona key goes, with no graceful wind-down. It serves a
+ *   removed persona and the old half of a destructive modify alike. In
+ *   order:
  *   1. its bring-up retries are cancelled and its bring-up state forgotten,
  *      and its pending restart timer is cancelled;
  *   2. a launch still in flight for it (the start pass's, which runs outside
@@ -32,10 +34,25 @@
  *      forgotten (read first), then the Stop-hook launch pass re-evaluates
  *      the persona's configured and launched-with directories against the
  *      personas still applied.
- *   The persona has already left the applied set (apply step 1), so every
- *   launch, restart and retry path refuses it, and a notice raised for it
- *   during the teardown (an outage onset from a failing kill) is dropped by
- *   the notifier, never posted or held. Each step's failure is logged and the
+ *   A removed persona has already left the applied set (apply step 1), so
+ *   every launch, restart and retry path refuses it, and a notice raised for
+ *   it during the teardown (an outage onset from a failing kill) is dropped
+ *   by the notifier, never posted or held. The old half of a destructive
+ *   modify (SR-8.6: a `credentials_file` path or `working_directory` change)
+ *   keeps its key applied until step 6 brings its new declaration up, so the
+ *   applied-set guard does not refuse it. Instead:
+ *   - its bring-up state and restart timer are cancelled as soon as the
+ *     teardown is submitted, before its serializer turn: work already queued
+ *     ahead of the teardown for the key (a restart timer's work, a bring-up
+ *     retry and its launch) then finds it not up or cancelled and launches
+ *     nothing, rather than launching the new declaration only for the
+ *     teardown to destroy it; from then until step 6 the relaunch gate and
+ *     the up predicate answer not up for it, so no restart, retry or launch
+ *     path starts it;
+ *   - notices raised during its teardown are held for a persona with no
+ *     client, so they are dropped again once its agent-director calls are
+ *     done, and none reaches its new half's destination.
+ *   Each step's failure is logged and the
  *   remaining steps still run. Nothing is posted to Slack and nothing is
  *   recorded in `startup-errors.log`; a row a failed delete leaves behind is
  *   swept at the next start (SR-6.3). Dry run: no agent-director call.
@@ -100,17 +117,34 @@
  *   longer applied when the operation runs gets nothing. Makes no Slack or
  *   agent-director call; never rejects. Dry run: the same.
  *
- * All four run through the per-persona lifecycle serializer (SR-6.6), so
- * each starts only after every operation already submitted for the persona
- * (a restart timer's work, a bring-up retry) has settled. None submits to the
- * serializer again from inside its own operation (the re-entrancy rule in
- * `persona-serializer.ts`). None touches another persona.
+ * - **template refresh** (SR-8.6 step 5): the agent-director template's
+ *   memory-read rules rewritten for the applied persona set, its other
+ *   arguments kept as the boot install wrote them
+ *   (`refreshSlackChannelBotTemplate`, `agent-director-template.ts`). It
+ *   belongs to no persona, so it does not go through the serializer. A
+ *   failure is logged there and is not fatal; never rejects. Dry run: the
+ *   same call, as the boot install makes it in dry run.
+ *
+ * The four per-persona operations run through the per-persona lifecycle
+ * serializer (SR-6.6), so each starts only after every operation already
+ * submitted for the persona (a restart timer's work, a bring-up retry) has
+ * settled. None submits to the serializer again from inside its own
+ * operation (the re-entrancy rule in `persona-serializer.ts`). None touches
+ * another persona.
+ *
+ * A persona with only next-launch changes (`claude_config_dir`,
+ * `stop_hook_bootstrap`, own or inherited) gets no operation: step 1's swap
+ * of the applied set is what its next launch reads (the spawn environment and
+ * `config_dir` label, the SR-6.2 label check before a resume, the trust patch,
+ * the reply-guard record and hook install, the transcript diagnosis), and its
+ * running instance keeps what it launched with.
  *
  * Logging: plain `[slack]` lines through the injected logger, token-free; a
  * thrown value is rendered only through `describeThrownValue`:
  *
  *   [slack] persona teardown of "<name>" (key=<key>): starting
  *   [slack] persona teardown of "<name>" (key=<key>): <step> failed: <thrown value>
+ *   [slack] persona teardown of "<name>" (key=<key>): <step> before its turn failed: <thrown value>
  *   [slack] persona teardown of "<name>" (key=<key>): complete
  *   [slack] persona teardown of "<name>" (key=<key>): complete, with <n> failed step(s)
  *   [slack] dry-run: persona teardown of "<name>" (key=<key>): skipping the agent-director kill and delete of cscb_<key>
@@ -125,6 +159,7 @@
  *   [slack] persona "<name>" (key=<key>): <step> before bringing it up again failed: <thrown value>
  *   [slack] persona "<name>" (key=<key>): reconnected with its changed credentials; its instance and MCP session are kept
  *   [slack] persona "<name>" (key=<key>): reconnected with its changed credentials and up again; its instance is kept
+ *   [slack] persona "<name>" (key=<key>): reconnected with its changed credentials; its session is kept, and its launch waits until its claude_config_dir resolves
  *   [slack] persona "<name>" (key=<key>): its changed credentials cannot reach Slack yet; the new connection retries and the current one stays in use
  *   [slack] persona "<name>" (key=<key>): its changed credentials cannot reach Slack yet; the new connection retries, and it stays broken by its credentials until that connection is in use
  *   [slack] persona "<name>" (key=<key>): it retries its bring-up with its changed credentials
@@ -133,7 +168,8 @@
  *   [slack] persona "<name>" (key=<key>): forgetting its cached DM conversation failed: <thrown value>
  *
  * A credentials change that cannot be used is logged by the bring-up
- * controller (`persona-credentials-change-failed`).
+ * controller (`persona-credentials-change-failed`); the template refresh's
+ * one line is `refreshSlackChannelBotTemplate`'s.
  *
  * `<settings>` lists the changed setting groups, comma-separated, in the
  * change plan's order (`channels`, `delivery`, `permission_prompts`,
@@ -146,6 +182,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+import type { MakeTemplateParams } from 'agent-director'
+import { refreshSlackChannelBotTemplate, type TemplateRefreshResult } from './agent-director-template.ts'
 import type { Persona, PersonaConfig } from './config.ts'
 import {
   isCredentialsBroken,
@@ -211,8 +249,9 @@ export interface PersonaLifecycleDeps {
   notifier: Pick<PersonaNotifier, 'forget'>
   /**
    * The persona set applied now (the server's `personaConfig`), read at each
-   * use: the teardown's Stop-hook pass, and whether an in-place update's key
-   * is still applied.
+   * use: the teardown's Stop-hook pass, whether a teardown's key is still
+   * applied (the old half of a destructive modify), and whether an in-place
+   * update's key is still applied.
    */
   appliedPersonas: () => readonly Persona[]
   /** Dry run (b.av2 SR-3.4): the teardown makes no agent-director call. */
@@ -263,11 +302,28 @@ export interface PersonaLifecycleDeps {
    * values), which joins a launch already in flight for it.
    */
   launch: (persona: Persona) => Promise<unknown>
+
+  // --- template refresh (apply step 5) ---
+  /** What the template refresh keeps from the start, and the client it calls. */
+  templateRefresh: {
+    /**
+     * The params the boot install wrote (`installSlackChannelBotTemplate`'s
+     * `params`): the refresh keeps every field but the memory-read rules, so
+     * the start-time server-wide arguments stay until the next start.
+     */
+    installed: MakeTemplateParams
+    /** The agent-director client (production: the singleton `getClient`). */
+    getClient: () => unknown
+  }
 }
 
 /** The lifecycle operations the reload controller's apply steps fan out to. */
 export interface PersonaLifecycle {
-  /** Persona teardown of one removed persona (apply step 2). Resolves once every step ran; never rejects. */
+  /**
+   * Persona teardown of one removed persona, or of the old half of a
+   * destructive modify (apply step 2), declared as before the change.
+   * Resolves once every step ran; never rejects.
+   */
   teardown(persona: Persona): Promise<void>
   /**
    * Apply bring-up of one added persona (apply step 6), with `applied` the
@@ -297,6 +353,13 @@ export interface PersonaLifecycle {
    * Resolves once done; never rejects.
    */
   updateInPlace(change: InPlaceApplyInput): Promise<void>
+  /**
+   * Template refresh (apply step 5): the agent-director template's
+   * memory-read rules for `applied`'s personas, its other arguments as the
+   * boot install wrote them. Not serialized (it belongs to no persona).
+   * Resolves once the call settled, successful or not; never rejects.
+   */
+  refreshTemplate(applied: PersonaConfig): Promise<TemplateRefreshResult>
 }
 
 /**
@@ -324,9 +387,48 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     }
   }
 
+  /** Whether `key` is in the applied set now; false when the set cannot be read. */
+  function isApplied(key: string): boolean {
+    try {
+      return deps.appliedPersonas().some((p) => p.key === key)
+    } catch {
+      return false
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Persona teardown (b.av2 SR-6.5)
   // -------------------------------------------------------------------------
+
+  /**
+   * Run when a teardown is submitted, before its serializer turn. For the old
+   * half of a destructive modify (its key still applied after step 1; a
+   * removed persona needs nothing here, the applied-set guard refuses it):
+   * cancel its bring-up state and retries and its pending restart timer now.
+   * Work already queued ahead of the teardown for the key then does nothing:
+   * a restart timer's work finds it not up (the relaunch gate), and a
+   * bring-up retry or its launch finds its entry cancelled. Otherwise that
+   * work would launch the new declaration (the launch paths read the applied
+   * set) only for the teardown to kill it. Both calls are synchronous and run
+   * again, as no-ops, in the teardown's own steps. A failure is logged.
+   */
+  function cancelBeforeTurn(persona: Persona): void {
+    const { key } = persona
+    if (!isApplied(key)) return
+    const prefix = `[slack] persona teardown of ${renderPersonaRef(persona.name, key)}`
+    const cancels: [string, () => unknown][] = [
+      ['cancelling its bring-up retries', () => deps.bringUps.cancel(key)],
+      ['cancelling its restart timer', () => deps.cancelRestartTimer(key)],
+    ]
+    for (const [what, cancel] of cancels) {
+      const failed = (err: unknown) => log(`${prefix}: ${what} before its turn failed: ${describeThrownValue(err)}`)
+      try {
+        void Promise.resolve(cancel()).catch(failed)
+      } catch (err) {
+        failed(err)
+      }
+    }
+  }
 
   async function runTeardown(persona: Persona): Promise<void> {
     const { key } = persona
@@ -374,6 +476,11 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     }
     // After the agent-director calls: a flag a failing call raised goes too.
     await step('forgetting its outage state', () => deps.resetOutageState([key]))
+    // The old half of a destructive modify is still applied, so a notice
+    // raised during this teardown (an outage onset from a failing kill) was
+    // held for it rather than dropped: drop it again, so it never reaches the
+    // destination of its new half once that is up.
+    if (isApplied(key)) await step('dropping the notices held during its teardown', () => deps.notifier.forget(key))
     await step('forgetting its restart failure count', () => deps.forgetFailures(key))
     await step('forgetting its health-check streak', () => deps.forgetDisconnectedStreak(key))
 
@@ -496,10 +603,14 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
       log(`${prefix}: credentials change not applied — the server is shutting down`)
       return { kind: 'skipped' }
     }
-    const reconnectedLine = (wasUp: boolean): string =>
-      wasUp
-        ? `${prefix}: reconnected with its changed credentials; its instance and MCP session are kept`
-        : `${prefix}: reconnected with its changed credentials and up again; its instance is kept`
+    // A persona held for its claude_config_dir (bug b.g57) has no MCP session
+    // and its launch still waits, whether or not it was up before the swap.
+    const reconnectedLine = (wasUp: boolean, held: boolean): string =>
+      held
+        ? `${prefix}: reconnected with its changed credentials; its session is kept, and its launch waits until its claude_config_dir resolves`
+        : wasUp
+          ? `${prefix}: reconnected with its changed credentials; its instance and MCP session are kept`
+          : `${prefix}: reconnected with its changed credentials and up again; its instance is kept`
     const hooks: CredentialsChangeHooks = {
       // Before the swap, so the notifier's flush at up never posts held
       // notices to the old app's DM (the new app may have another DM).
@@ -512,13 +623,13 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
       },
       // A reconnect left retrying took over after this operation resolved.
       onSwapped: (swap) => {
-        if (swap.late) log(reconnectedLine(swap.wasUp))
+        if (swap.late) log(reconnectedLine(swap.wasUp, swap.held === true))
       },
     }
     const result = await deps.bringUps.changeCredentials(persona, applied.personas, deps.connections, hooks)
     switch (result.kind) {
       case 'swapped':
-        log(reconnectedLine(result.cameBackUp !== true))
+        log(reconnectedLine(result.cameBackUp !== true, result.held === true))
         break
       case 'retrying':
         log(
@@ -570,9 +681,17 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
   }
 
   return {
-    teardown: (persona) => deps.serialize(persona.key, () => runTeardown(persona)),
+    teardown: (persona) => {
+      cancelBeforeTurn(persona)
+      return deps.serialize(persona.key, () => runTeardown(persona))
+    },
     bringUp: (persona, applied, options) => deps.serialize(persona.key, () => runBringUp(persona, applied, options)),
     reconnectCredentials: (persona, applied) => deps.serialize(persona.key, () => runReconnectCredentials(persona, applied)),
     updateInPlace: (change) => deps.serialize(change.persona.key, () => runUpdateInPlace(change)),
+    refreshTemplate: (applied) =>
+      refreshSlackChannelBotTemplate(applied, deps.templateRefresh.installed, {
+        getClient: deps.templateRefresh.getClient,
+        log,
+      }),
   }
 }

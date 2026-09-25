@@ -22,6 +22,7 @@ import {
   prePersonaConversionMessage,
   resolvePersonaConfig,
   resolveRealPath,
+  resolveRealPathStrict,
   credentialsFilesToProtect,
   configFileReadFailureMessage,
   CONFIG_NOT_REGULAR_FILE_CODE,
@@ -1935,5 +1936,141 @@ describe('start-path primitives (b.av2 SR-8.7, SR-1.5, SR-10.3)', () => {
       expect(errors.loader.message).toBe(expected(path))
       assertNoLeak(errors, 'errors')
     })
+  })
+})
+
+// ===========================================================================
+// resolveRealPathStrict (bug b.g57): the real path of a persona's
+// claude_config_dir with no lexical fallback. A directory not created yet
+// resolves through its nearest existing ancestor (E13 Director decision 1);
+// anything else that fails is unresolvable. Real-file-system cases live in a
+// mkdtempSync directory; injected cases pass both realpath and lstat, so they
+// touch no file system at all.
+// ===========================================================================
+
+describe('resolveRealPathStrict (bug b.g57)', () => {
+  let tmp: string
+  /** The temp root's own real path: the temp root may itself sit behind a symlink. */
+  let real: string
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'strict-real-path-'))
+    real = realpathSync(tmp)
+    mkdirSync(join(tmp, 'dir'))
+    writeFileSync(join(tmp, 'dir', 'file.json'), PLACEHOLDER)
+    symlinkSync(join(tmp, 'dir'), join(tmp, 'dir-link'))
+    symlinkSync(join(tmp, 'absent'), join(tmp, 'dangling'))
+    symlinkSync(join(tmp, 'loop'), join(tmp, 'loop'))
+  })
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true })
+  })
+
+  /** `rel` appended to the temp root as text, so a trailing `/` survives. */
+  const at = (rel: string) => `${tmp}/${rel}`
+  /** The temp root's and `dir`'s entries; not recursive, since the symlink loop would never end. */
+  const listing = () => [...readdirSync(tmp), ...readdirSync(join(tmp, 'dir')).map((name) => `dir/${name}`)].sort()
+  /** An errno-style error, as the fs functions throw. */
+  const errno = (code: string) => Object.assign(new Error(`simulated ${code}`), { code })
+
+  test.each([
+    ['an existing directory', 'dir', 'dir'],
+    ['a symlink to a directory', 'dir-link', 'dir'],
+    ['a directory not created yet', 'dir/new', 'dir/new'],
+    ['a directory not created yet, several levels down, with a trailing slash', 'dir/new/deeper/', 'dir/new/deeper'],
+    ['a directory not created yet under a symlinked parent', 'dir-link/new/deeper', 'dir/new/deeper'],
+  ])('%s resolves to its real path, or the one it will have once created, and writes nothing', (_label, input, expected) => {
+    const before = listing()
+    expect(resolveRealPathStrict(at(input))).toEqual({ resolved: true, path: join(real, expected) })
+    expect(listing()).toEqual(before)
+  })
+
+  test.each([
+    { label: 'a symlink that points to nothing (an unmounted drive)', input: 'dangling', code: 'ENOENT', danglingSymlink: true },
+    { label: 'a path under a symlink that points to nothing', input: 'dangling/sub', code: 'ENOENT', danglingSymlink: true },
+    { label: 'a path under a regular file', input: 'dir/file.json/sub', code: 'ENOTDIR', danglingSymlink: false },
+    { label: 'a symlink loop', input: 'loop', code: 'ELOOP', danglingSymlink: false },
+  ] as const)('$label is unresolvable ($code), never its lexical form', ({ input, code, danglingSymlink }) => {
+    const before = listing()
+    expect(resolveRealPathStrict(at(input))).toEqual({ resolved: false, code, danglingSymlink })
+    expect(listing()).toEqual(before)
+  })
+
+  test.each<{ label: string; thrown: unknown; code: string }>([
+    { label: 'EIO (a dropped network mount)', thrown: errno('EIO'), code: 'EIO' },
+    { label: 'ESTALE', thrown: errno('ESTALE'), code: 'ESTALE' },
+    { label: 'EACCES', thrown: errno('EACCES'), code: 'EACCES' },
+    { label: 'an error with no code', thrown: new Error('simulated failure'), code: 'unknown' },
+    { label: 'a thrown string', thrown: 'simulated failure', code: 'unknown' },
+    { label: 'an error whose code is not an errno code', thrown: Object.assign(new Error('simulated'), { code: fakeToken(BOT_TOKEN_PREFIX) }), code: 'unknown' },
+  ])('realpath failing with $label is unresolvable ($code), with no walk up and no lstat', ({ thrown, code }) => {
+    const realpaths: string[] = []
+    const lstats: string[] = []
+    const result = resolveRealPathStrict('/drive/claude', {
+      realpath: (path) => {
+        realpaths.push(path)
+        throw thrown
+      },
+      lstat: (path) => {
+        lstats.push(path)
+        return { isSymbolicLink: () => false }
+      },
+    })
+    expect(result).toEqual({ resolved: false, code, danglingSymlink: false })
+    expect(realpaths).toEqual(['/drive/claude'])
+    expect(lstats).toEqual([])
+    assertNoLeak(result, 'result')
+  })
+
+  test('a missing directory whose ancestor resolves: that ancestor\'s real path plus the missing components, the first of them lstat\'ed', () => {
+    const realpaths: string[] = []
+    const lstats: string[] = []
+    const result = resolveRealPathStrict('/base/a/b/c', {
+      realpath: (path) => {
+        realpaths.push(path)
+        if (path === '/base/a') return '/mounted/a'
+        throw errno('ENOENT')
+      },
+      lstat: (path) => {
+        lstats.push(path)
+        throw errno('ENOENT')
+      },
+    })
+    expect(result).toEqual({ resolved: true, path: '/mounted/a/b/c' })
+    expect(realpaths).toEqual(['/base/a/b/c', '/base/a/b', '/base/a'])
+    expect(lstats).toEqual(['/mounted/a/b'])
+  })
+
+  test.each<[string, (path: string) => { isSymbolicLink(): boolean }, { code: string; danglingSymlink: boolean }]>([
+    ['it is a symlink (pointing to nothing)', () => ({ isSymbolicLink: () => true }), { code: 'ENOENT', danglingSymlink: true }],
+    ['it exists and is not a symlink (created meanwhile)', () => ({ isSymbolicLink: () => false }), { code: 'ENOENT', danglingSymlink: false }],
+    ['lstat fails with EACCES', () => { throw errno('EACCES') }, { code: 'EACCES', danglingSymlink: false }],
+    ['lstat fails with EIO', () => { throw errno('EIO') }, { code: 'EIO', danglingSymlink: false }],
+  ])('a missing directory whose ancestor resolves, when its first missing component is checked and %s: unresolvable', (_label, lstat, expected) => {
+    const result = resolveRealPathStrict('/base/a/b', {
+      realpath: (path) => {
+        if (path === '/base') return '/base'
+        throw errno('ENOENT')
+      },
+      lstat,
+    })
+    expect(result).toEqual({ resolved: false, ...expected })
+  })
+
+  test.each<{ label: string; realpath: (path: string) => string; code: string }>([
+    { label: 'no ancestor resolves, up to the root', realpath: () => { throw errno('ENOENT') }, code: 'ENOENT' },
+    { label: 'an ancestor fails with EIO on the way up', realpath: (path) => { throw errno(path === '/base/a/b' ? 'ENOENT' : 'EIO') }, code: 'EIO' },
+  ])('$label: unresolvable ($code), with no lstat', ({ realpath, code }) => {
+    const lstats: string[] = []
+    const result = resolveRealPathStrict('/base/a/b', {
+      realpath,
+      lstat: (path) => {
+        lstats.push(path)
+        return { isSymbolicLink: () => false }
+      },
+    })
+    expect(result).toEqual({ resolved: false, code, danglingSymlink: false })
+    expect(lstats).toEqual([])
   })
 })

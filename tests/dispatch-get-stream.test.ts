@@ -6,8 +6,9 @@
  * lost its standalone GET stream (`_GET_stream`), the MCP SDK's send() would
  * evaporate silently. The dispatch path in src/persona-routing.ts therefore
  * does NOT call notification() and adds no ack reaction. It decides the
- * recovery state from P's restart guards (restarting, starting now,
- * auto-restart disabled, restart limit reached), schedules a human-triggered
+ * recovery state from whether P is up (not up, bug b.g57) and P's restart
+ * guards (restarting, starting now, auto-restart disabled, restart limit
+ * reached), schedules a human-triggered
  * restart of P in the session's cwd only when starting now, and raises one
  * lost-message notice naming the sender and the state at P's
  * permission-prompt destination, through P's own client (b.av2 SR-4.6,
@@ -51,6 +52,8 @@ import type { Persona } from '../src/config.ts'
 import { hasSessionStream } from '../src/persona-routing.ts'
 import { buildLostMessageNotice, type LostMessageState } from '../src/lost-message.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
+import { createPersonaUpPredicate } from '../src/persona-start.ts'
+import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
 import {
   makeAppMention,
   makeChannelMessage,
@@ -119,6 +122,7 @@ function makeAlpha(opts: {
   sessionRestartDelay?: number
   restartDelayS?: number
   launchSession?: RoutingHarnessOptions['launchSession']
+  isPersonaUp?: RoutingHarnessOptions['isPersonaUp']
 }): Alpha {
   const alphaSpec: PersonaSpec = {
     name: 'alpha',
@@ -135,6 +139,7 @@ function makeAlpha(opts: {
       restartDelayS: opts.restartDelayS ?? NEVER_FIRE_RESTART_DELAY_S,
       launchSession: opts.launchSession,
       ackReaction: ACK_REACTION,
+      isPersonaUp: opts.isPersonaUp,
     },
   )
   harnesses.push(h)
@@ -226,6 +231,17 @@ async function arrangeState(state: LostMessageState, destination: Destination): 
       expect(isRestartPendingOrActive(a.alpha.key)).toBe(true)
       return { a, release: () => launchResolve(true) }
     }
+    case 'not-up': {
+      // Bug b.g57: alpha held (its bring-up retrying, as for an unresolvable
+      // claude_config_dir) while its Slack connection still serves, through
+      // the real up predicate.
+      const notUp = new Set<string>()
+      const serving: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0SERVING', botId: 'B0SERVING' } }
+      const isPersonaUp = createPersonaUpPredicate({ status: () => serving }, { isUp: (key) => !notUp.has(key) })
+      const a = makeAlpha({ ...base, isPersonaUp })
+      notUp.add(a.alpha.key)
+      return { a, release: () => {} }
+    }
     case 'starting-now':
       return { a: makeAlpha(base), release: () => {} }
     case 'auto-restart-disabled':
@@ -253,6 +269,7 @@ describe('dispatch-site _GET_stream branch (b.sjy + b.9cj)', () => {
   // -------------------------------------------------------------------------
   const STATES: readonly [LostMessageState, boolean, number][] = [
     // state, restart pending or active after the message, launches after it
+    ['not-up', false, 0], // b.g57: nothing scheduled for a persona that is not up
     ['restarting', true, 1], // the in-flight launch only; none stacked
     ['starting-now', true, 1],
     ['auto-restart-disabled', false, 0],

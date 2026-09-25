@@ -79,13 +79,16 @@ import {
 import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import {
   AGENT_DIRECTOR_LIVE_STATES,
+  checkLaunchConfigDir,
   deletePersonaInstance,
+  holdLaunchIfConfigDirUnresolvable,
   isLaunchInFlight,
   killPersonaInstance,
   launchSession,
   notifyRestartCapReached,
   reconcileOrphans,
   reconnectMcp,
+  setConfigDirUnresolvableHook,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
   setSessionNotifier,
@@ -180,7 +183,7 @@ import { createCronLog } from './cron-log.ts'
 import { createCronDispatcher } from './cron-dispatch.ts'
 import { handleInterject } from './interject.ts'
 import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
-import { createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
+import { configInEffect, createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
 import { createReloadTickDriver } from './reload-timer.ts'
 import { PRODUCTION_SLACK_CLIENT_FACTORY } from './persona-slack-clients.ts'
 import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy, withOutageDetection } from './outage-state.ts'
@@ -686,6 +689,8 @@ const personaRouting = createPersonaRouting({
   // module is still loading.
   notify: (key, text, options) => personaNotifier.notify(key, text, options),
   log: (line) => console.error(line),
+  // A lost message for a persona that is not up restarts nothing (b.g57 hold).
+  isPersonaUp,
 })
 
 // Permission Block Kit builders moved to src/permission-poller.ts
@@ -954,13 +959,31 @@ export function _buildStatRouteImpl(deps?: {
  * key is in flight the adapter therefore skips the kill; the in-flight launch
  * owns the session's lifecycle.
  *
+ * Bug b.g57: with `getPersona`, a persona whose claude_config_dir cannot be
+ * resolved to a real path is not killed either. The kill precedes a launch
+ * that could not be made, so the instance and its row are left as they are
+ * and the persona is handed to the bring-up controller's hold, as the launch
+ * would (`holdLaunchIfConfigDirUnresolvable`); the launch that follows is then
+ * refused by the relaunch gate (`'skipped'`), counting no failure.
+ *
+ * @param getPersona  The applied persona with a key (production:
+ *   `getAppliedPersona`); without it the directory is not checked here.
  * @internal
  */
-export function _buildKillSessionAdapter(): (key: string) => Promise<void> {
+export function _buildKillSessionAdapter(
+  getPersona?: (key: string) => Persona | undefined,
+): (key: string) => Promise<void> {
   // `key` is the persona key.
   return async (key: string) => {
     if (isLaunchInFlight(key)) {
       console.error(`[slack] killSession (restart adapter): launch already in flight for persona=${key} — not killing`)
+      return
+    }
+    const persona = getPersona?.(key)
+    if (persona !== undefined && holdLaunchIfConfigDirUnresolvable(persona)) {
+      console.error(
+        `[slack] killSession (restart adapter): persona=${key} claude_config_dir cannot be resolved to a real path — not killing; its row is kept`,
+      )
       return
     }
     try {
@@ -1123,10 +1146,11 @@ export async function main(): Promise<void> {
   // Declared here, before the controller whose onApplied reads it, so that
   // closure never depends on declaration order (no temporal dead zone).
   let appliedConfig!: PersonaConfig
-  // A confirmed apply's teardowns (step 2), in-place updates (step 3),
-  // credentials changes (step 4) and bring-ups (step 6, recoveries
-  // included), composed in persona-lifecycle.ts once the bring-up controller
-  // exists (below).
+  // A confirmed apply's teardowns (step 2, destructive old halves included),
+  // in-place updates (step 3), credentials changes (step 4), template
+  // refresh (step 5) and bring-ups (step 6, recoveries and destructive new
+  // halves included), composed in persona-lifecycle.ts once the bring-up
+  // controller exists (below).
   // Declared here for the same reason as appliedConfig; an apply runs only
   // after the start bring-up pass, long after it is set.
   let personaLifecycleOps!: PersonaLifecycle
@@ -1138,6 +1162,7 @@ export async function main(): Promise<void> {
       updateInPlace: (change) => personaLifecycleOps.updateInPlace(change),
       bringUp: (persona, applied, options) => personaLifecycleOps.bringUp(persona, applied, options),
       reconnectCredentials: (persona, applied) => personaLifecycleOps.reconnectCredentials(persona, applied),
+      refreshTemplate: (applied) => personaLifecycleOps.refreshTemplate(applied),
     },
     log: (line) => console.error(line),
     tickDriver: createReloadTickDriver({ log: (line) => console.error(line) }),
@@ -1158,7 +1183,7 @@ export async function main(): Promise<void> {
     // config without the start-time values, and the controller logs it.
     onApplied: (config) => {
       if (appliedConfig === undefined) throw new Error('a confirmed apply ran before the start resolved its configuration')
-      personaConfig = { ...appliedConfig, personas: config.personas }
+      personaConfig = configInEffect(appliedConfig, config)
     },
   })
   reloadController = reload
@@ -1186,8 +1211,9 @@ export async function main(): Promise<void> {
   // boot, after the persona config is set: its memory-read rules cover the
   // personas' effective config dirs. Atomic replacement via
   // Client.makeTemplate(..., overwrite: true) gives us "ensure post-state"
-  // semantics. Fatal startup error on failure.
-  await installSlackChannelBotTemplate(personaConfig)
+  // semantics. Fatal startup error on failure. A confirmed apply's step 5
+  // refreshes its memory-read rules and keeps the rest of what this wrote.
+  const installedTemplate = await installSlackChannelBotTemplate(personaConfig)
 
   // Initialize message archive if configured. Name lookups run on the
   // receiving persona's own client (b.av2 SR-4.1).
@@ -1260,6 +1286,9 @@ export async function main(): Promise<void> {
     // it, and a persona no longer in it is neither re-checked nor launched.
     appliedPersonas: () => personaConfig?.personas ?? [],
     launch: (persona) => spawnForPersona(persona, personaConfig ?? appliedConfig, false),
+    // Bug b.g57: a held persona's claude_config_dir is re-checked exactly as
+    // the launch checks it.
+    checkConfigDir: checkLaunchConfigDir,
     serialize: personaLifecycle.run,
     // b.av2 SR-6.3: a session is registered only while its persona is up. A
     // persona that stops being up (a refused reopen) has its session dropped;
@@ -1271,10 +1300,15 @@ export async function main(): Promise<void> {
     }),
   })
   bringUps = personaBringUps
+  // Bug b.g57: a launch that finds a persona's claude_config_dir unresolvable
+  // launches nothing and hands the persona to the controller, which holds it
+  // retrying and launches it once the directory resolves.
+  setConfigDirUnresolvableHook(personaBringUps.holdForConfigDir)
 
   // b.av2 SR-6.5 / SR-6.1 / SR-8.6 / SR-6.6 / SR-6.4: the apply's persona
   // teardown, in-place update, credentials change and bring-up (recovery
-  // included), each through the per-persona serializer. This supplies only
+  // included), each through the per-persona serializer, and its template
+  // refresh. This supplies only
   // the production dependencies; the operations live in persona-lifecycle.ts.
   personaLifecycleOps = createPersonaLifecycle({
     serialize: personaLifecycle.run,
@@ -1304,6 +1338,8 @@ export async function main(): Promise<void> {
     },
     storageCheck: (persona) => runPersonaStorageCheck(persona, personaNotifier.notify),
     launch: (persona) => spawnForPersona(persona, personaConfig ?? appliedConfig, false),
+    // Step 5 keeps the server-wide arguments the boot install wrote.
+    templateRefresh: { installed: installedTemplate.params, getClient },
   })
 
   // Only a persona that is up may be restarted or relaunched: the health
@@ -1500,7 +1536,7 @@ export async function main(): Promise<void> {
     },
     hasSessionStream,
     reconnectSession: _buildReconnectSessionAdapter(),
-    killSession: _buildKillSessionAdapter(),
+    killSession: _buildKillSessionAdapter(getAppliedPersona),
     launchSession: async (key) => {
       if (!personaConfig) return false
       // Launches the applied persona with this key; false when there is none.

@@ -41,6 +41,11 @@
  *     content, a neighbour's `true` record, a directory in the record's
  *     place, `../<name>` traversal) and the gate running before the jq check.
  *
+ * The AC 59 block runs the guard over record directories a confirmed reload
+ * left (`makeReloadHarness` with the real launch path): the guard follows a
+ * persona's launched value until its next launch, and a neighbour's launch
+ * leaves it unchanged.
+ *
  * Fixture provenance is recorded above the injected-prompt describe block.
  *
  * SPDX-License-Identifier: MIT
@@ -51,7 +56,10 @@ import { spawnSync } from 'node:child_process'
 import { resolve, join } from 'node:path'
 import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync, readFileSync, symlinkSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import type { PersonaInput } from '../src/config.ts'
 import { PERSONA_KEY_MAX_LENGTH, personaKey } from '../src/persona-identity.ts'
+import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
+import { makeReloadHarness, type ReloadHarness, type ReloadRun } from './test-helpers/reload-harness.ts'
 import {
   makeReplyGuardRecordDir,
   RECORD_EMPTY,
@@ -1008,5 +1016,143 @@ describe('slack-reply-guard.sh — per-persona record gate (b.av2 SR-9.4)', () =
       expect(control.exitCode).toBe(0)
       expect(control.stderr).toBe(MISSING_JQ_WARNING)
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC 59: the guard over the records a confirmed reload leaves (b.av2 SR-9.4,
+// SR-8.6 `stop_hook_bootstrap` row). A running instance keeps the value it
+// launched with, so the guard must remind or stay quiet as the persona's
+// launched value says, not the newly applied one, until its next launch.
+//
+// Each case runs a server through `makeReloadHarness` with the real launch
+// path (`realLaunch`: the reply-guard steps write `reply-guard/<key>` under
+// the harness's temp state directory), confirms a change with the
+// operator's gesture, and drives next launches through the restart path
+// (`run.relaunch`, the row seeded `ended` so the ladder resumes it). The
+// guard then runs on GATE_FIXTURE (via-carrying, no reply) with the
+// harness's record directory as its argument and CSCB_PERSONA set to the
+// persona's key in an explicitly built child environment (`spawnGuard`
+// never passes the test process's environment on). Every persona has its own
+// temp `claude_config_dir`, or a shared temp one.
+// ---------------------------------------------------------------------------
+
+describe('slack-reply-guard.sh — AC 59: records left by a confirmed reload (b.av2 SR-9.4, SR-8.6)', () => {
+  let h: ReloadHarness
+  let savedStateDirEnv: string | undefined
+  /** Every guard run of the test, for the leak check. */
+  let guardRuns: RunResult[]
+
+  beforeEach(() => {
+    h = makeReloadHarness({ personaConfigDirs: true })
+    guardRuns = []
+    // Nothing here is a startup launch, but a recordStartupError write would
+    // still land in a temp dir, never under HOME.
+    savedStateDirEnv = process.env.SLACK_STATE_DIR
+    process.env.SLACK_STATE_DIR = h.stateDir
+  })
+
+  afterEach(async () => {
+    try {
+      await h.cleanup()
+    } finally {
+      if (savedStateDirEnv === undefined) delete process.env.SLACK_STATE_DIR
+      else process.env.SLACK_STATE_DIR = savedStateDirEnv
+    }
+  })
+
+  /** A server running `personas` (top-level settings `top`) from a byte-equal record and config file, detection started. */
+  async function running(personas: PersonaInput[], top: { stop_hook_bootstrap?: boolean } = {}): Promise<ReloadRun> {
+    h.materialize(...personas)
+    h.writeRecord({ ...top, personas })
+    h.writeConfig({ ...top, personas })
+    const run = await h.startDetecting({ realLaunch: true })
+    await run.ticks.tick()
+    expect(h.pendingExists()).toBe(false)
+    return run
+  }
+
+  /** Confirm `personas` (with `top`) and await the apply; a next-launch change makes no lifecycle call. */
+  async function apply(run: ReloadRun, personas: PersonaInput[], top: { stop_hook_bootstrap?: boolean } = {}): Promise<void> {
+    h.writeConfig({ ...top, personas })
+    const cp = run.checkpoint()
+    await (await run.confirmPending()).applying
+    expect(h.readRecord()).toEqual(h.readConfig()!)
+    expect(run.since(cp).lifecycle).toEqual([])
+  }
+
+  /** The persona's next launch: its instance has ended, and the restart path resumes it. */
+  async function nextLaunch(run: ReloadRun, persona: PersonaInput): Promise<void> {
+    h.seedRow(persona, { state: 'ended' })
+    expect(await run.relaunch(persona.name)).toBe(true)
+  }
+
+  /** The real guard for `persona` over the harness's record directory. */
+  function guardFor(persona: PersonaInput): RunResult {
+    const r = spawnGuard(harness(join(FIX, GATE_FIXTURE)), { args: [h.replyGuardDir], persona: h.key(persona.name) })
+    guardRuns.push(r)
+    return r
+  }
+
+  function expectReminded(persona: PersonaInput): void {
+    const r = guardFor(persona)
+    expect(r.exitCode).toBe(2)
+    expect(r.stderr).toBe(GATE_LINE)
+  }
+
+  function expectQuiet(persona: PersonaInput): void {
+    const r = guardFor(persona)
+    expect(r.exitCode).toBe(0)
+    expect(r.stderr).toBe('')
+    expect(r.stdout).toBe('')
+  }
+
+  /** Nothing posted, and no token in the logs, the guard's output, the records or anything else captured. */
+  function expectNoPostNoLeak(run: ReloadRun): void {
+    expect(run.slackPosts()).toEqual([])
+    assertNoLeak(run.captured({ guardRuns, records: writtenFile(h.replyGuardDir), sessionNotices: run.sessionNotices }))
+  }
+
+  test('AC 59 own value true → false: after the apply the guard still reminds A (exit 2, its provenance wording); after A\'s next launch it is quiet', async () => {
+    const a = h.persona('Guard A')
+    const run = await running([a])
+    expectReminded(a)
+
+    const aOff = { ...a, stop_hook_bootstrap: false }
+    await apply(run, [aOff])
+    expectReminded(a)
+
+    await nextLaunch(run, aOff)
+    expectQuiet(a)
+    expectNoPostNoLeak(run)
+  })
+
+  test('AC 59 inherited default false → true: after the apply the guard is quiet for the inheriting persona; after its next launch it reminds', async () => {
+    const a = h.persona('Guard A')
+    const run = await running([a], { stop_hook_bootstrap: false })
+    expectQuiet(a)
+
+    await apply(run, [a], { stop_hook_bootstrap: true })
+    expectQuiet(a)
+
+    await nextLaunch(run, a)
+    expectReminded(a)
+    expectNoPostNoLeak(run)
+  })
+
+  test("AC 59 a neighbour's false launch into the same dir, after A's value was changed and before A relaunches, leaves A's guard at exit 2", async () => {
+    const d = h.configDir('shared')
+    const a = h.persona('Guard A', { claude_config_dir: d })
+    const n = h.persona('Guard N', { claude_config_dir: d, stop_hook_bootstrap: false })
+    const run = await running([a, n])
+    expectReminded(a)
+    expectQuiet(n)
+
+    await apply(run, [{ ...a, stop_hook_bootstrap: false }, n])
+    await nextLaunch(run, n)
+
+    expectReminded(a)
+    expectQuiet(n)
+    expectNoPostNoLeak(run)
   })
 })

@@ -21,15 +21,27 @@
 // ---------------------------------------------------------------------------
 
 /**
- * The recovery state a lost message reports: a restart of P already pending
- * or running; a human-triggered restart of P started for this message;
- * auto-restart disabled (`session_restart_delay` 0); or P at the
- * restart-failure cap.
+ * The recovery state a lost message reports: P not up (b.av2 SR-6.4: its
+ * bring-up is retrying or broken, such as a launch waiting for its
+ * claude_config_dir, bug b.g57), so no restart is started and its instance is
+ * launched once it recovers; a restart of P already pending or running; a
+ * human-triggered restart of P started for this message; auto-restart
+ * disabled (`session_restart_delay` 0); or P at the restart-failure cap.
  */
-export type LostMessageState = 'restarting' | 'starting-now' | 'auto-restart-disabled' | 'restart-limit-reached'
+export type LostMessageState =
+  | 'not-up'
+  | 'restarting'
+  | 'starting-now'
+  | 'auto-restart-disabled'
+  | 'restart-limit-reached'
 
 /** The restart-state queries for the receiving persona, asked in order and only as far as needed. */
 export interface LostMessageRecoveryQueries {
+  /**
+   * True when the persona is not up (the one up predicate, `isPersonaUp`,
+   * answers false). Absent: the persona counts as up.
+   */
+  isNotUp?(): boolean
   /** True when a restart of the persona is already pending or running. */
   isRestartPending(): boolean
   /** True when auto-restart is disabled (`session_restart_delay` is 0). */
@@ -44,11 +56,12 @@ export interface LostMessageRecoveryQueries {
 
 /**
  * The recovery state for a lost message, in the human-trigger order (b.kvq /
- * b.9cj): restart pending, then auto-restart disabled, then at the cap;
- * otherwise `starting-now`, and the caller fires the human-triggered restart.
- * Stops at the first query that answers true. Changes nothing.
+ * b.9cj): not up, then restart pending, then auto-restart disabled, then at
+ * the cap; otherwise `starting-now`, and the caller fires the human-triggered
+ * restart. Stops at the first query that answers true. Changes nothing.
  */
 export function decideLostMessageState(queries: LostMessageRecoveryQueries): LostMessageState {
+  if (queries.isNotUp?.() === true) return 'not-up'
   if (queries.isRestartPending()) return 'restarting'
   if (queries.isAutoRestartDisabled()) return 'auto-restart-disabled'
   if (queries.isAtRestartLimit()) return 'restart-limit-reached'
@@ -61,6 +74,8 @@ export function decideLostMessageState(queries: LostMessageRecoveryQueries): Los
 
 /** The recovery wording each state adds to the notice. */
 const STATE_WORDING: Record<LostMessageState, string> = {
+  'not-up':
+    'Recovery: not up — this persona is not up, so no restart was started; its instance will be launched once it recovers.',
   'restarting': 'Recovery: restarting — a restart of this persona\'s instance was already under way.',
   'starting-now': 'Recovery: starting now — a restart of this persona\'s instance has just been started.',
   'auto-restart-disabled':

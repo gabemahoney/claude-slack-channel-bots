@@ -41,9 +41,12 @@
  * pass's applies the bytes and the change plan that pass derived: an invalid
  * candidate logs `reload-invalid` and changes nothing; a valid one runs step
  * 1 (rewrite the record, then swap the applied state and tell `onApplied`),
- * then steps 2–6 of `reload-apply.ts` in order (by default step 2 tears down
- * each removed persona and step 6 brings up each added one, through the
- * lifecycle operations), and logs
+ * then steps 2–6 of `reload-apply.ts` in order (by default through the
+ * lifecycle operations: step 2 tears down each removed persona and the old
+ * half of each destructive modify, steps 3 and 4 update in place and
+ * reconnect, step 5 refreshes the agent-director template when the config
+ * directories changed, and step 6 brings up each added persona and the new
+ * half of each destructive modify), and logs
  * `reload-applied`, or `reload-noop` when nothing effective changed. A
  * mismatched, unreadable or malformed confirmation applies nothing and logs
  * `reload-stale-confirmation`. The pending state is then refreshed against
@@ -52,7 +55,7 @@
  * The controller (`createReloadController`) is built with every dependency
  * injected, as `createCronScheduler` is: the SR-8.1 paths, the durable
  * writer and delete, the log sink, the lifecycle operations (the start
- * bring-up pass, and the apply's teardown and bring-up), the tick driver, the dry-run flag, the held
+ * bring-up pass, and the apply's per-step operations), the tick driver, the dry-run flag, the held
  * credentials digests and bring-up states, and the Slack client factory that later work binds
  * (applying a confirmed change). It keeps the applied bytes and configuration
  * in memory. `readAppliedPersonaConfig` is the CLI's read-only resolver over
@@ -252,12 +255,14 @@ export interface ReloadTickDriver {
  * The per-persona lifecycle operations the controller drives. `startBringUp`
  * is the start pass. A confirmed apply's default step bodies
  * (`lifecycleApplySlots`, `reload-apply.ts`) fan out to `teardown` (step 2,
- * each removed persona), `updateInPlace` (step 3, each persona modified in
- * place), `reconnectCredentials` (step 4, each persona whose credentials
- * changed and that is not broken by its credentials) and `bringUp` (step 6,
- * each added persona, and as a recovery each persona broken by its
- * credentials whose credentials changed); production binds all four through
- * `persona-lifecycle.ts`.
+ * each removed persona and the old half of each destructive modify),
+ * `updateInPlace` (step 3, each persona modified in place),
+ * `reconnectCredentials` (step 4, each persona whose credentials changed and
+ * that is not broken by its credentials), `refreshTemplate` (step 5, once,
+ * when the config directories changed) and `bringUp` (step 6, each added
+ * persona and the new half of each destructive modify, and as a recovery
+ * each persona broken by its credentials whose credentials changed);
+ * production binds all five through `persona-lifecycle.ts`.
  */
 export interface ReloadLifecycleOps {
   /**
@@ -278,7 +283,11 @@ export interface ReloadLifecycleOps {
    * would, so step 4 and step 6 never both skip a confirmed change.
    */
   bringUp(persona: Persona, applied: PersonaConfig, options?: ApplyBringUpOptions): Promise<unknown>
-  /** Tear down one persona a confirmed change removed (and, from E13, the old half of a destructive modify). */
+  /**
+   * Tear down one persona a confirmed change removed, or the old half of a
+   * destructive modify (declared as before the change; its key stays
+   * applied, and step 6 brings its new declaration up fresh).
+   */
   teardown(persona: Persona): Promise<unknown>
   /**
    * Apply one persona's changed credentials file (b.av2 SR-8.6 step 4,
@@ -295,6 +304,15 @@ export interface ReloadLifecycleOps {
    * is its entry in the configuration step 1 made current.
    */
   updateInPlace(change: InPlaceApplyInput): Promise<unknown>
+  /**
+   * Refresh the agent-director template's memory-read rules for the persona
+   * set of `applied`, the configuration step 1 made current (b.av2 SR-8.6
+   * step 5), keeping the template's start-time server-wide arguments. Asked
+   * only when the change plan's `configDirsChanged`. Resolves once the
+   * refresh settled, whether it succeeded or failed: a failure is logged,
+   * never fatal, and not retried.
+   */
+  refreshTemplate(applied: PersonaConfig): Promise<unknown>
 }
 
 /**
@@ -387,10 +405,11 @@ export interface ReloadControllerDeps {
    * Test override: the bodies of apply steps 2–6 (`reload-apply.ts`), used
    * instead of the default ones; an unbound step then does nothing. Without
    * it the controller runs `lifecycleApplySlots` over `lifecycle` (step 2
-   * tears down each removed persona, step 3 updates each persona modified in
-   * place, step 4 reconnects each persona whose credentials changed, step 6
-   * brings up each added one and each credentials-broken one whose
-   * credentials changed).
+   * tears down each removed persona and the old half of each destructive
+   * modify, step 3 updates each persona modified in place, step 4 reconnects
+   * each persona whose credentials changed, step 5 refreshes the template,
+   * step 6 brings up each added one, the new half of each destructive modify
+   * and each credentials-broken one whose credentials changed).
    * Production never sets it.
    */
   applySteps?: ApplyStepSlots
@@ -402,6 +421,27 @@ export interface ReloadControllerDeps {
    * file); unset operations use the real file system.
    */
   configFs?: Partial<PersonaConfigFs>
+}
+
+// ---------------------------------------------------------------------------
+// The configuration in effect
+// ---------------------------------------------------------------------------
+
+/**
+ * The configuration the server runs once a confirmed apply's step 1 made
+ * `applied` current (b.av2 SR-8.6, the server-wide row): `applied`'s persona
+ * set over every server-wide setting of `startTime`, the configuration the
+ * server started with. A changed server-wide setting (the listener's `bind`
+ * and `port`, the restart delay, `resume_enabled`, the cron paths, …) is
+ * recorded by step 1 and takes effect only at the next start, which runs the
+ * record. The top-level `claude_config_dir` and `stop_hook_bootstrap` are not
+ * held back by this: they act only as inherited defaults, already resolved
+ * into each of `applied`'s personas, so an inheriting persona's next launch
+ * uses the new value. The one place the server derives what it runs after an
+ * apply (the `onApplied` of `main()` in `server.ts`). Pure.
+ */
+export function configInEffect(startTime: PersonaConfig, applied: PersonaConfig): PersonaConfig {
+  return { ...startTime, personas: applied.personas }
 }
 
 // ---------------------------------------------------------------------------

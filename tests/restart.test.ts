@@ -5,7 +5,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -49,7 +49,16 @@ import {
   notifyRestartCapReached,
   setSessionNotifier,
   _resetPreLaunchReplyGuard,
+  _setConfigDirFs,
+  _resetConfigDirFs,
+  checkLaunchConfigDir,
+  setConfigDirUnresolvableHook,
+  spawnForPersona,
 } from '../src/session-manager.ts'
+import { createPersonaBringUpController, type PersonaBringUpController } from '../src/persona-bringup-controller.ts'
+import { PERSONA_CONFIG_DIR_UNRESOLVABLE } from '../src/persona-diagnostics.ts'
+import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
 import { _resetLaunchedWithDirs, getLaunchedWithDir } from '../src/stop-hook-bootstrap.ts'
 import { makeReplyGuardRecordDir, type ReplyGuardRecordDir } from './test-helpers/reply-guard-record.ts'
 import { installRecordingReplyGuard, observeLaunchCalls, type LaunchCall } from './test-helpers/reply-guard-launch.ts'
@@ -64,17 +73,20 @@ import {
 import { makeStubClient } from './test-helpers/agent-director-stub.ts'
 import {
   cannedErr,
+  cannedOk,
   cannedGetResult,
   errGeneric,
   errInstanceIdCollision,
   errSpawnNotFound,
   errTmuxSendKeys,
   holdSpawns,
+  makeStubCallLog,
   type SpawnHold,
+  type StubCallLog,
 } from './test-helpers/agent-director-stub.ts'
 import type { Client } from 'agent-director'
 import type { DeleteParams, FindMissingParams, KillParams, ResumeParams, SendKeysParams, SpawnParams, SpawnResult, StatusParams } from 'agent-director'
-import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
+import { configDirLabelValue, personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
 import { stubOpenedDmId, type StubWebMethod } from './test-helpers/slack-stub.ts'
@@ -2275,5 +2287,295 @@ describe('restart: the reply-guard record holds the effective value before the r
     expect(spawnCalls).toEqual([])
     expect(rg.readRecord(a.key)).toBeNull()
     expect(getLaunchedWithDir(a.key)).toBeUndefined()
+  })
+
+  // b.av2 SR-8.6 next-launch rows (AC 59): restart.ts keeps no persona
+  // values; each relaunch goes through the launch adapter, handed the applied
+  // set at that moment (the server's `personaConfig`, which a confirmed
+  // apply's step 1 swaps), and the reply guard reads the live applied set.
+  test('claude_config_dir and stop_hook_bootstrap changed between two restarts: the first relaunch uses the old values; the second deletes the old-label row and spawns fresh with the new CLAUDE_CONFIG_DIR (not created yet) and writes the new record', async () => {
+    const newDir = join(dir, 'claude-config-new')
+    const configFor = (claude_config_dir: string, stop_hook_bootstrap: boolean) =>
+      makeMultiPersonaConfig([{ name: 'Alpha Desk', claude_config_dir, stop_hook_bootstrap }], dir, { agent_director_poll_interval_ms: 1 })
+    const before = configFor(configDir, true)
+    let applied = before
+    const [a] = before.personas as [Persona]
+    mkdirSync(a.working_directory, { recursive: true })
+    installRecordingReplyGuard(() => applied.personas, rg.stateDir, events)
+    // The row the first relaunch leaves behind, labelled for the old directory.
+    const oldRow = cannedGetResult({ state: 'ended' }, a, dir)
+    const deleteCalls: DeleteParams[] = []
+    const stub = makeStubClient({
+      statusFn: () => ({ state: 'waiting' }),
+      spawnCalls,
+      resumeCalls,
+      deleteCalls,
+      spawnQueue: [
+        cannedOk<SpawnResult>({ claude_instance_id: personaInstanceId(a.key) }),
+        cannedErr<SpawnResult>(errInstanceIdCollision()),
+        cannedOk<SpawnResult>({ claude_instance_id: personaInstanceId(a.key) }),
+      ],
+      getResult: oldRow,
+    })
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+    setClientForTests(stub as unknown as Client)
+    const results: Array<boolean | 'skipped'> = []
+    initRestart(makeDeps({
+      launchSession: async (key) => {
+        const ok = await launchPersonaSession(key, applied)
+        results.push(ok)
+        return ok
+      },
+    }))
+
+    scheduleRestart(a.key, a.working_directory)
+    await waitFor(() => results.length === 1)
+    expect(results).toEqual([true])
+    expect(spawnCalls).toHaveLength(1)
+    expect(spawnCalls[0]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configDir)
+    expect(spawnCalls[0]!.label).toContain(`config_dir=${oldRow.labels['config_dir']}`)
+    expect(rg.readRecord(a.key)).toBe('true')
+
+    // Step 1 of a confirmed apply: the applied set now holds the new values.
+    applied = configFor(newDir, false)
+    scheduleRestart(a.key, a.working_directory)
+    await waitFor(() => results.length === 2)
+
+    expect(results).toEqual([true, true])
+    expect(resumeCalls).toEqual([])
+    expect(deleteCalls.map((d) => d.claude_instance_id)).toEqual([[personaInstanceId(a.key)]])
+    expect(spawnCalls).toHaveLength(3)
+    expect(spawnCalls[2]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(newDir)
+    expect(spawnCalls[2]!.label).toEqual([
+      'service=cscb',
+      `persona=${a.key}`,
+      `config_dir=${configDirLabelValue(join(realpathSync(dir), 'claude-config-new'))}`,
+    ])
+    expect(rg.readRecord(a.key)).toBe('false')
+    expect(getFailureCount(a.key)).toBe(0)
+    expect(errLines.filter((l) => l.includes(PERSONA_CONFIG_DIR_UNRESOLVABLE))).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Bug b.g57 — a restart of a persona whose claude_config_dir cannot be
+// resolved to a real path, wired as server.ts wires it: the real relaunch
+// gate over the real bring-up controller (on the connection harness's fake
+// clock, the personas brought up on the stub Slack), the real liveness, kill
+// (with the applied-persona getter) and launch adapters, the controller's
+// `holdForConfigDir` installed as the session manager's hook and its
+// pre-launch check (`checkLaunchConfigDir`) as the controller's re-check. The
+// failing realpath is injected through `_setConfigDirFs`. Every persona path
+// is under a temp dir removed in afterEach.
+// ---------------------------------------------------------------------------
+
+describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
+  let dir: string
+  let h: ConnectionHarness
+  let controller: PersonaBringUpController
+  let a: Persona
+  let b: Persona
+  let aConfigDir: string
+  /** Whether the injected realpath fails for A's claude_config_dir. */
+  let broken: boolean
+  let calls: StubCallLog
+  let controllerLines: string[]
+  let gateLines: string[]
+  let errLines: string[]
+  let leftUp: string[]
+  let capCalls: string[]
+  let origConsoleError: typeof console.error
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'restart-g57-'))
+    aConfigDir = join(dir, 'claude-a')
+    const bConfigDir = join(dir, 'claude-b')
+    mkdirSync(aConfigDir)
+    mkdirSync(bConfigDir)
+    h = makeConnectionHarness(
+      [{ name: 'Alpha Desk', claude_config_dir: aConfigDir }, { name: 'Beta Ops', claude_config_dir: bConfigDir }],
+      dir,
+      { files: true, overrides: { agent_director_poll_interval_ms: 1 } },
+    )
+    ;[a, b] = h.personas as [Persona, Persona]
+    controllerLines = []
+    gateLines = []
+    errLines = []
+    leftUp = []
+    capCalls = []
+    broken = false
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+
+    _setSpawnHomeDir(dir)
+    _resetInFlightLaunches()
+    _setDialogPollIntervalMs(1)
+    _setDialogReadyTimeoutMs(200)
+    _setTmuxCapturePane(async () => '')
+    _setTmuxSendEnter(async () => {})
+    _setTmuxSessionProber(async () => true)
+    _setTmuxServerEnsurer(async () => {})
+    _setConfigDirFs({
+      realpath: (path) => {
+        if (broken && (path === aConfigDir || path.startsWith(`${aConfigDir}/`))) {
+          throw Object.assign(new Error('EIO: injected'), { code: 'EIO' })
+        }
+        return realpathSync(path)
+      },
+    })
+
+    // A's session is dead and its row `ended`, labelled for its directory (a
+    // spawn collides with it); B's row is gone. Each reports `waiting` once relaunched.
+    calls = makeStubCallLog()
+    const launched = (p: Persona) =>
+      calls.resumeCalls.some((r) => r.claude_instance_id === personaInstanceId(p.key)) ||
+      calls.spawnCalls.some((s) => s.claude_instance_id === personaInstanceId(p.key))
+    const stub = makeStubClient({
+      ...calls,
+      getResult: cannedGetResult({ state: 'ended' }, a, dir),
+      statusFn: (p) => {
+        const persona = p.claude_instance_id === personaInstanceId(a.key) ? a : b
+        if (persona === a && calls.resumeCalls.length > 0) return { state: 'waiting' }
+        if (persona === a) return { state: 'ended' }
+        return launched(b) ? { state: 'waiting' } : errSpawnNotFound()
+      },
+    })
+    const realSpawn = stub.spawn.bind(stub)
+    stub.spawn = async (params) => {
+      if (params.claude_instance_id !== personaInstanceId(a.key)) return realSpawn(params)
+      calls.spawnCalls.push(params)
+      throw errInstanceIdCollision()
+    }
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+    setClientForTests(stub as unknown as Client)
+    setSessionNotifier(() => {})
+
+    controller = createPersonaBringUpController({
+      connections: { bringUp: h.connections.bringUp, status: (key) => h.manager.status(key) },
+      dryRun: false,
+      log: (line) => void controllerLines.push(line),
+      launch: (persona) => spawnForPersona(persona, h.config!, false),
+      checkConfigDir: checkLaunchConfigDir,
+      appliedPersonas: () => h.config?.personas ?? [],
+      onLeftUp: (persona) => void leftUp.push(persona.key),
+      clock: h.clock,
+    })
+    h.onStatus = (key, status) => controller.onConnectionStatus(key, status)
+    setConfigDirUnresolvableHook(controller.holdForConfigDir)
+    for (const persona of h.personas) expect((await controller.bringUp(persona, h.personas)).outcome).toBe('up')
+  })
+
+  afterEach(async () => {
+    console.error = origConsoleError
+    cancelAllRestartTimers()
+    controller.cancelAll()
+    await h.manager.stopAll()
+    setConfigDirUnresolvableHook(undefined)
+    _resetConfigDirFs()
+    _resetInFlightLaunches()
+    resetClientForTests()
+    _resetOutageState()
+    setSessionNotifier(undefined)
+    _resetSpawnHomeDir()
+    _resetDialogPollIntervalMs()
+    _resetDialogReadyTimeoutMs()
+    _resetTmuxDialogHelpers()
+    _resetTmuxSessionProber()
+    _resetTmuxServerEnsurer()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  function makeRealDeps(): RestartDeps {
+    const gate = createPersonaRelaunchGate(
+      { status: (key) => h.manager.status(key) },
+      (line) => void gateLines.push(line),
+      { isUp: (key) => controller.isUp(key), isApplied: (key) => controller.isApplied(key) },
+    )
+    return {
+      canRestart: gate,
+      isSessionAlive: _buildIsSessionAliveAdapter(() => h.config),
+      isSessionConnected: () => false,
+      hasSessionStream: () => false,
+      reconnectSession: _buildReconnectSessionAdapter(),
+      killSession: _buildKillSessionAdapter((key) => h.getPersona(key)),
+      launchSession: (key) => launchPersonaSession(key, h.config!, { canLaunch: gate }),
+      getRestartDelay: () => FAST_DELAY_S,
+      isShuttingDown: () => false,
+      onCapReached: (key) => void capCalls.push(key),
+    }
+  }
+
+  /** Poll (foreground, real time) until `cond` holds or `ms` elapse. */
+  async function waitFor(cond: () => boolean, ms = 1000): Promise<void> {
+    const deadline = Date.now() + ms
+    while (!cond() && Date.now() < deadline) await Bun.sleep(1)
+  }
+
+  /** The calls in `list` addressed to `p`'s instance. */
+  const idsFor = <T extends { claude_instance_id?: unknown }>(list: T[], p: Persona): T[] =>
+    list.filter((c) => c.claude_instance_id === personaInstanceId(p.key))
+
+  /** Every `persona-config-dir-unresolvable` line, from the controller and the console. */
+  const classLines = () => [...controllerLines, ...errLines].filter((l) => l.includes(`${PERSONA_CONFIG_DIR_UNRESOLVABLE}:`))
+
+  test('b.g57: realpath throwing for A\'s claude_config_dir at a restart — no kill, delete, spawn or resume for A (its row untouched), one line naming A and the path, A not up and its count unchanged; once it resolves (fake clock) A resumes the same row with no confirmation; B restarts as before', async () => {
+    recordFailure(a.key)
+    initRestart(makeRealDeps())
+    broken = true
+
+    scheduleRestart(a.key, a.working_directory)
+    scheduleRestart(b.key, b.working_directory)
+    await waitFor(() => !isRestartPendingOrActive(a.key) && !isRestartPendingOrActive(b.key))
+
+    // A: only the liveness probe reached agent-director.
+    expect(idsFor(calls.killCalls, a)).toEqual([])
+    expect(calls.deleteCalls).toEqual([])
+    expect(idsFor(calls.spawnCalls, a)).toEqual([])
+    expect(calls.resumeCalls).toEqual([])
+    expect(idsFor(calls.statusCalls, a)).toHaveLength(1)
+    // Class, persona, path and reason; the whole sentence is pinned in tests/persona-bringup.test.ts.
+    expect(classLines()).toHaveLength(1)
+    expect(classLines()[0]).toStartWith(
+      `[slack] ${PERSONA_CONFIG_DIR_UNRESOLVABLE}: personas[${a.index}] ${renderPersonaRef(a.name, a.key)} path=${JSON.stringify(aConfigDir)}: `,
+    )
+    expect(classLines()[0]).toContain('(EIO)')
+    expect(controller.isUp(a.key)).toBe(false)
+    expect(controller.state(a.key)).toEqual({
+      outcome: 'retrying',
+      causes: { configDir: { step: 'claude-config-dir', class: PERSONA_CONFIG_DIR_UNRESOLVABLE, cause: expect.stringContaining('(EIO)') } },
+    })
+    expect(leftUp).toEqual([a.key])
+    expect(getFailureCount(a.key)).toBe(1)
+    expect(capCalls).toEqual([])
+    expect(gateLines).toEqual([`[slack] persona=${a.key}: not relaunched — its bring-up has not succeeded; eligible again once it is up`])
+    // B, beside it: killed and spawned fresh, still up, nothing counted.
+    expect(idsFor(calls.killCalls, b)).toHaveLength(1)
+    expect(idsFor(calls.spawnCalls, b)).toHaveLength(1)
+    expect(controller.isUp(b.key)).toBe(true)
+    expect(getFailureCount(b.key)).toBe(0)
+
+    // Still unresolvable at the first re-check (5 s): nothing more, no second line.
+    await h.clock.advance(5_000)
+    expect(calls.resumeCalls).toEqual([])
+    expect(idsFor(calls.spawnCalls, a)).toEqual([])
+    expect(classLines()).toHaveLength(1)
+    expect(controller.isUp(a.key)).toBe(false)
+
+    // It resolves: the next re-check (10 s on) clears the hold and launches A,
+    // whose row still carries the matching label, so the ladder resumes it.
+    broken = false
+    await h.clock.advance(10_000)
+    await waitFor(() => calls.resumeCalls.length > 0 && !isLaunchInFlight(a.key))
+
+    expect(calls.resumeCalls.map((r) => r.claude_instance_id)).toEqual([personaInstanceId(a.key)])
+    expect(calls.deleteCalls).toEqual([])
+    expect(idsFor(calls.killCalls, a)).toEqual([])
+    expect(idsFor(calls.spawnCalls, a)).toHaveLength(1) // the spawn that collided with the row
+    expect(controller.isUp(a.key)).toBe(true)
+    expect(classLines()).toEqual([expect.any(String), expect.stringContaining(': cleared: claude_config_dir resolves to a real path again')])
+    expect(idsFor(calls.spawnCalls, b)).toHaveLength(1)
+    assertNoLeak({ controllerLines, gateLines, errLines, managerLines: h.lines })
   })
 })

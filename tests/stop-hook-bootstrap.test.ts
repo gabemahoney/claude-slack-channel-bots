@@ -10,7 +10,11 @@
  * SR-8.6),
  * the two-persona shared-dir case end to end through the installed command,
  * the undo of an optimistic launch, the teardown helper and the record
- * helpers.
+ * helpers. The AC 59 block drives the same rule through a confirmed reload
+ * (`makeReloadHarness` with the real launch path, b.av2 SR-8.6): a changed
+ * `stop_hook_bootstrap` or `claude_config_dir`, own or inherited, reaches the
+ * record and the managed hook only at the persona's next launch, and a
+ * neighbour's launch leaves a running persona's record unchanged.
  *
  * Isolation (b.av2 SR-13.2):
  *   - mkdtempSync per-test temp directories, removed in afterEach
@@ -48,7 +52,7 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { type Persona, type PersonaConfig, resolvePersonaConfig } from '../src/config.ts'
+import { type Persona, type PersonaConfig, type PersonaInput, resolvePersonaConfig } from '../src/config.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import {
   deleteReplyGuardRecord,
@@ -65,6 +69,7 @@ import {
   stopHookBootstrap,
   teardownPersonaReplyGuard,
 } from '../src/stop-hook-bootstrap.ts'
+import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import {
   makeMultiPersonaConfig,
@@ -72,6 +77,12 @@ import {
   makePersonaConfigInput,
   type PersonaSpec,
 } from './test-helpers/persona-config.ts'
+import {
+  makeReloadHarness,
+  TEMPLATE_REFRESH_KEY,
+  type ReloadHarness,
+  type ReloadRun,
+} from './test-helpers/reload-harness.ts'
 import { makeReplyGuardRecordDir, type ReplyGuardRecordDir } from './test-helpers/reply-guard-record.ts'
 
 /** Absolute path to src/stop-hook-bootstrap.ts, for the fake-HOME subprocess. */
@@ -1188,4 +1199,265 @@ describe('stop-hook-bootstrap and the reply-guard record', () => {
 
     expect(snapshotTree(rec.stateDir)).toEqual(before)
   })
+})
+
+// ---------------------------------------------------------------------------
+// AC 59: next-launch values through a confirmed reload (b.av2 SR-8.6
+// `stop_hook_bootstrap` and `claude_config_dir` rows, SR-9.4, SR-6.2)
+//
+// Every case runs a server through `makeReloadHarness` with the real launch
+// path (`realLaunch`: `spawnForPersona` with the reply-guard steps over the
+// harness's temp state directory), confirms a change with the operator's
+// gesture, then drives each persona's next launch through the restart path
+// (`run.relaunch`, its row seeded `ended` so the ladder resumes or spawns
+// afresh, which is when the reply-guard steps run). Every persona has its own
+// temp `claude_config_dir` (or a shared temp one); none resolves to ~/.claude,
+// and the start-time Stop-hook bootstrap is not run, so every managed entry
+// and record here was written by a launch. E10's direct-launch, install-matrix,
+// quoting and refusal cases are above and not repeated.
+// ---------------------------------------------------------------------------
+
+describe('AC 59: a confirmed stop_hook_bootstrap or claude_config_dir change reaches the record and the hook only at the next launch', () => {
+  let h: ReloadHarness
+  let savedStateDirEnv: string | undefined
+
+  beforeEach(() => {
+    h = makeReloadHarness({ personaConfigDirs: true })
+    // Nothing here is a startup launch, but a recordStartupError write would
+    // still land in a temp dir, never under HOME.
+    savedStateDirEnv = process.env['SLACK_STATE_DIR']
+    process.env['SLACK_STATE_DIR'] = h.stateDir
+  })
+
+  afterEach(async () => {
+    try {
+      await h.cleanup()
+    } finally {
+      if (savedStateDirEnv === undefined) delete process.env['SLACK_STATE_DIR']
+      else process.env['SLACK_STATE_DIR'] = savedStateDirEnv
+    }
+  })
+
+  /** The managed commands in `<dir>/settings.json`; none when the file does not exist. */
+  function hookIn(dir: string): (string | undefined)[] {
+    return existsSync(join(dir, 'settings.json')) ? managedCommands(dir) : []
+  }
+
+  /** The one managed command, from the module's resolver over the harness's state directory. */
+  function installed(): string[] {
+    return [managedHookCommand(h.stateDir)]
+  }
+
+  type TopLevel = { stop_hook_bootstrap?: boolean; claude_config_dir?: string }
+
+  /**
+   * A server running `personas` from a byte-equal record and config file
+   * (with the top-level settings `top`), detection started and its first
+   * check run; every start launch is a fresh spawn through the real path.
+   */
+  async function running(personas: PersonaInput[], top: TopLevel = {}): Promise<ReloadRun> {
+    h.materialize(...personas)
+    h.writeRecord({ ...top, personas })
+    h.writeConfig({ ...top, personas })
+    const run = await h.startDetecting({ realLaunch: true })
+    await run.ticks.tick()
+    expect(h.pendingExists()).toBe(false)
+    for (const p of personas) expect(h.rowOf(p.name)?.state).toBe('waiting')
+    return run
+  }
+
+  /**
+   * Confirm `personas` (with `top`) as the new configuration and await the
+   * apply. Returns the apply's lifecycle records as `<op> <name>` (`<op>`
+   * alone for step 5's template refresh).
+   */
+  async function apply(run: ReloadRun, personas: PersonaInput[], top: TopLevel = {}): Promise<string[]> {
+    h.writeConfig({ ...top, personas })
+    const cp = run.checkpoint()
+    await (await run.confirmPending()).applying
+    expect(h.readRecord()).toEqual(h.readConfig()!)
+    const nameOf = new Map(personas.map((p) => [h.key(p.name), p.name]))
+    return run.since(cp).lifecycle.map((r) => (r.key === TEMPLATE_REFRESH_KEY ? r.op : `${r.op} ${nameOf.get(r.key) ?? r.key}`))
+  }
+
+  /** The persona's next launch: its instance has ended, and the restart path launches it again. */
+  async function nextLaunch(run: ReloadRun, persona: PersonaInput): Promise<void> {
+    h.seedRow(persona, { state: 'ended' })
+    expect(await run.relaunch(persona.name)).toBe(true)
+  }
+
+  /** The persona's spawns and resumes that succeeded (an optimistic spawn that met the row is not one), as `<verb> <CLAUDE_CONFIG_DIR>`. */
+  function launchesOf(run: ReloadRun, persona: PersonaInput): string[] {
+    return run
+      .composition!.instanceCallsOf(persona.name)
+      .filter((c) => (c.verb === 'spawn' || c.verb === 'resume') && c.result === 'ok')
+      .map((c) => (c.verb === 'spawn' ? `spawn ${c.claudeConfigDir}` : 'resume'))
+  }
+
+  /** Every persona's instance calls, to show an apply made none. */
+  function instanceCalls(run: ReloadRun, personas: PersonaInput[]): Record<string, string[]> {
+    return Object.fromEntries(
+      personas.map((p) => [p.name, run.composition!.instanceCallsOf(p.name).map((c) => c.verb)]),
+    )
+  }
+
+  /** Closing checks: nothing posted, and no token in the logs, records, settings files or anything else captured. */
+  function expectNoPostNoLeak(run: ReloadRun, dirs: string[]): void {
+    expect(run.slackPosts()).toEqual([])
+    assertNoLeak(
+      run.captured({
+        records: writtenFile(h.replyGuardDir),
+        settings: dirs.map((d) => writtenFile(d)),
+        sessionNotices: run.sessionNotices,
+      }),
+    )
+  }
+
+  test('AC 59 own value true → false: the apply leaves the true record and the hook; the next launch writes false and removes the hook', async () => {
+    const d = h.configDir('d')
+    const a = h.persona('Hook A', { claude_config_dir: d })
+    const run = await running([a])
+    expect(h.readReplyGuardRecord(a.name)).toBe('true')
+    expect(hookIn(d)).toEqual(installed())
+    const before = instanceCalls(run, [a])
+
+    // The apply itself neither tore down nor launched A, nor rewrote its record or the hook.
+    expect(await apply(run, [{ ...a, stop_hook_bootstrap: false }])).toEqual([])
+    expect(instanceCalls(run, [a])).toEqual(before)
+    expect(h.readReplyGuardRecord(a.name)).toBe('true')
+    expect(hookIn(d)).toEqual(installed())
+
+    await nextLaunch(run, a)
+
+    expect(launchesOf(run, a)).toEqual([`spawn ${d}`, 'resume'])
+    expect(h.readReplyGuardRecord(a.name)).toBe('false')
+    expect(hookIn(d)).toEqual([])
+    expectNoPostNoLeak(run, [d])
+  })
+
+  // A runs in D with true, and its value is confirmed as false; B (false)
+  // launches into D before A relaunches: added by the same apply (its apply
+  // bring-up launches it), or already running and restarted after the apply.
+  test.each(['added in the same apply', 'restarted after the apply'] as const)(
+    "AC 59 a neighbour's launch into the same dir (%s) leaves A's true record and the hook; A's own next launch then removes it",
+    async (how) => {
+      const d = h.configDir('shared')
+      const a = h.persona('Hook A', { claude_config_dir: d })
+      const b = h.persona('Hook B', { claude_config_dir: d, stop_hook_bootstrap: false })
+      const aOff = { ...a, stop_hook_bootstrap: false }
+      let run: ReloadRun
+      if (how === 'added in the same apply') {
+        run = await running([a])
+        h.materialize(b)
+        expect(await apply(run, [aOff, b])).toEqual([`bring-up ${b.name}`, `launch ${b.name}`])
+        expect(launchesOf(run, b)).toEqual([`spawn ${d}`])
+      } else {
+        run = await running([a, b])
+        expect(await apply(run, [aOff, b])).toEqual([])
+        await nextLaunch(run, b)
+        expect(launchesOf(run, b)).toEqual([`spawn ${d}`, 'resume'])
+      }
+      expect(launchesOf(run, a)).toEqual([`spawn ${d}`])
+
+      expect(h.readReplyGuardRecord(b.name)).toBe('false')
+      expect(h.readReplyGuardRecord(a.name)).toBe('true')
+      expect(hookIn(d)).toEqual(installed())
+
+      // A's own next launch writes false; no one in D needs the hook now.
+      await nextLaunch(run, aOff)
+      expect(h.readReplyGuardRecord(a.name)).toBe('false')
+      expect(hookIn(d)).toEqual([])
+      expectNoPostNoLeak(run, [d])
+    },
+  )
+
+  // A and B inherit the top-level value, which the apply flips; C overrides
+  // it with the old value, so C's record would change only if C wrongly
+  // followed the new default. Each has its own dir.
+  test.each([
+    [true, false],
+    [false, true],
+  ] as const)(
+    'AC 59 inherited default %p → %p: the apply changes no record; each inheriting persona\'s record changes only at its own next launch; the overriding one never changes',
+    async (was, now) => {
+      const a = h.persona('Inherit A')
+      const b = h.persona('Inherit B')
+      const c = h.persona('Override C', { stop_hook_bootstrap: was })
+      const personas = [a, b, c]
+      const run = await running(personas, { stop_hook_bootstrap: was })
+      const records = () => personas.map((p) => h.readReplyGuardRecord(p.name))
+      const old = String(was)
+      const fresh = String(now)
+      expect(records()).toEqual([old, old, old])
+      const before = instanceCalls(run, personas)
+
+      expect(await apply(run, personas, { stop_hook_bootstrap: now })).toEqual([])
+      expect(instanceCalls(run, personas)).toEqual(before)
+      expect(records()).toEqual([old, old, old])
+
+      await nextLaunch(run, b)
+      expect(records()).toEqual([old, fresh, old])
+
+      await nextLaunch(run, c)
+      expect(records()).toEqual([old, fresh, old])
+
+      await nextLaunch(run, a)
+      expect(records()).toEqual([fresh, fresh, old])
+      // Each dir's hook follows its own persona's record.
+      expect(personas.map((p) => hookIn(p.claude_config_dir!))).toEqual([
+        now ? installed() : [],
+        now ? installed() : [],
+        was ? installed() : [],
+      ])
+      expectNoPostNoLeak(run, personas.map((p) => p.claude_config_dir!))
+    },
+  )
+
+  // A (true) moves from D1 to D2, as its own value or as the inherited
+  // top-level one. M, which stays in D1, relaunches after the apply and
+  // before A: D1's hook then stays only because A's running instance
+  // launched with D1 and has a true record. After A's next launch D1 keeps
+  // the hook only if M needs it.
+  test.each(
+    (['own', 'inherited'] as const).flatMap((source) =>
+      ([false, true] as const).map((neighbourOn) => [source, neighbourOn] as const),
+    ),
+  )(
+    'AC 59 claude_config_dir moved D1 → D2 (%s value; D1 neighbour stop_hook_bootstrap=%p): D1 keeps the hook until A relaunches; then D2 has it and A\'s record, and D1 keeps it only for the neighbour',
+    async (source, neighbourOn) => {
+      const d1 = h.configDir('d1')
+      const d2 = h.configDir('d2')
+      const dirOf = (dir: string): Partial<PersonaInput> =>
+        source === 'own' ? { claude_config_dir: dir } : { claude_config_dir: undefined }
+      const topOf = (dir: string): TopLevel => (source === 'own' ? {} : { claude_config_dir: dir })
+      const a = h.persona('Mover A', dirOf(d1))
+      const m = h.persona('Stayer M', { claude_config_dir: d1, stop_hook_bootstrap: neighbourOn })
+      const run = await running([a, m], topOf(d1))
+      expect(hookIn(d1)).toEqual(installed())
+      expect(existsSync(join(d2, 'settings.json'))).toBe(false)
+      const before = instanceCalls(run, [a, m])
+
+      const aMoved = { ...a, ...dirOf(d2) }
+      // Step 5 refreshes the template (the config dirs changed); nothing else runs.
+      expect(await apply(run, [aMoved, m], topOf(d2))).toEqual(['template-refresh'])
+      expect(instanceCalls(run, [a, m])).toEqual(before)
+      expect(hookIn(d1)).toEqual(installed())
+      expect(hookIn(d2)).toEqual([])
+
+      // M's launch re-evaluates D1 over the applied set, in which A now names D2.
+      await nextLaunch(run, m)
+      expect(h.readReplyGuardRecord(m.name)).toBe(String(neighbourOn))
+      expect(h.readReplyGuardRecord(a.name)).toBe('true')
+      expect(hookIn(d1)).toEqual(installed())
+      expect(hookIn(d2)).toEqual([])
+
+      // A's next launch: a fresh spawn with D2 (the row's config_dir label is D1's).
+      await nextLaunch(run, aMoved)
+      expect(launchesOf(run, a)).toEqual([`spawn ${d1}`, `spawn ${d2}`])
+      expect(h.readReplyGuardRecord(a.name)).toBe('true')
+      expect(hookIn(d2)).toEqual(installed())
+      expect(hookIn(d1)).toEqual(neighbourOn ? installed() : [])
+      expectNoPostNoLeak(run, [d1, d2])
+    },
+  )
 })

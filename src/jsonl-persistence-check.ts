@@ -41,7 +41,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { Database } from 'bun:sqlite'
 import type { GetResult } from 'agent-director'
-import type { Persona, PersonaConfig, ServerSettings } from './config.ts'
+import { resolveRealPathStrict, type Persona, type PersonaConfig, type ServerSettings, type StrictRealPathFs } from './config.ts'
 import { recordStartupError as defaultRecordStartupError } from './startup-errors.ts'
 import { withOutageDetection } from './outage-state.ts'
 import { ErrSpawnNotFound } from './agent-director-errors.ts'
@@ -99,6 +99,12 @@ export interface JsonlPersistenceSafeguardDeps {
    * Default: the OS home, read at call time.
    */
   home?: string
+  /**
+   * Realpath and lstat for resolving each persona's claude_config_dir (Layer
+   * 2, bug b.g57): a persona whose directory cannot be resolved is skipped.
+   * Default: the real file system.
+   */
+  configDirFs?: Partial<StrictRealPathFs>
 }
 
 // ---------------------------------------------------------------------------
@@ -433,19 +439,26 @@ interface Layer2Effects {
   archiveCountSince: ArchiveCountSince
   recordError: typeof defaultRecordStartupError
   home: string
+  configDirFs: Partial<StrictRealPathFs> | undefined
 }
 
 /**
  * Why the collision ladder will replace this row with a fresh spawn instead
  * of resuming it (E3 Task 3 guards, via `compareRowToPersona`), or undefined
- * when the row matches the persona.
+ * when the row matches the persona. A claude_config_dir with no real path
+ * gives no `config_dir` verdict, so no mismatch (bug b.g57).
  */
-function rowReplacementReason(row: GetResult, persona: Persona, home: string): string | undefined {
-  const cmp = compareRowToPersona(row, persona, home)
+function rowReplacementReason(
+  row: GetResult,
+  persona: Persona,
+  home: string,
+  configDirFs: Partial<StrictRealPathFs> | undefined,
+): string | undefined {
+  const cmp = compareRowToPersona(row, persona, home, undefined, configDirFs)
   if (!cmp.cwdMatches) {
     return `row cwd=${row.cwd || '<none>'} differs from working_directory=${persona.working_directory}`
   }
-  if (!cmp.configDirMatches) {
+  if (cmp.configDirMatches === false) {
     const was = cmp.configDirLabel === undefined ? 'missing' : `was=${cmp.configDirLabel}`
     return `row config_dir label ${was}, now=${cmp.expectedConfigDirLabel}`
   }
@@ -461,6 +474,20 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
   const { key } = persona
   const ref = personaRef(persona)
   const claudeInstanceId = personaInstanceId(key)
+
+  // Bug b.g57: a claude_config_dir with no real path (an unmounted drive, a
+  // dropped mount, a symlink pointing to nothing) is not checked this pass:
+  // its transcript can't be located, and its launch waits for the directory
+  // with the row kept, so there is no lost history to report.
+  const configDir = resolveClaudeConfigDir(persona.claude_config_dir, fx.home)
+  const resolution = resolveRealPathStrict(configDir, fx.configDirFs)
+  if (!resolution.resolved) {
+    console.error(
+      `[slack] jsonl-persistence-check: ${ref} claude_config_dir="${configDir}" cannot be resolved to a real path ` +
+        `(${resolution.code}) — transcript not checked this pass`,
+    )
+    return
+  }
 
   let row: GetResult
   try {
@@ -478,7 +505,7 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
 
   // Case 7: the collision ladder will replace this row rather than resume or
   // reconnect it (b.av2 SR-6.2), so there is no resume to warn about.
-  const replacement = rowReplacementReason(row, persona, fx.home)
+  const replacement = rowReplacementReason(row, persona, fx.home, fx.configDirFs)
   if (replacement !== undefined) {
     console.error(
       `[slack] jsonl-persistence-check: ${ref} ${replacement} — the collision ladder will replace this row; ` +
@@ -672,6 +699,10 @@ export function runPersonaStorageCheck(
  *   (b.av2 SR-7.4): single quiet console line, no loud signal.
  * - A row the collision ladder will replace rather than resume: single
  *   quiet console line, no loud signal.
+ * - A persona whose claude_config_dir cannot be resolved to a real path (bug
+ *   b.g57): skipped for this pass before any AD call, with one quiet console
+ *   line; no lost-history, inconclusive or transcript-loss signal and no
+ *   label mismatch (its launch waits for the directory, row kept).
  * - notify undefined (a unit test): no notices; loud errors still recorded.
  * - Own unexpected failure: one warning line, returns (never throws).
  */
@@ -692,6 +723,7 @@ export async function runJsonlPersistenceSafeguard(
       archiveCountSince: deps?.archiveCountSince ?? makeDefaultArchiveCount(config),
       recordError,
       home,
+      configDirFs: deps?.configDirFs,
     }
 
     // Layer 1 — non-persistent storage.

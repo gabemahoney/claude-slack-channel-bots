@@ -82,10 +82,28 @@
  * again (a confirmed credentials reconnect left retrying succeeded) is
  * launched the same way, through its launch path's collision ladder.
  *
+ * claude_config_dir hold (bug b.g57): a launch that finds the persona's
+ * effective claude_config_dir unresolvable (a symlink on its path pointing to
+ * nothing, an unmounted drive, a dropped mount) launches nothing and hands
+ * the failure to `holdForConfigDir`. The persona is then `retrying` with a
+ * `configDir` cause (and leaves up, as below), its instance, agent-director
+ * row and Slack connection untouched. The directory is re-checked on the
+ * persona's own timer on the SR-3.2 schedule, outside the restart counter and
+ * cap, each attempt through the serializer. The class line
+ * (`persona-config-dir-unresolvable`) is logged when the hold starts and a
+ * cleared line when the directory resolves, then the persona is launched:
+ *
+ *   [slack] persona-config-dir-unresolvable: personas[<i>] "<name>" (key=<key>) path="<dir>": cleared: claude_config_dir resolves to a real path again; continuing the launch
+ *   [slack] persona "<name>" (key=<key>): up after its claude_config_dir resolved — launching
+ *
+ * A confirmed credentials change meanwhile goes by the Slack side
+ * (`slackSideOutcome`): a held persona whose connection works is reconnected
+ * like an up one, and stays held.
+ *
  * Leaving up (SR-6.3, SR-6.4): each time a persona's outcome changes from
- * `up` to `broken` or `retrying` (a refused reopen of a running persona, or a
- * Web API call refused for its bot token), the injected `onLeftUp` is told
- * once. A lost connection being
+ * `up` to `broken` or `retrying` (a refused reopen of a running persona, a
+ * Web API call refused for its bot token, or a claude_config_dir hold), the
+ * injected `onLeftUp` is told once. A lost connection being
  * reopened (`lost`, `retrying` a reopen) stays `up`. Production wires
  * `createNotUpSessionDropper`, which drops the persona's registered MCP
  * session; its instance and agent-director row are kept.
@@ -145,7 +163,7 @@
  */
 
 import type { Persona } from './config.ts'
-import { checkPersonaWorkingDirectory } from './persona-bringup.ts'
+import { checkPersonaConfigDir, checkPersonaWorkingDirectory } from './persona-bringup.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import {
   SYSTEM_PERSONA_CONNECTION_CLOCK,
@@ -187,6 +205,8 @@ export interface PersonaBringUpCauses {
   credentials?: PersonaBringUpFailure
   directory?: PersonaBringUpFailure
   slack?: PersonaBringUpFailure
+  /** Its launch waits for its claude_config_dir to resolve (bug b.g57, `holdForConfigDir`). */
+  configDir?: PersonaBringUpFailure
 }
 
 /** A persona's bring-up state, as the controller reports it. Never holds a token. */
@@ -216,6 +236,11 @@ export interface CredentialsSwap {
    * its MCP session, dropped then, registers again.
    */
   wasUp: boolean
+  /**
+   * Present when the persona is held for its claude_config_dir (bug b.g57)
+   * at the swap: its launch still waits, and it has no MCP session.
+   */
+  held?: true
 }
 
 /** Told when a confirmed credentials change takes effect on the persona's connection. */
@@ -242,9 +267,11 @@ export type PersonaCredentialsChangeResult =
    * Up persona: the new connection is in use, the old one closed; the new
    * file's content is held. `cameBackUp` when the persona was not up right
    * before the swap (its current connection was refused while the attempt
-   * ran): it is up again, and its MCP session registers again.
+   * ran): it is up again, and its MCP session registers again. `held` when
+   * it is held for its claude_config_dir (bug b.g57) after the swap: its
+   * launch still waits, and it has no MCP session.
    */
-  | { kind: 'swapped'; cameBackUp?: true }
+  | { kind: 'swapped'; cameBackUp?: true; held?: true }
   /**
    * The new file's content is held and retried with: an up persona whose new
    * connection is retrying while its old one stays in use (`connection:
@@ -286,6 +313,26 @@ export function isCredentialsBroken(state: Pick<PersonaBringUpState, 'outcome' |
   return state.causes.credentials !== undefined || state.causes.slack?.class === PERSONA_CREDENTIALS_REFUSED
 }
 
+/**
+ * A bring-up state's outcome without the claude_config_dir hold (bug b.g57):
+ * what its bring-up steps and Slack connection give. A persona held for its
+ * claude_config_dir while its connection works is `retrying` with the
+ * `configDir` cause alone; its Slack side is `up`. Any other state's outcome
+ * is returned as it is. A confirmed credentials change reconnects or retries
+ * by this outcome (`changeCredentials`), so the change plan's `retrying` fact
+ * reads it too. Pure.
+ */
+export function slackSideOutcome(state: Pick<PersonaBringUpState, 'outcome' | 'causes'>): PersonaBringUpOutcome | undefined {
+  const { causes } = state
+  const heldOnly =
+    state.outcome === 'retrying' &&
+    causes.configDir !== undefined &&
+    causes.credentials === undefined &&
+    causes.directory === undefined &&
+    causes.slack === undefined
+  return heldOnly ? 'up' : state.outcome
+}
+
 /** Dependencies of `createPersonaBringUpController`. */
 export interface PersonaBringUpControllerDeps
   extends Pick<PersonaConnectDeps, 'dryRun' | 'log' | 'checkLocal' | 'checkDirectory' | 'fs'> {
@@ -316,10 +363,20 @@ export interface PersonaBringUpControllerDeps
    */
   appliedPersonas?: () => readonly Persona[]
   /**
+   * Re-check a held persona's claude_config_dir (bug b.g57,
+   * `holdForConfigDir`), with the persona's current applied declaration.
+   * Production passes the session manager's pre-launch check
+   * (`checkLaunchConfigDir`), so the re-check and the launch resolve the
+   * directory the same way; default `checkPersonaConfigDir` with the OS home
+   * and the real file system.
+   */
+  checkConfigDir?: (persona: Persona) => { ok: true } | PersonaCheckFailure
+  /**
    * The per-persona lifecycle serializer's `run` (b.av2 SR-6.6,
    * `persona-serializer.ts`). Each retry attempt runs through it, through to
    * the launch it triggers: a directory re-check (with its Slack step and
-   * launch) and the launch after a Slack retry reached `up`. Its checks (the
+   * launch), a claude_config_dir re-check (with its launch) and the launch
+   * after a Slack retry reached `up`. Its checks (the
    * persona is cancelled, no longer applied, already launched) run when the
    * attempt starts. Not the first bring-up (`bringUp`). Without it the work
    * runs at once. Production passes the server's one shared serializer.
@@ -370,7 +427,10 @@ export interface PersonaBringUpController {
    * it `applied`, the set the confirmed apply made current, never the set the
    * persona was first brought up with); reconnects an up persona through
    * `connections.reconnectCredentials` and hands a Slack-retrying one's new
-   * tokens to `connections.replaceRetryTokens`. Resolves once an up
+   * tokens to `connections.replaceRetryTokens`. Up and retrying are decided
+   * on the Slack side (`slackSideOutcome`): a persona held for its
+   * claude_config_dir (bug b.g57) with a working connection is reconnected
+   * like an up one and stays held. Resolves once an up
    * persona's first attempt settled. Touches no other persona. Run it
    * through the persona's serializer turn (the lifecycle does). Never
    * rejects except through a throwing injected dependency.
@@ -381,6 +441,20 @@ export interface PersonaBringUpController {
     connections: CredentialsChangeConnections,
     hooks?: CredentialsChangeHooks,
   ): Promise<PersonaCredentialsChangeResult>
+  /**
+   * Hold back a persona whose launch found its claude_config_dir unresolvable
+   * (bug b.g57; the session manager's hook, `setConfigDirUnresolvableHook`).
+   * The persona becomes `retrying` with a `configDir` cause: `onLeftUp` fires
+   * once if it was up, and nothing is delivered to it. The failure's line is
+   * logged when the episode starts, not again while it lasts. The directory is
+   * re-checked on the persona's own timer (SR-3.2 schedule: 5 s doubling to
+   * 300 s, no cap), each attempt through the serializer; once it resolves, one
+   * cleared line, then the launch. The Slack connection, the instance and its
+   * row are left as they are. Synchronous; never awaits the serializer.
+   * Returns false, doing nothing, for a persona the controller does not know
+   * (never brought up, or cancelled): the caller then logs the line itself.
+   */
+  holdForConfigDir(persona: Persona, failure: PersonaCheckFailure): boolean
   /** Stop one persona's retries and forget it; a retry already running does nothing more. Idempotent. */
   cancel(key: string): void
   /** Cancel every persona. */
@@ -396,7 +470,10 @@ interface TimerBox {
   handle: unknown
 }
 
-/** An open directory episode: the cause that opened it (for its cleared line) and the latest one. */
+/**
+ * An open directory or claude_config_dir episode: the cause that opened it
+ * (for its cleared line) and the latest one.
+ */
 interface DirectoryEpisode {
   readonly opened: PersonaCheckFailure
   latest: PersonaCheckFailure
@@ -443,6 +520,11 @@ interface BringUpEntry {
   directory: DirectoryEpisode | undefined
   readonly directorySchedule: PersonaRetrySchedule
   directoryTimer: TimerBox | undefined
+  /** Its launch waits for its claude_config_dir to resolve (bug b.g57); undefined when not held. */
+  configDir: DirectoryEpisode | undefined
+  /** The claude_config_dir re-check schedule, reset when an episode opens. */
+  readonly configDirSchedule: PersonaRetrySchedule
+  configDirTimer: TimerBox | undefined
   /** Set once step 3 was handed to the manager: the Slack side is then the manager's status. */
   slackStarted: boolean
   /** Step 3 threw (a programming error): broken, not retried. */
@@ -468,6 +550,9 @@ const DIRECTORY_CLEARED_CONTINUING = 'cleared: working directory is usable again
 const DIRECTORY_CLEARED_STILL_BROKEN =
   'cleared: working directory is usable again; the persona stays broken until its credentials file is fixed and the change confirmed'
 
+/** Cause of a claude_config_dir cleared line (bug b.g57). */
+const CONFIG_DIR_CLEARED = 'cleared: claude_config_dir resolves to a real path again; continuing the launch'
+
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
@@ -477,6 +562,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
   const { connections } = deps
   const clock = deps.clock ?? SYSTEM_PERSONA_CONNECTION_CLOCK
   const checkDirectory = deps.checkDirectory ?? checkPersonaWorkingDirectory
+  const checkConfigDir = deps.checkConfigDir ?? ((persona: Persona) => checkPersonaConfigDir(persona))
   const entries = new Map<string, BringUpEntry>()
   const serialize: PersonaSerialize = deps.serialize ?? (async (_key, operation) => operation())
 
@@ -522,12 +608,24 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     }
   }
 
-  function outcomeOf(entry: BringUpEntry): PersonaBringUpOutcome | undefined {
+  /**
+   * The outcome of the persona's bring-up steps and Slack connection, without
+   * the claude_config_dir hold (bug b.g57): `up` for a held persona whose
+   * connection works. What a credentials change decides between reconnecting
+   * and retrying by.
+   */
+  function slackSideOutcomeOf(entry: BringUpEntry): PersonaBringUpOutcome | undefined {
     if (entry.credentials) return 'broken'
     if (entry.directory) return 'retrying'
     if (entry.slackError) return 'broken'
     if (!entry.slackStarted) return undefined
     return slackOutcome(connections.status(entry.persona.key))
+  }
+
+  function outcomeOf(entry: BringUpEntry): PersonaBringUpOutcome | undefined {
+    const slack = slackSideOutcomeOf(entry)
+    // Up on Slack, but its launch waits for its claude_config_dir (b.g57).
+    return slack === 'up' && entry.configDir !== undefined ? 'retrying' : slack
   }
 
   function causesOf(entry: BringUpEntry): PersonaBringUpCauses {
@@ -548,12 +646,16 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
         causes.slack = personaSlackStatusFailure(status)
       }
     }
+    if (entry.configDir) {
+      const { latest } = entry.configDir
+      causes.configDir = { step: 'claude-config-dir', class: latest.class, cause: latest.cause }
+    }
     return causes
   }
 
   function summary(entry: BringUpEntry): PersonaBringUpResultSummary {
     const causes = causesOf(entry)
-    const failures = [causes.credentials, causes.directory, causes.slack].filter(
+    const failures = [causes.credentials, causes.directory, causes.slack, causes.configDir].filter(
       (f): f is PersonaBringUpFailure => f !== undefined,
     )
     // A persona the manager stopped during its bring-up is not up and is not retried.
@@ -719,6 +821,85 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
   }
 
   // -------------------------------------------------------------------------
+  // claude_config_dir hold (bug b.g57)
+  // -------------------------------------------------------------------------
+
+  function holdForConfigDir(persona: Persona, failure: PersonaCheckFailure): boolean {
+    const entry = entries.get(persona.key)
+    if (entry === undefined || entry.cancelled) return false
+    if (entry.configDir !== undefined) {
+      // The same episode: a launch path found it still unresolvable.
+      entry.configDir.latest = failure
+      if (entry.configDirTimer === undefined) scheduleConfigDirRecheck(entry)
+      return true
+    }
+    entry.configDir = { opened: failure, latest: failure }
+    entry.configDirSchedule.reset()
+    log(failure.line)
+    observeOutcome(entry)
+    scheduleConfigDirRecheck(entry)
+    return true
+  }
+
+  function scheduleConfigDirRecheck(entry: BringUpEntry): void {
+    if (entry.cancelled) return
+    clearConfigDirTimer(entry)
+    const timer: TimerBox = { handle: undefined }
+    entry.configDirTimer = timer
+    timer.handle = clock.setTimeout(() => {
+      if (entry.configDirTimer !== timer) return
+      entry.configDirTimer = undefined
+      serialize(entry.persona.key, () => recheckConfigDir(entry)).catch((err) =>
+        log(`[slack] persona ${ref(entry)}: claude_config_dir retry failed: ${describeThrownValue(err)}`),
+      )
+    }, entry.configDirSchedule.nextDelayMs())
+  }
+
+  function clearConfigDirTimer(entry: BringUpEntry): void {
+    const timer = entry.configDirTimer
+    if (timer === undefined) return
+    entry.configDirTimer = undefined
+    clock.clearTimeout(timer.handle)
+  }
+
+  /**
+   * One claude_config_dir re-check, with the persona's current applied
+   * declaration: still unresolvable → the next one on the schedule; resolved
+   * → cleared line, then the launch, unless the persona is no longer up on
+   * Slack (its own recovery then launches it). A persona no longer applied is
+   * not re-checked and its re-checks end.
+   */
+  async function recheckConfigDir(entry: BringUpEntry): Promise<void> {
+    const episode = entry.configDir
+    if (entry.cancelled || episode === undefined) return
+    const persona = appliedPersona(entry.persona.key, entry.persona)
+    if (persona === undefined) {
+      log(`[slack] persona ${ref(entry)}: no longer applied — its claude_config_dir retry stops`)
+      return
+    }
+    const result = checkConfigDir(persona)
+    if (!result.ok) {
+      episode.latest = result
+      scheduleConfigDirRecheck(entry)
+      return
+    }
+
+    entry.configDir = undefined
+    const { opened } = episode
+    log(formatPersonaDiagnostic({
+      class: opened.class,
+      name: entry.persona.name,
+      key: entry.persona.key,
+      index: entry.persona.index,
+      path: opened.path,
+      cause: CONFIG_DIR_CLEARED,
+    }))
+    observeOutcome(entry)
+    // Inside the persona's serialized turn: the launch is called directly.
+    if (outcomeOf(entry) === 'up') await launchUp(entry, 'its claude_config_dir resolved', 'its claude_config_dir resolved')
+  }
+
+  // -------------------------------------------------------------------------
   // Public surface
   // -------------------------------------------------------------------------
 
@@ -752,6 +933,9 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
       directory: local.directory ? { opened: local.directory, latest: local.directory } : undefined,
       directorySchedule: createPersonaRetrySchedule(),
       directoryTimer: undefined,
+      configDir: undefined,
+      configDirSchedule: createPersonaRetrySchedule(),
+      configDirTimer: undefined,
       slackStarted: false,
       slackError: undefined,
       lastStatus: undefined,
@@ -828,6 +1012,15 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     return isCredentialsBroken({ outcome: outcomeOf(entry), causes: causesOf(entry) }) ? 'broken' : 'connection'
   }
 
+  /**
+   * `{ held: true }` for a persona held for its claude_config_dir (bug b.g57)
+   * once its new connection is in use (its Slack side is up then, so the
+   * hold alone keeps it from up), otherwise nothing.
+   */
+  function heldAfterSwap(entry: BringUpEntry): { held?: true } {
+    return entry.configDir !== undefined ? { held: true } : {}
+  }
+
   async function changeCredentials(
     persona: Persona,
     applied: readonly Persona[],
@@ -841,7 +1034,9 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     if (current === undefined) return { kind: 'skipped' }
     // Decided now, not at the preview: a Web API call may have broken it since.
     if (isCredentialsBroken({ outcome: outcomeOf(entry), causes: causesOf(entry) })) return { kind: 'credentials-broken' }
-    const outcome = outcomeOf(entry)
+    // From the Slack side only: a persona held for its claude_config_dir
+    // (b.g57) with a working connection is reconnected, and stays held.
+    const outcome = slackSideOutcomeOf(entry)
     const up = outcome === 'up'
     // An undefined outcome with Slack started: its first attempt is in flight.
     const retrying = outcome === 'retrying' || (outcome === undefined && entry.slackStarted)
@@ -881,7 +1076,8 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
         if (later.kind === 'swapped') {
           hold(entry, next)
           entry.live = next
-          runHook(entry, () => hooks.onSwapped?.({ late: true, wasUp }))
+          const swap: CredentialsSwap = { late: true, wasUp, ...heldAfterSwap(entry) }
+          runHook(entry, () => hooks.onSwapped?.(swap))
           return
         }
         onLateRefusal(entry, later.outcome)
@@ -891,7 +1087,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
         // still reports its old connection: from here on its own connection
         // uses the new content, so that is both held and live.
         if (entry.cancelled) return
-        wasUp = outcomeOf(entry) === 'up'
+        wasUp = slackSideOutcomeOf(entry) === 'up'
         hold(entry, next)
         entry.live = next
         if (hooks.beforeSwap !== undefined) runHook(entry, hooks.beforeSwap)
@@ -904,8 +1100,9 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
         // for a manager that did not call the hook).
         hold(entry, next)
         entry.live = next
-        runHook(entry, () => hooks.onSwapped?.({ late: false, wasUp }))
-        return wasUp ? { kind: 'swapped' } : { kind: 'swapped', cameBackUp: true }
+        const held = heldAfterSwap(entry)
+        runHook(entry, () => hooks.onSwapped?.({ late: false, wasUp, ...held }))
+        return wasUp ? { kind: 'swapped', ...held } : { kind: 'swapped', cameBackUp: true, ...held }
       case 'retrying':
         // What it is retrying with: nothing is pending. Its own connection
         // still uses the live content. Worded by its state now: a refusal of
@@ -935,7 +1132,8 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
    */
   function onLateRefusal(entry: BringUpEntry, refusal: SlackCredentialsRefusedOutcome): void {
     const persona = appliedPersona(entry.persona.key, entry.persona) ?? entry.persona
-    if (outcomeOf(entry) === 'up') {
+    // Still up on its own connection, held for its claude_config_dir or not.
+    if (slackSideOutcomeOf(entry) === 'up') {
       hold(entry, entry.live)
       logChangeFailed(persona, refusal.cause, 'connection')
       return
@@ -956,6 +1154,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     entries.delete(key)
     entry.cancelled = true
     clearDirectoryTimer(entry)
+    clearConfigDirTimer(entry)
   }
 
   return {
@@ -972,6 +1171,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     },
     credentialsDigest: (key) => entries.get(key)?.credentialsDigest,
     changeCredentials,
+    holdForConfigDir,
     cancel,
     cancelAll: () => {
       for (const key of [...entries.keys()]) cancel(key)
@@ -991,7 +1191,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
 export function describePersonaNotUp(state: PersonaBringUpState | undefined): string {
   if (state === undefined) return 'its bring-up has not run'
   if (state.outcome === undefined || state.outcome === 'up') return 'its Slack connection is not serving'
-  const cause = state.causes.credentials ?? state.causes.directory ?? state.causes.slack
+  const cause = state.causes.credentials ?? state.causes.directory ?? state.causes.slack ?? state.causes.configDir
   return cause === undefined ? state.outcome : `${state.outcome}: ${cause.cause}`
 }
 

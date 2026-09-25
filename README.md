@@ -344,7 +344,7 @@ When you want different personas to authenticate as different Claude accounts (e
 
 `planner` launches with the Max account; `reviewer` falls through to the top-level value and uses the corporate account. Use `claude auth login --claudeai` (or `--console`) with `CLAUDE_CONFIG_DIR` set to the same directory to populate each config dir before starting the server.
 
-Once applied (see [Reload](#reload)), a change to a persona's effective `claude_config_dir` or its `working_directory` makes that persona start fresh, without its prior conversation, at its next launch. The old transcript stays in the old config directory. The [Troubleshooting](#troubleshooting) entry "Bots come back with no memory of the prior conversation" says when that launch happens.
+Once applied (see [Reload](#reload)), a change to a persona's effective `claude_config_dir` makes that persona start fresh, without its prior conversation, at its next launch. A change to its `working_directory` starts it fresh at once (see [Destructive changes](#destructive-changes)). The old transcript stays in the old config directory. The [Troubleshooting](#troubleshooting) entry "Bots come back with no memory of the prior conversation" says when that launch happens.
 
 #### Per-persona `stop_hook_bootstrap` override
 
@@ -491,7 +491,7 @@ server-wide setting port changed: once applied, it is recorded and takes effect 
 server-wide setting claude_config_dir changed: inherited by "planner" (key=planner), "reviewer" (key=reviewer); takes effect at each one's next launch, which starts fresh (the conversation is not resumed), instance kept until then.
 ```
 
-The preview describes the full effect of the change. A few kinds of change take effect only at the next start; see [What takes effect at the next start](#what-takes-effect-at-the-next-start).
+The preview describes the full effect of the change. Server-wide settings take effect only at the next start, and `claude_config_dir` and `stop_hook_bootstrap` at the persona's next launch; see [What takes effect at the next start](#what-takes-effect-at-the-next-start).
 
 Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In `server.log`, each preview line (everything after the `fingerprint:` line and the blank line) is prefixed `[slack] reload-preview:`, and the first one ends with where the preview is written: ` (preview in "<path of config.json.pending>")`.
 
@@ -541,25 +541,23 @@ grep -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed)' "
 | A persona is added | It is brought up exactly as at start, including the storage check (`jsonl-non-persistent`, see [Startup errors](#startup-errors)). If its credentials file or working directory is bad, it logs the same lines as at start and never affects running personas. See "A persona doesn't come up or doesn't answer" in [Troubleshooting](#troubleshooting). |
 | A persona is removed | It is torn down. Its instance, its agent-director row and its conversation are destroyed. Its posted permission prompts stay in Slack, and clicking one has no effect. |
 | A persona's `name` changes | A removal plus an addition. The old session is destroyed, and a fresh one starts with no history. |
+| A persona's `credentials_file` path or `working_directory` changes | It is torn down and brought up fresh from its new entry, with no restart. Its instance, its agent-director row and its conversation are destroyed, and the new credentials file is read. See [Destructive changes](#destructive-changes). |
 | `channels`, `delivery`, `permission_prompts`, `dm.enabled` or `dm.contact` changes | Applied in place, from the next event or post. The instance and its conversation are kept. A changed DM contact is used for the next prompt. |
-| A credentials file's content changes (same path), such as a rotated token | Only that persona is reconnected: the new connection opens, then the old one closes, and its instance and conversation are kept. A persona down because of its credentials comes up with the fixed file, with no restart. For a running persona, if the new file can't be used, the old connection keeps running, `server.log` shows `persona-credentials-change-failed`, and the change stays pending. A persona down because of its credentials whose new file can't be used stays down with its usual line, such as `persona-credentials-invalid`. |
+| A credentials file's content changes (same path), such as a rotated token | Only that persona is reconnected: the new connection opens, then the old one closes, and its instance and conversation are kept. A persona whose launch is waiting for its `claude_config_dir` (`persona-config-dir-unresolvable`) is reconnected the same way and keeps waiting. A persona down because of its credentials comes up with the fixed file, with no restart. For a running persona, if the new file can't be used, the old connection keeps running, `server.log` shows `persona-credentials-change-failed`, and the change stays pending. A persona down because of its credentials whose new file can't be used stays down with its usual line, such as `persona-credentials-invalid`. |
 | A persona's declaration and credentials are unchanged | It is not touched. |
 
 ### What takes effect at the next start
 
-A confirmation records these changes, but the running server doesn't act on them yet:
+A confirmation records these changes, and they take effect later:
 
-- **`credentials_file` or `working_directory`.** The persona's instance and connection keep running as they are. After a confirmed `working_directory` change, though, the server admits the persona's MCP session only from the new directory: if the running bot's session reconnects from the old one, it is refused and the bot goes silent in Slack, and if its session drops, the server relaunches it fresh in the new directory, without its conversation. So restart promptly.
-- **`claude_config_dir` or `stop_hook_bootstrap`.** They take effect at the persona's next launch.
-- **Server-wide settings** such as `port` or `bind`. The server keeps the values it started with.
+- **Server-wide settings** such as `port` or `bind`. The running server keeps the values it started with, and the next start uses the recorded ones. `stop_timeout` and `exit_timeout` are the exception: only the CLI uses them, and it reads them from the record, so the next `stop` or `clean_restart` uses them.
+- **`claude_config_dir` or `stop_hook_bootstrap`**, the persona's own or inherited from the top level. The running instance and its conversation are kept, and the persona's next launch uses the new value. That launch happens when the bot dies (a crash or a failed health check), at a `clean_restart`, at `stop --stop-bots` then `start`, or after a host reboot. A plain `stop` and `start` reconnects to the running instance, which is not a launch. A changed `claude_config_dir` makes that launch start fresh.
 
-To make them take effect, wait for the `reload-applied` line, then run `claude-slack-channel-bots clean_restart`. It reads the bot list from the record before it stops the server, so run earlier it can work from the old record. The server comes back on the record, and every bot is relaunched. Conversations resume, except that a changed `working_directory` or `claude_config_dir` starts that persona fresh. A changed `credentials_file` only reconnects the persona to Slack with the new app, and its conversation is kept.
-
-A persona added or relaunched with a `claude_config_dir` that no persona used at the last start asks for permission each time it reads its memory notes, until the next start. Relaunched means an existing persona restarted after a crash or a failed health check once a `claude_config_dir` change is confirmed.
+To make them take effect sooner, wait for the `reload-applied` line, then run `claude-slack-channel-bots clean_restart`. It reads the bot list from the record before it stops the server, so if you run it earlier it can work from the old record. The server comes back on the record, and every bot is relaunched. Conversations resume, except that a changed `claude_config_dir` starts that persona fresh.
 
 ### Destructive changes
 
-`DESTRUCTIVE:` lines in the preview name the sessions the change destroys: a removed or renamed persona at the confirmation, and a changed `working_directory` at the relaunch. A `DESTRUCTIVE:` line for a changed `credentials_file` destroys nothing in this build: the change is only recorded, and a restart reconnects the persona. Read the preview before you rename it. There is no undo. Re-adding a removed persona brings up a fresh session, and the old conversation isn't guaranteed to resume.
+`DESTRUCTIVE:` lines in the preview name the sessions the change destroys when you confirm it. A removed or renamed persona is torn down. A persona whose `credentials_file` path or `working_directory` changed is torn down and then brought up fresh from its new entry, with no restart. If the teardown can't delete the persona's agent-director row (for example, agent-director is unreachable), the bring-up finds that row. A row whose working directory or config directory no longer matches is replaced. When only the `credentials_file` path changed, the row still matches, so the bring-up may resume it with its conversation. Read the preview before you rename it. There is no undo. Re-adding a removed persona brings up a fresh session, and the old conversation isn't guaranteed to resume.
 
 ### Stale confirmations
 
@@ -952,7 +950,7 @@ The `AskUserQuestion` tool is denied for every CSCB-spawned bot via the agent-di
 
 ### Memory-directory reads
 
-The template also pre-allows each bot to read its own persistent-memory directory, so those reads don't surface a permission prompt to a human. One `Read(//<config-dir>/projects/*/memory/**)` rule is derived per distinct Claude config directory across your personas (a persona's own `claude_config_dir`, the top-level `claude_config_dir`, or the `~/.claude` default). The rule is scoped to `projects/*/memory/**` only — never the config-dir root, which holds live credentials — so it never pre-authorizes credential reads.
+The template also pre-allows each bot to read its own persistent-memory directory, so those reads don't surface a permission prompt to a human. One `Read(//<config-dir>/projects/*/memory/**)` rule is derived per distinct Claude config directory across your personas (a persona's own `claude_config_dir`, the top-level `claude_config_dir`, or the `~/.claude` default). The rules follow the applied personas: when a confirmed change alters the set of config directories, the server rewrites them. If that rewrite fails, `server.log` shows a `template refresh: … failed` line. Until the directories change again or the server restarts, a persona using a new directory then asks for permission each time it reads its memory notes. The rule is scoped to `projects/*/memory/**` only — never the config-dir root, which holds live credentials — so it never pre-authorizes credential reads.
 
 ---
 
@@ -1139,6 +1137,7 @@ grep -E '\(key=<key>\)|persona=<key>\b' ~/.claude/channels/slack/server.log
 | `persona-credentials-change-failed` | Keeps running on its old credentials | Fix the credentials file, then confirm the new pending change |
 | `persona-slack-unreachable` | Retries on its own | Nothing; it comes up once Slack answers |
 | `persona-directory-*` | Retries on its own | Create or fix the working directory; the persona comes up with no restart |
+| `persona-config-dir-unresolvable` | Retries on its own; its session is kept | Remount the drive or fix the symlink behind its `claude_config_dir`; the persona resumes its conversation with no restart |
 
 While a persona is down, its Claude instance keeps running and keeps its history, but the server doesn't serve it until the persona is up.
 
@@ -1186,6 +1185,7 @@ The notice names the sender (by display name, or user ID; for a bot or webhook p
 
 | Recovery state in the notice | What it means | What to do |
 |------------------------------|---------------|------------|
+| `not up` | The persona isn't up, for example because its launch is waiting for its `claude_config_dir` (`persona-config-dir-unresolvable`), so no restart was started. Its instance is launched once the persona recovers. | Fix the persona's cause (see "A persona doesn't come up or doesn't answer"), then resend once it's back. |
 | `restarting` | A restart of the persona's instance was already under way. | Resend the message (or ask the sender to) once the persona is back. |
 | `starting now` | The lost message triggered a fast restart (the backoff delay is clamped down to 5 seconds, never raised). | Resend in a moment, once the persona is back. |
 | `auto-restart disabled` | `session_restart_delay` is `0`; the instance will not restart on its own. | Restart the server, then resend. |
@@ -1211,7 +1211,7 @@ This is intentional: when agent-director is unreachable, the teardown cannot run
 **Bots come back with no memory of the prior conversation after a reboot**
 With `resume_enabled: true`, a bot whose host rebooted (or pod resumed) should return with its conversation history. If it comes back amnesiac, confirm the system-installed `agent-director` is **≥ 0.8.0** (`agent-director version`) — reboot recovery relies on capabilities added in that release. Note that `bun run install-check` does **not** confirm this: its client floor is `0.7.0`, lower than the reboot-recovery requirement, so install-check passes on a `0.7.x` binary that still yields amnesiac bots. Verify the resume requirement directly with `agent-director version`. Note: legacy sessions created before upgrading to 0.8.0 may lose history exactly once on their first post-upgrade recovery, then resume cleanly thereafter.
 
-A bot also starts fresh, by design, when its session no longer matches the applied configuration. A config edit takes effect only once it is applied (see [Reload](#reload)); a restart or reboot alone runs the last-applied record. When a change to a persona's `working_directory` is applied, the session is replaced instead of resumed at its next launch. When a change to a persona's effective `claude_config_dir` (its own or the top-level default) is applied, the bot starts fresh the next time it would be resumed: after `clean_restart`, after `stop --stop-bots` then `start`, after a reboot, or when the bot dies. A bot that keeps running across a plain `stop` and `start` keeps its old config directory until then. The old transcript stays in the old config directory. The first start after upgrading from an earlier release also replaces every existing bot once, because the server removes managed sessions it cannot attribute. The log names the reason: search `server.log` for `sweeping row`, `replacing the row` or `not resuming; spawning fresh`.
+A bot also starts fresh, by design, when its session no longer matches the applied configuration. A config edit takes effect only once it is applied (see [Reload](#reload)); a restart or reboot alone runs the last-applied record. When a change to a persona's `working_directory` is applied, the persona is torn down and brought up fresh at once. When a change to a persona's effective `claude_config_dir` (its own or the top-level default) is applied, the bot starts fresh the next time it would be resumed: after `clean_restart`, after `stop --stop-bots` then `start`, after a reboot, or when the bot dies. A bot that keeps running across a plain `stop` and `start` keeps its old config directory until then. The old transcript stays in the old config directory. The first start after upgrading from an earlier release also replaces every existing bot once, because the server removes managed sessions it cannot attribute. The log names the reason: search `server.log` for `sweeping row`, `replacing the row` or `not resuming; spawning fresh`.
 
 **Session crashes on resume with "sandbox required but unavailable"**
 This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json` and apply the change (see [Reload](#reload)) to disable `--resume` entirely — the bot will always start a fresh Claude session instead of resuming a prior conversation, both on startup and on runtime auto-restart:

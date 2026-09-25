@@ -31,6 +31,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import type { MakeTemplateParams } from 'agent-director'
 import { mkdtempSync, rmSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
@@ -190,6 +191,23 @@ interface Fixture {
   connections: PersonaLifecycleDeps['connections']
   /** Every recording `bringUps.changeCredentials` call's connections and hooks, in order. */
   changeCalls: Array<{ connections: CredentialsChangeConnections; hooks: CredentialsChangeHooks | undefined }>
+  /** Every `makeTemplate` call the template refresh made on its stub agent-director client, in order. */
+  templateCalls: MakeTemplateParams[]
+}
+
+/**
+ * What the boot install wrote (the template refresh's `installed`): every
+ * field but `allow` must reach the refresh unchanged. Its fields differ from
+ * what `buildTemplateParams` would give, so a refresh built from anything
+ * else shows.
+ */
+const INSTALLED_TEMPLATE: MakeTemplateParams = {
+  name: 'slack-channel-bot',
+  label: ['app=cscb'],
+  relay_mode: 'on',
+  claude_args: ['--dangerously-load-development-channels', 'server:slack-channel-router', '--mcp-config', '/start/mcp.json'],
+  allow: ['Read(//start/claude/projects/*/memory/**)'],
+  deny: ['Read(//start/secret/**)'],
 }
 
 function makeFixture(opts: FixtureOptions = {}): Fixture {
@@ -199,6 +217,7 @@ function makeFixture(opts: FixtureOptions = {}): Fixture {
   const lines: string[] = []
   const submitted: string[] = []
   const changeCalls: Fixture['changeCalls'] = []
+  const templateCalls: MakeTemplateParams[] = []
   const applied: Persona[] = [a]
   const serializer = createPersonaSerializer()
   const fails = new Set(opts.fail ?? [])
@@ -275,11 +294,15 @@ function makeFixture(opts: FixtureOptions = {}): Fixture {
     },
     storageCheck: rec('storageCheck', byPersona, () => undefined),
     launch: rec('launch', byPersona, async () => ({ key: 'x', action: 'spawned' })),
+    templateRefresh: {
+      installed: INSTALLED_TEMPLATE,
+      getClient: () => makeStubClient({ makeTemplateCalls: templateCalls }),
+    },
     ...opts.overrides,
   }
   return {
     lifecycle: createPersonaLifecycle(deps), serializer, config, a, b, applied, trail, lines, submitted,
-    connections: deps.connections, changeCalls,
+    connections: deps.connections, changeCalls, templateCalls,
   }
 }
 
@@ -298,6 +321,21 @@ function fullTeardownTrail(p: Persona, launchPass: string): string[] {
     `resetOutageState:${k}`, `killInstance:${k}`, `deleteInstance:${k}`, `resetOutageState:${k}`,
     `forgetFailures:${k}`, `forgetDisconnectedStreak:${k}`,
     `replyGuard.launchedWithDir:${k}`, `replyGuard.teardown:${k}`, `replyGuard.launchPass:${launchPass}`,
+  ]
+}
+
+/**
+ * The teardown trail for a key still applied when it is submitted (the old
+ * half of a destructive modify): its bring-up retries and restart timer
+ * cancelled at submit, before its turn, then the full trail with its held
+ * notices dropped again right after the agent-director calls.
+ */
+function stillAppliedTeardownTrail(p: Persona, launchPass: string): string[] {
+  const full = fullTeardownTrail(p, launchPass)
+  const afterAd = full.lastIndexOf(`resetOutageState:${p.key}`) + 1
+  return [
+    `bringUps.cancel:${p.key}`, `cancelRestartTimer:${p.key}`,
+    ...full.slice(0, afterAd), `notifier.forget:${p.key}`, ...full.slice(afterAd),
   ]
 }
 
@@ -480,6 +518,143 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 })
 
 // ---------------------------------------------------------------------------
+// Persona teardown of a key still applied: the old half of a destructive
+// modify (b.av2 SR-8.6, a credentials_file path or working_directory change).
+// ---------------------------------------------------------------------------
+
+describe('persona teardown of a key still applied (the old half of a destructive modify, SR-8.6)', () => {
+  // Rows: whether B is still applied when its teardown is submitted, what ran
+  // at submit while B's turn was held, and the whole trail once it ran.
+  test.each<[string, boolean, (f: Fixture) => string[], (f: Fixture, launchPass: string) => string[]]>([
+    [
+      'B still applied (a destructive modify\'s old half): its bring-up retries and restart timer are cancelled at submit, before its turn; its held notices are dropped again after the agent-director calls',
+      true,
+      (f) => [`bringUps.cancel:${f.b.key}`, `cancelRestartTimer:${f.b.key}`],
+      (f, launchPass) => stillAppliedTeardownTrail(f.b, launchPass),
+    ],
+    [
+      'B removed (it left the applied set at step 1): nothing runs before its turn, and its notices are dropped once',
+      false,
+      () => [],
+      (f, launchPass) => fullTeardownTrail(f.b, launchPass),
+    ],
+  ])('%s', async (_label, stillApplied, atSubmit, whole) => {
+    const f = makeFixture()
+    if (stillApplied) f.applied.push(f.b)
+    const blocker = Promise.withResolvers<void>()
+    const held = f.serializer.run(f.b.key, () => blocker.promise)
+
+    const done = f.lifecycle.teardown(f.b)
+    await flush()
+    expect(f.trail).toEqual(atSubmit(f))
+    expect(f.lines).toEqual([])
+
+    blocker.resolve()
+    await held
+    await done
+    const launchPass = `${JSON.stringify([f.b.claude_config_dir, undefined])}:[${f.applied.map((p) => p.key).join(',')}]`
+    expect(f.trail).toEqual(whole(f, launchPass))
+    expect(f.lines).toEqual([`${teardownPrefix(f.b)}: starting`, `${teardownPrefix(f.b)}: complete`])
+    expect(f.trail.join('\n')).not.toContain(f.a.key + ':')
+    expect(f.submitted).toEqual([f.b.key])
+  })
+
+  test('dry run, B still applied: the early cancels and the second notice drop still run; only the kill and delete (and the clean slate before them) are skipped', async () => {
+    const f = makeFixture({ dryRun: true })
+    f.applied.push(f.b)
+
+    await f.lifecycle.teardown(f.b)
+
+    const k = f.b.key
+    const launchPass = `${JSON.stringify([f.b.claude_config_dir, undefined])}:[${f.a.key},${k}]`
+    const trail = stillAppliedTeardownTrail(f.b, launchPass)
+    const firstReset = trail.indexOf(`resetOutageState:${k}`)
+    expect(f.trail).toEqual(
+      trail.filter((c, i) => c !== `killInstance:${k}` && c !== `deleteInstance:${k}` && i !== firstReset),
+    )
+  })
+
+  // Rows: the early cancel that fails, its step phrase, and whether it throws or returns a rejected promise.
+  test.each<[DepName, string, 'throws' | 'rejects']>([
+    ['bringUps.cancel', 'cancelling its bring-up retries', 'throws'],
+    ['cancelRestartTimer', 'cancelling its restart timer', 'throws'],
+    ['cancelRestartTimer', 'cancelling its restart timer', 'rejects'],
+  ])('%s failing at submit (%s; it %s): one token-safe "before its turn failed" line, the other early cancel still runs, and the whole teardown still runs', async (dep, phrase, how) => {
+    // A throw also fails the same step in the teardown's turn; a rejection is overridden for the early call only.
+    let calls = 0
+    const f = makeFixture(
+      how === 'throws'
+        ? { fail: [dep] }
+        : {
+            overrides: {
+              cancelRestartTimer: (key) => {
+                f.trail.push(`cancelRestartTimer:${key}`)
+                return calls++ === 0 ? Promise.reject(failure()) : false
+              },
+            },
+          },
+    )
+    f.applied.push(f.b)
+
+    await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
+    await flush()
+
+    const launchPass = `${JSON.stringify([f.b.claude_config_dir, undefined])}:[${f.a.key},${f.b.key}]`
+    expect(f.trail).toEqual(stillAppliedTeardownTrail(f.b, launchPass))
+    const beforeTurn = f.lines.filter((l) => l.includes(' before its turn failed: '))
+    expect(beforeTurn).toHaveLength(1)
+    expect(beforeTurn[0]).toMatch(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${phrase} before its turn failed: Error`)}( |$)`))
+    expect(f.lines).toContain(`${teardownPrefix(f.b)}: starting`)
+    expect(f.lines.at(-1)).toBe(how === 'throws' ? `${teardownPrefix(f.b)}: complete, with 1 failed step(s)` : `${teardownPrefix(f.b)}: complete`)
+    assertNoLeak({ lines: f.lines })
+  })
+
+  test('both early cancels failing: one line each, in order, before the teardown starts', async () => {
+    const f = makeFixture({ fail: ['bringUps.cancel', 'cancelRestartTimer'] })
+    f.applied.push(f.b)
+
+    await f.lifecycle.teardown(f.b)
+
+    expect(f.lines.slice(0, 3)).toEqual([
+      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: cancelling its bring-up retries before its turn failed: Error`)}( |$)`)),
+      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: cancelling its restart timer before its turn failed: Error`)}( |$)`)),
+      `${teardownPrefix(f.b)}: starting`,
+    ])
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 2 failed step(s)`)
+    assertNoLeak({ lines: f.lines })
+  })
+
+  test('B still applied and dropping its notices failing: both drops are logged token-safely, the second by its own phrase, and every other step still runs', async () => {
+    const f = makeFixture({ fail: ['notifier.forget'] })
+    f.applied.push(f.b)
+
+    await f.lifecycle.teardown(f.b)
+
+    const launchPass = `${JSON.stringify([f.b.claude_config_dir, undefined])}:[${f.a.key},${f.b.key}]`
+    expect(f.trail).toEqual(stillAppliedTeardownTrail(f.b, launchPass))
+    expect(f.lines.slice(1, -1)).toEqual([
+      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: dropping its held notices failed: Error`)}( |$)`)),
+      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: dropping the notices held during its teardown failed: Error`)}( |$)`)),
+    ])
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 2 failed step(s)`)
+    assertNoLeak({ lines: f.lines })
+  })
+
+  test('the applied set cannot be read: B counts as not applied (no early cancel, no second notice drop), and the launch pass\'s failed read is its one failed step', async () => {
+    const f = makeFixture({ overrides: { appliedPersonas: () => { throw failure() } } })
+
+    await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
+
+    expect(f.trail).toEqual(fullTeardownTrail(f.b, '').slice(0, -1))
+    expect(f.lines.slice(1)).toEqual([
+      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: re-evaluating the Stop hook in its config directories failed: Error`)}( |$)`)),
+      `${teardownPrefix(f.b)}: complete, with 1 failed step(s)`,
+    ])
+    assertNoLeak({ lines: f.lines })
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Persona teardown with the real agent-director calls, outage state,
 // notifier and destination hold: no wind-down, no flag and no notice left.
 // ---------------------------------------------------------------------------
@@ -620,6 +795,29 @@ describe('persona teardown (SR-6.5) over the real kill and delete, outage state,
     )
     expect(r.emissions).toEqual([])
     expect(r.h.totalPosts()).toBe(0)
+  })
+
+  test('the old half of a destructive modify (B still applied, its connection stopped) with agent-director unreachable: the onset its failing kill raises is held for B, then dropped after the agent-director calls, so B\'s new half, once validated and flushed, posts nothing', async () => {
+    const unreachable = new ErrSystemInstallDisappeared('kill', '/opt/ad/bin')
+    const r = makeReal({ killError: unreachable, deleteError: unreachable })
+    const b = r.f.b
+    r.f.applied.push(b) // B keeps its key applied until step 6 brings its new declaration up
+    r.h.validated.delete(b.key) // its connection is stopped: no validated client, so a notice for it is held
+
+    await r.f.lifecycle.teardown(b)
+    await flush()
+    expect(r.emissions.map((e) => e.key)).toEqual([b.key]) // the onset was raised for B
+
+    // Step 6: B's new half comes up and its held notices are flushed.
+    r.h.validate(b.key)
+    await r.h.notifier.flush(b.key)
+
+    expect(r.h.posts(b.key)).toEqual([])
+    expect(r.h.totalPosts()).toBe(0)
+    expect([...getOutageFlags(b.key)]).toEqual([])
+    expect(r.h.hold.view(b.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    expect(r.f.lines.at(-1)).toBe(`${teardownPrefix(b)}: complete, with 2 failed step(s)`)
+    assertNoLeak({ lines: r.f.lines, logs: r.h.logs })
   })
 
   test('a notice held for B by the destination hold is cancelled: its retry timer is gone and it is never posted, even once its retry would have come due', async () => {
@@ -991,6 +1189,8 @@ describe('recovery bring-up (SR-6.4, SR-8.6 step 6): a credentials-broken person
 
 describe('credentials change (SR-8.6 step 4): the controller\'s change over the connection manager, one line per outcome', () => {
   const lineOf = (f: Fixture, rest: string) => `[slack] persona ${renderPersonaRef(f.b.name, f.b.key)}: ${rest}`
+  /** The reconnected line of a persona held for its claude_config_dir (bug b.g57): no MCP session, its launch still waits. */
+  const HELD_RECONNECTED = 'reconnected with its changed credentials; its session is kept, and its launch waits until its claude_config_dir resolves'
 
   // Rows: the controller's result, and the lifecycle's line after the persona prefix (none for failed and skipped).
   test.each<[string, PersonaCredentialsChangeResult, string | undefined]>([
@@ -1000,6 +1200,8 @@ describe('credentials change (SR-8.6 step 4): the controller\'s change over the 
       { kind: 'swapped', cameBackUp: true },
       'reconnected with its changed credentials and up again; its instance is kept',
     ],
+    ['swapped, held for its claude_config_dir (bug b.g57)', { kind: 'swapped', held: true }, HELD_RECONNECTED],
+    ['swapped, up again and held for its claude_config_dir: held wins', { kind: 'swapped', cameBackUp: true, held: true }, HELD_RECONNECTED],
     [
       'retrying, the current connection kept',
       { kind: 'retrying', connection: 'kept' },
@@ -1047,7 +1249,10 @@ describe('credentials change (SR-8.6 step 4): the controller\'s change over the 
     ['at once, refused before it', { late: false, wasUp: false }, undefined],
     ['later, up before it', { late: true, wasUp: true }, 'reconnected with its changed credentials; its instance and MCP session are kept'],
     ['later, refused before it', { late: true, wasUp: false }, 'reconnected with its changed credentials and up again; its instance is kept'],
-  ])('a swap %s: the swapped hook logs the reconnected line only for a late swap, worded by whether B was up before it', async (_label, swap, rest) => {
+    ['at once, held for its claude_config_dir', { late: false, wasUp: true, held: true }, undefined],
+    ['later, up before it and held for its claude_config_dir: held wins', { late: true, wasUp: true, held: true }, HELD_RECONNECTED],
+    ['later, refused before it and held for its claude_config_dir: held wins', { late: true, wasUp: false, held: true }, HELD_RECONNECTED],
+  ])('a swap %s: the swapped hook logs the reconnected line only for a late swap, worded by whether B is held, else by whether it was up before it', async (_label, swap, rest) => {
     const f = makeFixture({ changeResult: { kind: 'retrying', connection: 'kept' } })
     await f.lifecycle.reconnectCredentials(f.b, appliedAB(f))
     const before = f.lines.length
@@ -1597,6 +1802,43 @@ describe('in-place update (SR-8.6, AC 58): forget the cached DM when its destina
 })
 
 // ---------------------------------------------------------------------------
+// Template refresh (SR-8.6 step 5) through the lifecycle: its dependencies
+// passed through, not serialized. The refresh itself (the `allow`
+// replacement, the exact lines, token safety, a rejection) is pinned in
+// agent-director-template.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('template refresh (SR-8.6 step 5) through the lifecycle: the start-time template and client passed through; not serialized', () => {
+  /** The applied config: B alone, whose own config dir gives the only rule (no default dir, so no home is read). */
+  const appliedOf = (f: Fixture): PersonaConfig => ({ ...f.config, personas: [f.b] })
+
+  test.each<[string, boolean]>([['live', false], ['dry run', true]])('%s: one makeTemplate call through templateRefresh.getClient with templateRefresh.installed\'s fields; its line goes to deps.log; no persona operation', async (_label, dryRun) => {
+    const f = makeFixture({ dryRun })
+
+    const result = await f.lifecycle.refreshTemplate(appliedOf(f))
+
+    expect(result).toEqual({ kind: 'refreshed', path: expect.stringMatching(/slack-channel-bot\.toml$/) })
+    expect(f.templateCalls).toEqual([{ ...INSTALLED_TEMPLATE, allow: expect.any(Array), overwrite: true }])
+    expect(f.lines).toEqual([expect.stringMatching(/^\[slack\] template refresh: rewrote /)])
+    expect(f.trail).toEqual([])
+    expect(f.submitted).toEqual([])
+  })
+
+  test('not serialized: it resolves while an operation holds A\'s and B\'s turns', async () => {
+    const f = makeFixture()
+    const blocker = Promise.withResolvers<void>()
+    const held = [f.serializer.run(f.a.key, () => blocker.promise), f.serializer.run(f.b.key, () => blocker.promise)]
+
+    const done = f.lifecycle.refreshTemplate(appliedOf(f))
+    expect(await settled(done)).toBe(true)
+    expect(f.templateCalls).toHaveLength(1)
+
+    blocker.resolve()
+    await Promise.all(held)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Serialization (SR-6.6): a teardown waits behind the key's restart, retry
 // launch and in-flight start-pass launch; never behind another key's work.
 // ---------------------------------------------------------------------------
@@ -1631,7 +1873,8 @@ describe('persona teardown serialization (SR-6.6)', () => {
     const bringUpOf = (p: Persona) => [`storageCheck:${p.key}`, `bringUps.bringUp:${p.key}:[${f.a.key},${f.b.key}]`, `launch:${p.key}`]
     expect(f.trail).toEqual([
       ...bTeardown.slice(0, 3),
-      ...fullTeardownTrail(f.a, `${JSON.stringify([f.a.claude_config_dir, undefined])}:[${f.a.key}]`),
+      // A is still applied (the old half of a destructive modify): its early cancels and second notice drop.
+      ...stillAppliedTeardownTrail(f.a, `${JSON.stringify([f.a.claude_config_dir, undefined])}:[${f.a.key}]`),
       ...bringUpOf(f.a),
       ...bTeardown.slice(3),
       ...bringUpOf(f.b),
@@ -1645,7 +1888,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
      * then twice in the work), `restart.submitted:<key>` (the fired timer
      * submits its work) and `restart.launchSession:<key>`.
      */
-    function initRestartFor(f: Fixture, launch: () => Promise<boolean>, up: () => boolean = () => true): void {
+    function initRestartFor(f: Fixture, launch: () => Promise<boolean>, up: () => boolean = () => true, delaySeconds = 0.001): void {
       initRestart({
         canRestart: (key) => { f.trail.push(`restart.canRestart:${key}`); return up() },
         isSessionAlive: async () => false,
@@ -1654,7 +1897,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
         reconnectSession: async () => undefined,
         killSession: async () => undefined,
         launchSession: async (key) => { f.trail.push(`restart.launchSession:${key}`); return launch() },
-        getRestartDelay: () => 0.001,
+        getRestartDelay: () => delaySeconds,
         isShuttingDown: () => false,
         onCapReached: () => undefined,
         serialize: (key, op) => { f.trail.push(`restart.submitted:${key}`); return f.serializer.run(key, op) },
@@ -1709,6 +1952,31 @@ describe('persona teardown serialization (SR-6.6)', () => {
       expect(teardownOnly(f)).toEqual(expectedTeardown(f))
       expect(isRestartPendingOrActive(k)).toBe(false)
     })
+    // Rows: whether B is still applied (a destructive modify's old half) or removed, and whether its
+    // restart timer is still pending once the teardown is submitted and before its turn.
+    test.each<[string, boolean, boolean]>([
+      ['still applied: cancelled at submit, before its turn', true, false],
+      ['removed: left for its turn (the relaunch gate refuses its work anyway)', false, true],
+    ])('B\'s pending restart timer, with B %s', async (_label, stillApplied, pendingBeforeTurn) => {
+      const f = makeFixture({ overrides: { cancelRestartTimer } })
+      if (stillApplied) f.applied.push(f.b)
+      initRestartFor(f, async () => true, () => true, 60) // a timer that never fires in the test
+      scheduleRestart(f.b.key, '/cwd/b')
+      expect(isRestartPendingOrActive(f.b.key)).toBe(true)
+      const blocker = Promise.withResolvers<void>()
+      const held = f.serializer.run(f.b.key, () => blocker.promise)
+
+      const done = f.lifecycle.teardown(f.b)
+      await flush()
+      expect(isRestartPendingOrActive(f.b.key)).toBe(pendingBeforeTurn)
+      expect(f.lines).toEqual([])
+
+      blocker.resolve()
+      await held
+      await done
+      expect(isRestartPendingOrActive(f.b.key)).toBe(false)
+      expect(restartOnly(f)).toEqual([`restart.canRestart:${f.b.key}`])
+    })
   })
 
   describe('behind a bring-up retry (real bring-up controller over the real connection manager)', () => {
@@ -1747,6 +2015,31 @@ describe('persona teardown serialization (SR-6.6)', () => {
       expect(r.h.manager.status(r.b.key)).toBeUndefined()
       expect(r.h.clock.pendingCount()).toBe(0)
       expect(r.h.manager.status(r.a.key)).toMatchObject({ state: 'up' })
+      assertNoLeak({ lines: r.h.lines, teardown: r.f.lines })
+    })
+
+    test('the old half of a destructive modify (B still applied): B\'s Slack retry comes up while B\'s turn is held, and its launch, queued ahead of the teardown, launches nothing, since the teardown cancelled B\'s bring-up at submit', async () => {
+      const r = await makeRetry()
+      const blocker = Promise.withResolvers<void>()
+      const held = r.f.serializer.run(r.b.key, () => blocker.promise)
+      await r.h.clock.advance(5_000) // B's retry comes up: its launch waits behind the blocker
+      expect(r.h.manager.status(r.b.key)).toMatchObject({ state: 'up' })
+      expect(r.launches).toEqual([])
+
+      r.f.applied.push(r.b) // B's key stays applied (its new declaration is brought up at step 6)
+      const done = r.f.lifecycle.teardown(r.b)
+      await flush()
+      expect(r.controller.state(r.b.key)).toBeUndefined()
+
+      blocker.resolve()
+      await held
+      await done
+      await r.h.clock.advance(3_600_000)
+
+      expect(r.launches).toEqual([])
+      expect(r.h.manager.status(r.b.key)).toBeUndefined()
+      expect(r.h.manager.status(r.a.key)).toMatchObject({ state: 'up' })
+      expect(r.h.clock.pendingCount()).toBe(0)
       assertNoLeak({ lines: r.h.lines, teardown: r.f.lines })
     })
 

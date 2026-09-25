@@ -12,7 +12,11 @@
  * evidence), idle-quiet, no-row skip, empty-session skip, AD-error-continue,
  * never-throws — plus the logged skip for a row the collision ladder will
  * replace (another cwd, or a missing or changed config_dir label). Notices go through the persona-keyed notice seam; some
- * cases wire it to the real per-persona notifier (b.av2 SR-7.2).
+ * cases wire it to the real per-persona notifier (b.av2 SR-7.2). Bug b.g57: a
+ * persona whose claude_config_dir cannot be resolved (an injected EIO, or a
+ * symlink pointing to nothing) is skipped for the pass before its row lookup,
+ * with one line and no notice, record or label mismatch, while another
+ * persona is checked as before; once it resolves it is checked again.
  *
  * Archive evidence (b.av2 SR-7.4): personaArchiveEvidenceScope and the real
  * makeDefaultArchiveCount against temp sqlite archives with several channels —
@@ -28,7 +32,7 @@
 
 import { describe, test, expect, afterEach, beforeEach, spyOn } from 'bun:test'
 import { homedir, tmpdir } from 'node:os'
-import { mkdtempSync, mkdirSync, symlinkSync, existsSync, chmodSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, symlinkSync, existsSync, chmodSync, writeFileSync, rmSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
 import type { GetResult } from 'agent-director'
 import {
@@ -52,6 +56,7 @@ import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona
 import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
 import { stubOpenedDmId } from './test-helpers/slack-stub.ts'
 import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
 // Temp dirs, temp home and console capture — all released after each test
@@ -1214,5 +1219,117 @@ describe('runPersonaStorageCheck — one persona\'s root at apply (b.av2 SR-6.2)
 
     const failedLine = `[slack] Warning: jsonl-persistence-check failed unexpectedly for ${renderPersonaRef(a.name, a.key)} — continuing: Error`
     expect(lines.filter((l) => l.startsWith(failedLine))).toHaveLength(unexpected ? 1 : 0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Bug b.g57: a claude_config_dir that cannot be resolved is not checked this
+// pass — no lost-history, inconclusive or transcript-loss notice, and no
+// config_dir label mismatch (the lexical label would have mismatched the row)
+// ---------------------------------------------------------------------------
+
+describe('b.g57: runJsonlPersistenceSafeguard — a claude_config_dir that cannot be resolved', () => {
+  /** Only `/` (ext4): the temp config dirs raise no Layer-1 record or notice. */
+  const EXT4_ROOT = '23 0 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n'
+
+  /**
+   * A, whose claude_config_dir is a symlink onto a "drive", and B, whose
+   * claude_config_dir is a plain directory. Both rows were written while the
+   * drive was there (so their config_dir labels match), and both have archived
+   * rows since spawn and no transcript: each is loud whenever it is checked.
+   */
+  function g57Fixture() {
+    const dir = makeTempDir()
+    const drive = join(dir, 'mnt', 'a')
+    mkdirSync(drive, { recursive: true })
+    const aDir = join(dir, 'claude-a')
+    symlinkSync(drive, aDir)
+    const bDir = join(dir, 'claude-b')
+    mkdirSync(bDir)
+    const config = makeMultiPersonaConfig(
+      [
+        { ...LAYER2_SPEC, name: 'Alpha Bot', working_directory: '/repo/alpha', claude_config_dir: aDir },
+        { ...LAYER2_SPEC, name: 'Beta Bot', working_directory: '/repo/beta', claude_config_dir: bDir },
+      ],
+      dir,
+    )
+    const [a, b] = config.personas as [Persona, Persona]
+    const rows = new Map(config.personas.map((p) => [p.key, makeRow({ jsonl_path: STALE_PATH }, p)]))
+    return { config, a, b, aDir, drive, rows, refA: renderPersonaRef(a.name, a.key), refB: renderPersonaRef(b.name, b.key) }
+  }
+  type G57Fixture = ReturnType<typeof g57Fixture>
+
+  /** One pass over both personas; `configDirFs` as given (the real file system when undefined). */
+  async function pass(fx: G57Fixture, configDirFs?: JsonlPersistenceSafeguardDeps['configDirFs']) {
+    const lookups: string[] = []
+    const c = await runLayer2(
+      {
+        readMountinfo: fixture(EXT4_ROOT),
+        getRow: async (key: string) => {
+          lookups.push(key)
+          return fx.rows.get(key)!
+        },
+        statFn: () => false,
+        archiveCountSince: () => 4,
+        ...(configDirFs === undefined ? {} : { configDirFs }),
+      },
+      fx.config,
+    )
+    return { ...c, lookups }
+  }
+
+  const skipLine = (fx: G57Fixture, code: string) =>
+    `[slack] jsonl-persistence-check: ${fx.refA} claude_config_dir="${fx.aDir}" cannot be resolved to a real path (${code}) — transcript not checked this pass`
+
+  /** A realpath that fails with EIO for A's directory while `broken.on`, the real one otherwise. */
+  function eioFor(path: string, broken: { on: boolean }): JsonlPersistenceSafeguardDeps['configDirFs'] {
+    return {
+      realpath: (p) => {
+        if (broken.on && p === path) throw Object.assign(new Error('simulated I/O error'), { code: 'EIO' })
+        return realpathSync(p)
+      },
+    }
+  }
+
+  test.each<[string, string, (fx: G57Fixture) => JsonlPersistenceSafeguardDeps['configDirFs']]>([
+    ['a realpath failing with EIO (a dropped mount), injected', 'EIO', (fx) => eioFor(fx.aDir, { on: true })],
+    ['a symlink pointing to nothing (an unmounted drive)', 'ENOENT', (fx) => {
+      rmSync(fx.drive, { recursive: true })
+      return undefined
+    }],
+  ])('b.g57: %s: A is skipped before its row lookup with one line and no notice, record or label mismatch; B is checked as before', async (_label, code, arrange) => {
+    const fx = g57Fixture()
+    const configDirFs = arrange(fx)
+    const log = captureErrorLog()
+
+    const c = await pass(fx, configDirFs)
+
+    expect(c.lookups).toEqual([fx.b.key])
+    expect(log.filter((l) => l.includes(fx.refA))).toEqual([skipLine(fx, code)])
+    expect(c.notices.map((n) => n.key)).toEqual([fx.b.key])
+    expect(c.errors.map((e) => e.key)).toEqual(['jsonl-transcript-lost'])
+    expect(c.errors[0]!.message).toContain(fx.refB)
+    expect(c.errors.filter((e) => e.message.includes(fx.refA))).toEqual([])
+    assertNoLeak({ c, log })
+  })
+
+  test('b.g57: A\'s directory resolves again in the next pass: A is checked normally, with no skip line', async () => {
+    const fx = g57Fixture()
+    const broken = { on: true }
+    const configDirFs = eioFor(fx.aDir, broken)
+    const log = captureErrorLog()
+    const first = await pass(fx, configDirFs)
+    expect(first.lookups).toEqual([fx.b.key])
+    const firstLines = log.length
+
+    broken.on = false
+    const second = await pass(fx, configDirFs)
+
+    expect(second.lookups).toEqual([fx.a.key, fx.b.key])
+    expect(second.notices.map((n) => n.key)).toEqual([fx.a.key, fx.b.key])
+    expect(second.errors.map((e) => e.key)).toEqual(['jsonl-transcript-lost', 'jsonl-transcript-lost'])
+    expect(second.errors[0]!.message).toContain(fx.refA)
+    expect(log.slice(firstLines).filter((l) => l.includes('cannot be resolved') || l.includes('config_dir label'))).toEqual([])
+    assertNoLeak({ first, second, log })
   })
 })

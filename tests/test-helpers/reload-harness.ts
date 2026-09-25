@@ -150,9 +150,14 @@
  * - `run.lifecycle`: the recorder. Its `ops` are the controller's
  *   `ReloadLifecycleOps`. The start pass (`startBringUp`) brings every
  *   applied persona up at once through `run.bringUps` and launches each one
- *   that ends `up`; a launch is only recorded (nothing is spawned).
+ *   that ends `up`; a launch is only recorded (nothing is spawned; with
+ *   `opts.realLaunch` it runs the real launch path, below).
  *   `bringUp` does the same for one persona; `teardown` cancels the persona's
- *   bring-up and stops its connection; `updateInPlace` is recorded (with the
+ *   bring-up and stops its connection (for the old half of a destructive
+ *   modify, whose key stays applied, it refuses a persona that has had a `dm`
+ *   destination, as below); `refreshTemplate` (step 5) is recorded as a
+ *   `template-refresh` record (key `TEMPLATE_REFRESH_KEY`) and calls
+ *   nothing; `updateInPlace` is recorded (with the
  *   changed `settings`) and does nothing else; `reconnectCredentials` (step
  *   4) runs the real controller's `changeCredentials` over the manager (the
  *   real reconnect: new connection first, the 10 s `start()` bound and the
@@ -166,13 +171,21 @@
  *   credentials-broken when it runs (the lifecycle applies the change as a
  *   reconnect then), need `opts.realLifecycle`: the stand-in rejects the
  *   call and `h.cleanup()` throws, naming it. With `opts.realLifecycle`, `bringUp` (a recovery
- *   included), `teardown`, `reconnectCredentials` and
- *   `updateInPlace` run the real composition instead (`run.composition`, see
+ *   included), `teardown`, `reconnectCredentials`, `updateInPlace` and
+ *   `refreshTemplate` run the real composition instead (`run.composition`, see
  *   `RealLifecycleComposition`: `createPersonaLifecycle` over the run's
  *   controller and manager, a real serializer, the run's destination
  *   resolver, the real agent-director kill and delete over a `makeStubClient`
- *   stub, `opts.agentDirector`, a recorded launch, and never shutting down). The controller's default step bodies call them for
- *   every confirmed apply run without `opts.applySteps`. Every call is a
+ *   stub, `opts.agentDirector`, a recorded launch, the template refresh over
+ *   that stub keeping `installedTemplate`, and never shutting down). The
+ *   controller's default step bodies call them for every confirmed apply run
+ *   without `opts.applySteps`: step 2 tears down each removed persona and the
+ *   old half of each destructive modify (`credentials_file` path,
+ *   `working_directory`), step 6 brings up each added persona and the new
+ *   half, so a destructive modify is a `teardown` then a `bring-up` record
+ *   of the same key; step 5 runs only when the plan's config directories
+ *   changed; a next-launch change (`claude_config_dir`,
+ *   `stop_hook_bootstrap`) gets no record. Every call is a
  *   `ReloadLifecycleRecord` in call order (`records`, `of(op)`, `keys(op)`);
  *   a bring-up record gets its `result` (outcome `up`/`broken`/`retrying` and
  *   each failure's class) when it resolves (`outcome(key)`, `classes(key)`).
@@ -185,10 +198,15 @@
  *   until `release()`, or makes it reject with `fail(err)`; `timeline` lists
  *   every apply-time teardown, in-place update, reconnect and bring-up as it started and
  *   settled or rejected, across personas and steps (b.av2 SR-8.6 step order
- *   without timing). The bring-up controller's `onLeftUp` is server.ts's
+ *   without timing); `hold('template-refresh')` holds step 5 the same way,
+ *   and `applyTimeline` is `timeline` with step 5 in its place. The bring-up controller's `onLeftUp` is server.ts's
  *   `createNotUpSessionDropper` over the real `dropPersonaSession`, so a
  *   persona that stops being up has its registered session dropped (one
- *   line). With `opts.realLifecycle` the manager gets the composition's
+ *   line). `run.serverConfig()` is `server.ts`'s `personaConfig`
+ *   (`configInEffect`: the applied persona set over the start's server-wide
+ *   settings), which every consumer and real launch reads; `h.readRecord()`
+ *   holds a changed server-wide value, and a later `h.start()` over the same
+ *   directories (the next server start) runs it. With `opts.realLifecycle` the manager gets the composition's
  *   serializer (`makeConnectionHarness`'s `serialize`, as `server.ts` passes
  *   `personaLifecycle.run`), so a b.ujn mark's network close of its detached
  *   socket waits for the persona's serializer turn (behind a lifecycle
@@ -300,6 +318,41 @@
  *   lifecycle call from a tick" (AC 55). Bring-up retries run only when the
  *   test advances `run.clock`, so they never mix into a stretch of ticks.
  *
+ * The real launch path (`opts.realLaunch`, implies `opts.realLifecycle`; see
+ * the option): every launch (start pass, bring-up retry, apply bring-up,
+ * `run.relaunch`) runs `spawnForPersona` over `run.serverConfig()`, with the
+ * trust patch, the reply-guard steps over `h.stateDir` and the collision
+ * ladder, against the composition's agent-director stub and the harness's
+ * row table (`AgentDirectorRow`, shared by every run as agent-director's
+ * store outlives a server restart): a spawn creates a `waiting` row, a
+ * resume sets it `waiting`, a kill `ended`, a delete removes it. A launch
+ * record gets the ladder's `action`. `run.composition.agentDirectorCalls` is
+ * every agent-director call in order (a spawn with its `cwd`,
+ * `CLAUDE_CONFIG_DIR` and `config_dir` label; each with its `result`), and
+ * `instanceCallsOf(name)` the persona's spawn, resume, kill and delete.
+ * `h.seedRow(persona, { state?, cwd?, configDir?, labels? })` sets or
+ * changes a row before a launch, to choose its path (`h.rowOf(name)` reads
+ * it); `run.relaunch(name)` is the persona's next launch through the
+ * restart path (the relaunch gate, then `launchSession`, in its serializer
+ * turn), with no apply. `h.stateDir` is the temp state directory, and
+ * `h.replyGuardDir` its record directory (the guard's argument);
+ * `h.readReplyGuardRecord(name)` reads a record. `h.configDir(name)` makes
+ * a temp `claude_config_dir`; with `makeReloadHarness({ personaConfigDirs:
+ * true })` every `h.persona` gets its own. A persona with none resolves to
+ * the temp home's `.claude`, never the operator's. Session-manager notices
+ * are `run.sessionNotices` (also raised through the run's notifier), and
+ * the session manager's `console.error` lines join `run.logs`.
+ *
+ * Step 5 (b.av2 SR-8.6): with the real composition the refresh calls the
+ * stub's `makeTemplate` (params on `run.composition.agentDirector
+ * .makeTemplateCalls`) with `run.composition.installedTemplate`'s start-time
+ * arguments (`buildTemplateParams` over the start configuration, built when
+ * the start applies; nothing is installed at the start), and its record gets
+ * how it settled (`refresh`).
+ * `run.composition.failTemplateRefresh(err)` makes the next one reject (the
+ * refresh logs one line and settles `failed`); `run.lifecycle.hold(
+ * 'template-refresh')` keeps it pending until released.
+ *
  * Call `await h.cleanup()` in `afterEach`: it stops every run (detection,
  * bring-up retries, connections) and removes the root, then throws if a
  * stand-in refused a call that needs `opts.realLifecycle`. A test that must show
@@ -319,7 +372,13 @@
  * arms no real timer and holds no token literal. The real composition
  * installs the outage state's module dependencies (its stub client and a
  * recording notice sink), and a registered session or delivered event
- * touches the registry and ack tracker; `h.cleanup()` resets them. It
+ * touches the registry and ack tracker; `h.cleanup()` resets them. A
+ * realLaunch run also installs the session manager's module seams (the
+ * process's agent-director client, dialog and tmux fakes, the spawn home,
+ * the trust patcher, the reply guard, the claude_config_dir hook, the
+ * session notifier) and captures `console.error`; `h.cleanup()` resets and
+ * restores them. No launch is a startup launch, so nothing resolves the
+ * state directory from the environment. It
  * spawns nothing but `mkfifo` (in `mkfifoAvailable` and `h.makeFifo`).
  *
  * SPDX-License-Identifier: MIT
@@ -327,6 +386,7 @@
 
 import { spawnSync } from 'node:child_process'
 import {
+  accessSync,
   chmodSync,
   closeSync,
   existsSync,
@@ -380,10 +440,13 @@ import {
 } from '../../src/persona-credentials.ts'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
+import type { MakeTemplateParams, SpawnParams } from 'agent-director'
 
 import { _resetAckTracker, consumeAck } from '../../src/ack-tracker.ts'
+import { resetClientForTests, setClientForTests } from '../../src/agent-director-client.ts'
+import { buildTemplateParams, type TemplateRefreshResult } from '../../src/agent-director-template.ts'
 import { defaultAccess } from '../../src/lib.ts'
-import { personaKey, renderPersonaRef } from '../../src/persona-identity.ts'
+import { personaInstanceId, personaKey, renderPersonaRef } from '../../src/persona-identity.ts'
 import { createPersonaEventRouter } from '../../src/persona-event-router.ts'
 import { createPersonaLifecycle, type PersonaLifecycle } from '../../src/persona-lifecycle.ts'
 import { createPersonaRouting } from '../../src/persona-routing.ts'
@@ -392,6 +455,7 @@ import {
   composePersonaStatusListeners,
   createPersonaClientLookup,
   createPersonaIdentityLookup,
+  createPersonaRelaunchGate,
   createPersonaUpFlushListener,
   createPersonaUpPredicate,
 } from '../../src/persona-start.ts'
@@ -406,11 +470,48 @@ import {
   type SessionEntry,
   type SessionToolDeps,
 } from '../../src/registry.ts'
-import { deletePersonaInstance, killPersonaInstance } from '../../src/session-manager.ts'
+import {
+  _resetDialogPollIntervalMs,
+  _resetDialogReadyTimeoutMs,
+  _resetFindMissingMemo,
+  _resetInFlightLaunches,
+  _resetPreLaunchReplyGuard,
+  _resetPreLaunchTrustPatcher,
+  _resetSpawnHomeDir,
+  _resetTmuxDialogHelpers,
+  _resetTmuxSessionProber,
+  _setDialogPollIntervalMs,
+  _setDialogReadyTimeoutMs,
+  _setSpawnHomeDir,
+  _setTmuxCapturePane,
+  _setTmuxSendEnter,
+  _setTmuxSessionProber,
+  checkLaunchConfigDir,
+  deletePersonaInstance,
+  killPersonaInstance,
+  launchSession,
+  personaConfigDirLabelValue,
+  setConfigDirUnresolvableHook,
+  setPreLaunchReplyGuard,
+  setPreLaunchTrustPatcher,
+  setSessionNotifier,
+  spawnForPersona,
+  whenLaunchSettled,
+  type SpawnPersonaResult,
+} from '../../src/session-manager.ts'
+import {
+  _resetLaunchedWithDirs,
+  getLaunchedWithDir,
+  preLaunchReplyGuard,
+  stopHookLaunchPass,
+  teardownPersonaReplyGuard,
+} from '../../src/stop-hook-bootstrap.ts'
+import { trustPatchPersona } from '../../src/trust-bootstrap.ts'
 import type { ApplyBringUpOptions, ApplyStepSlots, InPlaceApplyInput } from '../../src/reload-apply.ts'
 import { composePendingFile, parsePendingFingerprint } from '../../src/reload-fingerprint.ts'
 import { DESTRUCTIVE_PREFIX, PENDING_PREVIEW_TITLE, type InPlaceSetting } from '../../src/reload-plan.ts'
 import {
+  configInEffect,
   createReloadController,
   RELOAD_INVALID,
   RELOAD_PREVIEW,
@@ -422,7 +523,15 @@ import {
   type ReloadTick,
   type ReloadTickDriver,
 } from '../../src/reload.ts'
-import { makeStubCallLog, makeStubClient, type StubCallLog, type StubClientOptions } from './agent-director-stub.ts'
+import {
+  cannedGetResult,
+  errInstanceIdCollision,
+  errSpawnNotFound,
+  makeStubCallLog,
+  makeStubClient,
+  type StubCallLog,
+  type StubClientOptions,
+} from './agent-director-stub.ts'
 import {
   APP_TOKEN_PREFIX,
   BOT_TOKEN_PREFIX,
@@ -437,6 +546,7 @@ import { makePersona } from './persona-config.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './persona-connection-harness.ts'
 import { makeNotifierStack } from './persona-notifier.ts'
 import { makeSessionServer, makeTransport, type ChannelNotification } from './persona-routing-harness.ts'
+import { REPLY_GUARD_DIR_NAME } from './reply-guard-record.ts'
 import {
   INITIAL_CREDENTIALS,
   type SlackEvent,
@@ -562,15 +672,22 @@ export function createManualTickDriver(): ManualTickDriver {
 // Lifecycle recorder
 // ---------------------------------------------------------------------------
 
-/** A per-persona lifecycle call the recorder saw. */
-export type ReloadLifecycleOp = 'bring-up' | 'launch' | 'teardown' | 'reconnect' | 'update-in-place'
+/**
+ * A lifecycle call the recorder saw: a per-persona one, or apply step 5's
+ * `template-refresh`, which belongs to no persona (its record's key is `''`).
+ */
+export type ReloadLifecycleOp = 'bring-up' | 'launch' | 'teardown' | 'reconnect' | 'update-in-place' | 'template-refresh'
 
 /**
  * What caused it: the start pass (`start`), the bring-up controller's own
- * retry (`retry`, launches only), or a lifecycle op the controller called for
- * one persona (`apply`).
+ * retry (`retry`, launches only), a lifecycle op the controller called for
+ * one persona (`apply`), or the restart module's launch (`restart`, launches
+ * only, `run.relaunch`).
  */
-export type ReloadLifecycleVia = 'start' | 'retry' | 'apply'
+export type ReloadLifecycleVia = 'start' | 'retry' | 'apply' | 'restart'
+
+/** The key of a `template-refresh` record and timeline entry: it belongs to no persona. */
+export const TEMPLATE_REFRESH_KEY = ''
 
 /** One lifecycle call, in call order. Holds no token. */
 export interface ReloadLifecycleRecord {
@@ -590,6 +707,24 @@ export interface ReloadLifecycleRecord {
   readonly recovery?: true
   /** Reconnect only: how the credentials change settled (its first attempt), set once it resolved. */
   change?: PersonaCredentialsChangeResult
+  /**
+   * Launch only, with `opts.realLaunch`: what the real launch path
+   * (`spawnForPersona`) did, set once it resolved (`spawned`, `resumed`,
+   * `reconnected`, `deferred`, `failed`, …). Absent for a recorded-only launch.
+   */
+  action?: SpawnPersonaResult['action']
+  /**
+   * Launch via `restart` only (`run.relaunch`): what the restart module's
+   * `launchSession` answered (`true`, `false`, or `'skipped'` when the
+   * relaunch gate refused it or the launch was deferred), set once resolved.
+   */
+  restart?: boolean | 'skipped'
+  /**
+   * `template-refresh` only, with the real composition: how the refresh
+   * settled (`refreshSlackChannelBotTemplate`'s result). Absent for the
+   * stand-in, which calls nothing.
+   */
+  refresh?: TemplateRefreshResult
 }
 
 export interface ReloadLifecycleRecorder {
@@ -623,18 +758,40 @@ export interface ReloadLifecycleRecorder {
    */
   hold(op: LifecycleGateOp, key: string): LifecycleGate
   /**
+   * Gate the next apply step 5 (`template-refresh`) the same way: recorded
+   * and its `start` entry (in `applyTimeline`) made when it arrives, then
+   * held before its body (with the real composition, the `makeTemplate`
+   * call) runs, so a test can show step 5 comes after step 4 settled and
+   * before step 6 starts. `fail(err)` makes the lifecycle member reject,
+   * which production's never does: to make the refresh itself fail (logged,
+   * not fatal), script `run.composition.failTemplateRefresh(err)` instead.
+   */
+  hold(op: 'template-refresh'): LifecycleGate
+  /**
    * The apply-time `teardown`, `update-in-place`, `reconnect` and `bring-up`
    * calls (a recovery bring-up included) in the
    * order they started and settled (`start`, then `settled` or `rejected`),
    * across personas and steps, so step order is asserted without timing
    * (b.av2 SR-8.6). A held call's `start` comes when it arrives, its
-   * `settled` after its body ran. Start-pass bring-ups are not here.
+   * `settled` after its body ran. Start-pass bring-ups are not here, and
+   * neither is step 5 (see `applyTimeline`).
    */
   readonly timeline: readonly LifecycleTimelineEntry[]
+  /**
+   * `timeline` with step 5 in its place: every apply-time call, the
+   * `template-refresh` included (key `TEMPLATE_REFRESH_KEY`), in the order
+   * they started and settled. For step-order cases that cover step 5.
+   */
+  readonly applyTimeline: readonly ApplyTimelineEntry[]
 }
 
-/** An apply-time lifecycle call a test can hold (`run.lifecycle.hold`). */
+/** A per-persona apply-time lifecycle call a test can hold (`run.lifecycle.hold(op, key)`). */
 export type LifecycleGateOp = 'teardown' | 'update-in-place' | 'reconnect' | 'bring-up'
+
+/** One entry of `run.lifecycle.applyTimeline`: a per-persona call, or apply step 5. Holds no token. */
+export type ApplyTimelineEntry =
+  | LifecycleTimelineEntry
+  | { readonly op: 'template-refresh'; readonly key: typeof TEMPLATE_REFRESH_KEY; readonly phase: LifecycleTimelineEntry['phase'] }
 
 /** `run.lifecycle.hold(op, key)`'s handle. */
 export interface LifecycleGate {
@@ -684,6 +841,114 @@ export interface RealLifecycleComposition {
    * (a recovery's re-check), is not recorded.
    */
   readonly calls: ReadonlyArray<readonly [string, string]>
+  /**
+   * Every agent-director call the stub received, in call order, with what a
+   * test needs of it (see `AgentDirectorCall`): the lifecycle's kill and
+   * delete, step 5's `makeTemplate`, and with `opts.realLaunch` the launch
+   * path's spawn, get, resume, status and the rest. Their full params are on
+   * `agentDirector` by verb.
+   */
+  readonly agentDirectorCalls: readonly AgentDirectorCall[]
+  /**
+   * The persona's instance calls (`spawn`, `resume`, `kill`, `delete` of
+   * `cscb_<key>`) among `agentDirectorCalls`, in order, with their results:
+   * a relaunch from an `ended` row with an old `config_dir` label reads
+   * spawn (`ErrInstanceIdCollision`), delete (`ok`), spawn (`ok`); one with
+   * the current label spawn (`ErrInstanceIdCollision`), resume (`ok`).
+   */
+  instanceCallsOf(name: string): AgentDirectorCall[]
+  /**
+   * What the start's template install wrote, as the step-5 refresh keeps it
+   * (`templateRefresh.installed`): `buildTemplateParams` over the start
+   * configuration (its `mcp_config_path` and system-prompt settings, from the
+   * record or config file the run started from; the append file probed on
+   * the real file system when the start applies, in `run.resolveStart()`,
+   * as `server.ts` installs it at start, never at a later read). No
+   * `makeTemplate` call is made at the start. Undefined until the start
+   * applied.
+   */
+  readonly installedTemplate: MakeTemplateParams | undefined
+  /**
+   * Make the next `makeTemplate` call (step 5's refresh) reject with `err`
+   * (a typed agent-director error such as `errTemplateMalformed()`, or any
+   * `Error`); each call queues one more failure. The refresh logs its one
+   * failure line and settles `{ kind: 'failed' }`; later calls succeed.
+   */
+  failTemplateRefresh(err: Error): void
+}
+
+/**
+ * One agent-director call in `run.composition.agentDirectorCalls`. Holds no
+ * token. `id` is the instance ID (`cscb_<key>`) for a per-instance verb.
+ * A `spawn` also carries its `cwd`, the `CLAUDE_CONFIG_DIR` of its spawn
+ * environment (undefined when absent) and its `config_dir` label value
+ * (undefined when absent). `result` is set once the call settled: `'ok'`, or
+ * the rejection's agent-director error name (`ErrInstanceIdCollision` for
+ * the ladder's optimistic spawn that met a row, `ErrSpawnNotFound`, …) or
+ * error name. A spawn that created an instance is `{ verb: 'spawn', result:
+ * 'ok' }`.
+ */
+export interface AgentDirectorCall {
+  readonly verb: string
+  readonly id?: string
+  readonly cwd?: string
+  readonly claudeConfigDir?: string
+  readonly configDirLabel?: string
+  result?: string
+}
+
+/** How a rejected agent-director call is named in `AgentDirectorCall.result`. */
+function errorName(err: unknown): string {
+  const errName = (err as { errName?: unknown } | undefined)?.errName
+  if (typeof errName === 'string') return errName
+  return err instanceof Error ? err.name : 'thrown'
+}
+
+/**
+ * A persona's agent-director row in the harness's row table (shared by every
+ * run, as agent-director's store outlives a server restart). With
+ * `opts.realLaunch`, a spawn creates the row (`waiting`, the spawn's `cwd`
+ * and labels), a resume sets it `waiting`, a kill `ended`, and a delete
+ * removes it; `get` answers it and `status` its state (a `working` row
+ * answers `waiting`, its turn over). `h.seedRow` sets or changes it.
+ */
+export interface AgentDirectorRow {
+  readonly state: string
+  readonly cwd: string
+  /** The row's labels (`service`, `persona`, `config_dir`, …). */
+  readonly labels: Readonly<Record<string, string>>
+}
+
+/** `h.seedRow`'s fields; each one given replaces the row's. */
+export interface AgentDirectorRowSeed {
+  /** `ended` (the default for a new row), `missing`, `waiting`, `working`, … */
+  state?: string
+  cwd?: string
+  /**
+   * The `config_dir` label, as the directory it names: its value is
+   * `personaConfigDirLabelValue(configDir, h.home)`. `null` removes the
+   * label. For a new row it defaults to the persona's `claude_config_dir`
+   * (or the temp home's `.claude`).
+   */
+  configDir?: string | null
+  /** Replace all labels (wins over `configDir`). */
+  labels?: Record<string, string>
+}
+
+/** The verbs `instanceCallsOf` keeps: those that start, stop or remove an instance. */
+const INSTANCE_VERBS: ReadonlySet<string> = new Set(['spawn', 'resume', 'kill', 'delete'])
+
+/** The label naming a row's config dir (`config_dir=<value>`). */
+const CONFIG_DIR_LABEL = 'config_dir'
+
+/** A spawn's `KEY=VALUE` labels as a row's label record. */
+function parseLabels(labels: readonly string[] | undefined): Record<string, string> {
+  const parsed: Record<string, string> = {}
+  for (const label of labels ?? []) {
+    const at = label.indexOf('=')
+    if (at > 0) parsed[label.slice(0, at)] = label.slice(at + 1)
+  }
+  return parsed
 }
 
 /** `h.rotateCredentials`'s options. */
@@ -1006,6 +1271,29 @@ export interface ReloadRunOptions {
    * serializer, as `server.ts` wires them.
    */
   realLifecycle?: boolean
+  /**
+   * The real persona launch path (implies `realLifecycle`): every launch (the
+   * start pass's, a bring-up retry's, an apply bring-up's and
+   * `run.relaunch`'s) runs `spawnForPersona` (the pre-launch
+   * claude_config_dir check, the collision ladder, the trust patch and the
+   * reply-guard steps) over the composition's agent-director stub and the
+   * harness's row table, with the configuration the server runs
+   * (`run.serverConfig()`), never as a startup launch (no
+   * `startup-errors.log`). The run installs, as `server.ts` does, the stub
+   * as the process's agent-director client, `trustPatchPersona`, the
+   * reply-guard steps over `h.stateDir` and the applied set, the bring-up
+   * controller's claude_config_dir hold and re-check, and a session notifier
+   * that records each notice (`run.sessionNotices`) and raises it through
+   * the run's notifier; the dialog poll runs at 1 ms, tmux is faked and the
+   * spawn home is `h.home`. The composition's reply-guard members are the
+   * real ones over `h.stateDir`. Every `console.error` line (the session
+   * manager's, the reply guard's) goes to `run.logs` while the run is the
+   * latest live one. The start-time bootstraps (the sweep, the trust and
+   * Stop-hook bootstraps, the template install) are not run. A new run
+   * forgets the launched-with directories and in-flight launches, as a new
+   * server process would; the row table and the record files persist.
+   */
+  realLaunch?: boolean
   /** With `realLifecycle`: options for the agent-director stub (e.g. `killError`). Its call captures are the harness's own. */
   agentDirector?: StubClientOptions
   /**
@@ -1209,6 +1497,29 @@ export interface ReloadRun {
   admitSession(name: string): ReloadSessionAdmission
   /** Every `run.logs` line naming the persona (its rendered name and key: lifecycle, bring-up, manager and diagnostic lines), in order. */
   linesOf(name: string): string[]
+  /**
+   * The configuration the server runs now (`server.ts`'s `personaConfig`):
+   * the applied persona set over the start's server-wide settings
+   * (`configInEffect`), so after an apply that changed `port`, `bind`, the
+   * acknowledgement or chunking settings, these still read their start-time
+   * values while `h.readRecord()` holds the new ones. Every consumer the run
+   * wires (routing, client and identity lookups, notices, tools) and every
+   * real launch read it. Undefined before the start applied.
+   */
+  serverConfig(): PersonaConfig | undefined
+  /**
+   * The persona's next launch through the restart path (`opts.realLaunch`):
+   * what `server.ts`'s restart `launchSession` adapter does, in the
+   * persona's serializer turn: `launchSession(key, run.serverConfig(), {
+   * canLaunch })` with the real relaunch gate (`createPersonaRelaunchGate`
+   * over the manager and the bring-up controller). Recorded as a `launch`
+   * via `restart` with its answer (`restart`). Set the row first
+   * (`h.seedRow(persona, { state: 'ended' })`) to choose the ladder's path.
+   * Resolves with the answer. Throws without `opts.realLaunch`.
+   */
+  relaunch(name: string): Promise<boolean | 'skipped'>
+  /** Every session-manager notice raised (spawn failure, restart cap, lost history) with `opts.realLaunch`, by persona key, in order. */
+  readonly sessionNotices: ReadonlyArray<{ readonly key: string; readonly text: string }>
   /** Stop detection (`controller.stopDetection()`, which stops `run.ticks`), cancel every bring-up retry and stop every connection. Idempotent. */
   stop(): Promise<void>
 }
@@ -1225,6 +1536,14 @@ export interface StartedReloadRun extends ReloadRun {
 export interface ReloadHarnessOptions {
   /** Directory to create the root in; the OS temp directory by default. */
   parentDir?: string
+  /**
+   * Give every `h.persona` its own `claude_config_dir`, `h.configDir(<key>)`
+   * (created), unless its overrides name one (`claude_config_dir:
+   * undefined` for a persona that inherits the top-level default). Without
+   * it a persona has none, so its effective directory is the temp home's
+   * `.claude` (`h.home`), never the operator's.
+   */
+  personaConfigDirs?: boolean
 }
 
 /** A persona as far as the file helpers need it. */
@@ -1235,8 +1554,31 @@ export interface ReloadHarness {
   readonly root: string
   /** The configuration directory: only the SR-8.1 files live here. */
   readonly dir: string
-  /** The temp home handed to the controller for `~` expansion. */
+  /** The temp home handed to the controller for `~` expansion, and the spawn home of a real launch (nothing is created in it). */
   readonly home: string
+  /** The temp state directory the reply-guard steps get (`server.ts`'s `STATE_DIR`), under the root. */
+  readonly stateDir: string
+  /** The reply-guard record directory, `<stateDir>/reply-guard`: the guard's argument; records are `<replyGuardDir>/<key>`. */
+  readonly replyGuardDir: string
+  /** The persona's reply-guard record's exact text, or undefined when there is none. */
+  readReplyGuardRecord(name: string): string | undefined
+  /** A temp `claude_config_dir` under the root named `name` (`<root>/claude-config/<name>`), created; returns its path. */
+  configDir(name: string): string
+  /**
+   * Set or change the persona's agent-director row in the row table (see
+   * `AgentDirectorRow`), before a launch, to choose the ladder's path: an
+   * `ended` row with an old `config_dir` label is deleted and spawned fresh,
+   * one with the current label resumed, a `waiting` one reconnected. A new
+   * row takes `seed`'s fields, else the persona's `working_directory`, its
+   * `claude_config_dir` for the label and the state `ended`; an existing row
+   * changes only the fields given.
+   */
+  seedRow(
+    persona: Pick<PersonaInput, 'name' | 'working_directory' | 'claude_config_dir'>,
+    seed?: AgentDirectorRowSeed,
+  ): AgentDirectorRow
+  /** The persona's row in the row table now; undefined when it has none. */
+  rowOf(name: string): AgentDirectorRow | undefined
   /** `reloadFilePaths(<dir>/config.json)`. */
   readonly paths: ReloadFilePaths
   /** The persona key of `name` (`personaKey`). */
@@ -1465,7 +1807,31 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
   const home = join(root, 'home')
   mkdirSync(dir)
   mkdirSync(home)
+  const stateDir = join(root, 'state')
+  const replyGuardDir = join(stateDir, REPLY_GUARD_DIR_NAME)
+  mkdirSync(stateDir)
   const paths = reloadFilePaths(join(dir, 'config.json'))
+
+  /** The agent-director row table, by instance ID: shared by every run (see `AgentDirectorRow`). */
+  const rows = new Map<string, { state: string; cwd: string; labels: Record<string, string> }>()
+  /** A realLaunch run installed the session manager's module seams: reset them at cleanup. */
+  let launchSeamsInstalled = false
+  /** `console.error` before the harness captured it (a realLaunch run), restored at cleanup. */
+  const originalConsoleError = console.error
+  let consoleCaptured = false
+  /** Where captured console lines go: the latest live realLaunch run's log. */
+  const consoleSinks: Array<{ readonly lines: string[]; readonly live: () => boolean }> = []
+
+  function captureConsole(sink: { readonly lines: string[]; readonly live: () => boolean }): void {
+    consoleSinks.push(sink)
+    if (consoleCaptured) return
+    consoleCaptured = true
+    console.error = (...args: unknown[]) => {
+      const target = [...consoleSinks].reverse().find((s) => s.live())
+      if (target === undefined) return originalConsoleError(...args)
+      target.lines.push(args.map((a) => (a instanceof Error ? `${a.name}: ${a.message}` : String(a))).join(' '))
+    }
+  }
 
   const channels = new Map<string, string>()
   const tokensByName = new Map<string, PersonaSlackTokens>()
@@ -1527,9 +1893,11 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
 
   function build(runOpts: ReloadRunOptions = {}): ReloadRun {
     const dryRun = runOpts.dryRun ?? false
+    const realLaunch = runOpts.realLaunch === true
+    const realLifecycle = runOpts.realLifecycle === true || realLaunch
     // With the real composition, one serializer shared by the manager, the
     // bring-up controller and the lifecycle, as server.ts shares its one.
-    const serializer = runOpts.realLifecycle ? createPersonaSerializer() : undefined
+    const serializer = realLifecycle ? createPersonaSerializer() : undefined
     const connections = makeConnectionHarness(
       [...tokensByName.keys()].map((name) => ({ name })),
       root,
@@ -1549,6 +1917,15 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const appliedConfigs: PersonaConfig[] = []
     let startHold: Promise<void> | undefined
     let outcome: ReloadStartOutcome | undefined
+    /** The configuration the start applied (`run.resolveStart()`): its server-wide settings stay in effect. */
+    let startConfig: PersonaConfig | undefined
+    let installedTemplateCache: MakeTemplateParams | undefined
+    const sessionNotices: Array<{ key: string; text: string }> = []
+
+    /** The start's configuration: what `run.resolveStart()` applied, else the start pass's. */
+    function startTimeConfig(): PersonaConfig | undefined {
+      return startConfig ?? startPasses[0]
+    }
 
     function record(
       op: ReloadLifecycleOp,
@@ -1563,6 +1940,28 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
 
     // Declared before the bring-up controller, whose applied-set getter reads it (late).
     let controller!: ReloadController
+
+    /** `server.ts`'s `personaConfig`: the applied persona set over the start's server-wide settings. */
+    function serverConfig(): PersonaConfig | undefined {
+      const applied = controller.applied()?.config
+      if (applied === undefined) return undefined
+      const start = startTimeConfig()
+      return start === undefined ? applied : configInEffect(start, applied)
+    }
+
+    /**
+     * One launch of `persona`, recorded; with `opts.realLaunch` the real
+     * launch path over the configuration the server runs (never a startup
+     * launch, so nothing reaches `startup-errors.log`).
+     */
+    async function launch(persona: Persona, via: ReloadLifecycleVia): Promise<void> {
+      const entry = record('launch', persona.key, via)
+      if (!realLaunch) return
+      const config = serverConfig()
+      if (config === undefined) throw new Error('reload-harness: a real launch ran before the start applied a configuration')
+      entry.action = (await spawnForPersona(persona, config, false)).action
+    }
+
     const bringUps = createPersonaBringUpController({
       connections: {
         bringUp: (persona, tokens) => connections.connections.bringUp(persona, tokens),
@@ -1572,7 +1971,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       dryRun,
       log,
       fs: runOpts.bringUpFs,
-      launch: async (persona) => void record('launch', persona.key, 'retry'),
+      launch: (persona) => launch(persona, 'retry'),
+      // As server.ts wires it: a held persona's claude_config_dir is
+      // re-checked exactly as the launch checks it (bug b.g57).
+      ...(realLaunch ? { checkConfigDir: checkLaunchConfigDir } : {}),
       // As server.ts wires it: a persona that stops being up (a refused
       // reopen, a Web API call refused for its bot token) has its registered
       // MCP session dropped; its instance is kept.
@@ -1584,9 +1986,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     })
 
     // The consumers of the applied settings, as server.ts wires them: each
-    // reads the controller's applied configuration (the server's
-    // `personaConfig`) at call time.
-    const appliedConfig = () => controller.applied()?.config ?? null
+    // reads the server's `personaConfig` (the applied persona set over the
+    // start's server-wide settings) at call time.
+    const appliedConfig = () => serverConfig() ?? null
     const getAppliedPersona = (key: string): Persona | undefined => appliedConfig()?.personas.find((p) => p.key === key)
     const clientFor = createPersonaClientLookup(connections.manager, appliedConfig)
     const identityFor = createPersonaIdentityLookup(connections.manager, appliedConfig)
@@ -1595,6 +1997,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       isUp: (key) => bringUps.isUp(key),
       isApplied: (key) => bringUps.isApplied(key),
     })
+    // server.ts's relaunch gate (the restart module and its launch).
+    const relaunchGate = createPersonaRelaunchGate(connections.manager, log, bringUps)
     const resolveUserName = async (key: string, userId: string): Promise<string> => {
       const client = clientFor(key)
       if (!client) return userId
@@ -1614,6 +2018,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       notify: (key, text, options) => noticeStack.notifier.notify(key, text, options),
       log,
       dedupeClock: () => connections.clock.now(),
+      // As server.ts wires it: a lost message for a persona that is not up restarts nothing.
+      isPersonaUp,
     })
     connections.onEvent = createPersonaEventRouter({ routing, clientFor, getPersona: getAppliedPersona, log })
     connections.onStatus = composePersonaStatusListeners(
@@ -1621,24 +2027,116 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       (key, status) => bringUps.onConnectionStatus(key, status),
     )
 
-    const composition = runOpts.realLifecycle ? buildComposition() : undefined
+    const composition = realLifecycle ? buildComposition() : undefined
 
     /** The real composition over this run (`opts.realLifecycle`); see `RealLifecycleComposition`. */
-    function buildComposition(): RealLifecycleComposition {
+    function buildComposition(): RealLifecycleComposition & { readonly client: unknown } {
       const calls: Array<readonly [string, string]> = []
       const agentDirector = makeStubCallLog()
       const agentDirectorOrder: string[] = []
+      const agentDirectorCalls: AgentDirectorCall[] = []
+      const templateFailures: Error[] = []
       const stub = makeStubClient({ ...runOpts.agentDirector, ...agentDirector })
+      /** Log `call`, run `body`, and note on `call` how it ended. */
+      async function tracked<T>(call: AgentDirectorCall, body: () => Promise<T>): Promise<T> {
+        agentDirectorCalls.push(call)
+        try {
+          const result = await body()
+          call.result = 'ok'
+          return result
+        } catch (err) {
+          call.result = errorName(err)
+          throw err
+        }
+      }
+      /** A row the table holds for `id`, or ErrSpawnNotFound (agent-director's answer for an unknown instance). */
+      const rowFor = (id: string) => {
+        const row = rows.get(id)
+        if (row === undefined) throw errSpawnNotFound()
+        return row
+      }
+      // The stub behind the harness's row table: each verb goes through the
+      // stub first (its captures and scripted outcomes), then acts on the row.
       const client = {
         ...stub,
-        kill: (params: Parameters<typeof stub.kill>[0]) => {
-          agentDirectorOrder.push(`kill ${params.claude_instance_id}`)
-          return stub.kill(params)
+        kill(params: Parameters<typeof stub.kill>[0]) {
+          const id = params.claude_instance_id
+          agentDirectorOrder.push(`kill ${id}`)
+          return tracked({ verb: 'kill', id }, async () => {
+            const result = await stub.kill(params)
+            const row = rows.get(id)
+            if (row !== undefined) row.state = 'ended'
+            return result
+          })
         },
-        delete: (params: Parameters<typeof stub.delete>[0]) => {
-          agentDirectorOrder.push(`delete ${params.claude_instance_id.join(',')}`)
-          return stub.delete(params)
+        delete(params: Parameters<typeof stub.delete>[0]) {
+          const ids = params.claude_instance_id
+          agentDirectorOrder.push(`delete ${ids.join(',')}`)
+          return tracked({ verb: 'delete', id: ids.join(',') }, async () => {
+            const result = await stub.delete(params)
+            for (const id of ids) rows.delete(id)
+            return result
+          })
         },
+        spawn(params: SpawnParams) {
+          const id = String(params.claude_instance_id)
+          const labels = parseLabels(params.label)
+          const call: AgentDirectorCall = {
+            verb: 'spawn',
+            id,
+            cwd: params.cwd,
+            claudeConfigDir: params.extra_env?.['CLAUDE_CONFIG_DIR'],
+            configDirLabel: labels[CONFIG_DIR_LABEL],
+          }
+          return tracked(call, async () => {
+            if (rows.has(id)) {
+              agentDirector.spawnCalls.push(params)
+              throw errInstanceIdCollision()
+            }
+            const result = await stub.spawn(params)
+            rows.set(id, { state: 'waiting', cwd: params.cwd, labels })
+            return result
+          })
+        },
+        resume(params: Parameters<typeof stub.resume>[0]) {
+          const id = params.claude_instance_id
+          return tracked({ verb: 'resume', id }, async () => {
+            const result = await stub.resume(params)
+            rowFor(id).state = 'waiting'
+            return result
+          })
+        },
+        get(params: Parameters<typeof stub.get>[0]) {
+          const id = params.claude_instance_id
+          return tracked({ verb: 'get', id }, async () => {
+            agentDirector.getCalls.push(params)
+            const row = rowFor(id)
+            return cannedGetResult({ claude_instance_id: id, state: row.state, cwd: row.cwd, labels: { ...row.labels } })
+          })
+        },
+        status(params: Parameters<typeof stub.status>[0]) {
+          const id = params.claude_instance_id
+          return tracked({ verb: 'status', id }, async () => {
+            agentDirector.statusCalls.push(params)
+            const row = rowFor(id)
+            // A working instance's turn is over by the first poll.
+            if (row.state === 'working') row.state = 'waiting'
+            return { state: row.state }
+          })
+        },
+        sendKeys: (params: Parameters<typeof stub.sendKeys>[0]) =>
+          tracked({ verb: 'sendKeys', id: params.claude_instance_id }, () => stub.sendKeys(params)),
+        readPane: (params: Parameters<typeof stub.readPane>[0]) =>
+          tracked({ verb: 'readPane', id: params.claude_instance_id }, () => stub.readPane(params)),
+        findMissing: (params: Parameters<typeof stub.findMissing>[0]) =>
+          tracked({ verb: 'findMissing' }, () => stub.findMissing(params)),
+        makeTemplate: (params: MakeTemplateParams) =>
+          tracked({ verb: 'makeTemplate' }, async () => {
+            const failure = templateFailures.shift()
+            if (failure === undefined) return stub.makeTemplate(params)
+            agentDirector.makeTemplateCalls.push(params)
+            throw failure
+          }),
       }
       // The real kill and delete run through withOutageDetection, whose
       // module state this installs (reset by `h.cleanup()`).
@@ -1691,7 +2189,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         // An apply here never runs during shutdown.
         isShuttingDown: () => false,
         log,
-        whenLaunchSettled: rec('whenLaunchSettled', async () => undefined),
+        whenLaunchSettled: rec('whenLaunchSettled', (key) => whenLaunchSettled(key)),
         cancelRestartTimer: rec('cancelRestartTimer', () => false),
         forgetFailures: rec('forgetFailures'),
         forgetDisconnectedStreak: rec('forgetDisconnectedStreak'),
@@ -1708,30 +2206,91 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           calls.push(['deleteInstance', key])
           return deletePersonaInstance(key)
         },
+        // With the real launch path, the real reply-guard members over the
+        // harness's state directory, as server.ts binds them; else recorders.
         replyGuard: {
-          launchedWithDir: rec<string | undefined>('replyGuard.launchedWithDir'),
-          teardown: rec('replyGuard.teardown'),
-          launchPass: (_dirs, personas) => void calls.push(['replyGuard.launchPass', personas.map((p) => p.key).join(',')]),
+          launchedWithDir: rec<string | undefined>('replyGuard.launchedWithDir', (key) =>
+            realLaunch ? getLaunchedWithDir(key) : undefined,
+          ),
+          teardown: rec('replyGuard.teardown', (key) => (realLaunch ? teardownPersonaReplyGuard(stateDir, key) : undefined)),
+          launchPass: (dirs, personas) => {
+            calls.push(['replyGuard.launchPass', personas.map((p) => p.key).join(',')])
+            if (realLaunch) stopHookLaunchPass(dirs, personas, stateDir)
+          },
         },
         storageCheck: (persona) => void calls.push(['storageCheck', persona.key]),
         launch: async (persona) => {
           calls.push(['launch', persona.key])
-          record('launch', persona.key, 'apply')
+          await launch(persona, 'apply')
+        },
+        // Step 5 keeps what the start's install wrote, read when it runs.
+        templateRefresh: {
+          get installed() {
+            const installed = installedTemplate()
+            if (installed === undefined) throw new Error('reload-harness: a template refresh ran before the start applied')
+            return installed
+          },
+          getClient: () => client,
         },
       })
-      return { lifecycle, agentDirector, agentDirectorOrder, calls }
+      return {
+        lifecycle,
+        agentDirector,
+        agentDirectorOrder,
+        calls,
+        agentDirectorCalls,
+        instanceCallsOf: (name) => {
+          const id = personaInstanceId(personaKey(name))
+          return agentDirectorCalls.filter((c) => c.id === id && INSTANCE_VERBS.has(c.verb))
+        },
+        get installedTemplate() {
+          return installedTemplate()
+        },
+        failTemplateRefresh: (err) => void templateFailures.push(err),
+        client,
+      }
+    }
+
+    /**
+     * The template params the start's install writes, over the start
+     * configuration; see `installedTemplate`. Built once, when the start
+     * applies (`run.resolveStart()`), as `server.ts` installs it at start: the
+     * append file is probed then, never at a later read.
+     */
+    function installTemplateAtStart(start: PersonaConfig): void {
+      installedTemplateCache = buildTemplateParams(start, {
+        accessSync: (path, mode) => accessSync(path, mode),
+        stderrWrite: log,
+      })
+    }
+
+    /** What the start's install wrote; undefined until the start applied. */
+    function installedTemplate(): MakeTemplateParams | undefined {
+      return installedTemplateCache
     }
 
     const timeline: LifecycleTimelineEntry[] = []
+    const applyTimeline: ApplyTimelineEntry[] = []
     const gates = new Map<string, { enter: () => void; wait: Promise<void> }>()
+
+    /** One `timeline` / `applyTimeline` entry (step 5's only in the latter). */
+    function onTimeline(op: LifecycleGateOp | 'template-refresh', key: string, phase: LifecycleTimelineEntry['phase']): void {
+      if (op === 'template-refresh') {
+        applyTimeline.push({ op, key: TEMPLATE_REFRESH_KEY, phase })
+        return
+      }
+      const entry: LifecycleTimelineEntry = { op, key, phase }
+      timeline.push(entry)
+      applyTimeline.push(entry)
+    }
 
     /**
      * One apply-time call of `op` for `key`: its `start` entry, then the
      * test's gate (if one was set with `hold`), then `body`, then `settled`
      * or `rejected`.
      */
-    async function gated<T>(op: LifecycleGateOp, key: string, body: () => Promise<T>): Promise<T> {
-      timeline.push({ op, key, phase: 'start' })
+    async function gated<T>(op: LifecycleGateOp | 'template-refresh', key: string, body: () => Promise<T>): Promise<T> {
+      onTimeline(op, key, 'start')
       let result: T
       try {
         const gate = gates.get(`${op} ${key}`)
@@ -1742,10 +2301,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         }
         result = await body()
       } catch (err) {
-        timeline.push({ op, key, phase: 'rejected' })
+        onTimeline(op, key, 'rejected')
         throw err
       }
-      timeline.push({ op, key, phase: 'settled' })
+      onTimeline(op, key, 'settled')
       return result
     }
 
@@ -1757,7 +2316,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       entry: ReloadLifecycleRecord = record('bring-up', persona.key, via),
     ): Promise<void> {
       entry.result = await bringUps.bringUp(persona, applied.personas)
-      if (entry.result.outcome === 'up') record('launch', persona.key, via)
+      if (entry.result.outcome === 'up') await launch(persona, via)
     }
 
     /**
@@ -1827,8 +2386,24 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
             await composition.lifecycle.teardown(persona)
             return
           }
+          // The old half of a destructive modify keeps its key applied, so
+          // its new half would post through a DM conversation the lifecycle
+          // forgets and the stand-in does not.
+          const stillApplied = controller.applied()?.config.personas.some((p) => p.key === persona.key) === true
+          if (stillApplied && mayHaveCachedDm(persona)) {
+            needsRealLifecycle('destructive-modify teardown', persona, 'it has had a dm destination')
+          }
           bringUps.cancel(persona.key)
           await connections.manager.stop(persona.key)
+        })
+      },
+      async refreshTemplate(applied) {
+        const entry = record('template-refresh', TEMPLATE_REFRESH_KEY, 'apply')
+        return gated('template-refresh', TEMPLATE_REFRESH_KEY, async () => {
+          // The stand-in calls nothing: only the record and timeline show it.
+          if (composition === undefined) return undefined
+          entry.refresh = await composition.lifecycle.refreshTemplate(applied)
+          return entry.refresh
         })
       },
       async reconnectCredentials(persona, applied) {
@@ -1867,6 +2442,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       records,
       startPasses,
       timeline,
+      applyTimeline,
       of: (op) => records.filter((r) => r.op === op),
       keys: (op) => records.filter((r) => r.op === op).map((r) => r.key),
       outcome: (key) => latestResolvedBringUp(key)?.result?.outcome,
@@ -1882,7 +2458,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         startHold.catch(() => undefined)
         return Object.assign(() => release(), { fail })
       },
-      hold(op, key) {
+      hold(op: LifecycleGateOp | 'template-refresh', key: string = TEMPLATE_REFRESH_KEY) {
         let enter!: () => void
         let release!: () => void
         let fail!: (err: Error) => void
@@ -2107,6 +2683,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       appliedKeys: () => controller.applied()?.config.personas.map((p) => p.key),
       resolveStart() {
         outcome = controller.resolveStart()
+        if (outcome.kind === 'applied') {
+          startConfig = outcome.config
+          installTemplateAtStart(outcome.config)
+        }
         return outcome
       },
       startDetection: () => controller.startDetection(),
@@ -2209,6 +2789,19 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         const ref = renderPersonaRef(name, personaKey(name))
         return logs.filter((line) => line.includes(ref))
       },
+      serverConfig,
+      async relaunch(name) {
+        if (!realLaunch || serializer === undefined) throw new Error('reload-harness: run.relaunch() needs opts.realLaunch')
+        const key = personaKey(name)
+        const entry = record('launch', key, 'restart')
+        // As server.ts's restart adapter, in the persona's turn (the restart module's serialize).
+        entry.restart = await serializer.run(key, async () => {
+          const config = serverConfig()
+          return config === undefined ? false : launchSession(key, config, { canLaunch: relaunchGate })
+        })
+        return entry.restart
+      },
+      sessionNotices,
       async stop() {
         if (stopped) return
         stopped = true
@@ -2219,14 +2812,81 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         await connections.manager.stopAll()
       },
     }
+    if (realLaunch) installLaunchSeams()
     runs.push(run)
     return run
+
+    /**
+     * The session manager's module seams, pointed at this run as `server.ts`
+     * installs them (see `opts.realLaunch`); the latest realLaunch run owns
+     * them, and `h.cleanup()` resets them.
+     */
+    function installLaunchSeams(): void {
+      launchSeamsInstalled = true
+      captureConsole({ lines: logs, live: () => !stopped })
+      setClientForTests(composition!.client as Parameters<typeof setClientForTests>[0])
+      _setDialogPollIntervalMs(1)
+      _setDialogReadyTimeoutMs(200)
+      _setTmuxCapturePane(async () => '')
+      _setTmuxSendEnter(async () => {})
+      _setTmuxSessionProber(async () => true)
+      _setSpawnHomeDir(home)
+      // A new server process: nothing in flight, no launched-with dir known.
+      _resetInFlightLaunches()
+      _resetLaunchedWithDirs()
+      _resetFindMissingMemo()
+      setPreLaunchTrustPatcher(trustPatchPersona)
+      setPreLaunchReplyGuard((persona) => {
+        const config = serverConfig()
+        return config === undefined ? undefined : preLaunchReplyGuard(persona, () => serverConfig()?.personas, stateDir)
+      })
+      setConfigDirUnresolvableHook((persona, failure) => bringUps.holdForConfigDir(persona, failure))
+      setSessionNotifier((key, text, options) => {
+        sessionNotices.push({ key, text })
+        return noticeStack.notifier.notify(key, text, options)
+      })
+    }
   }
 
   const h: ReloadHarness = {
     root,
     dir,
     home,
+    stateDir,
+    replyGuardDir,
+    readReplyGuardRecord(name) {
+      const path = join(replyGuardDir, personaKey(name))
+      return existsSync(path) ? readFileSync(path, 'utf-8') : undefined
+    },
+    configDir(name) {
+      const path = inside(join('claude-config', name))
+      mkdirSync(path, { recursive: true })
+      return path
+    },
+    seedRow(persona, seed = {}) {
+      const id = personaInstanceId(personaKey(persona.name))
+      const existing = rows.get(id)
+      const row = existing ?? {
+        state: 'ended',
+        cwd: persona.working_directory,
+        labels: {
+          service: 'cscb',
+          persona: personaKey(persona.name),
+          [CONFIG_DIR_LABEL]: personaConfigDirLabelValue(persona.claude_config_dir, home),
+        },
+      }
+      if (seed.state !== undefined) row.state = seed.state
+      if (seed.cwd !== undefined) row.cwd = seed.cwd
+      if (seed.configDir === null) delete row.labels[CONFIG_DIR_LABEL]
+      else if (seed.configDir !== undefined) row.labels[CONFIG_DIR_LABEL] = personaConfigDirLabelValue(seed.configDir, home)
+      if (seed.labels !== undefined) row.labels = { ...seed.labels }
+      rows.set(id, row)
+      return h.rowOf(persona.name)!
+    },
+    rowOf(name) {
+      const row = rows.get(personaInstanceId(personaKey(name)))
+      return row === undefined ? undefined : { state: row.state, cwd: row.cwd, labels: { ...row.labels } }
+    },
     paths,
     key: (name) => personaKey(name),
     persona(name, overrides = {}) {
@@ -2235,7 +2895,14 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         channel = `${CHANNEL_ID_STEM}${String(channels.size + 1).padStart(3, '0')}`
         channels.set(name, channel)
       }
-      return makePersona({ name, channels: [{ id: channel, delivery: 'all' }], permission_prompts: channel, ...overrides }, root)
+      const configDir =
+        opts.personaConfigDirs === true && !('claude_config_dir' in overrides)
+          ? { claude_config_dir: h.configDir(personaKey(name)) }
+          : {}
+      return makePersona(
+        { name, channels: [{ id: channel, delivery: 'all' }], permission_prompts: channel, ...configDir, ...overrides },
+        root,
+      )
     },
     writeConfig: (input) => writeBytes(paths.config, serialize(input)),
     writeConfigBytes: (bytes) => writeBytes(paths.config, bytes),
@@ -2459,6 +3126,22 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         for (const run of runs) await run.stop()
       } finally {
         tokenWatch?.restore()
+        if (consoleCaptured) console.error = originalConsoleError
+        if (launchSeamsInstalled) {
+          resetClientForTests()
+          _resetDialogPollIntervalMs()
+          _resetDialogReadyTimeoutMs()
+          _resetTmuxDialogHelpers()
+          _resetTmuxSessionProber()
+          _resetSpawnHomeDir()
+          _resetInFlightLaunches()
+          _resetLaunchedWithDirs()
+          _resetFindMissingMemo()
+          _resetPreLaunchTrustPatcher()
+          _resetPreLaunchReplyGuard()
+          setConfigDirUnresolvableHook(undefined)
+          setSessionNotifier(undefined)
+        }
         if (outageStateInstalled) _resetOutageState()
         if (registryTouched) {
           _resetRegistry()

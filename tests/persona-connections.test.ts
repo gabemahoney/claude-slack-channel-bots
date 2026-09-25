@@ -1261,8 +1261,9 @@ describe('no writes', () => {
 // ---------------------------------------------------------------------------
 
 describe('diagnostic lines', () => {
-  test('the label set is exactly the start, credentials, Slack-validation, connection, directory, unclaimed-channel, DM-drop, destination-failed and credentials-change-failed classes', () => {
+  test('the label set is exactly the start, credentials, Slack-validation, connection, directory, unclaimed-channel, DM-drop, destination-failed, credentials-change-failed and config-dir-unresolvable classes', () => {
     expect([...PERSONA_DIAGNOSTIC_CLASSES].sort()).toEqual([
+      'persona-config-dir-unresolvable',
       'persona-connection-lost',
       'persona-connection-restored',
       'persona-credentials-change-failed',
@@ -5694,7 +5695,7 @@ describe('bring-up outcomes (E5)', () => {
       assertNoLeak(f.captured())
     })
 
-    const failure = (step: 'credentials' | 'working-directory' | 'slack', cause: string) => ({ step, class: `class of ${step}`, cause })
+    const failure = (step: 'credentials' | 'working-directory' | 'slack' | 'claude-config-dir', cause: string) => ({ step, class: `class of ${step}`, cause })
     test.each<[string, PersonaBringUpState | undefined, string]>([
       ['no state (the controller never brought it up, or it was cancelled)', undefined, 'its bring-up has not run'],
       ['no outcome yet (its first Slack attempt in flight)', { outcome: undefined, causes: {} }, 'its Slack connection is not serving'],
@@ -5715,6 +5716,11 @@ describe('bring-up outcomes (E5)', () => {
         'retrying: dir missing',
       ],
       ['retrying with a Slack cause only', { outcome: 'retrying', causes: { slack: failure('slack', 'unreachable') } }, 'retrying: unreachable'],
+      [
+        'retrying, held for its claude_config_dir only (bug b.g57)',
+        { outcome: 'retrying', causes: { configDir: failure('claude-config-dir', 'config dir unresolvable') } },
+        'retrying: config dir unresolvable',
+      ],
     ])('describePersonaNotUp: %s', (_label, state, expected) => {
       expect(describePersonaNotUp(state)).toBe(expected)
     })

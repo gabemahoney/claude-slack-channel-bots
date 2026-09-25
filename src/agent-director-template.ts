@@ -1,5 +1,6 @@
 /**
- * agent-director-template.ts — SR-3.2 boot-time template install.
+ * agent-director-template.ts — SR-3.2 boot-time template install, and its
+ * apply-time refresh (b.av2 SR-8.6 step 5).
  *
  * Builds the SR-3.1 `MakeTemplateParams` from the resolved PersonaConfig and calls
  * `client.makeTemplate({ ..., overwrite: true })`, giving us "ensure
@@ -10,8 +11,18 @@
  * rename(2), shipped in agent-director v0.4.3).
  *
  * On any rejection — `ErrTemplateMalformed`, `ErrTemplateNameUnsafe`, any
- * other `AgentDirectorError`, or a non-typed throw — this module records a
- * fatal startup error and exits non-zero. The template is load-bearing.
+ * other `AgentDirectorError`, or a non-typed throw — the boot install records
+ * a fatal startup error and exits non-zero. The template is load-bearing.
+ *
+ * The refresh (`refreshSlackChannelBotTemplate`) rewrites the same template
+ * after a confirmed configuration change whose set of effective config
+ * directories changed (the reload apply runs it only then, from the change
+ * plan's `configDirsChanged`). Only the memory-read `allow` rules follow the
+ * new persona set; every other field, the server-wide `claude_args`
+ * included, is what the boot install wrote (they take effect at the next
+ * start). A rejection is logged in one line and is not fatal, and nothing
+ * retries it: the rules stay as last installed until the next refresh or
+ * start.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -28,6 +39,7 @@ import { getClient, DEFAULT_TEMPLATE_NAME } from './agent-director-client.ts'
 import { recordStartupError } from './startup-errors.ts'
 import type { PersonaConfig } from './config.ts'
 import { effectiveClaudeConfigDirs } from './persona-identity.ts'
+import { describeThrownValue } from './persona-connection-errors.ts'
 
 // ---------------------------------------------------------------------------
 // Injectable dependency surface
@@ -206,34 +218,128 @@ export function buildTemplateParams(
 // SR-3.2 installer
 // ---------------------------------------------------------------------------
 
+/** What the boot install wrote: agent-director's result and the params it installed. */
+export interface InstalledTemplate extends MakeTemplateResult {
+  /**
+   * The params the boot install passed to `makeTemplate`: its server-wide
+   * arguments (`claude_args`, with or without the append-system-prompt flag
+   * as the boot probe decided) are what every apply-time refresh keeps.
+   */
+  params: MakeTemplateParams
+}
+
+/**
+ * One-line detail of a rejected `makeTemplate`: a typed agent-director
+ * error's name and description, else `describeUntyped`'s description of the
+ * thrown value.
+ */
+function describeTemplateFailure(err: unknown, describeUntyped: (err: unknown) => string): string {
+  return err instanceof AgentDirectorError ? `${err.errName}: ${err.errDescription}` : describeUntyped(err)
+}
+
+/** The boot install's detail of an untyped throw: its message. */
+function untypedMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
 /**
  * Install the slack-channel-bot template at boot. Fatal on any rejection
- * from `client.makeTemplate(...)`.
+ * from `client.makeTemplate(...)`. Resolves with agent-director's result and
+ * the params it installed (`InstalledTemplate`), which the apply-time
+ * refresh keeps its server-wide arguments from.
  */
 export async function installSlackChannelBotTemplate(
   personaConfig: PersonaConfig,
   deps?: Partial<TemplateInstallDeps>,
-): Promise<MakeTemplateResult> {
+): Promise<InstalledTemplate> {
   const d = mergeDeps(deps)
   const client = d.getClient() as {
     makeTemplate: (p: MakeTemplateParams) => Promise<MakeTemplateResult>
   }
   const params = buildTemplateParams(personaConfig, deps)
   try {
-    return await client.makeTemplate(params)
+    return { ...(await client.makeTemplate(params)), params }
   } catch (err) {
-    const detail =
-      err instanceof AgentDirectorError
-        ? `${err.errName}: ${err.errDescription}`
-        : err instanceof Error
-        ? err.message
-        : String(err)
     d.recordStartupError(
       'ad-template-install',
-      `Failed to install agent-director template '${params.name}'. Detail: ${detail}`,
+      `Failed to install agent-director template '${params.name}'. Detail: ${describeTemplateFailure(err, untypedMessage)}`,
     )
     d.exit(1)
     // unreachable; placates TS when exit() is mocked in tests
-    return { path: '' }
+    return { path: '', params }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-8.6 step 5 — apply-time refresh
+// ---------------------------------------------------------------------------
+
+/** Dependencies of `refreshSlackChannelBotTemplate`. */
+export interface TemplateRefreshDeps {
+  /** Returns the agent-director client (production: the singleton `getClient`). */
+  getClient: () => unknown
+  /** Receives the refresh's one `[slack]` line (the server log). */
+  log: (line: string) => void
+  /** Home directory for the default config dir's rule; the OS home, read at call time, by default. */
+  home?: string
+}
+
+/** How a refresh ended. */
+export type TemplateRefreshResult =
+  | { kind: 'refreshed'; path: string }
+  /** `makeTemplate` rejected or threw; the line is logged, the template stays as last installed. */
+  | { kind: 'failed' }
+
+/**
+ * Refresh the slack-channel-bot template after a confirmed configuration
+ * change (b.av2 SR-8.6 step 5): `installed` with its memory-read `allow`
+ * rules derived afresh from `applied`'s personas (`deriveMemoryReadAllowRules`,
+ * the boot install's derivation, so the rule shape and its per-project
+ * memory scope are the same, never a config-dir root). Every other field is
+ * `installed`'s: `claude_args` keeps the start-time MCP config and
+ * system-prompt flags (the append file is not probed again), and `name`,
+ * `label`, `deny` and `relay_mode` are unchanged. `applied`'s server-wide
+ * values are not read. Always overwrites. The caller decides when to refresh
+ * (the apply: when the change plan's `configDirsChanged`); this makes the
+ * call every time it is asked.
+ *
+ * Never rejects and never exits: a rejection (a typed agent-director error
+ * or any throw) logs one line and resolves `{ kind: 'failed' }`. The line
+ * names a typed error by its name and description, and any other throw only
+ * through `describeThrownValue` (its type, a safe `code` and its stack
+ * frames, never its message), so a message holding a token never reaches
+ * the log. No startup
+ * error is recorded, nothing is posted and no persona's state is touched,
+ * and nothing retries it. A success logs one line too.
+ */
+export async function refreshSlackChannelBotTemplate(
+  applied: PersonaConfig,
+  installed: MakeTemplateParams,
+  deps: TemplateRefreshDeps,
+): Promise<TemplateRefreshResult> {
+  const allow = deriveMemoryReadAllowRules(applied, deps.home)
+  const params: MakeTemplateParams = { ...installed, allow, overwrite: true }
+  const log = (line: string): void => {
+    try {
+      deps.log(line)
+    } catch {
+      /* a failing logger must not fail the refresh */
+    }
+  }
+  try {
+    const client = deps.getClient() as { makeTemplate: (p: MakeTemplateParams) => Promise<MakeTemplateResult> }
+    const result = await client.makeTemplate(params)
+    log(
+      `[slack] template refresh: rewrote the agent-director template '${params.name}' with the memory-read rules ` +
+        `of the applied config directories (${allow.length} rule(s)); its other arguments are the start's`,
+    )
+    return { kind: 'refreshed', path: result.path }
+  } catch (err) {
+    log(
+      `[slack] template refresh: refreshing the agent-director template '${params.name}' failed ` +
+        `(${describeTemplateFailure(err, describeThrownValue)}); its memory-read rules stay as last installed until the config ` +
+        `directories change again or the server restarts`,
+    )
+    return { kind: 'failed' }
   }
 }

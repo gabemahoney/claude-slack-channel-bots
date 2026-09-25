@@ -41,7 +41,7 @@ import {
   type Persona,
   type PersonaConfig,
 } from './config.ts'
-import { isCredentialsBroken, type PersonaBringUpState } from './persona-bringup-controller.ts'
+import { isCredentialsBroken, slackSideOutcome, type PersonaBringUpState } from './persona-bringup-controller.ts'
 import type { CredentialsDigest } from './persona-credentials.ts'
 import { escapeCause } from './persona-diagnostics.ts'
 import { effectiveClaudeConfigDirs, renderPersonaRef } from './persona-identity.ts'
@@ -225,8 +225,11 @@ export interface CredentialsPersonaChange extends ChangePlanPersonaRef {
    * The persona is retrying its bring-up (Slack-unreachable or
    * directory-broken), or its first Slack attempt is in flight: it has no
    * connection yet and retries with the new content (b.av2 SR-8.6), or, when
-   * the new content is not locally valid, with its current content.
-   * Undefined when its bring-up state could not be queried.
+   * the new content is not locally valid, with its current content. A
+   * persona whose connection works while its launch waits for its
+   * claude_config_dir (bug b.g57) is not retrying here: it is reconnected
+   * (`slackSideOutcome`). Undefined when its bring-up state could not be
+   * queried.
    */
   retrying?: boolean
   /**
@@ -525,8 +528,11 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
       const state = facts.bringUpState?.(persona.key)
       const known = state !== FACT_UNKNOWN
       const credentialsBroken = known ? isCredentialsBroken(state) : undefined
-      // An undefined outcome: its first Slack attempt is in flight, so it has no connection yet.
-      const retrying = known ? state !== undefined && (state.outcome === 'retrying' || state.outcome === undefined) : undefined
+      // By its Slack side: a persona held for its claude_config_dir (b.g57)
+      // with a working connection is reconnected, not retried. An undefined
+      // outcome: its first Slack attempt is in flight, so it has no connection yet.
+      const outcome = known && state !== undefined ? slackSideOutcome(state) : undefined
+      const retrying = known ? state !== undefined && (outcome === 'retrying' || outcome === undefined) : undefined
       const problem = facts.credentialsProblem?.(persona.credentials_file)
       plan.credentials.push({ ...ref, path: persona.credentials_file, credentialsBroken, retrying, problem })
       changed = true
@@ -710,9 +716,20 @@ function modifiedLine(
   return effects.length === 0 ? undefined : `${personaRef(ref)}: ${effects.join('; ')}.`
 }
 
+/**
+ * The server-wide settings only the CLI uses (`stop` and `clean_restart`),
+ * which it takes from the last-applied record (b.av2 SR-8.7): they take
+ * effect for the CLI as soon as an apply rewrites the record, not at the next
+ * server start. The running server does not use them.
+ */
+const CLI_RECORD_SETTINGS: ReadonlySet<string> = new Set<string>(['stop_timeout', 'exit_timeout'])
+
 function settingLine(s: ServerSettingChange): string {
   const prefix = `server-wide setting ${s.name} changed:`
   const recorded = 'once applied, it is recorded'
+  if (CLI_RECORD_SETTINGS.has(s.name)) {
+    return `${prefix} ${recorded}, and the CLI takes it from the record from then on (the running server does not use it).`
+  }
   if (s.inheritedBy === undefined) return `${prefix} ${recorded} and takes effect at the next server start after that.`
   if (s.inheritedBy.length === 0) return `${prefix} ${recorded}; no persona inherits it, so no instance is affected.`
   const who = s.inheritedBy.map((p) => renderPersonaRef(p.name, p.key)).join(', ')

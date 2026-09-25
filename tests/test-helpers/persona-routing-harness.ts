@@ -33,6 +33,8 @@
  *   persona's client from `clientFor`, or the user ID when the persona has no
  *   client (`h.clients.setUnavailable`); the `resolveUserName` option
  *   replaces it;
+ * - the up predicate (`isPersonaUp`), only when the caller passes one, so by
+ *   default every persona counts as up;
  * - a line capture for the module's log seam, the notifier and the hold
  *   (`h.logs`), and an order capture (`h.order`) for ack, archive, config and
  *   identity reads.
@@ -91,8 +93,12 @@ export const NEVER_FIRE_RESTART_DELAY_S = 9999
 // Lost-message recovery states
 // ---------------------------------------------------------------------------
 
-/** The four recovery states a lost-message notice reports (b.av2 SR-7.3), in decision order. */
+/**
+ * The five recovery states a lost-message notice reports (b.av2 SR-7.3;
+ * `not-up` from bug b.g57), in decision order.
+ */
 export const LOST_MESSAGE_STATES: readonly LostMessageState[] = [
+  'not-up',
   'restarting',
   'starting-now',
   'auto-restart-disabled',
@@ -104,6 +110,7 @@ export const LOST_MESSAGE_STATES: readonly LostMessageState[] = [
  * told apart by its text and not only by equality with the builder's output.
  */
 export const LOST_STATE_PHRASES: Readonly<Record<LostMessageState, RegExp>> = {
+  'not-up': /\bnot up\b/i,
   'restarting': /\brestarting\b/i,
   'starting-now': /\bstarting now\b/i,
   'auto-restart-disabled': /\bauto-restart disabled\b/i,
@@ -249,6 +256,8 @@ export interface RoutingHarnessOptions {
   dedupeClock?: PersonaRoutingDeps['dedupeClock']
   /** Replaces the routing's `notify` (default: the real notifier, `h.notifier.notify`); calls are still recorded in `h.notices`. */
   notify?: PersonaRoutingDeps['notify']
+  /** The routing's up predicate (b.av2 SR-6.4, bug b.g57); absent, as by default, every persona counts as up. */
+  isPersonaUp?: PersonaRoutingDeps['isPersonaUp']
 }
 
 /** One notice the routing raised: the persona key and the body, without the notifier's persona prefix. */
@@ -442,6 +451,7 @@ export function makeRoutingHarness(
     },
     log,
     dedupeClock: opts.dedupeClock,
+    isPersonaUp: opts.isPersonaUp,
   })
 
   initRestart(restartDeps)

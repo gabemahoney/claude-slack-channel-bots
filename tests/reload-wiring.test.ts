@@ -10,8 +10,11 @@
  * the bring-up controller holds; SR-8.6 step 6: the preview reads the
  * bring-up controller's state to tell a persona broken by its credentials
  * from one to reconnect; SR-8.6 step 1: `onApplied` swaps the server's
- * applied config to the confirmed persona set over the start-time
- * server-wide values. These assertions fail if main() arms the timer
+ * applied config to `configInEffect(<start-time config>, <confirmed>)`, the
+ * confirmed persona set over the start-time server-wide values (AC 61, the
+ * server-wide row: nothing in server.ts reads the controller's own applied
+ * config, and `configInEffect` itself is tested as a pure function at the end
+ * of this file). These assertions fail if main() arms the timer
  * before the start bring-up returns (or before the refused-start exit), from
  * more than one call site or not at all; if shutdown() stops calling it off;
  * or if the controller is built with anything but the production tick driver,
@@ -22,16 +25,19 @@
  * 2) and bring-ups (step 6) are the controller's default fan-out over its
  * lifecycle members `teardown` and `bringUp`; its in-place updates (step 3,
  * E12 Task 3) over `updateInPlace`; its credentials reconnects (step 4, E13
- * Task 1) over `reconnectCredentials`, and the recovery of a
+ * Task 1) over `reconnectCredentials`, its template refresh (step 5, E13
+ * Task 2) over `refreshTemplate`, and the recovery of a
  * credentials-broken persona (step 6, SR-6.4) over `bringUp` with its
- * `recovery` option. The audit pins that production binds all four, every
+ * `recovery` option. The audit pins that production binds all five, every
  * argument forwarded, to the one `PersonaLifecycle` main() composes with
  * `createPersonaLifecycle` (declared before the controller, assigned once
  * after the bring-up controller exists and before detection is armed), passes
  * no `applySteps` override (which would replace that fan-out), and that the
  * restart timers, the connection manager (the deferred socket close after a
  * Web API auth error, b.ujn), the bring-up retries and the lifecycle share
- * one per-persona serializer. What the default step bodies do with those members
+ * one per-persona serializer, and that the refresh gets the server-wide
+ * template arguments the boot install wrote (a value captured once at start,
+ * never re-read at apply) and the agent-director client. What the default step bodies do with those members
  * is tested in tests/reload-apply.test.ts; what the teardown, the apply
  * bring-up and the in-place update do is tested behaviourally against
  * `createPersonaLifecycle`.
@@ -51,7 +57,8 @@
  * connections). This follows tests/cron-scheduler-wiring.test.ts and
  * tests/start-sweep-wiring.test.ts: it reads the source with comments
  * stripped and anchors on content, never on line numbers. It reads no file
- * but src/server.ts and touches no home directory.
+ * but src/server.ts, imports only the pure `configInEffect` from
+ * src/reload.ts, and touches no home directory.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -73,6 +80,8 @@ import {
   startResolution,
   stripComments,
 } from './test-helpers/source-audit.ts'
+import { makePersonaConfig } from './test-helpers/persona-config.ts'
+import { configInEffect } from '../src/reload.ts'
 
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(readFileSync('src/server.ts', 'utf-8'))
@@ -149,10 +158,12 @@ function endOfBringUpStatement(bringUpAt: number): number {
 }
 
 /**
- * The start-time applied config the controller's `onApplied` spreads. Its
- * body must be exactly a guard that throws while that config is still unset,
- * then the swap `<loaded> = { ...<start-time>, personas: <applied>.personas }`;
- * fails the test otherwise.
+ * The start-time applied config the controller's `onApplied` keeps the
+ * server-wide values of. Its body must be exactly a guard that throws while
+ * that config is still unset, then the swap
+ * `<loaded> = configInEffect(<start-time>, <applied>)` (start-time first:
+ * `configInEffect` keeps its first argument's server-wide values and takes
+ * only the second's personas); fails the test otherwise.
  */
 function startTimeConfig(): string {
   const { loaded } = startResolution(SERVER_CODE)
@@ -161,7 +172,7 @@ function startTimeConfig(): string {
     new RegExp(
       `^\\(?\\s*(\\w+)\\s*\\)?\\s*=>\\s*\\{\\s*` +
         `if\\s*\\(\\s*(\\w+)\\s*===\\s*undefined\\s*\\)\\s*throw\\s+new\\s+Error\\s*\\(\\s*'[^']*'\\s*\\)\\s*;?\\s*` +
-        `${loaded}\\s*=\\s*\\{\\s*\\.\\.\\.\\2\\s*,\\s*personas\\s*:\\s*\\1\\s*\\.\\s*personas\\s*,?\\s*\\}\\s*;?\\s*\\}$`,
+        `${loaded}\\s*=\\s*configInEffect\\s*\\(\\s*\\2\\s*,\\s*\\1\\s*\\)\\s*;?\\s*\\}$`,
     ),
   )
   expect(swap).not.toBeNull()
@@ -254,6 +265,10 @@ describe('server.ts wires the reload detection tick (b.av2 SR-8.2)', () => {
     expect(insideMain(SERVER_CODE, at)).toBe(true)
     expect(at).toBeGreaterThan(assignAt)
     expect(at).toBeLessThan(onlyMethodCall('startDetection').at)
+    // The swap is reload.ts's configInEffect (tested as a pure function
+    // below), not a local stand-in of the same name.
+    expect(importSource(SERVER_CODE, 'configInEffect')).toBe('./reload.ts')
+    expect(indicesOf(/\b(?:let|const|var|function)\s+configInEffect\b/g, SERVER_CODE)).toEqual([])
   })
 
   // SR-8.2: no file watcher. Only the controller's own options are audited, so
@@ -316,35 +331,38 @@ function forwardingHolder(lifecycle: Map<string, string>, member: string, arity:
 
 /**
  * The lifecycle holder the controller's `teardown`, `updateInPlace`,
- * `reconnectCredentials` and `bringUp` members forward to (see the first test
- * below).
+ * `reconnectCredentials`, `refreshTemplate` and `bringUp` members forward to
+ * (see the first test below).
  */
 function lifecycleHolder(): string {
   const lifecycle = objectProperties(controllerProps().get('lifecycle') ?? '')
   const teardown = forwardingHolder(lifecycle, 'teardown', 1)
-  // All four on the same holder. bringUp forwards its third parameter, the
+  // All five on the same holder. bringUp forwards its third parameter, the
   // options carrying `recovery` (SR-8.6 step 6, SR-6.4): a binding that drops
   // it typechecks, but would bring a credentials-broken persona up as new.
   expect(forwardingHolder(lifecycle, 'updateInPlace', 1)).toBe(teardown)
   expect(forwardingHolder(lifecycle, 'reconnectCredentials', 2)).toBe(teardown)
+  expect(forwardingHolder(lifecycle, 'refreshTemplate', 1)).toBe(teardown)
   expect(forwardingHolder(lifecycle, 'bringUp', 3)).toBe(teardown)
   return teardown
 }
 
-describe('server.ts binds the confirmed apply\'s teardown, in-place update, credentials change and bring-up (b.av2 SR-6.1, SR-6.4, SR-6.5, SR-6.6, SR-8.6 steps 3, 4 and 6)', () => {
-  // ReloadLifecycleOps.teardown, .updateInPlace, .reconnectCredentials and
-  // .bringUp are required, so the typecheck catches a missing member; it
-  // cannot catch one bound to something that does nothing, to another
-  // member, or one that drops an optional argument. Without these bindings a
+describe('server.ts binds the confirmed apply\'s teardown, in-place update, credentials change, template refresh and bring-up (b.av2 SR-6.1, SR-6.4, SR-6.5, SR-6.6, SR-8.6 steps 3 to 6)', () => {
+  // ReloadLifecycleOps.teardown, .updateInPlace, .reconnectCredentials,
+  // .refreshTemplate and .bringUp are required, so the typecheck catches a
+  // missing member; it cannot catch one bound to something that does
+  // nothing, to another member, or one that drops an optional argument.
+  // Without these bindings a
   // confirmed removal would leave the persona's connection, session and
   // instance running, a confirmed addition would never come up, a confirmed
   // routing change would be recorded as applied while the persona's cached
   // DM conversation stayed and no line was logged, a rotated token would
-  // never reach the persona's connection, and a credentials-broken persona
-  // would never recover.
-  test('the controller\'s lifecycle members teardown, updateInPlace, reconnectCredentials and bringUp (with its options) forward their arguments to one lifecycle holder, beside the start bring-up', () => {
+  // never reach the persona's connection, a confirmed config-directory
+  // change would leave the template's memory-read rules on the old
+  // directories, and a credentials-broken persona would never recover.
+  test('the controller\'s lifecycle members teardown, updateInPlace, reconnectCredentials, refreshTemplate and bringUp (with its options) forward their arguments to one lifecycle holder, beside the start bring-up', () => {
     const lifecycle = objectProperties(controllerProps().get('lifecycle') ?? '')
-    expect([...lifecycle.keys()].sort()).toEqual(['bringUp', 'reconnectCredentials', 'startBringUp', 'teardown', 'updateInPlace'])
+    expect([...lifecycle.keys()].sort()).toEqual(['bringUp', 'reconnectCredentials', 'refreshTemplate', 'startBringUp', 'teardown', 'updateInPlace'])
     expect(lifecycleHolder()).toMatch(/^\w+$/)
   })
 
@@ -444,7 +462,8 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       ['deleteInstance', 'deletePersonaInstance'],
     ])
     // Functions and objects with a parameter name of the source's choosing.
-    const shaped = ['log', 'replyGuard', 'storageCheck', 'launch']
+    // (`templateRefresh` is pinned in the test after this one.)
+    const shaped = ['log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh']
     expect([...props.keys()].sort()).toEqual([...expected.keys(), ...shaped].sort())
     for (const [dep, value] of expected) expect([dep, props.get(dep)]).toEqual([dep, value])
 
@@ -516,6 +535,46 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(m![2]).toBe(startTimeConfig())
     expect(launch).toBe(onlyCallProps('createPersonaBringUpController').get('launch') ?? '')
   })
+
+  // SR-8.6 step 5: the refresh rewrites only the memory-read rules; the
+  // template's server-wide arguments keep their start-time values (the
+  // server-wide row). `templateRefresh` is required, so the typecheck
+  // catches it missing; it cannot catch arguments rebuilt from the applied
+  // config at apply (a confirmed server-wide change would then reach the
+  // template at once), taken from a second install, or a stand-in client.
+  test('step 5\'s template refresh gets exactly the params the one boot install wrote, captured at start, and the agent-director client', () => {
+    const refresh = objectProperties(onlyCallProps('createPersonaLifecycle').get('templateRefresh') ?? '')
+    expect([...refresh.keys()].sort()).toEqual(['getClient', 'installed'])
+    expect(refresh.get('getClient')).toBe('getClient')
+
+    // `installed` is `<boot install>.params`, where the boot install is
+    // `const <name> = await installSlackChannelBotTemplate(<applied config>)`:
+    // the only install, run on every start in main()'s own statement list,
+    // after the start set the applied config and before detection is armed
+    // (so before any apply could change it), and a `const`, so nothing
+    // replaces it later.
+    const installs = [...SERVER_CODE.matchAll(/\bconst\s+(\w+)\s*=\s*await\s+installSlackChannelBotTemplate\s*\(/g)]
+    expect(installs).toHaveLength(1)
+    const installed = installs[0]![1]!
+    expect(refresh.get('installed')).toBe(`${installed}.params`)
+    const installAt = installs[0]!.index!
+    expect(callsOf(SERVER_CODE, 'installSlackChannelBotTemplate')).toEqual([installAt + installs[0]![0].lastIndexOf('installSlackChannelBotTemplate')])
+    expect(onlyCallArguments(SERVER_CODE, 'installSlackChannelBotTemplate').trim()).toBe(loadedConfigName(SERVER_CODE))
+    expect(atMainTopLevel(SERVER_CODE, installAt)).toBe(true)
+    expect(installAt).toBeGreaterThan(startResolution(SERVER_CODE).assignAt)
+    expect(installAt).toBeLessThan(onlyMethodCall('startDetection').at)
+    expect(installAt).toBeLessThan(callsOf(SERVER_CODE, 'createPersonaLifecycle')[0]!)
+
+    // The production functions, not local stand-ins; server.ts never
+    // refreshes or rebuilds the template itself (the lifecycle does).
+    expect(importSource(SERVER_CODE, 'installSlackChannelBotTemplate')).toBe('./agent-director-template.ts')
+    expect(importSource(SERVER_CODE, 'getClient')).toBe('./agent-director-client.ts')
+    for (const name of ['installSlackChannelBotTemplate', 'getClient']) {
+      expect([name, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
+    }
+    expect(anyCallOf('refreshSlackChannelBotTemplate')).toEqual([])
+    expect(anyCallOf('buildTemplateParams')).toEqual([])
+  })
 })
 
 
@@ -573,5 +632,79 @@ describe('AC 58: in-place consumers read the applied config onApplied swaps, at 
     ['the MCP session tools (reply scope)', () => constObjectProps('sessionToolDeps')],
   ])('AC 58: %s get getPersona: getAppliedPersona', (_consumer, props) => {
     expect(props().get('getPersona')).toBe('getAppliedPersona')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Server-wide settings keep their start-time values until the next start (AC 61)
+// ---------------------------------------------------------------------------
+
+describe('AC 61: server-wide settings keep their start-time values after a confirmed apply (b.av2 SR-8.6, the server-wide row)', () => {
+  // Every consumer of a server-wide setting reads the applied config holder
+  // (at call time, as the AC 58 consumers above, or once at start, as the
+  // listener's bind and port). After an apply that holder is exactly what
+  // configInEffect makes of the start-time config and the confirmed one, so
+  // no consumer can see a confirmed server-wide value before the next start.
+  // The acknowledgement reaction and the reply chunk settings have no
+  // consumer in src/ yet (the reply tool reads access.json until E9); once
+  // they do, they read the same holder.
+  test('configInEffect keeps every server-wide setting of the start-time config and takes only the confirmed persona set', () => {
+    const startTime = makePersonaConfig({ claude_config_dir: '/start/claude' }, '/start-base')
+    const persona = startTime.personas[0]!
+    // Every server-wide setting changed, one added (ack_reaction) and one
+    // dropped (claude_config_dir), and the persona set replaced.
+    const applied = makePersonaConfig(
+      {
+        personas: [{ ...persona, key: 'other', name: 'Other', claude_config_dir: '/applied/claude' }],
+        bind: '0.0.0.0',
+        port: 4200,
+        session_restart_delay: 5,
+        health_check_interval: 30,
+        exit_timeout: 7,
+        stop_timeout: 9,
+        cozempic_prescription: 'aggressive',
+        system_prompt_mode: 'replace',
+        resume_enabled: false,
+        stop_hook_bootstrap: false,
+        agent_director_poll_interval_ms: 12_345,
+        ack_reaction: 'eyes',
+        reply_chunk_limit: 1000,
+        reply_chunk_mode: 'length',
+      },
+      '/applied-base',
+    )
+    const serverWide = Object.keys(startTime).filter((key) => key !== 'personas').sort()
+    // The fixture changes every server-wide setting the start has.
+    for (const key of serverWide) {
+      expect([key, applied[key as keyof typeof applied]]).not.toEqual([key, startTime[key as keyof typeof startTime]])
+    }
+    const before = structuredClone({ startTime, applied })
+
+    const inEffect = configInEffect(startTime, applied)
+    expect(Object.keys(inEffect).sort()).toEqual([...serverWide, 'personas'].sort())
+    for (const key of serverWide) {
+      expect([key, inEffect[key as keyof typeof inEffect]]).toEqual([key, startTime[key as keyof typeof startTime]])
+    }
+    // A setting the start did not have stays absent until the next start.
+    expect('ack_reaction' in inEffect).toBe(false)
+    // The confirmed persona set itself, each persona's resolved (inherited)
+    // values included.
+    expect(inEffect.personas).toBe(applied.personas)
+    // Pure: neither input is changed, and the result is a new object.
+    expect({ startTime, applied }).toEqual(before)
+    expect(inEffect).not.toBe(startTime)
+    expect(inEffect).not.toBe(applied)
+  })
+
+  test('the applied config holder is written only by the start and by onApplied\'s configInEffect, and nothing reads the reload controller\'s own applied config', () => {
+    const { loaded, outcome, assignAt } = startResolution(SERVER_CODE)
+    const writes = [...SERVER_CODE.matchAll(new RegExp(`(?<![\\w.$])${loaded}\\s*(?:[-+*/|&?]{1,2})?=(?![=>])\\s*([^\\n;]*)`, 'g'))]
+    const startTime = startTimeConfig()
+    const param = (controllerProps().get('onApplied') ?? '').match(/^\(?\s*(\w+)/)![1]!
+    expect(writes.map((w) => w[1]!.trim()).sort()).toEqual([`${outcome}.config`, `configInEffect(${startTime}, ${param})`].sort())
+    expect(writes.find((w) => w[1]!.trim() === `${outcome}.config`)!.index).toBe(assignAt)
+    // The controller's applied() carries a confirmed change's server-wide
+    // values; a consumer bound to it would apply them at once.
+    expect(indicesOf(/\.\s*applied\s*\(/g, SERVER_CODE)).toEqual([])
   })
 })

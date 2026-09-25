@@ -233,12 +233,16 @@ Per-persona changes take effect at the apply: an added persona is brought up,
 a removed one is torn down, and `channels`, `delivery`, `permission_prompts`,
 `dm.enabled` and `dm.contact` are updated in place, and a persona whose
 credentials file changed at the same path is reconnected with it (or brought
-up again, when it was down because of its credentials). No check here
-rotates a token: that path has unit coverage only. A server-wide setting such
-as `session_restart_delay` is only recorded at the apply; its preview line
-says it `takes effect at the next server start after that`. For such an edit,
-confirm it, then restart the test server with the "Guarded restart" in the
-DMs section.
+up again, when it was down because of its credentials). A persona whose
+`credentials_file` path or `working_directory` changed is torn down and
+brought up fresh (a `DESTRUCTIVE:` line), and a changed `claude_config_dir` or
+`stop_hook_bootstrap` takes effect at the persona's next launch. No check here
+rotates a token, moves a persona's paths or changes those two settings: those
+paths have unit coverage only (b.av2 SR-14 gives AC 59, 60 and 61 no live
+leg). A server-wide setting such as `session_restart_delay` or `port` is only
+recorded at the apply; its preview line says it `takes effect at the next
+server start after that`. For such an edit, confirm it, then restart the test
+server with the "Guarded restart" in the DMs section.
 
 The steps that use the gesture are "Turn A's DMs on", the lost-message setup,
 Check 22's teardown, and the runtime add and remove section. The Reboot
@@ -1497,12 +1501,11 @@ have passed first: Check 23 needs exactly A, B and C applied.
 
 D's entry below sets no `claude_config_dir`, like A's, B's and C's, so D
 launches with the same effective config directory the start already
-prepared. Don't give D a new `claude_config_dir`: with the build under test,
-a persona added at an apply with a new effective config directory launches
-from an agent-director template without that directory's memory Read allow
-rule, so D's memory reads would raise permission prompts until the next
-start. If a run does use one, expect those prompts and note them; they don't
-fail these checks.
+prepared. Don't give D a new `claude_config_dir`: these checks don't cover
+it. If a run does use one, the apply rewrites the agent-director template's
+memory-read rules before D is brought up (one `[slack] template refresh:`
+line). If that line says `failed`, expect a permission prompt for each of D's
+memory reads and note them; they don't fail these checks.
 
 Redefine `LOG`, `since` and `guard` (from the DMs section) in any new shell.
 

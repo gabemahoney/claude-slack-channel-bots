@@ -347,9 +347,14 @@ export type CannedRowPersona = Pick<Persona, 'key' | 'working_directory' | 'clau
  * directory, instance ID `cscb_<key>`, tmux session `slack_bot_<key>`, and the
  * labels `service=cscb`, `persona=<key>` and `config_dir=<value>` (no
  * `channel` label). The `config_dir` value comes from the production helper
- * `personaConfigDirLabelValue` (real path, lexical fallback) against the
- * caller's `home`, never the OS home. No I/O beyond that helper's realpath;
- * nothing is created or written.
+ * `personaConfigDirLabelValue` (the strict real path, no lexical fallback;
+ * bug b.g57) against the caller's `home`, never the OS home. A
+ * claude_config_dir that cannot be resolved (a symlink on its path pointing
+ * to nothing, a dropped mount) makes that helper throw
+ * `ConfigDirUnresolvableError`, so the persona forms of `cannedListRow` and
+ * `cannedGetResult` throw it too, even when the overrides replace `labels`:
+ * build such a row while the directory resolves, or use the no-persona form.
+ * No I/O beyond that helper's realpath; nothing is created or written.
  */
 function personaRowDefaults(persona: CannedRowPersona, home: string): {
   cwd: string

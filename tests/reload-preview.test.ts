@@ -3,7 +3,9 @@
  * pending-change preview (b.av2 SR-8.4, SR-8.6, SR-10.3) in
  * src/reload-plan.ts: `buildChangePlan`, `changePlanCounts`,
  * `renderChangePlanCounts`, `renderPreviewLines`, `renderPreview`,
- * `renderPreviewLogLines`, `renderInvalidLogLine` and `isCredentialsBroken`,
+ * `renderPreviewLogLines`, `renderInvalidLogLine`, `isCredentialsBroken` and
+ * `slackSideOutcome` (the bring-up outcome without a claude_config_dir hold,
+ * bug b.g57, which the credentials row's `retrying` fact reads),
  * plus the plan's `configDirsChanged` flag (the agent-director template
  * refresh, SR-8.6 step 5, never rendered) and facts the caller could not
  * gather (`FACT_UNKNOWN`).
@@ -32,18 +34,21 @@ import { join } from 'node:path'
 
 import {
   parsePersonaConfigBytes,
+  PERSONA_TOP_LEVEL_KEYS,
   type PersonaConfig,
   type PersonaConfigInput,
   type PersonaInput,
 } from '../src/config.ts'
-import type { PersonaBringUpState } from '../src/persona-bringup-controller.ts'
+import { slackSideOutcome, type PersonaBringUpState } from '../src/persona-bringup-controller.ts'
 import { credentialsReadProblem } from '../src/persona-credentials.ts'
 import {
+  PERSONA_CONFIG_DIR_UNRESOLVABLE,
   PERSONA_CREDENTIALS_INVALID,
   PERSONA_CREDENTIALS_REFUSED,
   PERSONA_DIRECTORY_MISSING,
   PERSONA_SLACK_UNREACHABLE,
 } from '../src/persona-diagnostics.ts'
+import type { PersonaBringUpStep } from '../src/persona-start.ts'
 import {
   buildChangePlan,
   changePlanCounts,
@@ -496,7 +501,9 @@ describe('credentials changed', () => {
     ])
   })
 
-  const failure = (step: 'credentials' | 'working-directory' | 'slack', cls: string) => ({ step, class: cls, cause: 'x' })
+  const failure = (step: PersonaBringUpStep, cls: string) => ({ step, class: cls, cause: 'x' })
+  /** Its launch waits for its claude_config_dir to resolve (bug b.g57, `holdForConfigDir`). */
+  const configDirHold = () => failure('claude-config-dir', PERSONA_CONFIG_DIR_UNRESOLVABLE)
 
   /** The bring-up states a credentials-changed persona can be in. */
   const STATES = {
@@ -511,6 +518,13 @@ describe('credentials changed', () => {
     up: { outcome: 'up', causes: {} },
     /** Its first Slack attempt is in flight: no outcome yet, so no connection yet. */
     firstAttempt: { outcome: undefined, causes: {} },
+    /** Bug b.g57: its connection works, its launch waits for its claude_config_dir. */
+    heldConfigDir: { outcome: 'retrying', causes: { configDir: configDirHold() } },
+    /** Slack unreachable at its bring-up and held for its claude_config_dir too: no connection yet. */
+    heldAndRetryingSlack: {
+      outcome: 'retrying',
+      causes: { slack: failure('slack', PERSONA_SLACK_UNREACHABLE), configDir: configDirHold() },
+    },
   } satisfies Record<string, PersonaBringUpState>
 
   test.each<[string, PersonaBringUpState | undefined, boolean, boolean]>([
@@ -521,6 +535,8 @@ describe('credentials changed', () => {
     ['retrying: working directory missing', STATES.retryingDirectory, false, true],
     ['up', STATES.up, false, false],
     ['in its first Slack attempt (no outcome yet)', STATES.firstAttempt, false, true],
+    ['held for its claude_config_dir with a working connection (b.g57): not retrying', STATES.heldConfigDir, false, false],
+    ['retrying for Slack and held for its claude_config_dir', STATES.heldAndRetryingSlack, false, true],
     ['the controller does not know', undefined, false, false],
   ])('a persona %s is credentials-broken and retrying exactly as its state says', (_label, state, broken, retrying) => {
     const { plan } = preview(applied(), { ...bravoRotated(), bringUpState: () => state })
@@ -617,6 +633,24 @@ describe('credentials changed', () => {
       (c) => `, but it cannot be used (${c}): it keeps retrying with its current content, instance kept.`,
     ],
     [
+      'held for its claude_config_dir with a working connection (b.g57), content valid: reconnected, not retried',
+      STATES.heldConfigDir,
+      undefined,
+      () => ': a new connection opens, then the old one closes, instance kept.',
+    ],
+    [
+      'held for its claude_config_dir with a working connection (b.g57), file missing',
+      STATES.heldConfigDir,
+      () => MISSING,
+      (c) => `, but it cannot be used (${c}): the current connection is kept, instance kept.`,
+    ],
+    [
+      'retrying for Slack and held for its claude_config_dir, content valid',
+      STATES.heldAndRetryingSlack,
+      undefined,
+      () => ': it has no connection yet, so it retries with the new content, instance kept.',
+    ],
+    [
       'broken by its local credentials check, content valid',
       STATES.brokenLocally,
       undefined,
@@ -663,6 +697,39 @@ describe('credentials changed', () => {
       `persona "bravo" (key=bravo): credentials file ${JSON.stringify(credentialsOf('bravo'))} changed${rest(problem ?? '')}`,
     ])
     // `render` ran assertNoLeak over the plan and every form: a cause from sentinel-bearing content leaked nothing.
+  })
+
+  // Rows: a bring-up state's Slack-side outcome (b.g57), then the state. Only
+  // a `retrying` outcome whose one cause is the claude_config_dir hold is `up`
+  // on the Slack side; any other cause beside the hold, or another outcome,
+  // keeps it as it is.
+  test.each<[string, PersonaBringUpState['outcome'], PersonaBringUpState]>([
+    ['held for its claude_config_dir alone', 'up', STATES.heldConfigDir],
+    ['held and retrying for Slack', 'retrying', STATES.heldAndRetryingSlack],
+    [
+      'held and retrying for its working directory',
+      'retrying',
+      { outcome: 'retrying', causes: { directory: failure('working-directory', PERSONA_DIRECTORY_MISSING), configDir: configDirHold() } },
+    ],
+    [
+      'held with a credentials cause beside it',
+      'retrying',
+      { outcome: 'retrying', causes: { credentials: failure('credentials', PERSONA_CREDENTIALS_INVALID), configDir: configDirHold() } },
+    ],
+    [
+      'broken with the hold beside its credentials cause',
+      'broken',
+      { outcome: 'broken', causes: { slack: failure('slack', PERSONA_CREDENTIALS_REFUSED), configDir: configDirHold() } },
+    ],
+    ['broken with the hold as its only cause', 'broken', { outcome: 'broken', causes: { configDir: configDirHold() } }],
+    ['retrying with no cause named', 'retrying', { outcome: 'retrying', causes: {} }],
+    ['retrying for Slack, not held', 'retrying', STATES.retryingSlack],
+    ['retrying for its working directory, not held', 'retrying', STATES.retryingDirectory],
+    ['up', 'up', STATES.up],
+    ['broken by its credentials', 'broken', STATES.brokenRefused],
+    ['in its first Slack attempt (no outcome yet)', undefined, STATES.firstAttempt],
+  ])('slackSideOutcome: a persona %s is %s on the Slack side', (_label, expected, state) => {
+    expect(slackSideOutcome(state)).toBe(expected)
   })
 
   test('why the content cannot be used is asked only for a credentials-changed persona, by its path, and never in dry run', () => {
@@ -953,41 +1020,83 @@ describe('next-launch changes', () => {
 // ---------------------------------------------------------------------------
 
 describe('server-wide settings', () => {
-  test('a changed port is recorded for the next server start and changes no persona', () => {
-    const { plan, lines } = preview(edited((c) => (c.port = 3200)))
+  /** The E11 line of a server-wide setting the running server reads: recorded, effective at the next start. */
+  const nextStartLine = (name: string) =>
+    `server-wide setting ${name} changed: once applied, it is recorded and takes effect at the next server start after that.`
+  /** The line of a setting only the CLI reads, from the last-applied record (`stop_timeout`, `exit_timeout`). */
+  const cliRecordLine = (name: string) =>
+    `server-wide setting ${name} changed: once applied, it is recorded, and the CLI takes it from the record ` +
+    'from then on (the running server does not use it).'
+
+  // Rows: a setting only the CLI reads (stop and clean_restart take it from the record), and a changed value.
+  test.each<[string, number]>([
+    ['stop_timeout', 45],
+    ['exit_timeout', 300],
+  ])('a changed %s is recorded and the CLI takes it from the record from then on (not at the next server start); it changes no persona', (name, value) => {
+    const { plan, lines } = preview(edited((c) => (c[name] = value)))
 
     expect(plan).toEqual(
-      planWith({ settings: [{ name: 'port' }], unchanged: [ref('alpha', 0), ref('bravo', 1), ref('charlie', 2)] }),
+      planWith({ settings: [{ name }], unchanged: [ref('alpha', 0), ref('bravo', 1), ref('charlie', 2)] }),
     )
-    expect(lines).toEqual([
-      header({ settings: 1 }),
-      'server-wide setting port changed: once applied, it is recorded and takes effect at the next server start after that.',
-    ])
+    expect(lines).toEqual([header({ settings: 1 }), cliRecordLine(name)])
+  })
+
+  // Rows: every server-wide setting the running server reads and no persona
+  // inherits (all but the CLI's two above and the inheritable
+  // claude_config_dir and stop_hook_bootstrap, pinned with their inheritors),
+  // and a changed value (made when the test runs: paths are under its root).
+  const NEXT_START_ROWS: Array<[string, () => unknown]> = [
+    ['bind', () => '0.0.0.0'],
+    ['port', () => 3200],
+    ['session_restart_delay', () => 61],
+    ['health_check_interval', () => 121],
+    ['mcp_config_path', () => join(root, 'other-mcp.json')],
+    ['append_system_prompt_file', () => join(root, 'prompt.md')],
+    ['cozempic_prescription', () => 'gentle'],
+    ['system_prompt_mode', () => 'none'],
+    ['message_archive_db', () => join(root, 'archive.db')],
+    ['resume_enabled', () => false],
+    ['agent_director_poll_interval_ms', () => 2000],
+    ['cron_table_path', () => join(root, 'other-crontab')],
+    ['cron_log_path', () => join(root, 'other-cron.log')],
+    ['cron_log_max_bytes', () => 1024],
+    ['ack_reaction', () => 'eyes'],
+    ['reply_chunk_limit', () => 2000],
+    ['reply_chunk_mode', () => 'length'],
+  ]
+
+  test('the next-start rows, the CLI\'s two and the two inheritable defaults are every server-wide setting (a new one needs its wording decided here)', () => {
+    const covered = [...NEXT_START_ROWS.map(([name]) => name), 'stop_timeout', 'exit_timeout', 'claude_config_dir', 'stop_hook_bootstrap']
+    expect(covered.sort()).toEqual(PERSONA_TOP_LEVEL_KEYS.filter((k) => k !== 'personas').sort())
+  })
+
+  test.each(NEXT_START_ROWS)('a changed %s keeps the E11 line: recorded, effective at the next server start; it changes no persona', (name, value) => {
+    const { plan, lines } = preview(edited((c) => (c[name] = value())))
+
+    expect(plan).toEqual(
+      planWith({ settings: [{ name }], unchanged: [ref('alpha', 0), ref('bravo', 1), ref('charlie', 2)] }),
+    )
+    expect(lines).toEqual([header({ settings: 1 }), nextStartLine(name)])
   })
 
   test.each<[string, (c: EditableInput) => void, string[]]>([
-    ['a path setting moved to another real path', (c) => (c.cron_log_path = join(root, 'other.log')), ['cron_log_path']],
-    ['a path setting that was unset', (c) => (c.message_archive_db = join(root, 'archive.db')), ['message_archive_db']],
+    ['a path setting moved to another real path', (c) => (c.cron_log_path = join(root, 'other.log')), [nextStartLine('cron_log_path')]],
+    ['a path setting that was unset', (c) => (c.message_archive_db = join(root, 'archive.db')), [nextStartLine('message_archive_db')]],
     [
-      'several settings, in the fixed key order',
+      'several settings, in the fixed key order, each with its own wording',
       (c) => {
         c.stop_timeout = 45
         c.reply_chunk_limit = 2000
         c.bind = '0.0.0.0'
       },
-      ['bind', 'stop_timeout', 'reply_chunk_limit'],
+      [nextStartLine('bind'), cliRecordLine('stop_timeout'), nextStartLine('reply_chunk_limit')],
     ],
-  ])('%s is a changed setting', (_label, mutate, names) => {
+  ])('%s is a changed setting', (_label, mutate, expected) => {
     const { plan, lines } = preview(edited(mutate))
 
-    expect(plan.settings).toEqual(names.map((name) => ({ name })))
-    expect(changePlanCounts(plan)).toEqual(counts({ settings: names.length }))
-    expect(lines.slice(1)).toEqual(
-      names.map(
-        (name) =>
-          `server-wide setting ${name} changed: once applied, it is recorded and takes effect at the next server start after that.`,
-      ),
-    )
+    expect(plan.settings).toEqual(expected.map((line) => ({ name: /^server-wide setting (\w+) /.exec(line)![1] })))
+    expect(changePlanCounts(plan)).toEqual(counts({ settings: expected.length }))
+    expect(lines.slice(1)).toEqual(expected)
   })
 })
 

@@ -19,6 +19,12 @@
  * outcomes and the directory-retry timers are the bring-up controller's
  * (`persona-bringup-controller.ts`).
  *
+ * `checkPersonaConfigDir` (bug b.g57) is the pre-launch check of a persona's
+ * effective claude_config_dir: its real path with no lexical fallback
+ * (`resolveRealPathStrict`), or `persona-config-dir-unresolvable`. The
+ * session manager runs it before every launch; the bring-up controller
+ * re-checks it while a launch waits for the directory.
+ *
  * Logging contract (same as `persona-credentials.ts`): every failure's
  * formatted line is returned; when a `log` is passed each failure line is
  * emitted through it exactly once per call; with none nothing is emitted.
@@ -40,7 +46,7 @@
 
 import { accessSync, constants as fsConstants, realpathSync, statSync } from 'node:fs'
 
-import type { Persona } from './config.ts'
+import { resolveRealPathStrict, type Persona, type StrictRealPathFs } from './config.ts'
 import {
   checkPersonaCredentialsAndDigest,
   describeRealPathCollision,
@@ -53,12 +59,14 @@ import {
   type OtherCredentialsPersona,
 } from './persona-credentials.ts'
 import {
+  PERSONA_CONFIG_DIR_UNRESOLVABLE,
   PERSONA_DIRECTORY_MISSING,
   PERSONA_DIRECTORY_UNUSABLE,
   personaCheckFailure,
   type PersonaCheckFailure,
   type PersonaDiagnosticLogger,
 } from './persona-diagnostics.ts'
+import { resolveClaudeConfigDir } from './persona-identity.ts'
 
 // ---------------------------------------------------------------------------
 // File-system seam
@@ -199,6 +207,60 @@ export function checkPersonaWorkingDirectory(
     return fail(PERSONA_DIRECTORY_UNUSABLE, `working directory is not searchable${errnoSuffix(err)}`)
   }
   return { ok: true }
+}
+
+/** The persona whose effective claude_config_dir is checked (`checkPersonaConfigDir`). */
+export type ConfigDirPersona = Pick<Persona, 'index' | 'name' | 'key' | 'claude_config_dir'>
+
+/** Result of `checkPersonaConfigDir`: the directory's real path (or the one it will have once created), or the failure. */
+export type ConfigDirCheckResult =
+  | { ok: true; realPath: string }
+  | PersonaCheckFailure<typeof PERSONA_CONFIG_DIR_UNRESOLVABLE>
+
+/** Options for `checkPersonaConfigDir`. */
+export interface CheckPersonaConfigDirOptions {
+  /** Home directory for `~` and an unset directory (`<home>/.claude`); defaults to the OS home, read at call time. */
+  home?: string
+  /** File-system overrides for the resolution; unset operations use the real file system. */
+  fs?: Partial<StrictRealPathFs>
+  /** When given, a failure's line is emitted through it exactly once. */
+  log?: PersonaDiagnosticLogger
+}
+
+/** What a `persona-config-dir-unresolvable` cause says after the resolution failure. */
+const CONFIG_DIR_UNRESOLVABLE_CONSEQUENCE = 'its session is kept, and its launch waits until it resolves'
+
+/**
+ * Check that a persona's effective claude_config_dir can be resolved to a
+ * real path before it is launched (bug b.g57), with `resolveRealPathStrict`:
+ * no lexical fallback. A directory not created yet under a resolvable
+ * ancestor passes, with the real path it will have. A symlink on its path
+ * that points to nothing, or any other resolution failure, is
+ * `persona-config-dir-unresolvable`, naming the configured directory
+ * (tilde-expanded and absolute; `<home>/.claude` when none is configured) as
+ * its path and the errno code in its cause. Never throws; opens nothing.
+ */
+export function checkPersonaConfigDir(
+  persona: ConfigDirPersona,
+  options: CheckPersonaConfigDirOptions = {},
+): ConfigDirCheckResult {
+  const path = resolveClaudeConfigDir(persona.claude_config_dir, options.home)
+  const resolution = resolveRealPathStrict(path, options.fs)
+  if (resolution.resolved) return { ok: true, realPath: resolution.path }
+  const reason = resolution.danglingSymlink
+    ? `${resolution.code}: a symlink on its path points to nothing`
+    : resolution.code
+  return personaCheckFailure(
+    {
+      class: PERSONA_CONFIG_DIR_UNRESOLVABLE,
+      name: persona.name,
+      key: persona.key,
+      index: persona.index,
+      path,
+      cause: `claude_config_dir cannot be resolved to a real path (${reason}); ${CONFIG_DIR_UNRESOLVABLE_CONSEQUENCE}`,
+    },
+    options.log,
+  )
 }
 
 /**

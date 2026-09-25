@@ -45,11 +45,12 @@
  * 6. Lost message (b.av2 SR-4.6, SR-7.3): when P has no live session, or its
  *    session has lost its GET stream, the message is dropped with no ack
  *    reaction, a human-triggered restart of P is scheduled only in the
- *    "starting now" state (`src/lost-message.ts` decides the state from the
- *    restart guards), and one lost-message notice naming the sender and the
- *    state goes to P's destination through the injected `notify`. Nothing is
- *    posted in the source conversation, and the message text is never in the
- *    notice.
+ *    "starting now" state (`src/lost-message.ts` decides the state from
+ *    whether P is up and the restart guards; a P that is not up is never
+ *    restarted from here), and one lost-message notice naming the sender and
+ *    the state goes to P's destination through the injected `notify`. Nothing
+ *    is posted in the source conversation, and the message text is never in
+ *    the notice.
  *
  * Deferred rule and where it is completed: the ack reaction's source and
  * keying (E9; today it comes from `access.json`).
@@ -58,8 +59,8 @@
  * client, reads no token, file or environment variable, starts no timer and
  * logs nothing. Every Slack client, the persona config, the bot identity, the
  * name resolver, the archive writer, the ack-reaction source, the notice sink,
- * the logger and (optionally) the dedupe clock are injected through
- * `createPersonaRouting`. The session lookup comes from
+ * the logger and (optionally) the dedupe clock and the up predicate are
+ * injected through `createPersonaRouting`. The session lookup comes from
  * the registry and the restart guards from the restart and backoff modules,
  * so tests drive their real state. This module never calls agent-director.
  *
@@ -152,6 +153,13 @@ export interface PersonaRoutingDeps {
   log(line: string): void
   /** Clock for the per-persona dedupe stores, in milliseconds; defaults to `Date.now`. */
   dedupeClock?: () => number
+  /**
+   * Whether persona P is up (b.av2 SR-6.4; production: the server's one
+   * `isPersonaUp` predicate), asked for a lost message only: a message lost
+   * for a persona that is not up schedules no restart and reports the
+   * `not-up` recovery state. Without it every persona counts as up.
+   */
+  isPersonaUp?(key: string): boolean
 }
 
 /** A persona-routing instance. */
@@ -395,12 +403,15 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
 
   /**
    * b.av2 SR-4.6, SR-7.3: the message is lost. Decide the recovery state from
-   * P's real restart guards (pending, auto-restart disabled, cap), schedule a
-   * human-triggered restart of P in `cwd` only when the state is
-   * `starting-now`, and raise one lost-message notice naming `senderLabel`
-   * and the state at P's destination. Nothing is posted in the source
-   * conversation. The notice is awaited so it is issued before dispatch
-   * returns; a failing sink is logged, never thrown.
+   * whether P is up (`isPersonaUp`: a persona that is not up, such as one
+   * whose launch waits for its claude_config_dir, is launched by its own
+   * recovery, never restarted from here) and P's real restart guards
+   * (pending, auto-restart disabled, cap), schedule a human-triggered restart
+   * of P in `cwd` only when the state is `starting-now`, and raise one
+   * lost-message notice naming `senderLabel` and the state at P's
+   * destination. Nothing is posted in the source conversation. The notice is
+   * awaited so it is issued before dispatch returns; a failing sink is
+   * logged, never thrown.
    */
   async function handleLostMessage(
     persona: Persona,
@@ -409,6 +420,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     config: PersonaRoutingConfig,
   ): Promise<void> {
     const state = decideLostMessageState({
+      isNotUp: () => deps.isPersonaUp?.(persona.key) === false,
       isRestartPending: () => isRestartPendingOrActive(persona.key),
       isAutoRestartDisabled: () => config.session_restart_delay === 0,
       isAtRestartLimit: () => isAtCap(persona.key, RESTART_FAILURE_CAP),

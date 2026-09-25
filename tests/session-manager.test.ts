@@ -123,6 +123,11 @@ import {
   killPersonaInstance,
   deletePersonaInstance,
   whenLaunchSettled,
+  ConfigDirUnresolvableError,
+  _setConfigDirFs,
+  _resetConfigDirFs,
+  setConfigDirUnresolvableHook,
+  type ConfigDirUnresolvableHook,
   type StartupPersonaOutcome,
 } from '../src/session-manager.ts'
 import {
@@ -137,7 +142,7 @@ import { UNATTRIBUTABLE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
 import { resolveJsonlPath } from '../src/cozempic.ts'
 import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../src/persona-destination-hold.ts'
-import { PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
+import { PERSONA_CONFIG_DIR_UNRESOLVABLE, PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
 import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import {
   makeDeferredConnect,
@@ -355,6 +360,8 @@ afterEach(() => {
   _resetPreLaunchTrustPatcher()
   _resetPreLaunchReplyGuard()
   _resetLaunchedWithDirs()
+  _resetConfigDirFs()
+  setConfigDirUnresolvableHook(undefined)
   setSessionNotifier(undefined)
   installedHold?.cancelAll()
   installedHold = undefined
@@ -697,8 +704,9 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
 
 // ---------------------------------------------------------------------------
 // b.av2 SR-2.2, SR-1.5 — the `config_dir` label hashes the REAL path of the
-// effective claude_config_dir, falling back to the lexical path when it cannot
-// be resolved.
+// effective claude_config_dir; a directory not created yet gets the label of
+// the real path it will have (bug b.g57: no lexical fallback; see the b.g57
+// block for the unresolvable and not-yet-created cases).
 // ---------------------------------------------------------------------------
 
 describe('spawnForPersona: config_dir label (SR-2.2, SR-1.5)', () => {
@@ -763,7 +771,7 @@ describe('spawnForPersona: config_dir label (SR-2.2, SR-1.5)', () => {
     expect(byKey.get('via_link')!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(link)
   })
 
-  test('a configured path that does not exist falls back to its lexical form', async () => {
+  test('a configured path not created yet, with no symlink on it, gets the label of that path (its nearest existing ancestor\'s real path plus the rest)', async () => {
     const missing = join(fixtureDir, 'not-created', 'claude')
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x', claude_config_dir: missing } }, fixtureDir)
     const params = (await spawnAll(cfg)).get('C')!
@@ -2353,6 +2361,78 @@ describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// b.av2 SR-8.6 next-launch rows (AC 59): a launch takes the persona's
+// effective claude_config_dir and stop_hook_bootstrap from the applied set it
+// is handed at that moment (the server hands `personaConfig`, which a
+// confirmed apply's step 1 swaps), and the reply guard reads the live applied
+// set; nothing is kept from an earlier launch.
+// ---------------------------------------------------------------------------
+
+describe('next launch: the applied values at launch time (b.av2 SR-8.6 next-launch rows, AC 59)', () => {
+  test('claude_config_dir and stop_hook_bootstrap changed between two launches: the first uses the old values; the second deletes the old-label row and spawns fresh with the new CLAUDE_CONFIG_DIR (not created yet, under a symlinked parent) and writes the new record', async () => {
+    useSpawnHome()
+    const work = fixtureSubdir('work')
+    const oldDir = fixtureSubdir('claude-config-old')
+    const realParent = fixtureSubdir('config-parent-real')
+    const linkParent = join(fixtureDir, 'config-parent-link')
+    symlinkSync(realParent, linkParent)
+    // Claude Code creates it at first launch; its parent's real path differs from the lexical one.
+    const newDir = join(linkParent, 'claude-config-new')
+    const configFor = (claude_config_dir: string, stop_hook_bootstrap: boolean) =>
+      makeMultiPersonaConfig([{ name: GUARD_NAME, working_directory: work, claude_config_dir, stop_hook_bootstrap }], fixtureDir, {
+        agent_director_poll_interval_ms: 1,
+      })
+    const before = configFor(oldDir, true)
+    const after = configFor(newDir, false)
+    let applied = before
+    const rg = makeReplyGuardRecordDir({ parentDir: fixtureDir })
+    installRecordingReplyGuard(() => applied.personas, rg.stateDir, [])
+
+    const first = makeStubCallLog()
+    installStub(first)
+    expect(await launchSession(GUARD_KEY, applied)).toBe(true)
+    expect(first.spawnCalls).toHaveLength(1)
+    expect(first.spawnCalls[0]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(oldDir)
+    expect(first.spawnCalls[0]!.label).toContain(configDirLabelFor(oldDir))
+    expect(rg.readRecord(GUARD_KEY)).toBe('true')
+    // The row the first launch left behind carries the old label.
+    const row = personaRow(before, GUARD_KEY, { state: 'ended' })
+    expect(first.spawnCalls[0]!.label).toContain(`config_dir=${row.labels['config_dir']}`)
+
+    // Step 1 of a confirmed apply swaps the applied set; the next launch is handed it.
+    applied = after
+    resetClientForTests()
+    const second = makeStubCallLog()
+    installStub({
+      ...second,
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: GUARD_INSTANCE }),
+      ],
+      getResult: row,
+    })
+    let result: boolean | 'skipped' | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await launchSession(GUARD_KEY, applied)
+    })
+
+    expect(result).toBe(true)
+    expect(second.resumeCalls).toHaveLength(0)
+    expect(second.deleteCalls.map((d) => d.claude_instance_id)).toEqual([[GUARD_INSTANCE]])
+    expect(second.spawnCalls).toHaveLength(2)
+    expect(second.spawnCalls[1]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(newDir)
+    expect(second.spawnCalls[1]!.label).toEqual([
+      'service=cscb',
+      `persona=${GUARD_KEY}`,
+      `config_dir=${configDirLabelValue(join(realpathSync(realParent), 'claude-config-new'))}`,
+    ])
+    expect(rg.readRecord(GUARD_KEY)).toBe('false')
+    // Not held for the directory that does not exist yet (bug b.g57, Director decision 1).
+    expect(errLog).not.toContain(PERSONA_CONFIG_DIR_UNRESOLVABLE)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // b.av2 SR-6.3 / AC 4 — the fixed instance ID and one in-flight launch per persona
 // ---------------------------------------------------------------------------
 
@@ -3059,6 +3139,393 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
     expect(calls.deleteCalls.map((d) => d.claude_instance_id)).toEqual([['cscb_C']])
     expect(calls.spawnCalls).toHaveLength(2)
     expect(errLog).toContain(`spawnForPersona: ${renderPersonaRef('C', 'C')} config_dir label changed (was=${stale}`)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Bug b.g57 — a claude_config_dir with no real path has no `config_dir` label
+// (no lexical fallback): the launch keeps the row, makes no agent-director
+// call that could kill, delete, spawn or resume, hands the persona to the
+// hold hook and is `'skipped'` on the restart path. The failing realpath is
+// injected through the session manager's `_setConfigDirFs` seam (reset in
+// the file's afterEach, with the hook); dangling symlinks and not-yet-created
+// directories are real, under the fixture dir.
+// ---------------------------------------------------------------------------
+
+/** An errno-style error, as `fs.realpathSync` throws it. */
+function errnoError(code: string): NodeJS.ErrnoException {
+  return Object.assign(new Error(`${code}: injected`), { code })
+}
+
+/** A realpath that throws `code` for `dir` and anything under it while `broken()` holds, and is the real one otherwise. */
+function realpathFailingUnder(dir: string, broken: () => boolean, code = 'EIO'): (path: string) => string {
+  return (path) => {
+    if (broken() && (path === dir || path.startsWith(`${dir}/`))) throw errnoError(code)
+    return realpathSync(path)
+  }
+}
+
+/**
+ * Assert `line` is a `persona-config-dir-unresolvable` line for `persona` and
+ * its configured `path`, giving `reason`: the class, persona and path prefix
+ * and the reason only. The whole cause sentence is pinned once, in
+ * tests/persona-bringup.test.ts.
+ */
+function expectConfigDirUnresolvableLine(line: string | undefined, persona: Persona, path: string, reason = 'EIO'): void {
+  expect(line).toStartWith(
+    `[slack] ${PERSONA_CONFIG_DIR_UNRESOLVABLE}: personas[${persona.index}] ${renderPersonaRef(persona.name, persona.key)} ` +
+      `path=${JSON.stringify(path)}: `,
+  )
+  expect(line).toContain(`(${reason})`)
+}
+
+/** The captured lines of the `persona-config-dir-unresolvable` class. */
+function configDirLines(errLog: string): string[] {
+  return errLog.split('\n').filter((line) => line.includes(`${PERSONA_CONFIG_DIR_UNRESOLVABLE}:`))
+}
+
+describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the launch', () => {
+  /** When the injected realpath starts failing for the persona's claude_config_dir. */
+  const FAILURE_POINTS = ['before the launch', 'during the launch (after its pre-launch check)'] as const
+  const ENTRIES = ['ended', 'missing', 'waiting (dead session)'] as const
+
+  /**
+   * The reply-guard persona (a hashed key) with a real working directory and
+   * claude_config_dir, a recording trust patcher, the real reply guard over a
+   * temp record dir, and a recording hold hook that does not hold (so the
+   * session manager logs the line itself). `broken` drives the injected
+   * realpath for the config dir.
+   */
+  function unresolvableFixture() {
+    const readLog = captureStartupErrors()
+    useSpawnHome()
+    const configDir = fixtureSubdir('claude-config')
+    const cfg = makeMultiPersonaConfig(
+      [{ name: GUARD_NAME, working_directory: fixtureSubdir('work'), claude_config_dir: configDir }],
+      fixtureDir,
+      { agent_director_poll_interval_ms: 1 },
+    )
+    const persona = personaOf(cfg, GUARD_KEY)
+    // The row the persona's last spawn left: its label matches the directory.
+    const row = personaRow(cfg, GUARD_KEY)
+    const events: string[] = []
+    setPreLaunchTrustPatcher(() => void events.push('patch'))
+    const rg = makeReplyGuardRecordDir({ parentDir: fixtureDir })
+    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
+    const held: Array<Parameters<ConfigDirUnresolvableHook>> = []
+    setConfigDirUnresolvableHook((...args) => (held.push(args), false))
+    return { cfg, persona, configDir, row, events, rg, held, readLog }
+  }
+
+  test.each(ENTRIES.flatMap((entry) => FAILURE_POINTS.map((point) => [entry, point] as const)))(
+    'b.g57: %s row with its matching label, realpath failing %s: \'skipped\' — no kill, delete or resume, no fresh spawn, one line naming the persona and the path, one hold; once it resolves the same row is resumed',
+    async (entry, point) => {
+      const f = unresolvableFixture()
+      const calls = makeStubCallLog()
+      installResumeEntry(entry, f.row, calls, GUARD_KEY)
+      let resolved = false
+      // During the launch: the pre-launch check passes and the directory stops
+      // resolving once the ladder has fetched the row.
+      const broken = () => !resolved && (point === 'before the launch' || calls.getCalls.length > 0)
+      _setConfigDirFs({ realpath: realpathFailingUnder(f.configDir, broken) })
+
+      let result: boolean | 'skipped' | undefined
+      const errLog = await withCapturedErr(async () => {
+        result = await launchSession(GUARD_KEY, f.cfg)
+      })
+
+      expect(result).toBe('skipped')
+      expect(calls.killCalls).toEqual([])
+      expect(calls.deleteCalls).toEqual([])
+      expect(calls.resumeCalls).toEqual([])
+      if (point === 'before the launch') {
+        // Nothing ran: no agent-director call at all, no trust patch, no reply-guard step or record.
+        expect(stubCallCount(calls)).toBe(0)
+        expect(f.events).toEqual([])
+      } else {
+        // Only the optimistic spawn (it collided) and the row fetch; never a replacement.
+        expect(calls.spawnCalls).toHaveLength(1)
+        expect(calls.getCalls).toHaveLength(1)
+        expect(errLog).not.toContain('config_dir label')
+      }
+      expect(f.rg.readRecord(GUARD_KEY)).toBeNull()
+      expect(f.held.map(([p, failure]) => [p.key, failure.class])).toEqual([[GUARD_KEY, PERSONA_CONFIG_DIR_UNRESOLVABLE]])
+      expect(configDirLines(errLog)).toHaveLength(1)
+      expectConfigDirUnresolvableLine(configDirLines(errLog)[0], f.persona, f.configDir)
+      expect(f.readLog()).toBe('')
+      expect(notices).toEqual([])
+
+      // Resolved: the same row, with the same label, is resumed.
+      resolved = true
+      resetClientForTests()
+      const after = makeStubCallLog()
+      installResumeEntry(entry, f.row, after, GUARD_KEY)
+      const resumedLog = await withCapturedErr(async () => {
+        result = await launchSession(GUARD_KEY, f.cfg)
+      })
+
+      expect(result).toBe(true)
+      expect(after.resumeCalls.map((r) => r.claude_instance_id)).toEqual([GUARD_INSTANCE])
+      expect(after.deleteCalls).toEqual([])
+      expect(after.spawnCalls).toHaveLength(1)
+      expect(f.rg.readRecord(GUARD_KEY)).toBe('true')
+      expect(configDirLines(resumedLog)).toEqual([])
+      assertNoLeak({ errLog, resumedLog, held: f.held })
+    },
+  )
+
+  test('b.g57: the ladder\'s comparison finds the directory unresolvable and the re-check right after finds it resolved again: \'skipped\' — the row kept (no kill, delete, resume or fresh spawn), one line, no hold', async () => {
+    const f = unresolvableFixture()
+    const calls = makeStubCallLog()
+    installResumeEntry('ended', f.row, calls, GUARD_KEY)
+    // Only the first resolution after the ladder fetched the row fails: its comparison.
+    let failedOnce = false
+    _setConfigDirFs({
+      realpath: (path) => {
+        if (path === f.configDir && calls.getCalls.length > 0 && !failedOnce) {
+          failedOnce = true
+          throw errnoError('EIO')
+        }
+        return realpathSync(path)
+      },
+    })
+
+    let result: boolean | 'skipped' | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await launchSession(GUARD_KEY, f.cfg)
+    })
+
+    expect(failedOnce).toBe(true)
+    expect(result).toBe('skipped')
+    expect(calls.killCalls).toEqual([])
+    expect(calls.deleteCalls).toEqual([])
+    expect(calls.resumeCalls).toEqual([])
+    expect(calls.spawnCalls).toHaveLength(1) // only the optimistic spawn, which collided
+    expect(
+      errLog.split('\n').filter((line) => line.includes('claude_config_dir could not be resolved during the launch')),
+    ).toEqual([
+      `[slack] spawnForPersona: ${renderPersonaRef(f.persona.name, f.persona.key)} claude_config_dir could not be resolved during the launch — keeping its row; not launching`,
+    ])
+    expect(errLog).not.toContain('config_dir label')
+    expect(f.held).toEqual([])
+    expect(configDirLines(errLog)).toEqual([])
+    expect(f.rg.readRecord(GUARD_KEY)).toBeNull()
+    expect(notices).toEqual([])
+    assertNoLeak({ errLog, result })
+  })
+
+  test.each<[string, number, ConfigDirUnresolvableHook | undefined]>([
+    ['no hook installed', 1, undefined],
+    ['a hook that holds the persona (the holder logs the line)', 0, () => true],
+    [
+      'a hook that throws',
+      1,
+      () => {
+        throw new Error('hold exploded')
+      },
+    ],
+  ])('b.g57: %s — deferred with no agent-director call; the session manager logs the line %d time(s)', async (_label, lineCount, hook) => {
+    const f = unresolvableFixture()
+    setConfigDirUnresolvableHook(hook)
+    const calls = makeStubCallLog()
+    installStub(calls)
+    _setConfigDirFs({ realpath: realpathFailingUnder(f.configDir, () => true) })
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(f.persona, f.cfg)
+    })
+
+    expect(result).toEqual({
+      key: GUARD_KEY,
+      action: 'deferred',
+      deferredBy: { step: 'claude-config-dir', class: PERSONA_CONFIG_DIR_UNRESOLVABLE, cause: expect.stringContaining('(EIO)') },
+    })
+    expect(stubCallCount(calls)).toBe(0)
+    expect(configDirLines(errLog)).toHaveLength(lineCount)
+    if (lineCount > 0) expectConfigDirUnresolvableLine(configDirLines(errLog)[0], f.persona, f.configDir)
+    assertNoLeak({ errLog, result })
+  })
+
+  test('b.g57: dry run runs the same check — deferred, not the dry-run no-op; nothing launched', async () => {
+    process.env['SLACK_DRY_RUN'] = '1'
+    const f = unresolvableFixture()
+    const calls = makeStubCallLog()
+    installStub(calls)
+    _setConfigDirFs({ realpath: realpathFailingUnder(f.configDir, () => true) })
+
+    const errLog = await withCapturedErr(async () => {
+      expect((await spawnForPersona(f.persona, f.cfg)).action).toBe('deferred')
+      expect(await launchSession(GUARD_KEY, f.cfg)).toBe('skipped')
+    })
+
+    expect(stubCallCount(calls)).toBe(0)
+    expect(f.events).toEqual([])
+    expect(errLog).not.toContain('dry-run: skipping spawn')
+  })
+
+  test('b.g57: the start pass counts a persona whose claude_config_dir is unresolvable as not brought up (retrying, its cause the claude_config_dir); the other persona is spawned', async () => {
+    const readLog = captureStartupErrors()
+    useSpawnHome()
+    const aDir = fixtureSubdir('claude-config-a')
+    const cfg = makeMultiPersonaConfig(
+      [
+        { name: 'Alpha Desk', working_directory: fixtureSubdir('work-a'), claude_config_dir: aDir },
+        { name: 'Beta Ops', working_directory: fixtureSubdir('work-b'), claude_config_dir: fixtureSubdir('claude-config-b') },
+      ],
+      fixtureDir,
+    )
+    const [a, b] = cfg.personas as [Persona, Persona]
+    const calls = makeStubCallLog()
+    installStub(calls)
+    _setConfigDirFs({ realpath: realpathFailingUnder(aDir, () => true) })
+
+    let result!: Awaited<ReturnType<typeof startupSessionManager>>
+    const errLog = await withCapturedErr(async () => {
+      result = await startupSessionManager(cfg, { concurrency: 1 })
+    })
+
+    expect(result.perPersona).toEqual([
+      {
+        key: a.key,
+        action: 'not-brought-up',
+        outcome: 'retrying',
+        failures: [{ step: 'claude-config-dir', class: PERSONA_CONFIG_DIR_UNRESOLVABLE, cause: expect.stringContaining('(EIO)') }],
+      },
+      { key: b.key, action: 'spawned' },
+    ])
+    expect(result.notBroughtUp).toBe(1)
+    expect(result.failed).toBe(0)
+    expect(calls.spawnCalls.map((p) => p.claude_instance_id)).toEqual([`cscb_${b.key}`])
+    expect(configDirLines(errLog)).toHaveLength(1)
+    expectConfigDirUnresolvableLine(configDirLines(errLog)[0], a, aDir)
+    expect(readLog()).toBe('')
+    expect(notices).toEqual([])
+    assertNoLeak({ errLog, result })
+  })
+
+  test('b.g57: a claude_config_dir not created yet under a symlinked parent spawns fresh with its parent\'s real path plus the rest; once created, the next launch computes the same label and resumes', async () => {
+    const home = useSpawnHome()
+    const realParent = fixtureSubdir('config-parent-real')
+    const linkParent = join(fixtureDir, 'config-parent-link')
+    symlinkSync(realParent, linkParent)
+    const configDir = join(linkParent, 'nested', 'claude')
+    const expected = configDirLabelValue(join(realpathSync(realParent), 'nested', 'claude'))
+    // A symlink on the path: the lexical label would differ.
+    expect(expected).not.toBe(configDirLabelValue(configDir))
+    const cfg = makeStandInPersonaConfig(
+      { C: { working_directory: fixtureSubdir('work'), claude_config_dir: configDir } },
+      fixtureDir,
+      { agent_director_poll_interval_ms: 1 },
+    )
+    const first = makeStubCallLog()
+    installStub(first)
+
+    const errLog = await withCapturedErr(async () => {
+      expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual({ key: 'C', action: 'spawned' })
+    })
+
+    expect(first.spawnCalls[0]!.label).toEqual(['service=cscb', 'persona=C', `config_dir=${expected}`])
+    expect(first.spawnCalls[0]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configDir)
+    expect(configDirLines(errLog)).toEqual([])
+
+    // Claude Code creates it at first launch; the label does not change.
+    mkdirSync(join(realParent, 'nested', 'claude'), { recursive: true })
+    expect(personaConfigDirLabelValue(configDir, home)).toBe(expected)
+    resetClientForTests()
+    const second = makeStubCallLog()
+    installResumeEntry('ended', personaRow(cfg, 'C', { labels: { service: 'cscb', persona: 'C', config_dir: expected } }), second)
+
+    expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual({ key: 'C', action: 'resumed' })
+    expect(second.resumeCalls.map((r) => r.claude_instance_id)).toEqual(['cscb_C'])
+    expect(second.deleteCalls).toEqual([])
+  })
+})
+
+// Bug b.g57 — compareRowToPersona gives no config_dir verdict for an
+// unresolvable directory, and personaConfigDirLabelValue has no label for it.
+describe('b.g57: compareRowToPersona and personaConfigDirLabelValue with an unresolvable claude_config_dir', () => {
+  /** How the directory is unresolvable: the configured path, the realpath override (none: the real one) and the errno code. */
+  interface Unresolvable {
+    configDir: string
+    realpath?: (path: string) => string
+    code: string
+  }
+
+  test.each<[string, () => Unresolvable]>([
+    [
+      'realpath fails with EIO (a dropped mount, injected)',
+      () => {
+        const configDir = fixtureSubdir('claude-config')
+        return { configDir, realpath: realpathFailingUnder(configDir, () => true), code: 'EIO' }
+      },
+    ],
+    [
+      'a dangling symlink',
+      () => {
+        const configDir = join(fixtureDir, 'config-link')
+        symlinkSync(join(fixtureDir, 'unmounted-target'), configDir)
+        return { configDir, code: 'ENOENT' }
+      },
+    ],
+    [
+      'a dangling symlink on an ancestor',
+      () => {
+        const link = join(fixtureDir, 'drive-link')
+        symlinkSync(join(fixtureDir, 'unmounted-drive'), link)
+        return { configDir: join(link, 'claude'), code: 'ENOENT' }
+      },
+    ],
+    [
+      'a path under a regular file (ENOTDIR)',
+      () => {
+        const file = join(fixtureDir, 'plain-file')
+        writeFileSync(file, '')
+        return { configDir: join(file, 'claude'), code: 'ENOTDIR' }
+      },
+    ],
+  ])('b.g57: %s — configDirResolved false, no config_dir verdict, no label; the row\'s lexical label is not a match', (_label, build) => {
+    const home = realpathSync(fixtureSubdir('home'))
+    const work = fixtureSubdir('work')
+    const { configDir, realpath, code } = build()
+    const fs = realpath === undefined ? undefined : { realpath }
+    // The label the lexical fallback would have computed and matched.
+    const row = { cwd: work, labels: { service: 'cscb', persona: 'C', config_dir: configDirLabelValue(configDir) } }
+
+    const result = compareRowToPersona(row, { working_directory: work, claude_config_dir: configDir }, home, undefined, fs)
+
+    expect(result).toEqual({
+      cwdMatches: true,
+      workingDirectoryResolved: true,
+      cwdCheckDeferred: false,
+      configDirResolved: false,
+      configDirMatches: undefined,
+      configDirLabel: configDirLabelValue(configDir),
+      expectedConfigDirLabel: undefined,
+    })
+    let thrown: unknown
+    try {
+      personaConfigDirLabelValue(configDir, home, fs)
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(ConfigDirUnresolvableError)
+    expect(thrown).toMatchObject({ path: configDir, code })
+  })
+
+  test('b.g57 control: a resolvable directory (and one not created yet) has configDirResolved true and the verdict as before', () => {
+    const home = realpathSync(fixtureSubdir('home'))
+    const work = fixtureSubdir('work')
+    const existing = fixtureSubdir('claude-config')
+    const notYet = join(fixtureDir, 'not-created', 'claude')
+    for (const configDir of [existing, notYet]) {
+      const label = personaConfigDirLabelValue(configDir, home)
+      const persona = { working_directory: work, claude_config_dir: configDir }
+      const matching = compareRowToPersona({ cwd: work, labels: { config_dir: label } }, persona, home)
+      expect(matching).toMatchObject({ configDirResolved: true, configDirMatches: true, expectedConfigDirLabel: label })
+      const stale = compareRowToPersona({ cwd: work, labels: { config_dir: 'aaaaaaaaaaaa' } }, persona, home)
+      expect(stale).toMatchObject({ configDirResolved: true, configDirMatches: false, expectedConfigDirLabel: label })
+    }
   })
 })
 

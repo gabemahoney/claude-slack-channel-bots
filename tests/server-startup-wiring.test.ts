@@ -27,14 +27,19 @@
  *   every connection status, stored for shutdown and cancelled there before
  *   the connections stop; the health check started only after the start
  *   bring-up returns. Its launch and its live applied set (`appliedPersonas`)
- *   read the applied config at call time (SR-8.6).
+ *   read the applied config at call time (SR-8.6). Bug b.g57: it re-checks a
+ *   held persona's claude_config_dir with the launch's own check
+ *   (`checkLaunchConfigDir`), its `holdForConfigDir` is the session
+ *   manager's hook for an unresolvable one, installed before any launch path,
+ *   and the restart module's kill adapter gets `getAppliedPersona`.
  * - The relaunch gate (SR-6.1, SR-6.4): built over the manager and the
  *   bring-up controller and passed to the restart module (`canRestart`), the
  *   restart launch and the health-check work list; the restart delay read
  *   from the applied config; the permission poller not started in dry run.
  * - Not-up personas (SR-6.3, SR-6.4, SR-8.6): the one `isPersonaUp`
  *   predicate (the controller's `isUp` and `isApplied`) handed
- *   to the permission poller, `/interject` and the MCP admission decision;
+ *   to the permission poller, `/interject`, the MCP admission decision and
+ *   the persona routing's lost-message branch (bug b.g57);
  *   a refused session disconnected and never registered; the controller's
  *   `onLeftUp` dropping the persona's registered session.
  * - SR-5.2: the file guard handed to the session tools protects every persona
@@ -57,8 +62,10 @@ import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
+  atMainTopLevel,
   balancedAfter,
   callArguments,
+  importSource,
   indicesOf,
   insideMain as insideMainOf,
   loadedConfigName,
@@ -391,6 +398,36 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
     expect(SERVER_CODE.slice(callEnd + 1, at).trim()).toBe('')
   })
 
+  // Bug b.g57: an unresolvable claude_config_dir is a retrying state the
+  // bring-up controller holds. Both bindings are optional (the controller's
+  // `checkConfigDir` defaults to a check against the OS home and file system,
+  // and with no hook a launch only logs and launches nothing), so only this
+  // audit makes sure production wires them: without the hook such a persona
+  // would never be launched once its directory resolves; with another check,
+  // the re-check could pass a directory the launch then refuses.
+  test('bug b.g57: the bring-up controller re-checks a held persona\'s claude_config_dir with the launch\'s own check, checkLaunchConfigDir from the session manager', () => {
+    expect(onlyCallProps('createPersonaBringUpController').get('checkConfigDir')).toBe('checkLaunchConfigDir')
+    expect(importSource(SERVER_CODE, 'checkLaunchConfigDir')).toBe('./session-manager.ts')
+    expect(indicesOf(/\b(?:let|const|var|function)\s+checkLaunchConfigDir\b/g, SERVER_CODE)).toEqual([])
+  })
+
+  test('bug b.g57: a launch hands an unresolvable claude_config_dir to the bring-up controller: setConfigDirUnresolvableHook(<controller>.holdForConfigDir) once, on every start, after `bringUps = <controller>` and before any launch path is wired', () => {
+    const controller = constOf('createPersonaBringUpController')
+    const at = onlyCallOf('setConfigDirUnresolvableHook')
+    expect(onlyCallArgs('setConfigDirUnresolvableHook')).toEqual([`${controller}.holdForConfigDir`])
+    expect(importSource(SERVER_CODE, 'setConfigDirUnresolvableHook')).toBe('./session-manager.ts')
+    expect(indicesOf(/\b(?:let|const|var|function)\s+setConfigDirUnresolvableHook\b/g, SERVER_CODE)).toEqual([])
+    // In main()'s own statement list, so dry run included and behind no branch.
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    const handoff = assignmentsTo('bringUps')
+    expect(handoff).toHaveLength(1)
+    expect(at).toBeGreaterThan(handoff[0]!.at)
+    // Before the restart module (its launches) and the start bring-up (the
+    // start's launches) can launch anything.
+    expect(at).toBeLessThan(onlyCallOf('initRestart'))
+    expect(at).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+  })
+
   test('shutdown cancels every persona\'s bring-up retry, once, before the Slack connections stop', () => {
     const [start, end] = shutdownBody(SERVER_CODE)
     const inShutdown = (at: number) => at > start && at < end
@@ -532,6 +569,17 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
     expect(objectProperties(args[2]!).get('canLaunch')).toBe(gate)
   })
 
+  // Bug b.g57: the adapter's persona lookup is optional; without it a restart
+  // of a persona whose claude_config_dir no longer resolves would kill its
+  // instance ahead of a launch that cannot be made.
+  test('bug b.g57: the restart module\'s kill is the kill adapter over the live applied persona lookup, getAppliedPersona', () => {
+    expect(onlyCallProps('initRestart').get('killSession')).toBe('_buildKillSessionAdapter(getAppliedPersona)')
+    // The only adapter built (its declaration aside): no other kill path without the lookup.
+    expect(indicesOf(/(?<![\w.$]|function\s+)_buildKillSessionAdapter\s*\(/g, SERVER_CODE)).toHaveLength(1)
+    // getAppliedPersona reads the holder at call time (pinned in tests/reload-wiring.test.ts).
+    expect(indicesOf(/\bfunction\s+getAppliedPersona\s*\(/g, SERVER_CODE)).toHaveLength(1)
+  })
+
   test('the health check\'s work list is built over the loaded config with the gate', () => {
     expect(onlyCallProps('initHealthCheck').get('getPersonas')).toContain('buildPersonaWorkList(')
     expect(onlyCallArgs('buildPersonaWorkList')).toEqual([loadedConfigName(SERVER_CODE), constOf('createPersonaRelaunchGate')])
@@ -599,6 +647,16 @@ describe('server.ts refuses service to a persona that is not up (b.av2 SR-6.3, S
     expect(interject).toHaveLength(3)
     expect(objectProperties(interject[2]!).get('isPersonaUp')).toBe('isPersonaUp')
     expect(onlyCallProps('decideSessionAdmission').get('isPersonaUp')).toBe('isPersonaUp')
+  })
+
+  // Bug b.g57: `isPersonaUp` is optional in PersonaRoutingDeps (without it
+  // every persona counts as up), so only this audit makes sure production
+  // binds it: a held persona whose connection still serves must get the
+  // not-up notice and no restart for each lost message.
+  test('b.g57: the persona routing gets the one isPersonaUp predicate, built before it, so a lost message for a persona that is not up restarts nothing', () => {
+    expect(onlyCallProps('createPersonaRouting').get('isPersonaUp')).toBe('isPersonaUp')
+    // Read when the routing is built: the predicate must already exist.
+    expect(onlyCallOf('createPersonaRouting')).toBeGreaterThan(onlyCallOf('createPersonaUpPredicate'))
   })
 
   test('handleInitialized decides admission over the roots path and the loaded personas, with the controller\'s not-up description, and no longer matches personas itself', () => {

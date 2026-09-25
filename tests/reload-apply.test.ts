@@ -1,8 +1,9 @@
 /**
  * reload-apply.test.ts — What a confirmed change does to the personas (b.av2
- * SR-6.1 at apply, SR-6.4, SR-6.5, SR-6.6, SR-8.6 steps 2, 3, 4 and 6, the
- * removal, `name`, in-place and credentials rows, SR-1.4 at apply; AC 19,
- * 22, 57, 58, 64, 68).
+ * SR-6.1 at apply, SR-6.4, SR-6.5, SR-6.6, SR-8.6 steps 2 to 6 and every
+ * table row: removal, `name`, in place, credentials, destructive modify,
+ * `claude_config_dir`, `stop_hook_bootstrap` and server-wide; SR-1.4 at
+ * apply; AC 19, 22, 57, 58, 59, 60, 61, 64, 68).
  *
  * Every case drives the real reload controller through `makeReloadHarness`:
  * start from a record, edit `config.json` (or a credentials file), tick to
@@ -28,21 +29,34 @@
  * are told apart (`run.socketActivity`, `run.currentStub`); the 10 s start
  * bound and the SR-3.2 retries run on `run.clock`.
  *
+ * The destructive, next-launch and server-wide rows and step 5 (AC 59, 60,
+ * 61) run with the real launch path where a launch is asserted
+ * (`opts.realLaunch`: `spawnForPersona` over the harness's agent-director
+ * row table, the trust patch and the reply-guard steps), and with every
+ * persona given its own temp `claude_config_dir` (`personaConfigDirs`), so
+ * a spawn's config directory and the template's memory-read rules name
+ * known temp paths. A persona's next launch after an apply is
+ * `run.relaunch(name)` (the restart path) from a row seeded with
+ * `h.seedRow`; the next server start is a later `h.start()` over the same
+ * directories. Step 5 is read from `run.lifecycle.applyTimeline` and the
+ * stub's `makeTemplate` captures.
+ *
  * Confirmation processing, invalid, stale and no-op candidates and step 1
- * are pinned in `tests/reload.test.ts`. Destructive modifies, next-launch
- * settings and the template refresh (step 5) are left to the work that binds
- * them: nothing here asserts their presence or absence.
+ * are pinned in `tests/reload.test.ts`; the preview's wording in
+ * `tests/reload-preview.test.ts`, so a preview line is asserted here only as
+ * far as it ties a row to its AC.
  *
  * SPDX-License-Identifier: MIT
  */
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
-import { rmSync, symlinkSync } from 'node:fs'
+import { existsSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
-import type { PersonaInput } from '../src/config.ts'
+import type { PersonaConfigInput, PersonaInput } from '../src/config.ts'
 import { isCredentialsBroken, type PersonaBringUpOutcome } from '../src/persona-bringup-controller.ts'
 import {
+  PERSONA_CONFIG_DIR_UNRESOLVABLE,
   PERSONA_CREDENTIALS_CHANGE_FAILED,
   PERSONA_CREDENTIALS_INVALID,
   PERSONA_CREDENTIALS_MISSING,
@@ -53,10 +67,11 @@ import {
   PERSONA_SLACK_UNREACHABLE,
   UNCLAIMED_CHANNEL,
 } from '../src/persona-diagnostics.ts'
-import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
+import { configDirLabelValue, personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import type { InPlaceSetting } from '../src/reload-plan.ts'
-import { RELOAD_APPLIED } from '../src/reload.ts'
-import { stubCallCount } from './test-helpers/agent-director-stub.ts'
+import { RELOAD_APPLIED, RELOAD_NOOP } from '../src/reload.ts'
+import { personaConfigDirLabelValue } from '../src/session-manager.ts'
+import { errTemplateMalformed, stubCallCount } from './test-helpers/agent-director-stub.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
 import {
   makeChannelMessage,
@@ -72,9 +87,13 @@ import {
   NO_RUN_ACTIVITY,
   SLACK_AUTH_REJECTED,
   SLACK_UNREACHABLE,
+  TEMPLATE_REFRESH_KEY,
+  type AgentDirectorCall,
+  type ApplyTimelineEntry,
   type LifecycleTimelineEntry,
   type PreparedPersonaState,
   type ReloadHarness,
+  type ReloadLifecycleRecord,
   type ReloadRun,
   type ReloadRunOptions,
 } from './test-helpers/reload-harness.ts'
@@ -98,6 +117,14 @@ function configOf(...personas: PersonaInput[]): { personas: PersonaInput[] } {
   return { personas }
 }
 
+/** Top-level (server-wide) settings in file form. */
+type TopLevel = Partial<Omit<PersonaConfigInput, 'personas'>>
+
+/** `top`'s settings and `personas`, in file form. */
+function configWith(top: TopLevel, personas: PersonaInput[]): PersonaConfigInput {
+  return { ...top, personas }
+}
+
 /** The keys of `names`, in order. */
 function keysOf(...names: string[]): string[] {
   return names.map((n) => h.key(n))
@@ -106,9 +133,14 @@ function keysOf(...names: string[]): string[] {
 /** A persona of `running`: its name, alone or with its overrides over `h.persona(name)`. */
 type PersonaSpec = string | [name: string, overrides: Partial<PersonaInput>]
 
-/** `running`'s options: the run's, plus `sessions` to register an MCP session for every persona once it has started. */
+/**
+ * `running`'s options: the run's, plus `sessions` to register an MCP session
+ * for every persona once it has started, and `top` for the top-level
+ * settings the record and configuration file carry.
+ */
 interface RunningOptions extends ReloadRunOptions {
   sessions?: boolean
+  top?: TopLevel
 }
 
 /** The real composition, with an MCP session registered for every persona (the AC 58 routing cases). */
@@ -126,12 +158,12 @@ async function running(
   opts: RunningOptions = {},
   prepare: (personas: PersonaInput[]) => void = () => undefined,
 ): Promise<{ run: ReloadRun; personas: PersonaInput[] }> {
-  const { sessions, ...runOpts } = opts
+  const { sessions, top = {}, ...runOpts } = opts
   const personas = specs.map((spec) => (typeof spec === 'string' ? h.persona(spec) : h.persona(...spec)))
   h.materialize(...personas)
   prepare(personas)
-  h.writeRecord(configOf(...personas))
-  h.writeConfig(configOf(...personas))
+  h.writeRecord(configWith(top, personas))
+  h.writeConfig(configWith(top, personas))
   const run = await h.startDetecting(runOpts)
   await run.ticks.tick()
   expect(h.pendingExists()).toBe(false)
@@ -140,12 +172,12 @@ async function running(
 }
 
 /**
- * Write `personas` as the configuration file, check it (the pending file is
- * written), confirm it and start the tick that applies it; `applying` is
- * that tick, not awaited.
+ * Write `personas` (with the top-level settings `top`) as the configuration
+ * file, check it (the pending file is written), confirm it and start the
+ * tick that applies it; `applying` is that tick, not awaited.
  */
-async function confirmConfig(run: ReloadRun, personas: PersonaInput[]): Promise<{ applying: Promise<void> }> {
-  h.writeConfig(configOf(...personas))
+async function confirmConfig(run: ReloadRun, personas: PersonaInput[], top: TopLevel = {}): Promise<{ applying: Promise<void> }> {
+  h.writeConfig(configWith(top, personas))
   await run.ticks.tick()
   expect(h.pendingExists()).toBe(true)
   h.confirm()
@@ -153,8 +185,24 @@ async function confirmConfig(run: ReloadRun, personas: PersonaInput[]): Promise<
 }
 
 /** `confirmConfig`, its apply awaited. */
-async function applyConfig(run: ReloadRun, personas: PersonaInput[]): Promise<void> {
-  await (await confirmConfig(run, personas)).applying
+async function applyConfig(run: ReloadRun, personas: PersonaInput[], top: TopLevel = {}): Promise<void> {
+  await (await confirmConfig(run, personas, top)).applying
+}
+
+/**
+ * Write `personas` (with `top`) as the configuration file and check it: the
+ * pending file is written, nothing is applied, and the pending file and log
+ * are leak-checked while the file exists. Returns the pending preview's
+ * lines; `h.confirm()` and a tick then apply it.
+ */
+async function previewConfig(run: ReloadRun, personas: PersonaInput[], top: TopLevel = {}): Promise<string[]> {
+  h.writeConfig(configWith(top, personas))
+  const cp = run.checkpoint()
+  await run.ticks.tick()
+  expect(h.pendingExists()).toBe(true)
+  expect(run.since(cp).lifecycle).toEqual([])
+  assertNoLeak(run.captured())
+  return h.pendingLines()!
 }
 
 /** Every closing check: nothing posted to Slack (b.av2 SR-7.2) and no token in anything captured. */
@@ -1383,7 +1431,7 @@ describe('AC 68: a confirmed token rotation reconnects only that persona (b.av2 
     assertNoLeak(run.captured())
   })
 
-  test("AC 68: a reconnect whose start() never settles holds the apply at step 4 until 10 s on the fake clock, while alpha keeps delivering its events; then it is abandoned, the old connection stays open and in use, the reconnect retries (complete for step order), step 6 brings up the persona added in the same apply, alpha gets no lifecycle call and its Slack side is untouched, and a later tick detects and previews a further edit", async () => {
+  test("AC 68: a reconnect whose start() never settles holds the apply at step 4 until 10 s on the fake clock, while alpha keeps delivering its events; then it is abandoned, the old connection stays open and in use, the reconnect retries (complete for step order), step 5 refreshes the template once (the added persona brings a new config directory), step 6 then brings up the persona added in the same apply, alpha gets no lifecycle call and its Slack side is untouched, and a later tick detects and previews a further edit", async () => {
     const { run, personas } = await running(['alpha', 'bravo'])
     const [alpha, bravo] = personas
     const [bravoKey, deltaKey] = keysOf('bravo', 'delta')
@@ -1391,7 +1439,8 @@ describe('AC 68: a confirmed token rotation reconnects only that persona (b.av2 
     const oldLabel = h.credentialsLabel('bravo')
     const oldIdentity = identityOf(run.stub('bravo'))
     const { label } = h.rotateCredentials(bravo!, { slack: { connect: [{ kind: 'open-never-answers' }] } })
-    const delta = h.persona('delta')
+    // Its own config directory changes the set of effective config directories, so the apply runs step 5.
+    const delta = h.persona('delta', { claude_config_dir: h.configDir('delta') })
     h.materialize(delta)
     h.writeConfig(configOf(alpha!, bravo!, delta))
     const activityFrom = run.socketActivity('bravo').length
@@ -1405,6 +1454,9 @@ describe('AC 68: a confirmed token rotation reconnects only that persona (b.av2 
     for (let i = 0; i < 20; i++) await new Promise((done) => setImmediate(done))
     expect(run.lifecycle.timeline).toEqual([{ op: 'reconnect', key: bravoKey, phase: 'start' }])
     expect(run.lifecycle.keys('bring-up').filter((k) => k === deltaKey)).toEqual([])
+    // Step 5 has not been asked either: no template refresh before the bound.
+    expect(run.lifecycle.applyTimeline).toEqual([{ op: 'reconnect', key: bravoKey, phase: 'start' }])
+    expect(run.lifecycle.of('template-refresh')).toEqual([])
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
     // Nothing of bravo's hang reaches alpha: untouched so far, and its next event is delivered while step 4 still holds.
     alphaUntouched()
@@ -1425,6 +1477,16 @@ describe('AC 68: a confirmed token rotation reconnects only that persona (b.av2 
       { op: 'bring-up', key: deltaKey, phase: 'start' },
       { op: 'bring-up', key: deltaKey, phase: 'settled' },
     ])
+    // Exactly one refresh, after the abandoned reconnect settled and before step 6.
+    expect(run.lifecycle.applyTimeline).toEqual([
+      { op: 'reconnect', key: bravoKey, phase: 'start' },
+      { op: 'reconnect', key: bravoKey, phase: 'settled' },
+      { op: 'template-refresh', key: TEMPLATE_REFRESH_KEY, phase: 'start' },
+      { op: 'template-refresh', key: TEMPLATE_REFRESH_KEY, phase: 'settled' },
+      { op: 'bring-up', key: deltaKey, phase: 'start' },
+      { op: 'bring-up', key: deltaKey, phase: 'settled' },
+    ])
+    expect(run.lifecycle.of('template-refresh')).toHaveLength(1)
     expect(run.lifecycle.of('reconnect')).toEqual([
       { op: 'reconnect', key: bravoKey, via: 'apply', change: { kind: 'retrying', connection: 'kept' } },
     ])
@@ -2057,6 +2119,1003 @@ describe('b.av2 SR-1.4 at apply: a credentials file whose real path is another a
       expect(build.hasToken(build.kind === 'socket' ? tokens.appToken : tokens.botToken)).toBe(true)
     }
     expect(run.logsOf(PERSONA_CREDENTIALS_INVALID)).toEqual([])
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Destructive modifies, next-launch and server-wide settings, and step 5
+// (AC 59, 60, 61; b.av2 SR-8.6 table rows and step 5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Replace `h` with a harness whose every persona gets its own temp
+ * `claude_config_dir` (`personaConfigDirs`), so a spawn's config directory
+ * and the template's memory-read rules name known temp paths.
+ */
+async function useConfigDirs(): Promise<void> {
+  await h.cleanup()
+  h = makeReloadHarness({ personaConfigDirs: true })
+}
+
+/** The real launch path (`spawnForPersona` over the row table; implies the real composition). */
+const REAL_LAUNCH: RunningOptions = { realLaunch: true }
+
+/** The temp `claude_config_dir` `personaConfigDirs` gives the persona named `name`. */
+function ownConfigDir(name: string): string {
+  return h.configDir(h.key(name))
+}
+
+/** A symlink named `name` among the temp config directories, pointing at `target`; returns its path. */
+function configDirLink(name: string, target: string): string {
+  const path = join(dirname(ownConfigDir('alpha')), name)
+  symlinkSync(target, path)
+  return path
+}
+
+/** The memory-read rules the template holds for `dirs`: one per distinct directory, sorted, scoped to project memory (b.av2 SR-11). */
+function memoryRules(...dirs: string[]): string[] {
+  return [...new Set(dirs)].sort().map((dir) => `Read(/${dir}/projects/*/memory/**)`)
+}
+
+/** The agent-director calls made from `from` (an `agentDirectorCalls` length taken earlier) on. */
+function adCallsSince(run: ReloadRun, from: number): AgentDirectorCall[] {
+  return run.composition!.agentDirectorCalls.slice(from)
+}
+
+/** The persona's instance calls (spawn, resume, kill, delete) from `from` on, as `<verb> <result>`. */
+function instanceCallsSince(run: ReloadRun, name: string, from: number): string[] {
+  return run.composition!.instanceCallsOf(name).slice(from).map((c) => `${c.verb} ${c.result}`)
+}
+
+/** The persona's last spawn call. */
+function lastSpawnOf(run: ReloadRun, name: string): AgentDirectorCall | undefined {
+  return run.composition!.instanceCallsOf(name).filter((c) => c.verb === 'spawn').at(-1)
+}
+
+/** Every `makeTemplate` call the stub received (step 5's refreshes; nothing is installed at the start). */
+function templateCalls(run: ReloadRun) {
+  return run.composition!.agentDirector.makeTemplateCalls
+}
+
+/** The step-5 record of a refresh that settled as `refresh` (the stand-in's has none). */
+function refreshRecord(refresh?: 'refreshed' | 'failed'): ReloadLifecycleRecord {
+  const settled = refresh === 'refreshed' ? { kind: 'refreshed' as const, path: expect.any(String) } : { kind: 'failed' as const }
+  return { op: 'template-refresh', key: TEMPLATE_REFRESH_KEY, via: 'apply', ...(refresh === undefined ? {} : { refresh: settled }) }
+}
+
+/** A `applyTimeline` entry of step 5. */
+function refreshEntry(phase: ApplyTimelineEntry['phase']): ApplyTimelineEntry {
+  return { op: 'template-refresh', key: TEMPLATE_REFRESH_KEY, phase }
+}
+
+/** The apply step each `applyTimeline` op belongs to. */
+const APPLY_STEP_OF: Record<ApplyTimelineEntry['op'], number> = {
+  teardown: 2,
+  'update-in-place': 3,
+  reconnect: 4,
+  'template-refresh': 5,
+  'bring-up': 6,
+}
+
+/** Yield event-loop turns (no timer), so a step that should wait would have started. */
+async function turns(): Promise<void> {
+  for (let i = 0; i < 20; i++) await new Promise((done) => setImmediate(done))
+}
+
+/** bravo's working directory moved to a new directory beside its old one, created unless `create` is false. */
+function movedDirectory(bravo: PersonaInput, create = true): PersonaInput {
+  const moved = h.persona(bravo.name, { working_directory: join(dirname(bravo.working_directory), 'moved') })
+  if (create) h.makeWorkingDirectory(moved)
+  return moved
+}
+
+/** bravo's `credentials_file` moved to a new path, written there with a new token set unless `write` is false. */
+function movedCredentials(bravo: PersonaInput, write = true): PersonaInput {
+  const moved = h.persona(bravo.name, { credentials_file: join(dirname(bravo.credentials_file), 'credentials-moved.json') })
+  if (write) h.rotateCredentials(moved)
+  return moved
+}
+
+describe('AC 60: a destructive modify tears the persona down at step 2 and brings it up fresh at step 6 (b.av2 SR-8.6, the credentials_file path and working_directory rows)', () => {
+  beforeEach(useConfigDirs)
+
+  test.each<{ setting: 'working_directory' | 'credentials_file'; move: (bravo: PersonaInput) => PersonaInput }>([
+    { setting: 'working_directory', move: (bravo) => movedDirectory(bravo) },
+    { setting: 'credentials_file', move: (bravo) => movedCredentials(bravo) },
+  ])("AC 60: bravo's $setting moved, beside alpha, is previewed DESTRUCTIVE:, then exactly one teardown and one bring-up for bravo: its old row killed and deleted and a fresh spawn (never a resume) from the new declaration, its old connection closed before the new one opened, and no call of any kind for alpha (real launch)", async ({ setting, move }) => {
+    const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
+    const [alpha, bravo] = personas
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    const bravoId = personaInstanceId(bravoKey)
+    expect(h.rowOf('bravo')?.state).toBe('waiting')
+    const oldLabel = h.credentialsLabel('bravo')
+    const moved = move(bravo!)
+    const newLabel = h.credentialsLabel('bravo')
+    expect(newLabel === oldLabel).toBe(setting === 'working_directory')
+    const tokens = h.tokens('bravo')
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const alphaInstanceCalls = run.composition!.instanceCallsOf('alpha').length
+    const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
+    const adFrom = run.composition!.agentDirectorCalls.length
+    const activityFrom = run.socketActivity('bravo').length
+    const buildsFrom = run.slack.buildsOf(bravoKey).length
+    const cp = run.checkpoint()
+
+    // Before confirmation: one DESTRUCTIVE: line, for bravo's setting; nothing applied.
+    await previewConfig(run, [alpha!, moved])
+    expect(h.pendingDestructiveLines()).toHaveLength(1)
+    expect(h.pendingDestructiveLines()![0]).toStartWith(`DESTRUCTIVE: persona ${renderPersonaRef('bravo', bravoKey)} ${setting} changed`)
+    h.confirm()
+    await run.ticks.tick()
+
+    // One teardown at step 2, then one bring-up at step 6, launched as a fresh spawn; nothing else.
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: bravoKey, via: 'apply' },
+      { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: bravoKey, via: 'apply', action: 'spawned' },
+    ])
+    expect(run.lifecycle.applyTimeline).toEqual([
+      { op: 'teardown', key: bravoKey, phase: 'start' },
+      { op: 'teardown', key: bravoKey, phase: 'settled' },
+      { op: 'bring-up', key: bravoKey, phase: 'start' },
+      { op: 'bring-up', key: bravoKey, phase: 'settled' },
+    ])
+    // Its old row killed and deleted, then spawned fresh from the new declaration: never resumed.
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'delete ok', 'spawn ok'])
+    expect(lastSpawnOf(run, 'bravo')).toMatchObject({ id: bravoId, cwd: moved.working_directory, claudeConfigDir: ownConfigDir('bravo') })
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', cwd: moved.working_directory })
+    // The old connection closed before the new one opened, and the new one has the new declaration's tokens.
+    expect(run.socketActivity('bravo').slice(activityFrom)).toEqual([
+      `discarded ${oldLabel}`,
+      `disconnected ${oldLabel}`,
+      `built ${newLabel}`,
+      `started ${newLabel}`,
+      `connected ${newLabel}`,
+    ])
+    const builds = run.slack.buildsOf(bravoKey).slice(buildsFrom)
+    expect(builds.map((b) => b.kind).sort()).toEqual(['socket', 'validation', 'web'])
+    for (const build of builds) expect(build.hasToken(build.kind === 'socket' ? tokens.appToken : tokens.botToken)).toBe(true)
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+    expect(run.bringUps.credentialsDigest(bravoKey)).toBe(h.credentialsDigestOf(moved))
+    // alpha: no lifecycle record, dependency call, agent-director call or Slack activity; no template refresh either.
+    alphaUntouched()
+    expect(run.composition!.calls.filter(([, key]) => key === alphaKey)).toEqual([])
+    expect(run.composition!.instanceCallsOf('alpha')).toHaveLength(alphaInstanceCalls)
+    expect(adCallsSince(run, adFrom).filter((c) => c.id !== bravoId)).toEqual([])
+    expect(run.logsOf('reload')).toEqual([])
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test.each<{ label: string; move: (bravo: PersonaInput) => PersonaInput; outcome: PersonaBringUpOutcome; cls: string; timers: number }>([
+    { label: 'a new working directory that is missing', move: (bravo) => movedDirectory(bravo, false), outcome: 'retrying', cls: PERSONA_DIRECTORY_MISSING, timers: 1 },
+    { label: 'a new credentials path that is missing', move: (bravo) => movedCredentials(bravo, false), outcome: 'broken', cls: PERSONA_CREDENTIALS_MISSING, timers: 0 },
+  ])('AC 60: bravo moved to $label is still torn down (its instance killed and deleted), and its fresh bring-up ends $outcome under the startup rules, launching nothing, while alpha is untouched and nothing is pending (real composition)', async ({ move, outcome, cls, timers }) => {
+    const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
+    const [alpha, bravo] = personas
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    const moved = move(bravo!)
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const cp = run.checkpoint()
+
+    await applyConfig(run, [alpha!, moved])
+
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: bravoKey, via: 'apply' },
+      { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome }) },
+    ])
+    expect(run.lifecycle.classes(bravoKey)).toEqual([cls])
+    expect(run.composition!.agentDirectorOrder).toEqual([`kill ${personaInstanceId(bravoKey)}`, `delete ${personaInstanceId(bravoKey)}`])
+    expect(run.clock.pendingCount()).toBe(timers)
+    alphaUntouched()
+    expect(run.composition!.calls.filter(([, key]) => key === alphaKey)).toEqual([])
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test("AC 60: bravo's working directory moved and its token rotated in the same credentials file, confirmed together, records only a teardown and a bring-up (no reconnect), and the bring-up connects with the new tokens (real composition)", async () => {
+    const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
+    const [alpha, bravo] = personas
+    const bravoKey = h.key('bravo')
+    const { tokens, label } = h.rotateCredentials(bravo!)
+    const moved = movedDirectory(bravo!)
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const cp = run.checkpoint()
+
+    await applyConfig(run, [alpha!, moved])
+
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: bravoKey, via: 'apply' },
+      { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: bravoKey, via: 'apply' },
+    ])
+    expect(run.composition!.calls.filter(([member]) => member.includes('Credentials'))).toEqual([])
+    expect(run.currentStub('bravo')).toBe(run.credentialsStub('bravo', label))
+    const builds = run.slack.buildsOf(bravoKey).filter((b) => b.credentials === label)
+    expect(builds.map((b) => b.kind).sort()).toEqual(['socket', 'validation', 'web'])
+    for (const build of builds) expect(build.hasToken(build.kind === 'socket' ? tokens.appToken : tokens.botToken)).toBe(true)
+    expect(run.bringUps.credentialsDigest(bravoKey)).toBe(h.credentialsDigestOf(moved))
+    alphaUntouched()
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test.each<{ label: string; breakBravo: (bravo: PersonaInput) => void; outcome: PersonaBringUpOutcome; timers: number; fix: (bravo: PersonaInput) => void }>([
+    {
+      label: 'credentials-broken (its file missing) with its instance row kept',
+      breakBravo: (bravo) => h.deleteCredentials(bravo),
+      outcome: 'broken',
+      timers: 0,
+      fix: (bravo) => void h.writeCredentials(bravo),
+    },
+    {
+      label: 'retrying on its missing working directory, with its instance row kept',
+      breakBravo: (bravo) => h.deleteWorkingDirectory(bravo),
+      outcome: 'retrying',
+      timers: 1,
+      fix: () => undefined,
+    },
+  ])("AC 60: bravo $label, whose working directory is moved, is still torn down (its kept row killed and deleted, any retry timer cancelled) and brought up fresh in the new directory; its old declaration never comes back (real launch)", async ({ breakBravo, outcome, timers, fix }) => {
+    const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH, ([, bravo]) => {
+      breakBravo(bravo!)
+      h.seedRow(bravo!, { state: 'ended' })
+    })
+    const [alpha, bravo] = personas
+    const bravoKey = h.key('bravo')
+    expect(run.lifecycle.outcome(bravoKey)).toBe(outcome)
+    expect(run.clock.pendingCount()).toBe(timers)
+    expect(h.rowOf('bravo')?.state).toBe('ended')
+    fix(bravo!)
+    const moved = movedDirectory(bravo!)
+    const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const cp = run.checkpoint()
+
+    await applyConfig(run, [alpha!, moved])
+
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: bravoKey, via: 'apply' },
+      { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: bravoKey, via: 'apply', action: 'spawned' },
+    ])
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'delete ok', 'spawn ok'])
+    expect(lastSpawnOf(run, 'bravo')).toMatchObject({ cwd: moved.working_directory })
+    expect(run.clock.pendingCount()).toBe(0)
+    // With its old directory back, far past every retry, nothing runs for its old declaration.
+    h.makeWorkingDirectory(bravo!)
+    const after = run.checkpoint()
+    const spawns = run.composition!.instanceCallsOf('bravo').length
+    await run.clock.advance(3_600_000)
+    expect(run.since(after).lifecycle).toEqual([])
+    expect(run.since(after).slackBuilds).toBe(0)
+    expect(run.composition!.instanceCallsOf('bravo')).toHaveLength(spawns)
+    alphaUntouched()
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test("AC 60: bravo's credentials reconnect from an earlier apply, still retrying, is cancelled by a later working-directory change's teardown: after its fresh bring-up, no further auth.test or start() for it on the fake clock", async () => {
+    const { run, personas } = await running(['alpha', 'bravo'])
+    const [alpha, bravo] = personas
+    const bravoKey = h.key('bravo')
+    const { label } = h.rotateCredentials(bravo!, { slack: { authTest: [{ kind: 'network' }] } })
+    const newStub = run.credentialsStub('bravo', label)
+    await (await run.confirmPending()).applying
+    expect(run.lifecycle.of('reconnect')).toEqual([
+      { op: 'reconnect', key: bravoKey, via: 'apply', change: { kind: 'retrying', connection: 'kept' } },
+    ])
+    expect(run.clock.pendingCount()).toBe(1)
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const cp = run.checkpoint()
+
+    await applyConfig(run, [alpha!, movedDirectory(bravo!)])
+
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: bravoKey, via: 'apply' },
+      { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: bravoKey, via: 'apply' },
+    ])
+    // The bring-up read the file as it stands: the rotated set, its one further auth.test.
+    expect(newStub.calls.authTest).toHaveLength(2)
+    expect(run.currentStub('bravo')).toBe(newStub)
+    expect(run.clock.pendingCount()).toBe(0)
+    const authTests = newStub.calls.authTest.length
+    const starts = newStub.sockets.map((s) => s.startCalls)
+    const after = run.checkpoint()
+    await run.clock.advance(3_600_000)
+    expect(newStub.calls.authTest).toHaveLength(authTests)
+    expect(newStub.sockets.map((s) => s.startCalls)).toEqual(starts)
+    expect(run.since(after).slackBuilds).toBe(0)
+    expect(run.since(after).lifecycle).toEqual([])
+    alphaUntouched()
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test.each<{ label: string; prepare: (personas: PersonaInput[]) => void; outcome: PersonaBringUpOutcome; trigger: (run: ReloadRun, bravo: PersonaInput) => Promise<unknown> }>([
+    {
+      label: 'a restart of its instance through the restart path',
+      prepare: () => undefined,
+      outcome: 'up',
+      trigger: async (run) => expect(await run.relaunch('bravo')).toBe('skipped'),
+    },
+    {
+      label: 'its bring-up retry, with its old directory back and the clock far past every retry',
+      prepare: ([, bravo]) => h.deleteWorkingDirectory(bravo!),
+      outcome: 'retrying',
+      trigger: async (run, bravo) => {
+        h.makeWorkingDirectory(bravo)
+        await run.clock.advance(3_600_000)
+      },
+    },
+  ])("AC 60: between the halves (bravo's step-2 teardown settled, its step-6 bring-up held), $label launches, reconnects and registers nothing; once released, exactly one spawn for its instance (real launch)", async ({ prepare, outcome, trigger }) => {
+    const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH, prepare)
+    const [alpha, bravo] = personas
+    const bravoKey = h.key('bravo')
+    expect(run.lifecycle.outcome(bravoKey)).toBe(outcome)
+    const moved = movedDirectory(bravo!)
+    const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
+    const gate = run.lifecycle.hold('bring-up', bravoKey)
+
+    const { applying } = await confirmConfig(run, [alpha!, moved])
+    await gate.entered
+    expect(run.lifecycle.timeline).toEqual([
+      { op: 'teardown', key: bravoKey, phase: 'start' },
+      { op: 'teardown', key: bravoKey, phase: 'settled' },
+      { op: 'bring-up', key: bravoKey, phase: 'start' },
+    ])
+    const between = run.checkpoint()
+    await trigger(run, bravo!)
+    await turns()
+
+    // Nothing started it: no launch or bring-up, no client, no connection, and its instance would not be admitted.
+    expect(run.since(between).lifecycle.filter((r) => r.via !== 'restart')).toEqual([])
+    expect(run.since(between).slackBuilds).toBe(0)
+    expect(run.connections.manager.status(bravoKey)).toBeUndefined()
+    expect(run.isUp('bravo')).toBe(false)
+    expect(run.admitSession('bravo').kind).toBe('not-up')
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'delete ok'])
+
+    gate.release()
+    await applying
+
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['kill ok', 'delete ok', 'spawn ok'])
+    expect(lastSpawnOf(run, 'bravo')).toMatchObject({ cwd: moved.working_directory })
+    expect(run.isUp('bravo')).toBe(true)
+    expect(run.admitSession('bravo').kind).toBe('admitted')
+    expectNoPostNoLeak(run)
+  })
+
+  test.each<{ setting: 'working_directory' | 'credentials_file'; move: (bravo: PersonaInput) => PersonaInput }>([
+    { setting: 'working_directory', move: (bravo) => movedDirectory(bravo) },
+    // Dry run reads no credentials file, so the new path need not exist.
+    { setting: 'credentials_file', move: (bravo) => movedCredentials(bravo, false) },
+  ])("AC 60 in dry run: bravo's $setting moved in the configuration file is still a destructive modify: previewed DESTRUCTIVE:, then one teardown that skips the agent-director kill and delete and one bring-up under the dry-run rules (no credentials read, no Slack client, a launch recorded), and alpha is untouched (real composition, dry run)", async ({ setting, move }) => {
+    const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true, dryRun: true })
+    const [alpha, bravo] = personas
+    const [alphaKey, bravoKey] = keysOf('alpha', 'bravo')
+    const moved = move(bravo!)
+    const cp = run.checkpoint()
+
+    await previewConfig(run, [alpha!, moved])
+    expect(h.pendingDestructiveLines()).toHaveLength(1)
+    expect(h.pendingDestructiveLines()![0]).toStartWith(`DESTRUCTIVE: persona ${renderPersonaRef('bravo', bravoKey)} ${setting} changed`)
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: bravoKey, via: 'apply' },
+      { op: 'bring-up', key: bravoKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: bravoKey, via: 'apply' },
+    ])
+    // The teardown skipped the agent-director calls, saying so once.
+    expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
+    expect(run.composition!.agentDirectorOrder).toEqual([])
+    expect(run.logs.filter((l) => l.startsWith(`[slack] dry-run: persona teardown of ${renderPersonaRef('bravo', bravoKey)}: `))).toHaveLength(1)
+    // The bring-up under the dry-run rules: no credentials file read, no Slack client or call.
+    expect(run.tickCredentialsReads).toEqual([])
+    expect(run.bringUps.credentialsDigest(bravoKey)).toBeUndefined()
+    expect(run.slack.builds).toEqual([])
+    expect(Object.values(run.slackCalls()).flat()).toEqual([])
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+    expect(run.appliedConfigs.at(-1)!.personas.find((p) => p.key === bravoKey)![setting]).toBe(moved[setting])
+    // alpha: no lifecycle record, dependency call or state change (no Slack client exists in dry run).
+    expect(run.since(cp).lifecycle.filter((r) => r.key === alphaKey)).toEqual([])
+    expect(run.composition!.calls.filter(([, key]) => key === alphaKey)).toEqual([])
+    expect(run.bringUps.state(alphaKey)?.outcome).toBe('up')
+    const applied = run.logsOf(RELOAD_APPLIED)
+    expect(applied).toHaveLength(1)
+    expect(applied[0]).toContain('1 destructively modified')
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test.each<{ setting: 'working_directory' | 'credentials_file' }>([{ setting: 'working_directory' }, { setting: 'credentials_file' }])(
+    "AC 60 control:bravo's $setting written as a symlink to the same real path is no change: previewed with no effective change, and confirmed it records no teardown and no bring-up and logs reload-noop",
+    async ({ setting }) => {
+      const { run, personas } = await running(['alpha', 'bravo'])
+      const [alpha, bravo] = personas
+      const link = join(dirname(bravo![setting]), `link-${setting}`)
+      symlinkSync(bravo![setting], link)
+      const cp = run.checkpoint()
+
+      await previewConfig(run, [alpha!, h.persona('bravo', { [setting]: link })])
+      expect(h.pendingHeader()).toContain('no effective change')
+      expect(h.pendingDestructiveLines()).toEqual([])
+      h.confirm()
+      await run.ticks.tick()
+
+      expect(run.since(cp).lifecycle).toEqual([])
+      expect(run.since(cp).slackCalls).toEqual([])
+      expect(run.since(cp).slackBuilds).toBe(0)
+      expect(run.logsOf(RELOAD_NOOP)).toHaveLength(1)
+      expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
+      await expectNothingPendingAfter(run)
+      expectNoPostNoLeak(run)
+    },
+  )
+})
+
+describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no session and takes effect at the next launch (b.av2 SR-8.6, SR-6.2, SR-9.4)', () => {
+  beforeEach(useConfigDirs)
+
+  test.each<{
+    setting: 'claude_config_dir' | 'stop_hook_bootstrap'
+    what: string
+    change: () => Partial<PersonaInput>
+    refresh: boolean
+    nextLaunch: string[]
+    record: string
+    /** The `config_dir` label the next launch must carry; default the strict label of the new directory. */
+    label?: () => string
+    /** Asserted before the next launch: the new directory is still not created. */
+    uncreated?: boolean
+  }>([
+    {
+      setting: 'claude_config_dir',
+      what: 'claude_config_dir, moved to an existing directory,',
+      change: () => ({ claude_config_dir: h.configDir('bravo-moved') }),
+      refresh: true,
+      // From an `ended` row labelled with the old directory: deleted, then spawned fresh with the new one.
+      nextLaunch: ['spawn ErrInstanceIdCollision', 'delete ok', 'spawn ok'],
+      record: 'true',
+    },
+    {
+      setting: 'claude_config_dir',
+      what: 'claude_config_dir, moved to a directory not created yet under a symlinked parent,',
+      change: () => ({ claude_config_dir: join(configDirLink('bravo-parent-link', h.configDir('bravo-parent')), 'fresh', 'nested') }),
+      refresh: true,
+      nextLaunch: ['spawn ErrInstanceIdCollision', 'delete ok', 'spawn ok'],
+      record: 'true',
+      // The nearest existing ancestor's real path (the link's target) plus the rest, never the path as written.
+      label: () => configDirLabelValue(join(h.configDir('bravo-parent'), 'fresh', 'nested'), h.home),
+      uncreated: true,
+    },
+    {
+      setting: 'stop_hook_bootstrap',
+      what: 'stop_hook_bootstrap',
+      change: () => ({ stop_hook_bootstrap: false }),
+      refresh: false,
+      // The row's label still matches: resumed.
+      nextLaunch: ['spawn ErrInstanceIdCollision', 'resume ok'],
+      record: 'false',
+    },
+  ])("AC 59: bravo's own $what changed records no teardown, bring-up or reconnect and no agent-director instance call, keeps its connection, MCP session, row and reply-guard record; its next launch uses the new value, and running alpha is unaffected (real launch)", async ({ setting, change, refresh, nextLaunch, record, label: expectedLabel, uncreated }) => {
+    const { run, personas } = await running(['alpha', 'bravo'], { ...REAL_LAUNCH, sessions: true })
+    const [alpha, bravo] = personas
+    const bravoKey = h.key('bravo')
+    const edited = h.persona('bravo', change())
+    const records = () => ({ alpha: h.readReplyGuardRecord('alpha'), bravo: h.readReplyGuardRecord('bravo') })
+    const recordsBefore = records()
+    expect(recordsBefore).toEqual({ alpha: 'true', bravo: 'true' })
+    const rows = () => ({ alpha: h.rowOf('alpha'), bravo: h.rowOf('bravo') })
+    const rowsBefore = rows()
+    const sessions = { alpha: run.session('alpha'), bravo: run.session('bravo') }
+    const sides = { alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }
+    const compositionFrom = run.composition!.calls.length
+    const adFrom = run.composition!.agentDirectorCalls.length
+    const alphaInstanceCalls = run.composition!.instanceCallsOf('alpha').length
+    const cp = run.checkpoint()
+
+    // Before confirmation: bravo's line says the change waits for its next launch; nothing destructive.
+    const lines = await previewConfig(run, [alpha!, edited])
+    const nextLaunchLine = `persona ${renderPersonaRef('bravo', bravoKey)}: ${setting} changed: takes effect at its next launch`
+    expect(lines.filter((l) => l.startsWith(nextLaunchLine))).toHaveLength(1)
+    expect(h.pendingDestructiveLines()).toEqual([])
+    h.confirm()
+    await run.ticks.tick()
+
+    // No lifecycle record for either persona; only step 5's one refresh when the directory set changed.
+    expect(run.since(cp).lifecycle).toEqual(refresh ? [refreshRecord('refreshed')] : [])
+    expect(run.composition!.calls.slice(compositionFrom)).toEqual([])
+    expect(adCallsSince(run, adFrom).map((c) => `${c.verb} ${c.result}`)).toEqual(refresh ? ['makeTemplate ok'] : [])
+    // Kept: the connection (no socket closed, client built or Slack call), the MCP session, the row and both records.
+    expect({ alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }).toEqual(sides)
+    expect(run.session('bravo')).toBe(sessions.bravo!)
+    expect(run.session('alpha')).toBe(sessions.alpha!)
+    expect(rows()).toEqual(rowsBefore)
+    expect(records()).toEqual(recordsBefore)
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    await expectNothingPendingAfter(run)
+
+    // Its next launch, through the restart path from an ended row: the new value.
+    if (uncreated) expect(existsSync(edited.claude_config_dir!)).toBe(false)
+    h.seedRow(bravo!, { state: 'ended' })
+    const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
+    const next = run.checkpoint()
+    expect(await run.relaunch('bravo')).toBe(true)
+    expect(run.since(next).lifecycle).toEqual([{ op: 'launch', key: bravoKey, via: 'restart', restart: true }])
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(nextLaunch)
+    const label = expectedLabel?.() ?? personaConfigDirLabelValue(edited.claude_config_dir, h.home)
+    expect(lastSpawnOf(run, 'bravo')).toMatchObject({ claudeConfigDir: edited.claude_config_dir, configDirLabel: label })
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', labels: expect.objectContaining({ config_dir: label }) })
+    expect(h.readReplyGuardRecord('bravo')).toBe(record)
+    // Never held as unresolvable, at the apply or the launch.
+    expect(run.logsOf(PERSONA_CONFIG_DIR_UNRESOLVABLE)).toEqual([])
+    expect(run.isUp('bravo')).toBe(true)
+    // No lost-history or transcript-loss warning for it: no notice, no post.
+    expect(run.sessionNotices).toEqual([])
+    // alpha, running beside it: no instance call, its row and its record unchanged.
+    expect(run.composition!.instanceCallsOf('alpha')).toHaveLength(alphaInstanceCalls)
+    expect(h.rowOf('alpha')).toEqual(rowsBefore.alpha)
+    expect(h.readReplyGuardRecord('alpha')).toBe(recordsBefore.alpha)
+    expect(run.session('alpha')).toBe(sessions.alpha!)
+    expectNoPostNoLeak(run)
+  })
+
+  test("b.g57: bravo, held because its claude_config_dir stopped resolving (a symlink whose target was removed), is launched once a confirmed change moves it to a directory that resolves: its 5 s re-check reads the applied declaration, not the one it was held with, and spawns it fresh in the new directory; alpha is untouched (real launch)", async () => {
+    const target = h.configDir('bravo-target')
+    const link = configDirLink('bravo-link', target)
+    const { run, personas } = await running(['alpha', ['bravo', { claude_config_dir: link }]], REAL_LAUNCH)
+    const [alpha, bravo] = personas
+    const bravoKey = h.key('bravo')
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const alphaInstanceCalls = run.composition!.instanceCallsOf('alpha').length
+    expect(run.isUp('bravo')).toBe(true)
+
+    // The link's target goes: the next launch finds the directory unresolvable and holds bravo.
+    rmSync(target, { recursive: true })
+    h.seedRow(bravo!, { state: 'ended' })
+    const bravoInstanceCalls = run.composition!.instanceCallsOf('bravo').length
+    expect(await run.relaunch('bravo')).toBe('skipped')
+    expect(run.bringUps.state(bravoKey)).toMatchObject({ outcome: 'retrying', causes: { configDir: expect.anything() } })
+    expect(run.isUp('bravo')).toBe(false)
+    expect(run.logsOf(PERSONA_CONFIG_DIR_UNRESOLVABLE)).toHaveLength(1)
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual([])
+    expect(run.clock.pendingCount()).toBe(1)
+
+    // A confirmed move to a directory that resolves: a next-launch change, so nothing is done to bravo at the apply.
+    const fresh = h.configDir('bravo-fresh')
+    const cp = run.checkpoint()
+    await applyConfig(run, [alpha!, h.persona('bravo', { claude_config_dir: fresh })])
+    expect(run.since(cp).lifecycle).toEqual([refreshRecord('refreshed')])
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual([])
+    expect(run.isUp('bravo')).toBe(false)
+
+    // Its re-check, 5 s after the hold: the new directory resolves, so one cleared line and one fresh spawn there.
+    await run.clock.advance(4_999)
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual([])
+    const recheck = run.checkpoint()
+    await run.clock.advance(1)
+    expect(run.since(recheck).lifecycle).toEqual([{ op: 'launch', key: bravoKey, via: 'retry', action: 'spawned' }])
+    expect(instanceCallsSince(run, 'bravo', bravoInstanceCalls)).toEqual(['spawn ErrInstanceIdCollision', 'delete ok', 'spawn ok'])
+    const label = personaConfigDirLabelValue(fresh, h.home)
+    expect(lastSpawnOf(run, 'bravo')).toMatchObject({ claudeConfigDir: fresh, configDirLabel: label })
+    expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', labels: expect.objectContaining({ config_dir: label }) })
+    const lines = run.logsOf(PERSONA_CONFIG_DIR_UNRESOLVABLE)
+    expect(lines).toHaveLength(2)
+    expect(lines[1]).toContain('cleared')
+    expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
+    expect(run.isUp('bravo')).toBe(true)
+    expect(run.clock.pendingCount()).toBe(0)
+    alphaUntouched()
+    expect(run.composition!.instanceCallsOf('alpha')).toHaveLength(alphaInstanceCalls)
+    expectNoPostNoLeak(run)
+  })
+})
+
+describe('AC 61: a changed inherited default leaves every instance undisturbed and reaches each inheriting persona at its next launch (b.av2 SR-8.6)', () => {
+  beforeEach(useConfigDirs)
+
+  test.each<{
+    setting: 'claude_config_dir' | 'stop_hook_bootstrap'
+    before: () => TopLevel
+    after: () => TopLevel
+    /** alpha's and bravo's overrides: they inherit the default. */
+    inherit: Partial<PersonaInput>
+    /** charlie's overrides: its own value. */
+    own: Partial<PersonaInput>
+    refresh: boolean
+    /** Each inheriting persona's next launch, and charlie's. */
+    inheritorLaunch: string[]
+    ownLaunch: string[]
+    /** What each persona's next launch used: its spawn's config directory and its reply-guard record. */
+    launched: (name: string) => { claudeConfigDir: string | undefined; record: string | undefined }
+  }>([
+    {
+      setting: 'claude_config_dir',
+      before: () => ({ claude_config_dir: h.configDir('default') }),
+      after: () => ({ claude_config_dir: h.configDir('default-new') }),
+      inherit: { claude_config_dir: undefined },
+      own: {},
+      refresh: true,
+      inheritorLaunch: ['spawn ErrInstanceIdCollision', 'delete ok', 'spawn ok'],
+      ownLaunch: ['spawn ErrInstanceIdCollision', 'resume ok'],
+      launched: (name) => ({ claudeConfigDir: name === 'charlie' ? ownConfigDir('charlie') : h.configDir('default-new'), record: 'true' }),
+    },
+    {
+      setting: 'stop_hook_bootstrap',
+      before: () => ({ stop_hook_bootstrap: true }),
+      after: () => ({ stop_hook_bootstrap: false }),
+      inherit: {},
+      own: { stop_hook_bootstrap: true },
+      refresh: false,
+      inheritorLaunch: ['spawn ErrInstanceIdCollision', 'resume ok'],
+      ownLaunch: ['spawn ErrInstanceIdCollision', 'resume ok'],
+      launched: (name) => ({ claudeConfigDir: ownConfigDir(name), record: name === 'charlie' ? 'true' : 'false' }),
+    },
+  ])('AC 61: the top-level $setting changed, inherited by alpha and bravo and overridden by charlie, is previewed as one line listing exactly alpha and bravo, records no teardown, bring-up or reconnect, and each inheritor\'s next launch uses the new default while charlie\'s keeps its own (real launch)', async ({ setting, before, after, inherit, own, refresh, inheritorLaunch, ownLaunch, launched }) => {
+    const names = ['alpha', 'bravo', 'charlie']
+    const { run, personas } = await running([['alpha', inherit], ['bravo', inherit], ['charlie', own]], { ...REAL_LAUNCH, top: before() })
+    const snapshot = () =>
+      Object.fromEntries(names.map((n) => [n, { row: h.rowOf(n), record: h.readReplyGuardRecord(n), side: slackSideOf(run, n) }]))
+    const kept = snapshot()
+    const adFrom = run.composition!.agentDirectorCalls.length
+    const cp = run.checkpoint()
+
+    // Before confirmation: one line for the default, naming exactly the inheritors.
+    const lines = await previewConfig(run, personas, after())
+    const settingLines = lines.filter((l) => l.startsWith(`server-wide setting ${setting} changed:`))
+    expect(settingLines).toHaveLength(1)
+    expect(settingLines[0]).toStartWith(
+      `server-wide setting ${setting} changed: inherited by ${renderPersonaRef('alpha', h.key('alpha'))}, ${renderPersonaRef('bravo', h.key('bravo'))}; `,
+    )
+    expect(settingLines[0]).not.toContain(renderPersonaRef('charlie', h.key('charlie')))
+    h.confirm()
+    await run.ticks.tick()
+
+    // Nothing done to any persona; only step 5's refresh when the directory set changed.
+    expect(run.since(cp).lifecycle).toEqual(refresh ? [refreshRecord('refreshed')] : [])
+    expect(adCallsSince(run, adFrom).map((c) => `${c.verb} ${c.result}`)).toEqual(refresh ? ['makeTemplate ok'] : [])
+    expect(snapshot()).toEqual(kept)
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    await expectNothingPendingAfter(run)
+
+    // Each one's next launch, from an ended row.
+    for (const persona of personas) h.seedRow(persona, { state: 'ended' })
+    for (const name of names) {
+      const from = run.composition!.instanceCallsOf(name).length
+      expect(await run.relaunch(name)).toBe(true)
+      expect(instanceCallsSince(run, name, from)).toEqual(name === 'charlie' ? ownLaunch : inheritorLaunch)
+      const { claudeConfigDir, record } = launched(name)
+      expect(lastSpawnOf(run, name)?.claudeConfigDir).toBe(claudeConfigDir)
+      expect(h.readReplyGuardRecord(name)).toBe(record)
+    }
+    expect(run.sessionNotices).toEqual([])
+    expectNoPostNoLeak(run)
+  })
+})
+
+describe('AC 61: a changed server-wide setting is recorded and takes effect at the next server start (b.av2 SR-8.6, the server-wide row)', () => {
+  test.each<{ setting: 'port' | 'reply_chunk_limit'; before: number; after: number }>([
+    { setting: 'port', before: 3101, after: 3102 },
+    { setting: 'reply_chunk_limit', before: 3000, after: 1200 },
+  ])('AC 61: $setting changed is listed in the preview; confirmed, it makes no lifecycle call, is recorded, counts as an effective change, and the running server keeps its start-time value until a fresh start over the same directories runs the new one', async ({ setting, before, after }) => {
+    const { run, personas } = await running(['alpha', 'bravo'], { top: { [setting]: before } as TopLevel })
+    expect(run.serverConfig()![setting]).toBe(before)
+    const sides = { alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }
+    const cp = run.checkpoint()
+
+    const lines = await previewConfig(run, personas, { [setting]: after } as TopLevel)
+    expect(lines.filter((l) => l.startsWith(`server-wide setting ${setting} changed:`))).toHaveLength(1)
+    expect(h.pendingHeader()).toContain('server-wide settings: 1 changed')
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(run.since(cp).lifecycle).toEqual([])
+    expect(run.since(cp).slackCalls).toEqual([])
+    expect(run.since(cp).slackBuilds).toBe(0)
+    expect({ alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }).toEqual(sides)
+    // Recorded, and an effective change; the running server still reads the start-time value.
+    expect(JSON.parse(h.readRecord()!.toString('utf-8'))[setting]).toBe(after)
+    expect(run.appliedConfigs.at(-1)![setting]).toBe(after)
+    expect(run.serverConfig()![setting]).toBe(before)
+    const applied = run.logsOf(RELOAD_APPLIED)
+    expect(applied).toHaveLength(1)
+    expect(applied[0]).toContain('server-wide settings: 1 changed')
+    expect(run.logsOf(RELOAD_NOOP)).toEqual([])
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+
+    // The next server start runs the record: the new value is in effect.
+    await run.stop()
+    const restarted = await h.start()
+    expect(restarted.serverConfig()![setting]).toBe(after)
+    expect(restarted.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
+    expectNoPostNoLeak(restarted)
+  })
+})
+
+describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-11)', () => {
+  beforeEach(useConfigDirs)
+
+  /** The top-level default charlie inherits. */
+  const DEFAULT_TOP = (): TopLevel => ({ claude_config_dir: h.configDir('default') })
+
+  interface RefreshRow {
+    label: string
+    /** The candidate over the running alpha and bravo (own directories) and charlie (inheriting `DEFAULT_TOP`). */
+    next: (personas: PersonaInput[], top: TopLevel) => { personas: PersonaInput[]; top: TopLevel }
+    /** The effective config directories, as written, after it. */
+    dirs: () => string[]
+    /** The candidate has no effective change: the apply runs step 5 only and logs reload-noop. */
+    noop?: boolean
+  }
+
+  /** delta, its files created, added to `personas`. */
+  function withDelta(personas: PersonaInput[], overrides: Partial<PersonaInput> = {}): PersonaInput[] {
+    const delta = h.persona('delta', overrides)
+    h.materialize(delta)
+    return [...personas, delta]
+  }
+
+  const REFRESH_ROWS: RefreshRow[] = [
+    {
+      label: "bravo's own directory moved to a new one",
+      next: ([alpha, , charlie], top) => ({ personas: [alpha!, h.persona('bravo', { claude_config_dir: h.configDir('bravo-moved') }), charlie!], top }),
+      dirs: () => [ownConfigDir('alpha'), h.configDir('bravo-moved'), h.configDir('default')],
+    },
+    {
+      label: 'the top-level default charlie inherits changed',
+      next: (personas) => ({ personas, top: { claude_config_dir: h.configDir('default-new') } }),
+      dirs: () => [ownConfigDir('alpha'), ownConfigDir('bravo'), h.configDir('default-new')],
+    },
+    {
+      label: 'delta added with a new directory',
+      next: (personas, top) => ({ personas: withDelta(personas), top }),
+      dirs: () => [ownConfigDir('alpha'), ownConfigDir('bravo'), h.configDir('default'), ownConfigDir('delta')],
+    },
+    {
+      label: 'bravo, the only persona using its directory, removed',
+      next: ([alpha, , charlie], top) => ({ personas: [alpha!, charlie!], top }),
+      dirs: () => [ownConfigDir('alpha'), h.configDir('default')],
+    },
+    {
+      // Director decision (c): the set is compared as written, so a new spelling of a used directory refreshes.
+      label: "delta added whose claude_config_dir is a symlink to alpha's directory (unchanged by real path, changed as written)",
+      next: (personas, top) => ({ personas: withDelta(personas, { claude_config_dir: configDirLink('delta-link', ownConfigDir('alpha')) }), top }),
+      dirs: () => [ownConfigDir('alpha'), ownConfigDir('bravo'), h.configDir('default'), join(dirname(ownConfigDir('alpha')), 'delta-link')],
+    },
+    {
+      label: "bravo's directory rewritten, on its own, as a symlink to the same real path (no effective change)",
+      next: ([alpha, , charlie], top) => ({
+        personas: [alpha!, h.persona('bravo', { claude_config_dir: configDirLink('bravo-link', ownConfigDir('bravo')) }), charlie!],
+        top,
+      }),
+      dirs: () => [ownConfigDir('alpha'), join(dirname(ownConfigDir('alpha')), 'bravo-link'), h.configDir('default')],
+      noop: true,
+    },
+  ]
+
+  test.each(REFRESH_ROWS)('step 5: $label changes the set of effective config directories, so the apply refreshes the template exactly once, its allow rules covering exactly the new set and every other field as installed (real composition)', async ({ next, dirs, noop }) => {
+    const { run, personas } = await running(['alpha', 'bravo', ['charlie', { claude_config_dir: undefined }]], { realLifecycle: true, top: DEFAULT_TOP() })
+    const installed = run.composition!.installedTemplate!
+    expect(installed.allow).toEqual(memoryRules(ownConfigDir('alpha'), ownConfigDir('bravo'), h.configDir('default')))
+    const candidate = next(personas, DEFAULT_TOP())
+    const cp = run.checkpoint()
+
+    await applyConfig(run, candidate.personas, candidate.top)
+
+    expect(run.lifecycle.of('template-refresh')).toEqual([refreshRecord('refreshed')])
+    expect(templateCalls(run)).toEqual([{ ...installed, allow: memoryRules(...dirs()), overwrite: true }])
+    expect(run.logs.filter((l) => l.startsWith('[slack] template refresh: '))).toHaveLength(1)
+    if (noop) {
+      expect(run.since(cp).lifecycle).toEqual([refreshRecord('refreshed')])
+      expect(run.logsOf(RELOAD_NOOP)).toHaveLength(1)
+      expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
+    } else {
+      expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+      expect(run.logsOf(RELOAD_NOOP)).toEqual([])
+    }
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test.each<{ label: string; next: (personas: PersonaInput[]) => PersonaInput[] }>([
+    { label: 'a stop_hook_bootstrap-only change', next: ([a, , c]) => [a!, h.persona('bravo', { stop_hook_bootstrap: false }), c!] },
+    { label: "a destructive modify (bravo's working directory moved)", next: ([a, b, c]) => [a!, movedDirectory(b!), c!] },
+    {
+      label: 'an in-place change',
+      next: ([a, , c]) => [a!, h.persona('bravo', { channels: [{ id: ownChannel('bravo'), delivery: 'all' }, { id: EXTRA_CHANNEL, delivery: 'all' }] }), c!],
+    },
+    {
+      label: "bravo moved into alpha's directory while charlie still uses bravo's old one",
+      next: ([a, , c]) => [a!, h.persona('bravo', { claude_config_dir: ownConfigDir('alpha') }), c!],
+    },
+  ])('step 5: $label leaves the set of effective config directories as it was, so the apply makes no makeTemplate call (real composition)', async ({ next }) => {
+    // charlie shares bravo's directory.
+    const { run, personas } = await running(['alpha', 'bravo', ['charlie', { claude_config_dir: ownConfigDir('bravo') }]], { realLifecycle: true })
+    const cp = run.checkpoint()
+
+    await applyConfig(run, next(personas))
+
+    expect(run.since(cp).lifecycle.filter((r) => r.op === 'template-refresh')).toEqual([])
+    expect(run.lifecycle.applyTimeline.filter((e) => e.op === 'template-refresh')).toEqual([])
+    expect(templateCalls(run)).toEqual([])
+    expect(run.logs.filter((l) => l.startsWith('[slack] template refresh: '))).toEqual([])
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test("step 5 keeps the template's start-time server-wide arguments: an apply that adds delta with a new directory and also changes mcp_config_path and the system-prompt settings refreshes the allow rules only, without probing the append file again (real composition)", async () => {
+    const prompt = join(h.root, 'system-prompt.md')
+    writeFileSync(prompt, 'be brief\n')
+    const startTop: TopLevel = { mcp_config_path: join(h.root, 'mcp-start.json'), system_prompt_mode: 'append', append_system_prompt_file: prompt }
+    const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true, top: startTop })
+    // Gone now, before anything reads the installed template: a refresh (or
+    // an install captured after the start) that probed the file again would
+    // drop the flag.
+    rmSync(prompt)
+    const installed = run.composition!.installedTemplate!
+    // What the start installed: its MCP config, and the append flag (its file was readable then).
+    expect(installed.claude_args).toEqual(expect.arrayContaining(['--mcp-config', startTop.mcp_config_path!, '--append-system-prompt-file', prompt]))
+
+    await applyConfig(run, withDelta(personas), { mcp_config_path: join(h.root, 'mcp-next.json'), system_prompt_mode: 'none' })
+
+    expect(templateCalls(run)).toEqual([
+      { ...installed, allow: memoryRules(ownConfigDir('alpha'), ownConfigDir('bravo'), ownConfigDir('delta')), overwrite: true },
+    ])
+    expect(run.serverConfig()!.mcp_config_path).toBe(startTop.mcp_config_path!)
+    expect(run.serverConfig()!.system_prompt_mode).toBe('append')
+    expect(run.lifecycle.outcome(h.key('delta'))).toBe('up')
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test.each<{ label: string; err: () => Error }>([
+    { label: 'a typed agent-director error', err: () => errTemplateMalformed() },
+    // Its message holds a fake token: only a token-free rendering of it may be logged.
+    { label: 'a generic throw', err: () => new Error(`the template store is unavailable ${fakeToken(APP_TOKEN_PREFIX, 'refresh')}`) },
+  ])('step 5: a refresh rejected with $label is logged once, with no token, and is not fatal: the process does not exit, step 6 still brings up the added persona after it, reload-applied is logged and nothing stays pending (real composition)', async ({ err }) => {
+    const { run, personas } = await running(['alpha', 'bravo'], { realLifecycle: true })
+    const deltaKey = h.key('delta')
+    const candidate = withDelta(personas)
+    run.composition!.failTemplateRefresh(err())
+    const exit = spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+    let exits: number
+    try {
+      await applyConfig(run, candidate)
+    } finally {
+      exits = exit.mock.calls.length
+      exit.mockRestore()
+    }
+
+    expect(exits).toBe(0)
+    expect(run.lifecycle.of('template-refresh')).toEqual([refreshRecord('failed')])
+    expect(templateCalls(run)).toHaveLength(1)
+    const refreshLines = run.logs.filter((l) => l.startsWith('[slack] template refresh: '))
+    expect(refreshLines).toHaveLength(1)
+    expect(refreshLines[0]).toContain('failed')
+    // Step 6 ran after it, and no step failed.
+    expect(run.lifecycle.applyTimeline).toEqual([
+      refreshEntry('start'),
+      refreshEntry('settled'),
+      { op: 'bring-up', key: deltaKey, phase: 'start' },
+      { op: 'bring-up', key: deltaKey, phase: 'settled' },
+    ])
+    expect(run.lifecycle.outcome(deltaKey)).toBe('up')
+    expect(run.logsOf('reload')).toEqual([])
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test("step 5 settles before step 6: with the refresh held, delta, added with a new directory, is not brought up; released, the makeTemplate call comes before delta's spawn, so it launches with the refreshed template (real launch; E12 Task 2's interim gap closed)", async () => {
+    const { run, personas } = await running(['alpha', 'bravo'], REAL_LAUNCH)
+    const deltaKey = h.key('delta')
+    const candidate = withDelta(personas)
+    const refresh = run.lifecycle.hold('template-refresh')
+    const adFrom = run.composition!.agentDirectorCalls.length
+
+    const { applying } = await confirmConfig(run, candidate)
+    await refresh.entered
+    await turns()
+    expect(run.lifecycle.applyTimeline).toEqual([refreshEntry('start')])
+    expect(adCallsSince(run, adFrom)).toEqual([])
+    expect(run.lifecycle.keys('bring-up').filter((k) => k === deltaKey)).toEqual([])
+
+    refresh.release()
+    await applying
+
+    expect(run.lifecycle.applyTimeline).toEqual([
+      refreshEntry('start'),
+      refreshEntry('settled'),
+      { op: 'bring-up', key: deltaKey, phase: 'start' },
+      { op: 'bring-up', key: deltaKey, phase: 'settled' },
+    ])
+    const verbs = adCallsSince(run, adFrom).map((c) => `${c.verb}${c.id === undefined ? '' : ` ${c.id}`} ${c.result}`)
+    expect(verbs[0]).toBe('makeTemplate ok')
+    expect(verbs.filter((v) => v.startsWith('spawn '))).toEqual([`spawn ${personaInstanceId(deltaKey)} ok`])
+    expect(run.lifecycle.of('launch').filter((r) => r.key === deltaKey)).toEqual([{ op: 'launch', key: deltaKey, via: 'apply', action: 'spawned' }])
+    expectNoPostNoLeak(run)
+  })
+
+  test("step order across all six steps in one apply: bravo's removal and charlie's old half (step 2), delta's in-place change (3), golf's rotation (4), the refresh (5), then echo's addition and charlie's new half (6); held members show step 5 starts only once step 4 settled and step 6 only once step 5 settled, and alpha gets nothing", async () => {
+    const { run, personas } = await running(['alpha', 'bravo', 'charlie', 'delta', 'golf'])
+    const [alpha, , charlie, , golf] = personas
+    const [alphaKey, bravoKey, charlieKey, deltaKey, echoKey, golfKey] = keysOf('alpha', 'bravo', 'charlie', 'delta', 'echo', 'golf')
+    const movedCharlie = movedDirectory(charlie!)
+    const editedDelta = h.persona('delta', { channels: [{ id: ownChannel('delta'), delivery: 'all' }, { id: EXTRA_CHANNEL, delivery: 'all' }] })
+    h.rotateCredentials(golf!)
+    const echo = h.persona('echo')
+    h.materialize(echo)
+    const alphaUntouched = watchUntouched(run, 'alpha')
+    const teardown = run.lifecycle.hold('teardown', bravoKey)
+    const reconnect = run.lifecycle.hold('reconnect', golfKey)
+    const refresh = run.lifecycle.hold('template-refresh')
+
+    const { applying } = await confirmConfig(run, [alpha!, movedCharlie, editedDelta, golf!, echo])
+    await teardown.entered
+    await turns()
+    // Step 2 holds on bravo's teardown: charlie's old half settled beside it, and nothing later started.
+    expect(run.lifecycle.applyTimeline).toEqual([
+      { op: 'teardown', key: bravoKey, phase: 'start' },
+      { op: 'teardown', key: charlieKey, phase: 'start' },
+      { op: 'teardown', key: charlieKey, phase: 'settled' },
+    ])
+
+    teardown.release()
+    await reconnect.entered
+    await turns()
+    // Step 4 holds on golf's reconnect: step 3 settled, and step 5 has not started.
+    expect(run.lifecycle.applyTimeline.slice(3)).toEqual([
+      { op: 'teardown', key: bravoKey, phase: 'settled' },
+      { op: 'update-in-place', key: deltaKey, phase: 'start' },
+      { op: 'update-in-place', key: deltaKey, phase: 'settled' },
+      { op: 'reconnect', key: golfKey, phase: 'start' },
+    ])
+
+    reconnect.release()
+    await refresh.entered
+    await turns()
+    // Step 5 holds: step 4 settled first, and no bring-up has started.
+    expect(run.lifecycle.applyTimeline.slice(7)).toEqual([
+      { op: 'reconnect', key: golfKey, phase: 'settled' },
+      refreshEntry('start'),
+    ])
+
+    refresh.release()
+    await applying
+
+    const timeline = run.lifecycle.applyTimeline
+    expect(timeline[9]).toEqual(refreshEntry('settled'))
+    expect(timeline.slice(10).map((e) => `${e.op} ${e.key} ${e.phase}`).sort()).toEqual(
+      [
+        `bring-up ${charlieKey} settled`,
+        `bring-up ${charlieKey} start`,
+        `bring-up ${echoKey} settled`,
+        `bring-up ${echoKey} start`,
+      ].sort(),
+    )
+    const steps = timeline.map((e) => APPLY_STEP_OF[e.op])
+    expect(steps).toEqual([...steps].sort((a, b) => a - b))
+    expect(run.lifecycle.of('reconnect')).toEqual([{ op: 'reconnect', key: golfKey, via: 'apply', change: { kind: 'swapped' } }])
+    expect(run.lifecycle.of('template-refresh')).toEqual([refreshRecord()])
+    expect(run.lifecycle.outcome(charlieKey)).toBe('up')
+    expect(run.lifecycle.outcome(echoKey)).toBe('up')
+    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'charlie', 'delta', 'golf', 'echo'))
+    expect(run.lifecycle.records.filter((r) => r.key === alphaKey && r.via === 'apply')).toEqual([])
+    alphaUntouched()
+    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
+    expect(run.logs.at(-1)).toStartWith(`[slack] ${RELOAD_APPLIED}: `)
     await expectNothingPendingAfter(run)
     expectNoPostNoLeak(run)
   })
