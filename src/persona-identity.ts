@@ -197,6 +197,26 @@ export function resolveClaudeConfigDir(configDir?: string, home: string = homedi
 }
 
 /**
+ * The distinct effective claude_config_dirs of a persona set, each resolved
+ * lexically by `resolveClaudeConfigDir`, sorted. A persona without one
+ * contributes `<home>/.claude`, so an absent directory and an explicit
+ * `<home>/.claude` are one entry. An empty persona set yields the default
+ * alone. The one rule for the directory set the agent-director template's
+ * memory-read rules are written from; generic over the persona shape so this
+ * module needs no import of the config loader.
+ *
+ * @param home  As for `resolveClaudeConfigDir`.
+ */
+export function effectiveClaudeConfigDirs(
+  personas: readonly { claude_config_dir?: string }[],
+  home?: string,
+): string[] {
+  const dirs = new Set<string>(personas.map((p) => resolveClaudeConfigDir(p.claude_config_dir, home)))
+  if (dirs.size === 0) dirs.add(resolveClaudeConfigDir(undefined, home))
+  return [...dirs].sort()
+}
+
+/**
  * Value of the `config_dir` label: the first 12 lowercase hex digits of the
  * SHA-256 of the resolved effective claude_config_dir (b.av2 SR-2.2).
  *

@@ -1,6 +1,6 @@
 ---
 name: debug-slack-channel-bots
-description: Diagnose a claude-slack-channel-bots persona that is silent, down or refused — find its server-log lines, match the class, and follow the fix for every persona failure, every config.json rejection and every last-applied record failure at start.
+description: Diagnose a claude-slack-channel-bots persona that is silent, down or refused — find its server-log lines, match the class, and follow the fix for every persona failure, every config.json rejection, every last-applied record failure at start, and every pending configuration change.
 version: 1.0.0
 license: MIT
 user-invocable: true
@@ -14,8 +14,9 @@ Diagnose a persona of `claude-slack-channel-bots` (CSCB) that doesn't answer,
 doesn't come up, or gets refused. Every persona failure is logged to the
 server log with a class label. This skill says where that log is, how to find
 one persona's lines, what each line means, and what the operator does about it.
-It also covers every reason `config.json` is rejected at start, and every
-reason the last-applied record (`config.json.last-applied`) stops a start.
+It also covers every reason `config.json` is rejected at start, every
+reason the last-applied record (`config.json.last-applied`) stops a start, and
+how to read a pending configuration change (`config.json.pending`).
 
 One broken persona never stops the server. Every healthy persona keeps serving,
 and nothing about a broken persona is posted to Slack under any identity. The
@@ -79,6 +80,9 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
 7. **A persona isn't reminded to reply in Slack, or is reminded after being
    opted out?** See
    [A persona isn't reminded to reply](#a-persona-isnt-reminded-to-reply-or-is-reminded-after-opting-out).
+8. **An edit of `config.json` had no effect, `config.json.pending` exists, or
+   `server.log` has `reload-preview` or `reload-invalid` lines?** The edit is
+   pending, not applied. See [Pending changes](#pending-changes).
 
 ---
 
@@ -738,12 +742,13 @@ When a record exists, a start runs the record and doesn't read `config.json`,
 so a restart doesn't apply an edit of `config.json`. The running server still
 checks an edit, within about 5 s once a start's bring-up is done (see
 [The last-applied record](#the-last-applied-record)). If the edit is wrong, it
-writes the error as one `INVALID:` line to `config.json.pending` and logs the
-same line under `reload-preview` in `server.log`; nothing is applied. To apply
-an edit, see [Applying a `config.json` edit](#applying-a-configjson-edit).
+writes the error as one `INVALID:` line to `config.json.pending` and logs it
+once under [`reload-invalid`](#reload-invalid) in `server.log`; nothing is
+applied. The error is the same message as in the tables below. To apply an
+edit, see [Applying a `config.json` edit](#applying-a-configjson-edit).
 
 ```text
-[slack] reload-preview: INVALID: <loader error> Nothing will be applied. (preview in "<path>/config.json.pending")
+[slack] reload-invalid: the pending configuration is invalid and nothing will be applied: <loader error> (preview in "<path>/config.json.pending")
 ```
 
 **Where it shows.** The server logs one line to `server.log` and exits 1, and
@@ -867,9 +872,10 @@ every 5 s, and the credentials files it references too, unless the server
 runs with `SLACK_DRY_RUN`. It applies nothing it finds. While an edit (or a
 changed credentials file) is waiting, it keeps `config.json.pending` beside
 `config.json`, and it deletes the file when nothing is waiting any more.
-The file only shows that something is waiting: to apply an edit, follow
-[Applying a `config.json` edit](#applying-a-configjson-edit). The check
-writes only to the server log, never to Slack.
+The file holds a preview of what applying the change would do, and the same
+preview is logged once (see [Pending changes](#pending-changes)). To apply an
+edit, follow [Applying a `config.json` edit](#applying-a-configjson-edit). The
+check writes only to the server log, never to Slack.
 
 If the check can't keep that file in step, it logs one of these plain
 `[slack] reload:` lines, with no class label. A failure that keeps repeating
@@ -896,25 +902,155 @@ are the ones under
 directory's permissions, free space or filesystem. Nothing running is
 affected.
 
+### Pending changes
+
+`config.json.pending` sits beside `config.json` in the state directory. It
+appears within about 5 s of saving `config.json`, or a credentials file that
+`config.json` references, with content that differs from what is applied. It
+says what applying the change would do. It is deleted when nothing differs
+any more. Nothing in it is applied, and it never reaches Slack.
+
+- **Saving, restarting or rebooting applies nothing.** Every start runs the
+  last-applied record, so a `config.json` edit stays pending across restarts
+  and reboots. A pending credentials-file change is the exception: every start
+  reads credentials files as they stand, so the next start applies it.
+- **Dry run.** With `SLACK_DRY_RUN` set, no credentials file is read: a
+  changed credentials file never shows as pending, and an added persona's
+  credentials file isn't checked.
+- **When it's checked.** The first check runs once a start's bring-up is done,
+  then every 5 s.
+
+Read it, and compare the edit with the applied configuration:
+
+```sh
+STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+cat "$STATE/config.json.pending"
+diff "$STATE/config.json.last-applied" "$STATE/config.json"
+```
+
+The file holds no token and no credentials content. It shows no setting value
+except the new path of a destructive path change (`working_directory changed
+to "<path>"`), plus persona names and credentials-file paths. The diff can
+show anything in `config.json` (see [Constraints](#constraints)).
+
+The first two lines are written by the server:
+`claude-slack-channel-bots: pending configuration change (written by the server)`
+and `fingerprint: sha256:<64 hex digits>`. The fingerprint identifies the
+exact files the preview was made from; nobody needs to read or type it. After
+a blank line comes the preview, one line per effect. Personas are named as
+`persona "<name>" (key=<key>)`.
+
+**Header.** The first preview line:
+
+```text
+A configuration change is pending; nothing has been applied. personas: <n> added, <n> removed, <n> destructively modified, <n> modified in place, <n> with changed credentials; server-wide settings: <n> changed.
+```
+
+`modified in place` counts personas with an in-place setting changed, or with
+a next-launch setting changed on the persona's own entry. A persona that only
+inherits a changed top-level default isn't counted there; the setting counts
+under `server-wide settings`. A persona with both an in-place change and
+changed credentials counts in both.
+
+**Line order and kinds.** After the header: removals, destructive modifies,
+additions, other changed personas (in `config.json` order), then server-wide
+settings.
+
+| Line | Meaning |
+|---|---|
+| `DESTRUCTIVE: persona "<name>" (key=<key>) is removed: its live session will be destroyed (its instance is torn down).` | The persona is gone from `config.json`. Renaming a persona changes its key, so a rename shows as this line for the old name plus an `is added` line for the new one. |
+| `DESTRUCTIVE: persona "<name>" (key=<key>) working_directory changed to "<path>": its live session will be destroyed, then it is brought up fresh.` | Its `credentials_file` or `working_directory` (compared by real path) changed, or its `name` changed without changing its key (`name changed`). Several are joined by ` and `, e.g. `credentials_file changed to "<path>" and working_directory changed to "<path>"`. The instance is replaced and loses its session history. |
+| `persona "<name>" (key=<key>) is added: it will be brought up and launched.` | A new persona. |
+| `persona "<name>" (key=<key>) is added but cannot come up: <cause>; <cause>.` | A new persona whose bring-up would fail now. The causes are the credentials and working-directory cause texts under [Persona diagnostic classes](#persona-diagnostic-classes) (for example `credentials file does not exist`, `credentials file is invalid: …`, `working directory does not exist`). Fix them before the change is applied. |
+| `persona "<name>" (key=<key>): <settings> changed: applied in place immediately, instance kept.` | `<settings>` lists one or more of `channels` (a channel added or removed), `delivery` (a kept channel's mode), `permission_prompts`, `dm.enabled`, `dm.contact`. Reordering channels isn't a change. |
+| `…: stop_hook_bootstrap changed: takes effect at its next launch, instance kept.` | The persona's own `stop_hook_bootstrap` changed. The running instance doesn't see it until it is launched again. |
+| `…: claude_config_dir changed: takes effect at its next launch, which starts fresh (the conversation is not resumed), instance kept until then.` | The persona's own `claude_config_dir` changed (by real path). The running instance is kept; its next launch uses the new directory and starts a new conversation. With both settings changed, the line reads `claude_config_dir, stop_hook_bootstrap changed:` with this effect. |
+| `…: credentials file "<path>" changed: a new connection opens, then the old one closes, instance kept.` | The credentials file's content changed at the same path, and the persona is up. The line names the persona and the path, never a token. |
+| `…: credentials file "<path>" changed: it has no connection yet, so it retries with the new content, instance kept.` | The same, for a persona still retrying its bring-up (Slack unreachable, or its working directory unusable). |
+| `…: credentials file "<path>" changed: it is broken by its credentials now, so it will be brought up.` | The same, for a persona that is broken by its credentials: its credentials file is missing, unreadable or invalid, or Slack refused its tokens ([`persona-credentials-refused`](#persona-credentials-refused)). |
+| `…: credentials file "<path>" changed, but it cannot be used (<cause>): the current connection is kept, instance kept.` | The new content is missing, unreadable or invalid; `<cause>` is the credentials cause text, for example `credentials file does not exist` (never file content). The persona is up and keeps its current connection. A restart reads the file as it stands, so the persona would then be `broken`: fix the file. |
+| `…: credentials file "<path>" changed, but it cannot be used (<cause>): it has no connection yet, so it retries with the new content, instance kept.` | The same bad content, for a retrying persona. |
+| `…: credentials file "<path>" changed, but it cannot be used (<cause>): it stays broken by its credentials.` | The same bad content, for a persona broken by its credentials. It stays broken until the file is fixed. |
+| `persona "<name>" (key=<key>) is added; whether it can come up could not be checked.` | A new persona whose credentials and working directory the check couldn't examine (see the `cannot check` line below). It isn't counted differently in the header. |
+| `…: credentials file "<path>" changed; whether it is broken by its credentials now could not be checked.` | A credentials change whose persona's bring-up state couldn't be read (see the `cannot check` line below). With bad content it starts `credentials file "<path>" changed, but it cannot be used (<cause>);`. |
+| `server-wide setting <name> changed: once applied, it is recorded and takes effect at the next server start after that.` | A top-level setting such as `port` or `bind`. |
+| `server-wide setting <name> changed: inherited by "<name>" (key=<key>), …; takes effect at each one's next launch, instance kept.` | The top-level `stop_hook_bootstrap` changed; the listed personas take the default and are affected. |
+| `server-wide setting claude_config_dir changed: inherited by "<name>" (key=<key>), …; takes effect at each one's next launch, which starts fresh (the conversation is not resumed), instance kept until then.` | The top-level `claude_config_dir` changed; each listed persona's next launch starts a new conversation. |
+| `server-wide setting <name> changed: once applied, it is recorded; no persona inherits it, so no instance is affected.` | The top-level `claude_config_dir` or `stop_hook_bootstrap` changed, but every persona sets its own value. |
+
+One persona's effects share one line, joined by `; `, for example
+`persona "bravo" (key=bravo): channels changed: applied in place immediately, instance kept; credentials file "<path>" changed: a new connection opens, then the old one closes, instance kept.`
+
+**Invalid.** When the edit can't be applied, the preview is one line and
+nothing else, and [`reload-invalid`](#reload-invalid) is logged:
+
+```text
+INVALID: <error> Nothing will be applied.
+```
+
+The error is a message from [Configuration rejections](#configuration-rejections),
+or `the configuration file "<path>" does not exist.` or
+`the configuration file "<path>" cannot be read (<errno>).`
+
+**No effective change.** The bytes differ but nothing would change, for
+example a whitespace or key-order edit, or a setting written out with its
+default value:
+
+```text
+A configuration change is pending; nothing has been applied. no effective change: applying it would change no persona and no server-wide setting.
+```
+
+**Logged once.** The same preview goes to `server.log` under
+[`reload-preview`](#reload-preview) (or `reload-invalid`), once each time the
+change differs from the one last logged, not at every check. The file can be
+rewritten without a new log line: if an added persona's directory is created
+later, its line in the file changes, but the log keeps the old one. The file
+is the current preview.
+
+If the check can't gather a fact the preview needs, it logs one line, and the
+preview says that fact `could not be checked` instead of guessing:
+`[slack] reload: cannot check <what>: <error>; the preview says it could not be checked`.
+`<what>` is `whether the added persona "<name>" (key=<key>) can come up` or
+`the bring-up state of persona "<name>" (key=<key>)`. The line is logged once, and again
+only after a check that gathered every fact. It is an internal error: report
+it as a bug.
+
+**Withdrawing a change.** Revert the edit so the file matches what is applied
+byte for byte (whitespace counts); for a credentials file, put back the
+content it had. With the operator's say-so, the applied `config.json` can be
+restored from the record, which discards every unapplied edit:
+
+```sh
+cp "$STATE/config.json.last-applied" "$STATE/config.json"
+```
+
+Within about 5 s the server deletes `config.json.pending` and logs
+[`reload-nothing-pending`](#reload-nothing-pending) once.
+
 ### Applying a `config.json` edit
 
 A restart doesn't apply an edit of `config.json` while a record exists. With
 the operator's say-so, stop the server, delete the record, and start: a start
 without a record checks and applies `config.json` as it stands.
 
-**The start applies the edit with no preview.** Nothing shows what will change
-before it happens, so check first what the edit does:
+**The start applies the edit with no confirmation.** Before stopping the
+server, while it still runs, read `config.json.pending` and diff `config.json`
+against the record (see [Pending changes](#pending-changes)). Read every line:
+the start applies every edit in `config.json`, not just the one you meant, and
+the preview lists them all. If it reads `INVALID`, the start would be refused:
+fix `config.json` first. The preview describes a confirmed apply; this start
+differs from it in one place:
 
 - A persona that was removed or renamed (a mistyped name counts: the name
   sets the key) has its running instance killed by the start sweep. A
   renamed persona comes up fresh under its new key, without its session
-  history.
+  history. The preview shows these as `DESTRUCTIVE:` lines.
 - A persona whose `working_directory` changed has its running instance killed
   by the start sweep too, and comes up fresh in the new directory, without
-  its session history.
+  its session history. The preview shows a `DESTRUCTIVE:` line.
 - A changed `credentials_file` only reconnects the persona to Slack with the
-  new app; its instance keeps running.
-- The start applies every edit in `config.json`, not just the one you meant.
+  new app at this start; its instance keeps running, although the preview
+  marks it `DESTRUCTIVE:`.
 
 Stop the server and keep a copy of the record:
 
@@ -924,9 +1060,10 @@ claude-slack-channel-bots stop &&
   cp "$STATE/config.json.last-applied" "$STATE/config.json.last-applied.bak"
 ```
 
-Compare the edit with the copy and read every difference against the list
-above (the configuration holds no tokens; if a value starts with `xoxb-` or
-`xapp-`, follow [Constraints](#constraints)):
+Compare the edit with the copy once more, in case `config.json` changed after
+the preview was read, and read every difference against the list above (the
+configuration holds no tokens; if a value starts with `xoxb-` or `xapp-`,
+follow [Constraints](#constraints)):
 
 ```sh
 diff "$STATE/config.json.last-applied.bak" "$STATE/config.json"
@@ -945,8 +1082,9 @@ rm "$STATE/config.json.last-applied" &&
   path and `working_directory` edits: the start sweep handles a changed
   working directory, destructively (see above). A setting that takes effect
   only at a bot's launch (`stop_hook_bootstrap`, a changed
-  `claude_config_dir`) doesn't reach a bot that kept running. For such a
-  change, run `claude-slack-channel-bots stop --stop-bots` in place of
+  `claude_config_dir`) doesn't reach a bot that kept running; the preview
+  shows it as a `takes effect at its next launch` or `inherited by` line. For
+  such a change, run `claude-slack-channel-bots stop --stop-bots` in place of
   `stop`: it exits the bots of the record's persona set, which is the set
   running, so the start launches each one with the edit. It cuts off their
   current turns.
@@ -1030,6 +1168,65 @@ record was deleted, failing on the listening address:
   file was removed but its directory could not be synced, the
   `[slack] reload: removed the pending-change file … but could not sync its directory …`
   line comes first and this line follows at once.
+
+### `reload-preview`
+
+- **Line:** every line of the preview in `config.json.pending`, each as
+  `[slack] reload-preview: <preview line>`. The first is the header, and it
+  ends with where the preview is written:
+
+  ```text
+  [slack] reload-preview: A configuration change is pending; nothing has been applied. personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed. (preview in "<pending path>")
+  [slack] reload-preview: DESTRUCTIVE: persona "<name>" (key=<key>) is removed: its live session will be destroyed (its instance is torn down).
+  ```
+
+  The ` (preview in "<pending path>")` part is missing when the pending file
+  couldn't be written (a plain `[slack] reload: cannot write the pending-change file …`
+  line says why).
+- **When:** once each time the pending change differs from the one last
+  logged: an edit made, changed again, or a credentials file re-saved with
+  new content. Also once at the first check after each start while a change
+  is still pending. Not at every check, and not when the file is only
+  rewritten.
+- **Meaning:** Informational. `config.json`, or a credentials file it
+  references, differs from what is applied, and the edit is valid. Nothing
+  has been applied. Each line is explained under
+  [Pending changes](#pending-changes).
+- **Fix:** Review the preview (the file is the current one). To withdraw the
+  change, revert the edit (see [Pending changes](#pending-changes)). To apply
+  a `config.json` edit, see
+  [Applying a `config.json` edit](#applying-a-configjson-edit).
+
+### `reload-invalid`
+
+- **Line:** one line, with the full error:
+
+  ```text
+  [slack] reload-invalid: the pending configuration is invalid and nothing will be applied: <error> (preview in "<pending path>")
+  ```
+
+  For example
+  `… nothing will be applied: loadPersonaConfig: malformed JSON in "<config path>" at line 1, column 17. (preview in "<pending path>")`.
+  The ` (preview in "<pending path>")` part is missing when the pending file
+  couldn't be written. `config.json.pending` holds the one line
+  `INVALID: <error> Nothing will be applied.`
+- **When:** a running server's check, once each time the pending change
+  differs from the one last logged, and once at the first check after each
+  start while it is still pending. An invalid candidate logs only this line,
+  never `reload-preview`.
+- **Cause:** the edited `config.json` fails to parse or validate (the
+  `<error>` is a message from
+  [Configuration rejections](#configuration-rejections); an unknown key whose
+  name could be a pasted token is counted, not shown), or `config.json` is
+  missing or can't be read while a record exists:
+  `the configuration file "<config path>" does not exist.` or
+  `the configuration file "<config path>" cannot be read (<errno>).`
+- **Effect:** Nothing is applied. The server keeps running the last-applied
+  record.
+- **Fix:** Correct `config.json` at the position or rule the error names, or
+  restore it (see withdrawing under [Pending changes](#pending-changes)).
+  Within about 5 s the check writes the new preview, or removes the pending
+  file and logs `reload-nothing-pending` if the file matches what is applied.
 
 ### The last-applied record can't be read or is invalid
 

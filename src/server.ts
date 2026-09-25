@@ -1079,7 +1079,8 @@ export async function main(): Promise<void> {
   // steps; the bring-up controller it uses is built further down.
   // The detection tick (b.av2 SR-8.2, SR-8.3) is armed only by
   // startDetection() after the start bring-up pass below; it reads the held
-  // credentials digests from the bring-up controller built further down.
+  // credentials digests and bring-up states from the bring-up controller
+  // built further down.
   const reload = createReloadController({
     paths: reloadFilePaths(CONFIG_PATH),
     lifecycle: {
@@ -1089,6 +1090,9 @@ export async function main(): Promise<void> {
     tickDriver: createReloadTickDriver({ log: (line) => console.error(line) }),
     dryRun: isDryRun(),
     heldCredentialsDigest: (key) => bringUps?.credentialsDigest(key),
+    // For the preview: a persona broken by its credentials is brought up at
+    // apply rather than reconnected (b.av2 SR-8.6).
+    bringUpState: (key) => bringUps?.state(key),
     slackClientFactory: PRODUCTION_SLACK_CLIENT_FACTORY,
   })
   reloadController = reload

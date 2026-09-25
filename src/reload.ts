@@ -29,7 +29,8 @@
  * driver (every 5 s in production). Each pass compares the configuration
  * file's bytes with the applied bytes and, unless in dry run, each
  * referenced credentials file's digest with the one the persona's bring-up
- * holds, and keeps `config.json.pending` (the preview behind a fingerprint,
+ * holds, and keeps `config.json.pending` (the SR-8.4 preview, rendered from
+ * the change plan of `reload-plan.ts`, behind a fingerprint,
  * `reload-fingerprint.ts`) in step: written while a change is pending,
  * deleted when nothing is. Its first pass after a start from the record is
  * the SR-8.7 comparison, so an unconfirmed edit stays pending. Nothing is
@@ -39,7 +40,7 @@
  * injected, as `createCronScheduler` is: the SR-8.1 paths, the durable
  * writer and delete, the log sink, the lifecycle operations (the start
  * bring-up pass today), the tick driver, the dry-run flag, the held
- * credentials digests, and the Slack client factory that later work binds
+ * credentials digests and bring-up states, and the Slack client factory that later work binds
  * (applying a confirmed change). It keeps the applied bytes and configuration
  * in memory. `readAppliedPersonaConfig` is the CLI's read-only resolver over
  * the same rules.
@@ -68,20 +69,23 @@ import {
   PersonaConfigReadError,
   readPersonaConfigBytes,
   referencedCredentialsPaths,
+  resolveRealPath,
   type Persona,
   type PersonaConfig,
   type PersonaConfigFs,
 } from './config.ts'
+import { checkPersonaWorkingDirectory, type WorkingDirectoryFs } from './persona-bringup.ts'
+import type { PersonaBringUpState } from './persona-bringup-controller.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
 import {
   credentialsDigest,
+  credentialsReadProblem,
   errnoSuffix,
   readCredentialsFile,
   type CredentialsDigest,
   type CredentialsFileRead,
   type CredentialsFs,
 } from './persona-credentials.ts'
-import { escapeCause } from './persona-diagnostics.ts'
 import { expandTilde, renderPersonaRef } from './persona-identity.ts'
 import type { PersonaSlackClientFactory } from './persona-slack-clients.ts'
 import {
@@ -92,6 +96,23 @@ import {
   type FingerprintContent,
   type FingerprintCredentialsEntry,
 } from './reload-fingerprint.ts'
+import {
+  addedPersonas,
+  buildChangePlan,
+  FACT_UNKNOWN,
+  RELOAD_INVALID,
+  RELOAD_PREVIEW,
+  renderInvalidLogLine,
+  renderPreview,
+  renderPreviewLogLines,
+  type AddedPersonaCause,
+  type ChangePlan,
+  type ChangePlanCandidate,
+  type ChangePlanFacts,
+  type FactUnknown,
+} from './reload-plan.ts'
+
+export { RELOAD_INVALID, RELOAD_PREVIEW } from './reload-plan.ts'
 
 // ---------------------------------------------------------------------------
 // Diagnostic classes (b.av2 SR-10.3)
@@ -115,9 +136,15 @@ export const RELOAD_NOTHING_PENDING = 'reload-nothing-pending'
 /**
  * Every reload diagnostic class label, in a fixed order. Kept apart from the
  * persona classes (`PERSONA_DIAGNOSTIC_CLASSES`): a reload line is about the
- * configuration, not one persona.
+ * configuration, not one persona. `reload-preview` and `reload-invalid` are
+ * defined beside the preview they log (`reload-plan.ts`).
  */
-export const RELOAD_DIAGNOSTIC_CLASSES = [RELOAD_RECORD_WRITE_FAILED, RELOAD_NOTHING_PENDING] as const
+export const RELOAD_DIAGNOSTIC_CLASSES = [
+  RELOAD_RECORD_WRITE_FAILED,
+  RELOAD_NOTHING_PENDING,
+  RELOAD_PREVIEW,
+  RELOAD_INVALID,
+] as const
 
 /** A reload diagnostic class label (closed set). */
 export type ReloadDiagnosticClass = (typeof RELOAD_DIAGNOSTIC_CLASSES)[number]
@@ -228,6 +255,9 @@ export type ReloadFileRemover = (path: string) => boolean
  */
 export type HeldCredentialsDigestQuery = (key: string) => CredentialsDigest | undefined
 
+/** An applied persona's current bring-up state (the bring-up controller's `state`), or undefined when unknown. */
+export type BringUpStateQuery = (key: string) => PersonaBringUpState | undefined
+
 /** Dependencies of `createReloadController`. */
 export interface ReloadControllerDeps {
   /** The configuration file and its reload files (`reloadFilePaths`). */
@@ -255,11 +285,25 @@ export interface ReloadControllerDeps {
    */
   heldCredentialsDigest?: HeldCredentialsDigestQuery
   /**
+   * An applied persona's current bring-up state (production: the bring-up
+   * controller's `state`), for the preview of a credentials change: a
+   * persona broken by its credentials is brought up at apply rather than
+   * reconnected (b.av2 SR-8.6). Without it no persona counts as broken by its
+   * credentials.
+   */
+  bringUpState?: BringUpStateQuery
+  /**
    * File-system overrides for the detection tick's credentials reads
    * (`readCredentialsFile`, which reads only a regular file); unset
    * operations use the real file system.
    */
   credentialsFs?: Partial<CredentialsFs>
+  /**
+   * File-system overrides for the detection tick's working-directory check
+   * of an added persona (`checkPersonaWorkingDirectory`); unset operations
+   * use the real file system.
+   */
+  workingDirectoryFs?: Partial<WorkingDirectoryFs>
   /** The Slack client factory; bound by the work that applies a confirmed change. */
   slackClientFactory?: PersonaSlackClientFactory
   /** Home directory for every `~` in the configuration; the OS home by default. */
@@ -380,40 +424,21 @@ function selectConfiguration(
 // Detection: the pending state (b.av2 SR-8.2, SR-8.3)
 // ---------------------------------------------------------------------------
 
-/**
- * Class of the line that logs the pending-change preview, once per change of
- * the pending state. Task 3 adds it (and `reload-invalid`) to
- * `RELOAD_DIAGNOSTIC_CLASSES` with the full SR-8.4 preview.
- */
-export const RELOAD_PREVIEW = 'reload-preview'
-
 /** One read of the configuration file by the detection tick. */
 type ConfigFileRead =
   | { ok: true; bytes: Buffer }
   | { ok: false; missing: boolean; code: string | undefined }
 
-/** What a confirmed apply would apply, as the tick sees it. */
-type PendingCandidate =
-  | { kind: 'valid'; config: PersonaConfig }
-  /**
-   * Fails validation (default mode); `error` is the loader's message, which
-   * echoes no rejected value and no unknown key name that could be a token.
-   */
-  | { kind: 'invalid'; error: string }
-  /** The configuration file is missing or cannot be read while a record exists. */
-  | { kind: 'unreadable'; missing: boolean; code: string | undefined }
-
 /** The pending state one detection pass derived. Holds no credentials content. */
 interface PendingState {
   /** The configuration file's bytes differ from the applied bytes (or it cannot be read). */
   configChanged: boolean
-  candidate: PendingCandidate
   /**
-   * The personas present in both the applied set and a valid candidate, with
-   * the same `credentials_file`, whose file's digest now differs from the one
-   * held for them; in candidate order. Never set in dry run.
+   * The change plan of the candidate against the applied configuration
+   * (`buildChangePlan`): what the preview renders, and the one place a
+   * credentials change is decided (never in dry run).
    */
-  credentialsChanged: Persona[]
+  plan: ChangePlan
   /** The SR-8.3 fingerprint of the bytes this pass read. */
   fingerprint: string
   /** A change is pending: the configuration changed or any credentials changed. */
@@ -434,70 +459,6 @@ function readConfigFile(path: string, fs: Partial<PersonaConfigFs> | undefined):
 function fingerprintContentOf(read: { ok: true; bytes: Uint8Array } | { ok: false; missing: boolean }): FingerprintContent {
   if (read.ok) return read.bytes
   return read.missing ? FINGERPRINT_MISSING : FINGERPRINT_UNREADABLE
-}
-
-/** A persona's settings as compared for "changed": everything but its position in the file. */
-function personaSettings(persona: Persona): string {
-  return JSON.stringify({ ...persona, index: undefined })
-}
-
-/** The server-wide setting names whose resolved values differ between two configurations. */
-function changedServerSettings(before: PersonaConfig, after: PersonaConfig): string[] {
-  const settings = (config: PersonaConfig): Record<string, unknown> => {
-    const { personas: _personas, ...rest } = config
-    return rest
-  }
-  const a = settings(before)
-  const b = settings(after)
-  return [...new Set([...Object.keys(a), ...Object.keys(b)])].filter(
-    (name) => JSON.stringify(a[name]) !== JSON.stringify(b[name]),
-  )
-}
-
-/** Suffix of an INVALID preview line. */
-const NOTHING_WILL_BE_APPLIED = 'Nothing will be applied.'
-
-/** First line of the preview body of a valid candidate. */
-const PENDING_PREVIEW_TITLE = 'A configuration change is pending. Nothing has been applied.'
-
-/**
- * The preview's change lines (minimal; b.av2 SR-8.4's full preview is Task
- * 3's): one INVALID line for an invalid candidate, otherwise one line per
- * persona added, changed or removed, per server-wide setting changed and per
- * persona whose credentials changed, or `no effective change`. Names personas
- * by name and key and credentials files by path, never any file content or
- * setting value. Pure.
- */
-function renderPreviewLines(state: PendingState, applied: PersonaConfig, configPath: string): string[] {
-  const { candidate } = state
-  if (candidate.kind === 'invalid') return [`INVALID: ${candidate.error} ${NOTHING_WILL_BE_APPLIED}`]
-  if (candidate.kind === 'unreadable') {
-    const what = candidate.missing
-      ? 'does not exist'
-      : `cannot be read${candidate.code !== undefined ? ` (${candidate.code})` : ''}`
-    return [`INVALID: the configuration file ${JSON.stringify(configPath)} ${what}. ${NOTHING_WILL_BE_APPLIED}`]
-  }
-
-  const next = candidate.config
-  const lines: string[] = []
-  for (const persona of next.personas) {
-    const before = applied.personas.find((p) => p.key === persona.key)
-    const ref = `personas[${persona.index}] ${renderPersonaRef(persona.name, persona.key)}`
-    if (before === undefined) lines.push(`added: ${ref}`)
-    else if (personaSettings(before) !== personaSettings(persona)) lines.push(`changed: ${ref}`)
-  }
-  for (const persona of applied.personas) {
-    if (!next.personas.some((p) => p.key === persona.key)) lines.push(`removed: ${renderPersonaRef(persona.name, persona.key)}`)
-  }
-  for (const name of changedServerSettings(applied, next)) lines.push(`server-wide setting changed: ${name}`)
-  for (const persona of state.credentialsChanged) {
-    lines.push(
-      `credentials changed: ${renderPersonaRef(persona.name, persona.key)} ` +
-        `credentials_file=${JSON.stringify(persona.credentials_file)}`,
-    )
-  }
-  if (lines.length === 0) lines.push('no effective change')
-  return lines
 }
 
 /** What the log last said about the pending state, for logging only its changes. */
@@ -521,15 +482,31 @@ interface PendingDetection {
  * configuration. One pass reads the configuration file once and, unless in
  * dry run, each credentials file it references once (stat-first, so a FIFO
  * or a device reads as unreadable and never blocks), derives the pending
- * state, then keeps `config.json.pending` in step: written durably when a
- * change is pending and the file is missing or stale, deleted durably when
- * nothing is pending. The credentials bytes are dropped at the end of the
- * pass; only their digests are compared, with the held ones.
+ * state through the change plan (`buildChangePlan` in `reload-plan.ts`),
+ * then keeps `config.json.pending` in step: written durably, with the
+ * SR-8.4 preview rendered from the plan, when a change is pending and the
+ * file is missing or differs from what the pass would write; deleted durably
+ * when nothing is pending. The credentials bytes are dropped at the end of
+ * the pass; only their digests are compared, with the held ones.
+ *
+ * The plan's facts come from what the pass already read, plus the least
+ * extra I/O: real paths only for paths written differently in the two
+ * configurations, and for each added persona the credentials content check
+ * over the bytes already read (none in dry run) and the working-directory
+ * check. An unchanged persona is not probed. The bring-up state is asked
+ * only for a persona whose credentials changed.
  *
  * Logging, through `deps.log` only (the server log, never Slack):
- * - `reload-preview`, one line, when the pending state (nothing, or pending
- *   with fingerprint F) changes to pending with a new fingerprint; a rewrite
- *   of a missing or stale file with an unchanged state logs nothing;
+ * - when the pending state (nothing, or pending with fingerprint F) changes
+ *   to pending with a new fingerprint: for a valid candidate every line of
+ *   the preview, each classed `reload-preview`; for an invalid one (a
+ *   missing or unreadable configuration file included) the one
+ *   `reload-invalid` line. A rewrite of a missing or stale file with an
+ *   unchanged state logs nothing, even when the preview changed (an added
+ *   persona's directory was created, say);
+ * - a preview fact that could not be gathered, once until a pass gathers
+ *   every fact again; the preview says the fact could not be checked
+ *   (`FACT_UNKNOWN`) instead of claiming an answer;
  * - `reload-nothing-pending`, one line, when the state changes to nothing
  *   pending, or at the first pass after a start that deletes a leftover
  *   pending file; never at a clean start;
@@ -561,9 +538,23 @@ function createPendingDetection(deps: ReloadControllerDeps, applied: AppliedConf
   let running = false
   let stopped = false
 
+  let factFailureLatched = false
+  /** A fact the preview needs could not be gathered in this pass. */
+  let factFailed = false
+
+  /**
+   * A persona named by key, as the logs name it (b.av2 SR-2.2): its
+   * JSON-quoted name from the candidate (else the applied set), key beside it.
+   */
+  function personaRefOf(key: string, candidate: ChangePlanCandidate): string {
+    const candidatePersonas = candidate.kind === 'valid' ? candidate.config.personas : []
+    const persona = [...candidatePersonas, ...applied.config.personas].find((p) => p.key === key)
+    return persona !== undefined ? renderPersonaRef(persona.name, persona.key) : `(key=${key})`
+  }
+
   /** The candidate for bytes that differ from the applied bytes (default mode, so collisions are rejected). */
-  function candidateOf(read: ConfigFileRead, configChanged: boolean): PendingCandidate {
-    if (!read.ok) return { kind: 'unreadable', missing: read.missing, code: read.code }
+  function candidateOf(read: ConfigFileRead, configChanged: boolean): ChangePlanCandidate {
+    if (!read.ok) return { kind: 'unreadable', path: paths.config, missing: read.missing, code: read.code }
     if (!configChanged) return { kind: 'valid', config: applied.config }
     try {
       return { kind: 'valid', config: parsePersonaConfigBytes(read.bytes, paths.config, configDir, { home: deps.home }) }
@@ -573,8 +564,52 @@ function createPendingDetection(deps: ReloadControllerDeps, applied: AppliedConf
   }
 
   /**
+   * A preview fact that could not be gathered (an injected query or check
+   * threw): logged once until a pass gathers every fact again; the plan
+   * carries it as `FACT_UNKNOWN`, and the preview says it could not be
+   * checked.
+   */
+  function noteFactFailure(what: string, err: unknown): void {
+    factFailed = true
+    if (factFailureLatched) return
+    factFailureLatched = true
+    deps.log(`[slack] reload: cannot check ${what}: ${describeThrownValue(err)}; the preview says it could not be checked`)
+  }
+
+  /**
+   * Whether each added persona can come up, as its bring-up would check it
+   * (b.av2 SR-6.1 steps 1 and 2): the credentials content from the bytes this
+   * pass already read (no second read; none in dry run, where no credentials
+   * file is read) and the working-directory check. No other persona is
+   * probed: a valid candidate has no real-path collision, so the directory
+   * check runs without the others.
+   */
+  function addedCannotComeUp(
+    candidate: PersonaConfig,
+    readCredentials: (path: string) => CredentialsFileRead,
+  ): Map<string, AddedPersonaCause[] | FactUnknown> {
+    const result = new Map<string, AddedPersonaCause[] | FactUnknown>()
+    for (const persona of addedPersonas(applied.config, candidate)) {
+      try {
+        const causes: AddedPersonaCause[] = []
+        const credentials = dryRun ? undefined : credentialsReadProblem(readCredentials(persona.credentials_file))
+        if (credentials !== undefined) causes.push({ step: 'credentials', cause: credentials })
+        const directory = checkPersonaWorkingDirectory(persona, { others: [], fs: deps.workingDirectoryFs })
+        if (!directory.ok) causes.push({ step: 'working-directory', cause: directory.cause })
+        result.set(persona.key, causes)
+      } catch (err) {
+        noteFactFailure(`whether the added persona ${renderPersonaRef(persona.name, persona.key)} can come up`, err)
+        result.set(persona.key, FACT_UNKNOWN)
+      }
+    }
+    return result
+  }
+
+  /**
    * One pass's pending state. Every credentials file is read and digested at
-   * most once, and only outside dry run.
+   * most once, and only outside dry run. The change plan decides whether any
+   * credentials changed (`buildChangePlan`), from the digests of this pass's
+   * reads and the held ones; the bytes are dropped when the pass returns.
    */
   function derive(): PendingState {
     const read = readConfigFile(paths.config, deps.configFs)
@@ -599,6 +634,15 @@ function createPendingDetection(deps: ReloadControllerDeps, applied: AppliedConf
       }
       return digest
     }
+    const realPaths = new Map<string, string>()
+    const realPathOf = (path: string): string => {
+      let real = realPaths.get(path)
+      if (real === undefined) {
+        real = resolveRealPath(path)
+        realPaths.set(path, real)
+      }
+      return real
+    }
 
     const entries: FingerprintCredentialsEntry[] = []
     if (!dryRun && read.ok) {
@@ -607,21 +651,33 @@ function createPendingDetection(deps: ReloadControllerDeps, applied: AppliedConf
       }
     }
 
-    const credentialsChanged: Persona[] = []
-    if (!dryRun && candidate.kind === 'valid') {
-      for (const persona of candidate.config.personas) {
-        const before = applied.config.personas.find((p) => p.key === persona.key)
-        if (before === undefined || before.credentials_file !== persona.credentials_file) continue
-        // Nothing held (no query, or an unknown persona): never counts as changed.
-        // A persona broken by a shared credentials file holds its own file's digest.
-        const held = deps.heldCredentialsDigest?.(persona.key)
-        if (held === undefined) continue
-        if (digestOf(persona.credentials_file) !== held) credentialsChanged.push(persona)
-      }
+    factFailed = false
+    const facts: ChangePlanFacts = {
+      realPath: realPathOf,
+      home: deps.home,
+      dryRun,
+      currentCredentialsDigest: (path) => (dryRun ? undefined : digestOf(path)),
+      // Nothing held (no query, or an unknown persona): never counts as changed.
+      // A persona broken by a shared credentials file holds its own file's digest.
+      heldCredentialsDigest: (key) => deps.heldCredentialsDigest?.(key),
+      // The same bytes the digest came from: no second read, none in dry run.
+      credentialsProblem: (path) => (dryRun ? undefined : credentialsReadProblem(readCredentials(path))),
+      bringUpState: (key) => {
+        try {
+          return deps.bringUpState?.(key)
+        } catch (err) {
+          noteFactFailure(`the bring-up state of persona ${personaRefOf(key, candidate)}`, err)
+          return FACT_UNKNOWN
+        }
+      },
+      addedCannotComeUp: candidate.kind === 'valid' ? addedCannotComeUp(candidate.config, readCredentials) : undefined,
     }
+    const plan = buildChangePlan(applied.config, candidate, facts)
+    if (!factFailed) factFailureLatched = false
 
     const fingerprint = reloadFingerprint(fingerprintContentOf(read), entries)
-    return { configChanged, candidate, credentialsChanged, fingerprint, pending: configChanged || credentialsChanged.length > 0 }
+    const credentialsChanged = plan.valid && plan.credentials.length > 0
+    return { configChanged, plan, fingerprint, pending: configChanged || credentialsChanged }
   }
 
   function readPendingFile(): PendingFileRead {
@@ -639,19 +695,26 @@ function createPendingDetection(deps: ReloadControllerDeps, applied: AppliedConf
     deps.log(line)
   }
 
-  /** Write the pending file when it is missing or stale; log the preview when the state changed. */
+  /**
+   * Write the pending file (the SR-8.4 preview behind the fingerprint) when it
+   * is missing or differs from what this pass would write; log the preview
+   * when the pending state changed: every `reload-preview` line of a valid
+   * candidate, or the one `reload-invalid` line of an invalid one. The log
+   * points at the pending file only when it holds this pass's preview.
+   */
   function keepPending(state: PendingState, file: PendingFileRead): void {
-    const lines = renderPreviewLines(state, applied.config, paths.config)
-    const valid = state.candidate.kind === 'valid'
-    const body = (valid ? [PENDING_PREVIEW_TITLE, ...lines] : lines).join('\n')
-    const bytes = Buffer.from(composePendingFile(state.fingerprint, body), 'utf-8')
-    if (rewriteDue || file.kind !== 'bytes' || !file.bytes.equals(bytes)) {
+    const bytes = Buffer.from(composePendingFile(state.fingerprint, renderPreview(state.plan)), 'utf-8')
+    let current = !rewriteDue && file.kind === 'bytes' && file.bytes.equals(bytes)
+    if (!current) {
       try {
         write(paths.pending, bytes)
         rewriteDue = false
         fileFailureLatched = false
+        current = true
       } catch (err) {
         rewriteDue = err instanceof DurableWriteUnsyncedError
+        // An unsynced write still put the preview in place.
+        current = rewriteDue
         noteFileFailure(
           rewriteDue
             ? `[slack] reload: wrote the pending-change file "${paths.pending}" but could not sync its directory${errnoSuffix(err)}; writing it again at the next check`
@@ -661,8 +724,11 @@ function createPendingDetection(deps: ReloadControllerDeps, applied: AppliedConf
     }
     if (logged.kind === 'pending' && logged.fingerprint === state.fingerprint) return
     logged = { kind: 'pending', fingerprint: state.fingerprint }
-    const summary = (valid ? 'a configuration change is pending, nothing has been applied: ' : '') + lines.join('; ')
-    deps.log(`[slack] ${RELOAD_PREVIEW}: ${escapeCause(summary)} (preview in "${paths.pending}")`)
+    const pendingFile = current ? paths.pending : undefined
+    const lines = state.plan.valid
+      ? renderPreviewLogLines(state.plan, pendingFile)
+      : [renderInvalidLogLine(state.plan, pendingFile)]
+    for (const line of lines) deps.log(line)
   }
 
   /**

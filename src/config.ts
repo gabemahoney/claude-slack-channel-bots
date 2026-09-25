@@ -92,6 +92,23 @@ const SHARED_TOP_LEVEL_KEYS = [
 ] as const
 
 /**
+ * The server-wide settings that hold a path, in the order of the top-level
+ * keys: the ones `resolveServerPaths` expands, and the ones a reload compares
+ * by real path (b.av2 SR-1.5, SR-8.4).
+ */
+export const SERVER_PATH_SETTINGS = [
+  'mcp_config_path',
+  'append_system_prompt_file',
+  'message_archive_db',
+  'claude_config_dir',
+  'cron_table_path',
+  'cron_log_path',
+] as const
+
+/** A server-wide setting that holds a path. */
+export type ServerPathSetting = (typeof SERVER_PATH_SETTINGS)[number]
+
+/**
  * The pre-rename name of `agent_director_poll_interval_ms`: rejected with a
  * message naming the new name (SR-4.1), never accepted as an alias.
  */
@@ -655,25 +672,15 @@ function validateServerPollAndCron(config: ServerSettings, style: RuleStyle): vo
  * Today's resolution of the server-wide path settings: `~` expanded and the
  * result made absolute with `path.resolve`. Empty or whitespace
  * `claude_config_dir` and cron paths are kept verbatim so validation rejects
- * them. Defaults from `applyServerDefaults` resolve the same way.
+ * them. Defaults from `applyServerDefaults` resolve the same way. Resolves
+ * exactly the `SERVER_PATH_SETTINGS` (the `satisfies` keeps the two in step).
  *
  * @param home  Home directory for `~`; the OS home, read only when needed, if omitted.
  */
-function resolveServerPaths(
-  settings: ServerSettings,
-  home?: string,
-): Pick<
-  ServerSettings,
-  | 'mcp_config_path'
-  | 'append_system_prompt_file'
-  | 'message_archive_db'
-  | 'claude_config_dir'
-  | 'cron_table_path'
-  | 'cron_log_path'
-> {
+function resolveServerPaths(settings: ServerSettings, home?: string): Pick<ServerSettings, ServerPathSetting> {
   const expand = (path: string): string => resolve(expandTildeWith(path, home))
   const expandUnlessBlank = (path: string): string => (path.trim() === '' ? path : expand(path))
-  return {
+  const resolved = {
     mcp_config_path: expand(settings.mcp_config_path),
     append_system_prompt_file:
       settings.append_system_prompt_file !== undefined ? expand(settings.append_system_prompt_file) : undefined,
@@ -689,7 +696,8 @@ function resolveServerPaths(
       typeof settings.cron_log_path === 'string'
         ? expandUnlessBlank(settings.cron_log_path)
         : settings.cron_log_path,
-  }
+  } satisfies Record<ServerPathSetting, unknown>
+  return resolved
 }
 
 /**

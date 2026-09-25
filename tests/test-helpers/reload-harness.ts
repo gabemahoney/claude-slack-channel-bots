@@ -47,6 +47,28 @@
  *     `h.readPendingText()` (undefined unless a regular file),
  *     `h.pendingFingerprint()` (`parsePendingFingerprint`), and
  *     `h.writePendingBytes(b)` for a leftover or hand-placed file;
+ *   - the preview in the pending file (b.av2 SR-8.4): `h.pendingBody()` is
+ *     the text after the two fingerprint lines and the blank line (found
+ *     through `parsePendingFingerprint` and `composePendingFile`, not by
+ *     re-parsing the layout), without the final newline, so it equals
+ *     `renderPreview(plan)`; `h.pendingLines()` its lines,
+ *     `h.pendingHeader()` the first (the counted header, the `no effective
+ *     change` header or the `INVALID:` line) and
+ *     `h.pendingDestructiveLines()` those starting `DESTRUCTIVE:`. Each is
+ *     undefined when the file is absent, not a regular file or not in the
+ *     pending layout;
+ * - prospective bring-up fixtures, for an added persona that cannot come up
+ *   (b.av2 SR-8.4, SR-6.1 steps 1 and 2):
+ *   `h.preparePersona(name, { credentials?, workingDirectory? }, overrides?)`
+ *   is `h.persona(name, overrides)` with its files left in the stated
+ *   states: credentials `valid` (default, `h.writeCredentials`), `missing`,
+ *   `invalid` (parseable, no `bot_token`) or `unreadable` (a directory);
+ *   working directory `present` (default), `missing` or `file` (a plain
+ *   file). Singly: `h.deleteWorkingDirectory(persona)`,
+ *   `h.makeWorkingDirectoryAFile(persona)`, with `h.deleteCredentials`,
+ *   `h.makeCredentialsUnreadable` and `h.writeCredentialsContent` above.
+ *   The controller judges these with the real checks (below), never canned
+ *   outcomes;
  * - the write-failure seam: `h.failWrites({ step?, code?, call? })` makes the
  *   controller's durable writer (`durableWriteFileSync` over an fs seam, as
  *   in production) throw an errno-style error at that `DurableWriteFs` call
@@ -113,15 +135,41 @@
  *   recorder's ops, the seam writer and remover, `run.ticks`, the dry-run
  *   flag, `heldCredentialsDigest` bound to `run.bringUps.credentialsDigest`
  *   (as `server.ts` binds it; `opts.heldCredentialsDigest` wraps that lookup,
- *   e.g. to make it throw so a detection pass fails), the stub factory and
- *   `h.home`.
+ *   e.g. to make it throw so a detection pass fails), `bringUpState` bound
+ *   to `run.bringUps.state` (as `server.ts` binds it; `opts.bringUpState`
+ *   wraps it the same way, e.g. to throw so the preview leaves a fact out),
+ *   the stub factory and `h.home`. The tick's prospective checks of an
+ *   added persona are the controller's own: the real credentials content
+ *   check over the bytes the tick read (none in dry run) and the real
+ *   working-directory check (`checkPersonaWorkingDirectory`) over the temp
+ *   directory. Both seams (the credentials reads through
+ *   `opts.credentialsFs` when given) are wrapped to record what the tick
+ *   touched:
+ *   `run.tickCredentialsReads` (every credentials path the tick opened; it
+ *   stays empty in dry run, b.av2 SR-3.4, SR-8.2) and
+ *   `run.tickDirectoryChecks` (every working directory it stat'd). Neither
+ *   is part of `since`; slice them by length around a stretch of ticks.
  *   `run.resolveStart()` calls its `resolveStart` and keeps the outcome as
  *   `run.outcome`; `run.startDetection()` calls its `startDetection`;
  * - captures: `run.logs` is the one `[slack]` stream (reload controller,
  *   bring-up controller and connection manager lines, in order), and
  *   `run.logsOf(label)` its lines starting `[slack] <label>: ` (a class such
  *   as `RELOAD_NOTHING_PENDING`, or `'reload'` for the unclassed failures);
- *   `run.writes` every call of the controller's writer (path, success);
+ *   `run.invalidLines()` is `logsOf(RELOAD_INVALID)`;
+ * - preview emissions (b.av2 SR-8.4, SR-10.3): one logged preview spans
+ *   several `reload-preview` lines, the first (the header) starting
+ *   `PREVIEW_EMISSION_START` (`[slack] reload-preview: ` then
+ *   `PENDING_PREVIEW_TITLE`). `run.previewEmissions()` groups `run.logs`
+ *   into emissions (a header and the `reload-preview` lines right after
+ *   it), `run.previewEmissionCount()` counts them,
+ *   `run.lastPreviewEmission()` is the latest one's full log lines and
+ *   `run.lastPreviewText()` the same as body lines (prefix removed, and the
+ *   header's ` (preview in "<h.paths.pending>")` suffix), which equals
+ *   `h.pendingLines()` when the file was written. The exported
+ *   `previewEmissions(lines)` and `previewEmissionText(emission, path)` do
+ *   the same over any slice, e.g. `run.since(cp).logs`. A `reload-invalid`
+ *   line is not an emission;
+ * - `run.writes` every call of the controller's writer (path, success);
  *   `run.removes` every call of its durable delete as what happened to the
  *   file (`ok`: it is gone; `removed`: this call removed it; `unsynced`: it
  *   was removed but the directory sync failed, so the delete threw although
@@ -186,15 +234,21 @@ import {
   type DurableWriteFs,
 } from '../../src/atomic-write.ts'
 import type { Persona, PersonaConfig, PersonaConfigFs, PersonaInput } from '../../src/config.ts'
-import type { PersonaBringUpFs } from '../../src/persona-bringup.ts'
+import {
+  DEFAULT_WORKING_DIRECTORY_FS,
+  type PersonaBringUpFs,
+  type WorkingDirectoryFs,
+} from '../../src/persona-bringup.ts'
 import {
   createPersonaBringUpController,
   type PersonaBringUpController,
   type PersonaBringUpOutcome,
   type PersonaBringUpResultSummary,
+  type PersonaBringUpState,
 } from '../../src/persona-bringup-controller.ts'
 import {
   credentialsDigest,
+  DEFAULT_CREDENTIALS_FS,
   PersonaSlackTokens,
   readCredentialsFile,
   type CredentialsDigest,
@@ -202,9 +256,12 @@ import {
 } from '../../src/persona-credentials.ts'
 import { personaKey } from '../../src/persona-identity.ts'
 import { composePersonaStatusListeners } from '../../src/persona-start.ts'
-import { parsePendingFingerprint } from '../../src/reload-fingerprint.ts'
+import { composePendingFile, parsePendingFingerprint } from '../../src/reload-fingerprint.ts'
+import { DESTRUCTIVE_PREFIX, PENDING_PREVIEW_TITLE } from '../../src/reload-plan.ts'
 import {
   createReloadController,
+  RELOAD_INVALID,
+  RELOAD_PREVIEW,
   reloadFilePaths,
   type ReloadController,
   type ReloadFilePaths,
@@ -474,6 +531,86 @@ export const NO_RUN_ACTIVITY: Readonly<ReloadRunActivity> = Object.freeze({
 })
 
 // ---------------------------------------------------------------------------
+// Preview emissions in the log (b.av2 SR-8.4, SR-10.3)
+// ---------------------------------------------------------------------------
+
+/** Start of every `reload-preview` log line. */
+const PREVIEW_LINE_START = `[slack] ${RELOAD_PREVIEW}: `
+
+/**
+ * Start of the first log line of every preview emission: the header, which
+ * opens both the counted preview and the `no effective change` one. No other
+ * preview line starts with the title.
+ */
+export const PREVIEW_EMISSION_START = `${PREVIEW_LINE_START}${PENDING_PREVIEW_TITLE}`
+
+/**
+ * The preview emissions among `lines` (any log slice, e.g. `run.logs` or
+ * `run.since(cp).logs`), in order: each is a header line (starting
+ * `PREVIEW_EMISSION_START`) and the `reload-preview` lines that follow it
+ * until the next header or a line of any other kind. The full log lines are
+ * kept. A `reload-invalid` line is no emission (see `run.invalidLines()`).
+ * A `reload-preview` line before any header is dropped (none is expected).
+ */
+export function previewEmissions(lines: readonly string[]): string[][] {
+  const emissions: string[][] = []
+  let current: string[] | undefined
+  for (const line of lines) {
+    if (line.startsWith(PREVIEW_EMISSION_START)) {
+      current = [line]
+      emissions.push(current)
+    } else if (current !== undefined && line.startsWith(PREVIEW_LINE_START)) {
+      current.push(line)
+    } else {
+      current = undefined
+    }
+  }
+  return emissions
+}
+
+/**
+ * One emission's lines as the preview body reads them: the `[slack]
+ * reload-preview: ` prefix removed from each, and from the header the
+ * ` (preview in "<pendingFile>")` suffix when it is exactly that. With the
+ * file written, the result equals `h.pendingLines()`. A header without the
+ * suffix (the write failed) is kept as it is: assert the suffix on the full
+ * log line (`run.lastPreviewEmission()[0]`).
+ */
+export function previewEmissionText(emission: readonly string[], pendingFile: string): string[] {
+  const suffix = ` (preview in ${JSON.stringify(pendingFile)})`
+  return emission.map((line, i) => {
+    const text = line.startsWith(PREVIEW_LINE_START) ? line.slice(PREVIEW_LINE_START.length) : line
+    return i === 0 && text.endsWith(suffix) ? text.slice(0, -suffix.length) : text
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Prospective bring-up fixtures (an added persona that cannot come up)
+// ---------------------------------------------------------------------------
+
+/**
+ * The state `h.preparePersona` leaves a persona's credentials file in:
+ * - `valid`: `h.writeCredentials` (a fresh fake token set);
+ * - `missing`: nothing at the path;
+ * - `invalid`: a parseable file without `bot_token` (`credentials file is invalid: …`);
+ * - `unreadable`: an empty directory at the path (`credentials file is a directory`).
+ */
+export type PreparedCredentials = 'valid' | 'missing' | 'invalid' | 'unreadable'
+
+/**
+ * The state `h.preparePersona` leaves a persona's working directory in:
+ * `present` (created), `missing` (nothing at the path) or `file` (a plain
+ * file at the path: `working directory is not a directory`).
+ */
+export type PreparedWorkingDirectory = 'present' | 'missing' | 'file'
+
+/** `h.preparePersona`'s file states; each defaults to the one that lets the persona come up. */
+export interface PreparedPersonaState {
+  credentials?: PreparedCredentials
+  workingDirectory?: PreparedWorkingDirectory
+}
+
+// ---------------------------------------------------------------------------
 // Runs
 // ---------------------------------------------------------------------------
 
@@ -510,6 +647,15 @@ export interface ReloadRunOptions {
     key: string,
     held: (key: string) => CredentialsDigest | undefined,
   ) => CredentialsDigest | undefined
+  /**
+   * Wrap the reload controller's bring-up state lookup: called with the
+   * persona key and the default lookup (`run.bringUps.state`, as `server.ts`
+   * binds it), e.g. to throw and so leave a fact out of the preview.
+   */
+  bringUpState?: (
+    key: string,
+    state: (key: string) => PersonaBringUpState | undefined,
+  ) => PersonaBringUpState | undefined
 }
 
 /** One server start over the harness's files; see the file comment. */
@@ -549,6 +695,33 @@ export interface ReloadRun {
    * `[slack] reload: …` lines (write, delete and tick failures).
    */
   logsOf(label: string): string[]
+  /** `previewEmissions(run.logs)`: every preview emission so far, each as its full log lines. */
+  previewEmissions(): string[][]
+  /** How many times the preview was logged so far, however many lines each emission spans. */
+  previewEmissionCount(): number
+  /** The full log lines of the latest preview emission; undefined when none. */
+  lastPreviewEmission(): string[] | undefined
+  /**
+   * The latest emission as the preview body reads it (`previewEmissionText`
+   * over `h.paths.pending`): equals `h.pendingLines()` when the file was
+   * written. Undefined when none.
+   */
+  lastPreviewText(): string[] | undefined
+  /** `logsOf(RELOAD_INVALID)`: the `reload-invalid` lines (one per invalid pending state logged). */
+  invalidLines(): string[]
+  /**
+   * Every path the detection tick's credentials reads opened (its
+   * `CredentialsFs.openFile`, through `opts.credentialsFs` when given), in
+   * order. Empty for a whole run in dry run (b.av2 SR-3.4, SR-8.2). The
+   * start's bring-up reads are not here (they use `bringUpFs`). Not part of
+   * `since`: slice it by length around a stretch of ticks.
+   */
+  readonly tickCredentialsReads: readonly string[]
+  /**
+   * Every path the detection tick's working-directory check stat'd (the
+   * added personas' directories), in order. Not part of `since`.
+   */
+  readonly tickDirectoryChecks: readonly string[]
   /** Where every capture stands now; see `since`. */
   checkpoint(): ReloadRunCheckpoint
   /** Everything captured after `cp` (compare with `NO_RUN_ACTIVITY` for "did nothing"). */
@@ -656,6 +829,33 @@ export interface ReloadHarness {
   pendingFingerprint(): string | undefined
   /** Write raw bytes to `paths.pending` (a leftover or hand-placed file); returns them. */
   writePendingBytes(bytes: string | Uint8Array): Buffer
+  /**
+   * The preview body of `paths.pending`: the text after its two fingerprint
+   * lines and the blank line (found through `parsePendingFingerprint` and
+   * `composePendingFile`), without the file's final newline, so it equals
+   * `renderPreview(plan)`. Undefined when the file is absent, not a regular
+   * file, or not in the pending layout.
+   */
+  pendingBody(): string | undefined
+  /** `pendingBody()` split into its lines; undefined when there is no body. */
+  pendingLines(): string[] | undefined
+  /** The preview's first line (the header, or the `INVALID:` line); undefined when there is no body. */
+  pendingHeader(): string | undefined
+  /** The body's lines starting `DESTRUCTIVE:` (`DESTRUCTIVE_PREFIX`), in order; undefined when there is no body. */
+  pendingDestructiveLines(): string[] | undefined
+  /**
+   * A file-form persona (`h.persona(name, overrides)`) whose credentials
+   * file and working directory are left in the given states (see
+   * `PreparedCredentials`, `PreparedWorkingDirectory`; by default `valid`
+   * and `present`, so it can come up). Whatever was at either path is
+   * replaced. For an added persona that cannot come up, e.g.
+   * `h.preparePersona('delta', { credentials: 'missing', workingDirectory: 'missing' })`.
+   */
+  preparePersona(name: string, state?: PreparedPersonaState, overrides?: Partial<PersonaInput>): PersonaInput
+  /** Delete the persona's working directory (absent is fine). */
+  deleteWorkingDirectory(persona: Pick<ReloadPersonaFiles, 'working_directory'>): void
+  /** Put a plain empty file at the persona's working-directory path (replacing whatever was there). */
+  makeWorkingDirectoryAFile(persona: Pick<ReloadPersonaFiles, 'working_directory'>): void
   /** Make the controller's durable writer fail (default every `openSync` call, `EIO`) until cleared. */
   failWrites(failure?: Partial<WriteFailure>): void
   /** Let the controller's durable writer succeed again. */
@@ -881,6 +1081,21 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     }
 
     const ticks = createManualTickDriver()
+    const tickCredentialsReads: string[] = []
+    const tickDirectoryChecks: string[] = []
+    const credentialsFs: Partial<CredentialsFs> = {
+      ...runOpts.credentialsFs,
+      openFile: (path) => {
+        tickCredentialsReads.push(path)
+        return (runOpts.credentialsFs?.openFile ?? DEFAULT_CREDENTIALS_FS.openFile)(path)
+      },
+    }
+    const workingDirectoryFs: Partial<WorkingDirectoryFs> = {
+      stat: (path) => {
+        tickDirectoryChecks.push(path)
+        return DEFAULT_WORKING_DIRECTORY_FS.stat(path)
+      },
+    }
     const controller = createReloadController({
       paths,
       lifecycle: ops,
@@ -912,7 +1127,12 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         const held = (k: string) => bringUps.credentialsDigest(k)
         return runOpts.heldCredentialsDigest === undefined ? held(key) : runOpts.heldCredentialsDigest(key, held)
       },
-      credentialsFs: runOpts.credentialsFs,
+      bringUpState: (key) => {
+        const state = (k: string) => bringUps.state(k)
+        return runOpts.bringUpState === undefined ? state(key) : runOpts.bringUpState(key, state)
+      },
+      credentialsFs,
+      workingDirectoryFs,
       slackClientFactory: connections.slack.factory,
       home,
       configFs: runOpts.configFs,
@@ -968,6 +1188,16 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       pendingWrites: () => writes.filter((w) => w.path === paths.pending),
       pendingRemoves: () => removes.filter((r) => r.path === paths.pending),
       logsOf: (label) => logs.filter((line) => line.startsWith(`[slack] ${label}: `)),
+      previewEmissions: () => previewEmissions(logs),
+      previewEmissionCount: () => previewEmissions(logs).length,
+      lastPreviewEmission: () => previewEmissions(logs).at(-1),
+      lastPreviewText() {
+        const last = run.lastPreviewEmission()
+        return last === undefined ? undefined : previewEmissionText(last, paths.pending)
+      },
+      invalidLines: () => run.logsOf(RELOAD_INVALID),
+      tickCredentialsReads,
+      tickDirectoryChecks,
       checkpoint,
       since,
       stub: (name) => connections.slack.persona(personaKey(name)),
@@ -1095,6 +1325,58 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       return text === undefined ? undefined : parsePendingFingerprint(text)
     },
     writePendingBytes: (bytes) => writeBytes(paths.pending, bytes),
+    pendingBody() {
+      const text = h.readPendingText()
+      const fingerprint = text === undefined ? undefined : parsePendingFingerprint(text)
+      if (text === undefined || fingerprint === undefined) return undefined
+      // The layout before the body, exactly as the writer composes it.
+      const head = composePendingFile(fingerprint, '')
+      if (!text.startsWith(head)) return undefined
+      const body = text.slice(head.length)
+      return body.endsWith('\n') ? body.slice(0, -1) : body
+    },
+    pendingLines: () => h.pendingBody()?.split('\n'),
+    pendingHeader: () => h.pendingLines()?.[0],
+    pendingDestructiveLines: () => h.pendingLines()?.filter((line) => line.startsWith(DESTRUCTIVE_PREFIX)),
+    preparePersona(name, state = {}, overrides = {}) {
+      const persona = h.persona(name, overrides)
+      switch (state.credentials ?? 'valid') {
+        case 'valid':
+          h.deleteCredentials(persona)
+          h.writeCredentials(persona)
+          break
+        case 'missing':
+          h.deleteCredentials(persona)
+          break
+        case 'invalid':
+          h.deleteCredentials(persona)
+          h.writeCredentialsContent(persona, { bot_token: undefined })
+          break
+        case 'unreadable':
+          h.makeCredentialsUnreadable(persona)
+          break
+      }
+      switch (state.workingDirectory ?? 'present') {
+        case 'present':
+          h.deleteWorkingDirectory(persona)
+          h.makeWorkingDirectory(persona)
+          break
+        case 'missing':
+          h.deleteWorkingDirectory(persona)
+          break
+        case 'file':
+          h.makeWorkingDirectoryAFile(persona)
+          break
+      }
+      return persona
+    },
+    deleteWorkingDirectory: (persona) => h.remove(persona.working_directory),
+    makeWorkingDirectoryAFile(persona) {
+      const full = inside(persona.working_directory)
+      rmSync(full, { recursive: true, force: true })
+      mkdirSync(dirname(full), { recursive: true })
+      writeFileSync(full, '')
+    },
     failWrites: (failure) => writeSeam.fail(failure),
     clearWriteFailure: () => writeSeam.clear(),
     failRemoves: (failure) => removeSeam.fail(failure),

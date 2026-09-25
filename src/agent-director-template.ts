@@ -27,7 +27,7 @@ import {
 import { getClient, DEFAULT_TEMPLATE_NAME } from './agent-director-client.ts'
 import { recordStartupError } from './startup-errors.ts'
 import type { PersonaConfig } from './config.ts'
-import { resolveClaudeConfigDir } from './persona-identity.ts'
+import { effectiveClaudeConfigDirs } from './persona-identity.ts'
 
 // ---------------------------------------------------------------------------
 // Injectable dependency surface
@@ -94,14 +94,10 @@ function mergeDeps(overrides?: Partial<TemplateInstallDeps>): TemplateInstallDep
  * @param home  Home directory for the default; the OS home, read at call time.
  */
 export function deriveMemoryReadAllowRules(personaConfig: PersonaConfig, home: string = homedir()): string[] {
-  const dirs = new Set<string>()
-  for (const persona of personaConfig.personas) {
-    dirs.add(resolveClaudeConfigDir(persona.claude_config_dir, home))
-  }
-  // Guard: a config with zero personas still gets the default-dir rule,
-  // matching the spawn-time fallback for any persona that would use the default.
-  if (dirs.size === 0) dirs.add(resolveClaudeConfigDir(undefined, home))
-  return [...dirs].sort().map((dir) => {
+  // `effectiveClaudeConfigDirs` also carries the guard: a config with zero
+  // personas still gets the default-dir rule, matching the spawn-time fallback
+  // for any persona that would use the default.
+  return effectiveClaudeConfigDirs(personaConfig.personas, home).map((dir) => {
     // `dir` is an absolute POSIX path (leading `/`). Claude Code's absolute
     // anchor is `//<abs-without-leading-slash>`, i.e. exactly two leading
     // slashes total — so join first, then strip the single leading slash and

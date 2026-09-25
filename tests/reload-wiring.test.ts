@@ -7,11 +7,13 @@
  * and keeps config.json.pending in step. It starts when the start's bring-up
  * pass returns, like the health check. SR-8.3: a credentials change is pending
  * only against the digest a persona connected, retried or broke with, which
- * the bring-up controller holds. These assertions fail if main() arms the
- * timer before the start bring-up returns (or before the refused-start exit),
- * from more than one call site or not at all; if shutdown() stops calling it
- * off; or if the controller is built with anything but the production tick
- * driver, `isDryRun()` and the bring-up controller's held digests, or is
+ * the bring-up controller holds; SR-8.6 step 6: the preview reads the
+ * bring-up controller's state to tell a persona broken by its credentials
+ * from one to reconnect. These assertions fail if main() arms the timer
+ * before the start bring-up returns (or before the refused-start exit), from
+ * more than one call site or not at all; if shutdown() stops calling it off;
+ * or if the controller is built with anything but the production tick driver,
+ * `isDryRun()` and the bring-up controller's held digests and states, or is
  * passed a file watcher.
  *
  * What the timer and the tick do is tested behaviourally in
@@ -65,6 +67,34 @@ function controllerProps(): Map<string, string> {
 /** Offsets of every plain assignment `<name> = <value>` (not `==`, not a declaration's type). */
 function assignmentsOf(name: string, value: string): number[] {
   return indicesOf(new RegExp(`(?<![\\w.$])${name}\\s*=(?![=>])\\s*${value}\\b`, 'g'), SERVER_CODE)
+}
+
+/**
+ * The receiver of the controller option `prop`, which must be exactly
+ * `(key) => <receiver>?.<method>(key)` (the same parameter passed through,
+ * nothing else in the body); fails the test otherwise.
+ */
+function bringUpLookup(props: Map<string, string>, prop: string, method: string): string {
+  const arrow = (props.get(prop) ?? '').match(
+    new RegExp(`^\\(?\\s*(\\w+)\\s*\\)?\\s*=>\\s*(\\w+)\\s*[?!]?\\.\\s*${method}\\s*\\(\\s*(\\w+)\\s*\\)$`),
+  )
+  expect(arrow).not.toBeNull()
+  expect(arrow![3]).toBe(arrow![1])
+  return arrow![2]!
+}
+
+/**
+ * `receiver` is the one bring-up controller main() builds, or the
+ * module-scope handle main() sets to it once, before detection is armed.
+ */
+function expectBringUpControllerHandle(receiver: string): void {
+  const bringUpDecl = [...SERVER_CODE.matchAll(/\bconst\s+(\w+)\s*=\s*createPersonaBringUpController\s*\(/g)]
+  expect(bringUpDecl).toHaveLength(1)
+  const bringUpController = bringUpDecl[0]![1]!
+  if (receiver === bringUpController) return
+  const handoffs = assignmentsOf(receiver, bringUpController).filter((a) => insideMain(SERVER_CODE, a))
+  expect(handoffs).toHaveLength(1)
+  expect(handoffs[0]!).toBeLessThan(onlyMethodCall('startDetection').at)
 }
 
 /**
@@ -135,22 +165,17 @@ describe('server.ts wires the reload detection tick (b.av2 SR-8.2)', () => {
     expect(driver).toMatch(/^createReloadTickDriver\s*\(/)
     expect(balancedAfter(driver, 0, '(', ')')[1]).toBe(driver.length - 1)
     expect(props.get('dryRun')).toBe('isDryRun()')
-    // `(key) => <held>?.credentialsDigest(key)`, where <held> is the bring-up
-    // controller or the module-scope handle set to it before detection is armed.
-    const held = (props.get('heldCredentialsDigest') ?? '').match(
-      /^\(?\s*(\w+)\s*\)?\s*=>\s*(\w+)\s*[?!]?\.\s*credentialsDigest\s*\(\s*(\w+)\s*\)$/,
-    )
-    expect(held).not.toBeNull()
-    expect(held![3]).toBe(held![1])
-    const bringUpDecl = [...SERVER_CODE.matchAll(/\bconst\s+(\w+)\s*=\s*createPersonaBringUpController\s*\(/g)]
-    expect(bringUpDecl).toHaveLength(1)
-    const bringUpController = bringUpDecl[0]![1]!
-    const receiver = held![2]!
-    if (receiver !== bringUpController) {
-      const handoffs = assignmentsOf(receiver, bringUpController).filter((a) => insideMain(SERVER_CODE, a))
-      expect(handoffs).toHaveLength(1)
-      expect(handoffs[0]!).toBeLessThan(onlyMethodCall('startDetection').at)
-    }
+    expectBringUpControllerHandle(bringUpLookup(props, 'heldCredentialsDigest', 'credentialsDigest'))
+  })
+
+  // SR-8.6 step 6: the preview tells a persona broken by its credentials
+  // (brought up at apply) from one that is reconnected. Without this binding
+  // every credentials change would preview as a reconnect.
+  test('the controller gets the bring-up controller\'s states, on the same handle as its held digests', () => {
+    const props = controllerProps()
+    const receiver = bringUpLookup(props, 'bringUpState', 'state')
+    expectBringUpControllerHandle(receiver)
+    expect(receiver).toBe(bringUpLookup(props, 'heldCredentialsDigest', 'credentialsDigest'))
   })
 
   // SR-8.2: no file watcher. Only the controller's own options are audited, so

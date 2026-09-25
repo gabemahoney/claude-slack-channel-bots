@@ -31,7 +31,9 @@
  * PERSONA_DIAGNOSTIC_CLASSES (imported, side-effect free) names a `##`–`####`
  * heading in the skill (the skill gives each class a `###` heading naming it),
  * so a class added without a skill entry, or an entry cut down to a passing
- * mention, fails here. Content audits of shipped text (forbidden terms, the
+ * mention, fails here. RELOAD_DIAGNOSTIC_CLASSES (src/reload.ts, imported,
+ * side-effect free) gets the same heading check in its own `test.each`, plus
+ * a non-empty, duplicate-free check on the list. Content audits of shipped text (forbidden terms, the
  * SR-1.7 exception) are later Epics' work (E6/E14), not this file's.
  *
  * Both npm-backed tests share one memoised pack probe per file load. The npm
@@ -48,6 +50,7 @@ import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import semver from 'semver'
 import { PERSONA_DIAGNOSTIC_CLASSES } from '../src/persona-diagnostics.ts'
+import { RELOAD_DIAGNOSTIC_CLASSES } from '../src/reload.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 
@@ -312,21 +315,46 @@ describe('b.av2 AC 27: the debugging skill ships in the package', () => {
   })
 })
 
+/**
+ * True when the skill has a `##`–`####` heading naming the whole label (not a
+ * prefix or suffix of a longer hyphenated word): a passing mention in body
+ * text is not an entry for the class.
+ */
+function skillHasClassHeading(label: string): boolean {
+  const text = readFileSync(resolve(REPO_ROOT, SKILL_REL), 'utf-8')
+  const re = new RegExp(
+    `^#{2,4} [^\\n]*(?<![\\w-])${escapeRegExp(label)}(?![\\w-])`,
+    'm',
+  )
+  return re.test(text)
+}
+
 describe('b.av2 AC 27: the debugging skill covers every persona diagnostic class', () => {
   // Labels come from the exported closed set, never a hand-copied list, so a
   // class added later without a skill entry fails here (b.av2 SR-12).
   test.each([...PERSONA_DIAGNOSTIC_CLASSES])(
     'AC 27: the skill has a heading for class %s',
     (label) => {
-      const text = readFileSync(resolve(REPO_ROOT, SKILL_REL), 'utf-8')
-      // A `##`–`####` heading naming the whole label (not a prefix or suffix of
-      // a longer hyphenated word): a passing mention in body text is not an
-      // entry for the class.
-      const re = new RegExp(
-        `^#{2,4} [^\\n]*(?<![\\w-])${escapeRegExp(label)}(?![\\w-])`,
-        'm',
-      )
-      expect(re.test(text)).toBe(true)
+      expect(skillHasClassHeading(label)).toBe(true)
+    },
+  )
+})
+
+describe('b.av2 SR-12: the debugging skill covers every reload diagnostic class', () => {
+  // The reload classes are their own exported closed set, kept apart from the
+  // persona classes (E11 Director decision 3). Imported, never hand-copied, so
+  // a reload class added without a skill entry fails here.
+  test('RELOAD_DIAGNOSTIC_CLASSES is non-empty and has no duplicates', () => {
+    expect(RELOAD_DIAGNOSTIC_CLASSES.length).toBeGreaterThan(0)
+    expect(new Set(RELOAD_DIAGNOSTIC_CLASSES).size).toBe(
+      RELOAD_DIAGNOSTIC_CLASSES.length,
+    )
+  })
+
+  test.each([...RELOAD_DIAGNOSTIC_CLASSES])(
+    'SR-12: the skill has a heading for class %s',
+    (label) => {
+      expect(skillHasClassHeading(label)).toBe(true)
     },
   )
 })

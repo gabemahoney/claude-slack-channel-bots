@@ -299,6 +299,25 @@ function validateCredentialsContent(content: string): PersonaSlackTokens | strin
   return new PersonaSlackTokens(obj['bot_token'] as string, obj['app_token'] as string)
 }
 
+/** Start of the cause of a credentials file whose content is invalid. */
+const INVALID_CONTENT_CAUSE_PREFIX = 'credentials file is invalid: '
+
+/**
+ * Why a credentials read (`readCredentialsFile`) is not locally valid
+ * (b.av2 SR-1.4, SR-6.1 step 1), or undefined when it is: the read's own
+ * cause for a missing or unreadable file, otherwise the content check's
+ * cause, worded as `checkPersonaCredentials` words it. For a caller that
+ * already holds the bytes (the reload tick's check of an added persona), so
+ * the file is not read a second time. Checks content only: the real-path
+ * collision rule is the caller's. Returns no token; the causes name keys and
+ * rules only. Pure.
+ */
+export function credentialsReadProblem(read: CredentialsFileRead): string | undefined {
+  if (!read.ok) return read.cause
+  const validated = validateCredentialsContent(read.bytes.toString('utf-8'))
+  return typeof validated === 'string' ? INVALID_CONTENT_CAUSE_PREFIX + validated : undefined
+}
+
 // ---------------------------------------------------------------------------
 // Stat-first read and digest (b.av2 SR-8.3)
 // ---------------------------------------------------------------------------
@@ -465,7 +484,7 @@ export function checkPersonaCredentialsAndDigest(
 
   const validated = validateCredentialsContent(read.bytes.toString('utf-8'))
   if (typeof validated === 'string') {
-    return { result: fail(PERSONA_CREDENTIALS_INVALID, `credentials file is invalid: ${validated}`), digest }
+    return { result: fail(PERSONA_CREDENTIALS_INVALID, INVALID_CONTENT_CAUSE_PREFIX + validated), digest }
   }
   return { result: { ok: true, tokens: validated }, digest }
 }

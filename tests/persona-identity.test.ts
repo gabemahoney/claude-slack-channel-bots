@@ -2,7 +2,8 @@
  * persona-identity.test.ts — persona key rule and derived identifiers.
  *
  * Covers b.av2 SR-2.1 (key rule and fit constraints), SR-2.2 (instance ID,
- * tmux name, labels, spawn env), SR-9.1/SR-9.3 (persona target resolution),
+ * tmux name, labels, spawn env), the effective config-dir set (SR-6.2, SR-8.6
+ * step 5), SR-9.1/SR-9.3 (persona target resolution),
  * SR-10.3 (persona-reference rendering) and SR-13.1 (no import side effects).
  *
  * Expected keys are literals computed independently from the spec (SHA-256
@@ -18,12 +19,13 @@
 
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import {
   PERSONA_KEY_MAX_LENGTH,
   configDirLabelValue,
+  effectiveClaudeConfigDirs,
   personaInstanceId,
   personaKey,
   personaLabels,
@@ -180,6 +182,57 @@ describe('derived identifiers', () => {
   test('different dirs give different labels', () => {
     const home = makeTempDir()
     expect(configDirLabelValue(join(home, 'a'), home)).not.toBe(configDirLabelValue(join(home, 'b'), home))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Effective config-dir set (b.av2 SR-6.2, SR-8.6 step 5)
+// ---------------------------------------------------------------------------
+
+describe('effectiveClaudeConfigDirs', () => {
+  test('an empty persona set yields the default dir alone', () => {
+    const home = makeTempDir()
+    expect(effectiveClaudeConfigDirs([], home)).toEqual([join(home, '.claude')])
+  })
+
+  test('a persona with no dir, an empty dir, ~/.claude and an explicit <home>/.claude are one default entry', () => {
+    const home = makeTempDir()
+    const personas = [
+      {},
+      { claude_config_dir: '' },
+      { claude_config_dir: '~/.claude' },
+      { claude_config_dir: join(home, '.claude') },
+      { claude_config_dir: join(home, '.claude') + '/' },
+    ]
+    expect(effectiveClaudeConfigDirs(personas, home)).toEqual([join(home, '.claude')])
+  })
+
+  test('distinct dirs are de-duplicated after lexical resolution and sorted', () => {
+    const home = makeTempDir()
+    const personas = [
+      { claude_config_dir: join(home, 'zeta') },
+      { claude_config_dir: '~/alpha' },
+      {},
+      { claude_config_dir: join(home, 'x', '..', 'alpha') },
+      { claude_config_dir: join(home, 'zeta') },
+    ]
+    expect(effectiveClaudeConfigDirs(personas, home)).toEqual([
+      join(home, '.claude'),
+      join(home, 'alpha'),
+      join(home, 'zeta'),
+    ])
+  })
+
+  test('no symlink is followed: a link to a dir is its own entry beside the dir', () => {
+    const home = makeTempDir()
+    const target = join(home, 'real-claude')
+    const link = join(home, 'link-claude')
+    mkdirSync(target)
+    symlinkSync(target, link)
+    expect(effectiveClaudeConfigDirs([{ claude_config_dir: link }, { claude_config_dir: target }], home)).toEqual([
+      link,
+      target,
+    ])
   })
 })
 

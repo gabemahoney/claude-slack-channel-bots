@@ -167,6 +167,8 @@ export SLACK_DRY_RUN=1
 
 `config.json` is read from `~/.claude/channels/slack/config.json` by default. Override the directory with `SLACK_STATE_DIR`. The server needs only this file and the credentials files it names.
 
+Once the server has started, it runs a recorded copy of this file. An edit changes nothing until you apply it, and a server restart alone doesn't apply it. See [Reload](#reload).
+
 Each bot is a **persona**: one Slack app, one Claude instance with its own working directory, and the channels it is configured into. Create one Slack app per persona (see `slack-app-manifest.yml`); that app gives the persona its own name and avatar in Slack.
 
 Postinstall creates a skeleton with an empty persona list. An empty list is valid: the server starts with no personas.
@@ -230,7 +232,7 @@ The rules that most often trip a first config:
 - Channel IDs are Slack channel IDs such as `C0123456789`, not channel names.
 - Unknown fields are rejected, at the top level and inside each persona.
 
-The server checks the whole file at start. Any error stops the start, and the message names the persona (`personas[<i>]`) and the field.
+The server checks the whole file before applying it, and the error message names the persona (`personas[<i>]`) and the field. At a start with no last-applied record, an error stops the start. On a running server, an error shows as an `INVALID` pending change (see [Reload](#reload)).
 
 #### Direct messages (`dm.enabled`)
 
@@ -308,10 +310,10 @@ These top-level fields apply to the whole server.
 | `claude_config_dir` | string | — | Default Claude on-disk config directory for every persona. When a persona has one (its own or this default), its session launches with `CLAUDE_CONFIG_DIR='<resolved-path>'` so the bot authenticates against a specific account. `~` is expanded and the path is resolved to absolute. A persona's own `claude_config_dir` overrides this value. When neither is set, Claude's own default applies. Must be non-empty when set. |
 | `resume_enabled` | boolean | `true` | When `true` (default), a bot whose session died — including after a host reboot or pod resume — comes back with its prior conversation history intact instead of starting fresh. When `false`, the session manager always performs a fresh launch instead of resuming, both on startup and on runtime auto-restart, even when a stored session exists. Set `false` as a workaround if your Claude Code version crashes with "sandbox required but unavailable" on resume (a known regression in v2.1.120). Requires a system-installed `agent-director` ≥ 0.8.0 for reboot recovery to actually restore history. |
 | `agent_director_poll_interval_ms` | number | `1000` | Poll interval (ms) for the agent-director permission relay tick. Must be a positive integer in `[200, 3_600_000]`. Replaces the pre-rename `claude_director_poll_interval_ms` — the old name is rejected at startup. |
-| `stop_hook_bootstrap` | boolean | `true` | Default for every persona: whether the persona gets the Slack Reply Guard reminder (see [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook)). The value applies per persona, from the persona's first launch after the server loads the change (`config.json` is read only at server start; `clean_restart` does both). A persona's own `stop_hook_bootstrap` overrides this value. Non-boolean values are rejected at startup. |
-| `cron_table_path` | string | `<config dir>/crontab` | Path to the crontable for the built-in cron scheduler (`cscb_cron`). Defaults to `crontab` in the directory of the loaded `config.json`. `~` is expanded like other path keys. The resolved path is exported into every managed session as `CSCB_CRONTABLE_PATH` so bots can find the crontable and self-schedule (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)). Must be a non-empty string when set. Changing it requires a server restart. |
-| `cron_log_path` | string | `<config dir>/cron.log` | Path to the `cscb_cron` log file. Defaults to `cron.log` in the directory of the loaded `config.json`. `~` is expanded like other path keys. Must be a non-empty string when set. Changing it requires a server restart. |
-| `cron_log_max_bytes` | number | — | Size cap in bytes for the cron log. Must be a positive integer when set. Cron-log pruning is disabled when absent. Changing it requires a server restart. |
+| `stop_hook_bootstrap` | boolean | `true` | Default for every persona: whether the persona gets the Slack Reply Guard reminder (see [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook)). The value applies per persona, from the persona's first launch after the change is applied (see [Reload](#reload)). A persona's own `stop_hook_bootstrap` overrides this value. Non-boolean values are rejected at startup. |
+| `cron_table_path` | string | `<config dir>/crontab` | Path to the crontable for the built-in cron scheduler (`cscb_cron`). Defaults to `crontab` in the directory of the loaded `config.json`. `~` is expanded like other path keys. The resolved path is exported into every managed session as `CSCB_CRONTABLE_PATH` so bots can find the crontable and self-schedule (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)). Must be a non-empty string when set. A change takes effect at the first server start after it is applied (see [Reload](#reload)). |
+| `cron_log_path` | string | `<config dir>/cron.log` | Path to the `cscb_cron` log file. Defaults to `cron.log` in the directory of the loaded `config.json`. `~` is expanded like other path keys. Must be a non-empty string when set. A change takes effect at the first server start after it is applied (see [Reload](#reload)). |
+| `cron_log_max_bytes` | number | — | Size cap in bytes for the cron log. Must be a positive integer when set. Cron-log pruning is disabled when absent. A change takes effect at the first server start after it is applied (see [Reload](#reload)). |
 
 #### Per-persona `claude_config_dir` override
 
@@ -342,7 +344,7 @@ When you want different personas to authenticate as different Claude accounts (e
 
 `planner` launches with the Max account; `reviewer` falls through to the top-level value and uses the corporate account. Use `claude auth login --claudeai` (or `--console`) with `CLAUDE_CONFIG_DIR` set to the same directory to populate each config dir before starting the server.
 
-Changing a persona's effective `claude_config_dir` or its `working_directory` makes that persona start fresh, without its prior conversation, at its next launch. The old transcript stays in the old config directory. The [Troubleshooting](#troubleshooting) entry "Bots come back with no memory of the prior conversation" says when that launch happens.
+Once applied (see [Reload](#reload)), a change to a persona's effective `claude_config_dir` or its `working_directory` makes that persona start fresh, without its prior conversation, at its next launch. The old transcript stays in the old config directory. The [Troubleshooting](#troubleshooting) entry "Bots come back with no memory of the prior conversation" says when that launch happens.
 
 #### Per-persona `stop_hook_bootstrap` override
 
@@ -372,7 +374,7 @@ Set `stop_hook_bootstrap` on an individual persona to override the top-level def
 }
 ```
 
-The value applies to that persona alone, even when it shares its `claude_config_dir` with other personas, and takes effect at the persona's first launch after the server loads the change (`config.json` is read only at server start). A running bot keeps the value it was launched with; `claude-slack-channel-bots clean_restart` restarts the server and relaunches every bot, so it does both.
+The value applies to that persona alone, even when it shares its `claude_config_dir` with other personas, and takes effect at the persona's first launch after the change is applied (see [Reload](#reload)). A running bot keeps the value it was launched with until it is relaunched.
 
 ---
 
@@ -417,7 +419,101 @@ Claude Code sessions need a config file pointing at the MCP server. A skeleton i
 }
 ```
 
-If you changed `port` or `bind` in `config.json`, update the `url` here to match. The server-managed session launcher uses `mcp_config_path` from `config.json` to locate this file.
+If you change `port` or `bind` in `config.json`, update the `url` here to match once the change is applied (see [Reload](#reload)). The server-managed session launcher uses `mcp_config_path` from the applied configuration to locate this file.
+
+---
+
+## Reload
+
+Saving `config.json` doesn't change what runs. The server runs the last configuration it applied, and it shows an edit as a pending change until you apply it.
+
+### Files beside the config file
+
+Both files sit in the same directory as `config.json` (`~/.claude/channels/slack/` by default, or `SLACK_STATE_DIR`). The server writes them; never edit either by hand.
+
+| File | What it is |
+|---|---|
+| `config.json.last-applied` | The record: a byte copy of the last configuration the server applied. |
+| `config.json.pending` | A preview of what applying the edit would do. It exists only while a change is pending. |
+
+### Start rules
+
+| At start | What happens |
+|---|---|
+| A record exists | The server runs the record, not `config.json`. This includes the start after a host reboot. |
+| No record (a fresh install, or the first start after upgrading to this release) | The server checks `config.json`, records it and applies it. If the file is missing or invalid, the server doesn't start and `server.log` says why. |
+| The record can't be read or is invalid | The server doesn't start. The log line names the record and says that deleting it makes the next start apply `config.json` as it stands. |
+| The record can't be written | The server doesn't start and logs `reload-record-write-failed`. |
+
+A configuration with zero personas is valid and starts.
+
+Credentials files are read as they stand at every start. So a credentials change still pending when the server stopped takes effect at the next start.
+
+`stop`, `stop --stop-bots` and `clean_restart` take their timeouts and persona set from the record when there is one, and from `config.json` otherwise.
+
+Deleting the record discards it: the next start applies `config.json` as it stands, whatever it contains.
+
+If the first start fails on a setting such as `port` or `bind`, see "A fix to config.json is ignored after a failed first start" in [Troubleshooting](#troubleshooting).
+
+### Editing the configuration
+
+While the server runs, it checks `config.json` and each credentials file the file names about every 5 seconds. It applies nothing it finds. When either differs from what is applied, the server writes `config.json.pending` and logs the same preview once in `server.log`. Nothing about a pending change is posted to Slack.
+
+- Restarting the server or rebooting the host doesn't apply a pending `config.json` edit. The start brings back the recorded personas, and the edit stays pending.
+- A pending credentials-file change is the exception: every start reads credentials files as they stand, so the next start applies it.
+- Reverting the edit byte for byte deletes the pending file, and the server logs `reload-nothing-pending`. A revert that leaves only a whitespace difference stays pending, as `no effective change`.
+- In dry run (`SLACK_DRY_RUN`), credentials files are not compared.
+
+To see what is pending:
+
+```sh
+cat ~/.claude/channels/slack/config.json.pending
+grep -E 'reload-(preview|invalid|nothing-pending)' ~/.claude/channels/slack/server.log | tail
+```
+
+### Reading the preview
+
+The first line counts the personas added, removed, destructively modified, modified in place and with changed credentials, and the server-wide settings changed. Then there is one line per affected persona and per changed setting. For example:
+
+```
+claude-slack-channel-bots: pending configuration change (written by the server)
+fingerprint: sha256:<64 hex digits>
+
+A configuration change is pending; nothing has been applied. personas: 1 added, 1 removed, 0 destructively modified, 1 modified in place, 1 with changed credentials; server-wide settings: 2 changed.
+DESTRUCTIVE: persona "scribe" (key=scribe) is removed: its live session will be destroyed (its instance is torn down).
+persona "helper" (key=helper) is added but cannot come up: working directory does not exist.
+persona "planner" (key=planner): channels changed: applied in place immediately, instance kept.
+persona "reviewer" (key=reviewer): credentials file "/home/operator/.config/cscb/reviewer-credentials.json" changed: a new connection opens, then the old one closes, instance kept.
+server-wide setting port changed: once applied, it is recorded and takes effect at the next server start after that.
+server-wide setting claude_config_dir changed: inherited by "planner" (key=planner), "reviewer" (key=reviewer); takes effect at each one's next launch, which starts fresh (the conversation is not resumed), instance kept until then.
+```
+
+Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In `server.log`, each preview line (everything after the `fingerprint:` line and the blank line) is prefixed `[slack] reload-preview:`, and the first one ends with where the preview is written: ` (preview in "<path of config.json.pending>")`.
+
+| Line | Meaning |
+|---|---|
+| `DESTRUCTIVE: …` | Applying it destroys that persona's live session: its instance and its conversation. A removed persona is torn down. A persona whose `name`, `credentials_file` or `working_directory` changed is torn down and brought up fresh. |
+| `… is added but cannot come up: …` | The new persona would fail to come up, for the reasons given. |
+| `credentials file "<path>" changed: …` | The persona's credentials file changed at the same path. The line names the persona and the path, never a token, and says what applying it does: a persona that is up opens a new connection, then closes the old one; a persona still retrying retries with the new content; a persona down because of its credentials `will be brought up`. |
+| `credentials file "<path>" changed, but it cannot be used (<cause>): …` | The new content is missing, unreadable or invalid, for example `credentials file does not exist`. A persona that is up keeps its current connection, and a persona down because of its credentials stays down. Every start reads the file as it stands, so after a restart the persona stays down until the file is fixed. |
+| `claude_config_dir changed: …, which starts fresh (the conversation is not resumed)` | The persona's next launch uses the new config directory and starts a new conversation. The running instance is kept until then. |
+| `… could not be checked.` | The server couldn't check whether an added persona can come up, or whether a persona is down because of its credentials. `server.log` has a `reload: cannot check …` line; report it as a bug. |
+| `server-wide setting … inherited by …` | A changed top-level default. The line lists the personas that inherit it. If none does, it says `no persona inherits it, so no instance is affected`. |
+| `server-wide setting … changed: once applied, it is recorded and takes effect at the next server start after that.` | A setting such as `port` or `bind`. It doesn't take effect until the server starts after the change is applied. |
+| `INVALID: <error> Nothing will be applied.` | The edited `config.json` is invalid or missing. Fix the file; nothing is applied until it is valid. `server.log` shows a `reload-invalid` line. |
+| `… no effective change: …` | The edit changes nothing that runs (for example, whitespace, or a default written out). |
+
+### Applying an edit
+
+To apply a pending edit:
+
+1. While the server still runs, read `config.json.pending`, and compare the files with `diff config.json.last-applied config.json`. The start applies every edit in `config.json`, so read every line. If the preview reads `INVALID`, fix `config.json` first.
+2. Stop the server with `claude-slack-channel-bots stop`. If the edit changes a setting that takes effect at a bot's next launch (`claude_config_dir` or `stop_hook_bootstrap`), use `stop --stop-bots` so the bots relaunch.
+3. Keep a copy of the record: `cp config.json.last-applied config.json.last-applied.bak`. Run `diff config.json.last-applied.bak config.json` once more, in case `config.json` changed after you read the preview.
+4. Delete `config.json.last-applied`.
+5. Run `claude-slack-channel-bots start`.
+
+Run the file commands in the directory that holds `config.json`. The start applies `config.json` as it stands and shows no preview first. The `DESTRUCTIVE:` effects happen at that start: removed and renamed personas lose their instances and conversations, and a changed `working_directory` starts that persona fresh. A changed `credentials_file` is the exception: this start only reconnects the persona to Slack with the new app, and its instance keeps running. If `config.json` is invalid, the server doesn't start. Fix the file and start again, or copy the `.bak` back to `config.json.last-applied` to run the previous configuration.
 
 ---
 
@@ -427,17 +523,17 @@ The `claude-slack-channel-bots` binary exposes three subcommands.
 
 ### `claude-slack-channel-bots start`
 
-Checks that the configuration file exists, starts the server in the background, and waits for it to get through startup.
+Checks that the configuration file or the last-applied record exists, starts the server in the background, and waits for it to get through startup.
 
-**Prerequisite check:** `config.json` exists at `STATE_DIR/config.json`, the same file the server loads. If it does not, `start` exits 1 with:
+**Prerequisite check:** `STATE_DIR/config.json` or `STATE_DIR/config.json.last-applied` exists. If neither does, `start` exits 1 with:
 
 ```
-missing prerequisite: config.json not found at <path>
+missing prerequisite: config.json not found at <path>, and no config.json.last-applied at <path>
 ```
 
-`start` reads no Slack token and needs no token environment variable. The server checks the file's contents, and each persona's credentials file, once it runs.
+`start` reads no Slack token and needs no token environment variable. The server checks the configuration, and each persona's credentials file, once it runs.
 
-The server first runs the agent-director startup gate: it imports `agent-director`, constructs the singleton Client, runs `client.version()`, and verifies `~/.agent-director/state.db` is owned by the current user. Failures land in `startup-errors.log` (see [Startup errors](#startup-errors)). agent-director enforces tmux availability at spawn time. The server then loads the configuration and starts listening, and only then writes its PID to `STATE_DIR/server.pid`. Conversation context is preserved across server restarts when possible.
+The server first runs the agent-director startup gate: it imports `agent-director`, constructs the singleton Client, runs `client.version()`, and verifies `~/.agent-director/state.db` is owned by the current user. Failures land in `startup-errors.log` (see [Startup errors](#startup-errors)). agent-director enforces tmux availability at spawn time. The server then loads the configuration and starts listening. With a last-applied record it runs the record; without one it checks `config.json`, records it and applies it (see [Reload](#reload)). Only then does it write its PID to `STATE_DIR/server.pid`. Conversation context is preserved across server restarts when possible.
 
 `start` waits up to 30 seconds for that PID file. The outcomes are:
 
@@ -459,13 +555,13 @@ The server first runs the agent-director startup gate: it imports `agent-directo
   [slack] Server is still starting in the background (PID 12345) after 30s — its log is /home/you/.claude/channels/slack/server.log
   ```
 
-A configuration from before personas stops the start. The server writes the conversion error to `server.log` and exits, so `start` shows the same line on the terminal and exits 1. In `server.log`, where each line is prefixed with a timestamp, it reads:
+At a start with no last-applied record, a configuration from before personas stops the start. The server writes the conversion error to `server.log` and exits, so `start` shows the same line on the terminal and exits 1. In `server.log`, where each line is prefixed with a timestamp, it reads:
 
 ```
 [slack] Fatal: configuration error — loadPersonaConfig: invalid persona config in "<path>": Persona config validation error: "<key>" belongs to the pre-persona configuration shape, which is no longer accepted. The configuration must be converted to personas: rewrite it by hand as a "personas" array. Nothing is converted automatically and the file has not been changed.
 ```
 
-`<key>` is the first pre-persona key found in the file. Any other invalid configuration fails the same way, with a message naming the persona and the field. A server that is already running makes the new one exit with `[slack] Server is already running (PID <pid>). Exiting.`, so `start` exits 1.
+`<key>` is the first pre-persona key found in the file. Any other invalid configuration fails the same way, with a message naming the persona and the field. A last-applied record that can't be read or is invalid stops the start with `[slack] Fatal: last-applied record error —` and the deletion hint, and a record that can't be written stops it with `reload-record-write-failed` (see [Troubleshooting](#troubleshooting)). A server that is already running makes the new one exit with `[slack] Server is already running (PID <pid>). Exiting.`, so `start` exits 1.
 
 ### `claude-slack-channel-bots stop`
 
@@ -475,7 +571,7 @@ Behavior by case:
 
 - **PID file missing:** prints `server is not running` and exits 0.
 - **Stale PID file** (process no longer running): removes the PID file, prints `server is not running (removed stale PID file)`, exits 0.
-- **Live process:** sends `SIGTERM`, polls for exit for up to `stop_timeout` seconds (default 30s). Prints `[slack] Server stopped.` on clean exit. Escalates to `SIGKILL` if the process does not exit within `stop_timeout`.
+- **Live process:** sends `SIGTERM`, polls for exit for up to `stop_timeout` seconds (default 30s), read from the last-applied record when there is one. Prints `[slack] Server stopped.` on clean exit. Escalates to `SIGKILL` if the process does not exit within `stop_timeout`.
 
 Plain `stop` leaves the managed bots running — they are meant to survive a server restart. Pass `--stop-bots` to gracefully exit the bots first:
 
@@ -483,9 +579,9 @@ Plain `stop` leaves the managed bots running — they are meant to survive a ser
 claude-slack-channel-bots stop --stop-bots
 ```
 
-This mirrors `clean_restart`'s order: the server is stopped **first**, then the bot teardown runs for each persona in `config.json`, addressing its instance as `cscb_<key>` — pause the bot, poll until it exits (or up to `exit_timeout` seconds), then force-kill on timeout. Teardown kills but never deletes each row, preserving its `claude_session_id` so the bots can resume their conversation history on the next start. Stopping the server first prevents its `onsessionclosed`/`scheduleRestart` handler from respawning a just-exited bot mid-teardown (which would delete its `ended` row and history). Use it when you want a clean, flushed shutdown of the bots (for example before a host reboot).
+This mirrors `clean_restart`'s order: the server is stopped **first**, then the bot teardown runs for each persona in the last-applied record (or in `config.json` when there is no record), addressing its instance as `cscb_<key>` — pause the bot, poll until it exits (or up to `exit_timeout` seconds), then force-kill on timeout. Teardown kills but never deletes each row, preserving its `claude_session_id` so the bots can resume their conversation history on the next start. Stopping the server first prevents its `onsessionclosed`/`scheduleRestart` handler from respawning a just-exited bot mid-teardown (which would delete its `ended` row and history). Use it when you want a clean, flushed shutdown of the bots (for example before a host reboot).
 
-If agent-director is unreachable, the teardown **fails loudly** — the command prints the error and exits non-zero rather than silently reporting a clean stop. (A config that cannot be loaded, a missing or pre-persona file included, is best-effort: teardown is skipped with `[slack] stop --stop-bots: could not load config — skipping bot teardown:` and the server stop still succeeds, since the server is already down.)
+If agent-director is unreachable, the teardown **fails loudly** — the command prints the error and exits non-zero rather than silently reporting a clean stop. (A configuration that cannot be loaded, a bad record or a missing or pre-persona file included, is best-effort: teardown is skipped with `[slack] stop --stop-bots: could not load config — skipping bot teardown:` and the server stop still succeeds, since the server is already down.)
 
 ### `claude-slack-channel-bots clean_restart`
 
@@ -495,11 +591,11 @@ Gracefully exits all managed Claude Code sessions, then stops and starts the ser
 claude-slack-channel-bots clean_restart
 ```
 
-For each persona in `config.json`, calls `client.pause({claude_instance_id})` via agent-director with the persona's instance ID `cscb_<key>`, and polls `client.status(...)` until the spawn transitions to `ended` / `missing` (or `client.status(...)` fails with `ErrSpawnNotFound` because the row is gone). If the spawn does not exit within `exit_timeout` seconds (default 120s), the spawn is force-killed via `client.kill(...)`. Teardown kills but never deletes each row, preserving its `claude_session_id` so bots resume their conversation history on the next start. All personas are processed in parallel. After the server restarts, the SR-1.4 collision-then-act dispatcher decides resume-vs-fresh per persona — agent-director owns Claude session-id state, not CSCB.
+For each persona in the last-applied record (or in `config.json` when there is no record), calls `client.pause({claude_instance_id})` via agent-director with the persona's instance ID `cscb_<key>`, and polls `client.status(...)` until the spawn transitions to `ended` / `missing` (or `client.status(...)` fails with `ErrSpawnNotFound` because the row is gone). If the spawn does not exit within `exit_timeout` seconds (default 120s), the spawn is force-killed via `client.kill(...)`. Teardown kills but never deletes each row, preserving its `claude_session_id` so bots resume their conversation history on the next start. All personas are processed in parallel. After the server restarts, the SR-1.4 collision-then-act dispatcher decides resume-vs-fresh per persona — agent-director owns Claude session-id state, not CSCB.
 
 `clean_restart` logs its progress to `STATE_DIR/clean_restart.log`. The lines that end it with an error (config load failure, agent-director initialization failure, teardown failure, start failure) are also printed to the terminal.
 
-`clean_restart` loads `config.json` first. If it cannot (a missing or pre-persona file included), it exits 1 with `[slack] clean_restart: failed to load config:` and the loader's error, and nothing is stopped.
+`clean_restart` loads the last-applied record first, or `config.json` when there is no record, and takes `exit_timeout` from it. If it cannot (a record that can't be read or is invalid, or a missing or pre-persona file), it exits 1 with `[slack] clean_restart: failed to load config:` and the loader's error, and nothing is stopped. For a bad record, the error says that deleting it makes the next start apply `config.json` (see [Reload](#reload)). `clean_restart` doesn't apply a pending `config.json` edit: the server comes back on the record.
 
 A benign kill outcome — the row already being gone — is tolerated per persona and does not abort the restart. Any other per-persona teardown failure, including a pause failure that escalates to a kill which then fails to reach agent-director, is fatal: it fails loudly and aborts the restart (non-zero exit).
 
@@ -533,7 +629,7 @@ Skip the CLI and run the server directly with Bun for development or debugging:
 bun src/server.ts
 ```
 
-It loads the same `config.json` that `start` checks for; a missing file stops it with `[slack] Fatal: configuration error — The configuration file "<path>" does not exist. The server requires the configuration file to start.` On startup the server prints the persona count, the MCP endpoint and example config:
+It follows the same [start rules](#start-rules) as `start`. With no last-applied record, a missing `config.json` stops it with `[slack] Fatal: configuration error — The configuration file "<path>" does not exist. The server requires the configuration file to start.` On startup the server prints the persona count, the MCP endpoint and example config:
 
 ```
 [slack] Loaded persona config: 2 persona(s)
@@ -864,7 +960,7 @@ When several Slack messages started the turn, the last one picks the wording. A 
 
 Set `stop_hook_bootstrap` in `config.json`: at the top level for every persona, or on a persona to override the top-level value for that persona alone. It defaults to `true`. Setting `stop_hook_bootstrap: false` on the persona, or inheriting `false` from the top level, is all an opt-out needs, even when the persona shares its `claude_config_dir` with other personas. See [Server-wide settings](#server-wide-settings) and [Per-persona `stop_hook_bootstrap` override](#per-persona-stop_hook_bootstrap-override).
 
-A change reaches a persona at its first launch after the server loads it; see [Timing](#timing-when-the-hook-is-patched-and-the-record-written).
+A change reaches a persona at its first launch after the change is applied (see [Reload](#reload)); see [Timing](#timing-when-the-hook-is-patched-and-the-record-written).
 
 ### Personas that answer without `reply` — opt them out
 
@@ -949,10 +1045,21 @@ If the tag, `via` or `chat_id` no longer appears, the guard is dark or misreadin
 ## Troubleshooting
 
 **config.json not found**
-`start` exits with `missing prerequisite: config.json not found at <path>`. Run `bun src/postinstall.ts` from the installed package directory to create the skeleton (`{"personas": []}`), or create the file manually. Verify `SLACK_STATE_DIR` matches the directory you populated.
+This applies only when there is no last-applied record. `start` exits with `missing prerequisite: config.json not found at <path>, and no config.json.last-applied at <path>`. Run `bun src/postinstall.ts` from the installed package directory to create the skeleton (`{"personas": []}`), or create the file manually. Verify `SLACK_STATE_DIR` matches the directory you populated. With a record, the server starts from the record, and a missing `config.json` shows as an `INVALID` pending change (see [Reload](#reload)).
+
+**The server won't start: last-applied record error**
+`server.log` shows `[slack] Fatal: last-applied record error — The last-applied record "<path>" …`: the record can't be read or is invalid. The line ends with the fix: deleting the record makes the next start apply `config.json` as it stands. That discards the record, so check `config.json` first; whatever it holds is what runs. See [Reload](#reload).
+
+**The server won't start: `reload-record-write-failed`**
+`server.log` shows `[slack] reload-record-write-failed: cannot write the last-applied record "<path>"`: a start with no record could not write it, so nothing was applied. Check that the directory holding `config.json` is writable and not full, then start again. If the line says the record `was written but its directory could not be synced`, the record is on disk and the next start runs it.
+
+**A fix to config.json is ignored after a failed first start**
+The first start writes the record before the server opens its port. If that start failed on a setting such as `port` or `bind`, the record still holds the bad value, and later starts run it. Apply the fix as described in [Applying an edit](#applying-an-edit).
+
+The `debug-slack-channel-bots` skill (below) has the full entries for these start failures and for pending changes.
 
 **Session connects but has no persona**
-If a Claude Code session connects but immediately disconnects, `server.log` shows `Session connected with CWD "<path>" — no matching persona`: the session's working directory is no persona's `working_directory`. It is compared with each persona's `working_directory` by real path (after tilde expansion, with symlinks resolved), so a symlinked path to the same directory also matches. If a second session connects from the same directory, it replaces the first. Two personas with the same working directory are rejected when the configuration loads.
+If a Claude Code session connects but immediately disconnects, `server.log` shows `Session connected with CWD "<path>" — no matching persona`: the session's working directory is no persona's `working_directory`. It is compared with each persona's `working_directory` by real path (after tilde expansion, with symlinks resolved), so a symlinked path to the same directory also matches. If a second session connects from the same directory, it replaces the first. Two personas with the same working directory (or the same credentials file) are rejected at a start with no last-applied record, and an edit that introduces them previews as `INVALID`. At a start from the record, only the personas involved fail to come up (`persona-directory-unusable`, retried, or `persona-credentials-invalid` for a shared credentials file), and the others come up.
 
 **A persona doesn't come up or doesn't answer**
 Symptoms: the persona is silent, `/interject` returns 503 for it, or its scheduled prompts log `no-session`. One broken persona never stops the server or delays the others, and nothing about it is posted to Slack. Look in `server.log` instead. Find the persona's key on its `persona-start` line, then read its lines. Each failure line names a class, the persona's `personas[i]` entry and the file or directory at fault:
@@ -985,10 +1092,10 @@ A channel that is in no persona's `channels` reaches no bot, even when a persona
 grep unclaimed-channel ~/.claude/channels/slack/server.log
 ```
 
-Add the channel to a persona's `channels` and restart the server.
+Add the channel to a persona's `channels` and apply the change (see [Reload](#reload)). Restarting the server alone doesn't apply it.
 
 **Permission relay not working**
-Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json`.
+Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json` and apply the change (see [Reload](#reload)).
 
 **A permission prompt or notice doesn't arrive**
 When Slack refuses a post to a persona's destination, the server holds the persona's prompts and notices and retries them with backoff. Once Slack accepts posts again, held notices are delivered, and a prompt is posted if its request is still open. It logs one `persona-destination-failed` line in `server.log` naming the persona, its destination and Slack's error, and one `cleared` line when posting works again:
@@ -1021,7 +1128,7 @@ The notice names the sender (by display name, or user ID; for a bot or webhook p
 
 A `starting now` restart still counts each failed launch toward the backoff/cap, and a restart already pending or active is not stacked.
 
-A **capped** persona (or any persona when auto-restart is disabled via `session_restart_delay: 0`) does **not** recover on an inbound message — firing another launch there would only burn a spawn attempt against a persona that cannot come up. To clear the cap and retry, restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`; the failure counter is in-process and cleared on restart, giving each persona a fresh attempt. To disable auto-restart entirely, set `session_restart_delay` to `0` in `config.json`.
+A **capped** persona (or any persona when auto-restart is disabled via `session_restart_delay: 0`) does **not** recover on an inbound message — firing another launch there would only burn a spawn attempt against a persona that cannot come up. To clear the cap and retry, restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`; the failure counter is in-process and cleared on restart, giving each persona a fresh attempt. To disable auto-restart entirely, set `session_restart_delay` to `0` in `config.json` and apply the change (see [Reload](#reload)).
 
 **Bot alive but silently unresponsive (MCP disconnected)**
 A bot can stay running yet lose its MCP connection to the server — the process is alive but no longer reachable, so it stops responding without ever emitting a disconnect event. The periodic health-check recovers this automatically: once a persona is seen alive-but-disconnected on two consecutive ticks, the health-check schedules a reconnect (or a relaunch if the process has since died), so a stranded persona comes back with no inbound message and no server restart. The recovery lands within roughly two `health_check_interval` periods (default 120 s each) plus the restart backoff delay (default `session_restart_delay` 60 s) before the reconnect runs — about 3–5 minutes with default settings. A bot mid-turn (`working` state) is deliberately left alone and reconnected on a later tick once its turn settles.
@@ -1039,10 +1146,10 @@ This is intentional: when agent-director is unreachable, the teardown cannot run
 **Bots come back with no memory of the prior conversation after a reboot**
 With `resume_enabled: true`, a bot whose host rebooted (or pod resumed) should return with its conversation history. If it comes back amnesiac, confirm the system-installed `agent-director` is **≥ 0.8.0** (`agent-director version`) — reboot recovery relies on capabilities added in that release. Note that `bun run install-check` does **not** confirm this: its client floor is `0.7.0`, lower than the reboot-recovery requirement, so install-check passes on a `0.7.x` binary that still yields amnesiac bots. Verify the resume requirement directly with `agent-director version`. Note: legacy sessions created before upgrading to 0.8.0 may lose history exactly once on their first post-upgrade recovery, then resume cleanly thereafter.
 
-A bot also starts fresh, by design, when its session no longer matches the config. Config edits take effect only when the server starts. If you change a persona's `working_directory`, the next server start replaces the session instead of resuming it. If you change a persona's effective `claude_config_dir` (its own or the top-level default), the bot starts fresh the next time it would be resumed: after `clean_restart`, after `stop --stop-bots` then `start`, after a reboot, or when the bot dies. A bot that keeps running across a plain `stop` and `start` keeps its old config directory until then. The old transcript stays in the old config directory. The first start after upgrading from an earlier release also replaces every existing bot once, because the server removes managed sessions it cannot attribute. The log names the reason: search `server.log` for `sweeping row`, `replacing the row` or `not resuming; spawning fresh`.
+A bot also starts fresh, by design, when its session no longer matches the applied configuration. A config edit takes effect only once it is applied (see [Reload](#reload)); a restart or reboot alone runs the last-applied record. When a change to a persona's `working_directory` is applied, the session is replaced instead of resumed. When a change to a persona's effective `claude_config_dir` (its own or the top-level default) is applied, the bot starts fresh the next time it would be resumed: after `clean_restart`, after `stop --stop-bots` then `start`, after a reboot, or when the bot dies. A bot that keeps running across a plain `stop` and `start` keeps its old config directory until then. The old transcript stays in the old config directory. The first start after upgrading from an earlier release also replaces every existing bot once, because the server removes managed sessions it cannot attribute. The log names the reason: search `server.log` for `sweeping row`, `replacing the row` or `not resuming; spawning fresh`.
 
 **Session crashes on resume with "sandbox required but unavailable"**
-This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json` to disable `--resume` entirely — the bot will always start a fresh Claude session instead of resuming a prior conversation, both on startup and on runtime auto-restart:
+This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json` and apply the change (see [Reload](#reload)) to disable `--resume` entirely — the bot will always start a fresh Claude session instead of resuming a prior conversation, both on startup and on runtime auto-restart:
 
 ```json
 {
@@ -1171,6 +1278,7 @@ This version configures bots as personas. When you upgrade from an earlier versi
 - **Rewrite `config.json` by hand.** A configuration from an earlier version is rejected at start with an error saying it must be converted to personas. Nothing is converted automatically and the file is not changed. Write a `personas` list as described in [Personas (config.json)](#personas-configjson); the server-wide settings keep their names.
 - **Move the tokens into credentials files.** Slack tokens are no longer read from environment variables. Create one [credentials file](#credentials-files) per persona, then remove the token exports from your shell profile.
 - **Give each persona its own Slack app.** Your existing app can serve one persona; create another app for each additional persona.
+- **The first start applies `config.json`.** It has no last-applied record yet, so it checks `config.json`, records it and applies it. After that, edits wait until you apply them; see [Reload](#reload).
 - **Expect each bot to start fresh once.** Bot instances created before this version are replaced at the first start after the upgrade, so each persona starts once without its prior conversation.
 
 ---
