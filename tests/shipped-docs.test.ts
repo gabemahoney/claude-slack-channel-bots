@@ -6,8 +6,10 @@
  * modify-semantics table (SR-12, SR-8.6), held against the change plan's
  * exported classes in src/reload-plan.ts, and the README persona reference
  * (SR-12), whose key tables list exactly the loader's keys and whose complete
- * example loads through the real loader (SR-13.5). E14 extends it into the
- * full shipped-docs audit (README, skills, MCP instructions).
+ * example loads through the real loader (SR-13.5), and the README's pointers
+ * to the setup wizard. E14 extends it into the full shipped-docs audit
+ * (README, skills, MCP instructions); the shipped-text audit at the end, over
+ * `SHIPPED_TEXTS`, starts it with the first-@mention claim (SR-12).
  *
  * Reads repo files resolved from this file's location, so the working
  * directory doesn't matter. The one writer is the complete-example load: it
@@ -16,7 +18,7 @@
  * credentials file. No real HOME, no server, no CLI (SR-13.2).
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join, resolve } from 'path'
 
@@ -32,6 +34,7 @@ import {
   type PersonaConfig,
 } from '../src/config.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
+import { findSection, headingAnchors, headingSlug, requiredSection, splitFences } from './test-helpers/markdown.ts'
 import {
   DESTRUCTIVE_PREFIX,
   DESTRUCTIVE_SETTINGS,
@@ -162,63 +165,9 @@ describe('slack-app-manifest.yml', () => {
   })
 })
 
-/**
- * The body of the Markdown section under the first heading `title` at `level`
- * (`##` = 2), up to the next heading at that level or higher; undefined when
- * there is no such heading. Fenced code blocks are not headings.
- */
-function findSection(text: string, level: number, title: string): string | undefined {
-  const lines = text.split('\n')
-  const heading = new RegExp(`^(#{1,${level}})\\s+(.*?)\\s*$`)
-  let inFence = false
-  let start = -1
-  for (let i = 0; i < lines.length; i++) {
-    if (/^\s*(```|~~~)/.test(lines[i])) inFence = !inFence
-    if (inFence) continue
-    const m = heading.exec(lines[i])
-    if (!m) continue
-    if (start >= 0) return lines.slice(start, i).join('\n')
-    if (m[1].length === level && m[2] === title) start = i + 1
-  }
-  return start >= 0 ? lines.slice(start).join('\n') : undefined
-}
-
 /** `findSection`, with '' when the heading is absent. */
-function markdownSection(text: string, level: number, title: string): string {
-  return findSection(text, level, title) ?? ''
-}
-
-/** `findSection`, throwing a message that names the missing heading instead of returning undefined. */
-function requiredSection(text: string, level: number, title: string, where: string): string {
-  const section = findSection(text, level, title)
-  if (section === undefined) throw new Error(`README.md has no "${'#'.repeat(level)} ${title}" heading ${where}`)
-  return section
-}
-
-/**
- * `section` split into its prose (every line outside a fenced code block) and
- * its fenced blocks in order, each with its info string (`json`, '' when
- * untagged) and its body lines exactly as written. A block closes at a line of
- * the same fence character at least as long as its opening fence.
- */
-function splitFences(section: string): { prose: string; blocks: { info: string; body: string }[] } {
-  const prose: string[] = []
-  const blocks: { info: string; body: string }[] = []
-  let open: { fence: string; info: string; body: string[] } | null = null
-  for (const line of section.split('\n')) {
-    if (open === null) {
-      const m = /^ {0,3}(`{3,}|~{3,})\s*([^\s`]*)/.exec(line)
-      if (m) open = { fence: m[1], info: m[2], body: [] }
-      else prose.push(line)
-    } else if (new RegExp(`^ {0,3}${open.fence[0]}{${open.fence.length},}\\s*$`).test(line)) {
-      blocks.push({ info: open.info, body: open.body.join('\n') })
-      open = null
-    } else {
-      open.body.push(line)
-    }
-  }
-  if (open !== null) blocks.push({ info: open.info, body: open.body.join('\n') })
-  return { prose: prose.join('\n'), blocks }
+function markdownSection(text: string, heading: string): string {
+  return findSection(text, heading) ?? ''
 }
 
 /** The cells of one Markdown table row, trimmed; `\|` stays in its cell. */
@@ -250,9 +199,17 @@ function codeSpans(cell: string): string[] {
   return [...cell.matchAll(/`([^`]+)`/g)].map((m) => m[1])
 }
 
-/** The README's persona configuration reference heading (`###`) and its complete-example heading (`####`), DOC-1's interface. */
-const PERSONAS_HEADING = 'Personas (config.json)'
-const EXAMPLE_HEADING = 'Example'
+/** The README's persona configuration reference heading and its complete-example heading, DOC-1's interface. */
+const PERSONAS_HEADING = '### Personas (config.json)'
+const EXAMPLE_HEADING = '#### Example'
+
+/** Where a section nested in the persona reference comes from, for `requiredSection` failures. */
+const IN_PERSONAS = `README.md, under "${PERSONAS_HEADING}",`
+
+/** The README's persona configuration reference, throwing when its heading is missing. */
+function personasSection(readme: string): string {
+  return requiredSection(readme, PERSONAS_HEADING, 'README.md')
+}
 
 /**
  * The complete example's text: the one fenced block, tagged `json`, directly
@@ -261,12 +218,11 @@ const EXAMPLE_HEADING = 'Example'
  * vacuously or on some other JSON block.
  */
 function completeExample(readme: string): string {
-  const personas = requiredSection(readme, 3, PERSONAS_HEADING, '')
-  const example = requiredSection(personas, 4, EXAMPLE_HEADING, `under "### ${PERSONAS_HEADING}"`)
+  const example = requiredSection(personasSection(readme), EXAMPLE_HEADING, IN_PERSONAS)
   const { blocks } = splitFences(example)
   if (blocks.length !== 1 || blocks[0].info !== 'json') {
     const found = blocks.map((b) => `\`\`\`${b.info}`).join(', ') || 'none'
-    throw new Error(`"#### ${EXAMPLE_HEADING}" must hold exactly one fenced json block; found: ${found}`)
+    throw new Error(`"${EXAMPLE_HEADING}" must hold exactly one fenced json block; found: ${found}`)
   }
   return blocks[0].body
 }
@@ -287,6 +243,21 @@ const KEY_TABLES: [heading: string, keys: readonly string[]][] = [
   ['Server-wide settings', PERSONA_TOP_LEVEL_KEYS.filter((key) => key !== 'personas')],
 ]
 
+/** The setup wizard: its skill name, its skill file and the heading of its credentials command. */
+const WIZARD_NAME = 'setup-slack-channel-bots'
+const WIZARD_FILE = `skills/${WIZARD_NAME}/SKILL.md`
+const WIZARD_CREDENTIALS_HEADING = 'Credentials command'
+
+/** The inline links in `text`: each target split into its path ('' for a same-file anchor) and its anchor ('' when none). */
+function markdownLinks(text: string): { target: string; path: string; anchor: string }[] {
+  return [...text.matchAll(/\]\(([^)\s]+)\)/g)].map(([, target]) => {
+    const hash = target.indexOf('#')
+    return hash < 0
+      ? { target, path: target, anchor: '' }
+      : { target, path: target.slice(0, hash), anchor: target.slice(hash + 1) }
+  })
+}
+
 describe('README.md', () => {
   const readme = readRepoFile('README.md')
 
@@ -298,8 +269,8 @@ describe('README.md', () => {
    * carries `DESTRUCTIVE:`. Wording is not pinned.
    */
   describe('What a confirmation applies (SR-8.6 rows)', () => {
-    const reload = markdownSection(readme, 2, 'Reload')
-    const table = firstTable(markdownSection(reload, 3, 'What a confirmation applies'))
+    const reload = markdownSection(readme, '## Reload')
+    const table = firstTable(markdownSection(reload, '### What a confirmation applies'))
 
     type Row = { change: string; confirmed: string; session: string }
     const rows: Row[] = table.rows.map(([change, confirmed, session]) => ({ change, confirmed, session }))
@@ -407,8 +378,7 @@ describe('README.md', () => {
    */
   describe('persona configuration reference (SR-12, SR-13.5)', () => {
     test.each(KEY_TABLES)('the "#### %s" table lists exactly the loader\'s keys, one code span per row', (heading, keys) => {
-      const personas = requiredSection(readme, 3, PERSONAS_HEADING, '')
-      const table = firstTable(requiredSection(personas, 4, heading, `under "### ${PERSONAS_HEADING}"`))
+      const table = firstTable(requiredSection(personasSection(readme), `#### ${heading}`, IN_PERSONAS))
       expect(table.header[0]).toBe('Field')
       const firstCells = table.rows.map(([cell]) => cell)
       expect(firstCells.filter((cell) => !/^`[^`]+`$/.test(cell))).toEqual([])
@@ -447,9 +417,9 @@ describe('README.md', () => {
         try {
           raw = JSON.parse(text)
         } catch {
-          throw new Error(`the "#### ${EXAMPLE_HEADING}" json block is not strict JSON`)
+          throw new Error(`the "${EXAMPLE_HEADING}" json block is not strict JSON`)
         }
-        if (!Array.isArray(raw.personas)) throw new Error(`the "#### ${EXAMPLE_HEADING}" json block has no personas array`)
+        if (!Array.isArray(raw.personas)) throw new Error(`the "${EXAMPLE_HEADING}" json block has no personas array`)
         const home = join(dir, 'home')
         const state = join(dir, 'state')
         mkdirSync(home)
@@ -519,5 +489,126 @@ describe('README.md', () => {
         check(loadExample())
       })
     })
+  })
+
+  /**
+   * The README points to the setup wizard: the Quick Start links to its skill
+   * file, and `#### Credentials files` names it and links to its credentials
+   * command. Every link into `skills/` must land on a real file and heading.
+   */
+  describe('setup wizard pointer', () => {
+    function credentialsFiles(): string {
+      return requiredSection(personasSection(readme), '#### Credentials files', IN_PERSONAS)
+    }
+
+    test('the Quick Start links to the wizard skill file', () => {
+      const quickStart = requiredSection(readme, '## Quick Start', 'README.md')
+      expect(markdownLinks(quickStart).map((link) => link.path)).toContain(WIZARD_FILE)
+    })
+
+    test(`"#### Credentials files" names the wizard, ${WIZARD_NAME}, outside any link target`, () => {
+      const prose = splitFences(credentialsFiles()).prose.replace(/\]\([^)]*\)/g, ']')
+      expect(prose).toMatch(new RegExp(`\\b${WIZARD_NAME}\\b`))
+    })
+
+    test(`"#### Credentials files" links to the wizard's "## ${WIZARD_CREDENTIALS_HEADING}" heading`, () => {
+      const targets = markdownLinks(credentialsFiles()).map((link) => link.target)
+      // That the heading exists in the wizard is the links-into-skills/ case below.
+      expect(targets).toContain(`${WIZARD_FILE}#${headingSlug(WIZARD_CREDENTIALS_HEADING)}`)
+    })
+
+    test('every README link into skills/ names an existing file and, with an anchor, one of its headings', () => {
+      const links = markdownLinks(readme).filter((link) => link.path.startsWith('skills/'))
+      expect(links.length).toBeGreaterThan(0)
+      const broken = links
+        .filter((link) => {
+          const file = resolve(REPO_ROOT, link.path)
+          if (!existsSync(file) || !statSync(file).isFile()) return true
+          return link.anchor !== '' && !headingAnchors(readFileSync(file, 'utf-8')).includes(link.anchor)
+        })
+        .map((link) => link.target)
+      expect(broken).toEqual([])
+    })
+  })
+})
+
+/** Every file under `skills/`, repo-relative and sorted, so a skill added later is audited too. */
+function shippedSkillFiles(): string[] {
+  return (readdirSync(resolve(REPO_ROOT, 'skills'), { recursive: true }) as string[])
+    .map((rel) => join('skills', rel))
+    .filter((rel) => statSync(resolve(REPO_ROOT, rel)).isFile())
+    .sort()
+}
+
+/**
+ * The MCP instruction text (`MCP_INSTRUCTIONS` in src/registry.ts, not
+ * exported): the string literals of its array, joined with spaces. Throws
+ * when the declaration isn't found, so the audit never passes on nothing.
+ */
+function mcpInstructionsText(): string {
+  const source = readRepoFile('src/registry.ts')
+  const decl = /const MCP_INSTRUCTIONS = \[([\s\S]*?)\]\.join\(/.exec(source)
+  const literals = decl
+    ? [...decl[1].matchAll(/'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|`((?:[^`\\]|\\.)*)`/g)].map((m) =>
+        (m[1] ?? m[2] ?? m[3]).replace(/\\(.)/g, '$1'),
+      )
+    : []
+  if (literals.join('').trim() === '') throw new Error('src/registry.ts has no `const MCP_INSTRUCTIONS = [ … ].join(…)` with string literals')
+  return literals.join(' ')
+}
+
+/** Every shipped text the audit reads: [name in failures, text]. */
+const SHIPPED_TEXTS: [name: string, read: () => string][] = [
+  ['README.md', () => readRepoFile('README.md')],
+  ...shippedSkillFiles().map((rel): [string, () => string] => [rel, () => readRepoFile(rel)]),
+  ['slack-app-manifest.yml', () => readRepoFile('slack-app-manifest.yml')],
+  ['MCP instructions (src/registry.ts MCP_INSTRUCTIONS)', mcpInstructionsText],
+]
+
+/**
+ * b.av2 SR-12: the claim that a first @mention activates (wakes, unlocks)
+ * event delivery in a channel, in the forms the README and the wizard once
+ * shipped ("Slack may not deliver messages until the bot is @mentioned for
+ * the first time … the first @mention activates event delivery"). Matched
+ * case-insensitively across line breaks. "Until … @mention" counts only next
+ * to a deliver, send or event word, and activation only with an activation
+ * verb (not the generic "starts" or "enables"), so the receiving section's
+ * legitimate @mention and delivery wording matches none of them; the control
+ * table below pins both sides.
+ */
+const FIRST_MENTION_CLAIM: [label: string, pattern: RegExp][] = [
+  ['a first @mention', /\bfirst\s+@?mention/gi],
+  ['@mentioned for the first time', /@?mention(?:ed|s|ing)?\b[^.]{0,40}?\bfirst\s+time\b/gi],
+  ['activating delivery', /\b(?:activat|wak|unlock)\w*\s+(?:the\s+)?(?:\w+\s+)?(?:event\s+)?delivery\b|\btrigger\w*\s+(?:the\s+)?(?:\w+\s+)?event\s+delivery\b/gi],
+  [
+    'no delivery until @mentioned',
+    /\b(?:deliver|send|sent|event)\w*\b[^.]{0,40}?\buntil\b[^.]{0,40}?@?mention(?:ed|s)?\b|\buntil\b[^.]{0,40}?@?mention(?:ed|s)?\b[^.]{0,40}?\b(?:deliver|send|sent|event)\w*/gi,
+  ],
+]
+
+/** Each match of `terms` in `text`, as `<label>: <matched text>`. */
+function termsIn(text: string, terms: readonly [label: string, pattern: RegExp][]): string[] {
+  return terms.flatMap(([label, pattern]) => [...text.matchAll(pattern)].map((m) => `${label}: ${m[0]}`))
+}
+
+describe('shipped text audit (README, skills, manifest, MCP instructions)', () => {
+  test(`the audit covers every skill file, the wizard's ${WIZARD_FILE} included`, () => {
+    expect(SHIPPED_TEXTS.map(([name]) => name)).toContain(WIZARD_FILE)
+  })
+
+  test.each(SHIPPED_TEXTS)('SR-12: %s does not claim a first @mention activates event delivery', (_name, read) => {
+    expect(termsIn(read(), FIRST_MENTION_CLAIM)).toEqual([])
+  })
+
+  /** Controls for the matcher: the historical claim and its variants match; ordinary @mention and delivery wording doesn't. */
+  test.each([
+    ['Slack may not deliver messages until the bot is @mentioned for the first time.', true],
+    ['This is a Slack Socket Mode behavior — the first @mention activates event delivery for that channel.', true],
+    ['@mention the bot once to activate delivery.', true],
+    ['Until you @mention the bot, it gets no events.', true],
+    ['A persona waits until it is @mentioned, then replies.', false],
+    ['The server enables event delivery for every configured channel.', false],
+  ] as const)('the first-@mention matcher on %p: matches is %p', (sentence, claim) => {
+    expect(termsIn(sentence, FIRST_MENTION_CLAIM).length > 0).toBe(claim)
   })
 })

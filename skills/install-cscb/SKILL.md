@@ -46,7 +46,7 @@ Read the output carefully:
 
 - **Exit 0 + "OK"**: agent-director is satisfied. Print the resolved
   binary path, detected version, and floor from the success output, then
-  exit cleanly. No further action required.
+  go to Step 5. No further remediation is required.
 
 - **Exit non-zero**: identify the class label on stderr (one of
   `ad-system-install-not-found`, `ad-system-install-too-old`,
@@ -194,16 +194,30 @@ the AD package is intact before re-invoking the skill.
 ## Step 4 — Loop or exit
 
 After each remediation step, re-run Step 1. The skill keeps looping
-until the check passes (exit cleanly with the success output) or the
+until the check passes (print the success output and go to Step 5) or the
 user declines to proceed (exit non-zero with the abort summary).
+
+## Step 5 — Next steps
+
+Once the check passes, agent-director is ready to run the personas.
+CSCB launches one agent-director instance per persona, named
+`cscb_<key>` after the persona's key; `agent-director list --label
+service=cscb` lists them once the server is running.
+
+- To add or change personas, run the setup wizard
+  (`/setup-slack-channel-bots`).
+- If a persona still does not come up after the server starts, the
+  cause is in the server log, not in the agent-director install. Use
+  the `debug-slack-channel-bots` skill.
 
 ## Notes
 
 - This skill does not maintain its own list of agent-director install
   commands. AD's documentation is the source of truth; the skill
   surfaces AD's published command verbatim.
-- This skill does not touch `~/.claude/channels/slack/` or CSCB's
-  routing configuration. It only acts on the system-wide
-  `agent-director` install.
+- This skill does not touch the persona configuration
+  (`~/.claude/channels/slack/config.json`), the persona credentials
+  files or the reload files beside the configuration. It only acts on
+  the system-wide `agent-director` install.
 - The skill is callable repeatedly; each invocation re-runs Step 1
   from a clean state.

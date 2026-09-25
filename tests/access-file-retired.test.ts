@@ -29,6 +29,8 @@ import { describe, expect, test } from 'bun:test'
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join, relative, resolve, sep } from 'node:path'
 
+import { sectionRange } from './test-helpers/markdown.ts'
+
 const REPO_ROOT = resolve(import.meta.dir, '..')
 
 /**
@@ -163,37 +165,16 @@ describe('the internal docs describe no retired access model', () => {
   }
 })
 
-/**
- * The 0-based line range `[start, end)` of the Markdown section whose heading
- * at `level` (`##` = 2) matches `title`, heading line included, up to the next
- * heading at that level or higher; `start` is -1 when absent. Lines inside a
- * ``` or ~~~ fence are not headings, so a `# comment` in a shell block does not
- * end the section. Mirrors `markdownSection` in tests/shipped-docs.test.ts,
- * returning line numbers so a failure can name `README.md:<line>`.
- */
-function markdownSectionRange(lines: string[], level: number, title: RegExp): { start: number; end: number } {
-  const heading = new RegExp(`^(#{1,${level}})\\s+(.*?)\\s*$`)
-  let inFence = false
-  let start = -1
-  for (let i = 0; i < lines.length; i++) {
-    if (/^\s*(```|~~~)/.test(lines[i])) inFence = !inFence
-    if (inFence) continue
-    const m = heading.exec(lines[i])
-    if (!m) continue
-    if (start >= 0) return { start, end: i }
-    if (m[1].length === level && title.test(m[2])) start = i
-  }
-  return { start, end: lines.length }
-}
-
 describe("README's Release section", () => {
   test('names no access.json', () => {
-    const lines = readFileSync(join(REPO_ROOT, 'README.md'), 'utf-8').split('\n')
-    const { start, end } = markdownSectionRange(lines, 2, /^Release\b/)
+    const text = readFileSync(join(REPO_ROOT, 'README.md'), 'utf-8')
+    // Fence-aware: a `# comment` in a shell block does not end the section.
+    const range = sectionRange(text, /^## Release\b/)
     // Fail loudly rather than pass on an empty section when the heading moves.
-    if (start === -1) throw new Error('README.md has no "## Release" heading; the Release-section guard cannot locate it')
-    const section = lines.slice(start, end)
+    if (range === undefined) throw new Error('README.md has no "## Release" heading; the Release-section guard cannot locate it')
+    const { start, end } = range
+    const section = text.split('\n').slice(start, end)
     expect(section.length).toBeGreaterThan(1)
-    expect(section.flatMap((text, i) => (ACCESS_JSON.test(text) ? [`README.md:${start + i + 1}`] : []))).toEqual([])
+    expect(section.flatMap((line, i) => (ACCESS_JSON.test(line) ? [`README.md:${start + i + 1}`] : []))).toEqual([])
   })
 })

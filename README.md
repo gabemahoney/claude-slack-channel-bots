@@ -30,11 +30,11 @@ A single HTTP MCP server that runs several independent Claude Code bots, called 
    claude /setup-slack-channel-bots
    ```
 
-   It covers the Slack app manifest, the system prompt file, the agent-director check and hook cleanup, and skips anything already configured. Until the skill is updated for personas, skip its token and routing steps (exporting token variables and writing `config.json`): the server reads no token from the environment and refuses a `config.json` with `routes`.
+   The wizard walks you through one persona at a time: creating and installing the persona's Slack app from `slack-app-manifest.yml`, setting its name and avatar, and inviting it to its channels, which you do in Slack; writing its credentials file, which you do in your terminal; and declaring the persona in `config.json`, which the wizard writes. Tokens go only into the wizard's [credentials command](skills/setup-slack-channel-bots/SKILL.md#credentials-command), which you run in your own terminal, never into the chat. On a running server, the wizard explains how to confirm the pending change (see [Reload](#reload)).
 
-4. **Create your personas:**
+4. **Or create your personas by hand:**
 
-   Create one Slack app per persona from `slack-app-manifest.yml`. Write each app's tokens to its own credentials file, then list the personas in `config.json`. See [Personas (config.json)](#personas-configjson) and [Credentials files](#credentials-files).
+   Skip this step if the wizard created them. Create one Slack app per persona from `slack-app-manifest.yml`. Write each app's tokens to its own credentials file, then list the personas in `config.json`. See [Personas (config.json)](#personas-configjson) and [Credentials files](#credentials-files).
 
 5. **Start the server:**
 
@@ -299,6 +299,10 @@ Each persona's Slack tokens live in its own credentials file, and `config.json` 
 - The server never writes or copies the file and doesn't check its mode. Keep it private: `chmod 600`.
 - The file's content is checked when the persona comes up, not when `config.json` is checked. A missing or malformed file keeps only that persona down (see [Troubleshooting](#troubleshooting)).
 - On a running server, a change to the file waits for confirmation like a `config.json` edit (see [Reload](#reload)).
+
+The setup wizard, `setup-slack-channel-bots`, writes this file for you with its [credentials command](skills/setup-slack-channel-bots/SKILL.md#credentials-command), which you run in your own terminal. The command reads both tokens without echoing them, validates the bot token with Slack `auth.test` and the app token with `apps.connections.open`, and writes the file with mode 0600 only when both pass. It asks before replacing an existing file.
+
+To rotate a persona's tokens, re-run the credentials command for its existing file (see the wizard's [Rotate a persona's tokens](skills/setup-slack-channel-bots/SKILL.md#rotate-a-personas-tokens)), then confirm the pending change (see [Confirming a change](#confirming-a-change)). Only that persona reconnects, and no restart is needed.
 
 Never put a token in `config.json`, a ticket or a chat.
 
@@ -1154,8 +1158,15 @@ While a persona is down, its Claude instance keeps running and keeps its history
 
 The `debug-slack-channel-bots` skill has an entry for every persona log class, every `config.json` rejection and each recovery step. It ships in the package at `skills/debug-slack-channel-bots/SKILL.md`, and postinstall links it into `~/.claude/skills/debug-slack-channel-bots`; a copied directory or file already at that path is left in place, and postinstall logs `skipped: <path> (not a link; …)` — remove it and re-run postinstall to get the link. Invoke `/debug-slack-channel-bots` from Claude Code.
 
-**Bot not receiving messages in a new channel**
-After inviting the bot to a channel, Slack may not deliver messages until the bot is @mentioned for the first time. This is a Slack Socket Mode behavior — the first @mention activates event delivery for that channel. After that, all messages flow normally.
+**A persona doesn't receive messages in a channel or DM**
+Check each of these for the persona that should receive the messages:
+
+- Its Slack app is invited to the channel.
+- The channel is in its `channels`, with the `delivery` you want. With `mentions`, only messages that @mention the persona directly and `@here` / `@channel` broadcasts arrive (see [Channel delivery](#channel-delivery)).
+- The edit that added the channel is applied. Until you confirm it, it is still pending (see [Reload](#reload)).
+- For DMs, `dm.enabled` is `true`. An app created from an earlier manifest needs the `im:write` scope and a re-install to start a DM (see [Direct messages](#direct-messages-dmenabled)).
+
+If the persona is down, see "A persona doesn't come up or doesn't answer" above, or run `/debug-slack-channel-bots`.
 
 **File attachment fails after a long wait**
 Each attempt of a Slack request is limited to 30 s, and that includes uploading a file attached with `reply`. An upload that takes longer than 30 s fails on every attempt, so the tool returns an error only after about 30 minutes, once the standard retries are spent. This is not a hang: send smaller files, or split a large attachment into several smaller ones.

@@ -33,6 +33,7 @@
 - Lead with the most important information
 - No marketing language — state facts
 - Use relative paths from the repo root when referencing files
+- Secrets: show no token value, only placeholders (`<bot token, starts with xoxb->`). No shipped doc or skill asks the operator to paste, type or show a token in a chat; tokens go only into the setup wizard's credentials command, run in the operator's own terminal (`## Credentials command` in `skills/setup-slack-channel-bots/SKILL.md`)
 
 ## When to Update
 

@@ -27,7 +27,7 @@ _metadata:
 
 display_information:
   name: Claude Slack Channels Bot
-  description: "Multi-session Slack-to-Claude bridge that routes messages to Claude Code sessions via Socket Mode"
+  description: "A Claude Code bot persona, served over Socket Mode by Claude Slack Channel Bots"
   background_color: "#1a1a2e"
 
 features:
