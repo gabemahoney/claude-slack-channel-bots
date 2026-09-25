@@ -1,6 +1,6 @@
 # Test Plan: clean_restart Lifecycle
 
-> This plan predates the persona runtime and is kept for history; it does not describe current behavior. See `docs/architecture.md` (Clean Restart) and `tests/cli.test.ts` for the current design and tests.
+> This plan predates the persona runtime and is kept for history; it does not describe current behavior. See `docs/architecture.md` (Clean Restart) and `tests/cli.test.ts` for the current design and tests. If you reuse a scenario that sets a setting such as `stop_timeout` or `exit_timeout`: once a start has written `config.json.last-applied`, the CLI and the server take their settings from that record, not from `config.json`. Set the value before the first start, on a fresh state dir.
 
 Covers the 30 test cases (T1–T30) defined in the SRD for the `clean_restart` subcommand and its surrounding startup/shutdown lifecycle. Tests are grouped by functional area.
 

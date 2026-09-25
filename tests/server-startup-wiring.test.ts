@@ -6,8 +6,12 @@
  *   src/server.ts; the connection manager is built inside main().
  * - SR-10.2: `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` are neither required nor
  *   read by the server; only src/cli.ts still names them.
- * - SR-8.7: the `MCP_HOST` / `MCP_PORT` fallback is gone; main() loads the
- *   required config file through the persona loader and exits on failure.
+ * - SR-8.7: the `MCP_HOST` / `MCP_PORT` fallback is gone; main() resolves the
+ *   start through the reload controller (the last-applied record when there
+ *   is one, else the required config file), exits on a refused start, sets
+ *   the applied config from the outcome, and requests the start bring-up from
+ *   the controller, whose lifecycle runs `startupSessionManager` over the
+ *   config the controller hands it.
  * - SR-13.2: importing src/server.ts touches nothing under HOME. Before the
  *   switch the import read the token variables (exiting without them) and
  *   created `~/.claude/channels/slack`; main() now creates the state and
@@ -21,7 +25,8 @@
  *   by the persona notifier and the permission poller.
  * - The bring-up controller (SR-6.1, SR-6.4): the start's bring-up, told
  *   every connection status, stored for shutdown and cancelled there before
- *   the connections stop.
+ *   the connections stop; the health check started only after the start
+ *   bring-up returns.
  * - The relaunch gate (SR-6.1, SR-6.4): built over the manager and the
  *   bring-up controller and passed to the restart module (`canRestart`), the
  *   restart launch and the health-check work list; the restart delay read
@@ -31,7 +36,7 @@
  *   a refused session disconnected and never registered; the controller's
  *   `onLeftUp` dropping the persona's registered session.
  * - SR-5.2: the file guard handed to the session tools protects every persona
- *   credentials file.
+ *   credentials file, as the reload controller lists them.
  *
  * Why part of this file is a static audit: main() cannot run in a unit test
  * (the agent-director startup gate, a real port, real Slack connections), so
@@ -53,10 +58,12 @@ import {
   balancedAfter,
   callArguments,
   indicesOf,
+  insideMain as insideMainOf,
   loadedConfigName,
   objectProperties,
   onlyCallArguments,
   splitTopLevel,
+  startResolution,
   stripComments,
 } from './test-helpers/source-audit.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
@@ -102,16 +109,9 @@ function assignmentsTo(name: string): Array<{ at: number; value: string }> {
     .map((m) => ({ at: m.index!, value: m[1]!.trim() }))
 }
 
-/** [start, end) of main()'s body in the code. */
-function mainBody(): [number, number] {
-  const decl = SERVER_CODE.search(/\bexport\s+async\s+function\s+main\s*\(\s*\)/)
-  expect(decl).toBeGreaterThan(-1)
-  return balancedAfter(SERVER_CODE, SERVER_CODE.indexOf(')', decl), '{', '}')
-}
-
+/** Whether `offset` lies inside main()'s body in server.ts. */
 function insideMain(offset: number): boolean {
-  const [start, end] = mainBody()
-  return offset > start && offset < end
+  return insideMainOf(SERVER_CODE, offset)
 }
 
 /** Every `.ts` file under src/, as [repo-relative path, source text]. */
@@ -170,15 +170,23 @@ describe('server.ts builds no Slack client and reads no token itself (SR-3.1, SR
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: the persona loader (SR-1.7, SR-8.7)
+// Static audit: the start resolution (SR-1.7, SR-8.7)
 // ---------------------------------------------------------------------------
 
-describe('main() loads the persona config through the persona loader (SR-1.7, SR-8.7)', () => {
-  test('imports loadStartPersonaConfig and no route loader from the config module', () => {
+describe('main() resolves the start through the reload controller and exits on a refused start (SR-1.7, SR-8.7)', () => {
+  test('imports createReloadController and reloadFilePaths from the reload module, and neither the start loader nor a route loader from the config module', () => {
+    expect(SERVER_CODE).toMatch(
+      /import\s*\{[^}]*\bcreateReloadController\b[^}]*\}\s*from\s*['"]\.\/reload\.ts['"]/,
+    )
+    expect(SERVER_CODE).toMatch(/import\s*\{[^}]*\breloadFilePaths\b[^}]*\}\s*from\s*['"]\.\/reload\.ts['"]/)
     const configImports = [...SERVER_CODE.matchAll(/import\s*\{([^}]*)\}\s*from\s*['"]\.\/config\.ts['"]/g)]
     expect(configImports).toHaveLength(1)
     const names = configImports[0]![1]!.split(',').map((n) => n.trim().replace(/^type\s+/, ''))
-    expect(names).toContain('loadStartPersonaConfig')
+    // The start never reads the config file around the controller.
+    for (const loader of ['loadStartPersonaConfig', 'loadPersonaConfig', 'parsePersonaConfigBytes', 'readPersonaConfigBytes']) {
+      expect(names).not.toContain(loader)
+      expect(callsOf(loader)).toEqual([])
+    }
     for (const routeName of ['loadConfig', 'resolveConfig', 'applyDefaults', 'validateConfig']) {
       expect(names).not.toContain(routeName)
     }
@@ -186,16 +194,44 @@ describe('main() loads the persona config through the persona loader (SR-1.7, SR
     expect(names.filter((n) => /rout/i.test(n))).toEqual([])
   })
 
-  test('loads CONFIG_PATH (the server config path) once, inside main(), and exits 1 when loading fails', () => {
+  test('builds the controller once, inside main(), over CONFIG_PATH\'s reload files (the server config path), and resolves the start once', () => {
     expect(SERVER_CODE).toMatch(/\bconst\s+CONFIG_PATH\s*=\s*resolveServerConfigPath\s*\(\s*\)/)
-    expect(insideMain(onlyCallOf('loadStartPersonaConfig'))).toBe(true)
-    // The call is the whole try block, and its catch exits.
-    const guarded = SERVER_CODE.search(
-      /try\s*\{\s*\w+\s*=\s*loadStartPersonaConfig\s*\(\s*CONFIG_PATH\s*\)\s*;?\s*\}\s*catch\s*\([^)]*\)\s*\{/,
+    // startResolution pins one resolveStart and one runStartBringUp, both
+    // called on this controller.
+    const { createAt, resolveAt } = startResolution(SERVER_CODE)
+    expect(onlyCallOf('createReloadController')).toBe(createAt)
+    expect(insideMain(createAt)).toBe(true)
+    expect(insideMain(resolveAt)).toBe(true)
+    expect(onlyCallProps('createReloadController').get('paths')).toBe('reloadFilePaths(CONFIG_PATH)')
+  })
+
+  test('a refused start exits 1 right after the resolution, before the applied config is set; on the start path the outcome\'s config is the only applied config, and nothing re-reads the config file into it', () => {
+    const { controller, outcome, loaded, resolveAt, assignAt, bringUpAt } = startResolution(SERVER_CODE)
+    // `const <outcome> = <controller>.resolveStart()`, then the refusal exit as
+    // the whole `if`, then `<loaded> = <outcome>.config`: nothing in between.
+    const sequence = new RegExp(
+      `\\bconst\\s+${outcome}\\s*=\\s*${controller}\\s*\\.\\s*resolveStart\\s*\\(\\s*\\)\\s*;?\\s*` +
+        `if\\s*\\(\\s*${outcome}\\s*\\.\\s*kind\\s*===\\s*'refused'\\s*\\)\\s*\\{?\\s*process\\s*\\.\\s*exit\\s*\\(\\s*1\\s*\\)\\s*;?\\s*\\}?\\s*` +
+        `${loaded}\\s*=\\s*${outcome}\\s*\\.\\s*config\\b`,
+      'g',
     )
-    expect(guarded).toBeGreaterThan(-1)
-    const catchBody = SERVER_CODE.slice(...balancedAfter(SERVER_CODE, SERVER_CODE.indexOf('catch', guarded), '{', '}'))
-    expect(catchBody).toMatch(/\bprocess\.exit\s*\(\s*1\s*\)/)
+    expect(indicesOf(sequence, SERVER_CODE)).toHaveLength(1)
+    // The start path, from the resolution to the start bring-up request (where
+    // every start pass reads the applied config), assigns it once: from the
+    // outcome. A later assignment outside that window (a confirmed apply,
+    // E12/E13) is not the start's.
+    const assigns = assignmentsTo(loaded)
+    expect(assigns.filter(({ at }) => at > resolveAt && at < bringUpAt).map(({ at }) => at)).toEqual([assignAt])
+    // No assignment anywhere reads the config file (the import test above
+    // also bans every config loader from server.ts).
+    for (const { value } of assigns) {
+      expect(value).not.toMatch(/\bCONFIG_PATH\b|\breadFileSync\b|\b(?:load|parse|read)\w*Config\w*\s*\(/)
+    }
+  })
+
+  test('the start resolution comes AFTER the PID check, so a duplicate start never writes the record', () => {
+    const { resolveAt } = startResolution(SERVER_CODE)
+    expect(resolveAt).toBeGreaterThan(onlyCallOf('checkPidConflict'))
   })
 
   test.each([
@@ -203,12 +239,12 @@ describe('main() loads the persona config through the persona loader (SR-1.7, SR
     ['the template install', 'installSlackChannelBotTemplate'],
     ['the connection manager', 'createPersonaConnectionManager'],
     ['Bun.serve', 'Bun\\.serve'],
-    ['the per-persona bring-up', 'startupSessionManager'],
-  ])('loads the config BEFORE %s', (_label, anchor) => {
-    const load = onlyCallOf('loadStartPersonaConfig')
+    ['the per-persona bring-up', 'runStartBringUp'],
+  ])('sets the applied config BEFORE %s', (_label, anchor) => {
+    const { assignAt } = startResolution(SERVER_CODE)
     const later = callsOf(anchor)
     expect(later.length).toBeGreaterThan(0)
-    for (const at of later) expect(load).toBeLessThan(at)
+    for (const at of later) expect(assignAt).toBeLessThan(at)
   })
 })
 
@@ -232,7 +268,7 @@ describe('main() installs the unhandledRejection handler before any persona conn
 
   test.each([
     ['the connection manager is built', 'createPersonaConnectionManager'],
-    ['the per-persona bring-up', 'startupSessionManager'],
+    ['the per-persona bring-up (the start bring-up request)', 'runStartBringUp'],
   ])('installs it BEFORE %s', (_label, anchor) => {
     const [install] = indicesOf(INSTALL, SERVER_CODE)
     expect(install).toBeDefined()
@@ -246,20 +282,56 @@ describe('main() installs the unhandledRejection handler before any persona conn
 // ---------------------------------------------------------------------------
 
 describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona config through the bring-up controller, which shutdown cancels (SR-6.1, SR-6.4)', () => {
-  test('gets the loaded persona config and, as its bring-up, the bring-up controller', () => {
+  test('is the reload controller\'s start bring-up: it gets the applied config the controller supplies and, as its bring-up, the bring-up controller', () => {
+    // The only startupSessionManager call is the whole body of the controller's
+    // lifecycle `startBringUp`, and its first argument is that closure's
+    // parameter: the controller's applied config (the record's at a start
+    // from the record), never the module-level config or a config read again
+    // from the file. main() requests the pass with no argument, so the
+    // controller supplies the config.
+    const { createAt, bringUpAt, controller } = startResolution(SERVER_CODE)
+    const lifecycle = objectProperties(callArguments(SERVER_CODE, createAt)).get('lifecycle')
+    expect(lifecycle).toBeDefined()
+    const startBringUp = objectProperties(lifecycle!).get('startBringUp')
+    expect(startBringUp).toBeDefined()
+    const arrow = startBringUp!.match(/^\(?\s*(\w+)\s*\)?\s*=>\s*startupSessionManager\s*\(/)
+    expect(arrow).not.toBeNull()
+    // The call is the tail of the body: nothing follows its closing bracket.
+    const [, close] = balancedAfter(startBringUp!, arrow![0].length - 1, '(', ')')
+    expect(close).toBe(startBringUp!.length - 1)
+    const [start, end] = balancedAfter(SERVER_CODE, createAt, '(', ')')
+    const at = onlyCallOf('startupSessionManager')
+    expect(at > start && at < end).toBe(true)
+
     const args = onlyCallArgs('startupSessionManager')
     expect(args).toHaveLength(2)
-    expect(args[0]).toBe(loadedConfigName(SERVER_CODE))
+    expect(args[0]).toBe(arrow![1])
     const options = objectProperties(args[1]!)
     expect([...options.keys()]).toEqual(['bringUp'])
     expect(options.get('bringUp')).toBe(constOf('createPersonaBringUpController'))
+
+    expect(insideMain(bringUpAt)).toBe(true)
+    expect(SERVER_CODE.slice(bringUpAt)).toMatch(/^runStartBringUp\s*\(\s*\)/)
+    expect(SERVER_CODE.slice(0, bringUpAt)).toMatch(new RegExp(`\\bawait\\s+${controller}\\s*\\.\\s*$`))
+  })
+
+  test('the health check starts only after the start bring-up returns: one startHealthCheck, inside main(), after the awaited runStartBringUp(), at the applied config\'s interval', () => {
+    // The previous test pins `await <controller>.runStartBringUp()`, so a call
+    // after it in main() runs once the pass has returned. The reload detection
+    // tick (b.av2 SR-8.2) follows the same rule.
+    const { bringUpAt, loaded } = startResolution(SERVER_CODE)
+    const at = onlyCallOf('startHealthCheck')
+    expect(insideMain(at)).toBe(true)
+    expect(at).toBeGreaterThan(bringUpAt)
+    expect(onlyCallArgs('startHealthCheck')).toEqual([`${loaded}.health_check_interval`])
   })
 
   test('the bring-up controller is built once, inside main(), over the connection manager, with dry run passed through and spawnForPersona over the applied config as its launch', () => {
     const at = onlyCallOf('createPersonaBringUpController')
     expect(insideMain(at)).toBe(true)
     expect(at).toBeGreaterThan(onlyCallOf('createPersonaConnectionManager'))
-    expect(at).toBeLessThan(onlyCallOf('startupSessionManager'))
+    // Built before the start bring-up runs startupSessionManager with it.
+    expect(at).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
 
     const props = onlyCallProps('createPersonaBringUpController')
     expect(props.get('connections')).toBe(constOf('createPersonaConnectionManager'))
@@ -281,9 +353,10 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
     expect(at).toBeGreaterThan(onlyCallOf('createPersonaBringUpController'))
     // Nothing connects before the start pass: server.ts never calls a
     // connection manager's bringUp itself, the controller does, from
-    // startupSessionManager. So the holder is set before any status can fire.
+    // startupSessionManager (the reload controller's start bring-up). So the
+    // holder is set before any status can fire.
     expect(indicesOf(/\.\s*bringUp\s*\(/g, SERVER_CODE)).toEqual([])
-    expect(at).toBeLessThan(onlyCallOf('startupSessionManager'))
+    expect(at).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
     // Right after it is built: the only code between the controller's
     // construction and the assignment is the construction itself.
     const [, callEnd] = balancedAfter(SERVER_CODE, onlyCallOf('createPersonaBringUpController'), '(', ')')
@@ -349,7 +422,7 @@ describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, 
     expect(assigns.map((a) => a.value)).toEqual([manager])
     expect(insideMain(assigns[0]!.at)).toBe(true)
     expect(assigns[0]!.at).toBeGreaterThan(onlyCallOf('createPersonaConnectionManager'))
-    expect(assigns[0]!.at).toBeLessThan(onlyCallOf('startupSessionManager'))
+    expect(assigns[0]!.at).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
   })
 
   test('clientFor and identityFor are the persona-start lookups over the connection view of `connections` and the loaded config', () => {
@@ -437,11 +510,11 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
   })
 
   test('getRestartDelay reads session_restart_delay from the config main() loaded', () => {
-    const loaded = loadedConfigName(SERVER_CODE)
+    const { loaded, assignAt } = startResolution(SERVER_CODE)
     const applied = [...SERVER_CODE.matchAll(new RegExp(`\\bconst\\s+(\\w+)(?:\\s*:\\s*\\w+)?\\s*=\\s*${loaded}\\s*(?:;|\\n)`, 'g'))]
     expect(applied).toHaveLength(1)
     expect(insideMain(applied[0]!.index!)).toBe(true)
-    expect(applied[0]!.index!).toBeGreaterThan(onlyCallOf('loadStartPersonaConfig'))
+    expect(applied[0]!.index!).toBeGreaterThan(assignAt)
     expect(onlyCallProps('initRestart').get('getRestartDelay')).toBe(`() => ${applied[0]![1]}.session_restart_delay`)
   })
 })
@@ -681,14 +754,25 @@ describe('main() owns the start-up side effects', () => {
 // ---------------------------------------------------------------------------
 
 describe('server.ts\'s file guard refuses every persona credentials file (b.av2 SR-5.2; E3 Task 5 carry)', () => {
-  test('assertSendable builds its protected list from the applied personas and the config path per call, and the session tools get it with clientFor', () => {
+  test('assertSendable builds its protected list per call from the reload controller (the applied personas and the config file), with the config file\'s paths before main() builds it, and the session tools get it with clientFor', () => {
     expect(SERVER_CODE).toMatch(/import\s*\{[^}]*\bassertSendable\s+as\s+libAssertSendable\b[^}]*\}\s*from\s*['"]\.\/lib\.ts['"]/)
     const fn = SERVER_CODE.search(/\bfunction\s+assertSendable\s*\(/)
     expect(fn).toBeGreaterThan(-1)
     const body = SERVER_CODE.slice(...balancedAfter(SERVER_CODE, fn, '{', '}'))
-    const list = body.match(/\bconst\s+(\w+)\s*=\s*credentialsFilesToProtect\s*\(/)
+    const list = body.match(
+      /\bconst\s+(\w+)\s*=\s*reloadController\s*\?\.\s*protectedCredentialsFiles\s*\(\s*\)\s*\?\?\s*credentialsFilesToProtect\s*\(/,
+    )
     expect(list).not.toBeNull()
-    expect(splitTopLevel(callArguments(body, list!.index!))).toEqual([`${loadedConfigName(SERVER_CODE)}?.personas ?? []`, 'CONFIG_PATH'])
+    const fallback = list!.index! + list![0].lastIndexOf('credentialsFilesToProtect')
+    expect(splitTopLevel(callArguments(body, fallback))).toEqual(['[]', 'CONFIG_PATH'])
+    // The holder is the module-scope controller main() builds, set once, inside
+    // main(), before the MCP server (and so any session tool) can run.
+    expect(SERVER_CODE).toMatch(/^let\s+reloadController\s*:\s*ReloadController\s*\|\s*undefined\s*$/m)
+    const { controller } = startResolution(SERVER_CODE)
+    const holder = assignmentsTo('reloadController')
+    expect(holder.map((a) => a.value)).toEqual([controller])
+    expect(insideMain(holder[0]!.at)).toBe(true)
+    expect(holder[0]!.at).toBeLessThan(onlyCallOf('Bun\\.serve'))
     const guard = body.search(/\blibAssertSendable\s*\(/)
     expect(guard).toBeGreaterThan(-1)
     expect(splitTopLevel(callArguments(body, guard))).toEqual(['filePath', 'resolve(STATE_DIR)', 'resolve(INBOX_DIR)', list![1]])

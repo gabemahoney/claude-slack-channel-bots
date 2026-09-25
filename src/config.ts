@@ -10,25 +10,28 @@
  * value (b.av2 SR-10.3).
  *
  * The configuration file is `config.json` in the state directory, at the path
- * `resolveServerConfigPath` returns (b.av2 SR-8.7). The server loads it
- * through `loadStartPersonaConfig` (the file is required and there is no
- * fallback) and the CLI reads the same path with `loadPersonaConfig`.
+ * `resolveServerConfigPath` returns (b.av2 SR-8.7). Which configuration a
+ * start runs (the last-applied record or this file) is decided by the reload
+ * controller (`src/reload.ts`), which validates the bytes it read through
+ * `parsePersonaConfigBytes`; a record is validated in record mode, where a
+ * real-path collision is left to the bring-up (b.av2 SR-1.5).
  *
- * Pure functions (expandTilde, resolvePersonaConfig, resolveRealPath) are
- * side-effect-free and importable by tests without performing any I/O
- * (b.av2 SR-13.1); importing this module touches no file and reads no
- * environment variable. resolvePersonaConfig and resolveRealPath resolve real
- * paths (b.av2 SR-1.5) but never open, read, create or write a file. The I/O
- * wrappers (loadPersonaConfig, loadStartPersonaConfig) read the JSON file once
- * and delegate to them.
+ * Pure functions (expandTilde, resolvePersonaConfig, parsePersonaConfigBytes,
+ * resolveRealPath) are side-effect-free and importable by tests without
+ * performing any I/O (b.av2 SR-13.1); importing this module touches no file
+ * and reads no environment variable. resolvePersonaConfig and resolveRealPath
+ * resolve real paths (b.av2 SR-1.5) but never open, read, create or write a
+ * file. The I/O wrapper (loadPersonaConfig) reads the JSON file once and
+ * delegates to them.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { readFileSync, realpathSync } from 'fs'
+import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync, realpathSync } from 'fs'
 import { homedir } from 'os'
 import { dirname, isAbsolute, join, resolve } from 'path'
 
+import { jsonSyntaxErrorOffset, positionAt } from './json-position.ts'
 import { expandTilde as expandTildeWith, personaKey, renderPersonaRef } from './persona-identity.ts'
 
 // ---------------------------------------------------------------------------
@@ -480,9 +483,10 @@ export function tryResolveRealPath(
  * `configPath`, tilde-expanded under `home` and made absolute.
  *
  * The current file is read tolerantly and not validated, so a file with an
- * invalid edit still protects the paths it names. An unreadable file,
- * unparseable JSON, or a file without a `personas` array contributes nothing;
- * this never throws. The file's contents never appear in the result beyond
+ * invalid edit still protects the paths it names. It is read through
+ * `readPersonaConfigBytes`, so a path that is not a regular file (a FIFO or a
+ * device) is never read. An unreadable or non-regular file, unparseable JSON,
+ * or a file without a `personas` array contributes nothing; this never throws. The file's contents never appear in the result beyond
  * the paths themselves. Callers compare the returned paths by
  * `resolveRealPath`.
  *
@@ -491,16 +495,20 @@ export function tryResolveRealPath(
  * @param configPath       Path to the configuration file; `~` is expanded under `home`.
  * @param home             Home directory for every `~`; defaults to the OS home,
  *   read at call time and only when a path needs it.
+ * @param fs               File-system overrides for reading the configuration
+ *   file (`PersonaConfigFs`); unset operations use the real file system.
  */
 export function credentialsFilesToProtect(
   appliedPersonas: readonly Persona[],
   configPath: string,
   home?: string,
+  fs?: Partial<PersonaConfigFs>,
 ): string[] {
   const paths = appliedPersonas.map((p) => p.credentials_file)
   let parsed: unknown
   try {
-    parsed = JSON.parse(readFileSync(resolve(expandTildeWith(configPath, home)), 'utf-8'))
+    const bytes = readPersonaConfigBytes(resolve(expandTildeWith(configPath, home)), fs)
+    parsed = JSON.parse(bytes.toString('utf-8'))
   } catch {
     return paths
   }
@@ -1077,6 +1085,19 @@ function checkRealPathCollisions(personas: readonly Persona[]): void {
   for (const setting of UNIQUE_PERSONA_PATH_SETTINGS) rejectSharedRealPath(personas, setting)
 }
 
+/** How `resolvePersonaConfig` validates. */
+export interface ResolvePersonaConfigOptions {
+  /**
+   * Record mode (b.av2 SR-1.5, record-start part): validate a start's
+   * `config.json.last-applied`. Skips only the real-path collision step
+   * (step 8): at a start from the record, two personas sharing a
+   * `working_directory` or a `credentials_file` are a bring-up failure of each
+   * persona involved, not a validation error. Every other rule runs
+   * unchanged. Default false.
+   */
+  record?: boolean
+}
+
 // ---------------------------------------------------------------------------
 // Persona loader: entry point (b.av2 SR-1.1, SR-1.7)
 // ---------------------------------------------------------------------------
@@ -1104,7 +1125,8 @@ function checkRealPathCollisions(personas: readonly Persona[]): void {
  *      name or key;
  *   8. the real-path collision step (b.av2 SR-1.5, see
  *      `checkRealPathCollisions`): no shared `working_directory`, then no
- *      shared `credentials_file`, compared by `resolveRealPath`.
+ *      shared `credentials_file`, compared by `resolveRealPath`. Skipped in
+ *      record mode (`options.record`).
  *
  * Steps 7 and 8 run only after every entry has parsed, so a per-entry
  * violation anywhere is reported before any cross-persona one.
@@ -1113,8 +1135,14 @@ function checkRealPathCollisions(personas: readonly Persona[]): void {
  * @param configDir  Directory of the configuration file; the cron path defaults sit under it.
  * @param home       Home directory for every `~` (persona and top-level paths and the
  *   `mcp_config_path` default). Defaults to the OS home, read at call time only.
+ * @param options    Record mode; see `ResolvePersonaConfigOptions`.
  */
-export function resolvePersonaConfig(raw: unknown, configDir: string, home: string = homedir()): PersonaConfig {
+export function resolvePersonaConfig(
+  raw: unknown,
+  configDir: string,
+  home: string = homedir(),
+  options: ResolvePersonaConfigOptions = {},
+): PersonaConfig {
   const style = PERSONA_RULE_STYLE
   if (!isJsonObject(raw)) {
     throw ruleError(style, `the configuration must be a JSON object, got ${jsonTypeName(raw)}.`)
@@ -1142,7 +1170,7 @@ export function resolvePersonaConfig(raw: unknown, configDir: string, home: stri
   // Cross-persona rules (b.av2 SR-1.5), only once every entry has parsed so
   // per-entry violations are reported first.
   checkUniqueNamesAndKeys(personas)
-  checkRealPathCollisions(personas)
+  if (options.record !== true) checkRealPathCollisions(personas)
 
   return { ...settings, personas }
 }
@@ -1183,9 +1211,18 @@ export function resolveServerConfigPath(home?: string, env: NodeJS.ProcessEnv = 
 // ---------------------------------------------------------------------------
 
 /**
- * `loadPersonaConfig` could not read the file (missing, unreadable, a
- * directory, …). The message names the path; `code` is the errno code when
- * the read error carried one.
+ * `PersonaConfigReadError.code` for a path that exists but is not a regular
+ * file (a FIFO, socket or device, after following symlinks). Not an errno
+ * code: worded so that the start's "cannot be read (<code>)" reads as the
+ * reason.
+ */
+export const CONFIG_NOT_REGULAR_FILE_CODE = 'not a regular file'
+
+/**
+ * `readPersonaConfigBytes` could not read the file (missing, unreadable, a
+ * directory, not a regular file, …). The message names the path; `code` is
+ * the errno code when the read error carried a safe one (`EISDIR` for a
+ * directory), or `CONFIG_NOT_REGULAR_FILE_CODE` for a FIFO, socket or device.
  */
 export class PersonaConfigReadError extends Error {
   readonly code: string | undefined
@@ -1198,51 +1235,193 @@ export class PersonaConfigReadError extends Error {
 }
 
 /**
+ * The file-system calls `readPersonaConfigBytes` makes. The real file system
+ * (`DEFAULT_PERSONA_CONFIG_FS`) is the default; callers may override any
+ * subset. Tests use it to simulate a FIFO or a device (`fstatFile` reporting
+ * neither a file nor a directory) or a failing open or read (throw an
+ * errno-style error with `code`) without creating one.
+ */
+export interface PersonaConfigFs {
+  /**
+   * Open the path read-only and non-blocking (`O_RDONLY | O_NONBLOCK`,
+   * following symlinks), so opening a FIFO never waits for a writer. Returns
+   * the descriptor. Throws an errno-style error (with `code`) on failure.
+   */
+  openFile(path: string): number
+  /** Stat an open descriptor. Throws an errno-style error (with `code`) on failure. */
+  fstatFile(fd: number): { isFile(): boolean; isDirectory(): boolean }
+  /** Read the whole file behind an open descriptor as bytes. Throws an errno-style error (with `code`) on failure. */
+  readFileFd(fd: number): Buffer
+  /** Close a descriptor opened by `openFile`. A failure is ignored. */
+  closeFile(fd: number): void
+}
+
+/** The real file system for `readPersonaConfigBytes`, looked up at call time. */
+export const DEFAULT_PERSONA_CONFIG_FS: PersonaConfigFs = {
+  openFile: (path) => openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK),
+  fstatFile: (fd) => fstatSync(fd),
+  readFileFd: (fd) => readFileSync(fd),
+  closeFile: (fd) => closeSync(fd),
+}
+
+/** How `parsePersonaConfigBytes` resolves and validates. */
+export interface ParsePersonaConfigBytesOptions extends ResolvePersonaConfigOptions {
+  /** Home directory for every `~`; defaults to the OS home, read at call time only. */
+  home?: string
+}
+
+/**
+ * The malformed-JSON error for `text`: names `source` and where the text
+ * first stops being JSON, and echoes none of it (b.av2 SR-10.3).
+ */
+function malformedJsonMessage(text: string, source: string): string {
+  const offset = jsonSyntaxErrorOffset(text)
+  // `JSON.parse` failed, so the scan finds an offset; without one (never
+  // expected) the message names no position rather than a wrong one.
+  if (offset === undefined) return `loadPersonaConfig: malformed JSON in "${source}".`
+  const { line, column } = positionAt(text, offset)
+  return `loadPersonaConfig: malformed JSON in "${source}" at line ${line}, column ${column}.`
+}
+
+/**
+ * Parse and validate a persona configuration from the exact bytes (or text)
+ * that were read, so the bytes that get recorded or applied are the bytes
+ * that were checked (b.av2 SR-8.7). The one JSON-parse path of the persona
+ * loader: `loadPersonaConfig` reads a file and delegates here, and the
+ * start's record and configuration file are validated here from bytes read
+ * once.
+ *
+ * Errors name `source` (the file the bytes came from):
+ * - malformed JSON: `loadPersonaConfig: malformed JSON in "<source>" at line
+ *   <L>, column <C>.`, a 1-based position of the first invalid character and
+ *   none of the parser's text, which can quote file content such as a pasted
+ *   token (b.av2 SR-10.3);
+ * - any validation failure: `loadPersonaConfig: invalid persona config in
+ *   "<source>": <cause>` (see `resolvePersonaConfig`).
+ *
+ * Bytes are decoded as UTF-8 exactly as `readFileSync(path, 'utf-8')` does
+ * (a byte order mark is kept, and rejected by the parser). Free of side
+ * effects: never reads, writes or creates a file, and never reads a
+ * credentials file.
+ *
+ * @param bytes      The configuration's bytes, or its text.
+ * @param source     The path to name in errors; used only as a label.
+ * @param configDir  Directory of the configuration file; the cron path defaults sit under it.
+ * @param options    `home` for `~`, and record mode (`ResolvePersonaConfigOptions`).
+ */
+export function parsePersonaConfigBytes(
+  bytes: Uint8Array | string,
+  source: string,
+  configDir: string,
+  options: ParsePersonaConfigBytesOptions = {},
+): PersonaConfig {
+  const text = typeof bytes === 'string' ? bytes : Buffer.from(bytes).toString('utf-8')
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new Error(malformedJsonMessage(text, source))
+  }
+
+  try {
+    return resolvePersonaConfig(parsed, configDir, options.home, { record: options.record })
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err)
+    throw new Error(`loadPersonaConfig: invalid persona config in "${source}": ${cause}`)
+  }
+}
+
+/**
+ * Read a persona configuration file's bytes once. A read failure is a
+ * `PersonaConfigReadError` naming the path, with the errno code when the
+ * error carried a safe one.
+ *
+ * Stat-first, as `checkPersonaCredentials` reads a credentials file: the file
+ * is opened once, read-only and non-blocking, its descriptor is stat'ed, and
+ * only a regular file is read, through the same descriptor (so the file
+ * checked is the file read). A directory fails with `EISDIR`; any other
+ * non-regular file (a FIFO, socket or device, after following symlinks) fails
+ * with `CONFIG_NOT_REGULAR_FILE_CODE` and is never read: a FIFO would block
+ * the read forever and a device such as `/dev/zero` would never end. There is
+ * no size cap.
+ *
+ * @param configPath  Absolute path of the file.
+ * @param fs          File-system overrides; unset operations use `DEFAULT_PERSONA_CONFIG_FS`.
+ */
+export function readPersonaConfigBytes(configPath: string, fs?: Partial<PersonaConfigFs>): Buffer {
+  const io: PersonaConfigFs = { ...DEFAULT_PERSONA_CONFIG_FS, ...fs }
+  const failure = (cause: string, code: string | undefined) =>
+    new PersonaConfigReadError(`loadPersonaConfig: cannot read persona config at "${configPath}": ${cause}`, code)
+  const errnoFailure = (err: unknown) => failure(err instanceof Error ? err.message : String(err), readErrnoCode(err))
+
+  let fd: number
+  try {
+    fd = io.openFile(configPath)
+  } catch (err) {
+    throw errnoFailure(err)
+  }
+  try {
+    let stats: { isFile(): boolean; isDirectory(): boolean }
+    try {
+      stats = io.fstatFile(fd)
+    } catch (err) {
+      throw errnoFailure(err)
+    }
+    if (stats.isDirectory()) throw failure('it is a directory', 'EISDIR')
+    if (!stats.isFile()) throw failure(`it is ${CONFIG_NOT_REGULAR_FILE_CODE}`, CONFIG_NOT_REGULAR_FILE_CODE)
+    try {
+      return io.readFileFd(fd)
+    } catch (err) {
+      throw errnoFailure(err)
+    }
+  } finally {
+    try {
+      io.closeFile(fd)
+    } catch {
+      // Nothing to report: the descriptor is gone either way.
+    }
+  }
+}
+
+/**
  * Reads a persona configuration file once, parses it and returns the
- * validated PersonaConfig (see `resolvePersonaConfig`). Read, parse and
- * validation failures are rethrown naming the path; a read failure is a
- * `PersonaConfigReadError`.
+ * validated PersonaConfig (`parsePersonaConfigBytes` in default mode, over the
+ * bytes read). Read, parse and validation failures are rethrown naming the
+ * path; a read failure is a `PersonaConfigReadError`.
  *
  * Read-only (b.av2 SR-1.7, AC 45): the file is opened for reading only and
  * nothing is ever written, renamed, created or converted. A malformed-JSON
- * error omits the parser's detail, which can quote file content such as a
- * pasted token (b.av2 SR-10.3). The server loads through
- * `loadStartPersonaConfig`, which calls this.
+ * error gives the line and column and omits the parser's detail, which can
+ * quote file content such as a pasted token (b.av2 SR-10.3).
  *
  * @param path  Path to the configuration file; `~` is expanded under `home`.
  * @param home  Home directory for every `~`; defaults to the OS home, read at call time only.
  */
 export function loadPersonaConfig(path: string, home?: string): PersonaConfig {
   const configPath = resolve(expandTildeWith(path, home))
-
-  let text: string
-  try {
-    text = readFileSync(configPath, 'utf-8')
-  } catch (err) {
-    const cause = err instanceof Error ? err.message : String(err)
-    throw new PersonaConfigReadError(
-      `loadPersonaConfig: cannot read persona config at "${configPath}": ${cause}`,
-      readErrnoCode(err),
-    )
-  }
-
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(text)
-  } catch {
-    throw new Error(`loadPersonaConfig: malformed JSON in "${configPath}".`)
-  }
-
-  try {
-    return resolvePersonaConfig(parsed, dirname(configPath), home)
-  } catch (err) {
-    const cause = err instanceof Error ? err.message : String(err)
-    throw new Error(`loadPersonaConfig: invalid persona config in "${configPath}": ${cause}`)
-  }
+  return parsePersonaConfigBytes(readPersonaConfigBytes(configPath), configPath, dirname(configPath), { home })
 }
 
 /** errno codes meaning the configuration file does not exist (ENOTDIR: an ancestor is not a directory). */
 const MISSING_CONFIG_CODES: ReadonlySet<string> = new Set(['ENOENT', 'ENOTDIR'])
+
+/** Whether a read error's errno code means the file does not exist. */
+export function isMissingConfigCode(code: string | undefined): boolean {
+  return code !== undefined && MISSING_CONFIG_CODES.has(code)
+}
+
+/**
+ * The start's message for a configuration file it cannot read (b.av2 SR-8.7):
+ * names the path, says whether it does not exist or cannot be read (with the
+ * errno code), and that the server requires the configuration file to start.
+ */
+export function configFileReadFailureMessage(configPath: string, code: string | undefined): string {
+  const what = isMissingConfigCode(code)
+    ? 'does not exist'
+    : `cannot be read${code !== undefined ? ` (${code})` : ''}`
+  return `The configuration file "${configPath}" ${what}. The server requires the configuration file to start.`
+}
 
 /** An errno code that is safe to echo: `E` plus upper-case letters and digits. */
 const SAFE_ERRNO_CODE_RE = /^E[A-Z0-9]+$/
@@ -1252,39 +1431,4 @@ function readErrnoCode(err: unknown): string | undefined {
   if (typeof err !== 'object' || err === null) return undefined
   const code = (err as { code?: unknown }).code
   return typeof code === 'string' && SAFE_ERRNO_CODE_RE.test(code) ? code : undefined
-}
-
-/**
- * Load the configuration at start (b.av2 SR-1.7 live, SR-8.7 no-record part).
- * Returns the resolved persona config, or throws one `Error` whose message is
- * ready to log:
- *
- * - the file is missing or cannot be read: the message names the path and
- *   says the server requires the configuration file to start. There is no
- *   fallback of any kind;
- * - the file carries a pre-persona key (`routes`, `default_route`,
- *   `default_dm_session`): `loadPersonaConfig`'s error, carrying E1's
- *   conversion message, passed through unchanged;
- * - any other parse or validation failure: `loadPersonaConfig`'s error,
- *   passed through unchanged.
- *
- * Reads the file once and nothing else: no environment variable, no write.
- *
- * @param path  Path to the configuration file (`resolveServerConfigPath()` at
- *   the server); `~` is expanded under `home`.
- * @param home  Home directory for every `~`; defaults to the OS home, read at call time only.
- */
-export function loadStartPersonaConfig(path: string, home?: string): PersonaConfig {
-  try {
-    return loadPersonaConfig(path, home)
-  } catch (err) {
-    if (!(err instanceof PersonaConfigReadError)) throw err
-    const configPath = resolve(expandTildeWith(path, home))
-    const what = err.code !== undefined && MISSING_CONFIG_CODES.has(err.code)
-      ? 'does not exist'
-      : `cannot be read${err.code !== undefined ? ` (${err.code})` : ''}`
-    throw new Error(
-      `The configuration file "${configPath}" ${what}. The server requires the configuration file to start.`,
-    )
-  }
 }

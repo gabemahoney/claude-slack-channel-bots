@@ -9,7 +9,9 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  fstatSync,
 } from 'fs'
+import { spawnSync } from 'child_process'
 import { tmpdir } from 'os'
 import { join, relative, resolve } from 'path'
 import { homedir } from 'os'
@@ -20,15 +22,21 @@ import {
   resolvePersonaConfig,
   resolveRealPath,
   credentialsFilesToProtect,
-  loadStartPersonaConfig,
+  configFileReadFailureMessage,
+  CONFIG_NOT_REGULAR_FILE_CODE,
+  DEFAULT_PERSONA_CONFIG_FS,
+  isMissingConfigCode,
+  parsePersonaConfigBytes,
+  PersonaConfigReadError,
+  readPersonaConfigBytes,
   resolveServerConfigPath,
   resolveServerStateDir,
+  type PersonaConfigFs,
   type PersonaConfigInput,
   type PersonaInput,
 } from '../src/config.ts'
 import { personaKey } from '../src/persona-identity.ts'
 import {
-  makeMultiPersonaConfig,
   makePersona,
   makePersonaConfig,
   makePersonaConfigInput,
@@ -37,6 +45,7 @@ import {
 import {
   APP_TOKEN_PREFIX,
   BOT_TOKEN_PREFIX,
+  LEAK_SENTINEL,
   assertNoLeak,
   fakeToken,
   writeCredentialsFile,
@@ -91,9 +100,7 @@ describe('expandTilde', () => {
 
 /**
  * Non-token-shaped stand-in for a secret, a rejected value or the content of a
- * credentials file; must never reach an error. Unhyphenated so a JSON parser
- * quotes it whole (Bun stops an identifier at `-`), keeping the malformed-JSON
- * leak check meaningful.
+ * credentials file; must never reach an error.
  */
 const PLACEHOLDER = 'placeholder_not_a_secret'
 
@@ -944,27 +951,11 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
+  // Malformed JSON through the loader is covered, with its position, under
+  // parsePersonaConfigBytes below.
   describe('loader I/O errors', () => {
     test.each([
       ['a missing file', (d: string) => join(d, 'absent.json'), 'cannot read'],
-      [
-        'malformed JSON',
-        (d: string) => {
-          const path = join(d, 'config.json')
-          writeFileSync(path, `{ "personas": [ ${PLACEHOLDER}`, 'utf-8')
-          return path
-        },
-        'malformed JSON',
-      ],
-      [
-        'malformed JSON holding a pasted token',
-        (d: string) => {
-          const path = join(d, 'config.json')
-          writeFileSync(path, `{ "personas": [], "bot_token": "${fakeToken(BOT_TOKEN_PREFIX)}" ${PLACEHOLDER}`, 'utf-8')
-          return path
-        },
-        'malformed JSON',
-      ],
       ['a JSON array', (d: string) => writeConfigFile(d, []), 'must be a JSON object'],
     ])('%s is rejected, naming the file path', (_label, setup, fragment) => {
       const path = setup(dir)
@@ -977,11 +968,91 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       }
       expect(message).toContain(fragment)
       expect(message).toContain(path)
-      expect(message).not.toContain(PLACEHOLDER)
-      expect(message).not.toContain('JSON Parse error')
     })
   })
 })
+
+// ---------------------------------------------------------------------------
+// Stat-first read seam helpers (readPersonaConfigBytes' PersonaConfigFs)
+// ---------------------------------------------------------------------------
+
+/** A `PersonaConfigFs` op the reader made, with the descriptor it used (none for `open`). */
+type ConfigFdCall = { op: 'open' | 'fstat' | 'read' | 'close'; fd?: number }
+
+/**
+ * The real configuration-read seam with every call recorded; `overrides`
+ * replace an op (a replaced `closeFile` still closes the real descriptor
+ * first, so nothing leaks). Returns the seam, the calls and the descriptor
+ * the real open returned.
+ */
+function recordingConfigFs(overrides: Partial<PersonaConfigFs> = {}) {
+  const calls: ConfigFdCall[] = []
+  let opened: number | undefined
+  const fs: Partial<PersonaConfigFs> = {
+    openFile: (path) => {
+      calls.push({ op: 'open' })
+      opened = (overrides.openFile ?? DEFAULT_PERSONA_CONFIG_FS.openFile)(path)
+      return opened
+    },
+    fstatFile: (fd) => {
+      calls.push({ op: 'fstat', fd })
+      return (overrides.fstatFile ?? DEFAULT_PERSONA_CONFIG_FS.fstatFile)(fd)
+    },
+    readFileFd: (fd) => {
+      calls.push({ op: 'read', fd })
+      return (overrides.readFileFd ?? DEFAULT_PERSONA_CONFIG_FS.readFileFd)(fd)
+    },
+    closeFile: (fd) => {
+      calls.push({ op: 'close', fd })
+      DEFAULT_PERSONA_CONFIG_FS.closeFile(fd)
+      overrides.closeFile?.(fd)
+    },
+  }
+  return { fs, calls, opened: () => opened }
+}
+
+/** An operation that throws an errno-style error with `code`. */
+function configFsFailsWith(code: string): () => never {
+  return () => {
+    throw Object.assign(new Error(`simulated ${code}`), { code })
+  }
+}
+
+/** An injected `fstatFile` for a FIFO, socket or device: neither a file nor a directory. */
+const NOT_REGULAR_STATS = () => ({ isFile: () => false, isDirectory: () => false })
+
+const hasMkfifo = spawnSync('mkfifo', ['--version']).status === 0
+
+/**
+ * Run `body` in a child `bun` with `config` bound to src/config.ts, bounded at
+ * 10 s: a blocking open or read of a FIFO with no writer never returns, so
+ * in-process it would hang the whole suite instead of failing the test.
+ * `body` prints one JSON line; returns the child and that line parsed.
+ * The child gets a built env (b.av2 SR-13.2): PATH, the test's temp `home` as
+ * HOME and a state dir under it, so nothing in it falls back to the real home.
+ */
+function runConfigChild(body: string, home: string) {
+  const modulePath = join(import.meta.dir, '..', 'src', 'config.ts')
+  const script = `const config = await import(${JSON.stringify(modulePath)})\n${body}`
+  const child = spawnSync(process.execPath, ['-e', script], {
+    timeout: 10_000,
+    encoding: 'utf-8',
+    env: { PATH: process.env['PATH'], HOME: home, SLACK_STATE_DIR: join(home, 'state') },
+  })
+  return { child, out: child.signal === null && child.stdout.trim() !== '' ? JSON.parse(child.stdout.trim()) : undefined }
+}
+
+/** Child-script source for a seam over `config.DEFAULT_PERSONA_CONFIG_FS` that records op names into `ops`. */
+const CHILD_RECORDING_FS = `
+  const d = config.DEFAULT_PERSONA_CONFIG_FS
+  const ops = []
+  const fs = {
+    openFile: (p) => (ops.push('open'), d.openFile(p)),
+    fstatFile: (fd) => (ops.push('fstat'), d.fstatFile(fd)),
+    readFileFd: (fd) => (ops.push('read'), d.readFileFd(fd)),
+    closeFile: (fd) => (ops.push('close'), d.closeFile(fd)),
+  }
+`
 
 // ---------------------------------------------------------------------------
 // credentialsFilesToProtect (b.av2 SR-5.2)
@@ -1073,14 +1144,65 @@ describe('credentialsFilesToProtect (b.av2 SR-5.2)', () => {
     const applied = appliedPersonas()
     expect(build(applied, setup())).toEqual([applied[0].credentials_file])
   })
+
+  // The current file is read through readPersonaConfigBytes' stat-first rule:
+  // a config.json that is not a regular file is never read and contributes
+  // nothing, and the descriptor is closed.
+  // Rows: label, arrange, whether the current file's path is listed, ops made after the open.
+  test.each<[string, () => { path: string; overrides: Partial<PersonaConfigFs> }, boolean, ConfigFdCall['op'][]]>([
+    ['a regular file, read through the injected seam', () => ({ path: writeCurrent(join(dir, 'current', 'credentials.json')), overrides: {} }),
+      true, ['fstat', 'read', 'close']],
+    ['a non-regular file, as the injected fstatFile reports it', () => ({
+      path: writeCurrent(join(dir, 'current', 'credentials.json')),
+      overrides: { fstatFile: NOT_REGULAR_STATS },
+    }), false, ['fstat', 'close']],
+    ['a symlink to /dev/zero (real character device)', () => {
+      symlinkSync('/dev/zero', join(dir, 'config.json'))
+      return { path: join(dir, 'config.json'), overrides: {} }
+    }, false, ['fstat', 'close']],
+    ['a read that fails with EIO (injected)', () => ({
+      path: writeCurrent(join(dir, 'current', 'credentials.json')),
+      overrides: { readFileFd: configFsFailsWith('EIO') },
+    }), false, ['fstat', 'read', 'close']],
+  ])('%s: opened once, closed, and only a regular file read contributes its paths', (_label, arrange, contributes, afterOpen) => {
+    const applied = appliedPersonas()
+    const { path, overrides } = arrange()
+    const { fs, calls, opened } = recordingConfigFs(overrides)
+
+    const list = credentialsFilesToProtect(applied, path, home, fs)
+
+    assertNoLeak({ list, lines }, 'protect')
+    expect(list).toEqual(contributes
+      ? [applied[0].credentials_file, join(dir, 'current', 'credentials.json')]
+      : [applied[0].credentials_file])
+    expect(calls.map((c) => c.op)).toEqual(['open', ...afterOpen])
+    expect(calls.slice(1).every((c) => c.fd === opened())).toBe(true)
+    expect(() => fstatSync(opened()!)).toThrow()
+    expect(lines).toEqual([])
+  })
+
+  test.skipIf(!hasMkfifo)('a real FIFO config.json with no writer: returns the applied paths at once, never read, descriptor closed (child process, 10 s bound; skipped where mkfifo is unavailable)', () => {
+    const path = join(dir, 'config.json')
+    expect(spawnSync('mkfifo', [path]).status).toBe(0)
+    const applied = [{ credentials_file: join(dir, 'applied', 'credentials.json') }]
+
+    const { child, out } = runConfigChild(`${CHILD_RECORDING_FS}
+      const list = config.credentialsFilesToProtect(${JSON.stringify(applied)}, ${JSON.stringify(path)}, ${JSON.stringify(home)}, fs)
+      console.log(JSON.stringify({ list, ops }))
+    `, home)
+
+    assertNoLeak({ stdout: child.stdout, stderr: child.stderr }, 'child')
+    expect(child.signal).toBeNull()
+    expect(out).toEqual({ list: [applied[0].credentials_file], ops: ['open', 'fstat', 'close'] })
+  }, 15_000)
 })
 
 // ---------------------------------------------------------------------------
 // Server config path (b.av2 SR-1.1, SR-8.7)
 // ---------------------------------------------------------------------------
 
-/** Environment variables these blocks change; restored after every test. */
-const START_ENV_KEYS = ['SLACK_STATE_DIR', 'MCP_HOST', 'MCP_PORT'] as const
+/** Environment variables this block changes; restored after every test. */
+const START_ENV_KEYS = ['SLACK_STATE_DIR'] as const
 
 /** Save the variables in `START_ENV_KEYS` and return a restore function. */
 function saveStartEnv(): () => void {
@@ -1141,23 +1263,24 @@ describe('resolveServerConfigPath / resolveServerStateDir (b.av2 SR-1.1)', () =>
   })
 })
 
+
 // ---------------------------------------------------------------------------
-// loadStartPersonaConfig (b.av2 SR-1.7 live part, SR-8.7 no-record part)
+// Start-path primitives (b.av2 SR-8.7, SR-1.5 record-start part, SR-10.3):
+// readPersonaConfigBytes, configFileReadFailureMessage and
+// parsePersonaConfigBytes. Which file a start runs, and what it logs, is
+// covered in tests/reload.test.ts.
 // ---------------------------------------------------------------------------
 
-describe('loadStartPersonaConfig (b.av2 SR-1.7, SR-8.7)', () => {
+describe('start-path primitives (b.av2 SR-8.7, SR-1.5, SR-10.3)', () => {
   let dir: string
   let home: string
-  let restoreEnv: () => void
 
   beforeEach(() => {
-    restoreEnv = saveStartEnv()
-    dir = mkdtempSync(join(tmpdir(), 'start-config-'))
-    home = mkdtempSync(join(tmpdir(), 'start-config-home-'))
+    dir = mkdtempSync(join(tmpdir(), 'config-bytes-'))
+    home = mkdtempSync(join(tmpdir(), 'config-bytes-home-'))
   })
 
   afterEach(() => {
-    restoreEnv()
     rmSync(dir, { recursive: true, force: true })
     rmSync(home, { recursive: true, force: true })
   })
@@ -1173,89 +1296,349 @@ describe('loadStartPersonaConfig (b.av2 SR-1.7, SR-8.7)', () => {
     throw new Error('expected a throw')
   }
 
-  const requiredMessage = (path: string, what: string) =>
-    `The configuration file "${path}" ${what}. The server requires the configuration file to start.`
+  describe('readPersonaConfigBytes and configFileReadFailureMessage', () => {
+    const requiredMessage = (path: string, what: string) =>
+      `The configuration file "${path}" ${what}. The server requires the configuration file to start.`
 
-  test('a valid two-persona file returns the resolved persona config', () => {
-    const channels = [{ id: 'C0TEST001', delivery: 'all' as const }]
-    const path = writeConfigFile(dir, makePersonaConfigInput({
-      personas: [makePersona({ name: 'Ops Bot' }, dir), makePersona({ name: 'review_bot' }, dir)],
-    }, dir))
-
-    const config = loadStartPersonaConfig(path, home)
-
-    // The loader defaults mcp_config_path under the home it was given (see the testing guide).
-    expect(config).toEqual(makeMultiPersonaConfig(
-      [{ name: 'Ops Bot', channels }, { name: 'review_bot', channels }],
-      dir,
-      { mcp_config_path: join(home, '.claude', 'slack-mcp.json') },
-    ))
-  })
-
-  test.each([
-    ['a missing file', () => join(dir, 'config.json'), 'does not exist'],
-    ['a path under a regular file (ENOTDIR)', () => {
-      writeFileSync(join(dir, 'not-a-dir'), '', 'utf-8')
-      return join(dir, 'not-a-dir', 'config.json')
-    }, 'does not exist'],
-    // A directory fails to read on every platform and as root.
-    ['a directory', () => {
-      mkdirSync(join(dir, 'config.json'))
-      return join(dir, 'config.json')
-    }, 'cannot be read (EISDIR)'],
-  ])('%s throws naming the path and that the server requires the file; nothing is returned', (_label, setup, what) => {
-    const path = setup()
-    let returned: unknown
-    const err = thrown(() => { returned = loadStartPersonaConfig(path, home) })
-    expect(returned).toBeUndefined()
-    expect(err.message).toBe(requiredMessage(path, what))
-  })
-
-  test('a missing file throws even with MCP_HOST and MCP_PORT set: there is no fallback config', () => {
-    process.env['MCP_HOST'] = '127.0.0.1'
-    process.env['MCP_PORT'] = '3999'
-    const path = join(dir, 'config.json')
-    let returned: unknown
-    const err = thrown(() => { returned = loadStartPersonaConfig(path, home) })
-    expect(returned).toBeUndefined()
-    expect(err.message).toBe(requiredMessage(path, 'does not exist'))
-  })
-
-  test('a ~ path is expanded under the injected home, and the message names the expanded path', () => {
-    const err = thrown(() => loadStartPersonaConfig('~/config.json', home))
-    expect(err.message).toBe(requiredMessage(join(home, 'config.json'), 'does not exist'))
-  })
-
-  test.each([
-    ['routes', { C0TEST001: { cwd: '/tmp/ops' } }],
-    ['default_route', '/tmp/ops'],
-    ['default_dm_session', '/tmp/ops'],
-  ])('a pre-persona file with %s passes E1\'s conversion error through unchanged; the file is unchanged', (key, value) => {
-    const path = writeConfigFile(dir, { ...makePersonaConfigInput({}, dir), [key]: value })
-    const bytes = readFileSync(path)
-
-    const err = thrown(() => loadStartPersonaConfig(path, home))
-
-    expect(err.message).toBe(thrown(() => loadPersonaConfig(path, home)).message)
-    expect(err.message).toContain(prePersonaConversionMessage(key))
-    expect(readFileSync(path).equals(bytes)).toBe(true)
-  })
-
-  test.each([
-    ['an invalid persona', () => writeConfigFile(dir, makePersonaConfigInput({
-      personas: [makePersona({ permission_prompts: undefined }, dir)],
-    }, dir))],
-    ['an unknown top-level key', () => writeConfigFile(dir, { ...makePersonaConfigInput({}, dir), extra_setting: 1 })],
-    ['malformed JSON', () => {
+    test('returns the file\'s exact bytes, a byte order mark and invalid UTF-8 included', () => {
       const path = join(dir, 'config.json')
-      writeFileSync(path, '{ "personas": [', 'utf-8')
-      return path
-    }],
-  ])('%s throws E1\'s error unchanged', (_label, setup) => {
-    const path = setup()
-    const err = thrown(() => loadStartPersonaConfig(path, home))
-    expect(err.message).toBe(thrown(() => loadPersonaConfig(path, home)).message)
-    expect(err.message).toContain(path)
-    expect(err.message).not.toContain('The server requires the configuration file')
+      const bytes = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('{}'), Buffer.from([0xff, 0x0a])])
+      writeFileSync(path, bytes)
+      const read = readPersonaConfigBytes(path)
+      assertNoLeak(read, 'bytes')
+      expect(read.equals(bytes)).toBe(true)
+    })
+
+    test.each([
+      { label: 'a missing file', code: 'ENOENT', what: 'does not exist', setup: () => join(dir, 'config.json') },
+      {
+        label: 'a path under a regular file',
+        code: 'ENOTDIR',
+        what: 'does not exist',
+        setup: () => {
+          writeFileSync(join(dir, 'not-a-dir'), '', 'utf-8')
+          return join(dir, 'not-a-dir', 'config.json')
+        },
+      },
+      // A directory fails to read on every platform and as root.
+      {
+        label: 'a directory',
+        code: 'EISDIR',
+        what: 'cannot be read (EISDIR)',
+        setup: () => {
+          mkdirSync(join(dir, 'config.json'))
+          return join(dir, 'config.json')
+        },
+      },
+    ])('$label throws a PersonaConfigReadError with $code; the start message names the path and says "$what"', ({ setup, code, what }) => {
+      const path = setup()
+      const err = thrown(() => readPersonaConfigBytes(path))
+      const startMessage = configFileReadFailureMessage(path, code)
+      assertNoLeak({ err, startMessage }, 'read failure')
+      expect(err).toBeInstanceOf(PersonaConfigReadError)
+      expect((err as PersonaConfigReadError).code).toBe(code)
+      expect(err.message).toContain(path)
+      expect(isMissingConfigCode(code)).toBe(what === 'does not exist')
+      expect(startMessage).toBe(requiredMessage(path, what))
+    })
+
+    test('a read error with no errno code is "cannot be read" with no code, and not a missing file', () => {
+      const path = join(dir, 'config.json')
+      const startMessage = configFileReadFailureMessage(path, undefined)
+      assertNoLeak(startMessage, 'start message')
+      expect(isMissingConfigCode(undefined)).toBe(false)
+      expect(startMessage).toBe(requiredMessage(path, 'cannot be read'))
+    })
+  })
+
+  // Stat-first (b.av2 SR-8.7 with the E2 FIFO carry): the file is opened once,
+  // read-only and non-blocking, its descriptor is stat'ed, only a regular file
+  // is read through that same descriptor, and the descriptor is always closed.
+  describe('readPersonaConfigBytes: opened once, checked, read and closed through its descriptor', () => {
+    const exactMessage = (path: string, cause: string) => `loadPersonaConfig: cannot read persona config at "${path}": ${cause}`
+    const CONTENT = '{ "personas": [] }\n'
+
+    type Row = {
+      label: string
+      arrange: (path: string) => Partial<PersonaConfigFs>
+      /** The error code, or `'ok'` when the file's bytes are returned. */
+      code: string
+      /** The exact message's cause, for an error row. */
+      cause?: string
+      afterOpen: ConfigFdCall['op'][]
+    }
+    test.each<Row>([
+      { label: 'a regular file', arrange: (p) => (writeFileSync(p, CONTENT), {}), code: 'ok', afterOpen: ['fstat', 'read', 'close'] },
+      {
+        label: 'a symlink to a regular file (followed, read)',
+        arrange: (p) => (writeFileSync(join(dir, 'target.json'), CONTENT), symlinkSync(join(dir, 'target.json'), p), {}),
+        code: 'ok',
+        afterOpen: ['fstat', 'read', 'close'],
+      },
+      {
+        label: 'a directory (real)',
+        arrange: (p) => (mkdirSync(p), {}),
+        code: 'EISDIR',
+        cause: 'it is a directory',
+        afterOpen: ['fstat', 'close'],
+      },
+      {
+        label: 'a symlink to /dev/zero (real character device)',
+        arrange: (p) => (symlinkSync('/dev/zero', p), {}),
+        code: CONFIG_NOT_REGULAR_FILE_CODE,
+        cause: 'it is not a regular file',
+        afterOpen: ['fstat', 'close'],
+      },
+      {
+        label: 'a FIFO, as the injected fstatFile reports it',
+        arrange: (p) => (writeFileSync(p, CONTENT), { fstatFile: NOT_REGULAR_STATS }),
+        code: CONFIG_NOT_REGULAR_FILE_CODE,
+        cause: 'it is not a regular file',
+        afterOpen: ['fstat', 'close'],
+      },
+      {
+        label: 'fstat fails with EIO (injected)',
+        arrange: (p) => (writeFileSync(p, CONTENT), { fstatFile: configFsFailsWith('EIO') }),
+        code: 'EIO',
+        cause: 'simulated EIO',
+        afterOpen: ['fstat', 'close'],
+      },
+      {
+        label: 'the read fails with EIO (injected)',
+        arrange: (p) => (writeFileSync(p, CONTENT), { readFileFd: configFsFailsWith('EIO') }),
+        code: 'EIO',
+        cause: 'simulated EIO',
+        afterOpen: ['fstat', 'read', 'close'],
+      },
+      {
+        label: 'closing throws (injected): ignored, the bytes stand',
+        arrange: (p) => (writeFileSync(p, CONTENT), { closeFile: configFsFailsWith('EIO') }),
+        code: 'ok',
+        afterOpen: ['fstat', 'read', 'close'],
+      },
+      {
+        label: 'closing throws after a refused non-regular file (injected): ignored, the refusal stands',
+        arrange: (p) => (writeFileSync(p, CONTENT), { fstatFile: NOT_REGULAR_STATS, closeFile: configFsFailsWith('EBADF') }),
+        code: CONFIG_NOT_REGULAR_FILE_CODE,
+        cause: 'it is not a regular file',
+        afterOpen: ['fstat', 'close'],
+      },
+    ])('$label', ({ arrange, code, cause, afterOpen }) => {
+      const path = join(dir, 'config.json')
+      const { fs, calls, opened } = recordingConfigFs(arrange(path))
+
+      if (code === 'ok') {
+        const bytes = readPersonaConfigBytes(path, fs)
+        assertNoLeak(bytes, 'bytes')
+        expect(bytes.toString('utf-8')).toBe(CONTENT)
+      } else {
+        const err = thrown(() => readPersonaConfigBytes(path, fs))
+        const startMessage = configFileReadFailureMessage(path, (err as PersonaConfigReadError).code)
+        assertNoLeak({ err, startMessage }, 'read failure')
+        expect(err).toBeInstanceOf(PersonaConfigReadError)
+        expect((err as PersonaConfigReadError).code).toBe(code)
+        expect(err.message).toBe(exactMessage(path, cause!))
+        expect(isMissingConfigCode(code)).toBe(false)
+        expect(startMessage).toBe(`The configuration file "${path}" cannot be read (${code}). The server requires the configuration file to start.`)
+      }
+      // Opened once; every later op used that descriptor; closed exactly once, last, for real.
+      expect(calls.map((c) => c.op)).toEqual(['open', ...afterOpen])
+      expect(calls.slice(1).every((c) => c.fd === opened())).toBe(true)
+      expect(() => fstatSync(opened()!)).toThrow()
+    })
+
+    test('the start message for a non-regular file is exact', () => {
+      const path = join(dir, 'config.json')
+      const startMessage = configFileReadFailureMessage(path, CONFIG_NOT_REGULAR_FILE_CODE)
+      assertNoLeak(startMessage, 'start message')
+      expect(CONFIG_NOT_REGULAR_FILE_CODE).toBe('not a regular file')
+      expect(isMissingConfigCode(CONFIG_NOT_REGULAR_FILE_CODE)).toBe(false)
+      expect(startMessage).toBe(`The configuration file "${path}" cannot be read (not a regular file). The server requires the configuration file to start.`)
+    })
+
+    test.each([
+      ['missing (real)', 'ENOENT'],
+      ['open denied with EACCES (injected)', 'EACCES'],
+      ['open fails with EIO (injected)', 'EIO'],
+    ])('a failed open (%s): nothing to stat, read or close', (_label, code) => {
+      const path = join(dir, 'config.json')
+      if (code !== 'ENOENT') writeFileSync(path, CONTENT)
+      const { fs, calls } = recordingConfigFs(code === 'ENOENT' ? {} : { openFile: configFsFailsWith(code) })
+
+      const err = thrown(() => readPersonaConfigBytes(path, fs))
+
+      assertNoLeak(err, 'read failure')
+      expect(err).toBeInstanceOf(PersonaConfigReadError)
+      expect((err as PersonaConfigReadError).code).toBe(code)
+      expect(err.message).toContain(path)
+      expect(calls.map((c) => c.op)).toEqual(['open'])
+    })
+
+    test.skipIf(!hasMkfifo)('a real FIFO with no writer: the open does not wait, it is refused unread and closed, and the path loader fails the same way (child process, 10 s bound; skipped where mkfifo is unavailable)', () => {
+      const path = join(dir, 'config.json')
+      expect(spawnSync('mkfifo', [path]).status).toBe(0)
+
+      const { child, out } = runConfigChild(`${CHILD_RECORDING_FS}
+        const outcome = (fn) => { try { fn(); return 'returned' } catch (e) { return { name: e.name, code: e.code, message: e.message } } }
+        const reader = outcome(() => config.readPersonaConfigBytes(${JSON.stringify(path)}, fs))
+        const loader = outcome(() => config.loadPersonaConfig(${JSON.stringify(path)}, ${JSON.stringify(home)}))
+        console.log(JSON.stringify({ reader, loader, ops }))
+      `, home)
+
+      assertNoLeak({ stdout: child.stdout, stderr: child.stderr }, 'child')
+      expect(child.signal).toBeNull()
+      const refused = { name: 'PersonaConfigReadError', code: CONFIG_NOT_REGULAR_FILE_CODE, message: exactMessage(path, 'it is not a regular file') }
+      expect(out).toEqual({ reader: refused, loader: refused, ops: ['open', 'fstat', 'close'] })
+    }, 15_000)
+  })
+
+  describe('parsePersonaConfigBytes', () => {
+    /** The record's path beside the config file: the label a start from the record passes. */
+    const recordPath = () => join(dir, 'config.json.last-applied')
+
+    /** Parse `input`'s JSON bytes labelled with the record path. */
+    const parse = (input: unknown, record = false) =>
+      parsePersonaConfigBytes(Buffer.from(JSON.stringify(input)), recordPath(), dir, { home, record })
+
+    /** Two personas, each with its own paths under `dir` unless overridden. */
+    const twoPersonas = (ops: Partial<PersonaInput> = {}, review: Partial<PersonaInput> = {}) =>
+      makePersonaConfigInput({
+        personas: [
+          makePersona({ name: 'Ops Bot', working_directory: join(dir, 'ops-work'), credentials_file: join(dir, 'ops.json'), ...ops }, dir),
+          makePersona({ name: 'review_bot', working_directory: join(dir, 'review-work'), credentials_file: join(dir, 'review.json'), ...review }, dir),
+        ],
+      }, dir)
+
+    const link = (target: string, rel: string) => {
+      symlinkSync(target, join(dir, rel))
+      return join(dir, rel)
+    }
+
+    test.each(['bytes', 'text'] as const)('a valid file\'s %s resolve, in both modes, to what loading it by path gives', (form) => {
+      const path = writeConfigFile(dir, twoPersonas({ credentials_file: '~/creds/ops.json' }))
+      const bytes = readPersonaConfigBytes(path)
+      const expected = loadPersonaConfig(path, home)
+      const given = form === 'bytes' ? new Uint8Array(bytes) : bytes.toString('utf-8')
+      const results = {
+        default: parsePersonaConfigBytes(given, path, dir, { home }),
+        record: parsePersonaConfigBytes(given, path, dir, { home, record: true }),
+      }
+      assertNoLeak({ bytes, expected, results }, 'resolved')
+
+      expect(results.default).toEqual(expected)
+      expect(results.record).toEqual(expected)
+      // `~` expands under the injected home on every route.
+      expect(expected.personas[0].credentials_file).toBe(join(home, 'creds', 'ops.json'))
+    })
+
+    // Record mode (a start from config.json.last-applied) leaves a real-path
+    // collision to the bring-up; the file loader and default mode still reject it.
+    test.each([
+      {
+        label: 'the same literal working_directory',
+        setting: 'working_directory',
+        build: () => [join(dir, 'shared-work'), join(dir, 'shared-work')],
+      },
+      {
+        label: "a symlink to the other persona's existing working_directory",
+        setting: 'working_directory',
+        build: () => {
+          mkdirSync(join(dir, 'ops-work'))
+          return [join(dir, 'ops-work'), link(join(dir, 'ops-work'), 'review-work')]
+        },
+      },
+      {
+        label: 'the same literal credentials_file',
+        setting: 'credentials_file',
+        build: () => [join(dir, 'shared.json'), join(dir, 'shared.json')],
+      },
+      {
+        label: "a symlink to the other persona's existing credentials_file",
+        setting: 'credentials_file',
+        build: () => {
+          const target = writeCredentialsFile(dir, 'ops.json')
+          return [target, link(target, 'review.json')]
+        },
+      },
+    ] as const)('record mode: $label validates with both personas present', ({ setting, build }) => {
+      const [opsPath, reviewPath] = build()
+      const input = twoPersonas({ [setting]: opsPath }, { [setting]: reviewPath })
+      const path = writeConfigFile(dir, input)
+
+      const config = parse(input, true)
+      const resolved = resolvePersonaConfig(input, dir, home, { record: true })
+      const errors = { default: thrown(() => parse(input)), loader: thrown(() => loadPersonaConfig(path, home)) }
+      assertNoLeak({ config, resolved, errors }, 'collision')
+      expect(config.personas.map((p) => [p.name, p[setting]])).toEqual([['Ops Bot', opsPath], ['review_bot', reviewPath]])
+      expect(resolved).toEqual(config)
+
+      for (const err of [errors.default, errors.loader]) {
+        expect(err.message).toContain(`personas[1] ${JSON.stringify('review_bot')} (key=review_bot): ${setting}`)
+        expect(err.message).toContain(`personas[0] ${JSON.stringify('Ops Bot')} (key=${personaKey('Ops Bot')})`)
+      }
+    })
+
+    // Every rule other than the real-path collision still runs in record mode,
+    // with the same error as default mode, naming the record's path.
+    test.each([
+      ['a duplicate name', () => twoPersonas({}, { name: 'Ops Bot' }), `name ${JSON.stringify('Ops Bot')}`],
+      [
+        'a duplicate name beside a shared working_directory',
+        () => twoPersonas({ working_directory: join(dir, 'shared') }, { name: 'Ops Bot', working_directory: join(dir, 'shared') }),
+        `name ${JSON.stringify('Ops Bot')}`,
+      ],
+      ['a duplicate key', () => twoPersonas({}, { name: personaKey('Ops Bot') }), `key ${personaKey('Ops Bot')}`],
+      ['routes', () => ({ ...twoPersonas(), routes: {} }), prePersonaConversionMessage('routes')],
+      ['default_route', () => ({ ...twoPersonas(), default_route: '/tmp/ops' }), prePersonaConversionMessage('default_route')],
+      ['default_dm_session', () => ({ ...twoPersonas(), default_dm_session: '/tmp/ops' }), prePersonaConversionMessage('default_dm_session')],
+      ['an unknown top-level key', () => ({ ...twoPersonas(), extra_setting: 1 }), '"extra_setting"'],
+      ['a per-entry violation', () => twoPersonas({}, { permission_prompts: undefined }), 'permission_prompts'],
+    ])('record mode still rejects %s, as default mode does, naming the record path', (_label, build, fragment) => {
+      const input = build()
+      const errors = { record: thrown(() => parse(input, true)), default: thrown(() => parse(input)) }
+      assertNoLeak(errors, 'errors')
+      const message = errors.record.message
+      expect(message).toBe(errors.default.message)
+      expect(message).toContain(fragment)
+      expect(message).toContain(`invalid persona config in "${recordPath()}"`)
+    })
+
+    // SR-10.3 (E1/E2 carry): a malformed file gives the 1-based line and
+    // column of the first invalid character and none of its content. A row's
+    // leak marker sits where Bun's own parse error would quote it.
+    const bareToken = `${LEAK_SENTINEL}_pasted`
+    const quotedToken = fakeToken(BOT_TOKEN_PREFIX)
+    test.each([
+      { label: 'a pasted token as a bare value on line 3', line: 3, column: 16, text: `{\n  "personas": [],\n  "bot_token": ${bareToken}\n}` },
+      {
+        label: 'a pasted token in a string left open at the end of line 3',
+        line: 3,
+        column: 17 + quotedToken.length,
+        text: `{\n  "personas": [],\n  "bot_token": "${quotedToken}\n}`,
+      },
+      { label: 'a file that ends inside the personas array', line: 1, column: 16, text: '{ "personas": [' },
+      {
+        label: 'a character outside the BMP earlier on the line (counted once)',
+        line: 1,
+        column: 16,
+        text: `{ "note": "\u{1F600}", ${bareToken} }`,
+      },
+      { label: 'CRLF line endings', line: 3, column: 3, text: `{\r\n  "personas": [],\r\n  ${bareToken}\r\n}` },
+      { label: 'a byte order mark', line: 1, column: 1, text: '\uFEFF{ "personas": [] }' },
+    ])('malformed JSON: $label is reported at line $line, column $column, echoing nothing', ({ text, line, column }) => {
+      const expected = (source: string) => `loadPersonaConfig: malformed JSON in "${source}" at line ${line}, column ${column}.`
+      const path = join(dir, 'config.json')
+      writeFileSync(path, text, 'utf-8')
+
+      const errors = {
+        default: thrown(() => parsePersonaConfigBytes(Buffer.from(text, 'utf-8'), recordPath(), dir, { home })),
+        record: thrown(() => parsePersonaConfigBytes(Buffer.from(text, 'utf-8'), recordPath(), dir, { home, record: true })),
+        loader: thrown(() => loadPersonaConfig(path, home)),
+      }
+      expect(errors.default.message).toBe(expected(recordPath()))
+      expect(errors.record.message).toBe(expected(recordPath()))
+      expect(errors.loader.message).toBe(expected(path))
+      assertNoLeak(errors, 'errors')
+    })
   })
 })

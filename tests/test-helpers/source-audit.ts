@@ -126,12 +126,87 @@ export function objectProperties(text: string): Map<string, string> {
 }
 
 /**
- * The variable the persona loader's result is assigned to in `code`
- * (`<name> = loadStartPersonaConfig(`); throws unless there is exactly one
- * such assignment.
+ * [start, end) of the body of `export async function main()` in `code`, both
+ * braces excluded. Throws when there is no such declaration.
+ */
+export function mainBody(code: string): [number, number] {
+  const decl = code.search(/\bexport\s+async\s+function\s+main\s*\(\s*\)/)
+  if (decl < 0) throw new Error('source-audit: no `export async function main()`')
+  return balancedAfter(code, code.indexOf(')', decl), '{', '}')
+}
+
+/** Whether `offset` lies inside main()'s body in `code` (see `mainBody`). */
+export function insideMain(code: string, offset: number): boolean {
+  const [start, end] = mainBody(code)
+  return offset > start && offset < end
+}
+
+/** The only match of the global regex `re` in `code`; throws naming `what` unless there is exactly one. */
+function onlyMatch(code: string, re: RegExp, what: string): RegExpMatchArray {
+  const matches = [...code.matchAll(re)]
+  if (matches.length !== 1) throw new Error(`source-audit: expected exactly one ${what}, found ${matches.length}`)
+  return matches[0]!
+}
+
+/** How `main()` resolves the start through the reload controller (see `startResolution`). */
+export interface StartResolution {
+  /** The controller's `const` name. */
+  controller: string
+  /** The start outcome's `const` name. */
+  outcome: string
+  /** The variable the applied config is assigned to (the loaded config every start pass reads). */
+  loaded: string
+  /** Offset of the `createReloadController(` call. */
+  createAt: number
+  /** Offset of the `resolveStart(` call. */
+  resolveAt: number
+  /** Offset of the `<loaded> = <outcome>.config` assignment. */
+  assignAt: number
+  /** Offset of the start bring-up invocation `<controller>.runStartBringUp(`. */
+  bringUpAt: number
+}
+
+/**
+ * How `main()` resolves the start through the reload controller (b.av2
+ * SR-8.7), as read from `code`:
+ *
+ *     const <controller> = createReloadController({ … })
+ *     const <outcome> = <controller>.resolveStart()
+ *     <loaded> = <outcome>.config
+ *     …
+ *     <controller>.runStartBringUp()
+ *
+ * It only locates these: it throws when one of them is missing or ambiguous
+ * (one `createReloadController(` declaration, one `resolveStart(` call on that
+ * controller bound to a `const`, one assignment from `<outcome>.config` after
+ * it, one `runStartBringUp(` call on that controller). What else assigns
+ * `<loaded>` (a later confirmed apply, E12/E13) is not its concern; the one
+ * test that owns the start's assignment rule is in
+ * tests/server-startup-wiring.test.ts.
+ */
+export function startResolution(code: string): StartResolution {
+  const create = onlyMatch(code, /\bconst\s+(\w+)(?:\s*:\s*\w+)?\s*=\s*(createReloadController)\s*\(/g, 'createReloadController declaration')
+  const controller = create[1]!
+  const createAt = create.index! + create[0].lastIndexOf(create[2]!)
+  onlyMatch(code, /\bresolveStart\s*\(/g, 'resolveStart call')
+  const resolve = onlyMatch(code, new RegExp(`\\bconst\\s+(\\w+)\\s*=\\s*${controller}\\s*\\.\\s*(resolveStart)\\s*\\(\\s*\\)`, 'g'), `const <outcome> = ${controller}.resolveStart()`)
+  const outcome = resolve[1]!
+  const resolveAt = resolve.index! + resolve[0].lastIndexOf(resolve[2]!)
+  const assign = onlyMatch(code, new RegExp(`(?<![\\w.$])(\\w+)\\s*=\\s*${outcome}\\s*\\.\\s*config\\b`, 'g'), `assignment from ${outcome}.config`)
+  const loaded = assign[1]!
+  const assignAt = assign.index!
+  if (assignAt < resolveAt) throw new Error(`source-audit: ${loaded} is assigned from ${outcome}.config before the start is resolved`)
+  onlyMatch(code, /\brunStartBringUp\s*\(/g, 'runStartBringUp call')
+  const bringUp = onlyMatch(code, new RegExp(`\\b${controller}\\s*\\.\\s*(runStartBringUp)\\s*\\(`, 'g'), `${controller}.runStartBringUp() call`)
+  const bringUpAt = bringUp.index! + bringUp[0].lastIndexOf(bringUp[1]!)
+  return { controller, outcome, loaded, createAt, resolveAt, assignAt, bringUpAt }
+}
+
+/**
+ * The variable `main()` sets to the applied persona config: the one
+ * `<name> = <outcome>.config` after `<outcome> = <controller>.resolveStart()`
+ * (see `startResolution`).
  */
 export function loadedConfigName(code: string): string {
-  const loads = [...code.matchAll(/\b(\w+)\s*=\s*loadStartPersonaConfig\s*\(/g)]
-  if (loads.length !== 1) throw new Error(`source-audit: expected one loadStartPersonaConfig assignment, found ${loads.length}`)
-  return loads[0]![1]!
+  return startResolution(code).loaded
 }

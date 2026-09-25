@@ -1,6 +1,6 @@
 ---
 name: debug-slack-channel-bots
-description: Diagnose a claude-slack-channel-bots persona that is silent, down or refused — find its server-log lines, match the class, and follow the fix for every persona failure and every config.json rejection.
+description: Diagnose a claude-slack-channel-bots persona that is silent, down or refused — find its server-log lines, match the class, and follow the fix for every persona failure, every config.json rejection and every last-applied record failure at start.
 version: 1.0.0
 license: MIT
 user-invocable: true
@@ -14,7 +14,8 @@ Diagnose a persona of `claude-slack-channel-bots` (CSCB) that doesn't answer,
 doesn't come up, or gets refused. Every persona failure is logged to the
 server log with a class label. This skill says where that log is, how to find
 one persona's lines, what each line means, and what the operator does about it.
-It also covers every reason `config.json` is rejected at start.
+It also covers every reason `config.json` is rejected at start, and every
+reason the last-applied record (`config.json.last-applied`) stops a start.
 
 One broken persona never stops the server. Every healthy persona keeps serving,
 and nothing about a broken persona is posted to Slack under any identity. The
@@ -56,7 +57,13 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
 4. **The server didn't start at all?** `start` printed a
    `Server failed to start` block. If it contains a
    `Fatal: configuration error` line, match the message under
-   [Configuration rejections](#configuration-rejections). Otherwise another
+   [Configuration rejections](#configuration-rejections). A
+   `Fatal: last-applied record error` line or a `reload-record-write-failed`
+   line is covered under [The last-applied record](#the-last-applied-record).
+   A first start that failed binding its port, then failed the same way after
+   `config.json` was fixed, is covered under
+   [A first start that fails after recording](#a-first-start-that-fails-after-recording).
+   Otherwise another
    start-time check failed, most often the agent-director startup gate
    (agent-director missing, too old or unreachable). Those failures are also
    recorded in `startup-errors.log`: read its latest lines and fix what they
@@ -96,8 +103,8 @@ ls -l "$STATE"/server.log*
   Persona lines then carry the `[slack]` prefix.
 - **`startup-errors.log`** in the same directory is a separate file, never
   rotated by CSCB, for the agent-director startup gate and a few start-time
-  warnings. No persona diagnostic goes there, and no configuration rejection
-  either.
+  warnings. No persona diagnostic goes there, and no configuration or
+  last-applied record refusal either.
 
 All lines for one persona (replace `ops_bot` with the key):
 
@@ -170,16 +177,23 @@ running, is kept but not served. Healthy personas are unaffected.
   before any other line about that persona's bring-up. It's the name-to-key
   map for that start.
 - **Fix:** None. If a persona has no `persona-start` line in the latest start,
-  it isn't in the `config.json` the server loaded, or the server didn't load
-  the configuration at all (see [Configuration rejections](#configuration-rejections)).
+  it isn't in the configuration the server applied at that start, or the
+  server didn't start at all (see [Configuration rejections](#configuration-rejections)
+  and [The last-applied record](#the-last-applied-record)). When a
+  last-applied record exists, a start runs the record, not `config.json`: a
+  persona added to `config.json` since the record was written isn't brought up
+  until the edit is applied (see
+  [Applying a `config.json` edit](#applying-a-configjson-edit)).
 
 ### `persona-credentials-missing`
 
 - **State:** `broken`. Doesn't recover on its own.
 - **Cause text:** `credentials file does not exist`. The path in `path="…"`
   doesn't exist, or a directory on the way to it doesn't.
-- **Fix:** Create the credentials file at that path, or correct the persona's
-  `credentials_file` in `config.json`. Then restart the server.
+- **Fix:** Create the credentials file at that path, then restart the server.
+  Or correct the persona's `credentials_file` in `config.json` and apply the
+  edit (see [Applying a `config.json` edit](#applying-a-configjson-edit)); a
+  plain restart doesn't apply it.
 
 ### `persona-credentials-unreadable`
 
@@ -213,10 +227,18 @@ running, is kept but not served. Healthy personas are unaffected.
   `xapp-`, `<n> unexpected key(s) (only bot_token and app_token are allowed)`.
   Or, for a shared file: `real path is also the credentials_file of "<name>"
   (key=<key>)`, with `(both resolve to "<path>")` when a symlink is involved.
-  The loader already rejects two personas naming the same file, so the shared
-  case appears only when a symlink changed after the configuration loaded.
-- **Fix:** The operator rewrites the file in the shape above (mode 0600), or
-  gives the persona its own file. Then restart the server. Use
+  The shared case can't come from `config.json` validated at a start without
+  a record: that check rejects two personas sharing a file (see
+  [Across personas](#across-personas)). It appears at a start from the
+  last-applied record, which doesn't run that check, or when a symlink changed
+  after the configuration loaded. Each persona sharing the file gets this line
+  and is `broken`; the other personas come up. A dry run reads no credentials
+  file, so it never logs the shared case.
+- **Fix:** The operator rewrites the file in the shape above (mode 0600), then
+  restarts the server. For a shared file, give each persona its own file: point
+  the symlink elsewhere and restart, or change a `credentials_file` in
+  `config.json` and apply the edit (see
+  [Applying a `config.json` edit](#applying-a-configjson-edit)). Use
   [Checking a credentials file's shape](#checking-a-credentials-files-shape) to
   confirm the fix without showing a token.
 
@@ -308,8 +330,10 @@ running, is kept but not served. Healthy personas are unaffected.
   one line with the same class and the cause
   `cleared: working directory is usable again; continuing the bring-up`, then
   Slack validation and the launch.
-- **Fix:** Create the directory (readable and searchable by the server's user),
-  or correct `working_directory` in `config.json` and restart the server.
+- **Fix:** Create the directory (readable and searchable by the server's user).
+  Or correct `working_directory` in `config.json` and apply the edit (see
+  [Applying a `config.json` edit](#applying-a-configjson-edit)); a plain
+  restart doesn't apply it.
 - If the persona also has a credentials cause, the cleared line ends
   `the persona stays broken until its credentials are fixed and the server is restarted`
   instead. See [Both causes at once](#both-causes-at-once).
@@ -321,12 +345,18 @@ running, is kept but not served. Healthy personas are unaffected.
   `working directory is not readable (<errno>)`,
   `working directory is not searchable (<errno>)`,
   `working directory cannot be inspected (<errno>)`, or
-  `real path is also the working_directory of "<name>" (key=<key>)` (a symlink
-  changed after the configuration loaded; the loader rejects two personas
-  sharing a directory).
+  `real path is also the working_directory of "<name>" (key=<key>)`, with
+  `(both resolve to "<path>")` when a symlink is involved.
+- **Shared directory:** `config.json` validated at a start without a record
+  rejects two personas sharing a directory (see [Across personas](#across-personas)).
+  A start from the last-applied record doesn't run that check, so there (or
+  after a symlink changed) each persona sharing the directory gets this line
+  and keeps retrying; the other personas come up.
 - **Fix:** Make the path a directory the server's user can read and search
-  (`chmod u+rx`), or point the persona at its own directory. The persona comes
-  up on the next re-check, within 300 s.
+  (`chmod u+rx`), or point the persona at its own directory (by changing the
+  symlink, or by changing `working_directory` in `config.json` and applying the
+  edit, see [Applying a `config.json` edit](#applying-a-configjson-edit)). A
+  fixed path comes up on the next re-check, within 300 s.
 
 ### `unclaimed-channel`
 
@@ -336,7 +366,8 @@ running, is kept but not served. Healthy personas are unaffected.
   persona lists in `channels`, so the message reached no one. Logged by each
   persona whose app received it.
 - **Fix:** Add the channel to the right persona's `channels` in `config.json`
-  and restart the server, or remove the app from the channel. If the ID is a
+  and apply the edit (see [Applying a `config.json` edit](#applying-a-configjson-edit)),
+  or remove the app from the channel. If the ID is a
   group DM (someone @mentioned the persona in a multi-person DM), the line is
   expected: do not add that ID to any persona's `channels`, because that would
   deliver group-DM mentions to it.
@@ -350,7 +381,8 @@ running, is kept but not served. Healthy personas are unaffected.
   line names the persona, the DM conversation, the message ts and
   `dm.enabled`, never the message text.
 - **Fix:** Set `dm.enabled` to `true` for that persona in `config.json` and
-  restart the server. Leaving it off is valid when the persona should ignore
+  apply the edit (see [Applying a `config.json` edit](#applying-a-configjson-edit)).
+  Leaving it off is valid when the persona should ignore
   DMs; the line is then expected.
 - **Group DMs:** a group DM (a direct message with more than one person) is
   not delivered and never logs `persona-dm-dropped`, whatever `dm.enabled`
@@ -642,15 +674,15 @@ and is `broken`.
   ```
 
   The server rewrites the record at every launch. Never edit or delete it by
-  hand; change `config.json` instead.
+  hand; change `config.json` and apply the edit.
 - **Causes and fixes:**
 
   | Cause | How to confirm | Fix |
   |---|---|---|
-  | The effective value isn't what you expect. A persona without its own `stop_hook_bootstrap` inherits the top-level one (default `true`). | The persona's entry and the top level of `config.json`. | With the operator's say-so, set `stop_hook_bootstrap` on the persona's entry (it overrides the top level), then relaunch it as in the next row. |
+  | The effective value isn't what you expect. A persona without its own `stop_hook_bootstrap` inherits the top-level one (default `true`). | The persona's entry and the top level of `config.json`. | With the operator's say-so, set `stop_hook_bootstrap` on the persona's entry (it overrides the top level), then apply the edit with the bots relaunched (see [Applying a `config.json` edit](#applying-a-configjson-edit), using `stop --stop-bots`). |
   | The value changed after the persona's instance launched. A running instance keeps the value it launched with; a change applies at the persona's next launch. A plain server restart reconnects to an instance that is still running, which is not a launch. | The record holds the old value. | With the operator's say-so, run `claude-slack-channel-bots clean_restart`. It relaunches every persona (resume or fresh spawn), cutting off their current turns, and each launch rewrites the persona's record. |
-  | No `claude_config_dir` is configured for the persona (nor at the top level). No hook is installed for it, so it gets no reminder. | `server.log` has `[slack] stop-hook-bootstrap: "<name>" (key=<key>) has no claude_config_dir — skipping`. | Give the persona (or the top level) a `claude_config_dir` of its own, then `clean_restart`. The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
-  | Its `claude_config_dir` resolves to the operator's own `~/.claude`. The server never installs the hook there, so the persona gets no reminder. | `startup-errors.log` has a `stop-hook-bootstrap-refuse-home` entry (recorded once per server start); `server.log` has `refusing to touch operator's own ~/.claude` at each launch. | Point the persona at a different `claude_config_dir`, then `clean_restart`. The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
+  | No `claude_config_dir` is configured for the persona (nor at the top level). No hook is installed for it, so it gets no reminder. | `server.log` has `[slack] stop-hook-bootstrap: "<name>" (key=<key>) has no claude_config_dir — skipping`. | Give the persona (or the top level) a `claude_config_dir` of its own, then apply the edit with the bots relaunched (see [Applying a `config.json` edit](#applying-a-configjson-edit), using `stop --stop-bots`). The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
+  | Its `claude_config_dir` resolves to the operator's own `~/.claude`. The server never installs the hook there, so the persona gets no reminder. | `startup-errors.log` has a `stop-hook-bootstrap-refuse-home` entry (recorded once per server start); `server.log` has `refusing to touch operator's own ~/.claude` at each launch. | Point the persona at a different `claude_config_dir`, then apply the edit with the bots relaunched (see [Applying a `config.json` edit](#applying-a-configjson-edit), using `stop --stop-bots`). The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
   | `jq` is not on the host's `PATH`. The hook is installed but can't read the transcript, so it never reminds. | `startup-errors.log` has a `stop-hook-bootstrap-jq-missing` entry. | Install `jq`. No restart is needed; the next turn is checked. |
   | The hook couldn't be installed: the directory is missing, or its `settings.json` is unreadable or not valid JSON (left untouched). | `startup-errors.log` (at start) or `server.log` (at a launch) has `stop-hook-bootstrap-dir-missing`, `stop-hook-bootstrap-not-a-dir` or `stop-hook-bootstrap-settings-…`; the `jq` command above shows no `slack-reply-guard.sh` entry. | Create the directory or fix the file, then `clean_restart`. |
   | The record couldn't be written at launch. The stale record is removed, so the persona gets no reminder until its next launch. | No record file; `server.log` has `[slack] reply-guard: could not write the record for "<name>" (key=<key>) at <path>`. | Fix the state directory's permissions or free space, then `clean_restart`. |
@@ -680,18 +712,28 @@ and is `broken`.
 | `[slack] persona-destination-hold: shutting down — <n> held notice(s) for "<name>" (key=<key>) dropped, not posted` | The server stopped while the persona's destination was failing. Its held notices are lost; its still-open prompts are posted after the next start. Fix the destination (see [`persona-destination-failed`](#persona-destination-failed)). |
 | `[slack] persona-destination-hold: hold cancelled — <n> held notice(s) for "<name>" (key=<key>) dropped, not posted` | The persona's held notices were dropped without being posted. Nothing to do. |
 | `[slack] persona-destination-hold: persona or client lookup threw for persona=<key>: … — held notices wait and retry with backoff` | An internal error while retrying the persona's held notices. They keep waiting and are retried with backoff. Report it as a bug, with the persona's lines around it. |
-| `[slack] Fatal: configuration error — …` | The server refused `config.json` and exited. See [Configuration rejections](#configuration-rejections). |
+| `[slack] Fatal: configuration error — …` | There was no last-applied record, and the server refused `config.json` and exited. See [Configuration rejections](#configuration-rejections). |
+| `[slack] Fatal: last-applied record error — …` | The server couldn't read or validate its last-applied record and exited. See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid). |
+| `[slack] Starting from the last-applied record "<path>"` or `[slack] No last-applied record: recorded the configuration file "<path>" as "<path>"` | Which configuration a start runs. See [The last-applied record](#the-last-applied-record). |
 | `… launch after its bring-up retry failed: …`, `… working-directory retry failed: …`, `… handling its change from up to <outcome> failed: …`, `persona … not brought up: Slack bring-up threw: …`, `persona <step> failed: personas[<i>] …`, `persona-destination-hold: retry of held notices failed for persona=<key>: …`, `persona-destination-hold: notice failure callback threw for persona=<key>: …`, `unhandled rejection (process keeps running): …` | An internal error. The server keeps running. Report it as a bug, with the persona's lines around it. |
 
 ---
 
 ## Configuration rejections
 
-`config.json` (in the state directory) is checked when the server starts. The
+`config.json` (in the state directory) is checked at a start only when there
+is no last-applied record (`config.json.last-applied`, see
+[The last-applied record](#the-last-applied-record)): the first start, the
+first start after an upgrade, or a start after the record was deleted. Then the
 first violation stops the start before any persona is brought up: nothing
 connects to Slack and nothing is launched. Credentials content and whether
 directories exist are never checked here; those are bring-up checks with the
 classes above.
+
+When a record exists, a start runs the record and doesn't read `config.json`,
+so an edit of `config.json` is neither checked nor applied by a restart. To
+apply an edit (and see these messages if it is wrong), see
+[Applying a `config.json` edit](#applying-a-configjson-edit).
 
 **Where it shows.** The server logs one line to `server.log` and exits 1, and
 `start` repeats the last lines of `server.log` on stderr under
@@ -713,9 +755,9 @@ duplicate-path rules, the persona paths. After a fix, start the server again.
 
 | Message | Cause | Fix |
 |---|---|---|
-| `missing prerequisite: config.json not found at <path>` (from `start`), or `The configuration file "<path>" does not exist. The server requires the configuration file to start.` | No `config.json` in the state directory. | Create it; `{"personas": []}` is the smallest valid file. Check `SLACK_STATE_DIR`. |
-| `The configuration file "<path>" cannot be read (<errno>). …` | Permissions, or the path is a directory. | Make it a readable file. |
-| `loadPersonaConfig: malformed JSON in "<path>".` | Not valid JSON. | Fix the syntax (`jq . config.json` shows where). |
+| `missing prerequisite: config.json not found at <path>, and no config.json.last-applied at <path>` (from `start`), or `The configuration file "<path>" does not exist. The server requires the configuration file to start.` | No `config.json` and no last-applied record in the state directory. | Create `config.json`; `{"personas": []}` is the smallest valid file. Check `SLACK_STATE_DIR`. |
+| `The configuration file "<path>" cannot be read (<errno>). …` | Permissions, or the path is a directory (`EISDIR`). `(not a regular file)` in place of the errno: the path is a FIFO, socket or device, which is never read. | Make it a readable regular file. |
+| `loadPersonaConfig: malformed JSON in "<path>" at line <L>, column <C>.` | Not valid JSON. The line and column (from 1) point at the first character that breaks it; the file's content is never echoed. | Fix the syntax at that position. |
 | `the configuration must be a JSON object, got <type>.` | Top level isn't an object. | Wrap it in `{ … }`. |
 | A key belonging to the pre-persona shape | See [Pre-persona configuration](#pre-persona-configuration). | |
 | `unknown top-level field(s) in config.json: "<key>", ….` | A top-level key the server doesn't know (often a typo). | Remove or correct it. |
@@ -747,7 +789,12 @@ duplicate-path rules, the persona paths. After a fix, start the server again.
 
 ### Across personas
 
-Checked only after every entry is valid.
+Checked only after every entry is valid. The two shared-path rules below are
+checked only for `config.json` at a start without a record. At a start from
+the last-applied record, a shared path is a bring-up failure of each persona
+involved instead ([`persona-directory-unusable`](#persona-directory-unusable)
+or [`persona-credentials-invalid`](#persona-credentials-invalid)), and the
+other personas come up.
 
 | Message (after the later persona's prefix) | Cause | Fix |
 |---|---|---|
@@ -773,7 +820,166 @@ Checked only after every entry is valid.
 - **Fix:** Rewrite the configuration by hand as a `personas` array and remove
   those keys. Nothing converts it for you, and the server never changes the
   file. Crontable lines that named channels must be rewritten to name personas
-  too.
+  too. Like every configuration rejection, this stops only a start without a
+  last-applied record.
+
+---
+
+## The last-applied record
+
+The server keeps a byte copy of the configuration it last applied,
+`config.json.last-applied`, beside `config.json` in the state directory. Every
+start runs the record when it exists and doesn't read `config.json` to decide
+what runs, so saving `config.json`, restarting or rebooting doesn't change the
+running configuration. Credentials files are the exception: every start reads
+them as they stand, so a changed credentials file takes effect at the next
+start.
+
+Without a record (the first start, the first start after an upgrade, or after
+the record was deleted), `config.json` is checked, copied to the record, then
+applied. The CLI takes its settings and persona set from the record too, or
+from `config.json` when there is none: `stop` (its `stop_timeout`),
+`stop --stop-bots` and `clean_restart`. Never edit the record's contents.
+
+Each start logs which configuration it runs:
+
+| Line | Meaning |
+|---|---|
+| `[slack] Starting from the last-applied record "<record path>"` | A record exists; the start runs it. |
+| `[slack] No last-applied record: recorded the configuration file "<config path>" as "<record path>"` | No record; `config.json` was valid and is now the record. |
+
+### Applying a `config.json` edit
+
+A restart doesn't apply an edit of `config.json` while a record exists. With
+the operator's say-so, stop the server, delete the record, and start: a start
+without a record checks and applies `config.json` as it stands.
+
+**The start applies the edit with no preview.** Nothing shows what will change
+before it happens, so check first what the edit does:
+
+- A persona that was removed or renamed (a mistyped name counts: the name
+  sets the key) has its running instance killed by the start sweep. A
+  renamed persona comes up fresh under its new key, without its session
+  history.
+- A persona whose `working_directory` changed has its running instance killed
+  by the start sweep too, and comes up fresh in the new directory, without
+  its session history.
+- A changed `credentials_file` only reconnects the persona to Slack with the
+  new app; its instance keeps running.
+- The start applies every edit in `config.json`, not just the one you meant.
+
+Stop the server and keep a copy of the record:
+
+```sh
+STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+claude-slack-channel-bots stop &&
+  cp "$STATE/config.json.last-applied" "$STATE/config.json.last-applied.bak"
+```
+
+Compare the edit with the copy and read every difference against the list
+above (the configuration holds no tokens; if a value starts with `xoxb-` or
+`xapp-`, follow [Constraints](#constraints)):
+
+```sh
+diff "$STATE/config.json.last-applied.bak" "$STATE/config.json"
+```
+
+Then, with the operator's say-so, delete the record and start. Keep the
+`.bak` copy until the new configuration runs as intended:
+
+```sh
+rm "$STATE/config.json.last-applied" &&
+  claude-slack-channel-bots start
+```
+
+- Plain `stop` leaves the bots running, and the next `start` reconnects to
+  them rather than relaunching them. That is enough for channel, credentials
+  path and `working_directory` edits: the start sweep handles a changed
+  working directory, destructively (see above). A setting that takes effect
+  only at a bot's launch (`stop_hook_bootstrap`, a changed
+  `claude_config_dir`) doesn't reach a bot that kept running. For such a
+  change, run `claude-slack-channel-bots stop --stop-bots` in place of
+  `stop`: it exits the bots of the record's persona set, which is the set
+  running, so the start launches each one with the edit. It cuts off their
+  current turns.
+- If `config.json` is invalid, the start is refused (see
+  [Configuration rejections](#configuration-rejections)), nothing runs and no
+  record is written. Fix `config.json` and start again, or restore the copy as
+  `config.json.last-applied` to run the previous configuration.
+- If the start fails after the record is written (the port is in use, or
+  `bind` names an address the host doesn't have), see
+  [A first start that fails after recording](#a-first-start-that-fails-after-recording).
+
+### A first start that fails after recording
+
+A start without a record writes `config.json.last-applied` before the server
+binds its port. If that start then fails, the record stays, and every later
+start runs it. The usual case is the first start, or the first after the
+record was deleted, failing on the listening address:
+
+- **Line:** `start` prints its `Server failed to start` block after the
+  `No last-applied record: recorded the configuration file …` line, and the
+  failure is a `[slack] Fatal:` line with the error from binding
+  `bind`:`port` (for example, the port is already in use).
+- **Trap:** Fixing `bind` or `port` in `config.json` and starting again
+  changes nothing: the next start runs the record, which holds the failing
+  values, and fails the same way.
+- **Fix:** If the cause is outside the file (another process holds the port),
+  free it and start again. If the fix is an edit of `config.json`, apply it
+  with [Applying a `config.json` edit](#applying-a-configjson-edit): delete
+  the record and start, so the start checks, records and applies the fixed
+  file.
+
+### `reload-record-write-failed`
+
+- **Line:** one of (the `(<errno>)` part appears only when the error has a
+  code):
+  - `[slack] reload-record-write-failed: cannot write the last-applied record "<record path>" (<errno>); the server does not start and nothing is applied`:
+    the record wasn't written, and there is still no record.
+  - `[slack] reload-record-write-failed: the last-applied record "<record path>" was written but its directory could not be synced (<errno>), so it may not survive a crash, and the next start will run it; the server does not start`:
+    the record is in place, but the state directory couldn't be synced, so it
+    may be lost in a crash or power loss.
+- **When:** A start without a record. `config.json` was valid, but the server
+  couldn't write `config.json.last-applied` beside it durably.
+- **Effect:** The server exits 1. No persona is brought up and nothing is
+  applied. `start` shows the line in its `Server failed to start` block. After
+  the second line, the next start runs the record that was written (a copy of
+  `config.json` at that start), unless a crash lost it.
+- **Cause:** Usually the state directory: the server's user can't create or
+  rename files in it (`EACCES`, `EPERM`), the disk or quota is full
+  (`ENOSPC`, `EDQUOT`), or the filesystem is read-only (`EROFS`). A
+  directory that can't be synced usually points at the filesystem (an I/O
+  error, `EIO`, or a filesystem that doesn't support syncing a directory).
+- **Fix:** Fix the directory's permissions, free space or filesystem, then
+  start the server again.
+
+### The last-applied record can't be read or is invalid
+
+- **Line:** `[slack] Fatal: last-applied record error — <cause> Deleting the last-applied record "<record path>" makes the next start apply the configuration file "<config path>" as it stands.`
+  It carries no class label.
+- **Cause:** one of:
+  - `The last-applied record "<record path>" cannot be read (<errno>).`: the
+    record exists but the server's user can't read it (permissions, or the path
+    is a directory, `EISDIR`); `(not a regular file)` means the path is a FIFO,
+    socket or device, which is never read;
+  - `loadPersonaConfig: malformed JSON in "<record path>" at line <L>, column <C>.`:
+    the record isn't valid JSON (it was edited or damaged);
+  - `loadPersonaConfig: invalid persona config in "<record path>": <message>`:
+    the record breaks a rule. The messages are the ones under
+    [Configuration rejections](#configuration-rejections), except the two
+    shared-path rules, which a record start leaves to the bring-up.
+- **Effect:** The server exits 1 and doesn't fall back to `config.json`.
+  Until the record is fixed or deleted, `clean_restart` fails with
+  `[slack] clean_restart: failed to load config:`, and `stop --stop-bots`
+  logs `could not load config — skipping bot teardown` and stops only the
+  server. `stop` logs one line saying it could not load the applied
+  configuration, and uses a 30 s `stop_timeout`.
+- **Fix:** If it can't be read, make it a readable file and start again; the
+  record is kept. Otherwise, with the operator's say-so, delete the record and
+  start, as under [Applying a `config.json` edit](#applying-a-configjson-edit).
+- **Warning:** Deleting the record makes the next start run whatever is in
+  `config.json` now, including any edit that was never applied. Read
+  `config.json` before deleting the record.
 
 ---
 

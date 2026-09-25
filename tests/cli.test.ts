@@ -3,17 +3,19 @@
  * `clean_restart`) at the createCli factory level, with all I/O injected.
  *
  * Persona model (b.av2 SR-8.7, SR-10.2): the CLI reads no Slack token (AC 47,
- * cli leg), reads the configuration file the server loads (`config.json` in
- * the state directory) with the persona loader, and tears down exactly the
- * configuration's personas, addressing each instance as `cscb_<key>`.
+ * cli leg), takes its settings and persona set from the configuration the
+ * server runs (`config.json.last-applied` beside `config.json` in the state
+ * directory when it exists, otherwise `config.json`), and tears down exactly
+ * that configuration's personas, addressing each instance as `cscb_<key>`.
  *
  * Isolation (b.av2 SR-13.2): every real path sits under a per-test
  * `mkdtempSync` directory removed in `afterEach`. The token variables are
  * removed for the whole file (restored afterwards), so no case or failure
  * message can see an ambient token. `start`'s daemon is always the injected
  * fake `spawnDaemon`; the only real spawn is the usage-text test, which gets
- * a built env (PATH, temp HOME, temp SLACK_STATE_DIR). Waits in `start` run on
- * the shared fake clock.
+ * a built env (PATH, temp HOME, temp SLACK_STATE_DIR). Waits in `start` and
+ * `stop` (the daemon startup wait, the SIGTERM and SIGKILL polls) run on the
+ * per-test fake clock; none waits in real time.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -21,13 +23,26 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join, relative, resolve } from 'node:path'
 import {
   DAEMON_FAILURE_LOG_LINES,
   DAEMON_STARTUP_POLL_MS,
   DAEMON_STARTUP_WAIT_MS,
+  STOP_KILL_WAIT_MS,
+  STOP_POLL_MS,
   createCli,
   createDirectorOps,
   type CliDeps,
@@ -37,13 +52,18 @@ import {
 } from '../src/cli.ts'
 import { ErrCallTimeout, ErrSpawnNotFound } from '../src/agent-director-errors.ts'
 import {
-  loadPersonaConfig,
+  CONFIG_NOT_REGULAR_FILE_CODE,
+  DEFAULT_PERSONA_CONFIG_FS,
   prePersonaConversionMessage,
   resolveServerConfigPath,
   resolveServerStateDir,
   type PersonaConfig,
+  type PersonaConfigFs,
+  type PersonaConfigInput,
 } from '../src/config.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
+import { readAppliedPersonaConfig } from '../src/reload.ts'
+import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, writeCredentialsFile } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
   makeMultiPersonaConfig,
@@ -132,6 +152,12 @@ afterEach(() => {
 const OPS_NAME = 'Ops Bot'
 const OPS_CHANNEL = 'C0TEST001'
 const opsId = (): string => personaInstanceId(personaKey(OPS_NAME))
+
+/** The last-applied record beside the per-test config.json. */
+const recordPath = (): string => `${configPath}.last-applied`
+
+/** The production `loadConfig` (b.av2 SR-8.7) over the per-test tree, with the temp root as home. */
+const appliedLoader = (path: string): PersonaConfig => readAppliedPersonaConfig(path, root)
 
 function opsConfig(overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): PersonaConfig {
   return makeMultiPersonaConfig([{ name: OPS_NAME, channels: [{ id: OPS_CHANNEL, delivery: 'all' }] }], root, overrides)
@@ -366,14 +392,34 @@ describe('start — pre-flight', () => {
     expect(code).not.toContain('SLACK_APP_TOKEN')
   })
 
-  test('no config.json in the state dir: exit 1, message names <stateDir>/config.json, nothing spawned', async () => {
+  test.each([
+    ['config.json only', false],
+    ['config.json.last-applied only (no config.json)', true],
+  ])('%s: start passes pre-flight and spawns the daemon', async (_label, recordOnly) => {
+    if (recordOnly) {
+      writeFileSync(recordPath(), readFileSync(configPath))
+      rmSync(configPath)
+    }
+    const b = makeDeps()
+
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.daemonSpawns).toHaveLength(1)
+    expect(b.exitCodes).toEqual([0])
+    expect(stderr.join('\n')).not.toContain('missing prerequisite')
+    assertNoLeak({ stderr }, 'start pre-flight')
+  })
+
+  test('neither config.json nor config.json.last-applied: exit 1, one line naming both paths, nothing spawned', async () => {
     rmSync(configPath)
     const b = makeDeps()
 
     await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
 
     expect(b.exitCodes).toEqual([1])
-    expect(stderr).toContain(`missing prerequisite: config.json not found at ${configPath}`)
+    expect(stderr).toEqual([
+      `missing prerequisite: config.json not found at ${configPath}, and no config.json.last-applied at ${recordPath()}`,
+    ])
     expect(b.daemonSpawns).toEqual([])
   })
 
@@ -400,7 +446,8 @@ describe('shared config path (SR-8.7)', () => {
     const props = objectProperties(code.slice(code.indexOf('const realDeps: CliDeps =')))
     expect(props.get('resolveStateDir')).toBe('() => resolveServerStateDir()')
     expect(props.get('resolveConfigPath')).toBe('() => resolveServerConfigPath()')
-    expect(props.get('loadConfig')).toBe('(path) => loadPersonaConfig(path)')
+    expect(props.get('loadConfig')).toBe('(path) => readAppliedPersonaConfig(path)')
+    expect(code).toMatch(/import\s*\{[^}]*\breadAppliedPersonaConfig\b[^}]*\}\s*from\s*'\.\/reload\.ts'/)
   })
 
   test('clean_restart loads exactly <stateDir>/config.json', async () => {
@@ -437,9 +484,9 @@ describe('shared config path (SR-8.7)', () => {
     expect(b.exitCodes).toEqual([0])
   })
 
-  test('clean_restart over a real two-persona file through the real loader tears down exactly cscb_<key> of each persona', async () => {
+  test('clean_restart over a real two-persona file through the production resolver (no record) tears down exactly cscb_<key> of each persona', async () => {
     writeConfigFile(stateDir, makePersonaConfigInput({ personas: [makePersona(ALPHA, root), makePersona(BETA, root)] }, root))
-    const b = makeDeps({ loadConfig: (p) => loadPersonaConfig(p, root) })
+    const b = makeDeps({ loadConfig: appliedLoader })
 
     await createCli(b.deps).clean_restart()
 
@@ -448,9 +495,9 @@ describe('shared config path (SR-8.7)', () => {
     expect(startedServer(b)).toBe(true)
   })
 
-  test('clean_restart given a pre-persona file (real loader) exits 1 with the conversion message, no director call, never starts', async () => {
+  test('clean_restart given a pre-persona file (production resolver, no record) exits 1 with the conversion message, no director call, never starts', async () => {
     writePrePersonaFile()
-    const b = makeDeps({ loadConfig: (p) => loadPersonaConfig(p, root) })
+    const b = makeDeps({ loadConfig: appliedLoader })
 
     await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
 
@@ -460,13 +507,13 @@ describe('shared config path (SR-8.7)', () => {
     expect(b.spawnCalls).toEqual([]) // neither stop nor start ran
   })
 
-  test('stop --stop-bots given a pre-persona file (real loader) logs, skips teardown and still stops the server', async () => {
+  test('stop --stop-bots given a pre-persona file (production resolver, no record) logs, skips teardown and still stops the server', async () => {
     writePrePersonaFile()
     let alive = true
     const b = makeDeps({
       serverPid: 4242,
       isProcessRunning: () => { const was = alive; alive = false; return was },
-      loadConfig: (p) => loadPersonaConfig(p, root),
+      loadConfig: appliedLoader,
     })
 
     await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
@@ -476,6 +523,502 @@ describe('shared config path (SR-8.7)', () => {
     expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
     expect(stderr.join('\n')).toContain('could not load config — skipping bot teardown')
   })
+})
+
+// ---------------------------------------------------------------------------
+// stop — the SIGTERM and SIGKILL waits run on the injected clock
+// ---------------------------------------------------------------------------
+
+describe('stop — waits on the injected clock', () => {
+  /** Record the fake-clock time of every server signal and the length of every sleep. */
+  function timed(b: Bundle): { signalAt: Array<[string, number]>; sleeps: number[] } {
+    const signalAt: Array<[string, number]> = []
+    const sleeps: number[] = []
+    const { kill, sleep } = b.deps
+    b.deps.kill = (pid, signal) => {
+      signalAt.push([String(signal), b.clock.now()])
+      kill(pid, signal)
+    }
+    b.deps.sleep = (ms) => {
+      sleeps.push(ms)
+      return sleep(ms)
+    }
+    return { signalAt, sleeps }
+  }
+
+  // A 5 s stop_timeout here would outlast the test's own 5 s timeout if the
+  // waits were real.
+  test('a server that ignores SIGTERM gets SIGKILL once stop_timeout has passed on the fake clock, then exits 0 at the next poll after it dies', async () => {
+    const b: Bundle = makeDeps({
+      serverPid: 4242,
+      config: opsConfig({ stop_timeout: 5 }),
+      isProcessRunning: () => !b.serverSignals.includes('SIGKILL'),
+    })
+    const t = timed(b)
+
+    await expect(createCli(b.deps).stop()).rejects.toBeInstanceOf(ExitError)
+
+    expect(t.signalAt.map(([s]) => s)).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(t.signalAt[0]![1]).toBe(0)
+    expect(t.signalAt[1]![1]).toBeGreaterThanOrEqual(5_000)
+    expect(t.signalAt[1]![1]).toBeLessThan(5_000 + STOP_POLL_MS)
+    expect(b.exitCodes).toEqual([0])
+    expect(b.exitTimes[0]).toBe(t.signalAt[1]![1] + STOP_POLL_MS)
+    expect(new Set(t.sleeps)).toEqual(new Set([STOP_POLL_MS]))
+    expect(stderr).toContain('[slack] Warning: server did not stop within 5s after SIGTERM — sending SIGKILL.')
+    expect(stderr).toContain('[slack] Server killed.')
+  })
+
+  test(`a server that survives SIGKILL: exit 1 once STOP_KILL_WAIT_MS (${STOP_KILL_WAIT_MS} ms) has passed on the fake clock`, async () => {
+    const b = makeDeps({ serverPid: 4242, config: opsConfig({ stop_timeout: 5 }), isProcessRunning: () => true })
+    const t = timed(b)
+
+    await expect(createCli(b.deps).stop()).rejects.toBeInstanceOf(ExitError)
+
+    expect(t.signalAt.map(([s]) => s)).toEqual(['SIGTERM', 'SIGKILL'])
+    const killAt = t.signalAt[1]![1]
+    expect(b.exitCodes).toEqual([1])
+    expect(b.exitTimes[0]).toBeGreaterThanOrEqual(killAt + STOP_KILL_WAIT_MS)
+    expect(b.exitTimes[0]).toBeLessThan(killAt + STOP_KILL_WAIT_MS + STOP_POLL_MS)
+    expect(new Set(t.sleeps)).toEqual(new Set([STOP_POLL_MS]))
+    expect(stderr).toContain('[slack] Warning: server did not die after SIGKILL.')
+  })
+
+  test('a server that exits after SIGTERM is seen at the first poll, STOP_POLL_MS after it', async () => {
+    let alive = true
+    const b = makeDeps({ serverPid: 4242, config: opsConfig({ stop_timeout: 5 }), isProcessRunning: () => { const was = alive; alive = false; return was } })
+    const t = timed(b)
+
+    await expect(createCli(b.deps).stop()).rejects.toBeInstanceOf(ExitError)
+
+    expect(t.signalAt).toEqual([['SIGTERM', 0]])
+    expect(b.exitCodes).toEqual([0])
+    expect(b.exitTimes).toEqual([STOP_POLL_MS])
+    expect(stderr).toContain('[slack] Server stopped.')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The last-applied record (b.av2 SR-8.7): settings and persona set come from
+// config.json.last-applied when it exists, from config.json when it does not.
+// Every case goes through the production resolver over real files in the
+// per-test tree.
+// ---------------------------------------------------------------------------
+
+describe('last-applied record (SR-8.7)', () => {
+  /** Only in the edited config.json: a record-sourced teardown never addresses it. */
+  const GAMMA = { name: 'Gamma Bot', channels: [{ id: 'C0GAMMA01', delivery: 'all' as const }], permission_prompts: 'C0GAMMA01' }
+  const alphaId = (): string => personaInstanceId(personaKey(ALPHA.name))
+  const betaId = (): string => personaInstanceId(personaKey(BETA.name))
+  const gammaId = (): string => personaInstanceId(personaKey(GAMMA.name))
+
+  /**
+   * The applied configuration: Alpha and Beta with the short timeouts. With
+   * stop_timeout 0 a live server gets SIGKILL straight after SIGTERM; with
+   * exit_timeout 0 a paused persona is killed at once. Reading the longer
+   * values of EDITED instead shows up as no SIGKILL and no kill.
+   */
+  const APPLIED = (): PersonaConfigInput =>
+    makePersonaConfigInput({ personas: [makePersona(ALPHA, root), makePersona(BETA, root)], stop_timeout: 0, exit_timeout: 0 }, root)
+  /** The operator's edit, not yet applied: Beta removed, Gamma added, longer timeouts. */
+  const EDITED = (): PersonaConfigInput =>
+    makePersonaConfigInput({ personas: [makePersona(ALPHA, root), makePersona(GAMMA, root)], stop_timeout: 5, exit_timeout: 5 }, root)
+
+  /**
+   * `record`: config.json.last-applied holds APPLIED and config.json holds
+   * EDITED. `config`: no record, config.json holds APPLIED. Each persona's
+   * credentials file holds fake tokens, so a CLI that read one and printed it
+   * fails `assertNoLeak`.
+   */
+  function writeSource(source: 'record' | 'config'): void {
+    for (const p of [ALPHA, BETA, GAMMA]) writeCredentialsFile(join(root, 'personas', personaKey(p.name)))
+    if (source === 'record') {
+      writeFileSync(recordPath(), JSON.stringify(APPLIED(), null, 2))
+      writeConfigFile(stateDir, EDITED())
+    } else {
+      writeConfigFile(stateDir, APPLIED())
+    }
+  }
+
+  /**
+   * A server that is up at `stop`'s liveness check and gone by the first poll,
+   * STOP_POLL_MS of fake-clock time after SIGTERM: stop_timeout 0 still sends
+   * SIGKILL (no poll before the deadline), any longer stop_timeout does not.
+   */
+  function goneAfterFirstCheck(): () => boolean {
+    let calls = 0
+    return () => ++calls === 1
+  }
+
+  /** Each instance's first status is `waiting` (so it is paused), every later one `ended`. */
+  function waitingThenEnded(): (id: string) => Promise<{ state: string }> {
+    const seen = new Set<string>()
+    return async (id) => {
+      const first = !seen.has(id)
+      seen.add(id)
+      return { state: first ? 'waiting' : 'ended' }
+    }
+  }
+
+  const runStopBots = (b: Bundle): Promise<void> =>
+    createCli(b.deps).stop({ stopBots: true }).catch((e) => { if (!(e instanceof ExitError)) throw e })
+  const runCleanRestart = (b: Bundle): Promise<void> => createCli(b.deps).clean_restart()
+
+  const SOURCES = [
+    ['record present: the record', 'record'],
+    ['no record: config.json', 'config'],
+  ] as const
+
+  test.each(SOURCES)('stop: stop_timeout comes from %s (0 → SIGKILL right after SIGTERM)', async (_label, source) => {
+    writeSource(source)
+    const b = makeDeps({ serverPid: 4242, isProcessRunning: goneAfterFirstCheck(), loadConfig: appliedLoader })
+
+    await expect(createCli(b.deps).stop()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.serverSignals).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(b.exitCodes).toEqual([0])
+    assertNoLeak({ stderr, exitCodes: b.exitCodes }, `stop (${source})`)
+  })
+
+  test.each([
+    ...SOURCES.map(([label, source]) => ['clean_restart', label, source, runCleanRestart] as const),
+    ...SOURCES.map(([label, source]) => ['stop --stop-bots', label, source, runStopBots] as const),
+  ])('%s: persona set and exit_timeout come from %s — exactly cscb_<key> of Alpha and Beta, each paused then killed at once, never Gamma', async (name, _label, source, run) => {
+    writeSource(source)
+    const b = makeDeps({
+      serverPid: 4242,
+      isProcessRunning: goneAfterFirstCheck(),
+      loadConfig: appliedLoader,
+      directorStatus: waitingThenEnded(),
+    })
+
+    await run(b)
+
+    const ids = [alphaId(), betaId()].sort()
+    // exit_timeout 0: no status poll after the pause, straight to kill.
+    expect([...b.statusCalls].sort()).toEqual(ids)
+    expect([...b.pauseCalls].sort()).toEqual(ids)
+    expect([...b.killCalls].sort()).toEqual(ids)
+    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).not.toContain(gammaId())
+    if (name === 'stop --stop-bots') {
+      expect(b.serverSignals).toEqual(['SIGTERM', 'SIGKILL'])
+      expect(b.exitCodes).toEqual([0])
+    } else {
+      expect(b.exitCodes).toEqual([])
+      expect(startedServer(b)).toBe(true)
+    }
+    assertNoLeak({ stderr, exitCodes: b.exitCodes }, `${name} (${source})`)
+  })
+
+  /** Every file under the per-test root (state dir and credentials files), by relative path, with its bytes. */
+  function snapshotTree(): Map<string, Buffer> {
+    const files = new Map<string, Buffer>()
+    for (const rel of readdirSync(root, { recursive: true }) as string[]) {
+      const path = join(root, rel)
+      if (statSync(path).isFile()) files.set(rel, readFileSync(path))
+    }
+    return files
+  }
+
+  const runStop = (b: Bundle): Promise<void> =>
+    createCli(b.deps).stop().catch((e) => { if (!(e instanceof ExitError)) throw e })
+
+  test.each([
+    ...SOURCES.map(([label, source]) => ['clean_restart', label, source, runCleanRestart] as const),
+    ...SOURCES.map(([label, source]) => ['stop --stop-bots', label, source, runStopBots] as const),
+    ...SOURCES.map(([label, source]) => ['stop', label, source, runStop] as const),
+  ])('%s never writes a reload file (%s): every file is byte-for-byte unchanged and none is added or removed', async (name, _label, source, run) => {
+    writeSource(source)
+    const b = makeDeps({
+      serverPid: 4242,
+      isProcessRunning: goneAfterFirstCheck(),
+      loadConfig: appliedLoader,
+      directorStatus: waitingThenEnded(),
+    })
+    const before = snapshotTree() // after makeDeps, so the PID file is in it
+
+    await run(b)
+
+    // Precondition: the run read the intended source and tore down its set.
+    if (name !== 'stop') expect([...b.killCalls].sort()).toEqual([alphaId(), betaId()].sort())
+    expect(existsSync(recordPath())).toBe(source === 'record')
+    const after = snapshotTree()
+    expect([...after.keys()].sort()).toEqual([...before.keys()].sort())
+    for (const [rel, bytes] of before) expect(after.get(rel)!.equals(bytes)).toBe(true)
+    assertNoLeak({ stderr, exitCodes: b.exitCodes }, `${name} (${source}, no writes)`)
+  })
+
+  test.each(SOURCES)('readAppliedPersonaConfig expands every ~ under the injected home: a "~/…" config path, and "~/…" persona paths in %s', (_label, source) => {
+    const tildePaths = (name: string) => ({
+      credentials_file: `~/personas/${personaKey(name)}/credentials.json`,
+      working_directory: `~/personas/${personaKey(name)}/work`,
+    })
+    const applied = makePersonaConfigInput(
+      {
+        personas: [makePersona({ ...ALPHA, ...tildePaths(ALPHA.name) }, root), makePersona({ ...BETA, ...tildePaths(BETA.name) }, root)],
+        stop_timeout: 0,
+        exit_timeout: 0,
+      },
+      root,
+    )
+    if (source === 'record') {
+      writeFileSync(recordPath(), JSON.stringify(applied, null, 2))
+      writeConfigFile(stateDir, EDITED())
+    } else {
+      writeConfigFile(stateDir, applied)
+    }
+    // Precondition: the injected home is not the process's own, so a `~`
+    // expanded under the OS home finds no file (or other paths).
+    expect(resolve(process.env['HOME'] ?? '')).not.toBe(resolve(root))
+
+    const config = readAppliedPersonaConfig(`~/${relative(root, configPath)}`, root)
+
+    expect(config.stop_timeout).toBe(0) // the applied file, not EDITED's 5
+    expect(config.personas.map((p) => [p.key, p.credentials_file, p.working_directory])).toEqual(
+      [ALPHA.name, BETA.name].map((n) => [
+        personaKey(n),
+        join(root, 'personas', personaKey(n), 'credentials.json'),
+        join(root, 'personas', personaKey(n), 'work'),
+      ]),
+    )
+  })
+
+  test.each([
+    ['clean_restart', runCleanRestart],
+    ['stop --stop-bots', runStopBots],
+  ] as const)('%s: a record whose two personas share a working directory by real path is still read (record mode); both instances are torn down', async (name, run) => {
+    const work = join(root, 'shared-work')
+    mkdirSync(work)
+    const alias = join(root, 'shared-work-link')
+    symlinkSync(work, alias)
+    writeFileSync(
+      recordPath(),
+      JSON.stringify(
+        makePersonaConfigInput(
+          {
+            personas: [makePersona({ ...ALPHA, working_directory: work }, root), makePersona({ ...BETA, working_directory: alias }, root)],
+            stop_timeout: 0,
+            exit_timeout: 0,
+          },
+          root,
+        ),
+      ),
+    )
+    const b = makeDeps({
+      serverPid: 4242,
+      isProcessRunning: goneAfterFirstCheck(),
+      loadConfig: appliedLoader,
+      directorStatus: waitingThenEnded(),
+    })
+
+    await run(b)
+
+    const ids = [alphaId(), betaId()].sort()
+    expect([...b.pauseCalls].sort()).toEqual(ids)
+    expect([...b.killCalls].sort()).toEqual(ids)
+    expect(stderr.join('\n')).not.toContain('could not load config')
+    expect(b.exitCodes).not.toContain(1)
+    assertNoLeak({ stderr, exitCodes: b.exitCodes }, name)
+  })
+
+  /**
+   * A record that is not JSON, holding a fake token, beside a valid
+   * config.json (EDITED). The parse error must name the record, carry the
+   * deletion hint and quote none of the record's content.
+   */
+  function writeMalformedRecord(): void {
+    writeConfigFile(stateDir, EDITED())
+    writeFileSync(recordPath(), `{"personas": [{"name": "${fakeToken(BOT_TOKEN_PREFIX, 'record')}"`)
+  }
+  const deletionHint = (): string => `Deleting the last-applied record "${recordPath()}"`
+  /** `stop`'s one line for a stop_timeout read failure, before the loader's message. */
+  const STOP_LOAD_FAILURE_PREFIX = '[slack] stop: could not load the applied configuration — using the default 30s stop_timeout: '
+
+  test('clean_restart with a malformed record: exit 1 naming the record with the deletion hint, no teardown, no fallback to config.json, never starts', async () => {
+    writeMalformedRecord()
+    const b = makeDeps({ loadConfig: appliedLoader, directorStatus: waitingThenEnded() })
+
+    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.exitCodes).toEqual([1])
+    expect(stderr).toHaveLength(1)
+    expect(stderr[0]!.startsWith('[slack] clean_restart: failed to load config:')).toBe(true)
+    expect(stderr[0]).toContain(deletionHint())
+    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+    expect(b.spawnCalls).toEqual([])
+    assertNoLeak({ stderr, exitCodes: b.exitCodes }, 'clean_restart (malformed record)')
+  })
+
+  test('stop --stop-bots with a malformed record: logs the record with the deletion hint, skips teardown (no fallback to config.json), still stops the server', async () => {
+    writeMalformedRecord()
+    const b = makeDeps({
+      serverPid: 4242,
+      isProcessRunning: goneAfterFirstCheck(),
+      loadConfig: appliedLoader,
+      directorStatus: waitingThenEnded(),
+    })
+
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+
+    expect(b.exitCodes).toEqual([0])
+    expect(b.serverSignals).toEqual(['SIGTERM'])
+    const skip = stderr.filter((l) => l.startsWith('[slack] stop --stop-bots: could not load config — skipping bot teardown:'))
+    expect(skip).toHaveLength(1)
+    expect(skip[0]).toContain(deletionHint())
+    // The server stop's own read failed too, and says so once, with the same hint.
+    const stopLine = stderr.filter((l) => l.startsWith(STOP_LOAD_FAILURE_PREFIX))
+    expect(stopLine).toHaveLength(1)
+    expect(stopLine[0]).toContain(deletionHint())
+    expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+    assertNoLeak({ stderr, exitCodes: b.exitCodes }, 'stop --stop-bots (malformed record)')
+  })
+
+  // -------------------------------------------------------------------------
+  // A record, or config.json without one, that is not a regular file: refused
+  // unread (`readPersonaConfigBytes`), so no CLI command can hang on a FIFO or
+  // a device. The file the loader would read is left a valid regular file for
+  // the FIFO kind, so a loader that bypassed the seam would read it and pass.
+  // -------------------------------------------------------------------------
+
+  const NON_REGULAR_KINDS = [
+    ['a FIFO (injected fstatFile: neither a file nor a directory)', 'fifo', CONFIG_NOT_REGULAR_FILE_CODE],
+    ['a directory (real)', 'directory', 'EISDIR'],
+  ] as const
+  const NON_REGULAR_CASES = SOURCES.flatMap(([label, source]) =>
+    NON_REGULAR_KINDS.map(([kindLabel, kind, code]) => [label, kindLabel, source, kind, code] as const),
+  )
+  /** Each case is bounded well below Bun's default, so a hang fails fast. */
+  const NON_REGULAR_TIMEOUT_MS = 2_000
+
+  interface NonRegularFile {
+    loader: (path: string) => PersonaConfig
+    /** The start's wording for the refused file (with the deletion hint for the record). */
+    cause: string
+    /** For the FIFO kind: the target was opened, nothing was read and every descriptor was closed. */
+    assertUnreadAndClosed(): void
+  }
+
+  function makeNonRegular(source: 'record' | 'config', kind: 'fifo' | 'directory', code: string): NonRegularFile {
+    writeSource(source)
+    const target = source === 'record' ? recordPath() : configPath
+    const cause =
+      source === 'record'
+        ? `The last-applied record "${recordPath()}" cannot be read (${code}). ${deletionHint()} makes the next start ` +
+          `apply the configuration file "${configPath}" as it stands.`
+        : `The configuration file "${configPath}" cannot be read (${code}). The server requires the configuration file to start.`
+    if (kind === 'directory') {
+      rmSync(target)
+      mkdirSync(target)
+      return { loader: appliedLoader, cause, assertUnreadAndClosed: () => {} }
+    }
+    const open = new Map<number, string>()
+    const reads: string[] = []
+    let targetOpens = 0
+    const fs: Partial<PersonaConfigFs> = {
+      openFile: (p) => {
+        const fd = DEFAULT_PERSONA_CONFIG_FS.openFile(p)
+        open.set(fd, p)
+        if (p === target) targetOpens++
+        return fd
+      },
+      fstatFile: (fd) =>
+        open.get(fd) === target ? { isFile: () => false, isDirectory: () => false } : DEFAULT_PERSONA_CONFIG_FS.fstatFile(fd),
+      readFileFd: (fd) => {
+        reads.push(open.get(fd) ?? `fd ${fd}`)
+        return DEFAULT_PERSONA_CONFIG_FS.readFileFd(fd)
+      },
+      closeFile: (fd) => {
+        open.delete(fd)
+        DEFAULT_PERSONA_CONFIG_FS.closeFile(fd)
+      },
+    }
+    return {
+      loader: (p) => readAppliedPersonaConfig(p, root, fs),
+      cause,
+      assertUnreadAndClosed: () => {
+        expect(targetOpens).toBeGreaterThan(0)
+        expect(reads).toEqual([]) // neither the target nor, for the record, config.json
+        expect([...open.values()]).toEqual([])
+      },
+    }
+  }
+
+  test.each(NON_REGULAR_CASES)(
+    'clean_restart (%s) where that file is %s: exit 1 at once with "cannot be read" wording, no teardown, no fallback, never starts',
+    async (_label, _kindLabel, source, kind, code) => {
+      const f = makeNonRegular(source, kind, code)
+      const b = makeDeps({ loadConfig: f.loader, directorStatus: waitingThenEnded() })
+
+      await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+
+      expect(b.exitCodes).toEqual([1])
+      expect(stderr).toHaveLength(1)
+      expect(stderr[0]!.startsWith('[slack] clean_restart: failed to load config:')).toBe(true)
+      expect(stderr[0]).toContain(f.cause)
+      expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+      expect(b.spawnCalls).toEqual([])
+      expect(b.clock.now()).toBe(0)
+      f.assertUnreadAndClosed()
+      assertNoLeak({ stderr, exitCodes: b.exitCodes }, `clean_restart (${source}, ${kind})`)
+    },
+    NON_REGULAR_TIMEOUT_MS,
+  )
+
+  test.each(NON_REGULAR_CASES)(
+    'stop --stop-bots (%s) where that file is %s: the server still stops (30 s default, so no SIGKILL), the skip line carries the "cannot be read" wording, no teardown',
+    async (_label, _kindLabel, source, kind, code) => {
+      const f = makeNonRegular(source, kind, code)
+      const b = makeDeps({
+        serverPid: 4242,
+        isProcessRunning: goneAfterFirstCheck(),
+        loadConfig: f.loader,
+        directorStatus: waitingThenEnded(),
+      })
+
+      await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+
+      expect(b.exitCodes).toEqual([0])
+      // The applied file's stop_timeout 0 would have sent SIGKILL; it was not read.
+      expect(b.serverSignals).toEqual(['SIGTERM'])
+      const skip = stderr.filter((l) => l.startsWith('[slack] stop --stop-bots: could not load config — skipping bot teardown:'))
+      expect(skip).toHaveLength(1)
+      expect(skip[0]).toContain(f.cause)
+      expect(stderr.filter((l) => l.startsWith(STOP_LOAD_FAILURE_PREFIX))).toEqual([`${STOP_LOAD_FAILURE_PREFIX}${f.cause}`])
+      expect([...b.statusCalls, ...b.pauseCalls, ...b.killCalls]).toEqual([])
+      f.assertUnreadAndClosed()
+      assertNoLeak({ stderr, exitCodes: b.exitCodes }, `stop --stop-bots (${source}, ${kind})`)
+    },
+    NON_REGULAR_TIMEOUT_MS,
+  )
+
+  // Plain `stop` reports the load failure in exactly one line, first, with the
+  // loader's message (the record's deletion hint, or the config wording), then
+  // falls back to the 30 s default stop_timeout and still stops the server.
+  test.each(NON_REGULAR_CASES)(
+    'stop (%s) where that file is %s: logs one "could not load" line with the "cannot be read" wording, then uses the 30 s default stop_timeout (fake clock) and still stops a server that ignores SIGTERM',
+    async (_label, _kindLabel, source, kind, code) => {
+      const f = makeNonRegular(source, kind, code)
+      const b: Bundle = makeDeps({
+        serverPid: 4242,
+        isProcessRunning: () => !b.serverSignals.includes('SIGKILL'),
+        loadConfig: f.loader,
+      })
+
+      await expect(createCli(b.deps).stop()).rejects.toBeInstanceOf(ExitError)
+
+      expect(b.serverSignals).toEqual(['SIGTERM', 'SIGKILL'])
+      expect(b.exitCodes).toEqual([0])
+      expect(b.exitTimes).toEqual([30_000 + STOP_POLL_MS])
+      expect(stderr).toEqual([
+        `${STOP_LOAD_FAILURE_PREFIX}${f.cause}`,
+        '[slack] Warning: server did not stop within 30s after SIGTERM — sending SIGKILL.',
+        '[slack] Server killed.',
+      ])
+      f.assertUnreadAndClosed()
+      assertNoLeak({ stderr, exitCodes: b.exitCodes }, `stop (${source}, ${kind})`)
+    },
+    NON_REGULAR_TIMEOUT_MS,
+  )
 })
 
 // ---------------------------------------------------------------------------

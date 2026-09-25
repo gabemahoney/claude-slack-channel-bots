@@ -3,19 +3,31 @@
  * src/server.ts (b.zak regression guard; b.av2 SR-6.2).
  *
  * The b.zak fix is a NEW module whose value is realised only if main() actually
- * invokes it BEFORE the resume path (startupSessionManager) that silently
- * deletes+fresh-spawns on ErrJsonlMissing. If the call is dropped or reordered,
- * the preventative warning never fires and every bot can lose memory silently —
- * exactly the 2026-09-20 incident.
+ * invokes it BEFORE the resume path (the start bring-up, which runs
+ * startupSessionManager) that silently deletes+fresh-spawns on
+ * ErrJsonlMissing. If the call is dropped or reordered, the preventative
+ * warning never fires and every bot can lose memory silently — exactly the
+ * 2026-09-20 incident.
  *
  * b.av2 SR-6.2 widens the audit to every start-time pass: the trust patch, the
- * Stop-hook bootstrap and the JSONL safeguard all run over the persona config
- * main() loaded (`loadStartPersonaConfig`) before the per-persona bring-up
- * (`startupSessionManager`, which brings each persona up and launches it; b.av2
- * SR-6.1), the agent-director template install covers the personas' config
- * dirs, and the session manager's pre-launch trust patcher is installed before
- * anything can launch (the persona Slack connections, Bun.serve, initRestart,
- * the per-persona bring-up).
+ * Stop-hook bootstrap and the JSONL safeguard all run over the applied persona
+ * config before the per-persona bring-up (b.av2 SR-6.1), the agent-director
+ * template install covers the personas' config dirs, and the session manager's
+ * pre-launch trust patcher is installed before anything can launch (the
+ * persona Slack connections, Bun.serve, initRestart, the per-persona bring-up).
+ *
+ * b.av2 SR-8.7 routes the start through the reload controller: main() resolves
+ * the start (`const start = reload.resolveStart()`), sets the applied config
+ * from it (`personaConfig = start.config`, the last-applied record's at a start
+ * from the record, never the edited config file), and requests the bring-up
+ * with `reload.runStartBringUp()`, which runs the controller's lifecycle
+ * `startBringUp` (`startupSessionManager` over the config the controller
+ * hands it). So every pass must come after that assignment and before that
+ * invocation; `startupSessionManager`'s text now sits in the controller's
+ * construction, above the passes, and is no ordering anchor (that its
+ * argument is the controller's applied config is pinned in
+ * tests/server-startup-wiring.test.ts). The E10 carry:
+ * the Stop-hook pass and the reply guard's getter read that applied config.
  *
  * b.av2 SR-9.4 adds the pre-launch reply guard: installed right after the
  * trust patcher, it runs `preLaunchReplyGuard` with the server's own
@@ -41,9 +53,12 @@ import {
   balancedAfter,
   callArguments,
   indicesOf,
+  insideMain,
   loadedConfigName,
+  mainBody,
   onlyCallArguments,
   splitTopLevel,
+  startResolution,
   stripComments,
 } from './test-helpers/source-audit.ts'
 
@@ -69,6 +84,17 @@ function firstCallOf(name: string): number {
   return calls[0]!
 }
 
+/**
+ * Offset of the start bring-up request in main(): `<controller>.runStartBringUp(`
+ * (the one call; startResolution throws otherwise). Fails unless it is inside
+ * main().
+ */
+function startBringUpAt(): number {
+  const { bringUpAt } = startResolution(SERVER_CODE)
+  expect(insideMain(SERVER_CODE, bringUpAt)).toBe(true)
+  return bringUpAt
+}
+
 /** Every start-time pass SR-6.2 requires to run over the applied personas. */
 const START_PASSES = [
   'installSlackChannelBotTemplate',
@@ -85,30 +111,38 @@ describe('server.ts wires the JSONL-persistence safeguard', () => {
     )
   })
 
-  test('calls the safeguard BEFORE startupSessionManager (the resume/wipe path)', () => {
+  test('calls the safeguard in main() BEFORE the start bring-up (the resume/wipe path)', () => {
     const safeguardIdx = SERVER_CODE.indexOf('runJsonlPersistenceSafeguard(')
-    const startupIdx = SERVER_CODE.indexOf('startupSessionManager(')
     // safeguardIdx > -1 proves the call exists (subsumes a separate "is called"
-    // test); startupIdx > -1 anchors the ordering; safeguard must precede resume.
-    expect(safeguardIdx).toBeGreaterThan(-1)
-    expect(startupIdx).toBeGreaterThan(-1)
-    expect(safeguardIdx).toBeLessThan(startupIdx)
+    // test); startBringUpAt() anchors the ordering on the bring-up request in
+    // main(); safeguard must precede resume.
+    expect(safeguardIdx).toBeGreaterThan(mainBody(SERVER_CODE)[0])
+    expect(safeguardIdx).toBeLessThan(startBringUpAt())
   })
 })
 
 describe('server.ts runs every start-time pass over the applied personas (b.av2 SR-6.2)', () => {
   test.each(['trustBootstrap', 'stopHookBootstrap', 'runJsonlPersistenceSafeguard'])(
-    'every %s call comes BEFORE startupSessionManager',
+    'every %s call comes BEFORE the start bring-up (`<controller>.runStartBringUp()` in main())',
     (pass) => {
       const passCalls = callsOf(pass)
-      const startupCalls = callsOf('startupSessionManager')
+      const bringUp = startBringUpAt()
       expect(passCalls.length).toBeGreaterThan(0)
-      expect(startupCalls.length).toBeGreaterThan(0)
-      for (const p of passCalls) for (const s of startupCalls) expect(p).toBeLessThan(s)
+      for (const p of passCalls) expect(p).toBeLessThan(bringUp)
     },
   )
 
-  test.each([...START_PASSES, 'startupSessionManager'])(
+  test.each([...START_PASSES])(
+    'every %s call comes AFTER the start resolution sets the applied config (`<loaded> = <outcome>.config`)',
+    (pass) => {
+      const { assignAt } = startResolution(SERVER_CODE)
+      const passCalls = callsOf(pass)
+      expect(passCalls.length).toBeGreaterThan(0)
+      for (const p of passCalls) expect(p).toBeGreaterThan(assignAt)
+    },
+  )
+
+  test.each([...START_PASSES])(
     '%s takes exactly the loaded persona config',
     (pass) => {
       const loaded = loadedConfigName(SERVER_CODE)
@@ -145,7 +179,7 @@ describe('server.ts installs the pre-launch trust patcher (b.av2 SR-6.2)', () =>
     ['the persona Slack connections', 'createPersonaConnectionManager'],
     ['Bun.serve', 'Bun\\.serve'],
     ['initRestart', 'initRestart'],
-    ['startupSessionManager', 'startupSessionManager'],
+    ['the start bring-up', 'runStartBringUp'],
   ])('installs the patcher BEFORE %s', (_label, anchor) => {
     const [install] = indicesOf(INSTALL, SERVER_CODE)
     expect(install).toBeDefined()
@@ -182,7 +216,7 @@ describe('server.ts installs the pre-launch reply guard with its state dir (b.av
     ['the persona Slack connections', 'createPersonaConnectionManager'],
     ['Bun.serve', 'Bun\\.serve'],
     ['initRestart', 'initRestart'],
-    ['startupSessionManager', 'startupSessionManager'],
+    ['the start bring-up', 'runStartBringUp'],
   ])('installs the reply guard BEFORE %s', (_label, anchor) => {
     const [install] = callsOf('setPreLaunchReplyGuard')
     expect(install).toBeDefined()

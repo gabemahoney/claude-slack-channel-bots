@@ -6,10 +6,13 @@
  * Security: per-persona delivery rules, persona posting scope, file exfiltration
  * guard, bot token sent only to Slack-hosted file URLs.
  *
- * Configuration: `main()` loads the persona configuration from
- * `config.json` in the state directory (`resolveServerConfigPath`). The file is
- * required: a missing, unreadable, pre-persona or invalid file stops the start
- * with one fatal line (b.av2 SR-1.7, SR-8.7). No Slack client is built and no
+ * Configuration: `main()` resolves the start through the reload controller
+ * (`reload.ts`, b.av2 SR-8.7): it runs `config.json.last-applied` beside
+ * `config.json` in the state directory (`resolveServerConfigPath`) when that
+ * record exists, and otherwise validates, records and applies `config.json`.
+ * A missing, unreadable, pre-persona or invalid file with no record, a record
+ * that cannot be read or validated, or a record that cannot be written stops
+ * the start with one line (b.av2 SR-1.7). No Slack client is built and no
  * token is read at module scope (SR-3.1, SR-10.2).
  *
  * Slack: one connection per persona, run by the connection manager
@@ -58,7 +61,6 @@ import {
   type Access,
 } from './lib.ts'
 import {
-  loadStartPersonaConfig,
   expandTilde,
   credentialsFilesToProtect,
   resolveRealPath,
@@ -154,6 +156,8 @@ import { createCronLog } from './cron-log.ts'
 import { createCronDispatcher } from './cron-dispatch.ts'
 import { handleInterject } from './interject.ts'
 import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
+import { createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
+import { PRODUCTION_SLACK_CLIENT_FACTORY } from './persona-slack-clients.ts'
 import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy, withOutageDetection } from './outage-state.ts'
 
 // ---------------------------------------------------------------------------
@@ -341,10 +345,13 @@ function getAccess(): Access {
 /**
  * Refuses files under the state directory outside the inbox, and every
  * persona credentials file named by the applied config or by the config file
- * currently on disk (b.av2 SR-5.2). The protected list is built per call.
+ * currently on disk (b.av2 SR-5.2): the reload controller's guard source,
+ * which main() builds. The protected list is built per call. Before main()
+ * builds the controller there is no applied config, and the config file's
+ * paths are still refused.
  */
 function assertSendable(filePath: string): void {
-  const protectedPaths = credentialsFilesToProtect(personaConfig?.personas ?? [], CONFIG_PATH)
+  const protectedPaths = reloadController?.protectedCredentialsFiles() ?? credentialsFilesToProtect([], CONFIG_PATH)
   libAssertSendable(filePath, resolve(STATE_DIR), resolve(INBOX_DIR), protectedPaths)
 }
 
@@ -652,10 +659,19 @@ const personaRouting = createPersonaRouting({
 // ---------------------------------------------------------------------------
 
 /**
- * The applied persona configuration, as loaded by main() (b.av2 SR-1). Null
- * only before main() loads it; every getter reads it at call time.
+ * The applied persona configuration, as main()'s start resolution chose it
+ * (b.av2 SR-1, SR-8.7): the last-applied record when there is one, never the
+ * edited config file. Null only before main() resolves the start; every
+ * getter reads it at call time.
  */
 let personaConfig: PersonaConfig | null = null
+
+/**
+ * The reload controller (b.av2 SR-8.7): built in main(), which resolves the
+ * start through it; the file guard reads its protected credentials files.
+ * Undefined before main() builds it (nothing is built or read at import).
+ */
+let reloadController: ReloadController | undefined
 
 /**
  * The applied persona with this key, read from the current persona config at
@@ -1044,17 +1060,28 @@ export async function main(): Promise<void> {
   // The agent-director store owns session-id state; CSCB's own sessions.json
   // registry was deleted (SR-7.1, Epic 2).
 
-  // b.av2 SR-1.7 / SR-8.7: the configuration file is required. A missing or
-  // unreadable file, a pre-persona file (the conversion error) or any invalid
-  // file stops the start here, before any port, PID file, Slack connection or
-  // spawn. There is no fallback.
-  try {
-    personaConfig = loadStartPersonaConfig(CONFIG_PATH)
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    console.error(`[slack] Fatal: configuration error — ${msg}`)
-    process.exit(1)
-  }
+  // b.av2 SR-8.7: every start runs the last-applied record
+  // (config.json.last-applied) when there is one, so an edit of config.json
+  // that was never applied does not run. Without a record, config.json is
+  // validated, recorded and applied. A missing, unreadable, pre-persona or
+  // invalid file (with no record), a record that cannot be read or validated,
+  // or a record that cannot be written stops the start here with one logged
+  // line, before any port, PID file, Slack connection or spawn, and after the
+  // PID check, so a duplicate start never writes the record. The start pass
+  // is the controller's lifecycle bring-up, run below after the pre-launch
+  // steps; the bring-up controller it uses is built further down.
+  const reload = createReloadController({
+    paths: reloadFilePaths(CONFIG_PATH),
+    lifecycle: {
+      startBringUp: (applied) => startupSessionManager(applied, { bringUp: personaBringUps }),
+    },
+    log: (line) => console.error(line),
+    slackClientFactory: PRODUCTION_SLACK_CLIENT_FACTORY,
+  })
+  reloadController = reload
+  const start = reload.resolveStart()
+  if (start.kind === 'refused') process.exit(1)
+  personaConfig = start.config
   // b.av2 SR-6.2: the trust patch precedes every launch. Installed as soon as
   // the persona config is set — before the Slack connections, Bun.serve and
   // initRestart — so no launch path (start, restart or a human trigger) can
@@ -1069,7 +1096,9 @@ export async function main(): Promise<void> {
     personaConfig === null ? undefined : preLaunchReplyGuard(persona, () => personaConfig?.personas, STATE_DIR),
   )
   console.error(`[slack] Loaded persona config: ${personaConfig.personas.length} persona(s)`)
-  // The loaded config, for closures below (it is never replaced after this).
+  // The applied config (the record's at a start from the record), for
+  // closures below: the launch after a bring-up retry and the restart delay.
+  // It is never replaced after this.
   const appliedConfig: PersonaConfig = personaConfig
 
   // SR-3.2: refresh the slack-channel-bot agent-director template on every
@@ -1411,9 +1440,11 @@ export async function main(): Promise<void> {
   // up, broken or retrying; a broken or retrying persona is logged, never
   // posted about, and a retrying one is launched later from its own retry.
   // A launch failure raises a notice to the persona's destination. The
-  // server stays up.
+  // server stays up. The pass is the reload controller's start bring-up
+  // (startupSessionManager over the applied set and the bring-up controller),
+  // so it runs exactly the applied persona set.
   try {
-    await startupSessionManager(personaConfig, { bringUp: personaBringUps })
+    await reload.runStartBringUp()
   } catch (err) {
     console.error('[slack] Warning: session startup failed — continuing:', err)
   }
@@ -1444,7 +1475,8 @@ export async function main(): Promise<void> {
 
   // INVARIANT: Health check starts only after startupSessionManager() returns.
   // Promise.allSettled ensures all launches have settled before this point.
-  // Do not move this call earlier in the startup sequence.
+  // Do not move this call earlier in the startup sequence. The reload
+  // detection tick (b.av2 SR-8.2) belongs beside it, for the same reason.
   startHealthCheck(personaConfig.health_check_interval)
 }
 

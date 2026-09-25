@@ -5,10 +5,13 @@
  * SR-6.3: at start, BEFORE any bring-up, the server runs the persona start
  * sweep, which kills and deletes `service=cscb` rows with no `persona` label,
  * an absent persona, the wrong instance ID or the wrong `cwd`. The sweep reads
- * the persona set main() loaded (`loadStartPersonaConfig`). If the call is
- * dropped, moved after the per-persona bring-up (`startupSessionManager`, which
- * brings each persona up and launches it) or fed anything but the loaded
- * config, a stale row survives into the collision ladder.
+ * the applied persona set main()'s start resolution chose (b.av2 SR-8.7:
+ * `personaConfig = start.config`, the last-applied record's at a start from
+ * the record). If the call is dropped, moved before that assignment or after
+ * the start bring-up (`reload.runStartBringUp()`, whose pass brings each
+ * persona up and launches it) or fed anything but the applied config, a
+ * stale row survives into the collision ladder, or the sweep kills the rows
+ * of a persona set that does not run.
  *
  * Why a static audit: main() cannot run in a unit test (the agent-director
  * startup gate, a real port, real Slack connections). This follows the
@@ -20,7 +23,7 @@
 
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
-import { indicesOf, loadedConfigName, stripComments } from './test-helpers/source-audit.ts'
+import { indicesOf, loadedConfigName, startResolution, stripComments } from './test-helpers/source-audit.ts'
 
 const SERVER_SRC = readFileSync('src/server.ts', 'utf-8')
 
@@ -29,7 +32,6 @@ const SERVER_CODE = stripComments(SERVER_SRC)
 
 /** Any call of the sweep in code, awaited or not, whatever its argument. */
 const ANY_SWEEP_CALL = /\breconcileOrphans\s*\(/g
-const STARTUP_CALL = /\bstartupSessionManager\s*\(/g
 
 /** The awaited sweep call with exactly the loaded persona config. */
 function sweepCall(): RegExp {
@@ -48,11 +50,11 @@ describe('server.ts wires the persona start sweep (b.av2 SR-6.3)', () => {
     expect(indicesOf(sweepCall(), SERVER_CODE)).toHaveLength(1)
   })
 
-  test('runs the sweep BEFORE startupSessionManager (the per-persona bring-up and launch)', () => {
+  test('runs the sweep AFTER the start resolution sets the applied config and BEFORE the start bring-up (the per-persona bring-up and launch)', () => {
     const [sweep] = indicesOf(sweepCall(), SERVER_CODE)
-    const startup = indicesOf(STARTUP_CALL, SERVER_CODE)
+    const { assignAt, bringUpAt } = startResolution(SERVER_CODE)
     expect(sweep).toBeDefined()
-    expect(startup.length).toBeGreaterThan(0)
-    for (const s of startup) expect(sweep!).toBeLessThan(s)
+    expect(sweep!).toBeGreaterThan(assignAt)
+    expect(sweep!).toBeLessThan(bringUpAt)
   })
 })

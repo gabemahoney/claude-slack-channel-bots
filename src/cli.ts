@@ -12,10 +12,12 @@
  *   clean_restart  — Exit every configured persona's instance, then stop and
  *                    start the server.
  *
- * The CLI reads the configuration file the server loads
- * (`resolveServerConfigPath`, b.av2 SR-8.7) with the persona loader, and
- * reads no Slack token: each persona's tokens live in its credentials file,
- * which only the server reads (b.av2 SR-10.2).
+ * The CLI takes its settings and persona set from the configuration the
+ * server runs (b.av2 SR-8.7): the last-applied record beside the
+ * configuration file (`resolveServerConfigPath`) when it exists, otherwise
+ * the configuration file (`readAppliedPersonaConfig`). It never writes any
+ * reload file, and reads no Slack token: each persona's tokens live in its
+ * credentials file, which only the server reads (b.av2 SR-10.2).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -25,12 +27,12 @@ import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, sta
 import { spawn, spawnSync } from 'child_process'
 import { isProcessRunning } from './pid.ts'
 import {
-  loadPersonaConfig,
   resolveServerConfigPath,
   resolveServerStateDir,
   type Persona,
   type PersonaConfig,
 } from './config.ts'
+import { readAppliedPersonaConfig, reloadFilePaths } from './reload.ts'
 import { initLogging } from './logging.ts'
 import { ErrSpawnNotFound } from './agent-director-errors.ts'
 import { getClient } from './agent-director-client.ts'
@@ -51,6 +53,12 @@ export const DAEMON_STARTUP_WAIT_MS = 30_000
 
 /** How often `start` checks the daemon while it waits. */
 export const DAEMON_STARTUP_POLL_MS = 100
+
+/** How often `stop` checks whether the server has exited, after SIGTERM and after SIGKILL. */
+export const STOP_POLL_MS = 100
+
+/** How long `stop` waits for the server to die after SIGKILL. */
+export const STOP_KILL_WAIT_MS = 2000
 
 /** Most `server.log` lines `start` repeats when the daemon exits during startup. */
 export const DAEMON_FAILURE_LOG_LINES = 20
@@ -102,9 +110,9 @@ export interface CliDeps {
   fileSize: (path: string) => number
   /** A file's bytes from `offset` to the end, as UTF-8 text; '' when it cannot be read. */
   readFileFrom: (path: string, offset: number) => string
-  /** Current time in milliseconds (the daemon startup wait's clock). */
+  /** Current time in milliseconds (the clock of the daemon startup wait and of `stop`'s exit polls). */
   now: () => number
-  /** Resolve after `ms` milliseconds (the daemon startup wait's clock). */
+  /** Resolve after `ms` milliseconds (the clock of the daemon startup wait and of `stop`'s exit polls). */
   sleep: (ms: number) => Promise<void>
   /** Remove a file. */
   unlinkSync: (path: string) => void
@@ -121,9 +129,13 @@ export interface CliDeps {
   /** Exit the process. */
   exit: (code: number) => never
   /**
-   * Load the persona configuration at `path` (`loadPersonaConfig` in
-   * production). Throws the loader's error unchanged, including E1's
-   * conversion error for a pre-persona file (b.av2 SR-1.7).
+   * The configuration the server runs, for the configuration file at `path`
+   * (`readAppliedPersonaConfig` in production, b.av2 SR-8.7): the last-applied
+   * record beside it when one exists, otherwise the file itself. Throws the
+   * start's wording on failure: a record that cannot be read or validated is
+   * named with the deletion hint (never falling back to the file), and a
+   * file error carries the loader's message, including E1's conversion error
+   * for a pre-persona file (b.av2 SR-1.7). Never writes any reload file.
    */
   loadConfig: (path: string) => PersonaConfig
   /**
@@ -233,7 +245,8 @@ export function createCli(deps: CliDeps): CliHandlers {
    * sequence, extracted so both clean_restart and `stop --stop-bots` reuse the
    * exact same tested logic instead of duplicating it.
    *
-   * Runs once per persona of the configuration file (b.av2 SR-8.7), addressing
+   * Runs once per persona of the configuration the server runs (b.av2 SR-8.7:
+   * the last-applied record, or the configuration file without one), addressing
    * each persona's instance as `cscb_<key>`; see `teardownPersona`. A config
    * with no personas tears down nothing.
    */
@@ -355,14 +368,17 @@ export function createCli(deps: CliDeps): CliHandlers {
     // No token check (b.av2 SR-10.2): the server reads each persona's tokens
     // from its credentials file, never from the environment.
 
-    // b.av2 SR-8.7: the configuration file the server loads must exist. Its
-    // contents are not checked here: the server validates them at start, and
-    // `start` reports that failure from the daemon's log (see
-    // `awaitDaemonStartup`).
+    // b.av2 SR-8.7: the configuration file the server loads, or its
+    // last-applied record, must exist. Their contents are not checked here:
+    // the server validates them at start, and `start` reports that failure
+    // from the daemon's log (see `awaitDaemonStartup`).
     const stateDir = deps.resolveStateDir()
     const configPath = deps.resolveConfigPath()
-    if (!deps.existsSync(configPath)) {
-      console.error(`missing prerequisite: config.json not found at ${configPath}`)
+    const recordPath = reloadFilePaths(configPath).lastApplied
+    if (!deps.existsSync(configPath) && !deps.existsSync(recordPath)) {
+      console.error(
+        `missing prerequisite: config.json not found at ${configPath}, and no config.json.last-applied at ${recordPath}`,
+      )
       deps.exit(1)
     }
 
@@ -586,22 +602,28 @@ export function createCli(deps: CliDeps): CliHandlers {
       return 0
     }
 
-    // Load stop_timeout from config (fall back to 30s if unavailable, a
-    // pre-persona file included)
+    // Load stop_timeout from the record or config (fall back to 30s if
+    // unavailable, a pre-persona file included). A read failure is reported in
+    // one line with the loader's message (which names the file and, for a bad
+    // record, carries the deletion hint, never file content), and the stop
+    // proceeds with the default.
     let stopTimeoutMs = 30_000
     try {
       const config = deps.loadConfig(deps.resolveConfigPath())
       if (typeof config.stop_timeout === 'number') {
         stopTimeoutMs = config.stop_timeout * 1000
       }
-    } catch { /* use default */ }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.error(`[slack] stop: could not load the applied configuration — using the default 30s stop_timeout: ${msg}`)
+    }
 
     // Live process — send SIGTERM and poll until exit or stop_timeout
     deps.kill(pid!, 'SIGTERM')
 
-    const deadline = Date.now() + stopTimeoutMs
-    while (Date.now() < deadline) {
-      await new Promise<void>((r) => setTimeout(r, 100))
+    const deadline = deps.now() + stopTimeoutMs
+    while (deps.now() < deadline) {
+      await deps.sleep(STOP_POLL_MS)
       if (!deps.isProcessRunning(pid!)) {
         try { deps.unlinkSync(pidFile) } catch { /* ignore */ }
         console.error('[slack] Server stopped.')
@@ -614,9 +636,9 @@ export function createCli(deps: CliDeps): CliHandlers {
     deps.kill(pid!, 'SIGKILL')
 
     // Poll briefly (~2s) to confirm death after SIGKILL
-    const killDeadline = Date.now() + 2000
-    while (Date.now() < killDeadline) {
-      await new Promise<void>((r) => setTimeout(r, 100))
+    const killDeadline = deps.now() + STOP_KILL_WAIT_MS
+    while (deps.now() < killDeadline) {
+      await deps.sleep(STOP_POLL_MS)
       if (!deps.isProcessRunning(pid!)) {
         try { deps.unlinkSync(pidFile) } catch { /* ignore */ }
         console.error('[slack] Server killed.')
@@ -784,7 +806,7 @@ if (import.meta.main) {
     resolveConfigPath: () => resolveServerConfigPath(),
     startServer: async () => { const { main } = await import('./server.ts'); return main() },
     exit: (code) => process.exit(code),
-    loadConfig: (path) => loadPersonaConfig(path),
+    loadConfig: (path) => readAppliedPersonaConfig(path),
     // b.qwo: install the AD Client singleton via the non-exiting startup gate
     // before teardown. runStartupGate performs Client.create() + setClient() and
     // returns a typed outcome; on failure we throw so the caller (clean_restart /

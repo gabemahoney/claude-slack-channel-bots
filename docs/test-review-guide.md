@@ -50,10 +50,14 @@ When reviewing tests, check for:
 - [ ] Persona suites drive virtual time with `createFakeClock` from `tests/test-helpers/fake-clock.ts`; a hand-rolled fake timer or clock is a defect
 - [ ] Connection tests build the manager with the `factory` from `makeStubSlackFactory` and the fake clock, and check client options through the factory's build records; a test that builds a real Slack client, or omits `factory` or `clock` so the production default applies, is a defect
 - [ ] An isolation test that makes one persona fail, drop or hang also checks that the healthy persona keeps delivering its events; one that asserts only on the failing persona is a defect
+- [ ] Reload-controller tests use `makeReloadHarness` from `tests/test-helpers/reload-harness.ts`: ticks are driven only through the harness's manual tick driver (`run.ticks`), and a real timer, `sleep` or timer-backed tick driver in a reload test is a defect
+- [ ] A reload test builds every SR-8.1 path (`config.json`, `.pending`, `.apply`, `.last-applied`) and every credentials file and working directory through the harness, under its temp root; a hand-built reload path, or any path outside the harness's temp directory, is a defect
+- [ ] Lifecycle effects in a reload test (bring-ups, launches, teardowns, reconnects, in-place updates) are asserted through the harness's lifecycle recorder, not a hand-rolled `ReloadLifecycleOps` stub
 
 ### Credentials and Leak Checks
 - [ ] Every test that handles tokens or a credentials file runs `assertNoLeak` over all its captured log lines, errors and results, failure paths included; a missing call is a defect
 - [ ] Files the code under test wrote are passed to `assertNoLeak` wrapped in `writtenFile`, not as a bare path string (which is checked only as text)
+- [ ] Every reload test runs `assertNoLeak(run.captured())` for each run, failure paths included, so its logs and every reload file it wrote are checked; a reload test with no `assertNoLeak` is a defect
 - [ ] No token literal anywhere in the test file, fake or not; every token comes from `fakeToken`, `makeCredentials` or `writeCredentialsFile` and so embeds `LEAK_SENTINEL`, and the sentinel's value is never copied in
 - [ ] Credentials files and working-directory fixtures are created only under the test's `mkdtempSync` directory, never under `~/.claude/channels/slack`, `~/.agent-director` or any other real-home path
 - [ ] Permission cases use the injected file-system seam so they pass as root; real-permission variants are `test.skipIf(isRoot)` with the reason in the test name

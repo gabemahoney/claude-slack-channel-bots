@@ -68,6 +68,12 @@ export interface ConnectionHarnessOptions {
   overrides?: Partial<Omit<PersonaConfig, 'personas'>>
   /** Write each persona's credentials file (its own fake tokens) and create its working directory. */
   files?: boolean
+  /**
+   * Per-persona-name tokens to register (and, with `files`, write) instead of
+   * the default `<key>-bot` / `<key>-app` fakes, e.g. a rotated set. Each must
+   * be sentinel-bearing (`fakeToken`) and distinct from every other persona's.
+   */
+  tokens?: Readonly<Record<string, PersonaSlackTokens>>
 }
 
 /** One call of `h.connections.bringUp`. A boolean, so a failure never prints a token. */
@@ -130,10 +136,12 @@ export function makeConnectionHarness(
   const clock = createFakeClock()
   const tokensByKey = new Map<string, PersonaSlackTokens>()
   for (const persona of personas) {
-    const tokens = new PersonaSlackTokens(
-      fakeToken(BOT_TOKEN_PREFIX, `${persona.key}-bot`),
-      fakeToken(APP_TOKEN_PREFIX, `${persona.key}-app`),
-    )
+    const tokens =
+      opts.tokens?.[persona.name] ??
+      new PersonaSlackTokens(
+        fakeToken(BOT_TOKEN_PREFIX, `${persona.key}-bot`),
+        fakeToken(APP_TOKEN_PREFIX, `${persona.key}-app`),
+      )
     tokensByKey.set(persona.key, tokens)
     if (!dryRun) slack.addPersona(persona.key, tokens, { leakMarker: LEAK_SENTINEL, ...opts.stubOptions?.[persona.name] })
     if (opts.files) {
