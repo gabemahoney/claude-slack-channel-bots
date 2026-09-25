@@ -35,7 +35,14 @@ import type { FindMissingParams, SendKeysParams, StatusParams } from 'agent-dire
 import type { PersonaConfig } from '../src/config.ts'
 import { personaInstanceId } from '../src/persona-identity.ts'
 import { makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
-import { assertNoLeak, writeCredentialsFile } from './test-helpers/credentials.ts'
+import {
+  APP_TOKEN_PREFIX,
+  BOT_TOKEN_PREFIX,
+  LEAK_SENTINEL,
+  assertNoLeak,
+  fakeToken,
+  writeCredentialsFile,
+} from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
 // assertSendable()
@@ -422,6 +429,34 @@ describe('_buildIsSessionAliveAdapter', () => {
 
     expect(await adapter('C1')).toBe(false)
     expect(statusCalls).toHaveLength(0)
+  })
+
+  // AC 20 (b.av2 SR-10.3): the catch-all status-error line logs the error's
+  // description (type, safe code, frames), never the error itself. Every
+  // console.error argument is kept unformatted, so a raw error fails the check.
+  test('AC 20: any other status error carrying fake tokens → one "status error" line naming its type and code only; returns false, no flag, nothing leaks', async () => {
+    const statusError = Object.assign(new Error(`status failed ${fakeToken(BOT_TOKEN_PREFIX, 'msg')}`), {
+      code: 'EIO',
+      detail: fakeToken(APP_TOKEN_PREFIX, 'detail'),
+      note: LEAK_SENTINEL,
+    })
+    const { emissions, adapter } = makeHarness(statusError)
+    const errArgs: unknown[][] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { errArgs.push(args) }
+    let result: boolean | undefined
+    try {
+      result = await adapter('C1')
+    } finally {
+      console.error = orig
+    }
+
+    expect(result).toBe(false)
+    expect(getOutageFlags('C1').size).toBe(0)
+    expect(errArgs).toHaveLength(1)
+    expect(errArgs[0]).toHaveLength(1)
+    expect(String(errArgs[0]![0])).toStartWith('[slack] isSessionAlive: status error for persona=C1: Error code=EIO at ')
+    assertNoLeak({ errArgs, emissions })
   })
 })
 

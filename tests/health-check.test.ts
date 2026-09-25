@@ -41,7 +41,7 @@ import {
   type ConnectionHarness,
   type ConnectionHarnessOptions,
 } from './test-helpers/persona-connection-harness.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
+import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -304,6 +304,39 @@ describe('startHealthCheck', () => {
 
     expect(deps.scheduleRestartCalls.some(c => c.key === 'dead_bot')).toBe(true)
     expect(deps.scheduleRestartCalls.some(c => c.key === 'failing_bot')).toBe(false)
+  })
+
+  // AC 20 (b.av2 SR-10.3): the per-persona catch logs the error's description
+  // (type, safe code, frames), never the error itself. Every console.error
+  // argument is kept unformatted, so a raw error fails the leak check.
+  test('AC 20: a persona check throws an error carrying fake tokens — one "error checking" line naming its type and code only; the other persona is still restarted; nothing leaks', async () => {
+    const deps = makeDeps({ personas: workList('failing_bot', 'dead_bot'), maxTicks: 1 })
+    const alive = deps.isSessionAlive
+    deps.isSessionAlive = async (key) => {
+      if (key !== 'failing_bot') return alive(key)
+      throw Object.assign(new Error(`status failed ${fakeToken(BOT_TOKEN_PREFIX, 'msg')}`), {
+        code: 'EIO',
+        detail: fakeToken(APP_TOKEN_PREFIX, 'detail'),
+        note: LEAK_SENTINEL,
+      })
+    }
+    initHealthCheck(deps)
+    const errArgs: unknown[][] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { errArgs.push(args) }
+    try {
+      startHealthCheck(FAST_INTERVAL_S)
+      await Bun.sleep(WAIT_MS)
+    } finally {
+      console.error = orig
+    }
+
+    expect(deps.scheduleRestartCalls.map((c) => c.key)).toEqual(['dead_bot'])
+    const lines = errArgs.filter((args) => String(args[0]).includes('error checking'))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toHaveLength(1)
+    expect(String(lines[0]![0])).toStartWith('[slack] health-check: error checking persona=failing_bot: Error code=EIO at ')
+    assertNoLeak({ errArgs, notices })
   })
 
   test('6. zero interval disables poller — isSessionAlive never called', async () => {

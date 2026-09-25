@@ -363,7 +363,7 @@ export function makeDefaultArchiveCount(
         .get(...ids, sinceEpochSeconds) as { n: number } | null
       return row ? Number(row.n) : 0
     } catch (err) {
-      console.error(`[slack] jsonl-persistence-check: archive count failed for ${ref}:`, err)
+      console.error(`[slack] jsonl-persistence-check: archive count failed for ${ref}: ${describeThrownValue(err)}`)
       return null
     } finally {
       try {
@@ -499,7 +499,7 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
       return
     }
     // Case 6: any other AD/get error — warn and move on.
-    console.error(`[slack] jsonl-persistence-check: AD get failed for ${ref} — skipping:`, err)
+    console.error(`[slack] jsonl-persistence-check: AD get failed for ${ref} — skipping: ${describeThrownValue(err)}`)
     return
   }
 
@@ -735,12 +735,12 @@ export async function runJsonlPersistenceSafeguard(
         await checkPersonaTranscript(persona, fx)
       } catch (err) {
         console.error(
-          `[slack] jsonl-persistence-check: unexpected error checking ${personaRef(persona)} — continuing:`,
-          err,
+          `[slack] jsonl-persistence-check: unexpected error checking ${personaRef(persona)} — continuing: ` +
+            describeThrownValue(err),
         )
       }
     }
   } catch (err) {
-    console.error('[slack] Warning: jsonl-persistence-check failed unexpectedly — startup continues:', err)
+    console.error(`[slack] Warning: jsonl-persistence-check failed unexpectedly — startup continues: ${describeThrownValue(err)}`)
   }
 }

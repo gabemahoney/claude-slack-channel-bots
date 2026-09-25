@@ -214,7 +214,7 @@ Two personas share the channel `C0555555555`. `planner` receives every message i
 
 | Field | Required | Description |
 |---|---|---|
-| `name` | yes | The persona's name, used in logs, `/interject` and the crontable. Each persona also has a **key**: the name itself when it is 1–40 characters of `a-z`, `0-9` and `_`, otherwise a derived form. Logs show both, as `"planner" (key=planner)`. |
+| `name` | yes | The persona's name, used in logs, `/interject` and the crontable. Each persona also has a **key**: the name itself when it is 1–40 characters of `a-z`, `0-9` and `_`, otherwise a derived form. Logs show both, as `"planner" (key=planner)`. The name is shown in logs and Slack messages, so it must not look like a Slack token: a name containing a Slack-token-shaped part (a prefix such as `xoxb-`, `xoxp-` or `xapp-` followed by a digit, not glued to a letter or digit before it) is rejected. Ordinary names such as `inboxapp-bot` or `sandboxapp-1` are fine. |
 | `credentials_file` | yes | Path to the persona's [credentials file](#credentials-files). Absolute, `~` or `~/…`. |
 | `working_directory` | yes | Working directory of the persona's Claude instance. Absolute, `~` or `~/…`. |
 | `channels` | yes, unless `dm.enabled` is `true` | The channels the persona is in. Each entry is `{ "id": "<channel ID>", "delivery": "all" \| "mentions" }`: `all` delivers every message in the channel, `mentions` only messages that @mention the persona or use `@here` / `@channel`. Invite the persona's Slack app to each channel. |
@@ -281,8 +281,8 @@ Each persona's Slack tokens live in its own credentials file, and `config.json` 
 
 ```json
 {
-  "bot_token": "xoxb-PLACEHOLDER",
-  "app_token": "xapp-PLACEHOLDER"
+  "bot_token": "<bot token, starts with xoxb->",
+  "app_token": "<app-level token, starts with xapp->"
 }
 ```
 
@@ -491,7 +491,7 @@ server-wide setting port changed: once applied, it is recorded and takes effect 
 server-wide setting claude_config_dir changed: inherited by "planner" (key=planner), "reviewer" (key=reviewer); takes effect at each one's next launch, which starts fresh (the conversation is not resumed), instance kept until then.
 ```
 
-The preview describes the full effect of the change. Server-wide settings take effect only at the next start, and `claude_config_dir` and `stop_hook_bootstrap` at the persona's next launch; see [What takes effect at the next start](#what-takes-effect-at-the-next-start).
+The preview describes the full effect of the change. What each kind of change does once confirmed is in [What a confirmation applies](#what-a-confirmation-applies).
 
 Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In `server.log`, each preview line (everything after the `fingerprint:` line and the blank line) is prefixed `[slack] reload-preview:`, and the first one ends with where the preview is written: ` (preview in "<path of config.json.pending>")`.
 
@@ -500,11 +500,12 @@ Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In 
 | `DESTRUCTIVE: …` | Applying it destroys that persona's live session: its instance and its conversation. A removed persona is torn down. A persona whose `name`, `credentials_file` or `working_directory` changed is torn down and brought up fresh. |
 | `… is added but cannot come up: …` | The new persona would fail to come up, for the reasons given. |
 | `credentials file "<path>" changed: …` | The persona's credentials file changed at the same path. The line names the persona and the path, never a token, and says what applying it does: a persona that is up opens a new connection, then closes the old one; a persona still retrying retries with the new content; a persona down because of its credentials `will be brought up`. |
-| `credentials file "<path>" changed, but it cannot be used (<cause>): …` | The new content is missing, unreadable or invalid, for example `credentials file does not exist`. A persona that is up keeps its current connection, and a persona still retrying keeps retrying with its current content; confirming logs `persona-credentials-change-failed` in `server.log`, and the change stays pending. A persona down because of its credentials stays down, and confirming logs its usual credentials line and leaves nothing pending. Every start reads the file as it stands, so after a restart the persona stays down until the file is fixed. |
+| `credentials file "<path>" changed, but it cannot be used (<cause>): …` | The new content is missing, unreadable or invalid, for example `credentials file does not exist`. A persona that is up keeps its current connection, and a persona still retrying keeps retrying with its current content; confirming logs `persona-credentials-change-failed` in `server.log`, and the change stays pending. A persona down because of its credentials stays down, and confirming logs its usual credentials line and leaves nothing pending. Every start reads the file as it stands, so after a restart the persona is down until the file is fixed and the change confirmed. |
 | `claude_config_dir changed: …, which starts fresh (the conversation is not resumed)` | The persona's next launch uses the new config directory and starts a new conversation. The running instance is kept until then. |
 | `… could not be checked.` | The server couldn't check whether an added persona can come up, or whether a persona is down because of its credentials. `server.log` has a `reload: cannot check …` line; report it as a bug. |
 | `server-wide setting … inherited by …` | A changed top-level default. The line lists the personas that inherit it. If none does, it says `no persona inherits it, so no instance is affected`. |
 | `server-wide setting … changed: once applied, it is recorded and takes effect at the next server start after that.` | A setting such as `port` or `bind`. It doesn't take effect until the server starts after the change is applied. |
+| `server-wide setting … changed: once applied, it is recorded, and the CLI takes it from the record from then on (the running server does not use it).` | `stop_timeout` or `exit_timeout`. Only the CLI uses them: once the change is applied, the next `stop` or `clean_restart` uses the new value, with no restart needed. |
 | `INVALID: <error> Nothing will be applied.` | The edited `config.json` is invalid or missing. Fix the file; nothing is applied until it is valid. `server.log` shows a `reload-invalid` line. |
 | `… no effective change: …` | The edit changes nothing that runs (for example, whitespace, or a default written out). |
 
@@ -516,7 +517,7 @@ To apply a pending change, rename `config.json.pending` to `config.json.apply` i
 cd "${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}" && mv config.json.pending config.json.apply
 ```
 
-Read the preview first. The server picks the confirmation up at its next check, within about 5 seconds; a check still running an earlier apply delays it, so `reload-applied` can come minutes later. It deletes the confirmation and applies it without a restart, except for the changes listed under [What takes effect at the next start](#what-takes-effect-at-the-next-start).
+Read the preview first. The server picks the confirmation up at its next check, within about 5 seconds; a check still running an earlier apply delays it, so `reload-applied` can come minutes later. It deletes the confirmation and applies it without a restart; next-launch and server-wide settings are recorded and take effect later (see [What a confirmation applies](#what-a-confirmation-applies)).
 
 You can direct an agent to do the rename for you. Nothing has to be computed, copied or typed. A confirmation made while the server is stopped is processed at the first check after the next start.
 
@@ -536,28 +537,36 @@ grep -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed)' "
 
 ### What a confirmation applies
 
-| Change | What happens |
-|---|---|
-| A persona is added | It is brought up exactly as at start, including the storage check (`jsonl-non-persistent`, see [Startup errors](#startup-errors)). If its credentials file or working directory is bad, it logs the same lines as at start and never affects running personas. See "A persona doesn't come up or doesn't answer" in [Troubleshooting](#troubleshooting). |
-| A persona is removed | It is torn down. Its instance, its agent-director row and its conversation are destroyed. Its posted permission prompts stay in Slack, and clicking one has no effect. |
-| A persona's `name` changes | A removal plus an addition. The old session is destroyed, and a fresh one starts with no history. |
-| A persona's `credentials_file` path or `working_directory` changes | It is torn down and brought up fresh from its new entry, with no restart. Its instance, its agent-director row and its conversation are destroyed, and the new credentials file is read. See [Destructive changes](#destructive-changes). |
-| `channels`, `delivery`, `permission_prompts`, `dm.enabled` or `dm.contact` changes | Applied in place, from the next event or post. The instance and its conversation are kept. A changed DM contact is used for the next prompt. |
-| A credentials file's content changes (same path), such as a rotated token | Only that persona is reconnected: the new connection opens, then the old one closes, and its instance and conversation are kept. A persona whose launch is waiting for its `claude_config_dir` (`persona-config-dir-unresolvable`) is reconnected the same way and keeps waiting. A persona down because of its credentials comes up with the fixed file, with no restart. For a running persona, if the new file can't be used, the old connection keeps running, `server.log` shows `persona-credentials-change-failed`, and the change stays pending. A persona down because of its credentials whose new file can't be used stays down with its usual line, such as `persona-credentials-invalid`. |
-| A persona's declaration and credentials are unchanged | It is not touched. |
+Each row is one kind of change: what happens once you confirm it, and what happens to the persona's live session (its instance and its conversation).
 
-### What takes effect at the next start
+| Change | Once confirmed | Live session |
+|---|---|---|
+| `channels`, `delivery`, `permission_prompts`, `dm.enabled` or `dm.contact` changes | Applied in place, immediately: from the next event or post. A changed DM contact is used for the next prompt. | Kept |
+| A credentials file's content changes (same path), such as a rotated token | Only that persona reconnects: the new connection opens, then the old one closes. If the new file can't be used or Slack refuses it, the old connection keeps running, `server.log` shows `persona-credentials-change-failed`, and the change stays pending. If Slack can't be reached, the old connection stays in use while the new one retries. A persona that is retrying (Slack unreachable, or its working directory unusable) retries with the new content. A persona whose launch is waiting for its `claude_config_dir` (`persona-config-dir-unresolvable`) is reconnected and keeps waiting. A persona down because of its credentials comes up on the confirmed change, with no restart; if its new file can't be used, it stays down with its usual line, such as `persona-credentials-invalid`, and nothing stays pending. | Kept |
+| `claude_config_dir` changes (the persona's own or inherited) | Recorded. The persona's next launch uses it and starts fresh when the directory changed: the conversation is not resumed, and the old transcript stays in the old directory. | Kept until the next launch |
+| `stop_hook_bootstrap` changes (the persona's own or inherited) | Recorded. The persona's next launch uses it. | Kept |
+| A persona is removed | Torn down. Its agent-director row is destroyed too. Its posted permission prompts stay in Slack, and clicking one has no effect. Previewed `DESTRUCTIVE:`. | Destroyed |
+| A persona's `credentials_file` path or `working_directory` changes | Torn down, then brought up fresh from its new entry, with no restart. Its agent-director row is destroyed too, and the new credentials file is read. Previewed `DESTRUCTIVE:`. See [Destructive changes](#destructive-changes). | Destroyed |
+| A persona's `name` changes | A removal plus an addition: the name sets the key. The old persona is torn down and the new one brought up fresh. The removal half is previewed `DESTRUCTIVE:` (`DESTRUCTIVE: persona "<old name>" … is removed`), followed by an `… is added` line for the new name. | Destroyed |
+| A server-wide setting changes, such as `port` | Recorded. The running server keeps its current value, and the next server start uses the recorded one. `stop_timeout` and `exit_timeout` are the exception: only the CLI uses them, and it takes them from the record at once, so the next `stop` or `clean_restart` uses them. | Not affected |
+| A persona is added | Brought up exactly as at start, including the storage check (`jsonl-non-persistent`, see [Startup errors](#startup-errors)). If its credentials file or working directory is bad, it logs the same lines as at start and never affects running personas. See "A persona doesn't come up or doesn't answer" in [Troubleshooting](#troubleshooting). | New session |
 
-A confirmation records these changes, and they take effect later:
+- **Inherited defaults.** A changed top-level `claude_config_dir` or `stop_hook_bootstrap` takes effect at each inheriting persona's next launch. The preview lists those personas; a persona that sets its own value isn't affected.
+- **Unchanged personas.** A persona whose declaration and credentials are unchanged is not touched.
+- **Several changes to one persona.** A `credentials_file` path or `working_directory` change wins: the persona is brought up fresh from its new entry, which carries its other changes with it. Otherwise each change applies as its row says. The order is teardowns, in-place updates, credentials reconnects, then bring-ups.
+- **Fixed on Slack's side.** A persona down because Slack refused its tokens, fixed in Slack (for example, its app re-installed) with the same tokens, has nothing pending. Re-save its credentials file with any byte change (a trailing newline is enough), wait for the pending change, then confirm it. The `debug-slack-channel-bots` skill (see [Troubleshooting](#troubleshooting)) has the details.
 
-- **Server-wide settings** such as `port` or `bind`. The running server keeps the values it started with, and the next start uses the recorded ones. `stop_timeout` and `exit_timeout` are the exception: only the CLI uses them, and it reads them from the record, so the next `stop` or `clean_restart` uses them.
-- **`claude_config_dir` or `stop_hook_bootstrap`**, the persona's own or inherited from the top level. The running instance and its conversation are kept, and the persona's next launch uses the new value. That launch happens when the bot dies (a crash or a failed health check), at a `clean_restart`, at `stop --stop-bots` then `start`, or after a host reboot. A plain `stop` and `start` reconnects to the running instance, which is not a launch. A changed `claude_config_dir` makes that launch start fresh.
+### When next-launch and server-wide changes take effect
+
+A persona's next launch happens when the bot dies (a crash or a failed health check), at a `clean_restart`, at `stop --stop-bots` then `start`, or after a host reboot. A plain `stop` and `start` reconnects to the running instance, which is not a launch. Server-wide settings take effect at the next server start (except `stop_timeout` and `exit_timeout`; see the table).
 
 To make them take effect sooner, wait for the `reload-applied` line, then run `claude-slack-channel-bots clean_restart`. It reads the bot list from the record before it stops the server, so if you run it earlier it can work from the old record. The server comes back on the record, and every bot is relaunched. Conversations resume, except that a changed `claude_config_dir` starts that persona fresh.
 
 ### Destructive changes
 
-`DESTRUCTIVE:` lines in the preview name the sessions the change destroys when you confirm it. A removed or renamed persona is torn down. A persona whose `credentials_file` path or `working_directory` changed is torn down and then brought up fresh from its new entry, with no restart. If the teardown can't delete the persona's agent-director row (for example, agent-director is unreachable), the bring-up finds that row. A row whose working directory or config directory no longer matches is replaced. When only the `credentials_file` path changed, the row still matches, so the bring-up may resume it with its conversation. Read the preview before you rename it. There is no undo. Re-adding a removed persona brings up a fresh session, and the old conversation isn't guaranteed to resume.
+`DESTRUCTIVE:` lines in the preview name the sessions the change destroys when you confirm it (see the table above). Read the preview before you rename it. There is no undo. Re-adding a removed persona brings up a fresh session, and the old conversation isn't guaranteed to resume.
+
+If the teardown can't delete the persona's agent-director row (for example, agent-director is unreachable), the bring-up finds that row. A row whose working directory or config directory no longer matches is replaced. When only the `credentials_file` path changed, the row still matches, so the bring-up may resume it with its conversation.
 
 ### Stale confirmations
 
@@ -1133,7 +1142,8 @@ grep -E '\(key=<key>\)|persona=<key>\b' ~/.claude/channels/slack/server.log
 
 | Class | Persona | What to do |
 |---|---|---|
-| `persona-credentials-missing`, `-unreadable`, `-invalid`, `-refused` | Stays down | Fix the credentials file, then confirm the pending change; the persona comes up with no restart |
+| `persona-credentials-missing`, `-unreadable`, `-invalid` | Stays down | Fix the credentials file, then confirm the pending change; the persona comes up with no restart |
+| `persona-credentials-refused` | Stays down | Put a working token in the credentials file, then confirm the pending change; the persona comes up with no restart. If the fix was made on Slack's side and the tokens are unchanged, nothing is pending: re-save the credentials file with any byte change (a trailing newline is enough), then confirm |
 | `persona-credentials-change-failed` | Keeps running on its old credentials | Fix the credentials file, then confirm the new pending change |
 | `persona-slack-unreachable` | Retries on its own | Nothing; it comes up once Slack answers |
 | `persona-directory-*` | Retries on its own | Create or fix the working directory; the persona comes up with no restart |
@@ -1159,7 +1169,7 @@ grep unclaimed-channel ~/.claude/channels/slack/server.log
 Add the channel to a persona's `channels` and apply the change (see [Reload](#reload)). Restarting the server alone doesn't apply it.
 
 **Permission relay not working**
-Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json` and apply the change (see [Reload](#reload)).
+Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json` and apply the change (see [Reload](#reload)); like every server-wide setting, it takes effect at the next server start.
 
 **A permission prompt or notice doesn't arrive**
 When Slack refuses a post to a persona's destination, the server holds the persona's prompts and notices and retries them with backoff. Once Slack accepts posts again, held notices are delivered, and a prompt is posted if its request is still open. It logs one `persona-destination-failed` line in `server.log` naming the persona, its destination and Slack's error, and one `cleared` line when posting works again:
@@ -1193,7 +1203,7 @@ The notice names the sender (by display name, or user ID; for a bot or webhook p
 
 A `starting now` restart still counts each failed launch toward the backoff/cap, and a restart already pending or active is not stacked.
 
-A **capped** persona (or any persona when auto-restart is disabled via `session_restart_delay: 0`) does **not** recover on an inbound message — firing another launch there would only burn a spawn attempt against a persona that cannot come up. To clear the cap and retry, restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`; the failure counter is in-process and cleared on restart, giving each persona a fresh attempt. To disable auto-restart entirely, set `session_restart_delay` to `0` in `config.json` and apply the change (see [Reload](#reload)).
+A **capped** persona (or any persona when auto-restart is disabled via `session_restart_delay: 0`) does **not** recover on an inbound message — firing another launch there would only burn a spawn attempt against a persona that cannot come up. To clear the cap and retry, restart the server with `claude-slack-channel-bots stop && claude-slack-channel-bots start`; the failure counter is in-process and cleared on restart, giving each persona a fresh attempt. To disable auto-restart entirely, set `session_restart_delay` to `0` in `config.json` and apply the change (see [Reload](#reload)); it takes effect at the next server start.
 
 **Bot alive but silently unresponsive (MCP disconnected)**
 A bot can stay running yet lose its MCP connection to the server — the process is alive but no longer reachable, so it stops responding without ever emitting a disconnect event. The periodic health-check recovers this automatically: once a persona is seen alive-but-disconnected on two consecutive ticks, the health-check schedules a reconnect (or a relaunch if the process has since died), so a stranded persona comes back with no inbound message and no server restart. The recovery lands within roughly two `health_check_interval` periods (default 120 s each) plus the restart backoff delay (default `session_restart_delay` 60 s) before the reconnect runs — about 3–5 minutes with default settings. A bot mid-turn (`working` state) is deliberately left alone and reconnected on a later tick once its turn settles.
@@ -1214,7 +1224,7 @@ With `resume_enabled: true`, a bot whose host rebooted (or pod resumed) should r
 A bot also starts fresh, by design, when its session no longer matches the applied configuration. A config edit takes effect only once it is applied (see [Reload](#reload)); a restart or reboot alone runs the last-applied record. When a change to a persona's `working_directory` is applied, the persona is torn down and brought up fresh at once. When a change to a persona's effective `claude_config_dir` (its own or the top-level default) is applied, the bot starts fresh the next time it would be resumed: after `clean_restart`, after `stop --stop-bots` then `start`, after a reboot, or when the bot dies. A bot that keeps running across a plain `stop` and `start` keeps its old config directory until then. The old transcript stays in the old config directory. The first start after upgrading from an earlier release also replaces every existing bot once, because the server removes managed sessions it cannot attribute. The log names the reason: search `server.log` for `sweeping row`, `replacing the row` or `not resuming; spawning fresh`.
 
 **Session crashes on resume with "sandbox required but unavailable"**
-This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json` and apply the change (see [Reload](#reload)) to disable `--resume` entirely — the bot will always start a fresh Claude session instead of resuming a prior conversation, both on startup and on runtime auto-restart:
+This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json`, apply the change and restart the server (server-wide settings take effect at the next start; see [Reload](#reload)) to disable `--resume` entirely — the bot will always start a fresh Claude session instead of resuming a prior conversation, both on startup and on runtime auto-restart:
 
 ```json
 {

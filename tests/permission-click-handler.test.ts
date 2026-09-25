@@ -68,9 +68,10 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { ErrSystemInstallDisappeared, type Client, type DecideParams, type DecideResult } from 'agent-director'
+import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable, type Client, type DecideParams, type DecideResult } from 'agent-director'
 import { handlePermissionClick, type ClickDeps } from '../src/permission-click-handler.ts'
 import { encodePermissionActionId } from '../src/permission-action-id.ts'
+import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { personaKeyFromActionId } from './test-helpers/action-id-key.ts'
 import {
   _resetPollerState,
@@ -86,12 +87,13 @@ import {
   cannedPermissionRequest,
   errAlreadyDecided,
   errAmbiguousRequest,
+  errGeneric,
   errInvalidFlags,
   errRelayFallenBack,
 } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeStubSlack, openedDm, type StubSlack } from './test-helpers/slack-stub.ts'
-import { LEAK_SENTINEL, assertNoLeak } from './test-helpers/credentials.ts'
+import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
 import {
   makePersonaClients,
   makeTrailCapture,
@@ -881,6 +883,76 @@ describe('handlePermissionClick — decide-error handling (SR-4.4)', () => {
     expect(h.stubA.calls.update).toHaveLength(0)
     expect(h.stubB.calls.update).toHaveLength(0)
     expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(false)
+  })
+
+  // AC 20 (b.av2 SR-10.3): the catch-all line logs the error's description
+  // (type, safe code, frames), never the error itself or its message.
+  /** A non-agent-director decide error whose message and properties carry fake tokens. */
+  const sentinelDecideError = (): Error =>
+    Object.assign(new Error(`socket closed ${fakeToken(BOT_TOKEN_PREFIX, 'msg')}`), {
+      code: 'ECONNRESET',
+      detail: fakeToken(APP_TOKEN_PREFIX, 'detail'),
+      note: LEAK_SENTINEL,
+    })
+
+  /** Click allow on A's seeded prompt with decide rejecting `err`; returns the log calls and trail. */
+  async function clickWithFailingDecide(err: Error): Promise<{ result: boolean; logs: unknown[][]; trail: ReturnType<typeof makeTrailCapture> }> {
+    await seedLiveEntry({ requestToken: TOKEN_A })
+    const decide = makeDecideStub({ throwOn: err })
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    const logs: unknown[][] = []
+    const trail = makeTrailCapture()
+    const result = await handlePermissionClick(
+      encodePermissionActionId('allow', h.instanceA, TOKEN_A),
+      clickDeps({ log: (...args: unknown[]) => logs.push(args), emitTrail: trail.emit }),
+    )
+    return { result, logs, trail }
+  }
+
+  // E13 Director decision 16: an agent-director errName is logged only when it
+  // passes `isSafeIdentifier`; a token-shaped one falls back to the description.
+  test.each([
+    { label: 'a non-AgentDirectorError carrying fake tokens', makeErr: sentinelDecideError, desc: 'Error code=ECONNRESET at ' },
+    {
+      label: 'an AgentDirectorError with a token-shaped errName',
+      makeErr: () => errGeneric('decide', fakeToken(BOT_TOKEN_PREFIX, 'errname'), 'transient'),
+      desc: 'AgentDirectorError at ',
+    },
+  ])('AC 20: $label → one "decide failed" line naming its type and safe code only; no log line or Slack call leaks', async ({ makeErr, desc }) => {
+    const { result, logs } = await clickWithFailingDecide(makeErr())
+
+    expect(result).toBe(true)
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toHaveLength(1)
+    expect(String(logs[0]![0])).toStartWith(`[slack] permission-click: decide failed for ${h.instanceA}: ${desc}`)
+    expect(h.stubA.calls.update).toHaveLength(0)
+    assertNoLeak({ logs, slack: h.stubA.web.callLog })
+  })
+
+  // AC 20 / E13 Director decision 16: the trail's raw_error_message
+  // (SR-V-2.7) is recorded with URL-like and token-like text replaced, on
+  // both the `other` branch and the ad/tmux carve-out.
+  const redactableText = (): string => `via https://files.example.test/upload?id=7 ${fakeToken(APP_TOKEN_PREFIX, 'msg')}`
+  test.each([
+    { label: 'a non-AgentDirectorError', resultClass: 'other', makeErr: () => new Error(`socket closed ${redactableText()}`) },
+    {
+      label: 'ErrSystemInstallDisappeared (carve-out)',
+      resultClass: 'ErrSystemInstallDisappeared',
+      makeErr: () => new ErrSystemInstallDisappeared('decide', `/opt/ad ${redactableText()}`),
+    },
+    {
+      label: 'ErrTmuxNotAvailable (carve-out)',
+      resultClass: 'ErrTmuxNotAvailable',
+      makeErr: () => new ErrTmuxNotAvailable('decide', 'ErrTmuxNotAvailable', `tmux not found ${redactableText()}`),
+    },
+  ])('AC 20: $label whose message holds a URL and a fake token → its cscb.ad_decide.attempted event records the message redacted', async ({ resultClass, makeErr }) => {
+    const { logs, trail } = await clickWithFailingDecide(makeErr())
+
+    const events = trail.events.filter((e) => e.event === 'cscb.ad_decide.attempted')
+    expect(events).toHaveLength(1)
+    expect(events[0]!['result_class']).toBe(resultClass)
+    expect(String(events[0]!['raw_error_message'])).toContain(`via ${REDACTED_URL_PLACEHOLDER} ${REDACTED_TOKEN_PLACEHOLDER}`)
+    assertNoLeak({ logs, trail: trail.events, slack: h.stubA.web.callLog })
   })
 })
 

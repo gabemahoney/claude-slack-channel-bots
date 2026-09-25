@@ -34,7 +34,7 @@ import { homedir } from 'os'
 import { basename, dirname, isAbsolute, join, resolve } from 'path'
 
 import { jsonSyntaxErrorOffset, positionAt } from './json-position.ts'
-import { expandTilde as expandTildeWith, personaKey, renderPersonaRef } from './persona-identity.ts'
+import { expandTilde as expandTildeWith, looksLikeSlackToken, personaKey, renderPersonaRef } from './persona-identity.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -951,13 +951,25 @@ function jsonTypeName(value: unknown): string {
 
 /**
  * Error style for one persona entry. Every message starts with `personas[i]`
- * and, when the name is valid, the persona reference of b.av2 SR-2.2
- * (JSON-quoted name with its key), and never echoes a rejected value.
+ * and, when the name is a non-empty string, the persona reference of b.av2
+ * SR-2.2 (JSON-quoted name with its key), and never echoes a rejected value.
+ * A name that looks like a Slack token (`looksLikeSlackToken`) is left out,
+ * and so is its key, which keeps the name's characters: such a name is
+ * rejected (`TOKEN_LIKE_NAME_MESSAGE`), and any error of its entry reported
+ * before that names `personas[i]` only (b.av2 SR-10.3).
  */
 function personaEntryStyle(name: unknown, index: number): RuleStyle {
-  const ref = isNonEmptyString(name) ? ` ${renderPersonaRef(name)}` : ''
+  const ref = isNonEmptyString(name) && !looksLikeSlackToken(name) ? ` ${renderPersonaRef(name)}` : ''
   return { prefix: `${PERSONA_ERROR_PREFIX}personas[${index}]${ref}: ` }
 }
+
+/**
+ * The error for a persona name that looks like a Slack token, after the
+ * entry's `personas[i]: ` prefix. Names the rule only, never the name or its key.
+ * Exported so tests can match the rule without copying the sentence.
+ */
+export const TOKEN_LIKE_NAME_MESSAGE =
+  "name looks like a Slack token. A persona's name appears in logs, previews and Slack messages, so it must not be a secret; choose another name."
 
 function rejectUnknownEntryKeys(
   obj: Record<string, unknown>,
@@ -1088,7 +1100,8 @@ function checkPersonaCrossSettings(persona: Persona, style: RuleStyle): void {
  *   0. the entry is a JSON object;
  *   1. shape and unknown keys: persona entry, `dm`, `channels` and each
  *      channel entry (stage 1);
- *   2. types and formats, in this order: `name`, `credentials_file`,
+ *   2. types and formats, in this order: `name` (required, a non-empty
+ *      string, then not shaped like a Slack token), `credentials_file`,
  *      `working_directory`, `claude_config_dir`, `stop_hook_bootstrap`,
  *      `channels` (in array order: `id`, `delivery`, duplicate ID), `dm.enabled`,
  *      `dm.contact`, `permission_prompts` (required);
@@ -1097,8 +1110,10 @@ function checkPersonaCrossSettings(persona: Persona, style: RuleStyle): void {
  *      `channels`, then a `dm` destination without `dm.contact` / with
  *      `dm.enabled` not true.
  *
- * Errors name `personas[i]` and, once the name is valid, the persona
- * reference, plus the setting's key path; they never echo a rejected value.
+ * Errors name `personas[i]` and, when the name is a non-empty string not
+ * shaped like a Slack token, the persona reference, plus the setting's key
+ * path; they never echo a rejected value. A token-shaped name is rejected
+ * here, so it never reaches the cross-persona rules, whose errors echo names.
  * Pure: no file-system access, and the OS home is never read (`home` is given).
  */
 function parsePersonaEntry(
@@ -1116,6 +1131,7 @@ function parsePersonaEntry(
   const name = raw['name']
   if (name === undefined) throw ruleError(style, 'name is required.')
   if (!isNonEmptyString(name)) throw ruleError(style, 'name must be a non-empty string.')
+  if (looksLikeSlackToken(name)) throw ruleError(style, TOKEN_LIKE_NAME_MESSAGE)
   const credentials_file = requirePersonaPath(raw, 'credentials_file', home, style)
   const working_directory = requirePersonaPath(raw, 'working_directory', home, style)
   const ownConfigDir = raw['claude_config_dir']
@@ -1298,7 +1314,9 @@ export interface ResolvePersonaConfigOptions {
  *      record mode (`options.record`).
  *
  * Steps 7 and 8 run only after every entry has parsed, so a per-entry
- * violation anywhere is reported before any cross-persona one.
+ * violation anywhere is reported before any cross-persona one; a persona name
+ * shaped like a Slack token is a per-entry violation, so no cross-persona
+ * error (which echoes names) ever involves one.
  *
  * @param raw        The parsed JSON value of the configuration file.
  * @param configDir  Directory of the configuration file; the cron path defaults sit under it.

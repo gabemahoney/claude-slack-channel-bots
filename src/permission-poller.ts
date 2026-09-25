@@ -98,7 +98,7 @@ import type {
 } from './agent-director-client.ts'
 import { withOutageDetection } from './outage-state.ts'
 import { encodePermissionActionId } from './permission-action-id.ts'
-import { describeSlackCallFailure } from './persona-connection-errors.ts'
+import { describeSlackCallFailure, describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
 import {
   classifySlackError,
   createPersonaDestinations,
@@ -508,6 +508,16 @@ function logViaDeps(deps: PollerDeps, ...args: unknown[]): void {
   else console.error(...args)
 }
 
+/**
+ * The tail of a failed agent-director call's log line: a typed error's
+ * `errName` when it passes `isSafeIdentifier`, else `describeThrownValue(err)`
+ * (never the raw `errName`, message or error object).
+ */
+export function describeAgentDirectorFailure(err: unknown): string {
+  if (err instanceof AgentDirectorError && isSafeIdentifier(err.errName)) return err.errName
+  return describeThrownValue(err)
+}
+
 /** The injected destination resolver, else the module-level default. */
 function destinationsFor(deps: PollerDeps): PersonaDestinations {
   if (deps.destinations) return deps.destinations
@@ -747,7 +757,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
       const r = await client.list({ state: ['check_permission'], label: ['service=cscb'] })
       rows = r.spawns
     } catch (err) {
-      logViaDeps(deps, '[slack] permission-poller: list failed:', err)
+      logViaDeps(deps, `[slack] permission-poller: list failed: ${describeThrownValue(err)}`)
       return
     }
 
@@ -819,8 +829,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
           // Outage flag raised; skip per-event log.
           continue
         }
-        const e = err instanceof AgentDirectorError ? err : null
-        logViaDeps(deps, `[slack] permission-poller: get failed for ${row.claude_instance_id}: ${e?.errName ?? String(err)}`)
+        logViaDeps(deps, `[slack] permission-poller: get failed for ${row.claude_instance_id}: ${describeAgentDirectorFailure(err)}`)
         continue
       }
 
@@ -896,8 +905,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
           dropPermission(entry.claudeInstanceId, entry.requestToken)
           continue
         }
-        const e = err instanceof AgentDirectorError ? err : null
-        logViaDeps(deps, `[slack] permission-poller: get-permission failed for ${entry.claudeInstanceId} token=${entry.requestToken}: ${e?.errName ?? String(err)}`)
+        logViaDeps(deps, `[slack] permission-poller: get-permission failed for ${entry.claudeInstanceId} token=${entry.requestToken}: ${describeAgentDirectorFailure(err)}`)
         // SR-2.4 transient retry: leave entry alive; next tick will retry.
         emitRowDecision(deps, 'transient_retry', entry.claudeInstanceId, entry.requestToken)
         continue

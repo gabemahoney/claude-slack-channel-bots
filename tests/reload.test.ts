@@ -27,7 +27,12 @@
  * at start comes up once its file is fixed and the change confirmed, and
  * only then (AC 65); a failed change stays pending; the held content follows
  * the outcome. The 64 KiB read cap on
- * the start, tick and confirmation paths. Every test runs `assertNoLeak` over
+ * the start, tick and confirmation paths. Token secrecy on the reload path
+ * (SR-10.3, AC 20): a Slack token pasted under a `bot_token` or `app_token`
+ * key, and a token-shaped persona name, each an INVALID candidate on a
+ * running server, a confirmed one and a refused start (from the config file
+ * or a hand-edited record), with every server-side file under the temp root
+ * leak-checked. Every test runs `assertNoLeak` over
  * what each run captured and checks no Slack post, except the one pure case
  * of the default step 3 body (`lifecycleApplySlots` gives each persona one
  * in-place update), which builds no run and handles no token.
@@ -46,6 +51,7 @@ import {
   type Persona,
   type PersonaConfigFs,
   type PersonaInput,
+  TOKEN_LIKE_NAME_MESSAGE,
 } from '../src/config.ts'
 import type { PersonaBringUpOutcome, PersonaCredentialsChangeResult } from '../src/persona-bringup-controller.ts'
 import { CREDENTIALS_UNREADABLE_MARKER } from '../src/persona-credentials.ts'
@@ -77,7 +83,15 @@ import {
 } from '../src/reload-apply.ts'
 import { composePendingFile, PENDING_FILE_HEADER, reloadFingerprint } from '../src/reload-fingerprint.ts'
 import { createReloadTickDriver } from '../src/reload-timer.ts'
-import { assertNoLeak, fakeToken, LEAK_SENTINEL, makeCredentials, writtenFile } from './test-helpers/credentials.ts'
+import {
+  APP_TOKEN_PREFIX,
+  assertNoLeak,
+  BOT_TOKEN_PREFIX,
+  fakeToken,
+  LEAK_SENTINEL,
+  makeCredentials,
+  writtenFile,
+} from './test-helpers/credentials.ts'
 import { stubCallCount } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import {
@@ -3805,6 +3819,180 @@ describe('a file larger than the 64 KiB read cap is unreadable to the tick', () 
     expect(run.since(cp)).toEqual(NO_RUN_ACTIVITY)
     expect(h.pendingExists()).toBe(false)
     expectNoPostNoLeak(run)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Token secrecy on the reload path (b.av2 SR-10.3; AC 20)
+// ---------------------------------------------------------------------------
+
+/** The loader's error for `source` (the config file or the record) with this validation `detail`. */
+function loaderError(source: string, detail: string): string {
+  return `loadPersonaConfig: invalid persona config in "${source}": Persona config validation error: ${detail}`
+}
+
+/** The one line a refused start logs: the config file's error, or the record's with the deletion hint. */
+function startRefusal(source: 'config' | 'record', detail: string): string {
+  return source === 'config'
+    ? `${CONFIG_REFUSAL}${loaderError(h.paths.config, detail)}`
+    : `${RECORD_REFUSAL}${loaderError(h.paths.lastApplied, detail)} ${deletionHint()}`
+}
+
+/**
+ * A start over `file` (a whole configuration input) as the configuration
+ * file with no record, or as a hand-edited record beside a valid config
+ * file: it refuses with exactly `startRefusal(source, detail)`, applies and
+ * writes nothing, and nothing it captured or left on disk carries a token.
+ */
+async function expectStartRefused(
+  source: 'config' | 'record',
+  file: unknown,
+  detail: string,
+  credentialsFiles: string[],
+): Promise<ReloadRun> {
+  const valid = h.persona('alpha')
+  const configBytes = source === 'config' ? h.writeConfig(file) : h.writeConfig(configOf(valid))
+  const recordBytes = source === 'record' ? h.writeRecord(file) : undefined
+
+  const run = await h.start()
+
+  expectNothingApplied(run)
+  expect(run.outcome.kind === 'refused' && run.outcome.source).toBe(source)
+  expect(run.logs).toEqual([startRefusal(source, detail)])
+  expect(run.writes).toEqual([])
+  expect(h.readRecord()).toEqual(recordBytes)
+  expect(h.readConfig()).toEqual(configBytes)
+  // The config file, the credentials files and the hand-edited record are the operator's; everything else is checked.
+  const operatorWritten = [h.paths.config, ...credentialsFiles, ...(source === 'record' ? [h.paths.lastApplied] : [])]
+  expectNoPostNoLeak(run)
+  assertNoLeak({ ...run.captured(), server: h.serverSideFiles(...operatorWritten) })
+  return run
+}
+
+/**
+ * A running server over alpha whose config file is then edited to `file`
+ * (an INVALID candidate with `detail` as its validation error): the ticks
+ * write the INVALID preview and log exactly one `reload-invalid` line; a
+ * confirmation of it applies nothing (no lifecycle call, the record byte for
+ * byte unchanged, one `reload-invalid` line) and later ticks do nothing.
+ * Every capture and every server-side file is leak-checked while the pending
+ * file exists, and again after the confirmation. `edit` gets alpha.
+ */
+async function expectInvalidCandidateStaysClean(
+  edit: (alpha: PersonaInput) => { file: unknown; credentialsFiles?: string[] },
+  detail: string,
+): Promise<ReloadRun> {
+  const { run, personas, recordBytes } = await running(['alpha'])
+  const applied = run.controller.applied()
+  const { file, credentialsFiles = [] } = edit(personas[0]!)
+  const operatorWritten = [h.paths.config, personas[0]!.credentials_file, ...credentialsFiles]
+  const error = loaderError(h.paths.config, detail)
+  const cp = run.checkpoint()
+
+  h.writeConfig(file)
+  await run.ticks.ticks(5)
+
+  // Checked first, while the pending file exists.
+  assertNoLeak({ ...run.captured(), server: h.serverSideFiles(...operatorWritten) })
+  expect(h.pendingLines()).toEqual(invalidPreview(error))
+  expect(run.since(cp)).toEqual(pendingWritten([invalidLogged(error)]))
+  expect(run.logsOf(RELOAD_PREVIEW)).toEqual([])
+
+  const confirmed = run.checkpoint()
+  h.confirm()
+  await run.ticks.tick()
+
+  expect(run.since(confirmed)).toEqual({
+    ...NO_RUN_ACTIVITY,
+    logs: [confirmedInvalidLogged(error)],
+    writes: [{ path: h.paths.pending, ok: true }],
+    removes: [applyRemoved()],
+  })
+  expect(h.readRecord()).toEqual(recordBytes)
+  expect(run.controller.applied()).toBe(applied)
+  expect(run.appliedConfigs).toEqual([])
+  expect(h.applyExists()).toBe(false)
+  expect(h.pendingLines()).toEqual(invalidPreview(error))
+  // The rewritten pending file is checked while it exists.
+  expectNoPostNoLeak(run)
+  assertNoLeak(h.serverSideFiles(...operatorWritten))
+
+  const later = run.checkpoint()
+  await run.ticks.ticks(5)
+  expect(run.since(later)).toEqual(NO_RUN_ACTIVITY)
+  return run
+}
+
+// A token pasted as a setting's value: the loader names the key (a plain setting name, E11 decision 5 left intact)
+// and never the value; the tick carries that error into the pending file and the log, the confirmation into the log,
+// and the start into its refusal. The token-named keys are the unknown-key block's above.
+describe('a Slack token pasted under a bot_token or app_token key never reaches the pending file, the log, the record or a start refusal', () => {
+  const placements: Array<{ label: string; place: (alpha: PersonaInput) => unknown; detail: () => string }> = [
+    {
+      label: 'a bot_token key in a persona entry',
+      place: (alpha) => configOf({ ...alpha, bot_token: fakeToken(BOT_TOKEN_PREFIX, 'PASTED') } as PersonaInput),
+      detail: () => `personas[0] "alpha" (key=${h.key('alpha')}): unknown field(s) in the persona entry: "bot_token".`,
+    },
+    {
+      label: 'an app_token key in a persona entry',
+      place: (alpha) => configOf({ ...alpha, app_token: fakeToken(APP_TOKEN_PREFIX, 'PASTED') } as PersonaInput),
+      detail: () => `personas[0] "alpha" (key=${h.key('alpha')}): unknown field(s) in the persona entry: "app_token".`,
+    },
+    {
+      label: 'a bot_token key at the top level',
+      place: (alpha) => ({ ...configOf(alpha), bot_token: fakeToken(BOT_TOKEN_PREFIX, 'PASTED') }),
+      detail: () => 'unknown top-level field(s) in config.json: "bot_token".',
+    },
+  ]
+
+  test.each(placements)('on a running server, $label is an INVALID candidate naming the key; its confirmation applies nothing', async ({ place, detail }) => {
+    await expectInvalidCandidateStaysClean((alpha) => ({ file: place(alpha) }), detail())
+  })
+
+  test.each(placements.flatMap((p) => (['config', 'record'] as const).map((source) => ({ ...p, source }))))(
+    'a start from the $source with $label refuses, naming the key and never the value',
+    async ({ source, place, detail }) => {
+      const [alpha] = materialized('alpha')
+      await expectStartRefused(source, place(alpha!), detail(), [alpha!.credentials_file])
+    },
+  )
+})
+
+// Director decision 5: a token-shaped persona name is rejected by the loader, never echoed with its key. The reload
+// path carries that error into the pending file and the log on every pending-state change, so it must stay clean too.
+describe('a token-shaped persona name never reaches the pending file, the log, the record or a start refusal', () => {
+  test.each<{ label: string; edit: (alpha: PersonaInput, name: string) => { file: unknown; credentialsFiles?: string[] }; index: number }>([
+    {
+      label: 'an existing persona renamed to one',
+      edit: (alpha, name) => ({ file: configOf({ ...alpha, name }) }),
+      index: 0,
+    },
+    {
+      label: 'a new persona added with one',
+      edit: (alpha, name) => {
+        // Charlie's own files, so everything but the name is valid (paths are derived from the name otherwise).
+        const [charlie] = materialized('charlie')
+        return { file: configOf(alpha, { ...charlie!, name }), credentialsFiles: [charlie!.credentials_file] }
+      },
+      index: 1,
+    },
+  ])('on a running server, $label is an INVALID candidate naming personas[i] only; its confirmation applies nothing', async ({ edit, index }) => {
+    const name = `Ops bot ${fakeToken(BOT_TOKEN_PREFIX, 'NAME')}`
+    const run = await expectInvalidCandidateStaysClean((alpha) => edit(alpha, name), `personas[${index}]: ${TOKEN_LIKE_NAME_MESSAGE}`)
+    // Neither the name nor its derived key reached a log line or the pending file.
+    const text = [...run.logs, h.readPendingText()!].join('\n')
+    expect(text).not.toContain(name)
+    expect(text).not.toContain(h.key(name))
+  })
+
+  test.each(['config', 'record'] as const)('a start from the %s with a token-shaped persona name refuses, naming personas[i] only', async (source) => {
+    const [alpha, charlie] = materialized('alpha', 'charlie')
+    const name = fakeToken(APP_TOKEN_PREFIX, 'NAME')
+    const run = await expectStartRefused(source, configOf(alpha!, { ...charlie!, name }), `personas[1]: ${TOKEN_LIKE_NAME_MESSAGE}`, [
+      alpha!.credentials_file,
+      charlie!.credentials_file,
+    ])
+    expect(run.logs.join('\n')).not.toContain(h.key(name))
   })
 })
 

@@ -309,7 +309,11 @@ export type ConnectionPersona = Pick<Persona, 'index' | 'name' | 'key' | 'creden
 export interface PersonaConnectionManagerDeps {
   /** Receives every forwarded event, tagged with its persona's key. */
   onEvent: PersonaEventHandler
-  /** Receives every log line (diagnostic lines and handler failures). */
+  /**
+   * Receives every log line: diagnostic lines, handler failures, and the
+   * connection-health lines each persona's Socket Mode library logger
+   * forwards (`socketModeSlackLogger`).
+   */
   log: PersonaDiagnosticLogger
   /** Dry run (SR-3.4): no credentials, no Slack call, every persona up with a placeholder identity. */
   dryRun: boolean
@@ -730,7 +734,7 @@ export function createPersonaConnectionManager(deps: PersonaConnectionManagerDep
   ): Promise<void> {
     let binding: SocketBinding
     try {
-      binding = bindSocket(entry, factory.createSocketClient(socketModeClientOptions(tokens.appToken)))
+      binding = bindSocket(entry, factory.createSocketClient(socketModeClientOptions(tokens.appToken, entry.persona, log)))
     } catch (err) {
       attempt.finish({ kind: 'failed', outcome: classifySlackValidationError(err, 'socket-mode') })
       return

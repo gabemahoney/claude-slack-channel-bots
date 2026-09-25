@@ -34,6 +34,7 @@ import { describe, test, expect, afterEach, beforeEach, spyOn } from 'bun:test'
 import { homedir, tmpdir } from 'node:os'
 import { mkdtempSync, mkdirSync, symlinkSync, existsSync, chmodSync, writeFileSync, rmSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
+import { Database } from 'bun:sqlite'
 import type { GetResult } from 'agent-director'
 import {
   resolveJsonlRoots,
@@ -49,14 +50,14 @@ import {
 import { resolveJsonlPath } from '../src/cozempic.ts'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { personaConfigDirLabelValue } from '../src/session-manager.ts'
-import { ErrSpawnNotFound } from '../src/agent-director-errors.ts'
+import { AgentDirectorError, ErrSpawnNotFound } from '../src/agent-director-errors.ts'
 import type { Persona, PersonaConfig } from '../src/config.ts'
 import { buildTempArchiveDb, type ArchiveRow } from './test-helpers/archive-db.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
 import { stubOpenedDmId } from './test-helpers/slack-stub.ts'
 import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
+import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
 // Temp dirs, temp home and console capture — all released after each test
@@ -69,6 +70,20 @@ function makeTempDir(prefix = 'jsonl-check-test-'): string {
   const dir = mkdtempSync(join(tmpdir(), prefix))
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }))
   return dir
+}
+
+/**
+ * Captures every console.error call's arguments unformatted (errors whole,
+ * with message, stack and properties) for the rest of the test, so a leak
+ * check sees what the server log would write (restored after it).
+ */
+function captureErrorArgs(): unknown[][] {
+  const calls: unknown[][] = []
+  const spy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+    calls.push(args)
+  })
+  cleanups.push(() => spy.mockRestore())
+  return calls
 }
 
 /** Captures console.error lines for the rest of the test (restored after it). */
@@ -1331,5 +1346,187 @@ describe('b.g57: runJsonlPersistenceSafeguard — a claude_config_dir that canno
     expect(second.errors[0]!.message).toContain(fx.refA)
     expect(log.slice(firstLines).filter((l) => l.includes('cannot be resolved') || l.includes('config_dir label'))).toEqual([])
     assertNoLeak({ first, second, log })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC 20 (b.av2 SR-10.3): the safeguard's lines carry no credential value when
+// the value that reaches them does — the b.g57 "transcript not checked this
+// pass" line (a realpath error), the agent-director get-failure line, the
+// archive-count, per-persona and whole-pass failure lines, and
+// runPersonaStorageCheck's notice-failure and own-failure lines, each under
+// an error carrying fake tokens. Every console.error argument is kept
+// unformatted. The configured claude_config_dir path is echoed by design (it
+// is not a credential), so it stays a plain temp path here.
+// ---------------------------------------------------------------------------
+
+describe('AC 20: jsonl-persistence-check lines carry no credential value', () => {
+  const EXT4_ROOT = '23 0 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n'
+
+  /** One persona with its own claude_config_dir under a temp dir; `settings` go to the config's server settings. */
+  function ac20Fixture(settings: Parameters<typeof makeMultiPersonaConfig>[2] = {}) {
+    const dir = makeTempDir()
+    const configDir = join(dir, 'claude-a')
+    mkdirSync(configDir)
+    const config = makeMultiPersonaConfig(
+      [{ ...LAYER2_SPEC, name: 'Alpha Bot', working_directory: '/repo/alpha', claude_config_dir: configDir }],
+      dir,
+      settings,
+    )
+    const [a] = config.personas as [Persona]
+    return { config, a, configDir, ref: renderPersonaRef(a.name, a.key) }
+  }
+
+  /** An error whose message and properties carry fake tokens, with `code` as given. */
+  function sentinelError(message: string, code: string): Error {
+    return Object.assign(new Error(`${message} ${fakeToken(BOT_TOKEN_PREFIX, 'err')}`), {
+      code,
+      path: fakeToken(APP_TOKEN_PREFIX, 'path'),
+      detail: LEAK_SENTINEL,
+    })
+  }
+
+  test.each([
+    ['an errno code (EIO)', 'EIO', 'EIO'],
+    ['a code that is itself a fake token', fakeToken(BOT_TOKEN_PREFIX, 'code'), 'unknown'],
+  ])('AC 20: realpath throws an error carrying fake tokens with %s — one "transcript not checked this pass" line, no row lookup; no captured argument carries a credential value', async (_label, code, shown) => {
+    const fx = ac20Fixture()
+    const errArgs = captureErrorArgs()
+    const lookups: string[] = []
+
+    const c = await runLayer2(
+      {
+        readMountinfo: fixture(EXT4_ROOT),
+        getRow: async (key: string) => {
+          lookups.push(key)
+          return makeRow({}, fx.a)
+        },
+        configDirFs: { realpath: () => { throw sentinelError('realpath failed', code) } },
+      },
+      fx.config,
+    )
+
+    expect(lookups).toEqual([])
+    expect(errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.includes(fx.ref))).toEqual([
+      `[slack] jsonl-persistence-check: ${fx.ref} claude_config_dir="${fx.configDir}" cannot be resolved to a real path (${shown}) — transcript not checked this pass`,
+    ])
+    assertNoLeak({ errArgs, c })
+  })
+
+  // The "AD get failed … skipping:" line logs describeThrownValue of the error
+  // (type, safe code or errName, frames), never the error itself.
+  test.each<[string, () => Error, string]>([
+    ['a plain error with a safe code', () => sentinelError('agent-director get failed', 'ErrGeneric'), 'Error code=ErrGeneric'],
+    [
+      'a base AgentDirectorError whose description carries a fake token',
+      () => new AgentDirectorError('get', 'ErrSomethingNew', `bad ${fakeToken(BOT_TOKEN_PREFIX, 'desc')}`),
+      'AgentDirectorError errName=ErrSomethingNew',
+    ],
+  ])('AC 20: agent-director get rejects with %s — the persona is skipped with its one line; no captured argument carries a credential value', async (_label, makeErr, shown) => {
+    const fx = ac20Fixture()
+    const errArgs = captureErrorArgs()
+
+    const c = await runLayer2(
+      {
+        readMountinfo: fixture(EXT4_ROOT),
+        getRow: async () => { throw makeErr() },
+      },
+      fx.config,
+    )
+
+    expect(c).toEqual({ errors: [], notices: [] })
+    const lines = errArgs.filter((args) => String(args[0]).includes('AD get failed'))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toHaveLength(1)
+    expect(String(lines[0]![0])).toStartWith(`[slack] jsonl-persistence-check: AD get failed for ${fx.ref} — skipping: ${shown}`)
+    assertNoLeak({ errArgs, c })
+  })
+
+  /**
+   * A real archive DB whose `messages` is a view over a column named by a
+   * fake token, so the counter's query fails with a SQLite error whose message
+   * quotes that token. Returns its path.
+   */
+  function archiveDbFailingWithToken(): string {
+    const dbPath = join(makeTempDir('jsonl-archive-test-'), 'archive.db')
+    const db = new Database(dbPath, { create: true })
+    db.run('CREATE TABLE base (a INTEGER)')
+    db.run(`CREATE VIEW messages AS SELECT [${fakeToken(BOT_TOKEN_PREFIX, 'column')}] AS channel_id, a AS timestamp FROM base`)
+    db.close()
+    return dbPath
+  }
+
+  // The archive-count, per-persona and whole-pass failure lines log
+  // describeThrownValue of the error, never the error or its message.
+  test.each<[string, (fx: ReturnType<typeof ac20Fixture>) => Partial<JsonlPersistenceSafeguardDeps>, (ref: string) => string, boolean]>([
+    [
+      'the archive count\'s query fails with a SQLite error quoting a fake token',
+      () => ({ archiveCountSince: undefined }),
+      (ref) => `[slack] jsonl-persistence-check: archive count failed for ${ref}: Error code=SQLITE_ERROR`,
+      true,
+    ],
+    [
+      'the persona\'s check throws an error carrying fake tokens',
+      () => ({ statFn: () => { throw sentinelError('stat failed', 'EIO') } }),
+      (ref) => `[slack] jsonl-persistence-check: unexpected error checking ${ref} — continuing: Error code=EIO`,
+      false,
+    ],
+    [
+      'the pass itself fails (the startup-error sink throws an error carrying fake tokens)',
+      () => ({
+        readMountinfo: fixture('24 23 8:2 / /home rw,relatime shared:2 - ext4 /dev/sda2 rw\n'),
+        recordStartupError: () => { throw sentinelError('sink failed', 'EIO') },
+      }),
+      () => '[slack] Warning: jsonl-persistence-check failed unexpectedly — startup continues: Error code=EIO',
+      false,
+    ],
+  ])('AC 20: %s — its one line names the error without its message; no captured argument carries a credential value', async (_label, depsFor, expectedLine, withArchive) => {
+    const fx = ac20Fixture(withArchive ? { message_archive_db: archiveDbFailingWithToken() } : {})
+    const errArgs = captureErrorArgs()
+
+    const c = await runLayer2(
+      {
+        readMountinfo: fixture(EXT4_ROOT),
+        getRow: async () => makeRow({}, fx.a),
+        ...depsFor(fx),
+      },
+      fx.config,
+    )
+
+    const line = expectedLine(fx.ref)
+    // Every line up to the error's description, which ends at its first frame.
+    const prefix = line.slice(0, line.lastIndexOf(': ') + 2)
+    const matching = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith(prefix))
+    expect(matching.map((l) => l.split(' at ')[0])).toEqual([line])
+    assertNoLeak({ errArgs, c })
+  })
+
+  // runPersonaStorageCheck (a persona a confirmed apply brings up) on a tmpfs
+  // root: its notice-failure and own-failure lines, the same way.
+  test.each<[string, 'notify' | 'record', (ref: string) => string]>([
+    ['the notice seam throws', 'notify', (ref) => `[slack] jsonl-persistence-check: notice failed for ${ref}: Error code=EIO`],
+    [
+      'the startup-error sink throws',
+      'record',
+      (ref) => `[slack] Warning: jsonl-persistence-check failed unexpectedly for ${ref} — continuing: Error code=EIO`,
+    ],
+  ])('AC 20: runPersonaStorageCheck on a tmpfs root, %s with an error carrying fake tokens — its one line names the error without its message; no captured argument carries a credential value', (_label, failing, expectedLine) => {
+    const fx = ac20Fixture()
+    const errArgs = captureErrorArgs()
+    const recorded: Array<[string, string]> = []
+    const boom = (): never => { throw sentinelError(`${failing} failed`, 'EIO') }
+
+    runPersonaStorageCheck(fx.a, failing === 'notify' ? boom : () => {}, {
+      readMountinfo: fixture(`${EXT4_ROOT}99 23 0:30 / ${fx.configDir} rw,relatime shared:11 - tmpfs tmpfs rw\n`),
+      recordStartupError: failing === 'record' ? boom : (key, message) => void recorded.push([key, message]),
+      home,
+    })
+
+    const line = expectedLine(fx.ref)
+    const prefix = line.slice(0, line.lastIndexOf(': ') + 2)
+    const matching = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith(prefix))
+    expect(matching.map((l) => l.split(' at ')[0])).toEqual([line])
+    expect(recorded.map(([key]) => key)).toEqual(failing === 'notify' ? ['jsonl-non-persistent'] : [])
+    assertNoLeak({ errArgs, recorded })
   })
 })

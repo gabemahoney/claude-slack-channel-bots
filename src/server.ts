@@ -838,7 +838,7 @@ async function shutdown(signal: string): Promise<void> {
   try {
     closeClient()
   } catch (err) {
-    console.error('[slack] closeClient on shutdown threw (ignored):', err)
+    console.error(`[slack] closeClient on shutdown threw (ignored): ${describeThrownValue(err)}`)
   }
 
   removePidFile(PID_FILE)
@@ -889,7 +889,7 @@ export function _buildIsSessionAliveAdapter(
         setOutageFlag(key, 'tmux-unavailable')
         return false
       }
-      console.error(`[slack] isSessionAlive: status error for persona=${key}:`, err)
+      console.error(`[slack] isSessionAlive: status error for persona=${key}: ${describeThrownValue(err)}`)
       return false
     }
   }
@@ -923,7 +923,7 @@ export function _buildStatRouteImpl(deps?: {
         const st = await stat(cwd)
         return st.isDirectory()
       } catch (err) {
-        console.error(`[slack] health-check: statRoute(${cwd}) failed:`, err)
+        console.error(`[slack] health-check: statRoute(${cwd}) failed: ${describeThrownValue(err)}`)
         return false
       }
     })()
@@ -993,7 +993,7 @@ export function _buildKillSessionAdapter(
     } catch (err) {
       if (err instanceof ErrSpawnNotFound) return
       if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) return
-      console.error(`[slack] killSession (restart adapter): error for persona=${key}:`, err)
+      console.error(`[slack] killSession (restart adapter): error for persona=${key}: ${describeThrownValue(err)}`)
     }
   }
 }
@@ -1563,7 +1563,7 @@ export async function main(): Promise<void> {
   try {
     await reconcileOrphans(personaConfig)
   } catch (err) {
-    console.error('[slack] Warning: orphan reconciliation failed:', err)
+    console.error(`[slack] Warning: orphan reconciliation failed: ${describeThrownValue(err)}`)
   }
 
   // b.uhv / b.k54 / b.av2 SR-6.2: patch .claude.json for every applied
@@ -1583,7 +1583,7 @@ export async function main(): Promise<void> {
   try {
     await runJsonlPersistenceSafeguard(personaConfig, personaNotifier.notify)
   } catch (err) {
-    console.error('[slack] Warning: jsonl-persistence safeguard failed — continuing:', err)
+    console.error(`[slack] Warning: jsonl-persistence safeguard failed — continuing: ${describeThrownValue(err)}`)
   }
 
   // b.osj / b.av2 SR-9.4: install (or remove) the CSCB-managed Stop hook in
@@ -1608,7 +1608,7 @@ export async function main(): Promise<void> {
   try {
     await reload.runStartBringUp()
   } catch (err) {
-    console.error('[slack] Warning: session startup failed — continuing:', err)
+    console.error(`[slack] Warning: session startup failed — continuing: ${describeThrownValue(err)}`)
   }
 
   // Initialize and start the health-check poller.

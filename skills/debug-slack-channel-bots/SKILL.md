@@ -93,7 +93,9 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    [A persona's routing settings were changed by a confirmed change](#a-personas-routing-settings-were-changed-by-a-confirmed-change).
    A confirmed change to its credentials file didn't take? Look for a
    [`persona-credentials-change-failed`](#persona-credentials-change-failed)
-   line.
+   line. A persona broken by its credentials whose app was fixed on Slack's
+   side, with nothing pending? See
+   [Fixed on Slack's side, same tokens](#fixed-on-slacks-side-same-tokens).
 
 ---
 
@@ -116,6 +118,19 @@ ls -l "$STATE"/server.log*
   `persona-start` line from the last start may be in an older generation.
 - **Line shape.** Every line starts with an ISO-8601 timestamp in brackets.
   Persona lines then carry the `[slack]` prefix.
+- **Error detail.** A failure on a Slack or agent-director path (a `<error>`
+  in the lines below) shows the error's class, a code such as `ENOENT` or an
+  agent-director error name such as `ErrSpawnNotFound`, and stack frames,
+  never the error's message. The `spawn-failed`, `orphan-cleanup…`,
+  `jsonl-transcript-lost-on-resume` and `jsonl-diagnosis-inconclusive`
+  records in `startup-errors.log` and the `Spawn failure:` notice
+  at the persona's destination add agent-director's own description after
+  the error name, with URLs shown as `<redacted-url>` and token-like text as
+  `<redacted-token>`; the notice cuts it at 300 characters. The
+  `stop --stop-bots` lines `agent-director initialization failed:` and
+  `bot teardown failed:` print the startup gate's or the teardown's own
+  message in full. The `[slack] Fatal:` line of a start that failed
+  unexpectedly prints the raw error.
 - **`startup-errors.log`** in the same directory is a separate file, never
   rotated by CSCB, for the agent-director startup gate and a few start-time
   warnings. No persona diagnostic goes there, and no configuration or
@@ -175,7 +190,7 @@ hex digits. Don't derive it by hand: read it from the persona's
 | Outcome | Causes | Recovers on its own? |
 |---|---|---|
 | `up` | None | — |
-| `broken` | Credentials missing, unreadable, invalid or refused by Slack | No: fix the credentials file and restart the server |
+| `broken` | Credentials missing, unreadable, invalid or refused by Slack | No: fix the credentials file, wait for the pending change and confirm it (see [Recovering a persona broken by its credentials](#recovering-a-persona-broken-by-its-credentials)); no restart |
 | `retrying` | Slack unreachable, working directory missing or unusable, or `claude_config_dir` unresolvable | Yes, once the cause clears; no restart |
 
 A persona that is not up posts nothing to Slack, and its instance, if one is
@@ -217,7 +232,9 @@ running are not affected. See
 - **State:** `broken`. Doesn't recover on its own.
 - **Cause text:** `credentials file does not exist`. The path in `path="…"`
   doesn't exist, or a directory on the way to it doesn't.
-- **Fix:** Create the credentials file at that path, then restart the server.
+- **Fix:** Create the credentials file at that path, then confirm the
+  pending change (see
+  [Recovering a persona broken by its credentials](#recovering-a-persona-broken-by-its-credentials)).
   Or correct the persona's `credentials_file` in `config.json` and confirm
   the edit: the persona is torn down and brought up fresh with the new path,
   with no restart (see
@@ -236,8 +253,9 @@ running are not affected. See
   a file over 64 KiB; a real credentials file is far smaller, so the path
   names the wrong file).
 - **Fix:** Make the path a regular file readable by the user the server runs
-  as (the file should be mode 0600, owned by that user). Then restart the
-  server.
+  as (the file should be mode 0600, owned by that user). Then confirm the
+  pending change (see
+  [Recovering a persona broken by its credentials](#recovering-a-persona-broken-by-its-credentials)).
 - **Added at runtime:** the same line, with the same fix, when a confirmed
   change adds this persona. Other personas are not affected.
 
@@ -272,14 +290,12 @@ running are not affected. See
   different content shows a pending credentials change for each persona that
   shares it (the server hashes the file for this and takes no token from it),
   but that change can't bring either persona up while they still share the
-  file.
+  file. See [A credentials file shared by two personas](#a-credentials-file-shared-by-two-personas)
+  for the fix.
 - **Fix:** The operator rewrites the file in the shape above (mode 0600), then
-  restarts the server. For a shared file, give each persona its own file: point
-  the symlink elsewhere and restart, or change a `credentials_file` in
-  `config.json` and confirm the edit, which tears that persona down and
-  brings it up fresh with no restart (see
-  [Confirming a pending change](#confirming-a-pending-change)). Use
-  [Checking a credentials file's shape](#checking-a-credentials-files-shape) to
+  confirms the pending change (see
+  [Recovering a persona broken by its credentials](#recovering-a-persona-broken-by-its-credentials)).
+  Use [Checking a credentials file's shape](#checking-a-credentials-files-shape) to
   confirm the fix without showing a token.
 - **Added at runtime:** the same line, with the same fix, when a confirmed
   change adds this persona. Other personas are not affected.
@@ -304,8 +320,12 @@ running are not affected. See
   operator write it into the credentials file: for `bot_token`, the app's Bot
   User OAuth Token (re-install the app to the workspace if it was uninstalled
   or its token revoked); for `app_token`, an app-level token with the
-  `connections:write` scope, with Socket Mode turned on. Then restart the
-  server.
+  `connections:write` scope, with Socket Mode turned on. Then confirm the
+  pending change (see
+  [Recovering a persona broken by its credentials](#recovering-a-persona-broken-by-its-credentials)).
+  If the fix was made on Slack's side and the tokens didn't change (the app
+  re-installed or re-enabled), nothing is pending: see
+  [Fixed on Slack's side, same tokens](#fixed-on-slacks-side-same-tokens).
 - **Added at runtime:** the same line, with the same fix, when a confirmed
   change adds this persona. Other personas are not affected.
 - A refusal on a persona that was already running is covered under
@@ -359,6 +379,19 @@ running are not affected. See
   network outage: the reopen keeps retrying, logging nothing more), or a lost
   line followed by `persona-credentials-refused` (see
   [A token was revoked while the persona was running](#a-token-was-revoked-while-the-persona-was-running)).
+- **Library reason:** shortly before the lost line there may be a
+  `[slack] persona Socket Mode: personas[<i>] "<name>" (key=<key>): …` line
+  from the Slack library, giving its reason:
+  `A ping wasn't received from the server before the timeout of <n>ms!` (Slack
+  sent no ping in time) or
+  `A pong wasn't received from the server before the timeout of <n>ms!` (Slack
+  didn't answer the client's pings). Either way the connection was judged dead,
+  closed, and is reopened as above. `Failed to send ping to Slack` means the
+  client couldn't send its ping (the error detail is not logged). An occasional
+  one is harmless; frequent ones point at the network path to Slack or at
+  Slack itself. The library's other output is deliberately not logged, since
+  it can hold the connection's URL and ticket; the server logs connection
+  failures itself.
 
 ### `persona-connection-restored`
 
@@ -709,6 +742,88 @@ then confirm the pending change (see
 [Confirming a pending change](#confirming-a-pending-change)); no restart is
 needed.
 
+### Recovering a persona broken by its credentials
+
+A persona that is `broken` (`persona-credentials-missing`, `-unreadable`,
+`-invalid` or `-refused`) comes up again through a confirmed change to its
+credentials file, with no restart. This holds whether it broke at a start, when
+a confirmed change added it, or while it was running.
+
+1. Have the operator correct the file: create it, fix its permissions, rewrite
+   it in the required shape (see
+   [`persona-credentials-invalid`](#persona-credentials-invalid)), or put a
+   working token in it (see
+   [`persona-credentials-refused`](#persona-credentials-refused)). Check it
+   with [Checking a credentials file's shape](#checking-a-credentials-files-shape).
+2. Within about 5 s `config.json.pending` appears with
+   `…: credentials file "<path>" changed: it is broken by its credentials now, so it will be brought up.`
+   (see [Pending changes](#pending-changes)).
+3. With the operator's say-so, confirm it by the rename (see
+   [Confirming a pending change](#confirming-a-pending-change)).
+4. `server.log` shows
+   `[slack] persona "<name>" (key=<key>): broken by its credentials and its credentials file changed — bringing it up again`,
+   a new `persona-start` line, then
+   `[slack] persona "<name>" (key=<key>): up at apply — launching`. The launch
+   reaches the persona's kept instance, so it keeps its conversation history.
+
+If the file still can't be used, or Slack refuses the new token, the persona
+logs its usual class line again and stays `broken`, and nothing stays pending
+until the file changes again. A server restart isn't needed: every start reads
+credentials files as they stand, so a restart would also pick up the fixed
+file, but it cuts off every persona and isn't the fix.
+
+### Fixed on Slack's side, same tokens
+
+A persona refused by Slack (`persona-credentials-refused`) whose app was then
+repaired in Slack (re-installed to the workspace, or re-enabled) with the same
+tokens stays `broken`. Nothing is pending, because the file didn't change, and
+a persona broken by its credentials recovers only through a confirmed change
+to its credentials file.
+
+**Fix:** have the operator re-save the credentials file with any byte change
+that keeps it valid; for example, re-save with a trailing newline, then confirm.
+A newline after the closing `}` is enough; a newline inside a token's string
+makes the file invalid. Then wait for `config.json.pending` and confirm it as in
+[Recovering a persona broken by its credentials](#recovering-a-persona-broken-by-its-credentials).
+If Slack still refuses the token, a new `persona-credentials-refused` line names
+the cause, the persona stays `broken`, and nothing stays pending: the file's
+new bytes are now the ones the server holds, so fix the app or the token and
+save the file again.
+
+### A credentials file shared by two personas
+
+`config.json` validated at a start without a record, and every edit, reject two
+personas whose `credentials_file` paths share a real path (see
+[Across personas](#across-personas); the edit previews as `INVALID`). The two
+cases where it still happens:
+
+- **At a start from the last-applied record** (which doesn't run that check),
+  each persona sharing the file is `broken` with
+  [`persona-credentials-invalid`](#persona-credentials-invalid)
+  (`real path is also the credentials_file of "<name>" (key=<key>)`), and the
+  start goes on for the other personas.
+- **At a confirmed change**, when a symlink changed after the preview so that a
+  persona's credentials file now resolves to another applied persona's: a
+  persona being brought up is `broken` with that same line, and a persona that
+  is up logs
+  [`persona-credentials-change-failed`](#persona-credentials-change-failed)
+  with that cause and keeps its current connection.
+
+**Fix after a start from the record.** Give one persona (say A) its own file:
+change its `credentials_file` in `config.json`, or point its symlink
+elsewhere. Changing the path in `config.json` and confirming is a destructive
+change of A (`DESTRUCTIVE: … credentials_file changed to "<path>" …`): A is
+torn down and brought up fresh from its new file. The other persona (B) stays
+`broken`, because its own file didn't change. To bring B up, have the operator
+re-save B's file with any byte change (see
+[Fixed on Slack's side, same tokens](#fixed-on-slacks-side-same-tokens)) and
+confirm its `credentials file "<path>" changed: it is broken by its credentials now, so it will be brought up.`
+line. Both steps can go into one confirmation: edit `config.json`, re-save B's
+file, wait until the preview shows both A's `DESTRUCTIVE:` line and B's
+`credentials file` line, then confirm once. B's bring-up checks the file
+against the configuration just applied, where A no longer shares it. They can
+also be two confirmations, one after the other.
+
 ### A running persona's directory disappears later
 
 This is not a bring-up retry. A persona that was up and whose working directory
@@ -1002,16 +1117,19 @@ registers again with its history. If the new token is refused too, a new
      nothing: the persona's next retry, at most 5 minutes later, opens the
      DM and posts them, and `server.log` has the `persona-destination-failed`
      `cleared:` line. With nothing held or pending no retry runs, and the
-     `cleared:` line comes with the persona's next prompt or notice. No server
-     restart is needed while the bot token is unchanged.
+     `cleared:` line comes with the persona's next prompt or notice. No restart
+     is needed (if the bot token changed, see the next bullet).
 - **The bot token after the re-install:** Slack adds the new scope to the
   app's existing grant, and the shipped manifest has token rotation off, so
   the Bot User OAuth Token normally stays the same. The operator checks this
   themselves, outside the chat: compare the Bot User OAuth Token on the app's
   OAuth & Permissions page with the persona's credentials file. If it changed,
-  the operator writes the new token into the credentials file and restarts the
-  server, as in the Fix of
-  [`persona-credentials-refused`](#persona-credentials-refused);
+  the operator writes the new token into the credentials file, waits for the
+  pending change and confirms it: a persona that is up reconnects with its
+  instance kept (see
+  [`persona-credentials-change-failed`](#persona-credentials-change-failed),
+  *When it works*), and one broken by its credentials comes up (see
+  [Recovering a persona broken by its credentials](#recovering-a-persona-broken-by-its-credentials));
   [Checking a credentials file's shape](#checking-a-credentials-files-shape)
   confirms the file without showing the token. Never ask for, read, print or
   compare a token value in the chat.
@@ -1046,10 +1164,10 @@ registers again with its history. If the new token is refused too, a new
 
   | Cause | How to confirm | Fix |
   |---|---|---|
-  | The effective value isn't what you expect. A persona without its own `stop_hook_bootstrap` inherits the top-level one (default `true`). | The persona's entry and the top level of `config.json`. | With the operator's say-so, set `stop_hook_bootstrap` on the persona's entry (it overrides the top level), then confirm the edit. It applies at the persona's next launch; to apply it now, relaunch the bots with `clean_restart` (see [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)). |
+  | The effective value isn't what you expect. A persona without its own `stop_hook_bootstrap` inherits the top-level one (default `true`). | The persona's entry and the top level of `config.json`. | With the operator's say-so, set `stop_hook_bootstrap` on the persona's entry (it overrides the top level), then confirm the edit. It applies at the persona's next launch; to apply it now, relaunch the bots with `clean_restart` (see [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)). |
   | The value changed after the persona's instance launched. A running instance keeps the value it launched with; a change applies at the persona's next launch. A plain server restart reconnects to an instance that is still running, which is not a launch. | The record holds the old value. | With the operator's say-so, run `claude-slack-channel-bots clean_restart`. It relaunches every persona (resume or fresh spawn), cutting off their current turns, and each launch rewrites the persona's record. |
-  | No `claude_config_dir` is configured for the persona (nor at the top level). No hook is installed for it, so it gets no reminder. | `server.log` has `[slack] stop-hook-bootstrap: "<name>" (key=<key>) has no claude_config_dir — skipping`. | Give the persona (or the top level) a `claude_config_dir` of its own, then confirm the edit and relaunch the bots with `clean_restart` (see [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)). The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
-  | Its `claude_config_dir` resolves to the operator's own `~/.claude`. The server never installs the hook there, so the persona gets no reminder. | `startup-errors.log` has a `stop-hook-bootstrap-refuse-home` entry (recorded once per server start); `server.log` has `refusing to touch operator's own ~/.claude` at each launch. | Point the persona at a different `claude_config_dir`, then confirm the edit and relaunch the bots with `clean_restart` (see [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)). The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
+  | No `claude_config_dir` is configured for the persona (nor at the top level). No hook is installed for it, so it gets no reminder. | `server.log` has `[slack] stop-hook-bootstrap: "<name>" (key=<key>) has no claude_config_dir — skipping`. | Give the persona (or the top level) a `claude_config_dir` of its own, then confirm the edit and relaunch the bots with `clean_restart` (see [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)). The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
+  | Its `claude_config_dir` resolves to the operator's own `~/.claude`. The server never installs the hook there, so the persona gets no reminder. | `startup-errors.log` has a `stop-hook-bootstrap-refuse-home` entry (recorded once per server start); `server.log` has `refusing to touch operator's own ~/.claude` at each launch. | Point the persona at a different `claude_config_dir`, then confirm the edit and relaunch the bots with `clean_restart` (see [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)). The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
   | `jq` is not on the host's `PATH`. The hook is installed but can't read the transcript, so it never reminds. | `startup-errors.log` has a `stop-hook-bootstrap-jq-missing` entry. | Install `jq`. No restart is needed; the next turn is checked. |
   | The hook couldn't be installed: the directory is missing, or its `settings.json` is unreadable or not valid JSON (left untouched). | `startup-errors.log` (at start) or `server.log` (at a launch) has `stop-hook-bootstrap-dir-missing`, `stop-hook-bootstrap-not-a-dir` or `stop-hook-bootstrap-settings-…`; the `jq` command above shows no `slack-reply-guard.sh` entry. | Create the directory or fix the file, then `clean_restart`. |
   | The record couldn't be written at launch. The stale record is removed, so the persona gets no reminder until its next launch. | No record file; `server.log` has `[slack] reply-guard: could not write the record for "<name>" (key=<key>) at <path>`. | Fix the state directory's permissions or free space, then `clean_restart`. |
@@ -1068,6 +1186,8 @@ registers again with its history. If the new token is refused too, a new
 | Line | Meaning |
 |---|---|
 | `[slack] persona "<name>" (key=<key>): up after its bring-up retry (directory\|Slack) — launching` | A retrying persona came up and is launched from its retry. Normal recovery. |
+| `[slack] persona Socket Mode: personas[<i>] "<name>" (key=<key>): <text>` | A connection-health line from the Slack library: a ping or pong timeout, or `Failed to send ping to Slack`. The connection is treated as dead and reopened. See [`persona-connection-lost`](#persona-connection-lost). |
+| `[WARN]  web-api:WebClient …` (or `[INFO]`, `[ERROR]`) | The Slack library's own line for a persona's Web API client: a Slack response warning, a rate-limit wait, or a failed request. URLs show as `<redacted-url>` and token-like text as `<redacted-token>`. Nothing to do unless it repeats. |
 | `[slack] Session connected: persona "<name>" (key=<key>) cwd="<path>"` | The persona's instance registered: it's being served. |
 | `[slack] No live session for persona "<name>" (key=<key>) chat_id=<id> — dropping message` | The persona's instance has no live MCP session (the persona is up but its instance isn't registered, or the persona isn't up while its Slack connection still receives, as for [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable)), so a message for it is lost: not delivered, not saved and not replayed later. Nothing else is posted in `<id>`, the conversation it came from (the notice below lands there only when `<id>` is the destination), and it gets no ack reaction. The persona posts one lost-message notice to its destination: `Persona "<name>" (key=<key>): :warning: *Message lost* — a message from <sender> …`, naming the sender (display name, else user ID; for a bot or webhook post, its name or bot ID) and ending in a `Recovery:` state, never the message text. `not up`: the persona isn't up, so no restart was started; its instance is launched once the persona recovers: fix its cause (its class line), then resend. `restarting` and `starting now`: the instance is being restarted; resend once it's back. `auto-restart disabled` and `restart limit reached`: the notice says to restart the server to recover. If the notice doesn't arrive, look for a [`persona-destination-failed`](#persona-destination-failed) line. |
 | `[slack] DROP: no _GET_stream for persona "<name>" (key=<key>) chat_id=<id> cwd="<path>" mcpSessionId=<id> — message will not reach the bot; triggering recovery` | The instance's session is registered and looks connected, but its message stream is gone (the `Dispatching to persona …` line just before it has `hasGetStream=false`). The message is lost exactly as for `No live session` above: the same lost-message notice at the destination, nothing else in the source conversation. |
@@ -1152,6 +1272,7 @@ as `channels2`, is therefore not shown. After a fix, start the server again.
 | `personas[<i>] must be a JSON object, got <type>.` | An array element isn't an object. | Make it a persona object. |
 | `unknown field(s) in the persona entry: "<key>".`, `… in dm: …`, `… in channels[<j>]: …`, each possibly with `1 field whose name is not shown …` or `plus <n> fields whose names are not shown …` | A key the schema doesn't have, at that level. As at the top level, only plain setting names are shown; others (a digit, as in `channels2`, a dash, a pasted token) are counted. | Remove or correct it. For an unshown field, compare that entry's keys with the persona keys in the README. |
 | `name is required.` / `name must be a non-empty string.` | Missing or blank name. | Give the persona a name. |
+| `name looks like a Slack token. A persona's name appears in logs, previews and Slack messages, so it must not be a secret; choose another name.` | The name contains something shaped like a Slack token. The message names only `personas[<i>]`, never the name or its key. | Choose another name. |
 | `credentials_file is required.` / `working_directory is required.` | Missing path. | Add it. |
 | `<setting> must be an absolute path, "~" or a path starting with "~/".` | `credentials_file`, `working_directory` or `claude_config_dir` is relative (or not a string). | Use an absolute path or `~/…`. |
 | `stop_hook_bootstrap must be a boolean.` / `dm.enabled must be a boolean.` | Wrong type. | Use `true` or `false`. |
@@ -1473,12 +1594,12 @@ What changes at once, with no restart:
   pending until the file changes again.
 
 Next-launch and server-wide settings are recorded and take effect later (see
-[What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)).
+[Next-launch and server-wide settings](#next-launch-and-server-wide-settings)).
 Never delete the record to apply an edit: the confirmation has already
 written the change into it. Deleting the record is only for a server that
 can't start (see [Starting without the record](#starting-without-the-record)).
 
-### What a confirmation doesn't apply yet
+### Next-launch and server-wide settings
 
 A confirmation records these changes in `config.json.last-applied`, and they
 take effect later. Until then, each persona keeps running as it was launched,
@@ -1519,7 +1640,7 @@ Look in `server.log` for the lines logged after the rename (the `grep` in
 
 | Line | Meaning |
 |---|---|
-| [`reload-applied`](#reload-applied) | The change was applied. Personas added, removed, destructively modified, changed in place or with a changed credentials file are handled (a credentials file that can't be used logs [`persona-credentials-change-failed`](#persona-credentials-change-failed) and stays pending); next-launch and server-wide settings are recorded (see [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)). A persona that isn't up has its own class line. |
+| [`reload-applied`](#reload-applied) | The change was applied. Personas added, removed, destructively modified, changed in place or with a changed credentials file are handled (a credentials file that can't be used logs [`persona-credentials-change-failed`](#persona-credentials-change-failed) and stays pending); next-launch and server-wide settings are recorded (see [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)). A persona that isn't up has its own class line. |
 | [`reload-noop`](#reload-noop) | The change had no effect (whitespace, key order, a default written out); the record now matches `config.json`. Nothing else happens. |
 | [`reload-invalid`](#reload-invalid), `the confirmed configuration is invalid, so nothing is applied` | `config.json` was invalid. Nothing is applied and the confirmation is used up. Fix the file, then confirm the new preview. |
 | [`reload-stale-confirmation`](#reload-stale-confirmation) | The confirmation didn't match the files as they stand, or couldn't be read. Nothing is applied. |
@@ -1836,7 +1957,7 @@ or a filesystem that doesn't support syncing a directory).
 
   The next start runs the new record, which also carries out the server-wide
   settings (see
-  [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)); the record already holds the change, so don't delete it.
+  [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)); the record already holds the change, so don't delete it.
 - **Fix:** None. If `config.json.pending` is written again after this line,
   something is still pending: see [Pending changes](#pending-changes). With
   nothing left pending, no `reload-nothing-pending` line follows; this line
@@ -1858,7 +1979,7 @@ or a filesystem that doesn't support syncing a directory).
   match again and nothing is pending. No persona, instance or setting changed.
   A `claude_config_dir` moved to another path for the same real directory
   (through a symlink) still logs one `template refresh:` line (see
-  [Memory-note reads](#what-a-confirmation-doesnt-apply-yet)): the template's
+  [Memory-note reads](#next-launch-and-server-wide-settings)): the template's
   rules are written from the path as spelled.
 - **Fix:** None.
 

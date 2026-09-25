@@ -33,6 +33,16 @@
  * - E2 Task 3 / README "File attachment fails after a long wait": `reply`
  *   uploads go through the manager's long-lived client, built with the 30 s
  *   options;
+ * - E13 decisions 12 and 15: the production factory hands the socket logger
+ *   of `socketModeClientOptions()` to the real
+ *   `SocketModeClient` and its own `apps.connections.open` client. Against
+ *   local stand-ins (port 0, fake tokens), a real client whose pings get no
+ *   pong puts exactly the pong-timeout line in the persona's log, and one
+ *   whose handshake is refused puts nothing there and nothing on the console
+ *   from the library's ticket-bearing error lines. The production factory's
+ *   real validation and long-lived WebClients hold their redacting logger, so
+ *   a Slack warning holding an upload URL and a fake token reaches the
+ *   console with both replaced;
  * - Task 2: a persona's held notices are flushed on its transition to `up`,
  *   and only that persona's (the hold-and-flush walk-through is in
  *   tests/persona-bringup.test.ts).
@@ -50,6 +60,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -57,6 +68,8 @@ import type { Database } from 'bun:sqlite'
 import type { Client as AdClient, DecideParams } from 'agent-director'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
+import { SocketModeClient, type Logger } from '@slack/socket-mode'
+import type { WebClient, WebClientOptions } from '@slack/web-api'
 
 import type { Persona } from '../src/config.ts'
 import { credentialsFilesToProtect } from '../src/config.ts'
@@ -69,7 +82,12 @@ import {
   type PersonaSocketEventName,
   type PersonaSocketEventPayload,
 } from '../src/persona-connections.ts'
-import { longLivedWebClientOptions } from '../src/persona-slack-clients.ts'
+import {
+  PRODUCTION_SLACK_CLIENT_FACTORY,
+  longLivedWebClientOptions,
+  socketModeClientOptions,
+  validationWebClientOptions,
+} from '../src/persona-slack-clients.ts'
 import type { PersonaRouting } from '../src/persona-routing.ts'
 import { createPersonaNotifier } from '../src/persona-notifier.ts'
 import { encodePermissionActionId } from '../src/permission-action-id.ts'
@@ -108,8 +126,9 @@ import {
 } from './test-helpers/persona-routing-harness.ts'
 import { initRestart } from '../src/restart.ts'
 import { cannedGetResultPlural, cannedListRow, cannedPermissionRequest } from './test-helpers/agent-director-stub.ts'
-import { LEAK_SENTINEL, assertNoLeak } from './test-helpers/credentials.ts'
+import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
 import { makeManagedRouting } from './test-helpers/persona-routing-managed.ts'
+import { outputDuringAsync, socketLogLine, ticketUrl } from './test-helpers/slack-logger-probes.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -754,19 +773,23 @@ describe('E2 carry: clientFor serves A\'s long-lived client only while A is serv
 // ---------------------------------------------------------------------------
 
 describe('E2 carry: reply file uploads go through the manager\'s long-lived client (README "File attachment fails after a long wait")', () => {
-  test('each persona\'s long-lived Web client is built once with longLivedWebClientOptions(): a 30 s per-attempt timeout and the library\'s default retries', async () => {
+  test('each persona\'s long-lived Web client is built once with longLivedWebClientOptions(): a 30 s per-attempt timeout, the library\'s default retries and a logger of its own', async () => {
     const h = harness()
     await bringUpBoth(h)
+    const { logger: _fresh, ...expected } = longLivedWebClientOptions()
 
+    const loggers: unknown[] = []
     for (const p of [h.A, h.B]) {
       const builds = h.slack.buildsOf(p.key, 'web')
       expect(builds).toHaveLength(1)
-      expect(builds[0]!.options).toEqual(longLivedWebClientOptions())
+      const { logger, ...options } = builds[0]!.options
+      expect(options).toStrictEqual(expected)
       // The README note depends on these exact values.
-      expect(builds[0]!.options).toEqual({ timeout: 30_000, attachOriginalToWebAPIRequestError: false })
-      expect(builds[0]!.options).not.toHaveProperty('retryConfig')
-      expect(builds[0]!.options).not.toHaveProperty('rejectRateLimitedCalls')
+      expect(options).toStrictEqual({ timeout: 30_000, attachOriginalToWebAPIRequestError: false })
+      expect(typeof logger?.warn).toBe('function')
+      loggers.push(logger)
     }
+    expect(loggers[0]).not.toBe(loggers[1])
   })
 
   test('a reply with a file, through clientFor, uploads on A\'s long-lived client and on no other client', async () => {
@@ -812,6 +835,179 @@ describe('E2 carry: reply file uploads go through the manager\'s long-lived clie
     expect(h.stub(h.A).calls.filesUploadV2).toHaveLength(1)
     expect(slackCalls(h.stub(h.B))).toBe(bBefore)
     assertNoLeak({ result, consoleLines })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// E13 decisions 12 and 15: the Slack libraries' own log output
+// ---------------------------------------------------------------------------
+
+/**
+ * The Socket Mode library's "WebSocket error!" line text under Bun: the
+ * handshake's WebSocket URL with its connection ticket (sentinel-bearing) and
+ * a fake token.
+ */
+const WS_ERROR_TEXT =
+  `WebSocket connection to '${ticketUrl('wss://wss-primary.slack.invalid')}' failed: Expected 101 status code ` +
+  fakeToken(APP_TOKEN_PREFIX, 'ws-error')
+
+/** The logger a real Socket Mode client holds, and the one its own `apps.connections.open` WebClient holds. */
+function loggersOf(client: SocketModeClient): { own: unknown; webClient: unknown } {
+  const inner = client as unknown as { logger: unknown; webClient: { logger: unknown } }
+  return { own: inner.logger, webClient: inner.webClient.logger }
+}
+
+/** A local stand-in for Slack's Web API (port 0): every method answers `answer`. The caller stops it. */
+function serveSlackApi(answer: Record<string, unknown>): { server: ReturnType<typeof Bun.serve>; url: string } {
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json(answer) })
+  return { server, url: `http://127.0.0.1:${server.port}/api/` }
+}
+
+/**
+ * A local WebSocket endpoint over raw TCP (port 0): `silent` completes the
+ * handshake and then answers no frame, so the client's pings get no pong
+ * (Bun.serve would answer them itself); `refuse` answers the handshake with
+ * a 400. `closeAll` closes every accepted connection. The caller stops it.
+ */
+function rawWebSocketEndpoint(mode: 'silent' | 'refuse'): { port: number; closeAll(): void; stop(): void } {
+  const sockets: { end(): void }[] = []
+  const server = Bun.listen({
+    hostname: '127.0.0.1',
+    port: 0,
+    socket: {
+      open(socket) {
+        sockets.push(socket)
+      },
+      data(socket, data) {
+        const key = /sec-websocket-key:\s*(\S+)/i.exec(data.toString('latin1'))?.[1]
+        if (key === undefined) return
+        if (mode === 'refuse') {
+          socket.write('HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n')
+          return
+        }
+        const accept = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')
+        socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
+      },
+    },
+  })
+  return {
+    port: server.port,
+    closeAll: () => sockets.forEach(socket => socket.end()),
+    stop: () => server.stop(true),
+  }
+}
+
+// What the manager builds each socket client with is checked in tests/persona-connections.test.ts
+// (the AC 20 connection-leg occasion table); these cases take the production factory's real clients.
+describe('E13 decisions 12 and 15: the production factory\'s real socket client holds its persona\'s socket logger, each real Web API client a redacting logger', () => {
+  test('the production factory hands socketModeClientOptions() to a real SocketModeClient unchanged: the client and its apps.connections.open WebClient hold the persona\'s socket logger, and the library\'s own WebSocket error line writes nothing', async () => {
+    const A = harness().A
+    const lines: string[] = []
+    const options = socketModeClientOptions(fakeToken(APP_TOKEN_PREFIX, 'production'), A, line => void lines.push(line))
+    let client: SocketModeClient | undefined
+
+    const output = await outputDuringAsync(() => {
+      client = PRODUCTION_SLACK_CLIENT_FACTORY.createSocketClient(options) as SocketModeClient
+      // The library's own `error` listener (SocketModeClient.js: "WebSocket error! …") logs through it.
+      client.emit('error', new Error(WS_ERROR_TEXT))
+    })
+
+    assertNoLeak({ output, lines })
+    expect(client).toBeInstanceOf(SocketModeClient)
+    expect(loggersOf(client!).own).toBe(options.logger as Logger)
+    expect(loggersOf(client!).webClient).toBe(options.logger as Logger)
+    expect(output).toEqual([])
+    expect(lines).toEqual([])
+
+    // Control: the same options without the logger fall back to the library's console logger, which writes the line.
+    const { logger: _logger, ...withoutLogger } = socketModeClientOptions(fakeToken(APP_TOKEN_PREFIX, 'control'), A, () => {})
+    const control = new SocketModeClient(withoutLogger)
+    expect((await outputDuringAsync(() => control.emit('error', new Error(WS_ERROR_TEXT)))).length).toBeGreaterThan(0)
+  })
+
+  // Rows: what the local WebSocket endpoint does, and the texts the persona's log then gets.
+  test.each<[string, 'silent' | 'refuse', string[]]>([
+    ['never answers the client\'s pings: exactly the pong-timeout line', 'silent', ["A pong wasn't received from the server before the timeout of 30ms!"]],
+    ['refuses the handshake: nothing of the library\'s ticket-bearing error lines', 'refuse', []],
+  ])('a real SocketModeClient from the production factory, against a local endpoint that %s, and nothing on the console', async (_label, mode, texts) => {
+    const A = harness().A
+    const endpoint = rawWebSocketEndpoint(mode)
+    const api = serveSlackApi({ ok: true, url: ticketUrl(`ws://127.0.0.1:${endpoint.port}`) })
+    const lines: string[] = []
+    let lineSeen!: () => void
+    const firstLine = new Promise<void>(resolve => (lineSeen = resolve))
+    const options = socketModeClientOptions(fakeToken(APP_TOKEN_PREFIX, 'probe'), A, line => {
+      lines.push(line)
+      lineSeen()
+    })
+    // What the library hands the logger, recorded before the logger decides.
+    const libraryLines: unknown[][] = []
+    const logger = options.logger!
+    for (const method of ['debug', 'info', 'warn', 'error'] as const) {
+      const decide = logger[method]
+      logger[method] = (...args: unknown[]) => {
+        libraryLines.push(args)
+        decide(...args)
+      }
+    }
+    try {
+      const output = await outputDuringAsync(async () => {
+        const client = PRODUCTION_SLACK_CLIENT_FACTORY.createSocketClient({
+          ...options,
+          clientPingTimeout: 30,
+          clientOptions: { ...options.clientOptions, slackApiUrl: api.url },
+        })
+        const started = client.start().then(() => 'connected', () => 'closed')
+        if (mode === 'silent') {
+          await firstLine
+          endpoint.closeAll()
+        }
+        expect(await started).toBe('closed')
+      })
+
+      assertNoLeak({ output, lines })
+      expect(output).toEqual([])
+      expect(lines).toEqual(texts.map(text => socketLogLine(A, text)))
+      // The library did log its ticket-bearing error lines; the logger dropped them.
+      if (mode === 'refuse') expect(libraryLines.filter(args => String(args[0]).includes(LEAK_SENTINEL)).length).toBeGreaterThan(0)
+    } finally {
+      endpoint.closeAll()
+      endpoint.stop()
+      api.server.stop(true)
+    }
+  })
+
+  // Rows: the client kind, the production factory's constructor for it and its option builder.
+  test.each<[string, (token: string, options: WebClientOptions) => unknown, () => WebClientOptions]>([
+    ['validation', PRODUCTION_SLACK_CLIENT_FACTORY.createValidationClient, validationWebClientOptions],
+    ['long-lived', PRODUCTION_SLACK_CLIENT_FACTORY.createWebClient, longLivedWebClientOptions],
+  ])('the production factory\'s real %s WebClient holds its redacting logger, and a Slack warning holding an upload URL and a fake token reaches the console redacted', async (_kind, create, build) => {
+    const warning = `superseded, see https://files.slack.invalid/upload/v1/${LEAK_SENTINEL} ${fakeToken(BOT_TOKEN_PREFIX, 'warning')}`
+    const api = serveSlackApi({ ok: true, user_id: 'U0WIRE01', bot_id: 'B0WIRE01', response_metadata: { warnings: [warning] } })
+    try {
+      const options = build()
+      const client = create(fakeToken(BOT_TOKEN_PREFIX, 'probe'), { ...options, slackApiUrl: api.url }) as WebClient
+
+      const output = await outputDuringAsync(() => client.auth.test())
+
+      assertNoLeak(output)
+      expect((client as unknown as { logger: unknown }).logger).toBe(options.logger)
+      // The library passes each warning to warn as forEach does: the warning, its index and the array.
+      expect(output).toEqual([
+        {
+          method: 'warn',
+          args: [
+            '[WARN] ',
+            'web-api:WebClient',
+            'superseded, see <redacted-url> <redacted-token>',
+            '0',
+            expect.stringContaining("'superseded, see <redacted-url> <redacted-token>'"),
+          ],
+        },
+      ])
+    } finally {
+      api.server.stop(true)
+    }
   })
 })
 

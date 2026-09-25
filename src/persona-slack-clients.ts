@@ -19,16 +19,33 @@
  * errors as `original`. The option builders below fix every one of those, and
  * the manager passes their result to the factory unchanged:
  *
- * - Socket Mode: `autoReconnectEnabled: false`, and `clientOptions` of
+ * - Socket Mode: `autoReconnectEnabled: false`, `clientOptions` of
  *   `retryConfig {retries: 0}`, `timeout: 10000`, `rejectRateLimitedCalls:
- *   true`, `attachOriginalToWebAPIRequestError: false`.
- * - Validation: the same four Web API options.
- * - Long-lived Web API: `timeout: 30000` and
- *   `attachOriginalToWebAPIRequestError: false` only. `retryConfig` and
- *   `rejectRateLimitedCalls` stay unset, so the library's default retry
- *   policy (about ten retries over about 30 minutes) and its rate-limit
- *   handling stay as the server has them today.
+ *   true`, `attachOriginalToWebAPIRequestError: false`, and a `logger` of its
+ *   own (`socketModeSlackLogger`) that drops every library line except a
+ *   fixed allowlist of connection-health lines, which it writes to the server
+ *   log with the persona reference. The library's console logger would print
+ *   error text holding the WebSocket URL and its connection ticket.
+ * - Validation: the same four Web API options, and a redacting `logger`
+ *   (`redactingSlackLogger`).
+ * - Long-lived Web API: `timeout: 30000`,
+ *   `attachOriginalToWebAPIRequestError: false` and a redacting `logger`.
+ *   `retryConfig` and `rejectRateLimitedCalls` stay unset, so the library's
+ *   default retry policy (about ten retries over about 30 minutes) and its
+ *   rate-limit handling stay as the server has them today.
  *
+ * The Web API clients' lines still reach the console as the library's own
+ * logger writes them, but URL-like and token-like text is replaced first. At
+ * its default level the library prints Slack's response warnings, the
+ * rate-limit wait and a failed request's error message ("http request
+ * failed <message>"). That message is not safe as it stands: on a 429 it
+ * holds the request URL, which for `filesUploadV2` is Slack's short-lived
+ * upload URL, a bearer like the Socket Mode ticket. The token itself travels
+ * only in the Authorization header, and today axios runs its `http` adapter
+ * under Bun, whose header check names the header, not its value; Bun's
+ * `fetch` `Headers` check does echo the value, so the redaction does not rely
+ * on which adapter runs or how its errors are worded.
+
  * Each builder returns a fresh object, so no option object is shared between
  * clients or personas (the libraries keep a reference to what they are
  * given).
@@ -39,15 +56,21 @@
  * added, dropped or changed.
  *
  * Pure module (b.av2 SR-13.1): nothing is constructed, read or scheduled at
- * import; no environment access, no file access, no logging.
+ * import; no environment access, no file access. Nothing logs at import: the
+ * library loggers built here write only when a client calls them.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { SocketModeClient, type SocketModeOptions } from '@slack/socket-mode'
+import { inspect } from 'node:util'
+
+import { LogLevel, SocketModeClient, type Logger, type SocketModeOptions } from '@slack/socket-mode'
 import { WebClient, type WebClientOptions } from '@slack/web-api'
 
+import type { Persona } from './config.ts'
+import { renderPersonaRef } from './persona-identity.ts'
 import { SLACK_START_TIMEOUT_MS } from './persona-slack-validation.ts'
+import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER, redactSlackLogText } from './slack-log-redaction.ts'
 
 // ---------------------------------------------------------------------------
 // Timing constants (b.av2 SR-3.3)
@@ -70,11 +93,11 @@ export const PERSONA_WEB_API_REQUEST_TIMEOUT_MS = 30_000
 // ---------------------------------------------------------------------------
 
 /**
- * The Web API options of the Socket Mode client's own HTTP client and of the
+ * The request limits of the Socket Mode client's own HTTP client and of the
  * validation client: no retries, a 10 s timeout, rate limits rejected, no
  * `original` on errors. A fresh object per call.
  */
-export function validationWebClientOptions(): WebClientOptions {
+function validationRequestLimits(): WebClientOptions {
   return {
     retryConfig: { retries: 0 },
     timeout: PERSONA_VALIDATION_REQUEST_TIMEOUT_MS,
@@ -84,28 +107,210 @@ export function validationWebClientOptions(): WebClientOptions {
 }
 
 /**
- * The options of a persona's Socket Mode client: library auto-reconnect off,
- * and `validationWebClientOptions()` for its `apps.connections.open` calls.
- * A fresh object per call.
+ * The options of the validation client: the validation request limits and a
+ * redacting logger (`redactingSlackLogger`). The Socket Mode client's own
+ * HTTP client takes the limits without this logger: it gets the socket's
+ * logger from the library. A fresh object per call.
  */
-export function socketModeClientOptions(appToken: string): SocketModeOptions {
+export function validationWebClientOptions(): WebClientOptions {
+  return { ...validationRequestLimits(), logger: redactingSlackLogger() }
+}
+
+// ---------------------------------------------------------------------------
+// Library loggers
+// ---------------------------------------------------------------------------
+
+/** The persona a Socket Mode client's forwarded lines name. */
+export type SlackLogPersona = Pick<Persona, 'index' | 'name' | 'key'>
+
+/** Receives each forwarded library line, as one server-log line. */
+export type SlackLibraryLineSink = (line: string) => void
+
+/** Severity of each level, as the library's console logger ranks them. */
+const LOG_SEVERITY: Record<LogLevel, number> = {
+  [LogLevel.ERROR]: 400,
+  [LogLevel.WARN]: 300,
+  [LogLevel.INFO]: 200,
+  [LogLevel.DEBUG]: 100,
+}
+
+/** Whether a line at `line` is written by a logger set to `threshold`. */
+function isWritten(line: LogLevel, threshold: LogLevel): boolean {
+  return LOG_SEVERITY[line] >= LOG_SEVERITY[threshold]
+}
+
+/** One allowlisted Socket Mode library line: its level, its exact text and what is forwarded. */
+interface SocketHealthLine {
+  readonly level: LogLevel
+  /** Anchored: the whole line must match. */
+  readonly pattern: RegExp
+  /** The text forwarded for a matching line. */
+  readonly forward: (line: string) => string
+}
+
+/**
+ * The Socket Mode library lines forwarded to the server log
+ * (`@slack/socket-mode` 2.0.6, `SlackWebSocket.js`), each passed by the
+ * library as its only argument:
+ * - warn `A ping wasn't received from the server before the timeout of <n>ms!`
+ *   (no ping from Slack in time; the library then disconnects);
+ * - warn `A pong wasn't received from the server before the timeout of <n>ms!`
+ *   (Slack did not answer the client's pings; the library then disconnects);
+ * - error `Failed to send ping to Slack (error: <error>)`: forwarded as
+ *   `Failed to send ping to Slack` only, since the error text is the
+ *   runtime's and is not checked.
+ * The two timeout lines are fixed text but for the number, so they are
+ * forwarded as they are.
+ */
+const SOCKET_HEALTH_LINES: readonly SocketHealthLine[] = [
+  {
+    level: LogLevel.WARN,
+    pattern: /^A (?:ping|pong) wasn't received from the server before the timeout of \d+ms!$/,
+    forward: line => line,
+  },
+  {
+    level: LogLevel.ERROR,
+    pattern: /^Failed to send ping to Slack \(error: [\s\S]*\)$/,
+    forward: () => 'Failed to send ping to Slack',
+  },
+]
+
+/** The text to forward for a library line at `level`, or `undefined` when it is not allowlisted. */
+function socketHealthText(level: LogLevel, msg: readonly unknown[]): string | undefined {
+  const [line] = msg
+  if (msg.length !== 1 || typeof line !== 'string') return undefined
+  const entry = SOCKET_HEALTH_LINES.find(candidate => candidate.level === level && candidate.pattern.test(line))
+  return entry?.forward(line)
+}
+
+/**
+ * The library logger of one persona's Socket Mode client. It drops every
+ * line except the connection-health lines of `SOCKET_HEALTH_LINES`, which it
+ * hands to `log` as
+ * `[slack] persona Socket Mode: personas[<i>] "<name>" (key=<key>): <text>`,
+ * so a connection that was up and then dropped keeps the library's reason
+ * beside CSCB's own `persona-connection-lost` line.
+ *
+ * Everything else is dropped because the library's error text is not safe to
+ * log: under Bun, a failed WebSocket handshake's error text holds the
+ * WebSocket URL `apps.connections.open` returned, connection ticket included
+ * (`SlackWebSocket.js` "WebSocket error occurred", `SocketModeClient.js`
+ * "WebSocket error!"), and "Failed to retrieve a new WSS URL" prints
+ * whatever message the Web API error carries. The server logs connection
+ * failures itself, token-safely (`describeThrownValue`). The socket client
+ * hands this logger to its own `apps.connections.open` client and its
+ * WebSocket too, so their lines are dropped as well.
+ *
+ * `setLevel` and `getLevel` keep the level the library reads (default INFO),
+ * and a forwarded line is written only at or above it. A throwing `log` is
+ * caught: the library calls the logger from its own timers. A fresh object
+ * per call.
+ */
+export function socketModeSlackLogger(persona: SlackLogPersona, log: SlackLibraryLineSink): Logger {
+  let level: LogLevel = LogLevel.INFO
+  const prefix = `[slack] persona Socket Mode: personas[${persona.index}] ${renderPersonaRef(persona.name, persona.key)}: `
+  const at = (lineLevel: LogLevel) => (...msg: unknown[]): void => {
+    if (!isWritten(lineLevel, level)) return
+    const text = socketHealthText(lineLevel, msg)
+    if (text === undefined) return
+    try {
+      log(`${prefix}${text}`)
+    } catch {
+      /* a failing sink must not throw into the library */
+    }
+  }
+  return {
+    debug: at(LogLevel.DEBUG),
+    info: at(LogLevel.INFO),
+    warn: at(LogLevel.WARN),
+    error: at(LogLevel.ERROR),
+    setLevel: (next: LogLevel): void => {
+      level = next
+    },
+    getLevel: (): LogLevel => level,
+    setName: (): void => {},
+  }
+}
+
+// The redactor and its placeholders live in the import-free
+// `slack-log-redaction.ts` (the permission trail uses them too) and are
+// re-exported here.
+export { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER, redactSlackLogText }
+
+/** The console label the library's console logger writes before each line, per level. */
+const CONSOLE_LABELS: Record<LogLevel, string> = {
+  [LogLevel.ERROR]: '[ERROR] ',
+  [LogLevel.WARN]: '[WARN] ',
+  [LogLevel.INFO]: '[INFO] ',
+  [LogLevel.DEBUG]: '[DEBUG] ',
+}
+
+/** The name a redacting logger writes on each line until the library sets one. */
+const REDACTING_LOGGER_DEFAULT_NAME = 'web-api:WebClient'
+
+/**
+ * The library logger of a persona's Web API client (validation and
+ * long-lived). It writes to the console as the library's own console logger
+ * does (`console.<level>(label, name, ...args)`, same labels, same level
+ * rule, default INFO) but redacts every argument first: a string through
+ * `redactSlackLogText`, any other value through the same after
+ * `util.inspect` (so no object reaches the console unredacted). A fresh
+ * object per call.
+ */
+export function redactingSlackLogger(): Logger {
+  let level: LogLevel = LogLevel.INFO
+  let name = REDACTING_LOGGER_DEFAULT_NAME
+  const at = (lineLevel: LogLevel) => (...msg: unknown[]): void => {
+    if (!isWritten(lineLevel, level)) return
+    const redacted = msg.map(arg => redactSlackLogText(typeof arg === 'string' ? arg : inspect(arg)))
+    console[lineLevel](CONSOLE_LABELS[lineLevel], name, ...redacted)
+  }
+  return {
+    debug: at(LogLevel.DEBUG),
+    info: at(LogLevel.INFO),
+    warn: at(LogLevel.WARN),
+    error: at(LogLevel.ERROR),
+    setLevel: (next: LogLevel): void => {
+      level = next
+    },
+    getLevel: (): LogLevel => level,
+    setName: (next: string): void => {
+      name = next
+    },
+  }
+}
+
+/**
+ * The options of a persona's Socket Mode client: library auto-reconnect off,
+ * the validation request limits for its `apps.connections.open` calls, and a
+ * logger of its own, `socketModeSlackLogger(persona, log)`, in place of the
+ * library's console logger. A fresh object per call.
+ */
+export function socketModeClientOptions(
+  appToken: string,
+  persona: SlackLogPersona,
+  log: SlackLibraryLineSink,
+): SocketModeOptions {
   return {
     appToken,
     autoReconnectEnabled: false,
-    clientOptions: validationWebClientOptions(),
+    clientOptions: validationRequestLimits(),
+    logger: socketModeSlackLogger(persona, log),
   }
 }
 
 /**
  * The options of a persona's long-lived Web API client: a 30 s per-attempt
- * timeout and no `original` on errors. `retryConfig` and
- * `rejectRateLimitedCalls` are deliberately unset (the library's default
- * retry policy and rate-limit handling apply). A fresh object per call.
+ * timeout, no `original` on errors and a redacting logger
+ * (`redactingSlackLogger`). `retryConfig` and `rejectRateLimitedCalls` are
+ * deliberately unset (the library's default retry policy and rate-limit
+ * handling apply). A fresh object per call.
  */
 export function longLivedWebClientOptions(): WebClientOptions {
   return {
     timeout: PERSONA_WEB_API_REQUEST_TIMEOUT_MS,
     attachOriginalToWebAPIRequestError: false,
+    logger: redactingSlackLogger(),
   }
 }
 

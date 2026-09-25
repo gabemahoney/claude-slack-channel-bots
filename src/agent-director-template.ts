@@ -39,7 +39,8 @@ import { getClient, DEFAULT_TEMPLATE_NAME } from './agent-director-client.ts'
 import { recordStartupError } from './startup-errors.ts'
 import type { PersonaConfig } from './config.ts'
 import { effectiveClaudeConfigDirs } from './persona-identity.ts'
-import { describeThrownValue } from './persona-connection-errors.ts'
+import { describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
+import { redactSlackLogText } from './slack-log-redaction.ts'
 
 // ---------------------------------------------------------------------------
 // Injectable dependency surface
@@ -229,12 +230,31 @@ export interface InstalledTemplate extends MakeTemplateResult {
 }
 
 /**
- * One-line detail of a rejected `makeTemplate`: a typed agent-director
- * error's name and description, else `describeUntyped`'s description of the
- * thrown value.
+ * The boot install's one-line detail of a rejected `makeTemplate`: a typed
+ * agent-director error's name and description, else the thrown value's
+ * message. It goes to the fatal startup error, not a Slack or
+ * agent-director log line.
  */
-function describeTemplateFailure(err: unknown, describeUntyped: (err: unknown) => string): string {
-  return err instanceof AgentDirectorError ? `${err.errName}: ${err.errDescription}` : describeUntyped(err)
+function describeTemplateFailure(err: unknown): string {
+  return err instanceof AgentDirectorError ? `${err.errName}: ${err.errDescription}` : untypedMessage(err)
+}
+
+/**
+ * The refresh's one-line detail of a rejected `makeTemplate`, safe to log: a
+ * typed agent-director error's `errName` when it passes `isSafeIdentifier`,
+ * then its description through `redactSlackLogText` (URL-like and token-like
+ * text replaced); any other throw, or a typed error whose `errName` fails the
+ * check, only through `describeThrownValue`. Never throws.
+ */
+function describeRefreshFailure(err: unknown): string {
+  try {
+    if (err instanceof AgentDirectorError && isSafeIdentifier(err.errName)) {
+      return `${err.errName}: ${redactSlackLogText(String(err.errDescription))}`
+    }
+  } catch {
+    /* an unreadable typed error falls back to the describer */
+  }
+  return describeThrownValue(err)
 }
 
 /** The boot install's detail of an untyped throw: its message. */
@@ -262,7 +282,7 @@ export async function installSlackChannelBotTemplate(
   } catch (err) {
     d.recordStartupError(
       'ad-template-install',
-      `Failed to install agent-director template '${params.name}'. Detail: ${describeTemplateFailure(err, untypedMessage)}`,
+      `Failed to install agent-director template '${params.name}'. Detail: ${describeTemplateFailure(err)}`,
     )
     d.exit(1)
     // unreachable; placates TS when exit() is mocked in tests
@@ -305,10 +325,12 @@ export type TemplateRefreshResult =
  *
  * Never rejects and never exits: a rejection (a typed agent-director error
  * or any throw) logs one line and resolves `{ kind: 'failed' }`. The line
- * names a typed error by its name and description, and any other throw only
- * through `describeThrownValue` (its type, a safe `code` and its stack
- * frames, never its message), so a message holding a token never reaches
- * the log. No startup
+ * names a typed error by its `errName` (only when it passes
+ * `isSafeIdentifier`) and its description with URL-like and token-like text
+ * redacted (`redactSlackLogText`), and any other throw, or a typed error
+ * with an unsafe `errName`, only through `describeThrownValue` (its type, a
+ * safe `code` and its stack frames, never its message), so a message holding
+ * a token never reaches the log. No startup
  * error is recorded, nothing is posted and no persona's state is touched,
  * and nothing retries it. A success logs one line too.
  */
@@ -337,7 +359,7 @@ export async function refreshSlackChannelBotTemplate(
   } catch (err) {
     log(
       `[slack] template refresh: refreshing the agent-director template '${params.name}' failed ` +
-        `(${describeTemplateFailure(err, describeThrownValue)}); its memory-read rules stay as last installed until the config ` +
+        `(${describeRefreshFailure(err)}); its memory-read rules stay as last installed until the config ` +
         `directories change again or the server restarts`,
     )
     return { kind: 'failed' }

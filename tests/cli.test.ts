@@ -45,6 +45,7 @@ import {
   DAEMON_STARTUP_WAIT_MS,
   STOP_KILL_WAIT_MS,
   STOP_POLL_MS,
+  StartupGateFailedError,
   createCli,
   createDirectorOps,
   type CliDeps,
@@ -52,7 +53,7 @@ import {
   type DirectorClient,
   type DirectorOps,
 } from '../src/cli.ts'
-import { ErrCallTimeout, ErrSpawnNotFound } from '../src/agent-director-errors.ts'
+import { AgentDirectorError, ErrCallTimeout, ErrSpawnNotFound } from '../src/agent-director-errors.ts'
 import {
   CONFIG_NOT_REGULAR_FILE_CODE,
   DEFAULT_PERSONA_CONFIG_FS,
@@ -65,7 +66,7 @@ import {
 } from '../src/config.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../src/persona-identity.ts'
 import { readAppliedPersonaConfig } from '../src/reload.ts'
-import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, writeCredentialsFile } from './test-helpers/credentials.ts'
+import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, writeCredentialsFile } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import {
   makeMultiPersonaConfig,
@@ -1354,6 +1355,66 @@ describe('persona-set teardown', () => {
     expect(stderr.join('\n')).toContain('teardown incomplete for 1 persona(s)')
     expect(startedServer(b)).toBe(false)
   })
+
+  // AC 20 (b.av2 SR-10.3): the pause-escalation, timeout-path "kill failed"
+  // and aggregate teardown lines log each error's description (type, a base
+  // agent-director error's errName, safe code, frames), never the error
+  // itself or its message. The errors carry fake tokens; the raw
+  // console.error arguments are checked. With a successful pause and
+  // `exit_timeout: 0` the poll loop never runs, so the timeout path's kill is
+  // reached at once.
+  test('AC 20: a pause and then its escalation kill failing with errors carrying fake tokens — the pause and teardown lines name each error without its message; clean_restart exits 1; nothing logged leaks', async () => {
+    const b = makeDeps({
+      directorStatus: async () => ({ state: 'waiting' }),
+      directorPause: async () => {
+        throw Object.assign(new Error(`pause refused ${fakeToken(BOT_TOKEN_PREFIX, 'pause')}`), { code: 'ECONNRESET', note: LEAK_SENTINEL })
+      },
+      directorKill: async () => {
+        throw new AgentDirectorError('kill', 'ErrKillBroken', `kill refused ${fakeToken(APP_TOKEN_PREFIX, 'kill')}`)
+      },
+    })
+
+    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+
+    const ref = renderPersonaRef(OPS_NAME, personaKey(OPS_NAME))
+    const line = (fragment: string): string[] => stderr.filter((l) => l.includes(fragment))
+    expect(line('pause failed').map((l) => l.split(' at ')[0])).toEqual([
+      `[slack] teardownBots: pause failed for persona ${ref} — escalating to kill: Error code=ECONNRESET`,
+    ])
+    expect(line('error during teardown').map((l) => l.split(' at ')[0])).toEqual([
+      '[slack] teardownBots: agent-director error during teardown: AgentDirectorError errName=ErrKillBroken',
+    ])
+    expect(b.exitCodes).toEqual([1])
+    expect(startedServer(b)).toBe(false)
+    assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
+  })
+
+  test('AC 20: a timeout-path kill failing with an error carrying fake tokens — the "kill failed" and teardown lines name the error without its message; clean_restart exits 1; nothing logged leaks', async () => {
+    const b = makeDeps({
+      config: opsConfig({ exit_timeout: 0 }),
+      directorStatus: async () => ({ state: 'waiting' }),
+      directorPause: async () => { /* pause succeeds */ },
+      directorKill: async () => {
+        throw Object.assign(new Error(`kill refused ${fakeToken(BOT_TOKEN_PREFIX, 'kill')}`), { code: 'ECONNRESET', note: LEAK_SENTINEL })
+      },
+    })
+
+    await expect(createCli(b.deps).clean_restart()).rejects.toBeInstanceOf(ExitError)
+
+    const ref = renderPersonaRef(OPS_NAME, personaKey(OPS_NAME))
+    const line = (fragment: string): string[] => stderr.filter((l) => l.includes(fragment))
+    expect(b.pauseCalls).toEqual([opsId()])
+    expect(b.killCalls).toEqual([opsId()])
+    expect(line('kill failed').map((l) => l.split(' at ')[0])).toEqual([
+      `[slack] teardownBots: kill failed for persona ${ref}: Error code=ECONNRESET`,
+    ])
+    expect(line('error during teardown').map((l) => l.split(' at ')[0])).toEqual([
+      '[slack] teardownBots: agent-director error during teardown: Error code=ECONNRESET',
+    ])
+    expect(b.exitCodes).toEqual([1])
+    expect(startedServer(b)).toBe(false)
+    assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1753,6 +1814,69 @@ describe('b.qwo — initClient startup gate', () => {
     await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
     expect(b.exitCodes).toContain(1)
     expect(b.statusCalls).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// stop --stop-bots failure lines (b.av2 SR-10.3, AC 20): a failure CSCB
+// authored prints its message; any other thrown value only its description
+// ---------------------------------------------------------------------------
+
+describe('stop --stop-bots failure lines (AC 20)', () => {
+  /** The stderr lines holding `fragment`, each cut before its first stack frame. */
+  const linesWith = (fragment: string): string[] => stderr.filter((l) => l.includes(fragment)).map((l) => l.split(' at ')[0]!)
+
+  test('a startup gate failure (StartupGateFailedError) prints the gate\'s class label and message on the initialization-failed line; exit 1, no director verb', async () => {
+    const detail = 'agent-director 0.9.0 is older than the required 0.10.0; run `bun add agent-director@^0.10.0`'
+    const b = makeStopDeps({
+      initClient: async () => { throw new StartupGateFailedError('ad-version-too-old', detail) },
+      directorStatus: async () => ({ state: 'waiting' }),
+    })
+
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+
+    expect(stderr.filter((l) => l.includes('initialization failed'))).toEqual([
+      `[slack] stop --stop-bots: agent-director initialization failed: agent-director startup gate failed (ad-version-too-old): ${detail}`,
+    ])
+    expect(b.exitCodes).toEqual([1])
+    expect(b.statusCalls).toEqual([])
+  })
+
+  test('an incomplete teardown (TeardownIncompleteError) prints its count and retry advice on the teardown-failed line; the underlying error, carrying fake tokens, is only described; exit 1; nothing logged leaks', async () => {
+    const b = makeStopDeps({
+      directorStatus: async () => {
+        throw Object.assign(new Error(`status refused ${fakeToken(BOT_TOKEN_PREFIX, 'status')}`), { code: 'ECONNREFUSED', note: LEAK_SENTINEL })
+      },
+    })
+
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+
+    expect(stderr.filter((l) => l.includes('bot teardown failed'))).toEqual([
+      '[slack] stop --stop-bots: bot teardown failed: teardownBots: agent-director error — teardown incomplete for 1 persona(s); ' +
+        'other personas may already have been paused or killed; rows are never deleted, safe to retry',
+    ])
+    expect(linesWith('error during teardown')).toEqual(['[slack] teardownBots: agent-director error during teardown: Error code=ECONNREFUSED'])
+    expect(b.exitCodes).toEqual([1])
+    assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
+  })
+
+  test.each<[string, () => unknown, string]>([
+    ['a plain Error with a safe code', () => Object.assign(new Error(`gate ${fakeToken(BOT_TOKEN_PREFIX, 'msg')}`), { code: 'EACCES', note: LEAK_SENTINEL }), 'Error code=EACCES'],
+    ['a base AgentDirectorError with a safe errName', () => new AgentDirectorError('init', 'ErrGateBroken', `refused ${fakeToken(APP_TOKEN_PREFIX, 'desc')}`), 'AgentDirectorError errName=ErrGateBroken'],
+    ['a base AgentDirectorError whose errName is token-shaped', () => new AgentDirectorError('init', fakeToken(BOT_TOKEN_PREFIX, 'errname'), `refused ${LEAK_SENTINEL}`), 'AgentDirectorError'],
+    ['a rejected string', () => `down ${fakeToken(BOT_TOKEN_PREFIX, 'str')}`, 'string'],
+  ])('initClient throwing %s carrying fake tokens → the initialization-failed line names it by description, never its message; exit 1; nothing logged leaks', async (_label, makeErr, shown) => {
+    const b = makeStopDeps({
+      initClient: async () => { throw makeErr() },
+      directorStatus: async () => ({ state: 'waiting' }),
+    })
+
+    await expect(createCli(b.deps).stop({ stopBots: true })).rejects.toBeInstanceOf(ExitError)
+
+    expect(linesWith('initialization failed')).toEqual([`[slack] stop --stop-bots: agent-director initialization failed: ${shown}`])
+    expect(b.exitCodes).toEqual([1])
+    expect(b.statusCalls).toEqual([])
+    assertNoLeak({ consoleErrorArgs: errorSpy.mock.calls, stderr })
   })
 })
 

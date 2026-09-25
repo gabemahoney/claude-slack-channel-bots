@@ -53,8 +53,9 @@ import { parsePermissionActionId, type PermissionDecision } from './permission-a
 import { describeSlackCallFailure } from './persona-connection-errors.ts'
 import { classifySlackError } from './persona-destination.ts'
 import { personaInstanceId, renderPersonaRef } from './persona-identity.ts'
-import { getLivePermission, markHandled } from './permission-poller.ts'
+import { describeAgentDirectorFailure, getLivePermission, markHandled } from './permission-poller.ts'
 import { emitTrail as defaultEmitTrail } from './permission-trail.ts'
+import { redactSlackLogText } from './slack-log-redaction.ts'
 import type {
   AdDecideResponseClass,
   ClosureVerdictTag,
@@ -305,7 +306,8 @@ export async function handlePermissionClick(
       // operator something is broken; the trail entry tells the engineer
       // what was actually thrown.
       const result_class: AdDecideResponseClass = err.errName as AdDecideResponseClass
-      const raw_error_message = err.message
+      // Redacted (URL-like and token-like text replaced) before it is recorded.
+      const raw_error_message = redactSlackLogText(err.message)
       emit({ ...decideEnvelope, result_class, raw_error_message })
       return true
     }
@@ -321,8 +323,10 @@ export async function handlePermissionClick(
       result_class,
     }
     if (result_class === 'other') {
+      // Kept for forensics (SR-V-2.7), but redacted first: the trail is a
+      // server-written file, and a thrown message can hold a URL or a token.
       const raw = err instanceof Error ? err.message : String(err)
-      emission['raw_error_message'] = raw
+      emission['raw_error_message'] = redactSlackLogText(raw)
     }
     emit(emission)
 
@@ -370,8 +374,7 @@ export async function handlePermissionClick(
       logDeps(deps, `[slack] permission-click: ErrAmbiguousRequest from decide for ${claudeInstanceId} (request_token=${requestToken})`)
       return true
     }
-    const e = err instanceof AgentDirectorError ? err : null
-    logDeps(deps, `[slack] permission-click: decide failed for ${claudeInstanceId}: ${e?.errName ?? String(err)}`)
+    logDeps(deps, `[slack] permission-click: decide failed for ${claudeInstanceId}: ${describeAgentDirectorFailure(err)}`)
     return true
   }
 

@@ -35,6 +35,7 @@ import {
 import { readAppliedPersonaConfig, reloadFilePaths } from './reload.ts'
 import { initLogging } from './logging.ts'
 import { ErrSpawnNotFound } from './agent-director-errors.ts'
+import { describeThrownValue } from './persona-connection-errors.ts'
 import { getClient } from './agent-director-client.ts'
 import type { Client } from 'agent-director'
 import { personaInstanceId, renderPersonaRef } from './persona-identity.ts'
@@ -167,6 +168,49 @@ export interface CliDeps {
 }
 
 // ---------------------------------------------------------------------------
+// CSCB-authored failures (b.av2 SR-10.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * The agent-director startup gate's failure, as the production `initClient`
+ * throws it. Its message is the gate's own class label and message
+ * (`runStartupGate`), which CSCB builds and which name versions, paths and the
+ * fix, never a token, so a failure line prints it rather than only describing
+ * the error: it is the operator's diagnosis.
+ */
+export class StartupGateFailedError extends Error {
+  constructor(readonly classLabel: string, detail: string) {
+    super(`agent-director startup gate failed (${classLabel}): ${detail}`)
+    this.name = 'StartupGateFailedError'
+  }
+}
+
+/**
+ * `teardownBots`' aggregate failure. Its message is CSCB's own (a persona
+ * count and the retry advice); each underlying error was already logged
+ * through `describeThrownValue`.
+ */
+class TeardownIncompleteError extends Error {
+  constructor(rejected: number) {
+    super(
+      `teardownBots: agent-director error — teardown incomplete for ${rejected} persona(s); ` +
+        `other personas may already have been paused or killed; rows are never deleted, safe to retry`,
+    )
+    this.name = 'TeardownIncompleteError'
+  }
+}
+
+/**
+ * The tail of a CLI failure line: the message of a failure CSCB authored
+ * ({@link StartupGateFailedError}, {@link TeardownIncompleteError}), else
+ * `describeThrownValue` of the thrown value, never its message.
+ */
+function describeCliFailure(err: unknown): string {
+  if (err instanceof StartupGateFailedError || err instanceof TeardownIncompleteError) return err.message
+  return describeThrownValue(err)
+}
+
+// ---------------------------------------------------------------------------
 // Log reads for the daemon startup report (production deps)
 // ---------------------------------------------------------------------------
 
@@ -273,12 +317,9 @@ export function createCli(deps: CliDeps): CliHandlers {
     const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected')
     if (rejected.length > 0) {
       for (const r of rejected) {
-        console.error('[slack] teardownBots: agent-director error during teardown:', r.reason)
+        console.error(`[slack] teardownBots: agent-director error during teardown: ${describeThrownValue(r.reason)}`)
       }
-      throw new Error(
-        `teardownBots: agent-director error — teardown incomplete for ${rejected.length} persona(s); ` +
-          `other personas may already have been paused or killed; rows are never deleted, safe to retry`,
-      )
+      throw new TeardownIncompleteError(rejected.length)
     }
   }
 
@@ -316,7 +357,7 @@ export function createCli(deps: CliDeps): CliHandlers {
     try {
       await deps.directorPause(id)
     } catch (err) {
-      console.error(`[slack] teardownBots: pause failed for persona ${ref} — escalating to kill:`, err)
+      console.error(`[slack] teardownBots: pause failed for persona ${ref} — escalating to kill: ${describeThrownValue(err)}`)
       // b.dnt: the kill's outcome decides this persona's fate. A benign
       // ErrSpawnNotFound (row genuinely already gone) resolves quietly;
       // any other kill error (e.g. AD died mid-teardown) rethrows so it
@@ -352,7 +393,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       await deps.directorKill(id)
       console.error(`[slack] teardownBots: persona ${ref} force-killed after ${elapsed}ms`)
     } catch (err) {
-      console.error(`[slack] teardownBots: kill failed for persona ${ref}:`, err)
+      console.error(`[slack] teardownBots: kill failed for persona ${ref}: ${describeThrownValue(err)}`)
       // b.dnt: same rule as the escalation path — a throwing kill here means
       // AD is dead mid-teardown, not a benign already-gone row. Rethrow so it
       // rejects into the aggregate; swallow only the benign ErrSpawnNotFound.
@@ -540,7 +581,7 @@ export function createCli(deps: CliDeps): CliHandlers {
         try {
           await deps.initClient()
         } catch (err) {
-          console.error('[slack] stop --stop-bots: agent-director initialization failed:', err)
+          console.error(`[slack] stop --stop-bots: agent-director initialization failed: ${describeCliFailure(err)}`)
           deps.exit(1)
         }
       }
@@ -562,7 +603,7 @@ export function createCli(deps: CliDeps): CliHandlers {
         try {
           await teardownBots(config.personas, config.exit_timeout)
         } catch (err) {
-          console.error('[slack] stop --stop-bots: bot teardown failed:', err)
+          console.error(`[slack] stop --stop-bots: bot teardown failed: ${describeCliFailure(err)}`)
           deps.exit(1)
         }
       }
@@ -814,9 +855,7 @@ if (import.meta.main) {
     initClient: async () => {
       const outcome = await runStartupGate()
       if (!outcome.ok) {
-        throw new Error(
-          `agent-director startup gate failed (${outcome.classLabel}): ${outcome.message}`,
-        )
+        throw new StartupGateFailedError(outcome.classLabel, outcome.message)
       }
     },
     directorStatus: directorOps.directorStatus,

@@ -64,7 +64,22 @@
  * from a Web API call on a persona's current client marks it
  * credentials-broken at once (one line, no delivery, later calls refused
  * locally), whatever the serializer holds, while other errors, stale
- * clients and B change nothing.
+ * clients and B change nothing. E13 Task 3 closes the AC 20 connection leg:
+ * every occasion that builds clients (bring-up and its retry, a reopen and its
+ * retry, a credentials reconnect and its retry, replaced retry tokens, the
+ * recovery bring-up of a credentials-broken persona) gives each client its
+ * exact SR-3.3 options with `attachOriginalToWebAPIRequestError: false`, each
+ * socket a library logger of its own (`socketModeSlackLogger`, E13 decisions
+ * 12 and 15: every library line dropped but the allowlisted connection-health
+ * lines, forwarded to the manager's log with the persona reference, the
+ * failed-ping line without its error text) and each Web API client
+ * (validation and long-lived) a redacting logger (`redactingSlackLogger`:
+ * URL-like, then token-like text replaced before the library's console
+ * output), while the socket's own `clientOptions` carry none; the reconnect's
+ * secrecy cases (a rejected call on the
+ * reconnected client, a late rejection of an abandoned reconnect `start()`, a
+ * failing close, the unhandledRejection handler on a reconnect's failure
+ * shapes) and `WebApiCallRefusedLocallyError` leak nothing.
  * Time is a fake clock throughout;
  * nothing sleeps (the start-pass cases poll in 1 ms real-time steps only for
  * the real spawn path).
@@ -107,6 +122,8 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
+import { LogLevel, type Logger } from '@slack/socket-mode'
+import type { WebClientOptions } from '@slack/web-api'
 import {
   CREDENTIALS_MISSING_MARKER,
   CREDENTIALS_UNREADABLE_MARKER,
@@ -136,6 +153,7 @@ import {
   isSafeIdentifier,
   slackPlatformReason,
 } from '../src/persona-connection-errors.ts'
+import { AgentDirectorError, ErrSpawnCapReached, ErrSpawnNotFound } from '../src/agent-director-errors.ts'
 import {
   DEFAULT_WORKING_DIRECTORY_FS,
   checkPersonaLocalBringUp,
@@ -176,6 +194,15 @@ import {
   type SlackValidationFailure,
   type SlackValidationOutcome,
 } from '../src/persona-slack-validation.ts'
+import {
+  longLivedWebClientOptions,
+  redactSlackLogText,
+  redactingSlackLogger,
+  socketModeClientOptions,
+  socketModeSlackLogger,
+  validationWebClientOptions,
+  type SlackLogPersona,
+} from '../src/persona-slack-clients.ts'
 import { MAX_TIMER_DELAY_MS, createPersonaRetrySchedule } from '../src/persona-retry-schedule.ts'
 import { WEB_API_CALL_REFUSED_LOCALLY, WebApiCallRefusedLocallyError } from '../src/persona-web-api-watch.ts'
 import { createSlackEpisodeTracker, type SlackEpisodeTracker } from '../src/persona-slack-episodes.ts'
@@ -200,6 +227,7 @@ import {
   mentionText,
   type ConnectOutcome,
   type SettledConnectOutcome,
+  type StubClientBuild,
   type StubClientKind,
   type StubSlack,
   type StubSlackFactory,
@@ -208,6 +236,7 @@ import {
   type WebApiOutcome,
 } from './test-helpers/slack-stub.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { PONG_TIMEOUT_TEXT, outputDuring, socketLogLine, ticketUrl } from './test-helpers/slack-logger-probes.ts'
 import {
   cannedGetResult,
   cannedListRow,
@@ -2217,32 +2246,459 @@ describe('connection manager: bring-up and identity (SR-3.1)', () => {
 // Client options (SR-3.3, AC 20 connection leg) and tokens (AC 47)
 // ---------------------------------------------------------------------------
 
+/** The Web API options of a validation client and of a socket client's `apps.connections.open` client (SR-3.3). */
+const NO_RETRY_OPTIONS = { retryConfig: { retries: 0 }, timeout: 10_000, rejectRateLimitedCalls: true, attachOriginalToWebAPIRequestError: false }
+
+/**
+ * Each client kind's exact SR-3.3 options, the token and the library logger
+ * aside (`expectBuiltWith` checks each logger by what it does). The long-lived
+ * client keeps the library's retry policy: no retryConfig, no
+ * rejectRateLimitedCalls. A socket's `clientOptions` carry no logger, so the
+ * library hands the socket's own logger to its `apps.connections.open`
+ * client.
+ */
+const SR33_OPTIONS: Record<StubClientKind, Record<string, unknown>> = {
+  socket: { autoReconnectEnabled: false, clientOptions: NO_RETRY_OPTIONS },
+  validation: NO_RETRY_OPTIONS,
+  web: { timeout: 30_000, attachOriginalToWebAPIRequestError: false },
+}
+
+/** A WebSocket URL as `apps.connections.open` returns it, its connection ticket sentinel-bearing. */
+const TICKET_URL = ticketUrl('wss://wss-primary.slack.invalid')
+
+/** A `filesUploadV2` upload URL (a short-lived bearer), sentinel-bearing. */
+const UPLOAD_URL = `https://files.slack.invalid/upload/v1/${LEAK_SENTINEL}-upload?sig=${LEAK_SENTINEL}`
+
+/**
+ * Text the Socket Mode library's own error lines hold under Bun (E13
+ * decision 12): a failed handshake's WebSocket URL with its connection
+ * ticket, and a fake token beside it.
+ */
+const SOCKET_LOG_TEXT =
+  `WebSocket error! Error: WebSocket connection to '${TICKET_URL}' failed: Expected 101 status code ` +
+  fakeToken(APP_TOKEN_PREFIX, 'socket-log')
+
+/** The library's ping-timeout warning (`SlackWebSocket.js`), forwarded as it is (the pong timeout's is `PONG_TIMEOUT_TEXT`). */
+const PING_TIMEOUT_TEXT = "A ping wasn't received from the server before the timeout of 30000ms!"
+
+/** The library's failed-ping error line, the runtime's error text in it holding the ticket URL and a fake token. */
+const PING_FAILED_TEXT = `Failed to send ping to Slack (error: Error: WebSocket is not open: ${TICKET_URL} ${fakeToken(APP_TOKEN_PREFIX, 'ping')})`
+
+/** What the socket logger forwards of a failed-ping line: the fixed text only. */
+const PING_FAILED_FORWARDED = 'Failed to send ping to Slack'
+
+/** The persona the unit cases' socket loggers name. */
+const LOG_PERSONA: SlackLogPersona = { index: 3, name: 'Ops Bot', key: 'ops_bot' }
+
+/** A socket logger for `persona` over a recording sink. */
+function recordingSocketLogger(persona: SlackLogPersona = LOG_PERSONA): { logger: Logger; lines: string[] } {
+  const { lines, log } = capture()
+  return { logger: socketModeSlackLogger(persona, log), lines }
+}
+
+/**
+ * `logger` is `persona`'s Socket Mode logger over the sink that fills
+ * `lines`: at its level (INFO unless set), the library's ticket-bearing error
+ * line at every method writes nothing anywhere, and the pong-timeout warning
+ * reaches `lines` exactly once, as `persona`'s line. The lines it added are
+ * taken out of `lines` again.
+ */
+function expectSocketLogger(logger: unknown, persona: SlackLogPersona, lines: string[]): void {
+  expect(typeof logger).toBe('object')
+  const l = logger as Logger
+  const before = lines.length
+  const output = outputDuring(() => {
+    for (const method of ['debug', 'info', 'warn', 'error'] as const) l[method](SOCKET_LOG_TEXT)
+    l.warn(PONG_TIMEOUT_TEXT)
+  })
+  const added = lines.splice(before)
+  assertNoLeak({ output, added })
+  expect(output).toEqual([])
+  expect(added).toEqual([socketLogLine(persona, PONG_TIMEOUT_TEXT)])
+}
+
+/** A failed request's message as a Web API client can log it: an upload URL (on a 429) and a fake token. */
+const WEB_API_LOG_TEXT = `Request failed with status code 429 (url: ${UPLOAD_URL}, token ${fakeToken(BOT_TOKEN_PREFIX, 'web-log')} sent)`
+
+/** `WEB_API_LOG_TEXT` redacted. */
+const WEB_API_LOG_REDACTED = 'Request failed with status code 429 (url: <redacted-url>, token <redacted-token> sent)'
+
+/**
+ * `logger` is a redacting Web API logger at its default level: the library's
+ * "http request failed" warning, an upload URL and a fake token in its
+ * message, reaches `console.warn` once, as the library's console logger
+ * writes it, both replaced.
+ */
+function expectRedactingLogger(logger: unknown): void {
+  expect(typeof logger).toBe('object')
+  const output = outputDuring(() => (logger as Logger).warn('http request failed', WEB_API_LOG_TEXT))
+  assertNoLeak(output)
+  expect(output).toEqual([{ method: 'warn', args: ['[WARN] ', 'web-api:WebClient', 'http request failed', WEB_API_LOG_REDACTED] }])
+}
+
+/**
+ * `build` got exactly `expected` (its token and logger aside); a socket
+ * client its persona's socket logger over the manager's log, and a Web API
+ * client (validation or long-lived) a redacting logger. Every Web API leg it
+ * can make (the client's own, or a socket's `apps.connections.open` client)
+ * has `attachOriginalToWebAPIRequestError: false`.
+ */
+function expectBuiltWith(h: Harness, build: StubClientBuild, expected: Record<string, unknown>): void {
+  const { appToken: _token, logger, ...options } = build.options as Record<string, unknown>
+  if (build.kind === 'socket') {
+    const persona = [h.a, h.b].find(p => p.key === build.persona)
+    expect(persona).toBeDefined()
+    expectSocketLogger(logger, persona!, h.lines)
+    expect(build.options.clientOptions?.attachOriginalToWebAPIRequestError).toBe(false)
+  } else {
+    expectRedactingLogger(logger)
+    expect(build.options.attachOriginalToWebAPIRequestError).toBe(false)
+  }
+  expect(options).toStrictEqual(expected)
+}
+
+/**
+ * No two clients in `builds` share an option object, a socket's
+ * `clientOptions` or a logger (the libraries keep a reference to what they
+ * are given).
+ */
+function expectNothingShared(builds: readonly StubClientBuild[]): void {
+  const objects: unknown[] = []
+  for (const build of builds) {
+    objects.push(build.options, build.options.logger)
+    if (build.kind === 'socket') objects.push(build.options.clientOptions)
+  }
+  expect(new Set(objects).size).toBe(objects.length)
+}
+
+const LOG_METHODS = ['debug', 'info', 'warn', 'error'] as const
+
+describe('socketModeSlackLogger: the allowlisted connection-health lines reach the server log, every other library line is dropped (E13 decisions 12, 15)', () => {
+  // Rows: the library line (method and text) and the text forwarded.
+  test.each<[string, 'warn' | 'error', string, string]>([
+    ['the ping timeout', 'warn', PING_TIMEOUT_TEXT, PING_TIMEOUT_TEXT],
+    ['the pong timeout', 'warn', PONG_TIMEOUT_TEXT, PONG_TIMEOUT_TEXT],
+    ['the failed ping, without its error text (a ticket URL and a fake token)', 'error', PING_FAILED_TEXT, PING_FAILED_FORWARDED],
+    ['a failed ping whose error text spans lines, without it', 'error', `Failed to send ping to Slack (error: Error: closed\n    at ${TICKET_URL})`, PING_FAILED_FORWARDED],
+  ])('%s: forwarded once, as the persona’s line, and nothing reaches the console', (_label, method, text, forwarded) => {
+    const { logger, lines } = recordingSocketLogger()
+    let returned: unknown = 'not called'
+
+    const output = outputDuring(() => {
+      returned = logger[method](text)
+    })
+
+    assertNoLeak({ output, lines })
+    expect(lines).toEqual([socketLogLine(LOG_PERSONA, forwarded)])
+    expect(output).toEqual([])
+    expect(returned).toBeUndefined()
+  })
+
+  test('a forwarded line reads [slack] persona Socket Mode: personas[<i>] "<name>" (key=<key>): <text>', () => {
+    const { logger, lines } = recordingSocketLogger()
+
+    logger.warn(PONG_TIMEOUT_TEXT)
+
+    expect(lines).toEqual([
+      '[slack] persona Socket Mode: personas[3] "Ops Bot" (key=ops_bot): A pong wasn\'t received from the server before the timeout of 5000ms!',
+    ])
+  })
+
+  // Rows: what the library line is, its method and its arguments. The logger is at DEBUG, so the
+  // allowlist alone drops each.
+  test.each<[string, (typeof LOG_METHODS)[number], unknown[]]>([
+    ['the ticket-bearing handshake error (SlackWebSocket.js)', 'error', [`WebSocket error occurred: WebSocket connection to '${TICKET_URL}' failed: Expected 101 status code`]],
+    ['the ticket-bearing "WebSocket error!" line (SocketModeClient.js)', 'error', [SOCKET_LOG_TEXT]],
+    ['a failed WSS URL retrieval with the Web API error text', 'error', [`Failed to retrieve a new WSS URL (error: Error: An API error occurred: invalid_auth ${fakeToken(APP_TOKEN_PREFIX, 'wss')})`]],
+    ['a failed WebSocket send', 'error', [`Failed to send a WebSocket message (error: Error: ${TICKET_URL})`]],
+    ['a received message, at debug', 'debug', [`Received a message on the WebSocket: {"envelope_id":"${LEAK_SENTINEL}"}`]],
+    ['the apps.connections.open client’s failed request (two arguments)', 'warn', ['http request failed', `connect ECONNREFUSED ${TICKET_URL}`]],
+    ['the apps.connections.open client’s rate-limit wait', 'info', ['API Call failed due to rate limiting. Will retry in 30 seconds.']],
+    ['the apps.connections.open client’s Slack warning', 'warn', [`missing_charset ${UPLOAD_URL}`]],
+    ['a timeout text with more after it', 'warn', [`${PONG_TIMEOUT_TEXT} ${TICKET_URL}`]],
+    ['a timeout text with more before it', 'warn', [`${TICKET_URL} ${PONG_TIMEOUT_TEXT}`]],
+    ['a timeout text with no number', 'warn', ["A pong wasn't received from the server before the timeout of ms!"]],
+    ['a timeout text without its closing "!"', 'warn', ["A pong wasn't received from the server before the timeout of 5000ms"]],
+    ['a failed-ping text without its error part', 'error', ['Failed to send ping to Slack']],
+    ['a timeout text and a second argument', 'warn', [PONG_TIMEOUT_TEXT, TICKET_URL]],
+    ['a timeout text in an Error', 'warn', [new Error(PONG_TIMEOUT_TEXT)]],
+    ['no argument', 'warn', []],
+    ['a timeout text at error, not its level', 'error', [PONG_TIMEOUT_TEXT]],
+    ['a timeout text at info', 'info', [PING_TIMEOUT_TEXT]],
+    ['a failed-ping text at warn, not its level', 'warn', [PING_FAILED_TEXT]],
+  ])('%s: dropped, nothing forwarded and nothing on the console', (_label, method, args) => {
+    const { logger, lines } = recordingSocketLogger()
+    logger.setLevel(LogLevel.DEBUG)
+
+    const output = outputDuring(() => logger[method](...args))
+
+    assertNoLeak({ output, lines })
+    expect(lines).toEqual([])
+    expect(output).toEqual([])
+  })
+
+  // Rows: the level set (none: the default) and what the pong-timeout warning and the failed-ping error forward at it.
+  test.each<[string, LogLevel | undefined, string[]]>([
+    ['no level set (INFO)', undefined, [PONG_TIMEOUT_TEXT, PING_FAILED_FORWARDED]],
+    ['DEBUG', LogLevel.DEBUG, [PONG_TIMEOUT_TEXT, PING_FAILED_FORWARDED]],
+    ['WARN', LogLevel.WARN, [PONG_TIMEOUT_TEXT, PING_FAILED_FORWARDED]],
+    ['ERROR', LogLevel.ERROR, [PING_FAILED_FORWARDED]],
+  ])('at %s, an allowlisted line is forwarded only at or above the level, and getLevel reports the level', (_label, level, forwarded) => {
+    const { logger, lines } = recordingSocketLogger()
+    if (level !== undefined) logger.setLevel(level)
+
+    logger.warn(PONG_TIMEOUT_TEXT)
+    logger.error(PING_FAILED_TEXT)
+
+    assertNoLeak(lines)
+    expect(lines).toEqual(forwarded.map(text => socketLogLine(LOG_PERSONA, text)))
+    expect(logger.getLevel()).toBe(level ?? LogLevel.INFO)
+  })
+
+  test('a sink that throws is caught: the library’s call returns normally, and a dropped line never reaches the sink', () => {
+    let sinkCalls = 0
+    const logger = socketModeSlackLogger(LOG_PERSONA, () => {
+      sinkCalls++
+      throw new Error(`sink down ${LEAK_SENTINEL}`)
+    })
+    const returned: unknown[] = []
+
+    const output = outputDuring(() => {
+      returned.push(logger.warn(PONG_TIMEOUT_TEXT), logger.error(PING_FAILED_TEXT), logger.error(SOCKET_LOG_TEXT))
+    })
+
+    assertNoLeak(output)
+    expect(output).toEqual([])
+    expect(returned).toEqual([undefined, undefined, undefined])
+    expect(sinkCalls).toBe(2)
+  })
+
+  test('each call gives a fresh logger with its own persona, sink and level; setName changes nothing forwarded', () => {
+    const first = recordingSocketLogger()
+    const other: SlackLogPersona = { index: 0, name: 'Alpha', key: personaKey('Alpha') }
+    const second = recordingSocketLogger(other)
+
+    expect(second.logger).not.toBe(first.logger)
+    first.logger.setLevel(LogLevel.ERROR)
+    second.logger.setName(`SocketModeClient ${LEAK_SENTINEL}`)
+    first.logger.warn(PONG_TIMEOUT_TEXT)
+    second.logger.warn(PONG_TIMEOUT_TEXT)
+
+    assertNoLeak({ first: first.lines, second: second.lines })
+    expect(first.lines).toEqual([])
+    expect(second.lines).toEqual([socketLogLine(other, PONG_TIMEOUT_TEXT)])
+    expect(second.logger.getLevel()).toBe(LogLevel.INFO)
+  })
+
+  test('socketModeClientOptions: exactly the SR-3.3 options, the app token given and the persona’s socket logger over the sink given, its clientOptions with no logger; nothing shared between two calls', () => {
+    const appToken = fakeToken(APP_TOKEN_PREFIX, 'options')
+    const { lines, log } = capture()
+    const first = socketModeClientOptions(appToken, LOG_PERSONA, log)
+    const second = socketModeClientOptions(appToken, LOG_PERSONA, log)
+
+    expect(first.appToken === appToken).toBe(true)
+    const { appToken: _token, logger, ...rest } = first
+    expect(rest).toStrictEqual(SR33_OPTIONS.socket)
+    expectSocketLogger(logger, LOG_PERSONA, lines)
+    expect(second.logger).not.toBe(first.logger)
+    expect(second.clientOptions).not.toBe(first.clientOptions)
+    expect(second).not.toBe(first)
+  })
+})
+
+describe('redactingSlackLogger and redactSlackLogText: Web API library lines reach the console with URL-like, then token-like text replaced (E13 decision 15)', () => {
+  // Rows: what the text holds, the text, and the text redacted.
+  test.each<[string, string, string]>([
+    [
+      'an upload URL in a 429’s failed-request message (the comma after it kept)',
+      `Request failed with status code 429 (url: ${UPLOAD_URL}, retry-after: 30)`,
+      'Request failed with status code 429 (url: <redacted-url>, retry-after: 30)',
+    ],
+    ['a wss URL with its ticket, in quotes', `WebSocket connection to '${TICKET_URL}' failed`, "WebSocket connection to '<redacted-url>' failed"],
+    ['a bot token', `Bearer ${fakeToken(BOT_TOKEN_PREFIX, 'text')} was refused`, 'Bearer <redacted-token> was refused'],
+    ['an app token in double quotes', `"${fakeToken(APP_TOKEN_PREFIX, 'text')}"`, '"<redacted-token>"'],
+    ['a user token (any xox<letter>- prefix)', `token ${fakeToken('xoxp-', 'user')}`, 'token <redacted-token>'],
+    ['a token in a URL (the URL replaced whole)', `https://slack.invalid/api?token=${fakeToken(BOT_TOKEN_PREFIX, 'query')}`, '<redacted-url>'],
+    ['a URL ending a sentence', `see https://slack.invalid/${LEAK_SENTINEL}.`, 'see <redacted-url>.'],
+    ['a URL in parentheses', `(https://slack.invalid/${LEAK_SENTINEL})`, '(<redacted-url>)'],
+    [
+      'URLs before ], ;, }, :, ! and ?',
+      `[http://a.invalid/${LEAK_SENTINEL}]; {ws://b.invalid/${LEAK_SENTINEL}}: https://c.invalid/${LEAK_SENTINEL}! https://d.invalid/${LEAK_SENTINEL}?`,
+      '[<redacted-url>]; {<redacted-url>}: <redacted-url>! <redacted-url>?',
+    ],
+    ['an upper-case scheme glued to a word', `url=HTTPS://SLACK.INVALID/${LEAK_SENTINEL}`, 'url=<redacted-url>'],
+    [
+      'several URLs and tokens',
+      `${TICKET_URL} ${fakeToken(BOT_TOKEN_PREFIX, 'one')} ${UPLOAD_URL} ${fakeToken(APP_TOKEN_PREFIX, 'two')}`,
+      '<redacted-url> <redacted-token> <redacted-url> <redacted-token>',
+    ],
+    ['neither', 'http request failed', 'http request failed'],
+    ['a scheme with nothing after it', 'the https:// scheme', 'the https:// scheme'],
+  ])('redactSlackLogText, %s', (_label, text, redacted) => {
+    const result = redactSlackLogText(text)
+
+    assertNoLeak(result)
+    expect(result).toBe(redacted)
+  })
+
+  // Rows: the method (also the console method it writes with) and its label.
+  test.each<[(typeof LOG_METHODS)[number], string]>([
+    ['debug', '[DEBUG] '],
+    ['info', '[INFO] '],
+    ['warn', '[WARN] '],
+    ['error', '[ERROR] '],
+  ])('at DEBUG, %s writes one console call of that method: the label %p, the logger name and each argument redacted', (method, label) => {
+    const logger = redactingSlackLogger()
+    logger.setLevel(LogLevel.DEBUG)
+
+    const output = outputDuring(() => logger[method]('http request failed', WEB_API_LOG_TEXT))
+
+    assertNoLeak(output)
+    expect(output).toEqual([{ method, args: [label, 'web-api:WebClient', 'http request failed', WEB_API_LOG_REDACTED] }])
+  })
+
+  test('a non-string argument is inspected, then redacted: a Slack warning’s index and array (the shape warnings reach warn in), an object and an Error', () => {
+    const logger = redactingSlackLogger()
+    const warning = `see ${UPLOAD_URL} ${fakeToken(BOT_TOKEN_PREFIX, 'warning')}`
+
+    const output = outputDuring(() => {
+      logger.warn(warning, 0, [warning])
+      logger.error({ url: TICKET_URL, headers: { authorization: `Bearer ${fakeToken(APP_TOKEN_PREFIX, 'header')}` } })
+      logger.error(new Error(`boom ${TICKET_URL}`))
+    })
+
+    assertNoLeak(output)
+    expect(output.map(call => call.method)).toEqual(['warn', 'error', 'error'])
+    expect(output.every(call => call.args.every(arg => typeof arg === 'string'))).toBe(true)
+    const [warned, object, error] = output.map(call => call.args as string[])
+    expect(warned!.slice(0, 4)).toEqual(['[WARN] ', 'web-api:WebClient', 'see <redacted-url> <redacted-token>', '0'])
+    expect(warned![4]).toContain("'see <redacted-url> <redacted-token>'")
+    expect(object![2]).toContain("'<redacted-url>'")
+    expect(object![2]).toContain("'Bearer <redacted-token>'")
+    expect(error![2]).toContain('boom <redacted-url>')
+  })
+
+  // Rows: the level set (none: the default) and the methods that write at it.
+  test.each<[string, LogLevel | undefined, string[]]>([
+    ['no level set (INFO)', undefined, ['info', 'warn', 'error']],
+    ['DEBUG', LogLevel.DEBUG, ['debug', 'info', 'warn', 'error']],
+    ['INFO', LogLevel.INFO, ['info', 'warn', 'error']],
+    ['WARN', LogLevel.WARN, ['warn', 'error']],
+    ['ERROR', LogLevel.ERROR, ['error']],
+  ])('at %s, only lines at or above the level are written, and getLevel reports the level', (_label, level, writes) => {
+    const logger = redactingSlackLogger()
+    if (level !== undefined) logger.setLevel(level)
+
+    const output = outputDuring(() => {
+      for (const method of LOG_METHODS) logger[method](`${method} line`)
+    })
+
+    expect(output.map(call => call.method)).toEqual(writes)
+    expect(logger.getLevel()).toBe(level ?? LogLevel.INFO)
+  })
+
+  test('each line carries web-api:WebClient until setName sets another name; each call gives a fresh logger with its own level and name', () => {
+    const first = redactingSlackLogger()
+    const second = redactingSlackLogger()
+    expect(second).not.toBe(first)
+    first.setName('custom-client')
+    first.setLevel(LogLevel.ERROR)
+
+    const output = outputDuring(() => {
+      first.error('one')
+      first.warn('below the level')
+      second.warn('two')
+    })
+
+    expect(output).toEqual([
+      { method: 'error', args: ['[ERROR] ', 'custom-client', 'one'] },
+      { method: 'warn', args: ['[WARN] ', 'web-api:WebClient', 'two'] },
+    ])
+  })
+
+  // Rows: the builder and its exact options, the logger aside.
+  test.each<[string, () => WebClientOptions, Record<string, unknown>]>([
+    ['validationWebClientOptions', validationWebClientOptions, NO_RETRY_OPTIONS],
+    ['longLivedWebClientOptions', longLivedWebClientOptions, SR33_OPTIONS.web],
+  ])('%s: exactly its SR-3.3 options and a redacting logger of its own, fresh per call', (_name, build, expected) => {
+    const first = build()
+    const second = build()
+
+    const { logger, ...rest } = first
+    expect(rest).toStrictEqual(expected)
+    expectRedactingLogger(logger)
+    expect(second.logger).not.toBe(first.logger)
+    expect(second).not.toBe(first)
+  })
+})
+
 describe('connection manager: client options (SR-3.3, AC 20 connection leg) and tokens from the file (AC 47)', () => {
-  const NO_RETRY = { retryConfig: { retries: 0 }, timeout: 10_000, rejectRateLimitedCalls: true, attachOriginalToWebAPIRequestError: false }
-
-  // The long-lived client keeps the library's retry policy: no retryConfig, no rejectRateLimitedCalls.
-  // Rows: kind, its exact options, and how many are built across A's bring-up and reopen and B's bring-up.
-  test.each<[StubClientKind, Record<string, unknown>, number]>([
-    ['socket', { autoReconnectEnabled: false, clientOptions: NO_RETRY }, 3],
-    ['validation', NO_RETRY, 2],
-    ['web', { timeout: 30_000, attachOriginalToWebAPIRequestError: false }, 2],
-  ])('every %s client, a reopen’s included, is built with exactly the SR-3.3 options', async (kind, expected, count) => {
+  // Rows: the occasion, what A does up to and through it (B is up first), and the kinds of every
+  // client built for A, in order, the occasion's last. A reopen builds a socket only, never a
+  // validation or long-lived client. Every row ends with A up.
+  test.each<[string, (h: Harness) => Promise<void>, StubClientKind[]]>([
+    ['bring-up', async h => {
+      expect(await h.manager.bringUp(h.a, h.a.tokens)).toMatchObject({ state: 'up' })
+    }, ['validation', 'web', 'socket']],
+    ['a bring-up retry (auth.test unreachable, answered 5 s later)', async h => {
+      stubOf(h, h.a).script.authTest.push({ kind: 'network' })
+      expect(await h.manager.bringUp(h.a, h.a.tokens)).toMatchObject({ state: 'retrying', phase: 'bring-up' })
+      await h.clock.advance(5_000)
+    }, ['validation', 'validation', 'web', 'socket']],
+    ['a reopen after Slack drops the socket', async h => {
+      await h.manager.bringUp(h.a, h.a.tokens)
+      stubOf(h, h.a).socket.drop()
+      await h.clock.flush()
+    }, ['validation', 'web', 'socket', 'socket']],
+    ['a reopen retried 5 s after a failed reopen', async h => {
+      await h.manager.bringUp(h.a, h.a.tokens)
+      stubOf(h, h.a).script.connect.push({ kind: 'network' })
+      stubOf(h, h.a).socket.drop()
+      await h.clock.flush()
+      expect(h.manager.status(h.a.key)).toMatchObject({ state: 'retrying', phase: 'reopen' })
+      await h.clock.advance(5_000)
+    }, ['validation', 'web', 'socket', 'socket', 'socket']],
+    ['a credentials reconnect', async h => {
+      await h.manager.bringUp(h.a, h.a.tokens)
+      const rotated = rotateCredentials(h, h.a)
+      expect(await h.manager.reconnectCredentials(h.a.key, rotated.tokens)).toMatchObject({ kind: 'swapped' })
+    }, ['validation', 'web', 'socket', 'validation', 'web', 'socket']],
+    ['a credentials reconnect’s backoff retry (auth.test unreachable, answered 5 s later)', async h => {
+      await h.manager.bringUp(h.a, h.a.tokens)
+      const rotated = rotateCredentials(h, h.a, ROTATED, { authTest: [{ kind: 'network' }] })
+      expect(await h.manager.reconnectCredentials(h.a.key, rotated.tokens)).toMatchObject({ kind: 'retrying' })
+      await h.clock.advance(5_000)
+      expect(h.manager.identity(h.a.key)).toEqual(rotated.identity)
+    }, ['validation', 'web', 'socket', 'validation', 'validation', 'web', 'socket']],
+    ['a retrying persona’s attempt with replaced tokens (replaceRetryTokens)', async h => {
+      stubOf(h, h.a).script.authTest.push({ kind: 'network' })
+      await h.manager.bringUp(h.a, h.a.tokens)
+      const rotated = rotateCredentials(h, h.a)
+      expect(h.manager.replaceRetryTokens(h.a.key, rotated.tokens)).toBe(true)
+      await h.clock.advance(5_000)
+      expect(h.manager.identity(h.a.key)).toEqual(rotated.identity)
+    }, ['validation', 'validation', 'web', 'socket']],
+    ['the recovery of a credentials-broken persona (teardown, then a fresh bring-up with its changed credentials)', async h => {
+      await h.manager.bringUp(h.a, h.a.tokens)
+      stubOf(h, h.a).script.post.push({ kind: 'platform', error: 'token_revoked' })
+      await rejectionOf(h.manager.webClient(h.a.key)!.chat.postMessage({ channel: WATCH_CHANNEL, text: 'revoked' }))
+      expect(h.manager.status(h.a.key)).toMatchObject({ state: 'broken' })
+      await h.manager.stop(h.a.key)
+      const rotated = rotateCredentials(h, h.a)
+      expect(await h.manager.bringUp(h.a, rotated.tokens)).toEqual({ state: 'up', identity: rotated.identity })
+    }, ['validation', 'web', 'socket', 'validation', 'web', 'socket']],
+  ])('AC 20 connection leg, %s: every client built gets exactly its SR-3.3 options, attachOriginalToWebAPIRequestError false on every Web API leg, a socket its persona’s socket logger over the manager’s log and a Web API client a redacting logger, each its own; B undisturbed', async (_occasion, occasion, kinds) => {
     const h = makeHarness()
-    await bringUpBoth(h)
-    stubOf(h, h.a).socket.drop()
-    await h.clock.flush()
+    expect(await h.manager.bringUp(h.b, h.b.tokens)).toMatchObject({ state: 'up' })
+
+    await occasion(h)
+
+    const builds = h.slack.buildsOf(h.a.key)
+    expect(builds.map(build => build.kind)).toEqual(kinds)
+    for (const build of builds) expectBuiltWith(h, build, SR33_OPTIONS[build.kind])
+    expectNothingShared(h.slack.builds)
     expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
-
-    const builds = h.slack.builds.filter(build => build.kind === kind)
-
-    // A's bring-up socket and its reopen socket.
-    expect(h.slack.buildsOf(h.a.key, 'socket')).toHaveLength(2)
-    expect(builds).toHaveLength(count)
-    for (const build of builds) {
-      const options: Record<string, unknown> = { ...build.options }
-      delete options.appToken
-      expect(options).toStrictEqual(expected)
-    }
+    await expectBUndisturbed(h)
   })
 
   test('AC 47: every client receives the credentials file’s tokens, never the environment’s', async () => {
@@ -3081,25 +3537,41 @@ describe('connection manager: dry run (SR-3.4)', () => {
 // ---------------------------------------------------------------------------
 
 describe('unhandledRejection handler (SR-3.3)', () => {
-  // Rows: label, the rejection reason, and pieces the line must carry. Called
-  // directly; never installed on the real process.
-  test.each<[string, unknown, string[]]>([
-    ['an Error with the sentinel in its message', new Error(`boom ${LEAK_SENTINEL}`), ['Error', 'at ']],
+  // Rows: label, what gives the rejection reason, and pieces the line must
+  // carry. The stub rows take the value a client of the stub (leak marker on,
+  // built without the SR-3.3 options, so a request error keeps its `original`
+  // with the Authorization header) rejects with or emits: a reconnect's
+  // worst case. Called directly; never installed on the real process.
+  test.each<[string, () => unknown, string[]]>([
+    ['an Error with the sentinel in its message', () => new Error(`boom ${LEAK_SENTINEL}`), ['Error', 'at ']],
     [
       'a Slack-shaped error with the sentinel in its message, headers, data and original',
-      sentinelSlackError('slack_webapi_request_error'),
+      () => sentinelSlackError('slack_webapi_request_error'),
       ['Error', 'code=slack_webapi_request_error'],
     ],
     [
       'an Error whose message spans several lines, the sentinel on a later, frame-shaped line',
-      new TypeError(`first line\n    at ${LEAK_SENTINEL} (frame-shaped:1:1)\n${fakeToken(BOT_TOKEN_PREFIX, 'third-line')}`),
+      () => new TypeError(`first line\n    at ${LEAK_SENTINEL} (frame-shaped:1:1)\n${fakeToken(BOT_TOKEN_PREFIX, 'third-line')}`),
       ['TypeError'],
     ],
-    ['undefined', undefined, ['undefined']],
-    ['null', null, ['null']],
-    ['a sentinel-bearing string', `boom ${LEAK_SENTINEL}`, ['string']],
-    ['a plain object holding a token', { token: fakeToken(APP_TOKEN_PREFIX, 'object') }, ['object']],
-  ])('%s: logs one token-free [slack] line, returns normally and never exits', (_label, reason, pieces) => {
+    ['undefined', () => undefined, ['undefined']],
+    ['null', () => null, ['null']],
+    ['a sentinel-bearing string', () => `boom ${LEAK_SENTINEL}`, ['string']],
+    ['a plain object holding a token', () => ({ token: fakeToken(APP_TOKEN_PREFIX, 'object') }), ['object']],
+    [
+      'a stub Socket Mode connect failure (request error from apps.connections.open)',
+      () => rejectionOf(makeStubSlack({ leakMarker: LEAK_SENTINEL, connect: [{ kind: 'network' }] }).createSocketClient().start()),
+      ['Error', 'code=slack_webapi_request_error'],
+    ],
+    ['a stub Socket Mode WebSocket error event', async () => {
+      const socket = makeStubSlack({ leakMarker: LEAK_SENTINEL, connect: [{ kind: 'websocket-error' }] }).createSocketClient()
+      let emitted: unknown
+      socket.on('error', (err: unknown) => void (emitted = err))
+      await socket.start().catch(() => undefined)
+      return emitted
+    }, ['Error', 'code=slack_socket_mode_websocket_error']],
+  ])('%s: logs one token-free [slack] line, returns normally and never exits', async (_label, produce, pieces) => {
+    const reason = await produce()
     const { lines, log } = capture()
     const exit = spyOn(process, 'exit').mockImplementation(() => undefined as never)
     let returned: unknown
@@ -3231,6 +3703,61 @@ describe('isSafeIdentifier (SR-10.3)', () => {
       const described = describeThrownValue(Object.assign(new Error('x'), { code }))
       expect(described.includes(` code=${code}`)).toBe(isSafeIdentifier(code))
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// describeThrownValue (SR-10.3, AC 20): a base agent-director error's errName
+// ---------------------------------------------------------------------------
+
+describe('describeThrownValue: a base AgentDirectorError names its errName, never its description (SR-10.3, AC 20)', () => {
+  /** The description before its stack frames (`<Type>[ errName=…][ code=…]`). */
+  const head = (described: string): string => described.split(' at ')[0]!
+  /** A description that carries a fake token, so a printed one fails the leak check. */
+  const desc = (): string => `refused ${fakeToken(BOT_TOKEN_PREFIX, 'desc')} ${LEAK_SENTINEL}`
+  const adError = (errName: unknown): Error => new AgentDirectorError('get', errName as string, desc())
+
+  test.each<[string, () => Error, string]>([
+    ['a short identifier', () => adError('ErrSomethingNew'), 'AgentDirectorError errName=ErrSomethingNew'],
+    ['a 64-character identifier', () => adError(`E${'r'.repeat(63)}`), `AgentDirectorError errName=E${'r'.repeat(63)}`],
+    ['an identifier beside a safe code', () => Object.assign(adError('ErrSomethingNew'), { code: 'EIO' }), 'AgentDirectorError errName=ErrSomethingNew code=EIO'],
+  ])('%s: printed as errName=, the description never', (_label, make, expected) => {
+    const err = make()
+    const described = describeThrownValue(err)
+
+    expect(head(described)).toBe(expected)
+    expect(described).toContain(' at ')
+    assertNoLeak({ described })
+    expect(() => assertNoLeak(err)).toThrow()
+  })
+
+  test.each<[string, unknown]>([
+    ['a fake token', fakeToken(BOT_TOKEN_PREFIX, 'errname')],
+    ['a sentinel-bearing phrase', `ErrX ${LEAK_SENTINEL}`],
+    ['two lines', `ErrSomethingNew\n${LEAK_SENTINEL}`],
+    ['65 characters', `E${'r'.repeat(64)}`],
+    ['an empty string', ''],
+    ['a number', 42],
+  ])('an errName that is %s is omitted; the description never printed', (_label, errName) => {
+    const described = describeThrownValue(adError(errName))
+
+    expect(head(described)).toBe('AgentDirectorError')
+    assertNoLeak({ described })
+  })
+
+  test.each<[string, () => unknown, string]>([
+    ['an agent-director subclass (ErrSpawnNotFound)', () => new ErrSpawnNotFound('get', 'ErrSpawnNotFound', desc()), 'ErrSpawnNotFound'],
+    ['a CSCB subclass (ErrSpawnCapReached)', () => new ErrSpawnCapReached(desc()), 'ErrSpawnCapReached'],
+    ['a plain Error carrying an errName', () => Object.assign(new Error(desc()), { errName: 'ErrSomethingNew' }), 'Error'],
+    ['a TypeError carrying an errName and a code', () => Object.assign(new TypeError(desc()), { errName: 'ErrSomethingNew', code: 'EIO' }), 'TypeError code=EIO'],
+    ['a plain object carrying an errName', () => ({ errName: 'ErrSomethingNew', message: desc() }), 'object'],
+    ['a string', () => desc(), 'string'],
+  ])('%s: described as before, with no errName', (_label, make, expected) => {
+    const described = describeThrownValue(make())
+
+    expect(head(described)).toBe(expected)
+    expect(described).not.toContain('errName=')
+    assertNoLeak({ described })
   })
 })
 
@@ -3475,13 +4002,8 @@ describe('connection manager: credentials reconnect (b.av2 SR-8.6 credentials ro
     await expectBUndisturbed(h)
   })
 
-  test('AC 20 connection leg: the reconnect’s validation, Web API and socket clients get exactly the SR-3.3 options and the new tokens, never the old', async () => {
-    const noRetry = { retryConfig: { retries: 0 }, timeout: 10_000, rejectRateLimitedCalls: true, attachOriginalToWebAPIRequestError: false }
-    const expected: Record<StubClientKind, Record<string, unknown>> = {
-      validation: noRetry,
-      web: { timeout: 30_000, attachOriginalToWebAPIRequestError: false },
-      socket: { autoReconnectEnabled: false, clientOptions: noRetry },
-    }
+  // The reconnect's client options are a row of the AC 20 connection-leg occasion table.
+  test('the reconnect’s validation, Web API and socket clients get the new tokens, never the old', async () => {
     const h = makeHarness()
     await bringUpBoth(h)
     const rotated = rotateCredentials(h, h.a)
@@ -3492,9 +4014,6 @@ describe('connection manager: credentials reconnect (b.av2 SR-8.6 credentials ro
     expect(builds.map(build => build.kind)).toEqual(['validation', 'web', 'socket'])
     const oldTokens = fileTokensOf(h.a)
     for (const build of builds) {
-      const options: Record<string, unknown> = { ...build.options }
-      delete options.appToken
-      expect(options).toStrictEqual(expected[build.kind])
       const [fresh, stale] = build.kind === 'socket'
         ? [rotated.tokens.appToken, oldTokens.appToken]
         : [rotated.tokens.botToken, oldTokens.botToken]
@@ -4094,6 +4613,168 @@ describe('connection manager: a pending credentials reconnect’s unreachable ep
     await h.manager.stopAll()
     expect(h.lines).toHaveLength(cleared === null ? 0 : 2)
     assertNoLeak({ first, secondOutcome, lines: h.lines })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Credentials reconnect secrecy (AC 20 reconnect leg): E2's secrecy cases for
+// the clients and closes a reconnect adds. Every failure is sentinel-bearing
+// (message, original, headers, data other than data.error).
+// ---------------------------------------------------------------------------
+
+describe('connection manager: credentials reconnect secrecy (AC 20 reconnect leg)', () => {
+  /**
+   * Unhandled rejections seen by a test-scoped process listener, added by
+   * `watchUnhandled` and removed after each test. `bun test` also fails the
+   * running test on an unhandled rejection before any listener sees it, so
+   * either way an escaping rejection fails the case.
+   */
+  let unhandled: unknown[] = []
+  const onUnhandled = (reason: unknown): void => void unhandled.push(reason)
+  function watchUnhandled(): void {
+    unhandled = []
+    process.on('unhandledRejection', onUnhandled)
+  }
+  afterEach(() => {
+    process.removeListener('unhandledRejection', onUnhandled)
+  })
+
+  // Rows: how the call on the reconnected client fails (the stub builds each as a request error
+  // with the sentinel in the axios-style original and its Authorization header).
+  test.each<[string, WebApiOutcome]>([
+    ['a refused connection', { kind: 'network' }],
+    ['a DNS failure', { kind: 'dns' }],
+    ['a timeout', { kind: 'timeout' }],
+  ])('after a swap, %s on A’s new long-lived Web API client (from the manager’s query) surfaces without original and leaks nothing; A stays up, nothing is logged; B undisturbed', async (_label, failure) => {
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const rotated = rotateCredentials(h, h.a)
+    expect(await h.manager.reconnectCredentials(h.a.key, rotated.tokens)).toEqual({ kind: 'swapped', identity: rotated.identity })
+    rotated.stub.script.post.push(failure, failure)
+    const web = h.manager.webClient(h.a.key)!
+
+    const thrown = await rejectionOf(web.chat.postMessage({ channel: WATCH_CHANNEL, text: 'on the reconnected client' }))
+    // Control: the same failure on a client of the new credentials built without the SR-3.3 option.
+    const control = await rejectionOf(rotated.stub.web.chat.postMessage({ channel: WATCH_CHANNEL, text: 'control' }))
+    await h.clock.flush()
+
+    expect(thrown).toMatchObject({ code: 'slack_webapi_request_error' })
+    expect(thrown).not.toHaveProperty('original')
+    expect(thrown).not.toBeInstanceOf(WebApiCallRefusedLocallyError)
+    assertNoLeak(thrown, 'reconnected client rejection')
+    expect(control).toHaveProperty('original')
+    expect(() => assertNoLeak(control)).toThrow()
+    // Both calls reached the new credentials' Slack (the manager's client and the control), none the old.
+    expect(rotated.stub.calls.postMessage).toHaveLength(2)
+    expect(stubOf(h, h.a).calls.postMessage).toEqual([])
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+    expect(h.lines).toEqual([])
+    await expectBUndisturbed(h)
+  })
+
+  // Rows: how A's reconnect start(), abandoned at the 10 s bound, settles later.
+  test.each<[string, SettledConnectOutcome]>([
+    ['rejects with a sentinel-bearing request error (original with an Authorization header)', { kind: 'reject', value: sentinelSlackError('slack_webapi_request_error') }],
+    ['rejects with a sentinel-bearing refusing platform error', { kind: 'reject', value: sentinelSlackError('slack_webapi_platform_error', 'invalid_auth') }],
+    ['rejects with the stub’s network error (leak marker on)', { kind: 'network' }],
+    ['rejects with the stub’s rate-limited error (leak marker on)', { kind: 'rate-limited', retryAfter: 1 }],
+    ['rejects with a plain Error holding a fake token', { kind: 'reject', value: new Error(`late ${fakeToken(APP_TOKEN_PREFIX, 'late')}`) }],
+    ['fails its WebSocket phase with a sentinel-bearing error event', { kind: 'websocket-error' }],
+  ])('a reconnect start() abandoned at 10 s that later %s raises no unhandled rejection, logs nothing more and changes nothing; the retry 5 s later swaps', async (_label, late) => {
+    watchUnhandled()
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const oldWeb = h.manager.webClient(h.a.key)
+    const deferred = makeDeferredConnect()
+    const rotated = rotateCredentials(h, h.a, ROTATED, { connect: [deferred.outcome] })
+    const reconnect = h.manager.reconnectCredentials(h.a.key, rotated.tokens)
+    await h.clock.advance(10_000)
+    expect(await reconnect).toMatchObject({ kind: 'retrying', outcome: { reason: 'timeout' } })
+    const abandoned = rotated.stub.socket
+    expect(abandoned.disconnectCalls).toBe(1)
+    const lines = [...h.lines]
+    const reported = h.statuses.length
+
+    deferred.settle(late)
+    await h.clock.flush()
+
+    expect(unhandled).toEqual([])
+    expect(h.lines).toEqual(lines)
+    expect(h.statuses).toHaveLength(reported)
+    expect(pendingDelays(h)).toEqual([5_000])
+    assertNoLeak({ lines: h.lines, statuses: h.statuses }, 'late reconnect rejection')
+    await expectOldConnectionKept(h, h.a, oldWeb)
+    await h.clock.advance(5_000)
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+    expect(rotated.stub.sockets.map(socket => socket.connected)).toEqual([false, true])
+    expect(unhandled).toEqual([])
+    assertNoLeak({ lines: h.lines }, 'reconnect lines')
+    await expectBUndisturbed(h)
+  })
+
+  // Rows: how the manager's own close of A's socket fails, as a sentinel-bearing error.
+  const FAILED_CLOSES: [string, (err: Error) => () => Promise<void>][] = [
+    ['rejects', err => () => Promise.reject(err)],
+    ['throws synchronously', err => () => {
+      throw err
+    }],
+  ]
+
+  test.each(FAILED_CLOSES)('the old connection’s close after a swap, its disconnect() %s: no unhandled rejection, no line, the swap stands; B undisturbed', async (_label, failing) => {
+    watchUnhandled()
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const old = stubOf(h, h.a).socket
+    let closes = 0
+    const close = failing(sentinelSlackError('slack_webapi_request_error'))
+    old.disconnect = () => {
+      closes++
+      return close()
+    }
+    const rotated = rotateCredentials(h, h.a)
+
+    const outcome = await h.manager.reconnectCredentials(h.a.key, rotated.tokens)
+    await h.clock.flush()
+
+    expect(outcome).toEqual({ kind: 'swapped', identity: rotated.identity })
+    expect(closes).toBe(1)
+    expect(unhandled).toEqual([])
+    expect(h.lines).toEqual([])
+    expect(h.manager.status(h.a.key)).toEqual({ state: 'up', identity: rotated.identity })
+    // The old socket was let go before its close: nothing from it reaches the handler, and no reopen follows.
+    expect(h.slack.activityOf(h.a.key).filter(a => a.credentials === INITIAL_CREDENTIALS && a.kind === 'socket').map(a => a.event).at(-1)).toBe('discarded')
+    await h.clock.advance(HOUR_MS)
+    expect(old.startCalls).toBe(1)
+    expect(h.lines).toEqual([])
+    await expectDelivers(h, h.a, rotated.stub)
+    await expectBUndisturbed(h)
+    assertNoLeak({ outcome, statuses: h.statuses })
+  })
+
+  test.each(FAILED_CLOSES)('the close of a reconnected socket whose bot token is then revoked (bug b.ujn), its disconnect() %s: no unhandled rejection, only the one refusal line', async (_label, failing) => {
+    watchUnhandled()
+    const h = makeHarness()
+    await bringUpBoth(h)
+    const rotated = rotateCredentials(h, h.a)
+    expect(await h.manager.reconnectCredentials(h.a.key, rotated.tokens)).toMatchObject({ kind: 'swapped' })
+    let closes = 0
+    const close = failing(sentinelSlackError('slack_webapi_request_error'))
+    rotated.stub.socket.disconnect = () => {
+      closes++
+      return close()
+    }
+    rotated.stub.script.post.push({ kind: 'platform', error: 'token_revoked' })
+
+    await rejectionOf(h.manager.webClient(h.a.key)!.chat.postMessage({ channel: WATCH_CHANNEL, text: 'revoked' }))
+    await h.clock.flush()
+
+    expect(closes).toBe(1)
+    expect(unhandled).toEqual([])
+    expect(h.lines).toEqual([webApiRefusalLine(h, 'chat.postMessage', 'token_revoked')])
+    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'broken', phase: 'running' })
+    await h.clock.advance(HOUR_MS)
+    expect(h.lines).toHaveLength(1)
+    await expectBUndisturbed(h)
   })
 })
 
@@ -4756,6 +5437,25 @@ describe('connection manager: a revoked bot token while running (the Web API aut
     expect(a.calls.apiCall).toHaveLength(1)
     assertNoLeak({ line: h.lines[0], status, local }, 'token-bearing method name')
     await expectBUndisturbed(h)
+  })
+
+  // Rows: label, the method name the refused call gave, and the method the error may name. A method
+  // name is the caller's code, never a secret, so only a token-shaped one (which always has a hyphen)
+  // or one that is not a method name at all is withheld.
+  test.each<[string, string, string | undefined]>([
+    ['a Web API method', 'chat.postMessage', 'chat.postMessage'],
+    ['a method name that is a fake bot token', fakeToken(BOT_TOKEN_PREFIX, 'method'), undefined],
+    ['a method name holding a fake app token after a dot', `apps.${fakeToken(APP_TOKEN_PREFIX, 'method')}`, undefined],
+    ['a method name holding a fake token after a newline', `chat.postMessage\n${fakeToken(BOT_TOKEN_PREFIX, 'line')}`, undefined],
+  ])('AC 20: a local refusal’s WebApiCallRefusedLocallyError for %s carries no token in message, stack, data or any field, for every auth code', (_label, method, named) => {
+    for (const code of WEB_API_AUTH_CODES) {
+      const err = new WebApiCallRefusedLocallyError(method, code)
+
+      assertNoLeak(err, `local refusal (${code})`)
+      assertNoLeak({ json: JSON.stringify(err), text: String(err), inspected: Bun.inspect(err) }, `local refusal (${code}) as text`)
+      expect(err).toMatchObject({ code: WEB_API_CALL_REFUSED_LOCALLY, method: named, data: { ok: false, error: code } })
+      expect(err.message).toBe(`Web API call ${named ?? '(unnamed)'} not sent: this client's bot token was refused by Slack (${code})`)
+    }
   })
 
   test('dry run: there is no Web API client to watch and nothing is built', async () => {

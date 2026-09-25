@@ -11,6 +11,9 @@
  *   shape the credentials tests need.
  * - `assertNoLeak` fails the test when the sentinel or a token-like value
  *   appears in captured log lines, errors, results or files the code wrote.
+ * - `TOKEN_LIKE` / `isTokenLike` are the one definition of "token-like" that
+ *   `assertNoLeak` applies, exported so a repo-level audit (e.g. no token
+ *   literal in any test file) uses exactly the same rule.
  *
  * Isolation (b.av2 SR-13.2): the helper writes only into the directory the
  * caller passes, which must be the test's own `mkdtempSync` directory, and
@@ -42,20 +45,38 @@ export const APP_TOKEN_PREFIX = 'xapp-'
 const DEFAULT_FILE_NAME = 'credentials.json'
 
 /**
- * A token-like value: a Slack token prefix followed by at least one token
- * character. A bare prefix, as in the rule text "bot_token must start with
- * xoxb-", does not match.
+ * A token-like value: a Slack token prefix (`xox` plus one lower-case letter,
+ * e.g. `xoxb-`, `xoxp-`, `xoxe-`, or `xapp-`) that starts the text or follows
+ * a character other than an ASCII letter or digit, followed by at least one
+ * token character (a letter or a digit), anywhere in the text. A bare prefix,
+ * as in the rule text "bot_token must start with xoxb-", a word such as
+ * "Xoxo bot", or a prefix glued to a word (`inboxapp-bot`) does not match.
+ *
+ * The same boundary as the source matcher `looksLikeSlackToken`
+ * (`src/persona-identity.ts`), but wider after the dash (a letter as well as a
+ * digit), so every value the loader rejects is token-like here too and
+ * `assertNoLeak` stays at least as strict (E13 Director decision 14). Not
+ * global, so `test` keeps no state between calls; build a global copy from
+ * `TOKEN_LIKE.source` to find every occurrence.
  */
-const TOKEN_LIKE = /(?:xoxb|xapp)-[A-Za-z0-9]/
+export const TOKEN_LIKE = /(?<![A-Za-z0-9])(?:xox[a-z]|xapp)-[A-Za-z0-9]/
+
+/** Whether `text` holds a token-like value (see `TOKEN_LIKE`). */
+export function isTokenLike(text: string): boolean {
+  return TOKEN_LIKE.test(text)
+}
 
 /**
- * A sentinel-bearing fake token: `prefix`, then `LEAK_SENTINEL`, then
- * `-<suffix>` when a suffix is given. Pass any prefix (`BOT_TOKEN_PREFIX`,
- * `APP_TOKEN_PREFIX`, a wrong one, or '' for no prefix); use distinct
- * suffixes to tell two fake tokens apart (e.g. 'env' vs 'file').
+ * A sentinel-bearing fake token: `prefix`, then a digit, then
+ * `LEAK_SENTINEL`, then `-<suffix>` when a suffix is given. The digit right
+ * after the prefix gives the fake the real format (every Slack token has a
+ * digit after its dash), so the source-side matcher `looksLikeSlackToken`
+ * sees it as a token. Pass any prefix (`BOT_TOKEN_PREFIX`, `APP_TOKEN_PREFIX`,
+ * a wrong one, or '' for no prefix); use distinct suffixes to tell two fake
+ * tokens apart (e.g. 'env' vs 'file').
  */
 export function fakeToken(prefix: string, suffix = ''): string {
-  return `${prefix}${LEAK_SENTINEL}${suffix === '' ? '' : `-${suffix}`}`
+  return `${prefix}1${LEAK_SENTINEL}${suffix === '' ? '' : `-${suffix}`}`
 }
 
 /**
@@ -126,7 +147,8 @@ export function writtenFile(path: string): WrittenFile {
 
 /**
  * Fail the test if `LEAK_SENTINEL` (any letter case) or a token-like value
- * (`xoxb-` or `xapp-` followed by a token character) appears in `captured`.
+ * (see `TOKEN_LIKE`: `xox<letter>-` or `xapp-`, not glued to a preceding
+ * letter or digit, followed by a token character) appears in `captured`.
  * A bare prefix such as "must start with xoxb-" passes.
  *
  * What is checked, by kind of value:
@@ -166,8 +188,8 @@ function checkText(text: string, label: string): void {
   if (text.toLowerCase().includes(LEAK_SENTINEL.toLowerCase())) {
     throw new Error(`assertNoLeak: ${label} contains LEAK_SENTINEL`)
   }
-  if (TOKEN_LIKE.test(text)) {
-    throw new Error(`assertNoLeak: ${label} contains a token-like value (xoxb-/xapp- followed by token characters)`)
+  if (isTokenLike(text)) {
+    throw new Error(`assertNoLeak: ${label} contains a token-like value (xox<letter>-/xapp- followed by token characters)`)
   }
 }
 

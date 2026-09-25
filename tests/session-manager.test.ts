@@ -120,6 +120,7 @@ import {
   setPreLaunchTrustPatcher,
   _resetPreLaunchTrustPatcher,
   _resetPreLaunchReplyGuard,
+  setPreLaunchReplyGuard,
   killPersonaInstance,
   deletePersonaInstance,
   whenLaunchSettled,
@@ -204,10 +205,14 @@ import {
   _resetOutageState,
 } from '../src/outage-state.ts'
 import {
+  AgentDirectorError,
   ErrSystemInstallDisappeared,
   ErrTmuxNotAvailable,
   ErrCwdNotFound,
+  ErrJsonlMissing,
+  ErrSpawnNotFound,
 } from '../src/agent-director-errors.ts'
+import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { RESTART_FAILURE_CAP } from '../src/restart.ts'
 
 // ---------------------------------------------------------------------------
@@ -521,6 +526,26 @@ function expectOneNoticeToDestination(h: NotifierHarness): string {
 function countStartupEntries(log: string, classLabel: string): number {
   return log.split('\n').filter((line) => line.includes(`] [${classLabel}] `)).length
 }
+
+/** The one `[<classLabel>]` entry of a startup-errors.log body; fails the test unless there is exactly one. */
+function onlyStartupEntry(log: string, classLabel: string): string {
+  const entries = log.split('\n').filter((line) => line.includes(`] [${classLabel}] `))
+  expect(entries).toHaveLength(1)
+  return entries[0]!
+}
+
+// AC 20 (b.av2 SR-10.3, E13 Director decision 16): an agent-director error's
+// description can carry a short-lived URL or a token. These build one that
+// carries both (the URL embeds the sentinel), and what `redactSlackLogText`
+// leaves of it.
+
+/** An agent-director error description holding a URL (with the sentinel) and a fake token. */
+const adDescription = (): string =>
+  `upload https://files.example.test/v1/${LEAK_SENTINEL}?ticket=1 refused ${fakeToken(BOT_TOKEN_PREFIX, 'desc')} retry later`
+/** `adDescription()` after `redactSlackLogText`. */
+const REDACTED_AD_DESCRIPTION = `upload ${REDACTED_URL_PLACEHOLDER} refused ${REDACTED_TOKEN_PLACEHOLDER} retry later`
+/** A token-shaped `errName`, which never passes `isSafeIdentifier`. */
+const tokenErrName = (): string => fakeToken(APP_TOKEN_PREFIX, 'errname')
 
 /** Pre-raise all three outage flags for a persona key so success-clear tests start with full bad-stretch. */
 function preSetAllFlags(key: string): void {
@@ -2202,6 +2227,38 @@ describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
     expect(readLog()).toBe('')
     expect(notices).toHaveLength(0)
   })
+
+  // AC 20 (b.av2 SR-10.3): a guard, or its undo, that throws an error whose
+  // message and properties carry fake tokens is logged by description only.
+  const guardError = (step: string): Error =>
+    Object.assign(new Error(`${step} failed ${fakeToken(BOT_TOKEN_PREFIX, step)}`), { code: 'EIO', detail: LEAK_SENTINEL })
+
+  test.each([
+    ['the guard throws (fresh spawn)', 'spawned', 'pre-launch reply guard failed', ' — launching anyway: '],
+    ['its undo throws (the optimistic spawn met an ended row, which is resumed)', 'resumed', 'undoing the pre-launch reply guard failed', ': '],
+  ] as const)('AC 20: %s with an error carrying fake tokens — the launch goes on; one line names the error without its message; nothing logged leaks', async (_label, action, fragment, separator) => {
+    const readLog = captureStartupErrors()
+    const { cfg, persona } = guardConfig()
+    const calls = newLadderCalls()
+    if (action === 'spawned') {
+      setPreLaunchReplyGuard(() => { throw guardError('guard') })
+      installStub({ ...calls })
+    } else {
+      setPreLaunchReplyGuard(() => () => { throw guardError('undo') })
+      installResumeEntry('ended', guardRow(cfg), calls, GUARD_KEY)
+    }
+
+    let result!: Awaited<ReturnType<typeof spawnForPersona>>
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(persona, cfg)
+    })
+
+    expect(result).toEqual({ key: GUARD_KEY, action })
+    expect(errLog.split('\n').filter((l) => l.includes(fragment)).map((l) => l.split(' at ')[0])).toEqual([
+      `[slack] spawnForPersona: ${fragment} for ${renderPersonaRef(GUARD_NAME, GUARD_KEY)}${separator}Error code=EIO`,
+    ])
+    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -3314,6 +3371,50 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
     assertNoLeak({ errLog, result })
   })
 
+  // AC 20 (b.av2 SR-10.3): the same mid-launch line when the realpath error
+  // carries fake tokens in its message and properties; every console.error
+  // argument is kept unformatted (errors whole), so a line that echoed the
+  // thrown error would fail the check. The configured claude_config_dir path
+  // is not a credential (paths stay echoed on purpose), so it stays plain.
+  test('AC 20: the mid-launch "could not be resolved during the launch" line, under a realpath error carrying fake tokens — no captured argument, record or result carries a credential value', async () => {
+    const f = unresolvableFixture()
+    const calls = makeStubCallLog()
+    installResumeEntry('ended', f.row, calls, GUARD_KEY)
+    let failedOnce = false
+    _setConfigDirFs({
+      realpath: (path) => {
+        if (path === f.configDir && calls.getCalls.length > 0 && !failedOnce) {
+          failedOnce = true
+          throw Object.assign(new Error(`EIO: i/o error, realpath ${fakeToken(BOT_TOKEN_PREFIX, 'realpath')}`), {
+            code: 'EIO',
+            path: fakeToken(APP_TOKEN_PREFIX, 'path'),
+            syscall: LEAK_SENTINEL,
+          })
+        }
+        return realpathSync(path)
+      },
+    })
+    const errArgs: unknown[][] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { errArgs.push(args) }
+    let result: boolean | 'skipped' | undefined
+    try {
+      result = await launchSession(GUARD_KEY, f.cfg)
+    } finally {
+      console.error = orig
+    }
+
+    expect(failedOnce).toBe(true)
+    expect(result).toBe('skipped')
+    expect(calls.killCalls).toEqual([])
+    expect(calls.deleteCalls).toEqual([])
+    expect(calls.resumeCalls).toEqual([])
+    const midLaunch = errArgs.filter((args) => String(args[0]).includes('could not be resolved during the launch'))
+    expect(midLaunch).toHaveLength(1)
+    expect(f.held).toEqual([])
+    assertNoLeak({ errArgs, result, startupErrorsLog: f.readLog(), notices })
+  })
+
   test.each<[string, number, ConfigDirUnresolvableHook | undefined]>([
     ['no hook installed', 1, undefined],
     ['a hook that holds the persona (the holder logs the line)', 0, () => true],
@@ -3362,6 +3463,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
     expect(stubCallCount(calls)).toBe(0)
     expect(f.events).toEqual([])
     expect(errLog).not.toContain('dry-run: skipping spawn')
+    assertNoLeak({ errLog, held: f.held })
   })
 
   test('b.g57: the start pass counts a persona whose claude_config_dir is unresolvable as not brought up (retrying, its cause the claude_config_dir); the other persona is spawned', async () => {
@@ -3439,6 +3541,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
     expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual({ key: 'C', action: 'resumed' })
     expect(second.resumeCalls.map((r) => r.claude_instance_id)).toEqual(['cscb_C'])
     expect(second.deleteCalls).toEqual([])
+    assertNoLeak({ errLog })
   })
 })
 
@@ -3823,6 +3926,50 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     expect(countStartupEntries(readLog(), 'spawn-failed')).toBe(1)
     expect(readLog()).toContain(`unexpected error spawning ${renderPersonaRef(f.a.name, f.a.key)}`)
     assertNoLeak({ lines: f.lines, errLog, result })
+  })
+
+  // AC 20 (b.av2 SR-10.3): the launch covers the persona's Slack bring-up, so
+  // the thrown value's message can carry a secret. The unexpected-error line
+  // and its startup-errors.log entry carry only its description (type, safe
+  // code, frames), with no cause appended; every console.error argument is
+  // kept unformatted.
+  test('AC 20: A\'s launch throws an error carrying fake tokens — the unexpected-error line and its startup-errors.log detail name its type and code only; nothing logged, recorded or returned leaks', async () => {
+    const readLog = captureStartupErrors()
+    installStub({})
+    const f = bringUpFixture()
+    Object.defineProperty(f.a, 'claude_config_dir', {
+      get() {
+        throw Object.assign(new Error(`launch exploded ${fakeToken(BOT_TOKEN_PREFIX, 'msg')}`), {
+          code: 'EIO',
+          detail: fakeToken(APP_TOKEN_PREFIX, 'detail'),
+          note: LEAK_SENTINEL,
+        })
+      },
+    })
+    const errArgs: unknown[][] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { errArgs.push(args) }
+    let result!: Awaited<ReturnType<typeof startupSessionManager>>
+    try {
+      result = await startupSessionManager(f.cfg, { concurrency: 1, bringUp: f.bringUp })
+    } finally {
+      console.error = orig
+    }
+
+    const ref = renderPersonaRef(f.a.name, f.a.key)
+    expect(result.perPersona).toEqual([
+      { key: f.a.key, action: 'failed' },
+      { key: f.b.key, action: 'spawned' },
+    ])
+    const lines = errArgs.filter((args) => String(args[0]).includes('startupSessionManager: unexpected error'))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toHaveLength(1)
+    expect(String(lines[0]![0])).toStartWith(`[slack] startupSessionManager: unexpected error for ${ref}: Error code=EIO at `)
+    const entries = readLog().split('\n').filter((l) => l.includes('] [spawn-failed] '))
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toContain(`] [spawn-failed] unexpected error spawning ${ref}: Error code=EIO at `)
+    expect(entries[0]).not.toContain(' — ')
+    assertNoLeak({ lines: f.lines, errArgs, startupErrorsLog: readLog(), result })
   })
 
   // The launch pool: steps 1–3 run for every persona at once; only the
@@ -5437,6 +5584,66 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
     expect(text).toContain(`Error: \`${errTmuxSessionCreate('spawn').errName}\``)
     expect(readLog()).toContain('[spawn-failed]')
   })
+
+  // -------------------------------------------------------------------------
+  // AC 20 (b.av2 SR-10.3): the approver's status, readPane/sendKeys and
+  // raw-tmux error lines log describeThrownValue of the error (type, safe
+  // code or errName, frames), never the error or its message. Each error
+  // carries fake tokens in its message and properties; every console.error
+  // argument is kept unformatted (errors whole).
+  // -------------------------------------------------------------------------
+
+  /** An error at `site` whose message and properties carry fake tokens, with a safe code. */
+  const tokenError = (site: string): Error =>
+    Object.assign(new Error(`${site} refused ${fakeToken(BOT_TOKEN_PREFIX, site)}`), {
+      code: 'ECONNRESET',
+      detail: fakeToken(APP_TOKEN_PREFIX, site),
+      note: LEAK_SENTINEL,
+    })
+
+  test.each<[string, () => void, string]>([
+    [
+      'status',
+      () => installStub({ statusQueue: [cannedErr(tokenError('status')), cannedOk({ state: 'waiting' })] }),
+      'status error persona=C: Error code=ECONNRESET',
+    ],
+    [
+      'readPane (pending row)',
+      () => installStub({ statusQueue: [cannedOk({ state: 'pending' }), cannedOk({ state: 'waiting' })], readPaneError: tokenError('readpane') }),
+      'readPane/sendKeys error persona=C: Error code=ECONNRESET',
+    ],
+    [
+      'sendKeys (pending row, needle on screen)',
+      () => installStub({
+        statusQueue: [cannedOk({ state: 'pending' }), cannedOk({ state: 'waiting' })],
+        readPaneResults: [{ pane: DEV_CHANNELS_PANE }],
+        sendKeysError: errGeneric('send-keys', 'ErrSendKeysBroken', `refused ${fakeToken(APP_TOKEN_PREFIX, 'sendkeys')}`),
+      }),
+      'readPane/sendKeys error persona=C: AgentDirectorError errName=ErrSendKeysBroken',
+    ],
+    [
+      'raw-tmux capture (dead row)',
+      () => {
+        _setTmuxCapturePane(async () => { throw tokenError('rawtmux') })
+        installStub({ statusQueue: [cannedOk({ state: 'missing' }), cannedOk({ state: 'waiting' })] })
+      },
+      'raw-tmux fallback error persona=C: Error code=ECONNRESET',
+    ],
+  ])('AC 20: a %s error carrying fake tokens — one approver line naming the error without its message; the approver goes on to the ready state; nothing logged leaks', async (_label, arrange, shown) => {
+    arrange()
+    const errArgs: unknown[][] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { errArgs.push(args) }
+    try {
+      await approvePreSessionDialogs('C', false)
+    } finally {
+      console.error = orig
+    }
+
+    const lines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith('[slack] approvePreSessionDialogs:'))
+    expect(lines.map((l) => l.split(' at ')[0])).toEqual([`[slack] approvePreSessionDialogs: ${shown}`])
+    assertNoLeak({ errArgs })
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -5888,6 +6095,8 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     jsonlDescription?: string
     getResult?: PersonaGetResultOverrides
     getError?: Error
+    /** The resume's rejection; default `errJsonlMissing(jsonlDescription)`. */
+    resumeError?: Error
     spawnCalls?: import('agent-director').SpawnParams[]
     deleteCalls?: import('agent-director').DeleteParams[]
     /** Persona key the row belongs to; default the stand-in CH. */
@@ -5901,7 +6110,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
         cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
         cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${key}` }),
       ],
-      resumeError: errJsonlMissing(opts.jsonlDescription),
+      resumeError: opts.resumeError ?? errJsonlMissing(opts.jsonlDescription),
       getResult: opts.getError
         ? undefined
         : personaRow(opts.cfg, key, { state: 'ended', ...opts.getResult }),
@@ -6251,6 +6460,128 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     expect(log).toContain('jsonl-diagnosis-inconclusive')
     // Detail names WHICH condition: the row could not be fetched.
     expect(log).toContain('could not fetch the agent-director row')
+  })
+
+  // AC 20 (b.av2 SR-10.3): the row-fetch failure is named by
+  // describeAgentDirectorFailure — an agent-director error's errName when it
+  // is a short identifier, else describeThrownValue (type, safe code, frames)
+  // — in the log line, startup-errors.log and the persona notice alike; never
+  // the thrown value's message or description, which carry fake tokens here.
+  test.each<[string, () => unknown, string]>([
+    ['a base AgentDirectorError', () => errGeneric('get', 'ErrSpawnGone', `gone ${fakeToken(BOT_TOKEN_PREFIX, 'desc')}`), 'ErrSpawnGone'],
+    ['a typed subclass (ErrSpawnNotFound)', () => new ErrSpawnNotFound('get', 'ErrSpawnNotFound', `gone ${LEAK_SENTINEL}`), 'ErrSpawnNotFound'],
+    [
+      'an AgentDirectorError whose errName is token-shaped',
+      () => errGeneric('get', fakeToken(BOT_TOKEN_PREFIX, 'errname'), `gone ${LEAK_SENTINEL}`),
+      'AgentDirectorError',
+    ],
+    ['an AgentDirectorError whose errName spans two lines', () => errGeneric('get', `ErrSpawnGone\n${LEAK_SENTINEL}`), 'AgentDirectorError'],
+    [
+      'a plain Error with a safe code',
+      () => Object.assign(new Error(`socket ${fakeToken(APP_TOKEN_PREFIX, 'msg')}`), { code: 'ECONNRESET' }),
+      'Error code=ECONNRESET',
+    ],
+    ['a rejected string', () => `down ${fakeToken(BOT_TOKEN_PREFIX, 'str')}`, 'string'],
+  ])('AC 20: row fetch fails with %s → named without its message in the line, startup-errors.log and notice', async (_label, makeErr, shown) => {
+    const readLog = captureStartupErrors()
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    const stub = installStub({
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+      ],
+      resumeError: errJsonlMissing(),
+    })
+    let getCalls = 0
+    stub.get = async (params) => {
+      getCalls++
+      if (getCalls >= 2) throw makeErr()
+      return personaRowsGet(cfg, { state: 'ended' })(params)
+    }
+    const errArgs: unknown[][] = []
+    const orig = console.error
+    console.error = (...args: unknown[]) => { errArgs.push(args) }
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    try {
+      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
+    } finally {
+      console.error = orig
+    }
+
+    expect(result?.action).toBe('fresh-after-inconclusive-amnesia')
+    const reasonOf = (text: string): string | undefined =>
+      /could not fetch the agent-director row \((.*?)\); AD reported/.exec(text)?.[1]?.split(' at ')[0]
+    const lines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.includes('could not fetch the agent-director row'))
+    expect(lines.map(reasonOf)).toEqual([shown])
+    expect(reasonOf(readLog())).toBe(shown)
+    expect(notices.map((n) => reasonOf(n.text)).filter((r) => r !== undefined)).toEqual([shown])
+    assertNoLeak({ errArgs, startupErrorsLog: readLog(), notices })
+  })
+
+  // AC 20 (E13 Director decision 16): when the row fetch fails and
+  // ErrJsonlMissing gave no enumerated paths, its description is echoed as
+  // "AD reported: …" only after redactSlackLogText, in the log line, the
+  // jsonl-diagnosis-inconclusive record and the persona notice; the record's
+  // cause is the error's name and the same redacted description.
+  test('AC 20: row fetch fails and ErrJsonlMissing\'s description holds a URL and a fake token → "AD reported:" carries it redacted in the line, the record and the notice; nothing leaks', async () => {
+    const readLog = captureStartupErrors()
+    const stub = installStub({
+      spawnQueue: [
+        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
+        cannedOk<import('agent-director').SpawnResult>({ claude_instance_id: `cscb_${CH}` }),
+      ],
+      resumeError: errJsonlMissing(adDescription()),
+    })
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
+    let getCalls = 0
+    stub.get = async (params) => {
+      getCalls++
+      if (getCalls >= 2) throw errGeneric('get', 'ErrSpawnGone')
+      return personaRowsGet(cfg, { state: 'ended' })(params)
+    }
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
+    })
+
+    expect(result?.action).toBe('fresh-after-inconclusive-amnesia')
+    const reported = `could not fetch the agent-director row (ErrSpawnGone); AD reported: ${REDACTED_AD_DESCRIPTION}`
+    expect(errLog.split('\n').filter((l) => l.includes(reported))).toHaveLength(1)
+    const entry = onlyStartupEntry(readLog(), 'jsonl-diagnosis-inconclusive')
+    expect(entry).toContain(reported)
+    expect(entry.endsWith(` — ErrJsonlMissing: ${REDACTED_AD_DESCRIPTION}`)).toBe(true)
+    expect(notices.map((n) => n.text).filter((t) => t.includes(reported))).toHaveLength(1)
+    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
+  })
+
+  // AC 20 (E13 Director decision 16): the lost record's cause is
+  // agentDirectorFailureCause(err): an errName that fails isSafeIdentifier is
+  // replaced by the describer's type and frames, and the description is
+  // redacted; never the error itself, whose message is `<errName>:
+  // <errDescription>`.
+  test('AC 20: lost, with an ErrJsonlMissing whose errName is token-shaped and whose description holds a URL and a fake token → the jsonl-transcript-lost-on-resume record names its type and the redacted description; nothing leaks', async () => {
+    const readLog = captureStartupErrors()
+    const startedAt = '2026-09-20T05:00:00Z'
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, {
+      message_archive_db: makeArchiveWithMessagesSince(startedAt, 2),
+    })
+    installAmnesia({
+      cfg,
+      resumeError: new ErrJsonlMissing('resume', tokenErrName(), adDescription()),
+      getResult: { jsonl_path: '/data/proj/sess-5.jsonl', claude_session_id: 'sess-5', cwd: CWD, started_at: startedAt },
+    })
+    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    const errLog = await withCapturedErr(async () => {
+      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
+    })
+
+    expect(result?.action).toBe('fresh-after-amnesia')
+    const entry = onlyStartupEntry(readLog(), 'jsonl-transcript-lost-on-resume')
+    expect(entry).toContain('2 message(s) since spawn')
+    const cause = entry.slice(entry.lastIndexOf(' — ') + ' — '.length)
+    expect(cause.startsWith('ErrJsonlMissing ')).toBe(true)
+    expect(cause.endsWith(`: ${REDACTED_AD_DESCRIPTION}`)).toBe(true)
+    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
   // (b) unparseable/absent started_at — the archive is even configured (a real
@@ -7267,11 +7598,16 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     expect(errLog).not.toContain('ErrSpawnBroken')
   })
 
+  // AC 20 (b.av2 SR-10.3): the sink's error carries fake tokens in its
+  // message and properties; the line names it by description only.
+  const sinkError = (): Error =>
+    Object.assign(new Error(`sink exploded ${fakeToken(BOT_TOKEN_PREFIX, 'sink')}`), { code: 'ECONNRESET', detail: LEAK_SENTINEL })
+
   test.each([
-    ['throws', () => { throw new Error('sink exploded') }],
-    ['rejects', () => Promise.reject(new Error('sink exploded'))],
-  ] as const)('a notifier that %s is contained: the spawn still reports failed and the error is logged', async (_label, sink) => {
-    captureStartupErrors()
+    ['throws', () => { throw sinkError() }],
+    ['rejects', () => Promise.reject(sinkError())],
+  ] as const)('a notifier that %s is contained: the spawn still reports failed and the error is logged by description (AC 20: nothing logged leaks)', async (_label, sink) => {
+    const readLog = captureStartupErrors()
     installGenericSpawnFailure()
     const cfg = makeNoticeConfig()
     setSessionNotifier(sink)
@@ -7283,7 +7619,10 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     })
 
     expect(action).toBe('failed')
-    expect(errLog).toContain(`[slack] session-manager: notifier failed for persona=${NOTICE_KEY}: `)
+    expect(
+      errLog.split('\n').filter((l) => l.includes('notifier failed')).map((l) => l.split(' at ')[0]),
+    ).toEqual([`[slack] session-manager: notifier failed for persona=${NOTICE_KEY}: Error code=ECONNRESET`])
+    assertNoLeak({ errLog, startupErrorsLog: readLog() })
   })
 
   test('the bare capture records the notice under the persona key with its body only', async () => {
@@ -7474,5 +7813,98 @@ describe('whenLaunchSettled: waits for the key\'s launch in flight, never reject
       await settleNotices()
     })
     expect(isLaunchInFlight('K')).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC 20 (b.av2 SR-10.3, E13 Director decision 16): an agent-director error's
+// text in the spawn and orphan-cleanup startup records and in the
+// spawn-failure notice posted to Slack
+// ---------------------------------------------------------------------------
+
+describe('AC 20: agent-director failure text in startup records and the spawn-failure notice', () => {
+  /** Persona `alpha` in a real temp working directory, the seam home installed. */
+  function orphanConfig(): { cfg: PersonaConfig; home: string } {
+    const home = useSpawnHome()
+    return { cfg: makeMultiPersonaConfig([{ name: 'alpha', working_directory: fixtureSubdir('alpha-work') }], fixtureDir), home }
+  }
+
+  /** Stub alpha's sweep: one row with a wrong instance ID (swept: kill, then delete), `failing` the verb that rejects. */
+  function installOrphan(failing: 'killError' | 'deleteError', err: Error): PersonaConfig {
+    const { cfg, home } = orphanConfig()
+    installStub({
+      listResult: { spawns: [cannedListRow({ claude_instance_id: 'cscb_alpha_old' }, personaOf(cfg, 'alpha'), home)] },
+      [failing]: err,
+    })
+    return cfg
+  }
+
+  // Each site records `<what> failed …: <label>` with the cause
+  // `<label>: <redacted description>`, where <label> is the errName when it
+  // is a short identifier, else describeThrownValue (the type and frames).
+  test.each<[string, string, string, (err: Error) => Promise<void>]>([
+    ['a failed spawn', 'spawn-failed', 'spawn', async (err) => {
+      installStub({ spawnError: err })
+      const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+      expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual({ key: 'C', action: 'failed' })
+    }],
+    ['a failed orphan kill', 'orphan-cleanup', 'kill', async (err) => {
+      expect(await reconcileOrphans(installOrphan('killError', err))).toEqual({ found: 1, killed: 1, failed: 0 })
+    }],
+    ['a failed orphan delete', 'orphan-cleanup', 'delete', async (err) => {
+      expect(await reconcileOrphans(installOrphan('deleteError', err))).toEqual({ found: 1, killed: 0, failed: 1 })
+    }],
+    ['a failed orphan list', 'orphan-cleanup-list-failed', 'list', async (err) => {
+      installStub({ listError: err })
+      expect(await reconcileOrphans(orphanConfig().cfg)).toEqual({ found: 0, killed: 0, failed: 0 })
+    }],
+  ])('%s with a base AgentDirectorError whose errName is token-shaped and whose description holds a URL and a fake token → the %s record names its type and the redacted description; nothing leaks', async (_label, classLabel, verb, run) => {
+    const readLog = captureStartupErrors()
+    const errLog = await withCapturedErr(() => run(new AgentDirectorError(verb, tokenErrName(), adDescription())))
+
+    const entry = onlyStartupEntry(readLog(), classLabel)
+    const cause = entry.slice(entry.lastIndexOf(' — ') + ' — '.length)
+    expect(cause.startsWith('AgentDirectorError ')).toBe(true)
+    expect(cause.endsWith(`: ${REDACTED_AD_DESCRIPTION}`)).toBe(true)
+    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
+  })
+
+  test('a failed spawn with a safe errName → the spawn-failed record is "<errName>: <redacted description>" after the detail', async () => {
+    const readLog = captureStartupErrors()
+    installStub({ spawnError: errGeneric('spawn', 'ErrSpawnBroken', adDescription()) })
+    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
+    const errLog = await withCapturedErr(async () => {
+      await spawnForPersona(personaOf(cfg, 'C'), cfg)
+    })
+
+    const entry = onlyStartupEntry(readLog(), 'spawn-failed')
+    expect(entry.endsWith(`] [spawn-failed] spawn failed for ${renderPersonaRef('C', 'C')}: ErrSpawnBroken — ErrSpawnBroken: ${REDACTED_AD_DESCRIPTION}`)).toBe(true)
+    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
+  })
+
+  // The notice's Error line is "`<label>` — <description>": the label as
+  // above, the description redacted first and then cut to 300 characters, so
+  // text past character 300 of the raw description shows when a long URL
+  // shrinks to its placeholder.
+  test.each<[string, () => string, (label: string) => void]>([
+    ['a token-shaped errName is named by its type', tokenErrName, (label) => expect(label.startsWith('AgentDirectorError ')).toBe(true)],
+    ['a safe errName is named as is', () => 'ErrSpawnBroken', (label) => expect(label).toBe('ErrSpawnBroken')],
+  ])('the spawn-failure notice posted to Slack: %s; its description is redacted, then capped at 300 characters; nothing leaks', async (_label, errName, checkLabel) => {
+    captureStartupErrors()
+    const cfg = makeNoticeConfig()
+    const h = installNoticeNotifier(cfg, { leakMarker: LEAK_SENTINEL })
+    const description =
+      `https://files.example.test/${'u'.repeat(380)}/${LEAK_SENTINEL} ${fakeToken(BOT_TOKEN_PREFIX, 'notice')} ${'y'.repeat(400)} end`
+
+    notifySpawnFailure(NOTICE_KEY, new AgentDirectorError('spawn', errName(), description), false)
+    await settleNotices()
+
+    const text = expectOneNoticeToDestination(h)
+    const errorLine = text.split('\n').filter((l) => l.startsWith('  Error: `'))
+    expect(errorLine).toHaveLength(1)
+    const [, label, shown] = /^ {2}Error: `(.*)` — (.*)$/.exec(errorLine[0]!) ?? []
+    checkLabel(label!)
+    expect(shown).toBe(`${REDACTED_URL_PLACEHOLDER} ${REDACTED_TOKEN_PLACEHOLDER} ${'y'.repeat(400)} end`.slice(0, 300))
+    assertNoLeak({ text, logs: h.logs, notices })
   })
 })

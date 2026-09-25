@@ -33,6 +33,7 @@ import {
   ErrCwdNotFound,
   ErrCwdNotADirectory,
 } from './agent-director-errors.ts'
+import { describeThrownValue } from './persona-connection-errors.ts'
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -260,8 +261,7 @@ export async function withOutageDetection<T>(
         setOutageFlag(key, 'cwd-unreachable', workingDirectory)
       } else {
         console.error(
-          `[slack] outage-state: withOutageDetection: cwd error on persona=${key} but workingDirectory is undefined — verb-class drift; rethrowing without raising flag`,
-          err,
+          `[slack] outage-state: withOutageDetection: cwd error on persona=${key} but workingDirectory is undefined — verb-class drift; rethrowing without raising flag: ${describeThrownValue(err)}`,
         )
       }
     }

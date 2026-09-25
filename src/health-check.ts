@@ -13,6 +13,7 @@
 
 import type { PersonaConfig } from './config.ts'
 import { setOutageFlag, clearOutageFlag } from './outage-state.ts'
+import { describeThrownValue } from './persona-connection-errors.ts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -250,7 +251,7 @@ export function startHealthCheck(intervalSeconds: number): void {
             disconnectedStreak.delete(key)
           }
         } catch (err) {
-          console.error(`[slack] health-check: error checking persona=${key}:`, err)
+          console.error(`[slack] health-check: error checking persona=${key}: ${describeThrownValue(err)}`)
         }
       }
     } finally {

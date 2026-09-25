@@ -5,10 +5,13 @@
  * A Slack library error can hold secrets beyond its code: its message, its
  * `original` (the raw request error, Authorization header included), request
  * headers, request config and `data`. `describeThrownValue` therefore keeps
- * only three things:
+ * only these things:
  *
  * - the value's constructor name (for an `Error`) or its type (anything else:
  *   `undefined`, `null`, `string`, `object`, …);
+ * - for a base agent-director error (constructor name `AgentDirectorError`,
+ *   an error name with no dedicated subclass), its `errName`, under the same
+ *   short-identifier check as `code` (never its description or message);
  * - the `code`, only when it is a short identifier (letters, digits and `_`;
  *   a Slack token always contains `-`, so it can never pass);
  * - the stack's frame lines (`at …`), after the message has been cut out of
@@ -50,19 +53,31 @@ const MAX_STACK_FRAMES = 10
 /** Separator between frames in a one-line description. */
 const FRAME_SEPARATOR = ' <- '
 
+/**
+ * Constructor name of agent-director's base error class. Matched by name, not
+ * `instanceof`, so this module imports nothing from agent-director.
+ */
+const AGENT_DIRECTOR_BASE_ERROR = 'AgentDirectorError'
+
 // ---------------------------------------------------------------------------
 // Describer
 // ---------------------------------------------------------------------------
 
 /**
  * Describe any thrown or rejected value in one line that is safe to log:
- * `<Type>[ code=<code>][ <frame> <- <frame> …]`. See the module comment for
- * what is kept. Never throws.
+ * `<Type>[ errName=<errName>][ code=<code>][ <frame> <- <frame> …]`
+ * (`errName` only for a base `AgentDirectorError`). See the module comment
+ * for what is kept. Never throws.
  */
 export function describeThrownValue(value: unknown): string {
   try {
     if (!(value instanceof Error)) return value === null ? 'null' : typeof value
-    const parts = [constructorName(value)]
+    const type = constructorName(value)
+    const parts = [type]
+    if (type === AGENT_DIRECTOR_BASE_ERROR) {
+      const errName = readProp(value, 'errName')
+      if (isSafeIdentifier(errName)) parts.push(`errName=${errName}`)
+    }
     const code = readProp(value, 'code')
     if (typeof code === 'string' && SAFE_IDENTIFIER_RE.test(code)) parts.push(`code=${code}`)
     const frames = stackFrames(value)

@@ -27,6 +27,7 @@ import {
   shouldNotifyCap,
 } from './backoff.ts'
 import type { PersonaSerialize } from './persona-serializer.ts'
+import { describeThrownValue } from './persona-connection-errors.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -245,7 +246,7 @@ async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionI
   try {
     alive = await d.isSessionAlive(key)
   } catch (err) {
-    console.error(`[slack] restart: isSessionAlive failed for persona=${key}:`, err)
+    console.error(`[slack] restart: isSessionAlive failed for persona=${key}: ${describeThrownValue(err)}`)
     alive = false
   }
 
@@ -272,7 +273,7 @@ async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionI
     try {
       reconnectResult = await d.reconnectSession(key)
     } catch (err) {
-      console.error(`[slack] restart: reconnectSession failed for persona=${key}:`, err)
+      console.error(`[slack] restart: reconnectSession failed for persona=${key}: ${describeThrownValue(err)}`)
       reconnectResult = undefined
     }
 
@@ -313,7 +314,7 @@ async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionI
   try {
     ok = await d.launchSession(key, cwd, sessionId)
   } catch (err) {
-    console.error(`[slack] restart: launchSession threw for persona=${key}:`, err)
+    console.error(`[slack] restart: launchSession threw for persona=${key}: ${describeThrownValue(err)}`)
     ok = false
   }
 

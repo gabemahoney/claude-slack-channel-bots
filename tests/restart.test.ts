@@ -54,11 +54,12 @@ import {
   checkLaunchConfigDir,
   setConfigDirUnresolvableHook,
   spawnForPersona,
+  type ConfigDirUnresolvableHook,
 } from '../src/session-manager.ts'
 import { createPersonaBringUpController, type PersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import { PERSONA_CONFIG_DIR_UNRESOLVABLE } from '../src/persona-diagnostics.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
+import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
 import { _resetLaunchedWithDirs, getLaunchedWithDir } from '../src/stop-hook-bootstrap.ts'
 import { makeReplyGuardRecordDir, type ReplyGuardRecordDir } from './test-helpers/reply-guard-record.ts'
 import { installRecordingReplyGuard, observeLaunchCalls, type LaunchCall } from './test-helpers/reply-guard-launch.ts'
@@ -255,6 +256,41 @@ describe('scheduleRestart', () => {
 
     expect(reconnectCalled).toBe(true)
     expect(deps.launchSessionCalls).toHaveLength(0)
+  })
+
+  // AC 20 (b.av2 SR-10.3): each dep failure the timer's work catches is logged
+  // as its description (type, safe code, frames), never the error itself. The
+  // thrown error carries fake tokens in its message and properties, and every
+  // console.error argument is kept unformatted.
+  test.each<[string, 'isSessionAlive' | 'reconnectSession' | 'launchSession', DepsOpts, string]>([
+    ['isSessionAlive throws', 'isSessionAlive', {}, 'isSessionAlive failed'],
+    ['reconnectSession throws (session alive)', 'reconnectSession', { isSessionAliveResult: true }, 'reconnectSession failed'],
+    ['launchSession throws', 'launchSession', {}, 'launchSession threw'],
+  ])('AC 20: %s with an error carrying fake tokens — one line naming its type and code only; nothing leaks', async (_label, dep, opts, phrase) => {
+    const deps = makeDeps(opts)
+    deps[dep] = async () => {
+      throw Object.assign(new Error(`${dep} failed ${fakeToken(BOT_TOKEN_PREFIX, 'msg')}`), {
+        code: 'EIO',
+        detail: fakeToken(APP_TOKEN_PREFIX, 'detail'),
+        note: LEAK_SENTINEL,
+      })
+    }
+    initRestart(deps)
+    const errArgs: unknown[][] = []
+    const origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errArgs.push(args) }
+    try {
+      scheduleRestart('test_bot_1', '/cwd/test')
+      await Bun.sleep(WAIT_MS)
+    } finally {
+      console.error = origConsoleError
+    }
+
+    const lines = errArgs.filter((args) => String(args[0]).includes(phrase))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toHaveLength(1)
+    expect(String(lines[0]![0])).toStartWith(`[slack] restart: ${phrase} for persona=test_bot_1: Error code=EIO at `)
+    assertNoLeak({ errArgs })
   })
 
   // Shutdown at schedule time (no timer armed, the gate not asked) is pinned in
@@ -2577,5 +2613,123 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     expect(classLines()).toEqual([expect.any(String), expect.stringContaining(': cleared: claude_config_dir resolves to a real path again')])
     expect(idsFor(calls.spawnCalls, b)).toHaveLength(1)
     assertNoLeak({ controllerLines, gateLines, errLines, managerLines: h.lines })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC 20 (b.av2 SR-10.3): the kill adapter's lines carry no credential value:
+// the "not killing" line for a persona whose claude_config_dir cannot be
+// resolved (bug b.g57), and the generic "error for persona" line for a kill
+// that fails. The adapter is called directly; the failing realpath is
+// injected through `_setConfigDirFs` and the failing kill through the stub
+// client, and each error carries fake tokens in its message and properties.
+// Every raw console.error argument is kept (errors whole), so a line that
+// echoed the thrown error would fail the check. The configured
+// claude_config_dir path is not a credential (paths stay echoed on purpose),
+// so it stays a plain temp path.
+// ---------------------------------------------------------------------------
+
+describe('AC 20: the restart kill adapter\'s lines carry no credential value', () => {
+  let dir: string
+  let calls: StubCallLog
+  /** Every console.error call, its arguments unformatted. */
+  let errArgs: unknown[][]
+  let origConsoleError: typeof console.error
+
+  /** A realpath failure whose message, path and syscall carry fake tokens (its errno code is real). */
+  function sentinelRealpathError(): NodeJS.ErrnoException {
+    return Object.assign(new Error(`EIO: i/o error, realpath ${fakeToken(BOT_TOKEN_PREFIX, 'realpath')}`), {
+      code: 'EIO',
+      path: fakeToken(APP_TOKEN_PREFIX, 'path'),
+      syscall: LEAK_SENTINEL,
+    })
+  }
+
+  /** The one persona, whose claude_config_dir is `<dir>/claude-a`, and its adapter over the applied-persona getter. */
+  function setUp() {
+    const config = makeMultiPersonaConfig([{ name: 'Alpha Desk', claude_config_dir: join(dir, 'claude-a') }], dir)
+    const [a] = config.personas as [Persona]
+    _setConfigDirFs({ realpath: () => { throw sentinelRealpathError() } })
+    const kill = _buildKillSessionAdapter((key) => config.personas.find((p) => p.key === key))
+    return { a, kill }
+  }
+
+  const adapterLines = () =>
+    errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith('[slack] killSession (restart adapter):'))
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'restart-ac20-'))
+    errArgs = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errArgs.push(args) }
+    calls = makeStubCallLog()
+    const stub = makeStubClient({ ...calls })
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
+    setClientForTests(stub as unknown as Client)
+    _resetInFlightLaunches()
+    _setSpawnHomeDir(dir)
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+    setConfigDirUnresolvableHook(undefined)
+    _resetConfigDirFs()
+    _resetInFlightLaunches()
+    resetClientForTests()
+    _resetOutageState()
+    _resetSpawnHomeDir()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test.each<[string, ConfigDirUnresolvableHook | undefined]>([
+    ['no hold hook (the session manager logs the failure line)', undefined],
+    ['a hook that holds the persona', () => true],
+    [
+      'a hook that throws an error carrying a fake token',
+      () => {
+        throw Object.assign(new Error(`hold failed ${fakeToken(BOT_TOKEN_PREFIX, 'hook')}`), { detail: LEAK_SENTINEL })
+      },
+    ],
+  ])('AC 20: realpath throws an error carrying fake tokens, %s — the kill is skipped with its one line; no captured argument carries a credential value', async (_label, hook) => {
+    const { a, kill } = setUp()
+    const held: Array<Parameters<ConfigDirUnresolvableHook>> = []
+    if (hook !== undefined) setConfigDirUnresolvableHook((...args) => (held.push(args), hook(...args)))
+
+    await kill(a.key)
+
+    expect(Object.values(calls).flat()).toEqual([])
+    expect(adapterLines()).toEqual([
+      `[slack] killSession (restart adapter): persona=${a.key} claude_config_dir cannot be resolved to a real path — not killing; its row is kept`,
+    ])
+    assertNoLeak({ errArgs, held })
+  })
+
+  test.each<[string, () => Error, string]>([
+    [
+      'a plain error with a safe code',
+      () => Object.assign(new Error(`kill refused ${fakeToken(BOT_TOKEN_PREFIX, 'kill')}`), { code: 'ECONNRESET', detail: LEAK_SENTINEL }),
+      'Error code=ECONNRESET',
+    ],
+    [
+      'a base AgentDirectorError whose description carries a fake token',
+      () => errGeneric('kill', 'ErrKillBroken', `kill refused ${fakeToken(APP_TOKEN_PREFIX, 'kill')}`),
+      'AgentDirectorError errName=ErrKillBroken',
+    ],
+  ])('AC 20: the kill fails with %s — one "error for persona" line naming the error without its message; no captured argument carries a credential value', async (_label, makeError, shown) => {
+    const config = makeMultiPersonaConfig([{ name: 'Alpha Desk' }], dir)
+    const [a] = config.personas as [Persona]
+    const killCalls: KillParams[] = []
+    const failing = makeStubClient({ killError: makeError(), killCalls })
+    _resetOutageState()
+    initOutageState({ notify: () => {}, getClient: () => failing as unknown as Client })
+
+    await _buildKillSessionAdapter()(a.key)
+
+    expect(killCalls.map((k) => k.claude_instance_id)).toEqual([personaInstanceId(a.key)])
+    expect(adapterLines().map((l) => l.split(' at ')[0])).toEqual([
+      `[slack] killSession (restart adapter): error for persona=${a.key}: ${shown}`,
+    ])
+    assertNoLeak({ errArgs })
   })
 })

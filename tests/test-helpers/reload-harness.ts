@@ -50,6 +50,9 @@
  *   them back (undefined when absent); `h.remove(path)` deletes a path and
  *   `h.replaceWithDirectory(path)` puts a directory there (unreadable as a
  *   file even as root). Every helper refuses a path outside the root;
+ * - the AC 20 directory sweep: `h.serverSideFiles(...operatorWritten)` is
+ *   every regular file under the root but those, keyed by root-relative
+ *   path, for `assertNoLeak` (names and contents);
  * - edits between ticks (detection, b.av2 SR-8.2, SR-8.3):
  *   - config: `h.writeConfig` / `h.writeConfigBytes`, `h.deleteConfig()`,
  *     `h.replaceWithDirectory(h.paths.config)`;
@@ -540,6 +543,7 @@ import {
   writeCredentialsFile,
   writtenFile,
   type CredentialsOverrides,
+  type WrittenFile,
 } from './credentials.ts'
 import type { FakeClock } from './fake-clock.ts'
 import { makePersona } from './persona-config.ts'
@@ -1603,6 +1607,21 @@ export interface ReloadHarness {
   replaceWithDirectory(path: string): void
   /** The names in the configuration directory, sorted. */
   configDirEntries(): string[]
+  /**
+   * The AC 20 directory sweep: every regular file under the root but
+   * `excluded` (the operator-written ones: `config.json`, credentials files,
+   * a hand-edited record), as a `writtenFile` keyed by its root-relative
+   * path, for `assertNoLeak`, which checks both the key (the file's name)
+   * and the content. That is what the server wrote anywhere under the root
+   * (the pending file, the record, a leftover confirmation, reply-guard
+   * records, anything under the state directory or the home). Symlinks are
+   * not followed and FIFOs are skipped: the server writes only regular
+   * files, so a symlink or FIFO under the root is a test fixture (a
+   * `claude_config_dir` link, `h.makeFifo`), a symlink's target is swept
+   * where it lives when it is under the root (and may dangle on purpose),
+   * and opening a FIFO would block the test.
+   */
+  serverSideFiles(...excluded: string[]): Record<string, WrittenFile>
   /**
    * Write a valid credentials file for `persona` with a fresh token set;
    * returns the set (never print it). `h.rotateCredentials` without options.
@@ -2917,6 +2936,18 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       mkdirSync(full, { recursive: true })
     },
     configDirEntries: () => readdirSync(dir).sort(),
+    serverSideFiles(...excluded) {
+      const files: Record<string, WrittenFile> = {}
+      const walk = (at: string): void => {
+        for (const entry of readdirSync(at, { withFileTypes: true })) {
+          const path = join(at, entry.name)
+          if (entry.isDirectory()) walk(path)
+          else if (entry.isFile() && !excluded.includes(path)) files[relative(root, path)] = writtenFile(path)
+        }
+      }
+      walk(root)
+      return files
+    },
     writeCredentials: (persona) => h.rotateCredentials(persona).tokens,
     rotateCredentials(persona, rotation = {}) {
       const key = personaKey(persona.name)

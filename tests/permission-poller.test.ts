@@ -2929,6 +2929,58 @@ describe('b.en2 Epic 6 — withOutageDetection wrapper integration (keyed by per
 })
 
 // ---------------------------------------------------------------------------
+// AC 20 (b.av2 SR-10.3): an agent-director call that fails with an error that
+// is not an agent-director error is logged as its description (type, safe
+// code, frames), never the error itself, on each of the poller's three read
+// sites. The error carries fake tokens in its message and properties. An
+// agent-director error is logged by its errName only when that passes
+// `isSafeIdentifier` (E13 Director decision 16); a token-shaped errName falls
+// back to the description.
+// ---------------------------------------------------------------------------
+
+describe('AC 20: an agent-director call failure on list, get or getPermission is logged without its message', () => {
+  const sentinelError = (): Error =>
+    Object.assign(new Error(`socket closed ${fakeToken(BOT_TOKEN_PREFIX, 'msg')}`), { code: 'ECONNRESET', note: LEAK_SENTINEL })
+  /** An agent-director error whose errName (and so its message) is a fake token. */
+  const tokenErrNameError = (): Error => errGeneric('get', fakeToken(BOT_TOKEN_PREFIX, 'errname'), 'transient')
+
+  test.each<{ site: 'list' | 'get' | 'getPermission'; label: string; makeErr: () => Error; phrase: string; tail: string }>([
+    { site: 'list', label: 'an error carrying fake tokens', makeErr: sentinelError, phrase: 'list failed', tail: 'list failed: Error code=ECONNRESET at ' },
+    { site: 'get', label: 'an error carrying fake tokens', makeErr: sentinelError, phrase: 'get failed for', tail: `get failed for ${INSTANCE_A}: Error code=ECONNRESET at ` },
+    { site: 'getPermission', label: 'an error carrying fake tokens', makeErr: sentinelError, phrase: 'get-permission failed for', tail: `get-permission failed for ${INSTANCE_A} token=${TOKEN_A}: Error code=ECONNRESET at ` },
+    { site: 'get', label: 'an AgentDirectorError with a token-shaped errName', makeErr: tokenErrNameError, phrase: 'get failed for', tail: `get failed for ${INSTANCE_A}: AgentDirectorError at ` },
+    { site: 'getPermission', label: 'an AgentDirectorError with a token-shaped errName', makeErr: tokenErrNameError, phrase: 'get-permission failed for', tail: `get-permission failed for ${INSTANCE_A} token=${TOKEN_A}: AgentDirectorError at ` },
+  ])('AC 20: $site rejects with $label — one line naming its type and safe code only; nothing logged, trailed or posted leaks', async ({ site, makeErr, phrase, tail }) => {
+    scriptPostTs(stubA, POST_TS)
+    const logCalls: unknown[][] = []
+    const trail = makeTrailCapture()
+    let rowsPresent = true
+    const ivl = startPoller(() => ({
+      list: async () => {
+        if (site === 'list') throw makeErr()
+        return { spawns: rowsPresent ? [checkPermRow()] : [] }
+      },
+      get: async () => {
+        if (site === 'get') throw makeErr()
+        return getResult(rowsPresent ? [cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })] : [])
+      },
+      getPermission: async (): Promise<GetPermissionResult> => { throw makeErr() },
+    }), { log: (...args) => { logCalls.push(args) }, emitTrail: trail.emit })
+
+    await ivl.tick()
+    // getPermission runs only for a posted request whose row has gone.
+    rowsPresent = false
+    if (site === 'getPermission') await ivl.tick()
+
+    const lines = logLines(logCalls, phrase)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toHaveLength(1)
+    expect(String(lines[0]![0])).toStartWith(`[slack] permission-poller: ${tail}`)
+    assertNoLeak({ logCalls, trail: trail.events, posts: posts(stubA) })
+  })
+})
+
+// ---------------------------------------------------------------------------
 // b.fae F4 — silent-wedge detector (empty permission_requests in
 // check_permission for K consecutive ticks → one-shot warning to the
 // persona's destination + cscb.poller.wedge_detected trail event + log;
