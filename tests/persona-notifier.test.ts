@@ -22,7 +22,10 @@
  * hold's own schedule, epochs and cap are proven in
  * `persona-destination-hold.test.ts`; this file keeps one case per failure
  * kind and the notifier-level rules. Nothing rejects. An injected resolver is
- * the one used (its cached DM is reused).
+ * the one used (its cached DM is reused). A teardown's `forget(key)` (b.av2
+ * SR-6.5) drops the persona's pre-validation queue unposted, with one line
+ * only when notices were dropped, so the key added again never posts them;
+ * it leaves the destination hold and other personas' queues alone.
  *
  * Pure module under test: built from injected fakes only, through the shared
  * `makeNotifierHarness` (`makeStubSlack` Web stubs, a validated-key set, a
@@ -578,6 +581,74 @@ describe('hold and flush per persona (SR-7.2)', () => {
   })
 })
 
+
+// ---------------------------------------------------------------------------
+// A teardown forgets the persona's held notices (b.av2 SR-6.5)
+// ---------------------------------------------------------------------------
+
+describe('forget(key): a teardown drops the persona\'s pre-validation queue (b.av2 SR-6.5)', () => {
+  const droppedLine = (p: Persona, n: number) =>
+    `[slack] persona-notifier: persona=${p.key}: dropped ${n} held notice(s), not posted — the persona was torn down`
+
+  test('drops A\'s held notices unposted with one line naming the count and no Slack call; A re-added under the same key posts only its own notices, and B\'s queue is untouched', async () => {
+    await h.notifier.notify(f.A.key, 'old-1')
+    await h.notifier.notify(f.A.key, 'old-2')
+    await h.notifier.notify(f.B.key, 'b-1')
+
+    h.notifier.forget(f.A.key)
+
+    expect(h.logs).toEqual([droppedLine(f.A, 2)])
+    for (const p of h.personas) expect(h.stub(p.key).callLog).toEqual([])
+
+    // A leaves the applied set and is added again under the same key.
+    h.personas.splice(h.personas.indexOf(f.A), 1)
+    h.personas.push({ ...f.A })
+    await h.notifier.notify(f.A.key, 'new-1')
+    await validateAndFlush(f.A)
+    await h.notifier.notify(f.A.key, 'new-2')
+    expect(texts(f.A)).toEqual(['new-1', 'new-2'].map((t) => formatPersonaNotice(f.A, t)))
+
+    await validateAndFlush(f.B)
+    expect(texts(f.B)).toEqual([formatPersonaNotice(f.B, 'b-1')])
+    expect(h.logs).toHaveLength(1)
+  })
+
+  test.each<[string, (x: Fixture) => string]>([
+    ['a persona with nothing held', (x) => x.A.key],
+    ['a key no persona has', () => 'no_such_persona'],
+  ])('%s: forget logs nothing, calls no Slack method and does not throw', async (_label, key) => {
+    await h.notifier.notify(f.B.key, 'b-1')
+    h.notifier.forget(key(f))
+    expect(h.logs).toEqual([])
+    expect(h.totalPosts()).toBe(0)
+    await validateAndFlush(f.B)
+    expect(texts(f.B)).toEqual([formatPersonaNotice(f.B, 'b-1')])
+  })
+
+  test('leaves the destination hold alone: with a notice held for a failing destination and another queued before validation, only the queued one is dropped; the held one posts once the cause clears', async () => {
+    h.validate(f.A.key)
+    failAlways(h.stub(f.A.key).script.post, { kind: 'platform', error: 'not_in_channel' })
+    await h.notifier.notify(f.A.key, 'held-at-destination')
+    // A's client is unavailable again (as before validation): the next notice is queued.
+    h.validated.delete(f.A.key)
+    await h.notifier.notify(f.A.key, 'queued')
+    const heldView = { held: true, heldNotices: 1, nextDueAt: 5_000 }
+    expect(h.hold.view(f.A.key)).toEqual(heldView)
+    const linesBefore = [...h.logs]
+
+    h.notifier.forget(f.A.key)
+
+    expect(h.logs).toEqual([...linesBefore, droppedLine(f.A, 1)])
+    expect(h.hold.view(f.A.key)).toEqual(heldView)
+    h.validate(f.A.key)
+    recover(h.stub(f.A.key).script.post)
+    await h.clock.runNext()
+    await h.notifier.flush(f.A.key)
+    // The failed first attempt, then the one retry that posted; the queued notice never.
+    expect(texts(f.A)).toEqual(['held-at-destination', 'held-at-destination'].map((t) => formatPersonaNotice(f.A, t)))
+    expect(h.hold.view(f.A.key)).toEqual(NOT_HELD)
+  })
+})
 
 // ---------------------------------------------------------------------------
 // Destination failures: held, retried on backoff, logged once per episode

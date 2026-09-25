@@ -41,7 +41,9 @@
  * pass's applies the bytes and the change plan that pass derived: an invalid
  * candidate logs `reload-invalid` and changes nothing; a valid one runs step
  * 1 (rewrite the record, then swap the applied state and tell `onApplied`),
- * then the bound steps 2–6 of `reload-apply.ts` in order, and logs
+ * then steps 2–6 of `reload-apply.ts` in order (by default step 2 tears down
+ * each removed persona and step 6 brings up each added one, through the
+ * lifecycle operations), and logs
  * `reload-applied`, or `reload-noop` when nothing effective changed. A
  * mismatched, unreadable or malformed confirmation applies nothing and logs
  * `reload-stale-confirmation`. The pending state is then refreshed against
@@ -50,7 +52,7 @@
  * The controller (`createReloadController`) is built with every dependency
  * injected, as `createCronScheduler` is: the SR-8.1 paths, the durable
  * writer and delete, the log sink, the lifecycle operations (the start
- * bring-up pass today), the tick driver, the dry-run flag, the held
+ * bring-up pass, and the apply's teardown and bring-up), the tick driver, the dry-run flag, the held
  * credentials digests and bring-up states, and the Slack client factory that later work binds
  * (applying a confirmed change). It keeps the applied bytes and configuration
  * in memory. `readAppliedPersonaConfig` is the CLI's read-only resolver over
@@ -105,6 +107,7 @@ import {
   applyStepInputs,
   applyStepNumber,
   applyStepsFor,
+  lifecycleApplySlots,
   RELOAD_APPLIED,
   RELOAD_NOOP,
   RELOAD_STALE_CONFIRMATION,
@@ -245,8 +248,12 @@ export interface ReloadTickDriver {
 
 /**
  * The per-persona lifecycle operations the controller drives. `startBringUp`
- * is the start pass; the others are bound by the work that implements the
- * apply step calling them (steps 2, 3, 4 and 6), and nothing calls them yet.
+ * is the start pass. A confirmed apply's default step bodies
+ * (`lifecycleApplySlots`, `reload-apply.ts`) fan out to `teardown` (step 2,
+ * each removed persona) and `bringUp` (step 6, each added persona);
+ * production binds both through `persona-lifecycle.ts`. `reconnectCredentials`
+ * and `updateInPlace` are bound by the work that implements steps 4 and 3,
+ * and nothing calls them yet.
  */
 export interface ReloadLifecycleOps {
   /**
@@ -256,10 +263,14 @@ export interface ReloadLifecycleOps {
    * the bring-up controller).
    */
   startBringUp(applied: PersonaConfig): Promise<unknown>
-  /** Bring up one persona a confirmed change added. */
-  bringUp?(persona: Persona, applied: PersonaConfig): Promise<unknown>
-  /** Tear down one persona a confirmed change removed or destructively modified. */
-  teardown?(persona: Persona): Promise<unknown>
+  /**
+   * Bring up one persona a confirmed change added, `applied` being the
+   * configuration step 1 made current. Resolves once it has an outcome and,
+   * when up, its launch settled.
+   */
+  bringUp(persona: Persona, applied: PersonaConfig): Promise<unknown>
+  /** Tear down one persona a confirmed change removed (and, from E13, the old half of a destructive modify). */
+  teardown(persona: Persona): Promise<unknown>
   /** Reconnect one persona with its changed credentials file. */
   reconnectCredentials?(persona: Persona, applied: PersonaConfig): Promise<unknown>
   /** Apply one persona's modified settings without tearing it down. */
@@ -298,7 +309,7 @@ export type BringUpStateQuery = (key: string) => PersonaBringUpState | undefined
 export interface ReloadControllerDeps {
   /** The configuration file and its reload files (`reloadFilePaths`). */
   paths: ReloadFilePaths
-  /** The lifecycle operations; `startBringUp` is required. */
+  /** The lifecycle operations; `startBringUp`, `bringUp` and `teardown` are required. */
   lifecycle: ReloadLifecycleOps
   /** Receives each `[slack]` line the controller logs (the server log). */
   log: (line: string) => void
@@ -352,8 +363,11 @@ export interface ReloadControllerDeps {
    */
   onApplied?: (config: PersonaConfig) => void
   /**
-   * The bodies of apply steps 2–6 (`reload-apply.ts`); an unbound step does
-   * nothing. Bound by the work that implements each step.
+   * Test override: the bodies of apply steps 2–6 (`reload-apply.ts`), used
+   * instead of the default ones; an unbound step then does nothing. Without
+   * it the controller runs `lifecycleApplySlots` over `lifecycle` (step 2
+   * tears down each removed persona, step 6 brings up each added one).
+   * Production never sets it.
    */
   applySteps?: ApplyStepSlots
   /** Home directory for every `~` in the configuration; the OS home by default. */
@@ -1083,6 +1097,16 @@ type StartPhase = 'unresolved' | 'refused' | 'applied' | 'bringing-up' | 'brough
 export function createReloadController(deps: ReloadControllerDeps): ReloadController {
   const { paths, lifecycle } = deps
   const write = deps.write ?? durableWriteFileSync
+  // Steps 2–6: the test override, else the fan-outs over the lifecycle
+  // members, which log each persona's rejected operation.
+  const applySlots =
+    deps.applySteps ??
+    lifecycleApplySlots(lifecycle, (step, persona, err) =>
+      deps.log(
+        `[slack] reload: apply step ${applyStepNumber(step)} (${step}) failed for persona ` +
+          `${renderPersonaRef(persona.name, persona.key)}: ${describeThrownValue(err)}`,
+      ),
+    )
   let phase: StartPhase = 'unresolved'
   let appliedState: AppliedConfiguration | undefined
   let detection: PendingDetection | undefined
@@ -1221,7 +1245,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     appliedState = { config: candidate.config, bytes, source: 'config' }
     notifyApplied(candidate.config)
 
-    await runApplySteps(deps.applySteps ?? {}, inputs, applyStepsFor(plan), (step, err) =>
+    await runApplySteps(applySlots, inputs, applyStepsFor(plan), (step, err) =>
       deps.log(`[slack] reload: apply step ${applyStepNumber(step)} (${step}) failed: ${describeThrownValue(err)}`),
     )
     deps.log(plan.noEffectiveChange ? renderNoopLogLine(paths.lastApplied) : renderAppliedLogLine(plan, paths.lastApplied))

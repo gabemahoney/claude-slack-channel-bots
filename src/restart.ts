@@ -11,6 +11,10 @@
  * the probe (before any reconnect or kill), so its instance and row are left
  * alone and its failure count is unchanged. `launchSession`'s own gate is the
  * backstop for a flip during the kill.
+ * A fired timer's work runs through the per-persona lifecycle serializer
+ * (b.av2 SR-6.6, `RestartDeps.serialize`), so it never overlaps a teardown or
+ * a bring-up retry's launch for the same persona, and its checks see the
+ * state when the work starts.
  * Isolated from server.ts side effects — injectable deps make it testable.
  *
  * SPDX-License-Identifier: MIT
@@ -22,6 +26,7 @@ import {
   nextBackoffDelay,
   shouldNotifyCap,
 } from './backoff.ts'
+import type { PersonaSerialize } from './persona-serializer.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -101,6 +106,16 @@ export interface RestartDeps {
    * queuing new timers for this persona until recordSuccess clears the latch.
    */
   onCapReached(key: string): void
+  /**
+   * The per-persona lifecycle serializer's `run` (b.av2 SR-6.6,
+   * `persona-serializer.ts`): a fired timer's work (every check, the probe,
+   * reconnect, kill and launch) is submitted through it, so it starts only
+   * after every operation already submitted for the persona has settled.
+   * Scheduling, backoff, the cap, the `activeLaunches` guard and the
+   * human-trigger clamp are not serialized. Without it the work runs at once.
+   * Production passes the server's one shared serializer.
+   */
+  serialize?: PersonaSerialize
 }
 
 // ---------------------------------------------------------------------------
@@ -155,7 +170,7 @@ export function scheduleRestart(
 
   // b.av2 SR-6.4: a persona that is not up gets no timer at all.
   if (!deps.canRestart(key)) {
-    console.error(`[slack] Not scheduling restart for persona=${key} — the persona is not up (its bring-up has not succeeded, or its Slack connection is not serving)`)
+    console.error(`[slack] Not scheduling restart for persona=${key} — the relaunch gate refused it (the persona is not up, or is no longer in the applied configuration)`)
     return
   }
 
@@ -187,131 +202,151 @@ export function scheduleRestart(
     activeLaunches.add(key)
 
     try {
-      if (!deps) return
-
-      if (deps.isShuttingDown()) {
-        console.error(`[slack] Skipping restart — server is shutting down (persona=${key})`)
-        return
-      }
-
-      // b.av2 SR-6.4: the persona stopped being up after this restart was
-      // scheduled (e.g. Slack refused a token on a reopen). Leave its instance
-      // and its row alone: no liveness probe, reconnect, kill or launch, and
-      // no success or failure recorded.
-      if (skipIfNotUp(deps, key)) return
-
-      let alive: boolean
-      try {
-        alive = await deps.isSessionAlive(key)
-      } catch (err) {
-        console.error(`[slack] restart: isSessionAlive failed for persona=${key}:`, err)
-        alive = false
-      }
-
-      // Asked again after the liveness probe: it is an async agent-director
-      // call, and the persona may have stopped being up while it ran. This is
-      // the last check before `reconnectSession` or `killSession` touch the
-      // instance; `launchSession`'s own gate (`'skipped'` below) covers a flip
-      // during the kill.
-      if (skipIfNotUp(deps, key)) return
-
-      if (alive) {
-        // If the session already re-established its MCP connection (e.g. Claude
-        // Code refreshed the SSE stream on its own), skip the reconnect. A
-        // session is only truly healed when it is connected AND its standalone
-        // GET SSE stream is present: a connected-but-streamless session (b.9cj)
-        // cannot receive messages, so it must proceed to recovery rather than be
-        // waved through as "already reconnected".
-        if (deps.isSessionConnected(key) && deps.hasSessionStream(key)) {
-          console.error(`[slack] Session already reconnected — skipping restart for persona=${key}`)
-          return
-        }
-        console.error(`[slack] Session alive but disconnected — reconnecting MCP for persona=${key}`)
-        let reconnectResult: 'success' | 'escalate-dead' | 'transient' | void
-        try {
-          reconnectResult = await deps.reconnectSession(key)
-        } catch (err) {
-          console.error(`[slack] restart: reconnectSession failed for persona=${key}:`, err)
-          reconnectResult = undefined
-        }
-
-        if (reconnectResult === 'success') {
-          // Reconnect succeeded — reset the failure counter and cap latch.
-          recordSuccess(key)
-        }
-        // Non-success/non-void branches ('escalate-dead', 'transient', or undefined):
-        // do NOT recordFailure here. SR-25.1 / single counting site: counting
-        // lives only at the launchSession boolean below. restart.ts does not
-        // re-enter scheduleRestart on any of these outcomes — it simply returns.
-        // Post-b.9a7 that is safe: the periodic health-check tick is now the
-        // retry driver. On the next tick the persona is re-observed; if it is
-        // still alive && !connected (or has since gone dead), the tick calls
-        // scheduleRestart again, so a failed/deferred reconnect is retried
-        // without any re-entry here. ('transient' also covers the b.9a7 hazard-2
-        // `working` defer: the tick retries once the turn settles.) For the
-        // dead-tmux 'escalate-dead' case CSCB now recovers itself (b.sv7 / Epic
-        // t1.tkk.e4): the reconnectSession adapter fires the internal memoized
-        // findMissing sweep before returning 'escalate-dead', so the frozen
-        // `working` row reconciles to `missing` and the NEXT tick observes
-        // alive === false and falls through to the kill+relaunch branch below.
-        // The external ~/startup/find-missing-loop.sh is belt-and-braces only —
-        // recovery no longer depends on it, and removing it is a separate
-        // operator decision. Not counting here keeps the failure count tied to
-        // actual launch attempts, not this reconnect site.
-        return
-      }
-
-      // Kill zombie if needed (ignore errors — session may not exist)
-      try {
-        await deps.killSession(key)
-      } catch { /* ignore */ }
-
-      console.error(`[slack] Relaunching session for persona=${key} cwd="${cwd}"`)
-
-      let ok: boolean | 'skipped'
-      try {
-        ok = await deps.launchSession(key, cwd, sessionId)
-      } catch (err) {
-        console.error(`[slack] restart: launchSession threw for persona=${key}:`, err)
-        ok = false
-      }
-
-      if (ok === 'skipped') {
-        // Declined, not attempted: the persona stopped being up between the
-        // last `canRestart` check above and the launch, and the launch's own
-        // gate (the same relaunch gate) logged why. The instance was already
-        // killed by then; the failure counter, backoff and cap latch are left
-        // exactly as they were.
-        return
-      }
-
-      if (ok) {
-        // Successful launch — reset consecutive-failure counter and cap latch.
-        recordSuccess(key)
-      } else {
-        // Launch failed — increment the failure counter (SINGLE COUNTING SITE:
-        // SR-25.1; counting happens only here at the launchSession boolean).
-        recordFailure(key)
-        console.error(`[slack] Session relaunch failed for persona=${key}`)
-
-        // Once-per-episode cap notification: fires exactly once when the failure
-        // count reaches RESTART_FAILURE_CAP. Subsequent calls return false (latched).
-        if (shouldNotifyCap(key, RESTART_FAILURE_CAP)) {
-          console.error(`[slack] Cap reached for persona=${key} — notifying and stopping restarts`)
-          deps.onCapReached(key)
-          // Do NOT schedule another timer — the persona is capped. The
-          // activeLaunches entry is removed in the finally block below.
-          // The tick guard (isAtCap in health-check.ts) prevents future ticks
-          // from re-scheduling while capped (SR-25.3/25.4).
-          return
-        }
-      }
+      const d = deps
+      if (!d) return
+      // b.av2 SR-6.6: the timer body's work runs through the per-persona
+      // lifecycle serializer, after any operation already running or queued
+      // for this persona (a teardown, a bring-up retry's launch). Every check
+      // below runs when the work starts, not when the timer fired. The
+      // `activeLaunches` entry covers the wait, so the health check and the
+      // lost-message path see the restart as active meanwhile.
+      await (d.serialize ?? runNow)(key, () => runRestartWork(d, key, cwd, sessionId))
     } finally {
       activeLaunches.delete(key)
     }
   }, delay * 1000)
 
   pendingRestartTimers.set(key, timer)
+}
+
+/** Run an operation at once (synchronously up to its first await): the timer body without an injected serializer. */
+async function runNow<T>(_key: string, operation: () => T | Promise<T>): Promise<T> {
+  return operation()
+}
+
+/**
+ * The work a restart timer does when it fires, run through the serializer:
+ * the shutdown and not-up checks, the liveness probe, then a reconnect, or a
+ * kill and a launch, and the success or failure accounting.
+ */
+async function runRestartWork(d: RestartDeps, key: string, cwd: string, sessionId: string | undefined): Promise<void> {
+  if (d.isShuttingDown()) {
+    console.error(`[slack] Skipping restart — server is shutting down (persona=${key})`)
+    return
+  }
+
+  // b.av2 SR-6.4: the persona stopped being up after this restart was
+  // scheduled (e.g. Slack refused a token on a reopen). Leave its instance
+  // and its row alone: no liveness probe, reconnect, kill or launch, and
+  // no success or failure recorded.
+  if (skipIfNotUp(d, key)) return
+
+  let alive: boolean
+  try {
+    alive = await d.isSessionAlive(key)
+  } catch (err) {
+    console.error(`[slack] restart: isSessionAlive failed for persona=${key}:`, err)
+    alive = false
+  }
+
+  // Asked again after the liveness probe: it is an async agent-director
+  // call, and the persona may have stopped being up while it ran. This is
+  // the last check before `reconnectSession` or `killSession` touch the
+  // instance; `launchSession`'s own gate (`'skipped'` below) covers a flip
+  // during the kill.
+  if (skipIfNotUp(d, key)) return
+
+  if (alive) {
+    // If the session already re-established its MCP connection (e.g. Claude
+    // Code refreshed the SSE stream on its own), skip the reconnect. A
+    // session is only truly healed when it is connected AND its standalone
+    // GET SSE stream is present: a connected-but-streamless session (b.9cj)
+    // cannot receive messages, so it must proceed to recovery rather than be
+    // waved through as "already reconnected".
+    if (d.isSessionConnected(key) && d.hasSessionStream(key)) {
+      console.error(`[slack] Session already reconnected — skipping restart for persona=${key}`)
+      return
+    }
+    console.error(`[slack] Session alive but disconnected — reconnecting MCP for persona=${key}`)
+    let reconnectResult: 'success' | 'escalate-dead' | 'transient' | void
+    try {
+      reconnectResult = await d.reconnectSession(key)
+    } catch (err) {
+      console.error(`[slack] restart: reconnectSession failed for persona=${key}:`, err)
+      reconnectResult = undefined
+    }
+
+    if (reconnectResult === 'success') {
+      // Reconnect succeeded — reset the failure counter and cap latch.
+      recordSuccess(key)
+    }
+    // Non-success/non-void branches ('escalate-dead', 'transient', or undefined):
+    // do NOT recordFailure here. SR-25.1 / single counting site: counting
+    // lives only at the launchSession boolean below. restart.ts does not
+    // re-enter scheduleRestart on any of these outcomes — it simply returns.
+    // Post-b.9a7 that is safe: the periodic health-check tick is now the
+    // retry driver. On the next tick the persona is re-observed; if it is
+    // still alive && !connected (or has since gone dead), the tick calls
+    // scheduleRestart again, so a failed/deferred reconnect is retried
+    // without any re-entry here. ('transient' also covers the b.9a7 hazard-2
+    // `working` defer: the tick retries once the turn settles.) For the
+    // dead-tmux 'escalate-dead' case CSCB now recovers itself (b.sv7 / Epic
+    // t1.tkk.e4): the reconnectSession adapter fires the internal memoized
+    // findMissing sweep before returning 'escalate-dead', so the frozen
+    // `working` row reconciles to `missing` and the NEXT tick observes
+    // alive === false and falls through to the kill+relaunch branch below.
+    // The external ~/startup/find-missing-loop.sh is belt-and-braces only —
+    // recovery no longer depends on it, and removing it is a separate
+    // operator decision. Not counting here keeps the failure count tied to
+    // actual launch attempts, not this reconnect site.
+    return
+  }
+
+  // Kill zombie if needed (ignore errors — session may not exist)
+  try {
+    await d.killSession(key)
+  } catch { /* ignore */ }
+
+  console.error(`[slack] Relaunching session for persona=${key} cwd="${cwd}"`)
+
+  let ok: boolean | 'skipped'
+  try {
+    ok = await d.launchSession(key, cwd, sessionId)
+  } catch (err) {
+    console.error(`[slack] restart: launchSession threw for persona=${key}:`, err)
+    ok = false
+  }
+
+  if (ok === 'skipped') {
+    // Declined, not attempted: the persona stopped being up between the
+    // last `canRestart` check above and the launch, and the launch's own
+    // gate (the same relaunch gate) logged why. The instance was already
+    // killed by then; the failure counter, backoff and cap latch are left
+    // exactly as they were.
+    return
+  }
+
+  if (ok) {
+    // Successful launch — reset consecutive-failure counter and cap latch.
+    recordSuccess(key)
+  } else {
+    // Launch failed — increment the failure counter (SINGLE COUNTING SITE:
+    // SR-25.1; counting happens only here at the launchSession boolean).
+    recordFailure(key)
+    console.error(`[slack] Session relaunch failed for persona=${key}`)
+
+    // Once-per-episode cap notification: fires exactly once when the failure
+    // count reaches RESTART_FAILURE_CAP. Subsequent calls return false (latched).
+    if (shouldNotifyCap(key, RESTART_FAILURE_CAP)) {
+      console.error(`[slack] Cap reached for persona=${key} — notifying and stopping restarts`)
+      d.onCapReached(key)
+      // Do NOT schedule another timer — the persona is capped. The
+      // activeLaunches entry is removed in the timer's finally block.
+      // The tick guard (isAtCap in health-check.ts) prevents future ticks
+      // from re-scheduling while capped (SR-25.3/25.4).
+      return
+    }
+  }
 }
 
 /**
@@ -336,6 +371,27 @@ export function cancelAllRestartTimers(): void {
     console.error(`[slack] Cancelled restart timer for persona=${key}`)
   }
   pendingRestartTimers.clear()
+}
+
+// ---------------------------------------------------------------------------
+// cancelRestartTimer — one persona's pending timer
+// ---------------------------------------------------------------------------
+
+/**
+ * Cancel the pending restart timer for persona `key`, if any, so it never
+ * fires (b.av2 SR-6.5, a teardown). Other personas' timers are untouched.
+ * A work already started (its `activeLaunches` entry) is left alone: the
+ * teardown waits for it through the lifecycle serializer. Records no success
+ * or failure and posts nothing; logs the cancelled-timer line only when a
+ * timer was pending. Returns whether one was.
+ */
+export function cancelRestartTimer(key: string): boolean {
+  const timer = pendingRestartTimers.get(key)
+  if (timer === undefined) return false
+  clearTimeout(timer)
+  pendingRestartTimers.delete(key)
+  console.error(`[slack] Cancelled restart timer for persona=${key}`)
+  return true
 }
 
 // ---------------------------------------------------------------------------

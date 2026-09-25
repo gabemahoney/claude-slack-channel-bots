@@ -35,7 +35,9 @@
  * the one archive row (SR-4.1) and the author and `via` meta (SR-4.4). Every
  * harness has fresh dedupe stores reading this test's fake clock. It also owns
  * inbound DMs per persona (SR-4.3; AC 15, AC 35 and the delivery leg of AC
- * 40/41) and the edited-event dedupe key (an edit that adds a mention).
+ * 40/41), the edited-event dedupe key (an edit that adds a mention) and a
+ * teardown's `forget(key)`, which drops one persona's dedupe store (b.av2
+ * SR-6.5).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -1140,6 +1142,47 @@ describe('SR-4.1 per-persona dedupe through the pipeline', () => {
 
     expect(first.p('A').notifications).toHaveLength(1)
     expect(second.p('A').notifications).toHaveLength(1)
+  })
+
+  // The stub-client harness does not expose the routing, so this case builds it
+  // as the server does, over the real connection manager (`makeManagedRouting`).
+  test('forget(key) drops only that persona\'s dedupe store (b.av2 SR-6.5): the key, added again, is delivered an event it had seen, another persona still collapses it, and nothing is logged', async () => {
+    const h = makeConnectionHarness([
+      { name: 'Alpha Bot', channels: [{ id: CS, delivery: 'all' }] },
+      { name: 'Beta Bot', channels: [{ id: CS, delivery: 'all' }] },
+    ], dir)
+    try {
+      for (const p of h.personas) expect(await h.bringUp(p)).toMatchObject({ state: 'up' })
+      initRestart(makeRestartDeps({ restartDelayS: NEVER_FIRE_RESTART_DELAY_S }))
+      const m = makeManagedRouting(h, dir)
+      const [A, B] = h.personas as [Persona, Persona]
+      const event = makeChannelMessage({ channel: CS })
+      const ts = event.ts as string
+      const ack = async () => {}
+      const receiveOnBoth = async () => {
+        for (const p of [A, B]) await m.routing.receive(event, ack, p.key)
+      }
+      const delivered = (p: Persona) => m.notifications.get(p.key)!.map((n) => n.params.meta.message_id)
+
+      await receiveOnBoth()
+      await receiveOnBoth() // a redelivery: collapsed on both keys
+      expect(delivered(A)).toEqual([ts])
+      expect(delivered(B)).toEqual([ts])
+
+      const logsBefore = [...m.logs]
+      const consoleBefore = [...consoleLines]
+      m.routing.forget(A.key)
+      m.routing.forget('no_such_persona')
+      expect(m.logs).toEqual(logsBefore)
+      expect(consoleLines).toEqual(consoleBefore)
+
+      await receiveOnBoth()
+      expect(delivered(A)).toEqual([ts, ts])
+      expect(delivered(B)).toEqual([ts])
+      assertNoLeak({ logs: m.logs, lines: h.lines, console: consoleLines })
+    } finally {
+      await h.manager.stopAll()
+    }
   })
 })
 

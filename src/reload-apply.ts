@@ -16,14 +16,23 @@
  *   6. bring-ups of added personas (and the new half of a destructive
  *      modify).
  *
- * Steps 2–6 are slots (`ApplyStepSlots`): a body per step, bound by the work
- * that implements it; an unbound slot does nothing. `applyStepInputs` hands
- * each slot the `Persona` declarations its step acts on, taken from the change
- * plan the detection tick built from the confirmed bytes (`buildChangePlan`,
- * `reload-plan.ts`), never from a second diff. `applyStepsFor` decides which
- * slots run: a plan with no effective change runs only slot 5, and only when
- * its config directories changed. `runApplySteps` runs them in order, each
+ * Steps 2–6 are slots (`ApplyStepSlots`): a body per step; an unbound slot
+ * does nothing. `applyStepInputs` hands each slot the `Persona` declarations
+ * of every class of the change plan (removed, added, the two halves of a
+ * destructive modify, in place, credentials, credentials-broken), taken from
+ * the plan the detection tick built from the confirmed bytes
+ * (`buildChangePlan`, `reload-plan.ts`), never from a second diff; each body
+ * binds to the classes its step acts on. `applyStepsFor` decides which slots
+ * run: a plan with no effective change runs only slot 5, and only when its
+ * config directories changed. `runApplySteps` runs them in order, each
  * awaited before the next.
+ *
+ * The controller's default bodies are `lifecycleApplySlots`: per-step
+ * fan-outs (`fanOutPersonas`) over the lifecycle members, step 2 to
+ * `teardown` for each removed persona and step 6 to `bringUp` for each added
+ * one. Within a step every persona's operation runs at once and the step
+ * settles once all of them settled; one persona's rejection is reported and
+ * never stops the others.
  *
  * The line renderers here give the apply-time reload classes their text:
  * `reload-applied`, `reload-noop`, `reload-stale-confirmation`, and the
@@ -31,8 +40,9 @@
  *
  * Pure (b.av2 SR-13.1): nothing here reads or writes a file, calls Slack or
  * agent-director, arms a timer, logs or holds state, and nothing runs at
- * import; `runApplySteps` only awaits the injected bodies. No output holds a
- * token, credentials content, a digest or a fingerprint.
+ * import; `runApplySteps` and the fan-outs only call and await the injected
+ * bodies and members. No output holds a token, credentials content, a digest
+ * or a fingerprint.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -48,6 +58,7 @@ import {
   type InvalidChangePlan,
   type ValidChangePlan,
 } from './reload-plan.ts'
+import type { ReloadLifecycleOps } from './reload.ts'
 
 // ---------------------------------------------------------------------------
 // Diagnostic classes (b.av2 SR-10.3); listed in `RELOAD_DIAGNOSTIC_CLASSES`
@@ -94,28 +105,48 @@ export interface CredentialsApplyInput {
   change: CredentialsPersonaChange
 }
 
-/** What the steps after step 1 act on, from one change plan. Holds no token or digest. */
+/**
+ * What the steps after step 1 act on, from one change plan, split by the
+ * plan's classes, each taken from the configuration that declares it. A step
+ * binds to the classes it acts on: step 2 tears down `removed` (and, from
+ * E13, `destructiveOld`), step 3 updates `inPlace`, step 4 reconnects
+ * `credentials`, step 5 reads `configDirsChanged`, step 6 brings up `added`
+ * (and, from E13, `destructiveNew` and `credentialsBroken`). Holds no token
+ * or digest.
+ */
 export interface ApplyStepInputs {
   /** The applied configuration before step 1. */
   previous: PersonaConfig
   /** The configuration step 1 applied (the confirmed candidate). */
   applied: PersonaConfig
   /**
-   * Step 2: the removed personas, then the destructively modified ones, as
-   * the previous configuration declares them.
+   * The removed personas, as the previous configuration declares them, in
+   * its order. A `name` change is a removal of the old key (and an addition
+   * of the new one).
    */
-  teardowns: Persona[]
-  /** Step 3: the personas modified in place, in candidate order. */
-  inPlaceUpdates: InPlaceApplyInput[]
-  /** Step 4: the personas whose credentials content changed, in candidate order. */
-  credentialsReconnects: CredentialsApplyInput[]
-  /** Step 5: whether the set of effective config directories changed. */
-  configDirsChanged: boolean
+  removed: Persona[]
+  /** The added personas, as the candidate declares them, in candidate order. */
+  added: Persona[]
+  /** The destructively modified personas, as the previous configuration declares them (the old half), in candidate order. */
+  destructiveOld: Persona[]
+  /** The destructively modified personas, as the candidate declares them (the new half), in candidate order. */
+  destructiveNew: Persona[]
+  /** The personas modified in place, in candidate order. */
+  inPlace: InPlaceApplyInput[]
   /**
-   * Step 6: the added personas, then the destructively modified ones, as the
-   * candidate declares them.
+   * The personas whose credentials content changed and that are not broken
+   * by their credentials (reconnected), in candidate order; one whose
+   * bring-up state could not be queried is here.
    */
-  bringUps: Persona[]
+  credentials: CredentialsApplyInput[]
+  /**
+   * The personas whose credentials content changed and that are broken by
+   * their credentials (brought up at apply rather than reconnected), in
+   * candidate order.
+   */
+  credentialsBroken: CredentialsApplyInput[]
+  /** Whether the set of effective config directories changed (step 5). */
+  configDirsChanged: boolean
 }
 
 /** The body of one step: acts on its inputs for every persona and settles once all of them are done. */
@@ -123,6 +154,12 @@ export type ApplyStepBody = (inputs: ApplyStepInputs) => Promise<unknown>
 
 /** The bodies of steps 2–6; an unbound slot does nothing. */
 export type ApplyStepSlots = Partial<Record<ApplyStepName, ApplyStepBody>>
+
+/** The per-persona lifecycle members the default step bodies fan out to (`ReloadLifecycleOps` in `reload.ts`). */
+export type ApplyLifecycleMembers = Pick<ReloadLifecycleOps, 'teardown' | 'bringUp'>
+
+/** Told of one persona's rejected lifecycle operation in a step. */
+export type ApplyPersonaFailure = (step: ApplyStepName, persona: Persona, err: unknown) => void
 
 /** `config`'s persona with `key`; throws when there is none (a plan built from another configuration). */
 function personaByKey(config: PersonaConfig, key: string): Persona {
@@ -133,23 +170,66 @@ function personaByKey(config: PersonaConfig, key: string): Persona {
 
 /**
  * The inputs of steps 2–6 for `plan`, the plan of `applied` against
- * `previous`: each persona the plan lists, taken by key from the
- * configuration that declares it (a removed persona and the old half of a
- * destructive modify from `previous`, everything else from `applied`). Pure.
+ * `previous`, split by class: each persona the plan lists, taken by key from
+ * the configuration that declares it (a removed persona and the old half of
+ * a destructive modify from `previous`, everything else from `applied`). Pure.
  */
 export function applyStepInputs(plan: ValidChangePlan, previous: PersonaConfig, applied: PersonaConfig): ApplyStepInputs {
+  const credentials = plan.credentials.map((change) => ({ persona: personaByKey(applied, change.key), change }))
   return {
     previous,
     applied,
-    teardowns: [...plan.removed, ...plan.destructive].map((p) => personaByKey(previous, p.key)),
-    inPlaceUpdates: plan.inPlace.map((p) => ({
+    removed: plan.removed.map((p) => personaByKey(previous, p.key)),
+    added: plan.added.map((p) => personaByKey(applied, p.key)),
+    destructiveOld: plan.destructive.map((p) => personaByKey(previous, p.key)),
+    destructiveNew: plan.destructive.map((p) => personaByKey(applied, p.key)),
+    inPlace: plan.inPlace.map((p) => ({
       persona: personaByKey(applied, p.key),
       previous: personaByKey(previous, p.key),
       settings: [...p.settings],
     })),
-    credentialsReconnects: plan.credentials.map((change) => ({ persona: personaByKey(applied, change.key), change })),
+    credentials: credentials.filter((c) => c.change.credentialsBroken !== true),
+    credentialsBroken: credentials.filter((c) => c.change.credentialsBroken === true),
     configDirsChanged: plan.configDirsChanged,
-    bringUps: [...plan.added, ...plan.destructive].map((p) => personaByKey(applied, p.key)),
+  }
+}
+
+/**
+ * Run `operation` for every persona at once (different personas are
+ * independent, b.av2 SR-6.6) and settle once all of them settled, never
+ * fail-fast: each rejection or throw is reported to `onFailure` with its
+ * persona, in `personas` order, and the others still complete. Never rejects
+ * (unless `onFailure` throws).
+ */
+export async function fanOutPersonas(
+  personas: readonly Persona[],
+  operation: (persona: Persona) => Promise<unknown>,
+  onFailure: (persona: Persona, err: unknown) => void,
+): Promise<void> {
+  const settled = await Promise.allSettled(personas.map(async (persona) => operation(persona)))
+  settled.forEach((result, i) => {
+    if (result.status === 'rejected') onFailure(personas[i]!, result.reason)
+  })
+}
+
+/**
+ * The controller's default step bodies (b.av2 SR-8.6): pure fan-outs over the
+ * lifecycle members. Step 2 tears down every removed persona, step 6 brings
+ * up every added one with the applied configuration; each settles once every
+ * persona's operation settled, a rejection going to `onFailure`. Steps 3–5
+ * and the destructive-modify halves are bound by later work. Pure: builds the
+ * bodies only.
+ */
+export function lifecycleApplySlots(members: ApplyLifecycleMembers, onFailure: ApplyPersonaFailure): ApplyStepSlots {
+  return {
+    teardowns: (inputs) =>
+      fanOutPersonas(inputs.removed, (persona) => members.teardown(persona), (persona, err) =>
+        onFailure('teardowns', persona, err),
+      ),
+    'bring-ups': (inputs) =>
+      fanOutPersonas(inputs.added, (persona) => members.bringUp(persona, inputs.applied), (persona, err) =>
+        onFailure('bring-ups', persona, err),
+      ),
   }
 }
 

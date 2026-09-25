@@ -120,6 +120,9 @@ import {
   setPreLaunchTrustPatcher,
   _resetPreLaunchTrustPatcher,
   _resetPreLaunchReplyGuard,
+  killPersonaInstance,
+  deletePersonaInstance,
+  whenLaunchSettled,
   type StartupPersonaOutcome,
 } from '../src/session-manager.ts'
 import {
@@ -6829,5 +6832,180 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     expect(notices[0].text.startsWith('Spawn failure:\n')).toBe(true)
     expect(notices[0].text).not.toContain(NOTICE_NAME)
     expect(typeof notices[0].options?.onPostFailure).toBe('function')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The persona teardown's quiet kill and delete (b.av2 SR-6.5)
+//
+// `killPersonaInstance(key)` / `deletePersonaInstance(key)` touch only
+// `cscb_<key>`, through `withOutageDetection` (its flags move as for any other
+// call), and are quiet: no log line, no startup error, no persona notice.
+// A row already gone (`ErrSpawnNotFound`) resolves false; every other error is
+// rethrown for the teardown to log. `tryKill` / `tryDelete` keep their own
+// behaviour (the collision ladder and start sweep cases above stay green).
+// ---------------------------------------------------------------------------
+
+describe('killPersonaInstance / deletePersonaInstance: the persona teardown\'s quiet kill and delete (b.av2 SR-6.5)', () => {
+  const B = 'B'
+  const A = 'A'
+
+  /** Run `fn` with the startup-errors log and console captured; returns what it resolved or rejected with, and everything captured. */
+  async function runQuietly<T>(fn: () => Promise<T>): Promise<{ outcome: { ok: T } | { err: unknown }; errLog: string; startupLog: string }> {
+    const readStartupLog = captureStartupErrors()
+    let outcome!: { ok: T } | { err: unknown }
+    const errLog = await withCapturedErr(async () => {
+      try {
+        outcome = { ok: await fn() }
+      } catch (err) {
+        outcome = { err }
+      }
+      await settleNotices()
+    })
+    return { outcome, errLog, startupLog: readStartupLog() }
+  }
+
+  test('a present row: kill addresses only cscb_B and resolves true, delete addresses only cscb_B and resolves true; no other verb, no line, no startup error, no notice', async () => {
+    const calls = makeStubCallLog()
+    installStub(calls)
+
+    const kill = await runQuietly(() => killPersonaInstance(B))
+    const del = await runQuietly(() => deletePersonaInstance(B))
+
+    expect(kill.outcome).toEqual({ ok: true })
+    expect(del.outcome).toEqual({ ok: true })
+    expect(calls.killCalls).toEqual([{ claude_instance_id: 'cscb_B' }])
+    expect(calls.deleteCalls).toEqual([{ claude_instance_id: ['cscb_B'] }])
+    expect(stubCallCount(calls)).toBe(2)
+    for (const r of [kill, del]) {
+      expect(r.errLog).toBe('')
+      expect(r.startupLog).toBe('')
+    }
+    expect(notices).toEqual([])
+    expect(outageEmissions).toEqual([])
+  })
+
+  test.each([
+    ['kill', () => killPersonaInstance(B)],
+    ['delete', () => deletePersonaInstance(B)],
+  ] as const)('%s: a row already gone (ErrSpawnNotFound) resolves false, quietly', async (verb, call) => {
+    installStub(verb === 'kill' ? { killError: errSpawnNotFound() } : { deleteError: errSpawnNotFound() })
+
+    const r = await runQuietly(call)
+
+    expect(r.outcome).toEqual({ ok: false })
+    expect(r.errLog).toBe('')
+    expect(r.startupLog).toBe('')
+    expect(notices).toEqual([])
+    expect(outageEmissions).toEqual([])
+  })
+
+  test.each([
+    ['kill', () => killPersonaInstance(B)],
+    ['delete', () => deletePersonaInstance(B)],
+  ] as const)('%s: any other error is rethrown unchanged, with no line, startup error or notice of its own', async (verb, call) => {
+    const err = errGeneric(verb, 'ErrBroken')
+    installStub(verb === 'kill' ? { killError: err } : { deleteError: err })
+
+    const r = await runQuietly(call)
+
+    expect(r.outcome).toEqual({ err })
+    expect(r.errLog).toBe('')
+    expect(r.startupLog).toBe('')
+    expect(notices).toEqual([])
+    expect(outageEmissions).toEqual([])
+  })
+
+  test.each([
+    ['kill', () => killPersonaInstance(B)],
+    ['delete', () => deletePersonaInstance(B)],
+  ] as const)('%s goes through the outage wrapper: agent-director unreachable raises B\'s ad-unreachable flag (and rethrows); a later success clears it with B\'s all-clear; A\'s flag is untouched', async (verb, call) => {
+    const BIN = '/opt/ad/bin/agent-director'
+    setOutageFlag(A, 'ad-unreachable', BIN)
+    outageEmissions = []
+    const unreachable = new ErrSystemInstallDisappeared(verb, BIN)
+    installStub(verb === 'kill' ? { killError: unreachable } : { deleteError: unreachable })
+
+    const failed = await runQuietly(call)
+
+    expect(failed.outcome).toEqual({ err: unreachable })
+    expect([...getOutageFlags(B)]).toEqual(['ad-unreachable'])
+    expect(outageEmissions.map((e) => e.key)).toEqual([B])
+
+    installStub({})
+    const ok = await runQuietly(call)
+
+    expect(ok.outcome).toEqual({ ok: true })
+    expect([...getOutageFlags(B)]).toEqual([])
+    expect(outageEmissions.map((e) => e.key)).toEqual([B, B])
+    expect(outageEmissions[1]!.text).toContain('All clear')
+    expect([...getOutageFlags(A)]).toEqual(['ad-unreachable'])
+    expect(ok.errLog).toBe('')
+    expect(notices).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// whenLaunchSettled (b.av2 SR-6.6): a teardown waits for a launch still in
+// flight for its key (the start pass's, which runs outside the serializer).
+// ---------------------------------------------------------------------------
+
+describe('whenLaunchSettled: waits for the key\'s launch in flight, never rejects, starts nothing (b.av2 SR-6.6)', () => {
+  /** Whether `p` settled (either way) once pending continuations ran. */
+  async function settledNow(p: Promise<unknown>): Promise<boolean> {
+    let done = false
+    p.then(() => { done = true }, () => { done = true })
+    await settleNotices()
+    return done
+  }
+
+  test('no launch in flight: resolves at once and makes no agent-director call', async () => {
+    const calls = makeStubCallLog()
+    installStub(calls)
+
+    expect(await settledNow(whenLaunchSettled('K'))).toBe(true)
+    expect(stubCallCount(calls)).toBe(0)
+    expect(isLaunchInFlight('K')).toBe(false)
+  })
+
+  test('K\'s launch held open: K\'s wait stays pending until the spawn is released, L\'s resolves at once; one spawn in total', async () => {
+    const cfg = makeStandInPersonaConfig({ K: { working_directory: '/x/k' } }, fixtureDir)
+    const held = holdSpawns(installStub({}))
+
+    const launch = spawnForPersona(personaOf(cfg, 'K'), cfg)
+    await held.entered('cscb_K')
+    const waitK = whenLaunchSettled('K')
+
+    expect(await settledNow(waitK)).toBe(false)
+    expect(await settledNow(whenLaunchSettled('L'))).toBe(true)
+
+    held.release('cscb_K')
+    await waitK
+    expect(await launch).toEqual({ key: 'K', action: 'spawned' })
+    expect(held.calls).toHaveLength(1)
+  })
+
+  test('a launch whose promise rejects: the wait still resolves (never rejects), and a failed spawn settles it too', async () => {
+    const cfg = makeStandInPersonaConfig({ K: { working_directory: '/x/k' } }, fixtureDir)
+    captureStartupErrors()
+    const held = holdSpawns(installStub({}))
+    // A config whose spawn parameters cannot be built: the ladder itself rejects.
+    const broken = Object.defineProperty({ ...cfg }, 'cron_table_path', { get: () => { throw new Error('unreadable') } })
+
+    await withCapturedErr(async () => {
+      const rejected = spawnForPersona(personaOf(cfg, 'K'), broken).catch((err: unknown) => err)
+      await expect(whenLaunchSettled('K')).resolves.toBeUndefined()
+      expect(await rejected).toBeInstanceOf(Error)
+
+      const failing = spawnForPersona(personaOf(cfg, 'K'), cfg)
+      await held.entered('cscb_K')
+      const waitK = whenLaunchSettled('K')
+      expect(await settledNow(waitK)).toBe(false)
+      held.fail('cscb_K', errGeneric('spawn', 'ErrSpawnBroken'))
+      await expect(waitK).resolves.toBeUndefined()
+      expect((await failing).action).toBe('failed')
+      await settleNotices()
+    })
+    expect(isLaunchInFlight('K')).toBe(false)
   })
 })

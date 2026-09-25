@@ -10,6 +10,8 @@
  *     checkMountFstype(dirPath, readMountinfo?)           — longest-prefix mount fstype or null
  *     checkJsonlPersistence(config, readMountinfo?, home?) — { nonPersistent[], warnings[] }
  *   A root on tmpfs/ramfs means resume is structurally impossible on this host.
+ *   A persona a confirmed apply brings up gets Layer 1 for its own root only
+ *   (`runPersonaStorageCheck`).
  *
  *   Layer 2 — per-persona missing-transcript check (the 2026-09-20 incident class):
  *     For each persona, fetch the AD row and stat the persisted vs fallback
@@ -252,7 +254,11 @@ export function checkJsonlPersistence(
   readMountinfo?: () => string,
   home: string = homedir(),
 ): JsonlPersistenceCheckResult {
-  const roots = resolveJsonlRoots(config, home)
+  return classifyJsonlRoots(resolveJsonlRoots(config, home), readMountinfo)
+}
+
+/** Classify each root by its mount's fstype (see `checkJsonlPersistence`). Never throws. */
+function classifyJsonlRoots(roots: readonly string[], readMountinfo?: () => string): JsonlPersistenceCheckResult {
   const nonPersistent: string[] = []
   const warnings: string[] = []
 
@@ -568,6 +574,83 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
 }
 
 // ---------------------------------------------------------------------------
+// Layer 1 — non-persistent storage
+// ---------------------------------------------------------------------------
+
+/** Layer 1's effects. */
+interface StorageLayerEffects {
+  notify: PersonaNotify | undefined
+  recordError: typeof defaultRecordStartupError
+  readMountinfo: (() => string) | undefined
+  home: string
+}
+
+/**
+ * Layer 1 over `roots`: a non-persistent root is recorded
+ * (`jsonl-non-persistent`) and warned about once to each of `personas` whose
+ * effective JSONL root it is; a root whose fstype cannot be determined is
+ * recorded (`jsonl-persistence-check-warning`), with no notice.
+ */
+function reportStorageLayer(personas: readonly Persona[], roots: readonly string[], fx: StorageLayerEffects): void {
+  const { nonPersistent, warnings } = classifyJsonlRoots(roots, fx.readMountinfo)
+
+  for (const root of nonPersistent) {
+    fx.recordError(
+      ERR_KEY_NON_PERSISTENT,
+      `JSONL storage root is on a non-persistent filesystem (tmpfs/ramfs) — resume is structurally impossible on this host. root="${root}"`,
+    )
+    // Roots are per persona, so notify only the personas whose effective
+    // JSONL root is this flagged non-persistent root.
+    for (const persona of personas) {
+      if (personaJsonlRoot(persona, fx.home) !== root) continue
+      sendNotice(
+        fx.notify,
+        persona,
+        `⚠️ CSCB startup warning: my conversation storage at \`${root}\` is on a non-persistent filesystem ` +
+          `(tmpfs/ramfs). Session resume will not survive a reboot on this host.`,
+      )
+    }
+  }
+
+  for (const root of warnings) {
+    fx.recordError(
+      ERR_KEY_PERSISTENCE_WARNING,
+      `Could not determine filesystem type for JSONL storage root — persistence unverified. root="${root}"`,
+    )
+  }
+}
+
+/**
+ * The non-persistent-storage check (Layer 1) for one persona's effective
+ * JSONL root only (b.av2 SR-6.2): a persona brought up by a confirmed apply.
+ * Its warning goes to that persona alone, through `notify` (the per-persona
+ * notifier, which holds it until the persona's client is validated), and is
+ * recorded as at start; no other persona is checked or warned. Layer 2 does
+ * not run: the launch's collision ladder handles the persona's row. Never
+ * throws; its own unexpected failure is one warning line.
+ */
+export function runPersonaStorageCheck(
+  persona: Persona,
+  notify: PersonaNotify | undefined,
+  deps?: Pick<JsonlPersistenceSafeguardDeps, 'readMountinfo' | 'recordStartupError' | 'home'>,
+): void {
+  try {
+    const home = deps?.home ?? homedir()
+    reportStorageLayer([persona], [personaJsonlRoot(persona, home)], {
+      notify,
+      recordError: deps?.recordStartupError ?? defaultRecordStartupError,
+      readMountinfo: deps?.readMountinfo,
+      home,
+    })
+  } catch (err) {
+    console.error(
+      `[slack] Warning: jsonl-persistence-check failed unexpectedly for ${personaRef(persona)} — continuing: ` +
+        describeThrownValue(err),
+    )
+  }
+}
+
+// ---------------------------------------------------------------------------
 // runJsonlPersistenceSafeguard — orchestrating entry point
 // ---------------------------------------------------------------------------
 
@@ -612,32 +695,7 @@ export async function runJsonlPersistenceSafeguard(
     }
 
     // Layer 1 — non-persistent storage.
-    const { nonPersistent, warnings } = checkJsonlPersistence(config, readMountinfo, home)
-
-    for (const root of nonPersistent) {
-      recordError(
-        ERR_KEY_NON_PERSISTENT,
-        `JSONL storage root is on a non-persistent filesystem (tmpfs/ramfs) — resume is structurally impossible on this host. root="${root}"`,
-      )
-      // Roots are per persona, so notify only the personas whose effective
-      // JSONL root is this flagged non-persistent root.
-      for (const persona of config.personas) {
-        if (personaJsonlRoot(persona, home) !== root) continue
-        sendNotice(
-          notify,
-          persona,
-          `⚠️ CSCB startup warning: my conversation storage at \`${root}\` is on a non-persistent filesystem ` +
-            `(tmpfs/ramfs). Session resume will not survive a reboot on this host.`,
-        )
-      }
-    }
-
-    for (const root of warnings) {
-      recordError(
-        ERR_KEY_PERSISTENCE_WARNING,
-        `Could not determine filesystem type for JSONL storage root — persistence unverified. root="${root}"`,
-      )
-    }
+    reportStorageLayer(config.personas, resolveJsonlRoots(config, home), { notify, recordError, readMountinfo, home })
 
     // Layer 2 — per-persona transcript loss. Isolated per persona.
     for (const persona of config.personas) {

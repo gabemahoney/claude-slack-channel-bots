@@ -12,6 +12,7 @@ import {
   initRestart,
   scheduleRestart,
   cancelAllRestartTimers,
+  cancelRestartTimer,
   _resetRestartState,
   isRestartPendingOrActive,
   RESTART_FAILURE_CAP,
@@ -25,6 +26,7 @@ import {
 } from '../src/backoff.ts'
 import { _buildIsSessionAliveAdapter, _buildKillSessionAdapter, _buildReconnectSessionAdapter } from '../src/server.ts'
 import { createPersonaRelaunchGate } from '../src/persona-start.ts'
+import { createPersonaSerializer, type PersonaSerialize } from '../src/persona-serializer.ts'
 import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
 import {
   _resetFindMissingMemo,
@@ -389,6 +391,161 @@ describe('cancelAllRestartTimers', () => {
     await Bun.sleep(WAIT_MS)
 
     expect(deps.launchSessionCalls).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// cancelRestartTimer — one persona's pending timer (b.av2 SR-6.5, a teardown)
+//
+// The teardown cancels the persona's pending timer; its failure count and cap
+// latch are forgotten separately (`forgetFailures`, backoff.test.ts), so the
+// cancel itself records no success or failure.
+// ---------------------------------------------------------------------------
+
+describe('cancelRestartTimer — per-persona clear (b.av2 SR-6.5)', () => {
+  const A = 'persona_a'
+  const B = 'persona_b'
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+
+  beforeEach(() => {
+    errLines = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+  })
+
+  const cancelledLines = () => errLines.filter((l) => l.startsWith('[slack] Cancelled restart timer'))
+
+  test('cancels B\'s pending timer so it never fires (no probe, reconnect, kill or launch; B\'s count untouched); A\'s timer still fires and A restarts; logged once, only when a timer was pending', async () => {
+    recordFailure(A)
+    recordFailure(B)
+    recordFailure(B)
+    const deps = makeDeps({ restartDelay: CAP_BASE_DELAY_S })
+    initRestart(deps)
+    scheduleRestart(A, '/cwd/a')
+    scheduleRestart(B, '/cwd/b')
+
+    expect(cancelRestartTimer(B)).toBe(true)
+    expect(isRestartPendingOrActive(B)).toBe(false)
+    expect(isRestartPendingOrActive(A)).toBe(true)
+    expect(cancelRestartTimer(B)).toBe(false)           // nothing pending any more
+    expect(cancelRestartTimer('never_scheduled')).toBe(false)
+    expect(cancelledLines()).toEqual([`[slack] Cancelled restart timer for persona=${B}`])
+
+    await Bun.sleep(WAIT_MS)
+
+    expect(deps.isSessionAliveCalls).toEqual([A])
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.killSessionCalls).toEqual([A])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([A])
+    expect(getFailureCount(A)).toBe(0)                  // A's launch succeeded
+    expect(getFailureCount(B)).toBe(2)                  // the cancel is neither success nor failure
+    expect(isRestartPendingOrActive(B)).toBe(false)
+    expect(cancelledLines()).toHaveLength(1)
+  })
+
+  test('work that already started is left alone: cancelRestartTimer returns false and the running restart still launches', async () => {
+    let releaseLaunch!: (ok: boolean) => void
+    const deps = makeDeps({ launchSession: () => new Promise<boolean>((res) => { releaseLaunch = res }) })
+    initRestart(deps)
+    scheduleRestart(B, '/cwd/b')
+    await Bun.sleep(WAIT_MS)                            // fired; the launch is held
+
+    expect(cancelRestartTimer(B)).toBe(false)
+    expect(isRestartPendingOrActive(B)).toBe(true)
+    expect(cancelledLines()).toEqual([])
+
+    releaseLaunch(true)
+    await Bun.sleep(1)
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([B])
+    expect(isRestartPendingOrActive(B)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// RestartDeps.serialize — a fired timer's work runs through the per-persona
+// lifecycle serializer (b.av2 SR-6.6). While it waits behind another
+// operation for the same persona the restart counts as active, and its
+// shutdown and not-up checks run when the work starts, not when it fired.
+// ---------------------------------------------------------------------------
+
+describe('RestartDeps.serialize — the timer\'s work waits behind the persona\'s running operation (b.av2 SR-6.6)', () => {
+  const A = 'persona_a'
+  const B = 'persona_b'
+  const skipLine = `[slack] Skipping restart for persona=${B} — the persona is no longer up; its instance is left as it is`
+  const shutdownLine = `[slack] Skipping restart — server is shutting down (persona=${B})`
+  let errLines: string[]
+  let origConsoleError: typeof console.error
+
+  beforeEach(() => {
+    errLines = []
+    origConsoleError = console.error
+    console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
+  })
+
+  afterEach(() => {
+    console.error = origConsoleError
+  })
+
+  test.each<[string, 'none' | 'shutdown' | 'not-up']>([
+    ['nothing changes while queued: the work probes, kills and relaunches B once released', 'none'],
+    ['shutdown starts while queued: the work skips at its shutdown check, before the gate', 'shutdown'],
+    ['B stops being up while queued: the work skips at its not-up check', 'not-up'],
+  ])('B\'s fired restart is submitted for B, does nothing while B\'s earlier operation runs, and counts as active; A restarts meanwhile — %s', async (_label, change) => {
+    let shuttingDown = false
+    const up = new Set([A, B])
+    const asked: string[] = []
+    const submitted: string[] = []
+    const serializer = createPersonaSerializer()
+    const serialize: PersonaSerialize = (key, op) => { submitted.push(key); return serializer.run(key, op) }
+    const deps = makeDeps({ restartDelay: CAP_BASE_DELAY_S })
+    deps.isShuttingDown = () => shuttingDown
+    deps.canRestart = (key) => { asked.push(key); return up.has(key) }
+    deps.serialize = serialize
+    initRestart(deps)
+
+    // An earlier operation for B (a teardown, a bring-up retry's launch) is running.
+    let releaseEarlier!: () => void
+    const earlier = serializer.run(B, () => new Promise<void>((res) => { releaseEarlier = res }))
+
+    scheduleRestart(B, '/cwd/b')
+    scheduleRestart(A, '/cwd/a')
+    await Bun.sleep(WAIT_MS)
+
+    // Both timers fired and submitted their work; A's ran, B's waits.
+    expect(submitted.sort()).toEqual([A, B])
+    expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([A])
+    expect(deps.isSessionAliveCalls).toEqual([A])
+    expect(asked.filter((k) => k === B)).toEqual([B])   // only at scheduling
+    expect(isRestartPendingOrActive(B)).toBe(true)
+    expect(isRestartPendingOrActive(A)).toBe(false)
+
+    if (change === 'shutdown') shuttingDown = true
+    if (change === 'not-up') up.delete(B)
+    releaseEarlier()
+    await earlier
+    await Bun.sleep(WAIT_MS)
+
+    const bLines = errLines.filter((l) => l.includes(`persona=${B}`) && !l.startsWith('[slack] Scheduling restart'))
+    if (change === 'none') {
+      expect(deps.isSessionAliveCalls).toEqual([A, B])
+      expect(deps.killSessionCalls).toEqual([A, B])
+      expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([A, B])
+      expect(asked.filter((k) => k === B)).toEqual([B, B, B])
+      expect(bLines).toEqual([`[slack] Relaunching session for persona=${B} cwd="/cwd/b"`])
+    } else {
+      expect(deps.isSessionAliveCalls).toEqual([A])
+      expect(deps.killSessionCalls).toEqual([A])
+      expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([A])
+      expect(asked.filter((k) => k === B)).toEqual(change === 'shutdown' ? [B] : [B, B])
+      expect(bLines).toEqual([change === 'shutdown' ? shutdownLine : skipLine])
+    }
+    expect(getFailureCount(B)).toBe(0)
+    expect(isRestartPendingOrActive(B)).toBe(false)
   })
 })
 
@@ -1018,7 +1175,7 @@ describe('not-up guard: a persona that is not up is never restarted (b.av2 SR-6.
   const skipLine = (key: string) =>
     `[slack] Skipping restart for persona=${key} — the persona is no longer up; its instance is left as it is`
   const refuseLine = (key: string) =>
-    `[slack] Not scheduling restart for persona=${key} — the persona is not up (its bring-up has not succeeded, or its Slack connection is not serving)`
+    `[slack] Not scheduling restart for persona=${key} — the relaunch gate refused it (the persona is not up, or is no longer in the applied configuration)`
   const linesFor = (key: string, prefix: string) =>
     errLines.filter((l) => l.startsWith(prefix) && l.includes(`persona=${key}`))
 
@@ -1387,11 +1544,11 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
   // its bring-up outcome is still `up` (until its teardown). The applied check
   // lives in the relaunch gate (`canRestart`), so RestartDeps is unchanged.
   // A refused request logs the gate's removal line (once per persona) and
-  // restart.ts's own "Not scheduling restart" line (per request; accepted
-  // deviation: that line's wording is the not-up one).
+  // restart.ts's own "Not scheduling restart" line (per request; its wording
+  // names both reasons the gate can refuse, PM N5).
   const removedLine = (key: string) => `[slack] persona=${key}: not relaunched — it is no longer in the applied configuration`
   const refuseLine = (key: string) =>
-    `[slack] Not scheduling restart for persona=${key} — the persona is not up (its bring-up has not succeeded, or its Slack connection is not serving)`
+    `[slack] Not scheduling restart for persona=${key} — the relaunch gate refused it (the persona is not up, or is no longer in the applied configuration)`
 
   test.each<[string, { humanTrigger?: boolean } | undefined]>([
     ['a disconnect or health-check restart', undefined],

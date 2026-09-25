@@ -1,7 +1,7 @@
 /**
  * outage-state.test.ts — SRD §Test plan cases 1-24, plus the
  * tests/getclient-allowlist.txt static audit (case 22) and the
- * resetAllToHealthy single-call-site audit (case 23 Part A).
+ * resetAllToHealthy call-site audit (case 23 Part A).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -226,6 +226,35 @@ describe('cases 10-14: bad-stretch history, reset, template, post-failure, start
     setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
     expect(emissions.length).toBe(before + 1)
     expect(emissions[before].text).toMatch(/agent-director unreachable/)
+  })
+
+  test('11b. resetAllToHealthy([key]) at a teardown (b.av2 SR-6.5): clears only that persona, silently; the neighbour keeps its flags and history', () => {
+    const { emissions } = makeHarness()
+    setOutageFlag(P1, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P2, 'ad-unreachable', '/bin/ad')
+    setOutageFlag(P2, 'cwd-unreachable', '/p2/work')
+    clearOutageFlag(P2, 'cwd-unreachable')  // P2's bad stretch now holds both classes
+    const before = emissions.length
+
+    resetAllToHealthy([P2])
+
+    expect(emissions.length).toBe(before)  // no notify for P2 (or anyone)
+    expect(getOutageFlags(P2).size).toBe(0)
+    expect([...getOutageFlags(P1)]).toEqual(['ad-unreachable'])
+
+    // P2's bad-stretch history is gone: a fresh flag posts one onset, and its
+    // all-clear names only that class, not the pre-teardown ones.
+    setOutageFlag(P2, 'cwd-unreachable', '/p2/work')
+    setOutageFlag(P2, 'cwd-unreachable', '/p2/work')
+    clearOutageFlag(P2, 'cwd-unreachable')
+    // P1's all-clear still posts as before.
+    clearOutageFlag(P1, 'ad-unreachable')
+
+    expect(emissions.slice(before).map((e) => e.key)).toEqual([P2, P2, P1])
+    const [p2Onset, p2Clear, p1Clear] = emissions.slice(before).map((e) => e.text)
+    expect(p2Onset).toMatch(/Working directory unreachable/)
+    expect(p2Clear).toBe(ALL_CLEAR_TEMPLATE(new Map<OutageClass, ClassRecord>([['cwd-unreachable', { detail: '/p2/work' }]])))
+    expect(p1Clear).toBe(ALL_CLEAR_TEMPLATE(new Map<OutageClass, ClassRecord>([['ad-unreachable', { detail: '/bin/ad' }]])))
   })
 
   test('12. notify synchronous failure propagates; state mutation already applied', () => {
@@ -653,7 +682,7 @@ describe('persona-keyed notices', () => {
 
 // ---------------------------------------------------------------------------
 // SRD § Test plan case 22 — getClient() allowlist static audit
-// SRD § Test plan case 23 Part A — resetAllToHealthy single-call-site audit
+// SRD § Test plan case 23 Part A — resetAllToHealthy call-site audit (boot + teardown)
 // ---------------------------------------------------------------------------
 
 describe('static audits', () => {
@@ -703,31 +732,32 @@ describe('static audits', () => {
     if (problems.length > 0) throw new Error(problems.join('\n\n'))
   })
 
-  test('23 Part A. exactly one resetAllToHealthy(...) call site in src/ outside src/outage-state.ts', async () => {
-    const { execSync } = await import('node:child_process')
+  test('23 Part A. exactly one resetAllToHealthy(...) call in src/ outside src/outage-state.ts, the boot reset in src/server.ts', async () => {
+    const { readFileSync, readdirSync, statSync } = await import('node:fs')
+    const { stripComments } = await import('./test-helpers/source-audit.ts')
 
-    let grepOut = ''
-    try {
-      grepOut = execSync(
-        `grep -rn 'resetAllToHealthy(' src/ --include='*.ts'`,
-        { encoding: 'utf-8' },
-      )
-    } catch (err) {
-      grepOut = ((err as { stdout?: Buffer }).stdout?.toString()) ?? ''
+    function walk(dir: string): string[] {
+      const out: string[] = []
+      for (const entry of readdirSync(dir)) {
+        const full = join(dir, entry)
+        if (statSync(full).isDirectory()) out.push(...walk(full))
+        else if (full.endsWith('.ts')) out.push(full)
+      }
+      return out
     }
+    // Code only (comments stripped), per repo-relative file, outage-state.ts itself excluded.
+    const code = new Map<string, string>()
+    for (const abs of walk('src')) {
+      const rel = abs.split('\\').join('/')
+      if (rel !== 'src/outage-state.ts') code.set(rel, stripComments(readFileSync(abs, 'utf-8')))
+    }
+    const countIn = (re: RegExp) =>
+      Object.fromEntries([...code].map(([f, c]) => [f, [...c.matchAll(re)].length] as const).filter(([, n]) => n > 0))
 
-    const matches = grepOut
-      .split('\n')
-      .filter((l) => l && !l.startsWith('src/outage-state.ts:'))
-      // Filter out comment / JSDoc lines like the case-22 audit.
-      .filter((l) => {
-        const m = l.match(/^[^:]+:\d+:(.*)$/)
-        return m ? !/^\s*(\*|\/\/)/.test(m[1]) : false
-      })
-
-    expect(matches).toHaveLength(1)
-    // The one sanctioned call site lives in src/server.ts.
-    expect(matches[0]).toMatch(/^src\/server\.ts:\d+:/)
+    // The one boot reset in server.ts. A teardown (b.av2 SR-6.5) reaches it
+    // through createPersonaLifecycle's injected resetOutageState, never by
+    // name; tests/reload-wiring.test.ts pins that binding.
+    expect(countIn(/(?<![\w.$])resetAllToHealthy\s*\(/g)).toEqual({ 'src/server.ts': 1 })
   })
 
   test('23 Part B. resetAllToHealthy is silent + idempotent across consecutive calls', () => {

@@ -14,7 +14,7 @@
  *   - getOutageFlags(key)                  — read live flag set
  *   - setOutageFlag(key, cls, detail?)     — raise flag + emit onset notice
  *   - clearOutageFlag(key, cls)            — lower flag; emits all-clear when set empties
- *   - resetAllToHealthy(keys)              — silent bulk wipe (boot-time reset)
+ *   - resetAllToHealthy(keys)              — silent wipe (boot-time reset; one key at a teardown)
  *   - withOutageDetection(key, dir, fn)    — AD verb wrapper; raises/clears flags on error/success
  *   - withSpawnDetection(key, dir, fn)     — like withOutageDetection + clears cwd-unreachable on success
  *   - _resetOutageState()                  — test-only state reset
@@ -204,7 +204,9 @@ export function clearOutageFlag(key: string, cls: OutageClass): void {
  * resetAllToHealthy — silently wipes each given persona's flag set and
  * bad-stretch history to a clean slate. No `notify` calls. Called at boot by
  * server.ts with the applied persona keys, before any persona is brought up,
- * as a defensive boundary for pre-start observations (added in Epic 2).
+ * as a defensive boundary for pre-start observations (added in Epic 2), and
+ * with one key by a teardown (b.av2 SR-6.5), which clears that persona's
+ * flags with no all-clear notice; other personas' entries are untouched.
  */
 export function resetAllToHealthy(keys: string[]): void {
   for (const key of keys) {

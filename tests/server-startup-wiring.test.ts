@@ -373,8 +373,17 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
     // Nothing connects before the start pass: server.ts never calls a
     // connection manager's bringUp itself, the controller does, from
     // startupSessionManager (the reload controller's start bring-up). So the
-    // holder is set before any status can fire.
-    expect(indicesOf(/\.\s*bringUp\s*\(/g, SERVER_CODE)).toEqual([])
+    // holder is set before any status can fire. The one `.bringUp(` in
+    // server.ts is the reload controller's `lifecycle.bringUp` member (a
+    // confirmed apply's step 6), which runs only after the start; what it
+    // forwards to is pinned in tests/reload-wiring.test.ts.
+    const bringUpCalls = indicesOf(/\.\s*bringUp\s*\(/g, SERVER_CODE)
+    expect(bringUpCalls).toHaveLength(1)
+    const [optionsStart, optionsEnd] = balancedAfter(SERVER_CODE, onlyCallOf('createReloadController'), '(', ')')
+    expect(bringUpCalls[0]!).toBeGreaterThan(optionsStart)
+    expect(bringUpCalls[0]!).toBeLessThan(optionsEnd)
+    const lifecycle = objectProperties(onlyCallProps('createReloadController').get('lifecycle') ?? '')
+    expect(indicesOf(/\.\s*bringUp\s*\(/g, lifecycle.get('bringUp') ?? '')).toHaveLength(1)
     expect(at).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
     // Right after it is built: the only code between the controller's
     // construction and the assignment is the construction itself.

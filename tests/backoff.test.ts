@@ -12,6 +12,7 @@ import { describe, test, expect, beforeEach } from 'bun:test'
 import {
   recordFailure,
   recordSuccess,
+  forgetFailures,
   getFailureCount,
   nextBackoffDelay,
   doublingBackoffDelay,
@@ -266,5 +267,57 @@ describe('per-channel isolation', () => {
     // C_B still at preCount=0 → base*1
     expect(nextBackoffDelay('C_A', BASE_S)).toBe(BASE_S * 2)
     expect(nextBackoffDelay('C_B', BASE_S)).toBe(BASE_S)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// forgetFailures — per-persona forget at a teardown (b.av2 SR-6.5)
+// ---------------------------------------------------------------------------
+
+describe('forgetFailures — per-persona forget (b.av2 SR-6.5)', () => {
+  const CAP = 5
+
+  /** Run `fn` with console.error/log/warn recorded; returns every line. */
+  function captureConsole(fn: () => void): string[] {
+    const lines: string[] = []
+    const saved = { error: console.error, log: console.log, warn: console.warn }
+    const rec = (...args: unknown[]): void => { lines.push(args.map(String).join(' ')) }
+    console.error = rec
+    console.log = rec
+    console.warn = rec
+    try { fn() } finally { Object.assign(console, saved) }
+    return lines
+  }
+
+  test('forgetting B clears its count and cap latch silently; A keeps its count, latch and delay', () => {
+    for (let i = 0; i < CAP; i++) recordFailure('A')
+    expect(shouldNotifyCap('A', CAP)).toBe(true)  // A latched
+    for (let i = 0; i < CAP; i++) recordFailure('B')
+    expect(shouldNotifyCap('B', CAP)).toBe(true)  // B latched
+
+    const lines = captureConsole(() => forgetFailures('B'))
+
+    expect(lines).toEqual([])
+    expect(getFailureCount('B')).toBe(0)
+    expect(isAtCap('B', CAP)).toBe(false)
+    expect(nextBackoffDelay('B', BASE_S)).toBe(BASE_S)
+    expect(getFailureCount('A')).toBe(CAP)
+    expect(nextBackoffDelay('A', BASE_S)).toBe(900)
+    expect(shouldNotifyCap('A', CAP)).toBe(false)  // A still latched
+
+    // A later cap episode for B notifies once, as for a fresh key.
+    for (let i = 0; i < CAP; i++) recordFailure('B')
+    expect(shouldNotifyCap('B', CAP)).toBe(true)
+    expect(shouldNotifyCap('B', CAP)).toBe(false)
+  })
+
+  test('forgetting an unknown key is a no-op', () => {
+    recordFailure('A')
+    recordFailure('A')
+    const lines = captureConsole(() => forgetFailures('NEVER_SEEN'))
+    expect(lines).toEqual([])
+    expect(getFailureCount('NEVER_SEEN')).toBe(0)
+    expect(getFailureCount('A')).toBe(2)
+    expect(nextBackoffDelay('A', BASE_S)).toBe(BASE_S * 4)
   })
 })

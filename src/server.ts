@@ -14,8 +14,10 @@
  * that cannot be read or validated, or a record that cannot be written stops
  * the start with one line (b.av2 SR-1.7). Once the start bring-up pass has
  * returned, the controller's detection tick (every 5 s, `reload-timer.ts`)
- * keeps `config.json.pending` in step with any unconfirmed change; nothing is
- * applied and nothing about it is posted to Slack (SR-8.2, SR-8.3, SR-7.2).
+ * keeps `config.json.pending` in step with any unconfirmed change, and applies
+ * a change only once the operator confirms it: removed personas are torn
+ * down and added ones brought up through `persona-lifecycle.ts` (SR-8.5,
+ * SR-8.6). Nothing about it is posted to Slack (SR-8.2, SR-8.3, SR-7.2).
  * No Slack client is built and no token is read at module scope (SR-3.1,
  * SR-10.2).
  *
@@ -77,7 +79,9 @@ import {
 import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import {
   AGENT_DIRECTOR_LIVE_STATES,
+  deletePersonaInstance,
   isLaunchInFlight,
+  killPersonaInstance,
   launchSession,
   notifyRestartCapReached,
   reconcileOrphans,
@@ -88,6 +92,7 @@ import {
   spawnForPersona,
   startupSessionManager,
   sweepDeadTmuxChannel,
+  whenLaunchSettled,
 } from './session-manager.ts'
 import { createPersonaNotifier } from './persona-notifier.ts'
 import { createPersonaDestinations } from './persona-destination.ts'
@@ -110,23 +115,38 @@ import {
   describePersonaNotUp,
   type PersonaBringUpController,
 } from './persona-bringup-controller.ts'
+import { createPersonaSerializer } from './persona-serializer.ts'
+import { createPersonaLifecycle, type PersonaLifecycle } from './persona-lifecycle.ts'
 import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { ErrSpawnNotFound } from 'agent-director'
 import { ErrSystemInstallDisappeared, ErrTmuxNotAvailable } from './agent-director-errors.ts'
 import { getClient, closeClient } from './agent-director-client.ts'
 import { trustBootstrap, trustPatchPersona } from './trust-bootstrap.ts'
-import { runJsonlPersistenceSafeguard } from './jsonl-persistence-check.ts'
-import { preLaunchReplyGuard, stopHookBootstrap } from './stop-hook-bootstrap.ts'
-import { startPermissionPoller, stopPermissionPoller } from './permission-poller.ts'
+import { runJsonlPersistenceSafeguard, runPersonaStorageCheck } from './jsonl-persistence-check.ts'
+import {
+  getLaunchedWithDir,
+  preLaunchReplyGuard,
+  stopHookBootstrap,
+  stopHookLaunchPass,
+  teardownPersonaReplyGuard,
+} from './stop-hook-bootstrap.ts'
+import { forgetPersonaPrompts, startPermissionPoller, stopPermissionPoller } from './permission-poller.ts'
 import {
   initRestart,
   scheduleRestart,
   cancelAllRestartTimers,
+  cancelRestartTimer,
   isRestartPendingOrActive,
   RESTART_FAILURE_CAP,
 } from './restart.ts'
-import { buildPersonaWorkList, initHealthCheck, startHealthCheck, stopHealthCheck } from './health-check.ts'
-import { isAtCap as backoffIsAtCap } from './backoff.ts'
+import {
+  buildPersonaWorkList,
+  forgetDisconnectedStreak,
+  initHealthCheck,
+  startHealthCheck,
+  stopHealthCheck,
+} from './health-check.ts'
+import { forgetFailures, isAtCap as backoffIsAtCap } from './backoff.ts'
 import { isDryRun } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
 import { consumeAck } from './ack-tracker.ts'
@@ -288,6 +308,14 @@ const isPersonaUp = createPersonaUpPredicate(connectionView, {
   isUp: (key) => bringUps?.isUp(key) ?? false,
   isApplied: (key) => bringUps?.isApplied(key) ?? false,
 })
+
+/**
+ * The per-persona lifecycle serializer (b.av2 SR-6.6): a restart timer's
+ * work, each bring-up retry attempt with its launch, and the apply's
+ * lifecycle operations run through it, one at a time per persona. Holds
+ * nothing until the first operation.
+ */
+const personaLifecycle = createPersonaSerializer()
 
 /** A not-up persona's outcome and cause, for the refusal and session-drop lines. */
 function describePersonaNotUpByKey(key: string): string {
@@ -1095,10 +1123,17 @@ export async function main(): Promise<void> {
   // Declared here, before the controller whose onApplied reads it, so that
   // closure never depends on declaration order (no temporal dead zone).
   let appliedConfig!: PersonaConfig
+  // A confirmed apply's teardowns (step 2) and bring-ups (step 6), composed
+  // in persona-lifecycle.ts once the bring-up controller exists (below).
+  // Declared here for the same reason as appliedConfig; an apply runs only
+  // after the start bring-up pass, long after it is set.
+  let personaLifecycleOps!: PersonaLifecycle
   const reload = createReloadController({
     paths: reloadFilePaths(CONFIG_PATH),
     lifecycle: {
       startBringUp: (applied) => startupSessionManager(applied, { bringUp: personaBringUps }),
+      teardown: (persona) => personaLifecycleOps.teardown(persona),
+      bringUp: (persona, applied) => personaLifecycleOps.bringUp(persona, applied),
     },
     log: (line) => console.error(line),
     tickDriver: createReloadTickDriver({ log: (line) => console.error(line) }),
@@ -1217,6 +1252,7 @@ export async function main(): Promise<void> {
     // it, and a persona no longer in it is neither re-checked nor launched.
     appliedPersonas: () => personaConfig?.personas ?? [],
     launch: (persona) => spawnForPersona(persona, personaConfig ?? appliedConfig, false),
+    serialize: personaLifecycle.run,
     // b.av2 SR-6.3: a session is registered only while its persona is up. A
     // persona that stops being up (a refused reopen) has its session dropped;
     // its instance and row are kept, nothing is restarted or posted, and the
@@ -1227,6 +1263,39 @@ export async function main(): Promise<void> {
     }),
   })
   bringUps = personaBringUps
+
+  // b.av2 SR-6.5 / SR-6.1 / SR-6.6: the apply's persona teardown and
+  // bring-up, each through the per-persona serializer. This supplies only the
+  // production dependencies; the operations live in persona-lifecycle.ts.
+  personaLifecycleOps = createPersonaLifecycle({
+    serialize: personaLifecycle.run,
+    bringUps: personaBringUps,
+    connections: manager,
+    routing: personaRouting,
+    destinations: personaDestinations,
+    destinationHold: personaDestinationHold,
+    notifier: personaNotifier,
+    appliedPersonas: () => personaConfig?.personas ?? [],
+    dryRun: isDryRun(),
+    isShuttingDown: () => shuttingDown,
+    log: (line) => console.error(line),
+    whenLaunchSettled,
+    cancelRestartTimer,
+    forgetFailures,
+    forgetDisconnectedStreak,
+    resetOutageState: resetAllToHealthy,
+    forgetPersonaPrompts,
+    dropSession: dropPersonaSessionAndKeepAlive,
+    killInstance: killPersonaInstance,
+    deleteInstance: deletePersonaInstance,
+    replyGuard: {
+      launchedWithDir: getLaunchedWithDir,
+      teardown: (key) => teardownPersonaReplyGuard(STATE_DIR, key),
+      launchPass: (dirs, personas) => stopHookLaunchPass(dirs, personas, STATE_DIR),
+    },
+    storageCheck: (persona) => runPersonaStorageCheck(persona, personaNotifier.notify),
+    launch: (persona) => spawnForPersona(persona, personaConfig ?? appliedConfig, false),
+  })
 
   // Only a persona that is up may be restarted or relaunched: the health
   // check's work list, the restart module (before any kill or reconnect) and
@@ -1437,6 +1506,9 @@ export async function main(): Promise<void> {
     isShuttingDown: () => shuttingDown,
     // The persona's restart-cap notice (SR-25.3), built in the session manager.
     onCapReached: (key) => notifyRestartCapReached(key),
+    // b.av2 SR-6.6: a fired timer's work waits its turn behind any lifecycle
+    // operation for the persona.
+    serialize: personaLifecycle.run,
   })
 
   // b.av2 SR-6.3: the start sweep, BEFORE the trust patch and any spawn.
@@ -1527,7 +1599,7 @@ export async function main(): Promise<void> {
   // start bring-up pass returns, like the health check; the controller arms
   // nothing before that. Every 5 s it compares config.json (and, outside dry
   // run, the credentials files it references) with what is applied and keeps
-  // config.json.pending in step. It applies nothing and never posts to Slack.
+  // config.json.pending in step, and applies a change the operator confirmed.
   reload.startDetection()
 }
 

@@ -56,6 +56,19 @@ export function recordFailure(key: string): number {
  * send-keys reconnect.
  */
 export function recordSuccess(key: string): void {
+  forgetFailures(key)
+}
+
+// ---------------------------------------------------------------------------
+// forgetFailures
+// ---------------------------------------------------------------------------
+
+/**
+ * Forget persona `key`'s consecutive-failure count and cap-notified latch
+ * (b.av2 SR-6.5, a teardown): the same reset as `recordSuccess`, but not a
+ * success. No other persona's state changes; logs and posts nothing.
+ */
+export function forgetFailures(key: string): void {
   failureCounts.delete(key)
   capNotified.delete(key)
 }

@@ -21,7 +21,12 @@
  *   differ from every earlier set); `h.writeCredentialsContent(persona, c)`
  *   writes invalid or hand-shaped content; `h.makeWorkingDirectory(persona)`
  *   creates the directory; `h.materialize(...personas)` does both for each.
- *   `h.tokens(name)` is the persona's latest valid set;
+ *   `h.tokens(name)` is the persona's latest valid set. A persona whose
+ *   first credentials are written after a run was built (a brand-new file
+ *   created while the server runs, AC 22) is registered with that run's stub
+ *   factory then, so its tokens route to its own stub (`run.stub(name)`,
+ *   scripted by the run's `opts.slack[name]`); a later rotation of a persona
+ *   the run already routes is not re-registered;
  * - configuration and record files: `h.writeConfig(input)` and
  *   `h.writeRecord(input)` write `input` as JSON in the same format (so the
  *   same input gives byte-identical files) and return the bytes;
@@ -128,14 +133,25 @@
  *   that ends `up`; a launch is only recorded (nothing is spawned).
  *   `bringUp` does the same for one persona; `teardown` cancels the persona's
  *   bring-up and stops its connection; `reconnectCredentials` and
- *   `updateInPlace` are recorded only. Every call is a `ReloadLifecycleRecord`
- *   in call order (`records`, `of(op)`, `keys(op)`); a bring-up record gets
- *   its `result` (outcome `up`/`broken`/`retrying` and each failure's class)
- *   when it resolves (`outcome(key)`, `classes(key)`). `startPasses` holds the
- *   applied configuration of each start pass; `holdStartPass()` keeps the
- *   next start pass from resolving until the returned release is called, or
- *   makes it reject once `release.fail(err)` is called (a start pass that
- *   throws after its bring-ups and launches);
+ *   `updateInPlace` are recorded only. With `opts.realLifecycle`, `bringUp`
+ *   and `teardown` run the real composition instead (`run.composition`, see
+ *   `RealLifecycleComposition`: `createPersonaLifecycle` over the run's
+ *   controller and manager, a real serializer, the real agent-director kill
+ *   and delete over a `makeStubClient` stub, `opts.agentDirector`, a
+ *   recorded launch, and never shutting down). The controller's default step bodies call them for
+ *   every confirmed apply run without `opts.applySteps`. Every call is a
+ *   `ReloadLifecycleRecord` in call order (`records`, `of(op)`, `keys(op)`);
+ *   a bring-up record gets its `result` (outcome `up`/`broken`/`retrying` and
+ *   each failure's class) when it resolves (`outcome(key)`, `classes(key)`).
+ *   `startPasses` holds the applied configuration of each start pass;
+ *   `holdStartPass()` keeps the next start pass from resolving until the
+ *   returned release is called, or makes it reject once `release.fail(err)`
+ *   is called (a start pass that throws after its bring-ups and launches).
+ *   Apply-time calls: `hold(op, key)` holds the next `teardown` or
+ *   `bring-up` of one persona before its body runs until `release()`, or
+ *   makes it reject with `fail(err)`; `timeline` lists every apply-time
+ *   teardown and bring-up as it started and settled or rejected, across
+ *   personas and steps (b.av2 SR-8.6 step order without timing);
  * - `run.ticks`: a manual `ReloadTickDriver`. Nothing runs until the test
  *   calls `tick()` or `ticks(n)` (each awaited until the pass settles; `tick`
  *   rejects when nothing is armed); no real timer is ever armed. `armed`,
@@ -214,11 +230,20 @@
  * no timer is left calls `await run.stop()` and checks
  * `run.clock.pendingCount()`.
  *
+ * The token environment: `h.poisonTokenEnvironment()` sets
+ * `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` to distinct sentinel-bearing fakes
+ * and records every read of either through `process.env` (AC 19/22: tokens
+ * come from the file, never the environment), until its `restore()` or
+ * `h.cleanup()`.
+ *
  * Isolation (b.av2 SR-13.2): every path is explicit and under the root; the
- * harness reads and sets no environment variable, never resolves the
- * operator's home, builds no real Slack client, arms no real timer and holds
- * no token literal. It spawns nothing but `mkfifo` (in `mkfifoAvailable` and
- * `h.makeFifo`).
+ * harness reads and sets no environment variable (except through
+ * `h.poisonTokenEnvironment()`, restored by `h.cleanup()`), never resolves
+ * the operator's home, builds no real Slack client or agent-director client,
+ * arms no real timer and holds no token literal. The real composition
+ * installs the outage state's module dependencies (its stub client and a
+ * recording notice sink), which `h.cleanup()` resets. It spawns nothing but
+ * `mkfifo` (in `mkfifoAvailable` and `h.makeFifo`).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -272,8 +297,12 @@ import {
   type CredentialsDigest,
   type CredentialsFs,
 } from '../../src/persona-credentials.ts'
-import { personaKey } from '../../src/persona-identity.ts'
+import { personaInstanceId, personaKey } from '../../src/persona-identity.ts'
+import { createPersonaLifecycle, type PersonaLifecycle } from '../../src/persona-lifecycle.ts'
+import { createPersonaSerializer, type PersonaSerializer } from '../../src/persona-serializer.ts'
 import { composePersonaStatusListeners } from '../../src/persona-start.ts'
+import { _resetOutageState, initOutageState } from '../../src/outage-state.ts'
+import { deletePersonaInstance, killPersonaInstance } from '../../src/session-manager.ts'
 import type { ApplyStepSlots } from '../../src/reload-apply.ts'
 import { composePendingFile, parsePendingFingerprint } from '../../src/reload-fingerprint.ts'
 import { DESTRUCTIVE_PREFIX, PENDING_PREVIEW_TITLE } from '../../src/reload-plan.ts'
@@ -289,10 +318,12 @@ import {
   type ReloadTick,
   type ReloadTickDriver,
 } from '../../src/reload.ts'
+import { makeStubCallLog, makeStubClient, type StubCallLog, type StubClientOptions } from './agent-director-stub.ts'
 import {
   APP_TOKEN_PREFIX,
   BOT_TOKEN_PREFIX,
   fakeToken,
+  LEAK_SENTINEL,
   writeCredentialsFile,
   writtenFile,
   type CredentialsOverrides,
@@ -456,7 +487,94 @@ export interface ReloadLifecycleRecorder {
    * `err` once its `fail(err)` is called.
    */
   holdStartPass(): StartPassHold
+  /**
+   * Gate the next apply-time call of `op` (`teardown` or `bring-up`) for the
+   * persona `key`: the call is recorded and its `start` timeline entry made
+   * when it arrives, then it waits, its body not yet run, until
+   * `gate.release()` (the body runs) or `gate.fail(err)` (the call rejects
+   * with `err` and its body never runs). Call `fail` before the call arrives
+   * to make it reject at once. Other personas' calls are not held.
+   */
+  hold(op: LifecycleGateOp, key: string): LifecycleGate
+  /**
+   * The apply-time `teardown` and `bring-up` calls in the order they started
+   * and settled (`start`, then `settled` or `rejected`), across personas and
+   * steps, so step order is asserted without timing (b.av2 SR-8.6). A held
+   * call's `start` comes when it arrives, its `settled` after its body ran.
+   * Start-pass bring-ups are not here.
+   */
+  readonly timeline: readonly LifecycleTimelineEntry[]
 }
+
+/** An apply-time lifecycle call a test can hold (`run.lifecycle.hold`). */
+export type LifecycleGateOp = 'teardown' | 'bring-up'
+
+/** `run.lifecycle.hold(op, key)`'s handle. */
+export interface LifecycleGate {
+  /** Resolves once the held call arrived (its record and `start` entry made). */
+  readonly entered: Promise<void>
+  /** Let the held call run its body. */
+  release(): void
+  /** Make the held call reject with `err`, its body never run. */
+  fail(err: Error): void
+}
+
+/** One entry of `run.lifecycle.timeline`. Holds no token. */
+export interface LifecycleTimelineEntry {
+  readonly op: LifecycleGateOp
+  readonly key: string
+  readonly phase: 'start' | 'settled' | 'rejected'
+}
+
+/**
+ * The real lifecycle composition a run binds with `opts.realLifecycle`
+ * (`run.composition`): `createPersonaLifecycle` (`persona-lifecycle.ts`) over
+ * the run's real bring-up controller and connection manager, a real
+ * per-persona serializer, the real `killPersonaInstance` and
+ * `deletePersonaInstance` over a `makeStubClient` agent-director stub, and a
+ * recording stand-in for every other dependency.
+ */
+export interface RealLifecycleComposition {
+  /** The composition the recorder's `teardown` and `bringUp` call. */
+  readonly lifecycle: PersonaLifecycle
+  /** The run's per-persona serializer, also handed to the bring-up controller (as `server.ts` does). */
+  readonly serializer: PersonaSerializer
+  /** Every agent-director verb call, by verb (`killCalls`, `deleteCalls`, …). */
+  readonly agentDirector: StubCallLog
+  /** The agent-director `kill` and `delete` calls in call order, as `<verb> <instance ID>`. */
+  readonly agentDirectorOrder: readonly string[]
+  /**
+   * Every call of a dependency the composition got, in call order, as
+   * `[member, key]` with the member named as in `PersonaLifecycleDeps`
+   * (`'bringUps.cancel'`, `'cancelRestartTimer'`, `'whenLaunchSettled'`,
+   * `'connections.stop'`, `'routing.forget'`, `'destinations.forget'`,
+   * `'destinationHold.cancel'`, `'notifier.forget'`, `'forgetPersonaPrompts'`,
+   * `'dropSession'`, `'resetOutageState'`, `'killInstance'`,
+   * `'deleteInstance'`, `'forgetFailures'`, `'forgetDisconnectedStreak'`,
+   * `'replyGuard.launchedWithDir'`, `'replyGuard.teardown'`,
+   * `'replyGuard.launchPass'`, `'storageCheck'`, `'bringUps.bringUp'`,
+   * `'launch'`) plus `'outage-notice'` for a notice the outage state raised.
+   */
+  readonly calls: ReadonlyArray<readonly [string, string]>
+}
+
+/**
+ * `h.poisonTokenEnvironment()`'s handle: the fake values it put in
+ * `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` (sentinel-bearing, distinct from
+ * every harness token set; never print them) and every read of either
+ * variable through `process.env` since.
+ */
+export interface TokenEnvironmentWatch {
+  readonly bot: string
+  readonly app: string
+  /** The names read (`SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN`), one entry per read, in order. */
+  readonly reads: readonly string[]
+  /** Put `process.env` and both variables back as they were. Idempotent; `h.cleanup()` calls it. */
+  restore(): void
+}
+
+/** The variables `h.poisonTokenEnvironment()` sets and watches. */
+const TOKEN_ENV_NAMES = ['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN'] as const
 
 /** `holdStartPass()`'s handle: call it to let the held start pass return, or `fail(err)` to make it throw `err`. */
 export interface StartPassHold {
@@ -680,6 +798,16 @@ export interface ReloadRunOptions {
   /** Also called with every configuration the controller's `onApplied` is told (after `run.appliedConfigs` records it). */
   onApplied?: (config: PersonaConfig) => void
   /**
+   * Bind the real lifecycle composition (`run.composition`, see
+   * `RealLifecycleComposition`) behind the recorder's `teardown` and
+   * `bringUp`, instead of the stand-ins; the bring-up controller then also
+   * gets the composition's serializer and the controller's live applied set,
+   * as `server.ts` wires it.
+   */
+  realLifecycle?: boolean
+  /** With `realLifecycle`: options for the agent-director stub (e.g. `killError`). Its call captures are the harness's own. */
+  agentDirector?: StubClientOptions
+  /**
    * Called with the path before every call of the controller's writer (the
    * record, the pending file), e.g. to observe what exists when the record
    * is written.
@@ -709,6 +837,8 @@ export interface ReloadRun {
   readonly removes: readonly ReloadRemoveRecord[]
   /** The latest `run.resolveStart()` outcome (also set by `h.start`). */
   readonly outcome: ReloadStartOutcome | undefined
+  /** The real lifecycle composition, with `opts.realLifecycle`; undefined otherwise. */
+  readonly composition: RealLifecycleComposition | undefined
   /** Every configuration the controller's `onApplied` was told, in order (one per confirmed apply's step 1). */
   readonly appliedConfigs: readonly PersonaConfig[]
   /** The persona keys of the controller's applied configuration now, in order; undefined before the start applied. */
@@ -920,6 +1050,13 @@ export interface ReloadHarness {
   failRemoves(failure?: Partial<WriteFailure>): void
   /** Let the controller's durable delete succeed again. */
   clearRemoveFailure(): void
+  /**
+   * Set `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` to distinct sentinel-bearing
+   * fakes and record every read of them through `process.env` (a proxy over
+   * it), until the returned watch's `restore()` or `h.cleanup()`: to show
+   * that nothing uses or reads the token environment. At most one at a time.
+   */
+  poisonTokenEnvironment(): TokenEnvironmentWatch
   /** Build a run without resolving its start. */
   build(opts?: ReloadRunOptions): ReloadRun
   /** Build a run, resolve its start and, when applied, run the start bring-up pass. */
@@ -1002,6 +1139,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
   const tokensByName = new Map<string, PersonaSlackTokens>()
   const credentialWrites = new Map<string, number>()
   const runs: ReloadRun[] = []
+  /** Per run: register a persona whose credentials were written after the run was built with its stub factory. */
+  const lateRegistrations: Array<(name: string, tokens: PersonaSlackTokens) => void> = []
+  let outageStateInstalled = false
+  let tokenWatch: TokenEnvironmentWatch | undefined
 
   /** `path`, resolved, if it is strictly under the root; throws otherwise. */
   function inside(path: string): string {
@@ -1063,6 +1204,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       return entry
     }
 
+    // Declared before the bring-up controller, whose applied-set getter reads it (late).
+    let controller!: ReloadController
+    const serializer = runOpts.realLifecycle ? createPersonaSerializer() : undefined
     const bringUps = createPersonaBringUpController({
       connections: {
         bringUp: (persona, tokens) => connections.connections.bringUp(persona, tokens),
@@ -1073,8 +1217,120 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       log,
       fs: runOpts.bringUpFs,
       launch: async (persona) => void record('launch', persona.key, 'retry'),
+      // As server.ts wires it, with the real composition only.
+      ...(serializer === undefined
+        ? {}
+        : { serialize: serializer.run, appliedPersonas: () => controller.applied()?.config.personas ?? [] }),
     })
     connections.onStatus = composePersonaStatusListeners((key, status) => bringUps.onConnectionStatus(key, status))
+
+    const composition = runOpts.realLifecycle ? buildComposition() : undefined
+
+    /** The real composition over this run (`opts.realLifecycle`); see `RealLifecycleComposition`. */
+    function buildComposition(): RealLifecycleComposition {
+      const calls: Array<readonly [string, string]> = []
+      const agentDirector = makeStubCallLog()
+      const agentDirectorOrder: string[] = []
+      const stub = makeStubClient({ ...runOpts.agentDirector, ...agentDirector })
+      const client = {
+        ...stub,
+        kill: (params: Parameters<typeof stub.kill>[0]) => {
+          agentDirectorOrder.push(`kill ${params.claude_instance_id}`)
+          return stub.kill(params)
+        },
+        delete: (params: Parameters<typeof stub.delete>[0]) => {
+          agentDirectorOrder.push(`delete ${params.claude_instance_id.join(',')}`)
+          return stub.delete(params)
+        },
+      }
+      // The real kill and delete run through withOutageDetection, whose
+      // module state this installs (reset by `h.cleanup()`).
+      initOutageState({
+        getClient: () => client as unknown as ReturnType<Parameters<typeof initOutageState>[0]['getClient']>,
+        notify: (key) => void calls.push(['outage-notice', key]),
+      })
+      outageStateInstalled = true
+      /** A recording dependency: logs `[member, key]`, then returns `result(key)`. */
+      const rec =
+        <R>(member: string, result: (key: string) => R = () => undefined as R) =>
+        (key: string): R => {
+          calls.push([member, key])
+          return result(key)
+        }
+      const lifecycle = createPersonaLifecycle({
+        serialize: serializer!.run,
+        bringUps: {
+          bringUp: (persona, applied) => {
+            calls.push(['bringUps.bringUp', persona.key])
+            return bringUps.bringUp(persona, applied)
+          },
+          cancel: rec('bringUps.cancel', (key) => bringUps.cancel(key)),
+        },
+        connections: { stop: rec('connections.stop', (key) => connections.manager.stop(key)) },
+        routing: { forget: rec('routing.forget') },
+        destinations: { forget: rec('destinations.forget') },
+        destinationHold: { cancel: rec('destinationHold.cancel') },
+        notifier: { forget: rec('notifier.forget', () => 0) },
+        appliedPersonas: () => controller.applied()?.config.personas ?? [],
+        dryRun,
+        // An apply here never runs during shutdown.
+        isShuttingDown: () => false,
+        log,
+        whenLaunchSettled: rec('whenLaunchSettled', async () => undefined),
+        cancelRestartTimer: rec('cancelRestartTimer', () => false),
+        forgetFailures: rec('forgetFailures'),
+        forgetDisconnectedStreak: rec('forgetDisconnectedStreak'),
+        resetOutageState: (keys) => {
+          for (const key of keys) calls.push(['resetOutageState', key])
+        },
+        forgetPersonaPrompts: rec('forgetPersonaPrompts', () => 0),
+        dropSession: rec('dropSession', async () => undefined),
+        killInstance: (key) => {
+          calls.push(['killInstance', key])
+          return killPersonaInstance(key)
+        },
+        deleteInstance: (key) => {
+          calls.push(['deleteInstance', key])
+          return deletePersonaInstance(key)
+        },
+        replyGuard: {
+          launchedWithDir: rec<string | undefined>('replyGuard.launchedWithDir'),
+          teardown: rec('replyGuard.teardown'),
+          launchPass: (_dirs, personas) => void calls.push(['replyGuard.launchPass', personas.map((p) => p.key).join(',')]),
+        },
+        storageCheck: (persona) => void calls.push(['storageCheck', persona.key]),
+        launch: async (persona) => {
+          calls.push(['launch', persona.key])
+          record('launch', persona.key, 'apply')
+        },
+      })
+      return { lifecycle, serializer: serializer!, agentDirector, agentDirectorOrder, calls }
+    }
+
+    const timeline: LifecycleTimelineEntry[] = []
+    const gates = new Map<string, { enter: () => void; wait: Promise<void> }>()
+
+    /**
+     * One apply-time call of `op` for `key`: its `start` entry, then the
+     * test's gate (if one was set with `hold`), then `body`, then `settled`
+     * or `rejected`.
+     */
+    async function gated(op: LifecycleGateOp, key: string, body: () => Promise<void>): Promise<void> {
+      timeline.push({ op, key, phase: 'start' })
+      try {
+        const gate = gates.get(`${op} ${key}`)
+        if (gate !== undefined) {
+          gates.delete(`${op} ${key}`)
+          gate.enter()
+          await gate.wait
+        }
+        await body()
+      } catch (err) {
+        timeline.push({ op, key, phase: 'rejected' })
+        throw err
+      }
+      timeline.push({ op, key, phase: 'settled' })
+    }
 
     /** One persona's bring-up through the real controller, then its recorded launch when up. */
     async function bringUpAndLaunch(persona: Persona, applied: PersonaConfig, via: ReloadLifecycleVia): Promise<void> {
@@ -1092,12 +1348,25 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       },
       async bringUp(persona, applied) {
         connections.config = applied
-        await bringUpAndLaunch(persona, applied, 'apply')
+        if (composition === undefined) {
+          await gated('bring-up', persona.key, () => bringUpAndLaunch(persona, applied, 'apply'))
+          return
+        }
+        const entry = record('bring-up', persona.key, 'apply')
+        await gated('bring-up', persona.key, async () => {
+          entry.result = await composition.lifecycle.bringUp(persona, applied)
+        })
       },
       async teardown(persona) {
         record('teardown', persona.key, 'apply')
-        bringUps.cancel(persona.key)
-        await connections.manager.stop(persona.key)
+        await gated('teardown', persona.key, async () => {
+          if (composition !== undefined) {
+            await composition.lifecycle.teardown(persona)
+            return
+          }
+          bringUps.cancel(persona.key)
+          await connections.manager.stop(persona.key)
+        })
       },
       async reconnectCredentials(persona) {
         record('reconnect', persona.key, 'apply')
@@ -1115,6 +1384,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       ops,
       records,
       startPasses,
+      timeline,
       of: (op) => records.filter((r) => r.op === op),
       keys: (op) => records.filter((r) => r.op === op).map((r) => r.key),
       outcome: (key) => latestResolvedBringUp(key)?.result?.outcome,
@@ -1129,6 +1399,20 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         // Handled here too, so a `fail` before the pass reaches its await is no unhandled rejection.
         startHold.catch(() => undefined)
         return Object.assign(() => release(), { fail })
+      },
+      hold(op, key) {
+        let enter!: () => void
+        let release!: () => void
+        let fail!: (err: Error) => void
+        const entered = new Promise<void>((done) => (enter = done))
+        const wait = new Promise<void>((done, reject) => {
+          release = done
+          fail = reject
+        })
+        // Handled here too, so a `fail` before the call arrives is no unhandled rejection.
+        wait.catch(() => undefined)
+        gates.set(`${op} ${key}`, { enter, wait })
+        return { entered, release: () => release(), fail: (err) => fail(err) }
       },
     }
 
@@ -1148,7 +1432,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         return DEFAULT_WORKING_DIRECTORY_FS.stat(path)
       },
     }
-    const controller = createReloadController({
+    controller = createReloadController({
       paths,
       lifecycle: ops,
       log,
@@ -1196,9 +1480,17 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       },
     })
 
+    /** Every persona key with a stub: those registered at build, then those whose credentials were written later. */
+    const stubKeys = dryRun ? [] : connections.personas.map((p) => p.key)
+    lateRegistrations.push((name, tokens) => {
+      const key = personaKey(name)
+      if (dryRun || stopped || stubKeys.includes(key)) return
+      connections.slack.addPersona(key, tokens, { leakMarker: LEAK_SENTINEL, ...runOpts.slack?.[name] })
+      stubKeys.push(key)
+    })
+
     function slackCalls(): Record<string, StubWebCall[]> {
-      if (dryRun) return {}
-      return Object.fromEntries(connections.personas.map((p) => [p.key, [...connections.slack.persona(p.key).callLog]]))
+      return Object.fromEntries(stubKeys.map((key) => [key, [...connections.slack.persona(key).callLog]]))
     }
 
     function checkpoint(): ReloadRunCheckpoint {
@@ -1238,6 +1530,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       get outcome() {
         return outcome
       },
+      composition,
       appliedConfigs,
       appliedKeys: () => controller.applied()?.config.personas.map((p) => p.key),
       resolveStart() {
@@ -1328,6 +1621,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         app_token: tokens.appToken,
       })
       tokensByName.set(persona.name, tokens)
+      for (const register of lateRegistrations) register(persona.name, tokens)
       return tokens
     },
     writeCredentialsContent: (persona, content) =>
@@ -1457,6 +1751,41 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     clearWriteFailure: () => writeSeam.clear(),
     failRemoves: (failure) => removeSeam.fail(failure),
     clearRemoveFailure: () => removeSeam.clear(),
+    poisonTokenEnvironment() {
+      if (tokenWatch !== undefined) throw new Error('reload-harness: the token environment is already poisoned')
+      const original = process.env
+      const previous = TOKEN_ENV_NAMES.map((name) => [name, original[name]] as const)
+      const bot = fakeToken(BOT_TOKEN_PREFIX, 'environment-bot')
+      const app = fakeToken(APP_TOKEN_PREFIX, 'environment-app')
+      original['SLACK_BOT_TOKEN'] = bot
+      original['SLACK_APP_TOKEN'] = app
+      const reads: string[] = []
+      const watched: ReadonlySet<string> = new Set(TOKEN_ENV_NAMES)
+      process.env = new Proxy(original, {
+        get(target, name, receiver) {
+          if (typeof name === 'string' && watched.has(name)) reads.push(name)
+          return Reflect.get(target, name, receiver)
+        },
+      })
+      let restored = false
+      const watch: TokenEnvironmentWatch = {
+        bot,
+        app,
+        reads,
+        restore() {
+          if (restored) return
+          restored = true
+          process.env = original
+          for (const [name, value] of previous) {
+            if (value === undefined) delete original[name]
+            else original[name] = value
+          }
+          tokenWatch = undefined
+        },
+      }
+      tokenWatch = watch
+      return watch
+    },
     build,
     async start(runOpts) {
       const run = build(runOpts)
@@ -1473,8 +1802,13 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     },
     runs,
     async cleanup() {
-      for (const run of runs) await run.stop()
-      rmSync(root, { recursive: true, force: true })
+      try {
+        for (const run of runs) await run.stop()
+      } finally {
+        tokenWatch?.restore()
+        if (outageStateInstalled) _resetOutageState()
+        rmSync(root, { recursive: true, force: true })
+      }
     },
   }
   return h

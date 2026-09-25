@@ -115,7 +115,7 @@ import {
   type HoldAttempt,
   type PersonaDestinationHold,
 } from './persona-destination-hold.ts'
-import { PERSONA_LABEL_KEY, renderPersonaRef } from './persona-identity.ts'
+import { PERSONA_LABEL_KEY, personaInstanceId, renderPersonaRef } from './persona-identity.ts'
 import { formatPersonaNotice } from './persona-notifier.ts'
 import { emitTrail as defaultEmitTrail } from './permission-trail.ts'
 import type {
@@ -393,6 +393,41 @@ export function markHandled(claudeInstanceId: string, requestToken: string): boo
 /** Drop the entry — the tick is the sole owner of clearing entries. */
 export function dropPermission(claudeInstanceId: string, requestToken: string): void {
   livePermissions.delete(makeCompositeKey(claudeInstanceId, requestToken))
+}
+
+/**
+ * Forget everything the poller keeps for persona `key` and its instance
+ * (`cscb_<key>`; b.av2 SR-6.5, a teardown): its tracked prompts, their
+ * not-posted records, its wedge and stuck-prompt state and its not-up skip
+ * episode. Makes no Slack call and renders no closing update: the posted
+ * prompts stay as they are, and a later tick has nothing of the persona's to
+ * reconcile. No other persona's state changes; no trail event. Logs one line
+ * when tracked prompts were dropped. Returns how many were.
+ */
+export function forgetPersonaPrompts(key: string): number {
+  const instanceId = personaInstanceId(key)
+  const ownedBy = (personaKey: string, claudeInstanceId: string) =>
+    personaKey === key || claudeInstanceId === instanceId
+  let dropped = 0
+  for (const [compositeKey, entry] of [...livePermissions]) {
+    if (!ownedBy(entry.personaKey, entry.claudeInstanceId)) continue
+    livePermissions.delete(compositeKey)
+    dropped++
+  }
+  const instancePrefix = makeCompositeKey(instanceId, '')
+  for (const compositeKey of [...unpostedPrompts.keys()]) {
+    if (compositeKey.startsWith(instancePrefix)) unpostedPrompts.delete(compositeKey)
+  }
+  for (const [claudeInstanceId, state] of [...wedgeStates]) {
+    if (ownedBy(state.personaKey, claudeInstanceId)) wedgeStates.delete(claudeInstanceId)
+  }
+  notUpSkipping.delete(key)
+  if (dropped > 0) {
+    const line = `[slack] permission-poller: persona=${key}: dropped ${dropped} tracked prompt(s); their Slack messages stay as posted`
+    if (depsRef) logViaDeps(depsRef, line)
+    else console.error(line)
+  }
+  return dropped
 }
 
 /** Test-only: reset module-scoped state. */

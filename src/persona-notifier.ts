@@ -141,6 +141,14 @@ export interface PersonaNotifier {
    * rejects.
    */
   flush(key: string): Promise<void>
+  /**
+   * Drop the persona's pre-validation queue unposted (b.av2 SR-6.5, a
+   * teardown), so a persona added later with the same key never posts the
+   * removed persona's notices. Leaves the destination hold alone (the
+   * teardown cancels it) and every other persona's queue. No Slack call;
+   * logs one line when notices were dropped. A no-op for an unknown key.
+   */
+  forget(key: string): void
 }
 
 /** A notice held until its persona's client is validated. */
@@ -287,5 +295,13 @@ export function createPersonaNotifier(deps: PersonaNotifierDeps): PersonaNotifie
     await Promise.all(queue.map((notice) => notify(key, notice.text, notice.options)))
   }
 
-  return { notify, flush }
+  function forget(key: string): void {
+    const queue = held.get(key)
+    if (queue === undefined) return
+    held.delete(key)
+    if (queue.length === 0) return
+    deps.log(`[slack] persona-notifier: persona=${key}: dropped ${queue.length} held notice(s), not posted — the persona was torn down`)
+  }
+
+  return { notify, flush, forget }
 }

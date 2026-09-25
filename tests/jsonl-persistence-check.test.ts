@@ -36,6 +36,7 @@ import {
   checkMountFstype,
   checkJsonlPersistence,
   runJsonlPersistenceSafeguard,
+  runPersonaStorageCheck,
   makeDefaultArchiveCount,
   personaArchiveEvidenceScope,
   UNATTRIBUTABLE_ZERO_REASON,
@@ -1121,5 +1122,97 @@ describe('runJsonlPersistenceSafeguard — zero archive count per SR-7.4', () =>
     expect(h.totalPosts()).toBe(0)
     expect(personaLines.filter((l) => l.includes('no archived activity since spawn'))).toHaveLength(1)
     expect(personaLines.filter((l) => l.includes('inconclusive'))).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// runPersonaStorageCheck — Layer 1 for one persona a confirmed apply brings
+// up (b.av2 SR-6.2): its own effective JSONL root only, recorded and warned
+// about exactly as the start safeguard does; never throws.
+// ---------------------------------------------------------------------------
+
+describe('runPersonaStorageCheck — one persona\'s root at apply (b.av2 SR-6.2)', () => {
+  /** Run the check for `persona` with a recording notify and startup-error sink. */
+  function runFor(
+    persona: Persona,
+    deps: Partial<Pick<JsonlPersistenceSafeguardDeps, 'readMountinfo' | 'recordStartupError'>> = {},
+    notify?: (key: string, text: string) => void,
+  ): Captured {
+    const captured: Captured = { errors: [], notices: [] }
+    runPersonaStorageCheck(persona, notify ?? ((key, text) => void captured.notices.push({ key, text })), {
+      readMountinfo: fixture(REALISTIC_MOUNTINFO),
+      recordStartupError: (key, message) => void captured.errors.push({ key, message }),
+      home,
+      ...deps,
+    })
+    return captured
+  }
+
+  /** The Layer 1 signals the start safeguard gives for a config holding only `persona`. */
+  async function atStart(persona: Persona, readMountinfo = fixture(REALISTIC_MOUNTINFO)): Promise<Captured> {
+    return runLayer2(
+      { readMountinfo, statFn: () => true, getRow: async () => { throw new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'x') } },
+      { ...layer2Config(), personas: [persona] },
+    )
+  }
+
+  test('a non-persistent root: the same jsonl-non-persistent record and warning as at start, to this persona only — not to another persona on the same root', async () => {
+    const config = makeMultiPersonaConfig(
+      [{ name: 'Alpha Bot', claude_config_dir: '/tmp/claude' }, { name: 'Beta Bot', claude_config_dir: '/tmp/claude' }],
+      makeTempDir(),
+    )
+    const [a] = config.personas as [Persona, Persona]
+
+    const c = runFor(a)
+
+    expect(c.errors.map((e) => e.key)).toEqual(['jsonl-non-persistent'])
+    expect(c.errors[0]!.message).toContain('root="/tmp/claude/projects"')
+    expect(c.notices.map((n) => n.key)).toEqual([a.key])
+    expect(c).toEqual(await atStart(a))
+  })
+
+  test.each<[string, string, string | undefined, string[]]>([
+    ['on a persistent root: nothing recorded, no warning', '/home/user/.claude', undefined, []],
+    ['on an unresolvable root: the jsonl-persistence-check-warning record as at start, no warning', '/no/matching/mount',
+      '24 23 8:2 / /home rw,relatime shared:2 - ext4 /dev/sda2 rw\n', ['jsonl-persistence-check-warning']],
+  ])('the persona %s, although another persona sits on a tmpfs root', async (_label, dir, mountinfo, recorded) => {
+    const config = makeMultiPersonaConfig(
+      [{ name: 'Alpha Bot', claude_config_dir: dir }, { name: 'Beta Bot', claude_config_dir: '/tmp/claude' }],
+      makeTempDir(),
+    )
+    const [a] = config.personas as [Persona, Persona]
+    const readMountinfo = fixture(mountinfo ?? REALISTIC_MOUNTINFO)
+
+    const c = runFor(a, { readMountinfo })
+
+    expect(c.errors.map((e) => e.key)).toEqual(recorded)
+    expect(c.notices).toEqual([])
+    expect(c).toEqual(await atStart(a, readMountinfo))
+  })
+
+  test('a persona with no claude_config_dir is checked at <home>/.claude/projects under deps.home', () => {
+    const config = makeMultiPersonaConfig([{ name: 'Alpha Bot' }], makeTempDir())
+    const [a] = config.personas as [Persona]
+    const homeOnTmpfs = `${REALISTIC_MOUNTINFO}99 23 0:30 / ${home} rw,relatime shared:11 - tmpfs tmpfs rw\n`
+
+    const c = runFor(a, { readMountinfo: fixture(homeOnTmpfs) })
+
+    expect(c.errors).toEqual([{ key: 'jsonl-non-persistent', message: expect.stringContaining(`root="${home}/.claude/projects"`) }])
+    expect(c.notices.map((n) => n.key)).toEqual([a.key])
+  })
+
+  test.each<[string, Partial<Pick<JsonlPersistenceSafeguardDeps, 'readMountinfo' | 'recordStartupError'>>, boolean]>([
+    ['the startup-error sink throws', { recordStartupError: () => { throw new Error('sink exploded') } }, true],
+    ['the notice seam throws', {}, false],
+    ['the mountinfo reader throws', { readMountinfo: () => { throw new Error('no /proc') } }, false],
+  ])('never throws when %s', (_label, deps, unexpected) => {
+    const config = makeMultiPersonaConfig([{ name: 'Alpha Bot', claude_config_dir: '/tmp/claude' }], makeTempDir())
+    const [a] = config.personas as [Persona]
+    const lines = captureErrorLog()
+
+    expect(() => runFor(a, deps, () => { throw new Error('notify exploded') })).not.toThrow()
+
+    const failedLine = `[slack] Warning: jsonl-persistence-check failed unexpectedly for ${renderPersonaRef(a.name, a.key)} — continuing: Error`
+    expect(lines.filter((l) => l.startsWith(failedLine))).toHaveLength(unexpected ? 1 : 0)
   })
 })

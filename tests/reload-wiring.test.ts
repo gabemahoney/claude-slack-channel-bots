@@ -18,6 +18,17 @@
  * `isDryRun()` and the bring-up controller's held digests and states, or is
  * passed a file watcher.
  *
+ * SR-6.5 / SR-6.1 / SR-6.6 (E12 Task 2): a confirmed apply's teardowns (step
+ * 2) and bring-ups (step 6) are the controller's default fan-out over its
+ * lifecycle members `teardown` and `bringUp`. The audit pins that production
+ * binds both to the one `PersonaLifecycle` main() composes with
+ * `createPersonaLifecycle` (declared before the controller, assigned once
+ * after the bring-up controller exists and before detection is armed), passes
+ * no `applySteps` override (which would replace that fan-out), and that the
+ * restart timers, the bring-up retries and the lifecycle share one
+ * per-persona serializer. What the teardown and the apply bring-up do is
+ * tested behaviourally against `createPersonaLifecycle`.
+ *
  * What the timer and the tick do is tested behaviourally in
  * tests/reload-timer.test.ts and tests/reload.test.ts. Only the wiring that
  * cannot be driven by a behaviour test is audited here: main() cannot run in
@@ -33,13 +44,17 @@
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import {
+  atMainTopLevel,
   balancedAfter,
   callsOf,
+  importSource,
   indicesOf,
   insideMain,
+  loadedConfigName,
   objectProperties,
   onlyCallArguments,
   shutdownBody,
+  splitTopLevel,
   startResolution,
   stripComments,
 } from './test-helpers/source-audit.ts'
@@ -118,6 +133,26 @@ function endOfBringUpStatement(bringUpAt: number): number {
   return bringUpAt
 }
 
+/**
+ * The start-time applied config the controller's `onApplied` spreads. Its
+ * body must be exactly a guard that throws while that config is still unset,
+ * then the swap `<loaded> = { ...<start-time>, personas: <applied>.personas }`;
+ * fails the test otherwise.
+ */
+function startTimeConfig(): string {
+  const { loaded } = startResolution(SERVER_CODE)
+  const onApplied = (controllerProps().get('onApplied') ?? '').replace(/\s+/g, ' ')
+  const swap = onApplied.match(
+    new RegExp(
+      `^\\(?\\s*(\\w+)\\s*\\)?\\s*=>\\s*\\{\\s*` +
+        `if\\s*\\(\\s*(\\w+)\\s*===\\s*undefined\\s*\\)\\s*throw\\s+new\\s+Error\\s*\\(\\s*'[^']*'\\s*\\)\\s*;?\\s*` +
+        `${loaded}\\s*=\\s*\\{\\s*\\.\\.\\.\\2\\s*,\\s*personas\\s*:\\s*\\1\\s*\\.\\s*personas\\s*,?\\s*\\}\\s*;?\\s*\\}$`,
+    ),
+  )
+  expect(swap).not.toBeNull()
+  return swap![2]!
+}
+
 describe('server.ts wires the reload detection tick (b.av2 SR-8.2)', () => {
   test('starts detection from exactly one call site: the start controller\'s startDetection(), inside main()', () => {
     const { controller } = startResolution(SERVER_CODE)
@@ -188,23 +223,12 @@ describe('server.ts wires the reload detection tick (b.av2 SR-8.2)', () => {
   // reply guard, the health work list) reads the holder it reassigns.
   test('the controller\'s onApplied swaps the applied config holder to the confirmed persona set over the start-time server-wide values', () => {
     const { loaded, assignAt, createAt } = startResolution(SERVER_CODE)
-    const onApplied = (controllerProps().get('onApplied') ?? '').replace(/\s+/g, ' ')
-    // The body is exactly: a guard that throws while the start-time config is
-    // still unset, then the swap spreading that same config.
-    const swap = onApplied.match(
-      new RegExp(
-        `^\\(?\\s*(\\w+)\\s*\\)?\\s*=>\\s*\\{\\s*` +
-          `if\\s*\\(\\s*(\\w+)\\s*===\\s*undefined\\s*\\)\\s*throw\\s+new\\s+Error\\s*\\(\\s*'[^']*'\\s*\\)\\s*;?\\s*` +
-          `${loaded}\\s*=\\s*\\{\\s*\\.\\.\\.\\2\\s*,\\s*personas\\s*:\\s*\\1\\s*\\.\\s*personas\\s*,?\\s*\\}\\s*;?\\s*\\}$`,
-      ),
-    )
-    expect(swap).not.toBeNull()
     // The spread is the start-time config: declared once, inside main(),
     // before the controller whose onApplied closes over it (no temporal dead
     // zone), and assigned once, from the holder, after the start resolution
     // set it and before detection is armed (the only point after which
     // onApplied can run).
-    const startTime = swap![2]!
+    const startTime = startTimeConfig()
     const decls = [...SERVER_CODE.matchAll(new RegExp(`\\b(?:let|const|var)\\s+${startTime}\\b[^\\n]*`, 'g'))]
     expect(decls.map((d) => d[0].trim())).toEqual([`let ${startTime}!: PersonaConfig`])
     expect(insideMain(SERVER_CODE, decls[0]!.index!)).toBe(true)
@@ -239,5 +263,207 @@ describe('server.ts wires the reload detection tick (b.av2 SR-8.2)', () => {
     expect(controllerProps().get('log')).toMatch(toServerLog)
     const driverProps = objectProperties(onlyCallArguments(SERVER_CODE, 'createReloadTickDriver'))
     expect(driverProps.get('log')).toMatch(toServerLog)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The confirmed apply's teardown and bring-up (b.av2 SR-6.1, SR-6.5, SR-6.6)
+// ---------------------------------------------------------------------------
+
+/** The top-level properties of the argument of the only call of the plain function `name`. */
+function onlyCallProps(name: string): Map<string, string> {
+  return objectProperties(onlyCallArguments(SERVER_CODE, name))
+}
+
+/** The name the one `const <name> = <factory>(…)` binds; fails unless there is exactly one. */
+function constOf(factory: string): string {
+  const decls = [...SERVER_CODE.matchAll(new RegExp(`\\bconst\\s+(\\w+)\\s*=\\s*${factory}\\s*\\(`, 'g'))]
+  expect(decls).toHaveLength(1)
+  return decls[0]![1]!
+}
+
+/** The lifecycle holder the controller's `teardown` and `bringUp` members forward to (see the first test below). */
+function lifecycleHolder(): string {
+  const lifecycle = objectProperties(controllerProps().get('lifecycle') ?? '')
+  const teardown = (lifecycle.get('teardown') ?? '').match(/^\(?\s*(\w+)\s*\)?\s*=>\s*(\w+)\s*\.\s*teardown\s*\(\s*(\w+)\s*\)$/)
+  const bringUp = (lifecycle.get('bringUp') ?? '').match(
+    /^\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>\s*(\w+)\s*\.\s*bringUp\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)$/,
+  )
+  expect(teardown).not.toBeNull()
+  expect(bringUp).not.toBeNull()
+  // Each passes its own parameters through, unchanged and in order.
+  expect(teardown![3]).toBe(teardown![1])
+  expect([bringUp![4], bringUp![5]]).toEqual([bringUp![1], bringUp![2]])
+  // Both on the same holder.
+  expect(bringUp![3]).toBe(teardown![2])
+  return teardown![2]!
+}
+
+describe('server.ts binds the confirmed apply\'s teardown and bring-up (b.av2 SR-6.1, SR-6.5, SR-6.6)', () => {
+  // ReloadLifecycleOps.teardown and .bringUp are required, so the typecheck
+  // catches a missing member; it cannot catch one bound to something that
+  // does nothing. Without these bindings a confirmed removal would leave the
+  // persona's connection, session and instance running, and a confirmed
+  // addition would never come up.
+  test('the controller\'s lifecycle members teardown and bringUp forward their arguments to one lifecycle holder, beside the start bring-up', () => {
+    const lifecycle = objectProperties(controllerProps().get('lifecycle') ?? '')
+    expect([...lifecycle.keys()].sort()).toEqual(['bringUp', 'startBringUp', 'teardown'])
+    expect(lifecycleHolder()).toMatch(/^\w+$/)
+  })
+
+  test('the holder is declared once, typed PersonaLifecycle, before the controller that closes over it', () => {
+    const holder = lifecycleHolder()
+    const decls = [...SERVER_CODE.matchAll(new RegExp(`\\b(?:let|const|var)\\s+${holder}\\b[^\\n]*`, 'g'))]
+    expect(decls).toHaveLength(1)
+    // `let`: it is assigned once the bring-up controller exists (next test).
+    expect(decls[0]![0]).toMatch(new RegExp(`^let\\s+${holder}\\s*!?\\s*:\\s*PersonaLifecycle\\b`))
+    expect(decls[0]!.index!).toBeLessThan(startResolution(SERVER_CODE).createAt)
+  })
+
+  test('the holder is assigned once, unconditionally, from the one createPersonaLifecycle({ … }), after `bringUps = <bring-up controller>` and before detection is armed', () => {
+    const holder = lifecycleHolder()
+    const assigns = [...SERVER_CODE.matchAll(new RegExp(`(?<![\\w.$])${holder}\\s*=(?![=>])\\s*(\\w+)\\s*\\(`, 'g'))]
+    expect(assigns.map((a) => a[1])).toEqual(['createPersonaLifecycle'])
+    // Nothing else writes the holder (a compound or bare assignment of another shape).
+    expect(indicesOf(new RegExp(`(?<![\\w.$])${holder}\\s*(?:[-+*/|&?]{1,2})?=(?![=>])`, 'g'), SERVER_CODE)).toEqual([assigns[0]!.index!])
+    const at = assigns[0]!.index!
+    // The one construction is this assignment's value.
+    const creates = callsOf(SERVER_CODE, 'createPersonaLifecycle')
+    expect(creates).toHaveLength(1)
+    expect(creates[0]!).toBe(at + assigns[0]![0].lastIndexOf('createPersonaLifecycle'))
+    // On every start, dry run included: in main()'s own statement list.
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    // Its bring-up controller exists (the handle the manager's status listener reads is set)…
+    const handoffs = assignmentsOf('bringUps', constOf('createPersonaBringUpController')).filter((a) => insideMain(SERVER_CODE, a))
+    expect(handoffs).toHaveLength(1)
+    expect(at).toBeGreaterThan(handoffs[0]!)
+    // …and it is set before the first point an apply can run.
+    expect(at).toBeLessThan(onlyMethodCall('startDetection').at)
+  })
+
+  test('no applySteps override: the controller runs its default fan-out over the lifecycle members', () => {
+    // applySteps replaces the whole step 2–6 fan-out (tests only); passed in
+    // production it would bypass the teardown and bring-up bound above.
+    expect(controllerProps().has('applySteps')).toBe(false)
+    expect(indicesOf(/\bapplySteps\b/g, SERVER_CODE)).toEqual([])
+  })
+
+  test('one per-persona serializer, built once at module scope: its run is the serialize of initRestart, the bring-up controller and the lifecycle', () => {
+    const serializer = constOf('createPersonaSerializer')
+    expect(callsOf(SERVER_CODE, 'createPersonaSerializer')).toHaveLength(1)
+    const decl = SERVER_CODE.search(new RegExp(`^const\\s+${serializer}\\s*=\\s*createPersonaSerializer\\s*\\(\\s*\\)\\s*$`, 'm'))
+    expect(decl).toBeGreaterThanOrEqual(0)
+    expect(insideMain(SERVER_CODE, decl)).toBe(false)
+    for (const factory of ['initRestart', 'createPersonaBringUpController', 'createPersonaLifecycle']) {
+      expect([factory, onlyCallProps(factory).get('serialize')]).toEqual([factory, `${serializer}.run`])
+    }
+  })
+
+  // Every dependency is required, so the typecheck catches a missing one; it
+  // cannot catch one bound to a stub (`() => undefined`, `async () => {}`) or
+  // two same-typed ones swapped (killInstance/deleteInstance). Each value is
+  // pinned to the production function or object it must be.
+  test('createPersonaLifecycle gets every production dependency: nothing stubbed, nothing swapped, nothing extra', () => {
+    const props = onlyCallProps('createPersonaLifecycle')
+    const loaded = loadedConfigName(SERVER_CODE)
+    const notifier = constOf('createPersonaNotifier')
+
+    // The same per-persona queue as restarts and bring-up retries (test above).
+    const expected = new Map<string, string>([
+      ['serialize', `${constOf('createPersonaSerializer')}.run`],
+      ['bringUps', constOf('createPersonaBringUpController')],
+      ['connections', constOf('createPersonaConnectionManager')],
+      ['routing', constOf('createPersonaRouting')],
+      ['destinations', constOf('createPersonaDestinations')],
+      ['destinationHold', constOf('createPersonaDestinationHold')],
+      ['notifier', notifier],
+      // The live applied set, read at call time.
+      ['appliedPersonas', `() => ${loaded}?.personas ?? []`],
+      // Dry run: the teardown makes no agent-director call.
+      ['dryRun', 'isDryRun()'],
+      ['isShuttingDown', '() => shuttingDown'],
+      ['whenLaunchSettled', 'whenLaunchSettled'],
+      ['cancelRestartTimer', 'cancelRestartTimer'],
+      ['forgetFailures', 'forgetFailures'],
+      ['forgetDisconnectedStreak', 'forgetDisconnectedStreak'],
+      // The silent per-key reset (never the boot reset of every persona).
+      ['resetOutageState', 'resetAllToHealthy'],
+      ['forgetPersonaPrompts', 'forgetPersonaPrompts'],
+      ['dropSession', 'dropPersonaSessionAndKeepAlive'],
+      ['killInstance', 'killPersonaInstance'],
+      ['deleteInstance', 'deletePersonaInstance'],
+    ])
+    // Functions and objects with a parameter name of the source's choosing.
+    const shaped = ['log', 'replyGuard', 'storageCheck', 'launch']
+    expect([...props.keys()].sort()).toEqual([...expected.keys(), ...shaped].sort())
+    for (const [dep, value] of expected) expect([dep, props.get(dep)]).toEqual([dep, value])
+
+    // The imported production functions, each from its own module and not
+    // shadowed by a local declaration of the same name.
+    const imports: Record<string, string> = {
+      whenLaunchSettled: './session-manager.ts',
+      killPersonaInstance: './session-manager.ts',
+      deletePersonaInstance: './session-manager.ts',
+      cancelRestartTimer: './restart.ts',
+      forgetFailures: './backoff.ts',
+      forgetDisconnectedStreak: './health-check.ts',
+      resetAllToHealthy: './outage-state.ts',
+      forgetPersonaPrompts: './permission-poller.ts',
+      getLaunchedWithDir: './stop-hook-bootstrap.ts',
+      teardownPersonaReplyGuard: './stop-hook-bootstrap.ts',
+      stopHookLaunchPass: './stop-hook-bootstrap.ts',
+      runPersonaStorageCheck: './jsonl-persistence-check.ts',
+    }
+    for (const [name, module] of Object.entries(imports)) {
+      expect([name, importSource(SERVER_CODE, name)]).toEqual([name, module])
+      expect([name, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
+    }
+
+    // The flag shutdown() sets, the one initRestart reads too.
+    expect(props.get('isShuttingDown')).toBe(onlyCallProps('initRestart').get('isShuttingDown'))
+    const [shutdownStart, shutdownEnd] = shutdownBody(SERVER_CODE)
+    const raises = assignmentsOf('shuttingDown', 'true')
+    expect(raises).toHaveLength(1)
+    expect(raises[0]!).toBeGreaterThan(shutdownStart)
+    expect(raises[0]!).toBeLessThan(shutdownEnd)
+
+    // The session drop is the one the not-up dropper uses: a server.ts
+    // function that drops the registry entry before the transport closes and
+    // the keep-alive stops, so the closing stream schedules no restart.
+    expect(onlyCallProps('createNotUpSessionDropper').get('drop')).toBe('dropPersonaSessionAndKeepAlive')
+    expect(indicesOf(/\bfunction\s+dropPersonaSessionAndKeepAlive\s*\(/g, SERVER_CODE)).toHaveLength(1)
+
+    // The log is the server log.
+    expect(props.get('log')).toMatch(/^\(?\s*(\w+)\s*\)?\s*=>\s*console\s*\.\s*error\s*\(\s*\1\s*\)$/)
+
+    // The reply guard's teardown and launch pass use the server's state dir,
+    // the one the start's stop-hook bootstrap writes.
+    const stateDir = splitTopLevel(onlyCallArguments(SERVER_CODE, 'stopHookBootstrap'))[1]
+    expect(stateDir).toMatch(/^\w+$/)
+    const guard = objectProperties(props.get('replyGuard') ?? '')
+    expect([...guard.keys()].sort()).toEqual(['launchPass', 'launchedWithDir', 'teardown'])
+    expect(guard.get('launchedWithDir')).toBe('getLaunchedWithDir')
+    const teardown = (guard.get('teardown') ?? '').match(new RegExp(`^\\(?(\\w+)\\)? => teardownPersonaReplyGuard\\(${stateDir}, (\\w+)\\)$`))
+    expect(teardown).not.toBeNull()
+    expect(teardown![2]).toBe(teardown![1])
+    const launchPass = (guard.get('launchPass') ?? '').match(
+      new RegExp(`^\\((\\w+), (\\w+)\\) => stopHookLaunchPass\\((\\w+), (\\w+), ${stateDir}\\)$`),
+    )
+    expect(launchPass).not.toBeNull()
+    expect([launchPass![3], launchPass![4]]).toEqual([launchPass![1], launchPass![2]])
+
+    // The storage check at apply posts through the persona notifier.
+    const storage = (props.get('storageCheck') ?? '').match(new RegExp(`^\\(?(\\w+)\\)? => runPersonaStorageCheck\\((\\w+), ${notifier}\\.notify\\)$`))
+    expect(storage).not.toBeNull()
+    expect(storage![2]).toBe(storage![1])
+
+    // The launch at apply is the retry launch: the applied config read at
+    // call time, the start-time one (the config onApplied spreads) as
+    // fallback, not at startup.
+    const launch = props.get('launch') ?? ''
+    const m = launch.match(new RegExp(`^\\((\\w+)\\) => spawnForPersona\\(\\1, ${loaded} \\?\\? (\\w+), false\\)$`))
+    expect(m).not.toBeNull()
+    expect(m![2]).toBe(startTimeConfig())
+    expect(launch).toBe(onlyCallProps('createPersonaBringUpController').get('launch') ?? '')
   })
 })

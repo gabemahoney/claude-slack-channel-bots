@@ -97,6 +97,12 @@
  *     skipped request posts once after it comes up; its tracked prompt and
  *     wedge count are held (not closed, dropped, re-posted or re-armed) and
  *     reconciled once it is up; the skip is logged once per episode.
+ *   - A teardown's drop (`forgetPersonaPrompts`, b.av2 SR-6.5): B's tracked
+ *     prompts (by key or `cscb_<key>`), not-posted records, stuck-prompt
+ *     count and not-up skip episode are dropped with no Slack call, trail
+ *     event or closing update, A's are kept; one line only when prompts were
+ *     dropped; a leftover row labelled for B after B left the applied set
+ *     posts and tracks nothing.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -110,6 +116,7 @@ import {
   _resetPollerState,
   buildPermissionBlocks,
   dropPermission,
+  forgetPersonaPrompts,
   getLivePermission,
   markHandled,
   startPermissionPoller,
@@ -3199,94 +3206,95 @@ describe('b.fae F4 — wedge detector', () => {
 })
 
 // ---------------------------------------------------------------------------
-// A persona that is not up (b.av2 SR-6.4, SR-7.2)
+// A persona that is not up (b.av2 SR-6.4, SR-7.2); the scenario is shared
+// with the teardown drop below
 // ---------------------------------------------------------------------------
 
-describe('poller tick — a persona that is not up (b.av2 SR-6.4)', () => {
-  const K = wedgeTripTicks(1000)
-  const UP: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0BOTUSER1', botId: 'B0BOTID001' } } as PersonaConnectionStatus
+const K = wedgeTripTicks(1000)
+const UP: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0BOTUSER1', botId: 'B0BOTID001' } } as PersonaConnectionStatus
 
-  /**
-   * The not-up states the production predicate (`createPersonaUpPredicate`)
-   * sees: a connection status, or none, and the bring-up outcome.
-   */
-  const NOT_UP: Array<[string, PersonaConnectionStatus | undefined, boolean]> = [
-    ['broken: Slack refused its token', { state: 'broken', phase: 'bring-up' } as PersonaConnectionStatus, false],
-    ['retrying: Slack unreachable at bring-up', { state: 'retrying', phase: 'bring-up' } as PersonaConnectionStatus, false],
-    ['broken or retrying on its working directory: no connection', undefined, false],
-    ['serving, but its bring-up outcome is not up', UP, false],
-  ]
+/**
+ * The not-up states the production predicate (`createPersonaUpPredicate`)
+ * sees: a connection status, or none, and the bring-up outcome.
+ */
+const NOT_UP: Array<[string, PersonaConnectionStatus | undefined, boolean]> = [
+  ['broken: Slack refused its token', { state: 'broken', phase: 'bring-up' } as PersonaConnectionStatus, false],
+  ['retrying: Slack unreachable at bring-up', { state: 'retrying', phase: 'bring-up' } as PersonaConnectionStatus, false],
+  ['broken or retrying on its working directory: no connection', undefined, false],
+  ['serving, but its bring-up outcome is not up', UP, false],
+]
 
-  /**
-   * A poller over personas A and B (listed) and D (not listed), all up to
-   * start with, each with a mutable set of open requests, and the production
-   * up predicate over a per-persona connection status and bring-up outcome.
-   * `down(key, variant?)` puts a persona in a `NOT_UP` state, `up(key)`
-   * brings it up.
-   */
-  function makeNotUpScenario() {
-    const statuses = new Map<string, PersonaConnectionStatus | undefined>([[KEY_A, UP], [KEY_B, UP], [KEY_D, UP]])
-    const outcomeUp = new Set<string>([KEY_A, KEY_B, KEY_D])
-    const isPersonaUp = createPersonaUpPredicate({ status: (key) => statuses.get(key) }, { isUp: (key) => outcomeUp.has(key) })
-    const open = new Map<string, PermissionRequestRow[]>()
-    const listed = new Set<Persona>([A, B])
-    const extraRows: ReturnType<typeof cannedListRow>[] = []
-    const getCalls: string[] = []
-    const getPermissionCalls: string[] = []
-    const logCalls: unknown[][] = []
-    const trail = makeTrailCapture()
-    const byInstance = (id: string) => config.personas.find((p) => personaInstanceId(p.key) === id)
-    const ivl = startPoller(() => ({
-      list: async () => ({ spawns: [...[...listed].map((p) => checkPermRow(p)), ...extraRows] }),
-      get: async ({ claude_instance_id }) => {
-        getCalls.push(claude_instance_id)
-        return getResult(open.get(claude_instance_id) ?? [], byInstance(claude_instance_id))
-      },
-      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
-        getPermissionCalls.push(params.request_token)
-        return cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null })
-      },
-    }), { isPersonaUp, emitTrail: trail.emit, log: (...args) => { logCalls.push(args) } })
-    return {
-      ivl,
-      open,
-      listed,
-      extraRows,
-      getCalls,
-      getPermissionCalls,
-      logCalls,
-      trail,
-      down(key: string, [, status, outcome]: [string, PersonaConnectionStatus | undefined, boolean] = NOT_UP[0]) {
-        statuses.set(key, status)
-        if (outcome) outcomeUp.add(key)
-        else outcomeUp.delete(key)
-      },
-      up(key: string) {
-        statuses.set(key, UP)
-        outcomeUp.add(key)
-      },
-      /** Fire `n` ticks, letting each settle. */
-      async drive(n: number) {
-        for (let i = 0; i < n; i++) {
-          ivl.fire()
-          await new Promise((r) => setTimeout(r, 0))
-        }
-      },
-    }
+/**
+ * A poller over personas A and B (listed) and D (not listed), all up to
+ * start with, each with a mutable set of open requests, and the production
+ * up predicate over a per-persona connection status and bring-up outcome.
+ * `down(key, variant?)` puts a persona in a `NOT_UP` state, `up(key)`
+ * brings it up.
+ */
+function makeNotUpScenario() {
+  const statuses = new Map<string, PersonaConnectionStatus | undefined>([[KEY_A, UP], [KEY_B, UP], [KEY_D, UP]])
+  const outcomeUp = new Set<string>([KEY_A, KEY_B, KEY_D])
+  const isPersonaUp = createPersonaUpPredicate({ status: (key) => statuses.get(key) }, { isUp: (key) => outcomeUp.has(key) })
+  const open = new Map<string, PermissionRequestRow[]>()
+  const listed = new Set<Persona>([A, B])
+  const extraRows: ReturnType<typeof cannedListRow>[] = []
+  const getCalls: string[] = []
+  const getPermissionCalls: string[] = []
+  const logCalls: unknown[][] = []
+  const trail = makeTrailCapture()
+  const byInstance = (id: string) => config.personas.find((p) => personaInstanceId(p.key) === id)
+  const ivl = startPoller(() => ({
+    list: async () => ({ spawns: [...[...listed].map((p) => checkPermRow(p)), ...extraRows] }),
+    get: async ({ claude_instance_id }) => {
+      getCalls.push(claude_instance_id)
+      return getResult(open.get(claude_instance_id) ?? [], byInstance(claude_instance_id))
+    },
+    getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
+      getPermissionCalls.push(params.request_token)
+      return cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null })
+    },
+  }), { isPersonaUp, emitTrail: trail.emit, log: (...args) => { logCalls.push(args) } })
+  return {
+    ivl,
+    open,
+    listed,
+    extraRows,
+    getCalls,
+    getPermissionCalls,
+    logCalls,
+    trail,
+    down(key: string, [, status, outcome]: [string, PersonaConnectionStatus | undefined, boolean] = NOT_UP[0]) {
+      statuses.set(key, status)
+      if (outcome) outcomeUp.add(key)
+      else outcomeUp.delete(key)
+    },
+    up(key: string) {
+      statuses.set(key, UP)
+      outcomeUp.add(key)
+    },
+    /** Fire `n` ticks, letting each settle. */
+    async drive(n: number) {
+      for (let i = 0; i < n; i++) {
+        ivl.fire()
+        await new Promise((r) => setTimeout(r, 0))
+      }
+    },
   }
+}
 
-  const requestA = () => cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })
-  const requestB = () => cannedPermissionRequest({ request_token: TOKEN_B, request_id: 2 })
-  const allUpdates = () => updates(stubA).length + updates(stubB).length + updates(stubD).length
-  const trailFor = (trail: TrailCapture, instanceId: string) =>
-    trail.events.filter((e) => e['claude_instance_id'] === instanceId)
-  const wedgeWarnings = () =>
-    [stubA, stubB, stubD].flatMap((s) => posts(s)).filter((c) => String(c.text).includes('blocked on a native'))
-  const skipStarts = (logCalls: unknown[][], persona: Persona) =>
-    logLines(logCalls, renderPersonaRef(persona.name, persona.key)).filter((l) => String(l[0]).includes('is not up'))
-  const skipEnds = (logCalls: unknown[][], persona: Persona) =>
-    logLines(logCalls, renderPersonaRef(persona.name, persona.key)).filter((l) => String(l[0]).includes('up again'))
+const requestA = () => cannedPermissionRequest({ request_token: TOKEN_A, request_id: 1 })
+const requestB = () => cannedPermissionRequest({ request_token: TOKEN_B, request_id: 2 })
+const allUpdates = () => updates(stubA).length + updates(stubB).length + updates(stubD).length
+const trailFor = (trail: TrailCapture, instanceId: string) =>
+  trail.events.filter((e) => e['claude_instance_id'] === instanceId)
+const wedgeWarnings = () =>
+  [stubA, stubB, stubD].flatMap((s) => posts(s)).filter((c) => String(c.text).includes('blocked on a native'))
+const skipStarts = (logCalls: unknown[][], persona: Persona) =>
+  logLines(logCalls, renderPersonaRef(persona.name, persona.key)).filter((l) => String(l[0]).includes('is not up'))
+const skipEnds = (logCalls: unknown[][], persona: Persona) =>
+  logLines(logCalls, renderPersonaRef(persona.name, persona.key)).filter((l) => String(l[0]).includes('up again'))
 
+describe('poller tick — a persona that is not up (b.av2 SR-6.4)', () => {
   test.each(NOT_UP)('%s: its row gets no get, no post, no update, no live entry and no trail event, while an up persona\'s row in the same tick posts through its own client', async (label, status, outcomeUp) => {
     const s = makeNotUpScenario()
     s.down(KEY_A, [label, status, outcomeUp])
@@ -3463,5 +3471,157 @@ describe('poller tick — a persona that is not up (b.av2 SR-6.4)', () => {
     // E3's not-applied handling logs the row on each of the three ticks.
     expect(logLines(s.logCalls, `${INSTANCE_A} names no applied persona`)).toHaveLength(3)
     expect(s.getCalls.filter((id) => id === INSTANCE_A)).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A teardown drops one persona's poller state (b.av2 SR-6.5)
+// ---------------------------------------------------------------------------
+
+describe('forgetPersonaPrompts — a teardown drops one persona\'s poller state (b.av2 SR-6.5)', () => {
+  const TOKEN_C = '33333333-3333-4333-8333-333333333333'
+  /** A spawn of B's that is not `cscb_<B>`: its prompt is B's by its `persona` label only. */
+  const B_OTHER_INSTANCE = `${INSTANCE_B}_other`
+  const droppedLine = (key: string, n: number) =>
+    `[slack] permission-poller: persona=${key}: dropped ${n} tracked prompt(s); their Slack messages stay as posted`
+  const droppedLines = (logCalls: unknown[][]) => logLines(logCalls, ' tracked prompt(s); their Slack messages stay as posted')
+
+  test('drops every tracked prompt of B, matched by its key or by its instance cscb_<key>, and none of A\'s, with no Slack call and no trail event; a later tick makes no closing update for B\'s closed requests while A\'s closes as before', async () => {
+    const s = makeNotUpScenario()
+    s.listed.clear()
+    s.listed.add(A)
+    s.extraRows.push(
+      // B's instance under A's label: B's by its instance.
+      cannedListRow({ claude_instance_id: INSTANCE_B, state: 'check_permission' }, A, personaDir),
+      // Another instance under B's label: B's by its key.
+      cannedListRow({ claude_instance_id: B_OTHER_INSTANCE, state: 'check_permission' }, B, personaDir),
+    )
+    s.open.set(INSTANCE_A, [requestA()])
+    s.open.set(INSTANCE_B, [requestB()])
+    s.open.set(B_OTHER_INSTANCE, [cannedPermissionRequest({ request_token: TOKEN_C, request_id: 3 })])
+    await s.ivl.tick()
+    const aEntry = getLivePermission(INSTANCE_A, TOKEN_A)
+    expect(aEntry).toMatchObject({ personaKey: KEY_A, channelId: A_DEST })
+    expect(getLivePermission(INSTANCE_B, TOKEN_B)).toMatchObject({ personaKey: KEY_A })
+    expect(getLivePermission(B_OTHER_INSTANCE, TOKEN_C)).toMatchObject({ personaKey: KEY_B, channelId: B_DEST })
+    const callsBefore = slackCalls(stubA, stubB, stubD)
+    const trailBefore = s.trail.events.length
+
+    expect(forgetPersonaPrompts(KEY_B)).toBe(2)
+
+    expect(getLivePermission(INSTANCE_B, TOKEN_B)).toBeUndefined()
+    expect(getLivePermission(B_OTHER_INSTANCE, TOKEN_C)).toBeUndefined()
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toEqual(aEntry)
+    expect(slackCalls(stubA, stubB, stubD)).toBe(callsBefore)
+    expect(s.trail.events).toHaveLength(trailBefore)
+    expect(droppedLines(s.logCalls)).toEqual([[droppedLine(KEY_B, 2)]])
+
+    // Every request closes and every row leaves check_permission.
+    s.listed.clear()
+    s.extraRows.length = 0
+    await s.ivl.tick()
+    expect(s.getPermissionCalls).toEqual([TOKEN_A])
+    expect(updates(stubA).map((c) => [c.channel, c.ts])).toEqual([[A_DEST, aEntry!.messageTs]])
+    expect(updates(stubB)).toEqual([])
+    expect(slackCalls(stubB)).toBe(1) // B's one prompt, as posted
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+
+    // Nothing left to drop: no second line.
+    expect(forgetPersonaPrompts(KEY_B)).toBe(0)
+    expect(droppedLines(s.logCalls)).toHaveLength(1)
+    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'tracked-prompt drop')
+  })
+
+  test('drops B\'s not-posted record, logging no drop line: the next tick logs B\'s not-posted line again, and A\'s record is kept', async () => {
+    const s = makeNotUpScenario()
+    s.open.set(INSTANCE_A, [requestA()])
+    s.open.set(INSTANCE_B, [requestB()])
+    clients.setUnavailable(KEY_A)
+    clients.setUnavailable(KEY_B)
+    const notPosted = (p: Persona) => logLines(s.logCalls, `no Slack client for ${renderPersonaRef(p.name, p.key)}`)
+    await s.drive(2)
+    expect(notPosted(A)).toHaveLength(1)
+    expect(notPosted(B)).toHaveLength(1)
+
+    expect(forgetPersonaPrompts(KEY_B)).toBe(0)
+    await s.drive(1)
+
+    expect(notPosted(B)).toHaveLength(2)
+    expect(notPosted(A)).toHaveLength(1)
+    expect(droppedLines(s.logCalls)).toEqual([])
+    expect(slackCalls(stubA, stubB, stubD)).toBe(0)
+  })
+
+  test('drops B\'s stuck-prompt count: B needs K fresh empty ticks to warn, while A\'s count, reached before the drop, trips on schedule', async () => {
+    const s = makeNotUpScenario()
+    await s.drive(K - 1)
+    expect(wedgeWarnings()).toHaveLength(0)
+
+    forgetPersonaPrompts(KEY_B)
+    await s.drive(1)
+    expect(wedgeWarnings().map((c) => c.channel)).toEqual([A_DEST])
+
+    await s.drive(K - 2)
+    expect(posts(stubB)).toHaveLength(0)
+    await s.drive(1)
+    expect(posts(stubB).map((c) => c.channel)).toEqual([B_DEST])
+    expect(wedgeWarnings()).toHaveLength(2)
+  })
+
+  test('drops B\'s not-up skip episode: once B leaves the applied set no "no longer applied" line is logged for it, and A\'s episode is kept', async () => {
+    const s = makeNotUpScenario()
+    s.down(KEY_A)
+    s.down(KEY_B)
+    await s.drive(2)
+    expect(skipStarts(s.logCalls, A)).toHaveLength(1)
+    expect(skipStarts(s.logCalls, B)).toHaveLength(1)
+
+    forgetPersonaPrompts(KEY_B)
+    unapply(KEY_B)
+    await s.drive(2)
+
+    expect(logLines(s.logCalls, `persona=${KEY_B} is no longer applied`)).toEqual([])
+    expect(skipStarts(s.logCalls, A)).toHaveLength(1)
+    s.up(KEY_A)
+    await s.drive(1)
+    expect(skipEnds(s.logCalls, A)).toHaveLength(1)
+  })
+
+  test('a leftover row still labelled for B, with open requests, after B was dropped and left the applied set: no get, post or tracked prompt for B, while A\'s prompts post and close as before', async () => {
+    const s = makeNotUpScenario()
+    s.open.set(INSTANCE_A, [requestA()])
+    s.open.set(INSTANCE_B, [requestB()])
+    await s.ivl.tick()
+    expect(posts(stubB)).toHaveLength(1)
+    const bGets = s.getCalls.filter((id) => id === INSTANCE_B).length
+
+    expect(forgetPersonaPrompts(KEY_B)).toBe(1)
+    unapply(KEY_B)
+    // B's row is still listed (its kill failed), with its old request and a new one.
+    s.open.set(INSTANCE_B, [requestB(), cannedPermissionRequest({ request_token: TOKEN_C, request_id: 3 })])
+    s.open.set(INSTANCE_A, [requestA(), cannedPermissionRequest({ request_token: TOKEN_C, request_id: 4 })])
+    await s.drive(2)
+
+    expect(s.getCalls.filter((id) => id === INSTANCE_B)).toHaveLength(bGets)
+    expect(slackCalls(stubB)).toBe(1)
+    expect(getLivePermission(INSTANCE_B, TOKEN_B)).toBeUndefined()
+    expect(getLivePermission(INSTANCE_B, TOKEN_C)).toBeUndefined()
+    expect(logLines(s.logCalls, `${INSTANCE_B} names no applied persona (persona=${KEY_B})`)).toHaveLength(2)
+    expect(rowDecisions(s.trail, 'post_attempted').map((e) => [e['claude_instance_id'], e['request_token']])).toEqual([
+      [INSTANCE_A, TOKEN_A],
+      [INSTANCE_B, TOKEN_B],
+      [INSTANCE_A, TOKEN_C],
+    ])
+
+    // A: the new request posted, and its first closes with one update.
+    expect(posts(stubA).map((c) => c.channel)).toEqual([A_DEST, A_DEST])
+    expect(getLivePermission(INSTANCE_A, TOKEN_C)).toMatchObject({ personaKey: KEY_A, channelId: A_DEST })
+    const aFirstTs = getLivePermission(INSTANCE_A, TOKEN_A)!.messageTs
+    s.open.set(INSTANCE_A, [cannedPermissionRequest({ request_token: TOKEN_C, request_id: 4 })])
+    await s.ivl.tick()
+    expect(s.getPermissionCalls).toEqual([TOKEN_A])
+    expect(updates(stubA).map((c) => [c.channel, c.ts])).toEqual([[A_DEST, aFirstTs]])
+    expect(slackCalls(stubB, stubD)).toBe(1)
+    assertNoLeak({ logCalls: s.logCalls, trail: s.trail.events }, 'leftover row')
   })
 })

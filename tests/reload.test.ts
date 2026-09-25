@@ -2369,42 +2369,59 @@ function applyNotRemoved(): ReloadRunActivity['removes'][number] {
 
 /**
  * `activity` with its lifecycle records left out: a confirmed change's
- * teardowns and bring-ups are bound by later work, so these cases neither
- * assert them nor their absence for a changed persona.
+ * teardowns and bring-ups are pinned in `tests/reload-apply.test.ts`, so
+ * these cases neither assert them nor their absence for a changed persona.
  */
 function outsideLifecycle(activity: ReloadRunActivity): ReloadRunActivity {
   return { ...activity, lifecycle: [] }
 }
 
+/**
+ * What one step's inputs name, by class: the keys of each class the step
+ * binds to (b.av2 SR-8.6), or the config-directories flag for the template
+ * refresh.
+ */
+type SlotActedOn = boolean | string[] | Record<string, string[]>
+
 /** One call of a recording apply-step slot: its step, what it acted on, and what step 1 had done by then. */
 interface SlotCall {
   step: ApplyStepName
-  keys: string[] | boolean
+  keys: SlotActedOn
   recordIsCandidate: boolean
   applied: string[] | undefined
 }
 
+/** The keys of `personas`, in order. */
+function keysIn(personas: readonly { key: string }[]): string[] {
+  return personas.map((p) => p.key)
+}
+
 /**
- * Apply-step slots that record each call, in order, with the keys their step
- * acts on (the config-directories flag for the template refresh), whether
- * the record already held `candidate()` and the applied keys at that moment.
+ * Apply-step slots that record each call, in order, with the keys of each
+ * class their step acts on (step 2: `removed` and `destructiveOld`; step 3:
+ * `inPlace`; step 4: `credentials` and `credentialsBroken`; step 5: the
+ * config-directories flag; step 6: `added` and `destructiveNew`), whether the
+ * record already held `candidate()` and the applied keys at that moment.
  * `failing` names a step whose body rejects after recording.
  */
 function recordingSlots(run: () => ReloadRun, candidate: () => Buffer | undefined, failing?: ApplyStepName) {
   const calls: SlotCall[] = []
   const events: string[] = []
-  const actedOn = (inputs: ApplyStepInputs, step: ApplyStepName): string[] | boolean => {
+  const actedOn = (inputs: ApplyStepInputs, step: ApplyStepName): SlotActedOn => {
     switch (step) {
       case 'teardowns':
-        return inputs.teardowns.map((p) => p.key)
+        return { removed: keysIn(inputs.removed), destructiveOld: keysIn(inputs.destructiveOld) }
       case 'in-place-updates':
-        return inputs.inPlaceUpdates.map((u) => u.persona.key)
+        return keysIn(inputs.inPlace.map((u) => u.persona))
       case 'credentials-reconnects':
-        return inputs.credentialsReconnects.map((c) => c.persona.key)
+        return {
+          credentials: keysIn(inputs.credentials.map((c) => c.persona)),
+          credentialsBroken: keysIn(inputs.credentialsBroken.map((c) => c.persona)),
+        }
       case 'template-refresh':
         return inputs.configDirsChanged
       case 'bring-ups':
-        return inputs.bringUps.map((p) => p.key)
+        return { added: keysIn(inputs.added), destructiveNew: keysIn(inputs.destructiveNew) }
     }
   }
   const slot = (step: ApplyStepName) => async (inputs: ApplyStepInputs) => {
@@ -3037,17 +3054,61 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     await run.ticks.tick()
 
     const after = { recordIsCandidate: true, applied: keysOf('alpha', 'charlie') }
+    // Each class lands only in its own input: the removal is no destructive
+    // old half, the addition no destructive new half, and alpha's rotation
+    // (alpha is up) is a reconnect, not a credentials-broken bring-up.
     expect(slots.calls).toEqual([
-      { step: 'teardowns', keys: [h.key('bravo')], ...after },
+      { step: 'teardowns', keys: { removed: [h.key('bravo')], destructiveOld: [] }, ...after },
       { step: 'in-place-updates', keys: [h.key('alpha')], ...after },
-      { step: 'credentials-reconnects', keys: [h.key('alpha')], ...after },
+      { step: 'credentials-reconnects', keys: { credentials: [h.key('alpha')], credentialsBroken: [] }, ...after },
       { step: 'template-refresh', keys: true, ...after },
-      { step: 'bring-ups', keys: [h.key('charlie')], ...after },
+      { step: 'bring-ups', keys: { added: [h.key('charlie')], destructiveNew: [] }, ...after },
     ])
     expect(slots.events).toEqual(APPLY_STEPS.flatMap((step) => [`start ${step}`, `end ${step}`]))
     expect(run.logsOf('reload')).toEqual([expect.stringMatching(/^\[slack\] reload: apply step 3 \(in-place-updates\) failed: /)])
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ added: 1, removed: 1, inPlace: 1, credentials: 1 })])
     expect(run.logs.at(-1)).toBe(appliedLogged({ added: 1, removed: 1, inPlace: 1, credentials: 1 }))
+    expectNoPostNoLeak(run)
+  })
+
+  test('the step inputs are split by class: a destructive modify is only its two halves (old and new declaration), and a rotation of a persona broken by its credentials only credentialsBroken', async () => {
+    let run!: ReloadRun
+    let seen: ApplyStepInputs | undefined
+    const slots = recordingSlots(() => run, () => h.readConfig())
+    const started = await running(['alpha', 'bravo'], {
+      slack: { bravo: SLACK_AUTH_REJECTED },
+      applySteps: {
+        ...slots.slots,
+        teardowns: async (inputs) => {
+          seen = inputs
+          await slots.slots.teardowns!(inputs)
+        },
+      },
+    })
+    run = started.run
+    const [alpha, bravo] = started.personas
+    expect(run.lifecycle.outcome(h.key('bravo'))).toBe('broken')
+    // alpha moves to a new working directory (destructive); bravo's file is rotated.
+    const moved = { ...alpha!, working_directory: join(h.root, 'alpha-moved') }
+    h.makeWorkingDirectory(moved)
+    h.writeCredentials(bravo!)
+    h.writeConfig(configOf(moved, bravo!))
+    await run.ticks.tick()
+
+    h.confirm()
+    await run.ticks.tick()
+
+    expect(slots.calls.map((c) => [c.step, c.keys])).toEqual([
+      ['teardowns', { removed: [], destructiveOld: [h.key('alpha')] }],
+      ['in-place-updates', []],
+      ['credentials-reconnects', { credentials: [], credentialsBroken: [h.key('bravo')] }],
+      ['bring-ups', { added: [], destructiveNew: [h.key('alpha')] }],
+    ])
+    // The old half is the previous declaration, the new half the applied one.
+    expect(seen!.destructiveOld[0]).toBe(seen!.previous.personas[0]!)
+    expect(seen!.destructiveNew[0]).toBe(seen!.applied.personas[0]!)
+    expect(seen!.destructiveNew[0]!.working_directory).not.toBe(seen!.destructiveOld[0]!.working_directory)
+    expect(seen!.credentialsBroken[0]!.change.credentialsBroken).toBe(true)
     expectNoPostNoLeak(run)
   })
 
@@ -3077,7 +3138,12 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     })
     // Every step this removal runs (no config directory changed, so no template refresh), after step 1.
     expect(slots.calls.map((c) => c.step)).toEqual(['teardowns', 'in-place-updates', 'credentials-reconnects', 'bring-ups'])
-    expect(slots.calls[0]).toEqual({ step: 'teardowns', keys: [h.key('bravo')], recordIsCandidate: true, applied: keysOf('alpha') })
+    expect(slots.calls[0]).toEqual({
+      step: 'teardowns',
+      keys: { removed: [h.key('bravo')], destructiveOld: [] },
+      recordIsCandidate: true,
+      applied: keysOf('alpha'),
+    })
     expect(h.readRecord()).toEqual(started.configBytes)
     expect(run.appliedKeys()).toEqual(keysOf('alpha'))
     expect(run.appliedConfigs).toHaveLength(1)

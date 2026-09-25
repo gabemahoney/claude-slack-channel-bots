@@ -151,6 +151,61 @@ export function insideMain(code: string, offset: number): boolean {
   return offset > start && offset < end
 }
 
+/**
+ * Whether a statement starting at `offset` sits in main()'s own statement
+ * list in `code`: inside main(), inside no nested block, call, array or
+ * literal, and not the brace-less body of an `if`, `else`, `while` or `for`
+ * (so it runs on every pass through main(), not behind a branch).
+ */
+export function atMainTopLevel(code: string, offset: number): boolean {
+  const [start, end] = mainBody(code)
+  if (offset <= start || offset >= end) return false
+  let depth = 0
+  let last = -1 // offset of the last code (non-space, non-literal) character before `offset`
+  for (let i = start; i < offset; i++) {
+    const past = skipLiteral(code, i)
+    if (past !== i) {
+      if (past > offset) return false // `offset` lies inside a literal
+      last = past - 1
+      i = past - 1
+      continue
+    }
+    const ch = code[i]!
+    if (ch in OPENERS) depth++
+    else if (CLOSERS.has(ch)) depth--
+    if (!/\s/.test(ch)) last = i
+  }
+  if (depth !== 0) return false
+  const before = code.slice(start, last + 1)
+  if (/\belse$/.test(before)) return false
+  if (code[last] !== ')') return true
+  // The statement follows a `)`: refuse it when that closes a branch or loop header.
+  for (const header of indicesOf(/\b(?:if|while|for)\s*\(/g, code.slice(0, last))) {
+    if (header < start) continue
+    if (balancedAfter(code, header, '(', ')')[1] === last) return false
+  }
+  return true
+}
+
+/**
+ * The module `name` is imported from in `code` (a named import, `name` or
+ * `x as name`, type-only imports excluded), or undefined when no import
+ * binds it. Throws when more than one import binds it.
+ */
+export function importSource(code: string, name: string): string | undefined {
+  const sources: string[] = []
+  for (const m of code.matchAll(/\bimport\s+(type\s+)?\{([^}]*)\}\s*from\s*(['"])([^'"]+)\3/g)) {
+    if (m[1]) continue
+    for (const spec of splitTopLevel(m[2]!)) {
+      if (/^type\s/.test(spec)) continue
+      const bound = spec.match(/^(?:[\w$]+\s+as\s+)?([\w$]+)$/)
+      if (bound?.[1] === name) sources.push(m[4]!)
+    }
+  }
+  if (sources.length > 1) throw new Error(`source-audit: ${name} is imported ${sources.length} times`)
+  return sources[0]
+}
+
 /** The only match of the global regex `re` in `code`; throws naming `what` unless there is exactly one. */
 function onlyMatch(code: string, re: RegExp, what: string): RegExpMatchArray {
   const matches = [...code.matchAll(re)]

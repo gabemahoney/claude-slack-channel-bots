@@ -83,6 +83,8 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
 8. **An edit of `config.json` had no effect, `config.json.pending` exists, or
    `server.log` has `reload-preview` or `reload-invalid` lines?** The edit is
    pending, not applied. See [Pending changes](#pending-changes).
+9. **A persona was just added or removed by a confirmed change?** See
+   [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change).
 
 ---
 
@@ -174,12 +176,18 @@ running, is kept but not served. Healthy personas are unaffected.
 
 ## Persona diagnostic classes
 
+**Personas added at runtime.** When a confirmed change adds a persona, the
+running server brings it up exactly as a start does, so every class below is
+logged for it the same way, with the same fix. Personas that were already
+running are not affected. See
+[A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change).
+
 ### `persona-start`
 
 - **Line:** `[slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting`
 - **Meaning:** One line per configured persona each time the server starts,
-  before any other line about that persona's bring-up. It's the name-to-key
-  map for that start.
+  and one for each persona a confirmed change adds, before any other line
+  about that persona's bring-up. It's the name-to-key map.
 - **Fix:** None. If a persona has no `persona-start` line in the latest start,
   it isn't in the configuration the server applied at that start, or the
   server didn't start at all (see [Configuration rejections](#configuration-rejections)
@@ -198,6 +206,8 @@ running, is kept but not served. Healthy personas are unaffected.
   Or correct the persona's `credentials_file` in `config.json` and apply the
   edit (see [Applying a `config.json` edit](#applying-a-configjson-edit)); a
   plain restart doesn't apply it.
+- **Added at runtime:** the same line, with the same fix, when a confirmed
+  change adds this persona. Other personas are not affected.
 
 ### `persona-credentials-unreadable`
 
@@ -212,6 +222,8 @@ running, is kept but not served. Healthy personas are unaffected.
 - **Fix:** Make the path a regular file readable by the user the server runs
   as (the file should be mode 0600, owned by that user). Then restart the
   server.
+- **Added at runtime:** the same line, with the same fix, when a confirmed
+  change adds this persona. Other personas are not affected.
 
 ### `persona-credentials-invalid`
 
@@ -252,6 +264,8 @@ running, is kept but not served. Healthy personas are unaffected.
   [Applying a `config.json` edit](#applying-a-configjson-edit)). Use
   [Checking a credentials file's shape](#checking-a-credentials-files-shape) to
   confirm the fix without showing a token.
+- **Added at runtime:** the same line, with the same fix, when a confirmed
+  change adds this persona. Other personas are not affected.
 
 ### `persona-credentials-refused`
 
@@ -270,6 +284,8 @@ running, is kept but not served. Healthy personas are unaffected.
   or its token revoked); for `app_token`, an app-level token with the
   `connections:write` scope, with Socket Mode turned on. Then restart the
   server.
+- **Added at runtime:** the same line, with the same fix, when a confirmed
+  change adds this persona. Other personas are not affected.
 - A refusal on a persona that was already running is covered under
   [A token was revoked while the persona was running](#a-token-was-revoked-while-the-persona-was-running).
 
@@ -297,6 +313,8 @@ running, is kept but not served. Healthy personas are unaffected.
   with a refusal instead, the persona becomes `persona-credentials-refused`.
 - **Fix:** None needed. If it never clears, check the host's network, DNS and
   proxy settings, and Slack's status page.
+- **Added at runtime:** the same line, with the same fix, when a confirmed
+  change adds this persona. Other personas are not affected.
 
 ### `persona-connection-lost`
 
@@ -345,6 +363,9 @@ running, is kept but not served. Healthy personas are unaffected.
   Or correct `working_directory` in `config.json` and apply the edit (see
   [Applying a `config.json` edit](#applying-a-configjson-edit)); a plain
   restart doesn't apply it.
+- **Added at runtime:** the same line when a confirmed change adds this
+  persona; it comes up on its own once the directory is usable. Other
+  personas are not affected.
 - If the persona also has a credentials cause, the cleared line ends
   `the persona stays broken until its credentials are fixed and the server is restarted`
   instead. See [Both causes at once](#both-causes-at-once).
@@ -368,6 +389,9 @@ running, is kept but not served. Healthy personas are unaffected.
   symlink, or by changing `working_directory` in `config.json` and applying the
   edit, see [Applying a `config.json` edit](#applying-a-configjson-edit)). A
   fixed path comes up on the next re-check, within 300 s.
+- **Added at runtime:** the same line when a confirmed change adds this
+  persona; it comes up on its own once the directory is usable. Other
+  personas are not affected.
 
 ### `unclaimed-channel`
 
@@ -538,7 +562,7 @@ it's down the server doesn't serve that instance:
 | `/interject` | HTTP 503 `{"error":"Persona is not up", …}`, logged as `[slack] /interject: refused for persona "<name>" (key=<key>) — the persona is not up; nothing delivered` |
 | Scheduled prompts | `no-session` in the cron log; the prompt is dropped, never queued |
 | Health check and restart don't relaunch it | `[slack] persona=<key>: not relaunched — its Slack connection is <state>; eligible again once it is up` (`<state>` is `not brought up`, `connecting`, `retrying its bring-up`, `broken` or `stopped`), or `… not relaunched — its bring-up has not succeeded; eligible again once it is up` |
-| A restart is asked for | `[slack] Not scheduling restart for persona=<key> — the persona is not up (…)`, or, when the persona stopped being up while a restart was pending, `[slack] Skipping restart for persona=<key> — the persona is no longer up; its instance is left as it is`. Neither counts toward the restart cap. |
+| A restart is asked for | `[slack] Not scheduling restart for persona=<key> — the relaunch gate refused it (the persona is not up, or is no longer in the applied configuration)`, or, when the persona stopped being up while a restart was pending, `[slack] Skipping restart for persona=<key> — the persona is no longer up; its instance is left as it is`. Neither counts toward the restart cap. |
 | Server notices for it are held | Posted once it's up. At most 20 are held; past that the oldest is dropped with `[slack] persona-notifier: more than 20 notices held for "<name>" (key=<key>) — oldest held notice dropped, not posted: <first line>` |
 
 **Directory-broken rows at start.** When the working directory has no real
@@ -560,6 +584,70 @@ or, failing that, the health check: two consecutive ticks of
 settings. A few refused lines right after a start are
 normal. If a refused instance keeps reconnecting in a loop while its persona is
 down, report it as a bug, with the persona's lines.
+
+---
+
+## A persona was added or removed by a confirmed change
+
+A confirmed change applies additions and removals on the running server, with
+no restart. A rename is both: the old key is removed and the new key is added.
+Every line below is in `server.log` only. The only things posted to Slack
+are an added persona's storage warning and spawn-failure notice, both at its
+own destination (below); a removal posts nothing.
+
+**Added persona.** It is brought up as at a start: its `persona-start` line,
+then any class line under
+[Persona diagnostic classes](#persona-diagnostic-classes), each with its usual
+fix. A persona that can't come up (bad credentials, a missing directory)
+never affects the personas already running. If the server was already
+shutting down when the bring-up began, it logs only the `not brought up` line
+below. If shutdown began during a bring-up that succeeded, its
+`persona-start` line (and any class line) comes first, then `not brought up`
+instead of `up at apply`.
+
+| Line | Meaning |
+|---|---|
+| `[slack] persona "<name>" (key=<key>): up at apply — launching` | It came up and its instance is being launched. Normal. |
+| `[slack] persona "<name>" (key=<key>): launch at apply failed: <error>` | The launch threw. Look for a spawn-failure notice at the persona's destination and the persona's lines around it; if nothing explains it, report it as a bug. |
+| `[slack] persona "<name>" (key=<key>): storage check at apply failed: <error>` | An internal error in the storage check. The bring-up went on. Report it as a bug. |
+| `[slack] persona "<name>" (key=<key>): not brought up — the server is shutting down` | The server was stopping, so the persona wasn't brought up or launched. It comes up at the next start. |
+
+Its conversation storage is checked as at start: a storage root on
+`tmpfs`/`ramfs` is recorded in `startup-errors.log` as `jsonl-non-persistent`,
+and a warning goes to the persona's destination once its Slack client is
+validated.
+
+The server's next check for pending changes waits until every teardown and
+bring-up of the change has settled, which can take minutes: up to 5 when a
+pre-session dialog has to be approved, up to 10 when a leftover instance of
+the persona is still `working`. A teardown also waits for any restart already
+under way for its persona. Meanwhile `config.json.pending` isn't refreshed and
+no other confirmation is picked up. Stopping the server doesn't wait for it.
+
+**Removed persona.** It is torn down at once, with no graceful wind-down: its
+Slack connection is closed, its MCP session dropped, its reply-guard record
+deleted, and its instance `cscb_<key>` killed and its agent-director row
+deleted. Its conversation can't be resumed. Its permission prompts stay in
+Slack as posted; clicking one does nothing, because clicks arrive only on the
+persona's own Slack connection, which the removal closed. To bring the persona
+back, add it to `config.json` again and confirm; its old conversation isn't
+guaranteed to be resumed.
+
+| Line | Meaning |
+|---|---|
+| `[slack] persona teardown of "<name>" (key=<key>): starting`, later `…: complete` | The teardown ran. Normal. |
+| `[slack] persona teardown of "<name>" (key=<key>): complete, with <n> failed step(s)` | Some steps failed; each has its own line (below). |
+| `[slack] persona teardown of "<name>" (key=<key>): agent-director kill of cscb_<key> failed: <error>` (or `… delete of cscb_<key> failed: …`) | agent-director couldn't kill or delete the instance, often because it was unreachable. The row may still be there (see [Listing instances](#listing-instances)); the next server start removes it. |
+| `[slack] persona teardown of "<name>" (key=<key>): <step> failed: <error>`, any other step | An internal error. The other steps still ran. Report it as a bug. |
+| `[slack] dry-run: persona teardown of "<name>" (key=<key>): skipping the agent-director kill and delete of cscb_<key>` | Dry run: the instance and its row are left alone. |
+| `[slack] Cancelled restart timer for persona=<key>` | A restart that was pending for it was cancelled. |
+| `[slack] permission-poller: persona=<key>: dropped <n> tracked prompt(s); their Slack messages stay as posted` | Its open prompts are no longer tracked. Their messages stay in Slack, and clicking them does nothing. |
+| `[slack] persona-notifier: persona=<key>: dropped <n> held notice(s), not posted — the persona was torn down` | Notices that were waiting for its Slack client are dropped. |
+| `[slack] persona-destination-hold: hold cancelled — <n> held notice(s) for "<name>" (key=<key>) dropped, not posted` | Notices that were waiting for its failing destination are dropped. |
+
+**Either.** `[slack] reload: apply step <n> (<step>) failed for persona "<name>" (key=<key>): <error>`
+is an internal error in that persona's teardown or bring-up; the other
+personas were still handled. Report it as a bug, with the persona's lines.
 
 ---
 
@@ -721,7 +809,7 @@ and is `broken`.
 | `[slack] persona-destination-hold: more than 20 notices held for "<name>" (key=<key>) while its destination fails — oldest held notice dropped, not posted: <first line>` | The persona's destination has been failing for a while (see [`persona-destination-failed`](#persona-destination-failed)) and more than 20 notices are waiting. The oldest is dropped; the line shows its first line. Fix the destination. |
 | `[slack] persona-destination-hold: persona=<key> is no longer applied — <n> held notice(s) dropped, not posted` | The persona was removed from the configuration while notices waited for its failing destination. They are dropped. Nothing to do. |
 | `[slack] persona-destination-hold: shutting down — <n> held notice(s) for "<name>" (key=<key>) dropped, not posted` | The server stopped while the persona's destination was failing. Its held notices are lost; its still-open prompts are posted after the next start. Fix the destination (see [`persona-destination-failed`](#persona-destination-failed)). |
-| `[slack] persona-destination-hold: hold cancelled — <n> held notice(s) for "<name>" (key=<key>) dropped, not posted` | The persona's held notices were dropped without being posted. Nothing to do. |
+| `[slack] persona-destination-hold: hold cancelled — <n> held notice(s) for "<name>" (key=<key>) dropped, not posted` | The persona was removed by a confirmed change, and its held notices were dropped without being posted. Nothing to do. |
 | `[slack] persona-destination-hold: persona or client lookup threw for persona=<key>: … — held notices wait and retry with backoff` | An internal error while retrying the persona's held notices. They keep waiting and are retried with backoff. Report it as a bug, with the persona's lines around it. |
 | `[slack] Fatal: configuration error — …` | There was no last-applied record, and the server refused `config.json` and exited. See [Configuration rejections](#configuration-rejections). |
 | `[slack] Fatal: last-applied record error — …` | The server couldn't read or validate its last-applied record and exited. See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid). |
@@ -1034,6 +1122,17 @@ Within about 5 s the server deletes `config.json.pending` and logs
 
 ### Applying a `config.json` edit
 
+**Adding or removing personas needs no restart.** When the preview lists only
+`is added` and `is removed` lines (a rename is one of each), read it, then,
+with the operator's say-so, rename `config.json.pending` to
+`config.json.apply`. Within about 5 s the running server picks up the
+confirmation and starts tearing the removed personas down and bringing the
+added ones up. It logs [`reload-applied`](#reload-applied) only once all of
+them have settled, possibly minutes later; a persona that is `retrying` at
+that point isn't up yet (see
+[A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)).
+For any other change, use the restart below.
+
 A restart doesn't apply an edit of `config.json` while a record exists. With
 the operator's say-so, stop the server, delete the record, and start: a start
 without a record checks and applies `config.json` as it stands.
@@ -1044,12 +1143,13 @@ against the record (see [Pending changes](#pending-changes)). Read every line:
 the start applies every edit in `config.json`, not just the one you meant, and
 the preview lists them all. If it reads `INVALID`, the start would be refused:
 fix `config.json` first. The preview describes a confirmed apply; this start
-differs from it in one place:
+differs from it in these places:
 
 - A persona that was removed or renamed (a mistyped name counts: the name
-  sets the key) has its running instance killed by the start sweep. A
-  renamed persona comes up fresh under its new key, without its session
-  history. The preview shows these as `DESTRUCTIVE:` lines.
+  sets the key) has its running instance killed by the start sweep, as a
+  confirmed removal would. A renamed persona comes up fresh under its new
+  key, without its session history. The preview shows these as
+  `DESTRUCTIVE:` lines.
 - A persona whose `working_directory` changed has its running instance killed
   by the start sweep too, and comes up fresh in the new directory, without
   its session history. The preview shows a `DESTRUCTIVE:` line.
@@ -1304,11 +1404,13 @@ or a filesystem that doesn't support syncing a directory).
   effect at the next start, as its preview line says.
 - **What happens to personas now:** the apply switches the persona set the
   server runs at once. Message routing, the up check, the notifier and the
-  permission poller read that set at each use. The apply doesn't yet stop or
-  start any instance or Slack connection:
-  - a removed persona (or the old key of a renamed one) keeps its instance
-    running and its Slack connection open until the next start, but it is
-    out of service now:
+  permission poller read that set at each use. Then:
+  - a removed persona (or the old key of a renamed one) is torn down: its
+    Slack connection is closed, its instance killed and its agent-director
+    row deleted, so its conversation can't be resumed; its permission
+    prompts stay in Slack as posted, and clicking one does nothing (see
+    [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)).
+    In the moment before its teardown it is already out of service:
     - each event it receives is dropped, with
       `[slack] persona-routing: no applied persona with key=<key> — event not delivered to it`;
     - `/interject` for it returns 404 (`Persona not found in the applied config`);
@@ -1329,7 +1431,8 @@ or a filesystem that doesn't support syncing a directory).
     `claude_config_dir` change takes effect at its next relaunch (a restart
     after its session ends), which launches the new declaration; until then
     its instance runs as launched;
-  - an added persona isn't brought up until the next start;
+  - an added persona is brought up and launched, as at a start (its
+    `persona-start` line, then `up at apply — launching` or a class line);
   - a persona with changed credentials keeps its current connection, and the
     credentials change stays pending (see
     [Pending changes](#pending-changes)).
@@ -1457,6 +1560,8 @@ Read the row's state with the persona's server-log lines:
 | Live state | The persona is up, but no `Session connected` since the start | Waiting to re-register; the health check reconnects it within about 3–5 minutes with default settings. |
 | `ended`, `missing`, or no row | The persona is up | The instance is dead. Restart and the health check relaunch it; look for `Scheduling restart for persona=<key>` and `Relaunching session`. |
 | `ended`, `missing`, or no row | The persona is down | Nothing to serve; it's launched once the persona comes up. |
+| No row | `persona teardown of … complete` | The persona was removed by a confirmed change; its instance was destroyed. Expected. |
+| A row | `persona teardown of …: agent-director delete of cscb_<key> failed` | The teardown couldn't delete it. The next server start removes it. |
 
 `tmux has-session -t slack_bot_<key>` confirms whether the instance's tmux
 session exists.

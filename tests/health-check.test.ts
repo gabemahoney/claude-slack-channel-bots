@@ -14,6 +14,8 @@ import {
   startHealthCheck,
   _resetHealthCheckState,
   buildPersonaWorkList,
+  forgetDisconnectedStreak,
+  stopHealthCheck,
   type HealthCheckDeps,
 } from '../src/health-check.ts'
 import {
@@ -1024,6 +1026,63 @@ describe('persona-keyed work list and streaks (b.av2 SR-6.3)', () => {
     expect(deps.tickCount()).toBe(2)
     expect(deps.isSessionConnectedCalls).toEqual(['persona_a', 'persona_b', 'persona_a', 'persona_b'])
     expect(deps.scheduleRestartCalls).toEqual([{ key: 'persona_a', cwd: personas.persona_a }])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// b.av2 SR-6.5 — a teardown forgets the persona's disconnected streak
+//
+// `forgetDisconnectedStreak(key)` drops one persona's streak at once, while it
+// may still be in the next tick's work list; the tick itself drops the streak
+// of a persona missing from its work list (case 12 above).
+// ---------------------------------------------------------------------------
+
+describe('forgetDisconnectedStreak — per-persona teardown (b.av2 SR-6.5)', () => {
+  /** Start the check and wait until `deps` has run `n` tick bodies (bounded by its `maxTicks`). */
+  async function runTicks(deps: ReturnType<typeof makeDeps>, n: number): Promise<void> {
+    initHealthCheck(deps)
+    startHealthCheck(FAST_INTERVAL_S)
+    for (let waited = 0; deps.tickCount() < n && waited < 500; waited++) await Bun.sleep(1)
+    await Bun.sleep(20)  // let the last tick body settle; later ticks stop at maxTicks
+    stopHealthCheck()
+    expect(deps.tickCount()).toBe(n)
+  }
+
+  test('B\'s streak is dropped at once and silently, A\'s is kept; B then leaves the work list (not probed) and is re-added with a fresh streak', async () => {
+    const full = workList('persona_a', 'persona_b')
+    const onlyA = { persona_a: full.persona_a }
+    const disconnected = { isSessionAliveResult: true, isSessionConnectedResult: false }
+
+    // One tick: both alive-but-disconnected, so each has a streak of 1.
+    const before = makeDeps({ ...disconnected, personas: full, maxTicks: 1 })
+    await runTicks(before, 1)
+    expect(before.scheduleRestartCalls).toEqual([])
+
+    const lines: string[] = []
+    const savedError = console.error
+    console.error = (...args: unknown[]) => void lines.push(args.map(String).join(' '))
+    try { forgetDisconnectedStreak('persona_b') } finally { console.error = savedError }
+    expect(lines).toEqual([])
+
+    //   tick1 [A, B]: A streak 2 → scheduled; B forgotten → fresh streak 1, not scheduled
+    //   tick2 [A]:    B torn down, out of the work list → not stat'd or probed
+    //   tick3 [A, B]: B re-added → checked again, fresh streak 1, not scheduled
+    //   tick4 [A, B]: B streak 2 → scheduled
+    const after = makeDeps({ ...disconnected, personasSequence: [full, onlyA, full, full], maxTicks: 4 })
+    await runTicks(after, 4)
+
+    const [A, B] = ['persona_a', 'persona_b']
+    expect(after.isSessionAliveCalls).toEqual([A, B, A, A, B, A, B])
+    expect(after.statRouteCalls).toEqual([full[A], full[B], full[A], full[A], full[B], full[A], full[B]])
+    expect(after.scheduleRestartCalls).toEqual([
+      { key: A, cwd: full[A] },
+      { key: A, cwd: full[A] },
+      { key: B, cwd: full[B] },
+    ])
+    // Each fire's own connectedness observation: A on its 1st (tick 1, its kept
+    // streak) and 3rd (tick 3); B on its 3rd (tick 4), two fresh observations
+    // after the forget and the re-add.
+    expect(after.scheduleRestartAtConnectedCount).toEqual([1, 3, 3])
   })
 })
 

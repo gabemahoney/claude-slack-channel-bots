@@ -1185,10 +1185,51 @@ function buildSpawnParams(persona: Persona, config: PersonaConfig): SpawnParams 
   }
 }
 
+/**
+ * Kill persona `key`'s instance (`cscb_<key>`) through `withOutageDetection`,
+ * quietly: logs nothing, records no startup error and raises no notice of its
+ * own (the wrapper still raises or clears the key's outage flags). Resolves
+ * true when the row was there, false when it was already gone
+ * (`ErrSpawnNotFound` counts as success); rethrows every other error for the
+ * caller to report. For the persona teardown (b.av2 SR-6.5).
+ */
+export async function killPersonaInstance(key: string): Promise<boolean> {
+  try {
+    await withOutageDetection(key, undefined, (client) => client.kill({ claude_instance_id: personaInstanceId(key) }))
+    return true
+  } catch (err) {
+    if (err instanceof ErrSpawnNotFound) return false
+    throw err
+  }
+}
+
+/** Delete persona `key`'s row (`cscb_<key>`) through `withOutageDetection`; rethrows every error. */
+function deleteInstanceRow(key: string): Promise<unknown> {
+  return withOutageDetection(key, undefined, (client) => client.delete({ claude_instance_id: [personaInstanceId(key)] }))
+}
+
+/**
+ * Delete persona `key`'s agent-director row (`cscb_<key>`) through
+ * `withOutageDetection`, quietly, as `killPersonaInstance` kills it: true when
+ * the row was there, false when it was already gone (`ErrSpawnNotFound`);
+ * every other error is rethrown. Unlike the collision ladder's delete, a
+ * failure records no startup error and raises no spawn-failure notice. For
+ * the persona teardown (b.av2 SR-6.5).
+ */
+export async function deletePersonaInstance(key: string): Promise<boolean> {
+  try {
+    await deleteInstanceRow(key)
+    return true
+  } catch (err) {
+    if (err instanceof ErrSpawnNotFound) return false
+    throw err
+  }
+}
+
 /** Best-effort kill — never throws. */
 async function tryKill(key: string): Promise<void> {
   try {
-    await withOutageDetection(key, undefined, (client) => client.kill({ claude_instance_id: personaInstanceId(key) }))
+    await killPersonaInstance(key)
   } catch {
     /* ignore */
   }
@@ -1273,7 +1314,7 @@ async function tryDelete(
   ref: string,
 ): Promise<boolean> {
   try {
-    await withOutageDetection(key, undefined, (client) => client.delete({ claude_instance_id: [personaInstanceId(key)] }))
+    await deleteInstanceRow(key)
     return true
   } catch (err) {
     if (err instanceof ErrSystemInstallDisappeared || err instanceof ErrTmuxNotAvailable) {
@@ -1985,6 +2026,23 @@ export function _resetInFlightLaunches(): void {
  */
 export function isLaunchInFlight(key: string): boolean {
   return inFlightLaunches.has(key)
+}
+
+/**
+ * Resolves once the launch in flight for persona `key` (if any) has settled,
+ * whatever its outcome; at once when none is. Never rejects and starts
+ * nothing. For a teardown (b.av2 SR-6.6), which must not kill or delete the
+ * row while a launch is still bringing it up; launches that run outside the
+ * lifecycle serializer (the start pass) are covered too.
+ */
+export async function whenLaunchSettled(key: string): Promise<void> {
+  const inFlight = inFlightLaunches.get(key)
+  if (inFlight === undefined) return
+  try {
+    await inFlight
+  } catch {
+    /* the launch's own caller handles its outcome */
+  }
 }
 
 /**

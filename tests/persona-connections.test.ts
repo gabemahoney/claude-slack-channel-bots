@@ -38,7 +38,21 @@
  * `checkPersonaCredentialsAndDigest` (checkPersonaCredentials's results
  * unchanged), and the controller's `credentialsDigest(key)` for an up,
  * retrying, credentials-broken, collision-broken (nothing held), dry-run,
- * unknown and cancelled persona. Time is a fake clock throughout;
+ * unknown and cancelled persona. E12 Task 2 adds SR-6.6 for the controller:
+ * every fixture wires the real per-persona serializer as server.ts does, and
+ * a directory re-check (through the launch it triggers) and a launch after a
+ * Slack retry wait behind a blocked lifecycle operation for their persona,
+ * never another persona's, and check cancelled, applied and already launched
+ * when they start. SR-6.1 / SR-6.5 at a confirmed apply: a persona outside
+ * the start set brought up against the applied set ends up, broken or
+ * retrying with the start pass's classes and lines while the running
+ * personas get no Slack call, takes its tokens from its file (never the
+ * environment) and holds the digest read then; the teardown's `cancel` then
+ * `stop` leave no retry attempt (a re-check queued behind the teardown
+ * included), close the socket with no reopen and no lost or restored line,
+ * and forget its state, digest and identity; `cancelAll` covers a persona
+ * added after the start; a `start()` settling after `stop` is no connection.
+ * Time is a fake clock throughout;
  * nothing sleeps (the start-pass cases poll in 1 ms real-time steps only for
  * the real spawn path).
  *
@@ -187,6 +201,7 @@ import {
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import type { PersonaSpec } from './test-helpers/persona-config.ts'
 import { resolveRealPath, type Persona } from '../src/config.ts'
+import { createPersonaSerializer, type PersonaSerializer } from '../src/persona-serializer.ts'
 import {
   createNotUpSessionDropper,
   createPersonaBringUpController,
@@ -2443,6 +2458,7 @@ describe('connection manager: reopen rules (SR-3.3)', () => {
     arrange(h)
     await h.clock.flush()
     const starts = startsOf(h, h.a)
+    const linesBefore = h.lines.length
 
     await h.manager.stop(h.a.key)
     await h.manager.stop(h.a.key)
@@ -2454,6 +2470,10 @@ describe('connection manager: reopen rules (SR-3.3)', () => {
     expect(liveSocketsOf(h, h.a)).toBe(0)
     expect(h.manager.status(h.a.key)).toBeUndefined()
     expect(h.manager.webClient(h.a.key)).toBeUndefined()
+    // A teardown's close (b.av2 SR-6.5): the identity is dropped and nothing is
+    // logged, so no persona-connection-lost, -restored or unreachable line.
+    expect(h.manager.identity(h.a.key)).toBeUndefined()
+    expect(h.lines.slice(linesBefore)).toEqual([])
     expect(statesOf(h, h.a).at(-1)).toBe('stopped')
     expect(h.manager.status(h.b.key)).toMatchObject({ state: 'up' })
     await expectDelivers(h, h.b)
@@ -2634,16 +2654,23 @@ describe('connection manager: reopen rules (SR-3.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Late settlement of an abandoned start() (SR-3.1, SR-3.3)
+// Late settlement of a stopped or abandoned start() (SR-3.1, SR-3.3, b.av2 SR-6.5)
 // ---------------------------------------------------------------------------
 
-describe('connection manager: late settlement of an abandoned start()', () => {
-  test.each<['bring-up' | 'reopen', string, SettledConnectOutcome]>([
-    ['bring-up', 'resolves', { kind: 'ok' }],
-    ['bring-up', 'rejects', { kind: 'network' }],
-    ['reopen', 'resolves', { kind: 'ok' }],
-    ['reopen', 'rejects', { kind: 'network' }],
-  ])('an abandoned %s start() that %s after the 10 s bound does not mark A up, forwards nothing and adds no attempt; B keeps delivering', async (phase, _settles, late) => {
+describe('connection manager: late settlement of a stopped or abandoned start()', () => {
+  // Rows: what ends A's in-flight start() (the manager's own stop, as a teardown's; or the 10 s
+  // bound), which start() it is, and how it settles afterwards. A stopped start() belongs to no
+  // connection: nothing follows. An abandoned one leaves A retrying on the backoff.
+  test.each<['stop' | 'abandonment', 'bring-up' | 'reopen', string, SettledConnectOutcome]>([
+    ['stop', 'bring-up', 'resolves', { kind: 'ok' }],
+    ['stop', 'bring-up', 'rejects', { kind: 'network' }],
+    ['stop', 'reopen', 'resolves', { kind: 'ok' }],
+    ['stop', 'reopen', 'rejects', { kind: 'network' }],
+    ['abandonment', 'bring-up', 'resolves', { kind: 'ok' }],
+    ['abandonment', 'bring-up', 'rejects', { kind: 'network' }],
+    ['abandonment', 'reopen', 'resolves', { kind: 'ok' }],
+    ['abandonment', 'reopen', 'rejects', { kind: 'network' }],
+  ])('after its %s, a %s start() for A that %s late is disconnected, forwards nothing, changes no status and adds no attempt; B keeps delivering', async (trigger, phase, _settles, late) => {
     const h = makeHarness()
     const a = stubOf(h, h.a)
     const deferred = makeDeferredConnect()
@@ -2658,18 +2685,27 @@ describe('connection manager: late settlement of an abandoned start()', () => {
       a.socket.drop()
     }
     await h.clock.flush()
-    const abandoned = a.socket
-    await h.clock.advance(10_000)
-    if (bringUpA !== undefined) await bringUpA
-    expect(abandoned.disconnectCalls).toBe(1)
-    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'retrying', phase, outcome: { reason: 'timeout' } })
-    await expectDelivers(h, h.b)
-    const starts = startsOf(h, h.a)
+    const inFlight = a.socket
+    expect(inFlight.startCalls).toBe(1)
+
+    if (trigger === 'stop') {
+      await h.manager.stop(h.a.key)
+      if (bringUpA !== undefined) expect(await bringUpA).toEqual({ state: 'stopped' })
+    } else {
+      await h.clock.advance(10_000)
+      if (bringUpA !== undefined) await bringUpA
+      expect(inFlight.disconnectCalls).toBe(1)
+      expect(h.manager.status(h.a.key)).toMatchObject({ state: 'retrying', phase, outcome: { reason: 'timeout' } })
+      await expectDelivers(h, h.b)
+    }
+    const disconnects = inFlight.disconnectCalls
     const reported = h.statuses.length
+    const linesBefore = h.lines.length
+    const starts = startsOf(h, h.a)
     // Should the late socket open, deliver on it while it is connected: nothing may reach the handler.
-    const lateText = 'from the abandoned socket'
+    const lateText = 'from A\'s late socket'
     const lateDeliveries: Promise<void>[] = []
-    abandoned.on('connected', () => void lateDeliveries.push(abandoned.deliver(makeChannelMessage({ text: lateText }))))
+    inFlight.on('connected', () => void lateDeliveries.push(inFlight.deliver(makeChannelMessage({ text: lateText }))))
 
     deferred.settle(late)
     await h.clock.flush()
@@ -2677,20 +2713,32 @@ describe('connection manager: late settlement of an abandoned start()', () => {
 
     expect(lateDeliveries).toHaveLength(late.kind === 'ok' ? 1 : 0)
     expect(h.events.filter(e => e.payload.event?.text === lateText)).toEqual([])
-    expect(abandoned.disconnectCalls).toBe(late.kind === 'ok' ? 2 : 1)
+    expect(inFlight.disconnectCalls).toBe(late.kind === 'ok' ? disconnects + 1 : disconnects)
     expect(liveSocketsOf(h, h.a)).toBe(0)
     expect(h.statuses).toHaveLength(reported)
+    expect(h.lines.slice(linesBefore)).toEqual([])
     expect(startsOf(h, h.a)).toBe(starts)
-    expect(pendingDelays(h)).toEqual([5_000])
     await expectDelivers(h, h.b)
 
-    await h.clock.advance(5_000)
-    expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
-    expect(liveSocketsOf(h, h.a)).toBe(1)
-    await expectDelivers(h, h.a)
-    const recovered = startsOf(h, h.a)
-    await h.clock.advance(HOUR_MS)
-    expect(startsOf(h, h.a)).toBe(recovered)
+    if (trigger === 'stop') {
+      expect(h.manager.status(h.a.key)).toBeUndefined()
+      expect(h.manager.identity(h.a.key)).toBeUndefined()
+      expect(h.manager.webClient(h.a.key)).toBeUndefined()
+      expect(h.clock.pendingCount()).toBe(0)
+      await h.clock.advance(HOUR_MS)
+      expect(startsOf(h, h.a)).toBe(starts)
+      expect(h.lines.slice(linesBefore)).toEqual([])
+    } else {
+      // The backoff's next attempt is still the only one, and it brings A up.
+      expect(pendingDelays(h)).toEqual([5_000])
+      await h.clock.advance(5_000)
+      expect(h.manager.status(h.a.key)).toMatchObject({ state: 'up' })
+      expect(liveSocketsOf(h, h.a)).toBe(1)
+      await expectDelivers(h, h.a)
+      const recovered = startsOf(h, h.a)
+      await h.clock.advance(HOUR_MS)
+      expect(startsOf(h, h.a)).toBe(recovered)
+    }
   })
 })
 
@@ -3210,6 +3258,8 @@ interface BringUpFixture {
   personas: readonly Persona[]
   controller: PersonaBringUpController
   notifier: PersonaNotifier
+  /** The per-persona lifecycle serializer the controller's retries run through (its `serialize`, as server.ts wires it). */
+  serializer: PersonaSerializer
   /** Keys the controller launched after a retry, in order. */
   launches: string[]
   /** Events the manager forwarded: the receiving key and the message text. */
@@ -3273,6 +3323,7 @@ function makeBringUpFixture(opts: BringUpFixtureOptions = {}): BringUpFixture {
   const directoryStats: [string, number][] = []
   const fsOverride: Partial<PersonaBringUpFs> = {}
   const notifierLines: string[] = []
+  const serializer = createPersonaSerializer()
   const notifier = createPersonaNotifier({
     getPersona: key => h.getPersona(key),
     clientFor: key => h.clientFor(key),
@@ -3292,6 +3343,7 @@ function makeBringUpFixture(opts: BringUpFixtureOptions = {}): BringUpFixture {
     dryRun,
     log: line => void h.lines.push(line),
     appliedPersonas: () => applied,
+    serialize: serializer.run,
     fs: {
       openFile: path => {
         credentialOpens.push(path)
@@ -3324,6 +3376,7 @@ function makeBringUpFixture(opts: BringUpFixtureOptions = {}): BringUpFixture {
     personas: h.personas,
     controller,
     notifier,
+    serializer,
     launches,
     events,
     credentialOpens,
@@ -4631,6 +4684,155 @@ describe('bring-up outcomes (E5)', () => {
   })
 
   // -------------------------------------------------------------------------
+  // Serialized retries (b.av2 SR-6.6). Each retry attempt, through to the
+  // launch it triggers, runs through the persona's lifecycle serializer: it
+  // waits behind an operation already running for its persona (a restart's
+  // work, an apply's teardown), never behind another persona's, and decides
+  // whether it is still wanted when it starts, not when it was submitted.
+  // The test holds the persona's turn with an operation of its own.
+  // -------------------------------------------------------------------------
+
+  describe('bring-up retries are serialized per persona (SR-6.6)', () => {
+    /** Occupy the persona's turn until `release()`; `settled` resolves once the blocking operation has. */
+    function blockPersona(f: BringUpFixture, persona: Persona): { release: () => void; settled: Promise<void> } {
+      const gate = Promise.withResolvers<void>()
+      return { release: () => gate.resolve(), settled: f.serializer.run(persona.key, () => gate.promise) }
+    }
+
+    /** Whether the serializer is idle for the persona, after pending continuations ran. */
+    async function idleFor(f: BringUpFixture, persona: Persona): Promise<boolean> {
+      let idle = false
+      void f.serializer.whenIdle(persona.key).then(() => { idle = true })
+      await f.h.clock.flush()
+      return idle
+    }
+
+    const statsOf = (f: BringUpFixture, persona: Persona) =>
+      f.directoryStats.filter(([path]) => path === persona.working_directory).map(([, at]) => at)
+
+    test('a directory re-check for A that falls due while an operation for A runs waits for it: nothing is stat\'ed, connected or launched until it settles; B\'s re-check is not held up', async () => {
+      const f = makeBringUpFixture()
+      const [a, b] = f.personas as [Persona, Persona]
+      for (const persona of [a, b]) breakDirectory(persona.working_directory, 'missing')
+      await bringUpEach(f)
+      for (const persona of [a, b]) repairDirectory(persona.working_directory)
+      const blocker = blockPersona(f, a)
+
+      await f.h.clock.advance(5_000)
+
+      expect([statsOf(f, a), statsOf(f, b)]).toEqual([[0], [0, 5_000]])
+      expect(f.h.slack.buildsOf(a.key)).toEqual([])
+      expect(f.controller.state(a.key)?.outcome).toBe('retrying')
+      expect(f.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
+      expect(f.launches).toEqual([b.key])
+      await expectServes(f, b)
+
+      blocker.release()
+      await blocker.settled
+      await f.h.clock.flush()
+
+      expect(statsOf(f, a)).toEqual([0, 5_000])
+      expect(f.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+      expect(f.launches).toEqual([b.key, a.key])
+      expect(f.h.clock.pendingCount()).toBe(0)
+      await expectServes(f, a)
+      assertNoLeak(f.captured())
+    })
+
+    test('a directory re-check holds A\'s turn through the launch it triggers: an operation for A submitted meanwhile starts only once that launch settled', async () => {
+      const launchGate = Promise.withResolvers<void>()
+      const f = makeBringUpFixture({ launch: persona => (persona.name === OUTCOME_A ? launchGate.promise : Promise.resolve()) })
+      const [a, b] = f.personas as [Persona, Persona]
+      breakDirectory(a.working_directory, 'missing')
+      await bringUpEach(f)
+      repairDirectory(a.working_directory)
+
+      await f.h.clock.advance(5_000)
+      expect(f.launches).toEqual([a.key])
+      const order: string[] = []
+      const next = f.serializer.run(a.key, () => void order.push('next operation for A'))
+      await f.h.clock.flush()
+      expect(order).toEqual([])
+      expect(await idleFor(f, a)).toBe(false)
+      expect(await idleFor(f, b)).toBe(true)
+
+      launchGate.resolve()
+      await next
+
+      expect(order).toEqual(['next operation for A'])
+      expect(await idleFor(f, a)).toBe(true)
+      assertNoLeak(f.captured())
+    })
+
+    test('a launch after A\'s Slack retry waits behind an operation for A and runs once it settles; B\'s launch after its own Slack retry is not held up', async () => {
+      const f = makeBringUpFixture({
+        slack: { [OUTCOME_A]: { authTest: [{ kind: 'network' }] }, [OUTCOME_B]: { authTest: [{ kind: 'network' }] } },
+      })
+      const [a, b] = f.personas as [Persona, Persona]
+      await bringUpEach(f)
+      const blocker = blockPersona(f, a)
+
+      await f.h.clock.advance(5_000)
+
+      for (const persona of [a, b]) expect(f.h.manager.status(persona.key)).toMatchObject({ state: 'up' })
+      expect(f.launches).toEqual([b.key])
+      expect(linesOf(f, a).filter(line => line.includes('up after its bring-up retry'))).toEqual([])
+
+      blocker.release()
+      await blocker.settled
+      await f.h.clock.flush()
+
+      expect(f.launches).toEqual([b.key, a.key])
+      expect(linesOf(f, a).filter(line => line.includes('up after its bring-up retry (Slack) — launching'))).toHaveLength(1)
+      await f.h.clock.advance(HOUR_MS)
+      expect(f.launches).toEqual([b.key, a.key])
+      await expectServes(f, a)
+      await expectServes(f, b)
+      assertNoLeak(f.captured())
+    })
+
+    // Rows: what changes while A's launch after its Slack retry is queued behind the operation
+    // for A; A's launches once it ran; its retry lines. The launch checks when it starts, so
+    // nothing, or only the first launch, happens.
+    test.each<[string, (f: BringUpFixture, a: Persona, b: Persona) => void, number, string[]]>([
+      ['A is cancelled (its teardown began)', (f, a) => f.controller.cancel(a.key), 0, []],
+      ['A leaves the applied set (a confirmed apply\'s step 1)', (f, _a, b) => f.setApplied([b]), 0, [
+        'up after its bring-up retry (Slack) but no longer applied — not launching',
+      ]],
+      ['a second launch for A is queued (the manager\'s retrying-then-up report replayed)', (f, a) => {
+        const reports = f.h.statuses.filter(([key]) => key === a.key).map(([, status]) => status)
+        const retrying = reports.find(status => status.state === 'retrying')!
+        const up = reports.filter(status => status.state === 'up').at(-1)!
+        f.controller.onConnectionStatus(a.key, retrying)
+        f.controller.onConnectionStatus(a.key, up)
+      }, 1, ['up after its bring-up retry (Slack) — launching']],
+    ])('a queued launch after A\'s Slack retry re-checks when it starts: %s while it waits', async (_label, meanwhile, launched, retryLines) => {
+      const f = makeBringUpFixture({ slack: { [OUTCOME_A]: { authTest: [{ kind: 'network' }] } } })
+      const [a, b] = f.personas as [Persona, Persona]
+      await bringUpEach(f)
+      const blocker = blockPersona(f, a)
+      await f.h.clock.advance(5_000)
+      expect(f.h.manager.status(a.key)).toMatchObject({ state: 'up' })
+      expect(f.launches).toEqual([])
+
+      meanwhile(f, a, b)
+      blocker.release()
+      await blocker.settled
+      await f.h.clock.flush()
+      expect(await idleFor(f, a)).toBe(true)
+
+      expect(f.launches).toEqual(Array<string>(launched).fill(a.key))
+      expect(linesOf(f, a).filter(line => line.includes('after its bring-up retry'))).toEqual(
+        retryLines.map(line => `[slack] persona ${renderPersonaRef(a.name, a.key)}: ${line}`),
+      )
+      await f.h.clock.advance(HOUR_MS)
+      expect(f.launches).toEqual(Array<string>(launched).fill(a.key))
+      await expectServes(f, b)
+      assertNoLeak(f.captured())
+    })
+  })
+
+  // -------------------------------------------------------------------------
   // Cancellation (shutdown now, teardown in E12)
   // -------------------------------------------------------------------------
 
@@ -4703,6 +4905,121 @@ describe('bring-up outcomes (E5)', () => {
       expect(f.controller.isUp(a.key)).toBe(false)
       await f.h.clock.advance(HOUR_MS)
       expect(f.launches).toEqual([])
+      await expectServes(f, b)
+      assertNoLeak(f.captured())
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // A confirmed apply (b.av2 SR-6.1, SR-6.5): the controller and manager legs
+  // the lifecycle calls, driven directly. The production apply and teardown
+  // (their steps, order and AC 19, AC 57, AC 64 cases) are tested in
+  // tests/persona-lifecycle.test.ts and tests/reload-apply.test.ts.
+  // -------------------------------------------------------------------------
+
+  describe('a confirmed apply: an added persona\'s bring-up, and a teardown\'s cancel and stop of a queued re-check (SR-6.1, SR-6.5)', () => {
+    /** A, B and C, with only A and B applied and brought up at the start; C is added later. */
+    async function startWithoutC(): Promise<{ f: BringUpFixture; a: Persona; b: Persona; c: Persona }> {
+      const f = makeBringUpFixture({ names: [OUTCOME_A, OUTCOME_B, OUTCOME_C] })
+      const [a, b, c] = f.personas as [Persona, Persona, Persona]
+      f.setApplied([a, b])
+      for (const persona of [a, b]) await f.controller.bringUp(persona, [a, b])
+      return { f, a, b, c }
+    }
+
+    /** Apply step 1 then step 6 for C: `added` (C's declaration) joins the applied set and is brought up against it. */
+    function addC(f: BringUpFixture, a: Persona, b: Persona, added: Persona): Promise<PersonaBringUpResultSummary> {
+      f.setApplied([a, b, added])
+      return f.controller.bringUp(added, [a, b, added])
+    }
+
+    /** A persona's Slack activity: every Web API call, every client built, every socket start(). */
+    function slackActivityOf(f: BringUpFixture, persona: Persona): { calls: number; builds: number; starts: number } {
+      const stub = f.h.stub(persona)
+      return {
+        calls: stub.callLog.length,
+        builds: f.h.slack.buildsOf(persona.key).length,
+        starts: stub.sockets.reduce((sum, socket) => sum + socket.startCalls, 0),
+      }
+    }
+
+    const statsOf = (f: BringUpFixture, persona: Persona) =>
+      f.directoryStats.filter(([path]) => path === persona.working_directory).map(([, at]) => at)
+
+    // Rows: C's outcome, and its arrangement (returning the declaration the apply adds). The other
+    // causes are the start pass's (the E5 start table) and the apply's (tests/reload-apply.test.ts).
+    test.each<[string, 'up' | 'retrying', (c: Persona, a: Persona) => Persona, PersonaDiagnosticClass[]]>([
+      ['healthy', 'up', c => c, []],
+      ['working directory that of the running A (a real-path collision with the applied set)', 'retrying', (c, a) => ({ ...c, working_directory: a.working_directory }), [PERSONA_DIRECTORY_UNUSABLE]],
+    ])('bring-up at apply of a persona outside the start set, %s: it ends %s with the start pass\'s classes and lines, and the running personas get no Slack call', async (_label, outcome, arrange, classes) => {
+      const { f, a, b, c } = await startWithoutC()
+      const added = arrange(c, a)
+      const running = [a, b].map(persona => slackActivityOf(f, persona))
+      const linesBefore = f.h.lines.length
+
+      const summary = await addC(f, a, b, added)
+
+      expect(summary.outcome).toBe(outcome)
+      expect(summary.failures.map(failure => failure.class)).toEqual(classes)
+      expect(f.controller.state(c.key)?.outcome).toBe(outcome)
+      // Its persona-start line first, then one line per cause; nothing for anyone else.
+      const logged = f.h.lines.slice(linesBefore)
+      expect(logged.filter(line => !line.includes(renderPersonaRef(c.name, c.key)))).toEqual([])
+      expect(logged.map(classOf)).toEqual([PERSONA_START, ...classes])
+      expect(logged[0]).toContain(`personas[${c.index}]`)
+      // The controller launches only after a retry; the first launch is the lifecycle's.
+      expect(f.launches).toEqual([])
+
+      await f.h.clock.advance(HOUR_MS)
+
+      // A collision persists while A runs there: C keeps retrying and is never launched.
+      expect(f.controller.state(c.key)?.outcome).toBe(outcome)
+      expect(f.launches).toEqual([])
+      if (outcome === 'up') await expectServes(f, c)
+      expect([a, b].map(persona => slackActivityOf(f, persona))).toEqual(running)
+      for (const persona of [a, b]) expect(f.h.manager.status(persona.key)).toMatchObject({ state: 'up' })
+      await expectServes(f, a)
+      await expectServes(f, b)
+      assertNoLeak(f.captured({ summary }))
+    })
+
+    test('a persona added at apply whose directory re-check falls due while a teardown holds its turn: the re-check waits, and the teardown\'s cancel and stop leave it no attempt; nothing is launched for it, A\'s own re-check still fires and B serves', async () => {
+      const { f, a, b, c } = await startWithoutC()
+      // A was brought up at the start; break it again and restart it the same way C comes up.
+      f.controller.cancel(a.key)
+      await f.h.manager.stop(a.key)
+      for (const persona of [a, c]) breakDirectory(persona.working_directory, 'missing')
+      expect((await f.controller.bringUp(a, [a, b])).outcome).toBe('retrying')
+      expect((await addC(f, a, b, c)).outcome).toBe('retrying')
+      for (const persona of [a, c]) repairDirectory(persona.working_directory)
+      const cActivity = slackActivityOf(f, c)
+      const cStats = statsOf(f, c)
+
+      // The teardown holds C's turn when C's re-check falls due, so the re-check waits behind it.
+      const turn = Promise.withResolvers<void>()
+      const teardown = f.serializer.run(c.key, async () => {
+        await turn.promise
+        f.controller.cancel(c.key)
+        await f.h.manager.stop(c.key)
+      })
+      await f.h.clock.advance(5_000)
+      expect(statsOf(f, c)).toEqual(cStats)
+      turn.resolve()
+      await teardown
+      await f.h.clock.flush()
+
+      expect(statsOf(f, c)).toEqual(cStats)
+      expect(slackActivityOf(f, c)).toEqual(cActivity)
+      expect(f.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+      expect(f.launches).toEqual([a.key])
+      expect(f.controller.state(c.key)).toBeUndefined()
+      expect(f.h.manager.status(c.key)).toBeUndefined()
+      await f.h.clock.advance(HOUR_MS)
+      expect(statsOf(f, c)).toEqual(cStats)
+      expect(slackActivityOf(f, c)).toEqual(cActivity)
+      expect(f.launches).toEqual([a.key])
+      expect(f.h.clock.pendingCount()).toBe(0)
+      await expectServes(f, a)
       await expectServes(f, b)
       assertNoLeak(f.captured())
     })

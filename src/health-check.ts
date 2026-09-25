@@ -111,6 +111,7 @@ let skippedTicks = 0
  *   - when a reconnect is scheduled for it (consumed on fire, below),
  *   - when a tick skips it: pending/active restart, at cap, or left out of the
  *     tick's work list by the relaunch gate,
+ *   - by `forgetDisconnectedStreak` when the persona is torn down,
  *   - and wholesale by `_resetHealthCheckState` (the test-reset seam and the
  *     production stop path both call it).
  */
@@ -261,6 +262,15 @@ export function startHealthCheck(intervalSeconds: number): void {
 // ---------------------------------------------------------------------------
 // stopHealthCheck
 // ---------------------------------------------------------------------------
+
+/**
+ * Forget persona `key`'s disconnected streak (b.av2 SR-6.5, a teardown). A
+ * persona gone from the work list loses it at the next tick anyway; this
+ * drops it at once. Other personas' streaks are untouched; logs nothing.
+ */
+export function forgetDisconnectedStreak(key: string): void {
+  disconnectedStreak.delete(key)
+}
 
 export function stopHealthCheck(): void {
   if (intervalId !== null) {

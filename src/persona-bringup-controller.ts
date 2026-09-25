@@ -100,7 +100,11 @@
  * Isolation (SR-3.3, SR-6.6): each persona's state, timer and in-flight flag
  * live in its own entry; nothing spans two personas, and a directory retry is
  * scheduled only once the previous one has finished, so attempts never
- * overlap.
+ * overlap. Each retry attempt, through to the launch it triggers, runs
+ * through the injected per-persona lifecycle serializer (`serialize`), so it
+ * never overlaps a restart's work or an apply's teardown for the persona,
+ * and its checks (cancelled, applied, already launched) see the state when
+ * it starts.
  *
  * Pure module (b.av2 SR-13.1): nothing is created, read or scheduled at
  * import or at `createPersonaBringUpController`. The clock, logger, checks,
@@ -128,6 +132,7 @@ import {
 } from './persona-diagnostics.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { createPersonaRetrySchedule, type PersonaRetrySchedule } from './persona-retry-schedule.ts'
+import type { PersonaSerialize } from './persona-serializer.ts'
 import {
   checkPersonaLocalSteps,
   connectPersonaSlack,
@@ -192,6 +197,16 @@ export interface PersonaBringUpControllerDeps
    * uses the set the persona was brought up with.
    */
   appliedPersonas?: () => readonly Persona[]
+  /**
+   * The per-persona lifecycle serializer's `run` (b.av2 SR-6.6,
+   * `persona-serializer.ts`). Each retry attempt runs through it, through to
+   * the launch it triggers: a directory re-check (with its Slack step and
+   * launch) and the launch after a Slack retry reached `up`. Its checks (the
+   * persona is cancelled, no longer applied, already launched) run when the
+   * attempt starts. Not the first bring-up (`bringUp`). Without it the work
+   * runs at once. Production passes the server's one shared serializer.
+   */
+  serialize?: PersonaSerialize
 }
 
 /** The controller handle. */
@@ -299,6 +314,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
   const clock = deps.clock ?? SYSTEM_PERSONA_CONNECTION_CLOCK
   const checkDirectory = deps.checkDirectory ?? checkPersonaWorkingDirectory
   const entries = new Map<string, BringUpEntry>()
+  const serialize: PersonaSerialize = deps.serialize ?? (async (_key, operation) => operation())
 
   function log(line: string): void {
     try {
@@ -427,10 +443,13 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
 
   /**
    * Launch after a retry, at most once per persona, with its current applied
-   * declaration; nothing for a persona no longer applied. A throw is logged,
-   * never posted.
+   * declaration; nothing for a persona no longer applied. Resolves once the
+   * launch settled; a throw is logged, never posted. Runs inside the
+   * persona's serialized retry attempt: the caller already holds the
+   * persona's turn, so this never submits to the serializer itself (see the
+   * re-entrancy rule in `persona-serializer.ts`).
    */
-  function launchAfterRetry(entry: BringUpEntry, via: 'directory' | 'Slack'): void {
+  async function launchAfterRetry(entry: BringUpEntry, via: 'directory' | 'Slack'): Promise<void> {
     if (entry.cancelled || entry.retryLaunched) return
     const persona = appliedPersona(entry.persona.key, entry.persona)
     if (persona === undefined) {
@@ -439,13 +458,11 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     }
     entry.retryLaunched = true
     log(`[slack] persona ${ref(entry)}: up after its bring-up retry (${via}) — launching`)
-    void (async () => {
-      try {
-        await deps.launch(persona)
-      } catch (err) {
-        log(`[slack] persona ${ref(entry)}: launch after its bring-up retry failed: ${describeThrownValue(err)}`)
-      }
-    })()
+    try {
+      await deps.launch(persona)
+    } catch (err) {
+      log(`[slack] persona ${ref(entry)}: launch after its bring-up retry failed: ${describeThrownValue(err)}`)
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -460,7 +477,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     timer.handle = clock.setTimeout(() => {
       if (entry.directoryTimer !== timer) return
       entry.directoryTimer = undefined
-      recheckDirectory(entry).catch((err) =>
+      serialize(entry.persona.key, () => recheckDirectory(entry)).catch((err) =>
         log(`[slack] persona ${ref(entry)}: working-directory retry failed: ${describeThrownValue(err)}`),
       )
     }, entry.directorySchedule.nextDelayMs())
@@ -509,8 +526,9 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     await connectSlack(entry)
     if (entry.cancelled) return
     // The same mapping as the outcome: `lost` or `retrying` a reopen right
-    // after the manager reported up still counts as up.
-    if (outcomeOf(entry) === 'up') launchAfterRetry(entry, 'directory')
+    // after the manager reported up still counts as up. The launch is part
+    // of this attempt: awaited here, inside the persona's serialized turn.
+    if (outcomeOf(entry) === 'up') await launchAfterRetry(entry, 'directory')
   }
 
   // -------------------------------------------------------------------------
@@ -571,8 +589,12 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
     if (entry === undefined) return
     const previous = entry.lastStatus
     entry.lastStatus = status
-    if (status.state === 'up' && previous?.state === 'retrying' && previous.phase === 'bring-up') {
-      launchAfterRetry(entry, 'Slack')
+    if (status.state === 'up' && previous?.state === 'retrying' && previous.phase === 'bring-up' && !entry.retryLaunched) {
+      // The launch waits its turn behind any lifecycle operation for the
+      // persona; whether it is still wanted is decided when it starts.
+      serialize(key, () => launchAfterRetry(entry, 'Slack')).catch((err) =>
+        log(`[slack] persona ${ref(entry)}: launch after its bring-up retry failed: ${describeThrownValue(err)}`),
+      )
     }
     observeOutcome(entry)
   }

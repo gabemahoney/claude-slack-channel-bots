@@ -163,6 +163,14 @@ export interface PersonaRouting {
    * run has settled. Never rejects.
    */
   receive(event: unknown, ack: SlackAck, personaKeys: string | readonly string[]): Promise<void>
+  /**
+   * Drop the persona's inbound dedupe store (b.av2 SR-6.5, a teardown), so a
+   * persona added later with the same key starts with an empty one. Another
+   * event received for the key creates a new store, so the teardown stops the
+   * persona's connection first. Other personas' stores are untouched; logs
+   * nothing. A no-op for an unknown key.
+   */
+  forget(key: string): void
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +424,12 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     }
   }
 
-  return { receive }
+  return {
+    receive,
+    forget: (key) => {
+      dedupeStores.delete(key)
+    },
+  }
 }
 
 // ---------------------------------------------------------------------------
