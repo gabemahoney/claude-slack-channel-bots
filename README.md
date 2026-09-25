@@ -51,7 +51,7 @@ See the sections below for manual configuration details if you prefer not to use
 - [Bun](https://bun.sh) `>= 1.0.21` (agent-director minimum)
 - [Claude Code](https://claude.ai/code) installed and authenticated
 - [`agent-director`](https://github.com/gabemahoney/agent-director) **installed system-wide** as a prerequisite — like `git` or `docker`. CSCB no longer vendors the AD binary. The npm `agent-director` package CSCB depends on is now a thin TypeScript shim that locates the system-installed binary at startup via `resolveSystemBinary()` / `Client.create()` and refuses to start when the binary is missing, too old, or unreachable. The startup gate enforces AD's required version (declared by AD in `dist/version-floor.json`) and reports the required version on mismatch. agent-director itself requires [tmux](https://github.com/tmux/tmux) on the operator's PATH; CSCB no longer probes for it directly.
-- Slack workspace admin access (to create and configure the Slack app)
+- Slack workspace admin access (to create and configure one Slack app per persona)
 - **cozempic** (optional) — Python 3.10+ and `pip install cozempic` — used by JSONL path resolution helpers retained for downstream callers.
 
 ### Supported platforms (inherited from agent-director)
@@ -165,11 +165,13 @@ export SLACK_DRY_RUN=1
 
 `config.json` is read from `~/.claude/channels/slack/config.json` by default. Override the directory with `SLACK_STATE_DIR`. The server needs only this file and the credentials files it names.
 
-Once the server has started, it runs a recorded copy of this file. An edit changes nothing until you apply it, and a server restart alone doesn't apply it. See [Reload](#reload).
-
 Each bot is a **persona**: one Slack app, one Claude instance with its own working directory, and the channels it is configured into. Create one Slack app per persona (see `slack-app-manifest.yml`); that app gives the persona its own name and avatar in Slack.
 
-Postinstall creates a skeleton with an empty persona list. An empty list is valid: the server starts with no personas.
+The top level holds a required `personas` array and the [server-wide settings](#server-wide-settings). Unknown keys are rejected at every level: the top level, each persona, its `dm` object and each channel entry. Only this persona format is accepted; a configuration written for an earlier major version must be rewritten by hand (see [Upgrading to personas](#upgrading-to-personas)).
+
+The first start of an install applies the file as it stands. After that, the server runs a recorded copy, and an edit changes nothing until you confirm it; a server restart alone doesn't apply it. See [Reload](#reload), and [What a confirmation applies](#what-a-confirmation-applies) for how each kind of change is applied.
+
+Postinstall creates a skeleton with an empty persona list. An empty list is valid: the server starts with no persona connected.
 
 ```json
 {
@@ -179,7 +181,13 @@ Postinstall creates a skeleton with an empty persona list. An empty list is vali
 
 #### Example
 
-Two personas share the channel `C0555555555`. `planner` receives every message in its home channel `C0123456789` and only its @mentions or `@here` / `@channel` in the shared channel. `reviewer` receives only its @mentions or `@here` / `@channel` in the shared channel.
+A complete `config.json` with three personas:
+
+- `planner` receives every message in its home channel `C0123456789` and in the shared channel `C0555555555`. Its permission prompts and notices go to its home channel. It takes no DMs.
+- `reviewer` receives only its @mentions and `@here` / `@channel` broadcasts in the shared channel. It takes DMs, and its prompts and notices go by DM to its contact `U0123456789`. It has its own Claude config directory and turns the [Slack Reply Guard](#slack-reply-guard-stop-hook) off for itself.
+- `helpdesk` is DM-only: it is in no channel and is reached only by DM. Its prompts and notices go by DM to its contact `U0987654321`.
+
+`planner` and `helpdesk` inherit the top-level `claude_config_dir`. The server-wide settings turn on an acknowledgement reaction and set how replies are split.
 
 ```json
 {
@@ -190,7 +198,7 @@ Two personas share the channel `C0555555555`. `planner` receives every message i
       "working_directory": "~/projects/alpha",
       "channels": [
         { "id": "C0123456789", "delivery": "all" },
-        { "id": "C0555555555", "delivery": "mentions" }
+        { "id": "C0555555555", "delivery": "all" }
       ],
       "permission_prompts": "C0123456789"
     },
@@ -201,77 +209,77 @@ Two personas share the channel `C0555555555`. `planner` receives every message i
       "channels": [
         { "id": "C0555555555", "delivery": "mentions" }
       ],
-      "permission_prompts": "C0555555555"
+      "dm": { "enabled": true, "contact": "U0123456789" },
+      "permission_prompts": "dm",
+      "claude_config_dir": "~/.claude-reviewer",
+      "stop_hook_bootstrap": false
+    },
+    {
+      "name": "helpdesk",
+      "credentials_file": "~/.config/cscb/helpdesk-credentials.json",
+      "working_directory": "~/projects/helpdesk",
+      "dm": { "enabled": true, "contact": "U0987654321" },
+      "permission_prompts": "dm"
     }
   ],
-  "port": 3100
+  "port": 3100,
+  "session_restart_delay": 60,
+  "claude_config_dir": "~/.claude-bots",
+  "ack_reaction": "eyes",
+  "reply_chunk_limit": 3000,
+  "reply_chunk_mode": "newline"
 }
 ```
+
+Replace the channel IDs, user IDs and paths with your own. Each persona's credentials file must exist with its tokens before that persona can come up (see [Credentials files](#credentials-files)).
 
 #### Persona fields
 
-| Field | Required | Description |
-|---|---|---|
-| `name` | yes | The persona's name, used in logs, `/interject` and the crontable. Each persona also has a **key**: the name itself when it is 1–40 characters of `a-z`, `0-9` and `_`, otherwise a derived form. Logs show both, as `"planner" (key=planner)`. Any non-empty name is accepted; there is no format rule. Logs, previews and Slack notices show the name JSON-quoted, with its key beside it. Inside a quoted error message (`message="…"`), token-like text is redacted, so a name that looks like a token is redacted there too. |
-| `credentials_file` | yes | Path to the persona's [credentials file](#credentials-files). Absolute, `~` or `~/…`. |
-| `working_directory` | yes | Working directory of the persona's Claude instance. Absolute, `~` or `~/…`. |
-| `channels` | yes, unless `dm.enabled` is `true` | The channels the persona is in. Each entry is `{ "id": "<channel ID>", "delivery": "all" \| "mentions" }`: `all` delivers every message in the channel, `mentions` only messages that @mention the persona or use `@here` / `@channel`. Invite the persona's Slack app to each channel. |
-| `permission_prompts` | yes | The persona's **destination**: where its permission prompts and server notices (including lost-message notices; see [Troubleshooting](#troubleshooting)) are posted. One of the persona's own channel IDs, or `"dm"` for a DM from the persona's app to its `dm.contact`. |
-| `claude_config_dir` | no | Claude config directory for this persona. Defaults to the top-level `claude_config_dir`. See [Per-persona `claude_config_dir` override](#per-persona-claude_config_dir-override). |
-| `stop_hook_bootstrap` | no | Slack Reply Guard switch for this persona. Defaults to the top-level `stop_hook_bootstrap`. See [Per-persona `stop_hook_bootstrap` override](#per-persona-stop_hook_bootstrap-override). |
-| `dm` | no | Direct-message settings: `{ "enabled": <boolean>, "contact": "<user ID>" }`. `enabled` defaults to `false`. `contact` is a Slack user ID such as `U0123456789` (starting with `U` or `W`), the person a `"dm"` destination addresses. See [Direct messages](#direct-messages-dmenabled). |
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string | yes | — | Any non-empty string; no format rule. See [Persona name and key](#persona-name-and-key). |
+| `credentials_file` | path | yes | — | Path to the persona's [credentials file](#credentials-files). |
+| `working_directory` | path | yes | — | Working directory of the persona's Claude instance. It must exist before the persona can come up. |
+| `channels` | array | yes, unless `dm.enabled` is `true` | none | The channels the persona is in: a list of [channel entries](#channel-entries). See [Channel delivery](#channel-delivery). |
+| `dm.enabled` | boolean | no | `false` | The persona's DMs switch. See [Direct messages](#direct-messages-dmenabled). |
+| `dm.contact` | string | when `permission_prompts` is `"dm"` | — | A Slack user ID such as `U0123456789`: the person a `"dm"` destination addresses. In Slack, open the person's profile, then **⋮** → **Copy member ID**. |
+| `permission_prompts` | string | yes | — | The persona's **destination**: where its permission prompts and server notices are posted. One of the persona's own channel IDs, or `"dm"`. See [Permission prompts](#permission-prompts). |
+| `claude_config_dir` | path | no | top-level `claude_config_dir` | Claude config directory for this persona. See [Next-launch settings](#next-launch-settings). |
+| `stop_hook_bootstrap` | boolean | no | top-level `stop_hook_bootstrap` | Slack Reply Guard switch for this persona. See [Next-launch settings](#next-launch-settings). |
 
-The rules that most often trip a first config:
+`dm` is an object holding `enabled` and `contact`: `"dm": { "enabled": true, "contact": "U0123456789" }`. A path is absolute, `~` or starts with `~/`. Paths are never redacted: a log line, preview or error that names a path shows it in full, with `~` expanded.
 
-- A persona needs at least one channel unless `dm.enabled` is `true`.
-- `permission_prompts` must be `"dm"` or one of the persona's own `channels` IDs.
-- A `"dm"` destination needs `dm.enabled: true` and a `dm.contact`.
-- No two personas may share a `working_directory` or a `credentials_file`, compared by real path. Names and keys must be unique too.
-- Channel IDs are Slack channel IDs such as `C0123456789`, not channel names.
-- Unknown fields are rejected, at the top level and inside each persona.
+#### Channel entries
 
-The server checks the whole file before applying it, and the error message names the persona (`personas[<i>]`) and the field. At a start with no last-applied record, an error stops the start. On a running server, an error shows as an `INVALID` pending change (see [Reload](#reload)).
+Each entry of `channels` is an object with two required fields:
 
-#### Direct messages (`dm.enabled`)
+| Field | Description |
+|---|---|
+| `id` | A Slack channel ID: `C` or `G` followed by capital letters and digits, such as `C0123456789`. Not a channel name. In Slack, click the channel name; the ID is at the bottom of the **About** tab. |
+| `delivery` | `"all"` or `"mentions"`. See [Channel delivery](#channel-delivery). |
 
-`dm.enabled` is each persona's DMs switch. It is off (`false`) by default.
+#### Persona name and key
 
-- **On:** anyone in the workspace can DM the persona's own Slack app, and that persona alone receives the DM and answers in it. The persona can also start a DM with a workspace user by passing the user's ID to `reply`, and posts there as itself.
-- **Off:** DMs to the persona's app are not delivered. The server logs one `persona-dm-dropped` line naming the persona and `dm.enabled`. The persona never opens, reads or posts in a DM.
-- **Group DMs** (DMs with more than one person) are never delivered to any persona, whatever `dm.enabled` says.
+The `name` identifies the persona in `config.json`, logs and targets. It isn't its Slack display name, which comes from the persona's Slack app. Any non-empty name is accepted.
 
-The config rules for DMs (a persona with no `channels`, a `"dm"` destination) are in the rules list above.
+Logs, previews and Slack notices show the name JSON-quoted, with its key beside it, as `"planner" (key=planner)`. Inside a quoted error message (`message="…"`), token-like text is redacted, so a name that looks like a token is redacted there too.
 
-A channel persona that also takes DMs:
+A name of 1–40 characters, all lower-case letters, digits and `_`, is its own key. Any other name gets a derived key:
 
-```json
-{
-  "name": "planner",
-  "credentials_file": "~/.config/cscb/planner-credentials.json",
-  "working_directory": "~/projects/alpha",
-  "channels": [
-    { "id": "C0123456789", "delivery": "all" }
-  ],
-  "permission_prompts": "C0123456789",
-  "dm": { "enabled": true }
-}
-```
+1. The name is lower-cased.
+2. Each run of characters other than `a-z`, `0-9` and `_` becomes one `_`.
+3. Leading and trailing `_` are trimmed, and the result is cut to 40 characters.
+4. `_` and an 8-character hash of the name are appended. A name with nothing left after step 3 gets the hash alone.
 
-A DM-only persona:
+`"Help Desk"`, for example, has the key `help_desk_95a3a6f5`. Each persona's `persona-start` line in `server.log` shows its key.
 
-```json
-{
-  "name": "helpdesk",
-  "credentials_file": "~/.config/cscb/helpdesk-credentials.json",
-  "working_directory": "~/projects/helpdesk",
-  "permission_prompts": "dm",
-  "dm": { "enabled": true, "contact": "U0123456789" }
-}
-```
+The key is used for:
 
-Starting a DM with a user (a `reply` to a user ID, or a persona whose `permission_prompts` is `"dm"`) needs the `im:write` bot scope, which the shipped `slack-app-manifest.yml` grants. A `"dm"` destination always opens its DM through Slack before it first posts there, even when the DM already exists. For an app created from an earlier manifest, a `"dm"` persona's prompts and notices are not posted, and a `reply` to a user ID fails with `missing_scope`, until the scope is added and the app is re-installed.
+- the persona's agent-director instance, `cscb_<key>`;
+- the `CSCB_PERSONA` environment variable of its Claude instance;
+- targets: [`/interject`](#interject) and the [crontable](#scheduled-prompts-cscb_cron) accept the persona's name or its key.
 
-Receiving DMs and replying in an existing DM (a `D…` ID) work without the scope. The `debug-slack-channel-bots` skill (see [Troubleshooting](#troubleshooting)) has the steps under "A persona can't open a DM".
+Renaming a persona changes its key, so the old persona is removed and a new one added (see [What a confirmation applies](#what-a-confirmation-applies)).
 
 #### Credentials files
 
@@ -284,13 +292,72 @@ Each persona's Slack tokens live in its own credentials file, and `config.json` 
 }
 ```
 
-`bot_token` is the app's bot token (`xoxb-…`), granted when you install the app to the workspace. `app_token` is an app-level token (`xapp-…`) with the `connections:write` scope, generated under Basic Information → App-Level Tokens.
+`bot_token` is the app's bot token (`xoxb-…`), shown under OAuth & Permissions once you install the app to the workspace. `app_token` is an app-level token (`xapp-…`) with the `connections:write` scope, generated under Basic Information → App-Level Tokens.
 
-Use one file per persona and keep it private (`chmod 600`). Never put a token in `config.json`, a ticket or a chat.
+- Tokens are read only from these files, never from `config.json` or the environment.
+- Two personas can't share a credentials file.
+- The server never writes or copies the file and doesn't check its mode. Keep it private: `chmod 600`.
+- The file's content is checked when the persona comes up, not when `config.json` is checked. A missing or malformed file keeps only that persona down (see [Troubleshooting](#troubleshooting)).
+- On a running server, a change to the file waits for confirmation like a `config.json` edit (see [Reload](#reload)).
+
+Never put a token in `config.json`, a ticket or a chat.
+
+#### Channel delivery
+
+Each channel entry's `delivery` sets which messages in that channel reach the persona:
+
+- **`all`**: every message in the channel.
+- **`mentions`**: only messages that @mention the persona directly, and `@here` / `@channel` broadcasts.
+
+Any number of personas may list the same channel, each with its own `delivery`. One persona can't list a channel twice. Invite the persona's Slack app to each of its channels. [How a persona receives messages](#how-a-persona-receives-messages) says how each message arrives and which `via` it carries.
+
+#### Direct messages (`dm.enabled`)
+
+`dm.enabled` is each persona's DMs switch. It is off (`false`) by default.
+
+- **On:** anyone in the workspace can DM the persona's own Slack app, and that persona alone receives the DM and answers in it. The persona can also start a DM with a workspace user by passing the user's ID to `reply`, and posts there as itself.
+- **Off:** DMs to the persona's app are not delivered. The server logs one `persona-dm-dropped` line naming the persona and `dm.enabled`. The persona never opens, reads or posts in a DM.
+- **Group DMs** (DMs with more than one person) are never delivered to any persona, whatever `dm.enabled` says.
+
+A persona with no `channels` must have `dm.enabled` set to `true`.
+
+`dm.contact` is the person who receives the persona's prompts and notices when `permission_prompts` is `"dm"`. It gates nothing else: it doesn't limit who can DM the persona.
+
+Starting a DM with a user (a `reply` to a user ID, or a persona whose `permission_prompts` is `"dm"`) needs the `im:write` bot scope, which the shipped `slack-app-manifest.yml` grants. A `"dm"` destination always opens its DM through Slack before it first posts there, even when the DM already exists. For an app created from an earlier manifest, a `"dm"` persona's prompts and notices are not posted, and a `reply` to a user ID fails with `missing_scope`, until the scope is added and the app is re-installed.
+
+Receiving DMs and replying in an existing DM (a `D…` ID) work without the scope. The `debug-slack-channel-bots` skill (see [Troubleshooting](#troubleshooting)) has the steps under "A persona can't open a DM".
+
+#### Permission prompts
+
+`permission_prompts` is required. It is the persona's destination: its permission prompts and its server notices, such as lost-message notices and restart-limit warnings, are posted there as the persona.
+
+- **A channel ID:** one of the persona's own `channels`. Everyone in that channel sees the prompts and notices.
+- **`"dm"`:** a DM from the persona's app to its `dm.contact`. It needs `dm.enabled: true` and a `dm.contact`.
+
+[Permission Relay](#permission-relay) covers how prompts are delivered and answered, and [Troubleshooting](#troubleshooting) what happens when Slack refuses a post to the destination.
+
+#### Next-launch settings
+
+`claude_config_dir` and `stop_hook_bootstrap` can be set on a persona or at the top level. A persona's own value wins; the top-level value is the default for every persona without one. Once a change is confirmed, it takes effect at the persona's next launch (see [When next-launch and server-wide changes take effect](#when-next-launch-and-server-wide-changes-take-effect)).
+
+**`claude_config_dir`** is the Claude config directory the persona's instance launches with (`CLAUDE_CONFIG_DIR`), so each persona can authenticate as a different Claude account. Populate each directory before the persona first launches:
+
+```sh
+CLAUDE_CONFIG_DIR=~/.claude-reviewer claude auth login --claudeai
+```
+
+Use `--console` instead of `--claudeai` for a Console account. When neither the persona nor the top level sets one, Claude's own default applies.
+
+- A directory that doesn't exist yet is fine when its parent exists.
+- A persona whose `claude_config_dir` can't be resolved to a real path (for example, a symlink on its path that points to nothing) is held: it closes or never opens its Slack connection and receives nothing, and `server.log` shows `persona-config-dir-unresolvable`. It reconnects once the directory resolves, with no restart.
+- A confirmed change to a persona's effective `claude_config_dir` makes it start fresh, without its prior conversation, at its next launch. The old transcript stays in the old directory.
+- The Slack Reply Guard never installs its hook in `~/.claude`, so a persona whose directory resolves there gets no reminder (see [Personal-dir refusal](#personal-dir-refusal)).
+
+**`stop_hook_bootstrap`** turns the [Slack Reply Guard](#slack-reply-guard-stop-hook) reminder on (`true`, the default) or off for the persona. It applies to that persona alone, even when it shares its `claude_config_dir` with other personas. A running bot keeps the value it was launched with until it is relaunched. See [Personas that answer without `reply`](#personas-that-answer-without-reply--opt-them-out) for when to turn it off.
 
 #### Server-wide settings
 
-These top-level fields apply to the whole server.
+These top-level fields apply to the whole server. A confirmed change to one takes effect at the next server start, with two exceptions. A change to `claude_config_dir` or `stop_hook_bootstrap` takes effect at each inheriting persona's next launch, and `stop_timeout` and `exit_timeout` are used only by the CLI, which takes them from the record at once. See [What a confirmation applies](#what-a-confirmation-applies).
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -309,73 +376,29 @@ These top-level fields apply to the whole server.
 | `resume_enabled` | boolean | `true` | When `true` (default), a bot whose session died — including after a host reboot or pod resume — comes back with its prior conversation history intact instead of starting fresh. When `false`, the session manager always performs a fresh launch instead of resuming, both on startup and on runtime auto-restart, even when a stored session exists. Set `false` as a workaround if your Claude Code version crashes with "sandbox required but unavailable" on resume (a known regression in v2.1.120). Requires a system-installed `agent-director` ≥ 0.8.0 for reboot recovery to actually restore history. |
 | `agent_director_poll_interval_ms` | number | `1000` | Poll interval (ms) for the agent-director permission relay tick. Must be a positive integer in `[200, 3_600_000]`. Replaces the pre-rename `claude_director_poll_interval_ms` — the old name is rejected at startup. |
 | `stop_hook_bootstrap` | boolean | `true` | Default for every persona: whether the persona gets the Slack Reply Guard reminder (see [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook)). The value applies per persona, from the persona's first launch after the change is applied (see [Reload](#reload)). A persona's own `stop_hook_bootstrap` overrides this value. Non-boolean values are rejected at startup. |
-| `cron_table_path` | string | `<config dir>/crontab` | Path to the crontable for the built-in cron scheduler (`cscb_cron`). Defaults to `crontab` in the directory of the loaded `config.json`. `~` is expanded like other path keys. The resolved path is exported into every managed session as `CSCB_CRONTABLE_PATH` so bots can find the crontable and self-schedule (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)). Must be a non-empty string when set. A change takes effect at the first server start after it is applied (see [Reload](#reload)). |
-| `cron_log_path` | string | `<config dir>/cron.log` | Path to the `cscb_cron` log file. Defaults to `cron.log` in the directory of the loaded `config.json`. `~` is expanded like other path keys. Must be a non-empty string when set. A change takes effect at the first server start after it is applied (see [Reload](#reload)). |
-| `cron_log_max_bytes` | number | — | Size cap in bytes for the cron log. Must be a positive integer when set. Cron-log pruning is disabled when absent. A change takes effect at the first server start after it is applied (see [Reload](#reload)). |
-| `ack_reaction` | string | — | Emoji name, without colons (for example `"eyes"`), of the acknowledgement reaction. When set, each persona a message is dispatched to adds the reaction under its own Slack identity once the message has reached its instance, not on receipt, so a message that reaches several personas carries one reaction per persona. A message that isn't dispatched gets no reaction: one lost because the persona's instance is down, or one the persona doesn't receive. Messages sent through `/interject` or cron aren't Slack messages and get none either. A persona's first `reply` in that conversation carrying the message's `message_id` removes that persona's reaction only; other personas' reactions stay until they reply. Absent means no acknowledgement. Must be non-empty when set. A change takes effect at the first server start after it is applied (see [Reload](#reload)). |
-| `reply_chunk_limit` | number | `4000` | Maximum characters per posted message: the `reply` tool splits longer text into several messages. Must be a positive integer. A change takes effect at the first server start after it is applied (see [Reload](#reload)). |
-| `reply_chunk_mode` | `"length"` \| `"newline"` | `"newline"` | How the `reply` tool splits text longer than `reply_chunk_limit`. `length`: hard split at the limit. `newline`: split at newline boundaries within the limit; a single line longer than the limit is posted whole. A change takes effect at the first server start after it is applied (see [Reload](#reload)). |
+| `cron_table_path` | string | `<config dir>/crontab` | Path to the crontable for the built-in cron scheduler (`cscb_cron`). Defaults to `crontab` in the directory of the loaded `config.json`. `~` is expanded like other path keys. The resolved path is exported into every managed session as `CSCB_CRONTABLE_PATH` so bots can find the crontable and self-schedule (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)). Must be a non-empty string when set. |
+| `cron_log_path` | string | `<config dir>/cron.log` | Path to the `cscb_cron` log file. Defaults to `cron.log` in the directory of the loaded `config.json`. `~` is expanded like other path keys. Must be a non-empty string when set. |
+| `cron_log_max_bytes` | number | — | Size cap in bytes for the cron log. Must be a positive integer when set. Cron-log pruning is disabled when absent. |
+| `ack_reaction` | string | — | Emoji name, without colons (for example `"eyes"`), of the acknowledgement reaction. When set, each persona a message is dispatched to adds the reaction under its own Slack identity once the message has reached its instance, not on receipt, so a message that reaches several personas carries one reaction per persona. A message that isn't dispatched gets no reaction: one lost because the persona's instance is down, or one the persona doesn't receive. Messages sent through `/interject` or cron aren't Slack messages and get none either. A persona's first `reply` in that conversation carrying the message's `message_id` removes that persona's reaction only; other personas' reactions stay until they reply. Absent means no acknowledgement. Must be non-empty when set. |
+| `reply_chunk_limit` | number | `4000` | Maximum characters per posted message: the `reply` tool splits longer text into several messages. Must be a positive integer. |
+| `reply_chunk_mode` | `"length"` \| `"newline"` | `"newline"` | How the `reply` tool splits text longer than `reply_chunk_limit`. `length`: hard split at the limit. `newline`: split at newline boundaries within the limit; a single line longer than the limit is posted whole. |
 
-#### Per-persona `claude_config_dir` override
+#### Load-time rules
 
-When you want different personas to authenticate as different Claude accounts (e.g. one runs as a personal Max account, another as a corporate account), set `claude_config_dir` on the individual persona. A persona's own value takes priority over the top-level `claude_config_dir`; personas without one fall back to the top-level value.
+Before it applies `config.json`, the server checks the whole file and reports the first rule it breaks:
 
-```json
-{
-  "personas": [
-    {
-      "name": "planner",
-      "credentials_file": "~/.config/cscb/planner-credentials.json",
-      "working_directory": "~/projects/alpha",
-      "channels": [{ "id": "C0123456789", "delivery": "all" }],
-      "permission_prompts": "C0123456789",
-      "claude_config_dir": "~/.claude-maxauth"
-    },
-    {
-      "name": "reviewer",
-      "credentials_file": "~/.config/cscb/reviewer-credentials.json",
-      "working_directory": "~/projects/beta",
-      "channels": [{ "id": "C0987654321", "delivery": "all" }],
-      "permission_prompts": "C0987654321"
-    }
-  ],
-  "claude_config_dir": "~/.claude-corp"
-}
-```
+- A persona's name or key equals another persona's name or key.
+- Two personas share a `working_directory` or a `credentials_file`, compared by real path.
+- `permission_prompts` names a channel that isn't in the persona's `channels`.
+- `permission_prompts` is `"dm"` without `dm.enabled: true` or without a `dm.contact`.
+- A persona has no channels and `dm.enabled` isn't `true`.
+- A persona lists the same channel twice.
+- A channel ID or `dm.contact` is malformed. Channel IDs start with `C` or `G` and user IDs with `U` or `W`, followed by capital letters and digits only; underscores are not allowed.
+- A path isn't absolute, `~` or `~/…`.
+- A required field is missing, or a key is unknown.
+- A value has the wrong type, isn't an allowed value, or is out of range.
 
-`planner` launches with the Max account; `reviewer` falls through to the top-level value and uses the corporate account. Use `claude auth login --claudeai` (or `--console`) with `CLAUDE_CONFIG_DIR` set to the same directory to populate each config dir before starting the server.
-
-Once applied (see [Reload](#reload)), a change to a persona's effective `claude_config_dir` makes that persona start fresh, without its prior conversation, at its next launch. A change to its `working_directory` starts it fresh at once (see [Destructive changes](#destructive-changes)). The old transcript stays in the old config directory. The [Troubleshooting](#troubleshooting) entry "Bots come back with no memory of the prior conversation" says when that launch happens.
-
-#### Per-persona `stop_hook_bootstrap` override
-
-Set `stop_hook_bootstrap` on an individual persona to override the top-level default for that one bot. A persona's own value wins over the top-level value; personas without one inherit the top-level default (which is itself `true` when absent).
-
-```json
-{
-  "personas": [
-    {
-      "name": "editor",
-      "credentials_file": "~/.config/cscb/editor-credentials.json",
-      "working_directory": "~/projects/gamma",
-      "channels": [{ "id": "C0123456789", "delivery": "all" }],
-      "permission_prompts": "C0123456789",
-      "claude_config_dir": "~/.claude-gamma",
-      "stop_hook_bootstrap": false
-    },
-    {
-      "name": "helper",
-      "credentials_file": "~/.config/cscb/helper-credentials.json",
-      "working_directory": "~/projects/delta",
-      "channels": [{ "id": "C0987654321", "delivery": "all" }],
-      "permission_prompts": "C0987654321",
-      "claude_config_dir": "~/.claude-delta"
-    }
-  ]
-}
-```
-
-The value applies to that persona alone, even when it shares its `claude_config_dir` with other personas, and takes effect at the persona's first launch after the change is applied (see [Reload](#reload)). A running bot keeps the value it was launched with until it is relaunched.
+For a persona error, the error names the persona (`personas[<i>]`) and the field. Credentials content and whether directories exist are not checked here; they are checked when each persona comes up. At a start with no last-applied record, an error stops the start. On a running server, an error shows as an `INVALID` pending change (see [Reload](#reload)). The `debug-slack-channel-bots` skill (`skills/debug-slack-channel-bots/SKILL.md`) lists every rejection with its cause and fix under "Configuration rejections".
 
 ---
 
@@ -926,7 +949,7 @@ If Slack refuses a post to the persona's destination, see "A permission prompt o
 
 ### Slack app prerequisites
 
-The Slack app must have **interactivity enabled** with **Socket Mode** as the delivery method. Open your Slack app config → **Interactivity & Shortcuts** → toggle **Interactivity** on. No Request URL is needed; Socket Mode delivers interaction payloads over the existing socket. This is included automatically if you created the app from `slack-app-manifest.yml`.
+Each persona's Slack app must have **interactivity enabled** with **Socket Mode** as the delivery method. In each app's config, open **Interactivity & Shortcuts** → toggle **Interactivity** on. No Request URL is needed; Socket Mode delivers interaction payloads over the existing socket. This is included automatically for an app created from `slack-app-manifest.yml`.
 
 ### AskUserQuestion
 
@@ -1005,7 +1028,7 @@ When several Slack messages started the turn, the last one picks the wording. A 
 
 ### Turning it on or off
 
-Set `stop_hook_bootstrap` in `config.json`: at the top level for every persona, or on a persona to override the top-level value for that persona alone. It defaults to `true`. Setting `stop_hook_bootstrap: false` on the persona, or inheriting `false` from the top level, is all an opt-out needs, even when the persona shares its `claude_config_dir` with other personas. See [Server-wide settings](#server-wide-settings) and [Per-persona `stop_hook_bootstrap` override](#per-persona-stop_hook_bootstrap-override).
+Set `stop_hook_bootstrap` in `config.json`: at the top level for every persona, or on a persona to override the top-level value for that persona alone. It defaults to `true`. Setting `stop_hook_bootstrap: false` on the persona, or inheriting `false` from the top level, is all an opt-out needs, even when the persona shares its `claude_config_dir` with other personas. See [Next-launch settings](#next-launch-settings) and [Server-wide settings](#server-wide-settings).
 
 A change reaches a persona at its first launch after the change is applied (see [Reload](#reload)); see [Timing](#timing-when-the-hook-is-patched-and-the-record-written).
 
@@ -1147,7 +1170,7 @@ grep unclaimed-channel ~/.claude/channels/slack/server.log
 Add the channel to a persona's `channels` and apply the change (see [Reload](#reload)). Restarting the server alone doesn't apply it.
 
 **Permission relay not working**
-Check that the Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json` and apply the change (see [Reload](#reload)); like every server-wide setting, it takes effect at the next server start.
+Check that the persona's Slack app has interactivity enabled (Interactivity & Shortcuts → toggle on). Verify the bot is in `check_permission` state via `agent-director list --state check_permission --label service=cscb` (operator CLI). Inspect `server.log` for `permission-poller:` lines — skipped-tick WARNs at 5+ consecutive skips signal that the poll interval is too tight; increase `agent_director_poll_interval_ms` in `config.json` and apply the change (see [Reload](#reload)); like every server-wide setting, it takes effect at the next server start.
 
 **A permission prompt or notice doesn't arrive**
 When Slack refuses a post to a persona's destination, the server holds the persona's prompts and notices and retries them with backoff. Once Slack accepts posts again, held notices are delivered, and a prompt is posted if its request is still open. It logs one `persona-destination-failed` line in `server.log` naming the persona, its destination and Slack's error, and one `cleared` line when posting works again:
@@ -1156,7 +1179,7 @@ When Slack refuses a post to a persona's destination, the server holds the perso
 grep persona-destination-failed ~/.claude/channels/slack/server.log
 ```
 
-- `missing_scope` (the line names `im:write`): add the scope and re-install the Slack app; see the `im:write` note under [Direct messages](#direct-messages-dmenabled).
+- `missing_scope` (the line names `im:write`): add the scope and re-install the persona's Slack app; see the `im:write` note under [Direct messages](#direct-messages-dmenabled).
 - `not_in_channel`: invite the persona's app to its `permission_prompts` channel.
 
 Up to 20 notices per persona are kept while it retries; past that the oldest is dropped. The `debug-slack-channel-bots` skill has the full entry for `persona-destination-failed`.
@@ -1170,6 +1193,10 @@ Auto-restart backs off exponentially on repeated launch failures — the delay d
 A message sent to a persona whose instance can't take it is lost, whether it came from the persona's own channel, a shared channel or a DM: it is not delivered, saved or replayed later, and nothing else is posted where it was sent. Instead, the persona posts one lost-message notice to its destination (its `permission_prompts` channel, or its DM with its contact). That notice is the only post; it lands in the conversation the message came from only when that conversation is the destination.
 
 The notice names the sender (by display name, or user ID; for a bot or webhook post, its name or bot ID) and the recovery state below. It never includes the message text.
+
+- **One notice per lost message.** A persona whose instance can't take messages while its Slack connection is up (restarting, at the restart limit, or with auto-restart off) posts one notice for each message it loses in a busy `delivery: all` channel. With a `"dm"` destination, each notice is a separate DM to its contact.
+- **Held notices are capped.** While the persona can't post to its destination, its notices are held and retried, up to 20 per persona; past that, the oldest is dropped (see "A permission prompt or notice doesn't arrive" above).
+- **Notices reach other personas.** A notice is a Slack post like any other, so a persona with `delivery: all` in the destination channel receives it. When the instances of two personas both can't take messages and each persona receives every message in the other's destination channel, each one's notice is a lost message for the other, so they keep posting notices about each other's notices until one of their instances takes messages again.
 
 | Recovery state in the notice | What it means | What to do |
 |------------------------------|---------------|------------|
@@ -1223,25 +1250,52 @@ Note this covers only `server.log` / `clean_restart.log`. `startup-errors.log` a
 
 ## Startup errors
 
-CSCB writes startup errors to `~/.claude/channels/slack/startup-errors.log` (override the directory with `SLACK_STATE_DIR`) in addition to stderr. Each entry is a single timestamped line. The file is append-only and never rotated by CSCB — copy `docs/logrotate-startup-errors.conf` into `/etc/logrotate.d/` if you want host-level rotation. Most classes below are fatal (the process exits non-zero); the JSONL-persistence warnings at the end are non-fatal and do not block startup.
+CSCB writes startup errors to `~/.claude/channels/slack/startup-errors.log` (override the directory with `SLACK_STATE_DIR`) in addition to stderr. Each entry is a single timestamped line. The file is append-only and never rotated by CSCB — copy `docs/logrotate-startup-errors.conf` into `/etc/logrotate.d/` if you want host-level rotation.
 
-Classes you may see:
+The classes in the first list are fatal: the process exits non-zero. The later groups (Slack Reply Guard setup, persona launch and conversation memory) are non-fatal: they are recorded, and the start continues.
+
+Fatal classes you may see:
 
 - `ad-system-install-not-found` — `Client.create()` could not locate an `agent-director` binary on PATH or at the standard install path. Install agent-director system-wide and retry. The log line appends a manual-skill-install instructions block pointing at `skills/install-cscb/SKILL.md` (URL, target path under `~/.claude/skills/`, and invocation command `/install-cscb`) for the interactive install/upgrade flow.
 - `ad-system-install-too-old` — the system-installed agent-director binary is below the floor declared in `dist/version-floor.json`. The log line names the detected and required versions, and appends the manual-skill-install instructions block.
 - `ad-system-install-unreachable` — agent-director was discovered but the probe could not execute it (e.g. permission bits, broken symlink, runtime crash). The log line surfaces AD's supplied `err.reason` value verbatim (one of `not-executable`, `not-a-regular-file`, `probe-timeout`, `probe-nonzero-exit`, `probe-killed-by-signal`, `unparseable-version`, `spawn-failed`, `other`) and appends the manual-skill-install instructions block.
 - `ad-bun-version-too-old` — agent-director needs Bun `>= 1.0.21`. Upgrade Bun.
-- `ad-version-probe` — `agent-director` was loaded but the `version()` probe failed (subprocess invocation, platform binary, etc.).
+- `ad-client-construct` — `Client.create()` failed with an error other than the `ad-system-install-*` ones; the line gives its detail. Check the install with the `install-cscb` skill, then retry.
 - `ad-shim-missing-get-permission` — the installed `agent-director` TS shim's `Client` does not expose `getPermission`. The npm-published package is out of sync with the system-installed binary. Reinstall a matching `agent-director` version and confirm the resolved package actually ships the method.
 - `ad-shim-catalog-incomplete` — the installed `agent-director` TS error catalog is missing one or more of `ErrInvalidFlags`, `ErrPermissionRequestNotFound`, `ErrAmbiguousRequest`. The log line lists the missing names. Same remediation as `ad-shim-missing-get-permission`.
 - `ad-shim-decide-drops-token` — the installed `agent-director` dist does not include `--request-token` in its bundled JS, meaning `buildDecide()` would resolve permission clicks against the wrong row. Reinstall a matching `agent-director` version and confirm `buildDecide` carries the flag.
 - `ad-version-floor-unreadable` — `node_modules/agent-director/dist/version-floor.json` could not be read, parsed, or is missing `.min_binary_version`. This is a packaging defect — reinstall `agent-director` from npm. Surfaced by `bun run install-check`; the startup gate itself does not emit this label (it relies on `Client.create()`, which fails differently when the AD package is corrupt).
-- `ad-call-timeout` — an agent-director verb call exceeded the configured `callTimeoutMs` (default 30 s). Investigate the subprocess or increase the timeout.
 - `ad-same-user` — `~/.agent-director/state.db` is owned by a different UID than the CSCB process. Reinstall agent-director as the correct user or remove the mismatched file.
 - `ad-same-user-stat` — Non-ENOENT stat error on the state DB (permissions, I/O). Investigate the file before re-launching.
-- `ad-template-install` — `client.makeTemplate(...)` rejected the boot-time refresh of the `slack-channel-bot` template. The line includes the agent-director `errName`.
+- `ad-template-install` — `client.makeTemplate(...)` rejected the boot-time refresh of the `slack-channel-bot` template. The line names the template and includes agent-director's error name and its description.
 
-The following classes are **non-fatal warnings** about conversation-memory loss. They are recorded to the same log but never exit the process or block startup. The first four are written by the JSONL-persistence safeguard, which runs *before* the resume path to warn about an *impending* loss; the last two (`jsonl-transcript-lost-on-resume`, `jsonl-diagnosis-inconclusive`) are written *by the resume path itself* when it tried to resume a row and either confirmed a wipe or could not determine whether one occurred:
+The following classes are **non-fatal**: the Slack Reply Guard's setup pass at server start (see [Slack Reply Guard (Stop hook)](#slack-reply-guard-stop-hook)). The guard stays fail-open, so an affected persona gets no reminder, and every other persona and the rest of the start are unaffected. Directory and file failures at a later launch are server-log lines only, never records here.
+
+- `stop-hook-bootstrap-refuse-home` — a persona's effective `claude_config_dir` resolves to `~/.claude`, which the server never writes. Recorded once per server start; the line names the directory and the personas. Give those personas their own `claude_config_dir` if they should get the reminder.
+- `stop-hook-bootstrap-jq-missing` — `jq` is not on `PATH`. The hook is installed anyway; it stays silent until `jq` is installed, with no restart needed.
+- `stop-hook-bootstrap-dir-missing` — a `claude_config_dir` that should get the hook doesn't exist, so it is skipped. Create the directory (for example with `claude auth login`, see [Next-launch settings](#next-launch-settings)); the persona's next launch installs the hook.
+- `stop-hook-bootstrap-not-a-dir` — a `claude_config_dir` exists but isn't a directory, so it is skipped. Fix the path.
+- `stop-hook-bootstrap-settings-read` — `<claude_config_dir>/settings.json` exists but can't be read (for example, permissions). The file is left untouched.
+- `stop-hook-bootstrap-settings-parse` — `settings.json` isn't valid JSON. The file is left untouched; fix its syntax.
+- `stop-hook-bootstrap-settings-shape` — the top level of `settings.json` isn't a JSON object. The file is left untouched.
+- `stop-hook-bootstrap-init` — the server couldn't resolve the path of its own `slack-reply-guard.sh`, so no directory is processed. Reinstall the package.
+- `stop-hook-bootstrap-dir` — an unexpected error while processing one directory; the line names the directory and the personas. Other directories are still processed.
+- `stop-hook-bootstrap` — an unexpected error in the setup pass itself. Report it as a bug.
+
+The following classes are **non-fatal** failures while preparing or launching personas at server start. A line for a failed agent-director call ends with agent-director's error name and, when it gives one, its description as `message="…"`, on one line, with token-like text redacted and long text cut short. At a later launch, the same failures are `server.log` lines only.
+
+- `ad-same-user-unenforced` — the platform gives no process user ID, so the check that `~/.agent-director/state.db` belongs to the CSCB user is skipped. Run CSCB on a supported platform (see [Supported platforms](#supported-platforms-inherited-from-agent-director)).
+- `trust-bootstrap-config-missing` — a persona's `<claude_config_dir>/.claude.json` can't be read, so its workspace trust isn't pre-accepted. Log the directory in (see [Next-launch settings](#next-launch-settings)).
+- `trust-bootstrap-config-parse` — that `.claude.json` isn't valid JSON, so it is left untouched. Fix its syntax.
+- `trust-bootstrap` — an unexpected error while pre-accepting a persona's workspace trust, such as a failed write of `.claude.json`; the line names the persona and its working directory. Check that the file is writable.
+- `spawn-failed` — launching, resuming or reconnecting a persona's instance failed; the line names the persona and the step. The server keeps running; see "Session not restarting after crash" in [Troubleshooting](#troubleshooting) for how restarts are retried.
+- `dev-channels-approve-spawn-died` — a persona's instance ended before its startup dialog was cleared. Restarts are retried as for `spawn-failed`.
+- `dev-channels-approve-not-ready` — a persona's instance didn't become ready in time: its startup dialog wasn't recognised or the session hung. A `Spawn failure:` notice is also posted to the persona's destination. Inspect the instance with `agent-director read-pane --claude-instance-id <id>`.
+- `spawn-failure-post` — posting a `Spawn failure:` notice to a persona's destination failed. The notice is held and retried; see "A permission prompt or notice doesn't arrive" in [Troubleshooting](#troubleshooting).
+- `orphan-cleanup-list-failed` — the server couldn't list its agent-director instances to remove stale ones (see "Bots come back with no memory" in [Troubleshooting](#troubleshooting)). Nothing is removed at this start.
+- `orphan-cleanup` — killing or deleting one such instance failed; the line names the instance and the persona label it carries.
+
+The following classes are **non-fatal warnings** about conversation-memory loss. They are recorded to the same log but never exit the process or block startup. The first four are written by the JSONL-persistence safeguard, which runs *before* the resume path to warn about an *impending* loss; the last two (`jsonl-transcript-lost-on-resume`, `jsonl-diagnosis-inconclusive`) are written *by the resume path itself* when it tried to resume a row and either confirmed a wipe or could not determine whether one occurred. Those two lines end with agent-director's error name and `message="…"`, as above:
 
 - `jsonl-non-persistent` — a session-transcript storage root (`<claude_config_dir>/projects`) is on a `tmpfs`/`ramfs` mount, so nothing there survives a reboot and session resume is structurally impossible on this host. A warning is also posted to the destination of each affected persona — those whose transcript storage root is the flagged mount, not every persona. Move the config dir to a persistent filesystem.
 - `jsonl-persistence-check-warning` — the safeguard could not determine the filesystem type of a transcript storage root (unreadable/unparseable `/proc/self/mountinfo`, or an unresolvable path), so persistence is unverified. No Slack post is made. Investigate the mount before relying on resume.
@@ -1326,12 +1380,14 @@ After step 1, every CSCB bot is spawned through `client.spawn(...)` with `relay_
 
 ### Upgrading to personas
 
-This version configures bots as personas. When you upgrade from an earlier version:
+This major version accepts only the persona configuration format. When you upgrade from an earlier major version:
 
-- **Rewrite `config.json` by hand.** A configuration from an earlier version is rejected at start with an error saying it must be converted to personas. Nothing is converted automatically and the file is not changed. Write a `personas` list as described in [Personas (config.json)](#personas-configjson); the server-wide settings keep their names.
+- **Rewrite `config.json` by hand.** A configuration from an earlier major version stops the server at start, with an error that names the offending setting and says the configuration must be converted to personas. Nothing is converted automatically and the file is not changed. Write a `personas` list as described in [Personas (config.json)](#personas-configjson); the server-wide settings keep their names. The `debug-slack-channel-bots` skill covers this error under "Pre-persona configuration".
 - **Set the reply settings in `config.json`.** Nothing else carries an acknowledgement reaction over: to keep one, set `ack_reaction` as a top-level setting. If you had changed how replies are split, set `reply_chunk_limit` and `reply_chunk_mode` there too. See [Server-wide settings](#server-wide-settings).
 - **Move the tokens into credentials files.** Slack tokens are no longer read from environment variables. Create one [credentials file](#credentials-files) per persona, then remove the token exports from your shell profile.
-- **Give each persona its own Slack app.** Your existing app can serve one persona; create another app for each additional persona.
+- **Give each persona its own Slack app.** Your existing app can serve one persona; create another app for each additional persona. Re-install the existing app from the current `slack-app-manifest.yml` so it gains the `im:write` scope; the `debug-slack-channel-bots` skill has the steps under "A persona can't open a DM".
+- **Decide who can reach each persona.** Who can reach a persona is decided only by its `channels`, each channel's `delivery` and its `dm.enabled` switch (see [Channel delivery](#channel-delivery) and [Direct messages](#direct-messages-dmenabled)).
+- **Rewrite crontable lines to name personas.** A crontable target that names a channel matches no persona, and the line is logged `unknown-persona` each time it fires. Rewrite each target as a persona's name or key (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)).
 - **The first start applies `config.json`.** It has no last-applied record yet, so it checks `config.json`, records it and applies it. After that, edits wait until you apply them; see [Reload](#reload).
 - **Expect each bot to start fresh once.** Bot instances created before this version are replaced at the first start after the upgrade, so each persona starts once without its prior conversation.
 
