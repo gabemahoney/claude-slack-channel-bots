@@ -235,8 +235,14 @@
  *   args)` calls an MCP tool as its instance over `createSessionServer`.
  *   Deliver only to a persona with a registered session (a lost message
  *   would reach the restart module, which the harness does not set up).
- *   A delivery makes a `users.info` call (the author's name), and no ack
- *   reaction. `run.noticeClock` is the destination hold's clock.
+ *   The routing and the MCP tools get the server-wide reply settings
+ *   (`ack_reaction`, `reply_chunk_limit`, `reply_chunk_mode`) as server.ts's
+ *   `getReplySettings` reads them: from `run.serverConfig()` at call time
+ *   (so after an apply, the start's values), with no reaction, 4000 and
+ *   `newline` when the config sets none; set them in the config the run
+ *   starts with. A delivery makes a `users.info` call (the author's name),
+ *   and, by default, no ack reaction. `run.noticeClock` is the destination
+ *   hold's clock.
  *   Not-up personas (b.av2 SR-6.3, SR-6.4): `run.isUp(name)` is server.ts's
  *   up check (`createPersonaUpPredicate`), `run.admitSession(name)` its MCP
  *   admission (`decideSessionAdmission`: registers when admitted, else one
@@ -416,7 +422,16 @@ import {
   durableWriteFileSync,
   type DurableWriteFs,
 } from '../../src/atomic-write.ts'
-import { DM_DESTINATION, MAX_RELOAD_FILE_BYTES, type Persona, type PersonaConfig, type PersonaConfigFs, type PersonaInput } from '../../src/config.ts'
+import {
+  DM_DESTINATION,
+  MAX_RELOAD_FILE_BYTES,
+  replySettingsOf,
+  type Persona,
+  type PersonaConfig,
+  type PersonaConfigFs,
+  type PersonaInput,
+  type ReplySettings,
+} from '../../src/config.ts'
 import {
   DEFAULT_WORKING_DIRECTORY_FS,
   type PersonaBringUpFs,
@@ -448,7 +463,6 @@ import type { MakeTemplateParams, SpawnParams } from 'agent-director'
 import { _resetAckTracker, consumeAck } from '../../src/ack-tracker.ts'
 import { resetClientForTests, setClientForTests } from '../../src/agent-director-client.ts'
 import { buildTemplateParams, type TemplateRefreshResult } from '../../src/agent-director-template.ts'
-import { defaultAccess } from '../../src/lib.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../../src/persona-identity.ts'
 import { createPersonaEventRouter } from '../../src/persona-event-router.ts'
 import { createPersonaLifecycle, type PersonaLifecycle } from '../../src/persona-lifecycle.ts'
@@ -2025,15 +2039,17 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       return res.user?.profile?.display_name || userId
     }
     const noticeStack = makeNotifierStack({ getPersona: getAppliedPersona, clientFor, log, isDryRun: () => dryRun })
-    // No ack reaction: a delivery makes no `reactions.add` call.
-    const access = defaultAccess()
+    // server.ts's getReplySettings: config.ts's replySettingsOf over
+    // `personaConfig` at call time, so after an apply the start's values
+    // (configInEffect). No ack reaction unless the start's config sets one.
+    const getReplySettings = (): ReplySettings => replySettingsOf(serverConfig())
     const routing = createPersonaRouting({
       getPersonaConfig: appliedConfig,
       getBotIdentity: identityFor,
       clientFor,
       resolveUserName,
       archive: () => undefined,
-      getAccess: () => access,
+      getReplySettings,
       notify: (key, text, options) => noticeStack.notifier.notify(key, text, options),
       log,
       dedupeClock: () => connections.clock.now(),
@@ -2624,7 +2640,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       assertSendable: (path) => {
         throw new Error(`reload-harness: no file may be sent (${JSON.stringify(path)})`)
       },
-      getAccess: () => access,
+      getReplySettings,
       getPersona: getAppliedPersona,
       clientFor,
       inboxDir: join(root, 'inbox'),

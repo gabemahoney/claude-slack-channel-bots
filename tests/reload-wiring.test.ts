@@ -14,7 +14,10 @@
  * confirmed persona set over the start-time server-wide values (AC 61, the
  * server-wide row: nothing in server.ts reads the controller's own applied
  * config, and `configInEffect` itself is tested as a pure function at the end
- * of this file). These assertions fail if main() arms the timer
+ * of this file; the ack reaction and reply chunk settings reach the routing
+ * and the MCP tools through `getReplySettings`, whose body is pinned to
+ * config.ts's pure `replySettingsOf` over that holder, and `replySettingsOf`
+ * is tested over the holder's value after the swap). These assertions fail if main() arms the timer
  * before the start bring-up returns (or before the refused-start exit), from
  * more than one call site or not at all; if shutdown() stops calling it off;
  * or if the controller is built with anything but the production tick driver,
@@ -58,7 +61,8 @@
  * tests/start-sweep-wiring.test.ts: it reads the source with comments
  * stripped and anchors on content, never on line numbers. It reads no file
  * but src/server.ts, imports only the pure `configInEffect` from
- * src/reload.ts, and touches no home directory.
+ * src/reload.ts and the pure `replySettingsOf`, constants and types from
+ * src/config.ts, runs no server code, and touches no home directory.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -82,6 +86,13 @@ import {
 } from './test-helpers/source-audit.ts'
 import { makePersonaConfig } from './test-helpers/persona-config.ts'
 import { configInEffect } from '../src/reload.ts'
+import {
+  DEFAULT_REPLY_CHUNK_LIMIT,
+  DEFAULT_REPLY_CHUNK_MODE,
+  replySettingsOf,
+  type PersonaConfig,
+  type ReplySettings,
+} from '../src/config.ts'
 
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(readFileSync('src/server.ts', 'utf-8'))
@@ -645,9 +656,10 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
   // listener's bind and port). After an apply that holder is exactly what
   // configInEffect makes of the start-time config and the confirmed one, so
   // no consumer can see a confirmed server-wide value before the next start.
-  // The acknowledgement reaction and the reply chunk settings have no
-  // consumer in src/ yet (the reply tool reads access.json until E9); once
-  // they do, they read the same holder.
+  // The acknowledgement reaction and the reply chunk settings reach their
+  // consumers (the routing's ack step and the reply tool) through the one
+  // accessor getReplySettings, which reads the same holder at call time
+  // (pinned by the last tests of this block).
   test('configInEffect keeps every server-wide setting of the start-time config and takes only the confirmed persona set', () => {
     const startTime = makePersonaConfig({ claude_config_dir: '/start/claude' }, '/start-base')
     const persona = startTime.personas[0]!
@@ -706,5 +718,110 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
     // The controller's applied() carries a confirmed change's server-wide
     // values; a consumer bound to it would apply them at once.
     expect(indicesOf(/\.\s*applied\s*\(/g, SERVER_CODE)).toEqual([])
+  })
+
+  // E13 carry: the ack reaction and the reply chunking must not follow a
+  // confirmed server-wide change before the next start. Both consumers get
+  // the accessor itself (not a value taken once, not a stand-in), so each
+  // use reads it again.
+  test.each([
+    ['the persona routing (the inbound ack reaction)', () => onlyCallProps('createPersonaRouting')],
+    ['the MCP session tools (the reply tool\'s chunking and ack removal)', () => constObjectProps('sessionToolDeps')],
+  ])('%s get getReplySettings: getReplySettings, the one accessor', (_consumer, props) => {
+    expect(props().get('getReplySettings')).toBe('getReplySettings')
+    // Nothing in server.ts calls it (a value read once and handed on): the
+    // only `getReplySettings(` is its declaration.
+    expect(anyCallOf('getReplySettings')).toEqual(indicesOf(/(?<=\bfunction\s+)getReplySettings\s*\(/g, SERVER_CODE))
+    expect(anyCallOf('getReplySettings')).toHaveLength(1)
+  })
+
+  test('getReplySettings, declared once at module scope, is exactly `return replySettingsOf(<applied config holder>)`, with config.ts\'s replySettingsOf', () => {
+    const decls = indicesOf(/\bfunction\s+getReplySettings\s*\(/g, SERVER_CODE)
+    expect(decls).toHaveLength(1)
+    expect(insideMain(SERVER_CODE, decls[0]!)).toBe(false)
+    expect(indicesOf(/\b(?:let|const|var)\s+getReplySettings\b/g, SERVER_CODE)).toEqual([])
+    const [paramsStart, paramsEnd] = balancedAfter(SERVER_CODE, decls[0]!, '(', ')')
+    expect(SERVER_CODE.slice(paramsStart, paramsEnd).trim()).toBe('')
+    const [bodyStart, bodyEnd] = balancedAfter(SERVER_CODE, paramsEnd, '{', '}')
+    expect(SERVER_CODE.slice(paramsEnd + 1, bodyStart - 1).replace(/\s+/g, ' ').trim()).toBe(': ReplySettings')
+    // The whole body: the holder onApplied swaps (read at call time), never
+    // the reload controller's applied config, a copy taken at start or a
+    // hand-written merge of the three keys.
+    const holder = loadedConfigName(SERVER_CODE)
+    expect(SERVER_CODE.slice(bodyStart, bodyEnd).replace(/\s+/g, ' ').trim()).toMatch(
+      new RegExp(`^return replySettingsOf\\s*\\(\\s*${holder}\\s*\\)\\s*;?$`),
+    )
+    // config.ts's pure function (tested below), not a local stand-in.
+    expect(importSource(SERVER_CODE, 'replySettingsOf')).toBe('./config.ts')
+    expect(indicesOf(/\b(?:function|let|const|var)\s+replySettingsOf\b/g, SERVER_CODE)).toEqual([])
+  })
+
+  test('replySettingsOf over the holder after a confirmed apply that changes ack_reaction, reply_chunk_limit and reply_chunk_mode yields the start-time values', () => {
+    const startTime = makePersonaConfig({ ack_reaction: 'eyes', reply_chunk_limit: 2000, reply_chunk_mode: 'length' }, '/start-base')
+    const applied = makePersonaConfig({ ack_reaction: 'thumbsup', reply_chunk_limit: 1000, reply_chunk_mode: 'newline' }, '/applied-base')
+    const startValues: ReplySettings = { ack_reaction: 'eyes', reply_chunk_limit: 2000, reply_chunk_mode: 'length' }
+    // The fixture changes all three.
+    expect(replySettingsOf(applied)).toEqual({ ack_reaction: 'thumbsup', reply_chunk_limit: 1000, reply_chunk_mode: 'newline' })
+
+    // onApplied's `<holder> = configInEffect(<start-time>, <confirmed>)` (pinned above).
+    const inEffect = configInEffect(startTime, applied)
+
+    expect(replySettingsOf(inEffect)).toEqual(startValues)
+  })
+
+  test('replySettingsOf over the holder after a confirmed apply that adds an ack_reaction the start had none of yields no reaction and the start\'s chunking', () => {
+    const startTime = makePersonaConfig({}, '/start-base')
+    const applied = makePersonaConfig({ ack_reaction: 'eyes', reply_chunk_limit: 1000, reply_chunk_mode: 'length' }, '/applied-base')
+
+    const settings = replySettingsOf(configInEffect(startTime, applied))
+
+    expect(settings.ack_reaction).toBeUndefined()
+    expect(settings).toEqual({ ack_reaction: undefined, reply_chunk_limit: startTime.reply_chunk_limit, reply_chunk_mode: startTime.reply_chunk_mode })
+    expect([settings.reply_chunk_limit, settings.reply_chunk_mode]).not.toEqual([1000, 'length'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// replySettingsOf: the server-wide reply settings of a config (b.av2 SR-1.6)
+// ---------------------------------------------------------------------------
+
+describe('replySettingsOf (b.av2 SR-1.6)', () => {
+  const DEFAULTS: ReplySettings = { ack_reaction: undefined, reply_chunk_limit: DEFAULT_REPLY_CHUNK_LIMIT, reply_chunk_mode: DEFAULT_REPLY_CHUNK_MODE }
+
+  test.each([
+    ['null (before the start resolves)', null],
+    ['undefined', undefined],
+  ])('with no config (%s): no reaction and the default chunking', (_label, config) => {
+    const settings = replySettingsOf(config)
+
+    expect(settings).toEqual(DEFAULTS)
+    expect(settings.ack_reaction).toBeUndefined()
+  })
+
+  test('a config with all three keys: exactly its three values, and the config is not changed', () => {
+    const config = makePersonaConfig({ ack_reaction: 'eyes', reply_chunk_limit: 1234, reply_chunk_mode: 'length' }, '/base')
+    // Not the defaults, so a default can't stand in for a value read.
+    expect([config.reply_chunk_limit, config.reply_chunk_mode]).not.toEqual([DEFAULT_REPLY_CHUNK_LIMIT, DEFAULT_REPLY_CHUNK_MODE])
+    const before = structuredClone(config)
+
+    const settings = replySettingsOf(config)
+
+    expect(settings).toEqual({ ack_reaction: 'eyes', reply_chunk_limit: 1234, reply_chunk_mode: 'length' })
+    expect(Object.keys(settings).sort()).toEqual(['ack_reaction', 'reply_chunk_limit', 'reply_chunk_mode'])
+    expect(config).toEqual(before)
+  })
+
+  test('a config missing all three keys: no reaction and the default chunking', () => {
+    const { ack_reaction: _a, reply_chunk_limit: _l, reply_chunk_mode: _m, ...rest } = makePersonaConfig({}, '/base')
+    const config = rest as PersonaConfig
+    expect(['ack_reaction', 'reply_chunk_limit', 'reply_chunk_mode'].filter((key) => key in config)).toEqual([])
+
+    expect(replySettingsOf(config)).toEqual(DEFAULTS)
+  })
+
+  test('a config with a reaction but no chunk keys: its reaction, and the defaults fill the missing chunking', () => {
+    const { reply_chunk_limit: _l, reply_chunk_mode: _m, ...rest } = makePersonaConfig({ ack_reaction: 'eyes' }, '/base')
+
+    expect(replySettingsOf(rest as PersonaConfig)).toEqual({ ...DEFAULTS, ack_reaction: 'eyes' })
   })
 })

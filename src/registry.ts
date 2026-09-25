@@ -35,7 +35,7 @@ import {
 import type { WebClient } from '@slack/web-api'
 import { writeFileSync } from 'fs'
 import { join, resolve } from 'path'
-import { DM_CONTACT_RE, MCP_SERVER_NAME, resolveRealPath, type Persona } from './config.ts'
+import { DM_CONTACT_RE, MCP_SERVER_NAME, resolveRealPath, type Persona, type ReplySettings } from './config.ts'
 import { chunkText, sanitizeFilename } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, slackPlatformReason } from './persona-connection-errors.ts'
@@ -501,8 +501,11 @@ export function resolveTransportForRequest(
 export interface SessionToolDeps {
   /** File exfiltration guard — throws when the file must not be sent */
   assertSendable: (filePath: string) => void
-  /** Current access config (chunking, reaction config, etc.) */
-  getAccess: () => import('./lib.ts').Access
+  /**
+   * The server-wide reply settings (b.av2 SR-1.6): reply chunking and the
+   * ack reaction name. Their start-time values; a reload does not change them.
+   */
+  getReplySettings: () => ReplySettings
   /** The current applied persona with this key, or undefined when there is none */
   getPersona: (key: string) => Persona | undefined
   /** The persona's validated Slack Web client, or undefined when it has none */
@@ -606,9 +609,6 @@ const TOOL_TARGET: Readonly<Record<string, { arg: string; action: PersonaTargetA
   fetch_messages: { arg: 'channel', action: 'act' },
   download_attachment: { arg: 'chat_id', action: 'act' },
 }
-
-/** Reply chunk size when the access config sets none. */
-const DEFAULT_CHUNK_LIMIT = 4000
 
 /** A CallTool result flagged as a tool error. */
 function toolError(text: string) {
@@ -736,7 +736,7 @@ export function createSessionServer(
   entry: SessionEntry,
   deps: SessionToolDeps,
 ): Server {
-  const { assertSendable, getAccess, getPersona, clientFor, resolveUserName, inboxDir, consumeAck } = deps
+  const { assertSendable, getReplySettings, getPersona, clientFor, resolveUserName, inboxDir, consumeAck } = deps
 
   const server = new Server(
     { name: MCP_SERVER_NAME, version: '0.1.0' },
@@ -971,10 +971,8 @@ export function createSessionServer(
           chatId = opened.id
         }
 
-        const access = getAccess()
-        const limit = access.textChunkLimit || DEFAULT_CHUNK_LIMIT
-        const mode = access.chunkMode || 'newline'
-        const chunks = chunkText(text, limit, mode)
+        const settings = getReplySettings()
+        const chunks = chunkText(text, settings.reply_chunk_limit, settings.reply_chunk_mode)
 
         let lastTs = ''
         let firstChunk = true
@@ -990,12 +988,13 @@ export function createSessionServer(
 
           if (firstChunk) {
             firstChunk = false
-            if (messageId && consumeAck(chatId, messageId)) {
+            const reaction = settings.ack_reaction
+            if (messageId && consumeAck(chatId, messageId) && reaction) {
               try {
                 await web.reactions.remove({
                   channel: chatId,
                   timestamp: messageId,
-                  name: access.ackReaction!,
+                  name: reaction,
                 })
               } catch { /* non-critical */ }
             }

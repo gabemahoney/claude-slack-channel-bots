@@ -402,6 +402,25 @@ export interface PersonaConfig extends ServerSettings {
   reply_chunk_mode: ReplyChunkMode
 }
 
+/**
+ * The three server-wide reply settings (b.av2 SR-1.6): the acknowledgement
+ * reaction and how replies are split. They take effect at server start.
+ */
+export type ReplySettings = Pick<PersonaConfig, 'ack_reaction' | 'reply_chunk_limit' | 'reply_chunk_mode'>
+
+/**
+ * The server-wide reply settings of `config` (b.av2 SR-1.6). With no
+ * configuration (before the server's start resolves): no reaction and the
+ * default chunking. Pure; does not mutate the input.
+ */
+export function replySettingsOf(config: PersonaConfig | null | undefined): ReplySettings {
+  return {
+    ack_reaction: config?.ack_reaction,
+    reply_chunk_limit: config?.reply_chunk_limit ?? DEFAULT_REPLY_CHUNK_LIMIT,
+    reply_chunk_mode: config?.reply_chunk_mode ?? DEFAULT_REPLY_CHUNK_MODE,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Pure functions
 // ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@ A single HTTP MCP server that runs several independent Claude Code bots, called 
    bun pm -g trust claude-slack-channel-bots
    ```
 
-   Bun blocks the lifecycle scripts of untrusted packages, so the postinstall does not run on the plain `install` above — you must trust the package for it to fire. The `-g` flag targets the global install; without it `bun pm trust` looks for a `package.json` in the current directory and errors with `No package.json was found`. (Run `bun pm -g untrusted` to confirm it is listed first.) The postinstall then creates skeleton config files in `~/.claude/channels/slack/` (or in `SLACK_STATE_DIR` when it is set and non-empty, the same directory the server reads). Skip this step and a later `start` fails with `missing prerequisite: config.json`.
+   Bun blocks the lifecycle scripts of untrusted packages, so the postinstall does not run on the plain `install` above — you must trust the package for it to fire. The `-g` flag targets the global install; without it `bun pm trust` looks for a `package.json` in the current directory and errors with `No package.json was found`. (Run `bun pm -g untrusted` to confirm it is listed first.) The postinstall then creates skeleton config files in `~/.claude/channels/slack/` (or in `SLACK_STATE_DIR` when it is set and non-empty, the same directory the server reads) and `~/.claude/slack-mcp.json`, and links the `debug-slack-channel-bots` skill into `~/.claude/skills/`. Skip this step and a later `start` fails with `missing prerequisite: config.json`.
 
 3. **Run the setup skill:**
 
@@ -30,7 +30,7 @@ A single HTTP MCP server that runs several independent Claude Code bots, called 
    claude /setup-slack-channel-bots
    ```
 
-   It covers the Slack app manifest, the system prompt file, `access.json`, the agent-director check and hook cleanup, and skips anything already configured. Until the skill is updated for personas, skip its token and routing steps (exporting token variables and writing `config.json`): the server reads no token from the environment and refuses a `config.json` with `routes`.
+   It covers the Slack app manifest, the system prompt file, the agent-director check and hook cleanup, and skips anything already configured. Until the skill is updated for personas, skip its token and routing steps (exporting token variables and writing `config.json`): the server reads no token from the environment and refuses a `config.json` with `routes`.
 
 4. **Create your personas:**
 
@@ -143,8 +143,7 @@ Runtime options are read from environment variables. None of them is required, a
 
 | Variable | Description |
 |---|---|
-| `SLACK_STATE_DIR` | Override the directory where `config.json`, `access.json`, and runtime state are stored. Defaults to `~/.claude/channels/slack`. |
-| `SLACK_ACCESS_MODE` | Set to `static` to load `access.json` once at startup and cache it for the lifetime of the process rather than re-reading it on every event. Useful in high-throughput environments where disk reads are a concern. |
+| `SLACK_STATE_DIR` | Override the directory where `config.json` and runtime state are stored. Defaults to `~/.claude/channels/slack`. |
 | `SLACK_DRY_RUN` | Set to `1` (or `true` / `yes`) to start the server without Slack. No credentials file is read and no Slack call is made. Each persona runs with a placeholder identity (`U000DRY_<key>`), and MCP tool calls (`reply`, `react`, etc.) and server notices are logged instead of sent. Useful for integration testing. |
 | `CSCB_LOG_MAX_BYTES` | Rotate `server.log` / `clean_restart.log` when the active file reaches this many bytes. Defaults to `10485760` (10 MiB). Values `<= 0` or non-numeric are ignored. |
 | `CSCB_LOG_KEEP` | Number of rotated generations to retain (`server.log.1` … `server.log.N`). Defaults to `5`. Set to `0` to keep none (the log is truncated instead of rolled). Values `< 0` or non-numeric are ignored. |
@@ -156,7 +155,6 @@ Shell profile example:
 ```sh
 # Optional overrides:
 export SLACK_STATE_DIR=~/.config/slack-channel-bots
-export SLACK_ACCESS_MODE=static
 # Dry-run mode (no Slack credentials needed):
 export SLACK_DRY_RUN=1
 ```
@@ -314,6 +312,9 @@ These top-level fields apply to the whole server.
 | `cron_table_path` | string | `<config dir>/crontab` | Path to the crontable for the built-in cron scheduler (`cscb_cron`). Defaults to `crontab` in the directory of the loaded `config.json`. `~` is expanded like other path keys. The resolved path is exported into every managed session as `CSCB_CRONTABLE_PATH` so bots can find the crontable and self-schedule (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)). Must be a non-empty string when set. A change takes effect at the first server start after it is applied (see [Reload](#reload)). |
 | `cron_log_path` | string | `<config dir>/cron.log` | Path to the `cscb_cron` log file. Defaults to `cron.log` in the directory of the loaded `config.json`. `~` is expanded like other path keys. Must be a non-empty string when set. A change takes effect at the first server start after it is applied (see [Reload](#reload)). |
 | `cron_log_max_bytes` | number | — | Size cap in bytes for the cron log. Must be a positive integer when set. Cron-log pruning is disabled when absent. A change takes effect at the first server start after it is applied (see [Reload](#reload)). |
+| `ack_reaction` | string | — | Emoji name, without colons (for example `"eyes"`), of the acknowledgement reaction. When set, a persona adds it under its own identity to a message delivered to it, and removes it with its first `reply` carrying that message's `message_id`. Absent means no acknowledgement. Must be non-empty when set. A change takes effect at the first server start after it is applied (see [Reload](#reload)). |
+| `reply_chunk_limit` | number | `4000` | Maximum characters per posted message: the `reply` tool splits longer text into several messages. Must be a positive integer. A change takes effect at the first server start after it is applied (see [Reload](#reload)). |
+| `reply_chunk_mode` | `"length"` \| `"newline"` | `"newline"` | How the `reply` tool splits text longer than `reply_chunk_limit`. `length`: hard split at the limit. `newline`: split at newline boundaries within the limit. A change takes effect at the first server start after it is applied (see [Reload](#reload)). |
 
 #### Per-persona `claude_config_dir` override
 
@@ -375,32 +376,6 @@ Set `stop_hook_bootstrap` on an individual persona to override the top-level def
 ```
 
 The value applies to that persona alone, even when it shares its `claude_config_dir` with other personas, and takes effect at the persona's first launch after the change is applied (see [Reload](#reload)). A running bot keeps the value it was launched with until it is relaunched.
-
----
-
-### Access Control (access.json)
-
-`access.json` is read from `~/.claude/channels/slack/access.json` by default (same directory as `config.json`). A skeleton file with defaults is created by postinstall. The file is written with `0600` permissions.
-
-`access.json` controls only the acknowledgement reaction and how long replies are chunked. Which messages a bot receives is set by each persona's `channels` and `dm.enabled` in `config.json` (see [How a persona receives messages](#how-a-persona-receives-messages)).
-
-#### Complete example
-
-```json
-{
-  "ackReaction": "eyes",
-  "textChunkLimit": 3000,
-  "chunkMode": "newline"
-}
-```
-
-#### Field reference
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `ackReaction` | string | — | Emoji name (without colons) to react with when a message is received and dispatched. Automatically removed when the bot sends its first reply. |
-| `textChunkLimit` | number | — | Maximum character count per Slack message when chunking long replies. Controlled by the `reply` tool. |
-| `chunkMode` | `"length"` \| `"newline"` | — | How to split overlong replies. `length`: hard split at `textChunkLimit` characters. `newline`: split at newline boundaries without exceeding `textChunkLimit`. |
 
 ---
 
@@ -730,7 +705,7 @@ Each MCP endpoint exposes the following tools to the connected Claude Code sessi
 
 | Tool | Description |
 |---|---|
-| `reply` | Send a message to one of the persona's configured channels or, when the persona's `dm.enabled` is `true`, to a DM conversation ID (`D…`) or a Slack user ID (`U…`/`W…`). A user ID opens a DM with that user and posts there as the persona; the result names the DM conversation ID to use for later calls. Auto-chunks long text according to `textChunkLimit` and `chunkMode` in `access.json`. Supports file attachments. |
+| `reply` | Send a message to one of the persona's configured channels or, when the persona's `dm.enabled` is `true`, to a DM conversation ID (`D…`) or a Slack user ID (`U…`/`W…`). A user ID opens a DM with that user and posts there as the persona; the result names the DM conversation ID to use for later calls. Splits long text into several messages by the server-wide `reply_chunk_limit` and `reply_chunk_mode` settings. Supports file attachments. |
 | `react` | Add an emoji reaction to a Slack message in a configured channel or, with `dm.enabled` `true`, a DM conversation (`D…`). |
 | `edit_message` | Edit a previously sent message (bot's own messages only) in a configured channel or, with `dm.enabled` `true`, a DM conversation (`D…`). |
 | `fetch_messages` | Fetch message history from a configured channel, a DM conversation (`D…`, with `dm.enabled` `true`) or a thread in either. Returns oldest-first. |
@@ -997,6 +972,7 @@ A "Yes" in the Reminder column means the [Slack Reply Guard](#slack-reply-guard-
 - **The first applicable `via` wins,** in the order `dm`, `mention`, `broadcast`, `receive_all_shared`, `receive_all`. A message that @mentions the persona in a channel it receives in full arrives as `mention`.
 - **The persona's own @mention is removed from the text.** Mentions of other personas and `@here` / `@channel` stay.
 - **Every author counts.** Posts by people, bots, integrations and other personas all arrive by these rules. Each persona posts as its own Slack app, so another persona's post reaches it like anyone else's.
+- **Anyone in the workspace can reach a persona,** in a channel it is configured into by that channel's `delivery` setting, and by DM when its `dm.enabled` is `true`. There is no approval step.
 - **A persona never receives its own posts.**
 - **Each message arrives at most once per persona,** even though Slack sends a channel @mention twice. A Slack redelivery more than 10 minutes after the first, or after a server restart, arrives again.
 - **A message without `via` is an injected prompt.** Its `user` label is free-form, so an `/interject` sender label, even one starting with `cscb-cron:`, cannot make it look like a Slack message.
@@ -1151,7 +1127,7 @@ grep -E '\(key=<key>\)|persona=<key>\b' ~/.claude/channels/slack/server.log
 
 While a persona is down, its Claude instance keeps running and keeps its history, but the server doesn't serve it until the persona is up.
 
-The `debug-slack-channel-bots` skill has an entry for every persona log class, every `config.json` rejection and each recovery step. It ships in the package at `skills/debug-slack-channel-bots/SKILL.md` (`node_modules/claude-slack-channel-bots/skills/debug-slack-channel-bots/SKILL.md` after install). Copy it to `~/.claude/skills/debug-slack-channel-bots/SKILL.md`, then invoke `/debug-slack-channel-bots` from Claude Code.
+The `debug-slack-channel-bots` skill has an entry for every persona log class, every `config.json` rejection and each recovery step. It ships in the package at `skills/debug-slack-channel-bots/SKILL.md`, and postinstall links it into `~/.claude/skills/debug-slack-channel-bots`; a copied directory or file already at that path is left in place, and postinstall logs `skipped: <path> (not a link; …)` — remove it and re-run postinstall to get the link. Invoke `/debug-slack-channel-bots` from Claude Code.
 
 **Bot not receiving messages in a new channel**
 After inviting the bot to a channel, Slack may not deliver messages until the bot is @mentioned for the first time. This is a Slack Socket Mode behavior — the first @mention activates event delivery for that channel. After that, all messages flow normally.
@@ -1351,6 +1327,7 @@ After step 1, every CSCB bot is spawned through `client.spawn(...)` with `relay_
 This version configures bots as personas. When you upgrade from an earlier version:
 
 - **Rewrite `config.json` by hand.** A configuration from an earlier version is rejected at start with an error saying it must be converted to personas. Nothing is converted automatically and the file is not changed. Write a `personas` list as described in [Personas (config.json)](#personas-configjson); the server-wide settings keep their names.
+- **Set the reply settings in `config.json`.** Nothing else carries an acknowledgement reaction over: to keep one, set `ack_reaction` as a top-level setting. If you had changed how replies are split, set `reply_chunk_limit` and `reply_chunk_mode` there too. See [Server-wide settings](#server-wide-settings).
 - **Move the tokens into credentials files.** Slack tokens are no longer read from environment variables. Create one [credentials file](#credentials-files) per persona, then remove the token exports from your shell profile.
 - **Give each persona its own Slack app.** Your existing app can serve one persona; create another app for each additional persona.
 - **The first start applies `config.json`.** It has no last-applied record yet, so it checks `config.json`, records it and applies it. After that, edits wait until you apply them; see [Reload](#reload).

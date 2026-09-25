@@ -45,7 +45,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
   - the `clean_restart` `fatal(...)` lines for a failed initialization or teardown: in production they receive the CSCB-built `StartupGateFailedError` and `TeardownIncompleteError`
   - the boot template install's failure, recorded verbatim as the operator's diagnosis; and the startup gate's message, which may embed agent-director's description or a construct error and is the same text the server writes to `startup-errors.log`
   - npm postinstall's agent-director probe, run with no config or credentials loaded
-  - paths that touch neither Slack nor agent-director: MCP roots and connect, the message archive's open, cron, permission trail and cron log writes, cozempic, the PID read, postinstall's skill symlinks, and the Stop-hook and trust patches' catch-alls (file system and JSON only)
+  - paths that touch neither Slack nor agent-director: MCP roots and connect, the message archive's open, cron, permission trail and cron log writes, cozempic, the PID read, and the Stop-hook and trust patches' catch-alls (file system and JSON only)
 
 ## Configuration
 
@@ -105,7 +105,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 
 - Module-scoped Maps: camelCase (e.g., `pendingPermissions`, `completedDecisions`)
 - Interfaces: PascalCase (e.g., `PendingPermission`, `SessionEntry`)
-- Constants: UPPER_SNAKE_CASE (e.g., `MAX_PENDING`, `STATE_DIR`)
+- Constants: UPPER_SNAKE_CASE (e.g., `DEFAULT_REPLY_CHUNK_LIMIT`, `STATE_DIR`)
 - Functions: camelCase, verb-first (e.g., `registerSession`, `buildPermissionBlocks`)
 - Section comments: `// ---` separator with descriptive header
 

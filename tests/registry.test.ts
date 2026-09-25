@@ -23,7 +23,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
-import type { Persona } from '../src/config.ts'
+import { DEFAULT_REPLY_CHUNK_LIMIT, DEFAULT_REPLY_CHUNK_MODE, type Persona, type ReplySettings } from '../src/config.ts'
 import { assertSendable } from '../src/lib.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import {
@@ -190,6 +190,25 @@ let openClients: Client[] = []
 let savedDryRun: string | undefined
 let consoleSpy: ReturnType<typeof spyOn> | undefined
 
+/**
+ * The server-wide reply settings the harness's `getReplySettings` returns
+ * (b.av2 SR-1.6): an ack reaction set, and the config's chunking defaults.
+ */
+const REPLY_SETTINGS: ReplySettings = {
+  ack_reaction: 'eyes',
+  reply_chunk_limit: DEFAULT_REPLY_CHUNK_LIMIT,
+  reply_chunk_mode: DEFAULT_REPLY_CHUNK_MODE,
+}
+
+/**
+ * The harness's session tool deps with `overrides` applied over
+ * `REPLY_SETTINGS`. Pass `ack_reaction: undefined` for no reaction configured.
+ */
+function depsWithReplySettings(overrides: Partial<ReplySettings>): SessionToolDeps {
+  const settings: ReplySettings = { ...REPLY_SETTINGS, ...overrides }
+  return { ...h.deps, getReplySettings: () => settings }
+}
+
 function makeHarness(): Harness {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'registry-test-')))
   const config = makeMultiPersonaConfig(
@@ -213,7 +232,7 @@ function makeHarness(): Harness {
   ])
   const deps: SessionToolDeps = {
     assertSendable: (p) => assertSendable(p, stateDir, inboxDir, [credentialsFile]),
-    getAccess: () => ({ dmPolicy: 'pairing' as const, allowFrom: [], channels: {}, pending: {}, ackReaction: 'eyes' }),
+    getReplySettings: () => REPLY_SETTINGS,
     getPersona: (key) => personas.get(key),
     clientFor: (key) => {
       const stub = clients.get(key)
@@ -1059,7 +1078,7 @@ describe('DM targets (through the MCP server)', () => {
     stubOf(h.alpha).script.open.push(openedDm(OPENED))
     const file = join(h.inboxDir, 'out.txt')
     writeFileSync(file, 'data')
-    const deps: SessionToolDeps = { ...h.deps, getAccess: () => ({ ...h.deps.getAccess(), textChunkLimit: 5 }) }
+    const deps = depsWithReplySettings({ reply_chunk_limit: 5 })
     const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), deps)
 
     const result = await session.call('reply', { chat_id: U, text: 'one\ntwo\nthree', files: [file] })
@@ -1673,15 +1692,23 @@ describe('reply files', () => {
 // Ack reaction removal
 // ---------------------------------------------------------------------------
 
+// The reaction name comes from the server-wide `ack_reaction` setting through
+// the injected `getReplySettings` (b.av2 SR-1.6).
 describe('reply — ack reaction removal', () => {
-  test("a tracked ack is removed once, through the persona's client", async () => {
+  test.each<[string, Partial<ReplySettings>, string]>([
+    ['the harness default', {}, 'eyes'],
+    ['another configured name', { ack_reaction: 'hourglass' }, 'hourglass'],
+  ])("a tracked ack is removed once, by the server-wide ack_reaction name (%s), through the persona's client; a second reply does not remove it again", async (_label, overrides, name) => {
     trackAck(A_ALL, MSG_TS)
-    const session = await openPersonaSession(h.alpha)
+    const session = await openSession(
+      registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()),
+      depsWithReplySettings(overrides),
+    )
 
     await session.call('reply', { chat_id: A_ALL, text: 'first', message_id: MSG_TS })
     await session.call('reply', { chat_id: A_ALL, text: 'second', message_id: MSG_TS })
 
-    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([{ channel: A_ALL, timestamp: MSG_TS, name: 'eyes' }])
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([{ channel: A_ALL, timestamp: MSG_TS, name }])
     expect(slackCallCount(stubOf(h.beta))).toBe(0)
   })
 
@@ -1698,15 +1725,21 @@ describe('reply — ack reaction removal', () => {
     expect(result.content[0]!.text).toStartWith('Sent 1 message(s)')
   })
 
-  test.each([
-    ['no ack tracked', false, { chat_id: A_ALL, text: 'hi', message_id: MSG_TS }],
-    ['reply without message_id', true, { chat_id: A_ALL, text: 'hi' }],
-  ])('%s → no reactions.remove call', async (_label, tracked, args) => {
+  test.each<[string, boolean, Partial<ReplySettings>, Record<string, unknown>]>([
+    ['no ack tracked', false, {}, { chat_id: A_ALL, text: 'hi', message_id: MSG_TS }],
+    ['reply without message_id', true, {}, { chat_id: A_ALL, text: 'hi' }],
+    ['no ack_reaction configured', true, { ack_reaction: undefined }, { chat_id: A_ALL, text: 'hi', message_id: MSG_TS }],
+  ])('%s → the reply posts and no reactions.remove call', async (_label, tracked, overrides, args) => {
     if (tracked) trackAck(A_ALL, MSG_TS)
-    const session = await openPersonaSession(h.alpha)
+    const session = await openSession(
+      registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()),
+      depsWithReplySettings(overrides),
+    )
 
-    await session.call('reply', args)
+    const result = await session.call('reply', args)
 
+    expect(result.isError).toBeUndefined()
+    expect(stubOf(h.alpha).calls.postMessage).toHaveLength(1)
     expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([])
   })
 })

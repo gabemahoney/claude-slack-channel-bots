@@ -72,7 +72,7 @@ import { SocketModeClient, type Logger } from '@slack/socket-mode'
 import type { WebClient, WebClientOptions } from '@slack/web-api'
 
 import type { Persona } from '../src/config.ts'
-import { credentialsFilesToProtect } from '../src/config.ts'
+import { credentialsFilesToProtect, DEFAULT_REPLY_CHUNK_LIMIT, DEFAULT_REPLY_CHUNK_MODE } from '../src/config.ts'
 import { assertSendable } from '../src/lib.ts'
 import { createPersonaEventRouter, type PersonaEventRouterDeps } from '../src/persona-event-router.ts'
 import { createPersonaUpFlushListener } from '../src/persona-start.ts'
@@ -806,7 +806,7 @@ describe('E2 carry: reply file uploads go through the manager\'s long-lived clie
 
     const deps: SessionToolDeps = {
       assertSendable: (p) => assertSendable(p, stateDir, inboxDir, credentialsFilesToProtect(h.config!.personas, join(stateDir, 'config.json'))),
-      getAccess: () => ({ dmPolicy: 'pairing' as const, allowFrom: [], channels: {}, pending: {} }),
+      getReplySettings: () => ({ reply_chunk_limit: DEFAULT_REPLY_CHUNK_LIMIT, reply_chunk_mode: DEFAULT_REPLY_CHUNK_MODE }),
       getPersona: (key) => h.getPersona(key),
       clientFor: h.clientFor,
       inboxDir,

@@ -51,7 +51,7 @@ describe('b.hdk: hooks/ directory does not exist at repo root', () => {
 // 3. SKILL.md — no hook install instructions
 //
 // After the fix, permission-relay.sh / ask-relay.sh still appear in the
-// *verification* section (Step 8 tells operators to check for orphan entries).
+// *verification* section (Step 7 tells operators to check for orphan entries).
 // That is intentional. The banned patterns are install-instruction forms:
 //   - cp ... permission-relay.sh / ask-relay.sh
 //   - ln -sf ... permission-relay.sh / ask-relay.sh

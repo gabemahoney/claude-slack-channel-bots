@@ -6,7 +6,6 @@ import {
   assertSendable,
   chunkText,
   sanitizeFilename,
-  defaultAccess,
 } from '../src/lib.ts'
 import type { Client } from 'agent-director'
 import {
@@ -56,8 +55,8 @@ describe('assertSendable', () => {
     expect(() => assertSendable(`${stateDir}/.env`, stateDir, inboxDir, [])).toThrow('Blocked')
   })
 
-  test('blocks access.json in state dir', () => {
-    expect(() => assertSendable(`${stateDir}/access.json`, stateDir, inboxDir, [])).toThrow('Blocked')
+  test('blocks config.json in state dir', () => {
+    expect(() => assertSendable(`${stateDir}/config.json`, stateDir, inboxDir, [])).toThrow('Blocked')
   })
 
   test('blocks nested files in state dir', () => {
@@ -78,7 +77,105 @@ describe('assertSendable', () => {
 
   test('blocks traversal into state dir via ..', () => {
     // Path that traverses out of inbox/ back into the protected state dir
-    expect(() => assertSendable(`${inboxDir}/../access.json`, stateDir, inboxDir, [])).toThrow()
+    expect(() => assertSendable(`${inboxDir}/../config.json`, stateDir, inboxDir, [])).toThrow()
+  })
+
+  // Directory boundaries: a prefix match counts only at a path separator.
+  test.each([
+    ['a sibling of inbox/ whose name starts with "inbox"', `${stateDir}/inbox-old/secret`],
+    ['the state dir itself', stateDir],
+    ['traversal out of inbox/ into an "inbox"-prefixed sibling', `${inboxDir}/../inbox-old/secret`],
+  ])('blocks %s', (_label, filePath) => {
+    expect(() => assertSendable(filePath, stateDir, inboxDir, []))
+      .toThrow('cannot send files from state directory')
+  })
+
+  test('does not treat a sibling directory named after the state dir as the state dir', () => {
+    expect(() => assertSendable(`${stateDir}2/secret`, stateDir, inboxDir, [])).not.toThrow()
+  })
+
+  test('tolerates a trailing separator on the state and inbox directories', () => {
+    expect(() => assertSendable(`${stateDir}/config.json`, `${stateDir}/`, `${inboxDir}/`, []))
+      .toThrow('cannot send files from state directory')
+    expect(() => assertSendable(`${inboxDir}/photo.png`, `${stateDir}/`, `${inboxDir}/`, [])).not.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// assertSendable(): the state-dir rule on real paths (b.av2 SR-5.2)
+// ---------------------------------------------------------------------------
+
+describe('assertSendable: state-dir rule on real paths', () => {
+  // Real files under a temp dir, realpath'd because the OS temp directory may
+  // itself be a symlink. Layout:
+  //   <dir>/state/config.json                a state-dir file outside inbox/
+  //   <dir>/state/inbox/photo.png            an inbox file
+  //   <dir>/state/inbox/to-config          -> state/config.json
+  //   <dir>/state/inbox-old/secret           a sibling of inbox/
+  //   <dir>/state2/secret                    a sibling of the state dir
+  //   <dir>/outside/to-config              -> state/config.json
+  //   <dir>/outside/to-photo               -> state/inbox/photo.png
+  //   <dir>/outside/state-link             -> state   (directory symlink)
+  let dir: string
+  let stateDir: string
+  let inboxDir: string
+
+  beforeEach(() => {
+    dir = realpathSync(mkdtempSync(join(tmpdir(), 'cscb-sendable-state-')))
+    stateDir = join(dir, 'state')
+    inboxDir = join(stateDir, 'inbox')
+    mkdirSync(inboxDir, { recursive: true })
+    mkdirSync(join(stateDir, 'inbox-old'))
+    mkdirSync(join(dir, 'state2'))
+    mkdirSync(join(dir, 'outside'))
+    writeFileSync(join(stateDir, 'config.json'), '{}')
+    writeFileSync(join(inboxDir, 'photo.png'), 'png')
+    writeFileSync(join(stateDir, 'inbox-old', 'secret'), 'not for sending')
+    writeFileSync(join(dir, 'state2', 'secret'), 'outside the state dir')
+    symlinkSync(join(stateDir, 'config.json'), join(inboxDir, 'to-config'))
+    symlinkSync(join(stateDir, 'config.json'), join(dir, 'outside', 'to-config'))
+    symlinkSync(join(inboxDir, 'photo.png'), join(dir, 'outside', 'to-photo'))
+    symlinkSync(stateDir, join(dir, 'outside', 'state-link'))
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  /** The error `assertSendable` throws for `rel` (under the temp dir), or undefined when it allows it. */
+  function refusal(rel: string, state = stateDir, inbox = inboxDir): Error | undefined {
+    try {
+      assertSendable(join(dir, rel), state, inbox, [])
+      return undefined
+    } catch (err) {
+      return err as Error
+    }
+  }
+
+  test.each([
+    ['a symlink outside the state dir to a state-dir file outside inbox/', 'outside/to-config'],
+    ['a state-dir file reached through a symlinked directory outside it', 'outside/state-link/config.json'],
+    ['a symlink inside inbox/ to a state-dir file outside inbox/', 'state/inbox/to-config'],
+    ['an existing file in a sibling of inbox/ whose name starts with "inbox"', 'state/inbox-old/secret'],
+  ])('refuses %s', (_label, rel) => {
+    expect(refusal(rel)?.message).toContain('cannot send files from state directory')
+  })
+
+  test.each([
+    ['a symlink outside the state dir to a file inside inbox/', 'outside/to-photo'],
+    ['an inbox file reached through a symlinked directory outside the state dir', 'outside/state-link/inbox/photo.png'],
+    ['an existing file in a sibling directory named after the state dir', 'state2/secret'],
+    ['a plain inbox file', 'state/inbox/photo.png'],
+  ])('allows %s', (_label, rel) => {
+    expect(refusal(rel)).toBeUndefined()
+  })
+
+  test('a state dir given through a symlink still refuses its real files outside inbox/ and allows its real inbox', () => {
+    const aliasState = join(dir, 'outside', 'state-link')
+    const aliasInbox = join(aliasState, 'inbox')
+    expect(refusal('state/config.json', aliasState, aliasInbox)?.message)
+      .toContain('cannot send files from state directory')
+    expect(refusal('state/inbox/photo.png', aliasState, aliasInbox)).toBeUndefined()
   })
 })
 
@@ -240,28 +337,6 @@ describe('sanitizeFilename', () => {
     expect(result).not.toContain('..')
     expect(result).not.toContain('\n')
     expect(result).not.toContain(';')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// defaultAccess()
-// ---------------------------------------------------------------------------
-
-describe('defaultAccess', () => {
-  test('returns pairing policy by default', () => {
-    expect(defaultAccess().dmPolicy).toBe('pairing')
-  })
-
-  test('returns empty allowlist', () => {
-    expect(defaultAccess().allowFrom).toEqual([])
-  })
-
-  test('returns empty channels', () => {
-    expect(defaultAccess().channels).toEqual({})
-  })
-
-  test('returns empty pending', () => {
-    expect(defaultAccess().pending).toEqual({})
   })
 })
 

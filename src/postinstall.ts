@@ -3,9 +3,20 @@
  * postinstall.ts — Scaffold skeleton config files for the Slack Channel Router.
  *
  * Creates STATE_DIR and the MCP config parent if missing, then writes
- * config.json, access.json, and slack-mcp.json only when they do not
- * already exist.  Safe to re-run: existing files are never modified.
- * Migrates routing.json → config.json if the old file is present.
+ * config.json and slack-mcp.json only when they do not already exist.
+ * Safe to re-run: existing files are never modified. Migrates
+ * routing.json → config.json if the old file is present. The retired
+ * access-control file of earlier releases is neither created nor touched
+ * (b.av2 SR-10.1).
+ *
+ * Links the debugging skill (debug-slack-channel-bots) into
+ * ~/.claude/skills/, replacing only a symbolic link that points elsewhere
+ * (dangling included); a real directory or regular file at that name is left
+ * in place with a `skipped:` line. Removes the link it created in earlier releases for
+ * the retired claude-slack-channels-config skill: only a symbolic link whose
+ * target resolves to this package's own skills/claude-slack-channels-config
+ * (existing or dangling). A real directory, a regular file or a link to any
+ * other path at that name is left untouched.
  *
  * The config.json skeleton is the empty persona configuration
  * `{"personas": []}` (b.av2 SR-1.7): it loads with zero personas. An existing
@@ -15,11 +26,17 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { existsSync, mkdirSync, writeFileSync, symlinkSync, readlinkSync, unlinkSync, renameSync, readFileSync } from 'fs'
+import { existsSync, lstatSync, mkdirSync, writeFileSync, symlinkSync, readlinkSync, unlinkSync, renameSync, readFileSync } from 'fs'
 import { homedir } from 'os'
 import { dirname, join, resolve } from 'path'
-import { defaultAccess } from './lib.ts'
 import { MCP_SERVER_NAME, resolveServerStateDir } from './config.ts'
+import { describeThrownValue } from './persona-connection-errors.ts'
+
+/** The skills postinstall links into the skills target. */
+const LINKED_SKILLS = ['debug-slack-channel-bots']
+
+/** The retired skill whose link from earlier releases postinstall removes. */
+const RETIRED_SKILL = 'claude-slack-channels-config'
 
 /**
  * Read the agent-director dependency range from the shipping package.json.
@@ -48,6 +65,33 @@ export interface PostinstallOptions {
   stateDir?: string
   /** Override the MCP config path (defaults to ~/.claude/slack-mcp.json) */
   mcpConfigPath?: string
+  /**
+   * Override the home directory (defaults to the OS home, read only when this
+   * is absent). The `~` of every default: the state directory when
+   * SLACK_STATE_DIR is unset, the MCP config path and the skills link target
+   * `~/.claude/skills/`.
+   */
+  homeDir?: string
+}
+
+/** The link's target, resolved against the link's own directory; undefined when `path` is not a symbolic link. */
+function symlinkTarget(path: string): string | undefined {
+  try {
+    if (!lstatSync(path).isSymbolicLink()) return undefined
+    return resolve(dirname(path), readlinkSync(path))
+  } catch {
+    return undefined
+  }
+}
+
+/** True when anything, a dangling symbolic link included, exists at `path`. */
+function entryExists(path: string): boolean {
+  try {
+    lstatSync(path)
+    return true
+  } catch {
+    return false
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -57,10 +101,11 @@ export interface PostinstallOptions {
 export function runPostinstall(options: PostinstallOptions = {}): void {
   // The server's state directory (resolveServerStateDir): an empty
   // SLACK_STATE_DIR means unset, and a relative one resolves the same way.
-  const stateDir = options.stateDir ?? resolveServerStateDir()
+  const home = (): string => options.homeDir ?? homedir()
+  const stateDir = options.stateDir ?? resolveServerStateDir(options.homeDir)
 
   const mcpConfigPath =
-    options.mcpConfigPath ?? join(homedir(), '.claude', 'slack-mcp.json')
+    options.mcpConfigPath ?? join(home(), '.claude', 'slack-mcp.json')
 
   // Ensure directories exist
   mkdirSync(stateDir, { recursive: true })
@@ -82,46 +127,51 @@ export function runPostinstall(options: PostinstallOptions = {}): void {
     console.log(`created: ${configPath}`)
   }
 
-  // access.json (permissions 0o600)
-  const accessPath = join(stateDir, 'access.json')
-  if (existsSync(accessPath)) {
-    console.log(`skipped: ${accessPath}`)
-  } else {
-    writeFileSync(
-      accessPath,
-      JSON.stringify(defaultAccess(), null, 2) + '\n',
-      { mode: 0o600 },
-    )
-    console.log(`created: ${accessPath}`)
-  }
-
   // Symlink skills into ~/.claude/skills/
-  const skillsTarget = join(homedir(), '.claude', 'skills')
+  const skillsTarget = join(home(), '.claude', 'skills')
   mkdirSync(skillsTarget, { recursive: true })
 
-  const skillNames = ['claude-slack-channels-config']
   const packageSkillsDir = resolve(dirname(import.meta.filename), '..', 'skills')
-  for (const name of skillNames) {
+  for (const name of LINKED_SKILLS) {
     const src = join(packageSkillsDir, name)
     const dest = join(skillsTarget, name)
     if (existsSync(src)) {
       try {
-        // Remove stale symlink or directory if it points elsewhere
-        if (existsSync(dest)) {
-          try {
-            const current = readlinkSync(dest)
-            if (resolve(current) === resolve(src)) {
-              console.log(`skipped: ${dest} (already linked)`)
-              continue
-            }
-          } catch { /* not a symlink — remove it */ }
+        // Replace only a symbolic link pointing elsewhere (dangling included).
+        // A real directory or file at the name is the operator's: left in place.
+        if (entryExists(dest)) {
+          const current = symlinkTarget(dest)
+          if (current === undefined) {
+            console.log(`skipped: ${dest} (not a link; left in place — remove it to let postinstall link the skill)`)
+            continue
+          }
+          if (current === resolve(src)) {
+            console.log(`skipped: ${dest} (already linked)`)
+            continue
+          }
           unlinkSync(dest)
         }
         symlinkSync(src, dest)
         console.log(`linked: ${dest} -> ${src}`)
       } catch (err) {
-        console.log(`warning: could not symlink ${name}: ${err}`)
+        console.log(`warning: could not symlink ${name}: ${describeThrownValue(err)}`)
       }
+    }
+  }
+
+  // Remove the retired skill's link, only when postinstall created it
+  const retiredSrc = resolve(packageSkillsDir, RETIRED_SKILL)
+  const retiredDest = join(skillsTarget, RETIRED_SKILL)
+  if (entryExists(retiredDest)) {
+    if (symlinkTarget(retiredDest) === retiredSrc) {
+      try {
+        unlinkSync(retiredDest)
+        console.log(`removed: ${retiredDest} (retired skill link)`)
+      } catch (err) {
+        console.log(`warning: could not remove ${RETIRED_SKILL} link: ${describeThrownValue(err)}`)
+      }
+    } else {
+      console.log(`skipped: ${retiredDest} (not created by postinstall; left in place)`)
     }
   }
 

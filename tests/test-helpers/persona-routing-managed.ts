@@ -9,7 +9,9 @@
  * (`createPersonaIdentityLookup`), `clientFor` from its client lookup
  * (`createPersonaClientLookup`), the user-name lookup on the receiving
  * persona's own client (`users.info`, the ID when it has no client), the
- * archive seam the caller passes (default: none), and as `notify` the real
+ * archive seam the caller passes (default: none), the server-wide
+ * `ack_reaction` from the harness's applied config (`h.config`, read at call
+ * time; none unless the harness's `overrides` set one), and as `notify` the real
  * persona notifier, built by `makeNotifierStack`
  * (tests/test-helpers/persona-notifier.ts) over the harness's
  * applied-persona and client lookups, never in dry run, whose destination
@@ -72,7 +74,9 @@ export function makeManagedRouting(h: ConnectionHarness, baseDir: string, opts: 
       return res.user?.profile?.display_name || userId
     },
     archive: opts.archive ?? (() => {}),
-    getAccess: () => ({}),
+    // As server.ts's getReplySettings: the applied config's ack_reaction, read
+    // at call time (none unless the harness's `overrides` set one).
+    getReplySettings: () => ({ ack_reaction: h.config?.ack_reaction }),
     notify: (key, text, options) => notifier.notify(key, text, options),
     log,
   })

@@ -4,8 +4,9 @@
  * `persona-dm-dropped`).
  *
  * Replaces the old DM-routing and default-route fallback suites and the gate
- * and pairing cases of server.test.ts (b.av2 SR-13.5). Drives the real
- * `createPersonaRouting` from src/persona-routing.ts (never server.ts) over:
+ * and pairing cases of server.test.ts, both paths now gone (b.av2 SR-13.5).
+ * Drives the real `createPersonaRouting` from src/persona-routing.ts (never
+ * server.ts) over:
  *
  * - one `makeStubSlack` stub per persona (leak marker on), handed out through
  *   `makePersonaClients` as the injected `clientFor`;
@@ -37,7 +38,10 @@
  * inbound DMs per persona (SR-4.3; AC 15, AC 35 and the delivery leg of AC
  * 40/41), the edited-event dedupe key (an edit that adds a mention) and a
  * teardown's `forget(key)`, which drops one persona's dedupe store (b.av2
- * SR-6.5).
+ * SR-6.5). AC 17 (SR-10.1, SR-10.2 access rows): a never-seen user in no
+ * config is delivered in an `all` channel, by mention in a mentions-only
+ * channel and by DM with DMs on, with no sender allowlist and no pairing
+ * reply. The ack reaction comes from the server-wide reply settings.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -281,7 +285,6 @@ describe('delivery rules against the receiving persona P', () => {
   // the three-element rows.
   test.each<[string, (ids: Ids) => SlackEvent, boolean, string?]>([
     ['`all` channel: a plain message is delivered', () => makeChannelMessage({ channel: PALL }), true],
-    ['`all` channel: a human with no allowlist or pairing entry is delivered (no sender filter)', () => makeChannelMessage({ channel: PALL, user: 'U0STRANGER' }), true],
     ['`mentions` channel: a message with P\'s user mention is delivered', (ids) => makeChannelMessage({ channel: PMENT, text: `${mentionText(ids.p)} hi` }), true],
     ['`mentions` channel: an app_mention of P is delivered', (ids) => makeAppMention({ channel: PMENT, text: `${mentionText(ids.p)} hi` }), true],
     ['`mentions` channel: a message without a mention is dropped', () => makeChannelMessage({ channel: PMENT }), false],
@@ -641,6 +644,89 @@ describe('DMs per persona (SR-4.3)', () => {
     expect(deliveries(h, ['Dm Bot'])).toEqual({ 'Dm Bot': enabled ? [{ chat_id: DA, via: 'dm' }] : [] })
     expect(lines(h, 'persona-dm-dropped')).toHaveLength(enabled ? 0 : 1)
     expect(lines(h, 'unclaimed-channel')).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC 17 (b.av2 SR-10.1, SR-10.2 access rows): any workspace user reaches a
+// persona configured to receive the message, in a channel by its delivery
+// settings and by DM with DMs on. There is no sender allowlist and no pairing
+// step: the author is an ID in no config that no connection has seen, the
+// message is delivered once, and nothing is sent to the author first or
+// instead (no `chat.postMessage` to them or their DM, no `conversations.open`).
+// ---------------------------------------------------------------------------
+
+describe('AC 17: any workspace user reaches a persona, with no allowlist and no pairing', () => {
+  /** Open Bot: `all` here, `mentions` there, DMs on. */
+  const C_ALL = 'C0AC17ALL'
+  const C_MENT = 'C0AC17MNT'
+  const D_OPEN = 'D0AC17DM01'
+  const specs = (): PersonaSpec[] => [
+    { name: 'Open Bot', channels: [{ id: C_ALL, delivery: 'all' }, { id: C_MENT, delivery: 'mentions' }], dm: { enabled: true } },
+  ]
+
+  /** A fresh user ID per call: never the stub's default author, never in any config. */
+  let seq = 0
+  const unknownUser = () => `U0AC17${String(++seq).padStart(4, '0')}`
+
+  /**
+   * The only Slack calls a delivery to `author`'s message may make on P's
+   * stub: the author's name lookup and the ack reaction on the message itself.
+   * Every other method (a post, an ephemeral or any `apiCall`, a
+   * `conversations.open`) stays empty, so no reply of any kind reaches the
+   * author before or instead of the delivery.
+   */
+  function expectOnlyLookupAndReaction(h: Harness, author: string, event: SlackEvent): void {
+    const { calls } = h.p('Open Bot').stub
+    expect(calls.usersInfo).toEqual([{ user: author }])
+    expect(calls.reactionsAdd).toEqual([{ channel: event.channel as string, timestamp: event.ts as string, name: 'eyes' }])
+    const others = Object.entries(calls).filter(([method, list]) => method !== 'usersInfo' && method !== 'reactionsAdd' && (list as unknown[]).length > 0)
+    expect(others).toEqual([])
+    expect(calls.conversationsOpen).toEqual([])
+    expect(h.allPosts()).toEqual([])
+  }
+
+  test.each<[string, (author: string, botUserId: string) => SlackEvent, string, Via]>([
+    ['a plain message in a channel where P has `delivery: all`', (user) => makeChannelMessage({ channel: C_ALL, user, text: 'first message from someone new' }), C_ALL, 'receive_all'],
+    ['a mention of P in a channel where P is mentions-only', (user, p) => makeChannelMessage({ channel: C_MENT, user, text: `${mentionText(p)} first message from someone new` }), C_MENT, 'mention'],
+    ['an app_mention of P in a channel where P is mentions-only', (user, p) => makeAppMention({ channel: C_MENT, user, text: `${mentionText(p)} first message from someone new` }), C_MENT, 'mention'],
+    ['a DM to P with DMs on', (user) => makeDm({ channel: D_OPEN, user, text: 'first message from someone new' }), D_OPEN, 'dm'],
+  ])('AC 17: %s from a never-seen user in no config is delivered once, with no allowlist check and no pairing reply', async (_label, build, chatId, via) => {
+    const h = makeHarness(specs(), { ackReaction: 'eyes' })
+    const P = h.p('Open Bot')
+    const author = unknownUser()
+    // The author is in no config: not a channel, not a DM contact, not anywhere.
+    expect(JSON.stringify(h.config)).not.toContain(author)
+    const event = build(author, P.stub.identity.botUserId)
+
+    await h.receive(event, ['Open Bot'])
+
+    expect(P.notifications.map((n) => ({ chat_id: n.params.meta.chat_id, via: n.params.meta.via, user_id: n.params.meta.user_id, content: n.params.content })))
+      .toEqual([{ chat_id: chatId, via, user_id: author, content: 'first message from someone new' }])
+    expect(lines(h, 'dropped')).toEqual([])
+    expect(lines(h, 'unclaimed-channel')).toEqual([])
+    expectOnlyLookupAndReaction(h, author, event)
+    expect(isRestartPendingOrActive(P.persona.key)).toBe(false)
+    assertNoLeak(captured(h))
+  })
+
+  test('AC 17: two different never-seen users posting in the same `all` channel are both delivered (no per-channel user filter)', async () => {
+    const h = makeHarness(specs(), { ackReaction: 'eyes' })
+    const P = h.p('Open Bot')
+    const [first, second] = [unknownUser(), unknownUser()]
+    const events = [
+      makeChannelMessage({ channel: C_ALL, user: first, text: 'hello from the first' }),
+      makeChannelMessage({ channel: C_ALL, user: second, text: 'hello from the second' }),
+    ]
+
+    for (const event of events) await h.receive(event, ['Open Bot'])
+
+    expect(P.notifications.map((n) => ({ message_id: n.params.meta.message_id, via: n.params.meta.via, user_id: n.params.meta.user_id })))
+      .toEqual(events.map((ev) => ({ message_id: ev.ts as string, via: 'receive_all', user_id: ev.user as string })))
+    expect(P.stub.calls.conversationsOpen).toEqual([])
+    expect(h.allPosts()).toEqual([])
+    expect(lines(h, 'dropped')).toEqual([])
+    assertNoLeak(captured(h))
   })
 })
 

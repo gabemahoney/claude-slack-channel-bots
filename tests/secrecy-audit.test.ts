@@ -124,7 +124,7 @@ const EXEMPT: Record<string, string> = {
   'tests/reload-plan-coverage.test.ts':
     "holds the loader's key tables against the change plan's classes; inputs are makePersona entries (credentials_file is only a path) and it captures no log, error or file",
   'tests/reload-wiring.test.ts':
-    "a source-text audit of src/server.ts plus the pure configInEffect over makePersonaConfig fixtures; it reads no credentials and runs no reload controller",
+    "a source-text audit of src/server.ts plus the pure configInEffect and replySettingsOf over makePersonaConfig fixtures; it reads no credentials and runs no reload controller",
   'tests/persona-identity.test.ts':
     'fake tokens are inputs to the looksLikeSlackToken / isTokenLike matcher parity table, whose results are booleans; nothing is logged, thrown or written',
 }
@@ -608,11 +608,6 @@ const RAW_ERROR_ALLOWED: { file: string; anchor: string; reason: string }[] = [
     file: 'src/permission-trail.ts',
     anchor: 'permission-trail: write failed',
     reason: 'a file-system error writing the permission trail',
-  },
-  {
-    file: 'src/postinstall.ts',
-    anchor: 'could not symlink',
-    reason: 'npm postinstall: a file-system error creating a skill symlink; no config or credentials are loaded',
   },
   {
     file: 'src/postinstall.ts',

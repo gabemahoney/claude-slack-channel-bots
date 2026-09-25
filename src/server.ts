@@ -53,19 +53,9 @@ import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/
 import type { WebClient } from '@slack/web-api'
 import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
-import {
-  readFileSync,
-  mkdirSync,
-  existsSync,
-  renameSync,
-  promises as fsPromises,
-} from 'fs'
+import { mkdirSync, promises as fsPromises } from 'fs'
 
-import {
-  defaultAccess,
-  assertSendable as libAssertSendable,
-  type Access,
-} from './lib.ts'
+import { assertSendable as libAssertSendable } from './lib.ts'
 import {
   expandTilde,
   credentialsFilesToProtect,
@@ -74,6 +64,8 @@ import {
   resolveServerStateDir,
   type Persona,
   type PersonaConfig,
+  type ReplySettings,
+  replySettingsOf,
   MCP_SERVER_NAME,
 } from './config.ts'
 import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
@@ -227,7 +219,6 @@ export function isHttpVerbose(env: NodeJS.ProcessEnv = process.env): boolean {
 const STATE_DIR = resolveServerStateDir()
 /** The configuration file main() loads; the file guard also reads it (b.av2 SR-5.2). */
 const CONFIG_PATH = resolveServerConfigPath()
-const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'server.pid')
 const KEEP_ALIVE_INTERVAL_MS = 30_000
@@ -345,40 +336,6 @@ let archiveWrite: ((key: string, event: unknown) => void) | undefined
 // removed (SR-7.1).
 
 // ---------------------------------------------------------------------------
-// Access settings — load (ack reaction and reply chunking until E9)
-// ---------------------------------------------------------------------------
-
-function loadAccess(): Access {
-  if (!existsSync(ACCESS_FILE)) return defaultAccess()
-  try {
-    const raw = readFileSync(ACCESS_FILE, 'utf-8')
-    return { ...defaultAccess(), ...JSON.parse(raw) }
-  } catch {
-    const aside = ACCESS_FILE + '.corrupt.' + Date.now()
-    try {
-      renameSync(ACCESS_FILE, aside)
-    } catch { /* ignore */ }
-    return defaultAccess()
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Static mode
-// ---------------------------------------------------------------------------
-
-const STATIC_MODE = (process.env['SLACK_ACCESS_MODE'] || '').toLowerCase() === 'static'
-let staticAccess: Access | null = null
-
-if (STATIC_MODE) {
-  staticAccess = loadAccess()
-}
-
-function getAccess(): Access {
-  if (STATIC_MODE && staticAccess) return staticAccess
-  return loadAccess()
-}
-
-// ---------------------------------------------------------------------------
 // Security — assertSendable (file exfiltration guard)
 // ---------------------------------------------------------------------------
 
@@ -434,7 +391,7 @@ function resolvePersonaUserName(personaKey: string, userId: string): Promise<str
 
 const sessionToolDeps: SessionToolDeps = {
   assertSendable,
-  getAccess,
+  getReplySettings,
   getPersona: getAppliedPersona,
   clientFor,
   inboxDir: INBOX_DIR,
@@ -683,7 +640,7 @@ const personaRouting = createPersonaRouting({
   clientFor,
   resolveUserName: resolvePersonaUserName,
   archive: (key, event) => archiveWrite?.(key, event),
-  getAccess,
+  getReplySettings,
   // Lost-message notices go through the one notifier. It is built further
   // down, so it is read at call time: naming it here would throw while this
   // module is still loading.
@@ -724,6 +681,18 @@ let reloadController: ReloadController | undefined
  */
 function getAppliedPersona(key: string): Persona | undefined {
   return personaConfig?.personas.find((p) => p.key === key)
+}
+
+/**
+ * The server-wide reply settings (b.av2 SR-1.6): `ack_reaction`,
+ * `reply_chunk_limit` and `reply_chunk_mode`, read from `personaConfig` at
+ * call time. A confirmed apply keeps their start-time values (`configInEffect`),
+ * so they change only at the next start (b.av2 SR-8.6). Before main() resolves
+ * the start: no reaction and the default chunking (`replySettingsOf`). The one source for the
+ * inbound ack step and the `reply` tool.
+ */
+function getReplySettings(): ReplySettings {
+  return replySettingsOf(personaConfig)
 }
 
 // ---------------------------------------------------------------------------

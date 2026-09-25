@@ -35,6 +35,10 @@
  *   replaces it;
  * - the up predicate (`isPersonaUp`), only when the caller passes one, so by
  *   default every persona counts as up;
+ * - the server-wide reply settings source (`getReplySettings`, as src/server.ts
+ *   passes its start-time `ack_reaction`): it returns the `ackReaction`
+ *   option, so by default there is no ack reaction and a delivery makes no
+ *   `reactions.add` call;
  * - a line capture for the module's log seam, the notifier and the hold
  *   (`h.logs`), and an order capture (`h.order`) for ack, archive, config and
  *   identity reads.
@@ -240,7 +244,7 @@ export interface RoutingHarnessOptions {
   throwOnNotify?: readonly string[]
   /** Per-name stub options, merged over the leak marker. */
   stubOptions?: Readonly<Record<string, StubSlackOptions>>
-  /** The ack reaction the injected ack-reaction source returns. */
+  /** The `ack_reaction` the injected reply settings source (`getReplySettings`) returns; default none. */
   ackReaction?: string
   /** The archive DB the archive seam writes to; the seam is a no-op without one. */
   archiveDb?: Database
@@ -444,7 +448,7 @@ export function makeRoutingHarness(
       h.order.push(`archive:${key}`)
       if (opts.archiveDb) h.archiveWrites.push(archiveSlackMessage(opts.archiveDb, event as SlackMessageEvent, resolver(key)))
     },
-    getAccess: () => ({ ackReaction: opts.ackReaction }),
+    getReplySettings: () => ({ ack_reaction: opts.ackReaction }),
     notify: (key, text, options) => {
       h.notices.push({ key, text })
       return notify(key, text, options)

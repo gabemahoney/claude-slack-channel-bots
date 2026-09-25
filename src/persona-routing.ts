@@ -52,8 +52,9 @@
  *    is posted in the source conversation, and the message text is never in
  *    the notice.
  *
- * Deferred rule and where it is completed: the ack reaction's source and
- * keying (E9; today it comes from `access.json`).
+ * Deferred rule and where it is completed: the ack reaction's per-persona
+ * keying (E9 Task 2). Its name comes from the server-wide `ack_reaction`
+ * setting (b.av2 SR-1.6).
  *
  * Side-effect free (b.av2 SR-13.1): importing this module creates no Slack
  * client, reads no token, file or environment variable, starts no timer and
@@ -68,7 +69,7 @@
  */
 
 import type { WebClient } from '@slack/web-api'
-import type { Persona, PersonaConfig } from './config.ts'
+import type { Persona, PersonaConfig, ReplySettings } from './config.ts'
 import type { SlackBotIdentity } from './persona-slack-validation.ts'
 import {
   decideDelivery,
@@ -76,7 +77,7 @@ import {
   type DeliverDecision,
   type DropDecision,
 } from './delivery-decision.ts'
-import { hasGetStreamKey, sanitizeFilename, type Access } from './lib.ts'
+import { hasGetStreamKey, sanitizeFilename } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import {
   formatPersonaDiagnostic,
@@ -141,8 +142,11 @@ export interface PersonaRoutingDeps {
    * must not throw.
    */
   archive(key: string, event: unknown): void
-  /** The ack-reaction source (`access.json` until E9). */
-  getAccess(): Pick<Access, 'ackReaction'>
+  /**
+   * The server-wide reply settings (b.av2 SR-1.6), read for the ack reaction
+   * name; absent `ack_reaction` means no reaction. Their start-time values.
+   */
+  getReplySettings(): Pick<ReplySettings, 'ack_reaction'>
   /**
    * Raise a notice at persona P's destination (the persona notifier's
    * `notify`, which adds P's reference and posts through the shared
@@ -391,7 +395,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
    * failed reaction is non-critical.
    */
   function addAckReaction(key: string, channel: string, ts: string): void {
-    const reaction = deps.getAccess().ackReaction
+    const reaction = deps.getReplySettings().ack_reaction
     if (!reaction) return
     const client = deps.clientFor(key)
     if (!client) return

@@ -1665,6 +1665,94 @@ Pass: the confirmed removal of D logged one teardown that completed, D's row is 
 
 After Check 25, the applied set is A, B and C again, and nothing is pending.
 
+## Open access (appended by E9)
+
+This check verifies the live leg of AC 17: a workspace user who has never
+interacted with the bots gets answers from a persona in a channel and by DM,
+with no allowlist and no pairing step. It covers b.av2 SR-10.1 (the server
+neither reads nor writes `access.json`, and a stale one is ignored and left
+in place) and SR-10.2's access rows, and checks what postinstall left on the
+test host: no `access.json`, a `debug-slack-channel-bots` skill link, and no
+`claude-slack-channels-config` link.
+
+Like the rest of this plan, the section runs only on the test workspace and
+the test host's server, never on the production install. The Safety section
+applies unchanged.
+
+**Run order:** run it after Check 25, on the same server. The applied set is
+A, B and C, with A's and B's DMs on, and nothing pending. If the server was
+stopped since, restart it as the E4 section says (confirm `hostname` and
+`whoami`, unset the token variables, `start`; do not rerun the check1
+pre-flight).
+
+### Setup for this check
+
+- **A first-time test user.** A user account in the test workspace, other than the operator's and the second test user's, that the operator can sign in as. It has never posted in A-home, never had a DM with any persona app ("CSCB Test A" to "CSCB Test D"), and was never messaged by one. Check its sidebar and **Apps** list. Its member ID (`U…`, from its profile) replaces `<FIRST_TIME_USER_ID>` below. Invite it to A-home. A rerun needs a new such user: this check gives the one used here a history with A and B.
+- **Nothing added for it.** No config edit, allowlist entry or approval of any kind is made for this user, before or during the check.
+
+Redefine `LOG`, `since`, `guard`, `tags` and `replies` (from the E4 and DMs
+sections) in any new shell.
+
+### Check 26: a first-time user reaches a persona in a channel and by DM, with no approval step (AC 17)
+
+Steps:
+
+1. Check what postinstall left, only if the guard passes:
+
+   ```sh
+   if guard; then
+     S=~/.claude/channels/slack
+     PKG="$(dirname "$(dirname "$(readlink -f "$(command -v claude-slack-channel-bots)")")")"; echo "PKG=$PKG"
+     ls -l "$S/access.json"
+     ls -ld ~/.claude/skills/debug-slack-channel-bots
+     L=$(readlink -f ~/.claude/skills/debug-slack-channel-bots); P=$(readlink -f "$PKG/skills/debug-slack-channel-bots")
+     echo "link=$L pkg=$P"; [ -n "$L" ] && [ "$L" = "$P" ] && echo SKILL_LINK_OK || echo SKILL_LINK_MISMATCH
+     ls ~/.claude/skills/debug-slack-channel-bots/SKILL.md
+     ls -ld ~/.claude/skills/claude-slack-channels-config
+   fi
+   ```
+
+2. Leave a stale access-control file in the state directory. It has the old format's most restrictive settings, so a server that still read it would drop every DM. Record its digest, only if the guard passes:
+
+   ```sh
+   if guard; then
+     CREATED=0
+     if [ ! -e "$S/access.json" ]; then
+       printf '{"dmPolicy":"disabled","allowFrom":[],"channels":{},"pending":{}}\n' > "$S/access.json"; CREATED=1
+     fi
+     STALE_SUM=$(sha256sum "$S/access.json"); echo "CREATED=$CREATED $STALE_SUM"
+   fi
+   ```
+
+   `CREATED=0` means a file was already there (see step 1's expected result); it then serves as the stale file and is left in place at the end.
+
+3. Restart the test server with the "Guarded restart" in the DMs section, so the start runs with the stale file in place. Its expected results apply unchanged.
+4. Record where the log ends: `MARK=$(wc -l < "$LOG")`.
+5. Signed in as the first-time user, post in A-home: "Reply with the word open-channel." Work out its `<TS>` (call it `<TS_CH>`).
+6. As the same user, send "Reply with the word open-dm." in a new DM with app B. Work out its `<TS>` (`<TS_DM>`) and note the DM conversation ID as `<B_NEW_DM_ID>`.
+7. Wait for both answers, then run:
+
+   ```sh
+   tags a <TS_CH>
+   tags b <TS_DM>
+   replies a | tail -n 1; replies b | tail -n 1
+   since "$MARK" | grep -iE 'pairing|allowlist|allowFrom|access\.json|dmPolicy|persona-dm-dropped'
+   [ "$(sha256sum "$S/access.json")" = "$STALE_SUM" ] && echo 'stale file unchanged'
+   ls "$S"/access.json.corrupt.* 2>/dev/null | wc -l
+   ```
+
+8. Remove the stale file only if this check created it and the guard passes: `if guard && [ "$CREATED" = 1 ]; then rm "$S/access.json"; fi`.
+
+Expected:
+
+- Step 1: `ls -l "$S/access.json"` reports that the file does not exist: this build's postinstall created none. A file there whose modification time is older than the install of the build under test was left by an earlier release; record that in Notes (the postinstall leg of this line is then not judged). A newer one fails this check. The first `ls -ld` shows `debug-slack-channel-bots` as a symbolic link (`l` in the mode), and the comparison prints `SKILL_LINK_OK`: the link and `$PKG/skills/debug-slack-channel-bots` resolve (`readlink -f`, both sides) to the same path, so a global install path that goes through a symbolic link does not fail this line. `SKILL.md` exists under the link. `ls -ld` reports that `claude-slack-channels-config` does not exist. If it does exist, record in Notes what it is: postinstall removes it only when it is a symbolic link to `$PKG/skills/claude-slack-channels-config`, and leaves anything else at that name. Only such a link fails this check.
+- Step 5: A answers "open-channel" in A-home under A's name and avatar.
+- Step 6: B answers "open-dm" in the DM under B's name and avatar.
+- Step 7: `tags a <TS_CH>` prints exactly one tag, with `chat_id="<A_HOME_CHANNEL_ID>"`, `via="receive_all"` and `user_id="<FIRST_TIME_USER_ID>"`. `tags b <TS_DM>` prints exactly one, with `chat_id="<B_NEW_DM_ID>"`, `via="dm"` and `user_id="<FIRST_TIME_USER_ID>"`. The last `replies a` line has `chat_id=<A_HOME_CHANNEL_ID>` and the last `replies b` line has `chat_id=<B_NEW_DM_ID>`, each with `error=false` and a result containing `Sent`. The `grep` prints nothing. `stale file unchanged` is printed, and the count of `.corrupt.` files is `0`.
+- At no point does the first-time user get a pairing code, an approval prompt or any message other than the two answers, in the channel, in the DM or as a Slackbot message. No config edit, allowlist entry or approval is made for the user.
+
+Pass: a user who had never interacted with the bots got answers from A in its channel and from B by DM, with no approval step; the stale `access.json` was neither read nor changed; and postinstall left no `access.json`, a `debug-slack-channel-bots` link into the package and no link to the retired skill.
+
 ## Setup from the wizard and README only (appended by E14)
 
 Placeholder. E14 fills in this section.
@@ -1738,6 +1826,6 @@ retired: `rm ~/.config/cscb-test/*-credentials.json`.
 The operator adds one row per run. Record pass or fail only, never a token or
 a log excerpt containing one.
 
-| Date | Build commit | Host / user | Check 1 | Check 2 | Check 3 | Check 4 | Check 5 | Check 6 | Check 7 | Check 8 | Check 9 | Check 10 | Check 11 | Check 12 | Check 13 | Check 14 | Check 15 | Check 16 | Check 17 | Check 18 | Check 19 | Check 20 | Check 21 | Check 22 | Check 23 (reboot) | Check 24 (runtime add) | Check 25 (confirmed removal) | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| | | | | | | | | | | | | | | | | | | | | | | | | | | | | |
+| Date | Build commit | Host / user | Check 1 | Check 2 | Check 3 | Check 4 | Check 5 | Check 6 | Check 7 | Check 8 | Check 9 | Check 10 | Check 11 | Check 12 | Check 13 | Check 14 | Check 15 | Check 16 | Check 17 | Check 18 | Check 19 | Check 20 | Check 21 | Check 22 | Check 23 (reboot) | Check 24 (runtime add) | Check 25 (confirmed removal) | Check 26 (open access) | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| | | | | | | | | | | | | | | | | | | | | | | | | | | | | | |

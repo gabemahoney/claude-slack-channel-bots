@@ -1,6 +1,6 @@
 ---
 name: setup-slack-channel-bots
-description: Interactive setup wizard for claude-slack-channel-bots — checks tokens, config.json, access.json, hooks, and Claude Code settings
+description: Interactive setup wizard for claude-slack-channel-bots — checks tokens, config.json, hooks, and Claude Code settings
 version: 1.0.0
 author: Jeremy Longshore <jeremy@intentsolutions.io>
 license: MIT
@@ -304,46 +304,7 @@ behavior is fully defined in the project's `CLAUDE.md` and a separate
 
 ---
 
-### Step 6 — Check access.json
-
-```bash
-STATE_DIR="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
-cat "$STATE_DIR/access.json" 2>/dev/null || echo "NOT_FOUND"
-```
-
-**If the file does not exist:**
-
-Inform the user that postinstall creates a skeleton with safe defaults:
-
-```json
-{
-  "dmPolicy": "pairing",
-  "allowFrom": [],
-  "channels": {},
-  "pending": {}
-}
-```
-
-The skeleton is created automatically on `bun install -g`. If it is still
-missing, run postinstall or create the file manually with the above content
-(`chmod 600`).
-
-**If the file exists**, show a brief summary of the current settings (dm
-policy, number of allowlisted users, opted-in channels). Explain
-customisation options:
-
-- `dmPolicy`: `"pairing"` (new DMs get a one-time code), `"allowlist"` (only
-  pre-approved users), or `"disabled"` (all DMs dropped).
-- Channels are not opted in by default. Use `/slack-channel-access channel
-  <id>` at runtime to add them, or edit `access.json` directly.
-- `ackReaction`: emoji name (without colons) to react with on receipt.
-- `textChunkLimit` / `chunkMode`: controls how long replies are split.
-
-Do not modify `access.json` during setup unless the user asks to.
-
----
-
-### Step 7 — Verify agent-director is installed
+### Step 6 — Verify agent-director is installed
 
 The modern permission relay runs automatically via agent-director — no
 operator action is required for permission-relay or ask-handling.
@@ -369,7 +330,7 @@ CSCB with `bun install -g claude-slack-channel-bots`.
 
 ---
 
-### Step 8 — Check settings.json for orphan legacy hook entries
+### Step 7 — Check settings.json for orphan legacy hook entries
 
 Operators upgrading from pre-Epic-2 (v0.5.x) may have `PermissionRequest` or
 `PreToolUse` `AskUserQuestion` entries in `~/.claude/settings.json` that point
@@ -393,7 +354,7 @@ and any `PreToolUse` entries with `matcher: "AskUserQuestion"` whose
 
 ---
 
-### Step 9 — Summary
+### Step 8 — Summary
 
 Print a final summary of what was checked and configured:
 
@@ -401,7 +362,6 @@ Print a final summary of what was checked and configured:
 - Token format: valid / invalid
 - ~/.claude/channels/slack/config.json: present and valid (N routes) / missing or skeleton
 - append_system_prompt_file: configured / skipped
-- access.json: present / missing
 - agent-director: installed (version X) / missing
 - slack-channel-bot template: registered (confirmed at startup) / unconfirmed
 - settings.json orphan PermissionRequest (.sh) hooks: none / found (needs cleanup)

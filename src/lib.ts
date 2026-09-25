@@ -3,15 +3,14 @@
  *
  * All functions here are side-effect-free (or accept their dependencies as
  * parameters) so they can be imported by tests without starting the Slack
- * socket or loading credentials: the stream-presence check, the `access.json`
- * settings model (ack reaction and reply chunking, until E9), the file
+ * socket or loading credentials: the stream-presence check, the file
  * exfiltration guard, text chunking and attachment-name sanitising.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { resolve } from 'path'
-import { resolveRealPath } from './config.ts'
+import { resolve, sep } from 'path'
+import { resolveRealPath, tryResolveRealPath } from './config.ts'
 
 // ---------------------------------------------------------------------------
 // MCP transport stream presence
@@ -28,59 +27,40 @@ export function hasGetStreamKey(transport: unknown): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Access model (access.json)
-//
-// Kept as stored until E9 removes it. Only `ackReaction` and the chunk
-// settings are read; the other fields no longer affect delivery.
-// ---------------------------------------------------------------------------
-
-export type DmPolicy = 'pairing' | 'allowlist' | 'disabled'
-
-export interface ChannelPolicy {
-  requireMention: boolean
-  allowFrom: string[]
-}
-
-export interface PendingEntry {
-  senderId: string
-  chatId: string
-  createdAt: number
-  expiresAt: number
-  replies: number
-}
-
-export interface Access {
-  dmPolicy: DmPolicy
-  allowFrom: string[]
-  channels: Record<string, ChannelPolicy>
-  pending: Record<string, PendingEntry>
-  ackReaction?: string
-  textChunkLimit?: number
-  chunkMode?: 'length' | 'newline'
-}
-
-// ---------------------------------------------------------------------------
-// Access helpers
-// ---------------------------------------------------------------------------
-
-export function defaultAccess(): Access {
-  return {
-    dmPolicy: 'pairing',
-    allowFrom: [],
-    channels: {},
-    pending: {},
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Security — assertSendable (file exfiltration guard)
 // ---------------------------------------------------------------------------
 
 /**
+ * True when `path` is `dir` itself or lies under it: a prefix test that
+ * respects path-component boundaries, so `/a/inbox-old/x` is not under
+ * `/a/inbox` and `/a/state2/x` is not under `/a/state`. Both strings are
+ * taken as given (no resolving); a trailing separator on `dir` is tolerated.
+ */
+function isWithinDir(path: string, dir: string): boolean {
+  if (path === dir) return true
+  return path.startsWith(dir.endsWith(sep) ? dir : dir + sep)
+}
+
+/**
+ * True when `path` is within `stateDir` but not within `inboxDir`
+ * (`isWithinDir` on the three strings as given).
+ */
+function inStateDirOutsideInbox(path: string, stateDir: string, inboxDir: string): boolean {
+  return isWithinDir(path, stateDir) && !isWithinDir(path, inboxDir)
+}
+
+/**
  * Throws if `filePath` must not be sent (b.av2 SR-5.2):
  *
- * - it resolves to inside `stateDir` but outside `inboxDir` (a lexical prefix
- *   test; both directory paths should be absolute, already resolved); or
+ * - it resolves to inside `stateDir` but outside `inboxDir`, by either of two
+ *   path-boundary-aware prefix tests (`isWithinDir`: `<stateDir>/inbox-old/`
+ *   is not in the inbox, `<stateDir>2/` is not in the state directory): the
+ *   lexical one (both directory paths should be absolute, already resolved)
+ *   and the same test on the real paths of the file and
+ *   both directories (`resolveRealPath`). So a symlink outside the state
+ *   directory that points into it is refused, and one that points into the
+ *   inbox is allowed. The real-path test applies only when the file's real
+ *   path resolves: a path that does not exist gets the lexical test alone; or
  * - its real path equals the real path of any of `protectedPaths`, the persona
  *   credentials files named by the applied or current configuration (see
  *   `credentialsFilesToProtect` in `config.ts`). Both sides are compared through
@@ -98,8 +78,12 @@ export function assertSendable(
   protectedPaths: readonly string[],
 ): void {
   const resolved = resolve(filePath)
+  const real = tryResolveRealPath(resolved)
 
-  if (resolved.startsWith(stateDir) && !resolved.startsWith(inboxDir)) {
+  if (
+    inStateDirOutsideInbox(resolved, stateDir, inboxDir) ||
+    (real !== undefined && inStateDirOutsideInbox(real, resolveRealPath(stateDir), resolveRealPath(inboxDir)))
+  ) {
     throw new Error(
       `Blocked: cannot send files from state directory (${stateDir}). ` +
         'Only files in inbox/ are sendable.',
@@ -107,8 +91,8 @@ export function assertSendable(
   }
 
   if (protectedPaths.length === 0) return
-  const real = resolveRealPath(resolved)
-  if (protectedPaths.some((p) => resolveRealPath(p) === real)) {
+  const comparable = real ?? resolved
+  if (protectedPaths.some((p) => resolveRealPath(p) === comparable)) {
     throw new Error(`Blocked: cannot send ${resolved} — it is a persona credentials file.`)
   }
 }
