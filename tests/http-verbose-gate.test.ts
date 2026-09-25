@@ -33,7 +33,7 @@ import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { isHttpVerbose, HTTP_VERBOSE_ENV } from '../src/server.ts'
 
-const SERVER_SRC = readFileSync('src/server.ts', 'utf-8')
+const SERVER_SRC = readFileSync(new URL('../src/server.ts', import.meta.url), 'utf-8')
 
 // The exact per-request access-line emit inside the /mcp fetch handler.
 const ACCESS_LINE_RE =

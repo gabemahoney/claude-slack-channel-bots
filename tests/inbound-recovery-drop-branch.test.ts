@@ -1057,7 +1057,7 @@ describe('b.kvq (6) humanTrigger delay clamp (DOWN only)', () => {
 // ===========================================================================
 
 describe('b.kvq (7) server.ts holds no copy of the lost-message branch', () => {
-  const SERVER_SRC = readFileSync('src/server.ts', 'utf-8')
+  const SERVER_SRC = readFileSync(new URL('../src/server.ts', import.meta.url), 'utf-8')
   const SERVER_CODE = stripComments(SERVER_SRC)
 
   test('server.ts code builds no lost-message notice, decides no recovery state and has no human-triggered scheduleRestart call site', () => {

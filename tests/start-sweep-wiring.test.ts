@@ -25,7 +25,7 @@ import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { indicesOf, loadedConfigName, startResolution, stripComments } from './test-helpers/source-audit.ts'
 
-const SERVER_SRC = readFileSync('src/server.ts', 'utf-8')
+const SERVER_SRC = readFileSync(new URL('../src/server.ts', import.meta.url), 'utf-8')
 
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(SERVER_SRC)

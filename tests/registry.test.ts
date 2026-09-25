@@ -23,7 +23,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
-import { DEFAULT_REPLY_CHUNK_LIMIT, DEFAULT_REPLY_CHUNK_MODE, type Persona, type ReplySettings } from '../src/config.ts'
+import { DEFAULT_REPLY_CHUNK_LIMIT, DEFAULT_REPLY_CHUNK_MODE, MCP_SERVER_NAME, type Persona, type ReplySettings } from '../src/config.ts'
 import { assertSendable } from '../src/lib.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import {
@@ -53,6 +53,7 @@ import {
   matchPersonaByRootsPath,
   checkPersonaTarget,
   isSlackHostedFileUrl,
+  MCP_INSTRUCTIONS,
   type PersonaTargetAction,
   type PersonaTargetCheck,
   _resetRegistry,
@@ -83,6 +84,7 @@ import {
   writeCredentialsFile,
   writtenFile,
 } from './test-helpers/credentials.ts'
+import { reloadTermsIn } from './test-helpers/reload-terms.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1873,17 +1875,6 @@ describe('reply — chunking by the server-wide settings', () => {
 // Tool list and MCP instructions
 // ---------------------------------------------------------------------------
 
-/**
- * Reload wording no MCP tool or instruction text may carry (b.av2 SR-8.8). The
- * same list as cli.test.ts's, kept local to each file on purpose.
- */
-const RELOAD_TERMS: readonly (string | RegExp)[] = [/reload/i, 'config.json.apply', 'config.json.pending', '.apply', '.pending']
-
-/** The listed reload terms found in `text`, as written in `RELOAD_TERMS`. */
-function reloadTermsIn(text: string): string[] {
-  return RELOAD_TERMS.filter((t) => (typeof t === 'string' ? text.includes(t) : t.test(text))).map(String)
-}
-
 describe('tool list and instructions', () => {
   test('lists exactly the five tools with their inputs and required inputs unchanged; no tool name, description or input schema text carries reload wording (AC 74)', async () => {
     const { client } = await openPersonaSession(h.alpha)
@@ -1932,21 +1923,24 @@ describe('tool list and instructions', () => {
     },
   )
 
-  test('AC 74: instructions carry no reload wording', async () => {
+  // The content audit (reload wording, AC 74; forbidden terms, AC 46) reads
+  // MCP_INSTRUCTIONS in shipped-docs.test.ts; this pins that a session sends
+  // exactly that string, so the audit reads what instances receive.
+  test('a session sends exactly MCP_INSTRUCTIONS as its instructions', async () => {
     const { client } = await openPersonaSession(h.alpha)
 
-    const instructions = client.getInstructions() ?? ''
-
-    expect(instructions).toContain('chat_id')
-    expect(reloadTermsIn(instructions)).toEqual([])
+    expect(client.getInstructions()).toBe(MCP_INSTRUCTIONS)
   })
 
-  test('instructions carry no pairing or access-control wording and still say to pass chat_id back', async () => {
+  test('the example tag in the instructions carries source="<MCP server name>", as the harness renders it', () => {
+    expect(MCP_INSTRUCTIONS).toContain(`source="${MCP_SERVER_NAME}"`)
+  })
+
+  test('instructions still say to pass chat_id back', async () => {
     const { client } = await openPersonaSession(h.alpha)
 
     const instructions = client.getInstructions() ?? ''
 
-    expect(instructions).not.toMatch(/pairing|access\.json|\/slack-channel:access|allowlist/i)
     expect(instructions).toContain('Reply with the reply tool — pass chat_id back.')
   })
 

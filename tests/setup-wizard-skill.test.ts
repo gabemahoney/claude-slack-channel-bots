@@ -11,10 +11,10 @@
  *
  * Covered elsewhere, not repeated here: the credentials command itself (its
  * section, its one bash block) is run by tests/credentials-command.test.ts.
- * The forbidden-term audit over all shipped text (token variable names,
- * access-control file, pre-persona keys) is E14 Task 3's audit, which Task 3
- * adds to tests/shipped-docs.test.ts. The three shell-token rows below are not
- * plain term checks and stay here.
+ * The forbidden-term audit over all shipped text (token variable names and
+ * export forms, a bearer token on a curl command line, the access-control
+ * file, pre-persona keys) lives in tests/shipped-docs.test.ts, which covers
+ * this skill with the rest of the shipped text.
  *
  * Reads repo files only; writes nothing.
  *
@@ -134,20 +134,18 @@ function sentenceUnits(text: string): string[] {
 const NEGATION_BEFORE = /\b(?:never|don't|do not|must not)\s+(?:(?:ask|tell|have|let|get)\s+(?:the\s+)?(?:user|operator)\s+(?:to\s+)?)?$/i
 
 /**
- * SR-12: the phrasings the pre-persona wizard used to take tokens in chat or
- * keep them in the shell, and variants of them. None may come back. A
- * negatable phrasing is allowed only as a prohibition (`NEGATION_BEFORE`).
+ * SR-12: the phrasings the pre-persona wizard used to take tokens in chat, and
+ * variants of them. None may come back. A negatable phrasing is allowed only
+ * as a prohibition (`NEGATION_BEFORE`). Keeping a token in the shell or on a
+ * command line (an exported token variable, "`export` lines", a bearer token
+ * in a curl argument) is caught across all shipped text by
+ * tests/shipped-docs.test.ts's forbidden-term audit.
  */
 const CHAT_TOKEN_PHRASINGS: [label: string, negatable: boolean, pattern: RegExp][] = [
   ['ask the user to provide a token', true, /\bask (?:the )?(?:user|operator) (?:to (?:provide|paste|type|enter|send|share|give)|for)\b[^.]{0,30}\btokens?\b/gi],
   ['paste a token here or into the chat', true, /\b(?:paste|type|enter|send|share)\b[^.]{0,30}\btokens?\b[^.]{0,20}\b(?:here|in(?:to)? (?:the |this )?(?:chat|conversation))\b/gi],
   ['validate a token the user sends', true, /\bvalidate (?:the|their|your) tokens?\b/gi],
   ['act once the user has given a token', true, /\b(?:after|once|when) (?:the )?(?:user|operator) (?:has )?(?:provides?|provided|pastes?|pasted|sends?|sent|enters?|entered|gives?|given)\b[^.]{0,20}\btokens?\b/gi],
-  // Kept here rather than left to Task 3's audit: these catch a token kept in
-  // the shell or on a command line, not a forbidden term.
-  ['export a token variable', false, /\bexport\s+\w*TOKEN\w*=/gi],
-  ['export lines for a shell profile', false, /`export` lines/gi],
-  ['a bearer token in a curl argument', false, /-H\s+["']Authorization: Bearer/gi],
 ]
 
 /** Each chat-token phrasing in `text` that is not a prohibition, as `<label>: <sentence>`. */

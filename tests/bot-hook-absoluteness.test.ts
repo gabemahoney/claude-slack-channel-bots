@@ -10,8 +10,13 @@
  * lines. The test guards against an AD regression that would silently
  * point bots' hooks at relative or in-checkout paths.
  *
- * Self-skips when AD is unavailable on the host (e.g. contributor laptops
- * without a system-wide install) so it never produces false failures.
+ * Never runs in the unit suite, and says so: a unit test never spawns a real
+ * Claude process (director decision), and agent-director refuses the
+ * `--print` claude arg the spawn passes (`ErrSpawnDeniedFlag`) before any
+ * instance exists. The case is skipped by `test.skipIf` with the reason in
+ * its name, so it shows as skipped, never as a vacuous pass; docker and live
+ * runs cover the property. When enabled, a missing agent-director or a failed
+ * spawn fails the case.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -31,27 +36,42 @@ import { join, resolve } from 'node:path'
 
 import { Client, resolveSystemBinary } from 'agent-director'
 
+import { personaInstanceId, personaLabels } from '../src/persona-identity.ts'
+
+/**
+ * Whether this file may spawn a real instance: never in the unit suite (a unit
+ * test never spawns a real Claude process). Decided here, at module scope, so
+ * the skip is visible in the case list and nothing below spawns.
+ */
+const REAL_SPAWN_ALLOWED: boolean = false
+const SKIP_REASON = 'needs a real agent-director spawn; covered by docker/live runs'
+
 const CSCB_CHECKOUT_ROOT = resolve(import.meta.dirname, '..')
 // One temp root per run holds both the isolated CLAUDE_CONFIG_DIR and the
 // agent-director store, so the test never opens or creates the real
 // ~/.agent-director/state.db (b.av2 SR-13.2) and cleans up in one rmSync.
-const TEST_ROOT = mkdtempSync(join(tmpdir(), 'cscb-hook-abs-'))
+// Created only when the spawn is allowed.
+const TEST_ROOT = REAL_SPAWN_ALLOWED ? mkdtempSync(join(tmpdir(), 'cscb-hook-abs-')) : ''
 const TEST_CONFIG_DIR = join(TEST_ROOT, 'claude-config')
 const TEST_STORE_PATH = join(TEST_ROOT, 'agent-director', 'state.db')
-const TEST_INSTANCE_ID = `cscb_hook_abs_${Date.now()}_${process.pid}`
+// Persona-shaped fixture (b.av2 SR-2.2): instance ID `cscb_<key>` and the
+// `service=cscb` / `persona=<key>` / `config_dir=<hash>` labels CSCB spawns
+// with, built through the same helpers. The key is unique per run.
+const TEST_PERSONA_KEY = `hook_abs_${Date.now()}_${process.pid}`
+const TEST_INSTANCE_ID = personaInstanceId(TEST_PERSONA_KEY)
+const TEST_LABELS = personaLabels(TEST_PERSONA_KEY, TEST_CONFIG_DIR, TEST_ROOT)
 
-let adAvailable = false
-let adAvailableSkipReason = ''
 let client: Client | null = null
 let spawnSucceeded = false
-let spawnSkipReason = ''
+let spawnFailure = ''
 
 beforeAll(async () => {
+  if (!REAL_SPAWN_ALLOWED) return
+
   try {
     await resolveSystemBinary()
-    adAvailable = true
   } catch (err) {
-    adAvailableSkipReason = `agent-director unavailable on host: ${(err as Error).message}`
+    spawnFailure = `agent-director unavailable on host: ${(err as Error).message}`
     return
   }
 
@@ -65,7 +85,7 @@ beforeAll(async () => {
       createIfMissing: true,
     })
   } catch (err) {
-    spawnSkipReason = `Client.create failed: ${(err as Error).message}`
+    spawnFailure = `Client.create failed: ${(err as Error).message}`
     return
   }
 
@@ -73,14 +93,14 @@ beforeAll(async () => {
     await client.spawn({
       claude_instance_id: TEST_INSTANCE_ID,
       cwd: '/tmp',
-      label: ['service=cscb', 'channel=C_HOOK_ABS_TEST'],
+      label: TEST_LABELS,
       relay_mode: 'on',
       claude_args: ['--print', 'noop'],
       extra_env: { CLAUDE_CONFIG_DIR: TEST_CONFIG_DIR },
     })
     spawnSucceeded = true
   } catch (err) {
-    spawnSkipReason = `spawn failed: ${(err as Error).message}`
+    spawnFailure = `spawn failed: ${(err as Error).message}`
   }
 })
 
@@ -96,7 +116,7 @@ afterAll(async () => {
   if (client) {
     try { client.close() } catch { /* close is no-op on failure */ }
   }
-  if (existsSync(TEST_ROOT)) {
+  if (TEST_ROOT !== '' && existsSync(TEST_ROOT)) {
     try { rmSync(TEST_ROOT, { recursive: true, force: true }) } catch { /* best-effort */ }
   }
 })
@@ -161,24 +181,8 @@ function firstArgvToken(command: string): string {
 }
 
 describe('SR-8.2: bot-hook absoluteness', () => {
-  test('preconditions: AD available + spawn succeeded', () => {
-    if (!adAvailable) {
-      // Self-skip on AD-unavailable hosts.
-      console.log(`[bot-hook-absoluteness] skipping: ${adAvailableSkipReason}`)
-      return
-    }
-    if (!spawnSucceeded) {
-      console.log(`[bot-hook-absoluteness] skipping: ${spawnSkipReason}`)
-      return
-    }
-    expect(spawnSucceeded).toBe(true)
-  })
-
-  test('every emitted hook command starts with an absolute path outside CSCB checkout', () => {
-    if (!adAvailable || !spawnSucceeded) {
-      console.log('[bot-hook-absoluteness] skipping property assertion (AD/spawn unavailable)')
-      return
-    }
+  test.skipIf(!REAL_SPAWN_ALLOWED)(`every emitted hook command starts with an absolute path outside the CSCB checkout (skipped: ${SKIP_REASON})`, () => {
+    if (!spawnSucceeded) throw new Error(`no instance to inspect: ${spawnFailure || 'spawn not attempted'}`)
 
     const settingsFiles = findSettingsFiles(TEST_CONFIG_DIR)
     expect(settingsFiles.length).toBeGreaterThan(0)

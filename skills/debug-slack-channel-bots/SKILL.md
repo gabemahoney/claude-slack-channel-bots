@@ -51,6 +51,12 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    says whether a server restart is needed, and `server.log` has a
    `No live session` or `DROP: no _GET_stream` line (see
    [Other lines you may see](#other-lines-you-may-see)).
+   A quick delivery check when `ack_reaction` is set: the persona adds that
+   reaction under its own name once a message reaches its instance, and
+   removes it with its first reply to that message. A Slack message with neither the persona's
+   reaction nor its reply was most likely not dispatched to it. Adding the
+   reaction can fail without a log line, so treat this as a hint and confirm
+   in `server.log`.
 2. **Pull every line for that key** from `server.log` (see
    [The server log](#the-server-log)).
 3. **Match the class** of the first failure line after its latest
@@ -376,7 +382,7 @@ running are not affected. See
 - **Normal:** Slack refreshes Socket Mode connections routinely, every few
   hours. An occasional `persona-connection-lost` line followed within seconds
   by `persona-connection-restored` is expected and needs no action.
-- **Flapping:** lost and restored pairs again and again, minutes apart or
+- **Flapping:** lost and restored lines that keep repeating, minutes apart or
   closer, are not Slack's routine refresh. The connection between the host and
   Slack is unstable (a proxy, firewall or NAT closing idle or long-lived
   connections, or a flaky network). The persona stays `up` and each reopen
@@ -1947,7 +1953,7 @@ or a filesystem that doesn't support syncing a directory).
   effect at the next start, or for the CLI at once (`stop_timeout`,
   `exit_timeout`), as its preview line says.
 - **What happens to personas now:** the apply switches the persona set the
-  server runs at once. Message routing, the up check, the notifier and the
+  server runs at once. Message delivery, the up check, the notifier and the
   permission poller read that set at each use. Then:
   - a removed persona (or the old key of a renamed one) is torn down: its
     Slack connection is closed, its instance killed and its agent-director

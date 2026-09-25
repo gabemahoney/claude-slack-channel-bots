@@ -21,6 +21,10 @@
  * conversations and (for `reply`) user IDs (`checkPersonaTarget`), and posts
  * as the persona with no username or icon override.
  *
+ * Instructions: `MCP_INSTRUCTIONS` is exported as the exact string every
+ * session server sends as its MCP `instructions`, so the shipped-docs audit
+ * reads what instances receive.
+ *
  * Importing this module has no side effects.
  *
  * SPDX-License-Identifier: MIT
@@ -703,10 +707,17 @@ async function fetchSlackHostedFile(url: string, token: string): Promise<SlackFi
   }
 }
 
-const MCP_INSTRUCTIONS = [
+/**
+ * The MCP instructions handed to every bot instance. `createSessionServer`
+ * passes this exact value as the server's `instructions`, so a test importing
+ * it reads the string instances receive. The example tag's `source` is the MCP
+ * server name (`MCP_SERVER_NAME`), which the Claude Code harness renders on
+ * every delivered `<channel>` tag.
+ */
+export const MCP_INSTRUCTIONS = [
   'The sender reads Slack, not this session. Anything you want them to see must go through the reply tool.',
   '',
-  'Messages from Slack arrive as <channel source="slack" chat_id="C..." message_id="1234567890.123456" user="display name" user_id="U..." thread_ts="..." ts="..." via="mention">.',
+  `Messages from Slack arrive as <channel source="${MCP_SERVER_NAME}" chat_id="C..." message_id="1234567890.123456" user="display name" user_id="U..." thread_ts="..." ts="..." via="mention">.`,
   'user_id is the author\'s Slack user ID. When a bot or integration without a user posted the message, the tag carries bot_id instead of user_id.',
   'via says how the message reached you: dm (a direct message to you), mention (you were @mentioned), broadcast (@here or @channel), ' +
     'receive_all_shared (a channel where you and at least one other persona receive every message), ' +

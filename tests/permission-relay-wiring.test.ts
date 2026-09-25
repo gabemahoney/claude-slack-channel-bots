@@ -31,7 +31,7 @@ import { readFileSync } from 'node:fs'
 import { callsOf, indicesOf, objectProperties, onlyCallArguments, shutdownBody, stripComments } from './test-helpers/source-audit.ts'
 
 /** server.ts with every comment removed (see stripComments). */
-const SERVER_CODE = stripComments(readFileSync('src/server.ts', 'utf-8'))
+const SERVER_CODE = stripComments(readFileSync(new URL('../src/server.ts', import.meta.url), 'utf-8'))
 
 describe('server.ts wires the click path by persona (b.av2 SR-7.1, SR-3.1)', () => {
   test('server.ts derives no persona key from an action ID', () => {

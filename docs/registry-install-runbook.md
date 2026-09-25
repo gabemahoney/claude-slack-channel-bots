@@ -44,30 +44,30 @@ by hand** — the scripts are the only authorized release path and they enforce
 every SR-X.Y release gate (clean tree, tests, typecheck, npm auth, next-version
 availability, finished-work audit, and the `/ci` Docker suite).
 
-There is no changelog file in this repo; the release-notes surface is the
-`Release v<version>` commit plus the annotated `v<version>` tag that `/publish
-prepare` creates.
+Release notes live in `CHANGELOG.md` at the repo root, under an "Unreleased"
+heading until the release is cut. `/publish` does not read that file: the
+release commit and the annotated `v<version>` tag `/publish prepare` creates
+both stay `Release v<version>`. It is not in `package.json`'s `files`, so the
+npm tarball does not carry it.
 
-> **Version note.** This branch bumps the in-tree `package.json` to `0.9.0` as
-> this ticket's release prep (cron is a new backward-compatible feature → at
-> least a minor). `/publish prepare` does **not** publish that `0.9.0` — it runs
-> `npm version <kind>` against the current `0.9.0`, so `prepare patch` releases
-> `0.9.1` and `prepare minor` releases `0.10.0`. The owner picks the bump;
-> skipping `0.9.0` on the registry is harmless. Every phase below uses whatever
-> version prepare reports (shown as `<version>` in the commands and expected
-> outputs) — not a hardcoded `0.9.0`.
+> **Version note.** `/publish prepare` does **not** publish the in-tree
+> `package.json` version as it stands — it runs `npm version <kind>` against it,
+> so the released version is one bump above it. The owner picks the bump kind
+> (`patch`, `minor` or `major`); `CHANGELOG.md`'s "Unreleased" notes say whether
+> the release is breaking. Every phase below uses whatever version prepare
+> reports (shown as `<version>` in the commands and expected outputs).
 
 Run the two-step path so you get a checkpoint between "ready" and "published":
 
 ```
-/publish prepare minor
+/publish prepare <kind>
 /publish promote
 ```
 
 Or the one-shot alias:
 
 ```
-/publish minor
+/publish <kind>
 ```
 
 `/publish prepare` bumps, packs, smoke-tests the tarball, and commits + tags
@@ -251,15 +251,14 @@ src/cli.ts start` from the repo — customer-shaped boot.
   stale pidfile is removed with a logged warning so a later `stop` can't act on a
   wrong PID. When no daemon is live, any residual pidfile is removed before
   launch.
-- Slack tokens do not come from the wrapper. From the persona release on,
-  `start` checks no token variable and the server reads each persona's tokens
-  only from the credentials file its `config.json` entry names; a
-  `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` export from `~/xoxb` / `~/xapp` is
-  ignored and can be dropped from `start_cscb`. Reference those files by name
-  only — never echo their contents.
-- `config.json` must be in the persona format before that release boots. A
-  route-keyed file (`routes`, `default_route`, `default_dm_session`) stops the
-  server with the conversion error, and `start` exits 1 after repeating that
+- Slack tokens do not come from the wrapper. `start` reads no token, and the
+  server reads each persona's tokens only from the credentials file its
+  `config.json` entry names. Any token export `start_cscb` still makes from
+  `~/xoxb` / `~/xapp` is ignored and can be dropped. Reference those files by
+  name only — never echo their contents.
+- `config.json` must be in the persona format. A pre-persona file (top-level
+  `routes`, `default_route` or `default_dm_session`) is rejected: the server
+  stops with the conversion error, and `start` exits 1 after repeating that
   error from `server.log`.
 
 **This change takes effect only on the next reboot or an authorized restart.**

@@ -16,8 +16,8 @@
  * touches the persona configuration; and nothing calls CSCB's configuration
  * routes or routing. Sections are found by title text through
  * tests/test-helpers/markdown.ts, which throws naming a missing heading. The
- * forbidden-term audit over shipped text is E14 Task 3's audit, which Task 3
- * adds to shipped-docs.test.ts; it is not repeated here.
+ * forbidden-term audit over shipped text lives in tests/shipped-docs.test.ts;
+ * it is not repeated here.
  *
  * SPDX-License-Identifier: MIT
  */

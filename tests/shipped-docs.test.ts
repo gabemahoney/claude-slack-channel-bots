@@ -1,15 +1,29 @@
 /**
- * shipped-docs.test.ts — audits files the package ships to the operator
- * (b.av2 SR-13.5). One `describe` per shipped file.
+ * shipped-docs.test.ts — the shipped-description audit (b.av2 SR-13.5): what
+ * the package ships to the operator and to bot instances describes personas
+ * and nothing else. It backs the SR-14 `shipped-docs` rows for AC 39, AC 46
+ * and AC 74.
  *
- * Covers the Slack app manifest (b.av2 AC 39, SR-4.3, SR-12), the README's
- * modify-semantics table (SR-12, SR-8.6), held against the change plan's
- * exported classes in src/reload-plan.ts, and the README persona reference
- * (SR-12), whose key tables list exactly the loader's keys and whose complete
- * example loads through the real loader (SR-13.5), and the README's pointers
- * to the setup wizard. E14 extends it into the full shipped-docs audit
- * (README, skills, MCP instructions); the shipped-text audit at the end, over
- * `SHIPPED_TEXTS`, starts it with the first-@mention claim (SR-12).
+ * Covers:
+ * - the Slack app manifest (AC 39, SR-4.3, SR-12): `im:write` and the pinned
+ *   scopes and events, and its comments;
+ * - the README's modify-semantics table (SR-12, SR-8.6), held against the
+ *   change plan's exported classes in src/reload-plan.ts;
+ * - the README persona reference (SR-12): its key tables list exactly the
+ *   loader's keys and its complete example loads through the real loader;
+ * - the README's pointers to the setup wizard;
+ * - the shipped-text audit (AC 46) over `SHIPPED_TEXTS` (the README, every
+ *   file under `skills/`, the whole manifest, the MCP instructions read
+ *   through `MCP_INSTRUCTIONS` exported by src/registry.ts, the Slack Reply
+ *   Guard's reminder text and the crontable template header): no
+ *   first-@mention claim (SR-12), and no term of `FORBIDDEN_TERMS` (the
+ *   pre-persona shape, the token environment variables and command-line
+ *   tokens, the access-control file, the retired name-rule wording). The one
+ *   exemption is the debugging skill's SR-1.7 entry (`AUDIT_EXCEPTIONS`);
+ * - the README's receiving section (SR-12, SR-4.4): its table's row for each
+ *   `via` value shows that value, and both injected kinds' rows show none;
+ * - the MCP instructions carry no reload wording (AC 74, SR-8.8).
+ * CHANGELOG.md and docs/ are not shipped descriptions and are not read.
  *
  * Reads repo files resolved from this file's location, so the working
  * directory doesn't matter. The one writer is the complete-example load: it
@@ -34,7 +48,20 @@ import {
   type PersonaConfig,
 } from '../src/config.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
-import { findSection, headingAnchors, headingSlug, requiredSection, splitFences } from './test-helpers/markdown.ts'
+import {
+  findSection,
+  flat,
+  headingAnchors,
+  headings,
+  headingSlug,
+  requiredSection,
+  sectionRange,
+  splitFences,
+} from './test-helpers/markdown.ts'
+import { RELOAD_TERMS } from './test-helpers/reload-terms.ts'
+import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
+import type { Via } from '../src/delivery-decision.ts'
+import { MCP_INSTRUCTIONS } from '../src/registry.ts'
 import {
   DESTRUCTIVE_PREFIX,
   DESTRUCTIVE_SETTINGS,
@@ -541,28 +568,59 @@ function shippedSkillFiles(): string[] {
 }
 
 /**
- * The MCP instruction text (`MCP_INSTRUCTIONS` in src/registry.ts, not
- * exported): the string literals of its array, joined with spaces. Throws
- * when the declaration isn't found, so the audit never passes on nothing.
+ * The MCP instruction text: `MCP_INSTRUCTIONS` as src/registry.ts exports it,
+ * the exact string every session server sends as its `instructions` (never
+ * the source file's text: its comments and identifiers aren't shipped). Throws
+ * when it is empty, so the audit never passes on nothing.
  */
 function mcpInstructionsText(): string {
-  const source = readRepoFile('src/registry.ts')
-  const decl = /const MCP_INSTRUCTIONS = \[([\s\S]*?)\]\.join\(/.exec(source)
-  const literals = decl
-    ? [...decl[1].matchAll(/'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|`((?:[^`\\]|\\.)*)`/g)].map((m) =>
-        (m[1] ?? m[2] ?? m[3]).replace(/\\(.)/g, '$1'),
-      )
-    : []
-  if (literals.join('').trim() === '') throw new Error('src/registry.ts has no `const MCP_INSTRUCTIONS = [ … ].join(…)` with string literals')
-  return literals.join(' ')
+  if (MCP_INSTRUCTIONS.trim() === '') throw new Error('src/registry.ts exports an empty MCP_INSTRUCTIONS')
+  return MCP_INSTRUCTIONS
 }
 
-/** Every shipped text the audit reads: [name in failures, text]. */
+/** The name the MCP instructions go by in the audit's failures and case titles. */
+const MCP_INSTRUCTIONS_NAME = 'MCP instructions (src/registry.ts MCP_INSTRUCTIONS)'
+
+/** The Slack Reply Guard, whose reminder text reaches every persona's instance. */
+const REPLY_GUARD_FILE = 'stop-hooks/slack-reply-guard.sh'
+
+/**
+ * The Slack Reply Guard's reminder text: every `PROVENANCE="…"` wording and
+ * the `REMINDER_TAIL="…"` the hook prints to the instance, one per line, read
+ * as the literal strings the script assigns (not its comments or code; an
+ * assignment that expands a variable is skipped). Throws when either is
+ * missing, so the audit never passes on nothing.
+ */
+function replyGuardReminderText(): string {
+  const script = readRepoFile(REPLY_GUARD_FILE)
+  const literals = (name: string) =>
+    [...script.matchAll(new RegExp(`^\\s*${name}="([^"$]*)"\\s*$`, 'gm'))].map((m) => m[1])
+  const provenances = literals('PROVENANCE')
+  const tails = literals('REMINDER_TAIL')
+  if (provenances.length === 0 || tails.length !== 1) {
+    throw new Error(`${REPLY_GUARD_FILE}: expected PROVENANCE wordings and one REMINDER_TAIL, found ${provenances.length} and ${tails.length}`)
+  }
+  return [...provenances, ...tails].join('\n')
+}
+
+/** The crontable header the server writes for a new crontable, as src/cron-bootstrap.ts exports it. */
+function crontableHeaderText(): string {
+  if (CRONTABLE_TEMPLATE_HEADER.trim() === '') throw new Error('src/cron-bootstrap.ts exports an empty CRONTABLE_TEMPLATE_HEADER')
+  return CRONTABLE_TEMPLATE_HEADER
+}
+
+/**
+ * Every shipped text the audit reads: [name in failures, text]. The MCP tool
+ * descriptions are not read: src/registry.ts builds the tool list inline in
+ * `createSessionServer` and exports no list to read it through.
+ */
 const SHIPPED_TEXTS: [name: string, read: () => string][] = [
   ['README.md', () => readRepoFile('README.md')],
   ...shippedSkillFiles().map((rel): [string, () => string] => [rel, () => readRepoFile(rel)]),
   ['slack-app-manifest.yml', () => readRepoFile('slack-app-manifest.yml')],
-  ['MCP instructions (src/registry.ts MCP_INSTRUCTIONS)', mcpInstructionsText],
+  [MCP_INSTRUCTIONS_NAME, mcpInstructionsText],
+  [`${REPLY_GUARD_FILE} (reminder text)`, replyGuardReminderText],
+  ['CRONTABLE_TEMPLATE_HEADER (src/cron-bootstrap.ts)', crontableHeaderText],
 ]
 
 /**
@@ -610,5 +668,511 @@ describe('shipped text audit (README, skills, manifest, MCP instructions)', () =
     ['The server enables event delivery for every configured channel.', false],
   ] as const)('the first-@mention matcher on %p: matches is %p', (sentence, claim) => {
     expect(termsIn(sentence, FIRST_MENTION_CLAIM).length > 0).toBe(claim)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC 46: the forbidden-term audit
+// ---------------------------------------------------------------------------
+
+/** One forbidden term: its label in case titles and failures, and its pattern (flag `g`, so every occurrence is found). */
+type Term = readonly [label: string, pattern: RegExp]
+
+/** A group of forbidden terms: what they stand for, the b.av2 SRs (or E14 decisions) that retire them, and the terms. */
+interface TermGroup {
+  name: string
+  cites: string
+  terms: readonly Term[]
+}
+
+/**
+ * AC 46's forbidden terms: the one list the audit checks every shipped text
+ * against. The first-@mention claim is `FIRST_MENTION_CLAIM` above, checked
+ * by its own case; reload wording is `RELOAD_TERMS` (tests/test-helpers/
+ * reload-terms.ts), checked in the MCP instructions only (SR-8.8 lets the README and the skills describe the
+ * gesture).
+ *
+ * Matching rules:
+ * - Key, file and variable names match as whole words (`\b…\b`), as written,
+ *   so `default_route` doesn't match inside a longer key.
+ * - The pre-persona shape is banned as nouns, not the verb (E14 decision 13):
+ *   `routes` only as a config key (`` `routes` ``, `"routes"`, `routes:`),
+ *   and route-keyed noun phrases ("per-route", "a/each/the route",
+ *   "route's", "routed channel", "route map"). "The server routes each Slack
+ *   event to every persona" and the MCP server name `slack-channel-router`
+ *   never match. `"cwd"` counts only inside a channel-keyed map
+ *   (`"C…": { … "cwd": … }`), so pasted agent-director output with a `cwd`
+ *   field is not a hit.
+ * - The access-control file's camelCase fields are matched case-sensitively,
+ *   so the persona settings `ack_reaction`, `reply_chunk_limit` and
+ *   `reply_chunk_mode` never match `ackReaction`, `textChunkLimit` or
+ *   `chunkMode`.
+ * - Wording is matched case-insensitively, with `\s+` between words so a
+ *   phrase wrapped across lines still matches.
+ * - A bearer token on a curl command line matches every header flag form
+ *   (`-H "…"`, `--header "…"`, `--header=…`, unquoted); the wizard's curl
+ *   config line `header = "Authorization: Bearer %s"` is not a flag.
+ * - The retired name rule matches only tied to a name ("a name that looks
+ *   like a Slack token"); the redaction wording "a value that looks like a
+ *   Slack token" is not a hit.
+ * - Token environment variables are banned by name and by export form, not
+ *   by the phrase "token environment variables": E14 decision 12 prescribes
+ *   that phrase for the README upgrade entry ("remove any token environment
+ *   variables you exported for the previous version"), so banning it would
+ *   need a second exemption; a name or an export is what would tell an
+ *   operator to set one.
+ */
+const FORBIDDEN_TERMS: readonly TermGroup[] = [
+  {
+    name: 'the pre-persona shape',
+    cites: 'b.av2 SR-1.7, SR-10.2',
+    terms: [
+      ['routes', /`routes`|"routes"|\broutes:/g],
+      ['default_route', /\bdefault_route\b/g],
+      ['default_dm_session', /\bdefault_dm_session\b/g],
+      ['per-route', /\bper[- ]route\b/gi],
+      ['a/each/the route', /\b(?:a|each|the)\s+route\b/gi],
+      ["route's", /\broute['’]s\b/gi],
+      ['routing config', /\brouting\s+config(?:uration)?\b/gi],
+      ['routed channel', /\brouted\s+channels?\b/gi],
+      ['route map', /\broute\s+maps?\b/gi],
+      ['a "cwd" in a channel-keyed map', /"C[A-Z0-9]+"\s*:\s*\{[^}]*"cwd"\s*:/g],
+    ],
+  },
+  {
+    name: 'the token environment variables',
+    cites: 'b.av2 SR-1.4, SR-10.2; E14 decision 12',
+    terms: [
+      ['SLACK_BOT_TOKEN', /\bSLACK_BOT_TOKEN\b/g],
+      ['SLACK_APP_TOKEN', /\bSLACK_APP_TOKEN\b/g],
+      ['an export of a token variable', /\bexport\s+\w*TOKEN\w*=/gi],
+      ['`export` lines for a shell profile', /`export`\s+lines\b/gi],
+    ],
+  },
+  {
+    name: 'a token on a command line',
+    cites: 'b.av2 SR-1.4',
+    terms: [['a bearer token in a curl header flag', /(?:-H|--header)[\s=]+["']?Authorization:\s*Bearer\b/gi]],
+  },
+  {
+    name: 'the access-control file and its model',
+    cites: 'b.av2 SR-10.1, SR-10.2, SR-12',
+    terms: [
+      ['access.json', /\baccess\.json\b/gi],
+      ['SLACK_ACCESS_MODE', /\bSLACK_ACCESS_MODE\b/g],
+      ['/slack-channel:access', /\bslack-channel:access\b/gi],
+      ['claude-slack-channels-config', /\bclaude-slack-channels-config\b/gi],
+      ['dmPolicy', /\bdmPolicy\b/g],
+      ['allowFrom', /\ballowFrom\b/g],
+      ['requireMention', /\brequireMention\b/g],
+      ['ackReaction', /\backReaction\b/g],
+      ['textChunkLimit', /\btextChunkLimit\b/g],
+      ['chunkMode', /\bchunkMode\b/g],
+      ['access-control wording', /\baccess[- ]control\b/gi],
+      ['allowlist wording', /\ballow[- ]?list(?:s|ed|ing)?\b/gi],
+      ['pairing wording', /\bpairing\b/gi],
+    ],
+  },
+  {
+    name: 'the retired persona-name rule',
+    cites: 'b.av2 SR-1.2; E14 Task 0',
+    terms: [['a name that "looks like a Slack token"', /\bnames?\b[^.]{0,40}\blooks?\s+like\s+an?\s+(?:Slack\s+)?token\b/gi]],
+  },
+]
+
+/** One exemption: `terms` may appear in `file` only inside the section under `heading` (bounded at the next heading of its level or higher). */
+interface AuditException {
+  file: string
+  heading: string
+  terms: readonly string[]
+  reason: string
+}
+
+/**
+ * The single exemption (b.av2 SR-12): the debugging skill's SR-1.7 entry may
+ * name the three pre-persona keys to say they are rejected. Any other term
+ * inside that section, and those keys anywhere else, still fail. When the
+ * heading is missing the audit throws for that file; it never exempts the
+ * whole file.
+ */
+const SR_1_7_EXCEPTION: AuditException = {
+  file: 'skills/debug-slack-channel-bots/SKILL.md',
+  heading: '## Pre-persona configuration',
+  terms: ['routes', 'default_route', 'default_dm_session'],
+  reason: 'b.av2 SR-1.7 rejection entry: names the keys only to say they are rejected',
+}
+
+const AUDIT_EXCEPTIONS: readonly AuditException[] = [SR_1_7_EXCEPTION]
+
+/** A forbidden term found in a text: its file, 1-based line, term label, matched text and whole line. */
+interface TermHit {
+  file: string
+  line: number
+  term: string
+  match: string
+  text: string
+}
+
+/** A hit as a failure line: `<file>:<line>: <term> ("<match>") in: <line>`. */
+function formatHit(hit: TermHit): string {
+  return `${hit.file}:${hit.line}: ${hit.term} ("${hit.match}") in: ${hit.text}`
+}
+
+/** Every occurrence of `terms` in `text`, with the line each starts on. Pure. */
+function findTerms(file: string, text: string, terms: readonly Term[]): TermHit[] {
+  const lines = text.split('\n')
+  return terms.flatMap(([term, pattern]) =>
+    [...text.matchAll(pattern)].map((m) => {
+      const line = text.slice(0, m.index).split('\n').length
+      return { file, line, term, match: flat(m[0]), text: lines[line - 1].trim() }
+    }),
+  )
+}
+
+/**
+ * `file`'s hits of `terms`, split into `hits` (failures) and `allowed` (inside
+ * an exemption of `exceptions` for that file). Throws when an exemption's
+ * heading is missing from `text`. Pure.
+ */
+function auditText(
+  file: string,
+  text: string,
+  terms: readonly Term[],
+  exceptions: readonly AuditException[] = AUDIT_EXCEPTIONS,
+): { hits: TermHit[]; allowed: TermHit[] } {
+  const ranges = exceptions
+    .filter((exception) => exception.file === file)
+    .map((exception) => {
+      const range = sectionRange(text, exception.heading)
+      if (range === undefined) {
+        throw new Error(`${file} has no heading "${exception.heading}" (${exception.reason}); nothing in it is exempted`)
+      }
+      // 0-based [start, end) to 1-based lines, heading line included.
+      return { terms: exception.terms, first: range.start + 1, last: range.end }
+    })
+  const exempt = (hit: TermHit) =>
+    ranges.some((r) => r.terms.includes(hit.term) && hit.line >= r.first && hit.line <= r.last)
+  const found = findTerms(file, text, terms)
+  return { hits: found.filter((hit) => !exempt(hit)), allowed: found.filter(exempt) }
+}
+
+/** Every forbidden term, across the groups. */
+const ALL_FORBIDDEN_TERMS: readonly Term[] = FORBIDDEN_TERMS.flatMap((group) => group.terms)
+
+/** A group's term labels, for case titles. */
+function termLabels(group: TermGroup): string {
+  return group.terms.map(([label]) => label).join(', ')
+}
+
+describe('AC 46: forbidden-term audit (README, skills, manifest, MCP instructions)', () => {
+  test('the audit reads skills/EXAMPLE_CLAUDE.md', () => {
+    expect(SHIPPED_TEXTS.map(([name]) => name)).toContain('skills/EXAMPLE_CLAUDE.md')
+  })
+
+  const cases = SHIPPED_TEXTS.flatMap(([name, read]) =>
+    FORBIDDEN_TERMS.map((group) => [name, group.name, group.cites, termLabels(group), read, group] as const),
+  )
+
+  test.each(cases)('%s: none of %s (%s): %s', (name, _group, _cites, _labels, read, group) => {
+    expect(auditText(name, read(), group.terms).hits.map(formatHit)).toEqual([])
+  })
+
+  test(`the only allowed hit: ${SR_1_7_EXCEPTION.terms.join(', ')} in ${SR_1_7_EXCEPTION.file} under "${SR_1_7_EXCEPTION.heading}" (SR-1.7); with the exemption off, they appear nowhere else in shipped text`, () => {
+    const keys = ALL_FORBIDDEN_TERMS.filter(([label]) => SR_1_7_EXCEPTION.terms.includes(label))
+    expect(keys.map(([label]) => label)).toEqual([...SR_1_7_EXCEPTION.terms])
+    const hits = SHIPPED_TEXTS.flatMap(([name, read]) => auditText(name, read(), keys, []).hits)
+    const range = sectionRange(readRepoFile(SR_1_7_EXCEPTION.file), SR_1_7_EXCEPTION.heading)
+    if (range === undefined) throw new Error(`${SR_1_7_EXCEPTION.file} has no heading "${SR_1_7_EXCEPTION.heading}"`)
+    const inside = (hit: TermHit) => hit.file === SR_1_7_EXCEPTION.file && hit.line > range.start && hit.line <= range.end
+    expect(hits.filter((hit) => !inside(hit)).map(formatHit)).toEqual([])
+    expect([...new Set(hits.map((hit) => hit.term))].sort()).toEqual([...SR_1_7_EXCEPTION.terms].sort())
+  })
+
+  test(`the SR-1.7 entry names the three keys, says they are rejected and that the configuration must be rewritten as personas`, () => {
+    const entry = flat(requiredSection(readRepoFile(SR_1_7_EXCEPTION.file), SR_1_7_EXCEPTION.heading, SR_1_7_EXCEPTION.file))
+    for (const key of SR_1_7_EXCEPTION.terms) expect(entry).toContain(`\`${key}\``)
+    expect(entry).toMatch(/\brejected\b/i)
+    expect(entry).toMatch(/\brewrit\w*\b[^.]*\bpersonas\b/i)
+  })
+
+  /**
+   * Shipped wording that is deliberately not a hit, each tied to its file and
+   * the reason no term matches it. Not exemptions: each line is scanned like
+   * any other; these cases pin that the term list leaves them alone. A
+   * RegExp names a line whose text is read from the file (frontmatter
+   * `author:` holds a person's name, which this file doesn't repeat).
+   */
+  const NOT_HITS_BY_DESIGN: [file: string, snippet: string | RegExp, reason: string][] = [
+    [SR_1_7_EXCEPTION.file, "## A persona's routing settings were changed by a confirmed change", "E14 decision 12: a persona's channel and DM settings"],
+    [SR_1_7_EXCEPTION.file, '#a-personas-routing-settings-were-changed-by-a-confirmed-change', "E14 decision 12: that heading's anchor"],
+    [SR_1_7_EXCEPTION.file, '`[slack] persona-routing: ', "E14 decision 12: the server's real log prefix"],
+    [SR_1_7_EXCEPTION.file, 'routinely', 'whole words: "routine" is not "routes"'],
+    ['README.md', 'remove any token environment variables you exported for the previous version', "E14 decision 12's upgrade wording: variables are banned by name and export form"],
+    ['README.md', 'slack-channel-router', 'the MCP server name; no route term matches it'],
+    [WIZARD_FILE, 'header = "Authorization: Bearer %s"', "the credentials command's curl config line, not a command-line argument"],
+    [WIZARD_FILE, /^allowed-tools:.*$/m, 'skill frontmatter: a tool list, not an allowlist'],
+    [WIZARD_FILE, /^author:.*$/m, 'E14 decision 12: frontmatter author fields are out of scope; no term matches them'],
+    ['skills/install-cscb/SKILL.md', /^author:.*$/m, 'E14 decision 12: frontmatter author fields are out of scope; no term matches them'],
+  ]
+
+  test.each(NOT_HITS_BY_DESIGN)('%s: %p is not a hit (%s)', (file, snippet, _reason) => {
+    const text = readRepoFile(file)
+    const line = typeof snippet === 'string' ? (text.includes(snippet) ? snippet : undefined) : snippet.exec(text)?.[0]
+    if (line === undefined) throw new Error(`${file} no longer contains ${String(snippet)}`)
+    expect(findTerms(file, line, ALL_FORBIDDEN_TERMS).map(formatHit)).toEqual([])
+  })
+})
+
+/**
+ * Self-checks for the scanner and the exemption, on in-memory text only: each
+ * term is flagged, the SR-1.7 exemption covers only its three keys and only
+ * inside its section, and persona wording is left alone.
+ */
+describe('AC 46: forbidden-term scanner self-checks', () => {
+  /** One sample per term, so a term added to the list needs a sample here. */
+  const SAMPLES: Record<string, string> = {
+    routes: 'Set `routes` to a map of channels.',
+    default_route: 'Set `default_route` to a channel.',
+    default_dm_session: 'Set `default_dm_session`.',
+    'per-route': 'Each per-route working directory.',
+    'a/each/the route': 'Each route has a cwd.',
+    "route's": "The route's session starts on demand.",
+    'routing config': 'Edit the routing\n  config in the file.',
+    'routed channel': 'Each routed channel has a session.',
+    'route map': 'The route map lists channels.',
+    'a "cwd" in a channel-keyed map': '{ "C0000": { "cwd": "~/work" } }',
+    SLACK_BOT_TOKEN: 'Set SLACK_BOT_TOKEN in your shell.',
+    SLACK_APP_TOKEN: 'Set SLACK_APP_TOKEN in your shell.',
+    'an export of a token variable': 'export MY_TOKEN="<bot token>"',
+    '`export` lines for a shell profile': 'Add the `export`\nlines to your shell profile.',
+    'a bearer token in a curl header flag': 'curl -H "Authorization: Bearer <bot token>" https://slack.com/api/auth.test',
+    'access.json': 'Edit access.json by hand.',
+    SLACK_ACCESS_MODE: 'Set SLACK_ACCESS_MODE to static.',
+    '/slack-channel:access': 'Run /slack-channel:access to pair.',
+    'claude-slack-channels-config': 'Run the claude-slack-channels-config skill to add a channel.',
+    dmPolicy: 'Set "dmPolicy" to open.',
+    allowFrom: 'Add the user to allowFrom.',
+    requireMention: 'Set requireMention for the channel.',
+    ackReaction: 'Set ackReaction to eyes.',
+    textChunkLimit: 'Set textChunkLimit to 4000.',
+    chunkMode: 'Set chunkMode to newline.',
+    'access-control wording': 'The Access Control file decides who may DM.',
+    'allowlist wording': 'Add the user to the allow-list.',
+    'pairing wording': 'Pairing codes expire after an hour.',
+    'a name that "looks like a Slack token"': 'A name that looks like a Slack\ntoken is rejected.',
+  }
+
+  /**
+   * More must-flag samples for the terms decision 13 narrowed: each form of
+   * the `routes` key, each route-keyed noun phrase, and each curl header
+   * flag form.
+   */
+  test.each([
+    ['routes', '`routes` in backticks', 'Remove `routes` from config.json.'],
+    ['routes', 'a quoted "routes" key', '{ "routes": { "C0000": {} } }'],
+    ['routes', 'a routes: key', 'routes:\n  C0000: {}'],
+    ['a/each/the route', '"a route"', 'Add a route for the new channel.'],
+    ['a/each/the route', '"the route"', 'The route for that channel is missing.'],
+    ['a "cwd" in a channel-keyed map', 'a multi-line channel map', '{\n  "C0ABC123": {\n    "name": "x",\n    "cwd": "~/work"\n  }\n}'],
+    ['a bearer token in a curl header flag', '--header "…"', 'curl --header "Authorization: Bearer <bot token>" https://slack.com/api/auth.test'],
+    ['a bearer token in a curl header flag', 'unquoted -H', 'curl -H Authorization:Bearer\\ <bot token> https://slack.com/api/auth.test'],
+    ['a bearer token in a curl header flag', '--header=…', "curl --header='Authorization: Bearer <bot token>' https://slack.com/api/auth.test"],
+    ['a name that "looks like a Slack token"', 'plural names', 'Persona names that look like a token are rejected.'],
+  ] as const)('%s is flagged in %s', (label, _form, text) => {
+    expect(findTerms('sample', text, ALL_FORBIDDEN_TERMS).map((hit) => hit.term)).toContain(label)
+  })
+
+  test('every term has a sample', () => {
+    expect(Object.keys(SAMPLES).sort()).toEqual(ALL_FORBIDDEN_TERMS.map(([label]) => label).sort())
+  })
+
+  test.each(FORBIDDEN_TERMS.flatMap((group) => group.terms.map(([label]) => [group.name, label] as const)))(
+    '%s: the term %s is flagged in its sample',
+    (_group, label) => {
+      expect(findTerms('sample', SAMPLES[label], ALL_FORBIDDEN_TERMS).map((hit) => hit.term)).toContain(label)
+    },
+  )
+
+  test.each([
+    ['the moved persona settings', '`ack_reaction`, `reply_chunk_limit` and `reply_chunk_mode` are server-wide settings.'],
+    ['the MCP server name', 'Tags carry source="slack-channel-router".'],
+    ['"routine" and "routinely"', 'Slack refreshes connections routinely; a routine refresh needs no action.'],
+    ['routing settings and the log prefix', "## A persona's routing settings\n`[slack] persona-routing: lost-message notice`"],
+    ['persona channel and DM wording', 'Each persona lists its `channels`, each with a `delivery`, and a per-persona `dm.enabled` switch.'],
+    ['frontmatter tool list', 'allowed-tools: [Read, Write, Edit, Bash, Glob]'],
+    ["decision 12's upgrade wording", 'Remove any token environment variables you exported for the previous version.'],
+    ['a non-token environment variable', 'Your persona key is in the `CSCB_PERSONA` environment variable. export CSCB_CRON_DIR=~/cron'],
+    ['the curl config header line', `  h='header = "Authorization: Bearer %s"\\n'`],
+    ['a token-like name, as the README now words it', 'a token-like name is redacted there too'],
+    ['"routes" as a verb (decision 13)', 'The server routes each Slack event to every persona that receives it.'],
+    ['pasted agent-director `cwd` output', '{\n  "claude_instance_id": "cscb_alpha",\n  "cwd": "/home/me/work",\n  "label": { "service": "cscb" }\n}'],
+    ['the redaction wording, not the name rule', 'A config error never echoes a value that looks like a Slack token.'],
+    ['the curl config header line, unindented', 'header = "Authorization: Bearer %s"'],
+  ])('%s is not flagged', (_label, text) => {
+    expect(findTerms('sample', text, ALL_FORBIDDEN_TERMS).map(formatHit)).toEqual([])
+  })
+
+  const FILE = SR_1_7_EXCEPTION.file
+  /** A synthetic debugging skill: the SR-1.7 section (with a subsection) between two other sections. */
+  const skill = (earlier: string, entry: string, later: string) =>
+    [
+      '# Debugging', //                                  l.1
+      '## Earlier', //                                   l.2
+      earlier, //                                        l.3
+      SR_1_7_EXCEPTION.heading, //                       l.4
+      entry, //                                          l.5
+      '### Detail', //                                   l.6
+      'Still inside: `default_route` is rejected.', //   l.7
+      '## Later', //                                     l.8
+      later, //                                          l.9
+    ].join('\n')
+  const ENTRY = '`routes`, `default_route` and `default_dm_session` are rejected.'
+
+  test('inside the SR-1.7 section, including its subsections, the three keys are allowed, not hits', () => {
+    const { hits, allowed } = auditText(FILE, skill('-', ENTRY, '-'), ALL_FORBIDDEN_TERMS)
+    expect(hits).toEqual([])
+    expect(allowed.map((hit) => `${hit.line}: ${hit.term}`)).toEqual(['5: routes', '5: default_route', '7: default_route', '5: default_dm_session'])
+  })
+
+  test.each([
+    ['just after the section', skill('-', ENTRY, 'Set `default_route`.'), `${FILE}:9: default_route`],
+    ['just before the section', skill('Set `default_dm_session`.', ENTRY, '-'), `${FILE}:3: default_dm_session`],
+  ])('a pre-persona key %s is a hit, with file and line', (_where, text, expected) => {
+    const hits = auditText(FILE, text, ALL_FORBIDDEN_TERMS).hits.map(formatHit)
+    expect(hits).toHaveLength(1)
+    expect(hits[0].startsWith(expected)).toBe(true)
+  })
+
+  test('the same section in another skill exempts nothing', () => {
+    const other = 'skills/other-skill/SKILL.md'
+    const { hits, allowed } = auditText(other, skill('-', ENTRY, '-'), ALL_FORBIDDEN_TERMS)
+    expect(allowed).toEqual([])
+    expect(hits.map((hit) => `${hit.file}:${hit.line}: ${hit.term}`).sort()).toEqual(
+      [`${other}:5: routes`, `${other}:5: default_route`, `${other}:7: default_route`, `${other}:5: default_dm_session`].sort(),
+    )
+  })
+
+  test.each([
+    ['a token variable', 'Unset SLACK_BOT_TOKEN too.', 'SLACK_BOT_TOKEN'],
+    ['the access-control file', 'Delete access.json too.', 'access.json'],
+    ['route-keyed wording', 'Each per-route setting is gone.', 'per-route'],
+  ])('%s inside the SR-1.7 section is a hit', (_label, line, term) => {
+    const { hits } = auditText(FILE, skill('-', `${ENTRY}\n${line}`, '-'), ALL_FORBIDDEN_TERMS)
+    expect(hits.map((hit) => `${hit.line}: ${hit.term}`)).toEqual([`6: ${term}`])
+  })
+
+  test.each([
+    ['removed', (text: string) => text.replace(`${SR_1_7_EXCEPTION.heading}\n`, '')],
+    ['renamed', (text: string) => text.replace(SR_1_7_EXCEPTION.heading, '## Legacy configuration')],
+    ['moved to another level', (text: string) => text.replace(SR_1_7_EXCEPTION.heading, `#${SR_1_7_EXCEPTION.heading}`)],
+  ])('with the SR-1.7 heading %s, the audit fails naming it and exempts nothing', (_how, edit) => {
+    expect(() => auditText(FILE, edit(skill('-', ENTRY, '-')), ALL_FORBIDDEN_TERMS)).toThrow(
+      `${FILE} has no heading "${SR_1_7_EXCEPTION.heading}"`,
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC 46: the README's receiving section (b.av2 SR-12, SR-4.4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every `via` value (b.av2 SR-4.4), with the README row that delivers it.
+ * src/delivery-decision.ts exports only `type Via`, no runtime list, so the
+ * list is written out here; typing it `Record<Via, …>` fails the typecheck
+ * when a value is added to or removed from `Via` until this list follows.
+ */
+const VIA_ROWS: Record<Via, string> = {
+  dm: 'Direct message',
+  mention: 'Direct @mention',
+  broadcast: '`@here` / `@channel` broadcast',
+  receive_all_shared: 'Every message, shared channel',
+  receive_all: 'Every message, this persona alone',
+}
+const VIA_VALUES = Object.keys(VIA_ROWS) as Via[]
+
+const RECEIVING_HEADING = '## How a persona receives messages'
+
+/** The two injected kinds' rows in the receiving table: they carry no `via` (b.av2 SR-12). */
+const INJECTED_ROWS = ['Scheduled prompt', '`/interject` message']
+
+/** Every pipe table in `section`, each as its header cells and body rows (the `|---|` line skipped). */
+function pipeTables(section: string): { header: string[]; rows: string[][] }[] {
+  const tables: { header: string[]; rows: string[][] }[] = []
+  let block: string[] = []
+  for (const line of [...section.split('\n'), '']) {
+    if (line.trimStart().startsWith('|')) {
+      block.push(line)
+      continue
+    }
+    if (block.length > 0) {
+      const [header, , ...rows] = block.map(tableCells)
+      tables.push({ header, rows })
+      block = []
+    }
+  }
+  return tables
+}
+
+describe(`AC 46: README "${RECEIVING_HEADING}" (SR-12, SR-4.4)`, () => {
+  const readme = readRepoFile('README.md')
+  const section = () => requiredSection(readme, RECEIVING_HEADING, 'README.md')
+
+  /**
+   * The section's table of the ways a message reaches a persona: the one
+   * table whose first column is `Kind` and that has a `` `via` `` column.
+   * Throws naming what is missing, so the row cases never pass on nothing.
+   */
+  function kindsTable(): { viaColumn: number; rows: string[][] } {
+    const tables = pipeTables(section()).filter((t) => t.header[0] === 'Kind' && t.header.includes('`via`'))
+    if (tables.length !== 1) {
+      throw new Error(`README.md "${RECEIVING_HEADING}" must hold one table with a Kind column and a \`via\` column; found ${tables.length}`)
+    }
+    return { viaColumn: tables[0].header.indexOf('`via`'), rows: tables[0].rows }
+  }
+
+  /** The `via` cell of the one row whose Kind cell is `label`; throws when there is no such row or more than one. */
+  function viaCell(label: string): string {
+    const { viaColumn, rows } = kindsTable()
+    const matches = rows.filter((row) => row[0] === label)
+    if (matches.length !== 1) throw new Error(`README.md "${RECEIVING_HEADING}": ${matches.length} rows of kind "${label}", expected 1`)
+    return matches[0][viaColumn] ?? ''
+  }
+
+  test.each(VIA_VALUES.map((via) => [via, VIA_ROWS[via]] as const))(
+    'the table row for `%s` (%s) shows exactly that via value as a code span',
+    (via, label) => {
+      expect(codeSpans(viaCell(label))).toEqual([via])
+    },
+  )
+
+  test.each(INJECTED_ROWS)('the injected kind %s has a table row showing no via value', (label) => {
+    expect(codeSpans(viaCell(label))).toEqual([])
+  })
+
+  test.each([
+    ['the scheduled prompt', /\bscheduled\s+prompt\b/i],
+    ['the `/interject` message', /`\/interject`\s+message\b/i],
+    ['that injected messages carry no `via`', /\bno\s+`via`/i],
+  ])('names %s', (_label, pattern) => {
+    expect(flat(section())).toMatch(pattern)
+  })
+
+  test('no "Messages a bot receives" heading remains', () => {
+    expect(headings(readme).filter((h) => /messages a bot receives/i.test(h.title)).map((h) => h.text)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC 74 (shipped-docs leg): no reload wording in the MCP instructions (b.av2 SR-8.8)
+// ---------------------------------------------------------------------------
+
+// `RELOAD_TERMS` (tests/test-helpers/reload-terms.ts) is the list the CLI and
+// MCP tool-list cases use too. The README and the skills may describe the
+// gesture and are not checked.
+describe('AC 74: the MCP instructions carry no reload wording (SR-8.8)', () => {
+  test.each(RELOAD_TERMS.map((term) => [String(term), term] as const))('%s is absent', (_label, term) => {
+    const text = mcpInstructionsText()
+    expect(typeof term === 'string' ? text.includes(term) : term.test(text)).toBe(false)
   })
 })

@@ -1,7 +1,7 @@
 {
   "name": "claude-slack-channel-bots",
   "version": "0.10.0",
-  "description": "Multi-session Slack-to-Claude bridge — run multiple Claude Code bots across Slack channels via Socket Mode",
+  "description": "Run several Claude Code personas, each its own Slack app, from one server via Socket Mode",
   "type": "module",
   "bin": {
     "claude-slack-channel-bots": "src/cli.ts"

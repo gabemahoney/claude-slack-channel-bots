@@ -139,7 +139,7 @@ who haven't yet installed CSCB at all.
 
 ### Environment Variables
 
-Runtime options are read from environment variables. None of them is required, and Slack tokens are never read from the environment: each persona's tokens live in its own credentials file (see [Credentials files](#credentials-files)). There is no `.env` file — export any of these in your shell profile.
+Runtime options are read from environment variables. None of them is required. Slack tokens come only from each persona's credentials file (see [Credentials files](#credentials-files)). There is no `.env` file — export any of these in your shell profile.
 
 | Variable | Description |
 |---|---|
@@ -262,7 +262,7 @@ Each entry of `channels` is an object with two required fields:
 
 The `name` identifies the persona in `config.json`, logs and targets. It isn't its Slack display name, which comes from the persona's Slack app. Any non-empty name is accepted.
 
-Logs, previews and Slack notices show the name JSON-quoted, with its key beside it, as `"planner" (key=planner)`. Inside a quoted error message (`message="…"`), token-like text is redacted, so a name that looks like a token is redacted there too.
+Logs, previews and Slack notices show the name JSON-quoted, with its key beside it, as `"planner" (key=planner)`. Inside a quoted error message (`message="…"`), token-like text is redacted, so a token-like name is redacted there too.
 
 A name of 1–40 characters, all lower-case letters, digits and `_`, is its own key. Any other name gets a derived key:
 
@@ -294,7 +294,7 @@ Each persona's Slack tokens live in its own credentials file, and `config.json` 
 
 `bot_token` is the app's bot token (`xoxb-…`), shown under OAuth & Permissions once you install the app to the workspace. `app_token` is an app-level token (`xapp-…`) with the `connections:write` scope, generated under Basic Information → App-Level Tokens.
 
-- Tokens are read only from these files, never from `config.json` or the environment.
+- Tokens come only from these files, never from `config.json`.
 - Two personas can't share a credentials file.
 - The server never writes or copies the file and doesn't check its mode. Keep it private: `chmod 600`.
 - The file's content is checked when the persona comes up, not when `config.json` is checked. A missing or malformed file keeps only that persona down (see [Troubleshooting](#troubleshooting)).
@@ -604,7 +604,7 @@ Checks that the configuration file or the last-applied record exists, starts the
 missing prerequisite: config.json not found at <path>, and no config.json.last-applied at <path>
 ```
 
-`start` reads no Slack token and needs no token environment variable. The server checks the configuration, and each persona's credentials file, once it runs.
+`start` reads no Slack token. The server checks the configuration, and each persona's credentials file, once it runs.
 
 The server first runs the agent-director startup gate: it imports `agent-director`, constructs the singleton Client, runs `client.version()`, and verifies `~/.agent-director/state.db` is owned by the current user. Failures land in `startup-errors.log` (see [Startup errors](#startup-errors)). agent-director enforces tmux availability at spawn time. The server then loads the configuration and starts listening. With a last-applied record it runs the record; without one it checks `config.json`, records it and applies it (see [Reload](#reload)). Only then does it write its PID to `STATE_DIR/server.pid`. Conversation context is preserved across server restarts when possible.
 
@@ -1395,10 +1395,11 @@ This major version accepts only the persona configuration format. When you upgra
 
 - **Rewrite `config.json` by hand.** A configuration from an earlier major version stops the server at start, with an error that names the offending setting and says the configuration must be converted to personas. Nothing is converted automatically and the file is not changed. Write a `personas` list as described in [Personas (config.json)](#personas-configjson); the server-wide settings keep their names. The `debug-slack-channel-bots` skill covers this error under "Pre-persona configuration".
 - **Set the reply settings in `config.json`.** Nothing else carries an acknowledgement reaction over: to keep one, set `ack_reaction` as a top-level setting. If you had changed how replies are split, set `reply_chunk_limit` and `reply_chunk_mode` there too. See [Server-wide settings](#server-wide-settings).
-- **Move the tokens into credentials files.** Slack tokens are no longer read from environment variables. Create one [credentials file](#credentials-files) per persona, then remove the token exports from your shell profile.
+- **Move the tokens into credentials files.** Tokens come only from each persona's credentials file. Create one [credentials file](#credentials-files) per persona, then remove any token environment variables you exported for the previous version.
 - **Give each persona its own Slack app.** Your existing app can serve one persona; create another app for each additional persona. Re-install the existing app from the current `slack-app-manifest.yml` so it gains the `im:write` scope; the `debug-slack-channel-bots` skill has the steps under "A persona can't open a DM".
 - **Decide who can reach each persona.** Who can reach a persona is decided only by its `channels`, each channel's `delivery` and its `dm.enabled` switch (see [Channel delivery](#channel-delivery) and [Direct messages](#direct-messages-dmenabled)).
 - **Rewrite crontable lines to name personas.** A crontable target that names a channel matches no persona, and the line is logged `unknown-persona` each time it fires. Rewrite each target as a persona's name or key (see [Scheduled Prompts](#scheduled-prompts-cscb_cron)).
+- **Update `/interject` callers to send `persona`.** A request without `persona` is refused with 400, and a successful response holds only `ok` and `persona`. Change every script that calls `/interject`, including host crontab `curl` lines, to name a persona by name or key (see [Interject](#interject)).
 - **The first start applies `config.json`.** It has no last-applied record yet, so it checks `config.json`, records it and applies it. After that, edits wait until you apply them; see [Reload](#reload).
 - **Expect each bot to start fresh once.** Bot instances created before this version are replaced at the first start after the upgrade, so each persona starts once without its prior conversation.
 

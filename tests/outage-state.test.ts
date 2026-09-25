@@ -9,7 +9,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative, resolve } from 'node:path'
 import type { Client } from 'agent-director'
 import {
   ErrSystemInstallDisappeared,
@@ -685,6 +685,10 @@ describe('persona-keyed notices', () => {
 // SRD § Test plan case 23 Part A — resetAllToHealthy call-site audit (boot + teardown)
 // ---------------------------------------------------------------------------
 
+// Repo root, so the audits below read src/ and the allow-list from any
+// working directory.
+const REPO_ROOT = resolve(import.meta.dir, '..')
+
 describe('static audits', () => {
   test('22. every getClient() site in src/ is content-anchored in tests/getclient-allowlist.txt', async () => {
     const { readFileSync, readdirSync, statSync } = await import('node:fs')
@@ -704,12 +708,12 @@ describe('static audits', () => {
       return out
     }
     const sources = new Map<string, string>()
-    for (const abs of walk('src')) {
+    for (const abs of walk(join(REPO_ROOT, 'src'))) {
       // Normalize to forward-slashed repo-relative path (matches allowlist).
-      sources.set(abs.split('\\').join('/'), readFileSync(abs, 'utf-8'))
+      sources.set(relative(REPO_ROOT, abs).split('\\').join('/'), readFileSync(abs, 'utf-8'))
     }
 
-    const allowlistText = readFileSync('tests/getclient-allowlist.txt', 'utf-8')
+    const allowlistText = readFileSync(join(REPO_ROOT, 'tests', 'getclient-allowlist.txt'), 'utf-8')
     const { violations, staleEntries } = auditGetClientAllowlist(sources, allowlistText)
 
     const problems: string[] = []
@@ -747,8 +751,8 @@ describe('static audits', () => {
     }
     // Code only (comments stripped), per repo-relative file, outage-state.ts itself excluded.
     const code = new Map<string, string>()
-    for (const abs of walk('src')) {
-      const rel = abs.split('\\').join('/')
+    for (const abs of walk(join(REPO_ROOT, 'src'))) {
+      const rel = relative(REPO_ROOT, abs).split('\\').join('/')
       if (rel !== 'src/outage-state.ts') code.set(rel, stripComments(readFileSync(abs, 'utf-8')))
     }
     const countIn = (re: RegExp) =>

@@ -83,6 +83,7 @@ import {
   makePersonaConfigInput,
   writeConfigFile,
 } from './test-helpers/persona-config.ts'
+import { reloadTermsIn } from './test-helpers/reload-terms.ts'
 import { stripComments, objectProperties } from './test-helpers/source-audit.ts'
 
 const CLI_SOURCE = resolve(import.meta.dir, '..', 'src', 'cli.ts')
@@ -1909,17 +1910,6 @@ describe('stop --stop-bots failure lines (AC 20)', () => {
 // unknown subcommand — regression for b.8tm (trail subcommand removed), and
 // the unadvertised reload gesture (b.av2 SR-8.8, AC 74 cli leg)
 // ---------------------------------------------------------------------------
-
-/**
- * Reload wording no CLI usage text may carry (b.av2 SR-8.8). The same list as
- * registry.test.ts's, kept local to each file on purpose.
- */
-const RELOAD_TERMS: readonly (string | RegExp)[] = [/reload/i, 'config.json.apply', 'config.json.pending', '.apply', '.pending']
-
-/** The listed reload terms found in `text`, as written in `RELOAD_TERMS`. */
-function reloadTermsIn(text: string): string[] {
-  return RELOAD_TERMS.filter((t) => (typeof t === 'string' ? text.includes(t) : t.test(text))).map(String)
-}
 
 /**
  * The subcommand and flag entries of the usage text, with its wording ignored.

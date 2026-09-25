@@ -28,7 +28,7 @@ import { readFileSync } from 'node:fs'
 import { callArguments, indicesOf, shutdownBody, startResolution, stripComments } from './test-helpers/source-audit.ts'
 
 /** server.ts with every comment removed (see stripComments). */
-const SERVER_CODE = stripComments(readFileSync('src/server.ts', 'utf-8'))
+const SERVER_CODE = stripComments(readFileSync(new URL('../src/server.ts', import.meta.url), 'utf-8'))
 
 /** The cron calls main() makes to build the scheduler. */
 const CRON_BUILDERS = ['createCronLog', 'createCronDispatcher', 'createCronScheduler']

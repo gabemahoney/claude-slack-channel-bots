@@ -95,7 +95,7 @@ import {
 } from '../src/config.ts'
 
 /** server.ts with every comment removed (see stripComments). */
-const SERVER_CODE = stripComments(readFileSync('src/server.ts', 'utf-8'))
+const SERVER_CODE = stripComments(readFileSync(new URL('../src/server.ts', import.meta.url), 'utf-8'))
 
 /** Every call of `method`, on any receiver or none (`x.m(`, `x?.m(`, `x!.m(`, `m(`). */
 function anyCallOf(method: string): number[] {
