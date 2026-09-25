@@ -285,9 +285,9 @@ describe('dispatch-site _GET_stream branch (b.sjy + b.9cj)', () => {
     const notifications = await dispatchToAlpha(a, event)
 
     expect(notifications).toHaveLength(0)
-    // No ack reaction and no ack-tracker entry for a lost message (the
-    // reaction itself is checked in expectOneLostNotice).
-    expect(consumeAck(ALPHA_SECOND, event.ts as string)).toBe(false)
+    // No ack reaction and no ack-tracker entry for a lost message, under
+    // alpha's key (the reaction itself is checked in expectOneLostNotice).
+    expect(consumeAck(a.alpha.key, ALPHA_SECOND, event.ts as string)).toBe(false)
     expect(isRestartPendingOrActive(a.alpha.key)).toBe(pending)
     // Never keyed by the source channel (mis-keying regression).
     expect(isRestartPendingOrActive(ALPHA_SECOND)).toBe(false)
@@ -380,7 +380,7 @@ describe('dispatch-site _GET_stream branch (b.sjy + b.9cj)', () => {
     // Without dedupe the app_mention would reach the branch again and raise a
     // second notice.
     expectOneLostNotice(a, 'starting-now')
-    expect(consumeAck(ALPHA_SECOND, message.ts as string)).toBe(false)
+    expect(consumeAck(a.alpha.key, ALPHA_SECOND, message.ts as string)).toBe(false)
     expect(isRestartPendingOrActive(a.alpha.key)).toBe(true)
     expectBetaUntouched(a)
     const ref = renderPersonaRef(a.alpha.name, a.alpha.key)
@@ -421,8 +421,11 @@ describe('dispatch-site _GET_stream branch (b.sjy + b.9cj)', () => {
     expectBetaUntouched(a)
     // Only a dispatched message gets the ack reaction.
     expect(a.h.p('alpha').stub.calls.reactionsAdd.map((c) => [c?.channel, c?.name])).toEqual([[ALPHA_SECOND, ACK_REACTION]])
-    // … and is tracked, so the reply can remove it.
-    expect(consumeAck(ALPHA_SECOND, event.ts as string)).toBe(true)
+    // … and is tracked under alpha's own key, so alpha's reply can remove it:
+    // beta, which never reacted, finds no entry, and alpha's consumes once.
+    expect(consumeAck(a.beta.key, ALPHA_SECOND, event.ts as string)).toBe(false)
+    expect(consumeAck(a.alpha.key, ALPHA_SECOND, event.ts as string)).toBe(true)
+    expect(consumeAck(a.alpha.key, ALPHA_SECOND, event.ts as string)).toBe(false)
     const ref = renderPersonaRef(a.alpha.name, a.alpha.key)
     expect(a.h.logs.filter((l) => l.includes(`Dispatching to persona ${ref} chat_id=${ALPHA_SECOND}`) && l.includes('hasGetStream=true connected=true'))).toHaveLength(1)
     expect(a.h.logs.filter((l) => l.includes('DROP:'))).toEqual([])

@@ -1059,6 +1059,47 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
   })
 
+  // AC 49 (b.av2 SR-1.6, SR-10.1, SR-10.2): access.json's ackReaction,
+  // textChunkLimit and chunkMode became ack_reaction, reply_chunk_limit and
+  // reply_chunk_mode. Their defaults and validation are pinned above; these
+  // cases pin the move: the old names are not accepted in config.json, and a
+  // leftover access.json beside it neither supplies the settings nor is
+  // touched. The access.json sits in the config directory, where the server
+  // used to keep it.
+  describe('settings moved from access.json (SR-1.6, SR-10.1, SR-10.2; AC 49)', () => {
+    test.each([
+      ['ackReaction', 'eyes'],
+      ['textChunkLimit', 1234],
+      ['chunkMode', 'length'],
+    ])('the old name %s at the top level is rejected as an unknown key, naming it', (key, value) => {
+      const message = loadError({ ...makePersonaConfigInput({}, dir), [key]: value })
+      expect(message).toContain(`unknown top-level field(s) in config.json: ${JSON.stringify(key)}.`)
+    })
+
+    // The access.json values differ from both the defaults and the set
+    // values, so a load that took any of them fails its row. Deliberately
+    // odd formatting makes the byte-identical check meaningful.
+    const ACCESS_JSON = '{ "ackReaction": "thumbsup",\n  "textChunkLimit": 1234, "chunkMode": "length" }\n\n'
+    test.each([
+      ['a config without the three keys loads the defaults', {}, { ack_reaction: undefined, reply_chunk_limit: 4000, reply_chunk_mode: 'newline' }],
+      ['a config setting all three loads exactly them', { ack_reaction: 'eyes', reply_chunk_limit: 2500, reply_chunk_mode: 'length' }, { ack_reaction: 'eyes', reply_chunk_limit: 2500, reply_chunk_mode: 'length' }],
+    ] as const)('beside a leftover access.json, %s; the access.json is byte-identical afterwards', (_label, set, expected) => {
+      const accessPath = join(dir, 'access.json')
+      writeFileSync(accessPath, ACCESS_JSON, 'utf-8')
+      const path = writeConfigFile(dir, makePersonaConfigInput(set, dir))
+      const listing = readdirSync(dir).sort()
+      const config = loadPersonaConfig(path, home)
+      assertNoLeak(config, 'config')
+      expect({
+        ack_reaction: config.ack_reaction,
+        reply_chunk_limit: config.reply_chunk_limit,
+        reply_chunk_mode: config.reply_chunk_mode,
+      }).toEqual(expected)
+      expect(readFileSync(accessPath, 'utf-8')).toBe(ACCESS_JSON)
+      expect(readdirSync(dir).sort()).toEqual(listing)
+    })
+  })
+
   describe('pre-persona rejection (SR-1.7 loader part; AC 45)', () => {
     /**
      * Load `input`, returning the error message plus proof that the file and

@@ -17,7 +17,7 @@
  *      the serializer) is waited for, so the kill below never races a launch
  *      that is bringing the row up;
  *   3. its Slack connection is stopped (so no further event arrives for it),
- *      then its inbound dedupe store is dropped;
+ *      then its inbound dedupe store and its ack-tracker entries are dropped;
  *   4. its cached DM destination is forgotten, its held destination notices
  *      are cancelled, and its pre-validation held notices dropped;
  *   5. its tracked permission prompts and wedge state are dropped (their
@@ -278,6 +278,8 @@ export interface PersonaLifecycleDeps {
   resetOutageState: (keys: string[]) => void
   /** Drop the key's tracked permission prompts and wedge state (`forgetPersonaPrompts`). */
   forgetPersonaPrompts: (key: string) => unknown
+  /** Drop the key's ack-tracker entries silently (`forgetPersonaAcks`). */
+  forgetAcks: (key: string) => void
   /**
    * Drop the MCP session registered for the key, its registry entry before
    * its transport closes (server.ts: `dropPersonaSessionAndKeepAlive`).
@@ -457,6 +459,7 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     // a new dedupe store.
     await step('stopping its Slack connection', () => deps.connections.stop(key))
     await step('forgetting its inbound dedupe store', () => deps.routing.forget(key))
+    await step('forgetting its ack-reaction entries', () => deps.forgetAcks(key))
     await step('forgetting its DM destination', () => deps.destinations.forget(key))
     await step('cancelling its held destination notices', () => deps.destinationHold.cancel(key))
     await step('dropping its held notices', () => deps.notifier.forget(key))

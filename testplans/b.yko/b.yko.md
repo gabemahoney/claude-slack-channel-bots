@@ -1187,46 +1187,31 @@ sections start from a healthy state.
 The check needs auto-restart off, so the killed instance stays down, and an
 acknowledgement reaction configured, so its absence means something.
 
-First confirm an acknowledgement reaction is configured, so the single
-restart below picks it up. Until a later Epic moves it, the reaction is
-`ackReaction` in `~/.claude/channels/slack/access.json`:
+The acknowledgement reaction is the server-wide `ack_reaction` setting in
+`config.json` (an emoji name without colons).
 
-```sh
-jq -r '.ackReaction // empty' ~/.claude/channels/slack/access.json   # must print an emoji name
-```
-
-If it prints nothing, set one now, and note it for the teardown:
-
-```sh
-A=~/.claude/channels/slack/access.json
-jq '.ackReaction = "eyes"' "$A" > "$A.tmp" && mv "$A.tmp" "$A"
-ACK_ADDED=1
-```
-
-The restart below makes the server read the reaction even when
-`SLACK_ACCESS_MODE=static`, where `access.json` is read only at `start`.
-Without a configured reaction the "no reaction" result proves nothing, so
-the check can't pass.
-
-`session_restart_delay` is a server-wide `config.json` key that the server
-reads once, at `start`. Setting it takes the confirmation gesture (see "Config
-edits after the first start" in Setup), which records it, and then the
-"Guarded restart" from the DMs section, which makes it take effect:
+`ack_reaction` and `session_restart_delay` are server-wide `config.json` keys
+that the server reads once, at `start`. Both go in one `config.json` edit,
+applied with the confirmation gesture (see "Config edits after the first
+start" in Setup), which records them, and then the "Guarded restart" from the
+DMs section, which makes them take effect:
 
 1. Define `guard()` as in "Guarded restart" step 1, if this shell doesn't have it. Note where the log ends, only if the guard passes: `if guard; then MARK=$(wc -l < "$LOG"); fi`. If it prints `NOT THE TEST HOST - stop`, do nothing more in this section and record that in Notes.
-2. Record the current value, then set it to `0`, while the server runs:
+2. Record the current values. Then, while the server runs, in one edit set the delay to `0` and, when no `ack_reaction` is set, set it to `"eyes"` (`ACK_ADDED=1`, for the teardown):
 
    ```sh
    CFG=~/.claude/channels/slack/config.json
    ORIG_DELAY=$(jq -c '.session_restart_delay' "$CFG"); echo "ORIG_DELAY=$ORIG_DELAY"
-   jq '.session_restart_delay = 0' "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
+   if [ -z "$(jq -r '.ack_reaction // empty' "$CFG")" ]; then ACK_ADDED=1; else ACK_ADDED=0; fi; echo "ACK_ADDED=$ACK_ADDED"
+   jq --argjson add "$ACK_ADDED" '.session_restart_delay = 0 | if $add == 1 then .ack_reaction = "eyes" else . end' "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
    jq -e '.session_restart_delay == 0' "$CFG"   # must print true
+   jq -r '.ack_reaction // empty' "$CFG"        # must print an emoji name
    ```
 
-   `ORIG_DELAY=null` means the key was absent (the default, 60 s). Keep `ORIG_DELAY` for the teardown.
-3. Wait about 10 s and read the preview: `cat ~/.claude/channels/slack/config.json.pending`. Its preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 1 changed.` and `server-wide setting session_restart_delay changed: once applied, it is recorded and takes effect at the next server start after that.`
-4. Confirm, only if the guard passes: `if guard; then mv ~/.claude/channels/slack/config.json.pending ~/.claude/channels/slack/config.json.apply; fi`. Wait about 10 s, then run `since "$MARK" | grep -F 'reload-applied:'`. It prints one `[slack] reload-applied: …` line whose counts end `server-wide settings: 1 changed)`. The delay is recorded but not yet in effect.
-5. Run the "Guarded restart". Its Expected items apply: the `Starting from the last-applied record` line, each persona's `Session connected` line, `0 failed, 0 not brought up`, no failure line, `cmp` printing `recorded`, and no `config.json.pending`. The start runs the record, so the delay of 0 is now in effect.
+   `ORIG_DELAY=null` means the key was absent (the default, 60 s). Keep `ORIG_DELAY` and `ACK_ADDED` for the teardown.
+3. Wait about 10 s and read the preview: `cat ~/.claude/channels/slack/config.json.pending`. Its preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 1 changed.` and `server-wide setting session_restart_delay changed: once applied, it is recorded and takes effect at the next server start after that.` When `ACK_ADDED=1`, the counts end `server-wide settings: 2 changed.` instead, and the preview also has `server-wide setting ack_reaction changed: once applied, it is recorded and takes effect at the next server start after that.`
+4. Confirm, only if the guard passes: `if guard; then mv ~/.claude/channels/slack/config.json.pending ~/.claude/channels/slack/config.json.apply; fi`. Wait about 10 s, then run `since "$MARK" | grep -F 'reload-applied:'`. It prints one `[slack] reload-applied: …` line whose counts end `server-wide settings: 1 changed)` (`server-wide settings: 2 changed)` when `ACK_ADDED=1`). The settings are recorded but not yet in effect.
+5. Run the "Guarded restart". Its Expected items apply: the `Starting from the last-applied record` line, each persona's `Session connected` line, `0 failed, 0 not brought up`, no failure line, `cmp` printing `recorded`, and no `config.json.pending`. The start runs the record, so the delay of 0 and the `ack_reaction` are now in effect.
 
 A's destination is A-home (`"permission_prompts": "<A_HOME_CHANNEL_ID>"`). A
 is mentions-only in coordination, so the message must mention A.
@@ -1268,26 +1253,26 @@ Expected:
 - `<sender>` is the operator's Slack name as the workspace shows it (display name, else full name), or `<OPERATOR_USER_ID>` if the name can't be looked up. It is plain text, not an @-mention.
 - The notice doesn't contain `lost-marker-7Q3Z` or any other words from the message.
 - Nothing appears in coordination after the operator's message: no reply, notice or other post from A, B, C or the server, including in a thread.
-- The message in coordination has no reaction from A: the configured `ackReaction` emoji is not on it.
+- The message in coordination has no reaction from A: the configured `ack_reaction` emoji is not on it.
 
 A notice in coordination, a second lost-message notice, or the marker in the
-notice fails this check. So does an `ackReaction` on the message.
+notice fails this check. So does an `ack_reaction` on the message.
 
 Teardown for this check (operator step on the test host), run whatever the result:
 
 1. Note where the log ends, only if the guard passes: `if guard; then MARK=$(wc -l < "$LOG"); fi`. The server keeps running.
-2. Restore the delay:
+2. In one edit, restore the delay and, if the setup added the reaction (`ACK_ADDED=1`), remove `ack_reaction`:
 
    ```sh
    CFG=~/.claude/channels/slack/config.json
-   if [ "$ORIG_DELAY" = null ]; then jq 'del(.session_restart_delay)' "$CFG"; else jq --argjson d "$ORIG_DELAY" '.session_restart_delay = $d' "$CFG"; fi > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
+   jq --argjson d "$ORIG_DELAY" --argjson rm "$ACK_ADDED" '(if $d == null then del(.session_restart_delay) else .session_restart_delay = $d end) | if $rm == 1 then del(.ack_reaction) else . end' "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
    jq -c '.session_restart_delay' "$CFG"   # must print the ORIG_DELAY value
+   jq -c '.ack_reaction' "$CFG"            # must print null when ACK_ADDED=1
    ```
 
-   Wait about 10 s, read `config.json.pending` (the same two preview lines as the setup's step 3), and confirm it, only if the guard passes: `if guard; then mv ~/.claude/channels/slack/config.json.pending ~/.claude/channels/slack/config.json.apply; fi`. Wait about 10 s; `since "$MARK" | grep -F 'reload-applied:'` prints one line whose counts end `server-wide settings: 1 changed)`. Without the confirmation, the next start runs the record with a delay of 0, and auto-restart stays off.
-3. If the setup added the reaction (`ACK_ADDED=1`), remove it: `A=~/.claude/channels/slack/access.json; jq 'del(.ackReaction)' "$A" > "$A.tmp" && mv "$A.tmp" "$A"`.
-4. Run the "Guarded restart", with its Expected items. A's instance is brought up again, resumed or fresh-spawned, and the restored delay is in effect.
-5. In A-home, post "Reply with the word back." A replies "back" in A-home under its own name and avatar.
+   Wait about 10 s, read `config.json.pending` (the same preview lines as the setup's step 3, with the `ack_reaction` line and `2 changed` when `ACK_ADDED=1`), and confirm it, only if the guard passes: `if guard; then mv ~/.claude/channels/slack/config.json.pending ~/.claude/channels/slack/config.json.apply; fi`. Wait about 10 s; `since "$MARK" | grep -F 'reload-applied:'` prints one line whose counts end `server-wide settings: 1 changed)` (`2 changed)` when `ACK_ADDED=1`). Without the confirmation, the next start runs the record with a delay of 0, and auto-restart stays off.
+3. Run the "Guarded restart", with its Expected items. A's instance is brought up again, resumed or fresh-spawned, and the restored delay is in effect.
+4. In A-home, post "Reply with the word back." A replies "back" in A-home under its own name and avatar.
 
 If A doesn't answer after the restart, record that in Notes: later sections
 need all three personas up.
@@ -1296,7 +1281,7 @@ Pass: A's instance was down with auto-restart off, the message was dropped
 with the `No live session` (or `DROP: no _GET_stream`) line, exactly one
 lost-message notice naming the operator and "auto-restart disabled" appeared
 in A-home under A's identity without the marker, nothing was posted in
-coordination, the message got no `ackReaction`, and A answered again after
+coordination, the message got no `ack_reaction`, and A answered again after
 the teardown.
 
 ## Reboot (appended by E11)
@@ -1776,8 +1761,8 @@ run starts from it: once the server is stopped, delete the
 must print `true`.
 
 If the lost-message section stopped before its own teardown, restore
-`session_restart_delay` (and remove an `ackReaction` it added) as that
-teardown's steps 2 and 3 say, once the server is stopped. With the server
+`session_restart_delay` (and remove an `ack_reaction` it added) as that
+teardown's step 2 says, once the server is stopped. With the server
 stopped there is nothing to confirm: the record deletion below covers it.
 
 If the runtime add and remove section stopped before Check 25's removal,

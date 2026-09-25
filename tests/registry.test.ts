@@ -1024,7 +1024,7 @@ describe('DM targets (through the MCP server)', () => {
 
   test("AC 37: DMs on, a reply in the delivered DM posts there through the persona's own client and removes its ack there", async () => {
     applyPersona(h.alpha, true)
-    trackAck(D, MSG_TS)
+    trackAck(h.alpha.key, D, MSG_TS)
     const session = await openPersonaSession(h.alpha)
 
     const result = await session.call('reply', { chat_id: D, text: 'hi', message_id: MSG_TS })
@@ -1038,7 +1038,7 @@ describe('DM targets (through the MCP server)', () => {
     expect(stubOf(h.beta).callLog).toEqual([])
   })
 
-  // The ack is tracked on the opened conversation in both rows; only the row
+  // Alpha's ack is tracked on the opened conversation in both rows; only the row
   // that passes message_id removes it, there, after the post.
   test.each<[string, string, Record<string, unknown>, StubWebCall[]]>([
     [U, 'no message_id', {}, []],
@@ -1053,7 +1053,7 @@ describe('DM targets (through the MCP server)', () => {
     async (user, _label, extraArgs, afterPost) => {
       applyPersona(h.alpha, true)
       stubOf(h.alpha).script.open.push(openedDm(OPENED))
-      trackAck(OPENED, MSG_TS)
+      trackAck(h.alpha.key, OPENED, MSG_TS)
       const session = await openPersonaSession(h.alpha)
 
       const result = await session.call('reply', { chat_id: user, text: 'hello there', ...extraArgs })
@@ -1692,18 +1692,30 @@ describe('reply files', () => {
 // Ack reaction removal
 // ---------------------------------------------------------------------------
 
+/** Register persona `p`'s session and open a client on it over `overrides` of `REPLY_SETTINGS`. */
+function openWithSettings(p: Persona, overrides: Partial<ReplySettings> = {}) {
+  return openSession(registerSession(p.working_directory, p.key, makeTransport(), makeServer()), depsWithReplySettings(overrides))
+}
+
+/** Beta Bot also lists A_ALL, so both personas may reply in one shared channel (E4). */
+function shareAlphaChannelWithBeta(): void {
+  applyPersona(h.beta, h.beta.dm.enabled, { channels: [...h.beta.channels, { id: A_ALL, delivery: 'all' }] })
+}
+
+/** The one `reactions.remove` a reply to MSG_TS in A_ALL makes, with the harness's `eyes`. */
+const REMOVE_EYES = { channel: A_ALL, timestamp: MSG_TS, name: 'eyes' }
+
 // The reaction name comes from the server-wide `ack_reaction` setting through
-// the injected `getReplySettings` (b.av2 SR-1.6).
+// the injected `getReplySettings` (b.av2 SR-1.6). The tracker is keyed by
+// (persona, conversation, ts) (b.av2 SR-4.5): a reply consumes only its own
+// persona's entry and removes the reaction through its own client.
 describe('reply — ack reaction removal', () => {
   test.each<[string, Partial<ReplySettings>, string]>([
     ['the harness default', {}, 'eyes'],
     ['another configured name', { ack_reaction: 'hourglass' }, 'hourglass'],
   ])("a tracked ack is removed once, by the server-wide ack_reaction name (%s), through the persona's client; a second reply does not remove it again", async (_label, overrides, name) => {
-    trackAck(A_ALL, MSG_TS)
-    const session = await openSession(
-      registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()),
-      depsWithReplySettings(overrides),
-    )
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    const session = await openWithSettings(h.alpha, overrides)
 
     await session.call('reply', { chat_id: A_ALL, text: 'first', message_id: MSG_TS })
     await session.call('reply', { chat_id: A_ALL, text: 'second', message_id: MSG_TS })
@@ -1713,7 +1725,7 @@ describe('reply — ack reaction removal', () => {
   })
 
   test('a failing reactions.remove does not fail the reply', async () => {
-    trackAck(A_ALL, MSG_TS)
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
     stubOf(h.alpha).web.reactions.remove = async () => {
       throw new Error('reaction_not_found')
     }
@@ -1725,22 +1737,117 @@ describe('reply — ack reaction removal', () => {
     expect(result.content[0]!.text).toStartWith('Sent 1 message(s)')
   })
 
-  test.each<[string, boolean, Partial<ReplySettings>, Record<string, unknown>]>([
-    ['no ack tracked', false, {}, { chat_id: A_ALL, text: 'hi', message_id: MSG_TS }],
-    ['reply without message_id', true, {}, { chat_id: A_ALL, text: 'hi' }],
-    ['no ack_reaction configured', true, { ack_reaction: undefined }, { chat_id: A_ALL, text: 'hi', message_id: MSG_TS }],
-  ])('%s → the reply posts and no reactions.remove call', async (_label, tracked, overrides, args) => {
-    if (tracked) trackAck(A_ALL, MSG_TS)
-    const session = await openSession(
-      registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()),
-      depsWithReplySettings(overrides),
-    )
+  // Each row tracks an entry for Alpha Bot, so a reply that ignored the
+  // message, the missing message_id or the missing setting would remove it.
+  test.each<[string, string, Partial<ReplySettings>, Record<string, unknown>]>([
+    ['an ack tracked for another message only', '1700000000.000999', {}, { chat_id: A_ALL, text: 'hi', message_id: MSG_TS }],
+    ['reply without message_id', MSG_TS, {}, { chat_id: A_ALL, text: 'hi' }],
+    ['no ack_reaction configured', MSG_TS, { ack_reaction: undefined }, { chat_id: A_ALL, text: 'hi', message_id: MSG_TS }],
+  ])('%s → the reply posts and no reactions.remove call', async (_label, trackedTs, overrides, args) => {
+    trackAck(h.alpha.key, A_ALL, trackedTs)
+    const session = await openWithSettings(h.alpha, overrides)
 
     const result = await session.call('reply', args)
 
     expect(result.isError).toBeUndefined()
     expect(stubOf(h.alpha).calls.postMessage).toHaveLength(1)
     expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([])
+    expect(stubOf(h.beta).callLog).toEqual([])
+  })
+
+  test("two personas tracking one message: A's reply removes only A's reaction, through A's client, then B's reply removes only B's, through B's", async () => {
+    shareAlphaChannelWithBeta()
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    trackAck(h.beta.key, A_ALL, MSG_TS)
+    const alpha = await openWithSettings(h.alpha)
+    const beta = await openWithSettings(h.beta)
+
+    await alpha.call('reply', { chat_id: A_ALL, text: 'from alpha', message_id: MSG_TS })
+
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([REMOVE_EYES])
+    expect(stubOf(h.beta).calls.reactionsRemove).toEqual([])
+
+    await beta.call('reply', { chat_id: A_ALL, text: 'from beta', message_id: MSG_TS })
+
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([REMOVE_EYES])
+    expect(stubOf(h.beta).calls.reactionsRemove).toEqual([REMOVE_EYES])
+    expect(stubOf(h.beta).calls.postMessage.map((c) => c.channel)).toEqual([A_ALL])
+  })
+
+  test("a reply whose message_id only another persona tracked removes nothing on any client; that persona's own reply still removes it", async () => {
+    shareAlphaChannelWithBeta()
+    trackAck(h.beta.key, A_ALL, MSG_TS)
+    const alpha = await openWithSettings(h.alpha)
+    const beta = await openWithSettings(h.beta)
+
+    const result = await alpha.call('reply', { chat_id: A_ALL, text: 'from alpha', message_id: MSG_TS })
+
+    expect(result.isError).toBeUndefined()
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([])
+    expect(stubOf(h.beta).callLog).toEqual([])
+
+    await beta.call('reply', { chat_id: A_ALL, text: 'from beta', message_id: MSG_TS })
+
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([])
+    expect(stubOf(h.beta).calls.reactionsRemove).toEqual([REMOVE_EYES])
+  })
+
+  // Beta Bot also tracks the message, so a reply that removed per chunk would
+  // show a second removal even if it consumed another persona's entry.
+  test('a multi-chunk reply carrying a tracked message_id removes the reaction exactly once, after its first chunk', async () => {
+    shareAlphaChannelWithBeta()
+    trackAck(h.alpha.key, A_ALL, MSG_TS)
+    trackAck(h.beta.key, A_ALL, MSG_TS)
+    const session = await openWithSettings(h.alpha, { reply_chunk_limit: 5 })
+
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'one\ntwo\nthree', message_id: MSG_TS })
+
+    expect(result.content[0]!.text).toStartWith(`Sent 3 message(s) to ${A_ALL}`)
+    expect(stubOf(h.alpha).callLog.map((c) => c.method)).toEqual([
+      'chat.postMessage',
+      'reactions.remove',
+      'chat.postMessage',
+      'chat.postMessage',
+    ])
+    expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([REMOVE_EYES])
+    expect(stubOf(h.beta).callLog).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Reply chunking by the server-wide settings
+// ---------------------------------------------------------------------------
+
+const LINE_A = 'a'.repeat(1999)
+const LINE_B = 'b'.repeat(1999)
+const LINE_C = 'c'.repeat(1999)
+/** 25 characters on four lines. */
+const PHONETIC = 'alpha\nbravo\ncharlie\ndelta'
+
+// `reply_chunk_limit` and `reply_chunk_mode` come from the server-wide settings
+// (b.av2 SR-1.6, SR-5.2); `{}` keeps the harness's, which are the config's
+// defaults (4000, `newline`). `chunkText`'s own edge cases are in server.test.ts.
+describe('reply — chunking by the server-wide settings', () => {
+  test.each<[string, Partial<ReplySettings>, string, string[]]>([
+    ['no chunk settings, 5999 characters on three lines: split on newlines', {}, `${LINE_A}\n${LINE_B}\n${LINE_C}`, [`${LINE_A}\n${LINE_B}`, LINE_C]],
+    ['no chunk settings, exactly 4000 characters: one post', {}, `${LINE_A}\n${'b'.repeat(2000)}`, [`${LINE_A}\n${'b'.repeat(2000)}`]],
+    ['length, limit 12: split at exactly 12 characters', { reply_chunk_mode: 'length', reply_chunk_limit: 12 }, PHONETIC, ['alpha\nbravo\n', 'charlie\ndelt', 'a']],
+    ['newline, limit 12: split on newlines, lines that fit kept together', { reply_chunk_mode: 'newline', reply_chunk_limit: 12 }, PHONETIC, ['alpha\nbravo', 'charlie', 'delta']],
+  ])('%s', async (_label, overrides, text, expected) => {
+    const { reply_chunk_limit: limit, reply_chunk_mode: mode } = { ...REPLY_SETTINGS, ...overrides }
+    const session = await openWithSettings(h.alpha, overrides)
+
+    const result = await session.call('reply', { chat_id: A_ALL, text })
+
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0]!.text).toStartWith(`Sent ${expected.length} message(s) to ${A_ALL}`)
+    const posts = stubOf(h.alpha).calls.postMessage as Array<{ channel: string; text: string }>
+    expect(posts.map((p) => p.text)).toEqual(expected)
+    expect(posts.map((p) => p.channel)).toEqual(expected.map(() => A_ALL))
+    expect(posts.filter((p) => p.text.length > limit)).toEqual([])
+    // `newline` mode drops the newline it splits at; `length` mode drops nothing.
+    expect(posts.map((p) => p.text).join(mode === 'newline' ? '\n' : '')).toBe(text)
+    expect(stubOf(h.beta).callLog).toEqual([])
   })
 })
 

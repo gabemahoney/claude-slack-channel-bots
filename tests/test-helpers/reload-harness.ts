@@ -460,7 +460,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import type { MakeTemplateParams, SpawnParams } from 'agent-director'
 
-import { _resetAckTracker, consumeAck } from '../../src/ack-tracker.ts'
+import { _resetAckTracker, consumeAck, forgetPersonaAcks } from '../../src/ack-tracker.ts'
 import { resetClientForTests, setClientForTests } from '../../src/agent-director-client.ts'
 import { buildTemplateParams, type TemplateRefreshResult } from '../../src/agent-director-template.ts'
 import { personaInstanceId, personaKey, renderPersonaRef } from '../../src/persona-identity.ts'
@@ -847,7 +847,7 @@ export interface RealLifecycleComposition {
    * Every call of a dependency the composition got, in call order, as
    * `[member, key]` with the member named as in `PersonaLifecycleDeps`
    * (`'bringUps.cancel'`, `'cancelRestartTimer'`, `'whenLaunchSettled'`,
-   * `'connections.stop'`, `'routing.forget'`, `'destinations.forget'`,
+   * `'connections.stop'`, `'routing.forget'`, `'forgetAcks'`, `'destinations.forget'`,
    * `'destinationHold.cancel'`, `'notifier.forget'`, `'forgetPersonaPrompts'`,
    * `'dropSession'`, `'resetOutageState'`, `'killInstance'`,
    * `'deleteInstance'`, `'forgetFailures'`, `'forgetDisconnectedStreak'`,
@@ -2215,6 +2215,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           },
         },
         routing: { forget: rec('routing.forget') },
+        // The real tracker's per-key forget, as server.ts binds it, so a key
+        // added again starts with no ack-reaction entry.
+        forgetAcks: rec('forgetAcks', (key) => forgetPersonaAcks(key)),
         // The run's one destination resolver, which the notices post through.
         destinations: { forget: rec('destinations.forget', (key) => noticeStack.destinations.forget(key)) },
         destinationHold: { cancel: rec('destinationHold.cancel') },

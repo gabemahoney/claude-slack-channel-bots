@@ -11,7 +11,10 @@
  * - the real persona-keyed registry: each persona named in `sessions` (default
  *   all) gets a registered session with a fake transport (holding `_GET_stream`
  *   unless `streamless`) and a fake MCP server that records
- *   `notifications/claude/channel` calls (or throws, with `throwOnNotify`);
+ *   `notifications/claude/channel` calls (or throws, with `throwOnNotify`).
+ *   An `onNotify` hook runs when `notification()` is called and is awaited
+ *   before the call is recorded, so a test can put the send in an ordered log,
+ *   hold it open or make it fail (a throwing hook: not recorded);
  * - the real restart and backoff state, with `initRestart` given
  *   `makeRestartDeps`: a session is never alive, launches are recorded in
  *   `h.launches`, and the restart delay is read from `h.restartDelayS` at call
@@ -36,9 +39,15 @@
  * - the up predicate (`isPersonaUp`), only when the caller passes one, so by
  *   default every persona counts as up;
  * - the server-wide reply settings source (`getReplySettings`, as src/server.ts
- *   passes its start-time `ack_reaction`): it returns the `ackReaction`
- *   option, so by default there is no ack reaction and a delivery makes no
- *   `reactions.add` call;
+ *   passes its start-time settings): it returns the `ackReaction` option and
+ *   the default chunking, so by default there is no ack reaction and a
+ *   delivery makes no `reactions.add` call;
+ * - `h.reply(name, args)`: persona `name`'s `reply` tool call through the real
+ *   session server (`createSessionServer` over an in-memory MCP link) with the
+ *   same `clientFor`, the real ack tracker and the same reply settings source
+ *   as the routing, as src/server.ts shares one source between the inbound ack
+ *   step and the `reply` tool. So an ack-tracker entry the routing recorded is
+ *   observed as a `reactions.remove` on the persona's own stub;
  * - a line capture for the module's log seam, the notifier and the hold
  *   (`h.logs`), and an order capture (`h.order`) for ack, archive, config and
  *   identity reads.
@@ -65,15 +74,18 @@ import type { WebClient } from '@slack/web-api'
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import type { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 
-import type { Persona, PersonaConfig } from '../../src/config.ts'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
+
+import { replySettingsOf, type Persona, type PersonaConfig, type ReplySettings } from '../../src/config.ts'
 import { createPersonaRouting, type PersonaRoutingDeps } from '../../src/persona-routing.ts'
 import { formatPersonaNotice, type PersonaNotifier } from '../../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
 import type { LostMessageState } from '../../src/lost-message.ts'
-import { registerSession, _resetRegistry } from '../../src/registry.ts'
+import { createSessionServer, registerSession, _resetRegistry, type SessionEntry, type SessionToolDeps } from '../../src/registry.ts'
 import { initRestart, _resetRestartState, type RestartDeps } from '../../src/restart.ts'
 import { _resetBackoffState } from '../../src/backoff.ts'
-import { _resetAckTracker } from '../../src/ack-tracker.ts'
+import { _resetAckTracker, consumeAck } from '../../src/ack-tracker.ts'
 import {
   archiveSlackMessage,
   createNameResolver,
@@ -137,12 +149,23 @@ export interface ChannelNotification {
   params: { content: string; meta: Record<string, string> }
 }
 
-/** A fake MCP server whose `notification()` records into `notifications`, or throws when `throws`. */
-export function makeSessionServer(notifications: ChannelNotification[], throws = false): Server {
+/**
+ * Runs when a fake session's `notification()` is called, before the call is
+ * recorded; awaited, so a pending hook holds the send open and a throwing one
+ * fails it (the notification is then not recorded).
+ */
+export type NotifyHook = (msg: ChannelNotification) => void | Promise<void>
+
+/**
+ * A fake MCP server whose `notification()` records into `notifications`, or
+ * throws when `throws`. `onNotify`, when given, runs first (see `NotifyHook`).
+ */
+export function makeSessionServer(notifications: ChannelNotification[], throws = false, onNotify?: NotifyHook): Server {
   return {
     connect: async () => {},
     notification: async (msg: ChannelNotification) => {
       if (throws) throw new Error(`notification failed ${LEAK_SENTINEL}`)
+      if (onNotify) await onNotify(msg)
       notifications.push(msg)
     },
   } as unknown as Server
@@ -177,6 +200,8 @@ export interface RegisterSessionOptions {
   disconnected?: boolean
   /** The session's `notification()` throws. */
   throwOnNotify?: boolean
+  /** Runs when the session's `notification()` is called, awaited before it is recorded (see `NotifyHook`). */
+  onNotify?: NotifyHook
 }
 
 // ---------------------------------------------------------------------------
@@ -242,9 +267,11 @@ export interface RoutingHarnessOptions {
   disconnected?: readonly string[]
   /** Names whose session's `notification()` throws. */
   throwOnNotify?: readonly string[]
+  /** Per-name hook on the harness-registered session's `notification()` (see `NotifyHook`). */
+  onNotify?: Readonly<Record<string, NotifyHook>>
   /** Per-name stub options, merged over the leak marker. */
   stubOptions?: Readonly<Record<string, StubSlackOptions>>
-  /** The `ack_reaction` the injected reply settings source (`getReplySettings`) returns; default none. */
+  /** The `ack_reaction` the reply settings source (`getReplySettings`) returns to the routing and `h.reply`; default none. */
   ackReaction?: string
   /** The archive DB the archive seam writes to; the seam is a no-op without one. */
   archiveDb?: Database
@@ -316,6 +343,13 @@ export interface RoutingHarness {
   notices: RaisedNotice[]
   /** The text the notifier posts for persona `name` and notice body `body` (its persona prefix, then the body). */
   noticeText(name: string, body: string): string
+  /**
+   * Persona `name`'s `reply` tool call with `args`, through the real session
+   * server over the same clients, the real ack tracker and the same reply
+   * settings as the routing (see the file comment). Resolves once the call has
+   * returned; rejects when the tool reports an error.
+   */
+  reply(name: string, args: Record<string, unknown>): Promise<void>
   /** Everything the harness captured, for `assertNoLeak`. */
   captured(): Record<string, unknown>
 }
@@ -356,7 +390,7 @@ export function makeRoutingHarness(
       session.cwd,
       persona.key,
       makeTransport(session.mcpSessionId, reg.streamless ?? false),
-      makeSessionServer(session.notifications, reg.throwOnNotify ?? false),
+      makeSessionServer(session.notifications, reg.throwOnNotify ?? false, reg.onNotify),
     )
     if (reg.disconnected) entry.connected = false
     return session
@@ -370,6 +404,7 @@ export function makeRoutingHarness(
       streamless: opts.streamless?.includes(name),
       disconnected: opts.disconnected?.includes(name),
       throwOnNotify: opts.throwOnNotify?.includes(name),
+      onNotify: opts.onNotify?.[name],
     })
     handle.notifications = session.notifications
     handle.sessionCwd = session.cwd
@@ -384,6 +419,41 @@ export function makeRoutingHarness(
   const getPersona = (key: string): Persona | undefined => h.config?.personas.find((p) => p.key === key)
   const webClientFor = (key: string) => clients.clientFor(key) as unknown as WebClient | undefined
   const { notifier, hold, clock: holdClock } = makeNotifierStack({ getPersona, clientFor: webClientFor, log })
+  // The one reply settings source for the inbound ack step and `h.reply`, as server.ts.
+  const getReplySettings = (): ReplySettings => ({ ...replySettingsOf(null), ack_reaction: opts.ackReaction })
+
+  async function reply(name: string, args: Record<string, unknown>): Promise<void> {
+    const { persona } = byName(name)
+    const deps: SessionToolDeps = {
+      assertSendable: () => {},
+      getReplySettings,
+      getPersona,
+      clientFor: webClientFor,
+      inboxDir: join(baseDir, 'inbox'),
+      resolveUserName: async (_key, userId) => userId,
+      consumeAck,
+      serverPort: 0,
+    }
+    const entry: SessionEntry = {
+      cwd: join(baseDir, 'reply', persona.key),
+      personaKey: persona.key,
+      transport: makeTransport(`mcp-reply-${persona.key}`),
+      server: makeSessionServer([]),
+      connected: true,
+      peerPort: 0,
+    }
+    const server = createSessionServer(entry, deps)
+    const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair()
+    await server.connect(serverTransport)
+    const client = new Client({ name: 'routing-harness-reply', version: '1.0.0' }, { capabilities: {} })
+    await client.connect(clientTransport)
+    try {
+      const result = (await client.callTool({ name: 'reply', arguments: args })) as { isError?: boolean }
+      if (result.isError) throw new Error(`reply as ${name} reported an error`)
+    } finally {
+      await client.close()
+    }
+  }
 
   const h: RoutingHarness = {
     config,
@@ -416,6 +486,7 @@ export function makeRoutingHarness(
     holdClock,
     notices: [],
     noticeText: (name, body) => formatPersonaNotice(byName(name).persona, body),
+    reply,
     captured: () => ({
       logs: h.logs,
       calls: Object.fromEntries(handles.map((x) => [x.persona.name, x.stub.calls])),
@@ -448,7 +519,7 @@ export function makeRoutingHarness(
       h.order.push(`archive:${key}`)
       if (opts.archiveDb) h.archiveWrites.push(archiveSlackMessage(opts.archiveDb, event as SlackMessageEvent, resolver(key)))
     },
-    getReplySettings: () => ({ ack_reaction: opts.ackReaction }),
+    getReplySettings,
     notify: (key, text, options) => {
       h.notices.push({ key, text })
       return notify(key, text, options)

@@ -514,8 +514,11 @@ export interface SessionToolDeps {
   inboxDir: string
   /** Resolve a user's display name through the persona's client */
   resolveUserName: (personaKey: string, userId: string) => Promise<string>
-  /** Consume a pending ack entry — returns true if it existed */
-  consumeAck: (channelId: string, messageTs: string) => boolean
+  /**
+   * Consume persona `personaKey`'s pending ack entry for the conversation and
+   * message — returns true if that persona's own entry existed
+   */
+  consumeAck: (personaKey: string, channelId: string, messageTs: string) => boolean
   /** TCP port the MCP HTTP server is listening on (retained for diagnostics). */
   serverPort: number
 }
@@ -986,10 +989,14 @@ export function createSessionServer(
           })
           lastTs = (res.ts as string) || lastTs
 
+          // The calling persona's own ack reaction, removed through its own
+          // client at most once (first chunk), only when its own entry for
+          // this message existed. `chatId` is the conversation posted to (for
+          // a user target, the DM just opened).
           if (firstChunk) {
             firstChunk = false
             const reaction = settings.ack_reaction
-            if (messageId && consumeAck(chatId, messageId) && reaction) {
+            if (messageId && consumeAck(persona.key, chatId, messageId) && reaction) {
               try {
                 await web.reactions.remove({
                   channel: chatId,

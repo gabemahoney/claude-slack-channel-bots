@@ -144,7 +144,7 @@ import {
 import { forgetFailures, isAtCap as backoffIsAtCap } from './backoff.ts'
 import { isDryRun } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
-import { consumeAck } from './ack-tracker.ts'
+import { consumeAck, forgetPersonaAcks } from './ack-tracker.ts'
 import {
   openArchiveDatabase,
   createPersonaArchiveWriter,
@@ -1297,6 +1297,7 @@ export async function main(): Promise<void> {
     forgetDisconnectedStreak,
     resetOutageState: resetAllToHealthy,
     forgetPersonaPrompts,
+    forgetAcks: forgetPersonaAcks,
     dropSession: dropPersonaSessionAndKeepAlive,
     killInstance: killPersonaInstance,
     deleteInstance: deletePersonaInstance,

@@ -42,6 +42,15 @@
  * config is delivered in an `all` channel, by mention in a mentions-only
  * channel and by DM with DMs on, with no sender allowlist and no pairing
  * reply. The ack reaction comes from the server-wide reply settings.
+ * AC 49 (b.av2 SR-4.5, SR-1.6 wiring): one ack reaction per dispatching
+ * persona, on its own client, only after its session accepted the
+ * notification, none for a message not dispatched (dropped, lost or a failed
+ * send), and the first reply of each persona removes its own; the replies run
+ * through the real `reply` tool over the same stubs and the real ack tracker
+ * (`h.reply`). A rejected or never-settling `reactions.add` is swallowed: the
+ * message stays delivered and the entry is still recorded. It also pins that
+ * nothing is awaited between the connected check and the send (b.9cj), with
+ * microtask flips and no timing sleeps.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -55,7 +64,13 @@ import { buildLostMessageNotice, type LostMessageState } from '../src/lost-messa
 import { INBOUND_DEDUPE_RETENTION_MS } from '../src/inbound-dedupe.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
-import { checkPersonaTarget, unregisterSession } from '../src/registry.ts'
+import {
+  checkPersonaTarget,
+  getSessionByPersona,
+  unregisterSession,
+  type SessionEntry,
+} from '../src/registry.ts'
+import { consumeAck } from '../src/ack-tracker.ts'
 import { initRestart, isRestartPendingOrActive } from '../src/restart.ts'
 import { openArchiveDatabase } from '../src/message-archive.ts'
 import { dryRunPersonaIdentity } from '../src/persona-connections.ts'
@@ -71,6 +86,7 @@ import {
   mentionText,
   userGroupMentionText,
   type SlackEvent,
+  type WebApiOutcome,
 } from './test-helpers/slack-stub.ts'
 import { posts, slackCalls } from './test-helpers/permission-relay-harness.ts'
 import { buildTempArchiveDb } from './test-helpers/archive-db.ts'
@@ -1184,6 +1200,8 @@ describe('SR-4.1 per-persona dedupe through the pipeline', () => {
 
     expect(A.notifications.map((n) => n.params.meta.via)).toEqual(['mention'])
     expect(A.stub.calls.reactionsAdd).toEqual([{ channel: MX_COORD, timestamp: pair.message.ts as string, name: 'eyes' }])
+    // AC 49: the one reaction is on A's own client, the receiving persona's; no other client reacts.
+    expect(h.all.filter((x) => x !== A).map((x) => x.stub.calls.reactionsAdd)).toEqual([[], [], [], []])
     expect(lines(h, 'Dispatching to persona')).toHaveLength(1)
     // Both events were acked.
     expect(h.order.filter((m) => m === 'ack')).toHaveLength(2)
@@ -1455,5 +1473,293 @@ describe('SR-4.4 delivered meta: author ID and via', () => {
     expect(content('A')).toEqual([{ via: 'mention', content: `${mentionText(b, 'beta')} ${broadcastText('here')} sync up now` }])
     expect(content('B')).toEqual([{ via: 'mention', content: `${mentionText(a)} ${broadcastText('here')} sync up ${mentionText(a, 'alpha')} now` }])
     expect(content('C')).toEqual([{ via: 'broadcast', content: text }])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC 49 (b.av2 SR-4.5, SR-1.6 wiring; E9 decision 2): with `ack_reaction`
+// set, each persona the message is dispatched to reacts under its own
+// identity (its own client) once its session has accepted the notification,
+// and records its own ack-tracker entry; a message not dispatched to a persona
+// (dropped by the decision, lost, or a failed send) gets neither. The first
+// reply of a persona carrying the `message_id` removes that persona's reaction
+// only. Replies run through the real `reply` tool (`h.reply`: the real
+// session server over the harness's per-persona stubs, the real ack tracker and
+// the harness's one reply settings source), so a tracker entry is observed only
+// as a `reactions.remove` on a persona's own stub.
+// ---------------------------------------------------------------------------
+
+describe('AC 49: one ack reaction per dispatching persona, on its own client, after the send; none for a message not dispatched', () => {
+  const ACK = 'eyes'
+  /** Gamma's home channel: Gamma never hears the shared channel. */
+  const CG = 'C0GAMMA01'
+  const NAMES = ['Alpha Bot', 'Beta Bot', 'Gamma Bot'] as const
+
+  /** A and B hear CS (A `all`, B `bDelivery`), each with its own home first (its destination); Gamma is a bystander. */
+  const sharedSpecs = (bDelivery: 'all' | 'mentions' = 'all'): PersonaSpec[] => [
+    { name: 'Alpha Bot', channels: [{ id: CA, delivery: 'all' }, { id: CS, delivery: 'all' }] },
+    { name: 'Beta Bot', channels: [{ id: CB, delivery: 'all' }, { id: CS, delivery: bDelivery }] },
+    { name: 'Gamma Bot', channels: [{ id: CG, delivery: 'all' }] },
+  ]
+
+  /** The `reactions.add` (and `reactions.remove`) arguments for `event`'s ack reaction. */
+  const ackOf = (event: SlackEvent) => ({ channel: event.channel as string, timestamp: event.ts as string, name: ACK })
+  /** Each persona's captured `reactions.add` calls, by name. */
+  const adds = (h: Harness): Record<string, unknown[]> => Object.fromEntries(h.all.map((x) => [x.persona.name, x.stub.calls.reactionsAdd]))
+  /** Each persona's captured `reactions.remove` calls, by name. */
+  const removes = (h: Harness): Record<string, unknown[]> => Object.fromEntries(h.all.map((x) => [x.persona.name, x.stub.calls.reactionsRemove]))
+  /** One list per persona name: `hit` for the names in `on`, `[]` for the rest. */
+  const only = <T>(on: readonly string[], hit: T[], names: readonly string[] = NAMES): Record<string, T[]> =>
+    Object.fromEntries(names.map((n) => [n, on.includes(n) ? hit : []]))
+
+  test('AC 49: a message in a channel two personas hear with `delivery: all` gets exactly one reaction on each one\'s own client (configured name, source conversation, message ts), and none on a bystander\'s', async () => {
+    const h = makeHarness(sharedSpecs(), { ackReaction: ACK })
+    const event = makeChannelMessage({ channel: CS })
+
+    await fanOut(h, event)
+
+    expect(deliveries(h, NAMES)).toEqual(only(['Alpha Bot', 'Beta Bot'], [{ chat_id: CS, via: 'receive_all_shared' }]))
+    expect(adds(h)).toEqual(only(['Alpha Bot', 'Beta Bot'], [ackOf(event)]))
+    expect(removes(h)).toEqual(only([], []))
+    expect(slackCalls(h.p('Gamma Bot').stub)).toBe(0)
+    assertNoLeak(captured(h))
+  })
+
+  // One row kills a mutant that never reacts (A must react), the other one that
+  // reacts to a message the decision drops as the persona's own.
+  test.each<[string, (ids: { a: string; aBot: string }) => SlackEvent, string[]]>([
+    ['a message that mentions no one: dispatched to A only (B is mentions-only)', () => makeChannelMessage({ channel: CS }), ['Alpha Bot']],
+    ['A\'s own post that mentions no one: dropped for every persona (A\'s own, B not mentioned)', (ids) => makeBotMessage({ channel: CS, user: ids.a, bot_id: ids.aBot }), []],
+  ])('AC 49: only dispatching personas react and record an entry — %s', async (_label, build, dispatched) => {
+    const h = makeHarness(sharedSpecs('mentions'), { ackReaction: ACK })
+    const { botUserId: a, botId: aBot } = h.p('Alpha Bot').stub.identity
+    const event = build({ a, aBot })
+
+    await fanOut(h, event)
+
+    expect(h.all.map((x) => x.notifications.length)).toEqual(NAMES.map((n) => (dispatched.includes(n) ? 1 : 0)))
+    expect(adds(h)).toEqual(only(dispatched, [ackOf(event)]))
+    // Each persona that heard it replies with its message_id: only a dispatching persona held an entry.
+    for (const name of ['Alpha Bot', 'Beta Bot']) await h.reply(name, { chat_id: CS, text: 'done', message_id: event.ts })
+    expect(removes(h)).toEqual(only(dispatched, [ackOf(event)]))
+    assertNoLeak(captured(h))
+  })
+
+  test('AC 49 (decision 2): the reaction comes only after P\'s session has accepted the notification — none and no entry while the send is pending, then one, in that order in one log', async () => {
+    const log: string[] = []
+    let accept!: () => void
+    const accepted = new Promise<void>((resolve) => { accept = resolve })
+    let sent!: () => void
+    const sending = new Promise<void>((resolve) => { sent = resolve })
+    const h = makeHarness(sharedSpecs(), {
+      ackReaction: ACK,
+      onNotify: {
+        'Alpha Bot': async () => {
+          log.push('notification sent')
+          sent()
+          await accepted
+          log.push('notification accepted')
+        },
+      },
+    })
+    const A = h.p('Alpha Bot')
+    const add = A.stub.web.reactions.add
+    A.stub.web.reactions.add = (args) => {
+      log.push('reactions.add')
+      return add(args)
+    }
+    const event = makeChannelMessage({ channel: CS })
+
+    const receiving = h.receive(event, ['Alpha Bot'])
+    await sending
+    expect(A.stub.calls.reactionsAdd).toEqual([])
+    expect(consumeAck(A.persona.key, CS, event.ts as string)).toBe(false)
+    accept()
+    await receiving
+
+    expect(log).toEqual(['notification sent', 'notification accepted', 'reactions.add'])
+    expect(A.notifications.map((n) => n.params.meta.message_id)).toEqual([event.ts as string])
+    expect(adds(h)).toEqual(only(['Alpha Bot'], [ackOf(event)]))
+    await h.reply('Alpha Bot', { chat_id: CS, text: 'done', message_id: event.ts })
+    expect(removes(h)).toEqual(only(['Alpha Bot'], [ackOf(event)]))
+    assertNoLeak(captured(h))
+  })
+
+  /**
+   * A's `reactions.add` fails or never answers. The call is fire-and-forget
+   * with its failure swallowed, and the entry is recorded before it is issued:
+   * A is still delivered, nothing is logged about it, no rejection escapes,
+   * and A's first reply still removes the reaction (b.av2 SR-4.5). An escaped
+   * rejection fails the case through the runner: `bun test` fails a test that
+   * leaves an unhandled rejection, and does so ahead of any
+   * `unhandledRejection` listener, so the case needs none; it only yields one
+   * macrotask turn so the rejection is reported within it.
+   */
+  test.each<[string, WebApiOutcome]>([
+    ['rejected with a platform error', { kind: 'platform', error: 'invalid_name' }],
+    ['rejected with a network error', { kind: 'network' }],
+    ['never settles', { kind: 'never' }],
+  ])('AC 49: A\'s reactions.add %s — A is still delivered, the failure is swallowed silently, and A\'s first reply still removes the reaction, once, on A\'s client', async (_label, outcome) => {
+    const h = makeHarness(sharedSpecs(), { ackReaction: ACK, stubOptions: { 'Alpha Bot': { reactionsAdd: [outcome] } } })
+    const event = makeChannelMessage({ channel: CS })
+
+    await fanOut(h, event)
+    // One macrotask turn: a rejection left unhandled is reported (and fails the case) here.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(deliveries(h, NAMES)).toEqual(only(['Alpha Bot', 'Beta Bot'], [{ chat_id: CS, via: 'receive_all_shared' }]))
+    expect(adds(h)).toEqual(only(['Alpha Bot', 'Beta Bot'], [ackOf(event)]))
+    // Each persona's one dispatch line, and nothing about the reaction.
+    expect([...h.logs, ...consoleLines].map((l) => l.startsWith('[slack] Dispatching to persona '))).toEqual([true, true])
+    // A second reply finds no entry left: the first removed it, once.
+    await h.reply('Alpha Bot', { chat_id: CS, text: 'done', message_id: event.ts })
+    await h.reply('Alpha Bot', { chat_id: CS, text: 'done', message_id: event.ts })
+    expect(removes(h)).toEqual(only(['Alpha Bot'], [ackOf(event)]))
+    assertNoLeak(captured(h))
+  })
+
+  /** Runs during P's author-name lookup, on P's registered session (if any). */
+  type DuringLookup = (key: string) => void
+  const dropStream: DuringLookup = (key) => {
+    (getSessionByPersona(key)!.transport as unknown as { _streamMapping: Map<string, unknown> })._streamMapping.delete('_GET_stream')
+  }
+
+  test.each<[string, RoutingHarnessOptions, DuringLookup?]>([
+    ['no registered session (b.kvq)', { sessions: ['Beta Bot', 'Gamma Bot'] }],
+    ['a registered session that reads disconnected', { disconnected: ['Alpha Bot'] }],
+    ['a connected session that has lost its GET stream (b.9cj)', { streamless: ['Alpha Bot'] }],
+    ['the session is unregistered during the author-name lookup', {}, (key) => unregisterSession(key)],
+    ['the session disconnects during the author-name lookup', {}, (key) => { getSessionByPersona(key)!.connected = false }],
+    ['the session loses its GET stream during the author-name lookup', {}, dropStream],
+    ['the send to the session throws (not dispatched)', { throwOnNotify: ['Alpha Bot'] }],
+  ])('AC 49: a message not dispatched to A — %s — gets no reaction on any client and leaves no entry (A\'s later reply removes nothing); B, dispatched, reacts and removes', async (_label, opts, ...[during]) => {
+    let aKey = ''
+    const h = makeHarness(sharedSpecs(), {
+      ackReaction: ACK,
+      restartDelayS: NEVER_FIRE_RESTART_DELAY_S,
+      resolveUserName: async (key, userId) => {
+        if (key === aKey) during?.(key)
+        return userId
+      },
+      ...opts,
+    })
+    const A = h.p('Alpha Bot')
+    aKey = A.persona.key
+    const event = makeChannelMessage({ channel: CS })
+
+    await fanOut(h, event)
+
+    expect(A.notifications).toHaveLength(0)
+    expect(h.p('Beta Bot').notifications).toHaveLength(1)
+    expect(adds(h)).toEqual(only(['Beta Bot'], [ackOf(event)]))
+    const reply = { chat_id: CS, text: 'done', message_id: event.ts }
+    await h.reply('Alpha Bot', reply)
+    expect(removes(h)).toEqual(only([], []))
+    // Control: the reply path does remove a reaction whose entry exists.
+    await h.reply('Beta Bot', reply)
+    expect(removes(h)).toEqual(only(['Beta Bot'], [ackOf(event)]))
+    expect(consumeAck(A.persona.key, CS, event.ts as string)).toBe(false)
+    assertNoLeak(captured(h))
+  })
+
+  test('AC 49: after the shared-channel dispatch, A\'s first reply carrying the message_id removes only A\'s reaction, on A\'s client; B\'s first reply then removes B\'s; later replies remove nothing more', async () => {
+    const h = makeHarness(sharedSpecs(), { ackReaction: ACK })
+    const event = makeChannelMessage({ channel: CS })
+    await fanOut(h, event)
+    const reply = { chat_id: CS, text: 'done', message_id: event.ts }
+
+    await h.reply('Alpha Bot', reply)
+    expect(removes(h)).toEqual(only(['Alpha Bot'], [ackOf(event)]))
+
+    await h.reply('Beta Bot', reply)
+    expect(removes(h)).toEqual(only(['Alpha Bot', 'Beta Bot'], [ackOf(event)]))
+
+    await h.reply('Alpha Bot', reply)
+    await h.reply('Beta Bot', reply)
+    expect(removes(h)).toEqual(only(['Alpha Bot', 'Beta Bot'], [ackOf(event)]))
+    // Control: all four replies were posted, each on its persona's own stub.
+    expect(h.postsTo(CS).map((p) => p.key)).toEqual(h.keys(['Alpha Bot', 'Alpha Bot', 'Beta Bot', 'Beta Bot']))
+    assertNoLeak(captured(h))
+  })
+
+  test('AC 49 DM: a DM to a persona with DMs on gets one reaction on its own client in the DM conversation; another persona\'s reply there removes nothing, its own first reply removes it, once', async () => {
+    const DM = 'D0AC49DM01'
+    const names = ['Dm Bot', 'Other Bot']
+    const h = makeHarness([{ name: 'Dm Bot', dm: { enabled: true } }, { name: 'Other Bot', dm: { enabled: true } }], { ackReaction: ACK })
+    const event = makeDm({ channel: DM })
+
+    await h.receive(event, ['Dm Bot'])
+
+    expect(deliveries(h, names)).toEqual({ 'Dm Bot': [{ chat_id: DM, via: 'dm' }], 'Other Bot': [] })
+    expect(adds(h)).toEqual(only(['Dm Bot'], [ackOf(event)], names))
+    const reply = { chat_id: DM, text: 'done', message_id: event.ts }
+    await h.reply('Other Bot', reply)
+    expect(removes(h)).toEqual(only([], [], names))
+    await h.reply('Dm Bot', reply)
+    await h.reply('Dm Bot', reply)
+    expect(removes(h)).toEqual(only(['Dm Bot'], [ackOf(event)], names))
+    assertNoLeak(captured(h))
+  })
+
+  test('AC 49: with no `ack_reaction`, the shared-channel dispatch captures no reactions.add and the replies no reactions.remove', async () => {
+    const h = makeHarness(sharedSpecs())
+    const event = makeChannelMessage({ channel: CS })
+
+    await fanOut(h, event)
+
+    expect(deliveries(h, NAMES)).toEqual(only(['Alpha Bot', 'Beta Bot'], [{ chat_id: CS, via: 'receive_all_shared' }]))
+    expect(adds(h)).toEqual(only([], []))
+    for (const name of ['Alpha Bot', 'Beta Bot']) await h.reply(name, { chat_id: CS, text: 'done', message_id: event.ts })
+    expect(removes(h)).toEqual(only([], []))
+    // No entry was recorded either.
+    for (const name of ['Alpha Bot', 'Beta Bot']) expect(consumeAck(h.p(name).persona.key, CS, event.ts as string)).toBe(false)
+    assertNoLeak(captured(h))
+  })
+
+  /**
+   * Makes `probe` of P's session (installed during P's author-name lookup)
+   * report present once and schedule it gone on the next microtask, so a
+   * send not in the same synchronous run as the read sees it gone.
+   */
+  type Flip = (entry: SessionEntry, probe: () => boolean) => void
+  test.each<[string, Flip]>([
+    ['the GET stream (read by the stream probe)', (entry, probe) => {
+      (entry.transport as unknown as { _streamMapping: { has(k: string): boolean } })._streamMapping = { has: (k) => k === '_GET_stream' && probe() }
+    }],
+    ['the connected flag (read at the session read)', (entry, probe) => {
+      Object.defineProperty(entry, 'connected', { configurable: true, get: probe, set: () => {} })
+    }],
+  ])('b.9cj / decision 2: nothing is awaited between the connected check and the send — %s goes away on the next microtask after it is read, and the send still sees it present', async (_label, install) => {
+    let present = true
+    /** Report present, and schedule it gone on the next microtask. */
+    const probe = () => {
+      const now = present
+      if (now) queueMicrotask(() => { present = false })
+      return now
+    }
+    const atSend: boolean[] = []
+    let aKey = ''
+    const h = makeHarness(sharedSpecs(), {
+      ackReaction: ACK,
+      onNotify: { 'Alpha Bot': () => { atSend.push(present) } },
+      resolveUserName: async (key, userId) => {
+        if (key === aKey) install(getSessionByPersona(key)!, probe)
+        return userId
+      },
+    })
+    const A = h.p('Alpha Bot')
+    aKey = A.persona.key
+    const event = makeChannelMessage({ channel: CS })
+
+    await h.receive(event, ['Alpha Bot'])
+
+    expect(atSend).toEqual([true])
+    // Control: the flip did happen, right after the read.
+    expect(present).toBe(false)
+    expect(A.notifications).toHaveLength(1)
+    expect(lines(h, 'DROP:')).toEqual([])
+    expect(lines(h, 'No live session')).toEqual([])
+    expect(adds(h)).toEqual(only(['Alpha Bot'], [ackOf(event)]))
+    assertNoLeak(captured(h))
   })
 })

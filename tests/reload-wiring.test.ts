@@ -468,6 +468,8 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       // The silent per-key reset (never the boot reset of every persona).
       ['resetOutageState', 'resetAllToHealthy'],
       ['forgetPersonaPrompts', 'forgetPersonaPrompts'],
+      // The silent per-key ack-tracker forget, so a key added again starts clean.
+      ['forgetAcks', 'forgetPersonaAcks'],
       ['dropSession', 'dropPersonaSessionAndKeepAlive'],
       ['killInstance', 'killPersonaInstance'],
       ['deleteInstance', 'deletePersonaInstance'],
@@ -489,6 +491,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       forgetDisconnectedStreak: './health-check.ts',
       resetAllToHealthy: './outage-state.ts',
       forgetPersonaPrompts: './permission-poller.ts',
+      forgetPersonaAcks: './ack-tracker.ts',
       getLaunchedWithDir: './stop-hook-bootstrap.ts',
       teardownPersonaReplyGuard: './stop-hook-bootstrap.ts',
       stopHookLaunchPass: './stop-hook-bootstrap.ts',

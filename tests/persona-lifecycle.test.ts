@@ -13,6 +13,7 @@
  *   `deletePersonaInstance` over `makeStubClient`, with the real outage state
  *   (`resetAllToHealthy`) and the real notifier, destination resolver and
  *   destination hold (`makeNotifierHarness`, fake clock);
+ * - the ack-reaction entries: the real ack tracker's `forgetPersonaAcks`;
  * - serialization behind a restart: the real restart module
  *   (`initRestart` with `serialize`, real `cancelRestartTimer`). Its timer is
  *   a real `setTimeout` (1 ms here; it takes no fake clock), waited for by a
@@ -39,6 +40,7 @@ import { join, relative } from 'node:path'
 import type { Persona, PersonaConfig } from '../src/config.ts'
 import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
 import { ErrSystemInstallDisappeared } from '../src/agent-director-errors.ts'
+import { _resetAckTracker, consumeAck, forgetPersonaAcks, trackAck } from '../src/ack-tracker.ts'
 import { _resetBackoffState } from '../src/backoff.ts'
 import { _resetOutageState, getOutageFlags, initOutageState, resetAllToHealthy, setOutageFlag } from '../src/outage-state.ts'
 import {
@@ -95,6 +97,7 @@ afterEach(async () => {
   _resetRestartState()
   _resetBackoffState()
   _resetOutageState()
+  _resetAckTracker()
   resetClientForTests()
   consoleSpy?.mockRestore()
   rmSync(dir, { recursive: true, force: true })
@@ -139,7 +142,7 @@ function makeConfig(): PersonaConfig {
 /** Dependency names the recorder fixture can make fail. */
 type DepName =
   | 'bringUps.cancel' | 'bringUps.bringUp' | 'bringUps.state' | 'bringUps.changeCredentials' | 'cancelRestartTimer' | 'whenLaunchSettled' | 'connections.stop'
-  | 'routing.forget' | 'destinations.forget' | 'destinationHold.cancel' | 'notifier.forget' | 'forgetPersonaPrompts'
+  | 'routing.forget' | 'forgetAcks' | 'destinations.forget' | 'destinationHold.cancel' | 'notifier.forget' | 'forgetPersonaPrompts'
   | 'dropSession' | 'resetOutageState' | 'killInstance' | 'deleteInstance' | 'forgetFailures'
   | 'forgetDisconnectedStreak' | 'replyGuard.launchedWithDir' | 'replyGuard.teardown' | 'replyGuard.launchPass'
   | 'storageCheck' | 'launch' | 'connections.reconnectCredentials' | 'connections.replaceRetryTokens'
@@ -266,6 +269,7 @@ function makeFixture(opts: FixtureOptions = {}): Fixture {
       replaceRetryTokens: rec('connections.replaceRetryTokens', byKey, () => false),
     },
     routing: { forget: rec('routing.forget', byKey, () => undefined) },
+    forgetAcks: rec('forgetAcks', byKey, () => undefined),
     destinations: { forget: rec('destinations.forget', byKey, () => undefined) },
     destinationHold: { cancel: rec('destinationHold.cancel', byKey, () => undefined) },
     notifier: { forget: rec('notifier.forget', byKey, () => undefined) },
@@ -316,7 +320,7 @@ function fullTeardownTrail(p: Persona, launchPass: string): string[] {
   const k = p.key
   return [
     `bringUps.cancel:${k}`, `cancelRestartTimer:${k}`, `whenLaunchSettled:${k}`,
-    `connections.stop:${k}`, `routing.forget:${k}`, `destinations.forget:${k}`, `destinationHold.cancel:${k}`,
+    `connections.stop:${k}`, `routing.forget:${k}`, `forgetAcks:${k}`, `destinations.forget:${k}`, `destinationHold.cancel:${k}`,
     `notifier.forget:${k}`, `forgetPersonaPrompts:${k}`, `dropSession:${k}`,
     `resetOutageState:${k}`, `killInstance:${k}`, `deleteInstance:${k}`, `resetOutageState:${k}`,
     `forgetFailures:${k}`, `forgetDisconnectedStreak:${k}`,
@@ -444,6 +448,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     ['whenLaunchSettled', 'waiting for its launch in flight', 1],
     ['connections.stop', 'stopping its Slack connection', 1],
     ['routing.forget', 'forgetting its inbound dedupe store', 1],
+    ['forgetAcks', 'forgetting its ack-reaction entries', 1],
     ['destinations.forget', 'forgetting its DM destination', 1],
     ['destinationHold.cancel', 'cancelling its held destination notices', 1],
     ['notifier.forget', 'dropping its held notices', 1],
@@ -478,7 +483,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   test('every step failing: the teardown still resolves, runs each step once and reports all of them', async () => {
     const all: DepName[] = [
       'bringUps.cancel', 'cancelRestartTimer', 'whenLaunchSettled', 'connections.stop', 'routing.forget',
-      'destinations.forget', 'destinationHold.cancel', 'notifier.forget', 'forgetPersonaPrompts', 'dropSession',
+      'forgetAcks', 'destinations.forget', 'destinationHold.cancel', 'notifier.forget', 'forgetPersonaPrompts', 'dropSession',
       'resetOutageState', 'killInstance', 'deleteInstance', 'forgetFailures', 'forgetDisconnectedStreak',
       'replyGuard.launchedWithDir', 'replyGuard.teardown', 'replyGuard.launchPass',
     ]
@@ -487,7 +492,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     await f.lifecycle.teardown(f.b)
 
     expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
-    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 19 failed step(s)`)
+    expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with 20 failed step(s)`)
     assertNoLeak({ lines: f.lines })
   })
 
@@ -497,10 +502,10 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     await f.lifecycle.teardown(f.b)
 
     const k = f.b.key
+    const full = fullTeardownTrail(f.b, launchPassOf(f, undefined))
+    const firstReset = full.indexOf(`resetOutageState:${k}`)
     expect(f.trail).toEqual(
-      fullTeardownTrail(f.b, launchPassOf(f, undefined)).filter(
-        (c, i) => c !== `killInstance:${k}` && c !== `deleteInstance:${k}` && !(c === `resetOutageState:${k}` && i === 10),
-      ),
+      full.filter((c, i) => c !== `killInstance:${k}` && c !== `deleteInstance:${k}` && i !== firstReset),
     )
     expect(f.lines).toEqual([
       `${teardownPrefix(f.b)}: starting`,
@@ -514,6 +519,25 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
     expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+  })
+
+  test('over the real ack tracker: tearing B down drops every ack-reaction entry of B\'s, so B added again starts clean, and leaves A\'s entries, even on the same message, untouched', async () => {
+    const f = makeFixture({ overrides: { forgetAcks: forgetPersonaAcks } })
+    const [a, b] = [f.a.key, f.b.key]
+    trackAck(a, 'C0SHARED01', '1700000000.000100')
+    trackAck(b, 'C0SHARED01', '1700000000.000100')
+    trackAck(b, 'D0BETADM01', '1700000000.000200')
+    trackAck(a, 'C0ALPHA001', '1700000000.000300')
+
+    await f.lifecycle.teardown(f.b)
+
+    // Every other step still ran, in order (the real forget records no trail entry).
+    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)).filter((c) => c !== `forgetAcks:${b}`))
+    expect(f.lines).toEqual([`${teardownPrefix(f.b)}: starting`, `${teardownPrefix(f.b)}: complete`])
+    expect(consumeAck(b, 'C0SHARED01', '1700000000.000100')).toBe(false)
+    expect(consumeAck(b, 'D0BETADM01', '1700000000.000200')).toBe(false)
+    expect(consumeAck(a, 'C0SHARED01', '1700000000.000100')).toBe(true)
+    expect(consumeAck(a, 'C0ALPHA001', '1700000000.000300')).toBe(true)
   })
 })
 

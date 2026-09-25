@@ -32,29 +32,30 @@
  *    no Slack call; any other reason logs one plain line naming the author
  *    ID. No drop line carries message text.
  * 5. Dispatch: the author's label is resolved, then P's session is looked up by
- *    persona key and its GET stream probed. Only a message that will actually
- *    be sent gets the ack reaction (through P's client) and an ack-tracker
- *    entry; then it goes as `notifications/claude/channel` to P's session
- *    only, with `chat_id` set to the source conversation (the channel, or the
- *    DM conversation). Nothing is awaited between the session read and the
- *    send. The meta `user` is the author's display name, or for an author
- *    without `user` (webhook, `bot_message`) the event's `username`, else its
- *    `bot_profile.name`, else its bot ID. The meta also carries the author's
+ *    persona key and its GET stream probed. The message goes as
+ *    `notifications/claude/channel` to P's session only, with `chat_id` set
+ *    to the source conversation (the channel, or the DM conversation).
+ *    Nothing is awaited between the session read and the send. Only once the
+ *    send has succeeded does P record its ack-tracker entry (keyed by P's key,
+ *    the conversation and the ts) and add the ack reaction through its own
+ *    client (b.av2 SR-4.5); a send that throws gets neither. The meta `user`
+ *    is the author's display name, or for an author without `user` (webhook,
+ *    `bot_message`) the event's `username`, else its `bot_profile.name`, else
+ *    its bot ID. The meta also carries the author's
  *    `user_id` (or, for an author without `user`, its `bot_id`; never both)
  *    and `via`, how the message reached P (b.av2 SR-4.4).
  * 6. Lost message (b.av2 SR-4.6, SR-7.3): when P has no live session, or its
  *    session has lost its GET stream, the message is dropped with no ack
- *    reaction, a human-triggered restart of P is scheduled only in the
- *    "starting now" state (`src/lost-message.ts` decides the state from
- *    whether P is up and the restart guards; a P that is not up is never
- *    restarted from here), and one lost-message notice naming the sender and
- *    the state goes to P's destination through the injected `notify`. Nothing
- *    is posted in the source conversation, and the message text is never in
- *    the notice.
+ *    reaction or ack-tracker entry, a human-triggered restart of P is
+ *    scheduled only in the "starting now" state (`src/lost-message.ts`
+ *    decides the state from whether P is up and the restart guards; a P that
+ *    is not up is never restarted from here), and one lost-message notice
+ *    naming the sender and the state goes to P's destination through the
+ *    injected `notify`. Nothing is posted in the source conversation, and the
+ *    message text is never in the notice.
  *
- * Deferred rule and where it is completed: the ack reaction's per-persona
- * keying (E9 Task 2). Its name comes from the server-wide `ack_reaction`
- * setting (b.av2 SR-1.6).
+ * The ack reaction's name comes from the server-wide `ack_reaction` setting
+ * (b.av2 SR-1.6); with it absent, no persona reacts or records an entry.
  *
  * Side-effect free (b.av2 SR-13.1): importing this module creates no Slack
  * client, reads no token, file or environment variable, starts no timer and
@@ -330,6 +331,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     // Read P's session after the await above, so a session replaced or dropped
     // during the lookup is seen. From here to notification() nothing is
     // awaited, so the stream probe and the send act on this one session (b.9cj).
+    // The ack reaction comes only after the send (below).
     const session = getSessionByPersona(persona.key)
     if (!session || !session.connected) {
       deps.log(`[slack] No live session for persona ${ref} chat_id=${chatId} — dropping message`)
@@ -358,12 +360,13 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       return
     }
 
-    // The message is dispatched: only now does it get the ack reaction.
-    addAckReaction(persona.key, chatId, ts)
+    // A throwing send propagates (the caller logs it): no entry, no reaction.
     await session.server.notification({
       method: CHANNEL_NOTIFICATION_METHOD,
       params: { content: text, meta },
     })
+    // The message is dispatched: only now does P react to it (b.av2 SR-4.5).
+    addAckReaction(persona.key, chatId, ts)
   }
 
   /**
@@ -388,18 +391,19 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   }
 
   /**
-   * Today's ack reaction and ack tracking, through P's client, for a message
-   * being dispatched; skipped when there is no reaction or P has no client.
-   * Synchronous: the entry is recorded and the reaction call issued, not
-   * awaited, so nothing is awaited between the stream probe and the send. A
-   * failed reaction is non-critical.
+   * P's ack reaction and ack-tracker entry for a message whose notification
+   * P's session has accepted, through P's own client; skipped when there is
+   * no reaction or P has no client. The entry (keyed by P's key, the
+   * conversation and the ts) is recorded first and the reaction call issued,
+   * not awaited, so P's first reply always finds the entry. A failed reaction
+   * is non-critical: swallowed, the entry kept, the message still delivered.
    */
   function addAckReaction(key: string, channel: string, ts: string): void {
     const reaction = deps.getReplySettings().ack_reaction
     if (!reaction) return
     const client = deps.clientFor(key)
     if (!client) return
-    trackAck(channel, ts)
+    trackAck(key, channel, ts)
     try {
       client.reactions.add({ channel, timestamp: ts, name: reaction }).catch(() => { /* non-critical */ })
     } catch { /* non-critical */ }
