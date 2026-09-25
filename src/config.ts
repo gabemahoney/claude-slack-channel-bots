@@ -7,7 +7,9 @@
  * (b.av2 SR-1.6). It rejects the pre-persona shape before any other check
  * with the conversion message (b.av2 SR-1.7) and never writes or converts
  * the file. Errors name the setting and the rule and never echo a rejected
- * value (b.av2 SR-10.3).
+ * value, and name an unknown key only when it is a plain setting name
+ * (`describeUnknownKeys`), so a pasted token never reaches an error
+ * (b.av2 SR-10.3).
  *
  * The configuration file is `config.json` in the state directory, at the path
  * `resolveServerConfigPath` returns (b.av2 SR-8.7). Which configuration a
@@ -505,17 +507,45 @@ export function credentialsFilesToProtect(
   fs?: Partial<PersonaConfigFs>,
 ): string[] {
   const paths = appliedPersonas.map((p) => p.credentials_file)
-  let parsed: unknown
+  let bytes: Buffer
   try {
-    const bytes = readPersonaConfigBytes(resolve(expandTildeWith(configPath, home)), fs)
-    parsed = JSON.parse(bytes.toString('utf-8'))
+    bytes = readPersonaConfigBytes(resolve(expandTildeWith(configPath, home)), fs)
   } catch {
     return paths
+  }
+  return [...paths, ...referencedCredentialsPaths(bytes, home)]
+}
+
+/**
+ * Every string `personas[i].credentials_file` named by the configuration
+ * `bytes`, in declaration order (duplicates kept), tilde-expanded under
+ * `home` and made absolute, as the persona loader expands persona paths.
+ *
+ * Tolerant and never throws: the bytes are parsed but not validated, so a
+ * file that fails other validation still yields the paths it names, and
+ * unparseable JSON, a value that is not an object, or a missing or non-array
+ * `personas` yields none; a parse error is discarded, never reported. Pure:
+ * reads no file. Only the paths leave it, never other content. The one
+ * extraction of referenced credentials paths: the SR-5.2 file guard
+ * (`credentialsFilesToProtect`) and the reload detection tick's fingerprint
+ * (b.av2 SR-8.3) both use it.
+ *
+ * @param bytes  The configuration's bytes, or its text.
+ * @param home   Home directory for every `~`; defaults to the OS home, read at
+ *   call time and only when a path needs it.
+ */
+export function referencedCredentialsPaths(bytes: Uint8Array | string, home?: string): string[] {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(typeof bytes === 'string' ? bytes : Buffer.from(bytes).toString('utf-8'))
+  } catch {
+    return []
   }
   const personas = typeof parsed === 'object' && parsed !== null
     ? (parsed as Record<string, unknown>)['personas']
     : undefined
-  if (!Array.isArray(personas)) return paths
+  if (!Array.isArray(personas)) return []
+  const paths: string[] = []
   for (const entry of personas) {
     const file = typeof entry === 'object' && entry !== null
       ? (entry as Record<string, unknown>)['credentials_file']
@@ -531,8 +561,9 @@ export function credentialsFilesToProtect(
 
 /**
  * How a validation rule words its error: the prefix it starts with. No rule
- * echoes a rejected value, so a token pasted into any setting cannot reach an
- * error (b.av2 SR-10.3).
+ * echoes a rejected value, and an unknown key's name is echoed only when it
+ * is a plain setting name (`describeUnknownKeys`), so a token pasted into
+ * any setting or as a key name cannot reach an error (b.av2 SR-10.3).
  */
 interface RuleStyle {
   prefix: string
@@ -662,7 +693,8 @@ function resolveServerPaths(
 }
 
 /**
- * Reject top-level keys outside `known` (SR-4.2), naming the keys only. The
+ * Reject top-level keys outside `known` (SR-4.2), naming only the keys that
+ * are safe to echo (`describeUnknownKeys`) and never a value. The
  * pre-rename `claude_director_poll_interval_ms` gets a targeted message naming
  * its new name (SR-4.1).
  *
@@ -686,13 +718,38 @@ function rejectUnknownTopLevelKeys(
     unknown.push(key)
   }
   if (unknown.length > 0) {
-    throw ruleError(style, `unknown top-level field(s) in config.json: ${quoteKeys(unknown)}.`)
+    throw ruleError(style, `unknown top-level field(s) in config.json: ${describeUnknownKeys(unknown)}.`)
   }
 }
 
-/** Key names JSON-quoted and comma-separated, for unknown-key errors. */
-function quoteKeys(keys: readonly string[]): string {
-  return keys.map((k) => JSON.stringify(k)).join(', ')
+/**
+ * An unknown key name the loader may echo: ASCII letters and underscores
+ * only, at most 48 characters, as every setting name is. Anything else (a
+ * digit, a dash, a dot, a space, a longer name) is not echoed: a token or
+ * other secret pasted as a key name would otherwise reach the start's log,
+ * `config.json.pending` and the reload log lines (b.av2 SR-10.3). Letters
+ * only, so a hex or base64 secret, a Slack token (`xoxb-…`) and a
+ * `ghp_…`-style token all fail it, while a typo such as `chanels` passes.
+ */
+export const ECHOABLE_KEY_NAME_RE = /^[A-Za-z_]{1,48}$/
+
+/**
+ * Unknown key names for an error, echoing only the names that pass
+ * `ECHOABLE_KEY_NAME_RE` (JSON-quoted, comma-separated, in order); the rest
+ * are counted, never shown:
+ *   `"chanels", "extra"`
+ *   `"chanels", plus 1 field whose name is not shown (it is not a plain setting name, so it could be a pasted secret)`
+ *   `2 fields whose names are not shown (they are not plain setting names, so they could be pasted secrets)`
+ */
+export function describeUnknownKeys(keys: readonly string[]): string {
+  const shown = keys.filter((k) => ECHOABLE_KEY_NAME_RE.test(k)).map((k) => JSON.stringify(k))
+  const hidden = keys.length - shown.length
+  if (hidden === 0) return shown.join(', ')
+  const count =
+    hidden === 1
+      ? '1 field whose name is not shown (it is not a plain setting name, so it could be a pasted secret)'
+      : `${hidden} fields whose names are not shown (they are not plain setting names, so they could be pasted secrets)`
+  return shown.length === 0 ? count : `${shown.join(', ')}, plus ${count}`
 }
 
 // ---------------------------------------------------------------------------
@@ -799,12 +856,13 @@ function rejectUnknownEntryKeys(
   style: RuleStyle,
 ): void {
   const unknown = Object.keys(obj).filter((key) => !allowed.includes(key))
-  if (unknown.length > 0) throw ruleError(style, `unknown field(s) in ${where}: ${quoteKeys(unknown)}.`)
+  if (unknown.length > 0) throw ruleError(style, `unknown field(s) in ${where}: ${describeUnknownKeys(unknown)}.`)
 }
 
 /**
  * Stage 1 of an entry: the shapes of the `dm` object and the `channels`
- * array and its entries, and unknown keys at every level (key names only).
+ * array and its entries, and unknown keys at every level (key names only,
+ * and only those safe to echo: `describeUnknownKeys`).
  */
 function checkPersonaEntryShape(entry: Record<string, unknown>, style: RuleStyle): void {
   rejectUnknownEntryKeys(entry, PERSONA_ENTRY_KEYS, 'the persona entry', style)
@@ -1114,7 +1172,8 @@ export interface ResolvePersonaConfigOptions {
  *   2. b.av2 SR-1.7: `routes` (any value), `default_route` or
  *      `default_dm_session` present → the conversion message, before any
  *      other check;
- *   3. unknown top-level keys (key names only; the SR-4.1 rename message);
+ *   3. unknown top-level keys (key names only, and only plain setting names:
+ *      `describeUnknownKeys`; the SR-4.1 rename message);
  *   4. `personas` present and an array (it may be empty);
  *   5. server-wide settings defaulted and validated (b.av2 SR-1.6);
  *   6. each persona entry in array order (see `parsePersonaEntry`),

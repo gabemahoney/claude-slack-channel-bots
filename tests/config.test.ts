@@ -25,10 +25,12 @@ import {
   configFileReadFailureMessage,
   CONFIG_NOT_REGULAR_FILE_CODE,
   DEFAULT_PERSONA_CONFIG_FS,
+  describeUnknownKeys,
   isMissingConfigCode,
   parsePersonaConfigBytes,
   PersonaConfigReadError,
   readPersonaConfigBytes,
+  referencedCredentialsPaths,
   resolveServerConfigPath,
   resolveServerStateDir,
   type PersonaConfigFs,
@@ -357,6 +359,33 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       const message = loadError(input)
       expect(message).toContain(JSON.stringify(key))
       if (inPersona) expectNamesPersona(message, 'Ops Bot')
+    })
+
+    // Director decision 5: a key whose name could be a pasted token is counted, never echoed.
+    // loadError's assertNoLeak fails if the name (each embeds the sentinel) reaches the error.
+    const ONE_HIDDEN = '1 field whose name is not shown (it is not a plain setting name, so it could be a pasted secret).'
+    const tokenNames: [string, string][] = [
+      ['an xoxb- token', fakeToken(BOT_TOKEN_PREFIX, 'key')],
+      ['an xapp- token', fakeToken(APP_TOKEN_PREFIX, 'key')],
+      ['a ghp_ token', fakeToken('ghp_')],
+    ]
+    const levels: [string, (name: string) => unknown, string][] = [
+      ['top-level', name => ({ ...makePersonaConfigInput(), [name]: 1 }), 'unknown top-level field(s) in config.json: '],
+      ['persona entry', name => persona({ [name]: 1 }), 'unknown field(s) in the persona entry: '],
+      ['dm object', name => persona({ dm: { enabled: false, [name]: true } }), 'unknown field(s) in dm: '],
+      ['channel entry', name => persona({ channels: [{ id: 'C0TEST001', delivery: 'all', [name]: 'x' }] }), 'unknown field(s) in channels[0]: '],
+    ]
+    test.each(levels.flatMap(([level, build, where]) =>
+      tokenNames.map(([what, name]): [string, string, unknown, string] => [level, what, build(name), where])))(
+      'an unknown key in the %s named with %s is rejected with a count, never its name', (level, _what, input, where) => {
+        const message = loadError(input)
+        expect(message).toContain(`${where}${ONE_HIDDEN}`)
+        if (level !== 'top-level') expectNamesPersona(message, 'Ops Bot')
+      })
+
+    test('a plain typo beside a token-named key is still echoed, and only the token-named one is counted', () => {
+      const message = loadError({ ...makePersonaConfigInput(), chanels: [], [fakeToken(BOT_TOKEN_PREFIX, 'key')]: 1 })
+      expect(message).toContain(`unknown top-level field(s) in config.json: "chanels", plus ${ONE_HIDDEN}`)
     })
   })
 
@@ -1055,6 +1084,50 @@ const CHILD_RECORDING_FS = `
 `
 
 // ---------------------------------------------------------------------------
+// describeUnknownKeys (b.av2 SR-10.3; Director decision 5): only plain setting
+// names are echoed. Pure; the loader's use of it is in `unknown keys` above.
+// ---------------------------------------------------------------------------
+
+describe('describeUnknownKeys (b.av2 SR-10.3)', () => {
+  const ONE = '1 field whose name is not shown (it is not a plain setting name, so it could be a pasted secret)'
+  const many = (n: number) => `${n} fields whose names are not shown (they are not plain setting names, so they could be pasted secrets)`
+
+  // Rows: label, the one unknown key, whether it is echoed.
+  test.each<[string, string, boolean]>([
+    ['a typo of a setting is echoed', 'chanels', true],
+    ['letters and underscores are echoed', 'extra_Setting', true],
+    ['one underscore (the shortest name) is echoed', '_', true],
+    ['48 letters (the longest name) are echoed', 'a'.repeat(48), true],
+    ['49 letters are counted, not shown', 'a'.repeat(49), false],
+    ['the empty name is counted, not shown', '', false],
+    ['a name with a digit is counted, not shown', 'chanels2', false],
+    ['a name with a dash is counted, not shown', 'bot-token', false],
+    ['a name with a dot is counted, not shown', 'dm.enabled', false],
+    ['a ghp_-style token with digits is counted, not shown', fakeToken('ghp_'), false],
+    ['an xoxb- token is counted, not shown', fakeToken(BOT_TOKEN_PREFIX), false],
+  ])('%s', (_label, key, echoed) => {
+    const described = describeUnknownKeys([key])
+    expect(described).toBe(echoed ? JSON.stringify(key) : ONE)
+    assertNoLeak(described)
+  })
+
+  test.each<[string, string[], string]>([
+    ['all echoable, JSON-quoted in order', ['chanels', 'extra'], '"chanels", "extra"'],
+    ['all hidden, counted', [fakeToken(BOT_TOKEN_PREFIX), fakeToken(APP_TOKEN_PREFIX)], many(2)],
+    [
+      'mixed: the echoable names in order, then the hidden count',
+      [fakeToken(BOT_TOKEN_PREFIX), 'chanels', 'x'.repeat(49), 'extra', fakeToken('ghp_')],
+      `"chanels", "extra", plus ${many(3)}`,
+    ],
+    ['one echoable and one hidden', ['chanels', fakeToken(APP_TOKEN_PREFIX)], `"chanels", plus ${ONE}`],
+  ])('%s', (_label, keys, expected) => {
+    const described = describeUnknownKeys(keys)
+    expect(described).toBe(expected)
+    assertNoLeak(described)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // credentialsFilesToProtect (b.av2 SR-5.2)
 // ---------------------------------------------------------------------------
 
@@ -1195,6 +1268,67 @@ describe('credentialsFilesToProtect (b.av2 SR-5.2)', () => {
     expect(child.signal).toBeNull()
     expect(out).toEqual({ list: [applied[0].credentials_file], ops: ['open', 'fstat', 'close'] })
   }, 15_000)
+})
+
+// ---------------------------------------------------------------------------
+// referencedCredentialsPaths (b.av2 SR-8.3): the extraction both
+// credentialsFilesToProtect and the reload fingerprint use. Its ~ expansion,
+// validation tolerance and the failure shapes shared with the file guard are
+// covered through credentialsFilesToProtect above; these cases are its own.
+// Pure: no file is read or written.
+// ---------------------------------------------------------------------------
+
+describe('referencedCredentialsPaths (b.av2 SR-8.3)', () => {
+  // An injected home that exists nowhere: expansion is string work only.
+  const home = '/nonexistent-home-for-test'
+
+  const configText = (personas: unknown): string => JSON.stringify({ personas })
+
+  test('returns each credentials_file in declaration order, duplicates kept, from bytes or text alike', () => {
+    const text = configText([
+      { name: 'beta', credentials_file: '/creds/beta.json' },
+      { name: 'alpha', credentials_file: '/creds/alpha.json' },
+      { name: 'gamma', credentials_file: '/creds/beta.json' },
+    ])
+
+    const fromText = referencedCredentialsPaths(text, home)
+    const fromBytes = referencedCredentialsPaths(new TextEncoder().encode(text), home)
+
+    expect(fromText).toEqual(['/creds/beta.json', '/creds/alpha.json', '/creds/beta.json'])
+    expect(fromBytes).toEqual(fromText)
+  })
+
+  test('relative and ~user paths are made absolute as written; entries without a usable credentials_file are skipped', () => {
+    const list = referencedCredentialsPaths(configText([
+      { credentials_file: '~other/b.json' },
+      { credentials_file: 'rel/c.json' },
+      { credentials_file: '/abs/../abs/d.json' },
+      { credentials_file: '' },
+      { credentials_file: ['/creds/array.json'] },
+      null,
+      '/creds/string-entry.json',
+    ]), home)
+
+    expect(list).toEqual([resolve('~other/b.json'), resolve('rel/c.json'), '/abs/d.json'])
+  })
+
+  test.each<[string, string | Uint8Array]>([
+    ['a top-level array', JSON.stringify([{ credentials_file: '/creds/a.json' }])],
+    ['a top-level string', JSON.stringify('/creds/a.json')],
+    ['bytes that are not UTF-8', new Uint8Array([0x7b, 0xff, 0xfe, 0x7d])],
+  ])('%s yields no paths, without throwing', (_label, input) => {
+    let list: string[] | undefined
+    let error: unknown
+    try {
+      list = referencedCredentialsPaths(input, home)
+    } catch (err) {
+      error = err
+    }
+
+    expect(error).toBeUndefined()
+    expect(list).toEqual([])
+    assertNoLeak({ list, error })
+  })
 })
 
 // ---------------------------------------------------------------------------

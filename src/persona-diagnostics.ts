@@ -181,9 +181,10 @@ const SHORT_ESCAPES: Readonly<Record<string, string>> = {
  * Replace each control character and U+2028/U+2029 in a cause with its JSON
  * escape (`\n`, `\u001b`, `\u2028`, …). Printable text, including non-ASCII,
  * is left unchanged. Explicit rather than `JSON.stringify`, which leaves DEL,
- * C1 controls and U+2028/U+2029 unescaped.
+ * C1 controls and U+2028/U+2029 unescaped. Also keeps a reload line (the
+ * pending-change preview in `reload.ts`) on one line.
  */
-function escapeCause(cause: string): string {
+export function escapeCause(cause: string): string {
   return cause.replace(
     CAUSE_UNSAFE_CHAR_RE,
     ch => SHORT_ESCAPES[ch] ?? `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`,

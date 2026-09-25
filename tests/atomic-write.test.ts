@@ -13,6 +13,13 @@
  * the rename is thrown as raised; a directory open or fsync failure after it
  * is a `DurableWriteUnsyncedError`; a directory close failure is ignored.
  *
+ * `durableUnlinkSync`, the durable delete of `config.json.pending` (b.av2
+ * SR-8.1, SR-8.3), runs on the same seam: unlink, then fsync of the
+ * directory; an absent target (ENOENT, ENOTDIR) returns false and syncs
+ * nothing; every other unlink failure reaches the caller as raised, and a
+ * directory open or fsync failure after the unlink is a
+ * `DurableUnlinkUnsyncedError`.
+ *
  * `atomicWriteFileSync` (E10) is covered by the stop-hook and reply-guard
  * suites and is not tested here.
  *
@@ -23,6 +30,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import {
   closeSync,
   fsyncSync,
+  mkdirSync,
   mkdtempSync,
   openSync,
   readdirSync,
@@ -35,7 +43,13 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
-import { durableWriteFileSync, DurableWriteUnsyncedError, type DurableWriteFs } from '../src/atomic-write.ts'
+import {
+  durableUnlinkSync,
+  DurableUnlinkUnsyncedError,
+  durableWriteFileSync,
+  DurableWriteUnsyncedError,
+  type DurableWriteFs,
+} from '../src/atomic-write.ts'
 import { reloadFilePaths } from '../src/reload.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 
@@ -100,6 +114,10 @@ interface Op {
 interface RecordingFsOptions {
   /** Steps that throw an injected errno error (each time they run). */
   failAt?: Step[]
+  /** The injected error's errno code per failing step; EIO when not given. */
+  codes?: Partial<Record<Step, string>>
+  /** A value to throw as is at a failing step, instead of an errno error (not recorded in `errors`). */
+  thrown?: Partial<Record<Step, unknown>>
   /** Largest number of bytes one writeSync call writes (a short write). */
   maxChunk?: number
   /** Called before each step is carried out, e.g. to look at the target mid-write. */
@@ -128,7 +146,8 @@ function makeRecordingFs(opts: RecordingFsOptions = {}): RecordingFs {
   const kinds = new Map<number, 'temp' | 'dir'>()
   const fail = (step: Step): void => {
     if (!opts.failAt?.includes(step)) return
-    const err = errnoError('EIO', step)
+    if (opts.thrown !== undefined && step in opts.thrown) throw opts.thrown[step]
+    const err = errnoError(opts.codes?.[step] ?? 'EIO', step)
     errors.set(step, err)
     throw err
   }
@@ -335,6 +354,14 @@ describe('durableWriteFileSync order through the fs seam', () => {
 // Failure at each step (fs seam)
 // ---------------------------------------------------------------------------
 
+/**
+ * A directory error with no string errno code: not an Error (so the unsynced
+ * error quotes it as a string) and with a numeric code (so its code is
+ * undefined). The other no-code shapes of the shared errno-code read are
+ * covered by the durableUnlinkSync "reaches the caller as raised" table.
+ */
+const DIRECTORY_ERROR_WITHOUT_CODE = { code: -5, toString: () => 'EIO: directory sync failed' }
+
 describe('durableWriteFileSync failure at each step', () => {
   test.each<Step>(['open-temp', 'write', 'fsync-temp', 'close-temp', 'rename'])(
     'a %s failure before the rename reaches the caller, keeps the previous bytes, removes the temporary file and closes every descriptor',
@@ -401,6 +428,25 @@ describe('durableWriteFileSync failure at each step', () => {
     },
   )
 
+  test('a fsync-dir failure with a non-Error whose code is a number is a DurableWriteUnsyncedError whose code is undefined, quoting it as a string', () => {
+    writeFileSync(target, OLD_BYTES)
+    const thrown = DIRECTORY_ERROR_WITHOUT_CODE
+    const rec = makeRecordingFs({ failAt: ['fsync-dir'], thrown: { 'fsync-dir': thrown } })
+
+    const error = caught(() => durableWriteFileSync(target, NEW_BYTES, rec.fs))
+
+    expect(error).toBeInstanceOf(DurableWriteUnsyncedError)
+    const unsynced = error as DurableWriteUnsyncedError
+    expect(unsynced.code).toBeUndefined()
+    expect(unsynced.syncError).toBe(thrown)
+    expect(unsynced.message).toBe(
+      `durableWriteFileSync: wrote "${target}" but could not sync its directory: EIO: directory sync failed`,
+    )
+    expect(new Uint8Array(readFileSync(target))).toEqual(NEW_BYTES)
+    expect(rec.openFds.size).toBe(0)
+    assertNoLeak({ error, written: writtenFile(dir) })
+  })
+
   test('a directory close failure after a successful fsync is ignored: the write returns with the new bytes in place', () => {
     writeFileSync(target, OLD_BYTES)
     const rec = makeRecordingFs({ failAt: ['close-dir'] })
@@ -413,6 +459,218 @@ describe('durableWriteFileSync failure at each step', () => {
     expect(new Uint8Array(readFileSync(target))).toEqual(NEW_BYTES)
     expect(entries()).toEqual(['config.json'])
     expect(rec.openFds.size).toBe(0)
+    assertNoLeak({ error, written: writtenFile(dir) })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Durable delete (b.av2 SR-8.1, SR-8.3)
+// ---------------------------------------------------------------------------
+
+describe('durableUnlinkSync', () => {
+  const PENDING_TEXT = 'pending preview\n'
+
+  /** `config.json.pending` beside `config.json` and `config.json.last-applied`; returns the pending path. */
+  function seedReloadFiles(): string {
+    const paths = reloadFilePaths(target)
+    writeFileSync(paths.config, NEW_BYTES)
+    writeFileSync(paths.lastApplied, OLD_BYTES)
+    writeFileSync(paths.pending, PENDING_TEXT)
+    return paths.pending
+  }
+
+  /** The siblings of the pending file are exactly as seeded. */
+  function expectSiblingsIntact(): void {
+    expect(new Uint8Array(readFileSync(target))).toEqual(NEW_BYTES)
+    expect(new Uint8Array(readFileSync(reloadFilePaths(target).lastApplied))).toEqual(OLD_BYTES)
+  }
+
+  /** Run the delete; its return value, or the error it threw. */
+  function unlink(path: string, fs?: DurableWriteFs): { removed?: boolean; error: unknown } {
+    let removed: boolean | undefined
+    const error = caught(() => {
+      removed = durableUnlinkSync(path, fs)
+    })
+    return { removed, error }
+  }
+
+  test('on the real file system: removes the file, returns true and leaves the other files in the directory intact', () => {
+    const pending = seedReloadFiles()
+
+    const { removed, error } = unlink(pending)
+
+    expect(error).toBeUndefined()
+    expect(removed).toBe(true)
+    expect(entries()).toEqual(['config.json', 'config.json.last-applied'])
+    expectSiblingsIntact()
+    assertNoLeak({ error, written: writtenFile(dir) })
+  })
+
+  test('unlinks the file, then opens, fsyncs and closes its directory, leaving no descriptor open', () => {
+    const pending = seedReloadFiles()
+    const rec = makeRecordingFs()
+
+    const { removed, error } = unlink(pending, rec.fs)
+
+    expect(error).toBeUndefined()
+    expect(removed).toBe(true)
+    const dirFd = rec.ops.find((op) => op.step === 'fsync-dir')?.fd
+    expect(rec.ops).toEqual([
+      { step: 'unlink', path: pending },
+      { step: 'open-dir', path: dir, flags: 'r' },
+      { step: 'fsync-dir', fd: dirFd },
+      { step: 'close-dir', fd: dirFd },
+    ])
+    expect(rec.openFds.size).toBe(0)
+    expect(entries()).toEqual(['config.json', 'config.json.last-applied'])
+    assertNoLeak({ error, written: writtenFile(dir) })
+  })
+
+  // The file system raises each code itself: nothing is injected.
+  test.each<[string, string, () => string]>([
+    ['a file that is already gone', 'ENOENT', () => reloadFilePaths(target).pending],
+    ['a missing parent directory', 'ENOENT', () => join(dir, 'missing', 'config.json.pending')],
+    ['a parent path that is a regular file', 'ENOTDIR', () => join(dir, 'config.json', 'config.json.pending')],
+  ])('%s (%s) is success: returns false, syncs no directory and changes nothing', (_label, _code, pathOf) => {
+    writeFileSync(target, NEW_BYTES)
+    writeFileSync(reloadFilePaths(target).lastApplied, OLD_BYTES)
+    const rec = makeRecordingFs()
+
+    const { removed, error } = unlink(pathOf(), rec.fs)
+
+    expect(error).toBeUndefined()
+    expect(removed).toBe(false)
+    expect(rec.ops.map((op) => op.step)).toEqual(['unlink'])
+    expect(entries()).toEqual(['config.json', 'config.json.last-applied'])
+    expectSiblingsIntact()
+    assertNoLeak({ error, written: writtenFile(dir) })
+  })
+
+  // Every code but ENOENT and ENOTDIR takes the one rethrow branch; two stand for them all.
+  test.each(['EIO', 'EACCES'])(
+    'an injected %s unlink failure reaches the caller as raised, keeps the file and syncs no directory',
+    (code) => {
+      const pending = seedReloadFiles()
+      const rec = makeRecordingFs({ failAt: ['unlink'], codes: { unlink: code } })
+
+      const { removed, error } = unlink(pending, rec.fs)
+
+      expect(error).toBe(rec.errors.get('unlink'))
+      expect(removed).toBeUndefined()
+      expect(rec.ops.map((op) => op.step)).toEqual(['unlink'])
+      expect(readFileSync(pending, 'utf-8')).toBe(PENDING_TEXT)
+      expectSiblingsIntact()
+      assertNoLeak({ error, written: writtenFile(dir) })
+    },
+  )
+
+  test('a directory at the path (the file system raises EISDIR itself) reaches the caller and the directory stays', () => {
+    const pending = reloadFilePaths(target).pending
+    mkdirSync(pending)
+    writeFileSync(join(pending, 'inside'), PENDING_TEXT)
+
+    const { removed, error } = unlink(pending)
+
+    expect((error as NodeJS.ErrnoException).code).toBe('EISDIR')
+    expect(removed).toBeUndefined()
+    expect(readFileSync(join(pending, 'inside'), 'utf-8')).toBe(PENDING_TEXT)
+    assertNoLeak({ error })
+  })
+
+  // Only the errno code decides "already absent": a message naming ENOENT,
+  // or a code that is not a string, is some other failure.
+  test.each<[string, unknown]>([
+    ['an Error with no code whose message names ENOENT', new Error('ENOENT: no such file or directory')],
+    ['an Error whose code is a number', Object.assign(new Error('unlink failed'), { code: -2 })],
+    ['a thrown string', 'ENOENT'],
+  ])('%s reaches the caller as raised', (_label, thrown) => {
+    const pending = seedReloadFiles()
+    const rec = makeRecordingFs()
+    const fs: DurableWriteFs = {
+      ...rec.fs,
+      unlinkSync: () => {
+        throw thrown
+      },
+    }
+
+    const { removed, error } = unlink(pending, fs)
+
+    expect(error).toBe(thrown)
+    expect(removed).toBeUndefined()
+    expect(rec.ops).toEqual([])
+    expect(readFileSync(pending, 'utf-8')).toBe(PENDING_TEXT)
+    assertNoLeak({ error })
+  })
+
+  // Rows: the failing step, its errno code (ENOENT after the unlink is not "already absent"), the steps run.
+  test.each<[Step, string, Step[]]>([
+    ['open-dir', 'EIO', ['unlink', 'open-dir']],
+    ['fsync-dir', 'ENOENT', ['unlink', 'open-dir', 'fsync-dir', 'close-dir']],
+  ])(
+    'an injected %s failure (%s) after the unlink is thrown as DurableUnlinkUnsyncedError keeping its code, with the file already gone, every descriptor closed and no retry',
+    (step, code, steps) => {
+      const pending = seedReloadFiles()
+      const rec = makeRecordingFs({ failAt: [step], codes: { [step]: code } })
+
+      const { removed, error } = unlink(pending, rec.fs)
+
+      const injected = rec.errors.get(step)
+      expect(injected).toBeDefined()
+      expect(error).toBeInstanceOf(DurableUnlinkUnsyncedError)
+      expect(error).toBeInstanceOf(Error)
+      const unsynced = error as DurableUnlinkUnsyncedError
+      expect(unsynced.name).toBe('DurableUnlinkUnsyncedError')
+      expect(unsynced.path).toBe(pending)
+      expect(unsynced.code).toBe(code)
+      expect(unsynced.syncError).toBe(injected)
+      expect(unsynced.message).toBe(
+        `durableUnlinkSync: removed "${pending}" but could not sync its directory: ${injected!.message}`,
+      )
+      expect(removed).toBeUndefined()
+      expect(rec.ops.map((op) => op.step)).toEqual(steps)
+      expect(rec.ops[0]).toEqual({ step: 'unlink', path: pending })
+      expect(rec.openFds.size).toBe(0)
+      expect(entries()).toEqual(['config.json', 'config.json.last-applied'])
+      expectSiblingsIntact()
+      assertNoLeak({ error, written: writtenFile(dir) })
+    },
+  )
+
+  test('a fsync-dir failure with a non-Error whose code is a number, after the unlink, is a DurableUnlinkUnsyncedError whose code is undefined, quoting it as a string', () => {
+    const pending = seedReloadFiles()
+    const thrown = DIRECTORY_ERROR_WITHOUT_CODE
+    const rec = makeRecordingFs({ failAt: ['fsync-dir'], thrown: { 'fsync-dir': thrown } })
+
+    const { removed, error } = unlink(pending, rec.fs)
+
+    expect(error).toBeInstanceOf(DurableUnlinkUnsyncedError)
+    const unsynced = error as DurableUnlinkUnsyncedError
+    expect(unsynced.name).toBe('DurableUnlinkUnsyncedError')
+    expect(unsynced.path).toBe(pending)
+    expect(unsynced.code).toBeUndefined()
+    expect(unsynced.syncError).toBe(thrown)
+    expect(unsynced.message).toBe(
+      `durableUnlinkSync: removed "${pending}" but could not sync its directory: EIO: directory sync failed`,
+    )
+    expect(removed).toBeUndefined()
+    expect(rec.ops.filter((op) => op.step === 'unlink')).toHaveLength(1)
+    expect(rec.openFds.size).toBe(0)
+    expect(entries()).toEqual(['config.json', 'config.json.last-applied'])
+    assertNoLeak({ error, written: writtenFile(dir) })
+  })
+
+  test('a directory close failure after a successful fsync is ignored: returns true with the file gone', () => {
+    const pending = seedReloadFiles()
+    const rec = makeRecordingFs({ failAt: ['close-dir'] })
+
+    const { removed, error } = unlink(pending, rec.fs)
+
+    expect(error).toBeUndefined()
+    expect(removed).toBe(true)
+    expect(rec.errors.has('close-dir')).toBe(true)
+    expect(rec.ops.map((op) => op.step)).toEqual(['unlink', 'open-dir', 'fsync-dir', 'close-dir'])
+    expect(rec.openFds.size).toBe(0)
+    expect(entries()).toEqual(['config.json', 'config.json.last-applied'])
     assertNoLeak({ error, written: writtenFile(dir) })
   })
 })

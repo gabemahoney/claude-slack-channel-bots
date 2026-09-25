@@ -135,6 +135,16 @@ export function mainBody(code: string): [number, number] {
   return balancedAfter(code, code.indexOf(')', decl), '{', '}')
 }
 
+/**
+ * [start, end) of the body of `async function shutdown(…)` in `code`, both
+ * braces excluded. Throws when there is no such declaration.
+ */
+export function shutdownBody(code: string): [number, number] {
+  const decl = code.search(/\basync\s+function\s+shutdown\s*\(/)
+  if (decl < 0) throw new Error('source-audit: no `async function shutdown(`')
+  return balancedAfter(code, code.indexOf(')', decl), '{', '}')
+}
+
 /** Whether `offset` lies inside main()'s body in `code` (see `mainBody`). */
 export function insideMain(code: string, offset: number): boolean {
   const [start, end] = mainBody(code)

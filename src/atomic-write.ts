@@ -9,6 +9,9 @@
  *   beside the configuration file (b.av2 SR-8.1): a uniquely named temporary
  *   file, fsync, rename, then fsync of the directory, so the new bytes
  *   survive a crash or power loss once it returns.
+ * - `durableUnlinkSync`: the durable delete of a reload file (unlink, then
+ *   fsync of the directory); an absent file is success. A directory failure
+ *   after the unlink is thrown as a `DurableUnlinkUnsyncedError`.
  *
  * Side-effect-free: importing it touches nothing. Nothing here logs; callers
  * decide the log line.
@@ -145,10 +148,15 @@ export class DurableWriteUnsyncedError extends Error {
     super(`durableWriteFileSync: wrote "${path}" but could not sync its directory: ${cause}`)
     this.name = 'DurableWriteUnsyncedError'
     this.path = path
-    const code = typeof syncError === 'object' && syncError !== null ? (syncError as { code?: unknown }).code : undefined
-    this.code = typeof code === 'string' ? code : undefined
+    this.code = errnoCodeOf(syncError)
     this.syncError = syncError
   }
+}
+
+/** The errno code `err` carries, when it is an object with a string `code`. */
+function errnoCodeOf(err: unknown): string | undefined {
+  const code = typeof err === 'object' && err !== null ? (err as { code?: unknown }).code : undefined
+  return typeof code === 'string' ? code : undefined
 }
 
 /**
@@ -206,4 +214,71 @@ export function durableWriteFileSync(path: string, bytes: Uint8Array, fs: Durabl
   } catch (err) {
     throw new DurableWriteUnsyncedError(path, err)
   }
+}
+
+// ---------------------------------------------------------------------------
+// Durable delete (b.av2 SR-8.1, SR-8.3)
+// ---------------------------------------------------------------------------
+
+/** errno codes meaning the target is already absent (ENOTDIR: an ancestor is not a directory). */
+const ABSENT_TARGET_CODES: ReadonlySet<string> = new Set(['ENOENT', 'ENOTDIR'])
+
+/**
+ * `durableUnlinkSync` unlinked the target but could not fsync (or open) its
+ * directory: the file IS gone, but the removal may not survive a crash or
+ * power loss. Distinguishes this post-unlink failure from an unlink failure,
+ * after which the file is still there. `code` is the directory error's errno
+ * code, when it had one; `syncError` is that error.
+ */
+export class DurableUnlinkUnsyncedError extends Error {
+  /** The target file, which is now gone. */
+  readonly path: string
+  /** The errno code of the directory error, when it carried one. */
+  readonly code: string | undefined
+  /** The error the directory open or fsync threw. */
+  readonly syncError: unknown
+
+  constructor(path: string, syncError: unknown) {
+    const cause = syncError instanceof Error ? syncError.message : String(syncError)
+    super(`durableUnlinkSync: removed "${path}" but could not sync its directory: ${cause}`)
+    this.name = 'DurableUnlinkUnsyncedError'
+    this.path = path
+    this.code = errnoCodeOf(syncError)
+    this.syncError = syncError
+  }
+}
+
+/**
+ * Delete `path` durably (b.av2 SR-8.1): unlink it, then fsync its directory,
+ * so the removal survives a crash or power loss once this returns. For the
+ * reload files, e.g. `config.json.pending` when nothing is pending.
+ *
+ * Returns true when a file was removed and false when `path` was already
+ * absent (the unlink failed with `ENOENT` or `ENOTDIR`); an absent target is
+ * success, and its directory is not synced. Every other failure reaches the
+ * caller as the thrown error, and nothing is logged:
+ * - an unlink failure (a directory at `path`, permission denied, …) leaves
+ *   `path` as it was;
+ * - a failure to open or fsync the directory comes after the unlink and is
+ *   thrown as a `DurableUnlinkUnsyncedError`: `path` is gone, but the removal
+ *   may not survive a crash. A failure to close the directory after its
+ *   fsync is ignored, as for `durableWriteFileSync`.
+ *
+ * @param path  The file to delete.
+ * @param fs    The file-system calls; the real ones by default.
+ */
+export function durableUnlinkSync(path: string, fs: DurableWriteFs = NODE_DURABLE_WRITE_FS): boolean {
+  try {
+    fs.unlinkSync(path)
+  } catch (err) {
+    const code = errnoCodeOf(err)
+    if (code !== undefined && ABSENT_TARGET_CODES.has(code)) return false
+    throw err
+  }
+  try {
+    fsyncDirectory(fs, dirname(path))
+  } catch (err) {
+    throw new DurableUnlinkUnsyncedError(path, err)
+  }
+  return true
 }

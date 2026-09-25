@@ -42,11 +42,12 @@ import { accessSync, constants as fsConstants, realpathSync, statSync } from 'no
 
 import type { Persona } from './config.ts'
 import {
-  checkPersonaCredentials,
+  checkPersonaCredentialsAndDigest,
   describeRealPathCollision,
   errnoSuffix,
   isMissingPathError,
   type CredentialsCheckResult,
+  type CredentialsDigest,
   type CredentialsFs,
   type CredentialsPersona,
   type OtherCredentialsPersona,
@@ -138,6 +139,15 @@ export interface LocalBringUpResult {
   directory: WorkingDirectoryCheckResult
   /** Every failure, credentials first then directory; empty when `ok`. */
   failures: PersonaCheckFailure[]
+  /**
+   * The digest or marker of the persona's own credentials file as step 1
+   * read it (`credentialsDigest`), for the bring-up to hold (b.av2 SR-8.3),
+   * whatever step 1's outcome, a real-path collision included (the file is
+   * then only hashed, never parsed). Always set by
+   * `checkPersonaLocalBringUp`; optional so an injected check may omit it.
+   * Never logged.
+   */
+  credentialsDigest?: CredentialsDigest
 }
 
 // ---------------------------------------------------------------------------
@@ -203,11 +213,11 @@ export function checkPersonaLocalBringUp(
   options: CheckPersonaLocalBringUpOptions,
 ): LocalBringUpResult {
   const { others, fs } = options
-  const credentials = checkPersonaCredentials(persona, { others, fs })
+  const { result: credentials, digest } = checkPersonaCredentialsAndDigest(persona, { others, fs })
   const directory = checkPersonaWorkingDirectory(persona, { others, fs })
   const failures: PersonaCheckFailure[] = []
   if (!credentials.ok) failures.push(credentials)
   if (!directory.ok) failures.push(directory)
   for (const failure of failures) options.log?.(failure.line)
-  return { ok: failures.length === 0, credentials, directory, failures }
+  return { ok: failures.length === 0, credentials, directory, failures, credentialsDigest: digest }
 }

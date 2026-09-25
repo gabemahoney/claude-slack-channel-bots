@@ -62,6 +62,7 @@ import {
   loadedConfigName,
   objectProperties,
   onlyCallArguments,
+  shutdownBody,
   splitTopLevel,
   startResolution,
   stripComments,
@@ -364,9 +365,7 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
   })
 
   test('shutdown cancels every persona\'s bring-up retry, once, before the Slack connections stop', () => {
-    const fn = SERVER_CODE.search(/\basync\s+function\s+shutdown\s*\(/)
-    expect(fn).toBeGreaterThan(-1)
-    const [start, end] = balancedAfter(SERVER_CODE, SERVER_CODE.indexOf(')', fn), '{', '}')
+    const [start, end] = shutdownBody(SERVER_CODE)
     const inShutdown = (at: number) => at > start && at < end
 
     const cancels = indicesOf(/\bbringUps\s*\?\.\s*cancelAll\s*\(\s*\)/g, SERVER_CODE)

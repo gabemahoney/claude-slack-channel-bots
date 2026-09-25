@@ -13,7 +13,8 @@
  * - Never reads an environment variable (in particular no Slack token
  *   variable).
  * - Never writes, copies, caches or persists the file or any value from it,
- *   and never checks or changes the file mode.
+ *   and never checks or changes the file mode. Only a digest of the bytes
+ *   leaves the check, for the bring-up to hold in memory.
  * - Causes and diagnostic lines name a bad token by its key and the rule it
  *   breaks, never its value; a JSON parse failure is described generically
  *   (the runtime's parse message can quote file contents); unexpected keys
@@ -39,6 +40,16 @@
  * is refused unread: a FIFO would block the read forever and a device such as
  * `/dev/zero` would never end.
  *
+ * Reader and digest (b.av2 SR-8.3): the stat-first read is its own export,
+ * `readCredentialsFile`, and `credentialsDigest` turns a read into what is
+ * held for it: the SHA-256 of the exact bytes, or a marker for a missing or an
+ * unreadable file. The check returns that digest beside its result, whatever
+ * the outcome (`checkPersonaCredentialsAndDigest`), so the bring-up can hold
+ * it; a file whose real path another applied persona shares is read only to
+ * be hashed there, never parsed, and no token is taken from it. The
+ * reload detection tick reads and digests each referenced file the same way.
+ * A digest is held in memory only and never logged.
+ *
  * Pure module (b.av2 SR-13.1): nothing runs at import and no token is read at
  * module scope. The server runs it as step 1 of each persona's start
  * (`checkPersonaLocalSteps` in `persona-start.ts`).
@@ -46,6 +57,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { createHash } from 'node:crypto'
 import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync, realpathSync } from 'node:fs'
 
 import { resolveRealPath, type Persona } from './config.ts'
@@ -113,8 +125,12 @@ export interface CredentialsFs {
   openFile(path: string): number
   /** Stat an open descriptor. Throws an errno-style error (with `code`) on failure. */
   fstatFile(fd: number): { isFile(): boolean; isDirectory(): boolean }
-  /** Read the whole file behind an open descriptor as UTF-8. Throws an errno-style error (with `code`) on failure. */
-  readFileFd(fd: number): string
+  /**
+   * Read the whole file behind an open descriptor as bytes (decoded as UTF-8
+   * only for validation, so the digest covers exactly the bytes read). Throws
+   * an errno-style error (with `code`) on failure.
+   */
+  readFileFd(fd: number): Buffer
   /** Close a descriptor opened by `openFile`. The check ignores a failure. */
   closeFile(fd: number): void
   /** Resolve a path's real path. Throws on failure; callers fall back to the lexical form. */
@@ -125,7 +141,7 @@ export interface CredentialsFs {
 export const DEFAULT_CREDENTIALS_FS: CredentialsFs = {
   openFile: path => openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK),
   fstatFile: fd => fstatSync(fd),
-  readFileFd: fd => readFileSync(fd, 'utf8'),
+  readFileFd: fd => readFileSync(fd),
   closeFile: fd => closeSync(fd),
   realpath: path => realpathSync(path),
 }
@@ -284,90 +300,184 @@ function validateCredentialsContent(content: string): PersonaSlackTokens | strin
 }
 
 // ---------------------------------------------------------------------------
-// Check
+// Stat-first read and digest (b.av2 SR-8.3)
 // ---------------------------------------------------------------------------
 
 /**
+ * One read of a credentials file (`readCredentialsFile`): its exact bytes, or
+ * why there are none. A failure's `cause` is the token-free text the check
+ * reports (`credentials file does not exist`, `… is a directory`, …).
+ */
+export type CredentialsFileRead =
+  | { ok: true; bytes: Buffer }
+  | { ok: false; missing: boolean; cause: string }
+
+/**
+ * Read a credentials file's bytes once, stat-first: open it read-only and
+ * non-blocking (so a FIFO never waits for a writer), fstat the descriptor and
+ * read only a regular file, through that same descriptor, so the file cannot
+ * be swapped between the check and the read. Anything but a regular file (a
+ * directory, FIFO, socket or device) is refused unread: a FIFO blocks a read
+ * forever and a device such as `/dev/zero` never ends. There is no size cap.
+ *
+ * The one reader of a credentials file: the bring-up's credentials check and
+ * the reload detection tick both use it. Never throws for a string path; the
+ * bytes are returned to the caller only and never logged.
+ *
+ * @param path  The credentials file, absolute and tilde-expanded.
+ * @param fs    File-system overrides; unset operations use `DEFAULT_CREDENTIALS_FS`.
+ */
+export function readCredentialsFile(path: string, fs?: Partial<CredentialsFs>): CredentialsFileRead {
+  const io: CredentialsFs = { ...DEFAULT_CREDENTIALS_FS, ...fs }
+  const unreadable = (cause: string): CredentialsFileRead => ({ ok: false, missing: false, cause })
+
+  // A failed open, stat or read: missing, a directory, permission denied, or other.
+  const failAccess = (err: unknown): CredentialsFileRead => {
+    if (isMissingPathError(err)) return { ok: false, missing: true, cause: 'credentials file does not exist' }
+    const code = errnoCode(err)
+    if (code === 'EISDIR') return unreadable('credentials file is a directory')
+    if (code === 'EACCES' || code === 'EPERM') {
+      return unreadable(`credentials file cannot be read: permission denied${errnoSuffix(err)}`)
+    }
+    return unreadable(`credentials file cannot be read${errnoSuffix(err)}`)
+  }
+
+  let fd: number
+  try {
+    fd = io.openFile(path)
+  } catch (err) {
+    return failAccess(err)
+  }
+  try {
+    let stats: { isFile(): boolean; isDirectory(): boolean }
+    try {
+      stats = io.fstatFile(fd)
+    } catch (err) {
+      return failAccess(err)
+    }
+    if (stats.isDirectory()) return unreadable('credentials file is a directory')
+    if (!stats.isFile()) return unreadable('credentials file is not a regular file')
+    try {
+      return { ok: true, bytes: io.readFileFd(fd) }
+    } catch (err) {
+      return failAccess(err)
+    }
+  } finally {
+    try {
+      io.closeFile(fd)
+    } catch {
+      // Nothing to report: the descriptor is gone either way.
+    }
+  }
+}
+
+/** The held value of a credentials file that does not exist (b.av2 SR-8.3). */
+export const CREDENTIALS_MISSING_MARKER = 'missing'
+
+/** The held value of a credentials file that exists but cannot be read (b.av2 SR-8.3). */
+export const CREDENTIALS_UNREADABLE_MARKER = 'unreadable'
+
+/** Start of a credentials digest: `sha256:` then 64 lower-case hex digits. */
+const CREDENTIALS_DIGEST_PREFIX = 'sha256:'
+
+/**
+ * What is held for the content of a credentials file: `sha256:<hex>` over the
+ * exact bytes read, or `CREDENTIALS_MISSING_MARKER` /
+ * `CREDENTIALS_UNREADABLE_MARKER`. A marker never equals a digest, so a
+ * missing or unreadable file never compares equal to any content (an empty
+ * file included). Compared by `===`. Held in memory only and never logged.
+ */
+export type CredentialsDigest = string
+
+/**
+ * The digest or marker of one read (`readCredentialsFile`): SHA-256 of the
+ * exact bytes, or the missing or unreadable marker. Pure.
+ */
+export function credentialsDigest(read: CredentialsFileRead): CredentialsDigest {
+  if (!read.ok) return read.missing ? CREDENTIALS_MISSING_MARKER : CREDENTIALS_UNREADABLE_MARKER
+  return CREDENTIALS_DIGEST_PREFIX + createHash('sha256').update(read.bytes).digest('hex')
+}
+
+// ---------------------------------------------------------------------------
+// Check
+// ---------------------------------------------------------------------------
+
+/** `checkPersonaCredentialsAndDigest`'s result: the check, and the digest of what it read. */
+export interface CredentialsCheckWithDigest {
+  result: CredentialsCheckResult
+  /**
+   * The digest or marker of the bytes of the persona's own
+   * `credentials_file` (`credentialsDigest`), whatever the check's outcome.
+   * For a real-path collision with another applied persona the file is read
+   * only to be hashed: it is never parsed and no token is taken from it.
+   * Never logged.
+   */
+  digest: CredentialsDigest
+}
+
+/**
  * Read a persona's credentials file and check it is locally valid
- * (b.av2 SR-1.4, SR-6.1 step 1). Checks, in order:
+ * (b.av2 SR-1.4, SR-6.1 step 1), returning the check's result and the digest
+ * of the bytes it read (b.av2 SR-8.3). Checks, in order:
  *
  *   1. its real path (`resolveRealPath`, lexical fallback) is no other
  *      applied persona's credentials file → else `persona-credentials-invalid`,
  *      naming the other persona. Checked first so another persona's tokens
- *      are never read on this persona's behalf;
- *   2. it exists → else `persona-credentials-missing`;
+ *      are never parsed or used on this persona's behalf: the file is read
+ *      (by `readCredentialsFile`, stat-first) only to hash it, and the
+ *      digest or marker is returned beside the failure, so a re-save of the
+ *      file can make a change pending once the collision is gone
+ *      (b.av2 SR-8.3);
+ *   2. it exists → else `persona-credentials-missing` (the missing marker);
  *   3. it is a regular file (after following symlinks; not a directory, FIFO,
  *      socket or device) and can be read (permitted) → else
- *      `persona-credentials-unreadable`. The file is opened non-blocking and
- *      its type checked through the descriptor before the read, so a FIFO or
- *      a device is never read and cannot be swapped in after the check;
+ *      `persona-credentials-unreadable` (the unreadable marker). The file is
+ *      read by `readCredentialsFile`, so a FIFO or a device is never read and
+ *      cannot be swapped in after the check;
  *   4. it is a JSON object with exactly `bot_token` (`xoxb-…`) and
  *      `app_token` (`xapp-…`) as strings, each with at least one character
  *      after its prefix and no whitespace or control character anywhere →
- *      else `persona-credentials-invalid`.
+ *      else `persona-credentials-invalid`. From step 4 on the digest is that
+ *      of the bytes read, valid or not.
  *
  * `persona.credentials_file` must already be absolute and tilde-expanded (as
  * the persona loader stores it). Filesystem errors are returned as failures,
  * never thrown; the only exception that propagates is one thrown by the
  * injected `options.log`.
  */
-export function checkPersonaCredentials(
+export function checkPersonaCredentialsAndDigest(
   persona: CredentialsPersona,
   options: CheckPersonaCredentialsOptions,
-): CredentialsCheckResult {
+): CredentialsCheckWithDigest {
   const fs: CredentialsFs = { ...DEFAULT_CREDENTIALS_FS, ...options.fs }
   const path = persona.credentials_file
   const fail = (cls: CredentialsDiagnosticClass, cause: string) =>
     personaCheckFailure({ class: cls, name: persona.name, key: persona.key, index: persona.index, path, cause }, options.log)
 
   const collision = describeRealPathCollision(path, persona.key, options.others, 'credentials_file', p => fs.realpath(p))
-  if (collision !== undefined) return fail(PERSONA_CREDENTIALS_INVALID, collision)
+  const read = readCredentialsFile(path, fs)
+  const digest = credentialsDigest(read)
+  if (collision !== undefined) return { result: fail(PERSONA_CREDENTIALS_INVALID, collision), digest }
 
-  // A failed open, stat or read: missing, a directory, permission denied, or other.
-  const failAccess = (err: unknown): CredentialsCheckResult => {
-    if (isMissingPathError(err)) return fail(PERSONA_CREDENTIALS_MISSING, 'credentials file does not exist')
-    const code = errnoCode(err)
-    if (code === 'EISDIR') return fail(PERSONA_CREDENTIALS_UNREADABLE, 'credentials file is a directory')
-    if (code === 'EACCES' || code === 'EPERM') {
-      return fail(PERSONA_CREDENTIALS_UNREADABLE, `credentials file cannot be read: permission denied${errnoSuffix(err)}`)
-    }
-    return fail(PERSONA_CREDENTIALS_UNREADABLE, `credentials file cannot be read${errnoSuffix(err)}`)
+  if (!read.ok) {
+    return { result: fail(read.missing ? PERSONA_CREDENTIALS_MISSING : PERSONA_CREDENTIALS_UNREADABLE, read.cause), digest }
   }
 
-  // Open once (non-blocking, so a FIFO never waits for a writer), then check
-  // the type and read through the same descriptor: the file cannot be swapped
-  // between the check and the read. Never read anything but a regular file:
-  // a FIFO blocks the read forever and a device such as /dev/zero never ends.
-  let fd: number
-  try {
-    fd = fs.openFile(path)
-  } catch (err) {
-    return failAccess(err)
+  const validated = validateCredentialsContent(read.bytes.toString('utf-8'))
+  if (typeof validated === 'string') {
+    return { result: fail(PERSONA_CREDENTIALS_INVALID, `credentials file is invalid: ${validated}`), digest }
   }
-  let content: string
-  try {
-    let stats: { isFile(): boolean; isDirectory(): boolean }
-    try {
-      stats = fs.fstatFile(fd)
-    } catch (err) {
-      return failAccess(err)
-    }
-    if (stats.isDirectory()) return fail(PERSONA_CREDENTIALS_UNREADABLE, 'credentials file is a directory')
-    if (!stats.isFile()) return fail(PERSONA_CREDENTIALS_UNREADABLE, 'credentials file is not a regular file')
-    try {
-      content = fs.readFileFd(fd)
-    } catch (err) {
-      return failAccess(err)
-    }
-  } finally {
-    try {
-      fs.closeFile(fd)
-    } catch {
-      // Nothing to report: the descriptor is gone either way.
-    }
-  }
+  return { result: { ok: true, tokens: validated }, digest }
+}
 
-  const validated = validateCredentialsContent(content)
-  if (typeof validated === 'string') return fail(PERSONA_CREDENTIALS_INVALID, `credentials file is invalid: ${validated}`)
-  return { ok: true, tokens: validated }
+/**
+ * Read a persona's credentials file and check it is locally valid
+ * (b.av2 SR-1.4, SR-6.1 step 1): `checkPersonaCredentialsAndDigest` without
+ * the digest. See it for the checks, their order and the failure classes.
+ */
+export function checkPersonaCredentials(
+  persona: CredentialsPersona,
+  options: CheckPersonaCredentialsOptions,
+): CredentialsCheckResult {
+  return checkPersonaCredentialsAndDigest(persona, options).result
 }

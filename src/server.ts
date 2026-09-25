@@ -12,8 +12,12 @@
  * record exists, and otherwise validates, records and applies `config.json`.
  * A missing, unreadable, pre-persona or invalid file with no record, a record
  * that cannot be read or validated, or a record that cannot be written stops
- * the start with one line (b.av2 SR-1.7). No Slack client is built and no
- * token is read at module scope (SR-3.1, SR-10.2).
+ * the start with one line (b.av2 SR-1.7). Once the start bring-up pass has
+ * returned, the controller's detection tick (every 5 s, `reload-timer.ts`)
+ * keeps `config.json.pending` in step with any unconfirmed change; nothing is
+ * applied and nothing about it is posted to Slack (SR-8.2, SR-8.3, SR-7.2).
+ * No Slack client is built and no token is read at module scope (SR-3.1,
+ * SR-10.2).
  *
  * Slack: one connection per persona, run by the connection manager
  * (`persona-connections.ts`) and brought up at start through the SR-6.1
@@ -157,6 +161,7 @@ import { createCronDispatcher } from './cron-dispatch.ts'
 import { handleInterject } from './interject.ts'
 import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
 import { createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
+import { createReloadTickDriver } from './reload-timer.ts'
 import { PRODUCTION_SLACK_CLIENT_FACTORY } from './persona-slack-clients.ts'
 import { initOutageState, setOutageFlag, clearOutageFlag, resetAllToHealthy, withOutageDetection } from './outage-state.ts'
 
@@ -741,6 +746,8 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true
   stopPermissionPoller()
   stopHealthCheck()
+  // The reload detection tick (b.av2 SR-8.2): no further pending-file check.
+  reloadController?.stopDetection()
   if (cronScheduler) {
     cronScheduler.stop()
     cronScheduler = null
@@ -1070,12 +1077,18 @@ export async function main(): Promise<void> {
   // PID check, so a duplicate start never writes the record. The start pass
   // is the controller's lifecycle bring-up, run below after the pre-launch
   // steps; the bring-up controller it uses is built further down.
+  // The detection tick (b.av2 SR-8.2, SR-8.3) is armed only by
+  // startDetection() after the start bring-up pass below; it reads the held
+  // credentials digests from the bring-up controller built further down.
   const reload = createReloadController({
     paths: reloadFilePaths(CONFIG_PATH),
     lifecycle: {
       startBringUp: (applied) => startupSessionManager(applied, { bringUp: personaBringUps }),
     },
     log: (line) => console.error(line),
+    tickDriver: createReloadTickDriver({ log: (line) => console.error(line) }),
+    dryRun: isDryRun(),
+    heldCredentialsDigest: (key) => bringUps?.credentialsDigest(key),
     slackClientFactory: PRODUCTION_SLACK_CLIENT_FACTORY,
   })
   reloadController = reload
@@ -1475,9 +1488,15 @@ export async function main(): Promise<void> {
 
   // INVARIANT: Health check starts only after startupSessionManager() returns.
   // Promise.allSettled ensures all launches have settled before this point.
-  // Do not move this call earlier in the startup sequence. The reload
-  // detection tick (b.av2 SR-8.2) belongs beside it, for the same reason.
+  // Do not move this call earlier in the startup sequence.
   startHealthCheck(personaConfig.health_check_interval)
+
+  // INVARIANT (b.av2 SR-8.2): the reload detection tick starts only after the
+  // start bring-up pass returns, like the health check; the controller arms
+  // nothing before that. Every 5 s it compares config.json (and, outside dry
+  // run, the credentials files it references) with what is applied and keeps
+  // config.json.pending in step. It applies nothing and never posts to Slack.
+  reload.startDetection()
 }
 
 if (import.meta.main) {

@@ -25,7 +25,7 @@
 
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
-import { balancedAfter, callArguments, indicesOf, startResolution, stripComments } from './test-helpers/source-audit.ts'
+import { callArguments, indicesOf, shutdownBody, startResolution, stripComments } from './test-helpers/source-audit.ts'
 
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(readFileSync('src/server.ts', 'utf-8'))
@@ -89,11 +89,9 @@ describe('server.ts wires the cron scheduler', () => {
     // code. Anchoring on content (not line numbers) keeps the audit robust to
     // edits elsewhere, and stripping comments keeps a commented-out stop from
     // satisfying it.
-    const fn = SERVER_CODE.search(/\basync\s+function\s+shutdown\s*\(/)
-    expect(fn).toBeGreaterThan(-1)
-    const shutdownBody = SERVER_CODE.slice(...balancedAfter(SERVER_CODE, SERVER_CODE.indexOf(')', fn), '{', '}'))
+    const shutdown = SERVER_CODE.slice(...shutdownBody(SERVER_CODE))
     // The stop call must live within the shutdown region; a bare presence check
     // elsewhere in the file would not prove it runs on the shutdown path.
-    expect(shutdownBody).toMatch(/\bcronScheduler[?!]?\.stop\s*\(/)
+    expect(shutdown).toMatch(/\bcronScheduler[?!]?\.stop\s*\(/)
   })
 })

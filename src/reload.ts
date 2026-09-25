@@ -20,17 +20,29 @@
  *   including one whose record reached the disk but whose directory could
  *   not be synced (that line says the next start will run the record).
  *
- * Credentials files are never read here: the start bring-up reads them as
- * they stand, so a credentials change made while the server was down takes
- * effect at the start. An empty `personas` array is a valid applied set.
+ * The start reads no credentials file: the start bring-up reads them as they
+ * stand, so a credentials change made while the server was down takes effect
+ * at the start. An empty `personas` array is a valid applied set.
+ *
+ * Detection (b.av2 SR-8.2, SR-8.3, SR-8.7): once the start bring-up pass has
+ * returned, `startDetection` hands the detection tick to the injected tick
+ * driver (every 5 s in production). Each pass compares the configuration
+ * file's bytes with the applied bytes and, unless in dry run, each
+ * referenced credentials file's digest with the one the persona's bring-up
+ * holds, and keeps `config.json.pending` (the preview behind a fingerprint,
+ * `reload-fingerprint.ts`) in step: written while a change is pending,
+ * deleted when nothing is. Its first pass after a start from the record is
+ * the SR-8.7 comparison, so an unconfirmed edit stays pending. Nothing is
+ * applied: no pass calls a lifecycle operation.
  *
  * The controller (`createReloadController`) is built with every dependency
  * injected, as `createCronScheduler` is: the SR-8.1 paths, the durable
- * writer, the log sink, the lifecycle operations (the start bring-up pass
- * today), and the tick driver and Slack client factory that later work binds
- * (the detection tick, applying a confirmed change). It keeps the applied
- * bytes and configuration in memory. `readAppliedPersonaConfig` is the
- * CLI's read-only resolver over the same rules.
+ * writer and delete, the log sink, the lifecycle operations (the start
+ * bring-up pass today), the tick driver, the dry-run flag, the held
+ * credentials digests, and the Slack client factory that later work binds
+ * (applying a confirmed change). It keeps the applied bytes and configuration
+ * in memory. `readAppliedPersonaConfig` is the CLI's read-only resolver over
+ * the same rules.
  *
  * Importable without side effects (b.av2 SR-13.1): importing it creates no
  * timer or Slack client, reads no file or environment variable and logs
@@ -42,7 +54,12 @@
 
 import { dirname, resolve } from 'node:path'
 
-import { durableWriteFileSync, DurableWriteUnsyncedError } from './atomic-write.ts'
+import {
+  durableUnlinkSync,
+  DurableUnlinkUnsyncedError,
+  durableWriteFileSync,
+  DurableWriteUnsyncedError,
+} from './atomic-write.ts'
 import {
   configFileReadFailureMessage,
   credentialsFilesToProtect,
@@ -50,13 +67,31 @@ import {
   parsePersonaConfigBytes,
   PersonaConfigReadError,
   readPersonaConfigBytes,
+  referencedCredentialsPaths,
   type Persona,
   type PersonaConfig,
   type PersonaConfigFs,
 } from './config.ts'
-import { errnoSuffix } from './persona-credentials.ts'
-import { expandTilde } from './persona-identity.ts'
+import { describeThrownValue } from './persona-connection-errors.ts'
+import {
+  credentialsDigest,
+  errnoSuffix,
+  readCredentialsFile,
+  type CredentialsDigest,
+  type CredentialsFileRead,
+  type CredentialsFs,
+} from './persona-credentials.ts'
+import { escapeCause } from './persona-diagnostics.ts'
+import { expandTilde, renderPersonaRef } from './persona-identity.ts'
 import type { PersonaSlackClientFactory } from './persona-slack-clients.ts'
+import {
+  composePendingFile,
+  FINGERPRINT_MISSING,
+  FINGERPRINT_UNREADABLE,
+  reloadFingerprint,
+  type FingerprintContent,
+  type FingerprintCredentialsEntry,
+} from './reload-fingerprint.ts'
 
 // ---------------------------------------------------------------------------
 // Diagnostic classes (b.av2 SR-10.3)
@@ -69,11 +104,20 @@ import type { PersonaSlackClientFactory } from './persona-slack-clients.ts'
 export const RELOAD_RECORD_WRITE_FAILED = 'reload-record-write-failed'
 
 /**
+ * Nothing is pending any more: the configuration file and the credentials
+ * files it references match what is applied again (a revert, or a leftover
+ * `config.json.pending` found obsolete at the first check after a start), and
+ * no pending file is left: it was deleted, or there was none (e.g. its write
+ * had failed). Logged once per change to nothing pending.
+ */
+export const RELOAD_NOTHING_PENDING = 'reload-nothing-pending'
+
+/**
  * Every reload diagnostic class label, in a fixed order. Kept apart from the
  * persona classes (`PERSONA_DIAGNOSTIC_CLASSES`): a reload line is about the
  * configuration, not one persona.
  */
-export const RELOAD_DIAGNOSTIC_CLASSES = [RELOAD_RECORD_WRITE_FAILED] as const
+export const RELOAD_DIAGNOSTIC_CLASSES = [RELOAD_RECORD_WRITE_FAILED, RELOAD_NOTHING_PENDING] as const
 
 /** A reload diagnostic class label (closed set). */
 export type ReloadDiagnosticClass = (typeof RELOAD_DIAGNOSTIC_CLASSES)[number]
@@ -126,8 +170,8 @@ export type ReloadTick = () => Promise<void>
 
 /**
  * Drives the detection tick: one serialized, self-re-arming timer in
- * production, a manual driver in tests. Bound by the detection tick's work;
- * nothing arms it yet.
+ * production (`createReloadTickDriver` in `reload-timer.ts`), a manual driver
+ * in tests. The controller hands it the tick from `startDetection`.
  */
 export interface ReloadTickDriver {
   /** Run `tick` repeatedly, never two passes at once. */
@@ -167,6 +211,23 @@ export interface ReloadLifecycleOps {
  */
 export type ReloadFileWriter = (path: string, bytes: Uint8Array) => void
 
+/**
+ * Deletes a file durably (`durableUnlinkSync` in production): returns true
+ * when a file was removed, false when it was already absent. Throws on any
+ * other failure: a `DurableUnlinkUnsyncedError` when the file was removed but
+ * its directory could not be synced, any other error when the file is still
+ * there.
+ */
+export type ReloadFileRemover = (path: string) => boolean
+
+/**
+ * The held credentials digest of an applied persona (the bring-up
+ * controller's `credentialsDigest`): what its bring-up read, whatever its
+ * outcome (a persona broken by a shared credentials file included), or
+ * undefined when nothing is held.
+ */
+export type HeldCredentialsDigestQuery = (key: string) => CredentialsDigest | undefined
+
 /** Dependencies of `createReloadController`. */
 export interface ReloadControllerDeps {
   /** The configuration file and its reload files (`reloadFilePaths`). */
@@ -177,16 +238,36 @@ export interface ReloadControllerDeps {
   log: (line: string) => void
   /** The durable writer; `durableWriteFileSync` by default. */
   write?: ReloadFileWriter
-  /** The detection tick's driver; bound by the detection tick's work. */
+  /** The durable delete (of `config.json.pending`); `durableUnlinkSync` by default. */
+  remove?: ReloadFileRemover
+  /** The detection tick's driver; without one, `startDetection` arms nothing. */
   tickDriver?: ReloadTickDriver
+  /**
+   * Dry run (b.av2 SR-3.4, SR-8.2): the detection tick reads no credentials
+   * file, credentials never count as changed and the fingerprint covers the
+   * configuration file alone. Default false.
+   */
+  dryRun?: boolean
+  /**
+   * The held credentials digests the detection tick compares against (b.av2
+   * SR-8.3); production binds the bring-up controller's `credentialsDigest`.
+   * Without it nothing is held, so credentials never count as changed.
+   */
+  heldCredentialsDigest?: HeldCredentialsDigestQuery
+  /**
+   * File-system overrides for the detection tick's credentials reads
+   * (`readCredentialsFile`, which reads only a regular file); unset
+   * operations use the real file system.
+   */
+  credentialsFs?: Partial<CredentialsFs>
   /** The Slack client factory; bound by the work that applies a confirmed change. */
   slackClientFactory?: PersonaSlackClientFactory
   /** Home directory for every `~` in the configuration; the OS home by default. */
   home?: string
   /**
-   * File-system overrides for reading the record and the configuration file
-   * (`readPersonaConfigBytes`, which reads only a regular file); unset
-   * operations use the real file system.
+   * File-system overrides for reading the record, the configuration file and
+   * the pending file (`readPersonaConfigBytes`, which reads only a regular
+   * file); unset operations use the real file system.
    */
   configFs?: Partial<PersonaConfigFs>
 }
@@ -296,6 +377,375 @@ function selectConfiguration(
 }
 
 // ---------------------------------------------------------------------------
+// Detection: the pending state (b.av2 SR-8.2, SR-8.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Class of the line that logs the pending-change preview, once per change of
+ * the pending state. Task 3 adds it (and `reload-invalid`) to
+ * `RELOAD_DIAGNOSTIC_CLASSES` with the full SR-8.4 preview.
+ */
+export const RELOAD_PREVIEW = 'reload-preview'
+
+/** One read of the configuration file by the detection tick. */
+type ConfigFileRead =
+  | { ok: true; bytes: Buffer }
+  | { ok: false; missing: boolean; code: string | undefined }
+
+/** What a confirmed apply would apply, as the tick sees it. */
+type PendingCandidate =
+  | { kind: 'valid'; config: PersonaConfig }
+  /**
+   * Fails validation (default mode); `error` is the loader's message, which
+   * echoes no rejected value and no unknown key name that could be a token.
+   */
+  | { kind: 'invalid'; error: string }
+  /** The configuration file is missing or cannot be read while a record exists. */
+  | { kind: 'unreadable'; missing: boolean; code: string | undefined }
+
+/** The pending state one detection pass derived. Holds no credentials content. */
+interface PendingState {
+  /** The configuration file's bytes differ from the applied bytes (or it cannot be read). */
+  configChanged: boolean
+  candidate: PendingCandidate
+  /**
+   * The personas present in both the applied set and a valid candidate, with
+   * the same `credentials_file`, whose file's digest now differs from the one
+   * held for them; in candidate order. Never set in dry run.
+   */
+  credentialsChanged: Persona[]
+  /** The SR-8.3 fingerprint of the bytes this pass read. */
+  fingerprint: string
+  /** A change is pending: the configuration changed or any credentials changed. */
+  pending: boolean
+}
+
+/** The configuration file's bytes, read stat-first, or why there are none. Never throws. */
+function readConfigFile(path: string, fs: Partial<PersonaConfigFs> | undefined): ConfigFileRead {
+  try {
+    return { ok: true, bytes: readPersonaConfigBytes(path, fs) }
+  } catch (err) {
+    const code = err instanceof PersonaConfigReadError ? err.code : undefined
+    return { ok: false, missing: isMissingConfigCode(code), code }
+  }
+}
+
+/** A read as the fingerprint takes it: the bytes, or the missing/unreadable marker. */
+function fingerprintContentOf(read: { ok: true; bytes: Uint8Array } | { ok: false; missing: boolean }): FingerprintContent {
+  if (read.ok) return read.bytes
+  return read.missing ? FINGERPRINT_MISSING : FINGERPRINT_UNREADABLE
+}
+
+/** A persona's settings as compared for "changed": everything but its position in the file. */
+function personaSettings(persona: Persona): string {
+  return JSON.stringify({ ...persona, index: undefined })
+}
+
+/** The server-wide setting names whose resolved values differ between two configurations. */
+function changedServerSettings(before: PersonaConfig, after: PersonaConfig): string[] {
+  const settings = (config: PersonaConfig): Record<string, unknown> => {
+    const { personas: _personas, ...rest } = config
+    return rest
+  }
+  const a = settings(before)
+  const b = settings(after)
+  return [...new Set([...Object.keys(a), ...Object.keys(b)])].filter(
+    (name) => JSON.stringify(a[name]) !== JSON.stringify(b[name]),
+  )
+}
+
+/** Suffix of an INVALID preview line. */
+const NOTHING_WILL_BE_APPLIED = 'Nothing will be applied.'
+
+/** First line of the preview body of a valid candidate. */
+const PENDING_PREVIEW_TITLE = 'A configuration change is pending. Nothing has been applied.'
+
+/**
+ * The preview's change lines (minimal; b.av2 SR-8.4's full preview is Task
+ * 3's): one INVALID line for an invalid candidate, otherwise one line per
+ * persona added, changed or removed, per server-wide setting changed and per
+ * persona whose credentials changed, or `no effective change`. Names personas
+ * by name and key and credentials files by path, never any file content or
+ * setting value. Pure.
+ */
+function renderPreviewLines(state: PendingState, applied: PersonaConfig, configPath: string): string[] {
+  const { candidate } = state
+  if (candidate.kind === 'invalid') return [`INVALID: ${candidate.error} ${NOTHING_WILL_BE_APPLIED}`]
+  if (candidate.kind === 'unreadable') {
+    const what = candidate.missing
+      ? 'does not exist'
+      : `cannot be read${candidate.code !== undefined ? ` (${candidate.code})` : ''}`
+    return [`INVALID: the configuration file ${JSON.stringify(configPath)} ${what}. ${NOTHING_WILL_BE_APPLIED}`]
+  }
+
+  const next = candidate.config
+  const lines: string[] = []
+  for (const persona of next.personas) {
+    const before = applied.personas.find((p) => p.key === persona.key)
+    const ref = `personas[${persona.index}] ${renderPersonaRef(persona.name, persona.key)}`
+    if (before === undefined) lines.push(`added: ${ref}`)
+    else if (personaSettings(before) !== personaSettings(persona)) lines.push(`changed: ${ref}`)
+  }
+  for (const persona of applied.personas) {
+    if (!next.personas.some((p) => p.key === persona.key)) lines.push(`removed: ${renderPersonaRef(persona.name, persona.key)}`)
+  }
+  for (const name of changedServerSettings(applied, next)) lines.push(`server-wide setting changed: ${name}`)
+  for (const persona of state.credentialsChanged) {
+    lines.push(
+      `credentials changed: ${renderPersonaRef(persona.name, persona.key)} ` +
+        `credentials_file=${JSON.stringify(persona.credentials_file)}`,
+    )
+  }
+  if (lines.length === 0) lines.push('no effective change')
+  return lines
+}
+
+/** What the log last said about the pending state, for logging only its changes. */
+type LoggedPendingState =
+  /** Before the first pass: counts as nothing pending, but a leftover pending file may still be deleted. */
+  | { kind: 'initial' }
+  | { kind: 'nothing' }
+  | { kind: 'pending'; fingerprint: string }
+
+/** The pending file as the tick found it. */
+type PendingFileRead = { kind: 'bytes'; bytes: Buffer } | { kind: 'absent' } | { kind: 'other' }
+
+/** The detection tick over one applied configuration, and the switch that ends it. */
+interface PendingDetection {
+  tick: ReloadTick
+  stop(): void
+}
+
+/**
+ * Build the detection tick (b.av2 SR-8.2, SR-8.3) over the applied
+ * configuration. One pass reads the configuration file once and, unless in
+ * dry run, each credentials file it references once (stat-first, so a FIFO
+ * or a device reads as unreadable and never blocks), derives the pending
+ * state, then keeps `config.json.pending` in step: written durably when a
+ * change is pending and the file is missing or stale, deleted durably when
+ * nothing is pending. The credentials bytes are dropped at the end of the
+ * pass; only their digests are compared, with the held ones.
+ *
+ * Logging, through `deps.log` only (the server log, never Slack):
+ * - `reload-preview`, one line, when the pending state (nothing, or pending
+ *   with fingerprint F) changes to pending with a new fingerprint; a rewrite
+ *   of a missing or stale file with an unchanged state logs nothing;
+ * - `reload-nothing-pending`, one line, when the state changes to nothing
+ *   pending, or at the first pass after a start that deletes a leftover
+ *   pending file; never at a clean start;
+ * - a failed pending-file write or delete, once per episode (an episode ends
+ *   at the next success or when the derived state changes), retried at the
+ *   next pass; a delete whose directory sync failed is not retried (the file
+ *   is gone) and is logged once, saying so;
+ * - an unexpected failure of a pass, once per episode.
+ *
+ * Never reads, writes, renames or deletes `config.json.apply` or the record,
+ * calls no lifecycle operation and creates no Slack client. Never throws.
+ */
+function createPendingDetection(deps: ReloadControllerDeps, applied: AppliedConfiguration): PendingDetection {
+  const { paths } = deps
+  const write = deps.write ?? durableWriteFileSync
+  const remove = deps.remove ?? durableUnlinkSync
+  const dryRun = deps.dryRun === true
+  const configDir = dirname(paths.config)
+  let logged: LoggedPendingState = { kind: 'initial' }
+  /**
+   * The state the last pass derived (`'nothing'`, or the fingerprint of the
+   * pending change): a change of it starts a new file-failure episode.
+   */
+  let derivedState: string | undefined
+  let fileFailureLatched = false
+  let tickFailureLatched = false
+  /** The last write reached the file but not its directory's fsync: write again. */
+  let rewriteDue = false
+  let running = false
+  let stopped = false
+
+  /** The candidate for bytes that differ from the applied bytes (default mode, so collisions are rejected). */
+  function candidateOf(read: ConfigFileRead, configChanged: boolean): PendingCandidate {
+    if (!read.ok) return { kind: 'unreadable', missing: read.missing, code: read.code }
+    if (!configChanged) return { kind: 'valid', config: applied.config }
+    try {
+      return { kind: 'valid', config: parsePersonaConfigBytes(read.bytes, paths.config, configDir, { home: deps.home }) }
+    } catch (err) {
+      return { kind: 'invalid', error: errorMessage(err) }
+    }
+  }
+
+  /**
+   * One pass's pending state. Every credentials file is read and digested at
+   * most once, and only outside dry run.
+   */
+  function derive(): PendingState {
+    const read = readConfigFile(paths.config, deps.configFs)
+    const configChanged = !read.ok || !read.bytes.equals(applied.bytes)
+    const candidate = candidateOf(read, configChanged)
+
+    const credentialsReads = new Map<string, CredentialsFileRead>()
+    const readCredentials = (path: string): CredentialsFileRead => {
+      let result = credentialsReads.get(path)
+      if (result === undefined) {
+        result = readCredentialsFile(path, deps.credentialsFs)
+        credentialsReads.set(path, result)
+      }
+      return result
+    }
+    const digests = new Map<string, CredentialsDigest>()
+    const digestOf = (path: string): CredentialsDigest => {
+      let digest = digests.get(path)
+      if (digest === undefined) {
+        digest = credentialsDigest(readCredentials(path))
+        digests.set(path, digest)
+      }
+      return digest
+    }
+
+    const entries: FingerprintCredentialsEntry[] = []
+    if (!dryRun && read.ok) {
+      for (const path of new Set(referencedCredentialsPaths(read.bytes, deps.home))) {
+        entries.push({ path, content: fingerprintContentOf(readCredentials(path)) })
+      }
+    }
+
+    const credentialsChanged: Persona[] = []
+    if (!dryRun && candidate.kind === 'valid') {
+      for (const persona of candidate.config.personas) {
+        const before = applied.config.personas.find((p) => p.key === persona.key)
+        if (before === undefined || before.credentials_file !== persona.credentials_file) continue
+        // Nothing held (no query, or an unknown persona): never counts as changed.
+        // A persona broken by a shared credentials file holds its own file's digest.
+        const held = deps.heldCredentialsDigest?.(persona.key)
+        if (held === undefined) continue
+        if (digestOf(persona.credentials_file) !== held) credentialsChanged.push(persona)
+      }
+    }
+
+    const fingerprint = reloadFingerprint(fingerprintContentOf(read), entries)
+    return { configChanged, candidate, credentialsChanged, fingerprint, pending: configChanged || credentialsChanged.length > 0 }
+  }
+
+  function readPendingFile(): PendingFileRead {
+    try {
+      return { kind: 'bytes', bytes: readPersonaConfigBytes(paths.pending, deps.configFs) }
+    } catch (err) {
+      const code = err instanceof PersonaConfigReadError ? err.code : undefined
+      return isMissingConfigCode(code) ? { kind: 'absent' } : { kind: 'other' }
+    }
+  }
+
+  function noteFileFailure(line: string): void {
+    if (fileFailureLatched) return
+    fileFailureLatched = true
+    deps.log(line)
+  }
+
+  /** Write the pending file when it is missing or stale; log the preview when the state changed. */
+  function keepPending(state: PendingState, file: PendingFileRead): void {
+    const lines = renderPreviewLines(state, applied.config, paths.config)
+    const valid = state.candidate.kind === 'valid'
+    const body = (valid ? [PENDING_PREVIEW_TITLE, ...lines] : lines).join('\n')
+    const bytes = Buffer.from(composePendingFile(state.fingerprint, body), 'utf-8')
+    if (rewriteDue || file.kind !== 'bytes' || !file.bytes.equals(bytes)) {
+      try {
+        write(paths.pending, bytes)
+        rewriteDue = false
+        fileFailureLatched = false
+      } catch (err) {
+        rewriteDue = err instanceof DurableWriteUnsyncedError
+        noteFileFailure(
+          rewriteDue
+            ? `[slack] reload: wrote the pending-change file "${paths.pending}" but could not sync its directory${errnoSuffix(err)}; writing it again at the next check`
+            : `[slack] reload: cannot write the pending-change file "${paths.pending}"${errnoSuffix(err)}; retrying at the next check`,
+        )
+      }
+    }
+    if (logged.kind === 'pending' && logged.fingerprint === state.fingerprint) return
+    logged = { kind: 'pending', fingerprint: state.fingerprint }
+    const summary = (valid ? 'a configuration change is pending, nothing has been applied: ' : '') + lines.join('; ')
+    deps.log(`[slack] ${RELOAD_PREVIEW}: ${escapeCause(summary)} (preview in "${paths.pending}")`)
+  }
+
+  /**
+   * Delete the pending file when present; once it is gone, log
+   * `reload-nothing-pending` if the state changed to nothing pending (or the
+   * first check removed a leftover file).
+   */
+  function keepNothingPending(file: PendingFileRead): void {
+    rewriteDue = false
+    let removed = false
+    let gone = file.kind === 'absent'
+    if (!gone) {
+      try {
+        removed = remove(paths.pending)
+        gone = true
+        fileFailureLatched = false
+      } catch (err) {
+        if (err instanceof DurableUnlinkUnsyncedError) {
+          // The file is gone; only the removal's durability is in doubt, and
+          // nothing retries it (the next start's first check removes a file
+          // that reappears after a crash). Logged once per such removal: the
+          // file is gone afterwards, so the next check does not remove it.
+          removed = true
+          gone = true
+          fileFailureLatched = false
+          deps.log(
+            `[slack] reload: removed the pending-change file "${paths.pending}" but could not sync its directory` +
+              `${errnoSuffix(err)}; it may reappear after a crash, and the next start removes it`,
+          )
+        } else {
+          noteFileFailure(
+            `[slack] reload: cannot remove the pending-change file "${paths.pending}"${errnoSuffix(err)}; retrying at the next check`,
+          )
+        }
+      }
+    }
+    // A file that could not be removed keeps the logged state as it is, so the
+    // line below follows the removal that succeeds at a later check.
+    if (!gone) return
+    if (logged.kind === 'pending' || (logged.kind === 'initial' && removed)) {
+      deps.log(
+        `[slack] ${RELOAD_NOTHING_PENDING}: the configuration file and the credentials files it references match ` +
+          `what is applied; no change is pending` +
+          (removed ? `, and the pending-change file "${paths.pending}" is removed` : ''),
+      )
+    }
+    logged = { kind: 'nothing' }
+  }
+
+  async function tick(): Promise<void> {
+    if (stopped || running) return
+    running = true
+    try {
+      const state = derive()
+      const stateId = state.pending ? state.fingerprint : 'nothing'
+      if (stateId !== derivedState) {
+        // A new pending state, or nothing pending: its first file failure is logged again.
+        derivedState = stateId
+        fileFailureLatched = false
+      }
+      const file = readPendingFile()
+      if (state.pending) keepPending(state, file)
+      else keepNothingPending(file)
+      tickFailureLatched = false
+    } catch (err) {
+      if (!tickFailureLatched) {
+        tickFailureLatched = true
+        deps.log(`[slack] reload: detection check failed: ${describeThrownValue(err)}; checking again at the next tick`)
+      }
+    } finally {
+      running = false
+    }
+  }
+
+  return {
+    tick,
+    stop: () => {
+      stopped = true
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Controller
 // ---------------------------------------------------------------------------
 
@@ -319,6 +769,21 @@ export interface ReloadController {
   /** The applied configuration and its bytes, once the start resolved `applied`. */
   applied(): AppliedConfiguration | undefined
   /**
+   * Start the detection tick (b.av2 SR-8.2): hand it to the injected tick
+   * driver. Arms it only once, and only after the start resolved `applied`
+   * and the start bring-up pass returned (`runStartBringUp` settled, even by
+   * a throw); called before that, after a refused start, a second time,
+   * after `stopDetection` or without a tick driver, it arms nothing. Returns
+   * whether it armed the tick. Resolution and the bring-up never start
+   * detection on their own.
+   */
+  startDetection(): boolean
+  /**
+   * Stop the detection tick at shutdown: stop the tick driver, and make any
+   * pass still due do nothing. Idempotent; safe before `startDetection`.
+   */
+  stopDetection(): void
+  /**
    * The credentials files the file guard must refuse (b.av2 SR-5.2): the
    * applied set's `credentials_file` paths, plus every `credentials_file`
    * string in the `personas` entries of the configuration file as it stands
@@ -335,14 +800,17 @@ type StartPhase = 'unresolved' | 'refused' | 'applied' | 'bringing-up' | 'brough
 /**
  * Create the reload controller. Creating it reads, writes, logs and arms
  * nothing. `resolveStart` does the start's reads, write and log line;
- * `protectedCredentialsFiles` reads the configuration file on each call, at
- * any phase, and writes and logs nothing.
+ * `startDetection` arms the detection tick (`createPendingDetection`) once
+ * the start bring-up pass has returned; `protectedCredentialsFiles` reads the
+ * configuration file on each call, at any phase, and writes and logs nothing.
  */
 export function createReloadController(deps: ReloadControllerDeps): ReloadController {
   const { paths, lifecycle } = deps
   const write = deps.write ?? durableWriteFileSync
   let phase: StartPhase = 'unresolved'
   let appliedState: AppliedConfiguration | undefined
+  let detection: PendingDetection | undefined
+  let detectionStopped = false
 
   function refuse(source: AppliedConfigSource, cls: ReloadDiagnosticClass | undefined, line: string): ReloadStartOutcome {
     phase = 'refused'
@@ -401,9 +869,25 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     }
   }
 
+  function startDetection(): boolean {
+    if (phase !== 'brought-up' || appliedState === undefined) return false
+    if (detection !== undefined || detectionStopped || deps.tickDriver === undefined) return false
+    detection = createPendingDetection(deps, appliedState)
+    deps.tickDriver.start(detection.tick)
+    return true
+  }
+
+  function stopDetection(): void {
+    detectionStopped = true
+    detection?.stop()
+    deps.tickDriver?.stop()
+  }
+
   return {
     resolveStart,
     runStartBringUp,
+    startDetection,
+    stopDetection,
     applied: () => appliedState,
     protectedCredentialsFiles: () =>
       credentialsFilesToProtect(appliedState?.config.personas ?? [], paths.config, deps.home, deps.configFs),

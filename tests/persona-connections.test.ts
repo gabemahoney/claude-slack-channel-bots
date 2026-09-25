@@ -32,7 +32,13 @@
  * persona refused on reopen has its session dropped, while a reopen in
  * progress keeps it; the controller's `onLeftUp` fires once per change out of
  * `up` (never for a persona that was never up, a failing listener logged), and
- * `describePersonaNotUp` gives the cause text. Time is a fake clock throughout;
+ * `describePersonaNotUp` gives the cause text. E11 Task 2 adds SR-8.3's held
+ * credentials digest: the stat-first `readCredentialsFile`, `credentialsDigest`
+ * (exact bytes, the missing and unreadable markers) and
+ * `checkPersonaCredentialsAndDigest` (checkPersonaCredentials's results
+ * unchanged), and the controller's `credentialsDigest(key)` for an up,
+ * retrying, credentials-broken, collision-broken (nothing held), dry-run,
+ * unknown and cancelled persona. Time is a fake clock throughout;
  * nothing sleeps (the start-pass cases poll in 1 ms real-time steps only for
  * the real spawn path).
  *
@@ -75,9 +81,14 @@ import {
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import {
+  CREDENTIALS_MISSING_MARKER,
+  CREDENTIALS_UNREADABLE_MARKER,
   DEFAULT_CREDENTIALS_FS,
   PersonaSlackTokens,
   checkPersonaCredentials,
+  checkPersonaCredentialsAndDigest,
+  credentialsDigest,
+  readCredentialsFile,
   type CredentialsFs,
 } from '../src/persona-credentials.ts'
 import {
@@ -359,6 +370,19 @@ function expectFailure(
   expect('tokens' in failure).toBe(false)
   return failure
 }
+
+/** The digest a credentials file's current bytes should hold: `sha256:` and the SHA-256 hex, computed here. */
+function sha256Digest(bytes: Uint8Array): string {
+  return `sha256:${createHash('sha256').update(bytes).digest('hex')}`
+}
+
+/** The expected digest of the file at `path` as it stands now. */
+function fileDigest(path: string): string {
+  return sha256Digest(readFileSync(path))
+}
+
+/** Bytes that are not valid UTF-8 (a lone continuation byte and 0xff), around the sentinel. */
+const INVALID_UTF8 = Buffer.concat([Buffer.from([0xff, 0x80]), Buffer.from(LEAK_SENTINEL), Buffer.from([0xc3])])
 
 /** Mode and content hash of every entry under `root`, keyed by relative path. */
 function snapshotTree(root: string): Record<string, string> {
@@ -682,6 +706,150 @@ describe('checkPersonaCredentials: real-path collision with another applied pers
     assertNoLeak({ result, lines })
     expect(result.ok).toBe(true)
     expect(lines).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The stat-first reader and the digest held for a read (b.av2 SR-8.3)
+// ---------------------------------------------------------------------------
+
+describe('readCredentialsFile and credentialsDigest (SR-8.3)', () => {
+  /** Write `bytes` as `persona`'s credentials file, creating its directory; the path. */
+  function writeRaw(persona: BringUpPersona, bytes: string | Uint8Array): string {
+    mkdirSync(join(dir, persona.key), { recursive: true })
+    writeFileSync(persona.credentials_file, bytes)
+    return persona.credentials_file
+  }
+
+  // Rows: label, the file's bytes. The read returns exactly those bytes and the digest is their SHA-256.
+  test.each<[string, (persona: BringUpPersona) => string]>([
+    ['a valid credentials file', persona => writeCreds(persona)],
+    ['an empty file', persona => writeRaw(persona, '')],
+    ['bytes that are not valid UTF-8 (never decoded and re-encoded)', persona => writeRaw(persona, INVALID_UTF8)],
+    ['a CRLF file with a byte order mark', persona => writeRaw(persona, `﻿{"bot_token": "${fakeToken(BOT_TOKEN_PREFIX)}"}\r\n`)],
+  ])('%s: the read returns the exact bytes on disk and the digest is sha256: and their SHA-256 hex', (_label, arrange) => {
+    const path = arrange(makePersona())
+    const onDisk = readFileSync(path)
+
+    const read = readCredentialsFile(path)
+    const digest = credentialsDigest(read)
+
+    if (!read.ok) throw new Error(`expected a read, got ${read.cause}`)
+    expect(Buffer.compare(read.bytes, onDisk)).toBe(0)
+    expect(digest).toMatch(/^sha256:[0-9a-f]{64}$/)
+    expect(digest).toBe(sha256Digest(onDisk))
+    assertNoLeak({ digest, json: JSON.stringify(digest) })
+  })
+
+  // Rows: label, arrange (returns the path and any injected ops), whether missing, the cause, the ops after the open.
+  test.each<[string, (persona: BringUpPersona) => Partial<CredentialsFs>, boolean, string, string[]]>([
+    ['the file does not exist', () => ({}), true, 'credentials file does not exist', []],
+    ['a directory at the path (real, holds as root)', persona => (mkdirSync(persona.credentials_file, { recursive: true }), {}),
+      false, 'credentials file is a directory', ['fstat', 'close']],
+    ['a FIFO, as the injected fstatFile reports it', persona => (writeCreds(persona), { fstatFile: () => ({ isFile: () => false, isDirectory: () => false }) }),
+      false, 'credentials file is not a regular file', ['fstat', 'close']],
+    ['the open denied with EACCES (injected)', persona => (writeCreds(persona), { openFile: failsWith('EACCES') }),
+      false, 'credentials file cannot be read: permission denied (EACCES)', []],
+    ['the read fails with EIO (injected)', persona => (writeCreds(persona), { readFileFd: failsWith('EIO') }),
+      false, 'credentials file cannot be read (EIO)', ['fstat', 'read', 'close']],
+  ])('%s: no bytes, the stat-first rule holds, and the digest is the missing or unreadable marker', (_label, arrange, missing, cause, afterOpen) => {
+    const persona = makePersona()
+    const injected = arrange(persona)
+    const ops: string[] = []
+    const fs: Partial<CredentialsFs> = {
+      openFile: path => (injected.openFile ?? DEFAULT_CREDENTIALS_FS.openFile)(path),
+      fstatFile: fd => (ops.push('fstat'), (injected.fstatFile ?? DEFAULT_CREDENTIALS_FS.fstatFile)(fd)),
+      readFileFd: fd => (ops.push('read'), (injected.readFileFd ?? DEFAULT_CREDENTIALS_FS.readFileFd)(fd)),
+      closeFile: fd => (ops.push('close'), DEFAULT_CREDENTIALS_FS.closeFile(fd)),
+    }
+
+    const read = readCredentialsFile(persona.credentials_file, fs)
+    const digest = credentialsDigest(read)
+
+    expect(read).toEqual({ ok: false, missing, cause })
+    expect(ops).toEqual(afterOpen)
+    expect(digest).toBe(missing ? CREDENTIALS_MISSING_MARKER : CREDENTIALS_UNREADABLE_MARKER)
+    assertNoLeak({ read, digest })
+  })
+
+  test('the two markers differ from each other, from every digest (an empty file’s included) and from the sha256: form', () => {
+    const empty = sha256Digest(new Uint8Array())
+
+    expect(credentialsDigest({ ok: true, bytes: Buffer.alloc(0) })).toBe(empty)
+    expect(new Set([CREDENTIALS_MISSING_MARKER, CREDENTIALS_UNREADABLE_MARKER, empty]).size).toBe(3)
+    for (const marker of [CREDENTIALS_MISSING_MARKER, CREDENTIALS_UNREADABLE_MARKER]) expect(marker).not.toMatch(/^sha256:/)
+  })
+
+  /** `persona`'s credentials path made a symlink to `other`'s (valid) file: a real-path collision; the others list. */
+  function shareFileWith(persona: BringUpPersona, other = makeOther()): OtherBringUpPersona[] {
+    writeCreds(other)
+    mkdirSync(join(dir, persona.key), { recursive: true })
+    symlinkSync(other.credentials_file, persona.credentials_file)
+    return [other]
+  }
+
+  // Rows: label, arrange (returns the others list), the expected digest (from the path).
+  test.each<[string, (persona: BringUpPersona) => OtherBringUpPersona[], (path: string) => string]>([
+    ['a valid file', persona => (writeCreds(persona), []), fileDigest],
+    ['a missing file', () => [], () => CREDENTIALS_MISSING_MARKER],
+    ['a directory at the path', persona => (mkdirSync(persona.credentials_file, { recursive: true }), []), () => CREDENTIALS_UNREADABLE_MARKER],
+    ['invalid content (JSON null)', persona => (writeCreds(persona, 'null'), []), fileDigest],
+    ['an empty file', persona => (writeRaw(persona, ''), []), fileDigest],
+    ['bytes that are not valid UTF-8', persona => (writeRaw(persona, INVALID_UTF8), []), fileDigest],
+    ['a symlink to another applied persona’s file (a collision: read only to be hashed)', persona => shareFileWith(persona), fileDigest],
+  ])('checkPersonaCredentialsAndDigest for %s: the result and line are checkPersonaCredentials’s, beside the digest of what was read', (_label, arrange, expected) => {
+    const persona = makePersona()
+    const others = arrange(persona)
+    const opens: string[] = []
+    const fs: Partial<CredentialsFs> = { openFile: path => (opens.push(path), DEFAULT_CREDENTIALS_FS.openFile(path)) }
+    const plain = capture()
+    const withDigest = capture()
+
+    const result = checkPersonaCredentials(persona, { others, fs, log: plain.log })
+    const both = checkPersonaCredentialsAndDigest(persona, { others, fs, log: withDigest.log })
+
+    expect(both.result).toEqual(result)
+    expect(withDigest.lines).toEqual(plain.lines)
+    expect(both.digest).toBe(expected(persona.credentials_file))
+    // Each check opens the file once, a collision's included (Director decision 1 reversed).
+    expect(opens).toEqual([persona.credentials_file, persona.credentials_file])
+    if (both.digest.startsWith('sha256:')) expect(plain.lines.some(line => line.includes(both.digest.slice('sha256:'.length)))).toBe(false)
+    assertNoLeak({ result, both, json: JSON.stringify(both.digest), lines: [...plain.lines, ...withDigest.lines] })
+  })
+
+  // A persona broken by a shared credentials file (Director decision 1 reversed): the file is read
+  // stat-first only to be hashed, never parsed, and the collision failure is unchanged.
+  // Rows: label, arrange (returns the others list and any injected fstatFile), the ops after the open, the expected digest.
+  test.each<[string, (persona: BringUpPersona) => [OtherBringUpPersona[], Partial<CredentialsFs>], string[], (path: string) => string]>([
+    ['a symlink to the other persona’s regular file', persona => [shareFileWith(persona), {}], ['fstat', 'read', 'close'], fileDigest],
+    ['a symlink to the other persona’s file reported as a FIFO (injected fstatFile)', persona =>
+      [shareFileWith(persona), { fstatFile: () => ({ isFile: () => false, isDirectory: () => false }) }],
+      ['fstat', 'close'], () => CREDENTIALS_UNREADABLE_MARKER],
+    ['the same non-existent path, compared lexically', persona => {
+      const other = makeOther()
+      persona.credentials_file = `${dir}/elsewhere/../${other.key}/credentials.json`
+      return [[other], {}]
+    }, [], () => CREDENTIALS_MISSING_MARKER],
+  ])('a collision (%s): the file is opened once and stat-first, the digest is of its bytes, and no token reaches the result, lines or digest', (_label, arrange, afterOpen, expected) => {
+    const persona = makePersona()
+    const [others, injected] = arrange(persona)
+    const ops: string[] = []
+    const fs: Partial<CredentialsFs> = {
+      openFile: path => (ops.push('open'), DEFAULT_CREDENTIALS_FS.openFile(path)),
+      fstatFile: fd => (ops.push('fstat'), (injected.fstatFile ?? DEFAULT_CREDENTIALS_FS.fstatFile)(fd)),
+      readFileFd: fd => (ops.push('read'), DEFAULT_CREDENTIALS_FS.readFileFd(fd)),
+      closeFile: fd => (ops.push('close'), DEFAULT_CREDENTIALS_FS.closeFile(fd)),
+    }
+    const { lines, log } = capture()
+
+    const { result, digest } = checkPersonaCredentialsAndDigest(persona, { others, fs, log })
+
+    const failure = expectFailure(result, PERSONA_CREDENTIALS_INVALID, lines)
+    expect(failure.cause).toContain(renderPersonaRef(others[0]!.name, others[0]!.key))
+    expect(failure.cause).toContain('credentials_file')
+    expect(ops).toEqual(['open', ...afterOpen])
+    expect(digest).toBe(expected(persona.credentials_file))
+    assertNoLeak({ result, digest, lines, json: JSON.stringify({ result, digest }) })
   })
 })
 
@@ -4274,6 +4442,216 @@ describe('bring-up outcomes (E5)', () => {
       expect(f.launches).toEqual([])
       await expectServes(f, b)
       assertNoLeak(f.captured())
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // The held credentials digest (E11, b.av2 SR-8.3): what each persona
+  // connected with, is retrying with or broke with, by digest only
+  // -------------------------------------------------------------------------
+
+  describe('held credentials digest (credentialsDigest)', () => {
+    /** Every persona's held digest, by key, for assertions and assertNoLeak. */
+    function digestsOf(f: BringUpFixture): Record<string, string | undefined> {
+      return Object.fromEntries(f.personas.map(persona => [persona.key, f.controller.credentialsDigest(persona.key)]))
+    }
+
+    /** No captured line carries a held digest's hex (or a marker as a digest would be logged). */
+    function expectNoDigestLogged(f: BringUpFixture): void {
+      const held = Object.values(digestsOf(f)).filter((d): d is string => d !== undefined && d.startsWith('sha256:'))
+      for (const digest of held) {
+        const hex = digest.slice('sha256:'.length)
+        expect(f.h.lines.filter(line => line.includes(hex))).toEqual([])
+      }
+    }
+
+    /** assertNoLeak over the fixture's captures, the held digests and their JSON form. */
+    function expectDigestsLeakNothing(f: BringUpFixture, extra: Record<string, unknown> = {}): void {
+      const digests = digestsOf(f)
+      assertNoLeak(f.captured({ digests, digestsJson: JSON.stringify(digests), ...extra }), 'held credentials digests')
+      expectNoDigestLogged(f)
+    }
+
+    test('an up persona holds the SHA-256 of the bytes it connected with; editing its file afterwards, or asking bringUp again, changes nothing and reads nothing', async () => {
+      const f = makeBringUpFixture()
+      const [a, b] = f.personas as [Persona, Persona]
+      const connectedWith = { [a.key]: fileDigest(a.credentials_file), [b.key]: fileDigest(b.credentials_file) }
+
+      const summaries = await bringUpEach(f)
+
+      expect([...summaries.values()].map(s => s.outcome)).toEqual(['up', 'up'])
+      expect(digestsOf(f)).toEqual(connectedWith)
+      expect(connectedWith[a.key]).toMatch(/^sha256:[0-9a-f]{64}$/)
+      expect(connectedWith[a.key]).not.toBe(connectedWith[b.key])
+
+      editCredentials(a)
+      expect((await f.controller.bringUp(a, f.personas)).outcome).toBe('up')
+      await f.h.clock.advance(HOUR_MS)
+
+      expect(fileDigest(a.credentials_file)).not.toBe(connectedWith[a.key])
+      expect(digestsOf(f)).toEqual(connectedWith)
+      expect(f.credentialOpens.filter(path => path === a.credentials_file)).toHaveLength(1)
+      await expectServes(f, a)
+      expectDigestsLeakNothing(f, { summaries: [...summaries.values()] })
+    })
+
+    test('a persona outside the applied set, or never brought up, holds nothing', async () => {
+      const f = makeBringUpFixture()
+      const [a, b] = f.personas as [Persona, Persona]
+      await f.controller.bringUp(a, f.personas)
+
+      expect(f.controller.credentialsDigest(a.key)).toBe(fileDigest(a.credentials_file))
+      expect(f.controller.credentialsDigest(b.key)).toBeUndefined()
+      expect(f.controller.credentialsDigest(personaKey('Not Applied'))).toBeUndefined()
+      expectDigestsLeakNothing(f)
+    })
+
+    // Rows: why A retries; `arrange` breaks it before the bring-up, `recover` lets the next retry succeed.
+    test.each<[string, (f: BringUpFixture, a: Persona) => void, (f: BringUpFixture, a: Persona) => void]>([
+      ['Slack is unreachable', (f, a) => void f.h.stub(a).script.authTest.push(...Array<WebApiOutcome>(5).fill({ kind: 'network' })), () => {}],
+      ['its working directory is missing', (_f, a) => breakDirectory(a.working_directory, 'missing'), (_f, a) => repairDirectory(a.working_directory)],
+    ])('a retrying persona (%s) holds the digest of its held content across retries after its file is edited, and still after it comes up', async (_label, arrange, recover) => {
+      const f = makeBringUpFixture()
+      const [a, b] = f.personas as [Persona, Persona]
+      const heldContent = fileDigest(a.credentials_file)
+      arrange(f, a)
+
+      expect((await bringUpEach(f)).get(a.key)?.outcome).toBe('retrying')
+      expect(f.controller.credentialsDigest(a.key)).toBe(heldContent)
+
+      // Edit A's file twice between retries: 5 s, 10 s, 20 s, 40 s.
+      for (const [i, stepMs] of [5_000, 10_000, 20_000, 40_000].entries()) {
+        if (i === 0 || i === 2) editCredentials(a)
+        await f.h.clock.advance(stepMs)
+        expect(f.controller.state(a.key)?.outcome).toBe('retrying')
+        expect(f.controller.credentialsDigest(a.key)).toBe(heldContent)
+      }
+      expect(fileDigest(a.credentials_file)).not.toBe(heldContent)
+
+      recover(f, a)
+      await f.h.clock.advance(HOUR_MS)
+
+      expect(f.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
+      expect(f.launches).toEqual([a.key])
+      expect(f.controller.credentialsDigest(a.key)).toBe(heldContent)
+      expect(f.controller.credentialsDigest(b.key)).toBe(fileDigest(b.credentials_file))
+      expect(f.credentialOpens.filter(path => path === a.credentials_file)).toHaveLength(1)
+      await expectServes(f, b)
+      expectDigestsLeakNothing(f)
+    })
+
+    // Rows: one per distinct held value (the missing marker, the unreadable marker, the digest of
+    // invalid bytes); the reader and check tables above cover the other file shapes.
+    test.each<[string, (f: BringUpFixture, a: Persona) => void, PersonaDiagnosticClass, (a: Persona) => string]>([
+      ['a missing file', (_f, a) => rmSync(a.credentials_file), PERSONA_CREDENTIALS_MISSING, () => CREDENTIALS_MISSING_MARKER],
+      ['a directory at the path (holds as root)', (_f, a) => {
+        rmSync(a.credentials_file)
+        mkdirSync(a.credentials_file)
+      }, PERSONA_CREDENTIALS_UNREADABLE, () => CREDENTIALS_UNREADABLE_MARKER],
+      ['bytes that are not valid UTF-8 (around the sentinel)', (_f, a) => writeFileSync(a.credentials_file, INVALID_UTF8), PERSONA_CREDENTIALS_INVALID, a => fileDigest(a.credentials_file)],
+    ])('a persona broken by %s holds the value of what broke it, unchanged once the file is fixed', async (_label, arrange, cls, heldFor) => {
+      const f = makeBringUpFixture()
+      const [a, b] = f.personas as [Persona, Persona]
+      arrange(f, a)
+      const brokeWith = heldFor(a)
+
+      const summaries = await bringUpEach(f)
+
+      expect(summaries.get(a.key)).toEqual({ outcome: 'broken', failures: [expect.objectContaining({ step: 'credentials', class: cls })] })
+      expect(summaries.get(b.key)?.outcome).toBe('up')
+      expect(f.controller.credentialsDigest(a.key)).toBe(brokeWith)
+      if (brokeWith === CREDENTIALS_MISSING_MARKER || brokeWith === CREDENTIALS_UNREADABLE_MARKER) {
+        // A marker, never the digest of an empty file.
+        expect(brokeWith).not.toBe(sha256Digest(new Uint8Array()))
+      } else {
+        expect(brokeWith).toMatch(/^sha256:[0-9a-f]{64}$/)
+      }
+
+      // The file is fixed: nothing re-reads it, so the held value stays what broke A.
+      rmSync(a.credentials_file, { recursive: true, force: true })
+      editCredentials(a)
+      await f.h.clock.advance(HOUR_MS)
+
+      expect(f.controller.state(a.key)?.outcome).toBe('broken')
+      expect(f.controller.credentialsDigest(a.key)).toBe(brokeWith)
+      expect(f.controller.credentialsDigest(b.key)).toBe(fileDigest(b.credentials_file))
+      await expectServes(f, b)
+      expectDigestsLeakNothing(f, { summaries: [...summaries.values()] })
+    })
+
+    test('personas broken by a shared credentials file (a record-start real-path collision) each hold the digest of their own path’s bytes, read once and never used to connect; a third persona holds its own (Director decision 1 reversed)', async () => {
+      const f = makeBringUpFixture({ names: [OUTCOME_A, OUTCOME_B, OUTCOME_C] })
+      const [a, b, c] = f.personas as [Persona, Persona, Persona]
+      // B's credentials file becomes a symlink to A's: the same file by real path.
+      rmSync(b.credentials_file)
+      symlinkSync(a.credentials_file, b.credentials_file)
+      const shared = fileDigest(a.credentials_file)
+      const expected = { [a.key]: shared, [b.key]: fileDigest(b.credentials_file), [c.key]: fileDigest(c.credentials_file) }
+
+      const summaries = await bringUpEach(f)
+
+      for (const persona of [a, b]) {
+        expect(summaries.get(persona.key)).toEqual({
+          outcome: 'broken',
+          failures: [expect.objectContaining({ step: 'credentials', class: PERSONA_CREDENTIALS_INVALID })],
+        })
+        // Hashed only: no Slack client was built with the shared file's tokens.
+        expect(f.h.slack.buildsOf(persona.key)).toEqual([])
+      }
+      expect(summaries.get(c.key)?.outcome).toBe('up')
+      expect(expected[b.key]).toBe(shared)
+      expect(expected[c.key]).not.toBe(shared)
+      expect(digestsOf(f)).toEqual(expected)
+      expect(f.credentialOpens).toEqual([a.credentials_file, b.credentials_file, c.credentials_file])
+
+      // A content change in the shared file: nothing re-reads it, so each keeps what it broke with.
+      editCredentials(a)
+      await f.h.clock.advance(HOUR_MS)
+      expect(fileDigest(a.credentials_file)).not.toBe(shared)
+      expect(digestsOf(f)).toEqual(expected)
+      expect(f.credentialOpens).toHaveLength(3)
+      await expectServes(f, c)
+      expectDigestsLeakNothing(f, { summaries: [...summaries.values()] })
+    })
+
+    test('dry run (SR-3.4): no credentials file is read and every persona, up or retrying, holds nothing', async () => {
+      const f = makeBringUpFixture({ dryRun: true })
+      const [a, b] = f.personas as [Persona, Persona]
+      f.fsOverride.openFile = () => { throw new Error('no credentials file may be opened in dry run') }
+      breakDirectory(b.working_directory, 'missing')
+
+      const summaries = await bringUpEach(f)
+      expect([summaries.get(a.key)?.outcome, summaries.get(b.key)?.outcome]).toEqual(['up', 'retrying'])
+      repairDirectory(b.working_directory)
+      await f.h.clock.advance(5_000)
+
+      expect(f.controller.state(b.key)).toEqual({ outcome: 'up', causes: {} })
+      expect(digestsOf(f)).toEqual({ [a.key]: undefined, [b.key]: undefined })
+      expect(f.credentialOpens).toEqual([])
+      expect(f.h.slack.builds).toEqual([])
+      expectDigestsLeakNothing(f, { summaries: [...summaries.values()] })
+    })
+
+    test('cancelling a persona forgets its digest; a fresh bring-up afterwards reads the file as it now stands and holds that', async () => {
+      const f = makeBringUpFixture()
+      const [a, b] = f.personas as [Persona, Persona]
+      const original = readFileSync(a.credentials_file)
+      rmSync(a.credentials_file)
+      await bringUpEach(f)
+      expect(f.controller.credentialsDigest(a.key)).toBe(CREDENTIALS_MISSING_MARKER)
+
+      f.controller.cancel(a.key)
+      expect(f.controller.credentialsDigest(a.key)).toBeUndefined()
+      expect(f.controller.credentialsDigest(b.key)).toBe(fileDigest(b.credentials_file))
+
+      // The file is back (with the tokens A's stub knows).
+      writeFileSync(a.credentials_file, original)
+      expect((await f.controller.bringUp(a, f.personas)).outcome).toBe('up')
+
+      expect(f.controller.credentialsDigest(a.key)).toBe(sha256Digest(original))
+      expect(f.credentialOpens.filter(path => path === a.credentials_file)).toHaveLength(2)
+      await expectServes(f, a)
+      expectDigestsLeakNothing(f)
     })
   })
 })

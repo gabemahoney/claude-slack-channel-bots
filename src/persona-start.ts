@@ -80,7 +80,7 @@ import type {
   PersonaStatusListener,
 } from './persona-connections.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
-import type { PersonaSlackTokens } from './persona-credentials.ts'
+import type { CredentialsDigest, PersonaSlackTokens } from './persona-credentials.ts'
 import type { PersonaCheckFailure, PersonaDiagnosticLogger } from './persona-diagnostics.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import type { PersonaNotifier } from './persona-notifier.ts'
@@ -135,6 +135,14 @@ export interface PersonaLocalStepsResult {
   directory: PersonaCheckFailure | undefined
   /** Step 1's tokens when it passed; never in dry run. Held in memory only, never logged. */
   tokens: PersonaSlackTokens | undefined
+  /**
+   * The digest or marker of the credentials bytes step 1 read, whatever its
+   * outcome (b.av2 SR-8.3), a real-path collision included (the file is then
+   * only hashed, never parsed); undefined in dry run (nothing is read) and
+   * when an injected `checkLocal` returns none. Held in memory only, never
+   * logged.
+   */
+  credentialsDigest: CredentialsDigest | undefined
 }
 
 /**
@@ -153,13 +161,19 @@ export function checkPersonaLocalSteps(
   const checkOptions = { others: deps.applied, fs: deps.fs, log: deps.log }
   if (deps.dryRun) {
     const directory = (deps.checkDirectory ?? checkPersonaWorkingDirectory)(persona, checkOptions)
-    return { credentials: undefined, directory: directory.ok ? undefined : directory, tokens: undefined }
+    return {
+      credentials: undefined,
+      directory: directory.ok ? undefined : directory,
+      tokens: undefined,
+      credentialsDigest: undefined,
+    }
   }
   const local = (deps.checkLocal ?? checkPersonaLocalBringUp)(persona, checkOptions)
   return {
     credentials: local.credentials.ok ? undefined : local.credentials,
     directory: local.directory.ok ? undefined : local.directory,
     tokens: local.credentials.ok ? local.credentials.tokens : undefined,
+    credentialsDigest: local.credentialsDigest,
   }
 }
 

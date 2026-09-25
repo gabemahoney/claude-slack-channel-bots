@@ -39,6 +39,12 @@
  * so an edit made meanwhile is not used (it is E11's pending change). The
  * manager itself keeps the same tokens for its own retries and reopens. The
  * tokens are never logged, returned or written, and no query exposes them.
+ * Beside them the entry holds the digest of the bytes that first read
+ * produced, or a missing/unreadable marker (b.av2 SR-8.3); the read-only
+ * `credentialsDigest(key)` query exposes only that, for the reload
+ * detection tick. A persona broken by a shared credentials file holds the
+ * digest of its own file too (read only to be hashed, never parsed), so once
+ * the collision is gone a re-save of that file makes a change pending.
  *
  * Launch on recovery: a persona launches from its own retry path, never
  * waiting for the health check: after a directory retry whose Slack step
@@ -104,7 +110,7 @@ import {
   type PersonaConnectionManager,
   type PersonaConnectionStatus,
 } from './persona-connections.ts'
-import type { PersonaSlackTokens } from './persona-credentials.ts'
+import type { CredentialsDigest, PersonaSlackTokens } from './persona-credentials.ts'
 import {
   PERSONA_START,
   formatPersonaDiagnostic,
@@ -188,6 +194,17 @@ export interface PersonaBringUpController {
   isUp(key: string): boolean
   /** The persona's outcome and causes, or undefined for an unknown or cancelled persona. */
   state(key: string): PersonaBringUpState | undefined
+  /**
+   * The digest or marker of the credentials bytes the persona's bring-up read
+   * (b.av2 SR-8.3): what it connected with, is retrying with or broke with.
+   * `sha256:<hex>`, or `CREDENTIALS_MISSING_MARKER` /
+   * `CREDENTIALS_UNREADABLE_MARKER`. A persona broken by a credentials file
+   * another applied persona shares holds the digest of its own file (hashed,
+   * never parsed). Undefined when nothing is held: dry run (no file is read)
+   * and an unknown or cancelled persona. Retries never re-read the file, so
+   * it never changes. Read-only; never logged.
+   */
+  credentialsDigest(key: string): CredentialsDigest | undefined
   /** Stop one persona's retries and forget it; a retry already running does nothing more. Idempotent. */
   cancel(key: string): void
   /** Cancel every persona. */
@@ -218,6 +235,8 @@ interface BringUpEntry {
   readonly tokens: PersonaSlackTokens | undefined
   /** Step 1's failure; cleared only by E13's confirmed change. */
   readonly credentials: PersonaCheckFailure | undefined
+  /** The digest or marker of the bytes step 1 read (a collision included); undefined in dry run, where none are read. Never logged. */
+  readonly credentialsDigest: CredentialsDigest | undefined
   directory: DirectoryEpisode | undefined
   readonly directorySchedule: PersonaRetrySchedule
   directoryTimer: TimerBox | undefined
@@ -470,6 +489,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
       applied,
       tokens: local.tokens,
       credentials: local.credentials,
+      credentialsDigest: local.credentialsDigest,
       directory: local.directory ? { opened: local.directory, latest: local.directory } : undefined,
       directorySchedule: createPersonaRetrySchedule(),
       directoryTimer: undefined,
@@ -523,6 +543,7 @@ export function createPersonaBringUpController(deps: PersonaBringUpControllerDep
       const entry = entries.get(key)
       return entry === undefined ? undefined : { outcome: outcomeOf(entry), causes: causesOf(entry) }
     },
+    credentialsDigest: (key) => entries.get(key)?.credentialsDigest,
     cancel,
     cancelAll: () => {
       for (const key of [...entries.keys()]) cancel(key)

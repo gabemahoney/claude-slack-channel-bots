@@ -233,7 +233,11 @@ running, is kept but not served. Healthy personas are unaffected.
   last-applied record, which doesn't run that check, or when a symlink changed
   after the configuration loaded. Each persona sharing the file gets this line
   and is `broken`; the other personas come up. A dry run reads no credentials
-  file, so it never logs the shared case.
+  file, so it never logs the shared case. Re-saving the shared file with
+  different content shows a pending credentials change for each persona that
+  shares it (the server hashes the file for this and takes no token from it),
+  but that change can't bring either persona up while they still share the
+  file.
 - **Fix:** The operator rewrites the file in the shape above (mode 0600), then
   restarts the server. For a shared file, give each persona its own file: point
   the symlink elsewhere and restart, or change a `credentials_file` in
@@ -731,9 +735,16 @@ directories exist are never checked here; those are bring-up checks with the
 classes above.
 
 When a record exists, a start runs the record and doesn't read `config.json`,
-so an edit of `config.json` is neither checked nor applied by a restart. To
-apply an edit (and see these messages if it is wrong), see
-[Applying a `config.json` edit](#applying-a-configjson-edit).
+so a restart doesn't apply an edit of `config.json`. The running server still
+checks an edit, within about 5 s once a start's bring-up is done (see
+[The last-applied record](#the-last-applied-record)). If the edit is wrong, it
+writes the error as one `INVALID:` line to `config.json.pending` and logs the
+same line under `reload-preview` in `server.log`; nothing is applied. To apply
+an edit, see [Applying a `config.json` edit](#applying-a-configjson-edit).
+
+```text
+[slack] reload-preview: INVALID: <loader error> Nothing will be applied. (preview in "<path>/config.json.pending")
+```
 
 **Where it shows.** The server logs one line to `server.log` and exits 1, and
 `start` repeats the last lines of `server.log` on stderr under
@@ -748,8 +759,11 @@ Messages about one persona start `personas[<i>] "<name>" (key=<key>): `, or
 just `personas[<i>]: ` when the name itself is the problem. A malformed value
 (a bad channel ID, `dm.contact` or `permission_prompts`) is never echoed, and
 no message shows a token. Messages do quote persona names and keys, channel
-IDs, unknown key names, the configuration file's path and, in the
-duplicate-path rules, the persona paths. After a fix, start the server again.
+IDs, the configuration file's path and, in the duplicate-path rules, the
+persona paths. An unknown key's name is quoted only when it is a plain setting
+name (letters and underscores, up to 48 characters); any other unknown key is
+counted instead, since it could be a pasted token. A name with a digit, such
+as `channels2`, is therefore not shown. After a fix, start the server again.
 
 ### Before any persona is read
 
@@ -760,7 +774,7 @@ duplicate-path rules, the persona paths. After a fix, start the server again.
 | `loadPersonaConfig: malformed JSON in "<path>" at line <L>, column <C>.` | Not valid JSON. The line and column (from 1) point at the first character that breaks it; the file's content is never echoed. | Fix the syntax at that position. |
 | `the configuration must be a JSON object, got <type>.` | Top level isn't an object. | Wrap it in `{ … }`. |
 | A key belonging to the pre-persona shape | See [Pre-persona configuration](#pre-persona-configuration). | |
-| `unknown top-level field(s) in config.json: "<key>", ….` | A top-level key the server doesn't know (often a typo). | Remove or correct it. |
+| `unknown top-level field(s) in config.json: "chanels".`, or `…: 1 field whose name is not shown (it is not a plain setting name, so it could be a pasted secret).`, or `…: "chanels", plus 2 fields whose names are not shown (they are not plain setting names, so they could be pasted secrets).` | A top-level key the server doesn't know (often a typo). Only names made of letters and underscores (up to 48 characters) are shown; any other name (one with a digit such as `channels2`, a dash, a dot, or a pasted token) is only counted. | Remove or correct it. For an unshown field, compare the file's top-level keys with the settings in the README. |
 | `claude_director_poll_interval_ms has been renamed to agent_director_poll_interval_ms …` | Old key name. | Rename it. |
 | `personas is required: an array of persona entries, which may be empty.` / `personas must be an array, got <type>.` | Missing or wrong type. | Add `"personas": [ … ]`. |
 | Server-wide type and range errors: `<key> must be a non-negative number.`, `<key> is invalid. Allowed values are: ….`, `<key> must be a boolean.`, `<key> must be a non-empty string when set.`, `<key> must be a string when set.`, `<key> must be a positive integer (>= 1) when set.`, `agent_director_poll_interval_ms must be a positive integer in [200, 3600000].`, `cron_table_path must be a non-empty string.`, `cron_log_path must be a non-empty string.` | A server-wide setting has the wrong type or is out of range. | Correct the named key. |
@@ -770,7 +784,7 @@ duplicate-path rules, the persona paths. After a fix, start the server again.
 | Message (after the persona prefix) | Cause | Fix |
 |---|---|---|
 | `personas[<i>] must be a JSON object, got <type>.` | An array element isn't an object. | Make it a persona object. |
-| `unknown field(s) in the persona entry: "<key>".`, `… in dm: …`, `… in channels[<j>]: …` | A key the schema doesn't have, at that level. | Remove or correct it. |
+| `unknown field(s) in the persona entry: "<key>".`, `… in dm: …`, `… in channels[<j>]: …`, each possibly with `1 field whose name is not shown …` or `plus <n> fields whose names are not shown …` | A key the schema doesn't have, at that level. As at the top level, only plain setting names are shown; others (a digit, as in `channels2`, a dash, a pasted token) are counted. | Remove or correct it. For an unshown field, compare that entry's keys with the persona keys in the README. |
 | `name is required.` / `name must be a non-empty string.` | Missing or blank name. | Give the persona a name. |
 | `credentials_file is required.` / `working_directory is required.` | Missing path. | Add it. |
 | `<setting> must be an absolute path, "~" or a path starting with "~/".` | `credentials_file`, `working_directory` or `claude_config_dir` is relative (or not a string). | Use an absolute path or `~/…`. |
@@ -847,6 +861,40 @@ Each start logs which configuration it runs:
 |---|---|
 | `[slack] Starting from the last-applied record "<record path>"` | A record exists; the start runs it. |
 | `[slack] No last-applied record: recorded the configuration file "<config path>" as "<record path>"` | No record; `config.json` was valid and is now the record. |
+
+Once a start's bring-up is done, the running server checks `config.json`
+every 5 s, and the credentials files it references too, unless the server
+runs with `SLACK_DRY_RUN`. It applies nothing it finds. While an edit (or a
+changed credentials file) is waiting, it keeps `config.json.pending` beside
+`config.json`, and it deletes the file when nothing is waiting any more.
+The file only shows that something is waiting: to apply an edit, follow
+[Applying a `config.json` edit](#applying-a-configjson-edit). The check
+writes only to the server log, never to Slack.
+
+If the check can't keep that file in step, it logs one of these plain
+`[slack] reload:` lines, with no class label. A failure that keeps repeating
+is logged once, until a later check succeeds or what is waiting changes (an
+edit made, changed again or reverted), and the check tries again every 5 s:
+
+- `[slack] reload: cannot write the pending-change file "<pending path>" (<errno>); retrying at the next check`
+- `[slack] reload: wrote the pending-change file "<pending path>" but could not sync its directory (<errno>); writing it again at the next check`
+- `[slack] reload: cannot remove the pending-change file "<pending path>" (<errno>); retrying at the next check`
+- `[slack] reload: detection check failed: <error>; checking again at the next tick`
+
+One more line has no retry, because the file is already gone:
+
+- `[slack] reload: removed the pending-change file "<pending path>" but could not sync its directory (<errno>); it may reappear after a crash, and the next start removes it`
+
+The server counts that file as removed, and
+[`reload-nothing-pending`](#reload-nothing-pending) follows (except for a
+file placed by hand while nothing was waiting, which is removed silently). If a crash
+brings the file back, the first check after the next start removes it.
+
+The `(<errno>)` part appears only when the error has a code. The usual causes
+are the ones under
+[`reload-record-write-failed`](#reload-record-write-failed): the state
+directory's permissions, free space or filesystem. Nothing running is
+affected.
 
 ### Applying a `config.json` edit
 
@@ -952,6 +1000,36 @@ record was deleted, failing on the listening address:
   error, `EIO`, or a filesystem that doesn't support syncing a directory).
 - **Fix:** Fix the directory's permissions, free space or filesystem, then
   start the server again.
+
+### `reload-nothing-pending`
+
+- **Line:** one of two variants:
+  - `[slack] reload-nothing-pending: the configuration file and the credentials files it references match what is applied; no change is pending, and the pending-change file "<pending path>" is removed`,
+    when that check removed `config.json.pending`;
+  - `[slack] reload-nothing-pending: the configuration file and the credentials files it references match what is applied; no change is pending`,
+    when there was no `config.json.pending` to remove (for example it was
+    deleted by hand, or never written).
+- **When:** once, when the state changes to nothing waiting, not at every
+  check. It is logged only after `config.json.pending` is gone. Two cases:
+  - an edit of `config.json` or of a credentials file was reverted, so the
+    files match what is applied again;
+  - the first check after a start removed a `config.json.pending` left over
+    from before, which the start made obsolete: the start applied the
+    waiting edit (the record was deleted, as under
+    [Applying a `config.json` edit](#applying-a-configjson-edit)), applied a
+    changed credentials file, or `config.json` was put back while the server
+    was stopped.
+- It is never logged at a clean start, where nothing was waiting and no
+  leftover file was found. After a start, it is logged only if the first
+  check actually removed a leftover file.
+- **Meaning:** Nothing is waiting to be applied. The server runs what it
+  applied, and `config.json` and the credentials files match it.
+- **Fix:** None. It is informational. If the removal failed, a plain
+  `[slack] reload: cannot remove the pending-change file …` line comes
+  first, and this line follows once a later check removes the file. If the
+  file was removed but its directory could not be synced, the
+  `[slack] reload: removed the pending-change file … but could not sync its directory …`
+  line comes first and this line follows at once.
 
 ### The last-applied record can't be read or is invalid
 

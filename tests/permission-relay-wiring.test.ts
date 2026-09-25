@@ -28,7 +28,7 @@
 
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
-import { balancedAfter, callsOf, indicesOf, objectProperties, onlyCallArguments, stripComments } from './test-helpers/source-audit.ts'
+import { callsOf, indicesOf, objectProperties, onlyCallArguments, shutdownBody, stripComments } from './test-helpers/source-audit.ts'
 
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(readFileSync('src/server.ts', 'utf-8'))
@@ -83,9 +83,7 @@ describe('server.ts wires the permission poller by persona (b.av2 SR-7.1)', () =
 
   test('shutdown cancels every persona\'s destination hold (held notices and retry timers), once', () => {
     const hold = [...SERVER_CODE.matchAll(/\bconst\s+(\w+)\s*=\s*createPersonaDestinationHold\s*\(/g)].map((m) => m[1])[0]!
-    const fn = SERVER_CODE.search(/\basync\s+function\s+shutdown\s*\(/)
-    expect(fn).toBeGreaterThan(-1)
-    const [start, end] = balancedAfter(SERVER_CODE, SERVER_CODE.indexOf(')', fn), '{', '}')
+    const [start, end] = shutdownBody(SERVER_CODE)
     const cancels = indicesOf(new RegExp(`\\b${hold}\\s*\\.\\s*cancelAll\\s*\\(\\s*\\)`, 'g'), SERVER_CODE)
     expect(cancels).toHaveLength(1)
     expect(cancels[0]!).toBeGreaterThan(start)
