@@ -18,6 +18,11 @@
  *   moves the due time, and its notice is re-queued in order;
  * - the gate (`begin`) refuses before the due time and while a retry is in
  *   flight; a gated success posts the held notices at once;
+ * - with the persona's `permission_prompts` changed in place during an open
+ *   episode, a failure at a destination the episode has not named logs one
+ *   more opening line naming it (never again for that destination, stale
+ *   failures silent, the backoff unreset), and the cleared line names the
+ *   destination the successful post went to;
  * - a failure from an attempt that started before the last episode change
  *   (opened or closed) logs nothing and schedules nothing; its notice is
  *   re-queued and, with no episode open, posted at once;
@@ -369,6 +374,110 @@ describe('an episode: held, retried on backoff, one start line, one cleared line
     expect(posts(C)).toHaveLength(1)
     expect(hold.view(C.key).heldNotices).toBe(2)
     expect(failures.map((f) => f.notice)).toEqual(['n1'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The destination changed in place while an episode is open
+// ---------------------------------------------------------------------------
+
+describe('C\'s permission_prompts changed in place while its episode is open', () => {
+  const C1 = 'C0CEE0001'
+  const C2 = 'C0CEE0002'
+  /** Replace C's applied entry with one sending prompts to `destination` (both channels listed); returns it. */
+  function moveC(destination: string): Persona {
+    const moved: Persona = {
+      ...C,
+      channels: [{ id: C1, delivery: 'all' }, { id: C2, delivery: 'all' }],
+      permission_prompts: destination,
+    }
+    applied.set(C.key, moved)
+    return moved
+  }
+  /** The opening lines are exactly one per `[destination, code]`, in order, each naming C, its destination and error. */
+  function expectOpeningLines(...expected: Array<[string, string]>): void {
+    const lines = startLines()
+    expect(lines).toHaveLength(expected.length)
+    expected.forEach(([destination, code], i) => {
+      expect(lines[i]).toContain(refOf(C))
+      expect(lines[i]).toContain(`destination=${destination} with error ${code}`)
+    })
+  }
+  /** Exactly one cleared line, naming C, the destination posted to and the episode's latest cause. */
+  function expectClearedLine(destination: string, code: string): void {
+    const lines = clearedLines()
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain(refOf(C))
+    expect(lines[0]).toContain(`cleared: destination=${destination} `)
+    expect(lines[0]).toContain(`error ${code}`)
+  }
+  const postedChannels = (): string[] => posts(C).map((c) => c.channel)
+
+  test('a failure at C1, then the first success at C2: the cleared line names C2, where the post went, and no line names C2 as failing', async () => {
+    stick(C, 'post', 'not_in_channel')
+    await deliver(C, 'n1')
+    moveC(C2)
+    unstick(C, 'post')
+    await clock.runNext()
+
+    expect(postedChannels()).toEqual([C1, C2])
+    expectOpeningLines([C1, 'not_in_channel'])
+    expectClearedLine(C2, 'not_in_channel')
+    expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+  })
+
+  test('a failure at C2 logs exactly one more opening line naming it; a repeat at C2, and a failure back at C1, log nothing; the backoff runs on unreset; the cleared line names C1 with the latest named cause', async () => {
+    stick(C, 'post', 'not_in_channel')
+    await deliver(C, 'n1')
+    moveC(C2)
+    unstick(C, 'post')
+    stick(C, 'post', 'channel_not_found')
+
+    await clock.runNext()
+    expectOpeningLines([C1, 'not_in_channel'], [C2, 'channel_not_found'])
+    expect(onlyTimerDelay()).toBe(10_000)
+
+    await clock.runNext()
+    expect(startLines()).toHaveLength(2)
+    expect(onlyTimerDelay()).toBe(20_000)
+
+    // Back to C1, already named in this episode.
+    moveC(C1)
+    await clock.runNext()
+    expect(startLines()).toHaveLength(2)
+    expect(onlyTimerDelay()).toBe(40_000)
+    expect(postedChannels()).toEqual([C1, C2, C2, C1])
+
+    unstick(C, 'post')
+    await clock.runNext()
+    expect(postedChannels()).toEqual([C1, C2, C2, C1, C1])
+    expectClearedLine(C1, 'channel_not_found')
+    expect(logs).toHaveLength(3)
+    expect(hold.view(C.key)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+  })
+
+  test('a stale failure at C2 (its attempt started before the episode opened at C1) logs nothing and moves nothing', async () => {
+    const slow = makeDeferredWebApiCall()
+    stub(C).script.post.push(slow.outcome, { kind: 'platform', error: 'not_in_channel' })
+    const pA = hold.deliver(moveC(C2), client(C), notice('nA'))
+    applied.set(C.key, C)
+    await deliver(C, 'nB')
+    expectOpeningLines([C1, 'not_in_channel'])
+    expect(hold.view(C.key)).toEqual({ held: true, heldNotices: 1, nextDueAt: 5000 })
+
+    slow.settle({ kind: 'platform', error: 'channel_not_found' })
+    await pA
+
+    expect(postedChannels()).toEqual([C2, C1])
+    expectOpeningLines([C1, 'not_in_channel'])
+    expect(hold.view(C.key)).toEqual({ held: true, heldNotices: 2, nextDueAt: 5000 })
+    expect(onlyTimerDelay()).toBe(5000)
+
+    await clock.runNext()
+    expect(postedTexts(C).slice(2)).toEqual(['nA', 'nB'])
+    expect(postedChannels().slice(2)).toEqual([C1, C1])
+    expectClearedLine(C1, 'not_in_channel')
+    expect(logs).toHaveLength(2)
   })
 })
 

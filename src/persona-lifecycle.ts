@@ -3,8 +3,8 @@
  * apply runs (b.av2 SR-6.1, SR-6.2, SR-6.5, SR-6.6, SR-8.6).
  *
  * `createPersonaLifecycle(deps)` composes, over injected dependencies, the
- * two operations the reload controller's apply steps fan out to
- * (`ReloadLifecycleOps.teardown` and `.bringUp`, `reload.ts`):
+ * three operations the reload controller's apply steps fan out to
+ * (`ReloadLifecycleOps.teardown`, `.bringUp` and `.updateInPlace`, `reload.ts`):
  *
  * - **persona teardown** (SR-6.5, apply step 2): everything the server holds
  *   for one persona key goes, with no graceful wind-down. In order:
@@ -56,11 +56,25 @@
  *   line is logged. Shutdown has already cancelled every bring-up and
  *   stopped every connection, so nothing started here would be released.
  *
- * Both run through the per-persona lifecycle serializer (SR-6.6), so each
- * starts only after every operation already submitted for the persona (a
- * restart timer's work, a bring-up retry) has settled. Neither submits to the
+ * - **in-place update** (SR-8.6, AC 58, apply step 3): a persona whose
+ *   `channels`, `delivery`, `permission_prompts` or `dm.*` changed keeps its
+ *   instance, Slack connection, Web API client, MCP session, restart,
+ *   backoff, health, outage and retry state, reply-guard record, tracked
+ *   prompts and held notices. The new values already took effect at apply
+ *   step 1: every consumer (tool scope, delivery decision, destination, DM
+ *   switch, archive evidence) reads the persona's entry from the applied
+ *   configuration at each use. What is left is the persona's cached DM
+ *   conversation, forgotten when `dm.contact`, `dm.enabled` or
+ *   `permission_prompts` changed, so the next DM-destination post opens the
+ *   DM for the current contact; then one line naming what changed. A key no
+ *   longer applied when the operation runs gets nothing. Makes no Slack or
+ *   agent-director call; never rejects. Dry run: the same.
+ *
+ * All three run through the per-persona lifecycle serializer (SR-6.6), so
+ * each starts only after every operation already submitted for the persona
+ * (a restart timer's work, a bring-up retry) has settled. None submits to the
  * serializer again from inside its own operation (the re-entrancy rule in
- * `persona-serializer.ts`). Neither touches another persona.
+ * `persona-serializer.ts`). None touches another persona.
  *
  * Logging: plain `[slack]` lines through the injected logger, token-free; a
  * thrown value is rendered only through `describeThrownValue`:
@@ -74,6 +88,12 @@
  *   [slack] persona "<name>" (key=<key>): launch at apply failed: <thrown value>
  *   [slack] persona "<name>" (key=<key>): storage check at apply failed: <thrown value>
  *   [slack] persona "<name>" (key=<key>): not brought up — the server is shutting down
+ *   [slack] persona "<name>" (key=<key>): updated in place (<settings>); its instance, Slack connection and MCP session are kept[; its cached DM conversation is forgotten | ; forgetting its cached DM conversation failed: <thrown value>]
+ *   [slack] persona "<name>" (key=<key>): in-place update failed: <thrown value>
+ *
+ * `<settings>` lists the changed setting groups, comma-separated, in the
+ * change plan's order (`channels`, `delivery`, `permission_prompts`,
+ * `dm.enabled`, `dm.contact`).
  *
  * Pure module (b.av2 SR-13.1): nothing is created, read or scheduled at
  * import or at `createPersonaLifecycle`; every dependency is injected, so
@@ -92,6 +112,8 @@ import { personaInstanceId, renderPersonaRef } from './persona-identity.ts'
 import type { PersonaNotifier } from './persona-notifier.ts'
 import type { PersonaRouting } from './persona-routing.ts'
 import type { PersonaSerialize } from './persona-serializer.ts'
+import type { InPlaceApplyInput } from './reload-apply.ts'
+import type { InPlaceSetting } from './reload-plan.ts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -117,13 +139,21 @@ export interface PersonaLifecycleDeps {
   connections: Pick<PersonaConnectionManager, 'stop'>
   /** The inbound routing: a removed persona's dedupe store is dropped. */
   routing: Pick<PersonaRouting, 'forget'>
-  /** The shared destination resolver: a removed persona's cached DM is forgotten. */
+  /**
+   * The shared destination resolver: a removed persona's cached DM is
+   * forgotten, and an in-place updated one's when its DM destination settings
+   * changed.
+   */
   destinations: Pick<PersonaDestinations, 'forget'>
   /** The shared destination hold: a removed persona's held notices and retry are cancelled. */
   destinationHold: Pick<PersonaDestinationHold, 'cancel'>
   /** The notifier: a removed persona's pre-validation held notices are dropped. */
   notifier: Pick<PersonaNotifier, 'forget'>
-  /** The persona set applied now (the server's `personaConfig`), read at each use. */
+  /**
+   * The persona set applied now (the server's `personaConfig`), read at each
+   * use: the teardown's Stop-hook pass, and whether an in-place update's key
+   * is still applied.
+   */
   appliedPersonas: () => readonly Persona[]
   /** Dry run (b.av2 SR-3.4): the teardown makes no agent-director call. */
   dryRun: boolean
@@ -185,13 +215,31 @@ export interface PersonaLifecycle {
    * outcome once an `up` persona's launch settled.
    */
   bringUp(persona: Persona, applied: PersonaConfig): Promise<PersonaBringUpResultSummary>
+  /**
+   * In-place update of one persona modified in place (apply step 3):
+   * `change.persona` is its entry in the configuration step 1 made current,
+   * `change.previous` its entry before, `change.settings` what changed.
+   * Resolves once done; never rejects.
+   */
+  updateInPlace(change: InPlaceApplyInput): Promise<void>
 }
+
+/**
+ * The in-place settings whose change can move the persona's DM destination
+ * (b.av2 SR-7.1): its cached DM conversation is forgotten when one changed
+ * (Director decision 11; the cache also re-checks the contact on each use).
+ */
+const DM_DESTINATION_SETTINGS: ReadonlySet<InPlaceSetting> = new Set<InPlaceSetting>([
+  'permission_prompts',
+  'dm.enabled',
+  'dm.contact',
+])
 
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
-/** Compose the persona teardown and the apply bring-up. Creates, reads and schedules nothing. */
+/** Compose the persona teardown, the apply bring-up and the in-place update. Creates, reads and schedules nothing. */
 export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifecycle {
   function log(line: string): void {
     try {
@@ -301,8 +349,38 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     return result
   }
 
+  // -------------------------------------------------------------------------
+  // In-place update (b.av2 SR-8.6, AC 58)
+  // -------------------------------------------------------------------------
+
+  async function runUpdateInPlace(change: InPlaceApplyInput): Promise<void> {
+    const { persona, settings } = change
+    const { key } = persona
+    try {
+      // Removed by a later apply before this ran: its teardown owns it.
+      if (!deps.appliedPersonas().some((p) => p.key === key)) return
+    } catch (err) {
+      log(`[slack] persona ${renderPersonaRef(persona.name, key)}: in-place update failed: ${describeThrownValue(err)}`)
+      return
+    }
+    const changed = settings.length > 0 ? settings.join(', ') : 'no setting'
+    let line =
+      `[slack] persona ${renderPersonaRef(persona.name, key)}: updated in place (${changed}); ` +
+      'its instance, Slack connection and MCP session are kept'
+    if (settings.some((setting) => DM_DESTINATION_SETTINGS.has(setting))) {
+      try {
+        deps.destinations.forget(key)
+        line += '; its cached DM conversation is forgotten'
+      } catch (err) {
+        line += `; forgetting its cached DM conversation failed: ${describeThrownValue(err)}`
+      }
+    }
+    log(line)
+  }
+
   return {
     teardown: (persona) => deps.serialize(persona.key, () => runTeardown(persona)),
     bringUp: (persona, applied) => deps.serialize(persona.key, () => runBringUp(persona, applied)),
+    updateInPlace: (change) => deps.serialize(change.persona.key, () => runUpdateInPlace(change)),
   }
 }

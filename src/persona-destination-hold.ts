@@ -65,7 +65,10 @@
  *   destination (the channel ID, or `dm`), the failed step and the Slack error
  *   code; for `missing_scope` on the open it names the `im:write` scope and
  *   says the app must be re-installed to gain it.
- * - A failed retry advances the schedule and logs nothing.
+ * - A failed retry advances the schedule and logs nothing, unless it failed at
+ *   a destination no line of the open episode has named yet (the persona's
+ *   `permission_prompts` changed in place): then it logs one fresh opening
+ *   line for that destination, once per distinct destination per episode.
  * - A failure from an attempt that started before the last episode change
  *   (an episode opened or closed since; e.g. the notifier's concurrent flush,
  *   all waiting on one DM open, or a slow post that fails after a retry has
@@ -76,8 +79,9 @@
  *   that started before the open episode opened changes nothing either: it is
  *   older evidence than the failure that opened the episode.
  * - The first successful retry ends the episode with one cleared line (the
- *   same class label, the cause starting `cleared:`, E2's convention) and
- *   resets the schedule; a later failure opens a new episode and logs again.
+ *   same class label, the cause starting `cleared:`, E2's convention, naming
+ *   the destination that post went to) and resets the schedule; a later
+ *   failure opens a new episode and logs again.
  * - Nothing is logged per attempt. The code is copied only when it is a short
  *   identifier (`safeFailureCode`); nothing else from the thrown value reaches
  *   a line, so no token value can.
@@ -269,13 +273,18 @@ interface TimerBox {
   handle: unknown
 }
 
-/** An open episode: what its cleared line names, copied from the failure that opened it. */
+/**
+ * An open episode: what its lines name, copied from the failure that opened
+ * it, or from the latest one at a destination not yet named in the episode.
+ */
 interface OpenEpisode {
   name: string
   index: number
   destination: string
   step: DestinationStep
   code: string
+  /** Every destination an opening line of this episode has named. */
+  named: Set<string>
 }
 
 /** A notice in a persona's FIFO. */
@@ -340,9 +349,9 @@ function openingCause(episode: OpenEpisode): string {
     'holding its permission prompts and notices and retrying with backoff'
 }
 
-/** The cause of an episode's cleared line. Pure. */
-function clearedCause(episode: OpenEpisode): string {
-  return `cleared: destination=${episode.destination} accepts posts again ` +
+/** The cause of an episode's cleared line, naming the destination that accepted the post. Pure. */
+function clearedCause(episode: OpenEpisode, destination: string): string {
+  return `cleared: destination=${destination} accepts posts again ` +
     `(was ${episode.step} error ${episode.code}); delivering what was held`
 }
 
@@ -399,7 +408,7 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
   function settle(entry: HoldEntry, started: number, persona: Persona, result: DestinationPostResult): SettledAs {
     const current = entry.episode !== undefined && started === entry.generation
     if (result.outcome === 'posted') {
-      if (current) closeEpisode(entry)
+      if (current) closeEpisode(entry, persona.permission_prompts)
       return 'posted'
     }
     if (result.outcome === 'refused') return 'refused'
@@ -409,7 +418,12 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     // nothing; the caller re-queues a notice and `ensureProgress` retries it.
     if (started !== entry.generation) return 'destination'
     if (entry.episode === undefined) openEpisode(entry, persona, result)
-    else scheduleRetry(entry, result)
+    else {
+      // The persona's destination changed in place while the episode is open:
+      // name the new destination once, in a fresh opening line.
+      if (!entry.episode.named.has(persona.permission_prompts)) nameDestination(entry, entry.episode, persona, result)
+      scheduleRetry(entry, result)
+    }
     return 'destination'
   }
 
@@ -420,9 +434,26 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
       destination: persona.permission_prompts,
       step: failure.step,
       code: safeFailureCode(failure.code),
+      named: new Set([persona.permission_prompts]),
     }
     entry.episode = episode
     entry.generation += 1
+    logOpening(entry, episode)
+    scheduleRetry(entry, failure)
+  }
+
+  /** Copy a failure at a destination not yet named in the open episode into it and log its opening line. */
+  function nameDestination(entry: HoldEntry, episode: OpenEpisode, persona: Persona, failure: DestinationFailure): void {
+    episode.name = persona.name
+    episode.index = persona.index
+    episode.destination = persona.permission_prompts
+    episode.step = failure.step
+    episode.code = safeFailureCode(failure.code)
+    episode.named.add(persona.permission_prompts)
+    logOpening(entry, episode)
+  }
+
+  function logOpening(entry: HoldEntry, episode: OpenEpisode): void {
     deps.log(formatPersonaDiagnostic({
       class: PERSONA_DESTINATION_FAILED,
       name: episode.name,
@@ -430,7 +461,6 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
       index: episode.index,
       cause: openingCause(episode),
     }))
-    scheduleRetry(entry, failure)
   }
 
   /** Take the next wait from the persona's schedule; the retry is due after it. */
@@ -440,7 +470,8 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
     clearTimer(entry)
   }
 
-  function closeEpisode(entry: HoldEntry): void {
+  /** Close the open episode; its cleared line names `destination`, the one the post that ended it went to. */
+  function closeEpisode(entry: HoldEntry, destination: string): void {
     const episode = entry.episode
     if (episode === undefined) return
     entry.episode = undefined
@@ -453,7 +484,7 @@ export function createPersonaDestinationHold(deps: PersonaDestinationHoldDeps): 
       name: episode.name,
       key: entry.key,
       index: episode.index,
-      cause: clearedCause(episode),
+      cause: clearedCause(episode, destination),
     }))
   }
 

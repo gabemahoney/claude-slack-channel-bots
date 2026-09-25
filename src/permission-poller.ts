@@ -777,7 +777,22 @@ async function runTick(deps: PollerDeps): Promise<void> {
         continue
       }
       if (resolved.kind === 'no_label') continue
-      const persona = resolved.persona
+      let persona = resolved.persona
+      // A confirmed reload's step 1 may swap the applied set during any await
+      // below: re-read the persona before each wedge attempt and prompt post,
+      // so a prompt goes to the destination applied now. A persona gone by
+      // then is skipped exactly as a row naming no applied persona is.
+      const reResolve = (): boolean => {
+        const current = deps.getPersona(persona.key)
+        if (current) {
+          persona = current
+          return true
+        }
+        logRowNotApplied(deps, row, persona.key)
+        nonConformingInstanceIds.add(row.claude_instance_id)
+        wedgeSkippedThisTick.add(row.claude_instance_id)
+        return false
+      }
       if (!deps.isPersonaUp(persona.key)) {
         // b.av2 SR-6.4: no get, no prompt, no wedge tick for a persona that is
         // not up; its requests stay open, so hold its live entries and wedge
@@ -826,6 +841,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
       // wedged, so it is intentionally excluded from wedgeObservedEmpty and
       // will be re-armed by reconcileWedgeStates below.
       if (got.permission_requests.length === 0) {
+        if (!reResolve()) continue
         wedgeObservedEmpty.add(row.claude_instance_id)
         await observeWedgeCandidate(deps, row.claude_instance_id, persona)
       }
@@ -837,6 +853,7 @@ async function runTick(deps: PollerDeps): Promise<void> {
           emitRowDecision(deps, 'already_tracked', row.claude_instance_id, perm.request_token)
           continue
         }
+        if (!reResolve()) break
         await dispatchPermissionPrompt(deps, row, persona, perm, key)
       }
     }
@@ -961,10 +978,15 @@ function resolveRowPersona(deps: PollerDeps, row: ListRow): RowPersona {
   }
   const persona = deps.getPersona(key)
   if (!persona) {
-    logViaDeps(deps, `[slack] permission-poller: spawn ${row.claude_instance_id} names no applied persona (persona=${key}) — skipping`)
+    logRowNotApplied(deps, row, key)
     return { kind: 'not_applied' }
   }
   return { kind: 'persona', persona }
+}
+
+/** Log that a listed row names no applied persona; the caller skips it. */
+function logRowNotApplied(deps: PollerDeps, row: ListRow, key: string): void {
+  logViaDeps(deps, `[slack] permission-poller: spawn ${row.claude_instance_id} names no applied persona (persona=${key}) — skipping`)
 }
 
 /**

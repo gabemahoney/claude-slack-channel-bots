@@ -55,6 +55,11 @@
  *     nothing else: no post, no `conversations.open` (an update is not a post).
  *   - A's channel prompt and D's DM prompt, clicked in one run, each update
  *     through their own client.
+ *   - In-place changes (E12): with B's channel dropped from `channels` and
+ *     its destination moved, or D's `dm.contact` changed, a click on the
+ *     prompt posted before the change still makes its one update where it
+ *     was posted, through the persona's client, with no post and no open;
+ *     A's prompt clicked in the same run is unaffected.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -144,6 +149,10 @@ const CHANNEL_D = 'C0INBOXBOT'
 const CONTACT_D = 'U0OPERATOR1'
 /** The DM conversation `conversations.open` returns for D's contact. */
 const DM_D = 'D0INBOXDM1'
+/** B's only channel and destination after an in-place change moves it off CHANNEL_B. */
+const CHANNEL_B_MOVED = 'C0BUILDNEW'
+/** D's `dm.contact` after an in-place change. */
+const CONTACT_D_MOVED = 'U0OPERATOR2'
 const TOKEN_A = '11111111-1111-4111-8111-111111111111'
 const TOKEN_B = '22222222-2222-4222-8222-222222222222'
 const TOKEN_C = '33333333-3333-4333-8333-333333333333'
@@ -585,12 +594,16 @@ const withDmsOff = (persona: Persona): Persona => ({
 })
 
 describe('handlePermissionClick — a prompt in a persona\'s DM (AC 29, AC 36)', () => {
-  test.each([
-    { label: 'AC 29: DMs on', dmsOff: false },
-    { label: 'AC 36: DMs turned off after the prompt was posted', dmsOff: true },
-  ] as const)('$label → an allow click is decided once; exactly one chat.update on the DM conversation and ts through D\'s own client; no post, no conversations.open, no call on another client', async ({ dmsOff }) => {
+  test.each<{ label: string; change?: (p: Persona) => Persona }>([
+    { label: 'AC 29: DMs on' },
+    { label: 'AC 36: DMs turned off after the prompt was posted', change: withDmsOff },
+    {
+      label: '`dm.contact` changed in place after the prompt was posted',
+      change: (p) => ({ ...p, dm: { enabled: true, contact: CONTACT_D_MOVED } }),
+    },
+  ])('$label → an allow click is decided once; exactly one chat.update on the DM conversation and ts through D\'s own client; no post, no conversations.open, no call on another client', async ({ change }) => {
     const { entry, seedCalls } = await seedDmPrompt(TOKEN_A)
-    if (dmsOff) h.applyPersona(withDmsOff(h.personaD))
+    if (change) h.applyPersona(change(h.personaD))
     const decide = makeDecideStub()
     initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
     const trail = makeTrailCapture()
@@ -628,6 +641,7 @@ describe('handlePermissionClick — a prompt in a persona\'s DM (AC 29, AC 36)',
     expect(getLivePermission(h.instanceD, TOKEN_A)?.handled).toBe(true)
     // Nothing logged: a DMs-off refusal would add a line.
     expect(logs).toEqual([])
+    assertNoLeak({ logs, trail: trail.events }, 'DM prompt click')
   })
 
   test('two personas: A\'s channel prompt and D\'s DM prompt, each clicked on its own connection → each update through its own client, in its own conversation', async () => {
@@ -659,6 +673,49 @@ describe('handlePermissionClick — a prompt in a persona\'s DM (AC 29, AC 36)',
     expect(h.stubB.callLog).toEqual([])
     expect(getLivePermission(h.instanceD, TOKEN_B)?.handled).toBe(true)
     expect(getLivePermission(h.instanceA, TOKEN_A)?.handled).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Prompts posted before an in-place change (E12; b.av2 SR-7.1, SR-5.1)
+// ---------------------------------------------------------------------------
+
+describe('handlePermissionClick — a prompt posted before an in-place change', () => {
+  // An in-place change replaces the persona's applied entry (read by
+  // `getPersona` at each click); a prompt posted before it stays where it was.
+  // (D's DM prompt after a `dm.contact` change is a row of the DM table above.)
+  test('B\'s channel prompt, after its channel leaves `channels` and `permission_prompts` names another channel → a click on its connection is decided once and makes one chat.update where the prompt was posted, through its own client; no post, no conversations.open', async () => {
+    await runSeedTick([[h.personaB, [cannedPermissionRequest({ request_token: TOKEN_B })]]])
+    const entry = getLivePermission(h.instanceB, TOKEN_B)!
+    expect(entry.channelId).toBe(CHANNEL_B)
+    const seedCalls = h.stubB.callLog.length
+
+    h.applyPersona({ ...h.personaB, channels: [{ id: CHANNEL_B_MOVED, delivery: 'all' }], permission_prompts: CHANNEL_B_MOVED })
+    const decide = makeDecideStub()
+    initOutageState({ getClient: () => decide.client as unknown as Client, notify: () => {} })
+    const trail = makeTrailCapture()
+    const logs: unknown[][] = []
+
+    await handlePermissionClick(
+      encodePermissionActionId('allow', h.instanceB, TOKEN_B),
+      clickDeps({ receivingPersonaKey: h.personaB.key, emitTrail: trail.emit, log: (...args) => { logs.push(args) } }),
+      { channel: entry.channelId, messageTs: entry.messageTs },
+    )
+
+    expect(decide.calls).toEqual([
+      { claude_instance_id: h.instanceB, decision: 'allow', request_token: TOKEN_B },
+    ] as Array<DecideParams & { request_token: string }>)
+    expect(h.stubB.callLog.slice(seedCalls).map((c) => ({ method: c.method, args: c.args }))).toEqual([
+      { method: 'chat.update', args: expect.objectContaining({ channel: CHANNEL_B, ts: entry.messageTs, text: ALLOWED_TEXT }) },
+    ])
+    // No other persona's client saw anything, and the click path posted nothing.
+    expect(h.stubA.callLog).toEqual([])
+    expect(h.stubD.callLog).toEqual([])
+    expect(trail.events.find((e) => e.event === 'cscb.chat_post.attempted')).toBeUndefined()
+    expect(getLivePermission(h.instanceB, TOKEN_B)?.handled).toBe(true)
+    // Nothing logged: a refused (posting-scope or instance) click would add a line.
+    expect(logs).toEqual([])
+    assertNoLeak({ logs, trail: trail.events }, 'in-place change click')
   })
 })
 

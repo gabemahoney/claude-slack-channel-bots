@@ -1,7 +1,7 @@
 /**
- * persona-lifecycle.test.ts — The persona teardown and the apply bring-up
- * (`createPersonaLifecycle`, src/persona-lifecycle.ts; b.av2 SR-6.1, SR-6.2,
- * SR-6.5, SR-6.6).
+ * persona-lifecycle.test.ts — The persona teardown, the apply bring-up and
+ * the in-place update (`createPersonaLifecycle`, src/persona-lifecycle.ts;
+ * b.av2 SR-6.1, SR-6.2, SR-6.5, SR-6.6, SR-8.6).
  *
  * Every lifecycle here runs through a real `createPersonaSerializer`. The
  * dependencies are recorders by default (each call appends `<dep>:<arg>` to
@@ -38,6 +38,8 @@ import { createPersonaBringUpController, type PersonaBringUpController, type Per
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { createPersonaLifecycle, type PersonaLifecycle, type PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
 import { createPersonaSerializer, type PersonaSerializer } from '../src/persona-serializer.ts'
+import type { InPlaceApplyInput } from '../src/reload-apply.ts'
+import type { InPlaceSetting } from '../src/reload-plan.ts'
 import { _resetRestartState, cancelAllRestartTimers, cancelRestartTimer, initRestart, isRestartPendingOrActive, scheduleRestart } from '../src/restart.ts'
 import { deletePersonaInstance, killPersonaInstance } from '../src/session-manager.ts'
 import { errGeneric, errSpawnNotFound, makeStubCallLog, makeStubClient, stubCallCount } from './test-helpers/agent-director-stub.ts'
@@ -651,6 +653,160 @@ describe('apply bring-up (SR-6.1, SR-6.2): storage check, bring-up, then a launc
     await held
     await forB
     expect(f.trail.filter((c) => c.startsWith('launch:'))).toEqual([`launch:${f.a.key}`, `launch:${f.b.key}`])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// In-place update (SR-8.6, AC 58, apply step 3): the DM-cache forget and one
+// line, under the serializer; nothing else about the persona is touched.
+// ---------------------------------------------------------------------------
+
+describe('in-place update (SR-8.6, AC 58): forget the cached DM when its destination settings changed, one line, nothing else', () => {
+  /** The step-3 input for `p` with `settings` changed (`previous` is not read by the operation). */
+  function change(p: Persona, settings: InPlaceSetting[]): InPlaceApplyInput {
+    return { persona: p, previous: p, settings }
+  }
+
+  /** The exact update line for `p`, with the optional DM-cache suffix. */
+  function updatedLine(p: Persona, settings: readonly InPlaceSetting[], suffix = ''): string {
+    return (
+      `[slack] persona ${renderPersonaRef(p.name, p.key)}: updated in place (${settings.join(', ')}); ` +
+      `its instance, Slack connection and MCP session are kept${suffix}`
+    )
+  }
+
+  const FORGOTTEN = '; its cached DM conversation is forgotten'
+
+  /** A fixture with B still applied (an in-place update leaves it in the set). */
+  function makeInPlaceFixture(opts: FixtureOptions = {}): Fixture {
+    const f = makeFixture(opts)
+    f.applied.push(f.b)
+    return f
+  }
+
+  // Rows: the changed settings, and whether B's cached DM is forgotten (Director decision 11).
+  test.each<[InPlaceSetting[], boolean]>([
+    [['channels'], false],
+    [['delivery'], false],
+    [['channels', 'delivery'], false],
+    [['permission_prompts'], true],
+    [['dm.enabled'], true],
+    [['dm.contact'], true],
+    [['delivery', 'dm.contact'], true],
+    [['channels', 'delivery', 'permission_prompts', 'dm.enabled', 'dm.contact'], true],
+  ])('AC 58: %j changed: forgets B\'s cached DM only when a DM destination setting changed, logs one line, and touches no other state of B (no bring-up, retry, restart, connection, session, prompts, held notice or reply guard), live and in dry run alike', async (settings, forgets) => {
+    for (const dryRun of [false, true]) {
+      const f = makeInPlaceFixture({ dryRun })
+
+      await expect(f.lifecycle.updateInPlace(change(f.b, settings))).resolves.toBeUndefined()
+
+      expect(f.trail).toEqual(forgets ? [`destinations.forget:${f.b.key}`] : [])
+      expect(f.lines).toEqual([updatedLine(f.b, settings, forgets ? FORGOTTEN : '')])
+      expect(f.submitted).toEqual([f.b.key])
+    }
+  })
+
+  test('forgetting the cached DM throws: the line carries the token-safe failure suffix instead, and the update still resolves', async () => {
+    const f = makeInPlaceFixture({ fail: ['destinations.forget'] })
+
+    await expect(f.lifecycle.updateInPlace(change(f.b, ['dm.contact']))).resolves.toBeUndefined()
+
+    expect(f.trail).toEqual([`destinations.forget:${f.b.key}`])
+    expect(f.lines).toHaveLength(1)
+    expect(f.lines[0]).toMatch(
+      new RegExp(`^${RegExp.escape(updatedLine(f.b, ['dm.contact'], '; forgetting its cached DM conversation failed: Error'))}( |$)`),
+    )
+    expect(f.lines[0]).not.toContain(FORGOTTEN)
+    assertNoLeak({ lines: f.lines })
+  })
+
+  test('a key no longer applied when the update runs (removed by a later apply): nothing is forgotten and no line is logged', async () => {
+    const f = makeFixture() // applied: [A]
+
+    await expect(f.lifecycle.updateInPlace(change(f.b, ['dm.contact']))).resolves.toBeUndefined()
+
+    expect(f.trail).toEqual([])
+    expect(f.lines).toEqual([])
+    expect(f.submitted).toEqual([f.b.key])
+  })
+
+  test('the applied set is read when the update runs, not when it was submitted: B leaving it while the update waits for B\'s turn gets nothing', async () => {
+    const f = makeInPlaceFixture()
+    const blocker = Promise.withResolvers<void>()
+    const held = f.serializer.run(f.b.key, () => blocker.promise)
+
+    const done = f.lifecycle.updateInPlace(change(f.b, ['dm.contact']))
+    f.applied.splice(f.applied.indexOf(f.b), 1)
+    blocker.resolve()
+    await held
+    await done
+
+    expect(f.trail).toEqual([])
+    expect(f.lines).toEqual([])
+  })
+
+  test('reading the applied set throws: one token-safe failure line, nothing forgotten, and the update resolves (no rejection)', async () => {
+    const f = makeInPlaceFixture({ overrides: { appliedPersonas: () => { throw failure() } } })
+
+    await expect(f.lifecycle.updateInPlace(change(f.b, ['dm.contact']))).resolves.toBeUndefined()
+
+    expect(f.trail).toEqual([])
+    expect(f.lines).toHaveLength(1)
+    expect(f.lines[0]).toMatch(
+      new RegExp(`^${RegExp.escape(`[slack] persona ${renderPersonaRef(f.b.name, f.b.key)}: in-place update failed: Error`)}( |$)`),
+    )
+    assertNoLeak({ lines: f.lines })
+  })
+
+  test('serialized per key: B\'s update waits behind an operation running for B; A\'s update does not', async () => {
+    const f = makeInPlaceFixture()
+    const blocker = Promise.withResolvers<void>()
+    const held = f.serializer.run(f.b.key, () => blocker.promise)
+
+    const forB = f.lifecycle.updateInPlace(change(f.b, ['dm.contact']))
+    await f.lifecycle.updateInPlace(change(f.a, ['dm.enabled']))
+    expect(await settled(forB)).toBe(false)
+    expect(f.trail).toEqual([`destinations.forget:${f.a.key}`])
+    expect(f.lines).toEqual([updatedLine(f.a, ['dm.enabled'], FORGOTTEN)])
+
+    blocker.resolve()
+    await held
+    await forB
+    expect(f.trail).toEqual([`destinations.forget:${f.a.key}`, `destinations.forget:${f.b.key}`])
+    expect(f.lines).toEqual([updatedLine(f.a, ['dm.enabled'], FORGOTTEN), updatedLine(f.b, ['dm.contact'], FORGOTTEN)])
+    expect(f.submitted).toEqual([f.b.key, f.a.key])
+  })
+
+  describe('over the real destination resolver (makeNotifierHarness): the next DM notice after the update', () => {
+    // Rows: the changed settings (B's DM contact itself unchanged), and how many opens B's two notices make.
+    test.each<[InPlaceSetting[], number]>([
+      [['channels', 'delivery'], 1],
+      [['dm.enabled'], 2],
+      [['permission_prompts'], 2],
+    ])('%j changed: B\'s next DM notice makes %i conversations.open in all, and both notices post to the opened DM through B\'s own client', async (settings, opens) => {
+      const config = makeConfig()
+      const [a, b0] = config.personas as [Persona, Persona]
+      const b: Persona = { ...b0, dm: { enabled: true, contact: 'U0BETA001' }, permission_prompts: 'dm' }
+      const h = makeNotifierHarness({ personas: [a, b] })
+      cleanups.push(() => h.hold.cancelAll())
+      const f = makeFixture({ overrides: { destinations: h.destinations } })
+      f.applied.splice(0, f.applied.length, a, b)
+
+      await h.notifier.notify(b.key, 'first notice')
+      await f.lifecycle.updateInPlace(change(b, settings))
+      await h.notifier.notify(b.key, 'second notice')
+
+      const stubB = h.stub(b.key)
+      expect(stubB.calls.conversationsOpen).toHaveLength(opens)
+      for (const args of stubB.calls.conversationsOpen) expect(args).toMatchObject({ users: 'U0BETA001' })
+      const posts = h.posts(b.key)
+      expect(posts).toHaveLength(2)
+      expect(posts[0]!.channel).toMatch(/^D/)
+      expect(posts[1]!.channel).toBe(posts[0]!.channel)
+      expect(h.posts(a.key)).toEqual([])
+      expect(h.clock.pendingCount()).toBe(0)
+      assertNoLeak({ lines: f.lines, logs: h.logs, posts: h.allPosts() })
+    })
   })
 })
 

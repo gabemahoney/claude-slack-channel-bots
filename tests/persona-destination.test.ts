@@ -11,7 +11,8 @@
  * share one open. A `dm` destination with DMs off or no contact is refused
  * with no Slack call. Nothing rejects. A `channel_not_found` eviction is
  * synchronous and drops only the entry the post used, never a newer (even
- * pending) one. Failures are described token-safely
+ * pending) one. An open in flight across a `forget(key)` (an in-place update,
+ * with or without a new contact) that then succeeds is never reused. Failures are described token-safely
  * (`describeDestinationFailure`, `describeDestinationFailureCause`).
  *
  * Pure module under test: built over one `makeStubSlack` stub per persona
@@ -191,6 +192,44 @@ describe('resolution (SR-7.1)', () => {
     expect(posts(A)).toHaveLength(2)
     expect(posts(B)).toHaveLength(2)
   })
+
+  // An in-place update forgets the persona's cached DM when `dm.contact`,
+  // `dm.enabled` or `permission_prompts` changed (E12 decision 11), so the
+  // forget can come with or without a new contact.
+  test.each([
+    ['with a new contact', 'U0NEWCON1'],
+    ['with the contact unchanged (a permission_prompts or dm.enabled change)', 'U0ALPHA01'],
+  ] as const)(
+    'an open in flight when forget(key) runs %s, succeeding afterwards, is never reused: the next post opens for the current contact; the other persona stays cached',
+    async (_label, contact) => {
+      await post(B, 'b-1')
+      const old = makeDeferredWebApiCall()
+      stub(A).script.open.push(old.outcome)
+      const oldPost = d.post(A, client(A), { text: 'old' })
+      await drainMicrotasks()
+
+      d.forget(A.key)
+      const current = withContact(A, contact)
+      old.settle({ kind: 'ok', result: { channel: { id: 'D0STALEDM1' } } })
+      // The post issued before the change finishes in the conversation it opened.
+      expect(record(await oldPost)).toMatchObject({ outcome: 'posted', channelId: 'D0STALEDM1' })
+      await drainMicrotasks()
+
+      stub(A).script.open.push(openedDm('D0FRESHDM1'))
+      expect(await post(current, 'new-1')).toMatchObject({ outcome: 'posted', channelId: 'D0FRESHDM1' })
+      expect(await post(current, 'new-2')).toMatchObject({ outcome: 'posted', channelId: 'D0FRESHDM1' })
+      await post(B, 'b-2')
+
+      expect(opens(A)).toEqual([{ users: 'U0ALPHA01' }, { users: contact }])
+      expect(posts(A).map((c) => [c.text, c.channel])).toEqual([
+        ['old', 'D0STALEDM1'],
+        ['new-1', 'D0FRESHDM1'],
+        ['new-2', 'D0FRESHDM1'],
+      ])
+      expect(opens(B)).toEqual([{ users: 'U0BETA002' }])
+      expect(posts(B).map((c) => c.channel)).toEqual([stubOpenedDmId('U0BETA002'), stubOpenedDmId('U0BETA002')])
+    },
+  )
 
   test('two dm personas with different contacts each open their own conversation on their own client only', async () => {
     const [ra, rb] = (await Promise.all([d.post(A, client(A), { text: 'for A' }), d.post(B, client(B), { text: 'for B' })])).map(record)

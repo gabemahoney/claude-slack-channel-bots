@@ -20,14 +20,25 @@
  *
  * SR-6.5 / SR-6.1 / SR-6.6 (E12 Task 2): a confirmed apply's teardowns (step
  * 2) and bring-ups (step 6) are the controller's default fan-out over its
- * lifecycle members `teardown` and `bringUp`. The audit pins that production
- * binds both to the one `PersonaLifecycle` main() composes with
+ * lifecycle members `teardown` and `bringUp`; its in-place updates (step 3,
+ * E12 Task 3) over `updateInPlace`. The audit pins that production binds all
+ * three to the one `PersonaLifecycle` main() composes with
  * `createPersonaLifecycle` (declared before the controller, assigned once
  * after the bring-up controller exists and before detection is armed), passes
  * no `applySteps` override (which would replace that fan-out), and that the
  * restart timers, the bring-up retries and the lifecycle share one
- * per-persona serializer. What the teardown and the apply bring-up do is
- * tested behaviourally against `createPersonaLifecycle`.
+ * per-persona serializer. What the default step bodies do with those members
+ * is tested in tests/reload-apply.test.ts; what the teardown, the apply
+ * bring-up and the in-place update do is tested behaviourally against
+ * `createPersonaLifecycle`.
+ *
+ * AC 58 (SR-8.6 step 3): an in-place change takes effect from the next event
+ * or post because its consumers read the applied config holder `onApplied`
+ * reassigns, at call time. The audit pins the consumers no other audit
+ * covers: the persona routing's `getPersonaConfig`, the by-key lookup
+ * `getAppliedPersona`, and the notifier's and the MCP tools' `getPersona`
+ * (the event router's, the permission poller's and the destination hold's
+ * are pinned in tests/permission-relay-wiring.test.ts).
  *
  * What the timer and the tick do is tested behaviourally in
  * tests/reload-timer.test.ts and tests/reload.test.ts. Only the wiring that
@@ -282,32 +293,40 @@ function constOf(factory: string): string {
   return decls[0]![1]!
 }
 
-/** The lifecycle holder the controller's `teardown` and `bringUp` members forward to (see the first test below). */
+/** The lifecycle holder the controller's `teardown`, `updateInPlace` and `bringUp` members forward to (see the first test below). */
 function lifecycleHolder(): string {
   const lifecycle = objectProperties(controllerProps().get('lifecycle') ?? '')
   const teardown = (lifecycle.get('teardown') ?? '').match(/^\(?\s*(\w+)\s*\)?\s*=>\s*(\w+)\s*\.\s*teardown\s*\(\s*(\w+)\s*\)$/)
+  const updateInPlace = (lifecycle.get('updateInPlace') ?? '').match(
+    /^\(?\s*(\w+)\s*\)?\s*=>\s*(\w+)\s*\.\s*updateInPlace\s*\(\s*(\w+)\s*\)$/,
+  )
   const bringUp = (lifecycle.get('bringUp') ?? '').match(
     /^\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*=>\s*(\w+)\s*\.\s*bringUp\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)$/,
   )
   expect(teardown).not.toBeNull()
+  expect(updateInPlace).not.toBeNull()
   expect(bringUp).not.toBeNull()
   // Each passes its own parameters through, unchanged and in order.
   expect(teardown![3]).toBe(teardown![1])
+  expect(updateInPlace![3]).toBe(updateInPlace![1])
   expect([bringUp![4], bringUp![5]]).toEqual([bringUp![1], bringUp![2]])
-  // Both on the same holder.
+  // All three on the same holder.
+  expect(updateInPlace![2]).toBe(teardown![2])
   expect(bringUp![3]).toBe(teardown![2])
   return teardown![2]!
 }
 
-describe('server.ts binds the confirmed apply\'s teardown and bring-up (b.av2 SR-6.1, SR-6.5, SR-6.6)', () => {
-  // ReloadLifecycleOps.teardown and .bringUp are required, so the typecheck
-  // catches a missing member; it cannot catch one bound to something that
-  // does nothing. Without these bindings a confirmed removal would leave the
-  // persona's connection, session and instance running, and a confirmed
-  // addition would never come up.
-  test('the controller\'s lifecycle members teardown and bringUp forward their arguments to one lifecycle holder, beside the start bring-up', () => {
+describe('server.ts binds the confirmed apply\'s teardown, in-place update and bring-up (b.av2 SR-6.1, SR-6.5, SR-6.6, SR-8.6 step 3)', () => {
+  // ReloadLifecycleOps.teardown, .updateInPlace and .bringUp are required, so
+  // the typecheck catches a missing member; it cannot catch one bound to
+  // something that does nothing, or to another member. Without these
+  // bindings a confirmed removal would leave the persona's connection,
+  // session and instance running, a confirmed addition would never come up,
+  // and a confirmed routing change would be recorded as applied while the
+  // persona's cached DM conversation stayed and no line was logged.
+  test('the controller\'s lifecycle members teardown, updateInPlace and bringUp forward their arguments to one lifecycle holder, beside the start bring-up', () => {
     const lifecycle = objectProperties(controllerProps().get('lifecycle') ?? '')
-    expect([...lifecycle.keys()].sort()).toEqual(['bringUp', 'startBringUp', 'teardown'])
+    expect([...lifecycle.keys()].sort()).toEqual(['bringUp', 'startBringUp', 'teardown', 'updateInPlace'])
     expect(lifecycleHolder()).toMatch(/^\w+$/)
   })
 
@@ -465,5 +484,63 @@ describe('server.ts binds the confirmed apply\'s teardown and bring-up (b.av2 SR
     expect(m).not.toBeNull()
     expect(m![2]).toBe(startTimeConfig())
     expect(launch).toBe(onlyCallProps('createPersonaBringUpController').get('launch') ?? '')
+  })
+})
+
+
+// ---------------------------------------------------------------------------
+// In-place changes reach their consumers through the live applied config (AC 58)
+// ---------------------------------------------------------------------------
+
+/** The top-level properties of the module-scope `const <name>: <Type> = { … }` object literal. */
+function constObjectProps(name: string): Map<string, string> {
+  const decls = indicesOf(new RegExp(`\\bconst\\s+${name}\\s*(?::\\s*\\w+\\s*)?=\\s*\\{`, 'g'), SERVER_CODE)
+  expect(decls).toHaveLength(1)
+  expect(insideMain(SERVER_CODE, decls[0]!)).toBe(false)
+  return objectProperties(SERVER_CODE.slice(SERVER_CODE.indexOf('=', decls[0]!)))
+}
+
+describe('AC 58: in-place consumers read the applied config onApplied swaps, at call time (b.av2 SR-8.6 step 3)', () => {
+  // A confirmed channels, delivery, destination, DM contact or DMs-switch
+  // change is applied by step 1's swap of the holder (pinned above); step 3
+  // only clears per-persona caches. A consumer bound to a copy taken at start
+  // would keep the old values until the next restart.
+  test('AC 58: the applied config holder is one module-scope `let`, the one onApplied reassigns', () => {
+    const loaded = loadedConfigName(SERVER_CODE)
+    const decls = [...SERVER_CODE.matchAll(new RegExp(`\\b(?:let|const|var)\\s+${loaded}\\b[^\\n]*`, 'g'))]
+    expect(decls.map((d) => d[0].trim())).toEqual([`let ${loaded}: PersonaConfig | null = null`])
+    expect(insideMain(SERVER_CODE, decls[0]!.index!)).toBe(false)
+    // onApplied's swap target is this holder (startTimeConfig fails otherwise).
+    startTimeConfig()
+  })
+
+  test('AC 58: the persona routing (posting scope, delivery) reads the holder at call time', () => {
+    expect(onlyCallProps('createPersonaRouting').get('getPersonaConfig')).toBe(`() => ${loadedConfigName(SERVER_CODE)}`)
+  })
+
+  test('AC 58: getAppliedPersona, declared once at module scope, looks the key up in the holder at call time', () => {
+    const decls = indicesOf(/\bfunction\s+getAppliedPersona\s*\(/g, SERVER_CODE)
+    expect(decls).toHaveLength(1)
+    expect(insideMain(SERVER_CODE, decls[0]!)).toBe(false)
+    expect(indicesOf(/\b(?:let|const|var)\s+getAppliedPersona\b/g, SERVER_CODE)).toEqual([])
+    const [params, paramsEnd] = balancedAfter(SERVER_CODE, decls[0]!, '(', ')')
+    const key = SERVER_CODE.slice(params, paramsEnd).match(/^\s*(\w+)\s*:\s*string\s*$/)
+    expect(key).not.toBeNull()
+    const [bodyStart, bodyEnd] = balancedAfter(SERVER_CODE, paramsEnd, '{', '}')
+    const body = SERVER_CODE.slice(bodyStart, bodyEnd).replace(/\s+/g, ' ').trim()
+    const find = body.match(
+      new RegExp(`^return ${loadedConfigName(SERVER_CODE)} ?\\?\\. ?personas ?\\. ?find ?\\( ?\\(? ?(\\w+) ?\\)? ?=> ?\\1 ?\\. ?key ?=== ?(\\w+) ?\\) ?;?$`),
+    )
+    expect(find).not.toBeNull()
+    expect(find![2]).toBe(key![1])
+  })
+
+  // The event router's, the permission poller's and the destination hold's
+  // getPersona are pinned in tests/permission-relay-wiring.test.ts.
+  test.each([
+    ['the persona notifier (destination, DM contact and switch for notices)', () => onlyCallProps('createPersonaNotifier')],
+    ['the MCP session tools (reply scope)', () => constObjectProps('sessionToolDeps')],
+  ])('AC 58: %s get getPersona: getAppliedPersona', (_consumer, props) => {
+    expect(props().get('getPersona')).toBe('getAppliedPersona')
   })
 })

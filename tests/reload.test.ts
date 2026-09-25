@@ -24,7 +24,9 @@
  * failures, the pending file rewritten after a consumed confirmation (AC 56),
  * `reload-noop`, and the order of the step 2–6 slots; the 64 KiB read cap on
  * the start, tick and confirmation paths. Every test runs `assertNoLeak` over
- * what each run captured and checks no Slack post.
+ * what each run captured and checks no Slack post, except the one pure case
+ * of the default step 3 body (`lifecycleApplySlots` gives each persona one
+ * in-place update), which builds no run and handles no token.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -37,6 +39,7 @@ import { dirname, join } from 'node:path'
 import {
   DEFAULT_PERSONA_CONFIG_FS,
   prePersonaConversionMessage,
+  type Persona,
   type PersonaConfigFs,
   type PersonaInput,
 } from '../src/config.ts'
@@ -51,10 +54,19 @@ import {
   RELOAD_RECORD_WRITE_FAILED,
   RELOAD_STALE_CONFIRMATION,
 } from '../src/reload.ts'
-import { APPLY_STEPS, type ApplyStepInputs, type ApplyStepName, type ApplyStepSlots } from '../src/reload-apply.ts'
+import {
+  APPLY_STEPS,
+  lifecycleApplySlots,
+  type ApplyLifecycleMembers,
+  type ApplyStepInputs,
+  type ApplyStepName,
+  type ApplyStepSlots,
+  type InPlaceApplyInput,
+} from '../src/reload-apply.ts'
 import { composePendingFile, PENDING_FILE_HEADER, reloadFingerprint } from '../src/reload-fingerprint.ts'
 import { createReloadTickDriver } from '../src/reload-timer.ts'
 import { assertNoLeak, fakeToken, LEAK_SENTINEL, makeCredentials, writtenFile } from './test-helpers/credentials.ts'
+import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import {
   makeReloadHarness,
   mkfifoAvailable,
@@ -2441,6 +2453,60 @@ function recordingSlots(run: () => ReloadRun, candidate: () => Buffer | undefine
   const slots: ApplyStepSlots = Object.fromEntries(APPLY_STEPS.map((step) => [step, slot(step)]))
   return { slots, calls, events }
 }
+
+describe('the default step 3 body updates each persona once (lifecycleApplySlots)', () => {
+  test('an in-place list naming one persona key twice gets exactly one updateInPlace for that persona, with its first entry; other personas are still updated and no other member runs', async () => {
+    const previous = makeMultiPersonaConfig([{ name: 'alpha' }, { name: 'bravo' }], h.root)
+    const applied = makeMultiPersonaConfig(
+      [
+        { name: 'alpha', channels: [{ id: 'C0TEST001', delivery: 'mentions' }] },
+        { name: 'bravo', permission_prompts: 'dm', dm: { enabled: true } },
+      ],
+      h.root,
+    )
+    const [alpha, bravo] = applied.personas as [Persona, Persona]
+    const [alphaPrev, bravoPrev] = previous.personas as [Persona, Persona]
+    const alphaFirst: InPlaceApplyInput = { persona: alpha, previous: alphaPrev, settings: ['delivery'] }
+    const bravoChange: InPlaceApplyInput = {
+      persona: bravo,
+      previous: bravoPrev,
+      settings: ['permission_prompts', 'dm.enabled'],
+    }
+    const alphaAgain: InPlaceApplyInput = { persona: alpha, previous: alphaPrev, settings: ['channels'] }
+    const calls: string[] = []
+    const updates: InPlaceApplyInput[] = []
+    const failures: string[] = []
+    const members: ApplyLifecycleMembers = {
+      teardown: async (persona) => void calls.push(`teardown ${persona.key}`),
+      bringUp: async (persona) => void calls.push(`bringUp ${persona.key}`),
+      updateInPlace: async (change) => {
+        calls.push(`updateInPlace ${change.persona.key}`)
+        updates.push(change)
+      },
+    }
+    const slots = lifecycleApplySlots(members, (step, persona) => failures.push(`${step} ${persona.key}`))
+    const inputs: ApplyStepInputs = {
+      previous,
+      applied,
+      removed: [],
+      added: [],
+      destructiveOld: [],
+      destructiveNew: [],
+      inPlace: [alphaFirst, bravoChange, alphaAgain],
+      credentials: [],
+      credentialsBroken: [],
+      configDirsChanged: false,
+    }
+
+    await slots['in-place-updates']!(inputs)
+
+    expect(calls).toEqual([`updateInPlace ${alpha.key}`, `updateInPlace ${bravo.key}`])
+    expect(updates).toHaveLength(2)
+    expect(updates[0]).toBe(alphaFirst)
+    expect(updates[1]).toBe(bravoChange)
+    expect(failures).toEqual([])
+  })
+})
 
 /**
  * A running server over `names` (see `running`) whose config file then drops

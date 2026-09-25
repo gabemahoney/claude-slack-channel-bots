@@ -85,6 +85,8 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    pending, not applied. See [Pending changes](#pending-changes).
 9. **A persona was just added or removed by a confirmed change?** See
    [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change).
+   Its channels, destination or DM settings were changed? See
+   [A persona's routing settings were changed by a confirmed change](#a-personas-routing-settings-were-changed-by-a-confirmed-change).
 
 ---
 
@@ -400,9 +402,12 @@ running are not affected. See
 - **Meaning:** The persona's Slack app is a member of a channel that no
   persona lists in `channels`, so the message reached no one. Logged by each
   persona whose app received it.
-- **Fix:** Add the channel to the right persona's `channels` in `config.json`
-  and apply the edit (see [Applying a `config.json` edit](#applying-a-configjson-edit)),
-  or remove the app from the channel. If the ID is a
+- **Fix:** Add the channel to the right persona's `channels` in `config.json`,
+  or remove the app from the channel. A `config.json` edit becomes pending (see
+  [Pending changes](#pending-changes)); once confirmed (see
+  [Applying a `config.json` edit](#applying-a-configjson-edit)) it applies in
+  place, with no restart, and the persona keeps its instance and
+  conversation. If the ID is a
   group DM (someone @mentioned the persona in a multi-person DM), the line is
   expected: do not add that ID to any persona's `channels`, because that would
   deliver group-DM mentions to it.
@@ -415,10 +420,12 @@ running are not affected. See
   that persona's `dm.enabled` is off, so the message was not delivered. The
   line names the persona, the DM conversation, the message ts and
   `dm.enabled`, never the message text.
-- **Fix:** Set `dm.enabled` to `true` for that persona in `config.json` and
-  apply the edit (see [Applying a `config.json` edit](#applying-a-configjson-edit)).
-  Leaving it off is valid when the persona should ignore
-  DMs; the line is then expected.
+- **Fix:** Set `dm.enabled` to `true` for that persona in `config.json`. The
+  edit becomes pending (see [Pending changes](#pending-changes)); once
+  confirmed (see [Applying a `config.json` edit](#applying-a-configjson-edit))
+  it applies in place, with no restart, and the persona keeps its instance and
+  conversation. DMs sent before that aren't delivered later. Leaving it off
+  is valid when the persona should ignore DMs; the line is then expected.
 - **Group DMs:** a group DM (a direct message with more than one person) is
   not delivered and never logs `persona-dm-dropped`, whatever `dm.enabled`
   says. This is by design, not a fault; turning `dm.enabled` on does not
@@ -453,7 +460,11 @@ running are not affected. See
     [Other lines you may see](#other-lines-you-may-see));
   - a permission request stays open in agent-director. Its prompt is posted
     at the first retry that succeeds, if the request is still open then;
-  - the line is logged once per episode. Failed retries log nothing;
+  - the line is logged once per episode. Failed retries log nothing, except
+    that when `permission_prompts` was changed by a confirmed reload during
+    the episode, the first failure at the new destination logs one more start
+    line naming it. The `cleared:` line names the destination the successful
+    post went to;
   - a spawn-failure notice that fails at startup writes a `spawn-failure-post`
     record to `startup-errors.log` at its first failed attempt. The notice is
     still held, so the record can be followed by the `cleared:` line and the
@@ -480,6 +491,16 @@ running are not affected. See
     persona's app is still installed, and that the server's host can reach
     Slack. The Slack client retries a network failure itself first, for up to
     about 30 minutes, so a network outage can reach this line late.
+  - To send the persona's prompts and notices somewhere else instead, change
+    its `permission_prompts` (a channel its app is in, or `dm`) or its
+    `dm.contact` in `config.json`. The edit becomes pending (see
+    [Pending changes](#pending-changes)); once confirmed (see
+    [Applying a `config.json` edit](#applying-a-configjson-edit)) it applies
+    in place, with no restart, and the persona keeps its instance and
+    conversation. What is held goes to the new destination at its next retry;
+    prompts already posted stay where they are and can still be answered; a
+    changed `dm.contact` gets a fresh DM at the next prompt or notice (see
+    [A persona's routing settings were changed by a confirmed change](#a-personas-routing-settings-were-changed-by-a-confirmed-change)).
 - **Recovery:** No server restart is needed. At the next retry (at most
   5 minutes after the fix) the held notices and any still-open prompt appear
   at the destination under the persona's name and avatar, and `server.log`
@@ -648,6 +669,34 @@ guaranteed to be resumed.
 **Either.** `[slack] reload: apply step <n> (<step>) failed for persona "<name>" (key=<key>): <error>`
 is an internal error in that persona's teardown or bring-up; the other
 personas were still handled. Report it as a bug, with the persona's lines.
+
+---
+
+## A persona's routing settings were changed by a confirmed change
+
+A confirmed change to a kept persona's `channels` (each entry's `delivery`
+included), `permission_prompts`, `dm.enabled` or `dm.contact` applies in
+place on the running server, with no restart. The persona's instance, its
+conversation, its Slack connection and its MCP session are kept. The new
+values govern its next message, tool call, permission prompt and notice. This
+holds for a persona that is `retrying` or `broken` too: it uses the new values
+once it is up.
+
+- **Prompts already posted** stay where they were posted and can still be
+  answered, including a prompt in the persona's DM after `dm.enabled` is
+  turned off.
+- **Prompts and notices held** for a failing destination (see
+  [`persona-destination-failed`](#persona-destination-failed)) aren't
+  dropped: each retry goes to the new destination.
+- **A changed `dm.contact`** gets a fresh DM: the next prompt or notice opens
+  the DM with the new contact.
+
+| Line | Meaning |
+|---|---|
+| `[slack] persona "<name>" (key=<key>): updated in place (<settings>); its instance, Slack connection and MCP session are kept` | The change was applied. `<settings>` lists what changed, such as `channels, dm.contact`. Normal. The same line is logged for a persona that is `retrying` or `broken`, though it has no instance, connection or session yet; it serves with the new values once it comes up. |
+| … the same line ending `; its cached DM conversation is forgotten` | `permission_prompts` or `dm.*` changed, so the next post to a DM destination opens the DM again. Normal. |
+| … the same line ending `; forgetting its cached DM conversation failed: <error>` | An internal error. The new values still apply. Report it as a bug. |
+| `[slack] persona "<name>" (key=<key>): in-place update failed: <error>` | An internal error. The new values still apply, because the server reads them at each use. Report it as a bug. |
 
 ---
 
@@ -1122,15 +1171,20 @@ Within about 5 s the server deletes `config.json.pending` and logs
 
 ### Applying a `config.json` edit
 
-**Adding or removing personas needs no restart.** When the preview lists only
-`is added` and `is removed` lines (a rename is one of each), read it, then,
-with the operator's say-so, rename `config.json.pending` to
-`config.json.apply`. Within about 5 s the running server picks up the
-confirmation and starts tearing the removed personas down and bringing the
-added ones up. It logs [`reload-applied`](#reload-applied) only once all of
-them have settled, possibly minutes later; a persona that is `retrying` at
-that point isn't up yet (see
-[A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)).
+**Adding or removing personas, and changing a persona's routing settings,
+needs no restart.** When the preview lists only `is added` and `is removed`
+lines (a rename is one of each) and `… changed: applied in place immediately,
+instance kept` lines (a change to `channels`, a channel's `delivery`,
+`permission_prompts` or `dm.*`), read it, then, with the operator's say-so,
+rename `config.json.pending` to `config.json.apply`. Within about 5 s the
+running server picks up the confirmation, starts tearing the removed personas
+down, updates the changed ones in place and brings the added ones up. It logs
+[`reload-applied`](#reload-applied) only once all of them have settled,
+possibly minutes later; a persona that is `retrying` at that point isn't up
+yet (see
+[A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)
+and
+[A persona's routing settings were changed by a confirmed change](#a-personas-routing-settings-were-changed-by-a-confirmed-change)).
 For any other change, use the restart below.
 
 A restart doesn't apply an edit of `config.json` while a record exists. With

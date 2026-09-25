@@ -46,7 +46,10 @@
  *     post log one episode line (naming `im:write` only for the former); no
  *     Slack call, trail event or line inside a backoff window; retries at 5 s
  *     and a further 10 s; delivered once when the cause clears, with one
- *     cleared line. A held persona never holds another; a request closed
+ *     cleared line. A prompt held when `permission_prompts` changes in place
+ *     is retried, once due, at the new destination only, tracked there and
+ *     named by the cleared line; a failure there logs one more opening line
+ *     naming it. A held persona never holds another; a request closed
  *     while held is never posted or updated; a stuck-prompt warning joins the
  *     episode and a held tick leaves its throttle alone; a payload error is
  *     not held and is tried again next tick. A due retry whose attempt ends
@@ -55,9 +58,16 @@
  *     as the throw rejects the tick) never leaves the persona held: its next
  *     prompt or warning posts. A token-shaped Slack error reaches the trail
  *     and the episode line as `unknown_error`.
- *   - Closing updates after DMs are turned off or the destination changes
- *     (AC 36, b.av2 SR-5.1): one `chat.update` on the recorded conversation
- *     and ts, no post and no open; later prompts use the new destination.
+ *   - Closing updates after DMs are turned off, the destination changes or
+ *     `dm.contact` changes in place with the cached DM forgotten (AC 36,
+ *     b.av2 SR-5.1): one `chat.update` on the recorded conversation and ts,
+ *     no post and no open; later prompts use the new destination; another
+ *     persona's tracked prompt is untouched.
+ *   - The applied set swapped mid-tick (a confirmed reload's step 1; AC 58):
+ *     a destination or DMs change during the `get`, or between two prompts
+ *     of one row, sends the next prompt to the new destination; a persona
+ *     removed then posts nothing more, logs the unchanged "names no applied
+ *     persona" line once and its tracked prompt is not closed.
  *   - Persona client unavailable: prompt logged once and retried; closure
  *     logged naming the persona (or its key once it is gone) and dropped;
  *     stuck-prompt warning unlatched and throttled.
@@ -149,7 +159,7 @@ import {
 } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
-import { asWebClient, makeStubSlack, openedDm, stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
+import { asWebClient, makeDeferredWebApiCall, makeStubSlack, openedDm, stubOpenedDmId, type StubSlack } from './test-helpers/slack-stub.ts'
 import { BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
 import {
   makeManualInterval,
@@ -786,6 +796,7 @@ describe('poller tick — persona routing (b.av2 SR-7.1)', () => {
 
 describe('poller tick — `dm` destination (b.av2 SR-7.1, SR-5.1)', () => {
   const A_CONTACT = 'U0ACONTACT1'
+  const D_NEW_CONTACT = 'U0DNEWCON1'
   const TOKEN_C = '33333333-3333-4333-8333-333333333333'
   const request = (request_token: string, request_id: number) => cannedPermissionRequest({ request_token, request_id })
   const allowAll = async (params: GetPermissionParams): Promise<GetPermissionResult> =>
@@ -894,6 +905,11 @@ describe('poller tick — `dm` destination (b.av2 SR-7.1, SR-5.1)', () => {
       KEY_A, () => reconfigure(KEY_A, { dm: { enabled: true, contact: A_CONTACT }, permission_prompts: 'dm' }),
       () => A_DEST, ['chat.postMessage'], ['conversations.open', 'chat.postMessage'], () => stubOpenedDmId(A_CONTACT),
     ],
+    [
+      'a DM prompt, after dm.contact changes',
+      KEY_D, () => reconfigure(KEY_D, { dm: { enabled: true, contact: D_NEW_CONTACT } }),
+      () => D_DM, ['conversations.open', 'chat.postMessage'], ['conversations.open', 'chat.postMessage'], () => stubOpenedDmId(D_NEW_CONTACT),
+    ],
   ])('%s: the closing update is one chat.update on the recorded conversation and ts through the persona\'s client, with no post and no open; a later prompt uses the new destination', async (_label, key, change, postedIn, firstMethods, nextMethods, nextChannel) => {
     const persona = getPersona(key)!
     const stub = stubOf(key)
@@ -995,6 +1011,136 @@ describe('poller tick — `dm` destination (b.av2 SR-7.1, SR-5.1)', () => {
     expect(methods(stubD)).toEqual(['conversations.open', 'chat.postMessage'])
     expect(getLivePermission(INSTANCE_D, TOKEN_B)?.channelId).toBe(D_DM)
     expect(refusals()).toHaveLength(2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The applied set swapped mid-tick (a confirmed reload's step 1; AC 58)
+// ---------------------------------------------------------------------------
+
+describe('poller tick — the applied set swapped mid-tick by a confirmed reload (AC 58)', () => {
+  const A_CONTACT = 'U0ACONTACT1'
+  const TOKEN_C = '33333333-3333-4333-8333-333333333333'
+  const request = (request_token: string, request_id: number) => cannedPermissionRequest({ request_token, request_id })
+  const allowAll = async (params: GetPermissionParams): Promise<GetPermissionResult> =>
+    cannedGetPermissionResponse({ request_token: params.request_token, decision: 'allow', decision_reason: null })
+  /** The poller's line for a listed row naming no applied persona, unchanged when the persona goes mid-tick. */
+  const notAppliedLine = (instance: string, key: string) =>
+    `[slack] permission-poller: spawn ${instance} names no applied persona (persona=${key}) — skipping`
+  const notAppliedLines = (logCalls: unknown[][]) => logLines(logCalls, 'names no applied persona')
+
+  test.each<[string, string, () => void, string[], () => string]>([
+    [
+      'AC 58: D\'s DMs turned off and its prompts moved to its channel while its get is in flight: one post to the channel, no conversations.open',
+      KEY_D, () => reconfigure(KEY_D, { dm: { enabled: false }, permission_prompts: D_WORK }), ['chat.postMessage'], () => D_WORK,
+    ],
+    [
+      'AC 58: A\'s prompts moved from its channel to dm while its get is in flight: the DM with the new contact is opened and posted to',
+      KEY_A, () => reconfigure(KEY_A, { dm: { enabled: true, contact: A_CONTACT }, permission_prompts: 'dm' }),
+      ['conversations.open', 'chat.postMessage'], () => stubOpenedDmId(A_CONTACT),
+    ],
+  ])('%s; the live entry names it', async (_label, key, change, expectedMethods, expectedChannel) => {
+    const persona = getPersona(key)!
+    const stub = key === KEY_A ? stubA : stubD
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow(persona)] }),
+      get: async () => {
+        change()
+        return getResult([request(TOKEN_A, 1)], persona)
+      },
+    }))
+    await ivl.tick()
+
+    expect(methods(stub)).toEqual(expectedMethods)
+    if (key === KEY_A) expect(stubA.calls.conversationsOpen).toEqual([{ users: A_CONTACT }])
+    expect(posts(stub).map((c) => c.channel)).toEqual([expectedChannel()])
+    expect(getLivePermission(personaInstanceId(key), TOKEN_A)?.channelId).toBe(expectedChannel())
+    expect(slackCalls(...[stubA, stubB, stubD].filter((s) => s !== stub))).toBe(0)
+  })
+
+  test.each<[string, PermissionRequestRow[]]>([
+    ['a new request (the prompt path)', [request(TOKEN_B, 2)]],
+    ['no open request (the stuck-prompt path)', []],
+  ])('A removed from the applied set while its get is in flight, the row showing %s: nothing posted, the unchanged not-applied line once, and its tracked prompt is not treated as closed', async (_label, laterRows) => {
+    scriptPostTs(stubA, POST_TS)
+    const logCalls: unknown[][] = []
+    const trail = makeTrailCapture()
+    const getPermissionCalls: GetPermissionParams[] = []
+    let rows = [request(TOKEN_A, 1)]
+    let removeDuringGet = false
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow(A)] }),
+      get: async () => {
+        if (removeDuringGet) unapply(KEY_A)
+        return getResult(rows, A)
+      },
+      getPermission: async (params: GetPermissionParams): Promise<GetPermissionResult> => {
+        getPermissionCalls.push(params)
+        return allowAll(params)
+      },
+    }), { log: (...args) => { logCalls.push(args) }, emitTrail: trail.emit })
+    await ivl.tick()
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)?.messageTs).toBe(POST_TS)
+
+    removeDuringGet = true
+    rows = laterRows
+    await ivl.tick()
+
+    expect(methods(stubA)).toEqual(['chat.postMessage'])
+    expect(getLivePermission(INSTANCE_A, TOKEN_B)).toBeUndefined()
+    expect(notAppliedLines(logCalls)).toEqual([[notAppliedLine(INSTANCE_A, KEY_A)]])
+    // TOKEN_A is missing from the row, yet it is neither closed nor updated.
+    expect(getPermissionCalls).toEqual([])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ channelId: A_DEST, messageTs: POST_TS, handled: false })
+    expect(rowDecisions(trail, 'reconciled_closed')).toEqual([])
+    expect(slackCalls(stubB, stubD)).toBe(0)
+    assertNoLeak({ logCalls, trail: trail.events }, 'removed mid-get')
+  })
+
+  /**
+   * Tick once with A's row holding the new requests `rows`, running `change`
+   * while the first prompt's chat.postMessage is in flight (it then answers
+   * POST_TS).
+   */
+  async function tickChangingDuringFirstPost(
+    change: () => void,
+    logCalls: unknown[][],
+    rows: PermissionRequestRow[] = [request(TOKEN_A, 1), request(TOKEN_B, 2)],
+  ): Promise<void> {
+    const first = makeDeferredWebApiCall()
+    stubA.script.post.push(first.outcome)
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow(A)] }),
+      get: async () => getResult(rows, A),
+    }), { log: (...args) => { logCalls.push(args) } })
+    const ticking = ivl.tick()
+    for (let i = 0; i < 1000 && posts(stubA).length === 0; i++) await Promise.resolve()
+    expect(posts(stubA)).toHaveLength(1)
+    change()
+    first.settle({ kind: 'ok', result: { ts: POST_TS } })
+    await ticking
+  }
+
+  test('AC 58: A\'s destination changed between two prompts of one row: the second goes to the new destination', async () => {
+    const logCalls: unknown[][] = []
+    await tickChangingDuringFirstPost(() => reconfigure(KEY_A, { permission_prompts: A_WORK }), logCalls)
+
+    expect(posts(stubA).map((c) => c.channel)).toEqual([A_DEST, A_WORK])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)?.channelId).toBe(A_DEST)
+    expect(getLivePermission(INSTANCE_A, TOKEN_B)?.channelId).toBe(A_WORK)
+    expect(notAppliedLines(logCalls)).toEqual([])
+  })
+
+  test('A removed after the first of three prompts of one row: the other two are not posted, the unchanged not-applied line once; the first stays tracked', async () => {
+    const logCalls: unknown[][] = []
+    await tickChangingDuringFirstPost(() => unapply(KEY_A), logCalls, [request(TOKEN_A, 1), request(TOKEN_B, 2), request(TOKEN_C, 3)])
+
+    expect(methods(stubA)).toEqual(['chat.postMessage'])
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ channelId: A_DEST, messageTs: POST_TS })
+    expect(getLivePermission(INSTANCE_A, TOKEN_B)).toBeUndefined()
+    expect(getLivePermission(INSTANCE_A, TOKEN_C)).toBeUndefined()
+    expect(notAppliedLines(logCalls)).toEqual([[notAppliedLine(INSTANCE_A, KEY_A)]])
+    expect(slackCalls(stubB, stubD)).toBe(0)
   })
 })
 
@@ -1164,6 +1310,85 @@ describe('poller tick — a destination failure holds the persona\'s prompts and
     expect(rowDecisions(trail, 'already_tracked')).toHaveLength(2)
     for (const other of [stubA, stubB, stubD].filter((s) => s !== stub)) expect(other.callLog).toEqual([])
     assertNoLeak({ logCalls, trail: trail.events }, 'held prompt')
+  })
+
+  test.each<[string, 'posts' | 'channel_not_found']>([
+    ['the cause clears: the retry due at 5 s posts once, to A_WORK', 'posts'],
+    ['A_WORK fails channel_not_found at 5 s: one more opening line naming A_WORK; the retry due at 15 s posts once, to A_WORK', 'channel_not_found'],
+  ])('a prompt held at A_DEST when permission_prompts changes in place to A_WORK — %s; it is tracked there (its closing update goes to A_WORK) and the cleared line names A_WORK', async (_label, atWork) => {
+    failSticky(stubA, 'post', 'not_in_channel')
+    const trail = makeTrailCapture()
+    const logCalls: unknown[][] = []
+    const { clock, hold } = makeHold(logCalls)
+    let rows = [request(TOKEN_A, 1)]
+    const ivl = startPoller(() => ({
+      list: async () => ({ spawns: [checkPermRow(A)] }),
+      get: async () => getResult(rows, A),
+      getPermission: allowAll,
+    }), { emitTrail: trail.emit, log: (...args) => { logCalls.push(args) }, destinationHold: hold })
+    // One tick at virtual time `ms`, settled through one zero-delay timer (see the test above).
+    const tickAt = async (ms: number): Promise<void> => {
+      await clock.advanceTo(ms)
+      ivl.fire()
+      await new Promise((r) => setTimeout(r, 0))
+    }
+    const expectHeldThrough = async (from: number, to: number): Promise<void> => {
+      const before = { calls: stubA.callLog.length, events: trail.events.length, lines: logCalls.length }
+      for (let ms = from; ms <= to; ms += 1000) await tickAt(ms)
+      expect({ calls: stubA.callLog.length, events: trail.events.length, lines: logCalls.length }).toEqual(before)
+    }
+    const prefix = `[slack] ${EPISODE_CLASS}: personas[${A.index}] ${renderPersonaRef(NAME_A, KEY_A)}: `
+    const opening = (destination: string, code: string) =>
+      `${prefix}chat.postMessage failed for destination=${destination} with error ${code}; ` +
+      'holding its permission prompts and notices and retrying with backoff'
+    const cleared = (destination: string, code: string) =>
+      `${prefix}cleared: destination=${destination} accepts posts again (was chat.postMessage error ${code}); delivering what was held`
+    const episode = () => episodeLines(logCalls).map((args) => String(args[0]))
+
+    // t=0: the post to A_DEST fails; the episode opens naming A_DEST.
+    await tickAt(0)
+    expect(posts(stubA).map((c) => c.channel)).toEqual([A_DEST])
+    expect(episode()).toEqual([opening(A_DEST, 'not_in_channel')])
+    expect(hold.view(KEY_A).nextDueAt).toBe(5000)
+
+    // The destination changes in place; the cause at A_DEST clears too.
+    reconfigure(KEY_A, { permission_prompts: A_WORK })
+    clearSticky(stubA, 'post')
+    if (atWork === 'channel_not_found') stubA.script.post.push({ kind: 'platform', error: 'channel_not_found' })
+    scriptPostTs(stubA, POST_TS)
+    await expectHeldThrough(1000, 4000)
+
+    // t=5 s: the due retry is exactly one post, to the new destination.
+    await tickAt(5000)
+    expect(posts(stubA).map((c) => c.channel)).toEqual([A_DEST, A_WORK])
+    let dueAt = 5000
+    if (atWork === 'channel_not_found') {
+      expect(episode()).toEqual([opening(A_DEST, 'not_in_channel'), opening(A_WORK, 'channel_not_found')])
+      expect(getLivePermission(INSTANCE_A, TOKEN_A)).toBeUndefined()
+      expect(hold.view(KEY_A)).toEqual({ held: true, heldNotices: 0, nextDueAt: 15_000 })
+      await expectHeldThrough(6000, 14_000)
+      dueAt = 15_000
+      await tickAt(dueAt)
+      expect(posts(stubA).map((c) => c.channel)).toEqual([A_DEST, A_WORK, A_WORK])
+      expect(episode()).toEqual([
+        opening(A_DEST, 'not_in_channel'),
+        opening(A_WORK, 'channel_not_found'),
+        cleared(A_WORK, 'channel_not_found'),
+      ])
+    } else {
+      expect(episode()).toEqual([opening(A_DEST, 'not_in_channel'), cleared(A_WORK, 'not_in_channel')])
+    }
+    expect(getLivePermission(INSTANCE_A, TOKEN_A)).toMatchObject({ personaKey: KEY_A, channelId: A_WORK, messageTs: POST_TS })
+    expect(hold.view(KEY_A)).toEqual({ held: false, heldNotices: 0, nextDueAt: undefined })
+    expect(pollerFailureLines(logCalls)).toEqual([])
+
+    // The request closes: its closing update goes where the prompt was posted.
+    rows = []
+    await tickAt(dueAt + 1000)
+    expect(updates(stubA).map((c) => [c.channel, c.ts])).toEqual([[A_WORK, POST_TS]])
+    expect(posts(stubA)).toHaveLength(atWork === 'posts' ? 2 : 3)
+    expect(slackCalls(stubB, stubD)).toBe(0)
+    assertNoLeak({ logCalls, trail: trail.events }, 'held prompt, destination changed')
   })
 
   test('AC 44: the missing_scope line names the persona and the im:write scope, and tells the operator to re-install the app with it', async () => {

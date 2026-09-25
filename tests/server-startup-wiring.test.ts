@@ -522,11 +522,13 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
     expect(onlyCallProps('initRestart').get('canRestart')).toBe(constOf('createPersonaRelaunchGate'))
   })
 
-  test('the restart module\'s launch passes the gate to launchSession as canLaunch', () => {
+  test('the restart module\'s launch passes the live applied config (read at call time, SR-8.6) and the gate to launchSession as canLaunch', () => {
     const gate = constOf('createPersonaRelaunchGate')
     expect(onlyCallProps('initRestart').get('launchSession')).toContain('launchSession(')
     const args = onlyCallArgs('launchSession')
     expect(args).toHaveLength(3)
+    // The live applied set a confirmed reload swaps, never the start-time config.
+    expect(args[1]).toBe(loadedConfigName(SERVER_CODE))
     expect(objectProperties(args[2]!).get('canLaunch')).toBe(gate)
   })
 

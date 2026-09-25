@@ -117,6 +117,7 @@ import {
   renderStaleConfirmationLogLine,
   runApplySteps,
   type ApplyStepSlots,
+  type InPlaceApplyInput,
   type StaleConfirmationReason,
 } from './reload-apply.ts'
 import {
@@ -250,10 +251,10 @@ export interface ReloadTickDriver {
  * The per-persona lifecycle operations the controller drives. `startBringUp`
  * is the start pass. A confirmed apply's default step bodies
  * (`lifecycleApplySlots`, `reload-apply.ts`) fan out to `teardown` (step 2,
- * each removed persona) and `bringUp` (step 6, each added persona);
- * production binds both through `persona-lifecycle.ts`. `reconnectCredentials`
- * and `updateInPlace` are bound by the work that implements steps 4 and 3,
- * and nothing calls them yet.
+ * each removed persona), `updateInPlace` (step 3, each persona modified in
+ * place) and `bringUp` (step 6, each added persona); production binds all
+ * three through `persona-lifecycle.ts`. `reconnectCredentials` is bound by
+ * the work that implements step 4, and nothing calls it yet.
  */
 export interface ReloadLifecycleOps {
   /**
@@ -273,8 +274,12 @@ export interface ReloadLifecycleOps {
   teardown(persona: Persona): Promise<unknown>
   /** Reconnect one persona with its changed credentials file. */
   reconnectCredentials?(persona: Persona, applied: PersonaConfig): Promise<unknown>
-  /** Apply one persona's modified settings without tearing it down. */
-  updateInPlace?(persona: Persona, previous: Persona, applied: PersonaConfig): Promise<unknown>
+  /**
+   * Apply the in-place settings of one persona a confirmed change modified in
+   * place, without tearing it down (its instance is kept): `change.persona`
+   * is its entry in the configuration step 1 made current.
+   */
+  updateInPlace(change: InPlaceApplyInput): Promise<unknown>
 }
 
 /**
@@ -309,7 +314,7 @@ export type BringUpStateQuery = (key: string) => PersonaBringUpState | undefined
 export interface ReloadControllerDeps {
   /** The configuration file and its reload files (`reloadFilePaths`). */
   paths: ReloadFilePaths
-  /** The lifecycle operations; `startBringUp`, `bringUp` and `teardown` are required. */
+  /** The lifecycle operations; all but `reconnectCredentials` are required. */
   lifecycle: ReloadLifecycleOps
   /** Receives each `[slack]` line the controller logs (the server log). */
   log: (line: string) => void
@@ -366,7 +371,8 @@ export interface ReloadControllerDeps {
    * Test override: the bodies of apply steps 2–6 (`reload-apply.ts`), used
    * instead of the default ones; an unbound step then does nothing. Without
    * it the controller runs `lifecycleApplySlots` over `lifecycle` (step 2
-   * tears down each removed persona, step 6 brings up each added one).
+   * tears down each removed persona, step 3 updates each persona modified in
+   * place, step 6 brings up each added one).
    * Production never sets it.
    */
   applySteps?: ApplyStepSlots

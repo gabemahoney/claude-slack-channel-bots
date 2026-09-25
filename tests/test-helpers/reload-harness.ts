@@ -132,13 +132,14 @@
  *   applied persona up at once through `run.bringUps` and launches each one
  *   that ends `up`; a launch is only recorded (nothing is spawned).
  *   `bringUp` does the same for one persona; `teardown` cancels the persona's
- *   bring-up and stops its connection; `reconnectCredentials` and
- *   `updateInPlace` are recorded only. With `opts.realLifecycle`, `bringUp`
- *   and `teardown` run the real composition instead (`run.composition`, see
+ *   bring-up and stops its connection; `updateInPlace` is recorded (with the
+ *   changed `settings`) and does nothing else; `reconnectCredentials` is
+ *   recorded only. With `opts.realLifecycle`, `bringUp`, `teardown` and
+ *   `updateInPlace` run the real composition instead (`run.composition`, see
  *   `RealLifecycleComposition`: `createPersonaLifecycle` over the run's
- *   controller and manager, a real serializer, the real agent-director kill
- *   and delete over a `makeStubClient` stub, `opts.agentDirector`, a
- *   recorded launch, and never shutting down). The controller's default step bodies call them for
+ *   controller and manager, a real serializer, the run's destination
+ *   resolver, the real agent-director kill and delete over a `makeStubClient`
+ *   stub, `opts.agentDirector`, a recorded launch, and never shutting down). The controller's default step bodies call them for
  *   every confirmed apply run without `opts.applySteps`. Every call is a
  *   `ReloadLifecycleRecord` in call order (`records`, `of(op)`, `keys(op)`);
  *   a bring-up record gets its `result` (outcome `up`/`broken`/`retrying` and
@@ -147,11 +148,32 @@
  *   `holdStartPass()` keeps the next start pass from resolving until the
  *   returned release is called, or makes it reject once `release.fail(err)`
  *   is called (a start pass that throws after its bring-ups and launches).
- *   Apply-time calls: `hold(op, key)` holds the next `teardown` or
- *   `bring-up` of one persona before its body runs until `release()`, or
- *   makes it reject with `fail(err)`; `timeline` lists every apply-time
- *   teardown and bring-up as it started and settled or rejected, across
- *   personas and steps (b.av2 SR-8.6 step order without timing);
+ *   Apply-time calls: `hold(op, key)` holds the next `teardown`,
+ *   `update-in-place` or `bring-up` of one persona before its body runs
+ *   until `release()`, or makes it reject with `fail(err)`; `timeline` lists
+ *   every apply-time teardown, in-place update and bring-up as it started and
+ *   settled or rejected, across personas and steps (b.av2 SR-8.6 step order
+ *   without timing);
+ * - the real consumers of the applied settings (b.av2 SR-13.1), wired as
+ *   `server.ts` wires them and reading the controller's applied
+ *   configuration at each use: the routing (`createPersonaRouting`) behind
+ *   the real event router on the manager's `onEvent`, and one destination
+ *   resolver, destination hold (on its own fake clock, never the real one or
+ *   `run.clock`) and notifier (`makeNotifierStack`), whose up-flush listener
+ *   joins the bring-up controller on `onStatus`; with `opts.realLifecycle`
+ *   the composition's `destinations.forget` is that resolver's. Post-apply
+ *   drivers (b.av2 SR-13.1): `run.registerSession(name)` registers the
+ *   persona's MCP session in the real registry (`run.session(name)` is it
+ *   now, compared by identity to show it was kept); `run.deliver(name,
+ *   event)` delivers an event on its socket stub, and `run.deliveries(name)`
+ *   is what reached its session (`chat_id`, `via`, `content`);
+ *   `run.notice(name, text)` raises a notice through the notifier (its Slack
+ *   calls are on `run.stub(name).callLog`); `run.callTool(name, tool,
+ *   args)` calls an MCP tool as its instance over `createSessionServer`.
+ *   Deliver only to a persona with a registered session (a lost message
+ *   would reach the restart module, which the harness does not set up).
+ *   A delivery makes a `users.info` call (the author's name), and no ack
+ *   reaction;
  * - `run.ticks`: a manual `ReloadTickDriver`. Nothing runs until the test
  *   calls `tick()` or `ticks(n)` (each awaited until the pass settles; `tick`
  *   rejects when nothing is armed); no real timer is ever armed. `armed`,
@@ -242,8 +264,9 @@
  * the operator's home, builds no real Slack client or agent-director client,
  * arms no real timer and holds no token literal. The real composition
  * installs the outage state's module dependencies (its stub client and a
- * recording notice sink), which `h.cleanup()` resets. It spawns nothing but
- * `mkfifo` (in `mkfifoAvailable` and `h.makeFifo`).
+ * recording notice sink), and a registered session or delivered event
+ * touches the registry and ack tracker; `h.cleanup()` resets them. It
+ * spawns nothing but `mkfifo` (in `mkfifoAvailable` and `h.makeFifo`).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -297,15 +320,35 @@ import {
   type CredentialsDigest,
   type CredentialsFs,
 } from '../../src/persona-credentials.ts'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
+
+import { _resetAckTracker, consumeAck } from '../../src/ack-tracker.ts'
+import { defaultAccess } from '../../src/lib.ts'
 import { personaInstanceId, personaKey } from '../../src/persona-identity.ts'
+import { createPersonaEventRouter } from '../../src/persona-event-router.ts'
 import { createPersonaLifecycle, type PersonaLifecycle } from '../../src/persona-lifecycle.ts'
-import { createPersonaSerializer, type PersonaSerializer } from '../../src/persona-serializer.ts'
-import { composePersonaStatusListeners } from '../../src/persona-start.ts'
+import { createPersonaRouting } from '../../src/persona-routing.ts'
+import { createPersonaSerializer } from '../../src/persona-serializer.ts'
+import {
+  composePersonaStatusListeners,
+  createPersonaClientLookup,
+  createPersonaIdentityLookup,
+  createPersonaUpFlushListener,
+} from '../../src/persona-start.ts'
 import { _resetOutageState, initOutageState } from '../../src/outage-state.ts'
+import {
+  _resetRegistry,
+  createSessionServer,
+  getSessionByPersona,
+  registerSession,
+  type SessionEntry,
+  type SessionToolDeps,
+} from '../../src/registry.ts'
 import { deletePersonaInstance, killPersonaInstance } from '../../src/session-manager.ts'
-import type { ApplyStepSlots } from '../../src/reload-apply.ts'
+import type { ApplyStepSlots, InPlaceApplyInput } from '../../src/reload-apply.ts'
 import { composePendingFile, parsePendingFingerprint } from '../../src/reload-fingerprint.ts'
-import { DESTRUCTIVE_PREFIX, PENDING_PREVIEW_TITLE } from '../../src/reload-plan.ts'
+import { DESTRUCTIVE_PREFIX, PENDING_PREVIEW_TITLE, type InPlaceSetting } from '../../src/reload-plan.ts'
 import {
   createReloadController,
   RELOAD_INVALID,
@@ -331,7 +374,9 @@ import {
 import type { FakeClock } from './fake-clock.ts'
 import { makePersona } from './persona-config.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './persona-connection-harness.ts'
-import type { StubSlack, StubSlackFactory, StubSlackOptions, StubWebCall } from './slack-stub.ts'
+import { makeNotifierStack } from './persona-notifier.ts'
+import { makeSessionServer, makeTransport, type ChannelNotification } from './persona-routing-harness.ts'
+import type { SlackEvent, StubSlack, StubSlackFactory, StubSlackOptions, StubWebCall } from './slack-stub.ts'
 
 // ---------------------------------------------------------------------------
 // Scripted Slack outcomes for a start
@@ -464,6 +509,8 @@ export interface ReloadLifecycleRecord {
   readonly via: ReloadLifecycleVia
   /** Bring-up only: the controller's summary, set once the bring-up resolved. */
   result?: PersonaBringUpResultSummary
+  /** In-place update only: the changed settings the controller passed (`InPlaceApplyInput.settings`), in its order. */
+  readonly settings?: readonly InPlaceSetting[]
 }
 
 export interface ReloadLifecycleRecorder {
@@ -488,26 +535,26 @@ export interface ReloadLifecycleRecorder {
    */
   holdStartPass(): StartPassHold
   /**
-   * Gate the next apply-time call of `op` (`teardown` or `bring-up`) for the
-   * persona `key`: the call is recorded and its `start` timeline entry made
-   * when it arrives, then it waits, its body not yet run, until
-   * `gate.release()` (the body runs) or `gate.fail(err)` (the call rejects
-   * with `err` and its body never runs). Call `fail` before the call arrives
-   * to make it reject at once. Other personas' calls are not held.
+   * Gate the next apply-time call of `op` (`teardown`, `update-in-place` or
+   * `bring-up`) for the persona `key`: the call is recorded and its `start`
+   * timeline entry made when it arrives, then it waits, its body not yet run,
+   * until `gate.release()` (the body runs) or `gate.fail(err)` (the call
+   * rejects with `err` and its body never runs). Call `fail` before the call
+   * arrives to make it reject at once. Other personas' calls are not held.
    */
   hold(op: LifecycleGateOp, key: string): LifecycleGate
   /**
-   * The apply-time `teardown` and `bring-up` calls in the order they started
-   * and settled (`start`, then `settled` or `rejected`), across personas and
-   * steps, so step order is asserted without timing (b.av2 SR-8.6). A held
-   * call's `start` comes when it arrives, its `settled` after its body ran.
-   * Start-pass bring-ups are not here.
+   * The apply-time `teardown`, `update-in-place` and `bring-up` calls in the
+   * order they started and settled (`start`, then `settled` or `rejected`),
+   * across personas and steps, so step order is asserted without timing
+   * (b.av2 SR-8.6). A held call's `start` comes when it arrives, its
+   * `settled` after its body ran. Start-pass bring-ups are not here.
    */
   readonly timeline: readonly LifecycleTimelineEntry[]
 }
 
 /** An apply-time lifecycle call a test can hold (`run.lifecycle.hold`). */
-export type LifecycleGateOp = 'teardown' | 'bring-up'
+export type LifecycleGateOp = 'teardown' | 'update-in-place' | 'bring-up'
 
 /** `run.lifecycle.hold(op, key)`'s handle. */
 export interface LifecycleGate {
@@ -535,10 +582,8 @@ export interface LifecycleTimelineEntry {
  * recording stand-in for every other dependency.
  */
 export interface RealLifecycleComposition {
-  /** The composition the recorder's `teardown` and `bringUp` call. */
+  /** The composition the recorder's `teardown`, `updateInPlace` and `bringUp` call. */
   readonly lifecycle: PersonaLifecycle
-  /** The run's per-persona serializer, also handed to the bring-up controller (as `server.ts` does). */
-  readonly serializer: PersonaSerializer
   /** Every agent-director verb call, by verb (`killCalls`, `deleteCalls`, …). */
   readonly agentDirector: StubCallLog
   /** The agent-director `kill` and `delete` calls in call order, as `<verb> <instance ID>`. */
@@ -556,6 +601,20 @@ export interface RealLifecycleComposition {
    * `'launch'`) plus `'outage-notice'` for a notice the outage state raised.
    */
   readonly calls: ReadonlyArray<readonly [string, string]>
+}
+
+/** One message the routing delivered to a persona's registered session (`run.deliveries`). Holds no token. */
+export interface ReloadDelivery {
+  readonly chat_id: string
+  /** The meta `via` (`dm`, `mention`, `broadcast`, `receive_all`, `receive_all_shared`). */
+  readonly via: string | undefined
+  readonly content: string
+}
+
+/** `run.callTool`'s result: whether the MCP tool answered with an error, and its text. */
+export interface ReloadToolResult {
+  readonly isError: boolean
+  readonly text: string
 }
 
 /**
@@ -799,8 +858,9 @@ export interface ReloadRunOptions {
   onApplied?: (config: PersonaConfig) => void
   /**
    * Bind the real lifecycle composition (`run.composition`, see
-   * `RealLifecycleComposition`) behind the recorder's `teardown` and
-   * `bringUp`, instead of the stand-ins; the bring-up controller then also
+   * `RealLifecycleComposition`) behind the recorder's `teardown`,
+   * `updateInPlace` and `bringUp`, instead of the stand-ins; the bring-up
+   * controller then also
    * gets the composition's serializer and the controller's live applied set,
    * as `server.ts` wires it.
    */
@@ -839,6 +899,30 @@ export interface ReloadRun {
   readonly outcome: ReloadStartOutcome | undefined
   /** The real lifecycle composition, with `opts.realLifecycle`; undefined otherwise. */
   readonly composition: RealLifecycleComposition | undefined
+  /**
+   * Register an MCP session for the persona named `name` in the real
+   * registry, as its instance's session: a fake transport holding its GET
+   * stream and a server recording what the routing delivers
+   * (`run.deliveries(name)`). A newer registration replaces the older one,
+   * as in the registry. `h.cleanup()` resets the registry and ack tracker.
+   */
+  registerSession(name: string): SessionEntry
+  /** The persona's registered session now (`getSessionByPersona`); compare by identity to show it was kept. */
+  session(name: string): SessionEntry | undefined
+  /** Every message the routing delivered to the persona's registered sessions, in order. */
+  deliveries(name: string): ReloadDelivery[]
+  /** Deliver `event` on the persona's current socket stub (`run.stub(name).socket.deliver`), through the event router and the routing. */
+  deliver(name: string, event: SlackEvent): Promise<void>
+  /** Raise a notice for the persona through the real notifier, as a notice site does; read the Slack calls on `run.stub(name).callLog`. */
+  notice(name: string, text: string): Promise<void>
+  /**
+   * Call MCP tool `tool` with `args` as the persona's instance: an in-memory
+   * MCP client over `createSessionServer` for its registered session (the
+   * real tool handlers, whose posting scope reads the applied persona at
+   * each call), with the run's client lookup. Needs `run.registerSession`
+   * first. No file may be sent (the file guard refuses every path).
+   */
+  callTool(name: string, tool: string, args: Record<string, unknown>): Promise<ReloadToolResult>
   /** Every configuration the controller's `onApplied` was told, in order (one per confirmed apply's step 1). */
   readonly appliedConfigs: readonly PersonaConfig[]
   /** The persona keys of the controller's applied configuration now, in order; undefined before the start applied. */
@@ -1142,6 +1226,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
   /** Per run: register a persona whose credentials were written after the run was built with its stub factory. */
   const lateRegistrations: Array<(name: string, tokens: PersonaSlackTokens) => void> = []
   let outageStateInstalled = false
+  /** A run registered an MCP session (or delivered through the routing): reset the registry and ack tracker at cleanup. */
+  let registryTouched = false
   let tokenWatch: TokenEnvironmentWatch | undefined
 
   /** `path`, resolved, if it is strictly under the root; throws otherwise. */
@@ -1222,7 +1308,39 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         ? {}
         : { serialize: serializer.run, appliedPersonas: () => controller.applied()?.config.personas ?? [] }),
     })
-    connections.onStatus = composePersonaStatusListeners((key, status) => bringUps.onConnectionStatus(key, status))
+
+    // The consumers of the applied settings, as server.ts wires them: each
+    // reads the controller's applied configuration (the server's
+    // `personaConfig`) at call time.
+    const appliedConfig = () => controller.applied()?.config ?? null
+    const getAppliedPersona = (key: string): Persona | undefined => appliedConfig()?.personas.find((p) => p.key === key)
+    const clientFor = createPersonaClientLookup(connections.manager, appliedConfig)
+    const identityFor = createPersonaIdentityLookup(connections.manager, appliedConfig)
+    const resolveUserName = async (key: string, userId: string): Promise<string> => {
+      const client = clientFor(key)
+      if (!client) return userId
+      const res = await client.users.info({ user: userId })
+      return res.user?.profile?.display_name || userId
+    }
+    const noticeStack = makeNotifierStack({ getPersona: getAppliedPersona, clientFor, log, isDryRun: () => dryRun })
+    // No ack reaction: a delivery makes no `reactions.add` call.
+    const access = defaultAccess()
+    const routing = createPersonaRouting({
+      getPersonaConfig: appliedConfig,
+      getBotIdentity: identityFor,
+      clientFor,
+      resolveUserName,
+      archive: () => undefined,
+      getAccess: () => access,
+      notify: (key, text, options) => noticeStack.notifier.notify(key, text, options),
+      log,
+      dedupeClock: () => connections.clock.now(),
+    })
+    connections.onEvent = createPersonaEventRouter({ routing, clientFor, getPersona: getAppliedPersona, log })
+    connections.onStatus = composePersonaStatusListeners(
+      createPersonaUpFlushListener(noticeStack.notifier),
+      (key, status) => bringUps.onConnectionStatus(key, status),
+    )
 
     const composition = runOpts.realLifecycle ? buildComposition() : undefined
 
@@ -1268,7 +1386,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         },
         connections: { stop: rec('connections.stop', (key) => connections.manager.stop(key)) },
         routing: { forget: rec('routing.forget') },
-        destinations: { forget: rec('destinations.forget') },
+        // The run's one destination resolver, which the notices post through.
+        destinations: { forget: rec('destinations.forget', (key) => noticeStack.destinations.forget(key)) },
         destinationHold: { cancel: rec('destinationHold.cancel') },
         notifier: { forget: rec('notifier.forget', () => 0) },
         appliedPersonas: () => controller.applied()?.config.personas ?? [],
@@ -1304,7 +1423,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           record('launch', persona.key, 'apply')
         },
       })
-      return { lifecycle, serializer: serializer!, agentDirector, agentDirectorOrder, calls }
+      return { lifecycle, agentDirector, agentDirectorOrder, calls }
     }
 
     const timeline: LifecycleTimelineEntry[] = []
@@ -1371,8 +1490,12 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       async reconnectCredentials(persona) {
         record('reconnect', persona.key, 'apply')
       },
-      async updateInPlace(persona) {
-        record('update-in-place', persona.key, 'apply')
+      async updateInPlace(change: InPlaceApplyInput) {
+        const { key } = change.persona
+        records.push({ op: 'update-in-place', key, via: 'apply', settings: [...change.settings] })
+        await gated('update-in-place', key, async () => {
+          if (composition !== undefined) await composition.lifecycle.updateInPlace(change)
+        })
       },
     }
 
@@ -1515,6 +1638,50 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       }
     }
 
+    // MCP sessions in the real registry, and the tool clients opened on them.
+    const notificationsByKey = new Map<string, ChannelNotification[]>()
+    const toolClients = new Map<SessionEntry, Client>()
+    let sessionSeq = 0
+    const toolDeps: SessionToolDeps = {
+      assertSendable: (path) => {
+        throw new Error(`reload-harness: no file may be sent (${JSON.stringify(path)})`)
+      },
+      getAccess: () => access,
+      getPersona: getAppliedPersona,
+      clientFor,
+      inboxDir: join(root, 'inbox'),
+      resolveUserName,
+      consumeAck,
+      serverPort: 0,
+    }
+
+    function registerRunSession(name: string): SessionEntry {
+      const key = personaKey(name)
+      registryTouched = true
+      let captured = notificationsByKey.get(key)
+      if (captured === undefined) {
+        captured = []
+        notificationsByKey.set(key, captured)
+      }
+      const cwd = getAppliedPersona(key)?.working_directory ?? join(root, 'sessions', key)
+      return registerSession(cwd, key, makeTransport(`mcp-${key}-${++sessionSeq}`), makeSessionServer(captured))
+    }
+
+    async function toolClientFor(name: string): Promise<Client> {
+      const entry = getSessionByPersona(personaKey(name))
+      if (entry === undefined) throw new Error(`reload-harness: no session registered for ${JSON.stringify(name)}`)
+      let client = toolClients.get(entry)
+      if (client === undefined) {
+        const server = createSessionServer(entry, toolDeps)
+        const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair()
+        await server.connect(serverTransport)
+        client = new Client({ name: 'reload-harness', version: '1.0.0' }, { capabilities: {} })
+        await client.connect(clientTransport)
+        toolClients.set(entry, client)
+      }
+      return client
+    }
+
     let stopped = false
     const run: ReloadRun = {
       controller,
@@ -1531,6 +1698,27 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         return outcome
       },
       composition,
+      registerSession: registerRunSession,
+      session: (name) => getSessionByPersona(personaKey(name)),
+      deliveries: (name) =>
+        (notificationsByKey.get(personaKey(name)) ?? []).map((n) => ({
+          chat_id: n.params.meta['chat_id']!,
+          via: n.params.meta['via'],
+          content: n.params.content,
+        })),
+      async deliver(name, event) {
+        registryTouched = true
+        await run.stub(name).socket.deliver(event)
+      },
+      notice: (name, text) => Promise.resolve(noticeStack.notifier.notify(personaKey(name), text)),
+      async callTool(name, tool, args) {
+        const client = await toolClientFor(name)
+        const result = (await client.callTool({ name: tool, arguments: args })) as {
+          isError?: boolean
+          content: Array<{ type: string; text?: string }>
+        }
+        return { isError: result.isError === true, text: result.content.map((c) => c.text ?? '').join('\n') }
+      },
       appliedConfigs,
       appliedKeys: () => controller.applied()?.config.personas.map((p) => p.key),
       resolveStart() {
@@ -1574,6 +1762,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         stopped = true
         controller.stopDetection()
         bringUps.cancelAll()
+        noticeStack.hold.cancelAll()
+        for (const client of toolClients.values()) await client.close()
         await connections.manager.stopAll()
       },
     }
@@ -1807,6 +1997,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       } finally {
         tokenWatch?.restore()
         if (outageStateInstalled) _resetOutageState()
+        if (registryTouched) {
+          _resetRegistry()
+          _resetAckTracker()
+        }
         rmSync(root, { recursive: true, force: true })
       }
     },

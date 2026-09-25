@@ -29,10 +29,11 @@
  *
  * The controller's default bodies are `lifecycleApplySlots`: per-step
  * fan-outs (`fanOutPersonas`) over the lifecycle members, step 2 to
- * `teardown` for each removed persona and step 6 to `bringUp` for each added
- * one. Within a step every persona's operation runs at once and the step
- * settles once all of them settled; one persona's rejection is reported and
- * never stops the others.
+ * `teardown` for each removed persona, step 3 to `updateInPlace` for each
+ * persona modified in place (once per persona) and step 6 to `bringUp` for
+ * each added one. Within a step every persona's operation runs at once and
+ * the step settles once all of them settled; one persona's rejection is
+ * reported and never stops the others.
  *
  * The line renderers here give the apply-time reload classes their text:
  * `reload-applied`, `reload-noop`, `reload-stale-confirmation`, and the
@@ -156,7 +157,7 @@ export type ApplyStepBody = (inputs: ApplyStepInputs) => Promise<unknown>
 export type ApplyStepSlots = Partial<Record<ApplyStepName, ApplyStepBody>>
 
 /** The per-persona lifecycle members the default step bodies fan out to (`ReloadLifecycleOps` in `reload.ts`). */
-export type ApplyLifecycleMembers = Pick<ReloadLifecycleOps, 'teardown' | 'bringUp'>
+export type ApplyLifecycleMembers = Pick<ReloadLifecycleOps, 'teardown' | 'updateInPlace' | 'bringUp'>
 
 /** Told of one persona's rejected lifecycle operation in a step. */
 export type ApplyPersonaFailure = (step: ApplyStepName, persona: Persona, err: unknown) => void
@@ -213,12 +214,29 @@ export async function fanOutPersonas(
 }
 
 /**
+ * The in-place inputs with one entry per persona key, the first kept, in
+ * their order: a persona that reaches step 3 through more than one class
+ * gets one update. Pure.
+ */
+function onePerPersona(inPlace: readonly InPlaceApplyInput[]): InPlaceApplyInput[] {
+  const seen = new Set<string>()
+  return inPlace.filter((change) => {
+    if (seen.has(change.persona.key)) return false
+    seen.add(change.persona.key)
+    return true
+  })
+}
+
+/**
  * The controller's default step bodies (b.av2 SR-8.6): pure fan-outs over the
- * lifecycle members. Step 2 tears down every removed persona, step 6 brings
- * up every added one with the applied configuration; each settles once every
- * persona's operation settled, a rejection going to `onFailure`. Steps 3–5
- * and the destructive-modify halves are bound by later work. Pure: builds the
- * bodies only.
+ * lifecycle members. Step 2 tears down every removed persona, step 3 updates
+ * every persona modified in place (`inputs.inPlace`, one update per persona),
+ * step 6 brings up every added one with the applied configuration; each
+ * settles once every persona's operation settled, a rejection going to
+ * `onFailure`. Step 3 comes before step 4, so a persona modified in place
+ * whose credentials also changed is updated before it is reconnected. Steps
+ * 4–5, the next-launch changes and the destructive-modify halves are bound by
+ * later work. Pure: builds the bodies only.
  */
 export function lifecycleApplySlots(members: ApplyLifecycleMembers, onFailure: ApplyPersonaFailure): ApplyStepSlots {
   return {
@@ -226,6 +244,15 @@ export function lifecycleApplySlots(members: ApplyLifecycleMembers, onFailure: A
       fanOutPersonas(inputs.removed, (persona) => members.teardown(persona), (persona, err) =>
         onFailure('teardowns', persona, err),
       ),
+    'in-place-updates': async (inputs) => {
+      const changes = onePerPersona(inputs.inPlace)
+      const byKey = new Map(changes.map((change) => [change.persona.key, change]))
+      await fanOutPersonas(
+        changes.map((change) => change.persona),
+        (persona) => members.updateInPlace(byKey.get(persona.key)!),
+        (persona, err) => onFailure('in-place-updates', persona, err),
+      )
+    },
     'bring-ups': (inputs) =>
       fanOutPersonas(inputs.added, (persona) => members.bringUp(persona, inputs.applied), (persona, err) =>
         onFailure('bring-ups', persona, err),
