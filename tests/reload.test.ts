@@ -2808,6 +2808,44 @@ describe('confirmation and apply (b.av2 SR-8.5, SR-8.6)', () => {
     expectNoPostNoLeak(run)
   })
 
+  test('sprint demo: an older copy of the pending file (P1, kept before a second edit wrote P2) placed at the apply path applies nothing: over many checks one reload-stale-confirmation line, the record and applied set unchanged, and P2 still pending', async () => {
+    let told = 0
+    const { run, personas, recordBytes } = await running(['alpha', 'bravo'], { onApplied: () => void told++ })
+    const [alpha, bravo] = personas
+    const applied = run.controller.applied()
+
+    // Edit 1 (bravo removed), check: P1 is pending; the operator keeps a copy.
+    h.writeConfig(configOf(alpha!))
+    await run.ticks.tick()
+    expect(h.pendingHeader()).toBe(previewHeader({ removed: 1 }))
+    const p1 = h.readPending()!
+    const fingerprint1 = h.pendingFingerprint()
+
+    // Edit 2 (bravo back, a server-wide setting changed), check: P2 replaces P1.
+    h.writeConfig({ ...configOf(alpha!, bravo!), stop_timeout: 45 })
+    await run.ticks.tick()
+    expect(h.pendingHeader()).toBe(previewHeader({ settings: 1 }))
+    const p2 = h.readPending()!
+    expect(h.pendingFingerprint()).not.toBe(fingerprint1)
+
+    // The saved P1 copy renamed into place instead of P2.
+    h.writeApplyBytes(p1)
+    const cp = run.checkpoint()
+    await run.ticks.ticks(5)
+
+    expect(run.since(cp)).toEqual({ ...NO_RUN_ACTIVITY, logs: [staleLogged(STALE_MISMATCH)], removes: [applyRemoved()] })
+    expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toEqual([staleLogged(STALE_MISMATCH)])
+    expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
+    expect(h.readRecord()).toEqual(recordBytes)
+    expect(run.controller.applied()).toBe(applied)
+    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
+    expect(run.appliedConfigs).toEqual([])
+    expect(told).toBe(0)
+    expect(h.applyExists()).toBe(false)
+    expect(h.readPending()).toEqual(p2)
+    expectNoPostNoLeak(run)
+  })
+
   test('a directory at the apply path is unreadable and undeletable: over many checks one reload-stale-confirmation line, one delete-failure line, nothing applied', async () => {
     const { run, recordBytes } = await pendingRemoval(['alpha', 'bravo'])
     const applied = run.controller.applied()

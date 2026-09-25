@@ -12,8 +12,10 @@
  * `mkdtempSync` directory removed in `afterEach`. The token variables are
  * removed for the whole file (restored afterwards), so no case or failure
  * message can see an ambient token. `start`'s daemon is always the injected
- * fake `spawnDaemon`; the only real spawn is the usage-text test, which gets
- * a built env (PATH, temp HOME, temp SLACK_STATE_DIR). Waits in `start` and
+ * fake `spawnDaemon`; the only real spawns are the eight tests of the
+ * `unknown subcommand` block (and its hidden-subcommand `beforeAll`), which
+ * run the CLI script through `runCli` with a built env (PATH, temp HOME, temp
+ * SLACK_STATE_DIR and BUN_RUNTIME_TRANSPILER_CACHE_PATH=0). Waits in `start` and
  * `stop` (the daemon startup wait, the SIGTERM and SIGKILL polls) run on the
  * per-test fake clock; none waits in real time.
  *
@@ -143,6 +145,20 @@ afterEach(() => {
   for (const name of TOKEN_VARS) delete process.env[name]
   rmSync(root, { recursive: true, force: true })
 })
+
+/**
+ * Every path under the per-test root (state dir and credentials files,
+ * directories included), sorted, with each file's bytes in base64 and `null`
+ * for a directory. Compare two snapshots with `toEqual`: a file added,
+ * removed, renamed or changed by one byte fails.
+ */
+function snapshotTree(): Record<string, string | null> {
+  const entries = (readdirSync(root, { recursive: true }) as string[]).sort()
+  return Object.fromEntries(entries.map((rel) => {
+    const path = join(root, rel)
+    return [rel, statSync(path).isFile() ? readFileSync(path, 'base64') : null]
+  }))
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -710,16 +726,6 @@ describe('last-applied record (SR-8.7)', () => {
     assertNoLeak({ stderr, exitCodes: b.exitCodes }, `${name} (${source})`)
   })
 
-  /** Every file under the per-test root (state dir and credentials files), by relative path, with its bytes. */
-  function snapshotTree(): Map<string, Buffer> {
-    const files = new Map<string, Buffer>()
-    for (const rel of readdirSync(root, { recursive: true }) as string[]) {
-      const path = join(root, rel)
-      if (statSync(path).isFile()) files.set(rel, readFileSync(path))
-    }
-    return files
-  }
-
   const runStop = (b: Bundle): Promise<void> =>
     createCli(b.deps).stop().catch((e) => { if (!(e instanceof ExitError)) throw e })
 
@@ -742,9 +748,7 @@ describe('last-applied record (SR-8.7)', () => {
     // Precondition: the run read the intended source and tore down its set.
     if (name !== 'stop') expect([...b.killCalls].sort()).toEqual([alphaId(), betaId()].sort())
     expect(existsSync(recordPath())).toBe(source === 'record')
-    const after = snapshotTree()
-    expect([...after.keys()].sort()).toEqual([...before.keys()].sort())
-    for (const [rel, bytes] of before) expect(after.get(rel)!.equals(bytes)).toBe(true)
+    expect(snapshotTree()).toEqual(before)
     assertNoLeak({ stderr, exitCodes: b.exitCodes }, `${name} (${source}, no writes)`)
   })
 
@@ -1753,22 +1757,130 @@ describe('b.qwo — initClient startup gate', () => {
 })
 
 // ---------------------------------------------------------------------------
-// unknown subcommand — regression for b.8tm (trail subcommand removed)
+// unknown subcommand — regression for b.8tm (trail subcommand removed), and
+// the unadvertised reload gesture (b.av2 SR-8.8, AC 74 cli leg)
 // ---------------------------------------------------------------------------
 
+/**
+ * Reload wording no CLI usage text may carry (b.av2 SR-8.8). The same list as
+ * registry.test.ts's, kept local to each file on purpose.
+ */
+const RELOAD_TERMS: readonly (string | RegExp)[] = [/reload/i, 'config.json.apply', 'config.json.pending', '.apply', '.pending']
+
+/** The listed reload terms found in `text`, as written in `RELOAD_TERMS`. */
+function reloadTermsIn(text: string): string[] {
+  return RELOAD_TERMS.filter((t) => (typeof t === 'string' ? text.includes(t) : t.test(text))).map(String)
+}
+
+/**
+ * The subcommand and flag entries of the usage text, with its wording ignored.
+ * Every indented line is an entry, named by its first word: a subcommand
+ * outside a `<name> flags:` section, a flag inside one. Anything else (a flag
+ * outside a section, a non-flag inside one) is `unexpected`.
+ */
+function usageEntries(output: string): {
+  synopsis: string[]
+  listed: string[]
+  flags: Record<string, string[]>
+  unexpected: string[]
+  allFlags: string[]
+} {
+  const lines = output.split('\n')
+  const synopsis = (lines.find((l) => /^Usage:/.test(l))?.match(/<([^>]*)>/)?.[1] ?? '').split('|').filter(Boolean)
+  const listed: string[] = []
+  const flags: Record<string, string[]> = {}
+  const unexpected: string[] = []
+  let section: string | undefined
+  for (const line of lines) {
+    if (/^\S/.test(line)) {
+      section = line.match(/^(\S+) flags:\s*$/)?.[1]
+      continue
+    }
+    const name = line.match(/^\s+(\S+)/)?.[1]
+    if (name === undefined) continue // a blank line
+    const isFlag = name.startsWith('-')
+    if (section === undefined && !isFlag) listed.push(name)
+    else if (section !== undefined && isFlag) (flags[section] ??= []).push(name)
+    else unexpected.push(name)
+  }
+  const allFlags = [...output.matchAll(/(?:^|\s)(--?[A-Za-z][\w-]*)/g)].map((m) => m[1]!)
+  return { synopsis, listed, flags, unexpected, allFlags }
+}
+
+/**
+ * Run the real CLI script in a child process: a built env (b.av2 SR-13.2):
+ * a temp HOME and state dir (the per-test root by default), no token, nothing
+ * else from process.env; bounded. Bun's transpiler cache is off, so the child
+ * writes nothing under the temp HOME (`.bun/install/cache`) that a tree
+ * snapshot would mistake for the CLI's doing.
+ */
+function runCli(args: string[], home = root) {
+  const result = spawnSync(process.execPath, [CLI_SOURCE, ...args], {
+    encoding: 'utf-8',
+    env: { PATH: process.env['PATH'] ?? '', HOME: home, SLACK_STATE_DIR: join(home, 'state'), BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0' },
+    timeout: 15_000,
+  })
+  // Spawned, and not killed by the time limit, so `status` is the CLI's own exit code.
+  expect(result.error).toBeUndefined()
+  expect(result.signal).toBeNull()
+  return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '', output: (result.stderr ?? '') + (result.stdout ?? '') }
+}
+
 describe('unknown subcommand', () => {
-  test('`trail` hits the usage error (non-zero exit; no "trail", retired reconcile flag or token variable in usage)', () => {
-    const result = spawnSync(process.execPath, [CLI_SOURCE, 'trail'], {
-      encoding: 'utf-8',
-      // A built env (b.av2 SR-13.2): temp HOME and state dir, no token, nothing else from process.env.
-      env: { PATH: process.env['PATH'] ?? '', HOME: root, SLACK_STATE_DIR: stateDir },
-    })
+  test('`trail` hits the usage error (non-zero exit; no "trail", retired reconcile flag, token variable or reload wording in usage; AC 74)', () => {
+    const result = runCli(['trail'])
     expect(result.status).not.toBe(0)
-    const output = (result.stderr ?? '') + (result.stdout ?? '')
+    const output = result.output
+    expect(output).toContain('Usage:')
     expect(output).not.toMatch(/\btrail\b/)
     expect(output).not.toContain('--reconcile-instance-ids')
     expect(output).not.toContain('CSCB_RECONCILE_INSTANCE_IDS')
     for (const name of TOKEN_VARS) expect(output).not.toContain(name)
     expect(output).toContain('start')
+    expect(reloadTermsIn(output)).toEqual([])
+  })
+
+  test('AC 74: no arguments exits non-zero with usage listing exactly start, stop and clean_restart, and only --stop-bots, under stop, with no reload wording', () => {
+    const result = runCli([])
+
+    expect(result.status).not.toBe(0)
+    const usage = usageEntries(result.output)
+    expect(usage.synopsis.sort()).toEqual(['clean_restart', 'start', 'stop'])
+    expect(usage.listed.sort()).toEqual(['clean_restart', 'start', 'stop'])
+    expect(usage.flags).toEqual({ stop: ['--stop-bots'] })
+    expect(usage.unexpected).toEqual([])
+    expect(usage.allFlags).toEqual(['--stop-bots'])
+    expect(reloadTermsIn(result.output)).toEqual([])
+  })
+
+  describe('AC 74: hidden subcommands', () => {
+    /** The no-argument usage (stderr), captured once in its own temp home. */
+    let noArgUsage: string
+    beforeAll(() => {
+      const home = mkdtempSync(join(tmpdir(), 'cscb-cli-usage-'))
+      try {
+        noArgUsage = runCli([], home).stderr
+        expect(noArgUsage).toStartWith('Usage:')
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    })
+
+    test.each(['reload', 'apply', 'confirm', 'reload-config', 'Reload', 'apply_config'])(
+      'AC 74: hidden subcommand `%s` takes the unknown-subcommand path: non-zero exit, the same usage, nothing else done (a pending file stays put)',
+      (spelling) => {
+        // A pending change is waiting, so a hidden confirm (pending renamed to
+        // apply) or any other touch of it shows in the snapshot.
+        writeFileSync(`${configPath}.pending`, readFileSync(configPath))
+        const before = snapshotTree()
+
+        const result = runCli([spelling])
+
+        expect(result.status).not.toBe(0)
+        expect(result.stderr).toBe(noArgUsage)
+        expect(result.stdout).toBe('')
+        expect(snapshotTree()).toEqual(before)
+      },
+    )
   })
 })

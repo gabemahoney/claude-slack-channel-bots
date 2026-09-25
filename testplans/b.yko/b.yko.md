@@ -211,27 +211,36 @@ These are expected and are not failures:
 - B's and C's permission prompts and notices go to the operator's DM with that persona's app, never to a channel.
 - A has DMs off in this setup (no `dm` field), so a DM to A is dropped until the DMs section turns A's DMs on.
 
-### Config edits after the first start (interim until E12)
+### Config edits after the first start
 
 Check 1's start records `config.json` as `config.json.last-applied`, a byte
 copy beside it. From then on every start runs that record, not `config.json`.
-An edit to `config.json` stays pending, shown in `config.json.pending`, until
-the operator confirms it. The build under test has no confirmation gesture
-yet; plan b.ob2's Epic 12 adds it.
+An edit to `config.json` stays pending until the operator confirms it. Every
+step below that changes the test config applies it with this confirmation
+gesture, on the TEST server only, while the server runs:
 
-Until then, every step below that applies a test-config edit uses this
-stopgap, on the TEST server only:
+1. Edit `config.json`.
+2. Within about 5 s the server writes `config.json.pending` and logs the same preview in `server.log`, one `[slack] reload-preview: …` line per preview line. Read the file: its first two lines are `claude-slack-channel-bots: pending configuration change (written by the server)` and `fingerprint: sha256:<64 hex digits>`, then a blank line and the preview. The preview's first line starts `A configuration change is pending; nothing has been applied.` and gives the counts; a line starting `DESTRUCTIVE:` removes a persona or destroys its instance. Check that the preview describes the edit you made.
+3. Confirm by renaming the file, unchanged: `mv ~/.claude/channels/slack/config.json.pending ~/.claude/channels/slack/config.json.apply`.
+4. Within about 5 s the server applies the change without a restart and logs one `[slack] reload-applied: applied the confirmed configuration change without a restart (<counts>); the last-applied record "<path of config.json>.last-applied" now holds it` line. Afterwards `config.json` and the record are byte-identical, and neither `config.json.pending` nor `config.json.apply` exists.
 
-1. Stop the TEST server.
-2. Edit `config.json`.
-3. Delete `config.json.last-applied`.
-4. Start the TEST server. A start with no record checks `config.json`, records it and applies it.
+A `[slack] reload-stale-confirmation: …` line instead means `config.json` or a
+credentials file changed after that preview was written; nothing is applied.
+Read the new `config.json.pending` and rename it again. Never edit the pending
+file, and never delete `config.json.last-applied` while the server runs.
 
-The steps that use it are "Turn A's DMs on" step 3, the lost-message setup
-step 3, Check 22's teardown step 2, and the Teardown section's deletion of
-the record and the pending-change file. The Reboot section does not use it:
-there, keeping the record is the point. E12 replaces the stopgap with the
-confirmation gesture (carried on `t3.ob2.nr.v5.6i`).
+Per-persona changes take effect at the apply: an added persona is brought up,
+a removed one is torn down, and `channels`, `delivery`, `permission_prompts`,
+`dm.enabled` and `dm.contact` are updated in place. A server-wide setting such
+as `session_restart_delay` is only recorded at the apply; its preview line
+says it `takes effect at the next server start after that`. For such an edit,
+confirm it, then restart the test server with the "Guarded restart" in the
+DMs section.
+
+The steps that use the gesture are "Turn A's DMs on", the lost-message setup,
+Check 22's teardown, and the runtime add and remove section. The Reboot
+section leaves its edit unconfirmed on purpose, and the final Teardown deletes
+the record with the server stopped, as clean-up for the next run.
 
 ---
 
@@ -582,12 +591,12 @@ The DMs switch per persona, as these checks use it:
 
 | Persona | `dm.enabled` in Checks 13–14 | `dm.enabled` in Checks 15–18 |
 |---|---|---|
-| A (`persona_a`) | off (Setup's config has no `dm` field) | on (the restart step below adds it) |
+| A (`persona_a`) | off (Setup's config has no `dm` field) | on (the confirmed edit below adds it) |
 | B (`persona_b`) | on, `dm` destination | on |
 | C (`persona_c`) | on, `dm` destination, `dm.contact` set | on |
 
-Only A changes, and only through `config.json` and a restart of the test
-server, so the setup stays config-file only (AC 14). B and C cannot be
+Only A changes, and only through a confirmed `config.json` edit, so the setup
+stays config-file only (AC 14). B and C cannot be
 switched off: a `dm` destination, or zero channels, needs DMs on (b.av2
 SR-1.5), so the config would be refused.
 
@@ -599,11 +608,10 @@ added and is then re-installed, as the `debug-slack-channel-bots` skill's
 section "A persona can't open a DM: re-install its app to gain `im:write`"
 says. The bot token normally stays the same; if the OAuth & Permissions page
 shows a different token, re-create that persona's credentials file as in
-Setup step 2, then restart the test server before Check 13 with the guarded
-stop and start of "Turn A's DMs on" (its steps 1, 2 and 4, without step 3's
-config edit and record deletion). This restart changes no `config.json`, so the
-record still matches it and is kept. The start reads the credentials files as
-they stand, so the re-created file takes effect. The operator compares the token outside the chat; never print it or
+Setup step 2, then restart the test server before Check 13 with the "Guarded
+restart" below. It changes no `config.json`, so the record still matches it
+and is kept. The start reads the credentials files as they stand, so the
+re-created file takes effect. The operator compares the token outside the chat; never print it or
 compare it in a chat.
 
 A **second test user** is needed: a user account in the test workspace, other
@@ -614,7 +622,7 @@ member ID (`U…`, from its profile) replaces `<SECOND_USER_ID>` below. A
 second test user from an earlier run already has a DM with A (Check 17 opened
 it), so a rerun uses a user that A has never messaged.
 
-Note two more values for the restart step below: `<TEST_HOST>`, the test
+Note two more values for the guard below: `<TEST_HOST>`, the test
 host's name exactly as `hostname` prints it (the pre-flight's `TEST_HOST`),
 and `<TEST_USER>`, the test host's user exactly as `whoami` prints it.
 
@@ -739,14 +747,12 @@ with the reason in Notes. It is not a pass.
 
 Pass: the call to `<SECOND_USER_ID>` returned the refusal naming `persona_a` and `<SECOND_USER_ID>`, and the second test user got nothing from A.
 
-### Turn A's DMs on (operator step on the test host)
+### Guarded restart (operator step on the test host)
 
-This is a config edit applied with the interim stopgap (see "Config edits
-after the first start" in Setup): stop the test server, edit `config.json`,
-delete `config.json.last-applied`, start. It is not a runtime reload. Plain
+A restart of the test server, used where a step needs one: after a
+re-created credentials file, and after confirming a server-wide setting. Plain
 `stop` leaves the persona instances running; `start` brings them back to the
-server. E12 replaces the record deletion in step 3 with the confirmation
-gesture.
+server, from the last-applied record.
 
 1. Define the guard. It fails, and says why, unless this is the test host
    and its user (the pre-flight's hostname comparison, plus the user).
@@ -767,24 +773,9 @@ gesture.
    fi
    ```
 
-   If it prints `NOT THE TEST HOST - stop`, do nothing more in this section.
+   If it prints `NOT THE TEST HOST - stop`, do nothing more in the section that called for the restart, and record that in Notes.
 
-3. In `~/.claude/channels/slack/config.json`, add this line to the `persona_a` entry, after its `channels` array (mind the commas):
-
-   ```json
-   "dm": { "enabled": true },
-   ```
-
-   Then check the file still parses: `jq -e '.personas[0].dm.enabled' ~/.claude/channels/slack/config.json` must print `true`.
-
-   Then delete the last-applied record (the stopgap), again only if the guard passes:
-
-   ```sh
-   if guard; then rm -f ~/.claude/channels/slack/config.json.last-applied; fi
-   ```
-
-   Without this, step 4's start runs the record, which has no `dm` line for A. The edit stays pending, A's DMs stay off, and Checks 15 and 17 fail as if the product were broken.
-4. Start the test server with no token variables, again only if the guard passes:
+3. Start the test server with no token variables, again only if the guard passes:
 
    ```sh
    if guard; then
@@ -793,13 +784,13 @@ gesture.
    fi
    ```
 
-5. Wait until the start's summary line and each persona's `Session connected` line appear. This can take about 3–5 minutes after a restart. Then read this start's lines:
+4. Wait until the start's summary line and each persona's `Session connected` line appear. This can take about 3–5 minutes after a restart. Then read this start's lines:
 
    ```sh
    since "$LOG_MARK" | grep -E 'last-applied record|persona-start:|Session connected: persona|startupSessionManager: complete|\) not brought up:|persona-(credentials|directory)-|persona-slack-unreachable'
    ```
 
-6. Check that the start recorded the edited file, and, about 10 s later, that no change is pending:
+5. Check that the record still matches `config.json`, and, about 10 s later, that no change is pending:
 
    ```sh
    cmp ~/.claude/channels/slack/config.json ~/.claude/channels/slack/config.json.last-applied && echo recorded
@@ -809,14 +800,72 @@ gesture.
 Expected:
 
 - `start` exits 0.
-- Step 5 prints one `[slack] No last-applied record: recorded the configuration file "<path of config.json>" as "<path of config.json>.last-applied"` line, and no `[slack] Starting from the last-applied record` line.
-- Step 6's `cmp` prints `recorded`, and `ls` reports that `config.json.pending` does not exist.
-- The last command prints one `[slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting` line for each of `personas[0] "persona_a" (key=persona_a)`, `personas[1] "persona_b" (key=persona_b)` and `personas[2] "persona_c" (key=persona_c)`.
+- Step 4 prints one `[slack] Starting from the last-applied record "<path of config.json>.last-applied"` line, and no `[slack] No last-applied record` line.
+- Step 5's `cmp` prints `recorded`, and `ls` reports that `config.json.pending` does not exist.
+- Step 4 prints one `[slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting` line for each of `personas[0] "persona_a" (key=persona_a)`, `personas[1] "persona_b" (key=persona_b)` and `personas[2] "persona_c" (key=persona_c)`.
 - It prints at least one `[slack] Session connected: persona "<name>" (key=<key>)` line for each of the three personas.
 - It prints one `[slack] startupSessionManager: complete — 3 persona(s): …` line, ending `0 failed, 0 not brought up`.
 - It prints no `[slack] persona "<name>" (key=<key>) not brought up:` line and no `persona-credentials-…`, `persona-directory-…` or `persona-slack-unreachable` line.
 
-If any of that is missing, or a failure line is present, stop the section and record the failure in Notes.
+If any of that is missing, or a failure line is present, stop the section that called for the restart and record the failure in Notes.
+
+### Turn A's DMs on (operator step on the test host)
+
+This is a config edit applied with the confirmation gesture (see "Config
+edits after the first start" in Setup), while the server runs. `dm.enabled`
+is updated in place: no restart, and A keeps its instance, Slack connection
+and MCP session.
+
+1. Define `guard()` as in "Guarded restart" step 1, if this shell doesn't have it. Note where the log ends and the server's PID, only if the guard passes:
+
+   ```sh
+   if guard; then
+     LOG_MARK=$(wc -l < "$LOG"); echo "LOG_MARK=$LOG_MARK"
+     PID_BEFORE=$(cat ~/.claude/channels/slack/server.pid); echo "PID_BEFORE=$PID_BEFORE"
+   fi
+   ```
+
+   If it prints `NOT THE TEST HOST - stop`, do nothing more in this section.
+
+2. In `~/.claude/channels/slack/config.json`, add this line to the `persona_a` entry, after its `channels` array (mind the commas):
+
+   ```json
+   "dm": { "enabled": true },
+   ```
+
+   Then check the file still parses: `jq -e '.personas[0].dm.enabled' ~/.claude/channels/slack/config.json` must print `true`.
+
+3. Wait about 10 s, then read the preview:
+
+   ```sh
+   cat ~/.claude/channels/slack/config.json.pending
+   since "$LOG_MARK" | grep -F 'reload-preview:'
+   ```
+
+4. Confirm, only if the guard passes, then wait about 10 s:
+
+   ```sh
+   if guard; then
+     mv ~/.claude/channels/slack/config.json.pending ~/.claude/channels/slack/config.json.apply
+   fi
+   ```
+
+5. Check the apply:
+
+   ```sh
+   since "$LOG_MARK" | grep -E 'reload-(applied|noop|stale-confirmation|invalid):|updated in place|persona-start:|persona teardown|Session disconnected|spawnForPersona'
+   cmp ~/.claude/channels/slack/config.json ~/.claude/channels/slack/config.json.last-applied && echo recorded
+   ls ~/.claude/channels/slack/config.json.pending ~/.claude/channels/slack/config.json.apply
+   [ "$(cat ~/.claude/channels/slack/server.pid)" = "$PID_BEFORE" ] && echo 'same server'
+   ```
+
+Expected:
+
+- Step 3: the pending file's preview is these two lines, after its two header lines and a blank line: `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 1 modified in place, 0 with changed credentials; server-wide settings: 0 changed.` and `persona "persona_a" (key=persona_a): dm.enabled changed: applied in place immediately, instance kept.` The `grep` prints the same two lines, each prefixed `[slack] reload-preview: `, the first ending ` (preview in "<path of config.json>.pending")`.
+- Step 5's first command prints exactly two lines: `[slack] persona "persona_a" (key=persona_a): updated in place (dm.enabled); its instance, Slack connection and MCP session are kept; its cached DM conversation is forgotten` and `[slack] reload-applied: applied the confirmed configuration change without a restart (personas: 0 added, 0 removed, 0 destructively modified, 1 modified in place, 0 with changed credentials; server-wide settings: 0 changed); the last-applied record "<path of config.json>.last-applied" now holds it`.
+- `cmp` prints `recorded`, `ls` reports that neither `config.json.pending` nor `config.json.apply` exists, and `same server` is printed.
+
+If any of that is missing, or another line is present, stop the section and record the failure in Notes.
 
 A's DMs stay on for the rest of this run. Teardown removes the `dm` line
 again and deletes the record, so the next run starts from Setup's config.
@@ -858,11 +907,12 @@ Check 19 noted.
 
 Steps:
 
-1. Confirm C's start in the restart's lines (from "Turn A's DMs on"):
+1. Confirm C's start in the lines of the server's most recent start. `START_MARK` is the log line before that start's `Loaded persona config` line:
 
    ```sh
-   since "$LOG_MARK" | grep -F '"persona_c" (key=persona_c)'
-   since "$LOG_MARK" | grep -E 'persona-(credentials|directory)-|persona-slack-unreachable' | grep -F '(key=persona_c)'
+   START_MARK=$(( $(grep -n 'Loaded persona config:' "$LOG" | tail -n 1 | cut -d: -f1) - 1 )); echo "START_MARK=$START_MARK"
+   since "$START_MARK" | grep -F '"persona_c" (key=persona_c)'
+   since "$START_MARK" | grep -E 'persona-(credentials|directory)-|persona-slack-unreachable' | grep -F '(key=persona_c)'
    agent-director list --label service=cscb
    ```
 
@@ -872,12 +922,12 @@ Steps:
    ```sh
    tags c <TS>
    replies c
-   since "$LOG_MARK" | grep -F '(key=persona_c)' \
+   since "$START_MARK" | grep -F '(key=persona_c)' \
      | grep -oE 'chat_id=[A-Z0-9]+|channel=[A-Z0-9]+|in (channel|conversation) [A-Z0-9]+' | sort -u
-   since "$LOG_MARK" | grep -F 'unclaimed-channel: personas[2] "persona_c"'
+   since "$START_MARK" | grep -F 'unclaimed-channel: personas[2] "persona_c"'
    ```
 
-   The third command lists every conversation ID on C's lines since the restart: its `Dispatching to persona "persona_c" (key=persona_c) chat_id=…` lines, any `dropped message from channel=…` line, and any `persona-dm-dropped` or `unclaimed-channel` line (`… in conversation …` / `… in channel …`). The RAW lines are not used: they keep only the first 300 characters of the event, which usually cut off its `"channel"` field.
+   The third command lists every conversation ID on C's lines since that start: its `Dispatching to persona "persona_c" (key=persona_c) chat_id=…` lines, any `dropped message from channel=…` line, and any `persona-dm-dropped` or `unclaimed-channel` line (`… in conversation …` / `… in channel …`). The RAW lines are not used: they keep only the first 300 characters of the event, which usually cut off its `"channel"` field.
 
 4. In the test workspace's channel browser, open every channel (A-home, coordination and the workspace's default channels) and look at its member list.
 
@@ -887,7 +937,7 @@ Expected:
 - C answers "dm-c" in the DM with C, under C's name and avatar.
 - `tags c <TS>` prints exactly one tag, with `chat_id="<C_DM_ID>"`, `via="dm"` and `user_id="<OPERATOR_USER_ID>"`.
 - Every line of `replies c` has a `chat_id` starting with `D`: C has posted only in DMs.
-- The ID extraction prints at least `chat_id=<C_DM_ID>`, and every ID it prints starts with `D`: C's pipeline has handled nothing outside a DM since the restart.
+- The ID extraction prints at least `chat_id=<C_DM_ID>`, and every ID it prints starts with `D`: C's pipeline has handled nothing outside a DM since that start.
 - The `unclaimed-channel` grep prints nothing.
 - "CSCB Test C" is in no channel's member list.
 
@@ -1152,13 +1202,12 @@ Without a configured reaction the "no reaction" result proves nothing, so
 the check can't pass.
 
 `session_restart_delay` is a server-wide `config.json` key that the server
-reads once, at `start`. Setting it needs the guarded stop and start of "Turn
-A's DMs on", with this edit in place of the `dm` line, and the same interim
-stopgap (see "Config edits after the first start" in Setup):
+reads once, at `start`. Setting it takes the confirmation gesture (see "Config
+edits after the first start" in Setup), which records it, and then the
+"Guarded restart" from the DMs section, which makes it take effect:
 
-1. Define `guard()` as in "Turn A's DMs on" step 1, if this shell doesn't have it.
-2. Stop the test server only if the guard passes, as in "Turn A's DMs on" step 2 (it records `LOG_MARK`). If it prints `NOT THE TEST HOST - stop`, do nothing more in this section and record that in Notes.
-3. Record the current value, then set it to `0`:
+1. Define `guard()` as in "Guarded restart" step 1, if this shell doesn't have it. Note where the log ends, only if the guard passes: `if guard; then MARK=$(wc -l < "$LOG"); fi`. If it prints `NOT THE TEST HOST - stop`, do nothing more in this section and record that in Notes.
+2. Record the current value, then set it to `0`, while the server runs:
 
    ```sh
    CFG=~/.claude/channels/slack/config.json
@@ -1168,9 +1217,9 @@ stopgap (see "Config edits after the first start" in Setup):
    ```
 
    `ORIG_DELAY=null` means the key was absent (the default, 60 s). Keep `ORIG_DELAY` for the teardown.
-
-   Then delete the last-applied record, as in "Turn A's DMs on" step 3: `if guard; then rm -f ~/.claude/channels/slack/config.json.last-applied; fi`. Without it, the start runs the record, the delay stays at its old value, and A restarts during Check 22.
-4. Start the test server as in "Turn A's DMs on" step 4, and wait and check it as in steps 5 and 6. The same Expected items apply: each persona's `Session connected` line, `0 failed, 0 not brought up`, no failure line, the `No last-applied record` line, `cmp` printing `recorded`, and no `config.json.pending`.
+3. Wait about 10 s and read the preview: `cat ~/.claude/channels/slack/config.json.pending`. Its preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 1 changed.` and `server-wide setting session_restart_delay changed: once applied, it is recorded and takes effect at the next server start after that.`
+4. Confirm, only if the guard passes: `if guard; then mv ~/.claude/channels/slack/config.json.pending ~/.claude/channels/slack/config.json.apply; fi`. Wait about 10 s, then run `since "$MARK" | grep -F 'reload-applied:'`. It prints one `[slack] reload-applied: …` line whose counts end `server-wide settings: 1 changed)`. The delay is recorded but not yet in effect.
+5. Run the "Guarded restart". Its Expected items apply: the `Starting from the last-applied record` line, each persona's `Session connected` line, `0 failed, 0 not brought up`, no failure line, `cmp` printing `recorded`, and no `config.json.pending`. The start runs the record, so the delay of 0 is now in effect.
 
 A's destination is A-home (`"permission_prompts": "<A_HOME_CHANNEL_ID>"`). A
 is mentions-only in coordination, so the message must mention A.
@@ -1219,7 +1268,7 @@ notice fails this check. So does an `ackReaction` on the message.
 
 Teardown for this check (operator step on the test host), run whatever the result:
 
-1. Stop the test server only if the guard passes, as in "Turn A's DMs on" step 2 (it records a new `LOG_MARK`).
+1. Note where the log ends, only if the guard passes: `if guard; then MARK=$(wc -l < "$LOG"); fi`. The server keeps running.
 2. Restore the delay:
 
    ```sh
@@ -1228,9 +1277,9 @@ Teardown for this check (operator step on the test host), run whatever the resul
    jq -c '.session_restart_delay' "$CFG"   # must print the ORIG_DELAY value
    ```
 
-   Then delete the last-applied record (the stopgap), as in "Turn A's DMs on" step 3: `if guard; then rm -f ~/.claude/channels/slack/config.json.last-applied; fi`. Without it, the start runs the record with a delay of 0, and auto-restart stays off.
+   Wait about 10 s, read `config.json.pending` (the same two preview lines as the setup's step 3), and confirm it, only if the guard passes: `if guard; then mv ~/.claude/channels/slack/config.json.pending ~/.claude/channels/slack/config.json.apply; fi`. Wait about 10 s; `since "$MARK" | grep -F 'reload-applied:'` prints one line whose counts end `server-wide settings: 1 changed)`. Without the confirmation, the next start runs the record with a delay of 0, and auto-restart stays off.
 3. If the setup added the reaction (`ACK_ADDED=1`), remove it: `A=~/.claude/channels/slack/access.json; jq 'del(.ackReaction)' "$A" > "$A.tmp" && mv "$A.tmp" "$A"`.
-4. Start the test server as in "Turn A's DMs on" step 4, and wait and check it as in steps 5 and 6, with the same Expected items. A's instance is brought up again, resumed or fresh-spawned.
+4. Run the "Guarded restart", with its Expected items. A's instance is brought up again, resumed or fresh-spawned, and the restored delay is in effect.
 5. In A-home, post "Reply with the word back." A replies "back" in A-home under its own name and avatar.
 
 If A doesn't answer after the restart, record that in Notes: later sections
@@ -1255,9 +1304,9 @@ the pending file or the log).
 
 This is the plan's only reboot. It runs only on the test host and the test
 workspace, never on the production install. The Safety section applies
-unchanged, and the reboot must disturb nothing but this test. It does not use
-the interim stopgap from Setup: the record is kept, because running it is
-what this check proves.
+unchanged, and the reboot must disturb nothing but this test. Its edit is
+left unconfirmed on purpose: the record is kept as it is, because running it
+is what this check proves.
 
 Resuming conversation history is best effort. A persona that comes back
 without its earlier conversation does not fail this check. Record it in
@@ -1272,7 +1321,19 @@ pre-flight).
 ### Prerequisites
 
 - **A test host**, not the production install (see Safety).
-- **The test server starts at boot**, by whatever mechanism the operator uses on that host. CSCB ships no boot mechanism, and this plan adds none. The mechanism must run `claude-slack-channel-bots start` as `<TEST_USER>`, with no `SLACK_STATE_DIR` and neither `SLACK_BOT_TOKEN` nor `SLACK_APP_TOKEN` in its environment, and must find `bun` and `agent-director` as the operator's shell does. Record the mechanism in Notes. On a host without one, record this check as "not run" with the reason. Starting the server by hand after the reboot is manual intervention, so it is not a pass.
+- **The test server starts at boot.** Starting CSCB at boot is the operator's job; CSCB ships no boot mechanism. On the test host only, never on the production install, this plan uses a user crontab `@reboot` line in `<TEST_USER>`'s crontab, and Teardown removes it. Whatever the mechanism, it must run `claude-slack-channel-bots start` as `<TEST_USER>`, with no `SLACK_STATE_DIR` and neither `SLACK_BOT_TOKEN` nor `SLACK_APP_TOKEN` in its environment, and must find `bun` and `agent-director` as the operator's shell does. Install the line from the operator's shell on the test host, only if the guard passes (cron's own `PATH` is minimal, so the line carries the shell's):
+
+  ```sh
+  if guard; then
+    ( crontab -l 2>/dev/null | grep -vF '# cscb-live-b.yko'
+      printf "@reboot PATH='%s' claude-slack-channel-bots start >> '%s/cscb-live/boot-start.log' 2>&1  # cscb-live-b.yko\n" "$PATH" "$HOME"
+    ) | crontab -
+  fi
+  crontab -l | grep -F '# cscb-live-b.yko'                               # the one @reboot line
+  crontab -l | grep -cE 'SLACK_(BOT|APP)_TOKEN|SLACK_STATE_DIR'           # must print 0
+  ```
+
+  Record the mechanism in Notes. If the operator uses another mechanism instead, it must meet the same constraints. Starting the server by hand after the reboot is manual intervention, so it is not a pass.
 - **A, B and C applied**, so `config.json.last-applied` exists and matches `config.json` (step 1 checks this).
 
 Redefine `LOG`, `since` and `guard` (from the DMs section) in any new shell,
@@ -1396,7 +1457,207 @@ revert cleared it with one `reload-nothing-pending` line.
 
 ## Runtime add and remove (appended by E12)
 
-Placeholder. E12 fills in this section.
+These checks verify the live legs of AC 19 and AC 22 (a new persona, with a
+freshly created credentials file and config entry, comes up at a confirmed
+apply and posts as itself, with no restart and no change to the server's
+environment) and AC 57 (a confirmed removal tears down only that persona).
+They cover b.av2 SR-14's runtime addition and confirmed removal, and SR-8.5
+and SR-8.6 (the confirmation and the apply). In passing, they check SR-7.2
+(reload output never reaches Slack) and SR-10.3 (no token in the pending file
+or the log).
+
+Like the rest of this plan, the section runs only on the test workspace and
+the test host's server, never on the production install. The Safety section
+applies unchanged. Resuming conversation history is best effort.
+
+**Run order:** run it after Check 23, on the server the reboot started. If
+the server was stopped since, restart it as the E4 section says (confirm
+`hostname` and `whoami`, unset the token variables, `start`; do not rerun the
+check1 pre-flight). Check 25 removes D again, so the applied set ends at A, B
+and C. If this section is ever run before the Reboot section, Check 25 must
+have passed first: Check 23 needs exactly A, B and C applied.
+
+### Setup for these checks
+
+- **A fourth test Slack app, D.** Create it in the test workspace from the shipped `slack-app-manifest.yml`, with its own display name and avatar ("CSCB Test D", with an avatar unlike A's, B's and C's). Install it and generate its app-level token (`connections:write`), as in Setup step 1. Don't create its credentials file yet: Check 24 does that.
+- **A channel for D.** Create **D-home** in the test workspace and invite app D only. Its ID replaces `<D_HOME_CHANNEL_ID>` below.
+- **A, B and C applied, nothing pending, server running.** Check 23's step 7 leaves this state. Confirm it:
+
+  ```sh
+  guard && echo 'test host'
+  S=~/.claude/channels/slack
+  cmp "$S/config.json" "$S/config.json.last-applied" && echo recorded
+  ls "$S/config.json.pending"                          # must not exist
+  jq -r '.personas[].name' "$S/config.json.last-applied"   # persona_a, persona_b, persona_c
+  kill -0 "$(cat "$S/server.pid")" && echo running
+  ```
+
+D's entry below sets no `claude_config_dir`, like A's, B's and C's, so D
+launches with the same effective config directory the start already
+prepared. Don't give D a new `claude_config_dir`: with the build under test,
+a persona added at an apply with a new effective config directory launches
+from an agent-director template without that directory's memory Read allow
+rule, so D's memory reads would raise permission prompts until the next
+start. If a run does use one, expect those prompts and note them; they don't
+fail these checks.
+
+Redefine `LOG`, `since` and `guard` (from the DMs section) in any new shell.
+
+### Check 24: a persona added at runtime comes up and posts as itself, with no restart (AC 19, AC 22)
+
+Steps:
+
+1. Note the log mark, the server's PID and the rows, only if the guard passes:
+
+   ```sh
+   if guard; then
+     MARK=$(wc -l < "$LOG"); echo "MARK=$MARK"
+     PID_BEFORE=$(cat "$S/server.pid"); echo "PID_BEFORE=$PID_BEFORE"
+     tr '\0' '\n' < "/proc/$PID_BEFORE/environ" | grep -cE '^SLACK_(BOT|APP)_TOKEN='   # must print 0
+     agent-director list --label service=cscb
+   fi
+   ```
+
+   Record the rows' instance IDs for A, B and C in Notes (they are not secrets).
+
+2. Start a conversation with A that stays open through the addition. In A-home, post "Remember the word quillfeather for later. Reply with the word noted." A replies "noted". The word is made up and harmless; never use a credential.
+
+3. Create D's credentials file from the terminal, exactly as in Setup step 2, with `persona_d` in the file name and app D's tokens. The tokens are entered with `read -s`, never in chat or on a command line. Then check the mode and create D's working directory:
+
+   ```sh
+   ls -l ~/.config/cscb-test/persona_d-credentials.json   # -rw-------
+   mkdir -p ~/cscb-live/d
+   ```
+
+4. Add D's entry to `~/.claude/channels/slack/config.json`, after `persona_c`'s entry (mind the commas), only on the test host:
+
+   ```json
+   {
+     "name": "persona_d",
+     "credentials_file": "~/.config/cscb-test/persona_d-credentials.json",
+     "working_directory": "~/cscb-live/d",
+     "channels": [
+       { "id": "<D_HOME_CHANNEL_ID>", "delivery": "mentions" }
+     ],
+     "dm": { "enabled": true },
+     "permission_prompts": "<D_HOME_CHANNEL_ID>"
+   }
+   ```
+
+   Then check it parses: `jq -r '.personas[].name' "$S/config.json"` must print `persona_a`, `persona_b`, `persona_c` and `persona_d`.
+
+5. Wait about 10 s, then read the preview and count token-like strings, without printing any:
+
+   ```sh
+   cat "$S/config.json.pending"
+   since "$MARK" | grep -E 'reload-(preview|invalid):'
+   grep -cE 'xox[a-z]-[0-9]|xapp-[0-9]' "$S/config.json.pending"   # must print 0
+   since "$MARK" | grep -cE 'xox[a-z]-[0-9]|xapp-[0-9]'            # must print 0
+   ```
+
+   Look at A-home, coordination, D-home and the operator's DMs with the apps for any post about the pending change.
+
+6. Confirm, only if the guard passes:
+
+   ```sh
+   if guard; then mv "$S/config.json.pending" "$S/config.json.apply"; fi
+   ```
+
+7. Wait until D's `Session connected` line appears (up to about 3 minutes), then run:
+
+   ```sh
+   since "$MARK" | grep -E 'reload-(applied|noop|stale-confirmation|invalid):|persona-start:|at apply|spawnForPersona|Session (connected|disconnected)|persona teardown|updated in place|\) not brought up:|persona-(credentials|directory)-|persona-slack-unreachable'
+   cmp "$S/config.json" "$S/config.json.last-applied" && echo recorded
+   ls "$S/config.json.pending" "$S/config.json.apply"
+   [ "$(cat "$S/server.pid")" = "$PID_BEFORE" ] && echo 'same server'
+   tr '\0' '\n' < "/proc/$PID_BEFORE/environ" | grep -cE '^SLACK_(BOT|APP)_TOKEN='   # must print 0
+   agent-director list --label service=cscb
+   ```
+
+8. In D-home, post "@CSCB Test D reply with the word arrived."
+9. In A-home, post "What word did I ask you to remember? Reply with just that word."
+
+Expected:
+
+- Step 1: the environment count prints `0`, and the list has exactly three rows, `cscb_persona_a`, `cscb_persona_b` and `cscb_persona_c`.
+- Step 5: after its two header lines and a blank line, the pending file's preview is `A configuration change is pending; nothing has been applied. personas: 1 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed.` and `persona "persona_d" (key=persona_d) is added: it will be brought up and launched.` The `grep` prints the same two lines once each, prefixed `[slack] reload-preview: `, the first ending ` (preview in "<path of config.json>.pending")`. Both counts print `0`. Nothing about the pending change appears in Slack.
+- If the second line reads `is added but cannot come up: …` instead, fix the cause it names (the credentials file or the working directory) and wait for the preview to change before confirming. Record that in Notes.
+- Step 7 prints exactly one `[slack] reload-applied: applied the confirmed configuration change without a restart (personas: 1 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed); the last-applied record "<path of config.json>.last-applied" now holds it` line, and for D exactly one each of:
+  - `[slack] persona-start: personas[3] "persona_d" (key=persona_d): bring-up starting`
+  - `[slack] persona "persona_d" (key=persona_d): up at apply — launching`
+  - `[slack] spawnForPersona: spawned "persona_d" (key=persona_d) instanceId=cscb_persona_d`
+  - and at least one `[slack] Session connected: persona "persona_d" (key=persona_d)` line.
+- Step 7 prints no other line: none names `persona_a`, `persona_b` or `persona_c`, and there is no `launch at apply failed`, `not brought up`, `persona-credentials-…`, `persona-directory-…` or `persona-slack-unreachable` line.
+- `recorded` and `same server` are printed, `ls` reports that neither `config.json.pending` nor `config.json.apply` exists, and the environment count prints `0`: the server was not restarted and its environment holds no token variable.
+- The list has exactly four rows: exactly one `cscb_persona_d` row, carrying a `persona` label naming `persona_d`, and A's, B's and C's rows with the instance IDs recorded in step 1.
+- Step 8: D replies "arrived" in D-home under D's own name and avatar, which differ from A's, B's and C's.
+- Step 9: A replies "quillfeather" in A-home under its own name and avatar: its conversation was not disturbed.
+
+A restart, a second row for D, or any lifecycle line for A, B or C fails this check.
+
+Pass: D, added with a new credentials file and config entry and confirmed by the rename, came up with one row and answered as itself, with the same server PID, no token in its environment, no lifecycle change for A, B and C, and A still recalling the word.
+
+### Check 25: a confirmed removal tears down only that persona (AC 57)
+
+Run it right after Check 24, on the same server.
+
+Steps:
+
+1. Note the log mark and the rows, only if the guard passes: `if guard; then MARK=$(wc -l < "$LOG"); agent-director list --label service=cscb; fi`. `PID_BEFORE` stays from Check 24.
+2. Optional: have D raise a permission prompt. In D-home, post "@CSCB Test D run a shell command that writes the current date to a file named removal-prompt.txt in your working directory." Wait for the prompt in D-home, and don't click it. Record in Notes whether this step ran.
+3. Remove D's entry from `config.json`, only if the guard passes:
+
+   ```sh
+   if guard; then
+     jq 'del(.personas[] | select(.name == "persona_d"))' "$S/config.json" > "$S/config.json.tmp" \
+       && mv "$S/config.json.tmp" "$S/config.json"
+   fi
+   jq -r '.personas[].name' "$S/config.json"   # must print persona_a, persona_b and persona_c only
+   ```
+
+4. Wait about 10 s, then read the preview:
+
+   ```sh
+   cat "$S/config.json.pending"
+   since "$MARK" | grep -E 'reload-(preview|invalid):'
+   ```
+
+5. Confirm, only if the guard passes, then wait about 30 s:
+
+   ```sh
+   if guard; then mv "$S/config.json.pending" "$S/config.json.apply"; fi
+   ```
+
+6. Check the apply:
+
+   ```sh
+   since "$MARK" | grep -E 'reload-(applied|noop|stale-confirmation|invalid):|persona-start:|at apply|spawnForPersona|Session (connected|disconnected)|persona teardown|updated in place'
+   cmp "$S/config.json" "$S/config.json.last-applied" && echo recorded
+   ls "$S/config.json.pending" "$S/config.json.apply"
+   [ "$(cat "$S/server.pid")" = "$PID_BEFORE" ] && echo 'same server'
+   agent-director list --label service=cscb
+   MARK2=$(wc -l < "$LOG")
+   ```
+
+7. In D-home, post "@CSCB Test D reply with the word gone." In the operator's DM with app D, send "Reply with the word gone." Wait two minutes, then run `since "$MARK2" | grep -E 'persona=persona_d:|Dispatching to persona "persona_d"|persona-dm-dropped: .*"persona_d"'`.
+8. If step 2 ran, click **Allow** on D's prompt. Wait one minute, then run `ls ~/cscb-live/d/removal-prompt.txt`.
+9. In A-home, post "What word did I ask you to remember? Reply with just that word."
+
+Expected:
+
+- Step 4: the pending file's preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed.` and `DESTRUCTIVE: persona "persona_d" (key=persona_d) is removed: its live session will be destroyed (its instance is torn down).` The `grep` prints the same two lines once each, prefixed `[slack] reload-preview: `. Nothing about it appears in Slack.
+- Step 6 prints `[slack] persona teardown of "persona_d" (key=persona_d): starting`, `[slack] persona teardown of "persona_d" (key=persona_d): complete` (not `complete, with <n> failed step(s)`), and one `[slack] reload-applied: …` line whose counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed`. A `Session disconnected` line for `persona "persona_d" (key=persona_d)` may also appear; record it in Notes. No line names `persona_a`, `persona_b` or `persona_c`, and there is no `persona-start` line.
+- `recorded` and `same server` are printed, and `ls` reports that neither `config.json.pending` nor `config.json.apply` exists.
+- The list has exactly three rows, `cscb_persona_a`, `cscb_persona_b` and `cscb_persona_c`, with the instance IDs recorded in Check 24 step 1. There is no `cscb_persona_d` row: it was killed and deleted.
+- Step 7: D posts nothing in D-home or in the DM, and the `grep` prints nothing: D's Slack connection is closed, so its events no longer reach the server.
+- Step 8: the prompt stays in D-home as posted; clicking it changes nothing in it (Slack may mark the click as failed), and `ls` reports that `removal-prompt.txt` does not exist.
+- Step 9: A replies "quillfeather" in A-home under its own name and avatar.
+
+A `cscb_persona_d` row after the apply, a reply from D, a restart, or any lifecycle line for A, B or C fails this check.
+
+Pass: the confirmed removal of D logged one teardown that completed, D's row is gone and D is silent, the server PID and A's, B's and C's rows are unchanged, A still recalls the word, and any prompt D had posted is inert.
+
+After Check 25, the applied set is A, B and C again, and nothing is pending.
 
 ## Setup from the wizard and README only (appended by E14)
 
@@ -1422,7 +1683,13 @@ must print `true`.
 
 If the lost-message section stopped before its own teardown, restore
 `session_restart_delay` (and remove an `ackReaction` it added) as that
-teardown's steps 2 and 3 say, once the server is stopped.
+teardown's steps 2 and 3 say, once the server is stopped. With the server
+stopped there is nothing to confirm: the record deletion below covers it.
+
+If the runtime add and remove section stopped before Check 25's removal,
+delete `persona_d`'s entry from `config.json` once the server is stopped. D's
+row, if one is left, names no configured persona, so the next start's sweep
+kills and deletes it. Remove `~/cscb-live/d` if it is not needed again.
 
 If the Reboot section stopped before its revert, put C back once the server
 is stopped, before removing A's `dm` line above (the saved copy still has
@@ -1437,11 +1704,20 @@ first start records Setup's config (the pre-flight fails while the record
 exists):
 
 ```sh
-rm -f ~/.claude/channels/slack/config.json.last-applied ~/.claude/channels/slack/config.json.pending
+rm -f ~/.claude/channels/slack/config.json.last-applied ~/.claude/channels/slack/config.json.pending ~/.claude/channels/slack/config.json.apply
 ```
 
-This is the interim stopgap from Setup. E12 changes it along with the other
-stopgap steps.
+This is clean-up for the next run, not a way to apply a change: it runs only
+with the server stopped.
+
+Remove the Reboot section's `@reboot` line from `<TEST_USER>`'s crontab, on
+the test host only (define `guard()` as in "Guarded restart" step 1 if this
+shell doesn't have it):
+
+```sh
+if guard; then crontab -l 2>/dev/null | grep -vF '# cscb-live-b.yko' | crontab -; fi
+crontab -l 2>/dev/null | grep -cF '# cscb-live-b.yko'   # must print 0
+```
 
 A rerun of the DMs section needs a second test user that A has never
 messaged: the one used here now has a DM with A (Check 17 opened it).
@@ -1456,6 +1732,6 @@ retired: `rm ~/.config/cscb-test/*-credentials.json`.
 The operator adds one row per run. Record pass or fail only, never a token or
 a log excerpt containing one.
 
-| Date | Build commit | Host / user | Check 1 | Check 2 | Check 3 | Check 4 | Check 5 | Check 6 | Check 7 | Check 8 | Check 9 | Check 10 | Check 11 | Check 12 | Check 13 | Check 14 | Check 15 | Check 16 | Check 17 | Check 18 | Check 19 | Check 20 | Check 21 | Check 22 | Check 23 (reboot) | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| | | | | | | | | | | | | | | | | | | | | | | | | | | |
+| Date | Build commit | Host / user | Check 1 | Check 2 | Check 3 | Check 4 | Check 5 | Check 6 | Check 7 | Check 8 | Check 9 | Check 10 | Check 11 | Check 12 | Check 13 | Check 14 | Check 15 | Check 16 | Check 17 | Check 18 | Check 19 | Check 20 | Check 21 | Check 22 | Check 23 (reboot) | Check 24 (runtime add) | Check 25 (confirmed removal) | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| | | | | | | | | | | | | | | | | | | | | | | | | | | | | |

@@ -419,22 +419,23 @@ Claude Code sessions need a config file pointing at the MCP server. A skeleton i
 }
 ```
 
-If you change `port` or `bind` in `config.json`, update the `url` here to match once the change is applied (see [Reload](#reload)). The server-managed session launcher uses `mcp_config_path` from the applied configuration to locate this file.
+If you change `port` or `bind` in `config.json`, the confirmed change takes effect only at the next start (see [Reload](#reload)), so update the `url` here to match at that restart. The server-managed session launcher uses `mcp_config_path` from the applied configuration to locate this file.
 
 ---
 
 ## Reload
 
-Saving `config.json` doesn't change what runs. The server runs the last configuration it applied, and it shows an edit as a pending change until you apply it.
+Saving `config.json` doesn't change what runs. The server runs the last configuration it applied, and it shows an edit as a pending change until you confirm it (see [Confirming a change](#confirming-a-change)).
 
 ### Files beside the config file
 
-Both files sit in the same directory as `config.json` (`~/.claude/channels/slack/` by default, or `SLACK_STATE_DIR`). The server writes them; never edit either by hand.
+These files sit in the same directory as `config.json` (`~/.claude/channels/slack/` by default, or `SLACK_STATE_DIR`). Never edit them by hand.
 
 | File | What it is |
 |---|---|
-| `config.json.last-applied` | The record: a byte copy of the last configuration the server applied. |
-| `config.json.pending` | A preview of what applying the edit would do. It exists only while a change is pending. |
+| `config.json.last-applied` | The record: a byte copy of the last configuration the server applied. The server writes it. |
+| `config.json.pending` | A preview of what applying the edit would do, written by the server. It exists only while a change is pending. |
+| `config.json.apply` | Your confirmation: the pending file, renamed. The server deletes it at its next check (see [Confirming a change](#confirming-a-change)). |
 
 ### Start rules
 
@@ -447,6 +448,8 @@ Both files sit in the same directory as `config.json` (`~/.claude/channels/slack
 
 A configuration with zero personas is valid and starts.
 
+CSCB ships no boot mechanism: starting the server after a host reboot is the operator's job.
+
 Credentials files are read as they stand at every start. So a credentials change still pending when the server stopped takes effect at the next start.
 
 `stop`, `stop --stop-bots` and `clean_restart` take their timeouts and persona set from the record when there is one, and from `config.json` otherwise.
@@ -457,7 +460,7 @@ If the first start fails on a setting such as `port` or `bind`, see "A fix to co
 
 ### Editing the configuration
 
-While the server runs, it checks `config.json` and each credentials file the file names about every 5 seconds. It applies nothing it finds. When either differs from what is applied, the server writes `config.json.pending` and logs the same preview once in `server.log`. Nothing about a pending change is posted to Slack.
+While the server runs, it checks `config.json` and each credentials file the file names about every 5 seconds. It applies nothing it finds. When either differs from what is applied, the server writes `config.json.pending` and logs the same preview once in `server.log`. The change waits for your confirmation (see [Confirming a change](#confirming-a-change)). Nothing about a pending change is posted to Slack.
 
 - Restarting the server or rebooting the host doesn't apply a pending `config.json` edit. The start brings back the recorded personas, and the edit stays pending.
 - A pending credentials-file change is the exception: every start reads credentials files as they stand, so the next start applies it.
@@ -488,6 +491,8 @@ server-wide setting port changed: once applied, it is recorded and takes effect 
 server-wide setting claude_config_dir changed: inherited by "planner" (key=planner), "reviewer" (key=reviewer); takes effect at each one's next launch, which starts fresh (the conversation is not resumed), instance kept until then.
 ```
 
+The preview describes the full effect of the change. A few kinds of change take effect only at the next start; see [What takes effect at the next start](#what-takes-effect-at-the-next-start).
+
 Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In `server.log`, each preview line (everything after the `fingerprint:` line and the blank line) is prefixed `[slack] reload-preview:`, and the first one ends with where the preview is written: ` (preview in "<path of config.json.pending>")`.
 
 | Line | Meaning |
@@ -503,17 +508,77 @@ Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In 
 | `INVALID: <error> Nothing will be applied.` | The edited `config.json` is invalid or missing. Fix the file; nothing is applied until it is valid. `server.log` shows a `reload-invalid` line. |
 | `… no effective change: …` | The edit changes nothing that runs (for example, whitespace, or a default written out). |
 
-### Applying an edit
+### Confirming a change
 
-To apply a pending edit:
+To apply a pending change, rename `config.json.pending` to `config.json.apply` in the same directory, with the server running:
 
-1. While the server still runs, read `config.json.pending`, and compare the files with `diff config.json.last-applied config.json`. The start applies every edit in `config.json`, so read every line. If the preview reads `INVALID`, fix `config.json` first.
-2. Stop the server with `claude-slack-channel-bots stop`. If the edit changes a setting that takes effect at a bot's next launch (`claude_config_dir` or `stop_hook_bootstrap`), use `stop --stop-bots` so the bots relaunch.
-3. Keep a copy of the record: `cp config.json.last-applied config.json.last-applied.bak`. Run `diff config.json.last-applied.bak config.json` once more, in case `config.json` changed after you read the preview.
-4. Delete `config.json.last-applied`.
-5. Run `claude-slack-channel-bots start`.
+```sh
+cd "${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}" && mv config.json.pending config.json.apply
+```
 
-Run the file commands in the directory that holds `config.json`. The start applies `config.json` as it stands and shows no preview first. The `DESTRUCTIVE:` effects happen at that start: removed and renamed personas lose their instances and conversations, and a changed `working_directory` starts that persona fresh. A changed `credentials_file` is the exception: this start only reconnects the persona to Slack with the new app, and its instance keeps running. If `config.json` is invalid, the server doesn't start. Fix the file and start again, or copy the `.bak` back to `config.json.last-applied` to run the previous configuration.
+Read the preview first. The server picks the confirmation up at its next check, within about 5 seconds; a check still running an earlier apply delays it, so `reload-applied` can come minutes later. It deletes the confirmation and applies it without a restart, except for the changes listed under [What takes effect at the next start](#what-takes-effect-at-the-next-start).
+
+You can direct an agent to do the rename for you. Nothing has to be computed, copied or typed. A confirmation made while the server is stopped is processed at the first check after the next start.
+
+Each confirmation logs one of these lines in `server.log`:
+
+```sh
+grep -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed)' "${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}/server.log" | tail
+```
+
+| Line | Meaning |
+|---|---|
+| `[slack] reload-applied: applied the confirmed configuration change without a restart (personas: …); the last-applied record "<path>" now holds it` | The change is applied, and `config.json.last-applied` holds it. |
+| `[slack] reload-noop: the confirmed configuration has no effective change, …` | Nothing that runs changed. The record was rewritten, and nothing is left pending. |
+| `[slack] reload-invalid: the confirmed configuration is invalid, so nothing is applied: <error>` | `config.json` was invalid or missing when you confirmed. The line carries the full error. Fix the file, then confirm the new preview. |
+| `[slack] reload-stale-confirmation: the confirmation "<path>" …; nothing is applied` | See [Stale confirmations](#stale-confirmations). |
+| `[slack] reload-record-write-failed: … the confirmed change is not applied and stays pending` | `config.json.last-applied` couldn't be written, so nothing is applied. Fix the state directory (permissions, free space), then confirm again. |
+
+### What a confirmation applies
+
+| Change | What happens |
+|---|---|
+| A persona is added | It is brought up exactly as at start, including the storage check (`jsonl-non-persistent`, see [Startup errors](#startup-errors)). If its credentials file or working directory is bad, it logs the same lines as at start and never affects running personas. See "A persona doesn't come up or doesn't answer" in [Troubleshooting](#troubleshooting). |
+| A persona is removed | It is torn down. Its instance, its agent-director row and its conversation are destroyed. Its posted permission prompts stay in Slack, and clicking one has no effect. |
+| A persona's `name` changes | A removal plus an addition. The old session is destroyed, and a fresh one starts with no history. |
+| `channels`, `delivery`, `permission_prompts`, `dm.enabled` or `dm.contact` changes | Applied in place, from the next event or post. The instance and its conversation are kept. A changed DM contact is used for the next prompt. |
+| A persona's declaration and credentials are unchanged | It is not touched. |
+
+### What takes effect at the next start
+
+A confirmation records these changes, but the running server doesn't act on them yet:
+
+- **`credentials_file` or `working_directory`.** The persona's instance and connection keep running as they are. After a confirmed `working_directory` change, though, the server admits the persona's MCP session only from the new directory: if the running bot's session reconnects from the old one, it is refused and the bot goes silent in Slack, and if its session drops, the server relaunches it fresh in the new directory, without its conversation. So restart promptly.
+- **`claude_config_dir` or `stop_hook_bootstrap`.** They take effect at the persona's next launch.
+- **Server-wide settings** such as `port` or `bind`. The server keeps the values it started with.
+
+A change to a credentials file's content is never recorded. The persona keeps its current connection, or stays down if its credentials were bad, and the change stays pending. Every start reads credentials files as they stand, so it needs only a restart, not a confirmation.
+
+To make them take effect, wait for the `reload-applied` line, then run `claude-slack-channel-bots clean_restart`. It reads the bot list from the record before it stops the server, so run earlier it can work from the old record. The server comes back on the record, and every bot is relaunched. Conversations resume, except that a changed `working_directory` or `claude_config_dir` starts that persona fresh. A changed `credentials_file` only reconnects the persona to Slack with the new app, and its conversation is kept.
+
+A persona added or relaunched with a `claude_config_dir` that no persona used at the last start asks for permission each time it reads its memory notes, until the next start. Relaunched means an existing persona restarted after a crash or a failed health check once a `claude_config_dir` change is confirmed.
+
+### Destructive changes
+
+`DESTRUCTIVE:` lines in the preview name the sessions the change destroys: a removed or renamed persona at the confirmation, and a changed `working_directory` at the relaunch. A `DESTRUCTIVE:` line for a changed `credentials_file` destroys nothing in this build: the change is only recorded, and a restart reconnects the persona. Read the preview before you rename it. There is no undo. Re-adding a removed persona brings up a fresh session, and the old conversation isn't guaranteed to resume.
+
+### Stale confirmations
+
+A confirmation is pinned to the exact content of `config.json` and of every credentials file it names. If any of them changed after the preview was written, nothing is applied. The confirmation is deleted, and one `reload-stale-confirmation` line is logged. The same happens for a confirmation that can't be read or isn't a pending file the server wrote.
+
+To fix it, wait for the server to write `config.json.pending` again (within about 5 seconds), read it and rename it again. A confirmation is used once. If the same content comes back later, for example after a revert and a redo, confirm it again.
+
+### Size limit
+
+`config.json`, the files beside it and each credentials file are read only up to 64 KiB; a larger file is treated as unreadable. If a very large change makes `config.json.pending` itself larger, its rename is refused as stale, so split the change into smaller edits.
+
+### No reload command
+
+By design, no CLI subcommand, MCP tool or HTTP endpoint applies a change: the rename is the only way. Personas are Claude instances that read help output and tool lists, and a reload can remove a persona, so none of them advertises it; this isn't a security boundary, since a bot running as your user could rename the file itself, so only direct one to when you intend to.
+
+### When the server can't start
+
+A confirmation needs a running server. When the record keeps the server from starting (it can't be read or is invalid, or the first start recorded a bad `port` or `bind`), fix `config.json`, delete `config.json.last-applied`, then run `claude-slack-channel-bots start`. With no record, the start applies `config.json` as it stands and shows no preview.
 
 ---
 
@@ -1054,7 +1119,7 @@ This applies only when there is no last-applied record. `start` exits with `miss
 `server.log` shows `[slack] reload-record-write-failed: cannot write the last-applied record "<path>"`: a start with no record could not write it, so nothing was applied. Check that the directory holding `config.json` is writable and not full, then start again. If the line says the record `was written but its directory could not be synced`, the record is on disk and the next start runs it.
 
 **A fix to config.json is ignored after a failed first start**
-The first start writes the record before the server opens its port. If that start failed on a setting such as `port` or `bind`, the record still holds the bad value, and later starts run it. Apply the fix as described in [Applying an edit](#applying-an-edit).
+The first start writes the record before the server opens its port. If that start failed on a setting such as `port` or `bind`, the record still holds the bad value, and later starts run it. Apply the fix as described in [When the server can't start](#when-the-server-cant-start).
 
 The `debug-slack-channel-bots` skill (below) has the full entries for these start failures and for pending changes.
 
@@ -1146,7 +1211,7 @@ This is intentional: when agent-director is unreachable, the teardown cannot run
 **Bots come back with no memory of the prior conversation after a reboot**
 With `resume_enabled: true`, a bot whose host rebooted (or pod resumed) should return with its conversation history. If it comes back amnesiac, confirm the system-installed `agent-director` is **≥ 0.8.0** (`agent-director version`) — reboot recovery relies on capabilities added in that release. Note that `bun run install-check` does **not** confirm this: its client floor is `0.7.0`, lower than the reboot-recovery requirement, so install-check passes on a `0.7.x` binary that still yields amnesiac bots. Verify the resume requirement directly with `agent-director version`. Note: legacy sessions created before upgrading to 0.8.0 may lose history exactly once on their first post-upgrade recovery, then resume cleanly thereafter.
 
-A bot also starts fresh, by design, when its session no longer matches the applied configuration. A config edit takes effect only once it is applied (see [Reload](#reload)); a restart or reboot alone runs the last-applied record. When a change to a persona's `working_directory` is applied, the session is replaced instead of resumed. When a change to a persona's effective `claude_config_dir` (its own or the top-level default) is applied, the bot starts fresh the next time it would be resumed: after `clean_restart`, after `stop --stop-bots` then `start`, after a reboot, or when the bot dies. A bot that keeps running across a plain `stop` and `start` keeps its old config directory until then. The old transcript stays in the old config directory. The first start after upgrading from an earlier release also replaces every existing bot once, because the server removes managed sessions it cannot attribute. The log names the reason: search `server.log` for `sweeping row`, `replacing the row` or `not resuming; spawning fresh`.
+A bot also starts fresh, by design, when its session no longer matches the applied configuration. A config edit takes effect only once it is applied (see [Reload](#reload)); a restart or reboot alone runs the last-applied record. When a change to a persona's `working_directory` is applied, the session is replaced instead of resumed at its next launch. When a change to a persona's effective `claude_config_dir` (its own or the top-level default) is applied, the bot starts fresh the next time it would be resumed: after `clean_restart`, after `stop --stop-bots` then `start`, after a reboot, or when the bot dies. A bot that keeps running across a plain `stop` and `start` keeps its old config directory until then. The old transcript stays in the old config directory. The first start after upgrading from an earlier release also replaces every existing bot once, because the server removes managed sessions it cannot attribute. The log names the reason: search `server.log` for `sweeping row`, `replacing the row` or `not resuming; spawning fresh`.
 
 **Session crashes on resume with "sandbox required but unavailable"**
 This is a known regression in certain Claude Code releases (e.g. v2.1.120) where `--resume` triggers a sandbox check that fails in headless environments. Set `resume_enabled: false` in `config.json` and apply the change (see [Reload](#reload)) to disable `--resume` entirely — the bot will always start a fresh Claude session instead of resuming a prior conversation, both on startup and on runtime auto-restart:

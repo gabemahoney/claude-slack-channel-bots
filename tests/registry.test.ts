@@ -1715,8 +1715,19 @@ describe('reply — ack reaction removal', () => {
 // Tool list and MCP instructions
 // ---------------------------------------------------------------------------
 
+/**
+ * Reload wording no MCP tool or instruction text may carry (b.av2 SR-8.8). The
+ * same list as cli.test.ts's, kept local to each file on purpose.
+ */
+const RELOAD_TERMS: readonly (string | RegExp)[] = [/reload/i, 'config.json.apply', 'config.json.pending', '.apply', '.pending']
+
+/** The listed reload terms found in `text`, as written in `RELOAD_TERMS`. */
+function reloadTermsIn(text: string): string[] {
+  return RELOAD_TERMS.filter((t) => (typeof t === 'string' ? text.includes(t) : t.test(text))).map(String)
+}
+
 describe('tool list and instructions', () => {
-  test('lists exactly the five tools with their inputs and required inputs unchanged', async () => {
+  test('lists exactly the five tools with their inputs and required inputs unchanged; no tool name, description or input schema text carries reload wording (AC 74)', async () => {
     const { client } = await openPersonaSession(h.alpha)
 
     const { tools } = await client.listTools()
@@ -1732,6 +1743,44 @@ describe('tool list and instructions', () => {
       fetch_messages: { properties: ['channel', 'limit', 'thread_ts'], required: ['channel'] },
       download_attachment: { properties: ['chat_id', 'message_id'], required: ['chat_id', 'message_id'] },
     })
+    // b.av2 SR-8.8: the whole tool definition (name, description, every schema
+    // property name and description), so a reload tool or hint can't slip in.
+    expect(Object.fromEntries(tools.map((t) => [t.name, reloadTermsIn(JSON.stringify(t))]))).toEqual(
+      Object.fromEntries(tools.map((t) => [t.name, []])),
+    )
+  })
+
+  test.each(['reload', 'apply_config'])(
+    'AC 74: calling a `%s` tool is refused as unknown, with no Slack call and nothing leaked',
+    async (name) => {
+      const { client } = await openPersonaSession(h.alpha)
+
+      const outcome = await client.callTool({ name, arguments: { chat_id: A_ALL } }).then(
+        (result) => ({ result: result as ToolResult, error: undefined as unknown }),
+        (error: unknown) => ({ result: undefined, error }),
+      )
+
+      // The unknown-tool refusal itself, as a tool error or a protocol
+      // not-found error; any other tool error (a hidden tool refusing) fails.
+      if (outcome.error === undefined) {
+        expect(outcome.result?.isError).toBe(true)
+        expect(outcome.result?.content.map((c) => c.text)).toEqual([expect.stringMatching(/unknown tool/i)])
+      } else {
+        expect(String(outcome.error)).toMatch(/unknown tool|not found/i)
+      }
+      expectNoSlackCall()
+      expect(h.fetches).toEqual([])
+      assertNoLeak({ outcome, lines: h.lines })
+    },
+  )
+
+  test('AC 74: instructions carry no reload wording', async () => {
+    const { client } = await openPersonaSession(h.alpha)
+
+    const instructions = client.getInstructions() ?? ''
+
+    expect(instructions).toContain('chat_id')
+    expect(reloadTermsIn(instructions)).toEqual([])
   })
 
   test('instructions carry no pairing or access-control wording and still say to pass chat_id back', async () => {

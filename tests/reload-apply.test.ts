@@ -303,6 +303,82 @@ describe('a confirmed addition brings the persona up (b.av2 SR-6.1 at apply, SR-
 })
 
 // ---------------------------------------------------------------------------
+// The Epic's dry-run sprint demo, first leg (a confirmed addition)
+// ---------------------------------------------------------------------------
+
+describe('the dry-run sprint demo: a confirmed addition (real composition, dry run)', () => {
+  /** The preview header's and the `reload-applied` line's counts for one added persona. */
+  const ONE_ADDED =
+    'personas: 1 added, 0 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; ' +
+    'server-wide settings: 0 changed'
+
+  test('sprint demo: in dry run, a persona added to config.json is previewed on one check, confirmed by one rename and brought up and launched on the next, without a restart or any agent-director call; the running persona is untouched and nothing is pending afterwards', async () => {
+    const { run, personas } = await running(['alpha'], { realLifecycle: true, dryRun: true })
+    const [alpha] = personas
+    const alphaKey = h.key('alpha')
+    const charlieKey = h.key('charlie')
+    expect(run.bringUps.state(alphaKey)?.outcome).toBe('up')
+    const charlie = h.persona('charlie')
+    h.materialize(charlie)
+    const cp = run.checkpoint()
+
+    // Edit, check: the pending file previews the addition and nothing is applied.
+    h.writeConfig(configOf(alpha!, charlie))
+    await run.ticks.tick()
+    expect(h.pendingLines()).toEqual([
+      `A configuration change is pending; nothing has been applied. ${ONE_ADDED}.`,
+      `persona ${JSON.stringify('charlie')} (key=${charlieKey}) is added: it will be brought up and launched.`,
+    ])
+    expect(run.since(cp).lifecycle).toEqual([])
+    expect(run.appliedKeys()).toEqual(keysOf('alpha'))
+
+    // Rename, check: applied.
+    h.confirm()
+    await run.ticks.tick()
+
+    // Exactly one bring-up, for charlie, which came up and launched.
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'bring-up', key: charlieKey, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key: charlieKey, via: 'apply' },
+    ])
+    expect(run.bringUps.state(charlieKey)?.outcome).toBe('up')
+    expect(run.connections.manager.status(charlieKey)?.state).toBe('up')
+    expect(run.since(cp).logs).toContain(`[slack] persona ${renderPersonaRef('charlie', charlieKey)}: up at apply — launching`)
+    expect(run.composition!.calls).toEqual([
+      ['storageCheck', charlieKey],
+      ['bringUps.bringUp', charlieKey],
+      ['launch', charlieKey],
+    ])
+    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'charlie'))
+    expect(run.appliedConfigs.map((c) => c.personas.map((p) => p.key))).toEqual([keysOf('alpha', 'charlie')])
+    // Dry run: no credentials file read at the checks or the bring-up, no Slack client, no Slack call.
+    expect(run.tickCredentialsReads).toEqual([])
+    expect(run.bringUps.credentialsDigest(charlieKey)).toBeUndefined()
+    expect(run.slack.builds).toEqual([])
+    expect(Object.values(run.slackCalls()).flat()).toEqual([])
+    // No agent-director kill, delete or any other call, and no teardown.
+    expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
+    expect(run.composition!.agentDirectorOrder).toEqual([])
+    expect(run.lifecycle.of('teardown')).toEqual([])
+    // No restart: one start pass, one run.
+    expect(run.lifecycle.startPasses).toHaveLength(1)
+    expect(h.runs).toHaveLength(1)
+    // Exactly one reload-applied line, naming one addition.
+    const appliedLines = run.logsOf(RELOAD_APPLIED)
+    expect(appliedLines).toEqual([
+      `[slack] ${RELOAD_APPLIED}: applied the confirmed configuration change without a restart (${ONE_ADDED}); ` +
+        `the last-applied record ${JSON.stringify(h.paths.lastApplied)} now holds it`,
+    ])
+    // alpha: no lifecycle record, dependency call or state change.
+    expect(run.since(cp).lifecycle.filter((r) => r.key === alphaKey)).toEqual([])
+    expect(run.composition!.calls.filter(([, key]) => key === alphaKey)).toEqual([])
+    expect(run.bringUps.state(alphaKey)?.outcome).toBe('up')
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Removals (AC 57; b.av2 SR-6.5)
 // ---------------------------------------------------------------------------
 

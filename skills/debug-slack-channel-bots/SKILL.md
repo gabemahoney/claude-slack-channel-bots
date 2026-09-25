@@ -1,6 +1,6 @@
 ---
 name: debug-slack-channel-bots
-description: Diagnose a claude-slack-channel-bots persona that is silent, down or refused — find its server-log lines, match the class, and follow the fix for every persona failure, every config.json rejection, every last-applied record failure at start, and every pending configuration change.
+description: Diagnose a claude-slack-channel-bots persona that is silent, down or refused — find its server-log lines, match the class, and follow the fix for every persona failure, every config.json rejection, every last-applied record failure at start, and every pending configuration change and its confirmation.
 version: 1.0.0
 license: MIT
 user-invocable: true
@@ -16,7 +16,8 @@ server log with a class label. This skill says where that log is, how to find
 one persona's lines, what each line means, and what the operator does about it.
 It also covers every reason `config.json` is rejected at start, every
 reason the last-applied record (`config.json.last-applied`) stops a start, and
-how to read a pending configuration change (`config.json.pending`).
+how to read and confirm a pending configuration change
+(`config.json.pending`).
 
 One broken persona never stops the server. Every healthy persona keeps serving,
 and nothing about a broken persona is posted to Slack under any identity. The
@@ -82,7 +83,10 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    [A persona isn't reminded to reply](#a-persona-isnt-reminded-to-reply-or-is-reminded-after-opting-out).
 8. **An edit of `config.json` had no effect, `config.json.pending` exists, or
    `server.log` has `reload-preview` or `reload-invalid` lines?** The edit is
-   pending, not applied. See [Pending changes](#pending-changes).
+   pending, not applied. See [Pending changes](#pending-changes), and
+   [Confirming a pending change](#confirming-a-pending-change) to apply it.
+   Renamed `config.json.pending` to `config.json.apply` and nothing
+   happened? See [I confirmed but nothing happened](#i-confirmed-but-nothing-happened).
 9. **A persona was just added or removed by a confirmed change?** See
    [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change).
    Its channels, destination or DM settings were changed? See
@@ -196,8 +200,8 @@ running are not affected. See
   and [The last-applied record](#the-last-applied-record)). When a
   last-applied record exists, a start runs the record, not `config.json`: a
   persona added to `config.json` since the record was written isn't brought up
-  until the edit is applied (see
-  [Applying a `config.json` edit](#applying-a-configjson-edit)).
+  until the edit is confirmed (see
+  [Confirming a pending change](#confirming-a-pending-change)).
 
 ### `persona-credentials-missing`
 
@@ -205,9 +209,9 @@ running are not affected. See
 - **Cause text:** `credentials file does not exist`. The path in `path="…"`
   doesn't exist, or a directory on the way to it doesn't.
 - **Fix:** Create the credentials file at that path, then restart the server.
-  Or correct the persona's `credentials_file` in `config.json` and apply the
-  edit (see [Applying a `config.json` edit](#applying-a-configjson-edit)); a
-  plain restart doesn't apply it.
+  Or correct the persona's `credentials_file` in `config.json`, confirm the
+  edit, then restart the server (see
+  [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)); a plain restart without the confirmation doesn't apply it.
 - **Added at runtime:** the same line, with the same fix, when a confirmed
   change adds this persona. Other personas are not affected.
 
@@ -262,8 +266,8 @@ running are not affected. See
 - **Fix:** The operator rewrites the file in the shape above (mode 0600), then
   restarts the server. For a shared file, give each persona its own file: point
   the symlink elsewhere and restart, or change a `credentials_file` in
-  `config.json` and apply the edit (see
-  [Applying a `config.json` edit](#applying-a-configjson-edit)). Use
+  `config.json`, confirm the edit and restart (see
+  [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)). Use
   [Checking a credentials file's shape](#checking-a-credentials-files-shape) to
   confirm the fix without showing a token.
 - **Added at runtime:** the same line, with the same fix, when a confirmed
@@ -362,9 +366,9 @@ running are not affected. See
   `cleared: working directory is usable again; continuing the bring-up`, then
   Slack validation and the launch.
 - **Fix:** Create the directory (readable and searchable by the server's user).
-  Or correct `working_directory` in `config.json` and apply the edit (see
-  [Applying a `config.json` edit](#applying-a-configjson-edit)); a plain
-  restart doesn't apply it.
+  Or correct `working_directory` in `config.json`, confirm the edit, then
+  restart the server (see
+  [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)); a plain restart without the confirmation doesn't apply it.
 - **Added at runtime:** the same line when a confirmed change adds this
   persona; it comes up on its own once the directory is usable. Other
   personas are not affected.
@@ -388,9 +392,9 @@ running are not affected. See
   and keeps retrying; the other personas come up.
 - **Fix:** Make the path a directory the server's user can read and search
   (`chmod u+rx`), or point the persona at its own directory (by changing the
-  symlink, or by changing `working_directory` in `config.json` and applying the
-  edit, see [Applying a `config.json` edit](#applying-a-configjson-edit)). A
-  fixed path comes up on the next re-check, within 300 s.
+  symlink, or by changing `working_directory` in `config.json`, confirming the
+  edit and restarting, see
+  [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)). A fixed path comes up on the next re-check, within 300 s.
 - **Added at runtime:** the same line when a confirmed change adds this
   persona; it comes up on its own once the directory is usable. Other
   personas are not affected.
@@ -405,7 +409,7 @@ running are not affected. See
 - **Fix:** Add the channel to the right persona's `channels` in `config.json`,
   or remove the app from the channel. A `config.json` edit becomes pending (see
   [Pending changes](#pending-changes)); once confirmed (see
-  [Applying a `config.json` edit](#applying-a-configjson-edit)) it applies in
+  [Confirming a pending change](#confirming-a-pending-change)) it applies in
   place, with no restart, and the persona keeps its instance and
   conversation. If the ID is a
   group DM (someone @mentioned the persona in a multi-person DM), the line is
@@ -422,7 +426,7 @@ running are not affected. See
   `dm.enabled`, never the message text.
 - **Fix:** Set `dm.enabled` to `true` for that persona in `config.json`. The
   edit becomes pending (see [Pending changes](#pending-changes)); once
-  confirmed (see [Applying a `config.json` edit](#applying-a-configjson-edit))
+  confirmed (see [Confirming a pending change](#confirming-a-pending-change))
   it applies in place, with no restart, and the persona keeps its instance and
   conversation. DMs sent before that aren't delivered later. Leaving it off
   is valid when the persona should ignore DMs; the line is then expected.
@@ -495,7 +499,7 @@ running are not affected. See
     its `permission_prompts` (a channel its app is in, or `dm`) or its
     `dm.contact` in `config.json`. The edit becomes pending (see
     [Pending changes](#pending-changes)); once confirmed (see
-    [Applying a `config.json` edit](#applying-a-configjson-edit)) it applies
+    [Confirming a pending change](#confirming-a-pending-change)) it applies
     in place, with no restart, and the persona keeps its instance and
     conversation. What is held goes to the new destination at its next retry;
     prompts already posted stay where they are and can still be answered; a
@@ -827,10 +831,10 @@ and is `broken`.
 
   | Cause | How to confirm | Fix |
   |---|---|---|
-  | The effective value isn't what you expect. A persona without its own `stop_hook_bootstrap` inherits the top-level one (default `true`). | The persona's entry and the top level of `config.json`. | With the operator's say-so, set `stop_hook_bootstrap` on the persona's entry (it overrides the top level), then apply the edit with the bots relaunched (see [Applying a `config.json` edit](#applying-a-configjson-edit), using `stop --stop-bots`). |
+  | The effective value isn't what you expect. A persona without its own `stop_hook_bootstrap` inherits the top-level one (default `true`). | The persona's entry and the top level of `config.json`. | With the operator's say-so, set `stop_hook_bootstrap` on the persona's entry (it overrides the top level), then confirm the edit and relaunch the bots with `clean_restart` (see [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)). |
   | The value changed after the persona's instance launched. A running instance keeps the value it launched with; a change applies at the persona's next launch. A plain server restart reconnects to an instance that is still running, which is not a launch. | The record holds the old value. | With the operator's say-so, run `claude-slack-channel-bots clean_restart`. It relaunches every persona (resume or fresh spawn), cutting off their current turns, and each launch rewrites the persona's record. |
-  | No `claude_config_dir` is configured for the persona (nor at the top level). No hook is installed for it, so it gets no reminder. | `server.log` has `[slack] stop-hook-bootstrap: "<name>" (key=<key>) has no claude_config_dir — skipping`. | Give the persona (or the top level) a `claude_config_dir` of its own, then apply the edit with the bots relaunched (see [Applying a `config.json` edit](#applying-a-configjson-edit), using `stop --stop-bots`). The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
-  | Its `claude_config_dir` resolves to the operator's own `~/.claude`. The server never installs the hook there, so the persona gets no reminder. | `startup-errors.log` has a `stop-hook-bootstrap-refuse-home` entry (recorded once per server start); `server.log` has `refusing to touch operator's own ~/.claude` at each launch. | Point the persona at a different `claude_config_dir`, then apply the edit with the bots relaunched (see [Applying a `config.json` edit](#applying-a-configjson-edit), using `stop --stop-bots`). The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
+  | No `claude_config_dir` is configured for the persona (nor at the top level). No hook is installed for it, so it gets no reminder. | `server.log` has `[slack] stop-hook-bootstrap: "<name>" (key=<key>) has no claude_config_dir — skipping`. | Give the persona (or the top level) a `claude_config_dir` of its own, then confirm the edit and relaunch the bots with `clean_restart` (see [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)). The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
+  | Its `claude_config_dir` resolves to the operator's own `~/.claude`. The server never installs the hook there, so the persona gets no reminder. | `startup-errors.log` has a `stop-hook-bootstrap-refuse-home` entry (recorded once per server start); `server.log` has `refusing to touch operator's own ~/.claude` at each launch. | Point the persona at a different `claude_config_dir`, then confirm the edit and relaunch the bots with `clean_restart` (see [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)). The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
   | `jq` is not on the host's `PATH`. The hook is installed but can't read the transcript, so it never reminds. | `startup-errors.log` has a `stop-hook-bootstrap-jq-missing` entry. | Install `jq`. No restart is needed; the next turn is checked. |
   | The hook couldn't be installed: the directory is missing, or its `settings.json` is unreadable or not valid JSON (left untouched). | `startup-errors.log` (at start) or `server.log` (at a launch) has `stop-hook-bootstrap-dir-missing`, `stop-hook-bootstrap-not-a-dir` or `stop-hook-bootstrap-settings-…`; the `jq` command above shows no `slack-reply-guard.sh` entry. | Create the directory or fix the file, then `clean_restart`. |
   | The record couldn't be written at launch. The stale record is removed, so the persona gets no reminder until its next launch. | No record file; `server.log` has `[slack] reply-guard: could not write the record for "<name>" (key=<key>) at <path>`. | Fix the state directory's permissions or free space, then `clean_restart`. |
@@ -885,7 +889,7 @@ checks an edit, within about 5 s once a start's bring-up is done (see
 writes the error as one `INVALID:` line to `config.json.pending` and logs it
 once under [`reload-invalid`](#reload-invalid) in `server.log`; nothing is
 applied. The error is the same message as in the tables below. To apply an
-edit, see [Applying a `config.json` edit](#applying-a-configjson-edit).
+edit, confirm it (see [Confirming a pending change](#confirming-a-pending-change)).
 
 ```text
 [slack] reload-invalid: the pending configuration is invalid and nothing will be applied: <loader error> (preview in "<path>/config.json.pending")
@@ -1015,7 +1019,7 @@ changed credentials file) is waiting, it keeps `config.json.pending` beside
 `config.json`, and it deletes the file when nothing is waiting any more.
 The file holds a preview of what applying the change would do, and the same
 preview is logged once (see [Pending changes](#pending-changes)). To apply an
-edit, follow [Applying a `config.json` edit](#applying-a-configjson-edit). The
+edit, confirm it (see [Confirming a pending change](#confirming-a-pending-change)). The
 check writes only to the server log, never to Slack.
 
 If the check can't keep that file in step, it logs one of these plain
@@ -1060,6 +1064,12 @@ any more. Nothing in it is applied, and it never reaches Slack.
   credentials file isn't checked.
 - **When it's checked.** The first check runs once a start's bring-up is done,
   then every 5 s.
+- **Applying it.** With the operator's say-so, rename `config.json.pending`
+  to `config.json.apply`; the next check applies the change it describes,
+  if the files still match it (see
+  [Confirming a pending change](#confirming-a-pending-change)). The operator
+  may direct an agent to do the rename. There is no reload command: no CLI
+  subcommand, MCP tool or HTTP endpoint applies a change.
 
 Read it, and compare the edit with the applied configuration:
 
@@ -1169,91 +1179,172 @@ cp "$STATE/config.json.last-applied" "$STATE/config.json"
 Within about 5 s the server deletes `config.json.pending` and logs
 [`reload-nothing-pending`](#reload-nothing-pending) once.
 
-### Applying a `config.json` edit
+### Confirming a pending change
 
-**Adding or removing personas, and changing a persona's routing settings,
-needs no restart.** When the preview lists only `is added` and `is removed`
-lines (a rename is one of each) and `… changed: applied in place immediately,
-instance kept` lines (a change to `channels`, a channel's `delivery`,
-`permission_prompts` or `dm.*`), read it, then, with the operator's say-so,
-rename `config.json.pending` to `config.json.apply`. Within about 5 s the
-running server picks up the confirmation, starts tearing the removed personas
-down, updates the changed ones in place and brings the added ones up. It logs
-[`reload-applied`](#reload-applied) only once all of them have settled,
-possibly minutes later; a persona that is `retrying` at that point isn't up
-yet (see
-[A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)
-and
-[A persona's routing settings were changed by a confirmed change](#a-personas-routing-settings-were-changed-by-a-confirmed-change)).
-For any other change, use the restart below.
+A running server applies a `config.json` edit only when its preview is
+confirmed: with the operator's say-so, rename `config.json.pending` to
+`config.json.apply` in the same state directory. The operator may do the
+rename, or direct an agent (such as a Claude session running this skill) to
+do it. No CLI subcommand, MCP tool or HTTP endpoint applies a change, by
+design; saving, restarting and rebooting apply nothing.
 
-A restart doesn't apply an edit of `config.json` while a record exists. With
-the operator's say-so, stop the server, delete the record, and start: a start
-without a record checks and applies `config.json` as it stands.
+1. Read the preview and diff `config.json` against the record (see
+   [Pending changes](#pending-changes)). The confirmation applies every edit
+   in `config.json`, not just the one you meant, and the preview lists them
+   all. If it reads `INVALID`, fix `config.json` first.
+2. Finish editing, and don't save `config.json` or a credentials file it
+   references again until the change is applied: any save after the preview
+   was written makes the confirmation stale.
+3. With the operator's say-so, rename the preview:
 
-**The start applies the edit with no confirmation.** Before stopping the
-server, while it still runs, read `config.json.pending` and diff `config.json`
-against the record (see [Pending changes](#pending-changes)). Read every line:
-the start applies every edit in `config.json`, not just the one you meant, and
-the preview lists them all. If it reads `INVALID`, the start would be refused:
-fix `config.json` first. The preview describes a confirmed apply; this start
-differs from it in these places:
+   ```sh
+   STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
+   mv "$STATE/config.json.pending" "$STATE/config.json.apply"
+   ```
+
+4. Within about 5 s the next check reads the confirmation and deletes it, so
+   it is used once. If its fingerprint still describes `config.json` and the
+   credentials files, the change is applied: the record is rewritten with
+   `config.json`'s bytes first, then removed personas are torn down, changed
+   routing settings are updated in place and added personas are brought up.
+   Otherwise nothing is applied and
+   [`reload-stale-confirmation`](#reload-stale-confirmation) is logged.
+5. Watch `server.log` for the outcome:
+
+   ```sh
+   grep -h -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed)|reload: ' "$STATE"/server.log | tail
+   ```
+
+   [`reload-applied`](#reload-applied) (or [`reload-noop`](#reload-noop))
+   is logged once every teardown and bring-up has settled, possibly minutes
+   later; a persona that is `retrying` at that point isn't up yet. See
+   [I confirmed but nothing happened](#i-confirmed-but-nothing-happened) for
+   every other outcome.
+
+What changes at once, with no restart:
+
+- **Added and removed personas** (a rename is one of each), the preview's
+  `is added` and `is removed` lines. See
+  [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change).
+- **A kept persona's routing settings**, the preview's `… changed: applied in
+  place immediately, instance kept` lines: `channels`, a channel's
+  `delivery`, `permission_prompts` and `dm.*`. See
+  [A persona's routing settings were changed by a confirmed change](#a-personas-routing-settings-were-changed-by-a-confirmed-change).
+
+Everything else in the change is recorded, and a later start carries it out
+(see [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)).
+Never delete the record to apply an edit: the confirmation has already
+written the change into it. Deleting the record is only for a server that
+can't start (see [Starting without the record](#starting-without-the-record)).
+
+### What a confirmation doesn't apply yet
+
+A confirmation records these changes in `config.json.last-applied`, but the
+running server doesn't carry them out. Until the next start (or launch), the
+persona keeps running as it was launched: same instance, same directory, same
+Slack connection. One exception to "as it was": after a confirmed
+`working_directory` change, MCP admission matches the new directory. If the
+running bot's MCP session re-registers from the old directory, it is refused
+(no matching persona) and the bot goes silent; if its session disconnects,
+the restart path relaunches it fresh in the new directory, without its
+conversation. So restart promptly after `reload-applied`.
+
+| Preview line | After the confirmation | To carry it out |
+|---|---|---|
+| `DESTRUCTIVE: … changed to "<path>" …` or `… name changed …` (a kept persona's `credentials_file`, `working_directory` or `name`) | Recorded. The persona isn't torn down or brought up again. | Restart: at the start, a persona whose `working_directory` changed has its instance killed by the start sweep and comes up fresh in the new directory, without its session history; a changed `credentials_file` only reconnects the persona to Slack with the new app, and its instance keeps running. |
+| `credentials file "<path>" changed …` | Not applied: the persona keeps its current connection, and the credentials change stays pending in `config.json.pending`. | Restart: every start reads credentials files as they stand. No confirmation is needed for it. |
+| `stop_hook_bootstrap changed` or `claude_config_dir changed` (`takes effect at its next launch`, or a top-level setting `inherited by …`) | Recorded. It reaches each persona at its next launch. | Relaunch the bots: `claude-slack-channel-bots clean_restart`, or `stop --stop-bots` then `start`. Both cut off the bots' current turns. A plain restart reconnects running bots, which is not a launch. |
+| `server-wide setting <name> changed: once applied, it is recorded and takes effect at the next server start after that.` | Recorded. | Restart. |
+
+Wait for `reload-applied`, then, with the operator's say-so, run
+`claude-slack-channel-bots clean_restart`. It covers every row above: the
+server comes back on the record and every bot is relaunched, resuming its
+conversation except where a changed `working_directory` or
+`claude_config_dir` starts it fresh. When no next-launch setting changed,
+`claude-slack-channel-bots stop && claude-slack-channel-bots start` is
+enough, and bots whose declaration didn't change keep running undisturbed.
+The record already holds
+the change, so don't delete it.
+
+A persona added by a confirmation, or an existing one relaunched (crash
+auto-restart or health check) after a confirmed `claude_config_dir` change,
+whose effective `claude_config_dir` (its own, else the top-level one, else
+`~/.claude`) no persona used at the last server start launches from an agent-director template without the rule that lets
+it read its memory notes, so each read of its memory notes asks for
+permission until the next server start refreshes the template.
+
+### I confirmed but nothing happened
+
+Look in `server.log` for the lines logged after the rename (the `grep` in
+[Confirming a pending change](#confirming-a-pending-change)):
+
+| Line | Meaning |
+|---|---|
+| [`reload-applied`](#reload-applied) | The change was applied. Personas added, removed or changed in place are handled; the rest is recorded (see [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)). A persona that isn't up has its own class line. |
+| [`reload-noop`](#reload-noop) | The change had no effect (whitespace, key order, a default written out); the record now matches `config.json`. Nothing else happens. |
+| [`reload-invalid`](#reload-invalid), `the confirmed configuration is invalid, so nothing is applied` | `config.json` was invalid. Nothing is applied and the confirmation is used up. Fix the file, then confirm the new preview. |
+| [`reload-stale-confirmation`](#reload-stale-confirmation) | The confirmation didn't match the files as they stand, or couldn't be read. Nothing is applied. |
+| [`reload-record-write-failed`](#reload-record-write-failed), `the confirmed change is not applied and stays pending` | The record couldn't be written. Nothing is applied; fix the state directory, then confirm again. |
+| `[slack] reload: cannot remove the confirmation "<apply path>" (<errno>); it was acted on once and is ignored until its content changes` | The confirmation was acted on once (one of the lines above), but the server couldn't delete it. It is ignored while its content stays the same. Fix the directory's permissions (or the read-only filesystem), then remove `config.json.apply` by hand. |
+| `[slack] reload: apply step <n> (<step>) failed …` or `[slack] reload: updating the server's applied configuration failed: <error>` | An internal error during the apply. Report it as a bug, with the lines around it. |
+
+No line at all:
+
+- **`config.json.apply` is still there.** The server isn't running, its
+  first check after a start hasn't run yet (checks begin once the start's
+  bring-up is done), or the file is in a different state directory from the
+  server's (see [The server log](#the-server-log)). A confirmation left while
+  the server is stopped is processed by the first check after the next start.
+- **An earlier confirmed change is still settling.** The next check waits
+  for every teardown and bring-up of it, which can take minutes (see
+  [A persona was added or removed by a confirmed change](#a-persona-was-added-or-removed-by-a-confirmed-change)).
+- **The file is gone and nothing new was logged.** It was a confirmation
+  already acted on that couldn't be deleted (an earlier `cannot remove the
+  confirmation` line): the server deletes it silently at a later check, once
+  it can. Or it was removed by hand.
+
+### Starting without the record
+
+Only for a server that can't start: the record can't be read or is invalid
+(see [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid)),
+or a first start failed after writing the record (see
+[A first start that fails after recording](#a-first-start-that-fails-after-recording)).
+A start without a record checks `config.json` as it stands, records it and
+applies it, with no preview and no confirmation.
+
+Read `config.json` first: the start applies every edit in it that was never
+applied. Compared with a confirmation:
 
 - A persona that was removed or renamed (a mistyped name counts: the name
-  sets the key) has its running instance killed by the start sweep, as a
-  confirmed removal would. A renamed persona comes up fresh under its new
-  key, without its session history. The preview shows these as
-  `DESTRUCTIVE:` lines.
+  sets the key) has its running instance killed by the start sweep. A renamed
+  persona comes up fresh under its new key, without its session history.
 - A persona whose `working_directory` changed has its running instance killed
-  by the start sweep too, and comes up fresh in the new directory, without
-  its session history. The preview shows a `DESTRUCTIVE:` line.
+  by the start sweep too, and comes up fresh in the new directory.
 - A changed `credentials_file` only reconnects the persona to Slack with the
-  new app at this start; its instance keeps running, although the preview
-  marks it `DESTRUCTIVE:`.
+  new app; its instance keeps running.
+- A setting that takes effect at a bot's launch (`stop_hook_bootstrap`, a
+  changed `claude_config_dir`) doesn't reach a bot that kept running. If the
+  server is still running, stop it with `stop --stop-bots` instead of `stop`.
 
-Stop the server and keep a copy of the record:
+With the operator's say-so, stop the server if it is still running, keep a
+copy of the record if it can be read, delete it and start. Keep the `.bak`
+copy until the new configuration runs as intended:
 
 ```sh
 STATE="${SLACK_STATE_DIR:-$HOME/.claude/channels/slack}"
-claude-slack-channel-bots stop &&
-  cp "$STATE/config.json.last-applied" "$STATE/config.json.last-applied.bak"
-```
-
-Compare the edit with the copy once more, in case `config.json` changed after
-the preview was read, and read every difference against the list above (the
-configuration holds no tokens; if a value starts with `xoxb-` or `xapp-`,
-follow [Constraints](#constraints)):
-
-```sh
+claude-slack-channel-bots stop --stop-bots
+cp "$STATE/config.json.last-applied" "$STATE/config.json.last-applied.bak"
 diff "$STATE/config.json.last-applied.bak" "$STATE/config.json"
-```
-
-Then, with the operator's say-so, delete the record and start. Keep the
-`.bak` copy until the new configuration runs as intended:
-
-```sh
 rm "$STATE/config.json.last-applied" &&
   claude-slack-channel-bots start
 ```
 
-- Plain `stop` leaves the bots running, and the next `start` reconnects to
-  them rather than relaunching them. That is enough for channel, credentials
-  path and `working_directory` edits: the start sweep handles a changed
-  working directory, destructively (see above). A setting that takes effect
-  only at a bot's launch (`stop_hook_bootstrap`, a changed
-  `claude_config_dir`) doesn't reach a bot that kept running; the preview
-  shows it as a `takes effect at its next launch` or `inherited by` line. For
-  such a change, run `claude-slack-channel-bots stop --stop-bots` in place of
-  `stop`: it exits the bots of the record's persona set, which is the set
-  running, so the start launches each one with the edit. It cuts off their
-  current turns.
-- If `config.json` is invalid, the start is refused (see
-  [Configuration rejections](#configuration-rejections)), nothing runs and no
-  record is written. Fix `config.json` and start again, or restore the copy as
-  `config.json.last-applied` to run the previous configuration.
-- If the start fails after the record is written (the port is in use, or
-  `bind` names an address the host doesn't have), see
-  [A first start that fails after recording](#a-first-start-that-fails-after-recording).
+The configuration holds no tokens; if a value in the diff starts with
+`xoxb-` or `xapp-`, follow [Constraints](#constraints). If `config.json` is
+invalid, the start is refused (see
+[Configuration rejections](#configuration-rejections)), nothing runs and no
+record is written. Fix `config.json` and start again, or restore the copy as
+`config.json.last-applied` to run the previous configuration.
 
 ### A first start that fails after recording
 
@@ -1271,7 +1362,7 @@ record was deleted, failing on the listening address:
   values, and fails the same way.
 - **Fix:** If the cause is outside the file (another process holds the port),
   free it and start again. If the fix is an edit of `config.json`, apply it
-  with [Applying a `config.json` edit](#applying-a-configjson-edit): delete
+  with [Starting without the record](#starting-without-the-record): delete
   the record and start, so the start checks, records and applies the fixed
   file.
 
@@ -1317,8 +1408,8 @@ else.
   change stays pending, and within about 5 s `config.json.pending` is written
   again. The confirmation was used up: it isn't acted on again.
 - **Fix:** Fix the cause below. Then read the new `config.json.pending`
-  (see [Pending changes](#pending-changes)) and apply the change again (see
-  [Applying a `config.json` edit](#applying-a-configjson-edit)). If the line
+  (see [Pending changes](#pending-changes)) and confirm it again (see
+  [Confirming a pending change](#confirming-a-pending-change)). If the line
   says writing the previous record back failed too, compare the record with
   `config.json` before any restart: the next start runs the record.
 
@@ -1343,7 +1434,7 @@ or a filesystem that doesn't support syncing a directory).
   - the first check after a start removed a `config.json.pending` left over
     from before, which the start made obsolete: the start applied the
     waiting edit (the record was deleted, as under
-    [Applying a `config.json` edit](#applying-a-configjson-edit)), applied a
+    [Starting without the record](#starting-without-the-record)), applied a
     changed credentials file, or `config.json` was put back while the server
     was stopped.
 - It is never logged at a clean start, where nothing was waiting and no
@@ -1384,7 +1475,7 @@ or a filesystem that doesn't support syncing a directory).
 - **Fix:** Review the preview (the file is the current one). To withdraw the
   change, revert the edit (see [Pending changes](#pending-changes)). To apply
   a `config.json` edit, see
-  [Applying a `config.json` edit](#applying-a-configjson-edit).
+  [Confirming a pending change](#confirming-a-pending-change).
 
 ### `reload-invalid`
 
@@ -1436,8 +1527,8 @@ or a filesystem that doesn't support syncing a directory).
   Within about 5 s the check writes the new preview, or removes the pending
   file and logs `reload-nothing-pending` if the file matches what is applied.
   After the confirmed variant, the old confirmation can't be reused: read the
-  new `config.json.pending` once the fix is in, then apply it (see
-  [Applying a `config.json` edit](#applying-a-configjson-edit)).
+  new `config.json.pending` once the fix is in, then confirm it (see
+  [Confirming a pending change](#confirming-a-pending-change)).
 
 ### `reload-applied`
 
@@ -1487,13 +1578,15 @@ or a filesystem that doesn't support syncing a directory).
     its instance runs as launched;
   - an added persona is brought up and launched, as at a start (its
     `persona-start` line, then `up at apply — launching` or a class line);
+  - a kept persona's `credentials_file` path change is only recorded: its
+    connection keeps running as it is until a restart reconnects it;
   - a persona with changed credentials keeps its current connection, and the
     credentials change stays pending (see
     [Pending changes](#pending-changes)).
 
-  The next start runs the new record, and it treats each persona as
-  [Applying a `config.json` edit](#applying-a-configjson-edit) describes
-  (the record no longer needs deleting: it already holds the change).
+  The next start runs the new record and carries out what the
+  confirmation left to it (see
+  [What a confirmation doesn't apply yet](#what-a-confirmation-doesnt-apply-yet)); the record already holds the change, so don't delete it.
 - **Fix:** None. If `config.json.pending` is written again after this line,
   something is still pending: see [Pending changes](#pending-changes). With
   nothing left pending, no `reload-nothing-pending` line follows; this line
@@ -1529,24 +1622,36 @@ or a filesystem that doesn't support syncing a directory).
   `config.json`, including one left there while the server was stopped (the
   first check after the start processes it). The line never shows the file's
   content.
-- **Cause:** A confirmation carries the fingerprint line of the
-  `config.json.pending` it was made from, and it applies only while that
-  still describes the files. It doesn't match when `config.json` or a
-  credentials file it references changed after that preview was written
-  (an old copy of `config.json.pending` included). A copy whose change was
-  already applied still matches while those files are unchanged: it logs
-  `reload-noop`, not this line. It holds no well-formed fingerprint when it was written
-  by hand or is damaged, and can't be read when it is a directory or not a
-  regular file. A copy of the current `config.json.pending` matches and
-  applies.
-- **Effect:** Nothing is applied. The confirmation is deleted and isn't
-  acted on again. A change that is still pending keeps its current preview in
-  `config.json.pending`, which the check writes again if it is missing.
-- **Fix:** Read the current `config.json.pending` (see
-  [Pending changes](#pending-changes)): it describes what would be applied
-  now. To apply it, see
-  [Applying a `config.json` edit](#applying-a-configjson-edit). Never write
-  a confirmation yourself or reuse an old one.
+- **Cause:** The confirmation's content no longer matches `config.json` and
+  the credentials files it references as they stand. A confirmation carries
+  the fingerprint line of the `config.json.pending` it was made from, and it
+  applies only while that still describes the files. The usual reasons:
+  - **An edit saved after the preview was written.** `config.json`, or a
+    credentials file it references, was saved again between the preview and
+    the rename, even with a change that was meant to go along with it.
+  - **A half-written save.** The check read `config.json` while an editor or
+    script was still writing it, wrote a preview of the partial file, and the
+    finished save no longer matches.
+  - **An older copy renamed.** The renamed file was an earlier
+    `config.json.pending` (a copy kept aside, or one from before a later
+    edit). A copy whose change was already applied still matches while the
+    files are unchanged: it logs `reload-noop`, not this line.
+  - **A hand-made or hand-edited confirmation.** A file written by hand, or a
+    preview edited or damaged, holds no well-formed fingerprint. One that is
+    a directory, a FIFO, socket or device, or over 64 KiB can't be read.
+- **Effect:** Nothing is applied. The confirmation is deleted, and the line is
+  logged once; the confirmation isn't acted on again. A change that is still
+  pending keeps its current preview in `config.json.pending`, which the check
+  writes again if it is missing.
+- **Fix:** Finish editing, wait about 5 s for `config.json.pending` to
+  refresh, read the new preview (see [Pending changes](#pending-changes)) and
+  rename it again (see
+  [Confirming a pending change](#confirming-a-pending-change)). Never write
+  or edit a confirmation: only the server's current `config.json.pending`
+  applies, renamed (a byte-for-byte copy also matches, but the rename is the
+  supported way). A confirmation is used once. After an edit
+  is reverted and redone, rename the new `config.json.pending`, even if it
+  reads the same as one renamed before.
 - **`is larger than the 64 KiB limit` on a fresh rename:** the server's own
   `config.json.pending` can exceed the cap for a very large single change
   (hundreds of personas renamed or credentials files changed at once), even
@@ -1556,7 +1661,7 @@ or a filesystem that doesn't support syncing a directory).
 - **A confirmation that can't be removed:** any confirmation, matched or not,
   is deleted before it is acted on. If that fails, the plain line
   `[slack] reload: cannot remove the confirmation "<apply path>" (<errno>); it was acted on once and is ignored until its content changes`
-  follows. The server retries the delete silently at each check and ignores
+  is logged just before the line that says how it was acted on. The server retries the delete silently at each check and ignores
   the file while its content stays the same. Remove it by hand once its
   directory is fixed (permissions, or a read-only filesystem). If it was
   removed but its directory couldn't be synced, the line is
@@ -1587,7 +1692,7 @@ or a filesystem that doesn't support syncing a directory).
   configuration, and uses a 30 s `stop_timeout`.
 - **Fix:** If it can't be read, make it a readable file and start again; the
   record is kept. Otherwise, with the operator's say-so, delete the record and
-  start, as under [Applying a `config.json` edit](#applying-a-configjson-edit).
+  start, as under [Starting without the record](#starting-without-the-record).
 - **Warning:** Deleting the record makes the next start run whatever is in
   `config.json` now, including any edit that was never applied. Read
   `config.json` before deleting the record.
